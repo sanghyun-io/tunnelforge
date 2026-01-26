@@ -420,8 +420,9 @@ class GitHubIssueReporter:
         if not HAS_REQUESTS:
             return False, "requests 라이브러리가 설치되지 않았습니다"
 
-        if not self.token or not self.repo:
-            return False, "GitHub 토큰 또는 리포지토리가 설정되지 않았습니다"
+        # GitHub App 모드면 token 체크 스킵
+        if not self._github_app and not self.repo:
+            return False, "GitHub App이 설정되지 않았습니다"
 
         try:
             # 1. 오류 요약
@@ -448,18 +449,13 @@ class GitHubIssueReporter:
 
 def get_reporter_from_config(config_manager) -> Optional[GitHubIssueReporter]:
     """
-    GitHubIssueReporter 인스턴스 생성
-
-    우선순위:
-    1. GitHub App (가장 안전)
-    2. 봇 토큰 (환경변수 또는 내장)
-    3. 사용자 설정 토큰 (ConfigManager)
+    GitHubIssueReporter 인스턴스 생성 (GitHub App 사용)
     """
     auto_report = config_manager.get_app_setting('github_auto_report', False)
     if not auto_report:
         return None
 
-    # 1. GitHub App 우선 사용 (가장 안전)
+    # GitHub App 사용
     try:
         from src.core.github_app_auth import get_github_app_auth
         github_app = get_github_app_auth()
@@ -470,33 +466,13 @@ def get_reporter_from_config(config_manager) -> Optional[GitHubIssueReporter]:
     except ImportError:
         pass
 
-    # 2. 봇 토큰 사용
-    from src.core.bot_credentials import get_bot_credentials
-    bot_token, bot_repo = get_bot_credentials()
-
-    if bot_token and bot_repo:
-        return GitHubIssueReporter(bot_token, bot_repo)
-
-    # 3. 사용자 설정 토큰 (폴백)
-    token = config_manager.get_app_setting('github_token', '')
-    repo = config_manager.get_app_setting('github_repo', '')
-
-    if token and repo:
-        return GitHubIssueReporter(token, repo)
-
     return None
 
 
-def is_bot_mode_available() -> bool:
-    """봇 모드 사용 가능 여부 확인 (GitHub App 또는 봇 토큰)"""
-    # GitHub App 확인
+def is_github_app_available() -> bool:
+    """GitHub App 설정 여부 확인"""
     try:
         from src.core.github_app_auth import is_github_app_configured
-        if is_github_app_configured():
-            return True
+        return is_github_app_configured()
     except ImportError:
-        pass
-
-    # 봇 토큰 확인
-    from src.core.bot_credentials import is_bot_configured
-    return is_bot_configured()
+        return False
