@@ -1,7 +1,7 @@
 """설정 관련 다이얼로그"""
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
-                             QButtonGroup, QGroupBox)
+                             QButtonGroup, QGroupBox, QMessageBox)
 
 
 class CloseConfirmDialog(QDialog):
@@ -77,7 +77,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config_mgr = config_manager
         self.setWindowTitle("설정")
-        self.setFixedSize(400, 220)
+        self.setFixedSize(500, 280)
         self.init_ui()
 
     def init_ui(self):
@@ -111,6 +111,40 @@ class SettingsDialog(QDialog):
             self.radio_exit.setChecked(True)
         else:  # 'ask' or default
             self.radio_ask.setChecked(True)
+
+        # GitHub 이슈 자동 보고 설정 그룹
+        github_group = QGroupBox("GitHub 이슈 자동 보고")
+        github_layout = QVBoxLayout(github_group)
+
+        # GitHub App 설정 확인
+        self._github_app_configured = self._check_github_app()
+
+        # 자동 보고 활성화 체크박스
+        self.chk_auto_report = QCheckBox("Export/Import 오류 시 자동으로 GitHub 이슈 생성")
+        github_layout.addWidget(self.chk_auto_report)
+
+        # GitHub App 설정 상태에 따른 설명
+        if self._github_app_configured:
+            desc_label = QLabel(
+                "오류 발생 시 자동으로 이슈를 생성하거나,\n"
+                "유사한 이슈가 있으면 코멘트를 추가합니다.\n"
+                "✅ GitHub App이 설정되어 있습니다."
+            )
+            desc_label.setStyleSheet("color: #27ae60; font-size: 11px; margin-left: 20px;")
+        else:
+            desc_label = QLabel(
+                "⚠️ GitHub App이 설정되지 않았습니다.\n"
+                "환경변수 또는 내장 설정이 필요합니다.\n"
+                "(GITHUB_APP_SETUP.md 참조)"
+            )
+            desc_label.setStyleSheet("color: #e74c3c; font-size: 11px; margin-left: 20px;")
+            self.chk_auto_report.setEnabled(False)
+
+        github_layout.addWidget(desc_label)
+        layout.addWidget(github_group)
+
+        # GitHub 설정 로드
+        self._load_github_settings()
 
         layout.addStretch()
 
@@ -151,4 +185,25 @@ class SettingsDialog(QDialog):
             action = 'ask'
 
         self.config_mgr.set_app_setting('close_action', action)
+
+        # GitHub 자동 보고 설정 저장
+        auto_report = self.chk_auto_report.isChecked()
+        self.config_mgr.set_app_setting('github_auto_report', auto_report)
+
         self.accept()
+
+    def _check_github_app(self) -> bool:
+        """GitHub App 설정 여부 확인"""
+        try:
+            from src.core.github_app_auth import is_github_app_configured
+            return is_github_app_configured()
+        except ImportError:
+            return False
+
+    def _load_github_settings(self):
+        """GitHub 설정 로드"""
+        auto_report = self.config_mgr.get_app_setting('github_auto_report', False)
+        # GitHub App이 설정되지 않았으면 자동 보고 비활성화
+        if not self._github_app_configured:
+            auto_report = False
+        self.chk_auto_report.setChecked(auto_report)
