@@ -418,12 +418,35 @@ class GitHubIssueReporter:
 
 
 def get_reporter_from_config(config_manager) -> Optional[GitHubIssueReporter]:
-    """ConfigManager에서 설정을 읽어 GitHubIssueReporter 인스턴스 생성"""
-    token = config_manager.get_app_setting('github_token', '')
-    repo = config_manager.get_app_setting('github_repo', '')
-    auto_report = config_manager.get_app_setting('github_auto_report', False)
+    """
+    GitHubIssueReporter 인스턴스 생성
 
-    if not auto_report or not token or not repo:
+    우선순위:
+    1. 봇 토큰 (환경변수 또는 내장)
+    2. 사용자 설정 토큰 (ConfigManager)
+    """
+    auto_report = config_manager.get_app_setting('github_auto_report', False)
+    if not auto_report:
         return None
 
-    return GitHubIssueReporter(token, repo)
+    # 1. 봇 토큰 우선 사용
+    from src.core.bot_credentials import get_bot_credentials
+    bot_token, bot_repo = get_bot_credentials()
+
+    if bot_token and bot_repo:
+        return GitHubIssueReporter(bot_token, bot_repo)
+
+    # 2. 사용자 설정 토큰 (폴백)
+    token = config_manager.get_app_setting('github_token', '')
+    repo = config_manager.get_app_setting('github_repo', '')
+
+    if token and repo:
+        return GitHubIssueReporter(token, repo)
+
+    return None
+
+
+def is_bot_mode_available() -> bool:
+    """봇 모드 사용 가능 여부 확인"""
+    from src.core.bot_credentials import is_bot_configured
+    return is_bot_configured()

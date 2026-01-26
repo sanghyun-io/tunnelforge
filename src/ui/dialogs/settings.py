@@ -77,9 +77,14 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_mgr = config_manager
+        self._bot_mode = False  # init_ui에서 설정됨
         self.setWindowTitle("설정")
-        self.setFixedSize(500, 420)
         self.init_ui()
+        # 봇 모드에 따라 다이얼로그 크기 조정
+        if self._bot_mode:
+            self.setFixedSize(500, 280)
+        else:
+            self.setFixedSize(500, 420)
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -117,18 +122,34 @@ class SettingsDialog(QDialog):
         github_group = QGroupBox("GitHub 이슈 자동 보고")
         github_layout = QVBoxLayout(github_group)
 
+        # 봇 모드 확인
+        self._bot_mode = self._check_bot_mode()
+
         # 자동 보고 활성화 체크박스
         self.chk_auto_report = QCheckBox("Export/Import 오류 시 자동으로 GitHub 이슈 생성")
         self.chk_auto_report.stateChanged.connect(self._on_auto_report_changed)
         github_layout.addWidget(self.chk_auto_report)
 
         # 설명 라벨
-        desc_label = QLabel(
-            "오류 발생 시 자동으로 이슈를 생성하거나,\n"
-            "유사한 이슈가 있으면 코멘트를 추가합니다."
-        )
-        desc_label.setStyleSheet("color: #666; font-size: 11px; margin-left: 20px;")
+        if self._bot_mode:
+            desc_label = QLabel(
+                "오류 발생 시 자동으로 이슈를 생성하거나,\n"
+                "유사한 이슈가 있으면 코멘트를 추가합니다.\n"
+                "✅ 봇 인증이 설정되어 있습니다."
+            )
+            desc_label.setStyleSheet("color: #27ae60; font-size: 11px; margin-left: 20px;")
+        else:
+            desc_label = QLabel(
+                "오류 발생 시 자동으로 이슈를 생성하거나,\n"
+                "유사한 이슈가 있으면 코멘트를 추가합니다."
+            )
+            desc_label.setStyleSheet("color: #666; font-size: 11px; margin-left: 20px;")
         github_layout.addWidget(desc_label)
+
+        # 사용자 토큰 입력 위젯들 (봇 모드가 아닐 때만 표시)
+        self.manual_credentials_widget = QWidget()
+        manual_layout = QVBoxLayout(self.manual_credentials_widget)
+        manual_layout.setContentsMargins(0, 0, 0, 0)
 
         # GitHub 토큰 입력
         token_layout = QHBoxLayout()
@@ -139,7 +160,7 @@ class SettingsDialog(QDialog):
         self.input_github_token.setPlaceholderText("ghp_xxxxxxxxxxxx")
         token_layout.addWidget(token_label)
         token_layout.addWidget(self.input_github_token)
-        github_layout.addLayout(token_layout)
+        manual_layout.addLayout(token_layout)
 
         # 리포지토리 입력
         repo_layout = QHBoxLayout()
@@ -149,7 +170,7 @@ class SettingsDialog(QDialog):
         self.input_github_repo.setPlaceholderText("owner/repo (예: sanghyun-io/db-connector)")
         repo_layout.addWidget(repo_label)
         repo_layout.addWidget(self.input_github_repo)
-        github_layout.addLayout(repo_layout)
+        manual_layout.addLayout(repo_layout)
 
         # 토큰 안내
         token_help = QLabel(
@@ -157,7 +178,7 @@ class SettingsDialog(QDialog):
             "필요 권한: repo (이슈 생성/코멘트 추가)"
         )
         token_help.setStyleSheet("color: #888; font-size: 10px; margin-top: 5px;")
-        github_layout.addWidget(token_help)
+        manual_layout.addWidget(token_help)
 
         # 연결 테스트 버튼
         test_layout = QHBoxLayout()
@@ -173,7 +194,13 @@ class SettingsDialog(QDialog):
         """)
         self.btn_test_github.clicked.connect(self._test_github_connection)
         test_layout.addWidget(self.btn_test_github)
-        github_layout.addLayout(test_layout)
+        manual_layout.addLayout(test_layout)
+
+        github_layout.addWidget(self.manual_credentials_widget)
+
+        # 봇 모드면 수동 입력 숨김
+        if self._bot_mode:
+            self.manual_credentials_widget.setVisible(False)
 
         layout.addWidget(github_group)
 
@@ -222,38 +249,55 @@ class SettingsDialog(QDialog):
 
         # GitHub 설정 저장
         auto_report = self.chk_auto_report.isChecked()
-        github_token = self.input_github_token.text().strip()
-        github_repo = self.input_github_repo.text().strip()
 
-        # 자동 보고 활성화 시 필수값 체크
-        if auto_report and (not github_token or not github_repo):
-            QMessageBox.warning(
-                self, "설정 오류",
-                "GitHub 자동 이슈 보고를 활성화하려면\n토큰과 리포지토리를 모두 입력해야 합니다."
-            )
-            return
+        # 봇 모드가 아닐 때만 수동 입력 값 체크
+        if not self._bot_mode:
+            github_token = self.input_github_token.text().strip()
+            github_repo = self.input_github_repo.text().strip()
+
+            # 자동 보고 활성화 시 필수값 체크
+            if auto_report and (not github_token or not github_repo):
+                QMessageBox.warning(
+                    self, "설정 오류",
+                    "GitHub 자동 이슈 보고를 활성화하려면\n토큰과 리포지토리를 모두 입력해야 합니다."
+                )
+                return
+
+            self.config_mgr.set_app_setting('github_token', github_token)
+            self.config_mgr.set_app_setting('github_repo', github_repo)
 
         self.config_mgr.set_app_setting('github_auto_report', auto_report)
-        self.config_mgr.set_app_setting('github_token', github_token)
-        self.config_mgr.set_app_setting('github_repo', github_repo)
-
         self.accept()
+
+    def _check_bot_mode(self) -> bool:
+        """봇 모드 사용 가능 여부 확인"""
+        try:
+            from src.core.bot_credentials import is_bot_configured
+            return is_bot_configured()
+        except ImportError:
+            return False
 
     def _load_github_settings(self):
         """GitHub 설정 로드"""
         auto_report = self.config_mgr.get_app_setting('github_auto_report', False)
-        github_token = self.config_mgr.get_app_setting('github_token', '')
-        github_repo = self.config_mgr.get_app_setting('github_repo', '')
 
         self.chk_auto_report.setChecked(auto_report)
-        self.input_github_token.setText(github_token)
-        self.input_github_repo.setText(github_repo)
 
-        # 비활성화 상태면 입력 필드 비활성화
-        self._on_auto_report_changed(Qt.CheckState.Checked.value if auto_report else Qt.CheckState.Unchecked.value)
+        # 봇 모드가 아닐 때만 수동 입력 값 로드
+        if not self._bot_mode:
+            github_token = self.config_mgr.get_app_setting('github_token', '')
+            github_repo = self.config_mgr.get_app_setting('github_repo', '')
+            self.input_github_token.setText(github_token)
+            self.input_github_repo.setText(github_repo)
+            # 비활성화 상태면 입력 필드 비활성화
+            self._on_auto_report_changed(Qt.CheckState.Checked.value if auto_report else Qt.CheckState.Unchecked.value)
 
     def _on_auto_report_changed(self, state):
         """자동 보고 체크박스 상태 변경 시"""
+        # 봇 모드면 수동 입력 필드 상태 변경 불필요
+        if self._bot_mode:
+            return
+
         enabled = state == Qt.CheckState.Checked.value
         self.input_github_token.setEnabled(enabled)
         self.input_github_repo.setEnabled(enabled)
