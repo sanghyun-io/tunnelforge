@@ -8,6 +8,7 @@ from PyQt6.QtGui import QAction, QIcon
 from src.ui.dialogs.tunnel_config import TunnelConfigDialog
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
 from src.ui.dialogs.db_dialogs import MySQLShellWizard
+from src.ui.dialogs.migration_dialogs import MigrationWizard
 
 
 class TunnelManagerUI(QMainWindow):
@@ -72,6 +73,17 @@ class TunnelManagerUI(QMainWindow):
         """)
         btn_mysqlsh_import.clicked.connect(self.open_mysqlsh_import)
 
+        # [Migration Analyzer] 버튼 - 마이그레이션 분석
+        btn_migration = QPushButton("🔄 Migration")
+        btn_migration.setStyleSheet("""
+            QPushButton {
+                background-color: #9b59b6; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #8e44ad; }
+        """)
+        btn_migration.clicked.connect(self.open_migration_analyzer)
+
         # [새로고침] 버튼 - Secondary 스타일
         btn_refresh = QPushButton("🔄 설정 로드")
         btn_refresh.setStyleSheet("""
@@ -99,6 +111,7 @@ class TunnelManagerUI(QMainWindow):
         header_layout.addWidget(btn_add)
         header_layout.addWidget(btn_mysqlsh_export)
         header_layout.addWidget(btn_mysqlsh_import)
+        header_layout.addWidget(btn_migration)
         header_layout.addWidget(btn_refresh)
         header_layout.addWidget(btn_settings)
         layout.addLayout(header_layout)
@@ -318,6 +331,14 @@ class TunnelManagerUI(QMainWindow):
             config_manager=self.config_mgr
         )
         wizard.start_import()
+
+    def open_migration_analyzer(self):
+        """마이그레이션 분석기 열기"""
+        MigrationWizard.start(
+            parent=self,
+            tunnel_engine=self.engine,
+            config_manager=self.config_mgr
+        )
 
     # --- 기존 터널링 로직 ---
     def start_tunnel(self, tunnel_config):
