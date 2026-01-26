@@ -1,0 +1,5 @@
+PyQt6>=6.4.0
+sshtunnel>=0.4.0
+paramiko>=3.0.0
+cryptography>=40.0.0
+pymysql>=1.0.0

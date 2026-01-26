@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/pip show:*)",
+      "Bash(.venv/Scripts/pip:*)",
+      "Bash(ls:*)",
+      "Bash(dir /b \"C:\\\\Users\\\\QESG\\\\Documents\\\\sanghyun-git\\\\tunnel-manager\\\\*.py\")",
+      "Bash(python -m py_compile:*)",
+      "Bash(python:*)",
+      "Bash(.venv/Scripts/python.exe:*)",
+      "Bash(.venv/Scripts/pip.exe:*)",
+      "Bash(mysqlsh:*)",
+      "Bash(wc:*)",
+      "Bash(.venv/Scripts/python:*)"
+    ]
+  }
+}

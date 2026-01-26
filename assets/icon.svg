@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <!-- Gradient for tunnel -->
+    <linearGradient id="tunnelGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#3B82F6"/>
+      <stop offset="100%" style="stop-color:#1D4ED8"/>
+    </linearGradient>
+    <!-- Gradient for outer ring -->
+    <linearGradient id="ringGrad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#60A5FA"/>
+      <stop offset="100%" style="stop-color:#2563EB"/>
+    </linearGradient>
+    <!-- Glow effect -->
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="3" result="coloredBlur"/>
+      <feMerge>
+        <feMergeNode in="coloredBlur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+    <!-- Shadow -->
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="4" stdDeviation="8" flood-color="#000" flood-opacity="0.25"/>
+    </filter>
+  </defs>
+
+  <!-- Background circle -->
+  <circle cx="256" cy="256" r="240" fill="#0F172A" filter="url(#shadow)"/>
+
+  <!-- Outer decorative ring -->
+  <circle cx="256" cy="256" r="220" fill="none" stroke="url(#ringGrad)" stroke-width="4" stroke-dasharray="20 10" opacity="0.5"/>
+
+  <!-- Tunnel pipe - 3D effect -->
+  <g filter="url(#glow)">
+    <!-- Main tunnel body -->
+    <path d="M100 256 C100 180, 160 140, 256 140 C352 140, 412 180, 412 256 C412 332, 352 372, 256 372 C160 372, 100 332, 100 256"
+          fill="none" stroke="url(#tunnelGrad)" stroke-width="40" stroke-linecap="round"/>
+
+    <!-- Inner tunnel highlight -->
+    <path d="M120 256 C120 195, 175 160, 256 160 C337 160, 392 195, 392 256 C392 317, 337 352, 256 352 C175 352, 120 317, 120 256"
+          fill="none" stroke="#60A5FA" stroke-width="20" stroke-linecap="round" opacity="0.6"/>
+  </g>
+
+  <!-- Left node (source) -->
+  <g filter="url(#glow)">
+    <circle cx="100" cy="256" r="35" fill="#10B981"/>
+    <circle cx="100" cy="256" r="20" fill="#34D399"/>
+    <circle cx="100" cy="256" r="8" fill="#fff"/>
+  </g>
+
+  <!-- Right node (destination) -->
+  <g filter="url(#glow)">
+    <circle cx="412" cy="256" r="35" fill="#10B981"/>
+    <circle cx="412" cy="256" r="20" fill="#34D399"/>
+    <circle cx="412" cy="256" r="8" fill="#fff"/>
+  </g>
+
+  <!-- Lock icon in center (security) -->
+  <g transform="translate(256, 256)" filter="url(#glow)">
+    <!-- Lock body -->
+    <rect x="-28" y="-5" width="56" height="45" rx="8" fill="#F59E0B"/>
+    <rect x="-22" y="5" width="44" height="30" rx="4" fill="#FBBF24"/>
+
+    <!-- Lock shackle -->
+    <path d="M-14 -5 L-14 -25 C-14 -45, 14 -45, 14 -25 L14 -5"
+          fill="none" stroke="#F59E0B" stroke-width="10" stroke-linecap="round"/>
+    <path d="M-10 -5 L-10 -23 C-10 -38, 10 -38, 10 -23 L10 -5"
+          fill="none" stroke="#FBBF24" stroke-width="6" stroke-linecap="round"/>
+
+    <!-- Keyhole -->
+    <circle cx="0" cy="15" r="6" fill="#92400E"/>
+    <rect x="-3" y="15" width="6" height="12" fill="#92400E"/>
+  </g>
+
+  <!-- Data flow particles -->
+  <g opacity="0.8">
+    <circle cx="150" cy="220" r="6" fill="#60A5FA">
+      <animate attributeName="cx" values="150;362" dur="2s" repeatCount="indefinite"/>
+      <animate attributeName="cy" values="220;220" dur="2s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.3;1" dur="2s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="200" cy="290" r="4" fill="#34D399">
+      <animate attributeName="cx" values="362;150" dur="1.5s" repeatCount="indefinite"/>
+      <animate attributeName="cy" values="290;290" dur="1.5s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="1;0.3;1" dur="1.5s" repeatCount="indefinite"/>
+    </circle>
+    <circle cx="280" cy="200" r="5" fill="#A78BFA">
+      <animate attributeName="cx" values="150;362" dur="2.5s" repeatCount="indefinite"/>
+      <animate attributeName="cy" values="240;240" dur="2.5s" repeatCount="indefinite"/>
+      <animate attributeName="opacity" values="0.5;1;0.5" dur="2.5s" repeatCount="indefinite"/>
+    </circle>
+  </g>
+</svg>

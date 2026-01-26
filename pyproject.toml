@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dataflare-tunnel-manager"
+version = "1.0.0"
+description = "SSH Tunnel and MySQL Database Manager"
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [
+    {name = "DataFlare"}
+]
+dependencies = [
+    "PyQt6>=6.4.0",
+    "sshtunnel>=0.4.0",
+    "paramiko>=3.0.0",
+    "cryptography>=40.0.0",
+    "pymysql>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pyinstaller>=5.0.0",
+]
+
+[project.scripts]
+tunnel-manager = "main:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
