@@ -5,6 +5,7 @@ MySQL Shell 기반 병렬 Export/Import
 - 전체 스키마 / 일부 테이블 지원
 """
 import os
+import re
 import subprocess
 import shutil
 import json
@@ -403,6 +404,7 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
             # 테이블별 진행률 모니터링 설정
             stop_monitor = threading.Event()
             monitor_thread = None
+            process = None
 
             if output_dir and schema and tables and table_progress_callback:
                 monitor_thread = threading.Thread(
@@ -977,9 +979,6 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
         Returns:
             (성공여부, 메시지, 테이블별 결과 dict)
         """
-        import re
-        from datetime import datetime
-
         if import_results is None:
             import_results = {}
 
@@ -1257,14 +1256,17 @@ def import_dump(
     input_dir: str,
     target_schema: Optional[str] = None,
     threads: int = 4,
-    drop_existing_tables: bool = True,
+    import_mode: str = "replace",
     progress_callback: Optional[Callable[[str], None]] = None
-) -> Tuple[bool, str]:
+) -> Tuple[bool, str, dict]:
     """
     Dump Import (간편 함수)
 
     Args:
-        drop_existing_tables: 기존 테이블 삭제 후 재생성 (기본: True)
+        import_mode: Import 모드
+            - "merge": 병합 (기존 데이터 유지)
+            - "replace": 전체 교체 (모든 객체 재생성, resetProgress=true)
+            - "recreate": 완전 재생성 (스키마 DROP 후 재생성)
     """
     config = MySQLShellConfig(host, port, user, password)
     importer = MySQLShellImporter(config)
@@ -1272,6 +1274,6 @@ def import_dump(
         input_dir,
         target_schema,
         threads,
-        drop_existing_tables=drop_existing_tables,
+        import_mode=import_mode,
         progress_callback=progress_callback
     )
