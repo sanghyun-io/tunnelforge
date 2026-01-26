@@ -10,6 +10,8 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 from typing import List, Optional
+from datetime import datetime
+import os
 
 from src.core.db_connector import MySQLConnector
 from src.exporters.mysqlsh_exporter import (
@@ -280,6 +282,14 @@ class MySQLShellExportDialog(QDialog):
         self.connection_info = connection_info  # 터널명 또는 host_port
         self.worker: Optional[MySQLShellWorker] = None
 
+        # 로그 수집용 변수
+        self.log_entries: List[str] = []
+        self.export_start_time: Optional[datetime] = None
+        self.export_end_time: Optional[datetime] = None
+        self.export_success: Optional[bool] = None
+        self.export_schema: str = ""
+        self.export_tables: List[str] = []
+
         # mysqlsh 설치 확인
         self.mysqlsh_installed, self.mysqlsh_msg = check_mysqlsh()
 
@@ -513,6 +523,19 @@ class MySQLShellExportDialog(QDialog):
         self.btn_export.clicked.connect(self.do_export)
         self.btn_export.setEnabled(self.mysqlsh_installed)
 
+        self.btn_save_log = QPushButton("📄 로그 저장")
+        self.btn_save_log.setStyleSheet("""
+            QPushButton {
+                background-color: #9b59b6; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #8e44ad; }
+            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
+        """)
+        self.btn_save_log.clicked.connect(self.save_log)
+        self.btn_save_log.setEnabled(False)
+        self.btn_save_log.setToolTip("Export 완료 후 로그를 파일로 저장할 수 있습니다.")
+
         btn_cancel = QPushButton("닫기")
         btn_cancel.setStyleSheet("""
             QPushButton {
@@ -523,6 +546,7 @@ class MySQLShellExportDialog(QDialog):
         """)
         btn_cancel.clicked.connect(self.close)
 
+        button_layout.addWidget(self.btn_save_log)
         button_layout.addStretch()
         button_layout.addWidget(self.btn_export)
         button_layout.addWidget(btn_cancel)
@@ -762,6 +786,28 @@ class MySQLShellExportDialog(QDialog):
         if self.config_manager:
             self.config_manager.set_app_setting('mysqlsh_export_dir', output_dir)
 
+        # 로그 수집 초기화
+        self.log_entries.clear()
+        self.export_start_time = datetime.now()
+        self.export_end_time = None
+        self.export_success = None
+        self.export_schema = schema
+        self.export_tables = self.get_selected_tables() if self.radio_partial.isChecked() else []
+        self.btn_save_log.setEnabled(False)
+
+        # 로그 헤더 추가
+        self._add_log(f"{'='*60}")
+        self._add_log(f"MySQL Shell Export 시작")
+        self._add_log(f"시작 시간: {self.export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        self._add_log(f"스키마: {schema}")
+        self._add_log(f"Export 유형: {'전체 스키마' if self.radio_full.isChecked() else '선택 테이블'}")
+        if self.radio_partial.isChecked():
+            self._add_log(f"선택 테이블: {', '.join(self.export_tables)}")
+        self._add_log(f"출력 폴더: {output_dir}")
+        self._add_log(f"병렬 스레드: {self.spin_threads.value()}")
+        self._add_log(f"압축 방식: {self.combo_compression.currentText()}")
+        self._add_log(f"{'='*60}")
+
         # UI 상태 변경 - 모든 입력 비활성화
         self.set_ui_enabled(False)
         self.txt_log.clear()
@@ -807,9 +853,16 @@ class MySQLShellExportDialog(QDialog):
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
+    def _add_log(self, msg: str):
+        """로그 항목 추가 (수집용)"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        log_entry = f"[{timestamp}] {msg}"
+        self.log_entries.append(log_entry)
+
     def on_progress(self, msg: str):
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
+        self._add_log(msg)
 
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
@@ -819,12 +872,27 @@ class MySQLShellExportDialog(QDialog):
 
         self.progress_bar.setValue(current)
         self.label_status.setText(f"✅ {table_name} ({current}/{total})")
+        self._add_log(f"테이블 완료: {table_name} ({current}/{total})")
 
     def on_finished(self, success: bool, message: str):
+        # 로그 기록
+        self.export_end_time = datetime.now()
+        self.export_success = success
+
+        self._add_log(f"{'='*60}")
+        self._add_log(f"Export {'성공' if success else '실패'}")
+        self._add_log(f"종료 시간: {self.export_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if self.export_start_time:
+            elapsed = self.export_end_time - self.export_start_time
+            self._add_log(f"소요 시간: {elapsed}")
+        self._add_log(f"결과 메시지: {message}")
+        self._add_log(f"{'='*60}")
+
         # UI 상태 복구
         self.set_ui_enabled(True)
         self.progress_bar.setVisible(False)
         self.label_status.setVisible(False)
+        self.btn_save_log.setEnabled(True)  # 로그 저장 버튼 활성화
 
         if success:
             self.txt_log.addItem(f"✅ 완료: {message}")
@@ -835,6 +903,68 @@ class MySQLShellExportDialog(QDialog):
         else:
             self.txt_log.addItem(f"❌ 실패: {message}")
             QMessageBox.warning(self, "Export 실패", f"❌ {message}")
+
+    def save_log(self):
+        """로그를 파일로 저장"""
+        if not self.log_entries:
+            QMessageBox.warning(self, "로그 없음", "저장할 로그가 없습니다.")
+            return
+
+        # 기본 파일명 생성
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        status = "success" if self.export_success else "failed"
+        default_filename = f"export_log_{self.export_schema}_{status}_{timestamp}.txt"
+
+        # 파일 저장 대화상자
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "로그 파일 저장",
+            os.path.join(self._get_base_output_dir(), default_filename),
+            "텍스트 파일 (*.txt);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                # 헤더 정보
+                f.write("=" * 70 + "\n")
+                f.write("MySQL Shell Export Log\n")
+                f.write("=" * 70 + "\n\n")
+
+                f.write(f"스키마: {self.export_schema}\n")
+                f.write(f"Export 유형: {'전체 스키마' if self.radio_full.isChecked() else '선택 테이블'}\n")
+                if self.export_tables:
+                    f.write(f"선택 테이블: {', '.join(self.export_tables)}\n")
+                f.write(f"출력 폴더: {self.input_output_dir.text()}\n")
+                f.write(f"연결 정보: {self.connection_info}\n")
+                f.write(f"결과: {'성공 ✅' if self.export_success else '실패 ❌'}\n")
+
+                if self.export_start_time:
+                    f.write(f"시작 시간: {self.export_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                if self.export_end_time:
+                    f.write(f"종료 시간: {self.export_end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                if self.export_start_time and self.export_end_time:
+                    elapsed = self.export_end_time - self.export_start_time
+                    f.write(f"소요 시간: {elapsed}\n")
+
+                f.write("\n" + "=" * 70 + "\n")
+                f.write("상세 로그\n")
+                f.write("=" * 70 + "\n\n")
+
+                for entry in self.log_entries:
+                    f.write(entry + "\n")
+
+            QMessageBox.information(
+                self, "저장 완료",
+                f"✅ 로그가 저장되었습니다.\n\n{file_path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "저장 실패",
+                f"❌ 로그 저장 중 오류가 발생했습니다.\n\n{str(e)}"
+            )
 
     def closeEvent(self, event):
         if self.connector:
@@ -861,6 +991,12 @@ class MySQLShellImportDialog(QDialog):
         self.table_items: dict = {}  # 테이블명 -> QListWidgetItem 매핑
         self.last_input_dir: str = ""  # 마지막 사용한 input_dir
         self.last_target_schema: str = ""  # 마지막 사용한 target_schema
+
+        # 로그 수집용 변수
+        self.log_entries: List[str] = []
+        self.import_start_time: Optional[datetime] = None
+        self.import_end_time: Optional[datetime] = None
+        self.import_success: Optional[bool] = None
 
         self.init_ui()
         self.load_schemas()
@@ -1153,6 +1289,19 @@ class MySQLShellImportDialog(QDialog):
         self.btn_import.clicked.connect(self.do_import)
         self.btn_import.setEnabled(self.mysqlsh_installed)
 
+        self.btn_save_log = QPushButton("📄 로그 저장")
+        self.btn_save_log.setStyleSheet("""
+            QPushButton {
+                background-color: #9b59b6; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #8e44ad; }
+            QPushButton:disabled { background-color: #bdc3c7; color: #7f8c8d; }
+        """)
+        self.btn_save_log.clicked.connect(self.save_log)
+        self.btn_save_log.setEnabled(False)
+        self.btn_save_log.setToolTip("Import 완료 후 로그를 파일로 저장할 수 있습니다.")
+
         btn_cancel = QPushButton("닫기")
         btn_cancel.setStyleSheet("""
             QPushButton {
@@ -1163,6 +1312,7 @@ class MySQLShellImportDialog(QDialog):
         """)
         btn_cancel.clicked.connect(self.close)
 
+        button_layout.addWidget(self.btn_save_log)
         button_layout.addStretch()
         button_layout.addWidget(self.btn_import)
         button_layout.addWidget(btn_cancel)
@@ -1219,6 +1369,12 @@ class MySQLShellImportDialog(QDialog):
         except Exception:
             return False
 
+    def _add_log(self, msg: str):
+        """로그 항목 추가 (수집용)"""
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        log_entry = f"[{timestamp}] {msg}"
+        self.log_entries.append(log_entry)
+
     def do_import(self, retry_tables: list = None):
         """Import 실행 (retry_tables가 주어지면 해당 테이블만 재시도)"""
         input_dir = self.input_dir.text()
@@ -1227,7 +1383,6 @@ class MySQLShellImportDialog(QDialog):
             QMessageBox.warning(self, "오류", "Dump 폴더를 선택하세요.")
             return
 
-        import os
         if not os.path.exists(input_dir):
             QMessageBox.warning(self, "오류", "폴더가 존재하지 않습니다.")
             return
@@ -1247,6 +1402,7 @@ class MySQLShellImportDialog(QDialog):
         self.set_ui_enabled(False)
         self.btn_retry.setVisible(False)
         self.btn_select_failed.setVisible(False)
+        self.btn_save_log.setEnabled(False)
 
         # 로그 및 진행 상황 UI 표시
         self.progress_group.setVisible(True)
@@ -1259,6 +1415,28 @@ class MySQLShellImportDialog(QDialog):
             self.table_list.clear()
             self.table_items.clear()
             self.import_results.clear()
+            # 로그 수집 초기화
+            self.log_entries.clear()
+            self.import_start_time = datetime.now()
+            self.import_end_time = None
+            self.import_success = None
+
+            # Import 모드 결정
+            import_mode_str = "증분 Import (병합)"
+            if self.radio_replace.isChecked():
+                import_mode_str = "전체 교체 Import"
+            elif self.radio_recreate.isChecked():
+                import_mode_str = "완전 재생성 Import"
+
+            # 로그 헤더 추가
+            self._add_log(f"{'='*60}")
+            self._add_log(f"MySQL Shell Import 시작")
+            self._add_log(f"시작 시간: {self.import_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+            self._add_log(f"Dump 폴더: {input_dir}")
+            self._add_log(f"대상 스키마: {target_schema if target_schema else '원본 스키마명 사용'}")
+            self._add_log(f"Import 모드: {import_mode_str}")
+            self._add_log(f"병렬 스레드: {self.spin_threads.value()}")
+            self._add_log(f"{'='*60}")
 
         # 프로그레스 바 초기화
         self.progress_bar.setValue(0)
@@ -1339,10 +1517,12 @@ class MySQLShellImportDialog(QDialog):
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
         self.label_status.setText(msg)
+        self._add_log(msg)
 
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
         self.label_tables.setText(f"📋 테이블: {current} / {total} 완료")
+        self._add_log(f"테이블 완료: {table_name} ({current}/{total})")
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
@@ -1395,6 +1575,11 @@ class MySQLShellImportDialog(QDialog):
         # 결과 저장
         self.import_results[table_name] = {'status': status, 'message': message}
 
+        # 로그에 테이블 상태 변경 기록 (done/error만)
+        if status in ('done', 'error'):
+            status_text = '완료' if status == 'done' else f'오류: {message}'
+            self._add_log(f"테이블 [{table_name}] {status_text}")
+
     def on_raw_output(self, line: str):
         """mysqlsh 실시간 출력 처리 (로그에 추가)"""
         # 너무 많은 로그 방지 (최대 500줄)
@@ -1402,6 +1587,8 @@ class MySQLShellImportDialog(QDialog):
             self.txt_log.takeItem(0)
         self.txt_log.addItem(line)
         self.txt_log.scrollToBottom()
+        # raw output도 로그에 기록
+        self._add_log(f"[mysqlsh] {line}")
 
     def on_import_finished(self, success: bool, message: str, results: dict):
         """Import 완료 처리 (결과 저장 및 재시도 버튼 표시)"""
@@ -1417,13 +1604,29 @@ class MySQLShellImportDialog(QDialog):
 
     def on_finished(self, success: bool, message: str):
         """작업 완료 처리"""
-        # UI 상태 복구
-        self.set_ui_enabled(True)
+        # 로그 기록
+        self.import_end_time = datetime.now()
+        self.import_success = success
 
         # 결과 요약
         done_count = sum(1 for r in self.import_results.values() if r.get('status') == 'done')
         error_count = sum(1 for r in self.import_results.values() if r.get('status') == 'error')
         total_count = len(self.import_results)
+
+        self._add_log(f"{'='*60}")
+        self._add_log(f"Import {'성공' if success else '실패'}")
+        self._add_log(f"종료 시간: {self.import_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        if self.import_start_time:
+            elapsed = self.import_end_time - self.import_start_time
+            self._add_log(f"소요 시간: {elapsed}")
+        self._add_log(f"성공: {done_count}개 테이블")
+        self._add_log(f"실패: {error_count}개 테이블")
+        self._add_log(f"결과 메시지: {message}")
+        self._add_log(f"{'='*60}")
+
+        # UI 상태 복구
+        self.set_ui_enabled(True)
+        self.btn_save_log.setEnabled(True)  # 로그 저장 버튼 활성화
 
         if success:
             self.label_status.setText(f"✅ Import 완료: {done_count}/{total_count} 테이블 성공")
@@ -1479,6 +1682,90 @@ class MySQLShellImportDialog(QDialog):
 
             # 재시도 실행
             self.do_import(retry_tables=selected_tables)
+
+    def save_log(self):
+        """로그를 파일로 저장"""
+        if not self.log_entries:
+            QMessageBox.warning(self, "로그 없음", "저장할 로그가 없습니다.")
+            return
+
+        # 기본 파일명 생성
+        timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+        status = "success" if self.import_success else "failed"
+
+        # 스키마 이름 추출 (폴더명에서)
+        schema_name = "unknown"
+        if self.last_input_dir:
+            schema_name = os.path.basename(self.last_input_dir).split('_')[0]
+        if self.last_target_schema:
+            schema_name = self.last_target_schema
+
+        default_filename = f"import_log_{schema_name}_{status}_{timestamp}.txt"
+
+        # 기본 저장 경로
+        default_dir = os.path.dirname(self.last_input_dir) if self.last_input_dir else os.path.expanduser("~")
+
+        # 파일 저장 대화상자
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "로그 파일 저장",
+            os.path.join(default_dir, default_filename),
+            "텍스트 파일 (*.txt);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            # 결과 요약
+            done_count = sum(1 for r in self.import_results.values() if r.get('status') == 'done')
+            error_count = sum(1 for r in self.import_results.values() if r.get('status') == 'error')
+            total_count = len(self.import_results)
+
+            with open(file_path, 'w', encoding='utf-8') as f:
+                # 헤더 정보
+                f.write("=" * 70 + "\n")
+                f.write("MySQL Shell Import Log\n")
+                f.write("=" * 70 + "\n\n")
+
+                f.write(f"Dump 폴더: {self.last_input_dir}\n")
+                f.write(f"대상 스키마: {self.last_target_schema if self.last_target_schema else '원본 스키마명 사용'}\n")
+                f.write(f"결과: {'성공 ✅' if self.import_success else '실패 ❌'}\n")
+                f.write(f"테이블 통계: 성공 {done_count}개, 실패 {error_count}개, 총 {total_count}개\n")
+
+                if self.import_start_time:
+                    f.write(f"시작 시간: {self.import_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                if self.import_end_time:
+                    f.write(f"종료 시간: {self.import_end_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                if self.import_start_time and self.import_end_time:
+                    elapsed = self.import_end_time - self.import_start_time
+                    f.write(f"소요 시간: {elapsed}\n")
+
+                # 실패한 테이블 목록
+                if error_count > 0:
+                    f.write("\n" + "-" * 70 + "\n")
+                    f.write("실패한 테이블 목록\n")
+                    f.write("-" * 70 + "\n")
+                    for table_name, result in self.import_results.items():
+                        if result.get('status') == 'error':
+                            f.write(f"  ❌ {table_name}: {result.get('message', 'Unknown error')}\n")
+
+                f.write("\n" + "=" * 70 + "\n")
+                f.write("상세 로그\n")
+                f.write("=" * 70 + "\n\n")
+
+                for entry in self.log_entries:
+                    f.write(entry + "\n")
+
+            QMessageBox.information(
+                self, "저장 완료",
+                f"✅ 로그가 저장되었습니다.\n\n{file_path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "저장 실패",
+                f"❌ 로그 저장 중 오류가 발생했습니다.\n\n{str(e)}"
+            )
 
     def closeEvent(self, event):
         if self.connector:
