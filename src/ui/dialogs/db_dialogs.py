@@ -848,13 +848,19 @@ class MySQLShellImportDialog(QDialog):
     def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None):
         super().__init__(parent)
         self.setWindowTitle("MySQL Shell Import (병렬 처리)")
-        self.resize(550, 450)
+        self.resize(600, 700)
 
         self.connector = connector
         self.config_manager = config_manager
         self.worker: Optional[MySQLShellWorker] = None
 
         self.mysqlsh_installed, self.mysqlsh_msg = check_mysqlsh()
+
+        # Import 결과 저장 (재시도용)
+        self.import_results: dict = {}
+        self.table_items: dict = {}  # 테이블명 -> QListWidgetItem 매핑
+        self.last_input_dir: str = ""  # 마지막 사용한 input_dir
+        self.last_target_schema: str = ""  # 마지막 사용한 target_schema
 
         self.init_ui()
         self.load_schemas()
@@ -1000,24 +1006,138 @@ class MySQLShellImportDialog(QDialog):
 
         layout.addWidget(mode_group)
 
-        # --- 진행 상황 ---
-        # 프로그레스 바
+        # --- 진행 상황 섹션 (확장된 UI) ---
+        self.progress_group = QGroupBox("진행 상황")
+        self.progress_group.setVisible(False)
+        progress_layout = QVBoxLayout(self.progress_group)
+
+        # 상세 진행률 표시 영역
+        detail_layout = QHBoxLayout()
+
+        # 왼쪽: 진행률 정보
+        left_detail = QVBoxLayout()
+        self.label_percent = QLabel("📊 진행률: 0%")
+        self.label_percent.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        self.label_data = QLabel("📦 데이터: 0 MB / 0 MB")
+        self.label_speed = QLabel("⚡ 속도: 0 rows/s")
+        self.label_tables = QLabel("📋 테이블: 0 / 0 완료")
+        left_detail.addWidget(self.label_percent)
+        left_detail.addWidget(self.label_data)
+        left_detail.addWidget(self.label_speed)
+        left_detail.addWidget(self.label_tables)
+
+        detail_layout.addLayout(left_detail)
+        detail_layout.addStretch()
+        progress_layout.addLayout(detail_layout)
+
+        # 프로그레스 바 (퍼센트 기준)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%v / %m 테이블")
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                text-align: center;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #27ae60;
+                border-radius: 3px;
+            }
+        """)
+        progress_layout.addWidget(self.progress_bar)
 
         # 상태 라벨
-        self.label_status = QLabel()
-        self.label_status.setVisible(False)
+        self.label_status = QLabel("준비 중...")
         self.label_status.setStyleSheet("color: #27ae60; font-weight: bold;")
-        layout.addWidget(self.label_status)
+        progress_layout.addWidget(self.label_status)
+
+        layout.addWidget(self.progress_group)
+
+        # --- 테이블 상태 목록 (GitHub Actions 스타일) ---
+        self.table_status_group = QGroupBox("테이블 Import 상태")
+        self.table_status_group.setVisible(False)
+        table_status_layout = QVBoxLayout(self.table_status_group)
+
+        self.table_list = QListWidget()
+        self.table_list.setMinimumHeight(150)
+        self.table_list.setMaximumHeight(200)
+        self.table_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self.table_list.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                background-color: #fafafa;
+            }
+            QListWidget::item {
+                padding: 4px 8px;
+                border-bottom: 1px solid #ecf0f1;
+            }
+            QListWidget::item:selected {
+                background-color: #e8f4f8;
+            }
+        """)
+        table_status_layout.addWidget(self.table_list)
+
+        # 재시도 버튼 (실패 시에만 표시)
+        retry_layout = QHBoxLayout()
+        self.btn_retry = QPushButton("🔄 선택한 테이블 재시도")
+        self.btn_retry.setVisible(False)
+        self.btn_retry.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        self.btn_retry.clicked.connect(self.do_retry)
+
+        self.btn_select_failed = QPushButton("실패한 테이블 모두 선택")
+        self.btn_select_failed.setVisible(False)
+        self.btn_select_failed.setStyleSheet("""
+            QPushButton {
+                background-color: #95a5a6; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #7f8c8d; }
+        """)
+        self.btn_select_failed.clicked.connect(self.select_failed_tables)
+
+        retry_layout.addWidget(self.btn_select_failed)
+        retry_layout.addWidget(self.btn_retry)
+        retry_layout.addStretch()
+        table_status_layout.addLayout(retry_layout)
+
+        layout.addWidget(self.table_status_group)
+
+        # --- 실행 로그 ---
+        self.log_group = QGroupBox("실행 로그")
+        self.log_group.setVisible(False)
+        log_layout = QVBoxLayout(self.log_group)
 
         self.txt_log = QListWidget()
-        self.txt_log.setMaximumHeight(100)
-        self.txt_log.setVisible(False)
-        layout.addWidget(self.txt_log)
+        self.txt_log.setMinimumHeight(80)
+        self.txt_log.setMaximumHeight(120)
+        self.txt_log.setStyleSheet("""
+            QListWidget {
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 9pt;
+                background-color: #2c3e50;
+                color: #ecf0f1;
+                border: 1px solid #34495e;
+                border-radius: 4px;
+            }
+            QListWidget::item {
+                padding: 2px 4px;
+            }
+        """)
+        log_layout.addWidget(self.txt_log)
+
+        layout.addWidget(self.log_group)
 
         # --- 버튼 ---
         button_layout = QHBoxLayout()
@@ -1099,7 +1219,8 @@ class MySQLShellImportDialog(QDialog):
         except Exception:
             return False
 
-    def do_import(self):
+    def do_import(self, retry_tables: list = None):
+        """Import 실행 (retry_tables가 주어지면 해당 테이블만 재시도)"""
         input_dir = self.input_dir.text()
 
         if not input_dir:
@@ -1118,16 +1239,34 @@ class MySQLShellImportDialog(QDialog):
                 QMessageBox.warning(self, "오류", "대상 스키마를 선택하세요.")
                 return
 
+        # 저장 (재시도용)
+        self.last_input_dir = input_dir
+        self.last_target_schema = target_schema
+
         # UI 상태 변경 - 모든 입력 비활성화
         self.set_ui_enabled(False)
-        self.txt_log.clear()
-        self.txt_log.setVisible(True)
+        self.btn_retry.setVisible(False)
+        self.btn_select_failed.setVisible(False)
 
-        # 프로그레스 바 초기화 및 표시
-        self.progress_bar.setVisible(True)
+        # 로그 및 진행 상황 UI 표시
+        self.progress_group.setVisible(True)
+        self.table_status_group.setVisible(True)
+        self.log_group.setVisible(True)
+
+        # 재시도가 아닌 경우 초기화
+        if not retry_tables:
+            self.txt_log.clear()
+            self.table_list.clear()
+            self.table_items.clear()
+            self.import_results.clear()
+
+        # 프로그레스 바 초기화
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(0)  # 초기에는 테이블 수 미정 (indeterminate)
-        self.label_status.setVisible(True)
+        self.progress_bar.setMaximum(100)
+        self.label_percent.setText("📊 진행률: 0%")
+        self.label_data.setText("📦 데이터: 0 MB / 0 MB")
+        self.label_speed.setText("⚡ 속도: 0 rows/s")
+        self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Import 준비 중...")
 
         # MySQL Shell 설정
@@ -1140,24 +1279,24 @@ class MySQLShellImportDialog(QDialog):
 
         # 타임존 설정 결정
         timezone_sql = None
-        
+
         if self.radio_tz_auto.isChecked():
             self.txt_log.addItem("🔍 타임존 지원 여부 확인 중...")
             QApplication.processEvents()
-            
+
             supports_named_tz = self.check_timezone_support()
-            
+
             if supports_named_tz:
                 self.txt_log.addItem("✅ 서버가 지역명 타임존을 지원합니다.")
             else:
                 timezone_sql = "SET SESSION time_zone = '+09:00'"
                 self.txt_log.addItem("⚠️ 서버가 지역명 타임존을 지원하지 않습니다.")
                 self.txt_log.addItem("ℹ️ 'Asia/Seoul' 에러 방지를 위해 타임존을 '+09:00'으로 자동 보정합니다.")
-        
+
         elif self.radio_tz_kst.isChecked():
             timezone_sql = "SET SESSION time_zone = '+09:00'"
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+09:00' (KST)로 설정합니다.")
-            
+
         elif self.radio_tz_utc.isChecked():
             timezone_sql = "SET SESSION time_zone = '+00:00'"
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+00:00' (UTC)로 설정합니다.")
@@ -1169,6 +1308,11 @@ class MySQLShellImportDialog(QDialog):
         elif self.radio_recreate.isChecked():
             import_mode = "recreate"
 
+        # 재시도 시 모드 표시
+        if retry_tables:
+            self.txt_log.addItem(f"🔄 재시도 모드: {len(retry_tables)}개 테이블")
+            import_mode = "merge"  # 재시도 시에는 병합 모드 사용
+
         # 작업 스레드 시작
         self.worker = MySQLShellWorker(
             "import", config,
@@ -1176,39 +1320,165 @@ class MySQLShellImportDialog(QDialog):
             target_schema=target_schema,
             threads=self.spin_threads.value(),
             import_mode=import_mode,
-            timezone_sql=timezone_sql
+            timezone_sql=timezone_sql,
+            retry_tables=retry_tables
         )
 
+        # 시그널 연결
         self.worker.progress.connect(self.on_progress)
         self.worker.table_progress.connect(self.on_table_progress)
+        self.worker.detail_progress.connect(self.on_detail_progress)
+        self.worker.table_status.connect(self.on_table_status)
+        self.worker.raw_output.connect(self.on_raw_output)
+        self.worker.import_finished.connect(self.on_import_finished)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
     def on_progress(self, msg: str):
+        """일반 진행 메시지 처리"""
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
+        self.label_status.setText(msg)
 
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
-        # 프로그레스 바 최대값 설정 (처음 호출 시)
-        if self.progress_bar.maximum() != total:
-            self.progress_bar.setMaximum(total)
+        self.label_tables.setText(f"📋 테이블: {current} / {total} 완료")
 
-        self.progress_bar.setValue(current)
-        self.label_status.setText(f"✅ {table_name} ({current}/{total})")
+    def on_detail_progress(self, info: dict):
+        """상세 진행 정보 업데이트"""
+        percent = info.get('percent', 0)
+        mb_done = info.get('mb_done', 0)
+        mb_total = info.get('mb_total', 0)
+        rows_sec = info.get('rows_sec', 0)
+        speed = info.get('speed', '0 B/s')
+
+        self.progress_bar.setValue(percent)
+        self.label_percent.setText(f"📊 진행률: {percent}%")
+        self.label_data.setText(f"📦 데이터: {mb_done:.2f} MB / {mb_total:.2f} MB")
+        self.label_speed.setText(f"⚡ 속도: {rows_sec:,} rows/s | {speed}")
+
+    def on_table_status(self, table_name: str, status: str, message: str):
+        """테이블 상태 업데이트 (GitHub Actions 스타일)"""
+        # 상태별 아이콘 및 스타일
+        status_icons = {
+            'pending': '⏳',
+            'loading': '🔄',
+            'done': '✅',
+            'error': '❌'
+        }
+        status_colors = {
+            'pending': '#95a5a6',
+            'loading': '#3498db',
+            'done': '#27ae60',
+            'error': '#e74c3c'
+        }
+
+        icon = status_icons.get(status, '❓')
+        color = status_colors.get(status, '#7f8c8d')
+
+        # 기존 아이템이 있으면 업데이트, 없으면 새로 생성
+        if table_name in self.table_items:
+            item = self.table_items[table_name]
+            display_text = f"{icon} {table_name}"
+            if status == 'error' and message:
+                display_text += f" - {message[:50]}..."
+            item.setText(display_text)
+            item.setForeground(Qt.GlobalColor.black)
+        else:
+            display_text = f"{icon} {table_name}"
+            if status == 'error' and message:
+                display_text += f" - {message[:50]}..."
+            item = QListWidgetItem(display_text)
+            self.table_list.addItem(item)
+            self.table_items[table_name] = item
+
+        # 결과 저장
+        self.import_results[table_name] = {'status': status, 'message': message}
+
+    def on_raw_output(self, line: str):
+        """mysqlsh 실시간 출력 처리 (로그에 추가)"""
+        # 너무 많은 로그 방지 (최대 500줄)
+        if self.txt_log.count() > 500:
+            self.txt_log.takeItem(0)
+        self.txt_log.addItem(line)
+        self.txt_log.scrollToBottom()
+
+    def on_import_finished(self, success: bool, message: str, results: dict):
+        """Import 완료 처리 (결과 저장 및 재시도 버튼 표시)"""
+        self.import_results = results
+
+        # 실패한 테이블이 있는지 확인
+        failed_tables = [t for t, r in results.items() if r.get('status') == 'error']
+
+        if failed_tables:
+            self.btn_retry.setVisible(True)
+            self.btn_select_failed.setVisible(True)
+            self.txt_log.addItem(f"⚠️ {len(failed_tables)}개 테이블 Import 실패")
 
     def on_finished(self, success: bool, message: str):
+        """작업 완료 처리"""
         # UI 상태 복구
         self.set_ui_enabled(True)
-        self.progress_bar.setVisible(False)
-        self.label_status.setVisible(False)
+
+        # 결과 요약
+        done_count = sum(1 for r in self.import_results.values() if r.get('status') == 'done')
+        error_count = sum(1 for r in self.import_results.values() if r.get('status') == 'error')
+        total_count = len(self.import_results)
 
         if success:
+            self.label_status.setText(f"✅ Import 완료: {done_count}/{total_count} 테이블 성공")
+            self.progress_bar.setValue(100)
             self.txt_log.addItem(f"✅ 완료: {message}")
-            QMessageBox.information(self, "Import 완료", "✅ Import가 완료되었습니다.")
+            QMessageBox.information(self, "Import 완료", f"✅ Import가 완료되었습니다.\n\n성공: {done_count}개 테이블")
         else:
+            self.label_status.setText(f"❌ Import 실패: {error_count}/{total_count} 테이블 오류")
             self.txt_log.addItem(f"❌ 실패: {message}")
-            QMessageBox.warning(self, "Import 실패", f"❌ {message}")
+
+            if error_count > 0:
+                QMessageBox.warning(
+                    self, "Import 실패",
+                    f"❌ Import 중 오류가 발생했습니다.\n\n"
+                    f"성공: {done_count}개 테이블\n"
+                    f"실패: {error_count}개 테이블\n\n"
+                    f"실패한 테이블을 선택하여 재시도할 수 있습니다."
+                )
+            else:
+                QMessageBox.warning(self, "Import 실패", f"❌ {message}")
+
+    def select_failed_tables(self):
+        """실패한 테이블 모두 선택"""
+        for table_name, result in self.import_results.items():
+            if result.get('status') == 'error':
+                if table_name in self.table_items:
+                    self.table_items[table_name].setSelected(True)
+
+    def do_retry(self):
+        """선택한 테이블 재시도"""
+        # 선택된 테이블 목록 가져오기
+        selected_tables = []
+        for table_name, item in self.table_items.items():
+            if item.isSelected():
+                selected_tables.append(table_name)
+
+        if not selected_tables:
+            QMessageBox.warning(self, "선택 필요", "재시도할 테이블을 선택하세요.")
+            return
+
+        # 확인 대화상자
+        reply = QMessageBox.question(
+            self, "재시도 확인",
+            f"선택한 {len(selected_tables)}개 테이블을 재시도하시겠습니까?\n\n"
+            f"테이블: {', '.join(selected_tables[:5])}{'...' if len(selected_tables) > 5 else ''}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            # 선택된 테이블 상태를 pending으로 초기화
+            for table in selected_tables:
+                self.on_table_status(table, 'pending', '')
+
+            # 재시도 실행
+            self.do_import(retry_tables=selected_tables)
 
     def closeEvent(self, event):
         if self.connector:
