@@ -1,7 +1,8 @@
 """설정 관련 다이얼로그"""
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
-                             QButtonGroup, QGroupBox)
+                             QButtonGroup, QGroupBox, QLineEdit, QMessageBox)
+from PyQt6.QtCore import Qt
 
 
 class CloseConfirmDialog(QDialog):
@@ -77,7 +78,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config_mgr = config_manager
         self.setWindowTitle("설정")
-        self.setFixedSize(400, 220)
+        self.setFixedSize(500, 420)
         self.init_ui()
 
     def init_ui(self):
@@ -111,6 +112,73 @@ class SettingsDialog(QDialog):
             self.radio_exit.setChecked(True)
         else:  # 'ask' or default
             self.radio_ask.setChecked(True)
+
+        # GitHub 이슈 자동 보고 설정 그룹
+        github_group = QGroupBox("GitHub 이슈 자동 보고")
+        github_layout = QVBoxLayout(github_group)
+
+        # 자동 보고 활성화 체크박스
+        self.chk_auto_report = QCheckBox("Export/Import 오류 시 자동으로 GitHub 이슈 생성")
+        self.chk_auto_report.stateChanged.connect(self._on_auto_report_changed)
+        github_layout.addWidget(self.chk_auto_report)
+
+        # 설명 라벨
+        desc_label = QLabel(
+            "오류 발생 시 자동으로 이슈를 생성하거나,\n"
+            "유사한 이슈가 있으면 코멘트를 추가합니다."
+        )
+        desc_label.setStyleSheet("color: #666; font-size: 11px; margin-left: 20px;")
+        github_layout.addWidget(desc_label)
+
+        # GitHub 토큰 입력
+        token_layout = QHBoxLayout()
+        token_label = QLabel("Personal Access Token:")
+        token_label.setFixedWidth(140)
+        self.input_github_token = QLineEdit()
+        self.input_github_token.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input_github_token.setPlaceholderText("ghp_xxxxxxxxxxxx")
+        token_layout.addWidget(token_label)
+        token_layout.addWidget(self.input_github_token)
+        github_layout.addLayout(token_layout)
+
+        # 리포지토리 입력
+        repo_layout = QHBoxLayout()
+        repo_label = QLabel("Repository:")
+        repo_label.setFixedWidth(140)
+        self.input_github_repo = QLineEdit()
+        self.input_github_repo.setPlaceholderText("owner/repo (예: sanghyun-io/db-connector)")
+        repo_layout.addWidget(repo_label)
+        repo_layout.addWidget(self.input_github_repo)
+        github_layout.addLayout(repo_layout)
+
+        # 토큰 안내
+        token_help = QLabel(
+            "토큰 발급: GitHub → Settings → Developer settings → Personal access tokens\n"
+            "필요 권한: repo (이슈 생성/코멘트 추가)"
+        )
+        token_help.setStyleSheet("color: #888; font-size: 10px; margin-top: 5px;")
+        github_layout.addWidget(token_help)
+
+        # 연결 테스트 버튼
+        test_layout = QHBoxLayout()
+        test_layout.addStretch()
+        self.btn_test_github = QPushButton("연결 테스트")
+        self.btn_test_github.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60; color: white;
+                padding: 4px 12px; border-radius: 3px; border: none;
+            }
+            QPushButton:hover { background-color: #229954; }
+            QPushButton:disabled { background-color: #95a5a6; }
+        """)
+        self.btn_test_github.clicked.connect(self._test_github_connection)
+        test_layout.addWidget(self.btn_test_github)
+        github_layout.addLayout(test_layout)
+
+        layout.addWidget(github_group)
+
+        # GitHub 설정 로드
+        self._load_github_settings()
 
         layout.addStretch()
 
@@ -151,4 +219,91 @@ class SettingsDialog(QDialog):
             action = 'ask'
 
         self.config_mgr.set_app_setting('close_action', action)
+
+        # GitHub 설정 저장
+        auto_report = self.chk_auto_report.isChecked()
+        github_token = self.input_github_token.text().strip()
+        github_repo = self.input_github_repo.text().strip()
+
+        # 자동 보고 활성화 시 필수값 체크
+        if auto_report and (not github_token or not github_repo):
+            QMessageBox.warning(
+                self, "설정 오류",
+                "GitHub 자동 이슈 보고를 활성화하려면\n토큰과 리포지토리를 모두 입력해야 합니다."
+            )
+            return
+
+        self.config_mgr.set_app_setting('github_auto_report', auto_report)
+        self.config_mgr.set_app_setting('github_token', github_token)
+        self.config_mgr.set_app_setting('github_repo', github_repo)
+
         self.accept()
+
+    def _load_github_settings(self):
+        """GitHub 설정 로드"""
+        auto_report = self.config_mgr.get_app_setting('github_auto_report', False)
+        github_token = self.config_mgr.get_app_setting('github_token', '')
+        github_repo = self.config_mgr.get_app_setting('github_repo', '')
+
+        self.chk_auto_report.setChecked(auto_report)
+        self.input_github_token.setText(github_token)
+        self.input_github_repo.setText(github_repo)
+
+        # 비활성화 상태면 입력 필드 비활성화
+        self._on_auto_report_changed(Qt.CheckState.Checked.value if auto_report else Qt.CheckState.Unchecked.value)
+
+    def _on_auto_report_changed(self, state):
+        """자동 보고 체크박스 상태 변경 시"""
+        enabled = state == Qt.CheckState.Checked.value
+        self.input_github_token.setEnabled(enabled)
+        self.input_github_repo.setEnabled(enabled)
+        self.btn_test_github.setEnabled(enabled)
+
+    def _test_github_connection(self):
+        """GitHub 연결 테스트"""
+        token = self.input_github_token.text().strip()
+        repo = self.input_github_repo.text().strip()
+
+        if not token or not repo:
+            QMessageBox.warning(self, "입력 오류", "토큰과 리포지토리를 모두 입력하세요.")
+            return
+
+        try:
+            from src.core.github_issue_reporter import GitHubIssueReporter
+
+            available, msg = GitHubIssueReporter.check_available()
+            if not available:
+                QMessageBox.warning(self, "라이브러리 오류", msg)
+                return
+
+            reporter = GitHubIssueReporter(token, repo)
+
+            # 리포지토리 정보 조회로 연결 테스트
+            import requests
+            url = f"{reporter.GITHUB_API_BASE}/repos/{repo}"
+            response = requests.get(url, headers=reporter._headers, timeout=10)
+
+            if response.status_code == 200:
+                repo_info = response.json()
+                repo_name = repo_info.get('full_name', repo)
+                QMessageBox.information(
+                    self, "연결 성공",
+                    f"✅ GitHub 연결 성공!\n\n리포지토리: {repo_name}"
+                )
+            elif response.status_code == 401:
+                QMessageBox.warning(self, "인증 실패", "❌ 토큰이 유효하지 않습니다.")
+            elif response.status_code == 404:
+                QMessageBox.warning(self, "리포지토리 없음", "❌ 리포지토리를 찾을 수 없습니다.")
+            else:
+                QMessageBox.warning(
+                    self, "연결 실패",
+                    f"❌ 연결 실패: HTTP {response.status_code}"
+                )
+
+        except ImportError:
+            QMessageBox.warning(
+                self, "라이브러리 오류",
+                "requests 라이브러리가 설치되지 않았습니다.\npip install requests"
+            )
+        except Exception as e:
+            QMessageBox.warning(self, "연결 실패", f"❌ 오류: {str(e)}")

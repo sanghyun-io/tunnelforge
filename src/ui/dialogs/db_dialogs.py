@@ -904,6 +904,40 @@ class MySQLShellExportDialog(QDialog):
             self.txt_log.addItem(f"❌ 실패: {message}")
             QMessageBox.warning(self, "Export 실패", f"❌ {message}")
 
+            # GitHub 이슈 자동 보고
+            self._report_error_to_github("export", message)
+
+    def _report_error_to_github(self, error_type: str, error_message: str):
+        """GitHub 이슈 자동 보고"""
+        if not self.config_manager:
+            return
+
+        try:
+            from src.core.github_issue_reporter import get_reporter_from_config
+
+            reporter = get_reporter_from_config(self.config_manager)
+            if not reporter:
+                return  # 자동 보고 비활성화 또는 설정 미완료
+
+            # 컨텍스트 정보 수집
+            context = {
+                'schema': self.export_schema,
+                'tables': self.export_tables,
+                'mode': '전체 스키마' if self.radio_full.isChecked() else '선택 테이블'
+            }
+
+            # 오류 리포트
+            success, result_msg = reporter.report_error(error_type, error_message, context)
+
+            if success:
+                self.txt_log.addItem(f"🐙 GitHub: {result_msg}")
+                self._add_log(f"GitHub 이슈 보고: {result_msg}")
+            else:
+                self._add_log(f"GitHub 이슈 보고 실패: {result_msg}")
+
+        except Exception as e:
+            self._add_log(f"GitHub 이슈 보고 중 오류: {str(e)}")
+
     def save_log(self):
         """로그를 파일로 저장"""
         if not self.log_entries:
@@ -1647,6 +1681,59 @@ class MySQLShellImportDialog(QDialog):
                 )
             else:
                 QMessageBox.warning(self, "Import 실패", f"❌ {message}")
+
+            # GitHub 이슈 자동 보고
+            self._report_error_to_github("import", message, error_count)
+
+    def _report_error_to_github(self, error_type: str, error_message: str, error_count: int = 0):
+        """GitHub 이슈 자동 보고"""
+        if not self.config_manager:
+            return
+
+        try:
+            from src.core.github_issue_reporter import get_reporter_from_config
+
+            reporter = get_reporter_from_config(self.config_manager)
+            if not reporter:
+                return  # 자동 보고 비활성화 또는 설정 미완료
+
+            # 실패한 테이블 목록
+            failed_tables = [t for t, r in self.import_results.items() if r.get('status') == 'error']
+            failed_messages = [r.get('message', '') for t, r in self.import_results.items() if r.get('status') == 'error']
+
+            # 컨텍스트 정보 수집
+            target_schema = self.combo_target_schema.currentText() if not self.chk_use_original.isChecked() else "(원본 스키마)"
+            context = {
+                'schema': target_schema,
+                'failed_tables': failed_tables,
+                'mode': self._get_import_mode_text()
+            }
+
+            # 오류 메시지 조합 (첫 3개 실패 메시지)
+            combined_error = error_message
+            if failed_messages:
+                combined_error += "\n\n실패한 테이블 오류:\n" + "\n".join(failed_messages[:3])
+
+            # 오류 리포트
+            success, result_msg = reporter.report_error(error_type, combined_error, context)
+
+            if success:
+                self.txt_log.addItem(f"🐙 GitHub: {result_msg}")
+                self._add_log(f"GitHub 이슈 보고: {result_msg}")
+            else:
+                self._add_log(f"GitHub 이슈 보고 실패: {result_msg}")
+
+        except Exception as e:
+            self._add_log(f"GitHub 이슈 보고 중 오류: {str(e)}")
+
+    def _get_import_mode_text(self) -> str:
+        """Import 모드 텍스트 반환"""
+        if self.radio_merge.isChecked():
+            return "merge (기존 데이터 유지)"
+        elif self.radio_replace.isChecked():
+            return "replace (기존 테이블 삭제)"
+        else:
+            return "recreate (스키마 재생성)"
 
     def select_failed_tables(self):
         """실패한 테이블 모두 선택"""
