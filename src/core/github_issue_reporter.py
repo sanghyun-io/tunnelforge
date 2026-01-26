@@ -28,19 +28,42 @@ class GitHubIssueReporter:
     # 유사도 임계값 (0.0 ~ 1.0)
     SIMILARITY_THRESHOLD = 0.6
 
-    def __init__(self, token: str, repo: str):
+    def __init__(self, token: str, repo: str, headers: Optional[Dict] = None):
         """
         Args:
-            token: GitHub Personal Access Token
+            token: GitHub Personal Access Token (또는 Installation Token)
             repo: 리포지토리 (owner/repo 형식, 예: 'sanghyun-io/db-connector')
+            headers: 커스텀 헤더 (GitHub App 사용 시)
         """
         self.token = token
         self.repo = repo
-        self._headers = {
-            "Authorization": f"token {token}",
-            "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "DataFlare-Tunnel-Manager"
-        }
+        self._github_app = None  # GitHub App 인스턴스 (동적 토큰 갱신용)
+
+        if headers:
+            self._headers = headers
+        else:
+            self._headers = {
+                "Authorization": f"token {token}",
+                "Accept": "application/vnd.github.v3+json",
+                "User-Agent": "DataFlare-Tunnel-Manager"
+            }
+
+    @classmethod
+    def from_github_app(cls, github_app) -> 'GitHubIssueReporter':
+        """GitHub App 인증으로 인스턴스 생성"""
+        headers = github_app.get_headers()
+        instance = cls(
+            token="",  # GitHub App은 동적 토큰 사용
+            repo=github_app.repo,
+            headers=headers
+        )
+        instance._github_app = github_app
+        return instance
+
+    def _refresh_headers_if_needed(self):
+        """GitHub App 사용 시 헤더 갱신"""
+        if self._github_app:
+            self._headers = self._github_app.get_headers()
 
     @staticmethod
     def check_available() -> Tuple[bool, str]:
@@ -226,6 +249,8 @@ class GitHubIssueReporter:
             return None
 
         try:
+            self._refresh_headers_if_needed()
+
             # 열린 이슈 검색 (최근 100개)
             url = f"{self.GITHUB_API_BASE}/repos/{self.repo}/issues"
             params = {
@@ -292,6 +317,8 @@ class GitHubIssueReporter:
             return False, "requests 라이브러리가 필요합니다", None
 
         try:
+            self._refresh_headers_if_needed()
+
             url = f"{self.GITHUB_API_BASE}/repos/{self.repo}/issues"
 
             # 본문에 핑거프린트 추가
@@ -343,6 +370,8 @@ class GitHubIssueReporter:
             return False, "requests 라이브러리가 필요합니다"
 
         try:
+            self._refresh_headers_if_needed()
+
             url = f"{self.GITHUB_API_BASE}/repos/{self.repo}/issues/{issue_number}/comments"
 
             timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
@@ -422,21 +451,33 @@ def get_reporter_from_config(config_manager) -> Optional[GitHubIssueReporter]:
     GitHubIssueReporter 인스턴스 생성
 
     우선순위:
-    1. 봇 토큰 (환경변수 또는 내장)
-    2. 사용자 설정 토큰 (ConfigManager)
+    1. GitHub App (가장 안전)
+    2. 봇 토큰 (환경변수 또는 내장)
+    3. 사용자 설정 토큰 (ConfigManager)
     """
     auto_report = config_manager.get_app_setting('github_auto_report', False)
     if not auto_report:
         return None
 
-    # 1. 봇 토큰 우선 사용
+    # 1. GitHub App 우선 사용 (가장 안전)
+    try:
+        from src.core.github_app_auth import get_github_app_auth
+        github_app = get_github_app_auth()
+        if github_app:
+            available, _ = github_app.check_available()
+            if available:
+                return GitHubIssueReporter.from_github_app(github_app)
+    except ImportError:
+        pass
+
+    # 2. 봇 토큰 사용
     from src.core.bot_credentials import get_bot_credentials
     bot_token, bot_repo = get_bot_credentials()
 
     if bot_token and bot_repo:
         return GitHubIssueReporter(bot_token, bot_repo)
 
-    # 2. 사용자 설정 토큰 (폴백)
+    # 3. 사용자 설정 토큰 (폴백)
     token = config_manager.get_app_setting('github_token', '')
     repo = config_manager.get_app_setting('github_repo', '')
 
@@ -447,6 +488,15 @@ def get_reporter_from_config(config_manager) -> Optional[GitHubIssueReporter]:
 
 
 def is_bot_mode_available() -> bool:
-    """봇 모드 사용 가능 여부 확인"""
+    """봇 모드 사용 가능 여부 확인 (GitHub App 또는 봇 토큰)"""
+    # GitHub App 확인
+    try:
+        from src.core.github_app_auth import is_github_app_configured
+        if is_github_app_configured():
+            return True
+    except ImportError:
+        pass
+
+    # 봇 토큰 확인
     from src.core.bot_credentials import is_bot_configured
     return is_bot_configured()
