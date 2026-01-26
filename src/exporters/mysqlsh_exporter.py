@@ -237,8 +237,9 @@ class MySQLShellExporter:
                     progress_callback(f"스키마 '{schema}' Export 시작 (스레드: {threads})")
 
             # mysqlsh 명령 구성
+            output_dir_escaped = output_dir.replace('\\', '/')
             js_code = f"""
-util.dumpSchemas(["{schema}"], "{output_dir.replace('\\', '/')}", {{
+util.dumpSchemas(["{schema}"], "{output_dir_escaped}", {{
     threads: {threads},
     compression: "{compression}",
     chunking: true,
@@ -331,10 +332,11 @@ util.dumpSchemas(["{schema}"], "{output_dir.replace('\\', '/')}", {{
 
             # 테이블 목록 JSON 형식으로 변환
             tables_json = json.dumps(final_tables)
+            output_dir_escaped = output_dir.replace('\\', '/')
 
             # mysqlsh 명령 구성
             js_code = f"""
-util.dumpTables("{schema}", {tables_json}, "{output_dir.replace('\\', '/')}", {{
+util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
     threads: {threads},
     compression: "{compression}",
     chunking: true,
@@ -577,8 +579,12 @@ class MySQLShellImporter:
         import_mode: str = "replace",
         timezone_sql: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
-        table_progress_callback: Optional[Callable[[int, int, str], None]] = None
-    ) -> Tuple[bool, str]:
+        table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        detail_callback: Optional[Callable[[dict], None]] = None,
+        table_status_callback: Optional[Callable[[str, str, str], None]] = None,
+        raw_output_callback: Optional[Callable[[str], None]] = None,
+        retry_tables: Optional[List[str]] = None
+    ) -> Tuple[bool, str, dict]:
         """
         Dump 파일 Import (3가지 모드 지원)
 
@@ -591,10 +597,16 @@ class MySQLShellImporter:
                 - "replace": 전체 교체 (모든 객체 재생성, resetProgress=true)
                 - "recreate": 완전 재생성 (스키마 DROP 후 재생성)
             progress_callback: 진행 상황 콜백
+            detail_callback: 상세 진행 정보 콜백 (percent, mb_done, mb_total, rows_sec)
+            table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
+            raw_output_callback: mysqlsh 실시간 출력 콜백
+            retry_tables: 재시도할 테이블 목록 (선택적)
 
         Returns:
-            (성공여부, 메시지)
+            (성공여부, 메시지, 테이블별 결과 dict)
         """
+        # 테이블별 Import 결과 추적
+        import_results: dict = {}
         try:
             # 메타데이터 확인
             metadata_path = os.path.join(input_dir, "_export_metadata.json")
@@ -610,6 +622,18 @@ class MySQLShellImporter:
                 if progress_callback:
                     progress_callback(f"메타데이터 확인: {source_schema} ({metadata.get('type')}) - {len(tables_to_import)}개 테이블")
 
+            # 재시도 모드인 경우 테이블 목록 필터링
+            if retry_tables:
+                tables_to_import = [t for t in tables_to_import if t in retry_tables]
+                if progress_callback:
+                    progress_callback(f"🔄 재시도 모드: {len(tables_to_import)}개 테이블만 Import")
+
+            # 테이블 상태 초기화 (pending 상태로)
+            for table in tables_to_import:
+                import_results[table] = {'status': 'pending', 'message': ''}
+                if table_status_callback:
+                    table_status_callback(table, 'pending', '')
+
             # 타임존 패치 (Asia/Seoul -> +09:00)
             if progress_callback:
                 progress_callback("타임존 보정 중... (Asia/Seoul -> +09:00)")
@@ -621,27 +645,27 @@ class MySQLShellImporter:
             # 대상 스키마 결정
             final_target_schema = target_schema or source_schema
             if not final_target_schema:
-                return False, "대상 스키마를 지정할 수 없습니다."
+                return False, "대상 스키마를 지정할 수 없습니다.", import_results
 
             # Import 모드별 처리
             if import_mode == "recreate":
                 # 완전 재생성: 스키마 DROP 후 재생성
                 if progress_callback:
                     progress_callback(f"⚠️ 스키마 '{final_target_schema}' 완전 재생성 중...")
-                
+
                 drop_schema_success, drop_schema_msg = self._drop_and_recreate_schema(
                     final_target_schema,
                     progress_callback
                 )
-                
+
                 if not drop_schema_success:
-                    return False, f"스키마 재생성 실패: {drop_schema_msg}"
-                
+                    return False, f"스키마 재생성 실패: {drop_schema_msg}", import_results
+
             elif import_mode == "replace":
                 # 전체 교체: 모든 객체 (테이블, 뷰, 프로시저, 이벤트) 삭제 후 재생성
                 if progress_callback:
                     progress_callback(f"전체 교체 모드: 모든 객체 삭제 중...")
-                
+
                 # 1. 테이블 삭제
                 if tables_to_import:
                     drop_success, drop_msg = self._drop_existing_tables(
@@ -650,7 +674,7 @@ class MySQLShellImporter:
                         progress_callback
                     )
                     if not drop_success:
-                        return False, f"테이블 삭제 실패: {drop_msg}"
+                        return False, f"테이블 삭제 실패: {drop_msg}", import_results
                 
                 # 2. View, Procedure, Event 삭제
                 drop_objects_success, drop_objects_msg = self._drop_all_objects(
@@ -658,15 +682,15 @@ class MySQLShellImporter:
                     progress_callback
                 )
                 if not drop_objects_success:
-                    return False, f"객체 삭제 실패: {drop_objects_msg}"
-                
+                    return False, f"객체 삭제 실패: {drop_objects_msg}", import_results
+
             elif import_mode == "merge":
                 # 병합: 기존 데이터 유지, 새 것만 추가
                 if progress_callback:
                     progress_callback(f"증분 병합 모드: 기존 데이터 유지")
-            
+
             else:
-                return False, f"알 수 없는 Import 모드: {import_mode}"
+                return False, f"알 수 없는 Import 모드: {import_mode}", import_results
 
             if progress_callback:
                 progress_callback(f"DDL + Data Import 시작 (스레드: {threads}, 모드: {import_mode})")
@@ -697,15 +721,16 @@ class MySQLShellImporter:
                 options.append(f'schema: "{target_schema}"')
 
             options_str = ", ".join(options)
+            input_dir_escaped = input_dir.replace('\\', '/')
 
             # mysqlsh 명령 구성 (local_infile 활성화 필요)
             # Timezone 설정이 있으면 util.loadDump 이전에 실행
             timezone_cmd = f'session.runSql("{timezone_sql}");' if timezone_sql else ""
-            
+
             js_code = f"""
                 session.runSql("SET GLOBAL local_infile = ON");
                 {timezone_cmd}
-                util.loadDump("{input_dir.replace('\\', '/')}", {{
+                util.loadDump("{input_dir_escaped}", {{
                     {options_str}
                 }});
             """
@@ -713,20 +738,24 @@ class MySQLShellImporter:
             print(js_code)
 
             # Import 실행 (실시간 진행률 파싱)
-            success, msg = self._run_mysqlsh_import(
+            success, msg, import_results = self._run_mysqlsh_import(
                 js_code,
                 progress_callback,
                 tables_to_import,
-                table_progress_callback
+                table_progress_callback,
+                detail_callback,
+                table_status_callback,
+                raw_output_callback,
+                import_results
             )
 
             if success and progress_callback:
                 progress_callback(f"✅ Import 완료 (DDL + Data, 모드: {import_mode})")
 
-            return success, msg
+            return success, msg, import_results
 
         except Exception as e:
-            return False, f"Import 오류: {str(e)}"
+            return False, f"Import 오류: {str(e)}", import_results
 
     def _drop_and_recreate_schema(
         self,
@@ -926,8 +955,12 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
         js_code: str,
         progress_callback: Optional[Callable[[str], None]] = None,
         tables: Optional[List[str]] = None,
-        table_progress_callback: Optional[Callable[[int, int, str], None]] = None
-    ) -> Tuple[bool, str]:
+        table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        detail_callback: Optional[Callable[[dict], None]] = None,
+        table_status_callback: Optional[Callable[[str, str, str], None]] = None,
+        raw_output_callback: Optional[Callable[[str], None]] = None,
+        import_results: Optional[dict] = None
+    ) -> Tuple[bool, str, dict]:
         """
         Import용 mysqlsh 명령 실행 (실시간 출력 파싱)
 
@@ -936,7 +969,25 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
             progress_callback: 일반 메시지 콜백
             tables: Import할 테이블 목록 (진행률 표시용)
             table_progress_callback: 테이블별 진행률 콜백
+            detail_callback: 상세 진행 정보 콜백 (percent, mb_done, mb_total, rows_sec, speed)
+            table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
+            raw_output_callback: mysqlsh 실시간 출력 콜백
+            import_results: 테이블별 결과 dict (수정됨)
+
+        Returns:
+            (성공여부, 메시지, 테이블별 결과 dict)
         """
+        import re
+        from datetime import datetime
+
+        if import_results is None:
+            import_results = {}
+
+        process = None
+        last_completed_count = 0
+        error_messages = []
+        current_loading_table = None
+
         try:
             cmd = [
                 "mysqlsh",
@@ -946,51 +997,158 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
             ]
 
             if progress_callback:
-                progress_callback(f"mysqlsh Import 실행 중...")
+                progress_callback(f"mysqlsh 실행 중...")
 
             # Popen으로 실행하여 실시간 출력 읽기
-            # stderr를 stdout으로 병합하여 데드락 방지 및 통합 로깅
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,  # Merge stderr into stdout
+                stderr=subprocess.STDOUT,
                 text=True,
                 encoding='utf-8',
                 errors='replace',
-                bufsize=1,  # Line buffering
+                bufsize=1,
                 universal_newlines=True
             )
 
-            # 진행률 추적
             total_tables = len(tables) if tables else 0
 
-            # 실시간 출력 읽기
-            import re
-            
             while True:
-                # stdout에서 한 줄 읽기
                 line = process.stdout.readline()
-                
-                # 프로세스가 종료되었고 더 이상 읽을 라인이 없으면 종료
+
                 if not line and process.poll() is not None:
                     break
-                
+
                 if line:
                     stripped_line = line.strip()
-                    # 디버깅을 위해 로깅 (콘솔에 출력하여 확인)
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+
+                    # 콘솔 디버깅 출력
                     print(f"[mysqlsh] {stripped_line}")
-                    
-                    # 테이블 로딩 패턴 감지
-                    # 예: "X thds loading | 100% (123.45 MB / 123.45 MB), 0 B/s, 2 / 6 tables done"
+
+                    # 실시간 출력 콜백 (UI에 전달)
+                    if raw_output_callback:
+                        raw_output_callback(f"[{timestamp}] {stripped_line}")
+
+                    # --- 패턴 1: 상세 진행 정보 파싱 ---
+                    # 예: "1 thds loading | 92% (88.95 MB / 96.69 MB), 1.5 MB/s (285.00 rows/s), 5 / 6 tables done"
+                    detail_match = re.search(
+                        r'(\d+)%\s*\(([0-9.]+)\s*([KMGT]?B)\s*/\s*([0-9.]+)\s*([KMGT]?B)\)',
+                        stripped_line
+                    )
+                    if detail_match and detail_callback:
+                        percent = int(detail_match.group(1))
+                        mb_done = float(detail_match.group(2))
+                        unit_done = detail_match.group(3)
+                        mb_total = float(detail_match.group(4))
+                        unit_total = detail_match.group(5)
+
+                        # 단위 변환 (MB로 통일)
+                        def to_mb(value, unit):
+                            if unit == 'KB':
+                                return value / 1024
+                            elif unit == 'GB':
+                                return value * 1024
+                            elif unit == 'TB':
+                                return value * 1024 * 1024
+                            return value  # B 또는 MB
+
+                        mb_done = to_mb(mb_done, unit_done)
+                        mb_total = to_mb(mb_total, unit_total)
+
+                        # rows/s 파싱
+                        rows_match = re.search(r'([0-9.]+)\s*[Kk]?\s*rows?/s', stripped_line)
+                        rows_sec = 0
+                        if rows_match:
+                            rows_sec = float(rows_match.group(1))
+                            if 'K' in stripped_line[rows_match.start():rows_match.end()].upper():
+                                rows_sec *= 1000
+
+                        # 속도 파싱 (MB/s, KB/s 등)
+                        speed_match = re.search(r'([0-9.]+)\s*([KMGT]?B)/s', stripped_line)
+                        speed_str = "0 B/s"
+                        if speed_match:
+                            speed_str = f"{speed_match.group(1)} {speed_match.group(2)}/s"
+
+                        detail_callback({
+                            'percent': percent,
+                            'mb_done': round(mb_done, 2),
+                            'mb_total': round(mb_total, 2),
+                            'rows_sec': int(rows_sec),
+                            'speed': speed_str
+                        })
+
+                    # --- 패턴 2: 테이블 완료 수 파싱 ---
+                    # 예: "5 / 6 tables done"
                     table_done_match = re.search(r'(\d+)\s*/\s*(\d+)\s*tables?\s*done', stripped_line, re.IGNORECASE)
-                    if table_done_match and tables and table_progress_callback:
-                        current = int(table_done_match.group(1))
+                    if table_done_match and tables:
+                        current_count = int(table_done_match.group(1))
                         total_in_log = int(table_done_match.group(2))
 
-                        # 테이블명은 알 수 없으므로 순서대로 가정
-                        if current <= len(tables):
-                            table_name = tables[current - 1] if current > 0 else "..."
-                            table_progress_callback(current, total_in_log, table_name)
+                        # 새로 완료된 테이블이 있는지 확인
+                        if current_count > last_completed_count:
+                            # 새로 완료된 테이블들 상태 업데이트
+                            for i in range(last_completed_count, min(current_count, len(tables))):
+                                table_name = tables[i]
+                                import_results[table_name] = {'status': 'done', 'message': ''}
+                                if table_status_callback:
+                                    table_status_callback(table_name, 'done', '')
+
+                            last_completed_count = current_count
+
+                        # 현재 로딩 중인 테이블 표시
+                        if current_count < len(tables):
+                            loading_table = tables[current_count]
+                            if loading_table != current_loading_table:
+                                current_loading_table = loading_table
+                                import_results[loading_table] = {'status': 'loading', 'message': ''}
+                                if table_status_callback:
+                                    table_status_callback(loading_table, 'loading', '')
+
+                        if table_progress_callback:
+                            table_name = tables[current_count - 1] if current_count > 0 else "..."
+                            table_progress_callback(current_count, total_in_log, table_name)
+
+                    # --- 패턴 3: 테이블 로딩 시작 감지 ---
+                    # 예: "Loading DDL and Data from ... for table `schema`.`table_name`"
+                    loading_match = re.search(r"Loading.*`(\w+)`\.`(\w+)`", stripped_line)
+                    if loading_match and tables:
+                        table_name = loading_match.group(2)
+                        if table_name in import_results:
+                            import_results[table_name] = {'status': 'loading', 'message': ''}
+                            if table_status_callback:
+                                table_status_callback(table_name, 'loading', '')
+
+                    # --- 패턴 4: 에러 감지 ---
+                    # 예: "ERROR: ...", "[ERROR] ...", "Error: ..."
+                    error_match = re.search(r'(?:ERROR|Error|\[ERROR\])[:\s]+(.+)', stripped_line, re.IGNORECASE)
+                    if error_match:
+                        error_msg = error_match.group(1).strip()
+                        error_messages.append(error_msg)
+
+                        # 테이블 관련 에러인지 확인
+                        table_error_match = re.search(r"`(\w+)`\.`(\w+)`", error_msg)
+                        if table_error_match:
+                            error_table = table_error_match.group(2)
+                            if error_table in import_results:
+                                import_results[error_table] = {'status': 'error', 'message': error_msg}
+                                if table_status_callback:
+                                    table_status_callback(error_table, 'error', error_msg)
+
+                        if progress_callback:
+                            progress_callback(f"❌ 에러: {error_msg}")
+
+                    # --- 패턴 5: Deadlock 감지 ---
+                    if 'deadlock' in stripped_line.lower():
+                        error_messages.append(f"Deadlock detected: {stripped_line}")
+                        if progress_callback:
+                            progress_callback(f"⚠️ Deadlock 감지: {stripped_line}")
+
+                    # --- 패턴 6: Warning 감지 ---
+                    warning_match = re.search(r'(?:WARNING|Warning|\[WARNING\])[:\s]+(.+)', stripped_line, re.IGNORECASE)
+                    if warning_match:
+                        if progress_callback:
+                            progress_callback(f"⚠️ 경고: {warning_match.group(1).strip()}")
 
             # 프로세스 종료 대기
             rc = process.poll()
@@ -1002,16 +1160,44 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                 # 최종 진행률 100% 표시
                 if tables and table_progress_callback and total_tables > 0:
                     table_progress_callback(total_tables, total_tables, tables[-1])
-                return True, "성공"
+
+                # 모든 테이블 완료 상태로 업데이트
+                for table in tables:
+                    if import_results.get(table, {}).get('status') != 'error':
+                        import_results[table] = {'status': 'done', 'message': ''}
+                        if table_status_callback:
+                            table_status_callback(table, 'done', '')
+
+                return True, "성공", import_results
             else:
-                return False, "mysqlsh 실행 실패 (로그 확인 필요)"
+                # 실패 시 pending 상태인 테이블들을 error로 변경
+                error_summary = "; ".join(error_messages[:3]) if error_messages else "알 수 없는 오류"
+                for table in tables:
+                    if import_results.get(table, {}).get('status') in ('pending', 'loading'):
+                        import_results[table] = {'status': 'error', 'message': error_summary}
+                        if table_status_callback:
+                            table_status_callback(table, 'error', error_summary)
+
+                return False, f"mysqlsh 실행 실패: {error_summary}", import_results
 
         except subprocess.TimeoutExpired:
             if process:
                 process.kill()
-            return False, "작업 시간 초과 (1시간)"
+            # 타임아웃 시 pending/loading 테이블들을 error로 변경
+            for table in (tables or []):
+                if import_results.get(table, {}).get('status') in ('pending', 'loading'):
+                    import_results[table] = {'status': 'error', 'message': '작업 시간 초과'}
+                    if table_status_callback:
+                        table_status_callback(table, 'error', '작업 시간 초과')
+            return False, "작업 시간 초과 (1시간)", import_results
         except Exception as e:
-            return False, str(e)
+            # 예외 발생 시 pending/loading 테이블들을 error로 변경
+            for table in (tables or []):
+                if import_results.get(table, {}).get('status') in ('pending', 'loading'):
+                    import_results[table] = {'status': 'error', 'message': str(e)}
+                    if table_status_callback:
+                        table_status_callback(table, 'error', str(e))
+            return False, str(e), import_results
 
 
 # 편의 함수
