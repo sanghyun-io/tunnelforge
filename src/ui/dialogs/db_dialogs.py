@@ -928,6 +928,38 @@ class MySQLShellImportDialog(QDialog):
 
         layout.addWidget(option_group)
 
+        # --- 타임존 설정 ---
+        tz_group = QGroupBox("타임존 설정")
+        tz_layout = QVBoxLayout(tz_group)
+
+        self.btn_tz_group = QButtonGroup(self)
+        
+        # 1. 자동 감지 (권장)
+        self.radio_tz_auto = QRadioButton("자동 감지 및 보정 (권장)")
+        self.radio_tz_auto.setChecked(True)
+        self.radio_tz_auto.setToolTip("서버가 지역명 타임존을 지원하지 않으면 자동으로 +09:00(KST)로 보정합니다.")
+        
+        # 2. 강제 KST
+        self.radio_tz_kst = QRadioButton("강제 KST (+09:00)")
+        
+        # 3. 강제 UTC
+        self.radio_tz_utc = QRadioButton("강제 UTC (+00:00)")
+        
+        # 4. 설정 안 함
+        self.radio_tz_none = QRadioButton("설정 안 함 (서버 기본값)")
+
+        self.btn_tz_group.addButton(self.radio_tz_auto)
+        self.btn_tz_group.addButton(self.radio_tz_kst)
+        self.btn_tz_group.addButton(self.radio_tz_utc)
+        self.btn_tz_group.addButton(self.radio_tz_none)
+
+        tz_layout.addWidget(self.radio_tz_auto)
+        tz_layout.addWidget(self.radio_tz_kst)
+        tz_layout.addWidget(self.radio_tz_utc)
+        tz_layout.addWidget(self.radio_tz_none)
+        
+        layout.addWidget(tz_group)
+
         # --- Import 모드 선택 ---
         mode_group = QGroupBox("Import 모드 선택")
         mode_layout = QVBoxLayout(mode_group)
@@ -1041,8 +1073,31 @@ class MySQLShellImportDialog(QDialog):
         self.chk_use_original.setEnabled(enabled)
         self.combo_target_schema.setEnabled(enabled and not self.chk_use_original.isChecked())
         self.spin_threads.setEnabled(enabled)
-        self.chk_drop_existing.setEnabled(enabled)
+        self.radio_merge.setEnabled(enabled)
+        self.radio_replace.setEnabled(enabled)
+        self.radio_recreate.setEnabled(enabled)
+        self.radio_recreate.setEnabled(enabled)
+        self.radio_tz_auto.setEnabled(enabled)
+        self.radio_tz_kst.setEnabled(enabled)
+        self.radio_tz_utc.setEnabled(enabled)
+        self.radio_tz_none.setEnabled(enabled)
         self.btn_import.setEnabled(enabled)
+
+    def check_timezone_support(self) -> bool:
+        """
+        서버가 'Asia/Seoul' 같은 지역명 타임존을 지원하는지 확인
+        """
+        if not self.connector:
+            return False
+            
+        try:
+            # mysql.time_zone_name 테이블에서 Asia/Seoul 조회
+            # 단순히 테이블 존재 여부만 보지 않고 실제 데이터가 있는지 확인
+            query = "SELECT 1 FROM mysql.time_zone_name WHERE Name = 'Asia/Seoul' LIMIT 1"
+            rows = self.connector.execute(query)
+            return len(rows) > 0
+        except Exception:
+            return False
 
     def do_import(self):
         input_dir = self.input_dir.text()
@@ -1083,13 +1138,45 @@ class MySQLShellImportDialog(QDialog):
             password=self.connector.password if hasattr(self.connector, 'password') else ""
         )
 
+        # 타임존 설정 결정
+        timezone_sql = None
+        
+        if self.radio_tz_auto.isChecked():
+            self.txt_log.addItem("🔍 타임존 지원 여부 확인 중...")
+            QApplication.processEvents()
+            
+            supports_named_tz = self.check_timezone_support()
+            
+            if supports_named_tz:
+                self.txt_log.addItem("✅ 서버가 지역명 타임존을 지원합니다.")
+            else:
+                timezone_sql = "SET SESSION time_zone = '+09:00'"
+                self.txt_log.addItem("⚠️ 서버가 지역명 타임존을 지원하지 않습니다.")
+                self.txt_log.addItem("ℹ️ 'Asia/Seoul' 에러 방지를 위해 타임존을 '+09:00'으로 자동 보정합니다.")
+        
+        elif self.radio_tz_kst.isChecked():
+            timezone_sql = "SET SESSION time_zone = '+09:00'"
+            self.txt_log.addItem("ℹ️ 타임존을 강제로 '+09:00' (KST)로 설정합니다.")
+            
+        elif self.radio_tz_utc.isChecked():
+            timezone_sql = "SET SESSION time_zone = '+00:00'"
+            self.txt_log.addItem("ℹ️ 타임존을 강제로 '+00:00' (UTC)로 설정합니다.")
+
+        # Import 모드 결정
+        import_mode = "merge"  # 기본값
+        if self.radio_replace.isChecked():
+            import_mode = "replace"
+        elif self.radio_recreate.isChecked():
+            import_mode = "recreate"
+
         # 작업 스레드 시작
         self.worker = MySQLShellWorker(
             "import", config,
             input_dir=input_dir,
             target_schema=target_schema,
             threads=self.spin_threads.value(),
-            drop_existing_tables=self.chk_drop_existing.isChecked()
+            import_mode=import_mode,
+            timezone_sql=timezone_sql
         )
 
         self.worker.progress.connect(self.on_progress)

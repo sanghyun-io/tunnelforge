@@ -58,7 +58,8 @@ class MySQLShellWorker(QThread):
                     self.kwargs['input_dir'],
                     self.kwargs.get('target_schema'),
                     self.kwargs.get('threads', 4),
-                    self.kwargs.get('drop_existing_tables', True),
+                    self.kwargs.get('import_mode', 'replace'),
+                    self.kwargs.get('timezone_sql'),
                     callback,
                     table_callback
                 )

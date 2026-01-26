@@ -574,18 +574,22 @@ class MySQLShellImporter:
         input_dir: str,
         target_schema: Optional[str] = None,
         threads: int = 4,
-        drop_existing_tables: bool = True,
+        import_mode: str = "replace",
+        timezone_sql: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None
     ) -> Tuple[bool, str]:
         """
-        Dump 파일 Import (DDL + Data 완전 교체)
+        Dump 파일 Import (3가지 모드 지원)
 
         Args:
             input_dir: Dump 디렉토리 경로
             target_schema: 대상 스키마 (None이면 원본 스키마 사용)
             threads: 병렬 스레드 수
-            drop_existing_tables: 기존 테이블 삭제 후 재생성 여부 (기본: True)
+            import_mode: Import 모드
+                - "merge": 병합 (기존 데이터 유지)
+                - "replace": 전체 교체 (모든 객체 재생성, resetProgress=true)
+                - "recreate": 완전 재생성 (스키마 DROP 후 재생성)
             progress_callback: 진행 상황 콜백
 
         Returns:
@@ -606,37 +610,88 @@ class MySQLShellImporter:
                 if progress_callback:
                     progress_callback(f"메타데이터 확인: {source_schema} ({metadata.get('type')}) - {len(tables_to_import)}개 테이블")
 
+            # 타임존 패치 (Asia/Seoul -> +09:00)
+            if progress_callback:
+                progress_callback("타임존 보정 중... (Asia/Seoul -> +09:00)")
+            
+            patched_count = self._patch_timezone_in_dump(input_dir)
+            if patched_count > 0 and progress_callback:
+                progress_callback(f"✅ {patched_count}개 SQL 파일 타임존 보정 완료")
+
             # 대상 스키마 결정
             final_target_schema = target_schema or source_schema
             if not final_target_schema:
                 return False, "대상 스키마를 지정할 수 없습니다."
 
-            # 기존 테이블 삭제 (옵션)
-            if drop_existing_tables and tables_to_import:
+            # Import 모드별 처리
+            if import_mode == "recreate":
+                # 완전 재생성: 스키마 DROP 후 재생성
                 if progress_callback:
-                    progress_callback(f"기존 테이블 삭제 중... ({len(tables_to_import)}개)")
-
-                drop_success, drop_msg = self._drop_existing_tables(
+                    progress_callback(f"⚠️ 스키마 '{final_target_schema}' 완전 재생성 중...")
+                
+                drop_schema_success, drop_schema_msg = self._drop_and_recreate_schema(
                     final_target_schema,
-                    tables_to_import,
                     progress_callback
                 )
-
-                if not drop_success:
-                    return False, f"기존 테이블 삭제 실패: {drop_msg}"
+                
+                if not drop_schema_success:
+                    return False, f"스키마 재생성 실패: {drop_schema_msg}"
+                
+            elif import_mode == "replace":
+                # 전체 교체: 모든 객체 (테이블, 뷰, 프로시저, 이벤트) 삭제 후 재생성
+                if progress_callback:
+                    progress_callback(f"전체 교체 모드: 모든 객체 삭제 중...")
+                
+                # 1. 테이블 삭제
+                if tables_to_import:
+                    drop_success, drop_msg = self._drop_existing_tables(
+                        final_target_schema,
+                        tables_to_import,
+                        progress_callback
+                    )
+                    if not drop_success:
+                        return False, f"테이블 삭제 실패: {drop_msg}"
+                
+                # 2. View, Procedure, Event 삭제
+                drop_objects_success, drop_objects_msg = self._drop_all_objects(
+                    final_target_schema,
+                    progress_callback
+                )
+                if not drop_objects_success:
+                    return False, f"객체 삭제 실패: {drop_objects_msg}"
+                
+            elif import_mode == "merge":
+                # 병합: 기존 데이터 유지, 새 것만 추가
+                if progress_callback:
+                    progress_callback(f"증분 병합 모드: 기존 데이터 유지")
+            
+            else:
+                return False, f"알 수 없는 Import 모드: {import_mode}"
 
             if progress_callback:
-                progress_callback(f"DDL + Data Import 시작 (스레드: {threads})")
+                progress_callback(f"DDL + Data Import 시작 (스레드: {threads}, 모드: {import_mode})")
 
-            # loadDump 옵션 구성 (DDL + Data 모두 로드)
+            # loadDump 옵션 구성 (모드별)
             options = [
                 f"threads: {threads}",
                 "loadDdl: true",  # DDL(테이블 구조) 로드
                 "loadData: true",  # Data 로드
-                "ignoreExistingObjects: false",  # 기존 객체 있으면 에러 (이미 DROP했으므로)
-                "resetProgress: true",
                 "showProgress: true"
             ]
+
+            # 모드별 옵션
+            if import_mode == "replace":
+                # 전체 교체: resetProgress로 View/Procedure/Event도 재생성
+                options.append("resetProgress: true")
+                options.append("ignoreExistingObjects: false")
+            elif import_mode == "merge":
+                # 병합: 기존 객체 무시
+                options.append("resetProgress: false")
+                options.append("ignoreExistingObjects: true")
+            elif import_mode == "recreate":
+                # 완전 재생성: 스키마가 비어있으므로 기본 설정
+                options.append("resetProgress: true")
+                options.append("ignoreExistingObjects: false")
 
             if target_schema:
                 options.append(f'schema: "{target_schema}"')
@@ -644,12 +699,18 @@ class MySQLShellImporter:
             options_str = ", ".join(options)
 
             # mysqlsh 명령 구성 (local_infile 활성화 필요)
+            # Timezone 설정이 있으면 util.loadDump 이전에 실행
+            timezone_cmd = f'session.runSql("{timezone_sql}");' if timezone_sql else ""
+            
             js_code = f"""
-session.runSql("SET GLOBAL local_infile = ON");
-util.loadDump("{input_dir.replace('\\', '/')}", {{
-    {options_str}
-}});
-"""
+                session.runSql("SET GLOBAL local_infile = ON");
+                {timezone_cmd}
+                util.loadDump("{input_dir.replace('\\', '/')}", {{
+                    {options_str}
+                }});
+            """
+
+            print(js_code)
 
             # Import 실행 (실시간 진행률 파싱)
             success, msg = self._run_mysqlsh_import(
@@ -660,12 +721,129 @@ util.loadDump("{input_dir.replace('\\', '/')}", {{
             )
 
             if success and progress_callback:
-                progress_callback(f"✅ Import 완료 (DDL + Data)")
+                progress_callback(f"✅ Import 완료 (DDL + Data, 모드: {import_mode})")
 
             return success, msg
 
         except Exception as e:
             return False, f"Import 오류: {str(e)}"
+
+    def _drop_and_recreate_schema(
+        self,
+        schema: str,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> Tuple[bool, str]:
+        """
+        스키마 완전 재생성 (DROP + CREATE)
+
+        Args:
+            schema: 스키마명
+            progress_callback: 진행 콜백
+
+        Returns:
+            (성공여부, 메시지)
+        """
+        try:
+            js_code = f"""
+session.runSql("DROP DATABASE IF EXISTS `{schema}`");
+session.runSql("CREATE DATABASE `{schema}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci");
+"""
+            
+            success, msg = self._run_mysqlsh(js_code, progress_callback)
+            
+            if success and progress_callback:
+                progress_callback(f"✅ 스키마 '{schema}' 재생성 완료")
+            
+            return success, msg
+        
+        except Exception as e:
+            return False, f"스키마 재생성 오류: {str(e)}"
+
+    def _drop_all_objects(
+        self,
+        schema: str,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> Tuple[bool, str]:
+        """
+        스키마의 모든 View, Procedure, Event 삭제
+
+        Args:
+            schema: 스키마명
+            progress_callback: 진행 콜백
+
+        Returns:
+            (성공여부, 메시지)
+        """
+        try:
+            # Views, Procedures, Events 조회 및 삭제
+            js_code = f"""
+// Views 삭제
+var views = session.runSql("SELECT TABLE_NAME FROM information_schema.VIEWS WHERE TABLE_SCHEMA = '{schema}'").fetchAll();
+for (var i = 0; i < views.length; i++) {{
+    var viewName = views[i][0];
+    session.runSql("DROP VIEW IF EXISTS `{schema}`.`" + viewName + "`");
+}}
+
+// Procedures 삭제
+var procedures = session.runSql("SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = '{schema}' AND ROUTINE_TYPE = 'PROCEDURE'").fetchAll();
+for (var i = 0; i < procedures.length; i++) {{
+    var procName = procedures[i][0];
+    session.runSql("DROP PROCEDURE IF EXISTS `{schema}`.`" + procName + "`");
+}}
+
+// Functions 삭제
+var functions = session.runSql("SELECT ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = '{schema}' AND ROUTINE_TYPE = 'FUNCTION'").fetchAll();
+for (var i = 0; i < functions.length; i++) {{
+    var funcName = functions[i][0];
+    session.runSql("DROP FUNCTION IF EXISTS `{schema}`.`" + funcName + "`");
+}}
+
+// Events 삭제
+var events = session.runSql("SELECT EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA = '{schema}'").fetchAll();
+for (var i = 0; i < events.length; i++) {{
+    var eventName = events[i][0];
+    session.runSql("DROP EVENT IF EXISTS `{schema}`.`" + eventName + "`");
+}}
+"""
+            
+            success, msg = self._run_mysqlsh(js_code, progress_callback)
+            
+            if success and progress_callback:
+                progress_callback(f"✅ View/Procedure/Event 삭제 완료")
+            
+            return success, msg
+        
+        except Exception as e:
+            return False, f"객체 삭제 오류: {str(e)}"
+
+    def _patch_timezone_in_dump(self, input_dir: str) -> int:
+        """
+        Dump 파일 내의 Asia/Seoul 타임존을 +09:00으로 보정
+        (타켓 서버에 타임존 정보가 없는 경우 발생하는 오류 방지)
+        
+        Returns:
+            보정된 파일 개수
+        """
+        patched_count = 0
+        try:
+            sql_files = glob_module.glob(os.path.join(input_dir, "*.sql"))
+            
+            for file_path in sql_files:
+                try:
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                    
+                    if "'Asia/Seoul'" in content:
+                        new_content = content.replace("'Asia/Seoul'", "'+09:00'")
+                        with open(file_path, 'w', encoding='utf-8') as f:
+                            f.write(new_content)
+                        patched_count += 1
+                except Exception:
+                    continue
+                    
+            return patched_count
+        except Exception:
+            return 0
 
     def _drop_existing_tables(
         self,
@@ -771,60 +949,62 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                 progress_callback(f"mysqlsh Import 실행 중...")
 
             # Popen으로 실행하여 실시간 출력 읽기
+            # stderr를 stdout으로 병합하여 데드락 방지 및 통합 로깅
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.STDOUT,  # Merge stderr into stdout
                 text=True,
-                bufsize=1,  # 라인 버퍼링
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,  # Line buffering
                 universal_newlines=True
             )
 
             # 진행률 추적
-            completed_tables = set()
             total_tables = len(tables) if tables else 0
 
-            # stdout과 stderr를 실시간으로 읽기
+            # 실시간 출력 읽기
             import re
-            stdout_lines = []
-            stderr_lines = []
-
+            
             while True:
                 # stdout에서 한 줄 읽기
                 line = process.stdout.readline()
-                if not line:
+                
+                # 프로세스가 종료되었고 더 이상 읽을 라인이 없으면 종료
+                if not line and process.poll() is not None:
                     break
+                
+                if line:
+                    stripped_line = line.strip()
+                    # 디버깅을 위해 로깅 (콘솔에 출력하여 확인)
+                    print(f"[mysqlsh] {stripped_line}")
+                    
+                    # 테이블 로딩 패턴 감지
+                    # 예: "X thds loading | 100% (123.45 MB / 123.45 MB), 0 B/s, 2 / 6 tables done"
+                    table_done_match = re.search(r'(\d+)\s*/\s*(\d+)\s*tables?\s*done', stripped_line, re.IGNORECASE)
+                    if table_done_match and tables and table_progress_callback:
+                        current = int(table_done_match.group(1))
+                        total_in_log = int(table_done_match.group(2))
 
-                stdout_lines.append(line)
-
-                # 테이블 로딩 패턴 감지: "X thds loading | 100% (123.45 MB / 123.45 MB), 0 B/s, 2 / 6 tables done"
-                # 또는 "X thds loading - YY% (X MB / Y MB), Z MB/s, M / N tables done"
-                table_done_match = re.search(r'(\d+)\s*/\s*(\d+)\s*tables?\s*done', line, re.IGNORECASE)
-                if table_done_match and tables and table_progress_callback:
-                    current = int(table_done_match.group(1))
-                    total = int(table_done_match.group(2))
-
-                    # 테이블명은 알 수 없으므로 순서대로 가정
-                    if current <= len(tables):
-                        table_name = tables[current - 1] if current > 0 else "..."
-                        table_progress_callback(current, total, table_name)
-
-            # stderr 읽기
-            stderr_output = process.stderr.read()
-            if stderr_output:
-                stderr_lines.append(stderr_output)
+                        # 테이블명은 알 수 없으므로 순서대로 가정
+                        if current <= len(tables):
+                            table_name = tables[current - 1] if current > 0 else "..."
+                            table_progress_callback(current, total_in_log, table_name)
 
             # 프로세스 종료 대기
-            process.wait(timeout=3600)
+            rc = process.poll()
+            if rc is None:
+                process.wait(timeout=3600)
+                rc = process.returncode
 
-            if process.returncode == 0:
+            if rc == 0:
                 # 최종 진행률 100% 표시
                 if tables and table_progress_callback and total_tables > 0:
                     table_progress_callback(total_tables, total_tables, tables[-1])
                 return True, "성공"
             else:
-                error_msg = stderr_output or "알 수 없는 오류"
-                return False, error_msg
+                return False, "mysqlsh 실행 실패 (로그 확인 필요)"
 
         except subprocess.TimeoutExpired:
             if process:
