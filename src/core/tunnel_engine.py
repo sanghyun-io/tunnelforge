@@ -14,39 +14,48 @@ class TunnelEngine:
         순서: RSA -> Ed25519 -> ECDSA -> (DSS는 paramiko 3.x 미지원)
         """
         key_path = os.path.expanduser(key_path)
-        
+
         # 1. 키 파일 존재 확인
         if not os.path.exists(key_path):
             raise FileNotFoundError(f"키 파일을 찾을 수 없습니다: {key_path}")
 
-        last_exception = None
-        
+        # 모든 시도에 대한 로그 수집
+        attempt_logs = []
+
         # 2. 여러 키 타입으로 로드 시도
         # Paramiko는 OpenSSH 포맷일 경우 RSAKey로 로드하려 하면 실패할 수 있음
         # 따라서 범용적인 PKey 로딩을 시도하거나 순차적으로 시도
-        
+
         key_classes = [
-            paramiko.RSAKey,
-            paramiko.Ed25519Key,
-            paramiko.ECDSAKey,
+            ("RSA", paramiko.RSAKey),
+            ("Ed25519", paramiko.Ed25519Key),
+            ("ECDSA", paramiko.ECDSAKey),
         ]
         # paramiko 3.x에서 DSSKey(DSA) 지원이 제거됨 - 필요시에만 추가
         if hasattr(paramiko, 'DSSKey'):
-            key_classes.append(paramiko.DSSKey)
+            key_classes.append(("DSS", paramiko.DSSKey))
 
-        for k_cls in key_classes:
+        for key_name, k_cls in key_classes:
             try:
                 # 암호가 있는 키라면 password 인자가 필요하지만, 일단 없는 것으로 가정
-                return k_cls.from_private_key_file(key_path)
+                key = k_cls.from_private_key_file(key_path)
+                print(f"✅ SSH 키 로드 성공: {key_name} 형식")
+                return key
             except paramiko.ssh_exception.PasswordRequiredException:
                 raise Exception("키 파일에 비밀번호(Passphrase)가 걸려있습니다. 현재 버전은 비밀번호를 지원하지 않습니다.")
             except Exception as e:
-                last_exception = e
+                attempt_logs.append(f"  - {key_name}: {type(e).__name__}: {str(e)}")
                 continue
-        
+
         # 3. 모든 시도가 실패했을 때
         # cryptography 라이브러리가 없으면 OpenSSH 포맷을 못 읽을 수 있음
-        raise Exception(f"키 파일을 인식할 수 없습니다 (OpenSSH 포맷인 경우 'pip install cryptography' 필요).\n마지막 에러: {last_exception}")
+        error_details = "\n".join(attempt_logs)
+        raise Exception(
+            f"키 파일을 인식할 수 없습니다.\n"
+            f"키 파일: {key_path}\n"
+            f"시도한 키 형식별 에러:\n{error_details}\n\n"
+            f"💡 OpenSSH 포맷인 경우 'pip install cryptography' 필요"
+        )
 
     def start_tunnel(self, config):
         """SSH 터널 또는 직접 연결 시작"""
@@ -72,12 +81,26 @@ class TunnelEngine:
     def _start_ssh_tunnel(self, config):
         """SSH 터널 시작 (내부 메서드)"""
         tid = config['id']
+        connection_logs = []
+
         try:
-            print(f"🚀 터널 시작 시도: {config['name']}")
+            connection_logs.append(f"🚀 터널 시작 시도: {config['name']}")
+            connection_logs.append(f"   Bastion: {config['bastion_user']}@{config['bastion_host']}:{config['bastion_port']}")
+            connection_logs.append(f"   Target: {config['remote_host']}:{config['remote_port']}")
+            connection_logs.append(f"   Local Port: {config['local_port']}")
+            connection_logs.append(f"   SSH Key: {config['bastion_key']}")
+
+            for log in connection_logs:
+                print(log)
 
             # 키 객체 직접 로드
+            connection_logs.append("🔑 SSH 키 로드 시도...")
+            print("🔑 SSH 키 로드 시도...")
             pkey_obj = self._load_private_key(config['bastion_key'])
+            connection_logs.append("✅ SSH 키 로드 성공")
 
+            connection_logs.append("🔗 SSH 터널 생성 중...")
+            print("🔗 SSH 터널 생성 중...")
             server = SSHTunnelForwarder(
                 (config['bastion_host'], int(config['bastion_port'])),
                 ssh_username=config['bastion_user'],
@@ -87,6 +110,8 @@ class TunnelEngine:
                 set_keepalive=30.0
             )
 
+            connection_logs.append("🚀 터널 연결 시작...")
+            print("🚀 터널 연결 시작...")
             server.start()
             self.active_tunnels[tid] = server
             self.tunnel_configs[tid] = config
@@ -95,8 +120,17 @@ class TunnelEngine:
 
         except Exception as e:
             error_msg = str(e)
-            print(f"❌ 터널 연결 실패: {error_msg}")
-            return False, error_msg
+            error_type = type(e).__name__
+
+            # 상세 에러 로그 구성
+            full_error = f"❌ 터널 연결 실패\n"
+            full_error += f"에러 타입: {error_type}\n"
+            full_error += f"에러 메시지: {error_msg}\n\n"
+            full_error += "📋 연결 시도 로그:\n"
+            full_error += "\n".join(connection_logs)
+
+            print(full_error)
+            return False, full_error
 
     def stop_tunnel(self, tid):
         """터널 종료"""
@@ -179,13 +213,23 @@ class TunnelEngine:
     def _test_ssh_tunnel_connection(self, config):
         """SSH 터널 연결 테스트"""
         temp_server = None
+        connection_logs = []
+
         try:
+            connection_logs.append("📋 연결 테스트 시작")
+            connection_logs.append(f"   Bastion: {config.get('bastion_user', 'N/A')}@{config.get('bastion_host', 'N/A')}:{config.get('bastion_port', 'N/A')}")
+            connection_logs.append(f"   Target: {config.get('remote_host', 'N/A')}:{config.get('remote_port', 'N/A')}")
+            connection_logs.append(f"   SSH Key: {config.get('bastion_key', 'N/A')}")
+
             if not config.get('bastion_key'):
                 return False, "❌ SSH 키 파일 경로가 비어있습니다."
 
             # 키 객체 직접 로드 (테스트 시에도 동일하게 적용)
+            connection_logs.append("🔑 SSH 키 로드 시도...")
             pkey_obj = self._load_private_key(config['bastion_key'])
+            connection_logs.append("✅ SSH 키 로드 성공")
 
+            connection_logs.append("🔗 임시 SSH 터널 생성 중...")
             temp_server = SSHTunnelForwarder(
                 (config['bastion_host'], int(config['bastion_port'])),
                 ssh_username=config['bastion_user'],
@@ -194,23 +238,34 @@ class TunnelEngine:
                 local_bind_address=('127.0.0.1', 0)
             )
 
+            connection_logs.append("🚀 Bastion Host 연결 시도...")
             temp_server.start()
             bastion_msg = "✅ 1. Bastion Host 연결 성공"
+            connection_logs.append(bastion_msg)
 
             try:
+                connection_logs.append("🔗 Target DB 포트 연결 시도...")
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(3)
                 s.connect(('127.0.0.1', temp_server.local_bind_port))
                 s.close()
                 db_msg = "✅ 2. Target DB 포트 도달 성공"
+                connection_logs.append(db_msg)
             except Exception as e:
-                db_msg = f"❌ 2. Target DB 연결 실패\n원인: {str(e)}"
-                return False, f"{bastion_msg}\n{db_msg}"
+                db_msg = f"❌ 2. Target DB 연결 실패\n원인: {type(e).__name__}: {str(e)}"
+                connection_logs.append(db_msg)
+                logs_summary = "\n".join(connection_logs)
+                return False, f"{bastion_msg}\n{db_msg}\n\n📋 전체 로그:\n{logs_summary}"
 
             return True, f"{bastion_msg}\n{db_msg}\n\n모든 연결이 정상입니다!"
 
         except Exception as e:
-            return False, f"❌ 1. Bastion Host 연결 실패\n원인: {str(e)}"
+            error_type = type(e).__name__
+            error_msg = str(e)
+            connection_logs.append(f"❌ 실패: {error_type}: {error_msg}")
+
+            logs_summary = "\n".join(connection_logs)
+            return False, f"❌ 1. Bastion Host 연결 실패\n에러 타입: {error_type}\n원인: {error_msg}\n\n📋 전체 로그:\n{logs_summary}"
 
         finally:
             if temp_server:

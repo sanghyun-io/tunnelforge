@@ -51,6 +51,11 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
+; 실행 중인 애플리케이션 자동 종료
+CloseApplications=force
+CloseApplicationsFilter=*.exe
+RestartApplications=yes
+
 [Languages]
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -60,7 +65,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; 메인 실행 파일 (.iss 파일 기준 상대 경로)
-Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion closeonexit restartreplace
 
 ; 라이선스 파일 포함 (선택적)
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion

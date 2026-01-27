@@ -52,6 +52,24 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Setup GitHub App credentials
+        if: ${{ vars.GH_APP_ID != '' }}
+        shell: bash
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+        run: |
+          # .env 파일 생성 (GitHub App 자동 이슈 리포팅용)
+          echo "GITHUB_APP_ID=${{ vars.GH_APP_ID }}" >> .env
+          echo "GITHUB_APP_INSTALLATION_ID=${{ vars.GH_APP_INSTALLATION_ID }}" >> .env
+          echo "GITHUB_REPO=${{ vars.GH_ISSUE_REPO || github.repository }}" >> .env
+
+          # Private Key 파일 생성
+          mkdir -p secrets
+          echo "$APP_PRIVATE_KEY" > secrets/github-app.pem
+          echo "GITHUB_APP_PRIVATE_KEY=secrets/github-app.pem" >> .env
+
+          echo "✅ GitHub App credentials configured"
+
       - name: Build with PyInstaller
         run: |
           python -m PyInstaller tunnel-manager.spec
