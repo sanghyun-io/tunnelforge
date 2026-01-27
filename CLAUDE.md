@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-DataFlare Tunnel Manager - Python PyQt6 GUI application for managing SSH tunnels and MySQL database connections. Enables secure remote database access through SSH bastion hosts with database export functionality.
+TunnelDB Manager - Python PyQt6 GUI application for managing SSH tunnels and MySQL database connections. Enables secure remote database access through SSH bastion hosts with database export functionality.
 
 ## Commands
 
@@ -36,7 +36,7 @@ python -m py_compile src/ui/workers/*.py
 main.py (Entry Point)
 ├── src/core/
 │   ├── ConfigManager (config_manager.py)
-│   │   └── Stores tunnel configs in %APPDATA%\Local\DataFlareTunnel\config.json
+│   │   └── Stores tunnel configs in %APPDATA%\Local\TunnelDB\config.json
 │   ├── TunnelEngine (tunnel_engine.py)
 │   │   ├── SSHTunnelForwarder for SSH tunnel mode
 │   │   └── Direct connection mode support

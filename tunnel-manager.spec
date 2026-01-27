@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 
 """
-DataFlare Tunnel Manager - PyInstaller Spec 파일
+TunnelDB Manager - PyInstaller Spec 파일
 
 이 파일은 PyInstaller가 실행 파일을 생성할 때 사용하는 설정입니다.
 빌드 방법: pyinstaller tunnel-manager.spec
@@ -87,7 +87,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='DataFlareTunnelManager',  # 실행 파일 이름
+    name='TunnelDBManager',  # 실행 파일 이름
     debug=False,  # True: 디버그 정보 포함
     bootloader_ignore_signals=False,
     strip=False,  # True: 바이너리에서 심볼 제거 (리눅스/맥)
@@ -112,5 +112,5 @@ exe = EXE(
 #     strip=False,
 #     upx=True,
 #     upx_exclude=[],
-#     name='DataFlareTunnelManager',
+#     name='TunnelDBManager',
 # )

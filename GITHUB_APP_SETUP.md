@@ -1,6 +1,6 @@
 # GitHub App 설정 가이드
 
-DataFlare Tunnel Manager의 자동 이슈 보고 기능은 GitHub App을 통해 인증합니다.
+TunnelDB Manager의 자동 이슈 보고 기능은 GitHub App을 통해 인증합니다.
 
 ## 왜 GitHub App인가?
 
@@ -18,7 +18,7 @@ DataFlare Tunnel Manager의 자동 이슈 보고 기능은 GitHub App을 통해 
 1. GitHub에서 **Settings** → **Developer settings** → **GitHub Apps** → **New GitHub App**
 
 2. 기본 정보 입력:
-   - **GitHub App name**: `DataFlare Issue Reporter` (원하는 이름)
+   - **GitHub App name**: `TunnelDB Issue Reporter` (원하는 이름)
    - **Homepage URL**: `https://github.com/your-org/your-repo`
    - **Webhook**: ☐ Active (체크 해제)
 

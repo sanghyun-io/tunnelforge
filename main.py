@@ -9,7 +9,7 @@ from src.ui.main_window import TunnelManagerUI
 
 def main():
     # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('dataflare.tunnelmanager.1.0')
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('tunneldb.manager.1.0')
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon('assets/icon.ico'))  # 또는 'assets/icon.png'

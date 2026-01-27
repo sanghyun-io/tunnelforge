@@ -1,6 +1,6 @@
-# DataFlare Tunnel Manager - 빌드 가이드
+# TunnelDB Manager - 빌드 가이드
 
-이 문서는 DataFlare Tunnel Manager를 Windows 실행 파일(`.exe`)로 빌드하는 방법을 설명합니다.
+이 문서는 TunnelDB Manager를 Windows 실행 파일(`.exe`)로 빌드하는 방법을 설명합니다.
 
 ## 📋 목차
 
@@ -64,7 +64,7 @@ pyinstaller tunnel-manager.spec
 Spec 파일 없이 명령줄 옵션으로 빌드할 수도 있습니다.
 
 ```bash
-pyinstaller --name "DataFlareTunnelManager" ^
+pyinstaller --name "TunnelDBManager" ^
             --onefile ^
             --windowed ^
             --icon "assets/icon.ico" ^
@@ -132,9 +132,9 @@ pyinstaller --console main.py
 ```
 tunnel-manager/
 ├── build/                          # 임시 빌드 파일 (삭제 가능)
-│   └── DataFlareTunnelManager/
+│   └── TunnelDBManager/
 ├── dist/                           # 최종 실행 파일 위치
-│   └── DataFlareTunnelManager.exe  # 배포용 실행 파일
+│   └── TunnelDBManager.exe  # 배포용 실행 파일
 └── tunnel-manager.spec             # PyInstaller 설정 파일
 ```
 
@@ -145,7 +145,7 @@ tunnel-manager/
 cd dist
 
 # 실행 파일 실행
-DataFlareTunnelManager.exe
+TunnelDBManager.exe
 ```
 
 ---
@@ -284,7 +284,7 @@ pyinstaller tunnel-manager.spec
 
 빌드 후 확인 사항:
 
-- [ ] `dist/DataFlareTunnelManager.exe` 생성 확인
+- [ ] `dist/TunnelDBManager.exe` 생성 확인
 - [ ] 실행 파일 정상 동작 테스트
 - [ ] SSH 터널 연결 테스트
 - [ ] 데이터베이스 연결 테스트

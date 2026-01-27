@@ -734,7 +734,7 @@ class MySQLShellImporter:
             chunk_file_bytes = done_data.get('chunkFileBytes', {})
 
             for chunk_file in chunk_file_bytes.keys():
-                # "dataflare@df_subs@15.tsv.zst" 또는 "dataflare@df_subs@@0.tsv.zst" 형식
+                # "mydb@table_name@15.tsv.zst" 또는 "mydb@table_name@@0.tsv.zst" 형식
                 if '@' in chunk_file:
                     parts = chunk_file.split('@')
                     if len(parts) >= 3:

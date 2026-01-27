@@ -1,4 +1,4 @@
-# DataFlare Tunnel Manager
+# TunnelDB Manager
 
 SSH 터널 및 MySQL 데이터베이스 관리를 위한 PyQt6 GUI 애플리케이션입니다.
 
@@ -112,9 +112,9 @@ tunnel-manager/
 
 ## 설정 파일 위치
 
-- **Windows**: `%LOCALAPPDATA%\DataFlareTunnel\config.json`
-- **Linux/macOS**: `~/.config/dataflare_tunnel/config.json`
+- **Windows**: `%LOCALAPPDATA%\TunnelDB\config.json`
+- **Linux/macOS**: `~/.config/tunneldb/config.json`
 
 ## 라이선스
 
-MIT License
+이 프로젝트는 MIT 라이선스로 배포됩니다. 자세한 내용은 [LICENSE](LICENSE) 파일을 참고하세요.

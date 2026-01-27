@@ -4,12 +4,12 @@ import uuid
 from cryptography.fernet import Fernet
 
 # 운영체제별 설정 파일 저장 경로 지정
-# Windows: C:\Users\User\AppData\Local\DataFlareTunnel
-# Mac/Linux: ~/.config/dataflare_tunnel
+# Windows: C:\Users\User\AppData\Local\TunnelDB
+# Mac/Linux: ~/.config/tunneldb
 if os.name == 'nt':
-    APP_DIR = os.path.join(os.environ['LOCALAPPDATA'], 'DataFlareTunnel')
+    APP_DIR = os.path.join(os.environ['LOCALAPPDATA'], 'TunnelDB')
 else:
-    APP_DIR = os.path.join(os.path.expanduser('~'), '.config', 'dataflare_tunnel')
+    APP_DIR = os.path.join(os.path.expanduser('~'), '.config', 'tunneldb')
 
 CONFIG_FILE = os.path.join(APP_DIR, 'config.json')
 KEY_FILE = os.path.join(APP_DIR, '.encryption_key')

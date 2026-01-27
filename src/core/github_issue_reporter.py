@@ -45,7 +45,7 @@ class GitHubIssueReporter:
             self._headers = {
                 "Authorization": f"token {token}",
                 "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "DataFlare-Tunnel-Manager"
+                "User-Agent": "TunnelDB-Manager"
             }
 
     @classmethod
@@ -221,7 +221,7 @@ class GitHubIssueReporter:
             body += "\n"
 
         body += """---
-> 이 이슈는 DataFlare Tunnel Manager에서 자동으로 생성되었습니다.
+> 이 이슈는 TunnelDB Manager에서 자동으로 생성되었습니다.
 """
         return body
 

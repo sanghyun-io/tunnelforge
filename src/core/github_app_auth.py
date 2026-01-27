@@ -48,7 +48,7 @@ class GitHubAppAuth:
 
     GITHUB_API_BASE = "https://api.github.com"
 
-    # 환경변수 키 (DATAFLARE_ prefix 제거)
+    # 환경변수 키
     ENV_APP_ID = "GITHUB_APP_ID"
     ENV_PRIVATE_KEY = "GITHUB_APP_PRIVATE_KEY"
     ENV_INSTALLATION_ID = "GITHUB_APP_INSTALLATION_ID"
@@ -64,7 +64,7 @@ class GitHubAppAuth:
     _EMBEDDED_REPO: Optional[str] = None
 
     # 난독화 키
-    _OBFUSCATION_KEY = b"DataFlareTunnelGitHubApp2024"
+    _OBFUSCATION_KEY = b"TunnelDBManagerGitHubApp2024"
 
     # 캐시된 Installation Token
     _cached_token: Optional[str] = None
@@ -253,7 +253,7 @@ class GitHubAppAuth:
         return {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "DataFlare-Tunnel-Manager"
+            "User-Agent": "TunnelDB-Manager"
         }
 
     def test_connection(self) -> Tuple[bool, str]:

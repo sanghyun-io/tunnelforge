@@ -27,7 +27,7 @@ class TunnelManagerUI(QMainWindow):
         print("✅ UI 초기화 완료")
 
     def init_ui(self):
-        self.setWindowTitle("DataFlare Tunnel Manager")
+        self.setWindowTitle("TunnelDB Manager")
         self.setGeometry(100, 100, 950, 600)
 
         # 메인 위젯 설정
@@ -347,7 +347,7 @@ class TunnelManagerUI(QMainWindow):
 
         if success:
             self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
-            self.tray_icon.showMessage("DataFlare Tunnel", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
+            self.tray_icon.showMessage("TunnelDB Manager", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
         else:
             self.statusBar().showMessage(f"연결 실패: {msg}")
             QMessageBox.critical(self, "연결 오류", f"터널 연결에 실패했습니다.\n\n원인: {msg}")
