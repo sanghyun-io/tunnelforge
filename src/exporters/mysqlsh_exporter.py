@@ -858,8 +858,8 @@ class MySQLShellImporter:
             # 타임존 패치 (Asia/Seoul -> +09:00)
             if progress_callback:
                 progress_callback("타임존 보정 중... (Asia/Seoul -> +09:00)")
-            
-            patched_count = self._patch_timezone_in_dump(input_dir)
+
+            patched_count = self._patch_timezone_in_dump(input_dir, progress_callback)
             if patched_count > 0 and progress_callback:
                 progress_callback(f"✅ {patched_count}개 SQL 파일 타임존 보정 완료")
 
@@ -1073,23 +1073,30 @@ for (var i = 0; i < events.length; i++) {{
         except Exception as e:
             return False, f"객체 삭제 오류: {str(e)}"
 
-    def _patch_timezone_in_dump(self, input_dir: str) -> int:
+    def _patch_timezone_in_dump(self, input_dir: str, progress_callback: Optional[Callable[[str], None]] = None) -> int:
         """
         Dump 파일 내의 Asia/Seoul 타임존을 +09:00으로 보정
         (타켓 서버에 타임존 정보가 없는 경우 발생하는 오류 방지)
-        
+
+        Args:
+            input_dir: Dump 디렉토리 경로
+            progress_callback: 진행 콜백
+
         Returns:
             보정된 파일 개수
         """
         patched_count = 0
         try:
             sql_files = glob_module.glob(os.path.join(input_dir, "*.sql"))
-            
+
+            if progress_callback:
+                progress_callback(f"  └─ {len(sql_files)}개 SQL 파일 스캔 중...")
+
             for file_path in sql_files:
                 try:
                     with open(file_path, 'r', encoding='utf-8') as f:
                         content = f.read()
-                    
+
                     if "'Asia/Seoul'" in content:
                         new_content = content.replace("'Asia/Seoul'", "'+09:00'")
                         with open(file_path, 'w', encoding='utf-8') as f:
@@ -1097,7 +1104,7 @@ for (var i = 0; i < events.length; i++) {{
                         patched_count += 1
                 except Exception:
                     continue
-                    
+
             return patched_count
         except Exception:
             return 0
