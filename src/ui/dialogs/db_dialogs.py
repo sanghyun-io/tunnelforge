@@ -19,6 +19,7 @@ from src.exporters.mysqlsh_exporter import (
     MySQLShellChecker, MySQLShellConfig, check_mysqlsh
 )
 from src.ui.workers.mysql_worker import MySQLShellWorker
+from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
 
 class DBConnectionDialog(QDialog):
@@ -1359,6 +1360,37 @@ class MySQLShellImportDialog(QDialog):
         input_layout.addWidget(btn_browse)
         container_layout.addWidget(input_group)
 
+        # --- MySQL 8.4 호환성 검사 상태 ---
+        self.upgrade_check_group = QGroupBox("MySQL 8.4 호환성 검사")
+        upgrade_check_layout = QVBoxLayout(self.upgrade_check_group)
+
+        # 상태 표시 레이아웃
+        status_line = QHBoxLayout()
+        self.lbl_upgrade_status = QLabel("📋 Dump 폴더를 선택하면 자동 검사됩니다.")
+        self.lbl_upgrade_status.setStyleSheet("color: #7f8c8d;")
+        status_line.addWidget(self.lbl_upgrade_status)
+        status_line.addStretch()
+
+        # 상세 보기 버튼
+        self.btn_view_issues = QPushButton("📊 상세 보기")
+        self.btn_view_issues.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white;
+                padding: 4px 12px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        self.btn_view_issues.setVisible(False)
+        self.btn_view_issues.clicked.connect(self._show_upgrade_issues_dialog)
+        status_line.addWidget(self.btn_view_issues)
+
+        upgrade_check_layout.addLayout(status_line)
+
+        # 호환성 검사 결과 저장
+        self._upgrade_issues: List[CompatibilityIssue] = []
+
+        container_layout.addWidget(self.upgrade_check_group)
+
         # --- 대상 스키마 ---
         schema_group = QGroupBox("대상 스키마")
         schema_layout = QVBoxLayout(schema_group)
@@ -1709,6 +1741,98 @@ class MySQLShellImportDialog(QDialog):
         )
         if folder:
             self.input_dir.setText(folder)
+            # 폴더 선택 시 자동으로 MySQL 8.4 호환성 검사 실행
+            self._run_upgrade_check(folder)
+
+    def _run_upgrade_check(self, dump_path: str):
+        """Import 전 MySQL 8.4 호환성 검사"""
+        self.lbl_upgrade_status.setText("🔍 호환성 검사 중...")
+        self.lbl_upgrade_status.setStyleSheet("color: #3498db;")
+        self.btn_view_issues.setVisible(False)
+        QApplication.processEvents()
+
+        try:
+            analyzer = DumpFileAnalyzer()
+            result = analyzer.analyze_dump_folder(dump_path)
+
+            self._upgrade_issues = result.compatibility_issues
+            error_count = sum(1 for i in self._upgrade_issues if i.severity == "error")
+            warning_count = sum(1 for i in self._upgrade_issues if i.severity == "warning")
+
+            if error_count > 0:
+                self.lbl_upgrade_status.setText(
+                    f"⚠️ 호환성 이슈: {error_count}개 오류, {warning_count}개 경고"
+                )
+                self.lbl_upgrade_status.setStyleSheet("color: #e74c3c; font-weight: bold;")
+                self.btn_view_issues.setVisible(True)
+            elif warning_count > 0:
+                self.lbl_upgrade_status.setText(
+                    f"⚠️ 호환성 경고: {warning_count}개 (Import 가능)"
+                )
+                self.lbl_upgrade_status.setStyleSheet("color: #f39c12;")
+                self.btn_view_issues.setVisible(True)
+            else:
+                self.lbl_upgrade_status.setText("✅ 호환성 검사 통과")
+                self.lbl_upgrade_status.setStyleSheet("color: #27ae60;")
+                self.btn_view_issues.setVisible(False)
+
+        except Exception as e:
+            self.lbl_upgrade_status.setText(f"❌ 검사 실패: {str(e)}")
+            self.lbl_upgrade_status.setStyleSheet("color: #e74c3c;")
+            self._upgrade_issues = []
+
+    def _show_upgrade_issues_dialog(self):
+        """호환성 이슈 상세 다이얼로그 표시"""
+        if not self._upgrade_issues:
+            return
+
+        from PyQt6.QtWidgets import QTableWidget, QTableWidgetItem, QHeaderView
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("MySQL 8.4 호환성 이슈 상세")
+        dialog.resize(800, 500)
+
+        layout = QVBoxLayout(dialog)
+
+        # 요약
+        error_count = sum(1 for i in self._upgrade_issues if i.severity == "error")
+        warning_count = sum(1 for i in self._upgrade_issues if i.severity == "warning")
+        info_count = sum(1 for i in self._upgrade_issues if i.severity == "info")
+
+        summary_label = QLabel(
+            f"<b>총 {len(self._upgrade_issues)}개 이슈</b>: "
+            f"<span style='color:red'>❌ 오류 {error_count}</span>, "
+            f"<span style='color:orange'>⚠️ 경고 {warning_count}</span>, "
+            f"<span style='color:blue'>ℹ️ 정보 {info_count}</span>"
+        )
+        layout.addWidget(summary_label)
+
+        # 테이블
+        table = QTableWidget()
+        table.setColumnCount(5)
+        table.setHorizontalHeaderLabels(["심각도", "유형", "위치", "설명", "권장 조치"])
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setRowCount(len(self._upgrade_issues))
+
+        severity_icons = {"error": "❌", "warning": "⚠️", "info": "ℹ️"}
+
+        for i, issue in enumerate(self._upgrade_issues):
+            severity_text = f"{severity_icons.get(issue.severity, '')} {issue.severity.upper()}"
+            table.setItem(i, 0, QTableWidgetItem(severity_text))
+            table.setItem(i, 1, QTableWidgetItem(issue.issue_type.value))
+            table.setItem(i, 2, QTableWidgetItem(issue.location))
+            table.setItem(i, 3, QTableWidgetItem(issue.description))
+            table.setItem(i, 4, QTableWidgetItem(issue.suggestion))
+
+        layout.addWidget(table)
+
+        # 닫기 버튼
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(dialog.close)
+        layout.addWidget(btn_close)
+
+        dialog.exec()
 
     def set_ui_enabled(self, enabled: bool):
         """Import 진행 중 UI 요소 활성화/비활성화"""

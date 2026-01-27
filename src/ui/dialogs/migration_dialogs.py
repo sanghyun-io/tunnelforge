@@ -59,7 +59,7 @@ class MigrationAnalyzerDialog(QDialog):
         schema_layout.addStretch()
         top_layout.addLayout(schema_layout)
 
-        # 분석 옵션 체크박스들
+        # 분석 옵션 체크박스들 (행 1: 기존 검사)
         options_layout = QHBoxLayout()
 
         self.chk_orphans = QCheckBox("고아 레코드 검사")
@@ -90,6 +90,34 @@ class MigrationAnalyzerDialog(QDialog):
         options_layout.addStretch()
 
         top_layout.addLayout(options_layout)
+
+        # 분석 옵션 체크박스들 (행 2: MySQL 8.4 Upgrade Checker)
+        options_layout2 = QHBoxLayout()
+
+        self.chk_auth_plugins = QCheckBox("인증 플러그인")
+        self.chk_auth_plugins.setChecked(True)
+        self.chk_auth_plugins.setToolTip("mysql_native_password, sha256_password 사용자 확인")
+
+        self.chk_zerofill = QCheckBox("ZEROFILL")
+        self.chk_zerofill.setChecked(True)
+        self.chk_zerofill.setToolTip("ZEROFILL 속성 사용 컬럼 확인")
+
+        self.chk_float_precision = QCheckBox("FLOAT(M,D)")
+        self.chk_float_precision.setChecked(True)
+        self.chk_float_precision.setToolTip("FLOAT(M,D), DOUBLE(M,D) deprecated 구문 확인")
+
+        self.chk_fk_name_length = QCheckBox("FK 이름 길이")
+        self.chk_fk_name_length.setChecked(True)
+        self.chk_fk_name_length.setToolTip("FK 이름 64자 초과 확인")
+
+        options_layout2.addWidget(QLabel("🔧 8.4 검사:"))
+        options_layout2.addWidget(self.chk_auth_plugins)
+        options_layout2.addWidget(self.chk_zerofill)
+        options_layout2.addWidget(self.chk_float_precision)
+        options_layout2.addWidget(self.chk_fk_name_length)
+        options_layout2.addStretch()
+
+        top_layout.addLayout(options_layout2)
 
         # 분석 버튼
         btn_layout = QHBoxLayout()
@@ -394,6 +422,11 @@ class MigrationAnalyzerDialog(QDialog):
         self.chk_keywords.setEnabled(enabled)
         self.chk_routines.setEnabled(enabled)
         self.chk_sql_mode.setEnabled(enabled)
+        # MySQL 8.4 Upgrade Checker 옵션
+        self.chk_auth_plugins.setEnabled(enabled)
+        self.chk_zerofill.setEnabled(enabled)
+        self.chk_float_precision.setEnabled(enabled)
+        self.chk_fk_name_length.setEnabled(enabled)
 
     def start_analysis(self):
         """분석 시작"""
@@ -416,7 +449,12 @@ class MigrationAnalyzerDialog(QDialog):
             check_charset=self.chk_charset.isChecked(),
             check_keywords=self.chk_keywords.isChecked(),
             check_routines=self.chk_routines.isChecked(),
-            check_sql_mode=self.chk_sql_mode.isChecked()
+            check_sql_mode=self.chk_sql_mode.isChecked(),
+            # MySQL 8.4 Upgrade Checker 옵션
+            check_auth_plugins=self.chk_auth_plugins.isChecked(),
+            check_zerofill=self.chk_zerofill.isChecked(),
+            check_float_precision=self.chk_float_precision.isChecked(),
+            check_fk_name_length=self.chk_fk_name_length.isChecked()
         )
 
         self.worker.progress.connect(self.add_log)
@@ -537,11 +575,23 @@ class MigrationAnalyzerDialog(QDialog):
         }
 
         type_names = {
+            # 기존 이슈 타입
             IssueType.ORPHAN_ROW: "고아 레코드",
             IssueType.DEPRECATED_FUNCTION: "deprecated 함수",
             IssueType.CHARSET_ISSUE: "문자셋",
             IssueType.RESERVED_KEYWORD: "예약어",
-            IssueType.SQL_MODE_ISSUE: "SQL 모드"
+            IssueType.SQL_MODE_ISSUE: "SQL 모드",
+            # MySQL 8.4 Upgrade Checker 이슈 타입 (신규)
+            IssueType.REMOVED_SYS_VAR: "제거된 시스템 변수",
+            IssueType.AUTH_PLUGIN_ISSUE: "인증 플러그인",
+            IssueType.INVALID_DATE: "잘못된 날짜",
+            IssueType.ZEROFILL_USAGE: "ZEROFILL 속성",
+            IssueType.FLOAT_PRECISION: "FLOAT 정밀도",
+            IssueType.INT_DISPLAY_WIDTH: "INT 표시 너비",
+            IssueType.FK_NAME_LENGTH: "FK 이름 길이",
+            IssueType.FTS_TABLE_PREFIX: "FTS_ 테이블명",
+            IssueType.SUPER_PRIVILEGE: "SUPER 권한",
+            IssueType.DEFAULT_VALUE_CHANGE: "기본값 변경",
         }
 
         for i, issue in enumerate(filtered):

@@ -123,6 +123,28 @@ class TunnelManagerUI(QMainWindow):
 
         layout.addWidget(self.table)
 
+        # --- 테이블 하단: 연결 추가 버튼 영역 ---
+        add_button_container = QWidget()
+        add_button_layout = QHBoxLayout(add_button_container)
+        add_button_layout.setContentsMargins(0, 8, 0, 8)
+
+        btn_add_tunnel = QPushButton("➕ 연결 추가")
+        btn_add_tunnel.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white; font-weight: bold;
+                padding: 8px 24px; border-radius: 4px; border: none;
+                font-size: 13px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
+
+        add_button_layout.addStretch()
+        add_button_layout.addWidget(btn_add_tunnel)
+        add_button_layout.addStretch()
+
+        layout.addWidget(add_button_container)
+
         # 하단 상태바
         self.statusBar().showMessage("준비됨")
 
@@ -245,33 +267,6 @@ class TunnelManagerUI(QMainWindow):
             h_box.addWidget(btn_del)
 
             self.table.setCellWidget(idx, 5, container)
-
-        # --- 마지막 행: 연결 추가 버튼 ---
-        add_row_idx = len(self.tunnels)
-        self.table.insertRow(add_row_idx)
-
-        # 빈 상태 칸
-        empty_item = QTableWidgetItem("")
-        empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-        self.table.setItem(add_row_idx, 0, empty_item)
-
-        # 연결 추가 버튼 (이름 칸에 배치)
-        btn_add = QPushButton("➕ 연결 추가")
-        btn_add.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 4px 12px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
-        btn_add.clicked.connect(self.add_tunnel_dialog)
-        self.table.setCellWidget(add_row_idx, 1, btn_add)
-
-        # 나머지 칸 비우기
-        for col in range(2, 6):
-            empty = QTableWidgetItem("")
-            empty.setFlags(empty.flags() & ~Qt.ItemFlag.ItemIsSelectable)
-            self.table.setItem(add_row_idx, col, empty)
 
     # --- 기능 로직 ---
     def add_tunnel_dialog(self):
@@ -454,7 +449,7 @@ class TunnelManagerUI(QMainWindow):
     def show_context_menu(self, position):
         """테이블 우클릭 컨텍스트 메뉴"""
         row = self.table.rowAt(position.y())
-        # 마지막 행(연결 추가 버튼)이거나 범위 밖이면 무시
+        # 범위 밖이면 무시
         if row < 0 or row >= len(self.tunnels):
             return
 

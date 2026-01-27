@@ -21,7 +21,12 @@ class MigrationAnalyzerWorker(QThread):
         check_charset: bool = True,
         check_keywords: bool = True,
         check_routines: bool = True,
-        check_sql_mode: bool = True
+        check_sql_mode: bool = True,
+        # MySQL 8.4 Upgrade Checker 옵션
+        check_auth_plugins: bool = True,
+        check_zerofill: bool = True,
+        check_float_precision: bool = True,
+        check_fk_name_length: bool = True
     ):
         super().__init__()
         self.connector = connector
@@ -31,6 +36,11 @@ class MigrationAnalyzerWorker(QThread):
         self.check_keywords = check_keywords
         self.check_routines = check_routines
         self.check_sql_mode = check_sql_mode
+        # MySQL 8.4 Upgrade Checker 옵션
+        self.check_auth_plugins = check_auth_plugins
+        self.check_zerofill = check_zerofill
+        self.check_float_precision = check_float_precision
+        self.check_fk_name_length = check_fk_name_length
 
     def run(self):
         try:
@@ -43,7 +53,12 @@ class MigrationAnalyzerWorker(QThread):
                 check_charset=self.check_charset,
                 check_keywords=self.check_keywords,
                 check_routines=self.check_routines,
-                check_sql_mode=self.check_sql_mode
+                check_sql_mode=self.check_sql_mode,
+                # MySQL 8.4 Upgrade Checker 옵션
+                check_auth_plugins=self.check_auth_plugins,
+                check_zerofill=self.check_zerofill,
+                check_float_precision=self.check_float_precision,
+                check_fk_name_length=self.check_fk_name_length
             )
 
             self.analysis_complete.emit(result)
