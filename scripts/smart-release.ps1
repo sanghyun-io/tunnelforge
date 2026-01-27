@@ -286,7 +286,7 @@ if ($DryRun) {
 
     if ($needsBump) {
         Write-Host "  git add $versionPy" -ForegroundColor Gray
-        Write-Host "  git commit -m ""Bump version to $newVersion""" -ForegroundColor Gray
+        Write-Host "  git commit -m `"Bump version to $newVersion`"" -ForegroundColor Gray
     }
 
     Write-Host "  git push origin main" -ForegroundColor Gray
@@ -301,7 +301,7 @@ if ($DryRun) {
 if ($needsBump) {
     Write-Host "[5/6] 버전 업데이트 중..." -ForegroundColor Yellow
 
-    $newContent = $versionContent -replace '__version__\s*=\s*[''"]([^''"]+)[''"]', "__version__ = `"$newVersion`""
+    $newContent = $versionContent -replace "__version__\s*=\s*[`"']([^`"']+)[`"']", "__version__ = `"$newVersion`""
     Set-Content -Path $versionPy -Value $newContent -NoNewline
 
     Write-Host "  [OK] $versionPy 업데이트 완료" -ForegroundColor Green
@@ -413,10 +413,10 @@ if ($needsBump) {
 
 Write-Host ""
 Write-Host "GitHub Actions에서 빌드가 진행됩니다:" -ForegroundColor Cyan
-Write-Host "  $remoteUrl/actions" -ForegroundColor White
+Write-Host "  https://github.com/$owner/$repo/actions" -ForegroundColor White
 Write-Host ""
 Write-Host "빌드 완료 후 릴리스 확인:" -ForegroundColor Cyan
-Write-Host "  $remoteUrl/releases/tag/$tag" -ForegroundColor White
+Write-Host "  https://github.com/$owner/$repo/releases/tag/$tag" -ForegroundColor White
 Write-Host ""
 Write-Host "빌드는 약 5-10분 소요됩니다." -ForegroundColor Gray
 Write-Host ""
