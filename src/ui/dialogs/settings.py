@@ -77,7 +77,7 @@ class SettingsDialog(QDialog):
         super().__init__(parent)
         self.config_mgr = config_manager
         self.setWindowTitle("설정")
-        self.setFixedSize(500, 280)
+        self.setMinimumSize(550, 320)
         self.init_ui()
 
     def init_ui(self):
@@ -121,25 +121,29 @@ class SettingsDialog(QDialog):
 
         # 자동 보고 활성화 체크박스
         self.chk_auto_report = QCheckBox("Export/Import 오류 시 자동으로 GitHub 이슈 생성")
+        self.chk_auto_report.setStyleSheet("font-size: 12px;")
         github_layout.addWidget(self.chk_auto_report)
 
         # GitHub App 설정 상태에 따른 설명
         if self._github_app_configured:
             desc_label = QLabel(
-                "오류 발생 시 자동으로 이슈를 생성하거나,\n"
-                "유사한 이슈가 있으면 코멘트를 추가합니다.\n"
-                "✅ GitHub App이 설정되어 있습니다."
+                "✅ GitHub App이 설정되어 있습니다.\n"
+                "오류 발생 시 자동으로 이슈를 생성하거나, 유사한 이슈가 있으면 코멘트를 추가합니다."
             )
-            desc_label.setStyleSheet("color: #27ae60; font-size: 11px; margin-left: 20px;")
+            desc_label.setStyleSheet("color: #27ae60; font-size: 11px; margin-left: 20px; margin-top: 5px;")
+            desc_label.setWordWrap(True)
+            github_layout.addWidget(desc_label)
 
             # 연결 테스트 버튼
             test_layout = QHBoxLayout()
+            test_layout.setContentsMargins(20, 5, 0, 0)
             btn_test = QPushButton("연결 테스트")
             btn_test.setStyleSheet("""
                 QPushButton {
                     background-color: #95a5a6; color: white;
-                    padding: 4px 12px; border-radius: 4px; border: none;
+                    padding: 6px 12px; border-radius: 4px; border: none;
                     font-size: 11px;
+                    min-height: 26px;
                 }
                 QPushButton:hover { background-color: #7f8c8d; }
             """)
@@ -150,13 +154,12 @@ class SettingsDialog(QDialog):
         else:
             desc_label = QLabel(
                 "⚠️ GitHub App이 설정되지 않았습니다.\n"
-                "환경변수 또는 내장 설정이 필요합니다.\n"
-                "(GITHUB_APP_SETUP.md 참조)"
+                "환경변수 또는 내장 설정이 필요합니다. (GITHUB_APP_SETUP.md 참조)"
             )
-            desc_label.setStyleSheet("color: #e74c3c; font-size: 11px; margin-left: 20px;")
+            desc_label.setStyleSheet("color: #e74c3c; font-size: 11px; margin-left: 20px; margin-top: 5px;")
+            desc_label.setWordWrap(True)
             self.chk_auto_report.setEnabled(False)
-
-        github_layout.addWidget(desc_label)
+            github_layout.addWidget(desc_label)
         layout.addWidget(github_group)
 
         # GitHub 설정 로드

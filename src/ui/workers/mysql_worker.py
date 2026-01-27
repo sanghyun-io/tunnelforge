@@ -18,6 +18,7 @@ class MySQLShellWorker(QThread):
     import_finished = pyqtSignal(bool, str, dict)  # success, message, results {'table_name': {'status': 'done'/'error', 'message': ''}}
     raw_output = pyqtSignal(str)  # mysqlsh 실시간 출력
     metadata_analyzed = pyqtSignal(dict)  # dump 메타데이터 분석 결과 (chunk_counts, table_sizes, total_bytes, schema)
+    table_chunk_progress = pyqtSignal(str, int, int)  # table_name, completed_chunks, total_chunks (테이블별 chunk 진행률)
 
     def __init__(self, task_type: str, config: MySQLShellConfig, **kwargs):
         super().__init__()
@@ -103,6 +104,9 @@ class MySQLShellWorker(QThread):
                 def metadata_callback(metadata: dict):
                     self.metadata_analyzed.emit(metadata)
 
+                def table_chunk_progress_callback(table_name: str, completed_chunks: int, total_chunks: int):
+                    self.table_chunk_progress.emit(table_name, completed_chunks, total_chunks)
+
                 success, msg, results = importer.import_dump(
                     self.kwargs['input_dir'],
                     self.kwargs.get('target_schema'),
@@ -115,7 +119,8 @@ class MySQLShellWorker(QThread):
                     table_status_callback,
                     raw_output_callback,
                     self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
-                    metadata_callback
+                    metadata_callback,
+                    table_chunk_progress_callback
                 )
                 self.import_finished.emit(success, msg, results)
                 self.finished.emit(success, msg)

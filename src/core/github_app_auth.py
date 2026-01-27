@@ -69,6 +69,7 @@ class GitHubAppAuth:
     # 캐시된 Installation Token
     _cached_token: Optional[str] = None
     _token_expires_at: Optional[datetime] = None
+    _cached_permissions: Optional[dict] = None
 
     def __init__(self, app_id: str, private_key: str, installation_id: str, repo: str):
         """
@@ -226,6 +227,9 @@ class GitHubAppAuth:
             data = response.json()
             self._cached_token = data.get('token')
 
+            # 권한 정보 캐싱
+            self._cached_permissions = data.get('permissions', {})
+
             # 만료 시간 파싱
             expires_at_str = data.get('expires_at')  # ISO 8601 형식
             if expires_at_str:
@@ -281,14 +285,21 @@ class GitHubAppAuth:
 
             response.raise_for_status()
 
-            # 3. 이슈 생성 권한 테스트 (실제로 생성하지는 않음)
-            repo_data = response.json()
-            permissions = repo_data.get('permissions', {})
+            # 3. 이슈 생성 권한 테스트
+            # GitHub App의 권한은 Installation Token 응답에 포함됩니다
+            if not self._cached_permissions:
+                return False, "권한 정보를 가져올 수 없습니다"
 
-            if not permissions.get('push', False):
+            # Issues 권한 확인 (read 또는 write)
+            issues_permission = self._cached_permissions.get('issues', 'none')
+            if issues_permission not in ['write', 'read']:
+                return False, f"이슈 생성 권한이 없습니다 (Issues: Write 권한 필요, 현재: {issues_permission})"
+
+            # write 권한이 있는지 확인
+            if issues_permission != 'write':
                 return False, "이슈 생성 권한이 없습니다 (Issues: Write 권한 필요)"
 
-            return True, f"✅ 연결 성공! 리포지토리: {self.repo}"
+            return True, f"✅ 연결 성공! 리포지토리: {self.repo}\n권한: Issues {issues_permission}"
 
         except requests.RequestException as e:
             error_msg = str(e)

@@ -779,7 +779,8 @@ class MySQLShellImporter:
         table_status_callback: Optional[Callable[[str, str, str], None]] = None,
         raw_output_callback: Optional[Callable[[str], None]] = None,
         retry_tables: Optional[List[str]] = None,
-        metadata_callback: Optional[Callable[[dict], None]] = None
+        metadata_callback: Optional[Callable[[dict], None]] = None,
+        table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None
     ) -> Tuple[bool, str, dict]:
         """
         Dump 파일 Import (3가지 모드 지원)
@@ -798,6 +799,7 @@ class MySQLShellImporter:
             raw_output_callback: mysqlsh 실시간 출력 콜백
             retry_tables: 재시도할 테이블 목록 (선택적)
             metadata_callback: 메타데이터 분석 결과 콜백 (chunk_counts, table_sizes 등)
+            table_chunk_progress_callback: 테이블별 chunk 진행률 콜백 (table_name, completed_chunks, total_chunks)
 
         Returns:
             (성공여부, 메시지, 테이블별 결과 dict)
@@ -968,7 +970,9 @@ class MySQLShellImporter:
                 detail_callback,
                 table_status_callback,
                 raw_output_callback,
-                import_results
+                import_results,
+                dump_metadata,
+                table_chunk_progress_callback
             )
 
             if success and progress_callback:
@@ -1197,7 +1201,9 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
         detail_callback: Optional[Callable[[dict], None]] = None,
         table_status_callback: Optional[Callable[[str, str, str], None]] = None,
         raw_output_callback: Optional[Callable[[str], None]] = None,
-        import_results: Optional[dict] = None
+        import_results: Optional[dict] = None,
+        dump_metadata: Optional[Dict] = None,
+        table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None
     ) -> Tuple[bool, str, dict]:
         """
         Import용 mysqlsh 명령 실행 (실시간 출력 파싱)
@@ -1211,6 +1217,8 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
             table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
             raw_output_callback: mysqlsh 실시간 출력 콜백
             import_results: 테이블별 결과 dict (수정됨)
+            dump_metadata: Dump 메타데이터 (chunk_counts 포함)
+            table_chunk_progress_callback: 테이블별 chunk 진행률 콜백 (table_name, completed_chunks, total_chunks)
 
         Returns:
             (성공여부, 메시지, 테이블별 결과 dict)
@@ -1222,6 +1230,19 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
         last_completed_count = 0
         error_messages = []
         current_loading_table = None
+
+        # 테이블별 chunk 진행률 추적
+        chunk_counts = {}  # {table_name: total_chunks}
+        table_chunk_progress = {}  # {table_name: set(completed_chunk_ids)}
+
+        if dump_metadata and table_chunk_progress_callback:
+            chunk_counts = dump_metadata.get('chunk_counts', {})
+            # 각 테이블의 완료된 chunk set 초기화
+            for table in tables or []:
+                if table in chunk_counts:
+                    table_chunk_progress[table] = set()
+                    # 초기 진행률 0 전송
+                    table_chunk_progress_callback(table, 0, chunk_counts[table])
 
         try:
             cmd = [
@@ -1354,6 +1375,24 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                             if table_status_callback:
                                 table_status_callback(table_name, 'loading', '')
 
+                    # --- 패턴 3-1: Chunk 로딩/완료 감지 (테이블별 chunk 진행률) ---
+                    # 예: "schema@table@@0.tsv.zst", "schema@table@@15.tsv.zst" 등
+                    # mysqlsh는 chunk 파일명을 로그에 출력함
+                    if table_chunk_progress_callback and chunk_counts:
+                        chunk_match = re.search(r'(\w+)@(\w+)@@(\d+)', stripped_line)
+                        if chunk_match:
+                            schema_name = chunk_match.group(1)
+                            table_name = chunk_match.group(2)
+                            chunk_id = int(chunk_match.group(3))
+
+                            # 해당 테이블이 추적 대상이고, 이 chunk가 아직 완료되지 않았다면
+                            if table_name in table_chunk_progress and chunk_id not in table_chunk_progress[table_name]:
+                                table_chunk_progress[table_name].add(chunk_id)
+                                completed = len(table_chunk_progress[table_name])
+                                total = chunk_counts.get(table_name, 1)
+                                # 진행률 콜백 호출
+                                table_chunk_progress_callback(table_name, completed, total)
+
                     # --- 패턴 4: 에러 감지 ---
                     # 예: "ERROR: ...", "[ERROR] ...", "Error: ..."
                     error_match = re.search(r'(?:ERROR|Error|\[ERROR\])[:\s]+(.+)', stripped_line, re.IGNORECASE)
@@ -1402,6 +1441,13 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                         import_results[table] = {'status': 'done', 'message': ''}
                         if table_status_callback:
                             table_status_callback(table, 'done', '')
+
+                # 모든 테이블의 chunk 진행률 100%로 업데이트
+                if table_chunk_progress_callback and chunk_counts:
+                    for table in tables:
+                        if table in chunk_counts:
+                            total_chunks = chunk_counts[table]
+                            table_chunk_progress_callback(table, total_chunks, total_chunks)
 
                 return True, "성공", import_results
             else:
@@ -1575,7 +1621,8 @@ def import_dump(
     target_schema: Optional[str] = None,
     threads: int = 4,
     import_mode: str = "replace",
-    progress_callback: Optional[Callable[[str], None]] = None
+    progress_callback: Optional[Callable[[str], None]] = None,
+    table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None
 ) -> Tuple[bool, str, dict]:
     """
     Dump Import (간편 함수)
@@ -1585,6 +1632,7 @@ def import_dump(
             - "merge": 병합 (기존 데이터 유지)
             - "replace": 전체 교체 (모든 객체 재생성, resetProgress=true)
             - "recreate": 완전 재생성 (스키마 DROP 후 재생성)
+        table_chunk_progress_callback: 테이블별 chunk 진행률 콜백 (table_name, completed, total)
     """
     config = MySQLShellConfig(host, port, user, password)
     importer = MySQLShellImporter(config)
@@ -1593,5 +1641,6 @@ def import_dump(
         target_schema,
         threads,
         import_mode=import_mode,
-        progress_callback=progress_callback
+        progress_callback=progress_callback,
+        table_chunk_progress_callback=table_chunk_progress_callback
     )

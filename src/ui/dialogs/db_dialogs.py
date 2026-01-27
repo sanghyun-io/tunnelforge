@@ -1285,6 +1285,9 @@ class MySQLShellImportDialog(QDialog):
         # 메타데이터 정보
         self.dump_metadata: Optional[dict] = None
 
+        # 테이블별 chunk 진행률 추적
+        self.table_chunk_progress: dict = {}  # {table_name: (completed, total)}
+
         self.init_ui()
         self.load_schemas()
 
@@ -1884,6 +1887,7 @@ class MySQLShellImportDialog(QDialog):
         self.worker.import_finished.connect(self.on_import_finished)
         self.worker.finished.connect(self.on_finished)
         self.worker.metadata_analyzed.connect(self.on_metadata_analyzed)
+        self.worker.table_chunk_progress.connect(self.on_table_chunk_progress)
         self.worker.start()
 
     def on_progress(self, msg: str):
@@ -1932,6 +1936,7 @@ class MySQLShellImportDialog(QDialog):
 
         # 메타데이터에서 테이블 정보 가져오기
         size_info = ""
+        chunk_info = ""
         if self.dump_metadata and 'table_sizes' in self.dump_metadata:
             size_bytes = self.dump_metadata['table_sizes'].get(table_name, 0)
             chunk_count = self.dump_metadata['chunk_counts'].get(table_name, 1)
@@ -1942,23 +1947,24 @@ class MySQLShellImportDialog(QDialog):
                     size_str = f"{size_mb:.1f} MB"
                 else:
                     size_str = f"{size_mb / 1024:.2f} GB"
+                size_info = f" ({size_str})"
 
-                # 크기 정보와 chunk 수 표시 (chunk가 2개 이상인 경우만)
-                if chunk_count > 1:
-                    size_info = f" ({size_str}, {chunk_count} chunks)"
-                else:
-                    size_info = f" ({size_str})"
+                # chunk 진행률 표시 (loading 상태이고 chunk가 2개 이상인 경우)
+                if status == 'loading' and chunk_count > 1 and table_name in self.table_chunk_progress:
+                    completed, total = self.table_chunk_progress[table_name]
+                    chunk_percent = (completed / total * 100) if total > 0 else 0
+                    chunk_info = f" [{completed}/{total} chunks, {chunk_percent:.0f}%]"
 
         # 기존 아이템이 있으면 업데이트, 없으면 새로 생성
         if table_name in self.table_items:
             item = self.table_items[table_name]
-            display_text = f"{icon} {table_name}{size_info}"
+            display_text = f"{icon} {table_name}{size_info}{chunk_info}"
             if status == 'error' and message:
                 display_text += f" - {message[:50]}..."
             item.setText(display_text)
             item.setForeground(Qt.GlobalColor.black)
         else:
-            display_text = f"{icon} {table_name}{size_info}"
+            display_text = f"{icon} {table_name}{size_info}{chunk_info}"
             if status == 'error' and message:
                 display_text += f" - {message[:50]}..."
             item = QListWidgetItem(display_text)
@@ -1972,6 +1978,63 @@ class MySQLShellImportDialog(QDialog):
         if status in ('done', 'error'):
             status_text = '완료' if status == 'done' else f'오류: {message}'
             self._add_log(f"테이블 [{table_name}] {status_text}")
+
+    def on_table_chunk_progress(self, table_name: str, completed_chunks: int, total_chunks: int):
+        """
+        테이블별 chunk 진행률 업데이트 (다중 파일 병렬 다운로드 스타일)
+
+        Args:
+            table_name: 테이블명
+            completed_chunks: 완료된 chunk 수
+            total_chunks: 전체 chunk 수
+        """
+        # 진행률 저장
+        self.table_chunk_progress[table_name] = (completed_chunks, total_chunks)
+
+        # 테이블 아이템이 존재하면 업데이트
+        if table_name in self.table_items:
+            item = self.table_items[table_name]
+
+            # 현재 상태 확인
+            current_status = self.import_results.get(table_name, {}).get('status', 'loading')
+            status_icons = {
+                'pending': '⏳',
+                'loading': '🔄',
+                'done': '✅',
+                'error': '❌'
+            }
+            icon = status_icons.get(current_status, '❓')
+
+            # 크기 정보
+            size_info = ""
+            if self.dump_metadata and 'table_sizes' in self.dump_metadata:
+                size_bytes = self.dump_metadata['table_sizes'].get(table_name, 0)
+                if size_bytes > 0:
+                    size_mb = size_bytes / (1024 * 1024)
+                    if size_mb < 1024:
+                        size_str = f"{size_mb:.1f} MB"
+                    else:
+                        size_str = f"{size_mb / 1024:.2f} GB"
+                    size_info = f" ({size_str})"
+
+            # chunk 진행률 표시
+            chunk_percent = (completed_chunks / total_chunks * 100) if total_chunks > 0 else 0
+            if total_chunks > 1:
+                # 다중 chunk 테이블: "🔄 df_subs (1.29 GB) [45/81 chunks, 55%]"
+                chunk_info = f" [{completed_chunks}/{total_chunks} chunks, {chunk_percent:.0f}%]"
+            else:
+                # 단일 chunk 테이블: 진행률 표시 안 함
+                chunk_info = ""
+
+            display_text = f"{icon} {table_name}{size_info}{chunk_info}"
+
+            # error 상태이면 메시지 추가
+            if current_status == 'error':
+                message = self.import_results.get(table_name, {}).get('message', '')
+                if message:
+                    display_text += f" - {message[:50]}..."
+
+            item.setText(display_text)
 
     def on_raw_output(self, line: str):
         """mysqlsh 실시간 출력 처리 (로그에 추가)"""
