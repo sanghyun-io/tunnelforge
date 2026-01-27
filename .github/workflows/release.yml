@@ -99,6 +99,11 @@ jobs:
           echo "installer_path=$($installerFile.FullName)" >> $env:GITHUB_OUTPUT
           echo "installer_name=$($installerFile.Name)" >> $env:GITHUB_OUTPUT
 
+          # Create version-less copy for latest download URL
+          $latestFile = "output\TunnelDBManager-Setup-latest.exe"
+          Copy-Item $installerFile.FullName $latestFile
+          Write-Host "✅ Latest copy created: $latestFile"
+
       - name: Generate Release Notes
         id: release_notes
         shell: bash
@@ -132,7 +137,8 @@ jobs:
           name: v${{ steps.get_version.outputs.version }}
           body_path: release_notes.md
           files: |
-            output/TunnelDBManager-Setup-*.exe
+            output/TunnelDBManager-Setup-${{ steps.get_version.outputs.version }}.exe
+            output/TunnelDBManager-Setup-latest.exe
           draft: false
           prerelease: false
           generate_release_notes: true

@@ -1,9 +1,21 @@
 """메인 UI 윈도우"""
+import sys
+import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidget, QTableWidgetItem, QPushButton,
                              QLabel, QMessageBox, QHeaderView, QSystemTrayIcon, QMenu)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
+
+
+def get_resource_path(relative_path):
+    """PyInstaller 빌드 환경에서 리소스 경로를 올바르게 반환"""
+    if hasattr(sys, '_MEIPASS'):
+        # PyInstaller로 빌드된 경우
+        return os.path.join(sys._MEIPASS, relative_path)
+    # 개발 환경
+    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), relative_path)
+
 
 from src.ui.dialogs.tunnel_config import TunnelConfigDialog
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
@@ -49,6 +61,11 @@ class TunnelManagerUI(QMainWindow):
     def init_ui(self):
         self.setWindowTitle("TunnelDB Manager")
         self.setGeometry(100, 100, 950, 600)
+
+        # 창 아이콘 설정
+        icon_path = get_resource_path('assets/icon.ico')
+        if os.path.exists(icon_path):
+            self.setWindowIcon(QIcon(icon_path))
 
         # 메인 위젯 설정
         central_widget = QWidget()
@@ -156,8 +173,10 @@ class TunnelManagerUI(QMainWindow):
     def init_tray(self):
         """시스템 트레이 아이콘 설정"""
         self.tray_icon = QSystemTrayIcon(self)
-        # 커스텀 아이콘 사용
-        self.tray_icon.setIcon(QIcon('assets/icon.ico'))
+        # 커스텀 아이콘 사용 (PyInstaller 빌드 환경 지원)
+        icon_path = get_resource_path('assets/icon.ico')
+        if os.path.exists(icon_path):
+            self.tray_icon.setIcon(QIcon(icon_path))
 
         tray_menu = QMenu()
         show_action = QAction("열기", self)
@@ -169,7 +188,14 @@ class TunnelManagerUI(QMainWindow):
         tray_menu.addAction(quit_action)
 
         self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
+
+    def _on_tray_activated(self, reason):
+        """트레이 아이콘 클릭 시"""
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show()
+            self.activateWindow()
 
     def refresh_table(self):
         """설정 데이터와 현재 터널 상태를 기반으로 테이블을 갱신합니다."""

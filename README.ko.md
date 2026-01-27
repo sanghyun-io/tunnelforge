@@ -21,7 +21,9 @@ TunnelDB Manager는 SSH 터널을 통해 원격 데이터베이스에 안전하�
 
 ## 다운로드
 
-[Releases](https://github.com/sanghyun-io/db-connector/releases)에서 최신 Windows 설치 파일을 다운로드하세요.
+**[최신 버전 다운로드](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-Setup-latest.exe)**
+
+또는 [Releases](https://github.com/sanghyun-io/db-connector/releases)에서 모든 버전을 확인하세요.
 
 ## 빠른 시작
 

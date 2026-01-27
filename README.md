@@ -21,7 +21,9 @@ TunnelDB Manager is a desktop application that simplifies secure database access
 
 ## Download
 
-Download the latest Windows installer from [Releases](https://github.com/sanghyun-io/db-connector/releases).
+**[Download Latest Version](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-Setup-latest.exe)**
+
+Or browse all versions at [Releases](https://github.com/sanghyun-io/db-connector/releases).
 
 ## Quick Start
 
