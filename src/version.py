@@ -4,7 +4,7 @@
 모든 버전 참조는 이 파일을 사용해야 합니다.
 """
 
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 __app_name__ = "TunnelDB Manager"
 
 # GitHub 저장소 정보 (업데이트 확인용)
