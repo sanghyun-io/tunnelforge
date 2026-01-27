@@ -24,10 +24,21 @@ hiddenimports = [
     # SSH 및 암호화 관련
     'sshtunnel',
     'paramiko',
+    'paramiko.dsskey',
+    'paramiko.rsakey',
+    'paramiko.ecdsakey',
+    'paramiko.ed25519key',
+    'paramiko.transport',
+    'paramiko.client',
+    'paramiko.pkey',
     'cryptography',
     'cryptography.hazmat.backends',
     'cryptography.hazmat.primitives',
     'cryptography.hazmat.primitives.asymmetric',
+    'cryptography.hazmat.primitives.asymmetric.ed25519',
+    'cryptography.hazmat.primitives.asymmetric.rsa',
+    'cryptography.hazmat.primitives.asymmetric.ec',
+    'cryptography.hazmat.primitives.asymmetric.dsa',
 
     # 데이터베이스 관련
     'pymysql',
