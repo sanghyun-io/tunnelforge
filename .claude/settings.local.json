@@ -11,7 +11,12 @@
       "Bash(.venv/Scripts/pip.exe:*)",
       "Bash(mysqlsh:*)",
       "Bash(wc:*)",
-      "Bash(.venv/Scripts/python:*)"
+      "Bash(.venv/Scripts/python:*)",
+      "Bash(zstd:*)",
+      "Bash(pip show:*)",
+      "Bash(pip install:*)",
+      "Bash(git rm:*)",
+      "Bash(git check-ignore:*)"
     ]
   }
 }
