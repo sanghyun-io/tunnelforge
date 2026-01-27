@@ -1,3 +1,6 @@
+# Language
+**Allways Answer Korean**
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
@@ -12,7 +15,8 @@ DataFlare Tunnel Manager - Python PyQt6 GUI application for managing SSH tunnels
 # Setup
 python -m venv .venv
 .venv\Scripts\activate  # Windows
-pip install -r requirements.txt
+pip install -e .              # 기본 의존성 설치
+pip install -e ".[dev]"       # 개발 의존성 포함 (PyInstaller 등)
 
 # Run application
 python main.py
@@ -95,8 +99,7 @@ tunnel-manager/
 │   ├── icon.png
 │   ├── icon.svg
 │   └── icon_512.png
-├── pyproject.toml
-├── requirements.txt
+├── pyproject.toml              # Package settings and dependencies
 └── README.md
 ```
 
