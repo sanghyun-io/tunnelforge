@@ -31,11 +31,11 @@ DefaultGroupName={#MyAppName}
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 
-; 라이선스 파일
-LicenseFile=installer\LICENSE.txt
+; 라이선스 파일 (.iss 파일 기준 상대 경로)
+LicenseFile=LICENSE.txt
 
-; 출력 설정
-OutputDir=output
+; 출력 설정 (프로젝트 루트의 output 폴더)
+OutputDir=..\output
 OutputBaseFilename=TunnelDBManager-Setup-{#MyAppVersion}
 
 ; 압축 설정
@@ -44,7 +44,7 @@ SolidCompression=yes
 
 ; UI 설정
 WizardStyle=modern
-SetupIconFile=assets\icon.ico
+SetupIconFile=..\assets\icon.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 
 ; 아키텍처 설정
@@ -59,11 +59,11 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 메인 실행 파일
-Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+; 메인 실행 파일 (.iss 파일 기준 상대 경로)
+Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 라이선스 파일 포함 (선택적)
-Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
 ; NOTE: Don't use "Flags: ignoreversion" on any shared system files
 

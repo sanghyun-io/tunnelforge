@@ -23,7 +23,8 @@
       "Bash(git remote:*)",
       "WebFetch(domain:api.github.com)",
       "Bash(git tag:*)",
-      "WebFetch(domain:github.com)"
+      "WebFetch(domain:github.com)",
+      "WebFetch(domain:productionresultssa4.blob.core.windows.net)"
     ]
   }
 }
