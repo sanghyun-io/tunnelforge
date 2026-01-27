@@ -143,6 +143,7 @@ class TunnelEngine:
                 host, port = self.get_connection_info(tid)
                 result.append({
                     'id': tid,
+                    'tunnel_id': tid,  # DB 연결 다이얼로그에서 자격 증명 조회용
                     'name': config.get('name', 'Unknown'),
                     'host': host,
                     'port': port,
