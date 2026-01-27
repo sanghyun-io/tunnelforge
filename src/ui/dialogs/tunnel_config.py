@@ -6,6 +6,9 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
 from PyQt6.QtCore import Qt
 import uuid
 
+from src.ui.workers.test_worker import ConnectionTestWorker, TestType
+from src.ui.dialogs.test_dialogs import TestProgressDialog
+
 
 class TunnelConfigDialog(QDialog):
     def __init__(self, parent=None, tunnel_data=None, tunnel_engine=None):
@@ -121,6 +124,19 @@ class TunnelConfigDialog(QDialog):
         self.lbl_local_port = QLabel("Local Bind Port:")
         form_layout.addRow(self.lbl_local_port, self.input_local_port)
 
+        # 터널 테스트 버튼
+        self.btn_tunnel_test = QPushButton("🔌 터널 테스트")
+        self.btn_tunnel_test.setStyleSheet("""
+            QPushButton {
+                background-color: #bdc3c7; color: #2c3e50;
+                padding: 4px 12px; border-radius: 4px; border: 1px solid #95a5a6;
+            }
+            QPushButton:hover { background-color: #95a5a6; }
+            QPushButton:disabled { background-color: #ecf0f1; color: #95a5a6; }
+        """)
+        self.btn_tunnel_test.clicked.connect(self._test_tunnel_only)
+        form_layout.addRow("", self.btn_tunnel_test)
+
         # --- 5. MySQL 인증 정보 (선택 사항) ---
         lbl_mysql = QLabel("--- MySQL 인증 정보 (선택 사항) ---")
         lbl_mysql.setStyleSheet("font-weight: bold; color: #2c3e50; margin-top: 15px;")
@@ -135,6 +151,20 @@ class TunnelConfigDialog(QDialog):
         self.input_db_user.setPlaceholderText("MySQL 사용자명")
         self.input_db_user.setEnabled(False)
         form_layout.addRow("DB User:", self.input_db_user)
+
+        # DB 인증 테스트 버튼
+        self.btn_db_test = QPushButton("🔐 DB 인증 테스트")
+        self.btn_db_test.setStyleSheet("""
+            QPushButton {
+                background-color: #bdc3c7; color: #2c3e50;
+                padding: 4px 12px; border-radius: 4px; border: 1px solid #95a5a6;
+            }
+            QPushButton:hover { background-color: #95a5a6; }
+            QPushButton:disabled { background-color: #ecf0f1; color: #95a5a6; }
+        """)
+        self.btn_db_test.setEnabled(False)  # 체크박스 연동
+        self.btn_db_test.clicked.connect(self._test_db_only)
+        form_layout.addRow("", self.btn_db_test)
 
         self.input_db_password = QLineEdit()
         self.input_db_password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -153,19 +183,19 @@ class TunnelConfigDialog(QDialog):
         # 초기 모드에 따라 UI 상태 설정
         self.on_mode_changed()
 
-        # --- 하단 버튼 (테스트 연결 & 저장/취소) ---
+        # --- 하단 버튼 (통합 테스트 & 저장/취소) ---
 
-        # 테스트 연결 버튼 - Warning 스타일
-        btn_test = QPushButton("⚡ 테스트 연결 (Test Connection)")
-        btn_test.setStyleSheet("""
+        # 통합 테스트 버튼 - Warning 스타일
+        self.btn_integrated_test = QPushButton("🚀 통합 테스트")
+        self.btn_integrated_test.setStyleSheet("""
             QPushButton {
                 background-color: #f1c40f; color: #333; font-weight: bold;
                 padding: 6px 16px; border-radius: 4px; border: none;
             }
             QPushButton:hover { background-color: #d4ac0d; }
         """)
-        btn_test.clicked.connect(self.run_test_connection)
-        layout.addWidget(btn_test)
+        self.btn_integrated_test.clicked.connect(self._test_integrated)
+        layout.addWidget(self.btn_integrated_test)
 
         # 구분 공백
         layout.addSpacing(10)
@@ -204,6 +234,7 @@ class TunnelConfigDialog(QDialog):
         """MySQL 자격 증명 저장 체크박스 토글"""
         self.input_db_user.setEnabled(checked)
         self.input_db_password.setEnabled(checked)
+        self.btn_db_test.setEnabled(checked)
         if not checked:
             self.input_db_user.clear()
             self.input_db_password.clear()
@@ -235,28 +266,121 @@ class TunnelConfigDialog(QDialog):
 
         return data
 
-    def run_test_connection(self):
-        """현재 입력된 정보로 연결 테스트 수행"""
+    def _test_tunnel_only(self):
+        """SSH 터널만 테스트 (Local 포트까지 확인)"""
         if not self.engine:
             QMessageBox.critical(self, "오류", "터널 엔진이 초기화되지 않았습니다.")
             return
 
-        # 현재 입력값 가져오기 (저장되지 않은 상태라도 테스트 가능해야 함)
         temp_config = self.get_data()
 
-        # UI 비활성화 및 커서 변경 (로딩 중 느낌)
-        self.setEnabled(False)
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        # 직접 연결 모드면 터널 테스트 불필요
+        if temp_config.get('connection_mode') == 'direct':
+            QMessageBox.information(self, "알림", "직접 연결 모드에서는 터널 테스트가 필요하지 않습니다.")
+            return
 
-        # 테스트 수행 (Blocking)
-        # 실제로는 별도 스레드로 빼는 게 좋지만, 여기선 간단히 구현
-        success, msg = self.engine.test_connection(temp_config)
+        dialog = TestProgressDialog(self, f"터널 테스트 - {temp_config.get('name', 'Unknown')}")
+        worker = ConnectionTestWorker(TestType.TUNNEL_ONLY, temp_config, self.engine, None)
+        worker.progress.connect(dialog.update_progress)
+        worker.finished.connect(lambda s, m: dialog.show_result(s, m))
+        worker.start()
+        dialog.exec()
 
-        # UI 복구
-        QApplication.restoreOverrideCursor()
-        self.setEnabled(True)
+    def _test_db_only(self):
+        """DB 인증만 테스트 (터널 경유)"""
+        if not self.engine:
+            QMessageBox.critical(self, "오류", "터널 엔진이 초기화되지 않았습니다.")
+            return
 
-        if success:
-            QMessageBox.information(self, "테스트 성공", msg)
-        else:
-            QMessageBox.warning(self, "테스트 실패", msg)
+        temp_config = self.get_data()
+
+        # DB 자격 증명 확인
+        db_user = self.input_db_user.text()
+        db_password = self.input_db_password.text()
+
+        if not db_user:
+            QMessageBox.warning(self, "경고", "DB 사용자명을 입력해주세요.")
+            return
+
+        # 비밀번호가 없고 기존 암호화된 비밀번호도 없는 경우
+        if not db_password and not self.tunnel_data.get('db_password_encrypted'):
+            QMessageBox.warning(self, "경고", "DB 비밀번호를 입력해주세요.")
+            return
+
+        dialog = TestProgressDialog(self, f"DB 인증 테스트 - {temp_config.get('name', 'Unknown')}")
+
+        # DB 테스트용 임시 ConfigManager 생성 (현재 입력값 사용)
+        class TempConfigManager:
+            def __init__(self, user, password, encrypted_password, encryptor):
+                self._user = user
+                self._password = password
+                self._encrypted = encrypted_password
+                self._encryptor = encryptor
+
+            def get_tunnel_credentials(self, tunnel_id):
+                if self._password:
+                    return self._user, self._password
+                elif self._encrypted and self._encryptor:
+                    return self._user, self._encryptor.decrypt(self._encrypted)
+                return self._user, None
+
+        # 부모 창(main_window)에서 encryptor 가져오기
+        encryptor = None
+        if hasattr(self.parent(), 'config_mgr'):
+            encryptor = self.parent().config_mgr.encryptor
+
+        temp_config_mgr = TempConfigManager(
+            db_user, db_password,
+            self.tunnel_data.get('db_password_encrypted'),
+            encryptor
+        )
+
+        worker = ConnectionTestWorker(TestType.DB_ONLY, temp_config, self.engine, temp_config_mgr)
+        worker.progress.connect(dialog.update_progress)
+        worker.finished.connect(lambda s, m: dialog.show_result(s, m))
+        worker.start()
+        dialog.exec()
+
+    def _test_integrated(self):
+        """통합 테스트 (터널 + DB)"""
+        if not self.engine:
+            QMessageBox.critical(self, "오류", "터널 엔진이 초기화되지 않았습니다.")
+            return
+
+        temp_config = self.get_data()
+        dialog = TestProgressDialog(self, f"통합 테스트 - {temp_config.get('name', 'Unknown')}")
+
+        # DB 자격 증명 확인 (선택 사항)
+        db_user = self.input_db_user.text() if self.chk_save_credentials.isChecked() else None
+        db_password = self.input_db_password.text() if self.chk_save_credentials.isChecked() else None
+
+        # 임시 ConfigManager
+        class TempConfigManager:
+            def __init__(self, user, password, encrypted_password, encryptor):
+                self._user = user
+                self._password = password
+                self._encrypted = encrypted_password
+                self._encryptor = encryptor
+
+            def get_tunnel_credentials(self, tunnel_id):
+                if self._password:
+                    return self._user, self._password
+                elif self._encrypted and self._encryptor:
+                    return self._user, self._encryptor.decrypt(self._encrypted)
+                return self._user, None
+
+        encryptor = None
+        if hasattr(self.parent(), 'config_mgr'):
+            encryptor = self.parent().config_mgr.encryptor
+
+        temp_config_mgr = TempConfigManager(
+            db_user, db_password,
+            self.tunnel_data.get('db_password_encrypted') if db_user else None,
+            encryptor
+        )
+
+        worker = ConnectionTestWorker(TestType.INTEGRATED, temp_config, self.engine, temp_config_mgr)
+        worker.progress.connect(dialog.update_progress)
+        worker.finished.connect(lambda s, m: dialog.show_result(s, m))
+        worker.start()
+        dialog.exec()

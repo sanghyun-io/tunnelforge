@@ -21,6 +21,7 @@ from src.ui.dialogs.tunnel_config import TunnelConfigDialog
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
 from src.ui.dialogs.db_dialogs import MySQLShellWizard
 from src.ui.dialogs.migration_dialogs import MigrationWizard
+from src.ui.dialogs.test_dialogs import SQLExecutionDialog
 
 
 class StartupUpdateCheckerThread(QThread):
@@ -77,50 +78,6 @@ class TunnelManagerUI(QMainWindow):
         title = QLabel("📡 터널링 연결 목록")
         title.setStyleSheet("font-size: 20px; font-weight: bold; color: #333;")
 
-        # [추가] 버튼 - Primary 스타일
-        btn_add = QPushButton("➕ 연결 추가")
-        btn_add.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
-        btn_add.clicked.connect(self.add_tunnel_dialog)
-
-        # [MySQL Shell Export] 버튼 (병렬 처리) - Primary 스타일
-        btn_mysqlsh_export = QPushButton("🚀 Shell Export")
-        btn_mysqlsh_export.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #229954; }
-        """)
-        btn_mysqlsh_export.clicked.connect(self.open_mysqlsh_export)
-
-        # [MySQL Shell Import] 버튼 - Primary 스타일
-        btn_mysqlsh_import = QPushButton("📥 Shell Import")
-        btn_mysqlsh_import.setStyleSheet("""
-            QPushButton {
-                background-color: #e67e22; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #d35400; }
-        """)
-        btn_mysqlsh_import.clicked.connect(self.open_mysqlsh_import)
-
-        # [Migration Analyzer] 버튼 - 마이그레이션 분석
-        btn_migration = QPushButton("🔄 Migration")
-        btn_migration.setStyleSheet("""
-            QPushButton {
-                background-color: #9b59b6; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #8e44ad; }
-        """)
-        btn_migration.clicked.connect(self.open_migration_analyzer)
-
         # [새로고침] 버튼 - Secondary 스타일
         btn_refresh = QPushButton("🔄 설정 로드")
         btn_refresh.setStyleSheet("""
@@ -145,10 +102,6 @@ class TunnelManagerUI(QMainWindow):
 
         header_layout.addWidget(title)
         header_layout.addStretch()
-        header_layout.addWidget(btn_add)
-        header_layout.addWidget(btn_mysqlsh_export)
-        header_layout.addWidget(btn_mysqlsh_import)
-        header_layout.addWidget(btn_migration)
         header_layout.addWidget(btn_refresh)
         header_layout.addWidget(btn_settings)
         layout.addLayout(header_layout)
@@ -163,6 +116,11 @@ class TunnelManagerUI(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # 호스트 늘리기
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # 셀 수정 방지
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)  # 행 단위 선택
+
+        # 컨텍스트 메뉴 설정
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self.show_context_menu)
+
         layout.addWidget(self.table)
 
         # 하단 상태바
@@ -287,6 +245,33 @@ class TunnelManagerUI(QMainWindow):
             h_box.addWidget(btn_del)
 
             self.table.setCellWidget(idx, 5, container)
+
+        # --- 마지막 행: 연결 추가 버튼 ---
+        add_row_idx = len(self.tunnels)
+        self.table.insertRow(add_row_idx)
+
+        # 빈 상태 칸
+        empty_item = QTableWidgetItem("")
+        empty_item.setFlags(empty_item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+        self.table.setItem(add_row_idx, 0, empty_item)
+
+        # 연결 추가 버튼 (이름 칸에 배치)
+        btn_add = QPushButton("➕ 연결 추가")
+        btn_add.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white; font-weight: bold;
+                padding: 4px 12px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_add.clicked.connect(self.add_tunnel_dialog)
+        self.table.setCellWidget(add_row_idx, 1, btn_add)
+
+        # 나머지 칸 비우기
+        for col in range(2, 6):
+            empty = QTableWidgetItem("")
+            empty.setFlags(empty.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.table.setItem(add_row_idx, col, empty)
 
     # --- 기능 로직 ---
     def add_tunnel_dialog(self):
@@ -464,3 +449,95 @@ class TunnelManagerUI(QMainWindow):
             QSystemTrayIcon.MessageIcon.Information,
             5000  # 5초 동안 표시
         )
+
+    # --- 컨텍스트 메뉴 ---
+    def show_context_menu(self, position):
+        """테이블 우클릭 컨텍스트 메뉴"""
+        row = self.table.rowAt(position.y())
+        # 마지막 행(연결 추가 버튼)이거나 범위 밖이면 무시
+        if row < 0 or row >= len(self.tunnels):
+            return
+
+        tunnel = self.tunnels[row]
+        menu = QMenu(self)
+
+        # Shell Export/Import
+        menu.addAction("🚀 Shell Export", lambda: self._context_shell_export(tunnel))
+        menu.addAction("📥 Shell Import", lambda: self._context_shell_import(tunnel))
+
+        menu.addSeparator()
+
+        # SQL 실행
+        menu.addAction("📄 SQL 파일 실행...", lambda: self.run_sql_file(tunnel))
+
+        menu.exec(self.table.mapToGlobal(position))
+
+    def run_sql_file(self, tunnel):
+        """SQL 파일 실행 다이얼로그"""
+        # 자격 증명 확인
+        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(
+                self, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
+            )
+            return
+
+        dialog = SQLExecutionDialog(self, tunnel, self.config_mgr, self.engine)
+        dialog.exec()
+
+    def _context_shell_export(self, tunnel):
+        """특정 터널용 Shell Export - 인증정보 자동 사용"""
+        # 자격 증명 확인
+        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(
+                self, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
+            )
+            return
+
+        # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
+        is_direct = tunnel.get('connection_mode') == 'direct'
+        if not is_direct and not self.engine.is_running(tunnel['id']):
+            success, msg = self.engine.start_tunnel(tunnel)
+            if not success:
+                QMessageBox.critical(self, "오류", f"터널 시작 실패:\n{msg}")
+                return
+            self.refresh_table()
+
+        wizard = MySQLShellWizard(
+            parent=self,
+            tunnel_engine=self.engine,
+            config_manager=self.config_mgr,
+            preselected_tunnel=tunnel
+        )
+        wizard.start_export()
+
+    def _context_shell_import(self, tunnel):
+        """특정 터널용 Shell Import - 인증정보 자동 사용"""
+        # 자격 증명 확인
+        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(
+                self, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
+            )
+            return
+
+        # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
+        is_direct = tunnel.get('connection_mode') == 'direct'
+        if not is_direct and not self.engine.is_running(tunnel['id']):
+            success, msg = self.engine.start_tunnel(tunnel)
+            if not success:
+                QMessageBox.critical(self, "오류", f"터널 시작 실패:\n{msg}")
+                return
+            self.refresh_table()
+
+        wizard = MySQLShellWizard(
+            parent=self,
+            tunnel_engine=self.engine,
+            config_manager=self.config_mgr,
+            preselected_tunnel=tunnel
+        )
+        wizard.start_import()

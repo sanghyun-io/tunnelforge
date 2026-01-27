@@ -168,6 +168,51 @@ class TunnelEngine:
         else:
             return '127.0.0.1', int(config['local_port'])
 
+    def create_temp_tunnel(self, config):
+        """
+        테스트용 임시 터널 생성 (local_port=0으로 자동 할당)
+        반환: (success, temp_server, error_msg)
+        """
+        # 직접 연결 모드인 경우 터널 불필요
+        if config.get('connection_mode') == 'direct':
+            return True, None, ""
+
+        try:
+            # SSH 키 로드
+            pkey_obj = self._load_private_key(config['bastion_key'])
+
+            # 임시 터널 생성 (포트 자동 할당)
+            temp_server = SSHTunnelForwarder(
+                (config['bastion_host'], int(config['bastion_port'])),
+                ssh_username=config['bastion_user'],
+                ssh_pkey=pkey_obj,
+                remote_bind_address=(config['remote_host'], int(config['remote_port'])),
+                local_bind_address=('127.0.0.1', 0)  # 0 = 자동 할당
+            )
+
+            temp_server.start()
+            print(f"🔗 임시 터널 생성: localhost:{temp_server.local_bind_port} -> {config['remote_host']}:{config['remote_port']}")
+            return True, temp_server, ""
+
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            return False, None, error_msg
+
+    def close_temp_tunnel(self, temp_server):
+        """임시 터널 종료"""
+        if temp_server:
+            try:
+                temp_server.stop()
+                print("🛑 임시 터널 종료됨")
+            except Exception as e:
+                print(f"⚠️ 임시 터널 종료 중 오류: {e}")
+
+    def get_temp_tunnel_port(self, temp_server):
+        """임시 터널의 로컬 포트 반환"""
+        if temp_server:
+            return temp_server.local_bind_port
+        return None
+
     def get_active_tunnels(self):
         """활성화된 터널/연결 목록 반환 (DB Export용)"""
         result = []

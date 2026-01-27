@@ -2,22 +2,199 @@
 MySQL 마이그레이션 분석기
 - 고아 레코드(orphan rows) 탐지
 - FK 관계 분석 및 정리
-- MySQL 8.0.x → 8.4.x 호환성 검사
+- MySQL 8.0.x → 8.4.x 호환성 검사 (Upgrade Checker 통합)
 - dry-run 지원
+- 덤프 파일 분석 (SQL/TSV)
 """
+import re
 from typing import List, Dict, Set, Tuple, Optional, Callable, Any
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from src.core.db_connector import MySQLConnector
+
+
+# ============================================================
+# MySQL 8.4 Upgrade Checker 상수 (constants.ts에서 포팅)
+# ============================================================
+
+# MySQL 8.4에서 제거된 시스템 변수 (47개)
+REMOVED_SYS_VARS_84 = (
+    'avoid_temporal_upgrade',
+    'binlog_transaction_dependency_tracking',
+    'default_authentication_plugin',
+    'group_replication_ip_allowlist',
+    'group_replication_recovery_complete_at',
+    'have_openssl',
+    'have_ssl',
+    'innodb_log_file_size',
+    'innodb_log_files_in_group',
+    'keyring_file_data',
+    'keyring_file_data_file',
+    'keyring_encrypted_file_data',
+    'keyring_encrypted_file_password',
+    'keyring_okv_conf_dir',
+    'keyring_hashicorp_auth_path',
+    'keyring_hashicorp_ca_path',
+    'keyring_hashicorp_caching',
+    'keyring_hashicorp_commit_auth_path',
+    'keyring_hashicorp_commit_caching',
+    'keyring_hashicorp_commit_role_id',
+    'keyring_hashicorp_commit_server_url',
+    'keyring_hashicorp_commit_store_path',
+    'keyring_hashicorp_role_id',
+    'keyring_hashicorp_secret_id',
+    'keyring_hashicorp_server_url',
+    'keyring_hashicorp_store_path',
+    'keyring_aws_cmk_id',
+    'keyring_aws_conf_file',
+    'keyring_aws_data_file',
+    'keyring_aws_region',
+    'log_bin_use_v1_row_events',
+    'master_verify_checksum',
+    'old_alter_table',
+    'relay_log_info_file',
+    'relay_log_info_repository',
+    'replica_parallel_type',
+    'slave_parallel_type',
+    'slave_rows_search_algorithms',
+    'sql_slave_skip_counter',
+    'sync_master_info',
+    'sync_relay_log',
+    'sync_relay_log_info',
+    'transaction_write_set_extraction',
+    'binlog_format',
+    'log_slave_updates',
+    'replica_compressed_protocol',
+    'slave_compressed_protocol',
+)
+
+# MySQL 8.4에서 추가된 새 예약어 (4개)
+NEW_RESERVED_KEYWORDS_84 = ('MANUAL', 'PARALLEL', 'QUALIFY', 'TABLESAMPLE')
+
+# MySQL 8.4에서 제거된 함수 (6개) - 기존 DEPRECATED_FUNCTIONS와 병합
+REMOVED_FUNCTIONS_84 = (
+    'PASSWORD', 'ENCODE', 'DECODE', 'DES_ENCRYPT', 'DES_DECRYPT',
+    'ENCRYPT', 'OLD_PASSWORD', 'MASTER_POS_WAIT'
+)
+
+# 인증 플러그인 상태
+AUTH_PLUGINS = {
+    'disabled': ['mysql_native_password'],  # 8.4에서 기본 비활성화
+    'removed': ['authentication_fido', 'authentication_fido_client'],  # 8.4에서 제거
+    'deprecated': ['sha256_password'],  # deprecated, caching_sha2_password 권장
+}
+
+# 제거된/deprecated SQL 모드 (10개)
+OBSOLETE_SQL_MODES = (
+    'DB2', 'MAXDB', 'MSSQL', 'MYSQL323', 'MYSQL40',
+    'ORACLE', 'POSTGRESQL', 'NO_FIELD_OPTIONS', 'NO_KEY_OPTIONS',
+    'NO_TABLE_OPTIONS', 'NO_AUTO_CREATE_USER',
+)
+
+# 기본값이 변경된 시스템 변수
+SYS_VARS_NEW_DEFAULTS_84 = {
+    'binlog_transaction_dependency_tracking': {
+        'old': 'COMMIT_ORDER', 'new': 'removed (use replica_parallel_type)',
+    },
+    'replica_parallel_workers': {
+        'old': '0', 'new': '4',
+    },
+    'innodb_adaptive_hash_index': {
+        'old': 'ON', 'new': 'OFF',
+    },
+    'innodb_doublewrite_pages': {
+        'old': '(innodb_write_io_threads)', 'new': '128',
+    },
+    'innodb_flush_method': {
+        'old': 'fsync (Unix)', 'new': 'O_DIRECT (Linux)',
+    },
+    'innodb_io_capacity': {
+        'old': '200', 'new': '10000',
+    },
+    'innodb_io_capacity_max': {
+        'old': '2 * innodb_io_capacity', 'new': '2 * new default',
+    },
+    'innodb_log_buffer_size': {
+        'old': '16M', 'new': '64M',
+    },
+    'innodb_redo_log_capacity': {
+        'old': '100M', 'new': '100M (now replaces log_file_size * files)',
+    },
+    'group_replication_consistency': {
+        'old': 'EVENTUAL', 'new': 'BEFORE_ON_PRIMARY_FAILOVER',
+    },
+}
+
+# ============================================================
+# 덤프 파일 분석용 정규식 패턴 (rules.ts에서 포팅)
+# ============================================================
+
+# 0000-00-00 날짜 (잘못된 날짜)
+INVALID_DATE_PATTERN = re.compile(r"['\"]0000-00-00['\"]|^0000-00-00$", re.MULTILINE)
+INVALID_DATETIME_PATTERN = re.compile(r"['\"]0000-00-00 00:00:00['\"]|^0000-00-00 00:00:00$", re.MULTILINE)
+
+# ZEROFILL 속성
+ZEROFILL_PATTERN = re.compile(r'\bZEROFILL\b', re.IGNORECASE)
+
+# FLOAT(M,D), DOUBLE(M,D) 구문 (deprecated)
+FLOAT_PRECISION_PATTERN = re.compile(
+    r'\b(FLOAT|DOUBLE|REAL)\s*\(\s*\d+\s*,\s*\d+\s*\)',
+    re.IGNORECASE
+)
+
+# INT 표시 너비 (deprecated, TINYINT(1) 제외)
+INT_DISPLAY_WIDTH_PATTERN = re.compile(
+    r'\b(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)\s*\(\s*(\d+)\s*\)',
+    re.IGNORECASE
+)
+
+# FK 이름 길이 (64자 초과)
+FK_NAME_LENGTH_PATTERN = re.compile(
+    r'CONSTRAINT\s+`?(\w{65,})`?\s+FOREIGN\s+KEY',
+    re.IGNORECASE
+)
+
+# mysql_native_password 인증 플러그인
+AUTH_PLUGIN_PATTERN = re.compile(
+    r"IDENTIFIED\s+(?:WITH\s+)?['\"]?(mysql_native_password|sha256_password|authentication_fido)['\"]?",
+    re.IGNORECASE
+)
+
+# FTS_ 접두사 테이블명 (내부 예약)
+FTS_TABLE_PREFIX_PATTERN = re.compile(r'CREATE\s+TABLE\s+`?FTS_', re.IGNORECASE)
+
+# GRANT 문의 SUPER 권한
+SUPER_PRIVILEGE_PATTERN = re.compile(r'\bGRANT\b.*\bSUPER\b', re.IGNORECASE)
+
+# 제거된 시스템 변수 사용 (SET/SELECT 문에서)
+SYS_VAR_USAGE_PATTERN = re.compile(
+    r"(?:SET|SELECT)\s+.*(?:@@(?:global|session)?\.)?" +
+    r"(" + "|".join(re.escape(v) for v in REMOVED_SYS_VARS_84) + r")\b",
+    re.IGNORECASE
+)
 
 
 class IssueType(Enum):
     """문제 유형"""
+    # 기존 이슈 타입
     ORPHAN_ROW = "orphan_row"  # 부모 없는 자식 레코드
     DEPRECATED_FUNCTION = "deprecated_function"  # deprecated 함수 사용
     CHARSET_ISSUE = "charset_issue"  # utf8mb3 → utf8mb4 필요
     RESERVED_KEYWORD = "reserved_keyword"  # 예약어 충돌
     SQL_MODE_ISSUE = "sql_mode_issue"  # deprecated SQL 모드
+
+    # MySQL 8.4 Upgrade Checker 이슈 타입 (신규)
+    REMOVED_SYS_VAR = "removed_sys_var"  # 제거된 시스템 변수
+    AUTH_PLUGIN_ISSUE = "auth_plugin_issue"  # 인증 플러그인 이슈
+    INVALID_DATE = "invalid_date"  # 0000-00-00 날짜
+    ZEROFILL_USAGE = "zerofill_usage"  # ZEROFILL 속성
+    FLOAT_PRECISION = "float_precision"  # FLOAT(M,D) 구문
+    INT_DISPLAY_WIDTH = "int_display_width"  # INT(11) 표시 너비
+    FK_NAME_LENGTH = "fk_name_length"  # FK 이름 64자 초과
+    FTS_TABLE_PREFIX = "fts_table_prefix"  # FTS_ 테이블명
+    SUPER_PRIVILEGE = "super_privilege"  # SUPER 권한 사용
+    DEFAULT_VALUE_CHANGE = "default_value_change"  # 기본값 변경됨
 
 
 class ActionType(Enum):
@@ -88,18 +265,17 @@ class AnalysisResult:
 class MigrationAnalyzer:
     """마이그레이션 분석기"""
 
-    # MySQL 8.4에서 제거된/deprecated된 함수들
-    DEPRECATED_FUNCTIONS = [
-        'PASSWORD', 'ENCODE', 'DECODE', 'DES_ENCRYPT', 'DES_DECRYPT',
-        'ENCRYPT', 'OLD_PASSWORD', 'MASTER_POS_WAIT'
-    ]
+    # MySQL 8.4에서 제거된/deprecated된 함수들 (전역 상수 사용)
+    DEPRECATED_FUNCTIONS = list(REMOVED_FUNCTIONS_84)
 
-    # MySQL 8.4에서 새로운 예약어들
+    # MySQL 8.4에서 새로운 예약어들 (기존 22개 + 8.4 추가 4개)
     NEW_RESERVED_KEYWORDS = [
         'CUME_DIST', 'DENSE_RANK', 'EMPTY', 'EXCEPT', 'FIRST_VALUE',
         'GROUPING', 'GROUPS', 'JSON_TABLE', 'LAG', 'LAST_VALUE', 'LATERAL',
         'LEAD', 'NTH_VALUE', 'NTILE', 'OF', 'OVER', 'PERCENT_RANK',
-        'RANK', 'RECURSIVE', 'ROW_NUMBER', 'SYSTEM', 'WINDOW'
+        'RANK', 'RECURSIVE', 'ROW_NUMBER', 'SYSTEM', 'WINDOW',
+        # MySQL 8.4 추가 예약어
+        'MANUAL', 'PARALLEL', 'QUALIFY', 'TABLESAMPLE'
     ]
 
     def __init__(self, connector: MySQLConnector):

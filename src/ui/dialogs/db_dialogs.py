@@ -2323,29 +2323,86 @@ class MySQLShellImportDialog(QDialog):
 class MySQLShellWizard:
     """MySQL Shell Export/Import 마법사"""
 
-    def __init__(self, parent=None, tunnel_engine=None, config_manager=None):
+    def __init__(self, parent=None, tunnel_engine=None, config_manager=None, preselected_tunnel=None):
         self.parent = parent
         self.tunnel_engine = tunnel_engine
         self.config_manager = config_manager
+        self.preselected_tunnel = preselected_tunnel
+
+    def _connect_preselected_tunnel(self) -> tuple:
+        """미리 선택된 터널로 연결 - (connector, connection_info) 반환"""
+        if not self.preselected_tunnel:
+            return None, None
+
+        tunnel = self.preselected_tunnel
+        tid = tunnel.get('id')
+        is_direct = tunnel.get('connection_mode') == 'direct'
+
+        # 자격 증명 가져오기
+        db_user, db_password = self.config_manager.get_tunnel_credentials(tid)
+        if not db_user:
+            QMessageBox.warning(
+                self.parent, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다."
+            )
+            return None, None
+
+        # 연결 정보 결정
+        if is_direct:
+            host = tunnel['remote_host']
+            port = int(tunnel['remote_port'])
+        elif self.tunnel_engine.is_running(tid):
+            host, port = self.tunnel_engine.get_connection_info(tid)
+        else:
+            QMessageBox.warning(
+                self.parent, "경고",
+                "터널이 활성화되어 있지 않습니다."
+            )
+            return None, None
+
+        # MySQLConnector 생성 및 연결
+        connector = MySQLConnector(host, port, db_user, db_password)
+        success, msg = connector.connect()
+
+        if not success:
+            QMessageBox.critical(
+                self.parent, "연결 오류",
+                f"DB 연결에 실패했습니다:\n{msg}"
+            )
+            return None, None
+
+        # 연결 식별자 (Export 폴더명 등에 사용)
+        connection_info = f"{tunnel.get('name', 'Unknown')}_{db_user}"
+
+        return connector, connection_info
 
     def start_export(self) -> bool:
         """Export 마법사 시작"""
-        # 1단계: DB 연결
-        conn_dialog = DBConnectionDialog(
-            self.parent,
-            tunnel_engine=self.tunnel_engine,
-            config_manager=self.config_manager
-        )
+        connector = None
+        connection_info = None
 
-        if conn_dialog.exec() != QDialog.DialogCode.Accepted:
-            return False
+        # 미리 선택된 터널이 있으면 바로 연결
+        if self.preselected_tunnel:
+            connector, connection_info = self._connect_preselected_tunnel()
+            if not connector:
+                return False
+        else:
+            # 1단계: DB 연결 다이얼로그
+            conn_dialog = DBConnectionDialog(
+                self.parent,
+                tunnel_engine=self.tunnel_engine,
+                config_manager=self.config_manager
+            )
 
-        connector = conn_dialog.get_connector()
-        if not connector:
-            return False
+            if conn_dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
 
-        # 연결 식별자 가져오기
-        connection_info = conn_dialog.get_connection_identifier()
+            connector = conn_dialog.get_connector()
+            if not connector:
+                return False
+
+            # 연결 식별자 가져오기
+            connection_info = conn_dialog.get_connection_identifier()
 
         # 2단계: Export
         export_dialog = MySQLShellExportDialog(
@@ -2360,19 +2417,27 @@ class MySQLShellWizard:
 
     def start_import(self) -> bool:
         """Import 마법사 시작"""
-        # 1단계: DB 연결
-        conn_dialog = DBConnectionDialog(
-            self.parent,
-            tunnel_engine=self.tunnel_engine,
-            config_manager=self.config_manager
-        )
+        connector = None
 
-        if conn_dialog.exec() != QDialog.DialogCode.Accepted:
-            return False
+        # 미리 선택된 터널이 있으면 바로 연결
+        if self.preselected_tunnel:
+            connector, _ = self._connect_preselected_tunnel()
+            if not connector:
+                return False
+        else:
+            # 1단계: DB 연결 다이얼로그
+            conn_dialog = DBConnectionDialog(
+                self.parent,
+                tunnel_engine=self.tunnel_engine,
+                config_manager=self.config_manager
+            )
 
-        connector = conn_dialog.get_connector()
-        if not connector:
-            return False
+            if conn_dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+
+            connector = conn_dialog.get_connector()
+            if not connector:
+                return False
 
         # 2단계: Import
         import_dialog = MySQLShellImportDialog(

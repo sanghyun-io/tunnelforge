@@ -47,7 +47,10 @@
       "Bash(source scripts/smart-release.sh:*)",
       "Bash(.venvScriptsactivate)",
       "Bash(pip index:*)",
-      "WebFetch(domain:pypi.org)"
+      "WebFetch(domain:pypi.org)",
+      "Bash(gh run view:*)",
+      "Bash(gh release view:*)",
+      "Bash(start \"\" \"dist\\\\TunnelDBManager-WebSetup.exe\")"
     ]
   }
 }
