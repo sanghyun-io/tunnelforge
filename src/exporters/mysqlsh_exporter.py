@@ -995,18 +995,21 @@ class MySQLShellImporter:
             (성공여부, 메시지)
         """
         try:
+            if progress_callback:
+                progress_callback(f"🗑️ 스키마 '{schema}' DROP 중...")
+
             js_code = f"""
 session.runSql("DROP DATABASE IF EXISTS `{schema}`");
 session.runSql("CREATE DATABASE `{schema}` DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci");
 """
-            
+
             success, msg = self._run_mysqlsh(js_code, progress_callback)
-            
+
             if success and progress_callback:
-                progress_callback(f"✅ 스키마 '{schema}' 재생성 완료")
-            
+                progress_callback(f"  └─ ✅ 스키마 '{schema}' 재생성 완료")
+
             return success, msg
-        
+
         except Exception as e:
             return False, f"스키마 재생성 오류: {str(e)}"
 
@@ -1026,6 +1029,9 @@ session.runSql("CREATE DATABASE `{schema}` DEFAULT CHARACTER SET utf8mb4 COLLATE
             (성공여부, 메시지)
         """
         try:
+            if progress_callback:
+                progress_callback(f"🗑️ View/Procedure/Function/Event 삭제 중...")
+
             # Views, Procedures, Events 조회 및 삭제
             js_code = f"""
 // Views 삭제
@@ -1056,14 +1062,14 @@ for (var i = 0; i < events.length; i++) {{
     session.runSql("DROP EVENT IF EXISTS `{schema}`.`" + eventName + "`");
 }}
 """
-            
+
             success, msg = self._run_mysqlsh(js_code, progress_callback)
-            
+
             if success and progress_callback:
-                progress_callback(f"✅ View/Procedure/Event 삭제 완료")
-            
+                progress_callback(f"  └─ ✅ View/Procedure/Event 삭제 완료")
+
             return success, msg
-        
+
         except Exception as e:
             return False, f"객체 삭제 오류: {str(e)}"
 
@@ -1114,6 +1120,9 @@ for (var i = 0; i < events.length; i++) {{
             (성공여부, 메시지)
         """
         try:
+            if progress_callback:
+                progress_callback(f"🗑️ 테이블 삭제 시작 ({len(tables)}개)...")
+
             # JSON 배열로 테이블 목록 생성
             tables_json = json.dumps(tables)
 
@@ -1130,7 +1139,7 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
             success, msg = self._run_mysqlsh(js_code, progress_callback)
 
             if success and progress_callback:
-                progress_callback(f"✅ {len(tables)}개 테이블 삭제 완료")
+                progress_callback(f"  └─ ✅ {len(tables)}개 테이블 삭제 완료")
 
             return success, msg
 
