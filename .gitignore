@@ -46,3 +46,10 @@ config.json
 # Distribution
 *.pyz
 *.pyzw
+
+# Environment variables
+.env
+
+# GitHub App Secrets
+secrets/*.pem
+!secrets/*.pem.example

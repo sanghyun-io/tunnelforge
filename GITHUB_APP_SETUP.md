@@ -44,16 +44,25 @@ App ID: 123456  ← 이 숫자를 메모
 
 ---
 
-## 3단계: Private Key 생성
+## 3단계: Private Key 생성 및 저장
 
 1. App 설정 페이지 하단의 **Private keys** 섹션
 2. **Generate a private key** 클릭
 3. `.pem` 파일이 자동 다운로드됨
-4. 이 파일을 안전한 위치에 보관
+4. 다운로드한 파일을 프로젝트의 `secrets/` 디렉토리에 복사:
 
 ```bash
-# 예: ~/.dataflare/github-app-private-key.pem
+# Windows (PowerShell)
+Copy-Item ~/Downloads/your-app.2024-01-27.private-key.pem secrets/github-app-private-key.pem
+
+# Linux/macOS
+cp ~/Downloads/your-app.2024-01-27.private-key.pem secrets/github-app-private-key.pem
+
+# 권한 설정 (Linux/macOS)
+chmod 600 secrets/github-app-private-key.pem
 ```
+
+**참고**: `secrets/` 디렉토리는 `.gitignore`에 의해 보호되므로 실수로 커밋되지 않습니다.
 
 ---
 
@@ -74,33 +83,62 @@ https://github.com/settings/installations/12345678
 
 ## 5단계: 환경변수 설정
 
-### Linux/macOS
+### 방법 1: .env 파일 (권장)
+
+프로젝트 루트에 `.env` 파일 생성:
+
+```bash
+# .env
+GITHUB_APP_ID=123456
+GITHUB_APP_PRIVATE_KEY=secrets/github-app-private-key.pem
+GITHUB_APP_INSTALLATION_ID=12345678
+GITHUB_REPO=your-org/your-repo
+```
+
+**Private Key 경로 옵션**:
+
+1. **프로젝트 내 (권장)**:
+   ```bash
+   GITHUB_APP_PRIVATE_KEY=secrets/github-app-private-key.pem
+   ```
+
+2. **절대 경로**:
+   - Windows: `GITHUB_APP_PRIVATE_KEY=C:\Users\YourName\.ssh\github-app-key.pem`
+   - Linux/macOS: `GITHUB_APP_PRIVATE_KEY=/home/username/.ssh/github-app-key.pem`
+
+**참고**:
+- `.env` 파일은 `.gitignore`에 추가하여 버전 관리에서 제외하세요
+- `.exe` 빌드 시에도 실행 파일과 같은 디렉토리에 `.env`를 배치하면 동작합니다
+
+### 방법 2: 시스템 환경변수
+
+#### Linux/macOS
 
 ```bash
 # ~/.bashrc 또는 ~/.zshrc에 추가
-export DATAFLARE_GITHUB_APP_ID="123456"
-export DATAFLARE_GITHUB_APP_PRIVATE_KEY="/path/to/private-key.pem"
-export DATAFLARE_GITHUB_APP_INSTALLATION_ID="12345678"
-export DATAFLARE_GITHUB_REPO="your-org/your-repo"
+export GITHUB_APP_ID="123456"
+export GITHUB_APP_PRIVATE_KEY="/path/to/private-key.pem"
+export GITHUB_APP_INSTALLATION_ID="12345678"
+export GITHUB_REPO="your-org/your-repo"
 ```
 
-### Windows (PowerShell)
+#### Windows (PowerShell)
 
 ```powershell
 # 시스템 환경변수로 설정
-[Environment]::SetEnvironmentVariable("DATAFLARE_GITHUB_APP_ID", "123456", "User")
-[Environment]::SetEnvironmentVariable("DATAFLARE_GITHUB_APP_PRIVATE_KEY", "C:\path\to\private-key.pem", "User")
-[Environment]::SetEnvironmentVariable("DATAFLARE_GITHUB_APP_INSTALLATION_ID", "12345678", "User")
-[Environment]::SetEnvironmentVariable("DATAFLARE_GITHUB_REPO", "your-org/your-repo", "User")
+[Environment]::SetEnvironmentVariable("GITHUB_APP_ID", "123456", "User")
+[Environment]::SetEnvironmentVariable("GITHUB_APP_PRIVATE_KEY", "C:\path\to\private-key.pem", "User")
+[Environment]::SetEnvironmentVariable("GITHUB_APP_INSTALLATION_ID", "12345678", "User")
+[Environment]::SetEnvironmentVariable("GITHUB_REPO", "your-org/your-repo", "User")
 ```
 
-### Windows (CMD)
+#### Windows (CMD)
 
 ```cmd
-setx DATAFLARE_GITHUB_APP_ID "123456"
-setx DATAFLARE_GITHUB_APP_PRIVATE_KEY "C:\path\to\private-key.pem"
-setx DATAFLARE_GITHUB_APP_INSTALLATION_ID "12345678"
-setx DATAFLARE_GITHUB_REPO "your-org/your-repo"
+setx GITHUB_APP_ID "123456"
+setx GITHUB_APP_PRIVATE_KEY "C:\path\to\private-key.pem"
+setx GITHUB_APP_INSTALLATION_ID "12345678"
+setx GITHUB_REPO "your-org/your-repo"
 ```
 
 ---
@@ -146,10 +184,10 @@ print(code)
 
 | 환경변수 | 설명 | 예시 |
 |---------|------|-----|
-| `DATAFLARE_GITHUB_APP_ID` | GitHub App ID | `123456` |
-| `DATAFLARE_GITHUB_APP_PRIVATE_KEY` | Private Key 파일 경로 또는 PEM 내용 | `/path/to/key.pem` |
-| `DATAFLARE_GITHUB_APP_INSTALLATION_ID` | App Installation ID | `12345678` |
-| `DATAFLARE_GITHUB_REPO` | 이슈를 생성할 리포지토리 | `owner/repo` |
+| `GITHUB_APP_ID` | GitHub App ID | `123456` |
+| `GITHUB_APP_PRIVATE_KEY` | Private Key 파일 경로 또는 PEM 내용 | `/path/to/key.pem` |
+| `GITHUB_APP_INSTALLATION_ID` | App Installation ID | `12345678` |
+| `GITHUB_REPO` | 이슈를 생성할 리포지토리 | `owner/repo` |
 
 ---
 

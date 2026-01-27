@@ -11,17 +11,24 @@ GitHub App을 사용한 인증은 Personal Access Token보다 안전합니다:
 - Private Key: App 설정에서 생성/다운로드 (.pem 파일)
 - Installation ID: App 설치 후 URL에서 확인
 
-환경변수:
-- DATAFLARE_GITHUB_APP_ID: App ID
-- DATAFLARE_GITHUB_APP_PRIVATE_KEY: Private Key (PEM 내용 또는 파일 경로)
-- DATAFLARE_GITHUB_APP_INSTALLATION_ID: Installation ID
-- DATAFLARE_GITHUB_REPO: 리포지토리 (owner/repo)
+환경변수 (.env 파일 또는 시스템 환경변수):
+- GITHUB_APP_ID: App ID
+- GITHUB_APP_PRIVATE_KEY: Private Key (PEM 내용 또는 파일 경로)
+- GITHUB_APP_INSTALLATION_ID: Installation ID
+- GITHUB_REPO: 리포지토리 (owner/repo)
 """
 
 import os
 import time
 from typing import Optional, Tuple
 from datetime import datetime, timedelta
+from pathlib import Path
+
+try:
+    from dotenv import load_dotenv
+    HAS_DOTENV = True
+except ImportError:
+    HAS_DOTENV = False
 
 try:
     import jwt
@@ -41,11 +48,14 @@ class GitHubAppAuth:
 
     GITHUB_API_BASE = "https://api.github.com"
 
-    # 환경변수 키
-    ENV_APP_ID = "DATAFLARE_GITHUB_APP_ID"
-    ENV_PRIVATE_KEY = "DATAFLARE_GITHUB_APP_PRIVATE_KEY"
-    ENV_INSTALLATION_ID = "DATAFLARE_GITHUB_APP_INSTALLATION_ID"
-    ENV_REPO = "DATAFLARE_GITHUB_REPO"
+    # 환경변수 키 (DATAFLARE_ prefix 제거)
+    ENV_APP_ID = "GITHUB_APP_ID"
+    ENV_PRIVATE_KEY = "GITHUB_APP_PRIVATE_KEY"
+    ENV_INSTALLATION_ID = "GITHUB_APP_INSTALLATION_ID"
+    ENV_REPO = "GITHUB_REPO"
+
+    # .env 파일 로드 여부
+    _env_loaded = False
 
     # 내장 값 (빌드 시 설정)
     _EMBEDDED_APP_ID: Optional[str] = None
@@ -83,8 +93,33 @@ class GitHubAppAuth:
         return True, "GitHub App 인증 사용 가능"
 
     @classmethod
+    def _load_env_file(cls):
+        """.env 파일 로드 (한 번만 실행)"""
+        if cls._env_loaded:
+            return
+
+        if HAS_DOTENV:
+            # 프로젝트 루트의 .env 파일 로드
+            # main.py가 있는 디렉토리 기준
+            current_dir = Path(__file__).resolve().parent.parent.parent
+            env_path = current_dir / '.env'
+
+            if env_path.exists():
+                load_dotenv(env_path)
+            else:
+                # exe 빌드 시: 실행 파일과 같은 디렉토리
+                exe_env_path = Path(os.getcwd()) / '.env'
+                if exe_env_path.exists():
+                    load_dotenv(exe_env_path)
+
+        cls._env_loaded = True
+
+    @classmethod
     def from_env_or_embedded(cls) -> Optional['GitHubAppAuth']:
         """환경변수 또는 내장 값에서 인스턴스 생성"""
+        # .env 파일 로드
+        cls._load_env_file()
+
         # 환경변수 우선
         app_id = os.environ.get(cls.ENV_APP_ID) or cls._get_embedded_value('app_id')
         private_key = cls._get_private_key()
@@ -152,7 +187,7 @@ class GitHubAppAuth:
         now = int(time.time())
         payload = {
             'iat': now - 60,  # 시계 오차 대비 60초 전
-            'exp': now + (10 * 60),  # 10분 후 만료
+            'exp': now + (9 * 60),  # 9분 후 만료 (총 10분 이내 유지)
             'iss': self.app_id
         }
 
@@ -216,6 +251,57 @@ class GitHubAppAuth:
             "Accept": "application/vnd.github.v3+json",
             "User-Agent": "DataFlare-Tunnel-Manager"
         }
+
+    def test_connection(self) -> Tuple[bool, str]:
+        """
+        GitHub API 연결 테스트
+
+        Returns:
+            (성공여부, 메시지)
+        """
+        if not HAS_REQUESTS:
+            return False, "requests 라이브러리가 필요합니다"
+
+        try:
+            # 1. Installation Token 발급 테스트
+            token = self.get_installation_token(force_refresh=True)
+            if not token:
+                return False, "Installation Token 발급 실패"
+
+            # 2. 리포지토리 접근 권한 테스트
+            headers = self.get_headers()
+            url = f"{self.GITHUB_API_BASE}/repos/{self.repo}"
+
+            response = requests.get(url, headers=headers, timeout=10)
+
+            if response.status_code == 404:
+                return False, f"리포지토리 '{self.repo}'를 찾을 수 없습니다"
+            elif response.status_code == 403:
+                return False, "리포지토리 접근 권한이 없습니다"
+
+            response.raise_for_status()
+
+            # 3. 이슈 생성 권한 테스트 (실제로 생성하지는 않음)
+            repo_data = response.json()
+            permissions = repo_data.get('permissions', {})
+
+            if not permissions.get('push', False):
+                return False, "이슈 생성 권한이 없습니다 (Issues: Write 권한 필요)"
+
+            return True, f"✅ 연결 성공! 리포지토리: {self.repo}"
+
+        except requests.RequestException as e:
+            error_msg = str(e)
+            if hasattr(e, 'response') and e.response is not None:
+                try:
+                    error_detail = e.response.json().get('message', '')
+                    if error_detail:
+                        error_msg = f"{error_msg}: {error_detail}"
+                except:
+                    pass
+            return False, f"연결 실패: {error_msg}"
+        except Exception as e:
+            return False, f"예상치 못한 오류: {str(e)}"
 
     # === 난독화 유틸리티 ===
 
