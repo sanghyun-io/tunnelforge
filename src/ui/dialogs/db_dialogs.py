@@ -6,7 +6,8 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QSpinBox, QPushButton, QComboBox,
     QCheckBox, QListWidget, QListWidgetItem, QGroupBox,
     QFileDialog, QMessageBox, QProgressBar, QApplication,
-    QRadioButton, QButtonGroup, QWidget, QAbstractItemView
+    QRadioButton, QButtonGroup, QWidget, QAbstractItemView,
+    QSplitter, QScrollArea
 )
 from PyQt6.QtCore import Qt
 from typing import List, Optional
@@ -149,17 +150,23 @@ class DBConnectionDialog(QDialog):
                 display = f"{t['name']} ({t['host']}:{t['port']})"
                 self.combo_tunnel.addItem(display, t)
             self.radio_tunnel.setEnabled(True)
-            # 터널 선택 변경 시 자격 증명 자동 채우기
+            # 터널 선택 변경 시 Host/Port 및 자격 증명 자동 채우기
             self.combo_tunnel.currentIndexChanged.connect(self._on_tunnel_selected)
 
     def _on_tunnel_selected(self):
-        """터널 선택 시 저장된 자격 증명 자동 채우기"""
+        """터널 선택 시 Host/Port 및 저장된 자격 증명 자동 채우기"""
         if not self.radio_tunnel.isChecked():
             return
 
         current_data = self.combo_tunnel.currentData()
-        if current_data and 'tunnel_id' in current_data:
-            self._fill_saved_credentials(current_data['tunnel_id'])
+        if current_data:
+            # Host와 Port 업데이트
+            if 'host' in current_data and 'port' in current_data:
+                self.input_host.setText(current_data['host'])
+                self.input_port.setValue(current_data['port'])
+            # 저장된 자격 증명 자동 채우기
+            if 'tunnel_id' in current_data:
+                self._fill_saved_credentials(current_data['tunnel_id'])
 
     def _fill_saved_credentials(self, tunnel_id: str):
         """저장된 자격 증명 자동 채우기"""
@@ -299,6 +306,36 @@ class MySQLShellExportDialog(QDialog):
     def init_ui(self):
         layout = QVBoxLayout(self)
 
+        # QSplitter로 상하 분할 (설정 영역 / 진행 상황 영역)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        layout.addWidget(self.splitter)
+
+        # ========== 상단: 설정 영역 (스크롤 가능) ==========
+        config_widget = QWidget()
+        config_layout = QVBoxLayout(config_widget)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 접기/펼치기 버튼 추가
+        collapse_layout = QHBoxLayout()
+        self.btn_collapse = QPushButton("🔽 설정 접기")
+        self.btn_collapse.setStyleSheet("""
+            QPushButton {
+                background-color: #ecf0f1; color: #2c3e50;
+                padding: 4px 12px; border-radius: 4px; border: 1px solid #bdc3c7;
+            }
+            QPushButton:hover { background-color: #d5dbdb; }
+        """)
+        self.btn_collapse.clicked.connect(self.toggle_config_section)
+        self.btn_collapse.setVisible(False)  # 초기에는 숨김
+        collapse_layout.addWidget(self.btn_collapse)
+        collapse_layout.addStretch()
+        config_layout.addLayout(collapse_layout)
+
+        # 설정 내용을 담을 컨테이너
+        self.config_container = QWidget()
+        container_layout = QVBoxLayout(self.config_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+
         # --- mysqlsh 상태 표시 ---
         status_group = QGroupBox("MySQL Shell 상태")
         status_layout = QVBoxLayout(status_group)
@@ -322,7 +359,7 @@ class MySQLShellExportDialog(QDialog):
             status_layout.addWidget(btn_guide)
 
         status_layout.addWidget(status_label)
-        layout.addWidget(status_group)
+        container_layout.addWidget(status_group)
 
         # --- Export 유형 선택 ---
         type_group = QGroupBox("Export 유형")
@@ -341,7 +378,7 @@ class MySQLShellExportDialog(QDialog):
 
         type_layout.addWidget(self.radio_full)
         type_layout.addWidget(self.radio_partial)
-        layout.addWidget(type_group)
+        container_layout.addWidget(type_group)
 
         # --- 스키마 선택 ---
         schema_layout = QHBoxLayout()
@@ -351,7 +388,7 @@ class MySQLShellExportDialog(QDialog):
         self.combo_schema.currentTextChanged.connect(self.on_schema_changed)
         schema_layout.addWidget(self.combo_schema)
         schema_layout.addStretch()
-        layout.addLayout(schema_layout)
+        container_layout.addLayout(schema_layout)
 
         # --- 테이블 선택 (일부 테이블 Export 시) ---
         self.table_group = QGroupBox("테이블 선택")
@@ -391,7 +428,7 @@ class MySQLShellExportDialog(QDialog):
         table_layout.addWidget(self.chk_include_fk)
 
         self.table_group.setVisible(False)
-        layout.addWidget(self.table_group)
+        container_layout.addWidget(self.table_group)
 
         # --- Export 옵션 ---
         option_group = QGroupBox("Export 옵션")
@@ -406,7 +443,7 @@ class MySQLShellExportDialog(QDialog):
         self.combo_compression.addItems(["zstd", "gzip", "none"])
         option_layout.addRow("압축 방식:", self.combo_compression)
 
-        layout.addWidget(option_group)
+        container_layout.addWidget(option_group)
 
         # --- 출력 폴더 설정 ---
         folder_group = QGroupBox("출력 폴더 설정")
@@ -483,31 +520,133 @@ class MySQLShellExportDialog(QDialog):
         preview_layout.addWidget(self.input_output_dir)
         folder_main_layout.addLayout(preview_layout)
 
-        layout.addWidget(folder_group)
+        container_layout.addWidget(folder_group)
 
         # 초기 출력 경로 설정
         self._load_naming_settings()
         self._update_output_dir_preview()
 
-        # --- 진행 상황 ---
-        # 프로그레스 바
+        # 설정 컨테이너를 config_layout에 추가
+        config_layout.addWidget(self.config_container)
+        config_layout.addStretch()
+
+        # 스크롤 영역으로 감싸기
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(config_widget)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.splitter.addWidget(scroll_area)
+
+        # ========== 하단: 진행 상황 영역 ==========
+        progress_widget = QWidget()
+        progress_main_layout = QVBoxLayout(progress_widget)
+        progress_main_layout.setContentsMargins(0, 0, 0, 0)
+        self.splitter.addWidget(progress_widget)
+
+        # --- 진행 상황 (개선된 UI) ---
+        self.progress_group = QGroupBox("진행 상황")
+        self.progress_group.setVisible(False)
+        progress_layout = QVBoxLayout(self.progress_group)
+
+        # 상세 진행률 표시 영역
+        detail_layout = QHBoxLayout()
+
+        # 왼쪽: 진행률 정보
+        left_detail = QVBoxLayout()
+        self.label_percent = QLabel("📊 진행률: 0%")
+        self.label_percent.setStyleSheet("font-weight: bold; font-size: 12pt;")
+        self.label_data = QLabel("📦 데이터: 0 MB / 0 MB")
+        self.label_speed = QLabel("⚡ 속도: 0 MB/s")
+        self.label_tables = QLabel("📋 테이블: 0 / 0 완료")
+        left_detail.addWidget(self.label_percent)
+        left_detail.addWidget(self.label_data)
+        left_detail.addWidget(self.label_speed)
+        left_detail.addWidget(self.label_tables)
+
+        detail_layout.addLayout(left_detail)
+        detail_layout.addStretch()
+        progress_layout.addLayout(detail_layout)
+
+        # 프로그레스 바 (퍼센트 기준)
         self.progress_bar = QProgressBar()
-        self.progress_bar.setVisible(False)
         self.progress_bar.setTextVisible(True)
-        self.progress_bar.setFormat("%v / %m 테이블 (%p%)")
-        layout.addWidget(self.progress_bar)
+        self.progress_bar.setFormat("%p%")
+        self.progress_bar.setMinimum(0)
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(0)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                text-align: center;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #27ae60;
+                border-radius: 3px;
+            }
+        """)
+        progress_layout.addWidget(self.progress_bar)
 
-        # 상태 레이블
-        self.label_status = QLabel()
-        self.label_status.setVisible(False)
-        self.label_status.setStyleSheet("color: #2980b9; font-weight: bold;")
-        layout.addWidget(self.label_status)
+        # 상태 라벨
+        self.label_status = QLabel("준비 중...")
+        self.label_status.setStyleSheet("color: #27ae60; font-weight: bold;")
+        progress_layout.addWidget(self.label_status)
 
-        # 로그
+        progress_main_layout.addWidget(self.progress_group)
+
+        # --- 테이블 상태 목록 (GitHub Actions 스타일) ---
+        self.table_status_group = QGroupBox("테이블 Export 상태")
+        self.table_status_group.setVisible(False)
+        table_status_layout = QVBoxLayout(self.table_status_group)
+
+        self.table_list = QListWidget()
+        self.table_list.setMinimumHeight(150)
+        self.table_list.setMaximumHeight(200)
+        self.table_list.setStyleSheet("""
+            QListWidget {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                background-color: #fafafa;
+            }
+            QListWidget::item {
+                padding: 4px 8px;
+                border-bottom: 1px solid #ecf0f1;
+            }
+        """)
+        table_status_layout.addWidget(self.table_list)
+        progress_main_layout.addWidget(self.table_status_group)
+
+        # 테이블 아이템 매핑 (테이블명 -> QListWidgetItem)
+        self.table_items = {}
+
+        # --- 실행 로그 (터미널 스타일) ---
+        self.log_group = QGroupBox("실행 로그")
+        self.log_group.setVisible(False)
+        log_layout = QVBoxLayout(self.log_group)
+
         self.txt_log = QListWidget()
+        self.txt_log.setMinimumHeight(80)
         self.txt_log.setMaximumHeight(120)
-        self.txt_log.setVisible(False)
-        layout.addWidget(self.txt_log)
+        self.txt_log.setStyleSheet("""
+            QListWidget {
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 9pt;
+                background-color: #2c3e50;
+                color: #ecf0f1;
+                border: 1px solid #34495e;
+                border-radius: 4px;
+            }
+            QListWidget::item {
+                padding: 2px 4px;
+            }
+        """)
+        log_layout.addWidget(self.txt_log)
+        progress_main_layout.addWidget(self.log_group)
+
+        # Splitter 초기 비율 설정 (설정:진행 = 60:40)
+        self.splitter.setStretchFactor(0, 60)
+        self.splitter.setStretchFactor(1, 40)
 
         # --- 버튼 ---
         button_layout = QHBoxLayout()
@@ -551,6 +690,38 @@ class MySQLShellExportDialog(QDialog):
         button_layout.addWidget(self.btn_export)
         button_layout.addWidget(btn_cancel)
         layout.addLayout(button_layout)
+
+    def toggle_config_section(self):
+        """설정 섹션 접기/펼치기"""
+        is_visible = self.config_container.isVisible()
+
+        if is_visible:
+            # 접기
+            self.config_container.setVisible(False)
+            self.btn_collapse.setText("🔼 설정 펼치기")
+        else:
+            # 펼치기
+            self.config_container.setVisible(True)
+            self.btn_collapse.setText("🔽 설정 접기")
+
+    def collapse_config_section(self):
+        """설정 섹션을 접음 (Export 시작 시)"""
+        self.config_container.setVisible(False)
+        self.btn_collapse.setText("🔼 설정 펼치기")
+        self.btn_collapse.setVisible(True)
+
+        # Splitter 비율 조정 (설정:진행 = 10:90)
+        total_height = self.splitter.height()
+        self.splitter.setSizes([int(total_height * 0.1), int(total_height * 0.9)])
+
+    def expand_config_section(self):
+        """설정 섹션을 펼침 (Export 완료 시)"""
+        self.config_container.setVisible(True)
+        self.btn_collapse.setText("🔽 설정 접기")
+
+        # Splitter 비율 복원 (설정:진행 = 60:40)
+        total_height = self.splitter.height()
+        self.splitter.setSizes([int(total_height * 0.6), int(total_height * 0.4)])
 
     def _get_base_output_dir(self) -> str:
         """기본 출력 디렉토리 (부모 폴더)"""
@@ -810,14 +981,25 @@ class MySQLShellExportDialog(QDialog):
 
         # UI 상태 변경 - 모든 입력 비활성화
         self.set_ui_enabled(False)
-        self.txt_log.clear()
-        self.txt_log.setVisible(True)
 
-        # 프로그레스 바 초기화 및 표시
-        self.progress_bar.setVisible(True)
+        # 설정 섹션 접기
+        self.collapse_config_section()
+
+        # 진행 상황 UI 표시
+        self.progress_group.setVisible(True)
+        self.table_status_group.setVisible(True)
+        self.log_group.setVisible(True)
+        self.txt_log.clear()
+        self.table_list.clear()
+        self.table_items.clear()
+
+        # 프로그레스 바 초기화
         self.progress_bar.setValue(0)
-        self.progress_bar.setMaximum(0)  # 초기에는 테이블 수 미정 (indeterminate)
-        self.label_status.setVisible(True)
+        self.progress_bar.setMaximum(100)
+        self.label_percent.setText("📊 진행률: 0%")
+        self.label_data.setText("📦 데이터: 0 MB / 0 MB")
+        self.label_speed.setText("⚡ 속도: 0 MB/s")
+        self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Export 준비 중...")
 
         # MySQL Shell 설정
@@ -848,8 +1030,12 @@ class MySQLShellExportDialog(QDialog):
                 include_fk_parents=self.chk_include_fk.isChecked()
             )
 
+        # 시그널 연결
         self.worker.progress.connect(self.on_progress)
         self.worker.table_progress.connect(self.on_table_progress)
+        self.worker.detail_progress.connect(self.on_detail_progress)
+        self.worker.table_status.connect(self.on_table_status)
+        self.worker.raw_output.connect(self.on_raw_output)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
 
@@ -890,12 +1076,17 @@ class MySQLShellExportDialog(QDialog):
 
         # UI 상태 복구
         self.set_ui_enabled(True)
-        self.progress_bar.setVisible(False)
-        self.label_status.setVisible(False)
         self.btn_save_log.setEnabled(True)  # 로그 저장 버튼 활성화
+
+        # 설정 섹션 펼치기
+        self.expand_config_section()
 
         if success:
             self.txt_log.addItem(f"✅ 완료: {message}")
+            # 최종 진행률 100% 표시
+            self.progress_bar.setValue(100)
+            self.label_percent.setText("📊 진행률: 100%")
+            self.label_status.setText("✅ Export 완료")
             QMessageBox.information(
                 self, "Export 완료",
                 f"✅ Export가 완료되었습니다.\n\n폴더: {self.input_output_dir.text()}"
@@ -906,6 +1097,65 @@ class MySQLShellExportDialog(QDialog):
 
             # GitHub 이슈 자동 보고
             self._report_error_to_github("export", message)
+
+    def on_detail_progress(self, info: dict):
+        """상세 진행 정보 업데이트"""
+        percent = info.get('percent', 0)
+        mb_done = info.get('mb_done', 0)
+        mb_total = info.get('mb_total', 0)
+        speed = info.get('speed', '0 B/s')
+
+        self.progress_bar.setValue(percent)
+        self.label_percent.setText(f"📊 진행률: {percent}%")
+
+        # Export는 데이터 크기를 표시하지 않음 (rows만 표시되므로)
+        if mb_done == 0 and mb_total == 0:
+            self.label_data.setText(f"📦 데이터: Export 진행 중...")
+        else:
+            self.label_data.setText(f"📦 데이터: {mb_done:.2f} MB / {mb_total:.2f} MB")
+
+        self.label_speed.setText(f"⚡ 속도: {speed}")
+
+    def on_table_status(self, table_name: str, status: str, message: str):
+        """테이블 상태 업데이트"""
+        # 상태별 아이콘 및 스타일
+        status_icons = {
+            'pending': '⏳',
+            'loading': '🔄',
+            'done': '✅',
+            'error': '❌'
+        }
+
+        icon = status_icons.get(status, '❓')
+
+        # 기존 아이템이 있으면 업데이트, 없으면 새로 생성
+        if table_name in self.table_items:
+            item = self.table_items[table_name]
+            display_text = f"{icon} {table_name}"
+            if status == 'error' and message:
+                display_text += f" - {message[:50]}..."
+            item.setText(display_text)
+        else:
+            # 새 아이템 생성
+            display_text = f"{icon} {table_name}"
+            if status == 'error' and message:
+                display_text += f" - {message[:50]}..."
+            item = QListWidgetItem(display_text)
+            self.table_list.addItem(item)
+            self.table_items[table_name] = item
+
+        # 로그에 테이블 상태 변경 기록 (done/error만)
+        if status in ('done', 'error'):
+            status_text = '완료' if status == 'done' else f'오류: {message}'
+            self._add_log(f"테이블 [{table_name}] {status_text}")
+
+    def on_raw_output(self, line: str):
+        """mysqlsh 실시간 출력 처리 (로그에 추가)"""
+        # 너무 많은 로그 방지 (최대 500줄)
+        if self.txt_log.count() > 500:
+            self.txt_log.takeItem(0)
+        self.txt_log.addItem(line)
+        self.txt_log.scrollToBottom()
 
     def _report_error_to_github(self, error_type: str, error_message: str):
         """GitHub 이슈 자동 보고"""
@@ -1032,11 +1282,44 @@ class MySQLShellImportDialog(QDialog):
         self.import_end_time: Optional[datetime] = None
         self.import_success: Optional[bool] = None
 
+        # 메타데이터 정보
+        self.dump_metadata: Optional[dict] = None
+
         self.init_ui()
         self.load_schemas()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
+
+        # QSplitter로 상하 분할 (설정 영역 / 진행 상황 영역)
+        self.splitter = QSplitter(Qt.Orientation.Vertical)
+        layout.addWidget(self.splitter)
+
+        # ========== 상단: 설정 영역 (스크롤 가능) ==========
+        config_widget = QWidget()
+        config_layout = QVBoxLayout(config_widget)
+        config_layout.setContentsMargins(0, 0, 0, 0)
+
+        # 접기/펼치기 버튼 추가
+        collapse_layout = QHBoxLayout()
+        self.btn_collapse = QPushButton("🔽 설정 접기")
+        self.btn_collapse.setStyleSheet("""
+            QPushButton {
+                background-color: #ecf0f1; color: #2c3e50;
+                padding: 4px 12px; border-radius: 4px; border: 1px solid #bdc3c7;
+            }
+            QPushButton:hover { background-color: #d5dbdb; }
+        """)
+        self.btn_collapse.clicked.connect(self.toggle_config_section)
+        self.btn_collapse.setVisible(False)  # 초기에는 숨김
+        collapse_layout.addWidget(self.btn_collapse)
+        collapse_layout.addStretch()
+        config_layout.addLayout(collapse_layout)
+
+        # 설정 내용을 담을 컨테이너
+        self.config_container = QWidget()
+        container_layout = QVBoxLayout(self.config_container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
 
         # --- mysqlsh 상태 ---
         status_group = QGroupBox("MySQL Shell 상태")
@@ -1050,7 +1333,7 @@ class MySQLShellImportDialog(QDialog):
             status_label.setStyleSheet("color: red;")
 
         status_layout.addWidget(status_label)
-        layout.addWidget(status_group)
+        container_layout.addWidget(status_group)
 
         # --- 입력 폴더 선택 ---
         input_group = QGroupBox("Dump 폴더")
@@ -1071,7 +1354,7 @@ class MySQLShellImportDialog(QDialog):
 
         input_layout.addWidget(self.input_dir)
         input_layout.addWidget(btn_browse)
-        layout.addWidget(input_group)
+        container_layout.addWidget(input_group)
 
         # --- 대상 스키마 ---
         schema_group = QGroupBox("대상 스키마")
@@ -1091,7 +1374,7 @@ class MySQLShellImportDialog(QDialog):
         target_layout.addStretch()
         schema_layout.addLayout(target_layout)
 
-        layout.addWidget(schema_group)
+        container_layout.addWidget(schema_group)
 
         # --- Import 옵션 ---
         option_group = QGroupBox("Import 옵션")
@@ -1102,7 +1385,7 @@ class MySQLShellImportDialog(QDialog):
         self.spin_threads.setValue(4)
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
-        layout.addWidget(option_group)
+        container_layout.addWidget(option_group)
 
         # --- 타임존 설정 ---
         tz_group = QGroupBox("타임존 설정")
@@ -1133,8 +1416,8 @@ class MySQLShellImportDialog(QDialog):
         tz_layout.addWidget(self.radio_tz_kst)
         tz_layout.addWidget(self.radio_tz_utc)
         tz_layout.addWidget(self.radio_tz_none)
-        
-        layout.addWidget(tz_group)
+
+        container_layout.addWidget(tz_group)
 
         # --- Import 모드 선택 ---
         mode_group = QGroupBox("Import 모드 선택")
@@ -1174,7 +1457,24 @@ class MySQLShellImportDialog(QDialog):
         self.btn_import_mode.addButton(self.radio_replace)
         self.btn_import_mode.addButton(self.radio_recreate)
 
-        layout.addWidget(mode_group)
+        container_layout.addWidget(mode_group)
+
+        # 설정 컨테이너를 config_layout에 추가
+        config_layout.addWidget(self.config_container)
+        config_layout.addStretch()
+
+        # 스크롤 영역으로 감싸기
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(config_widget)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.splitter.addWidget(scroll_area)
+
+        # ========== 하단: 진행 상황 영역 ==========
+        progress_widget = QWidget()
+        progress_main_layout = QVBoxLayout(progress_widget)
+        progress_main_layout.setContentsMargins(0, 0, 0, 0)
+        self.splitter.addWidget(progress_widget)
 
         # --- 진행 상황 섹션 (확장된 UI) ---
         self.progress_group = QGroupBox("진행 상황")
@@ -1226,7 +1526,7 @@ class MySQLShellImportDialog(QDialog):
         self.label_status.setStyleSheet("color: #27ae60; font-weight: bold;")
         progress_layout.addWidget(self.label_status)
 
-        layout.addWidget(self.progress_group)
+        progress_main_layout.addWidget(self.progress_group)
 
         # --- 테이블 상태 목록 (GitHub Actions 스타일) ---
         self.table_status_group = QGroupBox("테이블 Import 상태")
@@ -1282,7 +1582,7 @@ class MySQLShellImportDialog(QDialog):
         retry_layout.addStretch()
         table_status_layout.addLayout(retry_layout)
 
-        layout.addWidget(self.table_status_group)
+        progress_main_layout.addWidget(self.table_status_group)
 
         # --- 실행 로그 ---
         self.log_group = QGroupBox("실행 로그")
@@ -1307,7 +1607,11 @@ class MySQLShellImportDialog(QDialog):
         """)
         log_layout.addWidget(self.txt_log)
 
-        layout.addWidget(self.log_group)
+        progress_main_layout.addWidget(self.log_group)
+
+        # Splitter 초기 비율 설정 (설정:진행 = 60:40)
+        self.splitter.setStretchFactor(0, 60)
+        self.splitter.setStretchFactor(1, 40)
 
         # --- 버튼 ---
         button_layout = QHBoxLayout()
@@ -1351,6 +1655,38 @@ class MySQLShellImportDialog(QDialog):
         button_layout.addWidget(self.btn_import)
         button_layout.addWidget(btn_cancel)
         layout.addLayout(button_layout)
+
+    def toggle_config_section(self):
+        """설정 섹션 접기/펼치기"""
+        is_visible = self.config_container.isVisible()
+
+        if is_visible:
+            # 접기
+            self.config_container.setVisible(False)
+            self.btn_collapse.setText("🔼 설정 펼치기")
+        else:
+            # 펼치기
+            self.config_container.setVisible(True)
+            self.btn_collapse.setText("🔽 설정 접기")
+
+    def collapse_config_section(self):
+        """설정 섹션을 접음 (Import 시작 시)"""
+        self.config_container.setVisible(False)
+        self.btn_collapse.setText("🔼 설정 펼치기")
+        self.btn_collapse.setVisible(True)
+
+        # Splitter 비율 조정 (설정:진행 = 10:90)
+        total_height = self.splitter.height()
+        self.splitter.setSizes([int(total_height * 0.1), int(total_height * 0.9)])
+
+    def expand_config_section(self):
+        """설정 섹션을 펼침 (Import 완료 시)"""
+        self.config_container.setVisible(True)
+        self.btn_collapse.setText("🔽 설정 접기")
+
+        # Splitter 비율 복원 (설정:진행 = 60:40)
+        total_height = self.splitter.height()
+        self.splitter.setSizes([int(total_height * 0.6), int(total_height * 0.4)])
 
     def load_schemas(self):
         self.combo_target_schema.clear()
@@ -1437,6 +1773,9 @@ class MySQLShellImportDialog(QDialog):
         self.btn_retry.setVisible(False)
         self.btn_select_failed.setVisible(False)
         self.btn_save_log.setEnabled(False)
+
+        # 설정 섹션 접기
+        self.collapse_config_section()
 
         # 로그 및 진행 상황 UI 표시
         self.progress_group.setVisible(True)
@@ -1544,6 +1883,7 @@ class MySQLShellImportDialog(QDialog):
         self.worker.raw_output.connect(self.on_raw_output)
         self.worker.import_finished.connect(self.on_import_finished)
         self.worker.finished.connect(self.on_finished)
+        self.worker.metadata_analyzed.connect(self.on_metadata_analyzed)
         self.worker.start()
 
     def on_progress(self, msg: str):
@@ -1572,7 +1912,7 @@ class MySQLShellImportDialog(QDialog):
         self.label_speed.setText(f"⚡ 속도: {rows_sec:,} rows/s | {speed}")
 
     def on_table_status(self, table_name: str, status: str, message: str):
-        """테이블 상태 업데이트 (GitHub Actions 스타일)"""
+        """테이블 상태 업데이트 (메타데이터 정보 포함)"""
         # 상태별 아이콘 및 스타일
         status_icons = {
             'pending': '⏳',
@@ -1590,16 +1930,35 @@ class MySQLShellImportDialog(QDialog):
         icon = status_icons.get(status, '❓')
         color = status_colors.get(status, '#7f8c8d')
 
+        # 메타데이터에서 테이블 정보 가져오기
+        size_info = ""
+        if self.dump_metadata and 'table_sizes' in self.dump_metadata:
+            size_bytes = self.dump_metadata['table_sizes'].get(table_name, 0)
+            chunk_count = self.dump_metadata['chunk_counts'].get(table_name, 1)
+
+            if size_bytes > 0:
+                size_mb = size_bytes / (1024 * 1024)
+                if size_mb < 1024:
+                    size_str = f"{size_mb:.1f} MB"
+                else:
+                    size_str = f"{size_mb / 1024:.2f} GB"
+
+                # 크기 정보와 chunk 수 표시 (chunk가 2개 이상인 경우만)
+                if chunk_count > 1:
+                    size_info = f" ({size_str}, {chunk_count} chunks)"
+                else:
+                    size_info = f" ({size_str})"
+
         # 기존 아이템이 있으면 업데이트, 없으면 새로 생성
         if table_name in self.table_items:
             item = self.table_items[table_name]
-            display_text = f"{icon} {table_name}"
+            display_text = f"{icon} {table_name}{size_info}"
             if status == 'error' and message:
                 display_text += f" - {message[:50]}..."
             item.setText(display_text)
             item.setForeground(Qt.GlobalColor.black)
         else:
-            display_text = f"{icon} {table_name}"
+            display_text = f"{icon} {table_name}{size_info}"
             if status == 'error' and message:
                 display_text += f" - {message[:50]}..."
             item = QListWidgetItem(display_text)
@@ -1623,6 +1982,44 @@ class MySQLShellImportDialog(QDialog):
         self.txt_log.scrollToBottom()
         # raw output도 로그에 기록
         self._add_log(f"[mysqlsh] {line}")
+
+    def on_metadata_analyzed(self, metadata: dict):
+        """
+        Dump 메타데이터 분석 결과 처리
+
+        메타데이터 구조:
+        {
+            'chunk_counts': {'table_name': chunk_count, ...},
+            'table_sizes': {'table_name': bytes, ...},
+            'total_bytes': int,
+            'schema': str
+        }
+        """
+        self.dump_metadata = metadata
+
+        # 대용량 테이블 정보를 테이블 상태 목록에 표시
+        if metadata and 'table_sizes' in metadata:
+            large_tables = [
+                (name, size, metadata['chunk_counts'].get(name, 1))
+                for name, size in metadata['table_sizes'].items()
+                if size > 50_000_000  # 50MB 이상
+            ]
+            large_tables.sort(key=lambda x: -x[1])
+
+            if large_tables:
+                # 상위 대용량 테이블을 미리 표시 (pending 상태로)
+                for table_name, size_bytes, chunk_count in large_tables[:10]:
+                    size_mb = size_bytes / (1024 * 1024)
+                    if size_mb < 1024:
+                        size_str = f"{size_mb:.1f} MB"
+                    else:
+                        size_str = f"{size_mb / 1024:.2f} GB"
+
+                    display = f"⏳ {table_name} ({size_str}, {chunk_count} chunks)"
+                    item = QListWidgetItem(display)
+                    item.setForeground(Qt.GlobalColor.gray)
+                    self.table_list.addItem(item)
+                    self.table_items[table_name] = item
 
     def on_import_finished(self, success: bool, message: str, results: dict):
         """Import 완료 처리 (결과 저장 및 재시도 버튼 표시)"""
