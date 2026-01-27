@@ -65,7 +65,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 ; 메인 실행 파일 (.iss 파일 기준 상대 경로)
-Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion closeonexit restartreplace
+Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 
 ; 라이선스 파일 포함 (선택적)
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
