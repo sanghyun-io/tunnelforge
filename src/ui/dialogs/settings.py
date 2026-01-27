@@ -131,6 +131,22 @@ class SettingsDialog(QDialog):
                 "✅ GitHub App이 설정되어 있습니다."
             )
             desc_label.setStyleSheet("color: #27ae60; font-size: 11px; margin-left: 20px;")
+
+            # 연결 테스트 버튼
+            test_layout = QHBoxLayout()
+            btn_test = QPushButton("연결 테스트")
+            btn_test.setStyleSheet("""
+                QPushButton {
+                    background-color: #95a5a6; color: white;
+                    padding: 4px 12px; border-radius: 4px; border: none;
+                    font-size: 11px;
+                }
+                QPushButton:hover { background-color: #7f8c8d; }
+            """)
+            btn_test.clicked.connect(self._test_github_connection)
+            test_layout.addWidget(btn_test)
+            test_layout.addStretch()
+            github_layout.addLayout(test_layout)
         else:
             desc_label = QLabel(
                 "⚠️ GitHub App이 설정되지 않았습니다.\n"
@@ -207,3 +223,52 @@ class SettingsDialog(QDialog):
         if not self._github_app_configured:
             auto_report = False
         self.chk_auto_report.setChecked(auto_report)
+
+    def _test_github_connection(self):
+        """GitHub API 연결 테스트"""
+        try:
+            from src.core.github_app_auth import get_github_app_auth
+
+            github_app = get_github_app_auth()
+            if not github_app:
+                QMessageBox.warning(
+                    self,
+                    "연결 테스트",
+                    "GitHub App 인스턴스를 생성할 수 없습니다.\n환경변수 설정을 확인하세요."
+                )
+                return
+
+            # 라이브러리 확인
+            available, msg = github_app.check_available()
+            if not available:
+                QMessageBox.warning(self, "연결 테스트", msg)
+                return
+
+            # 연결 테스트 실행
+            success, message = github_app.test_connection()
+
+            if success:
+                QMessageBox.information(
+                    self,
+                    "연결 테스트 성공",
+                    message
+                )
+            else:
+                QMessageBox.warning(
+                    self,
+                    "연결 테스트 실패",
+                    message
+                )
+
+        except ImportError as e:
+            QMessageBox.critical(
+                self,
+                "오류",
+                f"모듈을 불러올 수 없습니다: {str(e)}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "오류",
+                f"연결 테스트 중 오류 발생:\n{str(e)}"
+            )
