@@ -1,6 +1,17 @@
-<#
+﻿<#
+#############################################################################
+# ⚠️  DO NOT DELETE - GitHub Actions 전용 스크립트
+#
+# 이 파일은 .github/workflows/release.yml에서 사용됩니다.
+# Windows Installer 빌드를 위해 반드시 필요합니다.
+#
+# 로컬에서 릴리스하려면 대신 다음 스크립트를 사용하세요:
+#   python scripts/smart_release.py
+#   ./scripts/smart-release.sh
+#############################################################################
+
 .SYNOPSIS
-    TunnelDB Manager Windows Installer를 로컬에서 빌드합니다.
+    TunnelDB Manager Windows Installer를 빌드합니다. (GitHub Actions 전용)
 
 .DESCRIPTION
     이 스크립트는 PyInstaller와 Inno Setup을 사용하여 Windows 설치 프로그램을 생성합니다.

@@ -26,7 +26,28 @@
       "WebFetch(domain:github.com)",
       "WebFetch(domain:productionresultssa4.blob.core.windows.net)",
       "WebFetch(domain:productionresultssa10.blob.core.windows.net)",
-      "Bash(gh run list:*)"
+      "Bash(gh run list:*)",
+      "Skill(release)",
+      "Bash(powershell.exe -Command \"[System.IO.File]::ReadAllBytes\\(''scripts/smart-release.ps1''\\)[0..2]\")",
+      "Bash(powershell.exe -Command \"$content = Get-Content ''scripts/smart-release.ps1'' -Raw -Encoding UTF8; [System.IO.File]::WriteAllText\\(''scripts/smart-release.ps1'', $content, [System.Text.UTF8Encoding]::new\\($true\\)\\)\")",
+      "Bash(powershell.exe -NoProfile -Command \"& { $content = [System.IO.File]::ReadAllText\\(''scripts/smart-release.ps1'', [System.Text.Encoding]::UTF8\\); $utf8Bom = [System.Text.UTF8Encoding]::new\\($true\\); [System.IO.File]::WriteAllText\\(''scripts/smart-release.ps1'', $content, $utf8Bom\\) }\")",
+      "Bash(powershell.exe -ExecutionPolicy Bypass -File scripts/fix-encoding.ps1)",
+      "Bash(powershell.exe -ExecutionPolicy Bypass -File scripts/smart-release.ps1 -DryRun)",
+      "Bash(for f in scripts/*.ps1)",
+      "Bash(do echo -n \"$f: \")",
+      "Bash(powershell.exe -Command \"[System.IO.File]::ReadAllBytes\\(''$f''\\)[0..2] -join '',''\")",
+      "Bash(do)",
+      "Bash(if grep -P '[가-힣]' \"$f\")",
+      "Bash(then)",
+      "Bash(echo:*)",
+      "Bash(else)",
+      "Bash(fi)",
+      "Bash(powershell.exe -ExecutionPolicy Bypass -File scripts/add-bom.ps1)",
+      "Bash(./scripts/smart-release.sh:*)",
+      "Bash(source scripts/smart-release.sh:*)",
+      "Bash(.venvScriptsactivate)",
+      "Bash(pip index:*)",
+      "WebFetch(domain:pypi.org)"
     ]
   }
 }

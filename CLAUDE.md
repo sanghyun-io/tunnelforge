@@ -35,19 +35,15 @@ python -m py_compile src/ui/workers/*.py
 
 # Version Management & Release
 # 🚀 Smart Release (권장) - GitHub와 비교하여 자동 버전 관리
-/release                                               # GitHub 버전과 비교하여 스마트 릴리스
-.\scripts\smart-release.ps1                            # PowerShell 직접 실행
-.\scripts\smart-release.ps1 -DryRun                    # 미리보기
+/release                                    # Claude Code에서 스마트 릴리스
+python scripts/smart_release.py             # Python 직접 실행 (권장)
+python scripts/smart_release.py --dry-run   # 미리보기
+./scripts/smart-release.sh                  # Bash 버전 (Python 없을 때)
+./scripts/smart-release.sh --dry-run        # Bash 미리보기
 
-# Legacy - 수동 타입 지정 방식 (기존 워크플로우)
-.\scripts\bump-version.ps1 -Type patch -AutoRelease   # 패치 버전 증가 + 자동 릴리스
-.\scripts\bump-version.ps1 -Type minor -AutoRelease   # 마이너 버전 증가 + 자동 릴리스
-.\scripts\bump-version.ps1 -Type major -AutoRelease   # 메이저 버전 증가 + 자동 릴리스
-.\scripts\bump-version.ps1 -Type patch -DryRun        # 미리보기
-
-# Release (수동 버전 관리 시 - 태그만 생성)
-.\scripts\create-release.ps1                           # PowerShell
-.\scripts\create-release.ps1 -DryRun                   # 미리보기
+# Legacy - PowerShell 버전 (인코딩 문제 가능성 있음)
+.\scripts\smart-release.ps1                 # PowerShell (UTF-8 BOM 필요)
+.\scripts\bump-version.ps1 -Type patch -AutoRelease   # 수동 타입 지정
 ```
 
 ## Architecture
@@ -176,70 +172,31 @@ GitHub Actions (automatic):
 - Attaches installer to release
 ```
 
-**레거시 - 수동 타입 지정 방식:**
+### Scripts 구조
 
-```bash
-# 사용자가 직접 bump 타입 결정 (GitHub 확인 없음)
-.\scripts\bump-version.ps1 -Type patch -AutoRelease
-
-This does:
-1. Reads current version from src/version.py
-2. Increments version (patch/minor/major) - 사용자 지정
-3. Updates src/version.py
-4. Commits changes
-5. Pushes to GitHub (main branch)
-6. Creates and pushes Git tag
-7. Triggers GitHub Actions
-
-단점:
-❌ GitHub 버전 확인 안함
-❌ 중복 릴리스 가능
-❌ 수동 버전 관리 시 릴리스 누락 가능
+```
+scripts/
+├── smart_release.py     # 🚀 스마트 릴리스 (Python, 권장)
+├── smart-release.sh     # 🚀 스마트 릴리스 (Bash, Python 없을 때)
+└── build-installer.ps1  # ⚠️ GitHub Actions 전용 (삭제 금지!)
 ```
 
-**수동 워크플로우:**
+### Script 상세
 
-```bash
-1. Update src/version.py manually
-   __version__ = "1.0.1"  →  "1.0.2"
-
-2. Commit & push
-   git add .
-   git commit -m "Bump version to 1.0.2"
-   git push origin main
-
-3. Create release tag
-   .\scripts\create-release.ps1
-
-4. GitHub Actions runs automatically
-```
-
-### Build Scripts
-
-- `scripts/smart-release.ps1`: **🚀 Smart Release (권장)**
+- **`scripts/smart_release.py`** - 🚀 Smart Release (권장)
   - GitHub API로 최신 릴리스 확인
   - 로컬 버전과 비교하여 적절한 액션 제안
-  - 동일 버전: 인터랙티브 선택 (patch/minor/major)
-  - 로컬이 높음: 릴리스 확인 후 태그만 생성
-  - 원격이 높음: 경고 출력
   - `/release` 스킬로 실행 가능
-  - Use `-DryRun` for preview
+  - `--dry-run` 옵션으로 미리보기
 
-- `scripts/bump-version.ps1`: Version management (레거시)
-  - Automatically increments version (major/minor/patch)
-  - Updates `src/version.py`
-  - Optional `-AutoRelease` for one-command release
-  - GitHub 버전 확인 없음
-  - Use `-DryRun` for preview
+- **`scripts/smart-release.sh`** - Bash 버전
+  - Python이 없을 때 대체용
+  - 동일한 기능 제공
 
-- `scripts/build-installer.ps1`: Local Windows Installer build
-  - Syncs version from `src/version.py` to `installer/TunnelDBManager.iss`
-  - Runs PyInstaller → Inno Setup
-
-- `scripts/create-release.ps1`: Release tag creation (manual workflow)
-  - Reads version, creates tag, pushes to GitHub
-  - 버전 업데이트는 하지 않음 (태그만 생성)
-  - Use `-DryRun` for preview without execution
+- **`scripts/build-installer.ps1`** - ⚠️ GitHub Actions 전용
+  - `.github/workflows/release.yml`에서 사용
+  - Windows Installer 빌드용 (PyInstaller + Inno Setup)
+  - **로컬에서 사용하지 않음, 삭제 금지!**
 
 ### GitHub Actions
 
