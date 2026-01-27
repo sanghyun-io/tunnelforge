@@ -2,13 +2,30 @@
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidget, QTableWidgetItem, QPushButton,
                              QLabel, QMessageBox, QHeaderView, QSystemTrayIcon, QMenu)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 
 from src.ui.dialogs.tunnel_config import TunnelConfigDialog
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
 from src.ui.dialogs.db_dialogs import MySQLShellWizard
 from src.ui.dialogs.migration_dialogs import MigrationWizard
+
+
+class StartupUpdateCheckerThread(QThread):
+    """앱 시작 시 업데이트 확인 백그라운드 스레드"""
+    update_available = pyqtSignal(str, str)  # latest_version, download_url
+
+    def run(self):
+        try:
+            from src.core.update_checker import UpdateChecker
+            checker = UpdateChecker()
+            needs_update, latest_version, download_url, error_msg = checker.check_update()
+
+            if needs_update and latest_version and download_url:
+                self.update_available.emit(latest_version, download_url)
+        except Exception:
+            # 업데이트 확인 실패는 조용히 무시 (앱 실행에 영향 없음)
+            pass
 
 
 class TunnelManagerUI(QMainWindow):
@@ -22,8 +39,11 @@ class TunnelManagerUI(QMainWindow):
         self.config_data = self.config_mgr.load_config()
         self.tunnels = self.config_data.get('tunnels', [])
 
+        self._update_checker_thread = None
+
         self.init_ui()
         self.init_tray()
+        self._check_update_on_startup()
         print("✅ UI 초기화 완료")
 
     def init_ui(self):
@@ -397,3 +417,24 @@ class TunnelManagerUI(QMainWindow):
         # 모든 창 닫고 종료
         import sys
         sys.exit(0)
+
+    def _check_update_on_startup(self):
+        """앱 시작 시 업데이트 확인 (백그라운드)"""
+        # 자동 업데이트 확인 설정 확인
+        if not self.config_mgr.get_app_setting('auto_update_check', True):
+            return
+
+        # 백그라운드 스레드에서 확인
+        self._update_checker_thread = StartupUpdateCheckerThread()
+        self._update_checker_thread.update_available.connect(self._on_startup_update_available)
+        self._update_checker_thread.start()
+
+    def _on_startup_update_available(self, latest_version: str, download_url: str):
+        """시작 시 업데이트 발견 시 트레이 알림"""
+        # 트레이 알림
+        self.tray_icon.showMessage(
+            "업데이트 사용 가능",
+            f"새로운 버전 {latest_version}이 사용 가능합니다.\n설정에서 다운로드할 수 있습니다.",
+            QSystemTrayIcon.MessageIcon.Information,
+            5000  # 5초 동안 표시
+        )

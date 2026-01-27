@@ -1,7 +1,12 @@
 """설정 관련 다이얼로그"""
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
-                             QButtonGroup, QGroupBox, QMessageBox)
+                             QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
+                             QWidget, QTextBrowser)
+from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QDesktopServices, QCursor
+from PyQt6.QtCore import QUrl
+from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 
 
 class CloseConfirmDialog(QDialog):
@@ -71,17 +76,70 @@ class CloseConfirmDialog(QDialog):
         return action, remember
 
 
+class UpdateCheckerThread(QThread):
+    """업데이트 확인 백그라운드 스레드"""
+    update_checked = pyqtSignal(bool, str, str, str)  # needs_update, latest_version, download_url, error_msg
+
+    def run(self):
+        try:
+            from src.core.update_checker import UpdateChecker
+            checker = UpdateChecker()
+            needs_update, latest_version, download_url, error_msg = checker.check_update()
+            self.update_checked.emit(needs_update, latest_version or "", download_url or "", error_msg or "")
+        except Exception as e:
+            self.update_checked.emit(False, "", "", f"업데이트 확인 실패: {str(e)}")
+
+
 class SettingsDialog(QDialog):
     """앱 설정 다이얼로그"""
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_mgr = config_manager
         self.setWindowTitle("설정")
-        self.setMinimumSize(550, 320)
+        self.setMinimumSize(600, 420)
+        self._update_checker_thread = None
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
+
+        # 탭 위젯 생성
+        tabs = QTabWidget()
+        tabs.addTab(self._create_general_tab(), "일반")
+        tabs.addTab(self._create_about_tab(), "정보")
+        layout.addWidget(tabs)
+
+        # 버튼
+        button_layout = QHBoxLayout()
+        btn_save = QPushButton("저장")
+        btn_save.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_save.clicked.connect(self.save_settings)
+
+        btn_cancel = QPushButton("취소")
+        btn_cancel.setStyleSheet("""
+            QPushButton {
+                background-color: #ecf0f1; color: #2c3e50;
+                padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
+            }
+            QPushButton:hover { background-color: #d5dbdb; }
+        """)
+        btn_cancel.clicked.connect(self.reject)
+
+        button_layout.addStretch()
+        button_layout.addWidget(btn_save)
+        button_layout.addWidget(btn_cancel)
+        layout.addLayout(button_layout)
+
+    def _create_general_tab(self) -> QWidget:
+        """일반 설정 탭 생성"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
 
         # 종료 동작 설정 그룹
         group_box = QGroupBox("창 닫기(X) 버튼 동작")
@@ -167,32 +225,81 @@ class SettingsDialog(QDialog):
 
         layout.addStretch()
 
-        # 버튼
-        button_layout = QHBoxLayout()
-        btn_save = QPushButton("저장")
-        btn_save.setStyleSheet("""
+        return tab
+
+    def _create_about_tab(self) -> QWidget:
+        """정보 탭 생성"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # 앱 정보
+        info_group = QGroupBox("애플리케이션 정보")
+        info_layout = QVBoxLayout(info_group)
+
+        # 앱 이름 & 버전
+        app_label = QLabel(f"<b>{__app_name__}</b>")
+        app_label.setStyleSheet("font-size: 16px; margin-bottom: 5px;")
+        info_layout.addWidget(app_label)
+
+        version_label = QLabel(f"버전: {__version__}")
+        version_label.setStyleSheet("font-size: 13px; color: #555;")
+        info_layout.addWidget(version_label)
+
+        layout.addWidget(info_group)
+
+        # 업데이트 확인
+        update_group = QGroupBox("업데이트")
+        update_layout = QVBoxLayout(update_group)
+
+        # 자동 업데이트 확인 체크박스
+        self.chk_auto_update = QCheckBox("앱 시작 시 자동으로 업데이트 확인")
+        self.chk_auto_update.setChecked(self.config_mgr.get_app_setting('auto_update_check', True))
+        update_layout.addWidget(self.chk_auto_update)
+
+        # 업데이트 확인 버튼
+        btn_layout = QHBoxLayout()
+        self.btn_check_update = QPushButton("업데이트 확인")
+        self.btn_check_update.setStyleSheet("""
             QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
+                background-color: #3498db; color: white;
+                padding: 8px 16px; border-radius: 4px; border: none;
+                font-size: 12px;
             }
             QPushButton:hover { background-color: #2980b9; }
+            QPushButton:disabled { background-color: #bdc3c7; }
         """)
-        btn_save.clicked.connect(self.save_settings)
+        self.btn_check_update.clicked.connect(self._check_for_updates)
+        btn_layout.addWidget(self.btn_check_update)
+        btn_layout.addStretch()
+        update_layout.addLayout(btn_layout)
 
-        btn_cancel = QPushButton("취소")
-        btn_cancel.setStyleSheet("""
-            QPushButton {
-                background-color: #ecf0f1; color: #2c3e50;
-                padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
-            }
-            QPushButton:hover { background-color: #d5dbdb; }
-        """)
-        btn_cancel.clicked.connect(self.reject)
+        # 업데이트 상태 라벨
+        self.update_status_label = QLabel("")
+        self.update_status_label.setWordWrap(True)
+        self.update_status_label.setStyleSheet("margin-top: 10px; font-size: 12px;")
+        update_layout.addWidget(self.update_status_label)
 
-        button_layout.addStretch()
-        button_layout.addWidget(btn_save)
-        button_layout.addWidget(btn_cancel)
-        layout.addLayout(button_layout)
+        layout.addWidget(update_group)
+
+        # GitHub 링크
+        github_group = QGroupBox("프로젝트")
+        github_layout = QVBoxLayout(github_group)
+
+        github_url = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}"
+        github_link = QLabel(f'GitHub: <a href="{github_url}">{GITHUB_OWNER}/{GITHUB_REPO}</a>')
+        github_link.setOpenExternalLinks(True)
+        github_link.setStyleSheet("font-size: 12px;")
+        github_layout.addWidget(github_link)
+
+        license_label = QLabel("라이선스: MIT")
+        license_label.setStyleSheet("font-size: 12px; color: #555;")
+        github_layout.addWidget(license_label)
+
+        layout.addWidget(github_group)
+
+        layout.addStretch()
+
+        return tab
 
     def save_settings(self):
         """설정 저장"""
@@ -209,7 +316,44 @@ class SettingsDialog(QDialog):
         auto_report = self.chk_auto_report.isChecked()
         self.config_mgr.set_app_setting('github_auto_report', auto_report)
 
+        # 자동 업데이트 확인 설정 저장
+        auto_update_check = self.chk_auto_update.isChecked()
+        self.config_mgr.set_app_setting('auto_update_check', auto_update_check)
+
         self.accept()
+
+    def _check_for_updates(self):
+        """업데이트 확인"""
+        self.btn_check_update.setEnabled(False)
+        self.btn_check_update.setText("확인 중...")
+        self.update_status_label.setText("업데이트를 확인하는 중입니다...")
+        self.update_status_label.setStyleSheet("color: #3498db; margin-top: 10px; font-size: 12px;")
+
+        # 백그라운드 스레드에서 확인
+        self._update_checker_thread = UpdateCheckerThread()
+        self._update_checker_thread.update_checked.connect(self._on_update_checked)
+        self._update_checker_thread.start()
+
+    def _on_update_checked(self, needs_update: bool, latest_version: str, download_url: str, error_msg: str):
+        """업데이트 확인 결과 처리"""
+        self.btn_check_update.setEnabled(True)
+        self.btn_check_update.setText("업데이트 확인")
+
+        if error_msg:
+            self.update_status_label.setText(f"❌ {error_msg}")
+            self.update_status_label.setStyleSheet("color: #e74c3c; margin-top: 10px; font-size: 12px;")
+            return
+
+        if needs_update:
+            self.update_status_label.setText(
+                f"✅ 새로운 버전 {latest_version}이 사용 가능합니다!\n"
+                f'<a href="{download_url}">다운로드 페이지로 이동</a>'
+            )
+            self.update_status_label.setStyleSheet("color: #27ae60; margin-top: 10px; font-size: 12px;")
+            self.update_status_label.setOpenExternalLinks(True)
+        else:
+            self.update_status_label.setText(f"✅ 최신 버전({__version__})을 사용하고 있습니다.")
+            self.update_status_label.setStyleSheet("color: #27ae60; margin-top: 10px; font-size: 12px;")
 
     def _check_github_app(self) -> bool:
         """GitHub App 설정 여부 확인"""

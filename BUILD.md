@@ -292,4 +292,141 @@ pyinstaller tunnel-manager.spec
 
 ---
 
+---
+
+## 📦 Windows Installer 생성
+
+PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows Installer를 생성합니다.
+
+### 파일 구조 이해하기
+
+프로젝트에는 2종류의 파일이 있습니다:
+
+| 파일 | 타입 | 용도 |
+|------|------|------|
+| `installer/TunnelDBManager.iss` | 설정 파일 | Installer 빌드 방법을 정의 (직접 실행 ❌) |
+| `scripts/build-installer.ps1` | 실행 스크립트 | 전체 빌드 과정을 자동화 (직접 실행 ✅) |
+
+**간단히 말하면:**
+- `.iss` 파일 = 레시피 (Installer에 무엇을 포함할지 정의)
+- `.ps1` 스크립트 = 요리사 (레시피를 읽고 자동으로 Installer 생성)
+
+**워크플로우:**
+```
+[build-installer.ps1 실행]
+    ↓
+    ├─→ PyInstaller 실행 → dist/TunnelDBManager.exe 생성
+    └─→ Inno Setup 실행 → TunnelDBManager.iss 읽기 → output/Installer.exe 생성
+```
+
+### 사전 요구사항
+
+- **Inno Setup 6** 설치: https://jrsoftware.org/isinfo.php
+  - 설치하지 않으면 자동화 스크립트가 에러 메시지와 함께 설치 안내를 표시합니다
+- Python 가상환경 활성화 및 의존성 설치 완료
+
+### 방법 1: 자동화 스크립트 사용 (권장) ⭐
+
+**이 방법이 제일 쉽습니다!** 프로젝트에 포함된 빌드 스크립트가 모든 과정을 자동으로 처리합니다.
+
+```powershell
+# 이것만 실행하면 됩니다!
+.\scripts\build-installer.ps1
+
+# 또는 BAT 파일 (PowerShell과 동일한 기능)
+.\scripts\build-installer.bat
+```
+
+**이 스크립트가 자동으로 하는 일:**
+1. ✅ PyInstaller로 `TunnelDBManager.exe` 빌드
+2. ✅ Inno Setup으로 `TunnelDBManager-Setup-1.0.0.exe` 생성
+3. ✅ 빌드 과정 상태를 실시간으로 표시
+4. ✅ 에러 발생 시 명확한 해결 방법 안내
+
+**스크립트 옵션:**
+
+```powershell
+# 이전 빌드 파일 정리 후 빌드
+.\scripts\build-installer.ps1 -Clean
+
+# PyInstaller 빌드 생략 (기존 EXE 사용)
+.\scripts\build-installer.ps1 -SkipPyInstaller
+
+# 옵션 조합
+.\scripts\build-installer.ps1 -Clean -SkipPyInstaller
+```
+
+### 방법 2: 수동 빌드 (고급 사용자용)
+
+자동화 스크립트를 사용하지 않고 직접 각 단계를 실행하는 방법입니다.
+
+```powershell
+# 1단계: PyInstaller로 EXE 빌드
+pyinstaller tunnel-manager.spec
+# → 결과: dist/TunnelDBManager.exe
+
+# 2단계: Inno Setup 컴파일러로 .iss 파일을 읽어서 Installer 생성
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\TunnelDBManager.iss
+# → 결과: output/TunnelDBManager-Setup-1.0.0.exe
+```
+
+**참고:** `TunnelDBManager.iss`는 직접 실행하는 게 아니라 Inno Setup 컴파일러(ISCC.exe)가 읽는 설정 파일입니다.
+
+### Installer 기능
+
+생성된 Installer는 다음 기능을 제공합니다:
+
+- ✅ 프로그램 추가/제거 지원
+- ✅ 시작 메뉴 단축키 자동 생성
+- ✅ 바탕화면 아이콘 (선택 옵션)
+- ✅ 언인스톨러 자동 생성
+- ✅ 업그레이드 시 이전 버전 자동 제거
+- ✅ 한국어/영어 다국어 지원
+- ✅ 관리자 권한 불필요
+
+### 빌드 결과물
+
+```
+tunnel-manager/
+├── dist/
+│   └── TunnelDBManager.exe          # PyInstaller 빌드 결과
+└── output/
+    └── TunnelDBManager-Setup-1.0.0.exe  # Windows Installer
+```
+
+### Installer 테스트
+
+```powershell
+# Installer 실행
+.\output\TunnelDBManager-Setup-1.0.0.exe
+
+# 설치 후 확인사항:
+# 1. 시작 메뉴에서 "TunnelDB Manager" 검색
+# 2. 프로그램 정상 실행 확인
+# 3. 제어판 > 프로그램 추가/제거에서 확인
+# 4. 제거 후 재설치 테스트
+```
+
+### Installer 커스터마이징
+
+`installer/TunnelDBManager.iss` 파일을 수정하여 설정을 변경할 수 있습니다:
+
+```iss
+[Setup]
+AppVersion=1.0.0                      ; 버전 번호
+DefaultDirName={autopf}\...          ; 기본 설치 경로
+Compression=lzma2/ultra64            ; 압축 설정
+
+[Languages]
+; 지원 언어 추가/제거
+Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+; 바탕화면 아이콘 기본 체크 여부
+Name: "desktopicon"; ...; Flags: unchecked
+```
+
+---
+
 **문서 작성일:** 2026-01-27

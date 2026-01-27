@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# TunnelDB Manager - Create Release (Bash Wrapper)
+
+# Check for help flag
+if [[ "$1" == "-h" || "$1" == "-Help" || "$1" == "--help" ]]; then
+    cat << 'EOF'
+
+TunnelDB Manager - Create Release
+
+Create Git tag from src/version.py and trigger GitHub Actions.
+
+Usage:
+  ./scripts/create-release [-DryRun]
+
+Options:
+  -DryRun          Preview without executing
+  -h, -Help        Show this help
+
+Description:
+  This script does NOT change the version.
+  It reads the version from src/version.py and creates a Git tag.
+
+  Workflow:
+    1. Read version from src/version.py
+    2. Create Git tag (v{version})
+    3. Push tag to GitHub
+    4. Trigger GitHub Actions
+
+Examples:
+  # Create release
+  ./scripts/create-release
+
+  # Preview
+  ./scripts/create-release -DryRun
+
+Recommended:
+  For version bump + release in one command:
+  ./scripts/bump-version -Type patch -AutoRelease
+
+EOF
+    exit 0
+fi
+
+# Convert path to Windows format
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -W 2>/dev/null || pwd)"
+PS_SCRIPT="$SCRIPT_DIR\\create-release.ps1"
+PS_SCRIPT="${PS_SCRIPT//\//\\}"
+
+# Call PowerShell script
+powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    & '$PS_SCRIPT' $*
+"

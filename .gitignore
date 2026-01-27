@@ -48,6 +48,9 @@ config.json
 *.pyz
 *.pyzw
 
+# Installer output
+output/
+
 # Environment variables
 .env
 

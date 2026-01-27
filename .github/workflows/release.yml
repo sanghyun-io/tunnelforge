@@ -1,0 +1,135 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*'  # v1.0.0, v1.0.1 등의 태그 push 시 자동 실행
+
+jobs:
+  build-windows-installer:
+    name: Build Windows Installer
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Extract version from tag
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Verify version consistency
+        shell: bash
+        run: |
+          PYTHON_VERSION=$(python -c "from src.version import __version__; print(__version__)")
+          TAG_VERSION="${{ steps.get_version.outputs.version }}"
+          echo "Python version: $PYTHON_VERSION"
+          echo "Tag version: $TAG_VERSION"
+          if [ "$PYTHON_VERSION" != "$TAG_VERSION" ]; then
+            echo "❌ Error: Version mismatch!"
+            echo "   src/version.py has: $PYTHON_VERSION"
+            echo "   Git tag has: $TAG_VERSION"
+            echo "   Please update src/version.py to match the tag version."
+            exit 1
+          fi
+          echo "✅ Version consistency verified: $PYTHON_VERSION"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Build with PyInstaller
+        run: |
+          python -m PyInstaller tunnel-manager.spec
+
+      - name: Verify EXE build
+        run: |
+          if (!(Test-Path "dist\TunnelDBManager.exe")) {
+            Write-Host "❌ Error: EXE file not found!"
+            exit 1
+          }
+          $exeSize = (Get-Item "dist\TunnelDBManager.exe").Length / 1MB
+          Write-Host "✅ EXE built: $($exeSize.ToString('0.0')) MB"
+
+      - name: Install Inno Setup
+        run: |
+          choco install innosetup -y
+
+      - name: Build Windows Installer
+        run: |
+          .\scripts\build-installer.ps1 -SkipPyInstaller
+
+      - name: Verify Installer build
+        id: verify_installer
+        run: |
+          $installerFile = Get-Item "output\TunnelDBManager-Setup-*.exe" | Select-Object -First 1
+          if (!$installerFile) {
+            Write-Host "❌ Error: Installer file not found!"
+            exit 1
+          }
+          $installerSize = $installerFile.Length / 1MB
+          Write-Host "✅ Installer built: $($installerFile.Name) ($($installerSize.ToString('0.0')) MB)"
+          echo "installer_path=$($installerFile.FullName)" >> $env:GITHUB_OUTPUT
+          echo "installer_name=$($installerFile.Name)" >> $env:GITHUB_OUTPUT
+
+      - name: Generate Release Notes
+        id: release_notes
+        shell: bash
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          cat << EOF > release_notes.md
+          ## TunnelDB Manager v$VERSION
+
+          ### 다운로드
+          - Windows Installer: \`TunnelDBManager-Setup-$VERSION.exe\`
+
+          ### 설치 방법
+          1. Installer를 다운로드합니다
+          2. 실행하여 설치 마법사를 따라갑니다
+          3. 설치 완료 후 바로 사용 가능합니다
+
+          ### 주요 기능
+          - 🔐 SSH 터널을 통한 안전한 데이터베이스 연결
+          - 🚀 MySQL Shell을 이용한 병렬 Export/Import
+          - 🔄 데이터베이스 마이그레이션 분석 도구
+          - 📊 시스템 트레이 상주 기능
+
+          ---
+          전체 변경 사항은 [CHANGELOG](https://github.com/${{ github.repository }}/compare/v$VERSION...main)를 참조하세요.
+          EOF
+          cat release_notes.md
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: v${{ steps.get_version.outputs.version }}
+          body_path: release_notes.md
+          files: |
+            output/TunnelDBManager-Setup-*.exe
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release Summary
+        run: |
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host " ✅ Release Created Successfully!" -ForegroundColor Green
+          Write-Host "========================================" -ForegroundColor Cyan
+          Write-Host ""
+          Write-Host "Release: v${{ steps.get_version.outputs.version }}" -ForegroundColor White
+          Write-Host "Installer: ${{ steps.verify_installer.outputs.installer_name }}" -ForegroundColor White
+          Write-Host "URL: https://github.com/${{ github.repository }}/releases/tag/v${{ steps.get_version.outputs.version }}" -ForegroundColor White
+          Write-Host ""
