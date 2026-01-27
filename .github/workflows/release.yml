@@ -5,6 +5,9 @@ on:
     tags:
       - 'v*'  # v1.0.0, v1.0.1 등의 태그 push 시 자동 실행
 
+permissions:
+  contents: write  # Required for creating releases and uploading assets
+
 jobs:
   build-windows-installer:
     name: Build Windows Installer

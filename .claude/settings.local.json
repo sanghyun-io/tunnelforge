@@ -24,7 +24,8 @@
       "WebFetch(domain:api.github.com)",
       "Bash(git tag:*)",
       "WebFetch(domain:github.com)",
-      "WebFetch(domain:productionresultssa4.blob.core.windows.net)"
+      "WebFetch(domain:productionresultssa4.blob.core.windows.net)",
+      "WebFetch(domain:productionresultssa10.blob.core.windows.net)"
     ]
   }
 }
