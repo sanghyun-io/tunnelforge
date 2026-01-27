@@ -122,6 +122,19 @@ jobs:
           Copy-Item $installerFile.FullName $latestFile
           Write-Host "✅ Latest copy created: $latestFile"
 
+      - name: Build Bootstrapper (Web Installer)
+        run: |
+          Write-Host "Building lightweight web installer (bootstrapper)..."
+          python -m PyInstaller bootstrapper/bootstrapper.spec --noconfirm
+
+          if (!(Test-Path "dist\TunnelDBManager-WebSetup.exe")) {
+            Write-Host "❌ Error: Bootstrapper build failed!"
+            exit 1
+          }
+
+          $bootstrapperSize = (Get-Item "dist\TunnelDBManager-WebSetup.exe").Length / 1MB
+          Write-Host "✅ Bootstrapper built: TunnelDBManager-WebSetup.exe ($($bootstrapperSize.ToString('0.0')) MB)"
+
       - name: Generate Release Notes
         id: release_notes
         shell: bash
@@ -131,12 +144,20 @@ jobs:
           ## TunnelDB Manager v$VERSION
 
           ### 다운로드
-          - Windows Installer: \`TunnelDBManager-Setup-$VERSION.exe\`
+          | 파일 | 설명 | 크기 |
+          |------|------|------|
+          | \`TunnelDBManager-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |
+          | \`TunnelDBManager-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |
 
           ### 설치 방법
-          1. Installer를 다운로드합니다
-          2. 실행하여 설치 마법사를 따라갑니다
-          3. 설치 완료 후 바로 사용 가능합니다
+
+          **온라인 설치 (권장):**
+          1. \`TunnelDBManager-WebSetup.exe\` 다운로드
+          2. 실행하면 자동으로 최신 버전 다운로드 및 설치
+
+          **오프라인 설치:**
+          1. \`TunnelDBManager-Setup-$VERSION.exe\` 다운로드
+          2. 설치 마법사를 따라 진행
 
           ### 주요 기능
           - 🔐 SSH 터널을 통한 안전한 데이터베이스 연결
@@ -157,6 +178,7 @@ jobs:
           files: |
             output/TunnelDBManager-Setup-${{ steps.get_version.outputs.version }}.exe
             output/TunnelDBManager-Setup-latest.exe
+            dist/TunnelDBManager-WebSetup.exe
           draft: false
           prerelease: false
           generate_release_notes: true

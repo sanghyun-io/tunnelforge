@@ -21,9 +21,19 @@ TunnelDB Manager is a desktop application that simplifies secure database access
 
 ## Download
 
-**[Download Latest Version](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-Setup-latest.exe)**
+### Online Install (Recommended, ~5MB)
 
-Or browse all versions at [Releases](https://github.com/sanghyun-io/db-connector/releases).
+**[Download Web Installer](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-WebSetup.exe)**
+
+Automatically downloads and installs the latest version.
+
+### Offline Install (~35MB)
+
+**[Download Full Installer](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-Setup-latest.exe)**
+
+For environments without internet access.
+
+Browse all versions at [Releases](https://github.com/sanghyun-io/db-connector/releases).
 
 ## Quick Start
 

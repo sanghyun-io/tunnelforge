@@ -30,8 +30,10 @@ python -m py_compile src/ui/dialogs/*.py
 python -m py_compile src/ui/workers/*.py
 
 # Build (Windows)
-.\scripts\build-installer.ps1           # Windows Installer 빌드
+.\scripts\build-installer.ps1           # Windows Installer 빌드 (오프라인, ~35MB)
 .\scripts\build-installer.ps1 -Clean    # 이전 빌드 정리 후 빌드
+.\scripts\build-bootstrapper.ps1        # 부트스트래퍼 빌드 (온라인, ~5MB)
+.\scripts\build-bootstrapper.ps1 -Clean # 이전 빌드 정리 후 빌드
 
 # Version Management & Release
 # 🚀 Smart Release (권장) - GitHub와 비교하여 자동 버전 관리
@@ -110,6 +112,12 @@ tunnel-manager/
 │       └── workers/
 │           ├── __init__.py
 │           └── mysql_worker.py
+├── bootstrapper/               # Online installer (bootstrapper)
+│   ├── __init__.py
+│   ├── version_info.py         # Bootstrapper version & GitHub info
+│   ├── downloader.py           # GitHub release download logic
+│   ├── bootstrapper.py         # tkinter GUI main
+│   └── bootstrapper.spec       # PyInstaller build config
 ├── assets/                     # Resource files
 │   ├── icon.ico
 │   ├── icon.png
@@ -176,9 +184,10 @@ GitHub Actions (automatic):
 
 ```
 scripts/
-├── smart_release.py     # 🚀 스마트 릴리스 (Python, 권장)
-├── smart-release.sh     # 🚀 스마트 릴리스 (Bash, Python 없을 때)
-└── build-installer.ps1  # ⚠️ GitHub Actions 전용 (삭제 금지!)
+├── smart_release.py       # 🚀 스마트 릴리스 (Python, 권장)
+├── smart-release.sh       # 🚀 스마트 릴리스 (Bash, Python 없을 때)
+├── build-installer.ps1    # ⚠️ GitHub Actions 전용 (삭제 금지!)
+└── build-bootstrapper.ps1 # 부트스트래퍼(온라인 설치) 빌드
 ```
 
 ### Script 상세
@@ -204,8 +213,12 @@ scripts/
   - Triggered by `v*` tags (e.g., v1.0.2)
   - Builds on `windows-latest` runner
   - Installs Inno Setup via Chocolatey
+  - Builds offline installer (~35MB) and bootstrapper (~5MB)
   - Generates release notes automatically
-  - Uploads installer to GitHub Release
+  - Uploads all installers to GitHub Release:
+    - `TunnelDBManager-Setup-{version}.exe` - 오프라인 설치
+    - `TunnelDBManager-Setup-latest.exe` - 항상 최신 (오프라인)
+    - `TunnelDBManager-WebSetup.exe` - 온라인 설치 (부트스트래퍼)
 
 ### Update Checker
 
