@@ -17,6 +17,7 @@ class MySQLShellWorker(QThread):
     table_status = pyqtSignal(str, str, str)  # table_name, status ('pending'/'loading'/'done'/'error'), message
     import_finished = pyqtSignal(bool, str, dict)  # success, message, results {'table_name': {'status': 'done'/'error', 'message': ''}}
     raw_output = pyqtSignal(str)  # mysqlsh 실시간 출력
+    metadata_analyzed = pyqtSignal(dict)  # dump 메타데이터 분석 결과 (chunk_counts, table_sizes, total_bytes, schema)
 
     def __init__(self, task_type: str, config: MySQLShellConfig, **kwargs):
         super().__init__()
@@ -34,18 +35,43 @@ class MySQLShellWorker(QThread):
         try:
             if self.task_type == "export_schema":
                 exporter = MySQLShellExporter(self.config)
+
+                # 상세 콜백 함수들
+                def detail_callback(info: dict):
+                    self.detail_progress.emit(info)
+
+                def table_status_callback(table_name: str, status: str, message: str = ""):
+                    self.table_status.emit(table_name, status, message)
+
+                def raw_output_callback(line: str):
+                    self.raw_output.emit(line)
+
                 success, msg = exporter.export_full_schema(
                     self.kwargs['schema'],
                     self.kwargs['output_dir'],
                     self.kwargs.get('threads', 4),
                     self.kwargs.get('compression', 'zstd'),
                     callback,
-                    table_callback
+                    table_callback,
+                    detail_callback,
+                    table_status_callback,
+                    raw_output_callback
                 )
                 self.finished.emit(success, msg)
 
             elif self.task_type == "export_tables":
                 exporter = MySQLShellExporter(self.config)
+
+                # 상세 콜백 함수들
+                def detail_callback(info: dict):
+                    self.detail_progress.emit(info)
+
+                def table_status_callback(table_name: str, status: str, message: str = ""):
+                    self.table_status.emit(table_name, status, message)
+
+                def raw_output_callback(line: str):
+                    self.raw_output.emit(line)
+
                 success, msg, tables = exporter.export_tables(
                     self.kwargs['schema'],
                     self.kwargs['tables'],
@@ -54,7 +80,10 @@ class MySQLShellWorker(QThread):
                     self.kwargs.get('compression', 'zstd'),
                     self.kwargs.get('include_fk_parents', True),
                     callback,
-                    table_callback
+                    table_callback,
+                    detail_callback,
+                    table_status_callback,
+                    raw_output_callback
                 )
                 self.finished.emit(success, msg)
 
@@ -71,6 +100,9 @@ class MySQLShellWorker(QThread):
                 def raw_output_callback(line: str):
                     self.raw_output.emit(line)
 
+                def metadata_callback(metadata: dict):
+                    self.metadata_analyzed.emit(metadata)
+
                 success, msg, results = importer.import_dump(
                     self.kwargs['input_dir'],
                     self.kwargs.get('target_schema'),
@@ -82,7 +114,8 @@ class MySQLShellWorker(QThread):
                     detail_callback,
                     table_status_callback,
                     raw_output_callback,
-                    self.kwargs.get('retry_tables')  # 재시도할 테이블 목록
+                    self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
+                    metadata_callback
                 )
                 self.import_finished.emit(success, msg, results)
                 self.finished.emit(success, msg)

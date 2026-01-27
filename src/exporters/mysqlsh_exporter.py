@@ -190,7 +190,10 @@ class MySQLShellExporter:
         threads: int = 4,
         compression: str = "zstd",
         progress_callback: Optional[Callable[[str], None]] = None,
-        table_progress_callback: Optional[Callable[[int, int, str], None]] = None
+        table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        detail_callback: Optional[Callable[[dict], None]] = None,
+        table_status_callback: Optional[Callable[[str, str, str], None]] = None,
+        raw_output_callback: Optional[Callable[[str], None]] = None
     ) -> Tuple[bool, str]:
         """
         전체 스키마 Export (병렬 처리)
@@ -202,6 +205,9 @@ class MySQLShellExporter:
             compression: 압축 방식 (zstd, gzip, none)
             progress_callback: 진행 상황 콜백 (msg)
             table_progress_callback: 테이블별 진행률 콜백 (current, total, table_name)
+            detail_callback: 상세 진행 정보 콜백 (percent, mb_done, mb_total, speed)
+            table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
+            raw_output_callback: mysqlsh 실시간 출력 콜백
 
         Returns:
             (성공여부, 메시지)
@@ -255,7 +261,10 @@ util.dumpSchemas(["{schema}"], "{output_dir_escaped}", {{
                 output_dir=output_dir,
                 schema=schema,
                 tables=tables if tables else None,
-                table_progress_callback=table_progress_callback
+                table_progress_callback=table_progress_callback,
+                detail_callback=detail_callback,
+                table_status_callback=table_status_callback,
+                raw_output_callback=raw_output_callback
             )
 
             if success:
@@ -278,7 +287,10 @@ util.dumpSchemas(["{schema}"], "{output_dir_escaped}", {{
         compression: str = "zstd",
         include_fk_parents: bool = True,
         progress_callback: Optional[Callable[[str], None]] = None,
-        table_progress_callback: Optional[Callable[[int, int, str], None]] = None
+        table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        detail_callback: Optional[Callable[[dict], None]] = None,
+        table_status_callback: Optional[Callable[[str, str, str], None]] = None,
+        raw_output_callback: Optional[Callable[[str], None]] = None
     ) -> Tuple[bool, str, List[str]]:
         """
         선택된 테이블만 Export (FK 의존성 자동 처리)
@@ -292,6 +304,9 @@ util.dumpSchemas(["{schema}"], "{output_dir_escaped}", {{
             include_fk_parents: FK 부모 테이블 자동 포함 여부
             progress_callback: 진행 상황 콜백 (msg)
             table_progress_callback: 테이블별 진행률 콜백 (current, total, table_name)
+            detail_callback: 상세 진행 정보 콜백 (percent, mb_done, mb_total, speed)
+            table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
+            raw_output_callback: mysqlsh 실시간 출력 콜백
 
         Returns:
             (성공여부, 메시지, 실제 Export된 테이블 목록)
@@ -352,7 +367,10 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
                 output_dir=output_dir,
                 schema=schema,
                 tables=final_tables,
-                table_progress_callback=table_progress_callback
+                table_progress_callback=table_progress_callback,
+                detail_callback=detail_callback,
+                table_status_callback=table_status_callback,
+                raw_output_callback=raw_output_callback
             )
 
             if success:
@@ -376,10 +394,13 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
         output_dir: Optional[str] = None,
         schema: Optional[str] = None,
         tables: Optional[List[str]] = None,
-        table_progress_callback: Optional[Callable[[int, int, str], None]] = None
+        table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        detail_callback: Optional[Callable[[dict], None]] = None,
+        table_status_callback: Optional[Callable[[str, str, str], None]] = None,
+        raw_output_callback: Optional[Callable[[str], None]] = None
     ) -> Tuple[bool, str]:
         """
-        mysqlsh 명령 실행 (테이블별 진행률 모니터링 지원)
+        mysqlsh 명령 실행 (테이블별 진행률 모니터링 지원 + 실시간 stdout 파싱)
 
         Args:
             js_code: 실행할 JavaScript 코드
@@ -388,6 +409,9 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
             schema: 스키마명 (모니터링용)
             tables: 테이블 목록 (모니터링용)
             table_progress_callback: 테이블별 진행률 콜백 (current, total, table_name)
+            detail_callback: 상세 진행 정보 콜백 (percent, mb_done, mb_total, speed)
+            table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
+            raw_output_callback: mysqlsh 실시간 출력 콜백
         """
         try:
             # mysqlsh 명령 구성
@@ -409,28 +433,115 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
             if output_dir and schema and tables and table_progress_callback:
                 monitor_thread = threading.Thread(
                     target=self._monitor_export_progress,
-                    args=(output_dir, schema, tables, table_progress_callback, stop_monitor),
+                    args=(output_dir, schema, tables, table_progress_callback, table_status_callback, stop_monitor),
                     daemon=True
                 )
                 monitor_thread.start()
 
-            # Popen으로 실행 (모니터링과 병행)
+            # Popen으로 실행 (실시간 출력 읽기 + 모니터링 병행)
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+                bufsize=1,
+                universal_newlines=True
             )
 
+            # 실시간 stdout 파싱 (Export 진행률)
+            completed_tables_set = set()
+            last_percent = 0
+
+            while True:
+                line = process.stdout.readline()
+
+                if not line and process.poll() is not None:
+                    break
+
+                if line:
+                    stripped_line = line.strip()
+                    timestamp = datetime.now().strftime("%H:%M:%S")
+
+                    # 콘솔 디버깅 출력
+                    print(f"[mysqlsh export] {stripped_line}")
+
+                    # 실시간 출력 콜백
+                    if raw_output_callback:
+                        raw_output_callback(f"[{timestamp}] {stripped_line}")
+
+                    # --- 패턴 1: 상세 진행 정보 파싱 ---
+                    # Export 예: "4 thds dumping - 27% (2.24M rows / ~8.23M rows), 25.39K rows/s, 6.60 MB/s uncompressed"
+                    # 퍼센트만 파싱 (rows 정보는 데이터 크기로 변환 불가)
+                    percent_match = re.search(r'dumping.*?(\d+)%', stripped_line)
+                    if percent_match and detail_callback:
+                        percent = int(percent_match.group(1))
+
+                        # 속도 파싱 (MB/s, KB/s 등 - "uncompressed" 앞의 속도)
+                        speed_match = re.search(r'([0-9.]+)\s*([KMGT]?B)/s\s+uncompressed', stripped_line)
+                        speed_str = "0 B/s"
+                        if speed_match:
+                            speed_str = f"{speed_match.group(1)} {speed_match.group(2)}/s"
+
+                        # 진행률이 증가한 경우에만 콜백 호출 (중복 방지)
+                        if percent > last_percent:
+                            detail_callback({
+                                'percent': percent,
+                                'mb_done': 0,  # Export는 rows만 표시하므로 0으로
+                                'mb_total': 0,
+                                'speed': speed_str
+                            })
+                            last_percent = percent
+
+                    # --- 패턴 2: 테이블 완료 감지 ---
+                    # 예: "Writing DDL for table `schema`.`table_name`"
+                    # 예: "Writing data for table `schema`.`table_name`"
+                    table_match = re.search(r"`([^`]+)`\.`([^`]+)`", stripped_line)
+                    if table_match and tables and table_status_callback:
+                        table_name = table_match.group(2)
+
+                        if table_name in tables:
+                            # "Writing" 패턴인 경우 loading 상태로
+                            if "Writing" in stripped_line or "dumping" in stripped_line.lower():
+                                if table_name not in completed_tables_set:
+                                    table_status_callback(table_name, 'loading', '')
+                            # "done" 패턴인 경우 완료 상태로
+                            elif "done" in stripped_line.lower():
+                                if table_name not in completed_tables_set:
+                                    completed_tables_set.add(table_name)
+                                    table_status_callback(table_name, 'done', '')
+
             # 완료 대기
-            stdout, stderr = process.communicate(timeout=3600)
+            rc = process.poll()
+            if rc is None:
+                process.wait(timeout=3600)
+                rc = process.returncode
+
+            stdout = ""
+            stderr = ""
 
             # 모니터링 종료
             stop_monitor.set()
             if monitor_thread:
                 monitor_thread.join(timeout=2)
 
-            if process.returncode == 0:
+            if rc == 0:
+                # 최종 진행률 100% 표시
+                if detail_callback:
+                    detail_callback({
+                        'percent': 100,
+                        'mb_done': 0,
+                        'mb_total': 0,
+                        'speed': '0 B/s'
+                    })
+
+                # 모든 테이블 완료 상태로 업데이트
+                if tables and table_status_callback:
+                    for table in tables:
+                        if table not in completed_tables_set:
+                            table_status_callback(table, 'done', '')
+
                 return True, "성공"
             else:
                 error_msg = stderr or stdout or "알 수 없는 오류"
@@ -451,6 +562,7 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
         schema: str,
         tables: List[str],
         callback: Callable[[int, int, str], None],
+        table_status_callback: Optional[Callable[[str, str, str], None]],
         stop_event: threading.Event
     ):
         """
@@ -458,6 +570,14 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
 
         mysqlsh는 데이터 export 시 {schema}@{table}@@{chunk}.zst 파일 생성
         (.json/.sql은 초반에 일괄 생성되므로 완료 판정에 부적합)
+
+        Args:
+            output_dir: 출력 디렉토리
+            schema: 스키마명
+            tables: 테이블 목록
+            callback: 테이블별 진행률 콜백 (current, total, table_name)
+            table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
+            stop_event: 중지 이벤트
         """
         total = len(tables)
         completed_tables = set()
@@ -490,6 +610,11 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
             time.sleep(0.1)
             folder_wait += 1
 
+        # 모든 테이블을 pending 상태로 초기화
+        if table_status_callback:
+            for table in tables:
+                table_status_callback(table, 'pending', '')
+
         while not stop_event.is_set():
             try:
                 # 데이터 파일 (.zst) 확인
@@ -511,6 +636,9 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
                         if table_name in tables_set and table_name not in completed_tables:
                             completed_tables.add(table_name)
                             callback(len(completed_tables), total, table_name)
+                            # 테이블 완료 상태 업데이트
+                            if table_status_callback:
+                                table_status_callback(table_name, 'done', '')
 
                 # 모든 테이블 완료 확인
                 if len(completed_tables) >= total:
@@ -541,6 +669,9 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
                             # 빈 테이블로 간주하여 완료 처리
                             completed_tables.add(table_name)
                             callback(len(completed_tables), total, table_name)
+                            # 테이블 완료 상태 업데이트
+                            if table_status_callback:
+                                table_status_callback(table_name, 'done', '')
             except Exception:
                 pass
 
@@ -573,6 +704,68 @@ class MySQLShellImporter:
     def __init__(self, config: MySQLShellConfig):
         self.config = config
 
+    def _analyze_dump_metadata(self, dump_dir: str) -> Optional[Dict]:
+        """
+        Dump 메타데이터 분석 - 테이블별 Chunk 정보 추출
+
+        Args:
+            dump_dir: Dump 디렉토리 경로
+
+        Returns:
+            {
+                'chunk_counts': {'table_name': chunk_count, ...},
+                'table_sizes': {'table_name': bytes, ...},
+                'total_bytes': int,
+                'schema': str
+            }
+            또는 None (메타데이터 파일이 없는 경우)
+        """
+        try:
+            done_json_path = os.path.join(dump_dir, '@.done.json')
+
+            if not os.path.exists(done_json_path):
+                return None
+
+            with open(done_json_path, 'r', encoding='utf-8') as f:
+                done_data = json.load(f)
+
+            # chunkFileBytes에서 테이블별 chunk 수 계산
+            chunk_counts = {}  # {'df_subs': 81, 'df_call_logs': 8, ...}
+            chunk_file_bytes = done_data.get('chunkFileBytes', {})
+
+            for chunk_file in chunk_file_bytes.keys():
+                # "dataflare@df_subs@15.tsv.zst" 또는 "dataflare@df_subs@@0.tsv.zst" 형식
+                if '@' in chunk_file:
+                    parts = chunk_file.split('@')
+                    if len(parts) >= 3:
+                        # schema@table@chunk 또는 schema@table@@chunk 형식
+                        table_name = parts[1]
+                        chunk_counts[table_name] = chunk_counts.get(table_name, 0) + 1
+
+            # tableDataBytes에서 테이블별 크기 추출
+            table_data_bytes = done_data.get('tableDataBytes', {})
+            table_sizes = {}
+            schema = None
+
+            # tableDataBytes 구조: {'schema_name': {'table_name': bytes, ...}}
+            for schema_name, tables in table_data_bytes.items():
+                schema = schema_name  # 스키마명 저장
+                for table_name, size_bytes in tables.items():
+                    table_sizes[table_name] = size_bytes
+
+            total_bytes = done_data.get('dataBytes', 0)
+
+            return {
+                'chunk_counts': chunk_counts,
+                'table_sizes': table_sizes,
+                'total_bytes': total_bytes,
+                'schema': schema or ''
+            }
+
+        except Exception as e:
+            # 메타데이터 분석 실패 시 None 반환 (기존 동작 유지)
+            return None
+
     def import_dump(
         self,
         input_dir: str,
@@ -585,7 +778,8 @@ class MySQLShellImporter:
         detail_callback: Optional[Callable[[dict], None]] = None,
         table_status_callback: Optional[Callable[[str, str, str], None]] = None,
         raw_output_callback: Optional[Callable[[str], None]] = None,
-        retry_tables: Optional[List[str]] = None
+        retry_tables: Optional[List[str]] = None,
+        metadata_callback: Optional[Callable[[dict], None]] = None
     ) -> Tuple[bool, str, dict]:
         """
         Dump 파일 Import (3가지 모드 지원)
@@ -603,6 +797,7 @@ class MySQLShellImporter:
             table_status_callback: 테이블별 상태 콜백 (table_name, status, message)
             raw_output_callback: mysqlsh 실시간 출력 콜백
             retry_tables: 재시도할 테이블 목록 (선택적)
+            metadata_callback: 메타데이터 분석 결과 콜백 (chunk_counts, table_sizes 등)
 
         Returns:
             (성공여부, 메시지, 테이블별 결과 dict)
@@ -610,7 +805,31 @@ class MySQLShellImporter:
         # 테이블별 Import 결과 추적
         import_results: dict = {}
         try:
-            # 메타데이터 확인
+            # Dump 메타데이터 분석 (@.done.json)
+            dump_metadata = self._analyze_dump_metadata(input_dir)
+            if dump_metadata and progress_callback:
+                total_size_gb = dump_metadata['total_bytes'] / (1024 * 1024 * 1024)
+                large_tables = [
+                    (name, size) for name, size in dump_metadata['table_sizes'].items()
+                    if size > 100_000_000  # 100MB 이상
+                ]
+                large_tables.sort(key=lambda x: -x[1])
+
+                progress_callback(f"📊 Dump 메타데이터 분석 완료")
+                progress_callback(f"  └─ 전체 데이터 크기: {total_size_gb:.2f} GB")
+
+                if large_tables:
+                    progress_callback(f"  └─ 대용량 테이블 ({len(large_tables)}개):")
+                    for name, size in large_tables[:5]:  # 상위 5개만 표시
+                        size_mb = size / (1024 * 1024)
+                        chunk_count = dump_metadata['chunk_counts'].get(name, 1)
+                        progress_callback(f"     • {name}: {size_mb:.1f} MB ({chunk_count} chunks)")
+
+            # 메타데이터 콜백 호출 (UI로 전달)
+            if dump_metadata and metadata_callback:
+                metadata_callback(dump_metadata)
+
+            # Export 메타데이터 확인 (_export_metadata.json)
             metadata_path = os.path.join(input_dir, "_export_metadata.json")
             metadata = None
             source_schema = None
@@ -666,7 +885,8 @@ class MySQLShellImporter:
             elif import_mode == "replace":
                 # 전체 교체: 모든 객체 (테이블, 뷰, 프로시저, 이벤트) 삭제 후 재생성
                 if progress_callback:
-                    progress_callback(f"전체 교체 모드: 모든 객체 삭제 중...")
+                    progress_callback(f"🔄 전체 교체 모드 시작")
+                    progress_callback(f"  └─ {len(tables_to_import)}개 테이블, View/Procedure/Event 삭제 예정")
 
                 # 1. 테이블 삭제
                 if tables_to_import:
@@ -1197,6 +1417,88 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                     if table_status_callback:
                         table_status_callback(table, 'error', str(e))
             return False, str(e), import_results
+
+
+class TableProgressTracker:
+    """테이블별 Import 진행상황 추적"""
+
+    def __init__(self, metadata: Optional[Dict]):
+        """
+        Args:
+            metadata: _analyze_dump_metadata()의 반환값
+        """
+        if metadata:
+            self.chunk_counts = metadata.get('chunk_counts', {})
+            self.table_sizes = metadata.get('table_sizes', {})
+            self.total_bytes = metadata.get('total_bytes', 0)
+        else:
+            self.chunk_counts = {}
+            self.table_sizes = {}
+            self.total_bytes = 0
+
+        self.completed_tables: Set[str] = set()
+
+    def estimate_loading_tables(
+        self,
+        loaded_bytes: int,
+        completed_tables: List[str]
+    ) -> List[Tuple[str, int, int]]:
+        """
+        현재 로딩 중인 테이블 추정
+
+        Args:
+            loaded_bytes: 현재까지 로딩된 바이트 수
+            completed_tables: 완료된 테이블 목록
+
+        Returns:
+            [(table_name, size_bytes, chunk_count), ...] (상위 4개, 크기 큰 순)
+        """
+        # 완료된 테이블들의 bytes 합계
+        self.completed_tables = set(completed_tables)
+        completed_bytes = sum(
+            self.table_sizes.get(t, 0) for t in self.completed_tables
+        )
+
+        # 남은 bytes
+        remaining_bytes = loaded_bytes - completed_bytes
+
+        # 대용량 테이블 중 미완료된 테이블 찾기 (10MB 이상)
+        loading_candidates = [
+            (
+                table,
+                self.table_sizes.get(table, 0),
+                self.chunk_counts.get(table, 1)
+            )
+            for table in self.table_sizes.keys()
+            if table not in self.completed_tables and self.table_sizes.get(table, 0) > 10_000_000
+        ]
+
+        # 크기 큰 순으로 정렬하여 상위 4개 반환
+        loading_candidates.sort(key=lambda x: -x[1])
+        return loading_candidates[:4]
+
+    def get_table_info(self, table_name: str) -> Tuple[int, int]:
+        """
+        테이블 정보 조회
+
+        Returns:
+            (size_bytes, chunk_count)
+        """
+        return (
+            self.table_sizes.get(table_name, 0),
+            self.chunk_counts.get(table_name, 1)
+        )
+
+    def format_size(self, size_bytes: int) -> str:
+        """바이트를 읽기 쉬운 형식으로 변환"""
+        if size_bytes < 1024:
+            return f"{size_bytes} B"
+        elif size_bytes < 1024 * 1024:
+            return f"{size_bytes / 1024:.1f} KB"
+        elif size_bytes < 1024 * 1024 * 1024:
+            return f"{size_bytes / (1024 * 1024):.1f} MB"
+        else:
+            return f"{size_bytes / (1024 * 1024 * 1024):.2f} GB"
 
 
 # 편의 함수
