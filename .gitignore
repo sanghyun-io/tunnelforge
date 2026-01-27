@@ -42,6 +42,7 @@ Thumbs.db
 config.json
 *.exe
 *.spec
+!tunnel-manager.spec  # PyInstaller 빌드 설정 파일은 커밋
 
 # Distribution
 *.pyz
