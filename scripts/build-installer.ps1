@@ -196,7 +196,10 @@ $InnoSetupPaths = @(
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
     "C:\Program Files\Inno Setup 6\ISCC.exe",
     "$env:ProgramFiles\Inno Setup 6\ISCC.exe",
-    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+    "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+    # Chocolatey 설치 경로 (GitHub Actions)
+    "C:\ProgramData\chocolatey\lib\innosetup\tools\ISCC.exe",
+    "$env:ChocolateyInstall\lib\innosetup\tools\ISCC.exe"
 )
 
 $ISCC = $null

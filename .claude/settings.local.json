@@ -21,7 +21,9 @@
       "Bash(chmod:*)",
       "Bash(powershell:*)",
       "Bash(git remote:*)",
-      "WebFetch(domain:api.github.com)"
+      "WebFetch(domain:api.github.com)",
+      "Bash(git tag:*)",
+      "WebFetch(domain:github.com)"
     ]
   }
 }

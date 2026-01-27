@@ -65,9 +65,22 @@ jobs:
       - name: Install Inno Setup
         run: |
           choco install innosetup -y
+          # Verify installation and show path
+          $isccPath = Get-Command iscc -ErrorAction SilentlyContinue
+          if ($isccPath) {
+            Write-Host "ISCC found in PATH: $($isccPath.Source)"
+          } else {
+            Write-Host "Searching for ISCC.exe..."
+            Get-ChildItem -Path "C:\ProgramData\chocolatey" -Recurse -Filter "ISCC.exe" -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "Found: $($_.FullName)" }
+          }
 
       - name: Build Windows Installer
         run: |
+          # Add Chocolatey Inno Setup to PATH if exists
+          $chocoIscc = "C:\ProgramData\chocolatey\lib\innosetup\tools"
+          if (Test-Path $chocoIscc) {
+            $env:PATH = "$chocoIscc;$env:PATH"
+          }
           .\scripts\build-installer.ps1 -SkipPyInstaller
 
       - name: Verify Installer build
