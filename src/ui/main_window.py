@@ -110,8 +110,23 @@ class TunnelManagerUI(QMainWindow):
         self.table.setColumnCount(7)
         self.table.setHorizontalHeaderLabels(["상태", "이름", "로컬 포트", "타겟 호스트", "기본 스키마", "전원", "관리"])
 
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # 이름 늘리기
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # 호스트 늘리기
+        # 열 너비 조정 가능 설정
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # 모든 열 조정 가능
+        header.setStretchLastSection(False)  # 마지막 열 자동 확장 비활성화
+
+        # 기본 열 너비 설정
+        self.table.setColumnWidth(0, 50)   # 상태
+        self.table.setColumnWidth(1, 150)  # 이름
+        self.table.setColumnWidth(2, 80)   # 로컬 포트
+        self.table.setColumnWidth(3, 180)  # 타겟 호스트
+        self.table.setColumnWidth(4, 100)  # 기본 스키마
+        self.table.setColumnWidth(5, 70)   # 전원
+        self.table.setColumnWidth(6, 120)  # 관리
+
+        # 저장된 열 너비 복원
+        self._restore_column_widths()
+
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # 셀 수정 방지
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)  # 행 단위 선택
 
@@ -350,6 +365,9 @@ class TunnelManagerUI(QMainWindow):
 
     def closeEvent(self, event):
         """닫기 버튼 클릭 시"""
+        # 열 너비 저장
+        self._save_column_widths()
+
         close_action = self.config_mgr.get_app_setting('close_action', 'ask')
 
         if close_action == 'ask':
@@ -384,6 +402,19 @@ class TunnelManagerUI(QMainWindow):
         # 모든 창 닫고 종료
         import sys
         sys.exit(0)
+
+    def _save_column_widths(self):
+        """테이블 열 너비를 설정에 저장"""
+        widths = [self.table.columnWidth(i) for i in range(self.table.columnCount())]
+        self.config_mgr.set_app_setting('ui_column_widths', widths)
+
+    def _restore_column_widths(self):
+        """저장된 열 너비를 복원"""
+        widths = self.config_mgr.get_app_setting('ui_column_widths')
+        if widths and len(widths) == self.table.columnCount():
+            for i, width in enumerate(widths):
+                if width > 0:  # 유효한 너비만 적용
+                    self.table.setColumnWidth(i, width)
 
     def _check_update_on_startup(self):
         """앱 시작 시 업데이트 확인 (백그라운드)"""
