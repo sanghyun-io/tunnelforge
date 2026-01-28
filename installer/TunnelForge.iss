@@ -1,16 +1,16 @@
-; TunnelDB Manager - Inno Setup Script
+; TunnelForge - Inno Setup Script
 ; Windows Installer 생성을 위한 스크립트
 ;
 ; 빌드 방법:
 ;   1. Inno Setup 6 설치: https://jrsoftware.org/isinfo.php
-;   2. 명령줄: ISCC.exe installer\TunnelDBManager.iss
+;   2. 명령줄: ISCC.exe installer\TunnelForge.iss
 ;   3. 또는: .\scripts\build-installer.ps1
 
-#define MyAppName "TunnelDB Manager"
+#define MyAppName "TunnelForge"
 #define MyAppVersion "1.0.0"
 #define MyAppPublisher "sanghyun-io"
-#define MyAppURL "https://github.com/sanghyun-io/tunnel-manager"
-#define MyAppExeName "TunnelDBManager.exe"
+#define MyAppURL "https://github.com/sanghyun-io/tunnelforge"
+#define MyAppExeName "TunnelForge.exe"
 
 [Setup]
 ; 애플리케이션 기본 정보
@@ -36,7 +36,7 @@ LicenseFile=LICENSE.txt
 
 ; 출력 설정 (프로젝트 루트의 output 폴더)
 OutputDir=..\output
-OutputBaseFilename=TunnelDBManager-Setup-{#MyAppVersion}
+OutputBaseFilename=TunnelForge-Setup-{#MyAppVersion}
 
 ; 압축 설정
 Compression=lzma2/ultra64
@@ -68,7 +68,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 
 ; 복구/업데이트 프로그램 (부트스트래퍼)
-Source: "..\dist\TunnelDBManager-WebSetup.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\dist\TunnelForge-WebSetup.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; 라이선스 파일 포함 (선택적)
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
@@ -78,7 +78,7 @@ Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 ; 시작 메뉴 단축키
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\복구 및 업데이트"; Filename: "{app}\TunnelDBManager-WebSetup.exe"; Comment: "최신 버전으로 재설치"
+Name: "{group}\복구 및 업데이트"; Filename: "{app}\TunnelForge-WebSetup.exe"; Comment: "최신 버전으로 재설치"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 
 ; 바탕화면 아이콘 (선택 사항)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-TunnelDB Manager - Smart Release Script
+TunnelForge - Smart Release Script
 
 GitHub 최신 릴리스와 비교하여 스마트하게 릴리스를 생성합니다.
 
@@ -96,7 +96,7 @@ def get_github_info() -> tuple[str, str]:
 def get_remote_version(owner: str, repo: str) -> str:
     """Get latest release version from GitHub API."""
     url = f"https://api.github.com/repos/{owner}/{repo}/releases/latest"
-    req = Request(url, headers={'User-Agent': 'TunnelDB-Release-Script'})
+    req = Request(url, headers={'User-Agent': 'TunnelForge-Release-Script'})
 
     try:
         with urlopen(req, timeout=10) as response:
@@ -134,7 +134,7 @@ def update_version_file(version_file: Path, content: str, new_version: str) -> N
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description='TunnelDB Manager - Smart Release',
+        description='TunnelForge - Smart Release',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 시나리오:
@@ -159,7 +159,7 @@ def main() -> int:
     version_file = Path('src/version.py')
 
     print_color("========================================", Colors.CYAN)
-    print_color(" TunnelDB Manager - Smart Release", Colors.CYAN)
+    print_color(" TunnelForge - Smart Release", Colors.CYAN)
     print_color("========================================", Colors.CYAN)
     print()
 

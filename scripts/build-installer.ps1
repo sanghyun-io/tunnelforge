@@ -11,7 +11,7 @@
 #############################################################################
 
 .SYNOPSIS
-    TunnelDB Manager Windows Installer를 빌드합니다. (GitHub Actions 전용)
+    TunnelForge Windows Installer를 빌드합니다. (GitHub Actions 전용)
 
 .DESCRIPTION
     이 스크립트는 PyInstaller와 Inno Setup을 사용하여 Windows 설치 프로그램을 생성합니다.
@@ -19,12 +19,12 @@
     빌드 프로세스:
     1. src/version.py에서 버전 읽기
     2. PyInstaller로 실행 파일(.exe) 빌드
-    3. 버전을 installer/TunnelDBManager.iss에 동기화
+    3. 버전을 installer/TunnelForge.iss에 동기화
     4. Inno Setup으로 Windows Installer(.exe) 생성
 
     출력 파일:
-    - dist\TunnelDBManager.exe (실행 파일)
-    - output\TunnelDBManager-Setup-{version}.exe (설치 프로그램)
+    - dist\TunnelForge.exe (실행 파일)
+    - output\TunnelForge-Setup-{version}.exe (설치 프로그램)
 
 .PARAMETER Clean
     빌드 전에 이전 빌드 디렉토리(build, dist, output)를 삭제합니다.
@@ -48,7 +48,7 @@
     .\scripts\build-installer.ps1 -SkipPyInstaller
 
     PyInstaller 빌드를 건너뛰고 기존 EXE로 Installer만 생성합니다.
-    EXE가 이미 dist\TunnelDBManager.exe에 있어야 합니다.
+    EXE가 이미 dist\TunnelForge.exe에 있어야 합니다.
 
 .EXAMPLE
     .\scripts\build-installer.ps1 -Clean -SkipPyInstaller
@@ -57,7 +57,7 @@
 
 .NOTES
     파일명: build-installer.ps1
-    작성자: TunnelDB Manager Team
+    작성자: TunnelForge Team
     요구사항:
     - Python 3.9+
     - PyInstaller (pip install -e ".[dev]"로 설치)
@@ -68,7 +68,7 @@
     - 릴리스는 bump-version.ps1 -AutoRelease로 자동화할 수 있습니다.
 
 .LINK
-    https://github.com/sanghyun-io/db-connector
+    https://github.com/sanghyun-io/tunnelforge
 #>
 
 param(
@@ -86,7 +86,7 @@ param(
 # Help 출력
 if ($Help) {
     Write-Host ""
-    Write-Host "TunnelDB Manager - Installer Builder" -ForegroundColor Cyan
+    Write-Host "TunnelForge - Installer Builder" -ForegroundColor Cyan
     Write-Host "Windows Installer를 로컬에서 빌드합니다." -ForegroundColor Gray
     Write-Host ""
     Write-Host "사용법:" -ForegroundColor Yellow
@@ -103,8 +103,8 @@ if ($Help) {
     Write-Host "  3. Inno Setup으로 Windows Installer 생성" -ForegroundColor Gray
     Write-Host ""
     Write-Host "출력:" -ForegroundColor Yellow
-    Write-Host "  - dist\TunnelDBManager.exe                    (실행 파일)" -ForegroundColor Gray
-    Write-Host "  - output\TunnelDBManager-Setup-{version}.exe  (설치 프로그램)" -ForegroundColor Gray
+    Write-Host "  - dist\TunnelForge.exe                    (실행 파일)" -ForegroundColor Gray
+    Write-Host "  - output\TunnelForge-Setup-{version}.exe  (설치 프로그램)" -ForegroundColor Gray
     Write-Host ""
     Write-Host "예제:" -ForegroundColor Yellow
     Write-Host "  # 기본 빌드" -ForegroundColor Gray
@@ -129,7 +129,7 @@ $ProjectRoot = Split-Path -Parent (Split-Path -Parent $PSCommandPath)
 Set-Location $ProjectRoot
 
 Write-Host "========================================" -ForegroundColor Cyan
-Write-Host " TunnelDB Manager - Installer Builder" -ForegroundColor Cyan
+Write-Host " TunnelForge - Installer Builder" -ForegroundColor Cyan
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -178,25 +178,25 @@ if (-not $SkipPyInstaller) {
     }
 
     # EXE 파일 존재 확인
-    if (-not (Test-Path "dist\TunnelDBManager.exe")) {
-        Write-Host "  ❌ dist\TunnelDBManager.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
+    if (-not (Test-Path "dist\TunnelForge.exe")) {
+        Write-Host "  ❌ dist\TunnelForge.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
         exit 1
     }
 
-    $exeSize = (Get-Item "dist\TunnelDBManager.exe").Length / 1MB
-    Write-Host "  ✅ EXE 빌드 완료: dist\TunnelDBManager.exe ($($exeSize.ToString('0.0')) MB)" -ForegroundColor Green
+    $exeSize = (Get-Item "dist\TunnelForge.exe").Length / 1MB
+    Write-Host "  ✅ EXE 빌드 완료: dist\TunnelForge.exe ($($exeSize.ToString('0.0')) MB)" -ForegroundColor Green
     Write-Host ""
 } else {
     Write-Host "[2/5] PyInstaller 빌드 건너뛰기 (-SkipPyInstaller)" -ForegroundColor Gray
 
     # EXE 파일 존재 확인
-    if (-not (Test-Path "dist\TunnelDBManager.exe")) {
-        Write-Host "  ❌ dist\TunnelDBManager.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
+    if (-not (Test-Path "dist\TunnelForge.exe")) {
+        Write-Host "  ❌ dist\TunnelForge.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
         Write-Host "  먼저 PyInstaller로 빌드하거나 -SkipPyInstaller 옵션을 제거하세요." -ForegroundColor Yellow
         exit 1
     }
 
-    Write-Host "  기존 EXE 사용: dist\TunnelDBManager.exe" -ForegroundColor Gray
+    Write-Host "  기존 EXE 사용: dist\TunnelForge.exe" -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -256,8 +256,8 @@ if ($versionContent -match '__version__\s*=\s*[''"]([^''"]+)[''"]') {
     exit 1
 }
 
-# TunnelDBManager.iss 파일 업데이트
-$issFile = "installer\TunnelDBManager.iss"
+# TunnelForge.iss 파일 업데이트
+$issFile = "installer\TunnelForge.iss"
 if (-not (Test-Path $issFile)) {
     Write-Host "  ❌ $issFile 파일을 찾을 수 없습니다." -ForegroundColor Red
     exit 1
@@ -273,7 +273,7 @@ Write-Host ""
 # Inno Setup으로 Installer 컴파일
 Write-Host "[5/5] Windows Installer 생성 중..." -ForegroundColor Yellow
 
-& $ISCC "installer\TunnelDBManager.iss"
+& $ISCC "installer\TunnelForge.iss"
 
 if ($LASTEXITCODE -ne 0) {
     Write-Host "  ❌ Installer 빌드 실패" -ForegroundColor Red
@@ -281,7 +281,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Installer 파일 확인
-$installerPattern = "output\TunnelDBManager-Setup-*.exe"
+$installerPattern = "output\TunnelForge-Setup-*.exe"
 $installerFile = Get-Item $installerPattern -ErrorAction SilentlyContinue | Select-Object -First 1
 
 if (-not $installerFile) {
@@ -299,7 +299,7 @@ Write-Host " ✅ 빌드 완료!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "출력 파일:" -ForegroundColor Cyan
-Write-Host "  📦 EXE: dist\TunnelDBManager.exe" -ForegroundColor White
+Write-Host "  📦 EXE: dist\TunnelForge.exe" -ForegroundColor White
 Write-Host "  📦 Installer: $($installerFile.FullName)" -ForegroundColor White
 Write-Host ""
 Write-Host "설치 프로그램 테스트:" -ForegroundColor Cyan

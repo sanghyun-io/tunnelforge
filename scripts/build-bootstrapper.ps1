@@ -1,10 +1,10 @@
 <#
 .SYNOPSIS
-    TunnelDB Manager 부트스트래퍼 빌드 스크립트
+    TunnelForge 부트스트래퍼 빌드 스크립트
 
 .DESCRIPTION
     경량 온라인 설치 프로그램(부트스트래퍼)을 PyInstaller로 빌드합니다.
-    출력: dist/TunnelDBManager-WebSetup.exe (~5-8MB)
+    출력: dist/TunnelForge-WebSetup.exe (~5-8MB)
 
 .PARAMETER Clean
     빌드 전 이전 빌드 파일 정리
@@ -24,7 +24,7 @@ $ErrorActionPreference = "Stop"
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 
 Write-Host "======================================" -ForegroundColor Cyan
-Write-Host "  TunnelDB Manager Bootstrapper Build" -ForegroundColor Cyan
+Write-Host "  TunnelForge Bootstrapper Build" -ForegroundColor Cyan
 Write-Host "======================================" -ForegroundColor Cyan
 Write-Host ""
 
@@ -40,9 +40,9 @@ try {
             Remove-Item -Recurse -Force "build"
             Write-Host "  - Removed build/" -ForegroundColor Gray
         }
-        if (Test-Path "dist/TunnelDBManager-WebSetup.exe") {
-            Remove-Item -Force "dist/TunnelDBManager-WebSetup.exe"
-            Write-Host "  - Removed dist/TunnelDBManager-WebSetup.exe" -ForegroundColor Gray
+        if (Test-Path "dist/TunnelForge-WebSetup.exe") {
+            Remove-Item -Force "dist/TunnelForge-WebSetup.exe"
+            Write-Host "  - Removed dist/TunnelForge-WebSetup.exe" -ForegroundColor Gray
         }
         Write-Host ""
     }
@@ -85,7 +85,7 @@ try {
     Write-Host ""
 
     # 결과 확인
-    $OutputFile = "dist\TunnelDBManager-WebSetup.exe"
+    $OutputFile = "dist\TunnelForge-WebSetup.exe"
     if (Test-Path $OutputFile) {
         $FileInfo = Get-Item $OutputFile
         $FileSizeMB = [math]::Round($FileInfo.Length / 1MB, 2)

@@ -1,6 +1,6 @@
 #!/bin/bash
 #
-# TunnelDB Manager - Smart Release Script (Bash version)
+# TunnelForge - Smart Release Script (Bash version)
 #
 # GitHub 최신 릴리스와 비교하여 스마트하게 릴리스를 생성합니다.
 #
@@ -45,7 +45,7 @@ print_color() {
 
 show_help() {
     cat << 'EOF'
-TunnelDB Manager - Smart Release (Bash)
+TunnelForge - Smart Release (Bash)
 
 Usage:
     ./scripts/smart-release.sh [OPTIONS]
@@ -141,7 +141,7 @@ main() {
     VERSION_FILE="src/version.py"
 
     print_color "$CYAN" "========================================"
-    print_color "$CYAN" " TunnelDB Manager - Smart Release"
+    print_color "$CYAN" " TunnelForge - Smart Release"
     print_color "$CYAN" "========================================"
     echo
 
