@@ -159,35 +159,41 @@ jobs:
             COMMITS=$(git log --pretty=format:"%s" -50 2>/dev/null || echo "")
           fi
 
-          # 커밋 메시지 파싱
+          # 커밋 메시지 파싱 (Windows Git Bash 호환)
           while IFS= read -r line; do
             [ -z "$line" ] && continue
 
-            # Conventional Commits 파싱
-            if [[ "$line" =~ ^feat(\(.+\))?:\ (.+) ]]; then
-              echo "- ${BASH_REMATCH[2]}" >> changes_feat.txt
-            elif [[ "$line" =~ ^fix(\(.+\))?:\ (.+) ]]; then
-              echo "- ${BASH_REMATCH[2]}" >> changes_fix.txt
-            elif [[ "$line" =~ ^docs(\(.+\))?:\ (.+) ]]; then
-              echo "- ${BASH_REMATCH[2]}" >> changes_docs.txt
-            elif [[ "$line" =~ ^refactor(\(.+\))?:\ (.+) ]]; then
-              echo "- ${BASH_REMATCH[2]}" >> changes_refactor.txt
-            elif [[ "$line" =~ ^perf(\(.+\))?:\ (.+) ]]; then
-              echo "- ${BASH_REMATCH[2]}" >> changes_perf.txt
-            elif [[ ! "$line" =~ ^(chore|ci|test|style|build)(\(.+\))?:\ ]]; then
+            # Conventional Commits 파싱 (간단한 패턴 사용)
+            if [[ "$line" == feat:* ]] || [[ "$line" == feat\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_feat.txt
+            elif [[ "$line" == fix:* ]] || [[ "$line" == fix\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_fix.txt
+            elif [[ "$line" == docs:* ]] || [[ "$line" == docs\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_docs.txt
+            elif [[ "$line" == refactor:* ]] || [[ "$line" == refactor\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_refactor.txt
+            elif [[ "$line" == perf:* ]] || [[ "$line" == perf\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_perf.txt
+            elif [[ "$line" != chore:* ]] && [[ "$line" != chore\(*\):* ]] && \
+                 [[ "$line" != ci:* ]] && [[ "$line" != ci\(*\):* ]] && \
+                 [[ "$line" != test:* ]] && [[ "$line" != test\(*\):* ]] && \
+                 [[ "$line" != style:* ]] && [[ "$line" != style\(*\):* ]] && \
+                 [[ "$line" != build:* ]] && [[ "$line" != build\(*\):* ]]; then
               # chore, ci, test, style, build 제외한 기타 커밋
-              if [[ ! "$line" =~ ^Merge\  ]] && [[ ! "$line" =~ ^Bump\ version ]]; then
+              if [[ "$line" != Merge* ]] && [[ "$line" != *"Bump version"* ]]; then
                 echo "- $line" >> changes_other.txt
               fi
             fi
           done <<< "$COMMITS"
 
           # 릴리스 노트 생성
-          cat << 'HEADER' > release_notes.md
-          ## TunnelForge v$VERSION
-
-          HEADER
-          sed -i "s/\$VERSION/$VERSION/g" release_notes.md
+          echo "## TunnelForge v$VERSION" > release_notes.md
+          echo "" >> release_notes.md
 
           # 변경사항 섹션 추가
           HAS_CHANGES=false
@@ -241,25 +247,23 @@ jobs:
           fi
 
           # 다운로드 및 설치 안내
-          cat << EOF >> release_notes.md
-          ---
-
-          ### 📥 다운로드
-          | 파일 | 설명 | 크기 |
-          |------|------|------|
-          | \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |
-          | \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |
-
-          ### 설치 방법
-
-          **온라인 설치 (권장):**
-          1. \`TunnelForge-WebSetup.exe\` 다운로드
-          2. 실행하면 자동으로 최신 버전 다운로드 및 설치
-
-          **오프라인 설치:**
-          1. \`TunnelForge-Setup-$VERSION.exe\` 다운로드
-          2. 설치 마법사를 따라 진행
-          EOF
+          echo "---" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### 📥 다운로드" >> release_notes.md
+          echo "| 파일 | 설명 | 크기 |" >> release_notes.md
+          echo "|------|------|------|" >> release_notes.md
+          echo "| \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |" >> release_notes.md
+          echo "| \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### 설치 방법" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**온라인 설치 (권장):**" >> release_notes.md
+          echo "1. \`TunnelForge-WebSetup.exe\` 다운로드" >> release_notes.md
+          echo "2. 실행하면 자동으로 최신 버전 다운로드 및 설치" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**오프라인 설치:**" >> release_notes.md
+          echo "1. \`TunnelForge-Setup-$VERSION.exe\` 다운로드" >> release_notes.md
+          echo "2. 설치 마법사를 따라 진행" >> release_notes.md
 
           echo ""
           echo "========== Generated Release Notes =========="
