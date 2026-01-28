@@ -1,5 +1,12 @@
+# -*- coding: utf-8 -*-
 import sys
+import io
 import ctypes
+
+# Windows 콘솔 UTF-8 출력 지원 (이모지 출력을 위해)
+if sys.platform == 'win32':
+    sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
 from PyQt6.QtWidgets import QApplication
 from PyQt6.QtGui import QIcon
 

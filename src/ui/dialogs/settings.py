@@ -2,7 +2,7 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
-                             QWidget, QTextBrowser)
+                             QWidget, QTextBrowser, QSizePolicy)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QCursor
 from PyQt6.QtCore import QUrl
@@ -273,10 +273,25 @@ class SettingsDialog(QDialog):
         btn_layout.addStretch()
         update_layout.addLayout(btn_layout)
 
-        # 업데이트 상태 라벨
-        self.update_status_label = QLabel("")
-        self.update_status_label.setWordWrap(True)
-        self.update_status_label.setStyleSheet("margin-top: 10px; font-size: 12px;")
+        # 업데이트 상태 표시 (QTextBrowser로 변경 - HTML 링크 및 동적 크기 지원)
+        self.update_status_label = QTextBrowser()
+        self.update_status_label.setReadOnly(True)
+        self.update_status_label.setOpenExternalLinks(True)
+        self.update_status_label.setStyleSheet("""
+            QTextBrowser {
+                background-color: transparent;
+                border: none;
+                margin-top: 10px;
+                font-size: 12px;
+            }
+        """)
+        # 내용에 맞게 크기 자동 조정
+        self.update_status_label.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.update_status_label.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.update_status_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Minimum)
+        self.update_status_label.setMinimumHeight(20)
+        self.update_status_label.setMaximumHeight(100)
+        self.update_status_label.document().contentsChanged.connect(self._adjust_update_label_height)
         update_layout.addWidget(self.update_status_label)
 
         layout.addWidget(update_group)
@@ -326,8 +341,9 @@ class SettingsDialog(QDialog):
         """업데이트 확인"""
         self.btn_check_update.setEnabled(False)
         self.btn_check_update.setText("확인 중...")
-        self.update_status_label.setText("업데이트를 확인하는 중입니다...")
-        self.update_status_label.setStyleSheet("color: #3498db; margin-top: 10px; font-size: 12px;")
+        self.update_status_label.setHtml(
+            '<div style="color: #3498db; font-size: 12px;">업데이트를 확인하는 중입니다...</div>'
+        )
 
         # 백그라운드 스레드에서 확인
         self._update_checker_thread = UpdateCheckerThread()
@@ -340,20 +356,31 @@ class SettingsDialog(QDialog):
         self.btn_check_update.setText("업데이트 확인")
 
         if error_msg:
-            self.update_status_label.setText(f"❌ {error_msg}")
-            self.update_status_label.setStyleSheet("color: #e74c3c; margin-top: 10px; font-size: 12px;")
+            self.update_status_label.setHtml(
+                f'<div style="color: #e74c3c; font-size: 12px;">❌ {error_msg}</div>'
+            )
             return
 
         if needs_update:
-            self.update_status_label.setText(
-                f"✅ 새로운 버전 {latest_version}이 사용 가능합니다!\n"
-                f'<a href="{download_url}">다운로드 페이지로 이동</a>'
+            self.update_status_label.setHtml(
+                f'<div style="color: #27ae60; font-size: 12px;">'
+                f'✅ 새로운 버전 {latest_version}이 사용 가능합니다!<br>'
+                f'<a href="{download_url}" style="color: #3498db;">다운로드 페이지로 이동</a>'
+                f'</div>'
             )
-            self.update_status_label.setStyleSheet("color: #27ae60; margin-top: 10px; font-size: 12px;")
-            self.update_status_label.setOpenExternalLinks(True)
         else:
-            self.update_status_label.setText(f"✅ 최신 버전({__version__})을 사용하고 있습니다.")
-            self.update_status_label.setStyleSheet("color: #27ae60; margin-top: 10px; font-size: 12px;")
+            self.update_status_label.setHtml(
+                f'<div style="color: #27ae60; font-size: 12px;">'
+                f'✅ 최신 버전({__version__})을 사용하고 있습니다.'
+                f'</div>'
+            )
+
+    def _adjust_update_label_height(self):
+        """업데이트 상태 라벨 높이를 내용에 맞게 조정"""
+        doc_height = self.update_status_label.document().size().height()
+        # 여백 추가하여 적절한 높이 설정
+        new_height = min(max(int(doc_height) + 10, 20), 100)
+        self.update_status_label.setFixedHeight(new_height)
 
     def _check_github_app(self) -> bool:
         """GitHub App 설정 여부 확인"""
