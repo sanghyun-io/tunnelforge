@@ -8,6 +8,17 @@ class TunnelEngine:
         self.active_tunnels = {}  # { tunnel_id: server_object or None(직접 연결) }
         self.tunnel_configs = {}  # { tunnel_id: config } - 연결 정보 저장용
 
+    def is_port_available(self, port: int) -> bool:
+        """포트가 사용 가능한지 확인"""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(1)
+            s.bind(('0.0.0.0', port))
+            s.close()
+            return True
+        except OSError:
+            return False
+
     def _load_private_key(self, key_path):
         """
         SSH 키를 명시적으로 로드합니다.
@@ -57,8 +68,16 @@ class TunnelEngine:
             f"💡 OpenSSH 포맷인 경우 'pip install cryptography' 필요"
         )
 
-    def start_tunnel(self, config):
-        """SSH 터널 또는 직접 연결 시작"""
+    def start_tunnel(self, config, check_port: bool = True):
+        """SSH 터널 또는 직접 연결 시작
+
+        Args:
+            config: 터널 설정
+            check_port: 포트 충돌 체크 여부 (자동 연결 시 사용)
+
+        Returns:
+            (success, message) 튜플
+        """
         tid = config['id']
 
         # 이미 실행 중인지 확인
@@ -74,6 +93,12 @@ class TunnelEngine:
             self.tunnel_configs[tid] = config
             print(f"🔗 직접 연결 모드: {config['name']} -> {config['remote_host']}:{config['remote_port']}")
             return True, f"직접 연결: {config['remote_host']}:{config['remote_port']}"
+
+        # SSH 터널 모드 - 포트 충돌 체크
+        if check_port:
+            local_port = int(config.get('local_port', 0))
+            if local_port > 0 and not self.is_port_available(local_port):
+                return False, f"포트 {local_port}이(가) 이미 사용 중입니다."
 
         # SSH 터널 모드
         return self._start_ssh_tunnel(config)

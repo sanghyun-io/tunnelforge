@@ -129,3 +129,15 @@ class ConfigManager:
                 db_password = self.encryptor.decrypt(encrypted_pw)
                 return (db_user, db_password)
         return ('', '')
+
+    def save_active_tunnels(self, tunnel_ids: list):
+        """종료 시 활성화된 터널 ID 목록 저장"""
+        config = self.load_config()
+        config['last_active_tunnels'] = tunnel_ids
+        self.save_config(config)
+        print(f"💾 활성 터널 상태 저장: {len(tunnel_ids)}개")
+
+    def get_last_active_tunnels(self) -> list:
+        """마지막으로 활성화되어 있던 터널 ID 목록 반환"""
+        config = self.load_config()
+        return config.get('last_active_tunnels', [])
