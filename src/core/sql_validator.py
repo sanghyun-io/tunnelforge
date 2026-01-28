@@ -146,6 +146,12 @@ class SQLValidator:
         'BIN_TO_UUID', 'UUID_TO_BIN', 'IS_UUID'
     }
 
+    # 시스템 스키마 (검증 제외)
+    SYSTEM_SCHEMAS = {
+        'INFORMATION_SCHEMA', 'MYSQL', 'PERFORMANCE_SCHEMA', 'SYS',
+        'information_schema', 'mysql', 'performance_schema', 'sys'
+    }
+
     # 테이블명 추출 패턴 (순서 중요: 더 구체적인 패턴 먼저)
     TABLE_PATTERNS = [
         # DELETE FROM table (FROM만 매칭되지 않도록 DELETE FROM을 먼저)
@@ -238,7 +244,13 @@ class SQLValidator:
                 if not table_match:
                     continue
 
+                schema_name = table_match.group(1)  # 스키마명 (없으면 None)
                 table_name = table_match.group(2)
+
+                # 시스템 스키마면 검증 건너뛰기 (INFORMATION_SCHEMA, mysql 등)
+                if schema_name and schema_name in self.SYSTEM_SCHEMAS:
+                    continue
+
                 table_start = full_match_start + table_match.start(2)
                 table_end = table_start + len(table_name)
 

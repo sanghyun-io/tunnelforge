@@ -217,6 +217,35 @@ class TestSQLValidator(unittest.TestCase):
         table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
         self.assertEqual(len(table_errors), 1)
 
+    def test_validate_system_schema_information_schema(self):
+        """[SUCCESS] INFORMATION_SCHEMA 시스템 스키마는 검증 제외"""
+        sql = """
+        SELECT TABLESPACE_NAME, FILE_NAME, FILE_TYPE
+        FROM INFORMATION_SCHEMA.FILES
+        WHERE FILE_NAME NOT LIKE CONCAT(@@datadir, '%')
+        """
+        issues = self.validator.validate(sql)
+
+        # INFORMATION_SCHEMA.FILES는 시스템 스키마이므로 에러 없어야 함
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_system_schema_mysql(self):
+        """[SUCCESS] mysql 시스템 스키마는 검증 제외"""
+        sql = "SELECT * FROM mysql.user"
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_system_schema_performance_schema(self):
+        """[SUCCESS] performance_schema 시스템 스키마는 검증 제외"""
+        sql = "SELECT * FROM performance_schema.threads"
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 0)
+
     # =========================================================================
     # 컬럼 검증 테스트
     # =========================================================================
