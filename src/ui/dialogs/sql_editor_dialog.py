@@ -217,8 +217,14 @@ class AutoCompletePopup(QListWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
+        # Tool 윈도우로 설정하여 포커스를 부모에게 유지
+        self.setWindowFlags(
+            Qt.WindowType.Tool |
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint
+        )
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)  # 포커스 가져가지 않음
         self.setMouseTracking(True)
         self.setMinimumWidth(200)
 
@@ -345,7 +351,7 @@ class AutoCompletePopup(QListWidget):
             new_row += direction
 
     def keyPressEvent(self, event):
-        """키 이벤트 (팝업 내부)"""
+        """키 이벤트 (팝업 내부) - 부모 에디터로 전달"""
         if event.key() == Qt.Key.Key_Escape:
             self.hide()
         elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
@@ -355,7 +361,9 @@ class AutoCompletePopup(QListWidget):
         elif event.key() == Qt.Key.Key_Down:
             self.move_selection(1)
         else:
-            super().keyPressEvent(event)
+            # 다른 키 입력은 부모 에디터로 전달
+            if self.parent():
+                self.parent().keyPressEvent(event)
 
 
 # =====================================================================
@@ -632,6 +640,10 @@ class ValidatingCodeEditor(CodeEditor):
         self._autocomplete_popup.move(global_pos)
         self._autocomplete_popup.show()
 
+        # 에디터에 포커스 유지 (팝업이 포커스 가져가지 않도록)
+        self.setFocus()
+        self.activateWindow()
+
     def _update_autocomplete_filter(self):
         """자동완성 필터 업데이트"""
         self._autocomplete_prefix = self._get_current_word()
@@ -653,6 +665,10 @@ class ValidatingCodeEditor(CodeEditor):
         cursor.insertText(text)
 
         self.setTextCursor(cursor)
+
+        # 에디터로 포커스 복원
+        self.setFocus()
+        self.activateWindow()
 
     def focusOutEvent(self, event):
         """포커스 잃을 때 자동완성 숨김"""
