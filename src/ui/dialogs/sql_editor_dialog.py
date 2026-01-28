@@ -211,12 +211,15 @@ class AutoCompletePopup(QListWidget):
 
     item_selected = pyqtSignal(str)  # 선택된 텍스트
 
+    # 항목당 높이 (padding 포함)
+    ITEM_HEIGHT = 24
+    MAX_HEIGHT = 200
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowFlags(Qt.WindowType.Popup | Qt.WindowType.FramelessWindowHint)
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.setMouseTracking(True)
-        self.setMaximumHeight(200)
         self.setMinimumWidth(200)
 
         self.setStyleSheet("""
@@ -274,6 +277,7 @@ class AutoCompletePopup(QListWidget):
 
         if self.count() > 0:
             self.setCurrentRow(0)
+            self._adjust_height(self.count())
 
     def filter_items(self, prefix: str):
         """입력에 따라 항목 필터링"""
@@ -294,7 +298,21 @@ class AutoCompletePopup(QListWidget):
                 self.setCurrentRow(i)
                 break
 
+        # 높이 조절
+        self._adjust_height(visible_count)
+
         return visible_count > 0
+
+    def _adjust_height(self, item_count: int):
+        """항목 개수에 따라 높이 조절"""
+        if item_count <= 0:
+            return
+
+        # 항목 개수 * 항목 높이 + 테두리 여백
+        calculated_height = item_count * self.ITEM_HEIGHT + 4
+        # 최대 높이 제한
+        new_height = min(calculated_height, self.MAX_HEIGHT)
+        self.setFixedHeight(new_height)
 
     def _on_item_clicked(self, item):
         """항목 클릭"""
@@ -554,22 +572,15 @@ class ValidatingCodeEditor(CodeEditor):
             elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter, Qt.Key.Key_Tab):
                 if self._autocomplete_popup.select_current():
                     return
+                # 선택 실패 시 (빈 목록 등) 팝업 닫고 기본 동작
+                self._autocomplete_popup.hide()
             elif event.key() == Qt.Key.Key_Up:
                 self._autocomplete_popup.move_selection(-1)
                 return
             elif event.key() == Qt.Key.Key_Down:
                 self._autocomplete_popup.move_selection(1)
                 return
-            elif event.key() == Qt.Key.Key_Backspace:
-                # 입력 삭제 시 접두사 업데이트
-                super().keyPressEvent(event)
-                self._update_autocomplete_filter()
-                return
-            elif event.text() and event.text().isalnum():
-                # 문자 입력 시 필터링
-                super().keyPressEvent(event)
-                self._update_autocomplete_filter()
-                return
+            # 그 외 키 입력은 에디터에 전달 후 필터링 업데이트
 
         # Ctrl+Space: 자동완성 표시
         if event.modifiers() == Qt.KeyboardModifier.ControlModifier and event.key() == Qt.Key.Key_Space:
@@ -583,11 +594,16 @@ class ValidatingCodeEditor(CodeEditor):
             QTimer.singleShot(50, self._show_autocomplete)
             return
 
+        # 일반 키 입력 처리
         super().keyPressEvent(event)
 
-        # 팝업이 열려있으면 필터링
+        # 팝업이 열려있으면 필터링 업데이트
         if self._autocomplete_popup.isVisible():
-            self._update_autocomplete_filter()
+            # 공백이나 특수문자 입력 시 팝업 닫기
+            if event.text() and not event.text().isalnum() and event.text() != '_':
+                self._autocomplete_popup.hide()
+            else:
+                self._update_autocomplete_filter()
 
     def _show_autocomplete(self):
         """자동완성 팝업 표시 요청"""
