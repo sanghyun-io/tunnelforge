@@ -543,25 +543,28 @@ class SQLAutoCompleter:
                                     'detail': f'{table}'
                                 })
 
-        # 키워드 추가 (column 컨텍스트 제외, 또는 SELECT 직후일 때는 포함)
-        if context['type'] == 'keyword' or context['type'] == 'column':
-            # SELECT 뒤에서는 DISTINCT, ALL 등 키워드도 유용
-            for kw in self.SQL_KEYWORDS:
-                if self._matches_prefix(kw, prefix):
-                    completions.append({
-                        'label': kw,
-                        'type': 'keyword',
-                        'detail': 'SQL 키워드'
-                    })
+        # table. 뒤가 아닌 경우에만 키워드/함수 추가
+        # (table. 뒤에서는 해당 테이블 컬럼만 제안)
+        if not context.get('table'):
+            # 키워드 추가 (keyword 또는 column 컨텍스트)
+            if context['type'] in ('keyword', 'column'):
+                for kw in self.SQL_KEYWORDS:
+                    if self._matches_prefix(kw, prefix):
+                        completions.append({
+                            'label': kw,
+                            'type': 'keyword',
+                            'detail': 'SQL 키워드'
+                        })
 
-        # 함수 추가 (항상)
-        for func in self.SQL_FUNCTIONS:
-            if self._matches_prefix(func, prefix):
-                completions.append({
-                    'label': f'{func}()',
-                    'type': 'function',
-                    'detail': 'SQL 함수'
-                })
+            # 함수 추가 (keyword 또는 column 컨텍스트)
+            if context['type'] in ('keyword', 'column'):
+                for func in self.SQL_FUNCTIONS:
+                    if self._matches_prefix(func, prefix):
+                        completions.append({
+                            'label': f'{func}()',
+                            'type': 'function',
+                            'detail': 'SQL 함수'
+                        })
 
         return completions
 

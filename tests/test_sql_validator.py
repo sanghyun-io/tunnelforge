@@ -453,7 +453,7 @@ class TestSQLAutoCompleter(unittest.TestCase):
         self.assertGreater(len(table_completions), 0)
 
     def test_autocomplete_after_table_dot(self):
-        """[SUCCESS] table. 뒤 → 해당 테이블 컬럼"""
+        """[SUCCESS] table. 뒤 → 해당 테이블 컬럼만 (키워드/함수 제외)"""
         sql = "SELECT users."
         completions = self.completer.get_completions(sql, len(sql))
 
@@ -465,6 +465,11 @@ class TestSQLAutoCompleter(unittest.TestCase):
         self.assertIn('email', column_labels)
         # 다른 테이블 컬럼은 없어야 함
         self.assertNotIn('total_amount', column_labels)
+
+        # 키워드와 함수는 포함되지 않아야 함 (table. 뒤에서는 컬럼만)
+        types = set(c['type'] for c in completions)
+        self.assertNotIn('keyword', types, "table. 뒤에서 키워드가 포함되면 안됨")
+        self.assertNotIn('function', types, "table. 뒤에서 함수가 포함되면 안됨")
 
     def test_autocomplete_after_select(self):
         """[SUCCESS] SELECT 뒤 → 컬럼/키워드"""
