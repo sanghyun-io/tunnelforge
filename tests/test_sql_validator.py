@@ -246,6 +246,37 @@ class TestSQLValidator(unittest.TestCase):
         table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
         self.assertEqual(len(table_errors), 0)
 
+    def test_validate_system_schema_sys(self):
+        """[SUCCESS] sys 시스템 스키마는 검증 제외"""
+        sql = "SELECT * FROM sys.version"
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_system_schema_ndbinfo(self):
+        """[SUCCESS] ndbinfo 시스템 스키마는 검증 제외 (NDB Cluster)"""
+        sql = "SELECT * FROM ndbinfo.nodes"
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_system_schema_case_insensitive(self):
+        """[SUCCESS] 시스템 스키마 대소문자 구분 없음"""
+        # 다양한 대소문자 조합 테스트
+        sqls = [
+            "SELECT * FROM INFORMATION_SCHEMA.TABLES",
+            "SELECT * FROM information_schema.tables",
+            "SELECT * FROM Information_Schema.Tables",
+            "SELECT * FROM MYSQL.user",
+            "SELECT * FROM MySQL.User",
+        ]
+        for sql in sqls:
+            issues = self.validator.validate(sql)
+            table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+            self.assertEqual(len(table_errors), 0, f"Failed for: {sql}")
+
     # =========================================================================
     # 컬럼 검증 테스트
     # =========================================================================

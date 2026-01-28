@@ -146,10 +146,14 @@ class SQLValidator:
         'BIN_TO_UUID', 'UUID_TO_BIN', 'IS_UUID'
     }
 
-    # 시스템 스키마 (검증 제외)
+    # 시스템 스키마 (검증 제외) - 대문자로 저장, 비교 시 upper()
+    # https://dev.mysql.com/doc/refman/8.0/en/system-schema.html
     SYSTEM_SCHEMAS = {
-        'INFORMATION_SCHEMA', 'MYSQL', 'PERFORMANCE_SCHEMA', 'SYS',
-        'information_schema', 'mysql', 'performance_schema', 'sys'
+        'INFORMATION_SCHEMA',  # 메타데이터
+        'MYSQL',               # 시스템 테이블 (권한, 설정 등)
+        'PERFORMANCE_SCHEMA',  # 성능 모니터링
+        'SYS',                 # Performance Schema 해석용 (5.7+)
+        'NDBINFO',             # NDB Cluster 정보 (NDB Cluster 전용)
     }
 
     # 테이블명 추출 패턴 (순서 중요: 더 구체적인 패턴 먼저)
@@ -248,7 +252,7 @@ class SQLValidator:
                 table_name = table_match.group(2)
 
                 # 시스템 스키마면 검증 건너뛰기 (INFORMATION_SCHEMA, mysql 등)
-                if schema_name and schema_name in self.SYSTEM_SCHEMAS:
+                if schema_name and schema_name.upper() in self.SYSTEM_SCHEMAS:
                     continue
 
                 table_start = full_match_start + table_match.start(2)
