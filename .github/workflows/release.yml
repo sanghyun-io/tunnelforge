@@ -117,11 +117,6 @@ jobs:
           echo "installer_path=$($installerFile.FullName)" >> $env:GITHUB_OUTPUT
           echo "installer_name=$($installerFile.Name)" >> $env:GITHUB_OUTPUT
 
-          # Create version-less copy for latest download URL
-          $latestFile = "output\TunnelDBManager-Setup-latest.exe"
-          Copy-Item $installerFile.FullName $latestFile
-          Write-Host "✅ Latest copy created: $latestFile"
-
       - name: Build Bootstrapper (Web Installer)
         run: |
           Write-Host "Building lightweight web installer (bootstrapper)..."
@@ -177,7 +172,6 @@ jobs:
           body_path: release_notes.md
           files: |
             output/TunnelDBManager-Setup-${{ steps.get_version.outputs.version }}.exe
-            output/TunnelDBManager-Setup-latest.exe
             dist/TunnelDBManager-WebSetup.exe
           draft: false
           prerelease: false
