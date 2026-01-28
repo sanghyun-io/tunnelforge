@@ -78,11 +78,11 @@ jobs:
 
       - name: Verify EXE build
         run: |
-          if (!(Test-Path "dist\TunnelDBManager.exe")) {
+          if (!(Test-Path "dist\TunnelForge.exe")) {
             Write-Host "❌ Error: EXE file not found!"
             exit 1
           }
-          $exeSize = (Get-Item "dist\TunnelDBManager.exe").Length / 1MB
+          $exeSize = (Get-Item "dist\TunnelForge.exe").Length / 1MB
           Write-Host "✅ EXE built: $($exeSize.ToString('0.0')) MB"
 
       - name: Build Bootstrapper (for recovery feature)
@@ -90,13 +90,13 @@ jobs:
           Write-Host "Building bootstrapper for recovery/update feature..."
           python -m PyInstaller bootstrapper/bootstrapper.spec --noconfirm
 
-          if (!(Test-Path "dist\TunnelDBManager-WebSetup.exe")) {
+          if (!(Test-Path "dist\TunnelForge-WebSetup.exe")) {
             Write-Host "❌ Error: Bootstrapper build failed!"
             exit 1
           }
 
-          $bootstrapperSize = (Get-Item "dist\TunnelDBManager-WebSetup.exe").Length / 1MB
-          Write-Host "✅ Bootstrapper built: TunnelDBManager-WebSetup.exe ($($bootstrapperSize.ToString('0.0')) MB)"
+          $bootstrapperSize = (Get-Item "dist\TunnelForge-WebSetup.exe").Length / 1MB
+          Write-Host "✅ Bootstrapper built: TunnelForge-WebSetup.exe ($($bootstrapperSize.ToString('0.0')) MB)"
           Write-Host "   This will be included in the installer for recovery feature."
 
       - name: Install Inno Setup
@@ -123,7 +123,7 @@ jobs:
       - name: Verify Installer build
         id: verify_installer
         run: |
-          $installerFile = Get-Item "output\TunnelDBManager-Setup-*.exe" | Select-Object -First 1
+          $installerFile = Get-Item "output\TunnelForge-Setup-*.exe" | Select-Object -First 1
           if (!$installerFile) {
             Write-Host "❌ Error: Installer file not found!"
             exit 1
@@ -184,7 +184,7 @@ jobs:
 
           # 릴리스 노트 생성
           cat << 'HEADER' > release_notes.md
-          ## TunnelDB Manager v$VERSION
+          ## TunnelForge v$VERSION
 
           HEADER
           sed -i "s/\$VERSION/$VERSION/g" release_notes.md
@@ -247,17 +247,17 @@ jobs:
           ### 📥 다운로드
           | 파일 | 설명 | 크기 |
           |------|------|------|
-          | \`TunnelDBManager-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |
-          | \`TunnelDBManager-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |
+          | \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |
+          | \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |
 
           ### 설치 방법
 
           **온라인 설치 (권장):**
-          1. \`TunnelDBManager-WebSetup.exe\` 다운로드
+          1. \`TunnelForge-WebSetup.exe\` 다운로드
           2. 실행하면 자동으로 최신 버전 다운로드 및 설치
 
           **오프라인 설치:**
-          1. \`TunnelDBManager-Setup-$VERSION.exe\` 다운로드
+          1. \`TunnelForge-Setup-$VERSION.exe\` 다운로드
           2. 설치 마법사를 따라 진행
           EOF
 
@@ -272,8 +272,8 @@ jobs:
           name: v${{ steps.get_version.outputs.version }}
           body_path: release_notes.md
           files: |
-            output/TunnelDBManager-Setup-${{ steps.get_version.outputs.version }}.exe
-            dist/TunnelDBManager-WebSetup.exe
+            output/TunnelForge-Setup-${{ steps.get_version.outputs.version }}.exe
+            dist/TunnelForge-WebSetup.exe
           draft: false
           prerelease: false
         env:
