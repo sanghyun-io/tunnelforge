@@ -22,6 +22,7 @@ from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
 from src.ui.dialogs.db_dialogs import MySQLShellWizard
 from src.ui.dialogs.migration_dialogs import MigrationWizard
 from src.ui.dialogs.test_dialogs import SQLExecutionDialog
+from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
 
 
 class StartupUpdateCheckerThread(QThread):
@@ -57,6 +58,7 @@ class TunnelManagerUI(QMainWindow):
         self.init_ui()
         self.init_tray()
         self._check_update_on_startup()
+        self._auto_connect_tunnels()
         print("✅ UI 초기화 완료")
 
     def init_ui(self):
@@ -100,8 +102,20 @@ class TunnelManagerUI(QMainWindow):
         """)
         btn_settings.clicked.connect(self.open_settings_dialog)
 
+        # [연결 추가] 버튼 - Primary 스타일
+        btn_add_tunnel = QPushButton("➕ 연결 추가")
+        btn_add_tunnel.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
+
         header_layout.addWidget(title)
         header_layout.addStretch()
+        header_layout.addWidget(btn_add_tunnel)
         header_layout.addWidget(btn_refresh)
         header_layout.addWidget(btn_settings)
         layout.addLayout(header_layout)
@@ -122,28 +136,6 @@ class TunnelManagerUI(QMainWindow):
         self.table.customContextMenuRequested.connect(self.show_context_menu)
 
         layout.addWidget(self.table)
-
-        # --- 테이블 하단: 연결 추가 버튼 영역 ---
-        add_button_container = QWidget()
-        add_button_layout = QHBoxLayout(add_button_container)
-        add_button_layout.setContentsMargins(0, 8, 0, 8)
-
-        btn_add_tunnel = QPushButton("➕ 연결 추가")
-        btn_add_tunnel.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 8px 24px; border-radius: 4px; border: none;
-                font-size: 13px;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
-        btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
-
-        add_button_layout.addStretch()
-        add_button_layout.addWidget(btn_add_tunnel)
-        add_button_layout.addStretch()
-
-        layout.addWidget(add_button_container)
 
         # 하단 상태바
         self.statusBar().showMessage("준비됨")
@@ -418,6 +410,10 @@ class TunnelManagerUI(QMainWindow):
 
     def close_app(self):
         """진짜 종료"""
+        # 현재 활성화된 터널 ID 목록 저장 (다음 시작 시 자동 연결용)
+        active_ids = list(self.engine.active_tunnels.keys())
+        self.config_mgr.save_active_tunnels(active_ids)
+
         self.engine.stop_all()
         self.tray_icon.hide()
         # 모든 창 닫고 종료
@@ -434,6 +430,60 @@ class TunnelManagerUI(QMainWindow):
         self._update_checker_thread = StartupUpdateCheckerThread()
         self._update_checker_thread.update_available.connect(self._on_startup_update_available)
         self._update_checker_thread.start()
+
+    def _auto_connect_tunnels(self):
+        """앱 시작 시 이전에 활성화되어 있던 터널 자동 연결"""
+        # 자동 연결 설정 확인
+        if not self.config_mgr.get_app_setting('auto_reconnect', True):
+            return
+
+        last_active = self.config_mgr.get_last_active_tunnels()
+        if not last_active:
+            return
+
+        print(f"🔄 이전 세션 터널 자동 연결 시도: {len(last_active)}개")
+
+        connected = []
+        skipped = []
+
+        for tid in last_active:
+            # 터널 설정 찾기
+            tunnel = next((t for t in self.tunnels if t.get('id') == tid), None)
+            if not tunnel:
+                print(f"⚠️ 터널 설정을 찾을 수 없음: {tid}")
+                continue
+
+            # 연결 시도
+            success, msg = self.engine.start_tunnel(tunnel, check_port=True)
+            if success:
+                connected.append(tunnel['name'])
+                print(f"✅ 자동 연결 성공: {tunnel['name']}")
+            else:
+                skipped.append((tunnel['name'], msg))
+                print(f"⚠️ 자동 연결 스킵: {tunnel['name']} - {msg}")
+
+        # 테이블 갱신
+        self.refresh_table()
+
+        # 결과 알림
+        if connected or skipped:
+            msg_parts = []
+            if connected:
+                msg_parts.append(f"✅ 연결됨: {', '.join(connected)}")
+            if skipped:
+                skip_msgs = [f"{name} ({reason})" for name, reason in skipped]
+                msg_parts.append(f"⚠️ 스킵: {', '.join(skip_msgs)}")
+
+            self.statusBar().showMessage(" | ".join(msg_parts), 5000)
+
+            # 트레이 알림 (연결된 터널이 있는 경우만)
+            if connected:
+                self.tray_icon.showMessage(
+                    "자동 연결 완료",
+                    f"{len(connected)}개 터널 연결됨" + (f", {len(skipped)}개 스킵" if skipped else ""),
+                    QSystemTrayIcon.MessageIcon.Information,
+                    3000
+                )
 
     def _on_startup_update_available(self, latest_version: str, download_url: str):
         """시작 시 업데이트 발견 시 트레이 알림"""
@@ -462,10 +512,42 @@ class TunnelManagerUI(QMainWindow):
 
         menu.addSeparator()
 
-        # SQL 실행
+        # SQL 에디터 및 실행
+        menu.addAction("📝 SQL 에디터 열기...", lambda: self.open_sql_editor(tunnel))
         menu.addAction("📄 SQL 파일 실행...", lambda: self.run_sql_file(tunnel))
 
         menu.exec(self.table.mapToGlobal(position))
+
+    def open_sql_editor(self, tunnel):
+        """SQL 에디터 다이얼로그 열기"""
+        # 자격 증명 확인
+        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(
+                self, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
+            )
+            return
+
+        # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
+        is_direct = tunnel.get('connection_mode') == 'direct'
+        if not is_direct and not self.engine.is_running(tunnel['id']):
+            reply = QMessageBox.question(
+                self, "터널 연결",
+                f"'{tunnel['name']}' 터널이 연결되어 있지 않습니다.\n터널을 시작하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                success, msg = self.engine.start_tunnel(tunnel)
+                if not success:
+                    QMessageBox.critical(self, "오류", f"터널 시작 실패:\n{msg}")
+                    return
+                self.refresh_table()
+            else:
+                return
+
+        dialog = SQLEditorDialog(self, tunnel, self.config_mgr, self.engine)
+        dialog.exec()
 
     def run_sql_file(self, tunnel):
         """SQL 파일 실행 다이얼로그"""
