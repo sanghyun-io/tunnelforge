@@ -1,4 +1,4 @@
-# TunnelDB Manager
+# TunnelForge
 
 Secure database management through SSH tunnels with a simple GUI.
 
@@ -8,9 +8,9 @@ Secure database management through SSH tunnels with a simple GUI.
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-## What is TunnelDB Manager?
+## What is TunnelForge?
 
-TunnelDB Manager is a desktop application that simplifies secure database access through SSH tunnels. Connect to remote MySQL databases safely via bastion hosts without complex command-line configurations.
+TunnelForge is a desktop application that simplifies secure database access through SSH tunnels. Connect to remote MySQL databases safely via bastion hosts without complex command-line configurations.
 
 ### Key Features
 
@@ -23,17 +23,17 @@ TunnelDB Manager is a desktop application that simplifies secure database access
 
 ### Online Install (Recommended, ~5MB)
 
-**[Download Web Installer](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-WebSetup.exe)**
+**[Download Web Installer](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe)**
 
 Automatically downloads and installs the latest version.
 
 ### Offline Install (~35MB)
 
-**[Download Full Installer](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-Setup-latest.exe)**
+**[Download Full Installer](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-Setup-latest.exe)**
 
 For environments without internet access.
 
-Browse all versions at [Releases](https://github.com/sanghyun-io/db-connector/releases).
+Browse all versions at [Releases](https://github.com/sanghyun-io/tunnelforge/releases).
 
 ## Quick Start
 
@@ -86,7 +86,7 @@ Create separate tunnel configurations for each environment (Development, Staging
 
 ## Configuration
 
-Settings are stored in: `%LOCALAPPDATA%\TunnelDB\config.json`
+Settings are stored in: `%LOCALAPPDATA%\TunnelForge\config.json`
 
 ## Contributing
 

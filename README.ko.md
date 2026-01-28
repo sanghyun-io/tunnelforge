@@ -1,4 +1,4 @@
-# TunnelDB Manager
+# TunnelForge
 
 SSH 터널을 통한 안전한 데이터베이스 관리 GUI 애플리케이션
 
@@ -8,9 +8,9 @@ SSH 터널을 통한 안전한 데이터베이스 관리 GUI 애플리케이션
 ![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
 ![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-## TunnelDB Manager란?
+## TunnelForge란?
 
-TunnelDB Manager는 SSH 터널을 통해 원격 데이터베이스에 안전하게 접근할 수 있는 데스크톱 애플리케이션입니다. 복잡한 커맨드라인 설정 없이 Bastion 호스트를 통해 MySQL 데이터베이스에 쉽게 연결하세요.
+TunnelForge는 SSH 터널을 통해 원격 데이터베이스에 안전하게 접근할 수 있는 데스크톱 애플리케이션입니다. 복잡한 커맨드라인 설정 없이 Bastion 호스트를 통해 MySQL 데이터베이스에 쉽게 연결하세요.
 
 ### 주요 기능
 
@@ -21,9 +21,9 @@ TunnelDB Manager는 SSH 터널을 통해 원격 데이터베이스에 안전하�
 
 ## 다운로드
 
-**[최신 버전 다운로드](https://github.com/sanghyun-io/db-connector/releases/latest/download/TunnelDBManager-Setup-latest.exe)**
+**[최신 버전 다운로드](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-Setup-latest.exe)**
 
-또는 [Releases](https://github.com/sanghyun-io/db-connector/releases)에서 모든 버전을 확인하세요.
+또는 [Releases](https://github.com/sanghyun-io/tunnelforge/releases)에서 모든 버전을 확인하세요.
 
 ## 빠른 시작
 
@@ -76,7 +76,7 @@ TunnelDB Manager는 SSH 터널을 통해 원격 데이터베이스에 안전하�
 
 ## 설정 파일 위치
 
-`%LOCALAPPDATA%\TunnelDB\config.json`
+`%LOCALAPPDATA%\TunnelForge\config.json`
 
 ## 기여하기
 

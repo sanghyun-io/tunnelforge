@@ -1,6 +1,6 @@
-# TunnelDB Manager - 빌드 가이드
+# TunnelForge - 빌드 가이드
 
-이 문서는 TunnelDB Manager를 Windows 실행 파일(`.exe`)로 빌드하는 방법을 설명합니다.
+이 문서는 TunnelForge를 Windows 실행 파일(`.exe`)로 빌드하는 방법을 설명합니다.
 
 ## 📋 목차
 
@@ -64,7 +64,7 @@ pyinstaller tunnel-manager.spec
 Spec 파일 없이 명령줄 옵션으로 빌드할 수도 있습니다.
 
 ```bash
-pyinstaller --name "TunnelDBManager" ^
+pyinstaller --name "TunnelForge" ^
             --onefile ^
             --windowed ^
             --icon "assets/icon.ico" ^
@@ -132,9 +132,9 @@ pyinstaller --console main.py
 ```
 tunnel-manager/
 ├── build/                          # 임시 빌드 파일 (삭제 가능)
-│   └── TunnelDBManager/
+│   └── TunnelForge/
 ├── dist/                           # 최종 실행 파일 위치
-│   └── TunnelDBManager.exe  # 배포용 실행 파일
+│   └── TunnelForge.exe  # 배포용 실행 파일
 └── tunnel-manager.spec             # PyInstaller 설정 파일
 ```
 
@@ -145,7 +145,7 @@ tunnel-manager/
 cd dist
 
 # 실행 파일 실행
-TunnelDBManager.exe
+TunnelForge.exe
 ```
 
 ---
@@ -284,7 +284,7 @@ pyinstaller tunnel-manager.spec
 
 빌드 후 확인 사항:
 
-- [ ] `dist/TunnelDBManager.exe` 생성 확인
+- [ ] `dist/TunnelForge.exe` 생성 확인
 - [ ] 실행 파일 정상 동작 테스트
 - [ ] SSH 터널 연결 테스트
 - [ ] 데이터베이스 연결 테스트
@@ -304,7 +304,7 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 
 | 파일 | 타입 | 용도 |
 |------|------|------|
-| `installer/TunnelDBManager.iss` | 설정 파일 | Installer 빌드 방법을 정의 (직접 실행 ❌) |
+| `installer/TunnelForge.iss` | 설정 파일 | Installer 빌드 방법을 정의 (직접 실행 ❌) |
 | `scripts/build-installer.ps1` | 실행 스크립트 | 전체 빌드 과정을 자동화 (직접 실행 ✅) |
 
 **간단히 말하면:**
@@ -315,8 +315,8 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 ```
 [build-installer.ps1 실행]
     ↓
-    ├─→ PyInstaller 실행 → dist/TunnelDBManager.exe 생성
-    └─→ Inno Setup 실행 → TunnelDBManager.iss 읽기 → output/Installer.exe 생성
+    ├─→ PyInstaller 실행 → dist/TunnelForge.exe 생성
+    └─→ Inno Setup 실행 → TunnelForge.iss 읽기 → output/Installer.exe 생성
 ```
 
 ### 사전 요구사항
@@ -338,8 +338,8 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 ```
 
 **이 스크립트가 자동으로 하는 일:**
-1. ✅ PyInstaller로 `TunnelDBManager.exe` 빌드
-2. ✅ Inno Setup으로 `TunnelDBManager-Setup-1.0.0.exe` 생성
+1. ✅ PyInstaller로 `TunnelForge.exe` 빌드
+2. ✅ Inno Setup으로 `TunnelForge-Setup-1.0.0.exe` 생성
 3. ✅ 빌드 과정 상태를 실시간으로 표시
 4. ✅ 에러 발생 시 명확한 해결 방법 안내
 
@@ -363,14 +363,14 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 ```powershell
 # 1단계: PyInstaller로 EXE 빌드
 pyinstaller tunnel-manager.spec
-# → 결과: dist/TunnelDBManager.exe
+# → 결과: dist/TunnelForge.exe
 
 # 2단계: Inno Setup 컴파일러로 .iss 파일을 읽어서 Installer 생성
-"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\TunnelDBManager.iss
-# → 결과: output/TunnelDBManager-Setup-1.0.0.exe
+"C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\TunnelForge.iss
+# → 결과: output/TunnelForge-Setup-1.0.0.exe
 ```
 
-**참고:** `TunnelDBManager.iss`는 직접 실행하는 게 아니라 Inno Setup 컴파일러(ISCC.exe)가 읽는 설정 파일입니다.
+**참고:** `TunnelForge.iss`는 직접 실행하는 게 아니라 Inno Setup 컴파일러(ISCC.exe)가 읽는 설정 파일입니다.
 
 ### Installer 기능
 
@@ -389,19 +389,19 @@ pyinstaller tunnel-manager.spec
 ```
 tunnel-manager/
 ├── dist/
-│   └── TunnelDBManager.exe          # PyInstaller 빌드 결과
+│   └── TunnelForge.exe          # PyInstaller 빌드 결과
 └── output/
-    └── TunnelDBManager-Setup-1.0.0.exe  # Windows Installer
+    └── TunnelForge-Setup-1.0.0.exe  # Windows Installer
 ```
 
 ### Installer 테스트
 
 ```powershell
 # Installer 실행
-.\output\TunnelDBManager-Setup-1.0.0.exe
+.\output\TunnelForge-Setup-1.0.0.exe
 
 # 설치 후 확인사항:
-# 1. 시작 메뉴에서 "TunnelDB Manager" 검색
+# 1. 시작 메뉴에서 "TunnelForge" 검색
 # 2. 프로그램 정상 실행 확인
 # 3. 제어판 > 프로그램 추가/제거에서 확인
 # 4. 제거 후 재설치 테스트
@@ -409,7 +409,7 @@ tunnel-manager/
 
 ### Installer 커스터마이징
 
-`installer/TunnelDBManager.iss` 파일을 수정하여 설정을 변경할 수 있습니다:
+`installer/TunnelForge.iss` 파일을 수정하여 설정을 변경할 수 있습니다:
 
 ```iss
 [Setup]

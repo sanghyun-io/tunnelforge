@@ -7,7 +7,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TunnelDB Manager - Python PyQt6 GUI application for managing SSH tunnels and MySQL database connections. Enables secure remote database access through SSH bastion hosts with database export functionality.
+TunnelForge - Python PyQt6 GUI application for managing SSH tunnels and MySQL database connections. Enables secure remote database access through SSH bastion hosts with database export functionality.
 
 ## Commands
 
@@ -54,7 +54,7 @@ python scripts/smart_release.py --dry-run   # 미리보기
 main.py (Entry Point)
 ├── src/core/
 │   ├── ConfigManager (config_manager.py)
-│   │   └── Stores tunnel configs in %APPDATA%\Local\TunnelDB\config.json
+│   │   └── Stores tunnel configs in %APPDATA%\Local\TunnelForge\config.json
 │   ├── TunnelEngine (tunnel_engine.py)
 │   │   ├── SSHTunnelForwarder for SSH tunnel mode
 │   │   └── Direct connection mode support
@@ -216,9 +216,9 @@ scripts/
   - Builds offline installer (~35MB) and bootstrapper (~5MB)
   - Generates release notes automatically
   - Uploads all installers to GitHub Release:
-    - `TunnelDBManager-Setup-{version}.exe` - 오프라인 설치
-    - `TunnelDBManager-Setup-latest.exe` - 항상 최신 (오프라인)
-    - `TunnelDBManager-WebSetup.exe` - 온라인 설치 (부트스트래퍼)
+    - `TunnelForge-Setup-{version}.exe` - 오프라인 설치
+    - `TunnelForge-Setup-latest.exe` - 항상 최신 (오프라인)
+    - `TunnelForge-WebSetup.exe` - 온라인 설치 (부트스트래퍼)
 
 ### Update Checker
 

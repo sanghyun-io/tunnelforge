@@ -1,4 +1,4 @@
-# Contributing to TunnelDB Manager
+# Contributing to TunnelForge
 
 Thank you for your interest in contributing! This guide covers development setup, build process, and release workflow.
 
@@ -14,8 +14,8 @@ Thank you for your interest in contributing! This guide covers development setup
 
 ```bash
 # Clone repository
-git clone https://github.com/sanghyun-io/db-connector.git
-cd db-connector
+git clone https://github.com/sanghyun-io/tunnelforge.git
+cd tunnelforge
 
 # Create virtual environment
 python -m venv .venv
@@ -71,8 +71,8 @@ tunnel-manager/
 ```
 
 **Output:**
-- `dist\TunnelDBManager.exe` - Standalone executable
-- `output\TunnelDBManager-Setup-{version}.exe` - Windows installer
+- `dist\TunnelForge.exe` - Standalone executable
+- `output\TunnelForge-Setup-{version}.exe` - Windows installer
 
 ## Release Process
 
@@ -117,7 +117,7 @@ When a `v*` tag is pushed, GitHub Actions:
 4. Creates GitHub Release
 5. Attaches installer to release
 
-**Monitor builds:** https://github.com/sanghyun-io/db-connector/actions
+**Monitor builds:** https://github.com/sanghyun-io/tunnelforge/actions
 
 ## Code Style
 
