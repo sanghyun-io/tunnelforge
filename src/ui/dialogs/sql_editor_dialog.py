@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSplitter, QPlainTextEdit, QTextEdit, QWidget, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
     QStatusBar, QApplication, QAbstractItemView, QListWidget, QListWidgetItem,
-    QDialogButtonBox
+    QDialogButtonBox, QMenu
 )
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QThread
 from PyQt6.QtGui import (
@@ -893,10 +893,21 @@ class SQLEditorDialog(QDialog):
                         item.setForeground(QColor("#888888"))
                     table.setItem(r, c, item)
 
-            # 컬럼 너비 자동 조절
-            table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+            # 컬럼 너비 설정
+            header = table.horizontalHeader()
+            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # 수동 조절 가능
+            header.setMaximumSectionSize(300)  # 최대 너비 제한
+            header.setStretchLastSection(True)  # 마지막 열 늘리기
+            table.resizeColumnsToContents()  # 초기 너비는 내용에 맞게
+
             table.setAlternatingRowColors(True)
             table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+
+            # 컨텍스트 메뉴 설정 (우클릭 복사)
+            table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+            table.customContextMenuRequested.connect(
+                lambda pos, t=table, c=columns: self._show_table_context_menu(pos, t, c)
+            )
 
             # 셀 복사 허용
             table.setStyleSheet("""
@@ -935,6 +946,53 @@ class SQLEditorDialog(QDialog):
             self.message_text.append("🛑 임시 터널 종료...")
             self.engine.close_temp_tunnel(self.temp_server)
             self.temp_server = None
+
+    def _show_table_context_menu(self, position, table, columns):
+        """결과 테이블 컨텍스트 메뉴"""
+        menu = QMenu(self)
+
+        copy_action = menu.addAction("📋 복사")
+        copy_action.triggered.connect(lambda: self._copy_table_data(table, columns, False))
+
+        copy_header_action = menu.addAction("📋 헤더 포함 복사")
+        copy_header_action.triggered.connect(lambda: self._copy_table_data(table, columns, True))
+
+        menu.exec(table.mapToGlobal(position))
+
+    def _copy_table_data(self, table, columns, include_header):
+        """테이블 데이터를 탭 구분 형식으로 클립보드에 복사 (Excel 호환)"""
+        selection = table.selectedRanges()
+        if not selection:
+            return
+
+        lines = []
+
+        # 선택된 열 범위 계산
+        first_col = min(r.leftColumn() for r in selection)
+        last_col = max(r.rightColumn() for r in selection)
+
+        # 헤더 포함 옵션
+        if include_header:
+            header_line = '\t'.join(columns[first_col:last_col + 1])
+            lines.append(header_line)
+
+        # 선택된 행 데이터
+        rows_set = set()
+        for range_ in selection:
+            for row in range(range_.topRow(), range_.bottomRow() + 1):
+                rows_set.add(row)
+
+        for row in sorted(rows_set):
+            row_data = []
+            for col in range(first_col, last_col + 1):
+                item = table.item(row, col)
+                value = item.text() if item else ''
+                # 탭과 줄바꿈은 공백으로 치환 (셀 구분 보호)
+                value = value.replace('\t', ' ').replace('\n', ' ')
+                row_data.append(value)
+            lines.append('\t'.join(row_data))
+
+        QApplication.clipboard().setText('\n'.join(lines))
 
     def close_result_tab(self, index):
         """결과 탭 닫기"""
