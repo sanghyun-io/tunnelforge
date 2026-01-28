@@ -83,6 +83,20 @@ jobs:
           $exeSize = (Get-Item "dist\TunnelDBManager.exe").Length / 1MB
           Write-Host "✅ EXE built: $($exeSize.ToString('0.0')) MB"
 
+      - name: Build Bootstrapper (for recovery feature)
+        run: |
+          Write-Host "Building bootstrapper for recovery/update feature..."
+          python -m PyInstaller bootstrapper/bootstrapper.spec --noconfirm
+
+          if (!(Test-Path "dist\TunnelDBManager-WebSetup.exe")) {
+            Write-Host "❌ Error: Bootstrapper build failed!"
+            exit 1
+          }
+
+          $bootstrapperSize = (Get-Item "dist\TunnelDBManager-WebSetup.exe").Length / 1MB
+          Write-Host "✅ Bootstrapper built: TunnelDBManager-WebSetup.exe ($($bootstrapperSize.ToString('0.0')) MB)"
+          Write-Host "   This will be included in the installer for recovery feature."
+
       - name: Install Inno Setup
         run: |
           choco install innosetup -y
@@ -117,19 +131,6 @@ jobs:
           echo "installer_path=$($installerFile.FullName)" >> $env:GITHUB_OUTPUT
           echo "installer_name=$($installerFile.Name)" >> $env:GITHUB_OUTPUT
 
-      - name: Build Bootstrapper (Web Installer)
-        run: |
-          Write-Host "Building lightweight web installer (bootstrapper)..."
-          python -m PyInstaller bootstrapper/bootstrapper.spec --noconfirm
-
-          if (!(Test-Path "dist\TunnelDBManager-WebSetup.exe")) {
-            Write-Host "❌ Error: Bootstrapper build failed!"
-            exit 1
-          }
-
-          $bootstrapperSize = (Get-Item "dist\TunnelDBManager-WebSetup.exe").Length / 1MB
-          Write-Host "✅ Bootstrapper built: TunnelDBManager-WebSetup.exe ($($bootstrapperSize.ToString('0.0')) MB)"
-
       - name: Generate Release Notes
         id: release_notes
         shell: bash
@@ -159,6 +160,12 @@ jobs:
           - 🚀 MySQL Shell을 이용한 병렬 Export/Import
           - 🔄 데이터베이스 마이그레이션 분석 도구
           - 📊 시스템 트레이 상주 기능
+          - 🔧 자동 복구 기능 (오류 발생 시 최신 버전으로 재설치 안내)
+
+          ### 문제 해결
+          프로그램 실행 오류 발생 시:
+          - **자동 안내**: 오류 발생 시 복구 프로그램 실행 옵션 제공
+          - **수동 복구**: 시작 메뉴 → TunnelDB Manager → "복구 및 업데이트" 실행
 
           ---
           전체 변경 사항은 [CHANGELOG](https://github.com/${{ github.repository }}/compare/v$VERSION...main)를 참조하세요.

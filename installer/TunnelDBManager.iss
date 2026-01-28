@@ -67,6 +67,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; 메인 실행 파일 (.iss 파일 기준 상대 경로)
 Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
 
+; 복구/업데이트 프로그램 (부트스트래퍼)
+Source: "..\dist\TunnelDBManager-WebSetup.exe"; DestDir: "{app}"; Flags: ignoreversion
+
 ; 라이선스 파일 포함 (선택적)
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -75,6 +78,7 @@ Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 ; 시작 메뉴 단축키
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
+Name: "{group}\복구 및 업데이트"; Filename: "{app}\TunnelDBManager-WebSetup.exe"; Comment: "최신 버전으로 재설치"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 
 ; 바탕화면 아이콘 (선택 사항)
