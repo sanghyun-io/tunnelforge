@@ -1,5 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
-"""TunnelDB Manager 부트스트래퍼 PyInstaller 설정
+"""TunnelForge 부트스트래퍼 PyInstaller 설정
 
 경량 온라인 설치 프로그램을 위한 빌드 설정입니다.
 불필요한 모듈을 제외하여 파일 크기를 최소화합니다.
@@ -62,7 +62,7 @@ exe = EXE(
     a.zipfiles,
     a.datas,
     [],
-    name='TunnelDBManager-WebSetup',
+    name='TunnelForge-WebSetup',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,

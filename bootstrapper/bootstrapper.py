@@ -1,4 +1,4 @@
-"""TunnelDB Manager 온라인 설치 프로그램 (부트스트래퍼)
+"""TunnelForge 온라인 설치 프로그램 (부트스트래퍼)
 
 GitHub에서 최신 버전을 자동 다운로드하고 설치 프로그램을 실행합니다.
 단일 파일로 구성되어 PyInstaller 빌드 시 import 문제가 없습니다.
@@ -21,18 +21,18 @@ import requests
 # ============================================================
 
 __bootstrapper_version__ = "1.0.0"
-__app_name__ = "TunnelDB Manager"
+__app_name__ = "TunnelForge"
 
 # GitHub 저장소 정보
 GITHUB_OWNER = "sanghyun-io"
-GITHUB_REPO = "db-connector"
+GITHUB_REPO = "tunnelforge"
 
 # GitHub API URL
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 # 다운로드 대상 파일 패턴
-INSTALLER_FILENAME_PATTERN = "TunnelDBManager-Setup-latest.exe"
+INSTALLER_FILENAME_PATTERN = "TunnelForge-Setup-latest.exe"
 
 
 # ============================================================
@@ -105,7 +105,7 @@ class InstallerDownloader:
             if not self.download_url:
                 for asset in assets:
                     asset_name = asset.get('name', '')
-                    if 'TunnelDBManager-Setup' in asset_name and asset_name.endswith('.exe'):
+                    if 'TunnelForge-Setup' in asset_name and asset_name.endswith('.exe'):
                         self.download_url = asset.get('browser_download_url')
                         self.file_size = asset.get('size', 0)
                         break
@@ -160,7 +160,7 @@ class InstallerDownloader:
 
         # 임시 파일 경로 생성
         temp_dir = tempfile.gettempdir()
-        filename = os.path.basename(self.download_url) or "TunnelDBManager-Setup.exe"
+        filename = os.path.basename(self.download_url) or "TunnelForge-Setup.exe"
         file_path = os.path.join(temp_dir, filename)
 
         try:

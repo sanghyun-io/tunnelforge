@@ -72,7 +72,7 @@ class InstallerDownloader:
             if not self.download_url:
                 for asset in assets:
                     asset_name = asset.get('name', '')
-                    if 'TunnelDBManager-Setup' in asset_name and asset_name.endswith('.exe'):
+                    if 'TunnelForge-Setup' in asset_name and asset_name.endswith('.exe'):
                         self.download_url = asset.get('browser_download_url')
                         self.file_size = asset.get('size', 0)
                         break
@@ -127,7 +127,7 @@ class InstallerDownloader:
 
         # 임시 파일 경로 생성
         temp_dir = tempfile.gettempdir()
-        filename = os.path.basename(self.download_url) or "TunnelDBManager-Setup.exe"
+        filename = os.path.basename(self.download_url) or "TunnelForge-Setup.exe"
         file_path = os.path.join(temp_dir, filename)
 
         try:
