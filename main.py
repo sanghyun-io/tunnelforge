@@ -33,7 +33,7 @@ def show_error_and_offer_recovery(error_message: str):
     IDYES = 6
 
     app_dir = get_app_dir()
-    updater_path = os.path.join(app_dir, "TunnelDBManager-WebSetup.exe")
+    updater_path = os.path.join(app_dir, "TunnelForge-WebSetup.exe")
     updater_exists = os.path.exists(updater_path)
 
     if updater_exists:
@@ -46,7 +46,7 @@ def show_error_and_offer_recovery(error_message: str):
         result = ctypes.windll.user32.MessageBoxW(
             None,
             message,
-            "TunnelDB Manager - 오류",
+            "TunnelForge - 오류",
             MB_YESNO | MB_ICONERROR
         )
 
@@ -61,7 +61,7 @@ def show_error_and_offer_recovery(error_message: str):
                     None,
                     f"복구 프로그램 실행 실패:\n{str(e)}\n\n"
                     f"수동으로 실행해 주세요:\n{updater_path}",
-                    "TunnelDB Manager - 오류",
+                    "TunnelForge - 오류",
                     0x10  # MB_ICONERROR
                 )
     else:
@@ -70,12 +70,12 @@ def show_error_and_offer_recovery(error_message: str):
             f"프로그램 실행 중 오류가 발생했습니다.\n\n"
             f"오류 내용:\n{error_message}\n\n"
             f"GitHub에서 최신 버전을 다운로드해 주세요:\n"
-            f"https://github.com/sanghyun-io/db-connector/releases"
+            f"https://github.com/sanghyun-io/tunnelforge/releases"
         )
         ctypes.windll.user32.MessageBoxW(
             None,
             message,
-            "TunnelDB Manager - 오류",
+            "TunnelForge - 오류",
             0x10  # MB_ICONERROR
         )
 
@@ -88,7 +88,7 @@ def main():
     from src.ui.main_window import TunnelManagerUI
 
     # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('tunneldb.manager.1.0')
+    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('tunnelforge.1.0')
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon('assets/icon.ico'))  # 또는 'assets/icon.png'
@@ -126,7 +126,7 @@ if __name__ == "__main__":
             app_dir = get_app_dir()
             log_path = os.path.join(app_dir, "crash.log")
             with open(log_path, 'w', encoding='utf-8') as f:
-                f.write(f"TunnelDB Manager Crash Log\n")
+                f.write(f"TunnelForge Crash Log\n")
                 f.write(f"=" * 50 + "\n")
                 f.write(error_details)
         except:

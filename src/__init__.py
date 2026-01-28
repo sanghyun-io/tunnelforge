@@ -1,1 +1,1 @@
-"""TunnelDB Manager - SSH 터널 및 MySQL 관리 도구"""
+"""TunnelForge - SSH 터널 및 MySQL 관리 도구"""

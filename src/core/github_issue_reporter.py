@@ -32,7 +32,7 @@ class GitHubIssueReporter:
         """
         Args:
             token: GitHub Personal Access Token (또는 Installation Token)
-            repo: 리포지토리 (owner/repo 형식, 예: 'sanghyun-io/db-connector')
+            repo: 리포지토리 (owner/repo 형식, 예: 'sanghyun-io/tunnelforge')
             headers: 커스텀 헤더 (GitHub App 사용 시)
         """
         self.token = token
@@ -45,7 +45,7 @@ class GitHubIssueReporter:
             self._headers = {
                 "Authorization": f"token {token}",
                 "Accept": "application/vnd.github.v3+json",
-                "User-Agent": "TunnelDB-Manager"
+                "User-Agent": "TunnelForge"
             }
 
     @classmethod
@@ -221,7 +221,7 @@ class GitHubIssueReporter:
             body += "\n"
 
         body += """---
-> 이 이슈는 TunnelDB Manager에서 자동으로 생성되었습니다.
+> 이 이슈는 TunnelForge에서 자동으로 생성되었습니다.
 """
         return body
 

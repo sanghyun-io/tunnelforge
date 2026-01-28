@@ -5,8 +5,8 @@
 """
 
 __version__ = "1.5.1"
-__app_name__ = "TunnelDB Manager"
+__app_name__ = "TunnelForge"
 
 # GitHub 저장소 정보 (업데이트 확인용)
 GITHUB_OWNER = "sanghyun-io"
-GITHUB_REPO = "db-connector"
+GITHUB_REPO = "tunnelforge"

@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tunneldb-manager"
+name = "tunnelforge"
 version = "1.0.0"
 description = "SSH Tunnel and MySQL Database Manager"
 readme = "README.md"
@@ -28,7 +28,7 @@ dev = [
 ]
 
 [project.scripts]
-tunnel-manager = "main:main"
+tunnelforge = "main:main"
 
 [tool.setuptools.packages.find]
 where = ["."]

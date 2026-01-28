@@ -1,34 +1,31 @@
 """
 SQL 쿼리 히스토리 관리
-- 실행한 쿼리 저장
-- 히스토리 조회/삭제
+- 실행한 쿼리 영구 저장
+- 히스토리 조회 (Chunk 지원)
+- 히스토리는 절대 삭제 불가 (영구 보관)
 """
 import os
 import json
 from datetime import datetime
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Tuple
 
 
 class SQLHistory:
-    """SQL 쿼리 히스토리 관리자"""
+    """SQL 쿼리 히스토리 관리자 (영구 보관)"""
 
-    def __init__(self, max_entries: int = 500):
-        """
-        Args:
-            max_entries: 최대 저장 항목 수 (기본 500개)
-        """
-        self.max_entries = max_entries
+    def __init__(self):
+        """히스토리 관리자 초기화"""
         self.history_file = self._get_history_file_path()
         self._ensure_directory()
 
     def _get_history_file_path(self) -> str:
         """히스토리 파일 경로 반환"""
-        # Windows: %APPDATA%\Local\TunnelDB\sql_history.json
+        # Windows: %APPDATA%\Local\TunnelForge\sql_history.json
         if os.name == 'nt':
-            base_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'TunnelDB')
+            base_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'TunnelForge')
         else:
-            # Linux/Mac: ~/.tunneldb
-            base_dir = os.path.expanduser('~/.tunneldb')
+            # Linux/Mac: ~/.tunnelforge
+            base_dir = os.path.expanduser('~/.tunnelforge')
 
         return os.path.join(base_dir, 'sql_history.json')
 
@@ -58,58 +55,107 @@ class SQLHistory:
         except IOError as e:
             print(f"히스토리 저장 오류: {e}")
 
-    def add_query(self, query: str, success: bool, result_count: int = 0, execution_time: float = 0.0):
+    def add_query(self, query: str, success: bool, result_count: int = 0,
+                  execution_time: float = 0.0, status: str = 'completed', error: str = None) -> str:
         """
-        쿼리 히스토리에 추가
+        쿼리 히스토리에 추가 (영구 저장)
 
         Args:
             query: 실행한 SQL 쿼리
             success: 성공 여부
-            result_count: 결과 행 수 (SELECT의 경우)
+            result_count: 결과 행 수 (SELECT의 경우) 또는 영향받은 행 수
             execution_time: 실행 시간 (초)
+            status: 상태 ('completed', 'pending', 'committed', 'rolled_back', 'error')
+            error: 에러 메시지 (실패 시)
+
+        Returns:
+            생성된 히스토리 ID (timestamp)
         """
         history = self._load_history()
 
+        timestamp = datetime.now().isoformat()
         entry = {
-            'timestamp': datetime.now().isoformat(),
+            'timestamp': timestamp,
             'query': query,
             'success': success,
             'result_count': result_count,
-            'execution_time': execution_time
+            'execution_time': execution_time,
+            'status': status
         }
 
-        # 맨 앞에 추가
+        if error:
+            entry['error'] = error
+
+        # 맨 앞에 추가 (최신순)
         history.insert(0, entry)
 
-        # 최대 항목 수 제한
-        if len(history) > self.max_entries:
-            history = history[:self.max_entries]
+        # 영구 보관 - 삭제 없음
+        self._save_history(history)
+        return timestamp
+
+    def update_status(self, history_id: str, new_status: str):
+        """
+        히스토리 항목의 상태 업데이트
+
+        Args:
+            history_id: 히스토리 ID (timestamp)
+            new_status: 새 상태 ('committed', 'rolled_back')
+        """
+        history = self._load_history()
+
+        for entry in history:
+            if entry.get('timestamp') == history_id:
+                entry['status'] = new_status
+                break
 
         self._save_history(history)
 
-    def get_history(self, limit: int = 50) -> List[Dict[str, Any]]:
+    def update_status_batch(self, history_ids: List[str], new_status: str):
         """
-        히스토리 조회
+        여러 히스토리 항목의 상태 일괄 업데이트
 
         Args:
-            limit: 최대 반환 항목 수
+            history_ids: 히스토리 ID 목록
+            new_status: 새 상태
+        """
+        if not history_ids:
+            return
+
+        history = self._load_history()
+        ids_set = set(history_ids)
+
+        for entry in history:
+            if entry.get('timestamp') in ids_set:
+                entry['status'] = new_status
+
+        self._save_history(history)
+
+    def get_history(self, limit: int = 50, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        히스토리 조회 (Chunk 지원)
+
+        Args:
+            limit: 반환할 항목 수
+            offset: 시작 위치 (0부터)
 
         Returns:
-            히스토리 목록 (최신순)
+            (히스토리 목록, 전체 항목 수) 튜플
         """
         history = self._load_history()
-        return history[:limit]
+        total_count = len(history)
+        return history[offset:offset + limit], total_count
 
-    def search_history(self, keyword: str, limit: int = 50) -> List[Dict[str, Any]]:
+    def search_history(self, keyword: str, limit: int = 50, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
         """
-        키워드로 히스토리 검색
+        키워드로 히스토리 검색 (Chunk 지원)
 
         Args:
             keyword: 검색 키워드
-            limit: 최대 반환 항목 수
+            limit: 반환할 항목 수
+            offset: 시작 위치
 
         Returns:
-            검색 결과 목록
+            (검색 결과 목록, 전체 검색 결과 수) 튜플
         """
         history = self._load_history()
         keyword_lower = keyword.lower()
@@ -119,22 +165,13 @@ class SQLHistory:
             if keyword_lower in entry.get('query', '').lower()
         ]
 
-        return results[:limit]
+        total_count = len(results)
+        return results[offset:offset + limit], total_count
 
-    def clear_history(self):
-        """히스토리 전체 삭제"""
-        self._save_history([])
-
-    def remove_entry(self, timestamp: str):
-        """
-        특정 항목 삭제
-
-        Args:
-            timestamp: 삭제할 항목의 타임스탬프
-        """
+    def get_total_count(self) -> int:
+        """전체 히스토리 항목 수 반환"""
         history = self._load_history()
-        history = [entry for entry in history if entry.get('timestamp') != timestamp]
-        self._save_history(history)
+        return len(history)
 
     def get_recent_unique(self, limit: int = 20) -> List[str]:
         """

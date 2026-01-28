@@ -64,7 +64,7 @@ class TunnelManagerUI(QMainWindow):
         print("✅ UI 초기화 완료")
 
     def init_ui(self):
-        self.setWindowTitle("TunnelDB Manager")
+        self.setWindowTitle("TunnelForge")
         self.setGeometry(100, 100, 950, 600)
 
         # 창 아이콘 설정
@@ -113,19 +113,16 @@ class TunnelManagerUI(QMainWindow):
         # 열 너비 조정 가능 설정
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # 모든 열 조정 가능
-        header.setStretchLastSection(False)  # 마지막 열 자동 확장 비활성화
+        header.setStretchLastSection(False)
 
-        # 기본 열 너비 설정
-        self.table.setColumnWidth(0, 50)   # 상태
-        self.table.setColumnWidth(1, 150)  # 이름
-        self.table.setColumnWidth(2, 80)   # 로컬 포트
-        self.table.setColumnWidth(3, 180)  # 타겟 호스트
-        self.table.setColumnWidth(4, 100)  # 기본 스키마
-        self.table.setColumnWidth(5, 70)   # 전원
-        self.table.setColumnWidth(6, 120)  # 관리
+        # 기본 열 비율 설정 (합계 = 1.0)
+        # 상태, 이름, 로컬포트, 타겟호스트, 기본스키마, 전원, 관리
+        self._default_column_ratios = [0.06, 0.18, 0.09, 0.25, 0.13, 0.09, 0.20]
+        self._column_ratios = self._load_column_ratios()
+        self._resizing_columns = False  # 재귀 방지 플래그
 
-        # 저장된 열 너비 복원
-        self._restore_column_widths()
+        # 사용자가 열 너비 조정 시 비율 업데이트
+        header.sectionResized.connect(self._on_column_resized)
 
         self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # 셀 수정 방지
         self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)  # 행 단위 선택
@@ -345,7 +342,7 @@ class TunnelManagerUI(QMainWindow):
 
         if success:
             self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
-            self.tray_icon.showMessage("TunnelDB Manager", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
+            self.tray_icon.showMessage("TunnelForge", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
         else:
             self.statusBar().showMessage(f"연결 실패: {msg}")
             QMessageBox.critical(self, "연결 오류", f"터널 연결에 실패했습니다.\n\n원인: {msg}")
@@ -363,10 +360,21 @@ class TunnelManagerUI(QMainWindow):
         self.refresh_table()
         QMessageBox.information(self, "알림", "설정 파일을 다시 불러왔습니다.")
 
+    def showEvent(self, event):
+        """창 표시 시 초기 열 비율 적용"""
+        super().showEvent(event)
+        from PyQt6.QtCore import QTimer
+        QTimer.singleShot(50, self._apply_column_ratios)
+
+    def resizeEvent(self, event):
+        """창 크기 변경 시 열 비율 유지"""
+        super().resizeEvent(event)
+        self._apply_column_ratios()
+
     def closeEvent(self, event):
         """닫기 버튼 클릭 시"""
-        # 열 너비 저장
-        self._save_column_widths()
+        # 열 비율 저장
+        self._save_column_ratios()
 
         close_action = self.config_mgr.get_app_setting('close_action', 'ask')
 
@@ -403,18 +411,49 @@ class TunnelManagerUI(QMainWindow):
         import sys
         sys.exit(0)
 
-    def _save_column_widths(self):
-        """테이블 열 너비를 설정에 저장"""
-        widths = [self.table.columnWidth(i) for i in range(self.table.columnCount())]
-        self.config_mgr.set_app_setting('ui_column_widths', widths)
+    def _load_column_ratios(self):
+        """저장된 열 비율 로드 (없으면 기본값)"""
+        ratios = self.config_mgr.get_app_setting('ui_column_ratios')
+        if ratios and len(ratios) == 7:
+            return ratios
+        return self._default_column_ratios.copy()
 
-    def _restore_column_widths(self):
-        """저장된 열 너비를 복원"""
-        widths = self.config_mgr.get_app_setting('ui_column_widths')
-        if widths and len(widths) == self.table.columnCount():
-            for i, width in enumerate(widths):
-                if width > 0:  # 유효한 너비만 적용
-                    self.table.setColumnWidth(i, width)
+    def _save_column_ratios(self):
+        """열 비율을 설정에 저장"""
+        self.config_mgr.set_app_setting('ui_column_ratios', self._column_ratios)
+
+    def _apply_column_ratios(self):
+        """현재 비율을 테이블 너비에 적용"""
+        if self._resizing_columns:
+            return
+
+        self._resizing_columns = True
+        try:
+            # 테이블 가용 너비 계산 (스크롤바, 테두리 등 제외)
+            available_width = self.table.viewport().width()
+            if available_width <= 0:
+                return
+
+            for i, ratio in enumerate(self._column_ratios):
+                width = int(available_width * ratio)
+                self.table.setColumnWidth(i, max(width, 30))  # 최소 30px
+        finally:
+            self._resizing_columns = False
+
+    def _on_column_resized(self, index, old_size, new_size):
+        """사용자가 열 너비를 조정했을 때 비율 업데이트"""
+        if self._resizing_columns:
+            return
+
+        # 현재 전체 너비로 비율 재계산
+        total_width = sum(self.table.columnWidth(i) for i in range(self.table.columnCount()))
+        if total_width <= 0:
+            return
+
+        self._column_ratios = [
+            self.table.columnWidth(i) / total_width
+            for i in range(self.table.columnCount())
+        ]
 
     def _check_update_on_startup(self):
         """앱 시작 시 업데이트 확인 (백그라운드)"""

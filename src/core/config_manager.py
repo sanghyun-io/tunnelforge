@@ -4,12 +4,12 @@ import uuid
 from cryptography.fernet import Fernet
 
 # 운영체제별 설정 파일 저장 경로 지정
-# Windows: C:\Users\User\AppData\Local\TunnelDB
-# Mac/Linux: ~/.config/tunneldb
+# Windows: C:\Users\User\AppData\Local\TunnelForge
+# Mac/Linux: ~/.config/tunnelforge
 if os.name == 'nt':
-    APP_DIR = os.path.join(os.environ['LOCALAPPDATA'], 'TunnelDB')
+    APP_DIR = os.path.join(os.environ['LOCALAPPDATA'], 'TunnelForge')
 else:
-    APP_DIR = os.path.join(os.path.expanduser('~'), '.config', 'tunneldb')
+    APP_DIR = os.path.join(os.path.expanduser('~'), '.config', 'tunnelforge')
 
 CONFIG_FILE = os.path.join(APP_DIR, 'config.json')
 KEY_FILE = os.path.join(APP_DIR, '.encryption_key')

@@ -64,7 +64,7 @@ class GitHubAppAuth:
     _EMBEDDED_REPO: Optional[str] = None
 
     # 난독화 키
-    _OBFUSCATION_KEY = b"TunnelDBManagerGitHubApp2024"
+    _OBFUSCATION_KEY = b"TunnelForgeGitHubApp2024"
 
     # 캐시된 Installation Token
     _cached_token: Optional[str] = None
@@ -253,7 +253,7 @@ class GitHubAppAuth:
         return {
             "Authorization": f"token {token}",
             "Accept": "application/vnd.github.v3+json",
-            "User-Agent": "TunnelDB-Manager"
+            "User-Agent": "TunnelForge"
         }
 
     def test_connection(self) -> Tuple[bool, str]:
