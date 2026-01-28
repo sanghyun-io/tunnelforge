@@ -267,11 +267,72 @@ class MySQLConnector:
             print(f"배치 쿼리 오류: {e}")
             return 0
 
-    def get_table_columns(self, table: str, schema: str = None) -> List[Dict[str, Any]]:
-        """테이블 컬럼 정보 조회"""
+    def get_db_version(self) -> Tuple[int, int, int]:
+        """DB 버전 반환 (major, minor, patch)
+
+        예: MySQL 8.0.32-ubuntu → (8, 0, 32)
+
+        Returns:
+            버전 튜플 (major, minor, patch) 또는 연결 실패 시 (0, 0, 0)
+        """
+        if not self.connection:
+            return (0, 0, 0)
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT VERSION()")
+                result = cursor.fetchone()
+                if result:
+                    version_str = list(result.values())[0]
+                    # "8.0.32-ubuntu" → "8.0.32"
+                    version_clean = version_str.split('-')[0]
+                    parts = version_clean.split('.')
+                    major = int(parts[0]) if len(parts) > 0 else 0
+                    minor = int(parts[1]) if len(parts) > 1 else 0
+                    patch = int(parts[2]) if len(parts) > 2 else 0
+                    return (major, minor, patch)
+        except Exception as e:
+            print(f"버전 조회 오류: {e}")
+
+        return (0, 0, 0)
+
+    def get_db_version_string(self) -> str:
+        """DB 버전 문자열 반환 (원본)"""
+        if not self.connection:
+            return ""
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT VERSION()")
+                result = cursor.fetchone()
+                if result:
+                    return list(result.values())[0]
+        except Exception:
+            pass
+
+        return ""
+
+    def get_table_columns(self, table: str, schema: str = None, use_cache: bool = True) -> List[Dict[str, Any]]:
+        """테이블 컬럼 정보 조회 (캐싱 지원)
+
+        Args:
+            table: 테이블명
+            schema: 스키마명 (None이면 현재 데이터베이스)
+            use_cache: 캐시 사용 여부 (기본 True)
+
+        Returns:
+            컬럼 정보 목록
+        """
         target_schema = schema or self.database
         if not target_schema:
             return []
+
+        # 캐시 확인
+        cache_key = f"{self._cache_key_prefix}:columns:{target_schema}:{table}"
+        if use_cache and self._cache:
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached
 
         query = """
         SELECT COLUMN_NAME, DATA_TYPE, IS_NULLABLE, COLUMN_KEY, COLUMN_DEFAULT, EXTRA
@@ -279,7 +340,32 @@ class MySQLConnector:
         WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
         ORDER BY ORDINAL_POSITION
         """
-        return self.execute(query, (target_schema, table))
+        result = self.execute(query, (target_schema, table))
+
+        # 캐시에 저장
+        if use_cache and self._cache and result:
+            self._cache.set(cache_key, result)
+
+        return result
+
+    def get_column_names(self, table: str, schema: str = None, use_cache: bool = True) -> List[str]:
+        """테이블 컬럼명 목록 반환 (간편 메서드)
+
+        Args:
+            table: 테이블명
+            schema: 스키마명 (None이면 현재 데이터베이스)
+            use_cache: 캐시 사용 여부 (기본 True)
+
+        Returns:
+            컬럼명 목록
+        """
+        columns = self.get_table_columns(table, schema, use_cache)
+        return [col['COLUMN_NAME'] for col in columns]
+
+    def table_exists(self, table: str, schema: str = None) -> bool:
+        """테이블 존재 여부 확인"""
+        tables = self.get_tables(schema)
+        return table in tables
 
     def get_create_table_statement(self, table: str, schema: str = None) -> str:
         """CREATE TABLE 문 조회"""

@@ -5,11 +5,17 @@ from .github_issue_reporter import GitHubIssueReporter, get_reporter_from_config
 from .github_app_auth import GitHubAppAuth, get_github_app_auth, is_github_app_configured
 from .migration_analyzer import MigrationAnalyzer, AnalysisResult, OrphanRecord, CleanupAction, ActionType
 from .sql_history import SQLHistory
+from .sql_validator import (
+    SQLValidator, SQLAutoCompleter, SchemaMetadataProvider,
+    SchemaMetadata, ValidationIssue, IssueSeverity
+)
 
 __all__ = [
     'ConfigManager', 'TunnelEngine', 'MySQLConnector', 'test_mysql_connection',
     'GitHubIssueReporter', 'get_reporter_from_config',
     'GitHubAppAuth', 'get_github_app_auth', 'is_github_app_configured',
     'MigrationAnalyzer', 'AnalysisResult', 'OrphanRecord', 'CleanupAction', 'ActionType',
-    'SQLHistory'
+    'SQLHistory',
+    'SQLValidator', 'SQLAutoCompleter', 'SchemaMetadataProvider',
+    'SchemaMetadata', 'ValidationIssue', 'IssueSeverity'
 ]
