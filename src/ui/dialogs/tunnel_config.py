@@ -113,6 +113,11 @@ class TunnelConfigDialog(QDialog):
         form_layout.addRow("Endpoint:", self.input_remote_host)
         form_layout.addRow("DB Port:", self.input_remote_port)
 
+        # 기본 스키마 (선택사항)
+        self.input_default_schema = QLineEdit(self.tunnel_data.get('default_schema', ''))
+        self.input_default_schema.setPlaceholderText("(선택사항) 예: my_database")
+        form_layout.addRow("기본 스키마:", self.input_default_schema)
+
         # --- 4. 로컬 설정 ---
         self.lbl_local = QLabel("--- Local (내 컴퓨터) ---")
         self.lbl_local.setStyleSheet("font-weight: bold; color: #2c3e50; margin-top: 15px;")
@@ -152,7 +157,13 @@ class TunnelConfigDialog(QDialog):
         self.input_db_user.setEnabled(False)
         form_layout.addRow("DB User:", self.input_db_user)
 
-        # DB 인증 테스트 버튼
+        self.input_db_password = QLineEdit()
+        self.input_db_password.setEchoMode(QLineEdit.EchoMode.Password)
+        self.input_db_password.setPlaceholderText("MySQL 비밀번호")
+        self.input_db_password.setEnabled(False)
+        form_layout.addRow("DB Password:", self.input_db_password)
+
+        # DB 인증 테스트 버튼 (DB Password 아래)
         self.btn_db_test = QPushButton("🔐 DB 인증 테스트")
         self.btn_db_test.setStyleSheet("""
             QPushButton {
@@ -165,12 +176,6 @@ class TunnelConfigDialog(QDialog):
         self.btn_db_test.setEnabled(False)  # 체크박스 연동
         self.btn_db_test.clicked.connect(self._test_db_only)
         form_layout.addRow("", self.btn_db_test)
-
-        self.input_db_password = QLineEdit()
-        self.input_db_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.input_db_password.setPlaceholderText("MySQL 비밀번호")
-        self.input_db_password.setEnabled(False)
-        form_layout.addRow("DB Password:", self.input_db_password)
 
         # 기존 자격 증명 있으면 체크
         if self.tunnel_data.get('db_user'):
@@ -252,7 +257,8 @@ class TunnelConfigDialog(QDialog):
             "bastion_key": self.input_bastion_key.text(),
             "remote_host": self.input_remote_host.text(),
             "remote_port": self.input_remote_port.value(),
-            "local_port": self.input_local_port.value()
+            "local_port": self.input_local_port.value(),
+            "default_schema": self.input_default_schema.text().strip() or None
         }
 
         # MySQL 자격 증명 (체크된 경우에만)

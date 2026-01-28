@@ -703,6 +703,14 @@ class SQLEditorDialog(QDialog):
                 self.db_combo.addItem("")  # 빈 항목
                 self.db_combo.addItems(schemas)
                 self.message_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
+
+                # 기본 스키마 자동 선택
+                default_schema = self.config.get('default_schema')
+                if default_schema:
+                    index = self.db_combo.findText(default_schema)
+                    if index >= 0:
+                        self.db_combo.setCurrentIndex(index)
+                        self.message_text.append(f"📌 기본 스키마 선택됨: {default_schema}")
             else:
                 self.message_text.append(f"❌ DB 연결 실패: {msg}")
 
@@ -895,13 +903,16 @@ class SQLEditorDialog(QDialog):
 
             # 컬럼 너비 설정
             header = table.horizontalHeader()
+            header.setSectionsMovable(True)  # 컬럼 드래그 이동 활성화
             header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # 수동 조절 가능
             header.setMaximumSectionSize(300)  # 최대 너비 제한
             header.setStretchLastSection(True)  # 마지막 열 늘리기
             table.resizeColumnsToContents()  # 초기 너비는 내용에 맞게
 
             table.setAlternatingRowColors(True)
-            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+            # 셀 단위 드래그 선택 (기존: SelectRows)
+            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+            table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
             # 컨텍스트 메뉴 설정 (우클릭 복사)
             table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -960,32 +971,48 @@ class SQLEditorDialog(QDialog):
         menu.exec(table.mapToGlobal(position))
 
     def _copy_table_data(self, table, columns, include_header):
-        """테이블 데이터를 탭 구분 형식으로 클립보드에 복사 (Excel 호환)"""
-        selection = table.selectedRanges()
-        if not selection:
+        """테이블 데이터를 탭 구분 형식으로 클립보드에 복사 (Excel 호환)
+
+        컬럼 이동 시 시각적 순서(visual order)를 따름
+        """
+        selected_ranges = table.selectedRanges()
+        if not selected_ranges:
             return
 
         lines = []
+        header = table.horizontalHeader()
 
-        # 선택된 열 범위 계산
-        first_col = min(r.leftColumn() for r in selection)
-        last_col = max(r.rightColumn() for r in selection)
+        # 선택된 행/열 수집 (logical index 기준)
+        all_rows = set()
+        all_logical_cols = set()
 
-        # 헤더 포함 옵션
-        if include_header:
-            header_line = '\t'.join(columns[first_col:last_col + 1])
-            lines.append(header_line)
-
-        # 선택된 행 데이터
-        rows_set = set()
-        for range_ in selection:
+        for range_ in selected_ranges:
             for row in range(range_.topRow(), range_.bottomRow() + 1):
-                rows_set.add(row)
+                all_rows.add(row)
+            for col in range(range_.leftColumn(), range_.rightColumn() + 1):
+                all_logical_cols.add(col)
 
-        for row in sorted(rows_set):
+        sorted_rows = sorted(all_rows)
+
+        # visual index로 정렬 (컬럼 이동 순서 반영)
+        sorted_visual_cols = sorted(
+            [header.visualIndex(col) for col in all_logical_cols]
+        )
+
+        # 헤더 포함 옵션 (시각적 순서로)
+        if include_header:
+            header_values = []
+            for visual_col in sorted_visual_cols:
+                logical_col = header.logicalIndex(visual_col)
+                header_values.append(columns[logical_col])
+            lines.append('\t'.join(header_values))
+
+        # 데이터 행 (시각적 순서로)
+        for row in sorted_rows:
             row_data = []
-            for col in range(first_col, last_col + 1):
-                item = table.item(row, col)
+            for visual_col in sorted_visual_cols:
+                logical_col = header.logicalIndex(visual_col)
+                item = table.item(row, logical_col)
                 value = item.text() if item else ''
                 # 탭과 줄바꿈은 공백으로 치환 (셀 구분 보호)
                 value = value.replace('\t', ' ').replace('\n', ' ')

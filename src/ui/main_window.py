@@ -122,9 +122,9 @@ class TunnelManagerUI(QMainWindow):
 
         # --- 테이블 설정 ---
         self.table = QTableWidget()
-        # 컬럼: 상태, 이름, 로컬포트, 타겟호스트, 전원, 관리(수정/삭제)
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels(["상태", "이름", "로컬 포트", "타겟 호스트", "전원", "관리"])
+        # 컬럼: 상태, 이름, 로컬포트, 타겟호스트, 기본 스키마, 전원, 관리(수정/삭제)
+        self.table.setColumnCount(7)
+        self.table.setHorizontalHeaderLabels(["상태", "이름", "로컬 포트", "타겟 호스트", "기본 스키마", "전원", "관리"])
 
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)  # 이름 늘리기
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)  # 호스트 늘리기
@@ -208,7 +208,12 @@ class TunnelManagerUI(QMainWindow):
             target_str = f"{tunnel.get('remote_host', '')}:{tunnel.get('remote_port', '')}"
             self.table.setItem(idx, 3, QTableWidgetItem(target_str))
 
-            # 5. 전원 (Start/Stop) 버튼
+            # 5. 기본 스키마
+            schema_item = QTableWidgetItem(tunnel.get('default_schema') or '-')
+            schema_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            self.table.setItem(idx, 4, schema_item)
+
+            # 6. 전원 (Start/Stop) 버튼
             btn_power = QPushButton("중지" if is_active else "시작")
             if is_active:
                 btn_power.setStyleSheet("""
@@ -228,9 +233,9 @@ class TunnelManagerUI(QMainWindow):
                     QPushButton:hover { background-color: #27ae60; }
                 """)
                 btn_power.clicked.connect(lambda checked, t=tunnel: self.start_tunnel(t))
-            self.table.setCellWidget(idx, 4, btn_power)
+            self.table.setCellWidget(idx, 5, btn_power)
 
-            # 6. 관리 (수정/삭제) 버튼 그룹
+            # 7. 관리 (수정/삭제) 버튼 그룹
             container = QWidget()
             h_box = QHBoxLayout(container)
             h_box.setContentsMargins(4, 4, 4, 4)
@@ -258,7 +263,7 @@ class TunnelManagerUI(QMainWindow):
             btn_del.clicked.connect(lambda checked, t=tunnel: self.delete_tunnel(t))
             h_box.addWidget(btn_del)
 
-            self.table.setCellWidget(idx, 5, container)
+            self.table.setCellWidget(idx, 6, container)
 
     # --- 기능 로직 ---
     def add_tunnel_dialog(self):

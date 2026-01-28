@@ -81,6 +81,18 @@ class MySQLConnector:
             print(f"스키마 조회 오류: {e}")
             return []
 
+    def schema_exists(self, schema_name: str) -> bool:
+        """특정 스키마 존재 여부 확인 (시스템 DB 포함)"""
+        if not self.connection:
+            return False
+
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SHOW DATABASES LIKE %s", (schema_name,))
+                return cursor.fetchone() is not None
+        except Exception:
+            return False
+
     def get_tables(self, schema: str = None) -> List[str]:
         """테이블 목록 조회"""
         if not self.connection:

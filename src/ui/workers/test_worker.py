@@ -92,9 +92,22 @@ class ConnectionTestWorker(QThread):
             success, msg = connector.connect()
 
             if success:
+                # 기본 스키마 검증 (있는 경우)
+                default_schema = self.config.get('default_schema')
+                if default_schema:
+                    self.progress.emit(f"📂 스키마 '{default_schema}' 존재 확인 중...")
+                    schema_exists = connector.schema_exists(default_schema)
+                    if not schema_exists:
+                        connector.disconnect()
+                        result_success = False
+                        result_msg = f"⚠️ DB 인증 성공, 스키마 없음\n\n스키마 '{default_schema}'가 존재하지 않습니다.\n\n사용자: {db_user}\n호스트: {host}:{port}"
+                        return
+
                 connector.disconnect()
                 result_success = True
                 result_msg = f"✅ DB 인증 성공!\n\n사용자: {db_user}\n호스트: {host}:{port}"
+                if default_schema:
+                    result_msg += f"\n스키마: {default_schema}"
             else:
                 result_success = False
                 result_msg = f"❌ DB 인증 실패\n\n{msg}"
