@@ -576,6 +576,17 @@ class SQLEditorDialog(QDialog):
         toolbar.addWidget(btn_history)
 
         toolbar.addStretch()
+
+        # LIMIT 설정
+        toolbar.addWidget(QLabel("LIMIT:"))
+        self.limit_combo = QComboBox()
+        self.limit_combo.setEditable(True)
+        self.limit_combo.addItems(["100", "500", "1000", "5000", "10000", "제한 없음"])
+        self.limit_combo.setCurrentText("1000")
+        self.limit_combo.setToolTip("SELECT 쿼리에 자동으로 적용되는 행 제한\n(LIMIT 절이 없는 경우에만 적용)")
+        self.limit_combo.setMinimumWidth(100)
+        toolbar.addWidget(self.limit_combo)
+
         layout.addLayout(toolbar)
 
         # --- 메인 스플리터 (에디터 + 결과) ---
@@ -724,6 +735,11 @@ class SQLEditorDialog(QDialog):
             QMessageBox.warning(self, "경고", "유효한 SQL 쿼리가 없습니다.")
             return
 
+        # LIMIT 자동 적용
+        limit_value = self._get_limit_value()
+        if limit_value:
+            queries = [self._apply_limit(q, limit_value) for q in queries]
+
         # 연결 정보 획득
         tid = self.config.get('id')
         db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
@@ -808,6 +824,51 @@ class SQLEditorDialog(QDialog):
             queries.append(query)
 
         return queries
+
+    def _get_limit_value(self):
+        """LIMIT 설정값 반환 (None이면 제한 없음)"""
+        limit_text = self.limit_combo.currentText().strip()
+        if limit_text == "제한 없음" or not limit_text:
+            return None
+        try:
+            return int(limit_text)
+        except ValueError:
+            return None
+
+    def _apply_limit(self, query, limit_value):
+        """SELECT 쿼리에 LIMIT 자동 적용 (이미 LIMIT이 있으면 적용 안함)"""
+        query_upper = query.upper().strip()
+
+        # SELECT 쿼리가 아니면 그대로 반환
+        if not query_upper.startswith('SELECT'):
+            return query
+
+        # 이미 LIMIT이 있으면 그대로 반환
+        # LIMIT 키워드 검색 (문자열 내부 제외)
+        in_string = False
+        string_char = None
+        check_text = []
+
+        for char in query:
+            if char in ("'", '"') and not in_string:
+                in_string = True
+                string_char = char
+                check_text.append(' ')
+            elif char == string_char and in_string:
+                in_string = False
+                string_char = None
+                check_text.append(' ')
+            elif in_string:
+                check_text.append(' ')
+            else:
+                check_text.append(char)
+
+        clean_query = ''.join(check_text).upper()
+        if ' LIMIT ' in clean_query or clean_query.endswith(' LIMIT'):
+            return query
+
+        # LIMIT 추가
+        return f"{query} LIMIT {limit_value}"
 
     def _on_progress(self, msg):
         """진행 메시지"""
