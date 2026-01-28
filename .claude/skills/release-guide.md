@@ -1,13 +1,13 @@
 ---
 skill_name: release-guide
-description: TunnelDB Manager 릴리스 프로세스 가이드 및 버전 관리 설명
+description: TunnelForge 릴리스 프로세스 가이드 및 버전 관리 설명
 version: 1.0.0
 tags: [release, versioning, github-actions, automation]
 ---
 
-# TunnelDB Manager - Release Guide
+# TunnelForge - Release Guide
 
-이 스킬은 TunnelDB Manager의 릴리스 프로세스와 버전 관리 방법을 설명합니다.
+이 스킬은 TunnelForge의 릴리스 프로세스와 버전 관리 방법을 설명합니다.
 
 ## 📋 버전 관리 원칙
 
@@ -89,11 +89,11 @@ tags: [release, versioning, github-actions, automation]
 2. **빌드**: PyInstaller로 EXE 생성
 3. **인스톨러**: Inno Setup으로 Windows Installer 생성
 4. **릴리스 생성**: GitHub Release 자동 생성
-5. **파일 첨부**: TunnelDBManager-Setup-{version}.exe 첨부
+5. **파일 첨부**: TunnelForge-Setup-{version}.exe 첨부
 
 ### 확인
-- **빌드 진행**: https://github.com/sanghyun-io/db-connector/actions
-- **릴리스**: https://github.com/sanghyun-io/db-connector/releases
+- **빌드 진행**: https://github.com/sanghyun-io/tunnelforge/actions
+- **릴리스**: https://github.com/sanghyun-io/tunnelforge/releases
 
 ---
 
@@ -197,7 +197,7 @@ src/version.py의 버전이 태그와 일치하지 않으면 GitHub Actions가 �
 - `scripts/create-release.ps1` - 릴리스 생성 스크립트
 - `scripts/build-installer.ps1` - 로컬 빌드 스크립트
 - `.github/workflows/release.yml` - GitHub Actions 워크플로우
-- `installer/TunnelDBManager.iss` - Inno Setup 설정
+- `installer/TunnelForge.iss` - Inno Setup 설정
 
 ---
 

@@ -1,10 +1,10 @@
 ---
 command_name: release
-description: TunnelDB Manager 새 버전 릴리스 생성 (버전 증가 + GitHub Actions 트리거)
+description: TunnelForge 새 버전 릴리스 생성 (버전 증가 + GitHub Actions 트리거)
 tags: [release, versioning, automation]
 ---
 
-당신은 TunnelDB Manager 프로젝트의 릴리스 프로세스를 도와주는 전문가입니다.
+당신은 TunnelForge 프로젝트의 릴리스 프로세스를 도와주는 전문가입니다.
 
 ## 목표
 
@@ -57,8 +57,8 @@ python scripts/smart_release.py --dry-run
 릴리스가 성공하면:
 
 1. 새 버전 번호 표시
-2. GitHub Actions 링크 제공: https://github.com/sanghyun-io/db-connector/actions
-3. 릴리스 페이지 링크 제공: https://github.com/sanghyun-io/db-connector/releases
+2. GitHub Actions 링크 제공: https://github.com/sanghyun-io/tunnelforge/actions
+3. 릴리스 페이지 링크 제공: https://github.com/sanghyun-io/tunnelforge/releases
 
 "빌드는 약 5-10분 소요됩니다. GitHub Actions에서 진행 상황을 확인하세요."
 

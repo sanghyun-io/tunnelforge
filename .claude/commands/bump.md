@@ -4,7 +4,7 @@ description: src/version.py의 버전만 증가 (Git 작업 없음, 수동 커�
 tags: [versioning]
 ---
 
-당신은 TunnelDB Manager 프로젝트의 버전 관리를 도와주는 전문가입니다.
+당신은 TunnelForge 프로젝트의 버전 관리를 도와주는 전문가입니다.
 
 ## 목표
 
