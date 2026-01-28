@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
 from PyQt6.QtCore import Qt
 import uuid
 
+from src.ui.styles import ButtonStyles, LabelStyles
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
 
@@ -34,7 +35,7 @@ class TunnelConfigDialog(QDialog):
 
         # --- 연결 방식 선택 ---
         lbl_mode = QLabel("--- 연결 방식 ---")
-        lbl_mode.setStyleSheet("font-weight: bold; color: #2c3e50; margin-top: 15px;")
+        lbl_mode.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_mode)
 
         self.mode_group = QButtonGroup(self)
@@ -63,7 +64,7 @@ class TunnelConfigDialog(QDialog):
 
         # --- 2. Bastion 서버 정보 ---
         self.lbl_bastion = QLabel("--- Bastion Host (중계 서버) ---")
-        self.lbl_bastion.setStyleSheet("font-weight: bold; color: #2c3e50; margin-top: 15px;")
+        self.lbl_bastion.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(self.lbl_bastion)
 
         self.input_bastion_host = QLineEdit(self.tunnel_data.get('bastion_host', ''))
@@ -100,7 +101,7 @@ class TunnelConfigDialog(QDialog):
 
         # --- 3. RDS/Remote 정보 ---
         lbl_remote = QLabel("--- Target DB (목적지) ---")
-        lbl_remote.setStyleSheet("font-weight: bold; color: #2c3e50; margin-top: 15px;")
+        lbl_remote.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_remote)
 
         self.input_remote_host = QLineEdit(self.tunnel_data.get('remote_host', ''))
@@ -120,7 +121,7 @@ class TunnelConfigDialog(QDialog):
 
         # --- 4. 로컬 설정 ---
         self.lbl_local = QLabel("--- Local (내 컴퓨터) ---")
-        self.lbl_local.setStyleSheet("font-weight: bold; color: #2c3e50; margin-top: 15px;")
+        self.lbl_local.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(self.lbl_local)
 
         self.input_local_port = QSpinBox()
@@ -129,22 +130,15 @@ class TunnelConfigDialog(QDialog):
         self.lbl_local_port = QLabel("Local Bind Port:")
         form_layout.addRow(self.lbl_local_port, self.input_local_port)
 
-        # 터널 테스트 버튼
+        # 터널 테스트 버튼 - 중앙화된 스타일 사용
         self.btn_tunnel_test = QPushButton("🔌 터널 테스트")
-        self.btn_tunnel_test.setStyleSheet("""
-            QPushButton {
-                background-color: #bdc3c7; color: #2c3e50;
-                padding: 4px 12px; border-radius: 4px; border: 1px solid #95a5a6;
-            }
-            QPushButton:hover { background-color: #95a5a6; }
-            QPushButton:disabled { background-color: #ecf0f1; color: #95a5a6; }
-        """)
+        self.btn_tunnel_test.setStyleSheet(ButtonStyles.TEST)
         self.btn_tunnel_test.clicked.connect(self._test_tunnel_only)
         form_layout.addRow("", self.btn_tunnel_test)
 
         # --- 5. MySQL 인증 정보 (선택 사항) ---
         lbl_mysql = QLabel("--- MySQL 인증 정보 (선택 사항) ---")
-        lbl_mysql.setStyleSheet("font-weight: bold; color: #2c3e50; margin-top: 15px;")
+        lbl_mysql.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_mysql)
 
         self.chk_save_credentials = QCheckBox("MySQL 자격 증명 저장")
@@ -163,16 +157,9 @@ class TunnelConfigDialog(QDialog):
         self.input_db_password.setEnabled(False)
         form_layout.addRow("DB Password:", self.input_db_password)
 
-        # DB 인증 테스트 버튼 (DB Password 아래)
+        # DB 인증 테스트 버튼 - 중앙화된 스타일 사용
         self.btn_db_test = QPushButton("🔐 DB 인증 테스트")
-        self.btn_db_test.setStyleSheet("""
-            QPushButton {
-                background-color: #bdc3c7; color: #2c3e50;
-                padding: 4px 12px; border-radius: 4px; border: 1px solid #95a5a6;
-            }
-            QPushButton:hover { background-color: #95a5a6; }
-            QPushButton:disabled { background-color: #ecf0f1; color: #95a5a6; }
-        """)
+        self.btn_db_test.setStyleSheet(ButtonStyles.TEST)
         self.btn_db_test.setEnabled(False)  # 체크박스 연동
         self.btn_db_test.clicked.connect(self._test_db_only)
         form_layout.addRow("", self.btn_db_test)
@@ -190,15 +177,9 @@ class TunnelConfigDialog(QDialog):
 
         # --- 하단 버튼 (통합 테스트 & 저장/취소) ---
 
-        # 통합 테스트 버튼 - Warning 스타일
+        # 통합 테스트 버튼 - 중앙화된 스타일 사용
         self.btn_integrated_test = QPushButton("🚀 통합 테스트")
-        self.btn_integrated_test.setStyleSheet("""
-            QPushButton {
-                background-color: #f1c40f; color: #333; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #d4ac0d; }
-        """)
+        self.btn_integrated_test.setStyleSheet(ButtonStyles.WARNING)
         self.btn_integrated_test.clicked.connect(self._test_integrated)
         layout.addWidget(self.btn_integrated_test)
 

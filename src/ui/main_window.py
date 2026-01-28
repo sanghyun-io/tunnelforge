@@ -7,6 +7,8 @@ from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 
+from src.ui.styles import ButtonStyles, LabelStyles
+
 
 def get_resource_path(relative_path):
     """PyInstaller 빌드 환경에서 리소스 경로를 올바르게 반환"""
@@ -78,39 +80,21 @@ class TunnelManagerUI(QMainWindow):
         # --- 상단 헤더 ---
         header_layout = QHBoxLayout()
         title = QLabel("📡 터널링 연결 목록")
-        title.setStyleSheet("font-size: 20px; font-weight: bold; color: #333;")
+        title.setStyleSheet(LabelStyles.TITLE)
 
-        # [새로고침] 버튼 - Secondary 스타일
+        # [새로고침] 버튼 - Secondary 스타일 (중앙화)
         btn_refresh = QPushButton("🔄 설정 로드")
-        btn_refresh.setStyleSheet("""
-            QPushButton {
-                background-color: #ecf0f1; color: #2c3e50;
-                padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
-            }
-            QPushButton:hover { background-color: #d5dbdb; }
-        """)
+        btn_refresh.setStyleSheet(ButtonStyles.SECONDARY)
         btn_refresh.clicked.connect(self.reload_config)
 
-        # [설정] 버튼 - Secondary 스타일
+        # [설정] 버튼 - Secondary 스타일 (중앙화)
         btn_settings = QPushButton("⚙️ 설정")
-        btn_settings.setStyleSheet("""
-            QPushButton {
-                background-color: #ecf0f1; color: #2c3e50;
-                padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
-            }
-            QPushButton:hover { background-color: #d5dbdb; }
-        """)
+        btn_settings.setStyleSheet(ButtonStyles.SECONDARY)
         btn_settings.clicked.connect(self.open_settings_dialog)
 
-        # [연결 추가] 버튼 - Primary 스타일
+        # [연결 추가] 버튼 - Primary 스타일 (중앙화)
         btn_add_tunnel = QPushButton("➕ 연결 추가")
-        btn_add_tunnel.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
+        btn_add_tunnel.setStyleSheet(ButtonStyles.PRIMARY)
         btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
 
         header_layout.addWidget(title)
@@ -213,53 +197,29 @@ class TunnelManagerUI(QMainWindow):
             schema_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             self.table.setItem(idx, 4, schema_item)
 
-            # 6. 전원 (Start/Stop) 버튼
+            # 6. 전원 (Start/Stop) 버튼 - 중앙화된 스타일 사용
             btn_power = QPushButton("중지" if is_active else "시작")
             if is_active:
-                btn_power.setStyleSheet("""
-                    QPushButton {
-                        background-color: #e74c3c; color: white; font-weight: bold;
-                        padding: 4px 12px; border-radius: 4px; border: none;
-                    }
-                    QPushButton:hover { background-color: #c0392b; }
-                """)
+                btn_power.setStyleSheet(ButtonStyles.DANGER)
                 btn_power.clicked.connect(lambda checked, t=tunnel: self.stop_tunnel(t))
             else:
-                btn_power.setStyleSheet("""
-                    QPushButton {
-                        background-color: #2ecc71; color: white; font-weight: bold;
-                        padding: 4px 12px; border-radius: 4px; border: none;
-                    }
-                    QPushButton:hover { background-color: #27ae60; }
-                """)
+                btn_power.setStyleSheet(ButtonStyles.SUCCESS)
                 btn_power.clicked.connect(lambda checked, t=tunnel: self.start_tunnel(t))
             self.table.setCellWidget(idx, 5, btn_power)
 
-            # 7. 관리 (수정/삭제) 버튼 그룹
+            # 7. 관리 (수정/삭제) 버튼 그룹 - 중앙화된 스타일 사용
             container = QWidget()
             h_box = QHBoxLayout(container)
             h_box.setContentsMargins(4, 4, 4, 4)
             h_box.setSpacing(5)
 
             btn_edit = QPushButton("수정")
-            btn_edit.setStyleSheet("""
-                QPushButton {
-                    background-color: #ecf0f1; color: #2c3e50;
-                    padding: 4px 10px; border-radius: 4px; border: 1px solid #bdc3c7;
-                }
-                QPushButton:hover { background-color: #d5dbdb; }
-            """)
+            btn_edit.setStyleSheet(ButtonStyles.EDIT)
             btn_edit.clicked.connect(lambda checked, t=tunnel: self.edit_tunnel_dialog(t))
             h_box.addWidget(btn_edit)
 
             btn_del = QPushButton("삭제")
-            btn_del.setStyleSheet("""
-                QPushButton {
-                    background-color: #fadbd8; color: #c0392b;
-                    padding: 4px 10px; border-radius: 4px; border: 1px solid #e74c3c;
-                }
-                QPushButton:hover { background-color: #f5b7b1; }
-            """)
+            btn_del.setStyleSheet(ButtonStyles.DELETE)
             btn_del.clicked.connect(lambda checked, t=tunnel: self.delete_tunnel(t))
             h_box.addWidget(btn_del)
 
