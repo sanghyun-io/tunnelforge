@@ -19,30 +19,23 @@ class ThemeManager(QObject):
 
     _instance = None
 
-    def __new__(cls):
-        if cls._instance is None:
-            cls._instance = super().__new__(cls)
-        return cls._instance
-
     def __init__(self):
-        # QObject는 항상 먼저 초기화 (PyQt 요구사항)
         super().__init__()
-
-        # 이미 초기화된 경우 나머지 스킵
-        if hasattr(self, '_initialized') and self._initialized:
-            return
-
-        self._initialized = True
         self._current_theme_type = ThemeType.SYSTEM
         self._current_colors = LIGHT_THEME
         self._config_manager = None
 
     @classmethod
     def instance(cls) -> 'ThemeManager':
-        """싱글톤 인스턴스 반환"""
+        """싱글톤 인스턴스 반환 (QObject와 호환되는 방식)"""
         if cls._instance is None:
             cls._instance = cls()
         return cls._instance
+
+    @classmethod
+    def reset_instance(cls):
+        """테스트용: 싱글톤 인스턴스 초기화"""
+        cls._instance = None
 
     def set_config_manager(self, config_manager):
         """ConfigManager 설정 (설정 저장/로드용)"""
