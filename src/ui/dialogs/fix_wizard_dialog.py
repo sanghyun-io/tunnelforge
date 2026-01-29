@@ -352,12 +352,18 @@ class BatchOptionDialog(QDialog):
     """전체 일괄 옵션 적용 다이얼로그
 
     이슈 유형별로 기본 옵션을 선택하여 모든 이슈에 일괄 적용합니다.
+
+    주의사항:
+    - 공통 옵션(strategy)만 표시 (모든 이슈에 있는 옵션)
+    - 적용 시 각 step의 실제 옵션에서 matching strategy를 찾아 적용
+    - 예: nullable이 아닌 컬럼에는 "NULL로 변경"이 없으므로 fallback
     """
 
     def __init__(self, steps: List[FixWizardStep], parent=None):
         super().__init__(parent)
         self.steps = steps
         self.option_combos: Dict[IssueType, QComboBox] = {}
+        self.type_warnings: Dict[IssueType, str] = {}  # 유형별 경고 메시지
 
         self.setWindowTitle("전체 일괄 옵션 적용")
         self.setMinimumWidth(500)
@@ -377,13 +383,14 @@ class BatchOptionDialog(QDialog):
 
         # 이슈 유형별 그룹
         type_counts: Dict[IssueType, int] = {}
-        type_options: Dict[IssueType, List[FixOption]] = {}
+        type_steps: Dict[IssueType, List[FixWizardStep]] = {}
 
         for step in self.steps:
             if step.issue_type not in type_counts:
                 type_counts[step.issue_type] = 0
-                type_options[step.issue_type] = step.options
+                type_steps[step.issue_type] = []
             type_counts[step.issue_type] += 1
+            type_steps[step.issue_type].append(step)
 
         type_names = {
             IssueType.INVALID_DATE: "잘못된 날짜",
@@ -393,6 +400,7 @@ class BatchOptionDialog(QDialog):
             IssueType.INT_DISPLAY_WIDTH: "INT 표시 너비",
             IssueType.DEPRECATED_ENGINE: "deprecated 엔진",
             IssueType.ENUM_EMPTY_VALUE: "ENUM 빈 값",
+            IssueType.AUTH_PLUGIN_ISSUE: "인증 플러그인",
         }
 
         for issue_type, count in type_counts.items():
@@ -400,10 +408,11 @@ class BatchOptionDialog(QDialog):
             group = QGroupBox(f"{type_name} ({count}개)")
             group_layout = QVBoxLayout(group)
 
-            combo = QComboBox()
-            options = type_options[issue_type]
+            # 공통 옵션 추출 (모든 step에 있는 strategy만)
+            common_options = self._get_common_options(type_steps[issue_type])
 
-            for option in options:
+            combo = QComboBox()
+            for option in common_options:
                 label = option.label
                 if option.is_recommended:
                     label = f"⭐ {label} (권장)"
@@ -411,6 +420,15 @@ class BatchOptionDialog(QDialog):
 
             group_layout.addWidget(combo)
             self.option_combos[issue_type] = combo
+
+            # 경고 메시지 (일부 이슈에만 있는 옵션이 있는 경우)
+            warning = self._get_warning_message(issue_type, type_steps[issue_type], common_options)
+            if warning:
+                self.type_warnings[issue_type] = warning
+                warning_label = QLabel(warning)
+                warning_label.setWordWrap(True)
+                warning_label.setStyleSheet("color: #e67e22; font-size: 11px; margin-top: 4px;")
+                group_layout.addWidget(warning_label)
 
             layout.addWidget(group)
 
@@ -428,14 +446,73 @@ class BatchOptionDialog(QDialog):
 
         layout.addWidget(btn_box)
 
+    def _get_common_options(self, steps: List[FixWizardStep]) -> List[FixOption]:
+        """모든 step에 공통으로 있는 옵션 추출"""
+        if not steps:
+            return []
+
+        # 첫 번째 step의 strategy 집합
+        common_strategies = {opt.strategy for opt in steps[0].options}
+
+        # 다른 step들과 교집합
+        for step in steps[1:]:
+            step_strategies = {opt.strategy for opt in step.options}
+            common_strategies &= step_strategies
+
+        # 첫 번째 step의 옵션 중 공통 strategy만 반환 (순서 유지)
+        return [opt for opt in steps[0].options if opt.strategy in common_strategies]
+
+    def _get_warning_message(
+        self,
+        issue_type: IssueType,
+        steps: List[FixWizardStep],
+        common_options: List[FixOption]
+    ) -> str:
+        """경고 메시지 생성"""
+        if issue_type == IssueType.INVALID_DATE:
+            # NULL 옵션이 공통에 없으면 일부 컬럼이 NOT NULL
+            has_null_option = any(
+                opt.strategy == FixStrategy.DATE_TO_NULL
+                for opt in common_options
+            )
+            if not has_null_option:
+                null_count = sum(
+                    1 for step in steps
+                    if any(opt.strategy == FixStrategy.DATE_TO_NULL for opt in step.options)
+                )
+                not_null_count = len(steps) - null_count
+                if null_count > 0:
+                    return f"⚠️ {not_null_count}개 컬럼은 NOT NULL이므로 'NULL로 변경'을 사용할 수 없습니다."
+
+        return ""
+
     def apply_options(self):
-        """선택된 옵션 적용"""
+        """선택된 옵션 적용
+
+        각 step의 실제 옵션에서 matching strategy를 찾아 적용합니다.
+        matching이 없으면 첫 번째 옵션으로 fallback합니다.
+        """
         for step in self.steps:
-            if step.issue_type in self.option_combos:
-                combo = self.option_combos[step.issue_type]
-                selected_option = combo.currentData()
-                if selected_option:
-                    step.selected_option = selected_option
+            if step.issue_type not in self.option_combos:
+                continue
+
+            combo = self.option_combos[step.issue_type]
+            selected_option = combo.currentData()
+
+            if not selected_option:
+                continue
+
+            # 해당 step의 옵션에서 같은 strategy를 찾아서 적용
+            matching_option = next(
+                (opt for opt in step.options if opt.strategy == selected_option.strategy),
+                None
+            )
+
+            if matching_option:
+                step.selected_option = matching_option
+            else:
+                # Fallback: 첫 번째 옵션 (보통 권장 옵션)
+                step.selected_option = step.options[0] if step.options else None
 
         self.accept()
 
