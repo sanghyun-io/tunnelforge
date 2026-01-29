@@ -3,11 +3,20 @@ import sys
 import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QTableWidget, QTableWidgetItem, QPushButton,
-                             QLabel, QMessageBox, QHeaderView, QSystemTrayIcon, QMenu)
+                             QLabel, QMessageBox, QHeaderView, QSystemTrayIcon, QMenu,
+                             QApplication)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QAction, QIcon
 
-from src.ui.styles import ButtonStyles, LabelStyles
+from src.ui.styles import (ButtonStyles, LabelStyles, get_full_app_style,
+                           get_dynamic_button_style, get_dynamic_table_style)
+from src.ui.theme_manager import ThemeManager
+from src.ui.themes import ThemeColors
+from src.ui.widgets.tunnel_tree import TunnelTreeWidget
+from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
+from src.core.logger import get_logger
+
+logger = get_logger('main_window')
 
 
 def get_resource_path(relative_path):
@@ -25,6 +34,11 @@ from src.ui.dialogs.db_dialogs import MySQLShellWizard
 from src.ui.dialogs.migration_dialogs import MigrationWizard
 from src.ui.dialogs.test_dialogs import SQLExecutionDialog
 from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
+from src.ui.dialogs.schedule_dialog import ScheduleListDialog
+from src.ui.dialogs.tunnel_status_dialog import TunnelStatusDialog
+from src.ui.dialogs.diff_dialog import SchemaDiffDialog
+from src.core.scheduler import BackupScheduler
+from src.core.tunnel_monitor import TunnelMonitor, TunnelState
 
 
 class StartupUpdateCheckerThread(QThread):
@@ -46,7 +60,7 @@ class StartupUpdateCheckerThread(QThread):
 
 class TunnelManagerUI(QMainWindow):
     def __init__(self, config_manager, tunnel_engine):
-        print("🖥️ UI 초기화 시작...")  # 디버깅용 로그
+        logger.info("UI 초기화 시작...")
         super().__init__()
         self.config_mgr = config_manager
         self.engine = tunnel_engine
@@ -57,11 +71,39 @@ class TunnelManagerUI(QMainWindow):
 
         self._update_checker_thread = None
 
+        # ThemeManager 초기화
+        self._init_theme_manager()
+
+        # BackupScheduler 초기화
+        self.scheduler = BackupScheduler(config_manager, tunnel_engine)
+        self.scheduler.add_callback(self._on_backup_complete)
+        self.scheduler.start()
+
+        # TunnelMonitor 초기화
+        self.tunnel_monitor = TunnelMonitor(tunnel_engine, config_manager)
+        self.tunnel_monitor.add_callback(self._on_tunnel_status_changed)
+        self.tunnel_monitor.start_monitoring()
+
         self.init_ui()
         self.init_tray()
         self._check_update_on_startup()
         self._auto_connect_tunnels()
-        print("✅ UI 초기화 완료")
+        logger.info("UI 초기화 완료")
+
+    def _init_theme_manager(self):
+        """ThemeManager 초기화 및 테마 적용"""
+        theme_mgr = ThemeManager.instance()
+        theme_mgr.set_config_manager(self.config_mgr)
+        theme_mgr.theme_changed.connect(self._on_theme_changed)
+        theme_mgr.load_saved_theme()
+
+    def _on_theme_changed(self, colors: ThemeColors):
+        """테마 변경 시 UI 업데이트"""
+        # 앱 전체 스타일 적용
+        app = QApplication.instance()
+        if app:
+            app.setStyleSheet(get_full_app_style(colors))
+        logger.info(f"테마 변경됨: {ThemeManager.instance().current_theme_type.value}")
 
     def init_ui(self):
         self.setWindowTitle("TunnelForge")
@@ -82,56 +124,55 @@ class TunnelManagerUI(QMainWindow):
         title = QLabel("📡 터널링 연결 목록")
         title.setStyleSheet(LabelStyles.TITLE)
 
-        # [새로고침] 버튼 - Secondary 스타일 (중앙화)
-        btn_refresh = QPushButton("🔄 설정 로드")
-        btn_refresh.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_refresh.clicked.connect(self.reload_config)
-
-        # [설정] 버튼 - Secondary 스타일 (중앙화)
-        btn_settings = QPushButton("⚙️ 설정")
-        btn_settings.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_settings.clicked.connect(self.open_settings_dialog)
+        # [그룹 추가] 버튼
+        btn_add_group = QPushButton("📁 그룹 추가")
+        btn_add_group.setStyleSheet(ButtonStyles.SECONDARY)
+        btn_add_group.clicked.connect(self.add_group_dialog)
 
         # [연결 추가] 버튼 - Primary 스타일 (중앙화)
         btn_add_tunnel = QPushButton("➕ 연결 추가")
         btn_add_tunnel.setStyleSheet(ButtonStyles.PRIMARY)
         btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
 
+        # [새로고침] 버튼 - Secondary 스타일 (중앙화)
+        btn_refresh = QPushButton("🔄 설정 로드")
+        btn_refresh.setStyleSheet(ButtonStyles.SECONDARY)
+        btn_refresh.clicked.connect(self.reload_config)
+
+        # [스키마 비교] 버튼 - Secondary 스타일
+        btn_schema_diff = QPushButton("🔀 스키마 비교")
+        btn_schema_diff.setStyleSheet(ButtonStyles.SECONDARY)
+        btn_schema_diff.clicked.connect(self._open_schema_diff_dialog)
+
+        # [설정] 버튼 - Secondary 스타일 (중앙화)
+        btn_settings = QPushButton("⚙️ 설정")
+        btn_settings.setStyleSheet(ButtonStyles.SECONDARY)
+        btn_settings.clicked.connect(self.open_settings_dialog)
+
         header_layout.addWidget(title)
         header_layout.addStretch()
+        header_layout.addWidget(btn_add_group)
         header_layout.addWidget(btn_add_tunnel)
         header_layout.addWidget(btn_refresh)
+        header_layout.addWidget(btn_schema_diff)
         header_layout.addWidget(btn_settings)
         layout.addLayout(header_layout)
 
-        # --- 테이블 설정 ---
-        self.table = QTableWidget()
-        # 컬럼: 상태, 이름, 로컬포트, 타겟호스트, 기본 스키마, 전원, 관리(수정/삭제)
-        self.table.setColumnCount(7)
-        self.table.setHorizontalHeaderLabels(["상태", "이름", "로컬 포트", "타겟 호스트", "기본 스키마", "전원", "관리"])
+        # --- 트리 위젯 설정 (터널 그룹핑 지원) ---
+        self.tunnel_tree = TunnelTreeWidget(self)
 
-        # 열 너비 조정 가능 설정
-        header = self.table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # 모든 열 조정 가능
-        header.setStretchLastSection(False)
-
-        # 기본 열 비율 설정 (합계 = 1.0)
-        # 상태, 이름, 로컬포트, 타겟호스트, 기본스키마, 전원, 관리
-        self._default_column_ratios = [0.06, 0.18, 0.09, 0.25, 0.13, 0.09, 0.20]
+        # 기본 열 비율 설정
+        self._default_column_ratios = [0.05, 0.20, 0.08, 0.25, 0.12, 0.10, 0.20]
         self._column_ratios = self._load_column_ratios()
-        self._resizing_columns = False  # 재귀 방지 플래그
+        self._resizing_columns = False
 
-        # 사용자가 열 너비 조정 시 비율 업데이트
-        header.sectionResized.connect(self._on_column_resized)
+        # 시그널 연결
+        self._connect_tree_signals()
 
-        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)  # 셀 수정 방지
-        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)  # 행 단위 선택
+        layout.addWidget(self.tunnel_tree)
 
-        # 컨텍스트 메뉴 설정
-        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-        self.table.customContextMenuRequested.connect(self.show_context_menu)
-
-        layout.addWidget(self.table)
+        # 호환성을 위해 table 변수 유지
+        self.table = self.tunnel_tree
 
         # 하단 상태바
         self.statusBar().showMessage("준비됨")
@@ -149,6 +190,21 @@ class TunnelManagerUI(QMainWindow):
         tray_menu = QMenu()
         show_action = QAction("열기", self)
         show_action.triggered.connect(self.show)
+
+        # 스케줄 백업 서브메뉴
+        schedule_menu = tray_menu.addMenu("📅 스케줄 백업")
+        schedule_manage_action = QAction("스케줄 관리...", self)
+        schedule_manage_action.triggered.connect(self._open_schedule_dialog)
+        schedule_menu.addAction(schedule_manage_action)
+
+        schedule_menu.addSeparator()
+
+        # 스케줄 즉시 실행 서브메뉴
+        self._schedule_run_menu = schedule_menu.addMenu("즉시 실행")
+        self._update_schedule_run_menu()
+
+        tray_menu.addSeparator()
+
         quit_action = QAction("종료", self)
         quit_action.triggered.connect(self.close_app)
 
@@ -165,51 +221,44 @@ class TunnelManagerUI(QMainWindow):
             self.show()
             self.activateWindow()
 
+    def _connect_tree_signals(self):
+        """트리 위젯 시그널 연결"""
+        self.tunnel_tree.tunnel_start_requested.connect(self.start_tunnel)
+        self.tunnel_tree.tunnel_stop_requested.connect(self.stop_tunnel)
+        self.tunnel_tree.tunnel_edit_requested.connect(self.edit_tunnel_dialog)
+        self.tunnel_tree.tunnel_delete_requested.connect(self.delete_tunnel)
+        self.tunnel_tree.tunnel_db_connect.connect(self._on_tree_db_connect)
+        self.tunnel_tree.tunnel_sql_editor.connect(self._on_tree_sql_editor)
+        self.tunnel_tree.tunnel_export.connect(self._on_tree_export)
+        self.tunnel_tree.tunnel_import.connect(self._on_tree_import)
+        self.tunnel_tree.tunnel_test.connect(self._on_tree_test_connection)
+        self.tunnel_tree.group_connect_all.connect(self._connect_all_in_group)
+        self.tunnel_tree.group_disconnect_all.connect(self._disconnect_all_in_group)
+        self.tunnel_tree.group_edit_requested.connect(self._edit_group_dialog)
+        self.tunnel_tree.group_delete_requested.connect(self._delete_group)
+        self.tunnel_tree.tunnel_moved_to_group.connect(self._on_tunnel_moved)
+
     def refresh_table(self):
-        """설정 데이터와 현재 터널 상태를 기반으로 테이블을 갱신합니다."""
-        self.table.setRowCount(0)
+        """설정 데이터와 현재 터널 상태를 기반으로 트리를 갱신합니다."""
+        # 그룹 및 순서 데이터 로드
+        groups = self.config_mgr.get_groups()
+        ungrouped_order = self.config_data.get('ungrouped_order', [])
 
-        for idx, tunnel in enumerate(self.tunnels):
-            self.table.insertRow(idx)
+        # 트리 위젯에 데이터 로드
+        self.tunnel_tree.load_data(self.tunnels, groups, ungrouped_order)
 
-            # config.json이 비어있거나 id가 없을 경우 대비
+        # 각 터널의 상태 업데이트 및 버튼 설정
+        for tunnel in self.tunnels:
             tid = tunnel.get('id')
             if not tid:
                 continue
 
             is_active = self.engine.is_running(tid)
-            is_direct = tunnel.get('connection_mode') == 'direct'
 
-            # 1. 상태 아이콘
-            status_item = QTableWidgetItem("🟢" if is_active else "⚪")
-            status_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(idx, 0, status_item)
+            # 상태 업데이트
+            self.tunnel_tree.update_tunnel_status(tid, is_active)
 
-            # 2. 이름 (직접 연결일 경우 표시 추가)
-            name = tunnel.get('name', 'Unknown')
-            if is_direct:
-                name += " [직접]"
-            self.table.setItem(idx, 1, QTableWidgetItem(name))
-
-            # 3. 로컬 포트 (직접 연결일 경우 "-" 표시)
-            if is_direct:
-                port_str = "-"
-            else:
-                port_str = str(tunnel.get('local_port', ''))
-            port_item = QTableWidgetItem(port_str)
-            port_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(idx, 2, port_item)
-
-            # 4. 타겟 호스트
-            target_str = f"{tunnel.get('remote_host', '')}:{tunnel.get('remote_port', '')}"
-            self.table.setItem(idx, 3, QTableWidgetItem(target_str))
-
-            # 5. 기본 스키마
-            schema_item = QTableWidgetItem(tunnel.get('default_schema') or '-')
-            schema_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
-            self.table.setItem(idx, 4, schema_item)
-
-            # 6. 전원 (Start/Stop) 버튼 - 중앙화된 스타일 사용
+            # 전원 버튼 생성
             btn_power = QPushButton("중지" if is_active else "시작")
             if is_active:
                 btn_power.setStyleSheet(ButtonStyles.DANGER)
@@ -217,13 +266,13 @@ class TunnelManagerUI(QMainWindow):
             else:
                 btn_power.setStyleSheet(ButtonStyles.SUCCESS)
                 btn_power.clicked.connect(lambda checked, t=tunnel: self.start_tunnel(t))
-            self.table.setCellWidget(idx, 5, btn_power)
+            self.tunnel_tree.set_power_button(tid, btn_power)
 
-            # 7. 관리 (수정/삭제) 버튼 그룹 - 중앙화된 스타일 사용
+            # 관리 버튼 그룹 생성
             container = QWidget()
             h_box = QHBoxLayout(container)
-            h_box.setContentsMargins(4, 4, 4, 4)
-            h_box.setSpacing(5)
+            h_box.setContentsMargins(2, 2, 2, 2)
+            h_box.setSpacing(3)
 
             btn_edit = QPushButton("수정")
             btn_edit.setStyleSheet(ButtonStyles.EDIT)
@@ -235,7 +284,112 @@ class TunnelManagerUI(QMainWindow):
             btn_del.clicked.connect(lambda checked, t=tunnel: self.delete_tunnel(t))
             h_box.addWidget(btn_del)
 
-            self.table.setCellWidget(idx, 6, container)
+            self.tunnel_tree.set_tunnel_buttons(tid, container)
+
+    # --- 트리 위젯 시그널 핸들러 ---
+    def _on_tree_db_connect(self, tunnel):
+        """트리에서 DB 연결 요청"""
+        self._connect_and_open_dialog(tunnel)
+
+    def _on_tree_sql_editor(self, tunnel):
+        """트리에서 SQL 에디터 요청"""
+        self._open_sql_editor(tunnel)
+
+    def _on_tree_export(self, tunnel):
+        """트리에서 Export 요청"""
+        self.open_mysqlsh_wizard(tunnel)
+
+    def _on_tree_import(self, tunnel):
+        """트리에서 Import 요청"""
+        self.open_mysqlsh_wizard(tunnel, start_tab=1)
+
+    def _on_tree_test_connection(self, tunnel):
+        """트리에서 연결 테스트 요청"""
+        self._test_tunnel_connection(tunnel)
+
+    def _connect_all_in_group(self, group_id: str):
+        """그룹 내 모든 터널 연결"""
+        groups = self.config_mgr.get_groups()
+        for group in groups:
+            if group['id'] == group_id:
+                for tunnel_id in group.get('tunnel_ids', []):
+                    tunnel = next((t for t in self.tunnels if t['id'] == tunnel_id), None)
+                    if tunnel and not self.engine.is_running(tunnel_id):
+                        self.start_tunnel(tunnel)
+                break
+
+    def _disconnect_all_in_group(self, group_id: str):
+        """그룹 내 모든 터널 해제"""
+        groups = self.config_mgr.get_groups()
+        for group in groups:
+            if group['id'] == group_id:
+                for tunnel_id in group.get('tunnel_ids', []):
+                    tunnel = next((t for t in self.tunnels if t['id'] == tunnel_id), None)
+                    if tunnel and self.engine.is_running(tunnel_id):
+                        self.stop_tunnel(tunnel)
+                break
+
+    def _on_tunnel_moved(self, tunnel_id: str, group_id: str):
+        """터널이 그룹으로 이동됨"""
+        target_group = group_id if group_id else None
+        success, msg = self.config_mgr.move_tunnel_to_group(tunnel_id, target_group)
+        if success:
+            self.reload_config()
+        else:
+            logger.warning(f"터널 이동 실패: {msg}")
+
+    # --- 그룹 관리 ---
+    def add_group_dialog(self):
+        """그룹 추가 다이얼로그"""
+        accepted, result = create_group_dialog(self)
+        if accepted and result:
+            success, msg, group_id = self.config_mgr.add_group(
+                result['name'],
+                result['color']
+            )
+            if success:
+                self.statusBar().showMessage(f"✅ {msg}")
+                self.reload_config()
+            else:
+                QMessageBox.warning(self, "그룹 생성 실패", msg)
+
+    def _edit_group_dialog(self, group_id: str):
+        """그룹 수정 다이얼로그"""
+        groups = self.config_mgr.get_groups()
+        group_data = next((g for g in groups if g['id'] == group_id), None)
+        if not group_data:
+            return
+
+        accepted, result = edit_group_dialog(self, group_data)
+        if accepted and result:
+            success, msg = self.config_mgr.update_group(group_id, result)
+            if success:
+                self.statusBar().showMessage(f"✅ {msg}")
+                self.reload_config()
+            else:
+                QMessageBox.warning(self, "그룹 수정 실패", msg)
+
+    def _delete_group(self, group_id: str):
+        """그룹 삭제"""
+        groups = self.config_mgr.get_groups()
+        group = next((g for g in groups if g['id'] == group_id), None)
+        if not group:
+            return
+
+        reply = QMessageBox.question(
+            self, "그룹 삭제",
+            f"'{group['name']}' 그룹을 삭제하시겠습니까?\n\n"
+            f"그룹에 속한 터널은 '그룹 없음'으로 이동됩니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            success, msg = self.config_mgr.delete_group(group_id)
+            if success:
+                self.statusBar().showMessage(f"✅ {msg}")
+                self.reload_config()
+            else:
+                QMessageBox.warning(self, "그룹 삭제 실패", msg)
 
     # --- 기능 로직 ---
     def add_tunnel_dialog(self):
@@ -405,11 +559,161 @@ class TunnelManagerUI(QMainWindow):
         active_ids = list(self.engine.active_tunnels.keys())
         self.config_mgr.save_active_tunnels(active_ids)
 
+        # 스케줄러 중지
+        if hasattr(self, 'scheduler') and self.scheduler:
+            self.scheduler.stop()
+
+        # 터널 모니터 중지
+        if hasattr(self, 'tunnel_monitor') and self.tunnel_monitor:
+            self.tunnel_monitor.stop_monitoring()
+
         self.engine.stop_all()
         self.tray_icon.hide()
         # 모든 창 닫고 종료
         import sys
         sys.exit(0)
+
+    # =========================================================================
+    # 스케줄 백업 관련 메서드
+    # =========================================================================
+
+    def _open_schedule_dialog(self):
+        """스케줄 관리 다이얼로그 열기"""
+        # 터널 목록 준비
+        tunnel_list = [(t['id'], t['name']) for t in self.tunnels]
+
+        dialog = ScheduleListDialog(self, self.scheduler, tunnel_list)
+        dialog.schedule_changed.connect(self._update_schedule_run_menu)
+        dialog.exec()
+
+    def _update_schedule_run_menu(self):
+        """즉시 실행 메뉴 업데이트"""
+        if not hasattr(self, '_schedule_run_menu'):
+            return
+
+        self._schedule_run_menu.clear()
+
+        schedules = self.scheduler.get_schedules()
+        if not schedules:
+            no_schedule_action = QAction("(스케줄 없음)", self)
+            no_schedule_action.setEnabled(False)
+            self._schedule_run_menu.addAction(no_schedule_action)
+            return
+
+        for schedule in schedules:
+            action = QAction(schedule.name, self)
+            action.setData(schedule.id)
+            action.triggered.connect(
+                lambda checked, sid=schedule.id: self._run_schedule_now(sid)
+            )
+            self._schedule_run_menu.addAction(action)
+
+    def _run_schedule_now(self, schedule_id: str):
+        """스케줄 즉시 실행"""
+        schedule = self.scheduler.get_schedule(schedule_id)
+        if not schedule:
+            return
+
+        # 백그라운드에서 실행
+        success, message = self.scheduler.run_now(schedule_id)
+
+        # 트레이 알림
+        if success:
+            self.tray_icon.showMessage(
+                "백업 완료",
+                f"{schedule.name} 백업이 완료되었습니다.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+        else:
+            self.tray_icon.showMessage(
+                "백업 실패",
+                f"{schedule.name}: {message}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000
+            )
+
+    def _on_backup_complete(self, schedule_name: str, success: bool, message: str):
+        """백업 완료 콜백 (스케줄러에서 호출)"""
+        if success:
+            self.tray_icon.showMessage(
+                "스케줄 백업 완료",
+                f"{schedule_name} 백업이 완료되었습니다.",
+                QSystemTrayIcon.MessageIcon.Information,
+                3000
+            )
+        else:
+            self.tray_icon.showMessage(
+                "스케줄 백업 실패",
+                f"{schedule_name}: {message}",
+                QSystemTrayIcon.MessageIcon.Warning,
+                5000
+            )
+
+    # =========================================================================
+    # 터널 모니터링 관련 메서드
+    # =========================================================================
+
+    def _on_tunnel_status_changed(self, tunnel_id: str, status):
+        """터널 상태 변경 콜백"""
+        # UI 스레드에서 안전하게 갱신
+        from PyQt6.QtCore import QMetaObject, Qt, Q_ARG
+        QMetaObject.invokeMethod(
+            self, "_update_tunnel_status_ui",
+            Qt.ConnectionType.QueuedConnection,
+            Q_ARG(str, tunnel_id)
+        )
+
+    def _update_tunnel_status_ui(self, tunnel_id: str):
+        """UI에서 터널 상태 업데이트"""
+        # 트리 위젯 갱신
+        if hasattr(self, 'tunnel_tree'):
+            self.refresh_table()
+
+    def open_tunnel_status_dialog(self, tunnel_id: str):
+        """터널 상태 상세 다이얼로그 열기"""
+        # 터널 이름 찾기
+        tunnel_name = tunnel_id
+        for tunnel in self.tunnels:
+            if tunnel.get('id') == tunnel_id:
+                tunnel_name = tunnel.get('name', tunnel_id)
+                break
+
+        dialog = TunnelStatusDialog(
+            self,
+            self.tunnel_monitor,
+            tunnel_id,
+            tunnel_name
+        )
+        dialog.exec()
+
+    def get_tunnel_status_info(self, tunnel_id: str) -> dict:
+        """터널 상태 정보 반환 (트리 위젯용)"""
+        if not hasattr(self, 'tunnel_monitor') or not self.tunnel_monitor:
+            return {}
+
+        status = self.tunnel_monitor.get_status(tunnel_id)
+
+        return {
+            'state': status.state,
+            'duration': status.format_duration(),
+            'latency': f"{status.latency_ms:.0f}ms" if status.latency_ms and status.latency_ms >= 0 else "-",
+            'reconnect_count': status.reconnect_count
+        }
+
+    # =========================================================================
+    # 스키마 비교 관련 메서드
+    # =========================================================================
+
+    def _open_schema_diff_dialog(self):
+        """스키마 비교 다이얼로그 열기"""
+        dialog = SchemaDiffDialog(
+            self,
+            tunnels=self.tunnels,
+            tunnel_engine=self.engine,
+            config_manager=self.config_mgr
+        )
+        dialog.exec()
 
     def _load_column_ratios(self):
         """저장된 열 비율 로드 (없으면 기본값)"""
@@ -476,7 +780,7 @@ class TunnelManagerUI(QMainWindow):
         if not last_active:
             return
 
-        print(f"🔄 이전 세션 터널 자동 연결 시도: {len(last_active)}개")
+        logger.info(f"이전 세션 터널 자동 연결 시도: {len(last_active)}개")
 
         connected = []
         skipped = []
@@ -485,17 +789,17 @@ class TunnelManagerUI(QMainWindow):
             # 터널 설정 찾기
             tunnel = next((t for t in self.tunnels if t.get('id') == tid), None)
             if not tunnel:
-                print(f"⚠️ 터널 설정을 찾을 수 없음: {tid}")
+                logger.warning(f"터널 설정을 찾을 수 없음: {tid}")
                 continue
 
             # 연결 시도
             success, msg = self.engine.start_tunnel(tunnel, check_port=True)
             if success:
                 connected.append(tunnel['name'])
-                print(f"✅ 자동 연결 성공: {tunnel['name']}")
+                logger.info(f"자동 연결 성공: {tunnel['name']}")
             else:
                 skipped.append((tunnel['name'], msg))
-                print(f"⚠️ 자동 연결 스킵: {tunnel['name']} - {msg}")
+                logger.warning(f"자동 연결 스킵: {tunnel['name']} - {msg}")
 
         # 테이블 갱신
         self.refresh_table()

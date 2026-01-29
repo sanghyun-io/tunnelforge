@@ -85,7 +85,11 @@ def main():
     from PyQt6.QtGui import QIcon
 
     from src.core import ConfigManager, TunnelEngine
+    from src.core.logger import get_logger
     from src.ui.main_window import TunnelManagerUI
+
+    # 루트 로거 초기화
+    logger = get_logger('main')
 
     # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
     ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('tunnelforge.1.0')
@@ -102,7 +106,7 @@ def main():
 
     # 2. 설정 파일 경로 안내 (첫 실행 사용자를 위해)
     config_path = config_mgr.get_config_path()
-    print(f"ℹ️ 설정 파일 위치: {config_path}")
+    logger.info(f"설정 파일 위치: {config_path}")
 
     # 3. UI 실행
     window = TunnelManagerUI(config_mgr, tunnel_engine)

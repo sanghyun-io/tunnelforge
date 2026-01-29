@@ -1,12 +1,18 @@
 """설정 관련 다이얼로그"""
+import os
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
-                             QWidget, QTextBrowser, QSizePolicy)
+                             QWidget, QTextBrowser, QSizePolicy, QTextEdit,
+                             QComboBox, QListWidget, QListWidgetItem, QFileDialog,
+                             QTableWidget, QTableWidgetItem, QHeaderView)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QCursor
+from PyQt6.QtGui import QDesktopServices, QCursor, QFont
 from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
+from src.core.logger import get_log_file_path, get_log_dir, read_log_file, filter_log_by_level, clear_log_file
+from src.ui.themes import ThemeType
+from src.ui.theme_manager import ThemeManager
 
 
 class CloseConfirmDialog(QDialog):
@@ -106,6 +112,8 @@ class SettingsDialog(QDialog):
         # 탭 위젯 생성
         tabs = QTabWidget()
         tabs.addTab(self._create_general_tab(), "일반")
+        tabs.addTab(self._create_pool_tab(), "연결 풀")
+        tabs.addTab(self._create_log_tab(), "로그")
         tabs.addTab(self._create_about_tab(), "정보")
         layout.addWidget(tabs)
 
@@ -170,6 +178,33 @@ class SettingsDialog(QDialog):
         else:  # 'ask' or default
             self.radio_ask.setChecked(True)
 
+        # 테마 설정 그룹
+        theme_group = QGroupBox("테마")
+        theme_layout = QHBoxLayout(theme_group)
+
+        theme_label = QLabel("화면 테마:")
+        theme_label.setStyleSheet("font-size: 12px;")
+        theme_layout.addWidget(theme_label)
+
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("시스템 설정 따르기", ThemeType.SYSTEM.value)
+        self.theme_combo.addItem("라이트 모드", ThemeType.LIGHT.value)
+        self.theme_combo.addItem("다크 모드", ThemeType.DARK.value)
+        self.theme_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 150px;")
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        theme_layout.addWidget(self.theme_combo)
+
+        theme_layout.addStretch()
+
+        layout.addWidget(theme_group)
+
+        # 현재 테마 설정 로드
+        theme_mgr = ThemeManager.instance()
+        current_theme = theme_mgr.current_theme_type.value
+        index = self.theme_combo.findData(current_theme)
+        if index >= 0:
+            self.theme_combo.setCurrentIndex(index)
+
         # GitHub 이슈 자동 보고 설정 그룹
         github_group = QGroupBox("GitHub 이슈 자동 보고")
         github_layout = QVBoxLayout(github_group)
@@ -223,9 +258,458 @@ class SettingsDialog(QDialog):
         # GitHub 설정 로드
         self._load_github_settings()
 
+        # 설정 백업/복원 그룹
+        backup_group = QGroupBox("설정 백업/복원")
+        backup_layout = QVBoxLayout(backup_group)
+
+        # 백업 목록 라벨
+        backup_list_label = QLabel("백업 목록 (최근 5개):")
+        backup_list_label.setStyleSheet("font-size: 12px; margin-bottom: 5px;")
+        backup_layout.addWidget(backup_list_label)
+
+        # 백업 목록 (QListWidget)
+        self.backup_list = QListWidget()
+        self.backup_list.setStyleSheet("""
+            QListWidget {
+                font-size: 11px;
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+            }
+            QListWidget::item {
+                padding: 5px;
+            }
+            QListWidget::item:selected {
+                background-color: #3498db;
+                color: white;
+            }
+        """)
+        self.backup_list.setMaximumHeight(100)
+        backup_layout.addWidget(self.backup_list)
+
+        # 백업 관리 버튼들
+        backup_btn_layout = QHBoxLayout()
+
+        btn_restore = QPushButton("복원")
+        btn_restore.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #219a52; }
+        """)
+        btn_restore.clicked.connect(self._restore_selected_backup)
+        backup_btn_layout.addWidget(btn_restore)
+
+        btn_export = QPushButton("내보내기")
+        btn_export.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_export.clicked.connect(self._export_config)
+        backup_btn_layout.addWidget(btn_export)
+
+        btn_import = QPushButton("가져오기")
+        btn_import.setStyleSheet("""
+            QPushButton {
+                background-color: #95a5a6; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #7f8c8d; }
+        """)
+        btn_import.clicked.connect(self._import_config)
+        backup_btn_layout.addWidget(btn_import)
+
+        backup_btn_layout.addStretch()
+        backup_layout.addLayout(backup_btn_layout)
+
+        layout.addWidget(backup_group)
+
+        # 백업 목록 로드
+        self._refresh_backup_list()
+
+        # 자동 재연결 설정 그룹
+        reconnect_group = QGroupBox("터널 자동 재연결")
+        reconnect_layout = QVBoxLayout(reconnect_group)
+
+        self.chk_auto_reconnect = QCheckBox("연결 끊김 시 자동 재연결")
+        self.chk_auto_reconnect.setStyleSheet("font-size: 12px;")
+        self.chk_auto_reconnect.setChecked(
+            self.config_mgr.get_app_setting('auto_reconnect', True)
+        )
+        reconnect_layout.addWidget(self.chk_auto_reconnect)
+
+        max_attempts_layout = QHBoxLayout()
+        max_attempts_label = QLabel("최대 재연결 시도 횟수:")
+        max_attempts_label.setStyleSheet("font-size: 12px; margin-left: 20px;")
+        max_attempts_layout.addWidget(max_attempts_label)
+
+        self.spin_max_reconnect = QSpinBox()
+        self.spin_max_reconnect.setRange(1, 20)
+        self.spin_max_reconnect.setValue(
+            self.config_mgr.get_app_setting('max_reconnect_attempts', 5)
+        )
+        self.spin_max_reconnect.setStyleSheet("font-size: 12px; min-width: 60px;")
+        max_attempts_layout.addWidget(self.spin_max_reconnect)
+        max_attempts_layout.addStretch()
+        reconnect_layout.addLayout(max_attempts_layout)
+
+        reconnect_desc = QLabel(
+            "연결이 끊어지면 점진적 백오프(1초→60초)를 적용하여 자동으로 재연결을 시도합니다."
+        )
+        reconnect_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
+        reconnect_desc.setWordWrap(True)
+        reconnect_layout.addWidget(reconnect_desc)
+
+        layout.addWidget(reconnect_group)
+
         layout.addStretch()
 
         return tab
+
+    def _refresh_backup_list(self):
+        """백업 목록 새로고침"""
+        self.backup_list.clear()
+        backups = self.config_mgr.list_backups()
+
+        if not backups:
+            item = QListWidgetItem("(백업 없음)")
+            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsSelectable)
+            self.backup_list.addItem(item)
+        else:
+            for filename, timestamp, size in backups:
+                size_kb = size / 1024
+                item_text = f"{timestamp}  ({size_kb:.1f} KB)"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.ItemDataRole.UserRole, filename)
+                self.backup_list.addItem(item)
+
+    def _restore_selected_backup(self):
+        """선택한 백업으로 복원"""
+        current_item = self.backup_list.currentItem()
+        if not current_item:
+            QMessageBox.warning(self, "알림", "복원할 백업을 선택하세요.")
+            return
+
+        filename = current_item.data(Qt.ItemDataRole.UserRole)
+        if not filename:
+            QMessageBox.warning(self, "알림", "복원할 백업을 선택하세요.")
+            return
+
+        reply = QMessageBox.question(
+            self, "복원 확인",
+            f"선택한 백업으로 설정을 복원하시겠습니까?\n\n"
+            f"현재 설정은 자동으로 백업됩니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            success, msg = self.config_mgr.restore_backup(filename)
+            if success:
+                QMessageBox.information(self, "복원 완료", msg + "\n\n앱을 재시작하면 변경사항이 적용됩니다.")
+                self._refresh_backup_list()
+            else:
+                QMessageBox.warning(self, "복원 실패", msg)
+
+    def _export_config(self):
+        """설정 내보내기"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "설정 내보내기",
+            "tunnelforge_config.json",
+            "JSON 파일 (*.json)"
+        )
+
+        if file_path:
+            success, msg = self.config_mgr.export_config(file_path)
+            if success:
+                QMessageBox.information(self, "내보내기 완료", msg)
+            else:
+                QMessageBox.warning(self, "내보내기 실패", msg)
+
+    def _import_config(self):
+        """설정 가져오기"""
+        file_path, _ = QFileDialog.getOpenFileName(
+            self, "설정 가져오기",
+            "",
+            "JSON 파일 (*.json)"
+        )
+
+        if file_path:
+            reply = QMessageBox.question(
+                self, "가져오기 확인",
+                f"선택한 파일에서 설정을 가져오시겠습니까?\n\n"
+                f"현재 설정은 자동으로 백업됩니다.",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+
+            if reply == QMessageBox.StandardButton.Yes:
+                success, msg = self.config_mgr.import_config(file_path)
+                if success:
+                    QMessageBox.information(self, "가져오기 완료", msg + "\n\n앱을 재시작하면 변경사항이 적용됩니다.")
+                    self._refresh_backup_list()
+                else:
+                    QMessageBox.warning(self, "가져오기 실패", msg)
+
+    def _create_pool_tab(self) -> QWidget:
+        """연결 풀 상태 탭 생성"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # 설명
+        desc_label = QLabel("DB 연결 풀 상태를 모니터링합니다. 연결 풀은 DB 연결을 재사용하여 성능을 향상시킵니다.")
+        desc_label.setStyleSheet("color: #666; font-size: 11px; padding: 8px;")
+        desc_label.setWordWrap(True)
+        layout.addWidget(desc_label)
+
+        # 풀 상태 테이블
+        pool_group = QGroupBox("활성 연결 풀")
+        pool_layout = QVBoxLayout(pool_group)
+
+        self.pool_table = QTableWidget()
+        self.pool_table.setColumnCount(5)
+        self.pool_table.setHorizontalHeaderLabels(["풀 키", "생성됨", "사용 중", "대기 중", "최대"])
+        self.pool_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self.pool_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        self.pool_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
+        self.pool_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
+        self.pool_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        self.pool_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.pool_table.setAlternatingRowColors(True)
+        self.pool_table.setStyleSheet("""
+            QTableWidget {
+                font-size: 12px;
+            }
+            QTableWidget::item {
+                padding: 4px;
+            }
+        """)
+        pool_layout.addWidget(self.pool_table)
+
+        # 컨트롤 버튼
+        btn_layout = QHBoxLayout()
+
+        btn_refresh_pool = QPushButton("🔄 새로고침")
+        btn_refresh_pool.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_refresh_pool.clicked.connect(self._refresh_pool_status)
+        btn_layout.addWidget(btn_refresh_pool)
+
+        btn_close_all = QPushButton("🛑 모든 연결 종료")
+        btn_close_all.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+        btn_close_all.clicked.connect(self._close_all_pools)
+        btn_layout.addWidget(btn_close_all)
+
+        btn_layout.addStretch()
+        pool_layout.addLayout(btn_layout)
+
+        layout.addWidget(pool_group)
+
+        # 정보 레이블
+        self.pool_info_label = QLabel("풀 상태를 새로고침하려면 '새로고침' 버튼을 클릭하세요.")
+        self.pool_info_label.setStyleSheet("color: #666; font-size: 11px; padding: 8px;")
+        layout.addWidget(self.pool_info_label)
+
+        layout.addStretch()
+
+        # 초기 로드
+        self._refresh_pool_status()
+
+        return tab
+
+    def _refresh_pool_status(self):
+        """연결 풀 상태 새로고침"""
+        try:
+            from src.core.connection_pool import get_pool_registry
+            registry = get_pool_registry()
+            stats_list = registry.get_all_stats()
+
+            self.pool_table.setRowCount(len(stats_list))
+
+            for row, stats in enumerate(stats_list):
+                # 풀 키
+                self.pool_table.setItem(row, 0, QTableWidgetItem(stats['pool_key']))
+                # 생성됨
+                self.pool_table.setItem(row, 1, QTableWidgetItem(str(stats['total_created'])))
+                # 사용 중
+                self.pool_table.setItem(row, 2, QTableWidgetItem(str(stats['in_use'])))
+                # 대기 중 (available)
+                self.pool_table.setItem(row, 3, QTableWidgetItem(str(stats['available'])))
+                # 최대
+                self.pool_table.setItem(row, 4, QTableWidgetItem(str(stats['max_connections'])))
+
+            if stats_list:
+                total_created = sum(s['total_created'] for s in stats_list)
+                total_in_use = sum(s['in_use'] for s in stats_list)
+                self.pool_info_label.setText(f"✅ {len(stats_list)}개 풀, 총 {total_created}개 연결 ({total_in_use}개 사용 중)")
+            else:
+                self.pool_info_label.setText("ℹ️ 활성 연결 풀이 없습니다.")
+
+        except Exception as e:
+            self.pool_info_label.setText(f"❌ 풀 상태 조회 실패: {str(e)}")
+
+    def _close_all_pools(self):
+        """모든 연결 풀 종료"""
+        reply = QMessageBox.question(
+            self, "확인",
+            "모든 DB 연결 풀을 종료하시겠습니까?\n\n"
+            "활성 연결이 있으면 작업이 중단될 수 있습니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            try:
+                from src.core.connection_pool import get_pool_registry
+                registry = get_pool_registry()
+                registry.close_all_pools()
+                self._refresh_pool_status()
+                QMessageBox.information(self, "완료", "모든 연결 풀이 종료되었습니다.")
+            except Exception as e:
+                QMessageBox.warning(self, "오류", f"풀 종료 실패: {str(e)}")
+
+    def _create_log_tab(self) -> QWidget:
+        """로그 뷰어 탭 생성"""
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+
+        # 상단 컨트롤
+        control_layout = QHBoxLayout()
+
+        # 로그 레벨 필터
+        filter_label = QLabel("로그 레벨:")
+        filter_label.setStyleSheet("font-size: 12px;")
+        control_layout.addWidget(filter_label)
+
+        self.log_level_combo = QComboBox()
+        self.log_level_combo.addItems(["ALL", "DEBUG", "INFO", "WARNING", "ERROR"])
+        self.log_level_combo.setCurrentText("ALL")
+        self.log_level_combo.currentTextChanged.connect(self._on_log_filter_changed)
+        self.log_level_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 100px;")
+        control_layout.addWidget(self.log_level_combo)
+
+        control_layout.addStretch()
+
+        # 새로고침 버튼
+        btn_refresh_log = QPushButton("새로고침")
+        btn_refresh_log.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_refresh_log.clicked.connect(self._refresh_log_viewer)
+        control_layout.addWidget(btn_refresh_log)
+
+        # 로그 폴더 열기 버튼
+        btn_open_log_folder = QPushButton("로그 폴더 열기")
+        btn_open_log_folder.setStyleSheet("""
+            QPushButton {
+                background-color: #95a5a6; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #7f8c8d; }
+        """)
+        btn_open_log_folder.clicked.connect(self._open_log_folder)
+        control_layout.addWidget(btn_open_log_folder)
+
+        # 로그 초기화 버튼
+        btn_clear_log = QPushButton("로그 초기화")
+        btn_clear_log.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+        btn_clear_log.clicked.connect(self._clear_log_file)
+        control_layout.addWidget(btn_clear_log)
+
+        layout.addLayout(control_layout)
+
+        # 로그 파일 경로 표시
+        log_path_label = QLabel(f"로그 파일: {get_log_file_path()}")
+        log_path_label.setStyleSheet("font-size: 10px; color: #666; margin: 5px 0;")
+        log_path_label.setWordWrap(True)
+        layout.addWidget(log_path_label)
+
+        # 로그 뷰어 (읽기 전용 텍스트 에디터)
+        self.log_viewer = QTextEdit()
+        self.log_viewer.setReadOnly(True)
+        self.log_viewer.setFont(QFont("Consolas", 9))
+        self.log_viewer.setStyleSheet("""
+            QTextEdit {
+                background-color: #1e1e1e;
+                color: #d4d4d4;
+                border: 1px solid #3c3c3c;
+                border-radius: 4px;
+                padding: 8px;
+            }
+        """)
+        self.log_viewer.setPlaceholderText("로그 파일이 없습니다.")
+        layout.addWidget(self.log_viewer)
+
+        # 최초 로그 로드
+        self._refresh_log_viewer()
+
+        return tab
+
+    def _refresh_log_viewer(self):
+        """로그 뷰어 새로고침"""
+        content = read_log_file(max_lines=500)
+        level = self.log_level_combo.currentText()
+        filtered_content = filter_log_by_level(content, level)
+        self.log_viewer.setPlainText(filtered_content)
+        # 스크롤을 맨 아래로
+        scrollbar = self.log_viewer.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
+    def _on_log_filter_changed(self, level: str):
+        """로그 필터 변경 시"""
+        self._refresh_log_viewer()
+
+    def _open_log_folder(self):
+        """로그 폴더를 탐색기에서 열기"""
+        log_dir = get_log_dir()
+        if os.path.exists(log_dir):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(log_dir))
+        else:
+            QMessageBox.information(self, "알림", "로그 폴더가 아직 생성되지 않았습니다.")
+
+    def _clear_log_file(self):
+        """로그 파일 초기화"""
+        reply = QMessageBox.question(
+            self, "로그 초기화",
+            "로그 파일을 초기화하시겠습니까?\n이 작업은 되돌릴 수 없습니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            success, msg = clear_log_file()
+            if success:
+                self._refresh_log_viewer()
+                QMessageBox.information(self, "알림", msg)
+            else:
+                QMessageBox.warning(self, "오류", msg)
 
     def _create_about_tab(self) -> QWidget:
         """정보 탭 생성"""
@@ -316,6 +800,16 @@ class SettingsDialog(QDialog):
 
         return tab
 
+    def _on_theme_changed(self, index: int):
+        """테마 선택 변경 시 즉시 적용"""
+        theme_value = self.theme_combo.currentData()
+        try:
+            theme_type = ThemeType(theme_value)
+            theme_mgr = ThemeManager.instance()
+            theme_mgr.set_theme(theme_type)
+        except ValueError:
+            pass
+
     def save_settings(self):
         """설정 저장"""
         if self.radio_minimize.isChecked():
@@ -327,6 +821,8 @@ class SettingsDialog(QDialog):
 
         self.config_mgr.set_app_setting('close_action', action)
 
+        # 테마 설정은 _on_theme_changed에서 이미 저장됨
+
         # GitHub 자동 보고 설정 저장
         auto_report = self.chk_auto_report.isChecked()
         self.config_mgr.set_app_setting('github_auto_report', auto_report)
@@ -334,6 +830,13 @@ class SettingsDialog(QDialog):
         # 자동 업데이트 확인 설정 저장
         auto_update_check = self.chk_auto_update.isChecked()
         self.config_mgr.set_app_setting('auto_update_check', auto_update_check)
+
+        # 자동 재연결 설정 저장
+        auto_reconnect = self.chk_auto_reconnect.isChecked()
+        self.config_mgr.set_app_setting('auto_reconnect', auto_reconnect)
+
+        max_reconnect = self.spin_max_reconnect.value()
+        self.config_mgr.set_app_setting('max_reconnect_attempts', max_reconnect)
 
         self.accept()
 

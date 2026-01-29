@@ -3,6 +3,11 @@ import paramiko
 import socket
 import os
 
+from src.core.logger import get_logger
+
+logger = get_logger('tunnel_engine')
+
+
 class TunnelEngine:
     def __init__(self):
         self.active_tunnels = {}  # { tunnel_id: server_object or None(직접 연결) }
@@ -50,7 +55,7 @@ class TunnelEngine:
             try:
                 # 암호가 있는 키라면 password 인자가 필요하지만, 일단 없는 것으로 가정
                 key = k_cls.from_private_key_file(key_path)
-                print(f"✅ SSH 키 로드 성공: {key_name} 형식")
+                logger.info(f"SSH 키 로드 성공: {key_name} 형식")
                 return key
             except paramiko.ssh_exception.PasswordRequiredException:
                 raise Exception("키 파일에 비밀번호(Passphrase)가 걸려있습니다. 현재 버전은 비밀번호를 지원하지 않습니다.")
@@ -91,7 +96,7 @@ class TunnelEngine:
         if config.get('connection_mode') == 'direct':
             self.active_tunnels[tid] = None  # 터널 객체 없음 (직접 연결)
             self.tunnel_configs[tid] = config
-            print(f"🔗 직접 연결 모드: {config['name']} -> {config['remote_host']}:{config['remote_port']}")
+            logger.info(f"직접 연결 모드: {config['name']} -> {config['remote_host']}:{config['remote_port']}")
             return True, f"직접 연결: {config['remote_host']}:{config['remote_port']}"
 
         # SSH 터널 모드 - 포트 충돌 체크
@@ -116,16 +121,16 @@ class TunnelEngine:
             connection_logs.append(f"   SSH Key: {config['bastion_key']}")
 
             for log in connection_logs:
-                print(log)
+                logger.debug(log)
 
             # 키 객체 직접 로드
-            connection_logs.append("🔑 SSH 키 로드 시도...")
-            print("🔑 SSH 키 로드 시도...")
+            connection_logs.append("SSH 키 로드 시도...")
+            logger.debug("SSH 키 로드 시도...")
             pkey_obj = self._load_private_key(config['bastion_key'])
             connection_logs.append("✅ SSH 키 로드 성공")
 
-            connection_logs.append("🔗 SSH 터널 생성 중...")
-            print("🔗 SSH 터널 생성 중...")
+            connection_logs.append("SSH 터널 생성 중...")
+            logger.debug("SSH 터널 생성 중...")
             server = SSHTunnelForwarder(
                 (config['bastion_host'], int(config['bastion_port'])),
                 ssh_username=config['bastion_user'],
@@ -135,12 +140,12 @@ class TunnelEngine:
                 set_keepalive=30.0
             )
 
-            connection_logs.append("🚀 터널 연결 시작...")
-            print("🚀 터널 연결 시작...")
+            connection_logs.append("터널 연결 시작...")
+            logger.debug("터널 연결 시작...")
             server.start()
             self.active_tunnels[tid] = server
             self.tunnel_configs[tid] = config
-            print(f"✅ 터널 연결 성공! (Local {config['local_port']} -> Remote {config['remote_host']})")
+            logger.info(f"터널 연결 성공! (Local {config['local_port']} -> Remote {config['remote_host']})")
             return True, "연결 성공"
 
         except Exception as e:
@@ -154,7 +159,7 @@ class TunnelEngine:
             full_error += "📋 연결 시도 로그:\n"
             full_error += "\n".join(connection_logs)
 
-            print(full_error)
+            logger.error(full_error)
             return False, full_error
 
     def stop_tunnel(self, tid):
@@ -167,10 +172,10 @@ class TunnelEngine:
                 del self.active_tunnels[tid]
                 if tid in self.tunnel_configs:
                     del self.tunnel_configs[tid]
-                print(f"🛑 터널 종료됨: {tid}")
+                logger.info(f"터널 종료됨: {tid}")
                 return True
             except Exception as e:
-                print(f"⚠️ 터널 종료 중 오류: {e}")
+                logger.warning(f"터널 종료 중 오류: {e}")
         return False
 
     def is_running(self, tid):
@@ -216,7 +221,7 @@ class TunnelEngine:
             )
 
             temp_server.start()
-            print(f"🔗 임시 터널 생성: localhost:{temp_server.local_bind_port} -> {config['remote_host']}:{config['remote_port']}")
+            logger.debug(f"임시 터널 생성: localhost:{temp_server.local_bind_port} -> {config['remote_host']}:{config['remote_port']}")
             return True, temp_server, ""
 
         except Exception as e:
@@ -228,9 +233,9 @@ class TunnelEngine:
         if temp_server:
             try:
                 temp_server.stop()
-                print("🛑 임시 터널 종료됨")
+                logger.debug("임시 터널 종료됨")
             except Exception as e:
-                print(f"⚠️ 임시 터널 종료 중 오류: {e}")
+                logger.warning(f"임시 터널 종료 중 오류: {e}")
 
     def get_temp_tunnel_port(self, temp_server):
         """임시 터널의 로컬 포트 반환"""

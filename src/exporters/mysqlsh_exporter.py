@@ -18,6 +18,9 @@ from typing import List, Dict, Set, Tuple, Callable, Optional
 from dataclasses import dataclass
 
 from src.core.db_connector import MySQLConnector
+from src.core.logger import get_logger
+
+logger = get_logger('mysqlsh_exporter')
 
 
 # =============================================================================
@@ -511,8 +514,8 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     current_time = time.time() * 1000  # ms 단위
 
-                    # 콘솔 디버깅 출력
-                    print(f"[mysqlsh export] {stripped_line}")
+                    # 로거 디버깅 출력
+                    logger.debug(f"[mysqlsh export] {stripped_line}")
 
                     # 실시간 출력 콜백
                     if raw_output_callback:
@@ -1030,7 +1033,7 @@ class MySQLShellImporter:
                 }});
             """
 
-            print(js_code)
+            logger.debug(f"mysqlsh Import JS 코드: {js_code}")
 
             # Import 실행 (실시간 진행률 파싱)
             success, msg, import_results = self._run_mysqlsh_import(
@@ -1365,8 +1368,8 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                     timestamp = datetime.now().strftime("%H:%M:%S")
                     current_time = time.time() * 1000  # ms 단위
 
-                    # 콘솔 디버깅 출력
-                    print(f"[mysqlsh] {stripped_line}")
+                    # 로거 디버깅 출력
+                    logger.debug(f"[mysqlsh] {stripped_line}")
 
                     # 실시간 출력 콜백 (UI에 전달)
                     if raw_output_callback:
