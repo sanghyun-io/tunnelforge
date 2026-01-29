@@ -26,7 +26,13 @@ class MigrationAnalyzerWorker(QThread):
         check_auth_plugins: bool = True,
         check_zerofill: bool = True,
         check_float_precision: bool = True,
-        check_fk_name_length: bool = True
+        check_fk_name_length: bool = True,
+        # 추가 검사 옵션
+        check_invalid_dates: bool = True,
+        check_year2: bool = True,
+        check_deprecated_engines: bool = True,
+        check_enum_empty: bool = True,
+        check_timestamp_range: bool = True
     ):
         super().__init__()
         self.connector = connector
@@ -41,6 +47,12 @@ class MigrationAnalyzerWorker(QThread):
         self.check_zerofill = check_zerofill
         self.check_float_precision = check_float_precision
         self.check_fk_name_length = check_fk_name_length
+        # 추가 검사 옵션
+        self.check_invalid_dates = check_invalid_dates
+        self.check_year2 = check_year2
+        self.check_deprecated_engines = check_deprecated_engines
+        self.check_enum_empty = check_enum_empty
+        self.check_timestamp_range = check_timestamp_range
 
     def run(self):
         try:
@@ -58,7 +70,13 @@ class MigrationAnalyzerWorker(QThread):
                 check_auth_plugins=self.check_auth_plugins,
                 check_zerofill=self.check_zerofill,
                 check_float_precision=self.check_float_precision,
-                check_fk_name_length=self.check_fk_name_length
+                check_fk_name_length=self.check_fk_name_length,
+                # 추가 검사 옵션
+                check_invalid_dates=self.check_invalid_dates,
+                check_year2=self.check_year2,
+                check_deprecated_engines=self.check_deprecated_engines,
+                check_enum_empty=self.check_enum_empty,
+                check_timestamp_range=self.check_timestamp_range
             )
 
             self.analysis_complete.emit(result)

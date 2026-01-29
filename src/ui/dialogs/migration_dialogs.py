@@ -4,6 +4,8 @@
 - FK 관계 시각화
 - dry-run 및 실제 정리 작업
 """
+import os
+import json
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QPushButton, QComboBox,
@@ -11,7 +13,8 @@ from PyQt6.QtWidgets import (
     QMessageBox, QProgressBar, QApplication,
     QRadioButton, QButtonGroup, QWidget, QTabWidget,
     QTextEdit, QTreeWidget, QTreeWidgetItem, QSplitter,
-    QTableWidget, QTableWidgetItem, QHeaderView, QFrame
+    QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
+    QFileDialog, QMenu
 )
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QFont, QColor
@@ -136,6 +139,17 @@ class MigrationAnalyzerDialog(QDialog):
         """)
         self.btn_analyze.clicked.connect(self.start_analysis)
         btn_layout.addWidget(self.btn_analyze)
+
+        # 저장/불러오기 버튼
+        self.btn_save = QPushButton("💾 결과 저장")
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self.save_analysis_result)
+        btn_layout.addWidget(self.btn_save)
+
+        self.btn_load = QPushButton("📂 결과 불러오기")
+        self.btn_load.clicked.connect(self.load_analysis_result)
+        btn_layout.addWidget(self.btn_load)
+
         btn_layout.addStretch()
         top_layout.addLayout(btn_layout)
 
@@ -457,7 +471,13 @@ class MigrationAnalyzerDialog(QDialog):
             check_auth_plugins=self.chk_auth_plugins.isChecked(),
             check_zerofill=self.chk_zerofill.isChecked(),
             check_float_precision=self.chk_float_precision.isChecked(),
-            check_fk_name_length=self.chk_fk_name_length.isChecked()
+            check_fk_name_length=self.chk_fk_name_length.isChecked(),
+            # 추가 검사 (기본 활성화)
+            check_invalid_dates=True,
+            check_year2=True,
+            check_deprecated_engines=True,
+            check_enum_empty=True,
+            check_timestamp_range=True
         )
 
         self.worker.progress.connect(self.add_log)
@@ -473,6 +493,8 @@ class MigrationAnalyzerDialog(QDialog):
             self.update_orphans_table(result.orphan_records)
             self.update_compatibility_table(result.compatibility_issues)
             self.update_fk_tree(result.fk_tree, result.schema)
+            # 저장 버튼 활성화
+            self.btn_save.setEnabled(True)
         except Exception as e:
             logger.error(f"분석 결과 UI 업데이트 오류: {e}", exc_info=True)
             QMessageBox.critical(self, "오류", f"분석 결과 표시 중 오류 발생:\n{e}")
@@ -573,6 +595,8 @@ class MigrationAnalyzerDialog(QDialog):
             elif issue.severity == "info" and show_info:
                 filtered.append(issue)
 
+        # UI 업데이트 최적화 - 일괄 업데이트
+        self.table_issues.setUpdatesEnabled(False)
         self.table_issues.setRowCount(len(filtered))
 
         severity_icons = {
@@ -613,6 +637,9 @@ class MigrationAnalyzerDialog(QDialog):
             self.table_issues.setItem(i, 2, QTableWidgetItem(issue.location))
             self.table_issues.setItem(i, 3, QTableWidgetItem(issue.description))
             self.table_issues.setItem(i, 4, QTableWidgetItem(issue.suggestion))
+
+        # UI 업데이트 재활성화
+        self.table_issues.setUpdatesEnabled(True)
 
     def update_fk_tree(self, fk_tree: Dict[str, List[str]], schema: str):
         """FK 트리 업데이트"""
@@ -762,6 +789,96 @@ class MigrationAnalyzerDialog(QDialog):
             f"실패: {fail_count}개\n"
             f"영향받은 행: {total_affected:,}개"
         )
+
+    # =========================================================================
+    # 분석 결과 저장/로드
+    # =========================================================================
+
+    def _get_analysis_dir(self) -> str:
+        """분석 결과 저장 디렉토리"""
+        if os.name == 'nt':
+            base_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'TunnelForge', 'analysis')
+        else:
+            base_dir = os.path.join(os.path.expanduser('~'), '.config', 'tunnelforge', 'analysis')
+        os.makedirs(base_dir, exist_ok=True)
+        return base_dir
+
+    def save_analysis_result(self):
+        """분석 결과 저장"""
+        if not self.analysis_result:
+            QMessageBox.warning(self, "저장 오류", "저장할 분석 결과가 없습니다.")
+            return
+
+        # 기본 파일명 생성
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{self.analysis_result.schema}_{timestamp}.json"
+        default_path = os.path.join(self._get_analysis_dir(), default_name)
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "분석 결과 저장",
+            default_path,
+            "JSON 파일 (*.json);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                json.dump(self.analysis_result.to_dict(), f, ensure_ascii=False, indent=2, default=str)
+
+            self.add_log(f"💾 분석 결과 저장 완료: {file_path}")
+            QMessageBox.information(self, "저장 완료", f"분석 결과가 저장되었습니다.\n\n{file_path}")
+
+        except Exception as e:
+            logger.error(f"분석 결과 저장 오류: {e}", exc_info=True)
+            QMessageBox.critical(self, "저장 오류", f"파일 저장 실패:\n{e}")
+
+    def load_analysis_result(self):
+        """분석 결과 불러오기"""
+        default_dir = self._get_analysis_dir()
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "분석 결과 불러오기",
+            default_dir,
+            "JSON 파일 (*.json);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+
+            result = AnalysisResult.from_dict(data)
+
+            # UI 업데이트
+            self.analysis_result = result
+            self.txt_schema.setText(result.schema)
+            self.update_overview(result)
+            self.update_orphans_table(result.orphan_records)
+            self.update_compatibility_table(result.compatibility_issues)
+            self.update_fk_tree(result.fk_tree, result.schema)
+            self.btn_save.setEnabled(True)
+
+            self.add_log(f"📂 분석 결과 불러오기 완료: {file_path}")
+            self.add_log(f"   스키마: {result.schema}, 분석일시: {result.analyzed_at}")
+            QMessageBox.information(
+                self,
+                "불러오기 완료",
+                f"분석 결과를 불러왔습니다.\n\n"
+                f"스키마: {result.schema}\n"
+                f"분석일시: {result.analyzed_at}\n"
+                f"테이블: {result.total_tables}개\n"
+                f"FK 관계: {result.total_fk_relations}개"
+            )
+
+        except Exception as e:
+            logger.error(f"분석 결과 불러오기 오류: {e}", exc_info=True)
+            QMessageBox.critical(self, "불러오기 오류", f"파일 불러오기 실패:\n{e}")
 
 
 class MigrationWizard:

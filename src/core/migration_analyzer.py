@@ -133,6 +133,69 @@ class AnalysisResult:
     cleanup_actions: List[CleanupAction] = field(default_factory=list)
     fk_tree: Dict[str, List[str]] = field(default_factory=dict)
 
+    def to_dict(self) -> dict:
+        """JSON 직렬화용 딕셔너리 변환"""
+        import dataclasses
+        return {
+            'schema': self.schema,
+            'analyzed_at': self.analyzed_at,
+            'total_tables': self.total_tables,
+            'total_fk_relations': self.total_fk_relations,
+            'orphan_records': [dataclasses.asdict(o) for o in self.orphan_records],
+            'compatibility_issues': [
+                {**dataclasses.asdict(i), 'issue_type': i.issue_type.value}
+                for i in self.compatibility_issues
+            ],
+            'cleanup_actions': [
+                {**dataclasses.asdict(a), 'action_type': a.action_type.value}
+                for a in self.cleanup_actions
+            ],
+            'fk_tree': self.fk_tree
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'AnalysisResult':
+        """딕셔너리에서 AnalysisResult 복원"""
+        orphan_records = [OrphanRecord(**o) for o in data.get('orphan_records', [])]
+        compatibility_issues = [
+            CompatibilityIssue(
+                issue_type=IssueType(i['issue_type']),
+                severity=i['severity'],
+                location=i['location'],
+                description=i['description'],
+                suggestion=i['suggestion'],
+                fix_query=i.get('fix_query'),
+                doc_link=i.get('doc_link'),
+                mysql_shell_check_id=i.get('mysql_shell_check_id'),
+                code_snippet=i.get('code_snippet'),
+                table_name=i.get('table_name'),
+                column_name=i.get('column_name')
+            )
+            for i in data.get('compatibility_issues', [])
+        ]
+        cleanup_actions = [
+            CleanupAction(
+                action_type=ActionType(a['action_type']),
+                table=a['table'],
+                description=a['description'],
+                sql=a['sql'],
+                affected_rows=a['affected_rows'],
+                dry_run=a.get('dry_run', True)
+            )
+            for a in data.get('cleanup_actions', [])
+        ]
+
+        return cls(
+            schema=data['schema'],
+            analyzed_at=data['analyzed_at'],
+            total_tables=data['total_tables'],
+            total_fk_relations=data['total_fk_relations'],
+            orphan_records=orphan_records,
+            compatibility_issues=compatibility_issues,
+            cleanup_actions=cleanup_actions,
+            fk_tree=data.get('fk_tree', {})
+        )
+
 
 class MigrationAnalyzer:
     """마이그레이션 분석기"""
@@ -599,7 +662,12 @@ AND `{orphan.child_column}` IS NOT NULL"""
         check_auth_plugins: bool = True,
         check_zerofill: bool = True,
         check_float_precision: bool = True,
-        check_fk_name_length: bool = True
+        check_fk_name_length: bool = True,
+        check_invalid_dates: bool = True,
+        check_year2: bool = True,
+        check_deprecated_engines: bool = True,
+        check_enum_empty: bool = True,
+        check_timestamp_range: bool = True
     ) -> AnalysisResult:
         """
         스키마 전체 분석
@@ -615,6 +683,11 @@ AND `{orphan.child_column}` IS NOT NULL"""
             check_zerofill: ZEROFILL 속성 검사 여부
             check_float_precision: FLOAT(M,D) 구문 검사 여부
             check_fk_name_length: FK 이름 길이 검사 여부
+            check_invalid_dates: 0000-00-00 날짜 검사 여부
+            check_year2: YEAR(2) 타입 검사 여부
+            check_deprecated_engines: deprecated 스토리지 엔진 검사 여부
+            check_enum_empty: ENUM 빈 문자열 검사 여부
+            check_timestamp_range: TIMESTAMP 2038년 범위 검사 여부
 
         Returns:
             AnalysisResult
@@ -640,43 +713,64 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         # 고아 레코드 검사
         if check_orphans and fk_list:
-            self._log("📌 [1/9] 고아 레코드 검사 시작...")
+            self._log("📌 [1/14] 고아 레코드 검사 시작...")
             result.orphan_records = self.find_orphan_records(schema)
-            self._log(f"✅ [1/9] 고아 레코드 검사 완료 (발견: {len(result.orphan_records)}건)")
+            self._log(f"✅ [1/14] 고아 레코드 검사 완료 (발견: {len(result.orphan_records)}건)")
 
         # 호환성 검사들 (기존)
         if check_charset:
-            self._log("📌 [2/9] 문자셋 이슈 검사...")
+            self._log("📌 [2/14] 문자셋 이슈 검사...")
             result.compatibility_issues.extend(self.check_charset_issues(schema))
 
         if check_keywords:
-            self._log("📌 [3/9] 예약어 충돌 검사...")
+            self._log("📌 [3/14] 예약어 충돌 검사...")
             result.compatibility_issues.extend(self.check_reserved_keywords(schema))
 
         if check_routines:
-            self._log("📌 [4/9] 저장 프로시저/함수 검사...")
+            self._log("📌 [4/14] 저장 프로시저/함수 검사...")
             result.compatibility_issues.extend(self.check_deprecated_in_routines(schema))
 
         if check_sql_mode:
-            self._log("📌 [5/9] SQL 모드 검사...")
+            self._log("📌 [5/14] SQL 모드 검사...")
             result.compatibility_issues.extend(self.check_sql_modes())
 
-        # MySQL 8.4 Upgrade Checker 검사들 (신규)
+        # MySQL 8.4 Upgrade Checker 검사들
         if check_auth_plugins:
-            self._log("📌 [6/9] 인증 플러그인 검사...")
+            self._log("📌 [6/14] 인증 플러그인 검사...")
             result.compatibility_issues.extend(self.check_auth_plugins())
 
         if check_zerofill:
-            self._log("📌 [7/9] ZEROFILL 속성 검사...")
+            self._log("📌 [7/14] ZEROFILL 속성 검사...")
             result.compatibility_issues.extend(self.check_zerofill_columns(schema))
 
         if check_float_precision:
-            self._log("📌 [8/9] FLOAT(M,D) 구문 검사...")
+            self._log("📌 [8/14] FLOAT(M,D) 구문 검사...")
             result.compatibility_issues.extend(self.check_float_precision(schema))
 
         if check_fk_name_length:
-            self._log("📌 [9/9] FK 이름 길이 검사...")
+            self._log("📌 [9/14] FK 이름 길이 검사...")
             result.compatibility_issues.extend(self.check_fk_name_length(schema))
+
+        if check_invalid_dates:
+            self._log("📌 [10/14] 0000-00-00 날짜값 검사...")
+            result.compatibility_issues.extend(self.check_invalid_date_values(schema))
+
+        # 추가 호환성 검사들
+        if check_year2:
+            self._log("📌 [11/14] YEAR(2) 타입 검사...")
+            result.compatibility_issues.extend(self.check_year2_type(schema))
+
+        if check_deprecated_engines:
+            self._log("📌 [12/14] deprecated 스토리지 엔진 검사...")
+            result.compatibility_issues.extend(self.check_deprecated_engines(schema))
+
+        if check_enum_empty:
+            self._log("📌 [13/14] ENUM 빈 문자열 검사...")
+            result.compatibility_issues.extend(self.check_enum_empty_value(schema))
+
+        if check_timestamp_range:
+            self._log("📌 [14/14] TIMESTAMP 범위 검사...")
+            result.compatibility_issues.extend(self.check_timestamp_range(schema))
 
         # 정리 작업 생성 (고아 레코드에 대해)
         for orphan in result.orphan_records:
@@ -840,6 +934,87 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         return issues
 
+    def check_invalid_date_values(self, schema: str) -> List[CompatibilityIssue]:
+        """0000-00-00 및 잘못된 날짜값 검사 (MySQL 8.4 호환성)
+
+        MySQL 8.4에서는 NO_ZERO_DATE, NO_ZERO_IN_DATE가 기본 sql_mode에 포함됨.
+        0000-00-00 또는 2024-00-15 같은 날짜는 더 이상 허용되지 않음.
+        """
+        self._log("🔍 0000-00-00 날짜값 확인 중...")
+
+        issues = []
+
+        # DATE, DATETIME, TIMESTAMP 컬럼 조회
+        col_query = """
+        SELECT TABLE_NAME, COLUMN_NAME, DATA_TYPE, COLUMN_DEFAULT
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s
+            AND DATA_TYPE IN ('date', 'datetime', 'timestamp')
+        ORDER BY TABLE_NAME, COLUMN_NAME
+        """
+        columns = self.connector.execute(col_query, (schema,))
+
+        if not columns:
+            self._log("  ✅ DATE/DATETIME 컬럼 없음")
+            return issues
+
+        self._log(f"  DATE/DATETIME 컬럼 {len(columns)}개 검사 중...")
+
+        checked_count = 0
+        for col in columns:
+            table = col['TABLE_NAME']
+            column = col['COLUMN_NAME']
+            data_type = col['DATA_TYPE']
+
+            try:
+                # 0000-00-00 값 존재 확인 (COUNT로 빠르게)
+                if data_type == 'date':
+                    check_query = f"""
+                    SELECT COUNT(*) as cnt
+                    FROM `{schema}`.`{table}`
+                    WHERE `{column}` = '0000-00-00'
+                        OR (`{column}` IS NOT NULL
+                            AND (MONTH(`{column}`) = 0 OR DAY(`{column}`) = 0))
+                    """
+                else:  # datetime, timestamp
+                    check_query = f"""
+                    SELECT COUNT(*) as cnt
+                    FROM `{schema}`.`{table}`
+                    WHERE `{column}` = '0000-00-00 00:00:00'
+                        OR (`{column}` IS NOT NULL
+                            AND (MONTH(`{column}`) = 0 OR DAY(`{column}`) = 0))
+                    """
+
+                result = self.connector.execute(check_query)
+                invalid_count = result[0]['cnt'] if result else 0
+
+                if invalid_count > 0:
+                    issues.append(CompatibilityIssue(
+                        issue_type=IssueType.INVALID_DATE,
+                        severity="error",
+                        location=f"{schema}.{table}.{column}",
+                        description=f"잘못된 날짜값 {invalid_count:,}개 발견 (0000-00-00 등)",
+                        suggestion="NULL로 변경하거나 유효한 날짜로 수정 필요 (8.4 NO_ZERO_DATE)",
+                        table_name=table,
+                        column_name=column,
+                        fix_query=f"UPDATE `{schema}`.`{table}` SET `{column}` = NULL WHERE `{column}` = '0000-00-00' OR MONTH(`{column}`) = 0 OR DAY(`{column}`) = 0;"
+                    ))
+                    self._log(f"    ⚠️ {table}.{column}: 잘못된 날짜 {invalid_count:,}개")
+
+                checked_count += 1
+
+            except Exception as e:
+                # 특정 테이블 검사 실패 시 스킵 (권한 등)
+                self._log(f"    ⏭️ {table}.{column} 검사 스킵: {str(e)[:50]}")
+                continue
+
+        if issues:
+            self._log(f"  ⚠️ 잘못된 날짜값 {len(issues)}개 컬럼에서 발견")
+        else:
+            self._log(f"  ✅ 잘못된 날짜값 없음 ({checked_count}개 컬럼 검사)")
+
+        return issues
+
     def check_int_display_width(self, schema: str) -> List[CompatibilityIssue]:
         """INT(11) 등 표시 너비 사용 확인 (TINYINT(1) 제외)"""
         self._log("🔍 INT 표시 너비 확인 중...")
@@ -869,6 +1044,169 @@ AND `{orphan.child_column}` IS NOT NULL"""
             self._log(f"  ℹ️ INT 표시 너비 {len(issues)}개 발견 (경미)")
         else:
             self._log("  ✅ INT 표시 너비 없음")
+
+        return issues
+
+    def check_year2_type(self, schema: str) -> List[CompatibilityIssue]:
+        """YEAR(2) 타입 검사 - MySQL 8.0에서 제거됨"""
+        self._log("🔍 YEAR(2) 타입 확인 중...")
+
+        issues = []
+
+        query = """
+        SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s
+            AND COLUMN_TYPE = 'year(2)'
+        """
+        columns = self.connector.execute(query, (schema,))
+
+        for col in columns:
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.REMOVED_SYS_VAR,  # 적절한 타입 사용
+                severity="error",
+                location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
+                description="YEAR(2) 타입 사용 - MySQL 8.0에서 제거됨",
+                suggestion="YEAR(4) 또는 YEAR로 변경 필요",
+                table_name=col['TABLE_NAME'],
+                column_name=col['COLUMN_NAME'],
+                fix_query=f"ALTER TABLE `{schema}`.`{col['TABLE_NAME']}` MODIFY `{col['COLUMN_NAME']}` YEAR;"
+            ))
+
+        if issues:
+            self._log(f"  ⚠️ YEAR(2) 타입 {len(issues)}개 발견")
+        else:
+            self._log("  ✅ YEAR(2) 타입 없음")
+
+        return issues
+
+    def check_deprecated_engines(self, schema: str) -> List[CompatibilityIssue]:
+        """deprecated 스토리지 엔진 검사"""
+        self._log("🔍 deprecated 스토리지 엔진 확인 중...")
+
+        issues = []
+
+        # deprecated 엔진 목록
+        deprecated_engines = {
+            'MyISAM': ('warning', 'InnoDB로 변환 권장 (트랜잭션/FK 지원)'),
+            'ARCHIVE': ('warning', 'InnoDB로 변환 권장'),
+            'BLACKHOLE': ('info', '테스트/복제용 엔진 - 필요시 유지'),
+            'FEDERATED': ('warning', 'MySQL 8.4에서 제거 예정'),
+            'MERGE': ('error', 'MySQL 8.4에서 제거됨 - InnoDB 파티셔닝으로 대체'),
+            'MEMORY': ('info', '임시 테이블용으로는 유지 가능'),
+        }
+
+        query = """
+        SELECT TABLE_NAME, ENGINE
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = %s
+            AND TABLE_TYPE = 'BASE TABLE'
+            AND ENGINE IS NOT NULL
+        """
+        tables = self.connector.execute(query, (schema,))
+
+        for table in tables:
+            engine = table['ENGINE']
+            if engine in deprecated_engines:
+                severity, suggestion = deprecated_engines[engine]
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.DEFAULT_VALUE_CHANGE,  # 적절한 타입 사용
+                    severity=severity,
+                    location=f"{schema}.{table['TABLE_NAME']}",
+                    description=f"deprecated 스토리지 엔진: {engine}",
+                    suggestion=suggestion,
+                    table_name=table['TABLE_NAME'],
+                    fix_query=f"ALTER TABLE `{schema}`.`{table['TABLE_NAME']}` ENGINE=InnoDB;" if engine != 'MEMORY' else None
+                ))
+
+        if issues:
+            self._log(f"  ⚠️ deprecated 엔진 {len(issues)}개 발견")
+        else:
+            self._log("  ✅ deprecated 엔진 없음")
+
+        return issues
+
+    def check_enum_empty_value(self, schema: str) -> List[CompatibilityIssue]:
+        """ENUM 빈 문자열('') 정의 검사 - 8.4에서 엄격해짐"""
+        self._log("🔍 ENUM 빈 문자열 확인 중...")
+
+        issues = []
+
+        query = """
+        SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s
+            AND DATA_TYPE = 'enum'
+            AND COLUMN_TYPE LIKE "%%''%%"
+        """
+        columns = self.connector.execute(query, (schema,))
+
+        for col in columns:
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.DEFAULT_VALUE_CHANGE,
+                severity="warning",
+                location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
+                description="ENUM에 빈 문자열('') 정의됨",
+                suggestion="빈 문자열 대신 NULL 허용 또는 명시적 값 사용 권장",
+                table_name=col['TABLE_NAME'],
+                column_name=col['COLUMN_NAME']
+            ))
+
+        if issues:
+            self._log(f"  ⚠️ ENUM 빈 문자열 {len(issues)}개 발견")
+        else:
+            self._log("  ✅ ENUM 빈 문자열 없음")
+
+        return issues
+
+    def check_timestamp_range(self, schema: str) -> List[CompatibilityIssue]:
+        """TIMESTAMP 범위 초과 데이터 검사 (2038년 문제)"""
+        self._log("🔍 TIMESTAMP 범위 확인 중...")
+
+        issues = []
+
+        # TIMESTAMP 컬럼 조회
+        col_query = """
+        SELECT TABLE_NAME, COLUMN_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_SCHEMA = %s
+            AND DATA_TYPE = 'timestamp'
+        """
+        columns = self.connector.execute(col_query, (schema,))
+
+        for col in columns:
+            table = col['TABLE_NAME']
+            column = col['COLUMN_NAME']
+
+            try:
+                # 2038-01-19 이후 데이터 확인
+                check_query = f"""
+                SELECT COUNT(*) as cnt
+                FROM `{schema}`.`{table}`
+                WHERE `{column}` > '2038-01-19 03:14:07'
+                """
+                result = self.connector.execute(check_query)
+                count = result[0]['cnt'] if result else 0
+
+                if count > 0:
+                    issues.append(CompatibilityIssue(
+                        issue_type=IssueType.INVALID_DATE,
+                        severity="error",
+                        location=f"{schema}.{table}.{column}",
+                        description=f"TIMESTAMP 범위 초과 데이터 {count:,}개 (2038년 문제)",
+                        suggestion="DATETIME으로 타입 변경 권장",
+                        table_name=table,
+                        column_name=column,
+                        fix_query=f"ALTER TABLE `{schema}`.`{table}` MODIFY `{column}` DATETIME;"
+                    ))
+
+            except Exception:
+                continue
+
+        if issues:
+            self._log(f"  ⚠️ TIMESTAMP 범위 초과 {len(issues)}개 발견")
+        else:
+            self._log(f"  ✅ TIMESTAMP 범위 정상")
 
         return issues
 
