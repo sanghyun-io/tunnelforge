@@ -517,30 +517,31 @@ class BatchOptionDialog(QDialog):
         self.accept()
 
 
-class SkippedTablesDialog(QDialog):
-    """생략된 테이블 목록 다이얼로그
+class IncludedTablesDialog(QDialog):
+    """자동 포함된 테이블 목록 다이얼로그
 
-    FK 연관테이블 일괄 변경으로 인해 자동 생략된 테이블 목록을 보여줍니다.
+    FK 연관테이블 일괄 변경으로 인해 자동 포함된 테이블 목록을 보여줍니다.
+    (옵션 선택 단계만 건너뛰고, 실제 SQL 실행에는 포함됨)
     """
 
     def __init__(self, steps: List[FixWizardStep], parent=None):
         super().__init__(parent)
         self.steps = steps
 
-        self.setWindowTitle("생략된 테이블 목록")
+        self.setWindowTitle("자동 포함된 테이블 목록")
         self.setMinimumSize(550, 400)
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # 생략된 테이블 필터
-        skipped_steps = [s for s in self.steps if s.skipped_by is not None]
+        # 자동 포함된 테이블 필터
+        included_steps = [s for s in self.steps if s.included_by is not None]
 
         # 안내 텍스트
         info_label = QLabel(
-            f"다음 {len(skipped_steps)}개 테이블은 FK 연관테이블 일괄 변경 옵션으로 인해\n"
-            "자동 생략되었습니다."
+            f"다음 {len(included_steps)}개 테이블은 FK 연관테이블 일괄 변경에 자동 포함되었습니다.\n"
+            "(옵션 선택 단계만 건너뛰고, 실제 SQL 실행에는 모두 포함됩니다)"
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("margin-bottom: 10px;")
@@ -549,17 +550,17 @@ class SkippedTablesDialog(QDialog):
         # 테이블
         table = QTableWidget()
         table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(["테이블명", "생략 원인"])
+        table.setHorizontalHeaderLabels(["테이블명", "포함 원인"])
         table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table.setRowCount(len(skipped_steps))
+        table.setRowCount(len(included_steps))
         table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
 
-        for i, step in enumerate(skipped_steps):
+        for i, step in enumerate(included_steps):
             table_name = step.location.split('.')[-1]
             table.setItem(i, 0, QTableWidgetItem(table_name))
-            table.setItem(i, 1, QTableWidgetItem(f"'{step.skipped_by}'의 FK 일괄 변경"))
+            table.setItem(i, 1, QTableWidgetItem(f"'{step.included_by}'의 FK 일괄 변경에 포함"))
 
         layout.addWidget(table)
 
@@ -578,8 +579,8 @@ class FixOptionPage(QWizardPage):
     개선 사항:
     - 전체 일괄 옵션 적용
     - FK 연관 테이블 Tree 시각화
-    - FK 연관테이블 일괄 변경 시 자동 생략
-    - 생략된 테이블 건너뛰기 네비게이션
+    - FK 연관테이블 일괄 변경 시 자동 포함 (옵션 선택만 건너뜀)
+    - 자동 포함된 테이블 건너뛰기 네비게이션
     """
 
     def __init__(self, wizard: FixWizardDialog):
@@ -644,20 +645,20 @@ class FixOptionPage(QWizardPage):
         """)
         self.btn_batch_apply.clicked.connect(self.show_batch_option_dialog)
 
-        self.btn_show_skipped = QPushButton("👁️ 생략된 테이블 (0개)")
-        self.btn_show_skipped.setToolTip("FK 일괄 변경으로 자동 생략된 테이블 목록")
-        self.btn_show_skipped.setStyleSheet("""
+        self.btn_show_included = QPushButton("👁️ 자동 포함된 테이블 (0개)")
+        self.btn_show_included.setToolTip("FK 일괄 변경에 자동 포함된 테이블 목록")
+        self.btn_show_included.setStyleSheet("""
             QPushButton {
-                background-color: #95a5a6; color: white;
+                background-color: #27ae60; color: white;
                 padding: 6px 12px; border-radius: 4px; border: none;
             }
-            QPushButton:hover { background-color: #7f8c8d; }
+            QPushButton:hover { background-color: #219a52; }
             QPushButton:disabled { background-color: #bdc3c7; }
         """)
-        self.btn_show_skipped.clicked.connect(self.show_skipped_tables_dialog)
+        self.btn_show_included.clicked.connect(self.show_included_tables_dialog)
 
         btn_layout.addWidget(self.btn_batch_apply)
-        btn_layout.addWidget(self.btn_show_skipped)
+        btn_layout.addWidget(self.btn_show_included)
         btn_layout.addStretch()
         progress_layout.addLayout(btn_layout)
 
@@ -760,15 +761,15 @@ class FixOptionPage(QWizardPage):
             except Exception:
                 self._fk_graph_builder = None
 
-        # 첫 번째 미생략 이슈로 이동
-        self._move_to_first_unskipped()
+        # 첫 번째 미포함(옵션 선택 필요) 이슈로 이동
+        self._move_to_first_not_included()
         self.show_current_issue()
 
-    def _move_to_first_unskipped(self):
-        """첫 번째 미생략 이슈로 이동"""
+    def _move_to_first_not_included(self):
+        """첫 번째 옵션 선택 필요 이슈로 이동 (자동 포함된 테이블 제외)"""
         steps = self.wizard_dialog.wizard_steps
         for i, step in enumerate(steps):
-            if step.skipped_by is None:
+            if step.included_by is None:
                 self.current_index = i
                 return
         self.current_index = 0
@@ -777,28 +778,28 @@ class FixOptionPage(QWizardPage):
         """진행률 업데이트"""
         steps = self.wizard_dialog.wizard_steps
         total = len(steps)
-        skipped = sum(1 for s in steps if s.skipped_by is not None)
-        active_total = total - skipped
+        included = sum(1 for s in steps if s.included_by is not None)
+        active_total = total - included
 
-        # 현재 위치 (생략 제외 인덱스)
+        # 현재 위치 (자동 포함된 테이블 제외 인덱스)
         active_index = sum(
             1 for i, s in enumerate(steps)
-            if i <= self.current_index and s.skipped_by is None
+            if i <= self.current_index and s.included_by is None
         )
 
         if active_total > 0:
             self.lbl_progress.setText(
                 f"이슈 {active_index} / {active_total} "
-                f"(전체 {total}개 중 {skipped}개 자동 생략)"
+                f"(전체 {total}개 중 {included}개 자동 포함)"
             )
             self.progress_bar.setValue(int(active_index / active_total * 100))
         else:
-            self.lbl_progress.setText(f"이슈 0 / 0 (전체 {total}개 모두 생략됨)")
+            self.lbl_progress.setText(f"이슈 0 / 0 (전체 {total}개 모두 일괄 처리)")
             self.progress_bar.setValue(100)
 
-        # 생략된 테이블 버튼 업데이트
-        self.btn_show_skipped.setText(f"👁️ 생략된 테이블 ({skipped}개)")
-        self.btn_show_skipped.setEnabled(skipped > 0)
+        # 자동 포함된 테이블 버튼 업데이트
+        self.btn_show_included.setText(f"👁️ 자동 포함된 테이블 ({included}개)")
+        self.btn_show_included.setEnabled(included > 0)
 
     def show_current_issue(self):
         """현재 이슈 표시"""
@@ -865,9 +866,9 @@ class FixOptionPage(QWizardPage):
             # 설명 라벨
             desc_text = f"    {option.description}"
 
-            # FK 일괄 변경 옵션일 경우 경고 추가
+            # FK 일괄 변경 옵션일 경우 안내 추가
             if option.strategy == FixStrategy.COLLATION_FK_CASCADE and option.related_tables:
-                desc_text += f"\n    ⚠️ 위 {len(option.related_tables)}개 테이블은 자동으로 생략됩니다"
+                desc_text += f"\n    ✅ 위 {len(option.related_tables)}개 테이블이 함께 처리됩니다"
 
             desc_label = QLabel(desc_text)
             desc_label.setWordWrap(True)
@@ -933,15 +934,15 @@ class FixOptionPage(QWizardPage):
         """네비게이션 버튼 상태 업데이트"""
         steps = self.wizard_dialog.wizard_steps
 
-        # 이전 미생략 이슈 존재 여부
+        # 이전 옵션 선택 필요 이슈 존재 여부 (자동 포함 제외)
         has_prev = any(
-            s.skipped_by is None
+            s.included_by is None
             for s in steps[:self.current_index]
         )
 
-        # 다음 미생략 이슈 존재 여부
+        # 다음 옵션 선택 필요 이슈 존재 여부 (자동 포함 제외)
         has_next = any(
-            s.skipped_by is None
+            s.included_by is None
             for s in steps[self.current_index + 1:]
         )
 
@@ -958,16 +959,16 @@ class FixOptionPage(QWizardPage):
 
         # FK 일괄 변경 옵션인 경우
         if option.strategy == FixStrategy.COLLATION_FK_CASCADE:
-            self._mark_related_tables_as_skipped(step, option)
+            self._mark_related_tables_as_included(step, option)
         else:
-            # 다른 옵션 선택 시 생략 해제
-            self._unmark_skipped_tables(step)
+            # 다른 옵션 선택 시 자동 포함 해제
+            self._unmark_included_tables(step)
 
         self.update_input_field()
         self.update_progress_display()
 
-    def _mark_related_tables_as_skipped(self, source_step: FixWizardStep, option: FixOption):
-        """FK 연관 테이블들을 생략 처리"""
+    def _mark_related_tables_as_included(self, source_step: FixWizardStep, option: FixOption):
+        """FK 연관 테이블들을 자동 포함 처리 (옵션 선택만 건너뜀, 실제 SQL에는 포함)"""
         if not option.related_tables:
             return
 
@@ -976,20 +977,20 @@ class FixOptionPage(QWizardPage):
         for other_step in self.wizard_dialog.wizard_steps:
             other_table = other_step.location.split('.')[-1]
 
-            # 연관 테이블인 경우 생략 처리 (현재 테이블 제외)
+            # 연관 테이블인 경우 자동 포함 처리 (현재 테이블 제외)
             if other_table in option.related_tables and other_table != source_table:
-                other_step.skipped_by = source_table
-                other_step.skipped_reason = f"'{source_table}'의 FK 연관테이블 일괄 변경으로 생략"
+                other_step.included_by = source_table
+                other_step.included_reason = f"'{source_table}'의 FK 일괄 변경에 포함"
                 other_step.selected_option = option  # 같은 옵션으로 설정
 
-    def _unmark_skipped_tables(self, source_step: FixWizardStep):
-        """이 테이블로 인해 생략된 테이블들의 생략 해제"""
+    def _unmark_included_tables(self, source_step: FixWizardStep):
+        """이 테이블로 인해 자동 포함된 테이블들의 포함 해제"""
         source_table = source_step.location.split('.')[-1]
 
         for other_step in self.wizard_dialog.wizard_steps:
-            if other_step.skipped_by == source_table:
-                other_step.skipped_by = None
-                other_step.skipped_reason = ""
+            if other_step.included_by == source_table:
+                other_step.included_by = None
+                other_step.included_reason = ""
                 other_step.selected_option = None  # 다시 선택하도록
 
     def update_input_field(self):
@@ -1027,14 +1028,14 @@ class FixOptionPage(QWizardPage):
             step.user_input = self.input_field.text()
 
     def prev_issue(self):
-        """이전 이슈 (생략된 테이블 건너뛰기)"""
+        """이전 이슈 (자동 포함된 테이블 건너뛰기)"""
         self.save_current_selection()
 
         prev_idx = self.current_index - 1
         steps = self.wizard_dialog.wizard_steps
 
         while prev_idx >= 0:
-            if steps[prev_idx].skipped_by is None:
+            if steps[prev_idx].included_by is None:
                 break
             prev_idx -= 1
 
@@ -1043,14 +1044,14 @@ class FixOptionPage(QWizardPage):
             self.show_current_issue()
 
     def next_issue(self):
-        """다음 이슈 (생략된 테이블 건너뛰기)"""
+        """다음 이슈 (자동 포함된 테이블 건너뛰기)"""
         self.save_current_selection()
 
         next_idx = self.current_index + 1
         steps = self.wizard_dialog.wizard_steps
 
         while next_idx < len(steps):
-            if steps[next_idx].skipped_by is None:
+            if steps[next_idx].included_by is None:
                 break
             next_idx += 1
 
@@ -1065,19 +1066,19 @@ class FixOptionPage(QWizardPage):
             # 모든 옵션이 적용되었으므로 다음 단계로 이동
             self.wizard_dialog.next()
 
-    def show_skipped_tables_dialog(self):
-        """생략된 테이블 목록 다이얼로그 표시"""
-        dialog = SkippedTablesDialog(self.wizard_dialog.wizard_steps, self)
+    def show_included_tables_dialog(self):
+        """자동 포함된 테이블 목록 다이얼로그 표시"""
+        dialog = IncludedTablesDialog(self.wizard_dialog.wizard_steps, self)
         dialog.exec()
 
     def validatePage(self) -> bool:
         """페이지 유효성 검사"""
         self.save_current_selection()
 
-        # 모든 미생략 이슈에 옵션이 선택되었는지 확인
+        # 모든 옵션 선택 필요 이슈에 옵션이 선택되었는지 확인
         for step in self.wizard_dialog.wizard_steps:
-            if step.skipped_by is not None:
-                continue  # 생략된 이슈는 검사 스킵
+            if step.included_by is not None:
+                continue  # 자동 포함된 이슈는 검사 스킵 (이미 옵션 선택됨)
 
             if not step.selected_option:
                 QMessageBox.warning(self, "선택 필요", f"'{step.location}'의 수정 옵션을 선택하세요.")
@@ -1167,18 +1168,18 @@ class PreviewPage(QWizardPage):
     def generate_sql_preview(self):
         """SQL 미리보기 생성
 
-        생략된 테이블의 SQL은 중복 없이 한 번만 포함됩니다.
+        자동 포함된 테이블의 SQL은 원본 테이블의 SQL에 이미 포함되어 있으므로 중복 출력하지 않습니다.
         """
         lines = []
         steps = self.wizard_dialog.wizard_steps
 
         # 통계
         total = len(steps)
-        skipped_count = sum(1 for s in steps if s.skipped_by is not None)
+        included_count = sum(1 for s in steps if s.included_by is not None)
         execute_count = sum(
             1 for s in steps
             if s.selected_option and s.selected_option.strategy != FixStrategy.SKIP
-            and s.skipped_by is None
+            and s.included_by is None
         )
 
         lines.append("-- ==========================================")
@@ -1186,8 +1187,8 @@ class PreviewPage(QWizardPage):
         lines.append(f"-- 스키마: {self.wizard_dialog.schema}")
         lines.append(f"-- 전체 이슈: {total}개")
         lines.append(f"-- 실행 대상: {execute_count}개")
-        if skipped_count > 0:
-            lines.append(f"-- FK 일괄 변경으로 생략: {skipped_count}개")
+        if included_count > 0:
+            lines.append(f"-- FK 일괄 변경에 자동 포함: {included_count}개")
         lines.append("-- ==========================================")
         lines.append("")
 
@@ -1196,8 +1197,8 @@ class PreviewPage(QWizardPage):
         counter = 0
 
         for step in steps:
-            # 생략된 테이블은 건너뛰기 (원본 테이블에서 이미 처리됨)
-            if step.skipped_by is not None:
+            # 자동 포함된 테이블은 건너뛰기 (원본 테이블의 SQL에 이미 포함됨)
+            if step.included_by is not None:
                 continue
 
             if step.selected_option and step.selected_option.strategy != FixStrategy.SKIP:
