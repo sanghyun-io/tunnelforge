@@ -2,14 +2,12 @@
 import sys
 import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-                             QTableWidget, QTableWidgetItem, QPushButton,
-                             QLabel, QMessageBox, QHeaderView, QSystemTrayIcon, QMenu,
-                             QApplication)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+                             QPushButton, QLabel, QMessageBox, QSystemTrayIcon,
+                             QMenu, QApplication)
+from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QAction, QIcon
 
-from src.ui.styles import (ButtonStyles, LabelStyles, get_full_app_style,
-                           get_dynamic_button_style, get_dynamic_table_style)
+from src.ui.styles import ButtonStyles, LabelStyles, get_full_app_style
 from src.ui.theme_manager import ThemeManager
 from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
@@ -38,7 +36,7 @@ from src.ui.dialogs.schedule_dialog import ScheduleListDialog
 from src.ui.dialogs.tunnel_status_dialog import TunnelStatusDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
 from src.core.scheduler import BackupScheduler
-from src.core.tunnel_monitor import TunnelMonitor, TunnelState
+from src.core.tunnel_monitor import TunnelMonitor
 
 
 class StartupUpdateCheckerThread(QThread):
@@ -144,6 +142,16 @@ class TunnelManagerUI(QMainWindow):
         btn_schema_diff.setStyleSheet(ButtonStyles.SECONDARY)
         btn_schema_diff.clicked.connect(self._open_schema_diff_dialog)
 
+        # [마이그레이션 분석] 버튼 - Secondary 스타일
+        btn_migration = QPushButton("🔄 마이그레이션")
+        btn_migration.setStyleSheet(ButtonStyles.SECONDARY)
+        btn_migration.clicked.connect(self.open_migration_analyzer)
+
+        # [스케줄] 버튼 - Secondary 스타일
+        btn_schedule = QPushButton("📅 스케줄")
+        btn_schedule.setStyleSheet(ButtonStyles.SECONDARY)
+        btn_schedule.clicked.connect(self._open_schedule_dialog)
+
         # [설정] 버튼 - Secondary 스타일 (중앙화)
         btn_settings = QPushButton("⚙️ 설정")
         btn_settings.setStyleSheet(ButtonStyles.SECONDARY)
@@ -155,6 +163,8 @@ class TunnelManagerUI(QMainWindow):
         header_layout.addWidget(btn_add_tunnel)
         header_layout.addWidget(btn_refresh)
         header_layout.addWidget(btn_schema_diff)
+        header_layout.addWidget(btn_migration)
+        header_layout.addWidget(btn_schedule)
         header_layout.addWidget(btn_settings)
         layout.addLayout(header_layout)
 
@@ -664,6 +674,7 @@ class TunnelManagerUI(QMainWindow):
             Q_ARG(str, tunnel_id)
         )
 
+    @pyqtSlot(str)
     def _update_tunnel_status_ui(self, tunnel_id: str):
         """UI에서 터널 상태 업데이트"""
         # 트리 위젯 갱신
