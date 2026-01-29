@@ -222,7 +222,8 @@ class TunnelStatusDialog(QDialog):
                 "reconnecting": "#f39c12",
                 "error": "#e74c3c"
             }
-            color = type_colors.get(event.event_type, "#000000")
+            # color는 향후 행 배경색에 사용 예정
+            _color = type_colors.get(event.event_type, "#000000")  # noqa: F841
             type_item.setForeground(Qt.GlobalColor.darkGreen if event.event_type in ["connected", "reconnected"] else Qt.GlobalColor.black)
             self.event_table.setItem(row, 1, type_item)
 

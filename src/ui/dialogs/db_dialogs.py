@@ -969,7 +969,7 @@ class MySQLShellExportDialog(QDialog):
 
         # 로그 헤더 추가
         self._add_log(f"{'='*60}")
-        self._add_log(f"MySQL Shell Export 시작")
+        self._add_log("MySQL Shell Export 시작")
         self._add_log(f"시작 시간: {self.export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         self._add_log(f"스키마: {schema}")
         self._add_log(f"Export 유형: {'전체 스키마' if self.radio_full.isChecked() else '선택 테이블'}")
@@ -1130,7 +1130,7 @@ class MySQLShellExportDialog(QDialog):
 
         # Export는 데이터 크기를 표시하지 않음 (rows만 표시되므로)
         if mb_done == 0 and mb_total == 0:
-            self.label_data.setText(f"📦 데이터: Export 진행 중...")
+            self.label_data.setText("📦 데이터: Export 진행 중...")
         else:
             self.label_data.setText(f"📦 데이터: {mb_done:.2f} MB / {mb_total:.2f} MB")
 
@@ -1949,7 +1949,7 @@ class MySQLShellImportDialog(QDialog):
 
             # 로그 헤더 추가
             self._add_log(f"{'='*60}")
-            self._add_log(f"MySQL Shell Import 시작")
+            self._add_log("MySQL Shell Import 시작")
             self._add_log(f"시작 시간: {self.import_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
             self._add_log(f"Dump 폴더: {input_dir}")
             self._add_log(f"대상 스키마: {target_schema if target_schema else '원본 스키마명 사용'}")
@@ -2075,7 +2075,8 @@ class MySQLShellImportDialog(QDialog):
         }
 
         icon = status_icons.get(status, '❓')
-        color = status_colors.get(status, '#7f8c8d')
+        # color는 향후 테이블 행 스타일링에 사용 예정
+        _color = status_colors.get(status, '#7f8c8d')  # noqa: F841
 
         # 메타데이터에서 테이블 정보 가져오기
         size_info = ""

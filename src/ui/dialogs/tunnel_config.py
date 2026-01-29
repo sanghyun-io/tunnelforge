@@ -283,7 +283,7 @@ class TunnelConfigDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "필수 필드 누락",
-                f"다음 필드를 입력해주세요:\n\n• " + "\n• ".join(missing_fields)
+                "다음 필드를 입력해주세요:\n\n• " + "\n• ".join(missing_fields)
             )
             return
 

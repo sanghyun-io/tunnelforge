@@ -153,7 +153,7 @@ class TunnelEngine:
             error_type = type(e).__name__
 
             # 상세 에러 로그 구성
-            full_error = f"❌ 터널 연결 실패\n"
+            full_error = "❌ 터널 연결 실패\n"
             full_error += f"에러 타입: {error_type}\n"
             full_error += f"에러 메시지: {error_msg}\n\n"
             full_error += "📋 연결 시도 로그:\n"

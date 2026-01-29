@@ -14,7 +14,7 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSplitter, QPlainTextEdit, QTextEdit, QWidget, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
     QStatusBar, QApplication, QAbstractItemView, QListWidget, QListWidgetItem,
-    QDialogButtonBox, QMenu, QCheckBox, QFrame, QToolTip
+    QDialogButtonBox, QMenu, QCheckBox, QFrame, QToolTip, QLineEdit
 )
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QThread, QTimer, QPoint
 from PyQt6.QtGui import (
@@ -870,7 +870,7 @@ class SQLTransactionWorker(QThread):
                     # 오류 발생 시 롤백
                     self.connector.connection.rollback()
                     self.connector.disconnect()
-                    self.finished.emit(False, f"❌ 오류 발생, 트랜잭션 롤백됨")
+                    self.finished.emit(False, "❌ 오류 발생, 트랜잭션 롤백됨")
                     return
 
                 except Exception as e:
@@ -878,7 +878,7 @@ class SQLTransactionWorker(QThread):
                     self.error_result.emit(idx, str(e), execution_time)
                     self.connector.connection.rollback()
                     self.connector.disconnect()
-                    self.finished.emit(False, f"❌ 오류 발생, 트랜잭션 롤백됨")
+                    self.finished.emit(False, "❌ 오류 발생, 트랜잭션 롤백됨")
                     return
 
             # 수정 쿼리가 있으면 커밋 확인 대기

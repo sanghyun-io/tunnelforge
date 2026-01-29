@@ -8,10 +8,10 @@ import json
 import csv
 import io
 from datetime import datetime
-from typing import List, Dict, Optional
+from typing import Dict
 from pathlib import Path
 
-from .migration_constants import IssueType, MYSQL_SHELL_CHECK_IDS
+from .migration_constants import MYSQL_SHELL_CHECK_IDS
 
 
 class ReportExporter:

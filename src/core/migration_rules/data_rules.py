@@ -19,7 +19,7 @@ MySQL 8.0 → 8.4 업그레이드 시 데이터 무결성 관련 호환성 검�
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import List, Optional, Callable, TYPE_CHECKING
 
@@ -27,7 +27,6 @@ from ..migration_constants import (
     IssueType,
     IDENTIFIER_LIMITS,
     ENUM_EMPTY_PATTERN,
-    SET_EMPTY_PATTERN,
     INVALID_DATE_PATTERN,
     INVALID_DATETIME_PATTERN,
     INVALID_DATE_VALUES_PATTERN,
@@ -168,11 +167,7 @@ class DataIntegrityRules:
 
         # INSERT ... VALUES (1, ...) 같은 숫자만 있는 패턴 감지는 복잡
         # 간단히 경고만 제공 (실제로는 스키마 정보 필요)
-        numeric_pattern = re.compile(
-            r"INSERT\s+INTO\s+`?(\w+)`?[^;]*?VALUES\s*\([^)]*\d+\s*[,)]",
-            re.IGNORECASE | re.DOTALL
-        )
-
+        # numeric_pattern은 향후 스키마 정보와 함께 사용될 예정
         # ENUM 컬럼에 숫자 삽입은 스키마 정보 없이는 감지 어려움
         # 일반적인 경고만 로깅
         return issues

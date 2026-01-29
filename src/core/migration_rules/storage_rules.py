@@ -11,8 +11,7 @@ MySQL 8.0 → 8.4 업그레이드 시 스토리지 엔진 관련 호환성 검�
 """
 
 import re
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import List, Optional, Callable, TYPE_CHECKING
 
 from ..migration_constants import (
@@ -134,7 +133,7 @@ class StorageRules:
                     severity="warning",
                     location=location,
                     description=f"{engine} 엔진 사용 (deprecated): {table_name}",
-                    suggestion=f"ENGINE=InnoDB로 변경 권장",
+                    suggestion="ENGINE=InnoDB로 변경 권장",
                     table_name=table_name
                 ))
 

@@ -5,7 +5,7 @@
 - 동기화 SQL 스크립트 생성
 """
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple
 from enum import Enum
 
 from src.core.logger import get_logger
@@ -727,7 +727,7 @@ class SyncScriptGenerator:
         """
         lines = [
             "-- =======================================================",
-            f"-- 스키마 동기화 스크립트",
+            "-- 스키마 동기화 스크립트",
             f"-- 타겟: {target_schema}",
             "-- 주의: 실행 전 반드시 백업을 수행하세요!",
             "-- =======================================================",

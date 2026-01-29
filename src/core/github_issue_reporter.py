@@ -10,7 +10,7 @@ Export/Import 오류 발생 시:
 import re
 import hashlib
 from datetime import datetime
-from typing import Optional, Tuple, List, Dict
+from typing import Optional, Tuple, Dict
 from difflib import SequenceMatcher
 
 try:

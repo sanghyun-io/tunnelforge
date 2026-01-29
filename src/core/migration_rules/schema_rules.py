@@ -23,14 +23,11 @@ MySQL 8.0 → 8.4 업그레이드 시 스키마 및 객체 관련 호환성 검�
 - S24-S25: Definer 검사
 """
 
-import re
-from dataclasses import dataclass, field
-from pathlib import Path
+from dataclasses import dataclass
 from typing import List, Optional, Callable, Dict, TYPE_CHECKING
 
 from ..migration_constants import (
     IssueType,
-    IDENTIFIER_LIMITS,
     INDEX_SIZE_LIMITS,
     CHARSET_BYTES_PER_CHAR,
     MYSQL_SCHEMA_TABLES,
@@ -498,7 +495,7 @@ class SchemaRules:
                 issue_type=IssueType.BLOB_TEXT_DEFAULT,
                 severity="error",
                 location=location,
-                description=f"BLOB/TEXT 컬럼에 DEFAULT 값 설정",
+                description="BLOB/TEXT 컬럼에 DEFAULT 값 설정",
                 suggestion="BLOB/TEXT 컬럼은 DEFAULT를 지원하지 않음",
                 code_snippet=line[:80]
             ))

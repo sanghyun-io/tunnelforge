@@ -5,7 +5,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
                              QWidget, QTextBrowser, QSizePolicy, QTextEdit,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
-                             QTableWidget, QTableWidgetItem, QHeaderView)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QCursor, QFont
 from PyQt6.QtCore import QUrl
@@ -403,8 +403,8 @@ class SettingsDialog(QDialog):
 
         reply = QMessageBox.question(
             self, "복원 확인",
-            f"선택한 백업으로 설정을 복원하시겠습니까?\n\n"
-            f"현재 설정은 자동으로 백업됩니다.",
+            "선택한 백업으로 설정을 복원하시겠습니까?\n\n"
+            "현재 설정은 자동으로 백업됩니다.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
@@ -442,8 +442,8 @@ class SettingsDialog(QDialog):
         if file_path:
             reply = QMessageBox.question(
                 self, "가져오기 확인",
-                f"선택한 파일에서 설정을 가져오시겠습니까?\n\n"
-                f"현재 설정은 자동으로 백업됩니다.",
+                "선택한 파일에서 설정을 가져오시겠습니까?\n\n"
+                "현재 설정은 자동으로 백업됩니다.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
 

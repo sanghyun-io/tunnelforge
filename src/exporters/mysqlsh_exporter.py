@@ -836,7 +836,7 @@ class MySQLShellImporter:
                 'schema': schema or ''
             }
 
-        except Exception as e:
+        except Exception:
             # 메타데이터 분석 실패 시 None 반환 (기존 동작 유지)
             return None
 
@@ -891,7 +891,7 @@ class MySQLShellImporter:
                 ]
                 large_tables.sort(key=lambda x: -x[1])
 
-                progress_callback(f"📊 Dump 메타데이터 분석 완료")
+                progress_callback("📊 Dump 메타데이터 분석 완료")
                 progress_callback(f"  └─ 전체 데이터 크기: {total_size_gb:.2f} GB")
 
                 if large_tables:
@@ -961,7 +961,7 @@ class MySQLShellImporter:
             elif import_mode == "replace":
                 # 전체 교체: 모든 객체 (테이블, 뷰, 프로시저, 이벤트) 삭제 후 재생성
                 if progress_callback:
-                    progress_callback(f"🔄 전체 교체 모드 시작")
+                    progress_callback("🔄 전체 교체 모드 시작")
                     progress_callback(f"  └─ {len(tables_to_import)}개 테이블, View/Procedure/Event 삭제 예정")
 
                 # 1. 테이블 삭제
@@ -985,7 +985,7 @@ class MySQLShellImporter:
             elif import_mode == "merge":
                 # 병합: 기존 데이터 유지, 새 것만 추가
                 if progress_callback:
-                    progress_callback(f"증분 병합 모드: 기존 데이터 유지")
+                    progress_callback("증분 병합 모드: 기존 데이터 유지")
 
             else:
                 return False, f"알 수 없는 Import 모드: {import_mode}", import_results
@@ -1108,7 +1108,7 @@ session.runSql("CREATE DATABASE `{schema}` DEFAULT CHARACTER SET utf8mb4 COLLATE
         """
         try:
             if progress_callback:
-                progress_callback(f"🗑️ View/Procedure/Function/Event 삭제 중...")
+                progress_callback("🗑️ View/Procedure/Function/Event 삭제 중...")
 
             # Views, Procedures, Events 조회 및 삭제
             js_code = f"""
@@ -1144,7 +1144,7 @@ for (var i = 0; i < events.length; i++) {{
             success, msg = self._run_mysqlsh(js_code, progress_callback)
 
             if success and progress_callback:
-                progress_callback(f"  └─ ✅ View/Procedure/Event 삭제 완료")
+                progress_callback("  └─ ✅ View/Procedure/Event 삭제 완료")
 
             return success, msg
 
@@ -1246,7 +1246,7 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
             ]
 
             if progress_callback:
-                progress_callback(f"mysqlsh 실행 중...")
+                progress_callback("mysqlsh 실행 중...")
 
             result = subprocess.run(
                 cmd,
@@ -1327,7 +1327,7 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
             ]
 
             if progress_callback:
-                progress_callback(f"mysqlsh 실행 중...")
+                progress_callback("mysqlsh 실행 중...")
 
             # Popen으로 실행하여 실시간 출력 읽기
             process = subprocess.Popen(
@@ -1466,7 +1466,7 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                     if table_chunk_progress_callback and chunk_counts:
                         chunk_match = RE_CHUNK.search(stripped_line)
                         if chunk_match:
-                            schema_name = chunk_match.group(1)
+                            _schema_name = chunk_match.group(1)  # noqa: F841
                             table_name = chunk_match.group(2)
                             chunk_id = int(chunk_match.group(3))
 
@@ -1605,9 +1605,6 @@ class TableProgressTracker:
         completed_bytes = sum(
             self.table_sizes.get(t, 0) for t in self.completed_tables
         )
-
-        # 남은 bytes
-        remaining_bytes = loaded_bytes - completed_bytes
 
         # 대용량 테이블 중 미완료된 테이블 찾기 (10MB 이상)
         loading_candidates = [

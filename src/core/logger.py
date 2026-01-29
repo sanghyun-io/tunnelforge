@@ -10,7 +10,6 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
-from typing import Optional
 
 # 로그 디렉토리 경로
 if os.name == 'nt':

@@ -256,7 +256,6 @@ class SQLValidator:
                     continue
 
                 table_start = full_match_start + table_match.start(2)
-                table_end = table_start + len(table_name)
 
                 # 이미 검증한 위치인지 확인 (중복 방지)
                 if table_start in validated_positions:
@@ -315,7 +314,6 @@ class SQLValidator:
             # 컬럼 존재 여부 확인
             if not metadata.has_column(table_name, column):
                 col_start = match.start(2)
-                col_end = col_start + len(column)
                 line, col_pos = self._offset_to_line_col(col_start, line_offsets)
                 suggestions = metadata.get_similar_columns(table_name, column)
 

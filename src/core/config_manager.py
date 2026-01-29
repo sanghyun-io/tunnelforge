@@ -186,7 +186,7 @@ class ConfigManager:
 
             # 백업 파일 검증 (유효한 JSON인지 확인)
             with open(backup_path, 'r', encoding='utf-8') as f:
-                backup_data = json.load(f)
+                json.load(f)  # 유효성 검증만 수행
 
             # 복원 실행
             shutil.copy2(backup_path, CONFIG_FILE)

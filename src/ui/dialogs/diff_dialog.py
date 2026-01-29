@@ -259,7 +259,7 @@ class SchemaDiffDialog(QDialog):
 
             success, msg = connector.connect()
             if not success:
-                schema_combo.addItem(f"(연결 실패)")
+                schema_combo.addItem("(연결 실패)")
                 return
 
             # 스키마 목록 조회
