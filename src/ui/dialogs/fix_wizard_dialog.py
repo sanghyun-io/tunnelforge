@@ -1062,8 +1062,8 @@ class FixOptionPage(QWizardPage):
         """전체 일괄 적용 다이얼로그 표시"""
         dialog = BatchOptionDialog(self.wizard_dialog.wizard_steps, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            # 다이얼로그에서 적용된 옵션 반영
-            self.show_current_issue()
+            # 모든 옵션이 적용되었으므로 다음 단계로 이동
+            self.wizard_dialog.next()
 
     def show_skipped_tables_dialog(self):
         """생략된 테이블 목록 다이얼로그 표시"""
