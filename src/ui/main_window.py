@@ -236,6 +236,7 @@ class TunnelManagerUI(QMainWindow):
         self.tunnel_tree.tunnel_export.connect(self._on_tree_export)
         self.tunnel_tree.tunnel_import.connect(self._on_tree_import)
         self.tunnel_tree.tunnel_test.connect(self._on_tree_test_connection)
+        self.tunnel_tree.tunnel_duplicate.connect(self.duplicate_tunnel)
         self.tunnel_tree.group_connect_all.connect(self._connect_all_in_group)
         self.tunnel_tree.group_disconnect_all.connect(self._disconnect_all_in_group)
         self.tunnel_tree.group_edit_requested.connect(self._edit_group_dialog)
@@ -1004,6 +1005,7 @@ class TunnelManagerUI(QMainWindow):
         # Shell Export/Import
         menu.addAction("🚀 Shell Export", lambda: self._context_shell_export(tunnel))
         menu.addAction("📥 Shell Import", lambda: self._context_shell_import(tunnel))
+        menu.addAction("🔍 고아 레코드 분석", lambda: self._context_orphan_check(tunnel))
 
         menu.addSeparator()
 
@@ -1113,3 +1115,31 @@ class TunnelManagerUI(QMainWindow):
             preselected_tunnel=tunnel
         )
         wizard.start_import()
+
+    def _context_orphan_check(self, tunnel):
+        """특정 터널용 고아 레코드 분석 - 인증정보 자동 사용"""
+        # 자격 증명 확인
+        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(
+                self, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
+            )
+            return
+
+        # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
+        is_direct = tunnel.get('connection_mode') == 'direct'
+        if not is_direct and not self.engine.is_running(tunnel['id']):
+            success, msg = self.engine.start_tunnel(tunnel)
+            if not success:
+                QMessageBox.critical(self, "오류", f"터널 시작 실패:\n{msg}")
+                return
+            self.refresh_table()
+
+        wizard = MySQLShellWizard(
+            parent=self,
+            tunnel_engine=self.engine,
+            config_manager=self.config_mgr,
+            preselected_tunnel=tunnel
+        )
+        wizard.start_orphan_check()

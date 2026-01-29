@@ -16,7 +16,8 @@ import os
 
 from src.core.db_connector import MySQLConnector
 from src.exporters.mysqlsh_exporter import (
-    MySQLShellChecker, MySQLShellConfig, check_mysqlsh
+    MySQLShellChecker, MySQLShellConfig, check_mysqlsh,
+    ForeignKeyResolver, OrphanRecordInfo
 )
 from src.ui.workers.mysql_worker import MySQLShellWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
@@ -2592,3 +2593,347 @@ class MySQLShellWizard:
         import_dialog.exec()
 
         return True
+
+    def start_orphan_check(self) -> bool:
+        """고아 레코드 검사 마법사 시작"""
+        connector = None
+
+        # 미리 선택된 터널이 있으면 바로 연결
+        if self.preselected_tunnel:
+            connector, _ = self._connect_preselected_tunnel()
+            if not connector:
+                return False
+        else:
+            # 1단계: DB 연결 다이얼로그
+            conn_dialog = DBConnectionDialog(
+                self.parent,
+                tunnel_engine=self.tunnel_engine,
+                config_manager=self.config_manager
+            )
+
+            if conn_dialog.exec() != QDialog.DialogCode.Accepted:
+                return False
+
+            connector = conn_dialog.get_connector()
+            if not connector:
+                return False
+
+        # 2단계: 고아 레코드 검사
+        orphan_dialog = OrphanRecordDialog(
+            self.parent,
+            connector=connector,
+            config_manager=self.config_manager
+        )
+        orphan_dialog.exec()
+
+        return True
+
+
+class OrphanRecordDialog(QDialog):
+    """고아 레코드 분석 다이얼로그"""
+
+    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None):
+        super().__init__(parent)
+        self.connector = connector
+        self.config_manager = config_manager
+        self.resolver: Optional[ForeignKeyResolver] = None
+        self.orphan_results: List[OrphanRecordInfo] = []
+
+        self.setWindowTitle("🔍 고아 레코드 분석")
+        self.setMinimumSize(900, 650)
+        self.setup_ui()
+
+    def setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # === 상단: 스키마 선택 ===
+        schema_group = QGroupBox("스키마 선택")
+        schema_layout = QHBoxLayout(schema_group)
+
+        self.schema_combo = QComboBox()
+        self.schema_combo.setMinimumWidth(200)
+        schema_layout.addWidget(QLabel("스키마:"))
+        schema_layout.addWidget(self.schema_combo)
+
+        self.analyze_btn = QPushButton("🔍 분석 시작")
+        self.analyze_btn.clicked.connect(self.start_analysis)
+        schema_layout.addWidget(self.analyze_btn)
+
+        schema_layout.addStretch()
+        layout.addWidget(schema_group)
+
+        # === 중앙: 결과 영역 ===
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # 왼쪽: 고아 관계 목록
+        left_widget = QWidget()
+        left_layout = QVBoxLayout(left_widget)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+
+        left_layout.addWidget(QLabel("발견된 고아 관계:"))
+        self.result_list = QListWidget()
+        self.result_list.currentRowChanged.connect(self.on_result_selected)
+        left_layout.addWidget(self.result_list)
+
+        splitter.addWidget(left_widget)
+
+        # 오른쪽: 상세 정보
+        right_widget = QWidget()
+        right_layout = QVBoxLayout(right_widget)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+
+        right_layout.addWidget(QLabel("상세 정보 / SQL 쿼리:"))
+
+        from PyQt6.QtWidgets import QTextEdit
+        self.detail_text = QTextEdit()
+        self.detail_text.setReadOnly(True)
+        self.detail_text.setStyleSheet("font-family: Consolas, monospace; font-size: 11px;")
+        right_layout.addWidget(self.detail_text)
+
+        # 쿼리 복사 버튼
+        copy_btn_layout = QHBoxLayout()
+        self.copy_query_btn = QPushButton("📋 쿼리 복사")
+        self.copy_query_btn.clicked.connect(self.copy_current_query)
+        self.copy_query_btn.setEnabled(False)
+        copy_btn_layout.addWidget(self.copy_query_btn)
+        copy_btn_layout.addStretch()
+        right_layout.addLayout(copy_btn_layout)
+
+        splitter.addWidget(right_widget)
+        splitter.setSizes([350, 550])
+
+        layout.addWidget(splitter, stretch=1)
+
+        # === 하단: 진행상황 및 버튼 ===
+        progress_layout = QHBoxLayout()
+        self.progress_label = QLabel("")
+        progress_layout.addWidget(self.progress_label)
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setVisible(False)
+        progress_layout.addWidget(self.progress_bar)
+        layout.addLayout(progress_layout)
+
+        # 버튼 영역
+        btn_layout = QHBoxLayout()
+
+        self.export_all_queries_btn = QPushButton("📄 전체 쿼리 내보내기")
+        self.export_all_queries_btn.clicked.connect(self.export_all_queries)
+        self.export_all_queries_btn.setEnabled(False)
+        btn_layout.addWidget(self.export_all_queries_btn)
+
+        self.export_report_btn = QPushButton("📊 보고서 저장")
+        self.export_report_btn.clicked.connect(self.export_report)
+        self.export_report_btn.setEnabled(False)
+        btn_layout.addWidget(self.export_report_btn)
+
+        btn_layout.addStretch()
+
+        self.close_btn = QPushButton("닫기")
+        self.close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(self.close_btn)
+
+        layout.addLayout(btn_layout)
+
+        # 스키마 목록 로드
+        self.load_schemas()
+
+    def load_schemas(self):
+        """스키마 목록 로드"""
+        if not self.connector:
+            return
+
+        try:
+            schemas = self.connector.get_schemas()
+            self.schema_combo.clear()
+            self.schema_combo.addItems(schemas)
+        except Exception as e:
+            QMessageBox.warning(self, "경고", f"스키마 목록 로드 실패:\n{str(e)}")
+
+    def start_analysis(self):
+        """고아 레코드 분석 시작"""
+        schema = self.schema_combo.currentText()
+        if not schema:
+            QMessageBox.warning(self, "경고", "스키마를 선택해주세요.")
+            return
+
+        self.result_list.clear()
+        self.detail_text.clear()
+        self.orphan_results.clear()
+        self.copy_query_btn.setEnabled(False)
+        self.export_all_queries_btn.setEnabled(False)
+        self.export_report_btn.setEnabled(False)
+
+        self.analyze_btn.setEnabled(False)
+        self.progress_label.setText("분석 중...")
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, 0)  # Indeterminate
+
+        QApplication.processEvents()
+
+        try:
+            self.resolver = ForeignKeyResolver(self.connector)
+
+            def progress_cb(msg):
+                self.progress_label.setText(msg)
+                QApplication.processEvents()
+
+            self.orphan_results = self.resolver.find_orphan_records(
+                schema,
+                progress_callback=progress_cb
+            )
+
+            # 결과 표시
+            self.display_results()
+
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"분석 중 오류 발생:\n{str(e)}")
+        finally:
+            self.analyze_btn.setEnabled(True)
+            self.progress_bar.setVisible(False)
+            self.progress_label.setText("")
+
+    def display_results(self):
+        """분석 결과 표시"""
+        if not self.orphan_results:
+            self.result_list.addItem("✅ 고아 레코드가 발견되지 않았습니다.")
+            self.detail_text.setText("모든 FK 관계가 정상입니다.")
+            return
+
+        total_orphans = sum(o.orphan_count for o in self.orphan_results)
+        self.progress_label.setText(f"⚠️ {len(self.orphan_results)}개 관계에서 총 {total_orphans:,}개 고아 레코드 발견")
+
+        for o in self.orphan_results:
+            item_text = f"⚠️ {o.table}.{o.column} → {o.referenced_table} ({o.orphan_count:,}건)"
+            self.result_list.addItem(item_text)
+
+        self.export_all_queries_btn.setEnabled(True)
+        self.export_report_btn.setEnabled(True)
+
+        # 첫 번째 항목 선택
+        if self.result_list.count() > 0:
+            self.result_list.setCurrentRow(0)
+
+    def on_result_selected(self, row: int):
+        """결과 목록 선택 시"""
+        if row < 0 or row >= len(self.orphan_results):
+            self.detail_text.clear()
+            self.copy_query_btn.setEnabled(False)
+            return
+
+        o = self.orphan_results[row]
+
+        detail = f"""═══════════════════════════════════════════════════════════════════
+ 고아 레코드 상세 정보
+═══════════════════════════════════════════════════════════════════
+
+📊 FK 관계:
+   자식 테이블: {o.table}
+   FK 컬럼: {o.column}
+   부모 테이블: {o.referenced_table}
+   참조 컬럼: {o.referenced_column}
+
+⚠️ 고아 레코드 수: {o.orphan_count:,}건
+
+📝 샘플 값 (최대 5개):
+   {', '.join(o.sample_values) if o.sample_values else '(없음)'}
+
+═══════════════════════════════════════════════════════════════════
+ 조회 쿼리 (아래 쿼리로 고아 레코드를 직접 조회할 수 있습니다)
+═══════════════════════════════════════════════════════════════════
+
+{o.query}
+"""
+        self.detail_text.setText(detail)
+        self.copy_query_btn.setEnabled(True)
+
+    def copy_current_query(self):
+        """현재 선택된 쿼리 복사"""
+        row = self.result_list.currentRow()
+        if row < 0 or row >= len(self.orphan_results):
+            return
+
+        o = self.orphan_results[row]
+        clipboard = QApplication.clipboard()
+        clipboard.setText(o.query)
+
+        self.progress_label.setText("✅ 쿼리가 클립보드에 복사되었습니다.")
+
+    def export_all_queries(self):
+        """전체 쿼리 내보내기"""
+        if not self.resolver:
+            return
+
+        schema = self.schema_combo.currentText()
+        if not schema:
+            return
+
+        # 파일 저장 다이얼로그
+        default_name = f"orphan_queries_{schema}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "쿼리 저장",
+            default_name,
+            "SQL 파일 (*.sql);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            all_queries = self.resolver.get_all_orphan_queries(schema)
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(all_queries)
+
+            QMessageBox.information(
+                self, "저장 완료",
+                f"✅ 쿼리가 저장되었습니다.\n\n{file_path}"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "저장 실패",
+                f"❌ 쿼리 저장 중 오류가 발생했습니다.\n\n{str(e)}"
+            )
+
+    def export_report(self):
+        """보고서 저장"""
+        if not self.resolver:
+            return
+
+        schema = self.schema_combo.currentText()
+        if not schema:
+            return
+
+        # 파일 저장 다이얼로그
+        default_name = f"orphan_report_{schema}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.md"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "보고서 저장",
+            default_name,
+            "Markdown 파일 (*.md);;텍스트 파일 (*.txt);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        def progress_cb(msg):
+            self.progress_label.setText(msg)
+            QApplication.processEvents()
+
+        success, msg, count = self.resolver.export_orphan_report(
+            schema,
+            file_path,
+            progress_callback=progress_cb
+        )
+
+        if success:
+            QMessageBox.information(
+                self, "저장 완료",
+                f"✅ 보고서가 저장되었습니다.\n\n{file_path}\n\n발견된 고아 관계: {count}건"
+            )
+        else:
+            QMessageBox.critical(self, "저장 실패", f"❌ {msg}")
+
+    def closeEvent(self, event):
+        """다이얼로그 닫기"""
+        # connector는 외부에서 관리하므로 여기서 닫지 않음
+        event.accept()

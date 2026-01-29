@@ -267,14 +267,14 @@ class TunnelConfigDialog(QDialog):
             return
 
         # SSH 터널 모드 필수 필드 검증
-        ssh_host = temp_config.get('ssh_host', '').strip()
-        ssh_user = temp_config.get('ssh_user', '').strip()
+        bastion_host = temp_config.get('bastion_host', '').strip()
+        bastion_user = temp_config.get('bastion_user', '').strip()
         remote_host = temp_config.get('remote_host', '').strip()
 
         missing_fields = []
-        if not ssh_host:
+        if not bastion_host:
             missing_fields.append("SSH 호스트")
-        if not ssh_user:
+        if not bastion_user:
             missing_fields.append("SSH 사용자")
         if not remote_host:
             missing_fields.append("Target DB (Endpoint)")

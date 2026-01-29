@@ -257,6 +257,7 @@ class IssueType(Enum):
     # 신규 이슈 타입 (확장)
     YEAR2_TYPE = "year2_type"  # YEAR(2) 타입
     LATIN1_CHARSET = "latin1_charset"  # latin1 charset
+    INDEX_ISSUE = "index_issue"  # 인덱스 관련 이슈 (일반)
     INDEX_TOO_LARGE = "index_too_large"  # 인덱스 크기 초과
     GROUPBY_ASC_DESC = "groupby_asc_desc"  # GROUP BY ASC/DESC
     SQL_CALC_FOUND_ROWS_USAGE = "sql_calc_found_rows"  # SQL_CALC_FOUND_ROWS

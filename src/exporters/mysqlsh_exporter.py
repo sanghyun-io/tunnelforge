@@ -138,6 +138,18 @@ sudo yum install mysql-shell
 """
 
 
+@dataclass
+class OrphanRecordInfo:
+    """고아 레코드 정보"""
+    table: str
+    column: str
+    referenced_table: str
+    referenced_column: str
+    orphan_count: int
+    sample_values: List[str]
+    query: str
+
+
 class ForeignKeyResolver:
     """FK 의존성 분석 및 해결"""
 
@@ -169,6 +181,231 @@ class ForeignKeyResolver:
                 deps[table].add(ref_table)
 
         return deps
+
+    def get_fk_details(self, schema: str) -> List[Dict]:
+        """
+        스키마 내 모든 FK 상세 정보 조회
+
+        Returns:
+            [{ table, column, referenced_table, referenced_column, constraint_name }, ...]
+        """
+        query = """
+        SELECT
+            TABLE_NAME,
+            COLUMN_NAME,
+            REFERENCED_TABLE_NAME,
+            REFERENCED_COLUMN_NAME,
+            CONSTRAINT_NAME
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE
+        WHERE TABLE_SCHEMA = %s
+          AND REFERENCED_TABLE_NAME IS NOT NULL
+        ORDER BY TABLE_NAME, COLUMN_NAME
+        """
+        rows = self.connector.execute(query, (schema,))
+        return [
+            {
+                'table': row['TABLE_NAME'],
+                'column': row['COLUMN_NAME'],
+                'referenced_table': row['REFERENCED_TABLE_NAME'],
+                'referenced_column': row['REFERENCED_COLUMN_NAME'],
+                'constraint_name': row['CONSTRAINT_NAME']
+            }
+            for row in rows
+        ]
+
+    def generate_orphan_query(
+        self,
+        schema: str,
+        table: str,
+        column: str,
+        ref_table: str,
+        ref_column: str
+    ) -> str:
+        """
+        고아 레코드 조회 쿼리 생성
+
+        Args:
+            schema: 스키마명
+            table: 자식 테이블명
+            column: FK 컬럼명
+            ref_table: 부모 테이블명
+            ref_column: 부모 PK 컬럼명
+
+        Returns:
+            고아 레코드 조회 SQL 쿼리
+        """
+        return f"""SELECT c.*
+FROM `{schema}`.`{table}` c
+LEFT JOIN `{schema}`.`{ref_table}` p ON c.`{column}` = p.`{ref_column}`
+WHERE c.`{column}` IS NOT NULL
+  AND p.`{ref_column}` IS NULL"""
+
+    def find_orphan_records(
+        self,
+        schema: str,
+        tables: Optional[List[str]] = None,
+        sample_limit: int = 5,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> List[OrphanRecordInfo]:
+        """
+        스키마 내 고아 레코드 검색
+
+        Args:
+            schema: 스키마명
+            tables: 검사할 테이블 목록 (None이면 전체)
+            sample_limit: 샘플 값 최대 개수
+            progress_callback: 진행 콜백
+
+        Returns:
+            고아 레코드 정보 리스트
+        """
+        results = []
+        fk_details = self.get_fk_details(schema)
+
+        # 테이블 필터링
+        if tables:
+            tables_set = set(tables)
+            fk_details = [fk for fk in fk_details if fk['table'] in tables_set]
+
+        total = len(fk_details)
+        for idx, fk in enumerate(fk_details, 1):
+            table = fk['table']
+            column = fk['column']
+            ref_table = fk['referenced_table']
+            ref_column = fk['referenced_column']
+
+            if progress_callback:
+                progress_callback(f"검사 중... ({idx}/{total}) {table}.{column}")
+
+            # 고아 레코드 수 조회
+            count_query = f"""
+            SELECT COUNT(*) as cnt
+            FROM `{schema}`.`{table}` c
+            LEFT JOIN `{schema}`.`{ref_table}` p ON c.`{column}` = p.`{ref_column}`
+            WHERE c.`{column}` IS NOT NULL
+              AND p.`{ref_column}` IS NULL
+            """
+            try:
+                count_result = self.connector.execute(count_query)
+                orphan_count = count_result[0]['cnt'] if count_result else 0
+
+                if orphan_count > 0:
+                    # 샘플 값 조회
+                    sample_query = f"""
+                    SELECT DISTINCT c.`{column}` as orphan_value
+                    FROM `{schema}`.`{table}` c
+                    LEFT JOIN `{schema}`.`{ref_table}` p ON c.`{column}` = p.`{ref_column}`
+                    WHERE c.`{column}` IS NOT NULL
+                      AND p.`{ref_column}` IS NULL
+                    LIMIT {sample_limit}
+                    """
+                    sample_result = self.connector.execute(sample_query)
+                    sample_values = [str(row['orphan_value']) for row in sample_result]
+
+                    results.append(OrphanRecordInfo(
+                        table=table,
+                        column=column,
+                        referenced_table=ref_table,
+                        referenced_column=ref_column,
+                        orphan_count=orphan_count,
+                        sample_values=sample_values,
+                        query=self.generate_orphan_query(schema, table, column, ref_table, ref_column)
+                    ))
+            except Exception as e:
+                if progress_callback:
+                    progress_callback(f"⚠️ {table}.{column} 검사 실패: {str(e)}")
+
+        return results
+
+    def export_orphan_report(
+        self,
+        schema: str,
+        output_path: str,
+        tables: Optional[List[str]] = None,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> Tuple[bool, str, int]:
+        """
+        고아 레코드 보고서를 파일로 저장
+
+        Args:
+            schema: 스키마명
+            output_path: 출력 파일 경로
+            tables: 검사할 테이블 목록 (None이면 전체)
+            progress_callback: 진행 콜백
+
+        Returns:
+            (성공여부, 메시지, 발견된 고아 관계 수)
+        """
+        try:
+            orphans = self.find_orphan_records(schema, tables, progress_callback=progress_callback)
+
+            with open(output_path, 'w', encoding='utf-8') as f:
+                f.write(f"# 고아 레코드 분석 보고서\n")
+                f.write(f"# 스키마: {schema}\n")
+                f.write(f"# 생성일시: {datetime.now().isoformat()}\n")
+                f.write(f"# 발견된 고아 관계: {len(orphans)}건\n")
+                f.write("=" * 80 + "\n\n")
+
+                if not orphans:
+                    f.write("✅ 고아 레코드가 발견되지 않았습니다.\n")
+                else:
+                    total_orphans = sum(o.orphan_count for o in orphans)
+                    f.write(f"⚠️ 총 {total_orphans:,}개의 고아 레코드 발견\n\n")
+
+                    for idx, o in enumerate(orphans, 1):
+                        f.write(f"## [{idx}] {o.table}.{o.column} → {o.referenced_table}.{o.referenced_column}\n")
+                        f.write(f"   고아 레코드 수: {o.orphan_count:,}건\n")
+                        f.write(f"   샘플 값: {', '.join(o.sample_values)}\n")
+                        f.write(f"\n   조회 쿼리:\n")
+                        f.write("   ```sql\n")
+                        for line in o.query.split('\n'):
+                            f.write(f"   {line}\n")
+                        f.write("   ```\n\n")
+                        f.write("-" * 80 + "\n\n")
+
+            return True, f"보고서 저장 완료: {output_path}", len(orphans)
+
+        except Exception as e:
+            return False, f"보고서 저장 실패: {str(e)}", 0
+
+    def get_all_orphan_queries(self, schema: str, tables: Optional[List[str]] = None) -> str:
+        """
+        모든 FK에 대한 고아 레코드 조회 쿼리 생성
+
+        Args:
+            schema: 스키마명
+            tables: 검사할 테이블 목록 (None이면 전체)
+
+        Returns:
+            모든 고아 레코드 조회 쿼리를 합친 SQL
+        """
+        fk_details = self.get_fk_details(schema)
+
+        if tables:
+            tables_set = set(tables)
+            fk_details = [fk for fk in fk_details if fk['table'] in tables_set]
+
+        queries = []
+        queries.append(f"-- 고아 레코드 조회 쿼리 (스키마: {schema})")
+        queries.append(f"-- 생성일시: {datetime.now().isoformat()}")
+        queries.append(f"-- FK 관계 수: {len(fk_details)}개")
+        queries.append("")
+
+        for idx, fk in enumerate(fk_details, 1):
+            table = fk['table']
+            column = fk['column']
+            ref_table = fk['referenced_table']
+            ref_column = fk['referenced_column']
+
+            queries.append(f"-- [{idx}] {table}.{column} → {ref_table}.{ref_column}")
+            queries.append(f"-- 고아 레코드 수 조회")
+            queries.append(f"""SELECT '{table}.{column}' AS fk_relation, COUNT(*) AS orphan_count
+FROM `{schema}`.`{table}` c
+LEFT JOIN `{schema}`.`{ref_table}` p ON c.`{column}` = p.`{ref_column}`
+WHERE c.`{column}` IS NOT NULL AND p.`{ref_column}` IS NULL;
+""")
+
+        return "\n".join(queries)
 
     def resolve_required_tables(
         self,
@@ -526,6 +763,7 @@ util.dumpTables("{schema}", {tables_json}, "{output_dir_escaped}", {{
                     percent_match = RE_PERCENT.search(stripped_line)
                     if percent_match and detail_callback:
                         percent = int(percent_match.group(1))
+                        percent = min(percent, 100)  # 100% 초과 방지
 
                         # 콜백 배칭: 임계값 및 시간 간격 조건 확인
                         should_callback = (
@@ -1380,6 +1618,7 @@ session.runSql("SET FOREIGN_KEY_CHECKS = 1");
                     detail_match = RE_DETAIL.search(stripped_line)
                     if detail_match and detail_callback:
                         percent = int(detail_match.group(1))
+                        percent = min(percent, 100)  # 100% 초과 방지
 
                         # 콜백 배칭: 임계값 및 시간 간격 조건 확인
                         should_callback = (

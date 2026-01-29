@@ -6,6 +6,7 @@
 """
 import os
 import json
+import shutil
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QPushButton, QComboBox,
@@ -46,6 +47,7 @@ class MigrationAnalyzerDialog(QDialog):
         self.worker: Optional[MigrationAnalyzerWorker] = None
         self.cleanup_worker: Optional[CleanupWorker] = None
         self._is_closing = False  # 닫기 진행 중 플래그
+        self._auto_saved_path: Optional[str] = None  # 자동 저장 경로
 
         self.init_ui()
         self.load_schemas()
@@ -355,7 +357,20 @@ class MigrationAnalyzerDialog(QDialog):
         self.btn_select_all = QPushButton("전체 선택")
         self.btn_select_all.clicked.connect(self.select_all_orphans)
 
+        # 쿼리 복사/내보내기 버튼 추가
+        self.btn_copy_orphan_query = QPushButton("📋 조회쿼리 복사")
+        self.btn_copy_orphan_query.setToolTip("선택된 고아 레코드의 조회 쿼리를 클립보드에 복사")
+        self.btn_copy_orphan_query.clicked.connect(self.copy_orphan_query)
+        self.btn_copy_orphan_query.setEnabled(False)
+
+        self.btn_export_orphan_query = QPushButton("📄 조회쿼리 저장")
+        self.btn_export_orphan_query.setToolTip("모든 고아 레코드 조회 쿼리를 .sql 파일로 저장")
+        self.btn_export_orphan_query.clicked.connect(self.export_orphan_queries)
+        self.btn_export_orphan_query.setEnabled(False)
+
         btn_layout.addWidget(self.btn_select_all)
+        btn_layout.addWidget(self.btn_copy_orphan_query)
+        btn_layout.addWidget(self.btn_export_orphan_query)
         btn_layout.addStretch()
         btn_layout.addWidget(self.btn_dry_run)
         btn_layout.addWidget(self.btn_execute)
@@ -398,10 +413,25 @@ class MigrationAnalyzerDialog(QDialog):
             QPushButton:hover { background-color: #8e44ad; }
             QPushButton:disabled { background-color: #bdc3c7; }
         """)
-        self.btn_auto_fix.setToolTip("호환성 이슈를 대화형 위저드로 자동 수정합니다.")
+        self.btn_auto_fix.setToolTip("자동 수정 가능한 이슈를 대화형 위저드로 수정합니다.")
         self.btn_auto_fix.setEnabled(False)  # 분석 완료 후 활성화
         self.btn_auto_fix.clicked.connect(self.open_fix_wizard)
         filter_layout.addWidget(self.btn_auto_fix)
+
+        # 수동 처리 가이드 버튼
+        self.btn_manual_guide = QPushButton("📖 수동 처리 가이드")
+        self.btn_manual_guide.setStyleSheet("""
+            QPushButton {
+                background-color: #e67e22; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #d35400; }
+            QPushButton:disabled { background-color: #bdc3c7; }
+        """)
+        self.btn_manual_guide.setToolTip("자동 수정이 불가능한 이슈에 대한 수동 처리 가이드를 제공합니다.")
+        self.btn_manual_guide.setEnabled(False)
+        self.btn_manual_guide.clicked.connect(self.show_manual_guide)
+        filter_layout.addWidget(self.btn_manual_guide)
 
         layout.addLayout(filter_layout)
 
@@ -549,10 +579,14 @@ class MigrationAnalyzerDialog(QDialog):
             self.update_orphans_table(result.orphan_records)
             self.update_compatibility_table(result.compatibility_issues)
             self.update_fk_tree(result.fk_tree, result.schema)
+
+            # 백그라운드 자동 저장 (기록 보관용)
+            self._auto_save_result(result)
+
             # 저장 버튼 활성화
             self.btn_save.setEnabled(True)
-            # 자동 수정 버튼 활성화 (호환성 이슈가 있을 때만)
-            self.btn_auto_fix.setEnabled(len(result.compatibility_issues) > 0)
+            # 자동/수동 버튼 활성화
+            self._update_fix_buttons(result.compatibility_issues)
         except Exception as e:
             logger.error(f"분석 결과 UI 업데이트 오류: {e}", exc_info=True)
             QMessageBox.critical(self, "오류", f"분석 결과 표시 중 오류 발생:\n{e}")
@@ -629,6 +663,7 @@ class MigrationAnalyzerDialog(QDialog):
 
         self.btn_dry_run.setEnabled(len(orphans) > 0)
         self.btn_execute.setEnabled(len(orphans) > 0)
+        self.btn_export_orphan_query.setEnabled(len(orphans) > 0)
 
     def update_compatibility_table(self, issues: List[CompatibilityIssue]):
         """호환성 이슈 테이블 업데이트"""
@@ -741,7 +776,10 @@ class MigrationAnalyzerDialog(QDialog):
 
         if not selected_rows or not self.analysis_result:
             self.txt_cleanup_sql.clear()
+            self.btn_copy_orphan_query.setEnabled(False)
             return
+
+        self.btn_copy_orphan_query.setEnabled(True)
 
         # 선택된 고아 레코드들에 대한 SQL 생성
         sql_parts = []
@@ -762,6 +800,95 @@ class MigrationAnalyzerDialog(QDialog):
     def select_all_orphans(self):
         """모든 고아 레코드 선택"""
         self.table_orphans.selectAll()
+
+    def _generate_orphan_select_query(self, orphan: OrphanRecord, schema: str) -> str:
+        """고아 레코드 조회 쿼리 생성"""
+        return f"""-- {orphan.child_table}.{orphan.child_column} → {orphan.parent_table}.{orphan.parent_column}
+-- 고아 레코드 수: {orphan.orphan_count:,}개
+SELECT c.*
+FROM `{schema}`.`{orphan.child_table}` c
+LEFT JOIN `{schema}`.`{orphan.parent_table}` p
+    ON c.`{orphan.child_column}` = p.`{orphan.parent_column}`
+WHERE c.`{orphan.child_column}` IS NOT NULL
+  AND p.`{orphan.parent_column}` IS NULL;"""
+
+    def copy_orphan_query(self):
+        """선택된 고아 레코드 조회 쿼리 복사"""
+        if not self.analysis_result:
+            return
+
+        selected_rows = self.table_orphans.selectionModel().selectedRows()
+        if not selected_rows:
+            QMessageBox.warning(self, "선택 필요", "복사할 고아 레코드를 선택하세요.")
+            return
+
+        schema = self.analysis_result.schema
+        queries = []
+
+        for row_index in selected_rows:
+            row = row_index.row()
+            if row < len(self.analysis_result.orphan_records):
+                orphan = self.analysis_result.orphan_records[row]
+                queries.append(self._generate_orphan_select_query(orphan, schema))
+
+        clipboard = QApplication.clipboard()
+        clipboard.setText("\n\n".join(queries))
+
+        QMessageBox.information(
+            self, "복사 완료",
+            f"✅ {len(queries)}개 조회 쿼리가 클립보드에 복사되었습니다."
+        )
+
+    def export_orphan_queries(self):
+        """모든 고아 레코드 조회 쿼리를 파일로 저장"""
+        if not self.analysis_result or not self.analysis_result.orphan_records:
+            QMessageBox.warning(self, "데이터 없음", "내보낼 고아 레코드가 없습니다.")
+            return
+
+        schema = self.analysis_result.schema
+        orphans = self.analysis_result.orphan_records
+        total_count = sum(o.orphan_count for o in orphans)
+
+        # 파일 저장 다이얼로그
+        from datetime import datetime
+        default_name = f"orphan_queries_{schema}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "고아 레코드 조회 쿼리 저장",
+            default_name,
+            "SQL 파일 (*.sql);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                f.write(f"-- ═══════════════════════════════════════════════════════════════\n")
+                f.write(f"-- 고아 레코드 조회 쿼리\n")
+                f.write(f"-- 스키마: {schema}\n")
+                f.write(f"-- 생성일시: {datetime.now().isoformat()}\n")
+                f.write(f"-- FK 관계 수: {len(orphans)}개\n")
+                f.write(f"-- 총 고아 레코드: {total_count:,}개\n")
+                f.write(f"-- ═══════════════════════════════════════════════════════════════\n\n")
+
+                for i, orphan in enumerate(orphans, 1):
+                    f.write(f"-- [{i}/{len(orphans)}] {orphan.child_table}.{orphan.child_column}\n")
+                    f.write(self._generate_orphan_select_query(orphan, schema))
+                    f.write("\n\n")
+
+            QMessageBox.information(
+                self, "저장 완료",
+                f"✅ 조회 쿼리가 저장되었습니다.\n\n"
+                f"파일: {file_path}\n"
+                f"FK 관계: {len(orphans)}개\n"
+                f"총 고아 레코드: {total_count:,}개"
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "저장 실패",
+                f"❌ 파일 저장 중 오류가 발생했습니다.\n\n{str(e)}"
+            )
 
     def execute_cleanup(self, dry_run: bool = True):
         """정리 작업 실행"""
@@ -849,17 +976,53 @@ class MigrationAnalyzerDialog(QDialog):
         )
 
     # =========================================================================
-    # 자동 수정 위저드
+    # 자동 수정 위저드 / 수동 처리 가이드
     # =========================================================================
 
+    # 자동 수정 가능한 이슈 타입
+    AUTO_FIXABLE_TYPES = {
+        IssueType.INVALID_DATE,
+        IssueType.CHARSET_ISSUE,
+        IssueType.ZEROFILL_USAGE,
+        IssueType.FLOAT_PRECISION,
+        IssueType.INT_DISPLAY_WIDTH,
+        IssueType.DEPRECATED_ENGINE,
+        IssueType.ENUM_EMPTY_VALUE,
+    }
+
+    def _update_fix_buttons(self, issues: list):
+        """자동 수정 / 수동 가이드 버튼 활성화 상태 업데이트"""
+        auto_fixable = [i for i in issues if i.issue_type in self.AUTO_FIXABLE_TYPES]
+        manual_only = [i for i in issues if i.issue_type not in self.AUTO_FIXABLE_TYPES]
+
+        self.btn_auto_fix.setEnabled(len(auto_fixable) > 0)
+        self.btn_manual_guide.setEnabled(len(manual_only) > 0)
+
+        # 버튼 텍스트에 개수 표시
+        if auto_fixable:
+            self.btn_auto_fix.setText(f"🔧 자동 수정 위저드 ({len(auto_fixable)})")
+        else:
+            self.btn_auto_fix.setText("🔧 자동 수정 위저드")
+
+        if manual_only:
+            self.btn_manual_guide.setText(f"📖 수동 처리 가이드 ({len(manual_only)})")
+        else:
+            self.btn_manual_guide.setText("📖 수동 처리 가이드")
+
     def open_fix_wizard(self):
-        """자동 수정 위저드 열기"""
+        """자동 수정 위저드 열기 (자동 수정 가능 이슈만)"""
         if not self.analysis_result:
             QMessageBox.warning(self, "분석 필요", "먼저 스키마 분석을 실행하세요.")
             return
 
-        if not self.analysis_result.compatibility_issues:
-            QMessageBox.information(self, "이슈 없음", "수정할 호환성 이슈가 없습니다.")
+        # 자동 수정 가능 이슈만 필터링
+        auto_fixable_issues = [
+            i for i in self.analysis_result.compatibility_issues
+            if i.issue_type in self.AUTO_FIXABLE_TYPES
+        ]
+
+        if not auto_fixable_issues:
+            QMessageBox.information(self, "이슈 없음", "자동 수정 가능한 이슈가 없습니다.")
             return
 
         try:
@@ -868,7 +1031,7 @@ class MigrationAnalyzerDialog(QDialog):
             wizard = FixWizardDialog(
                 parent=self,
                 connector=self.connector,
-                issues=self.analysis_result.compatibility_issues,
+                issues=auto_fixable_issues,  # 자동 수정 가능 이슈만 전달
                 schema=self.analysis_result.schema
             )
             result = wizard.exec()
@@ -892,6 +1055,29 @@ class MigrationAnalyzerDialog(QDialog):
             logger.error(f"자동 수정 위저드 오류: {e}", exc_info=True)
             QMessageBox.critical(self, "오류", f"자동 수정 위저드 실행 중 오류:\n{e}")
 
+    def show_manual_guide(self):
+        """수동 처리 가이드 다이얼로그 열기"""
+        if not self.analysis_result:
+            QMessageBox.warning(self, "분석 필요", "먼저 스키마 분석을 실행하세요.")
+            return
+
+        # 수동 처리 필요 이슈만 필터링
+        manual_issues = [
+            i for i in self.analysis_result.compatibility_issues
+            if i.issue_type not in self.AUTO_FIXABLE_TYPES
+        ]
+
+        if not manual_issues:
+            QMessageBox.information(self, "이슈 없음", "수동 처리가 필요한 이슈가 없습니다.")
+            return
+
+        try:
+            dialog = ManualGuideDialog(manual_issues, self)
+            dialog.exec()
+        except Exception as e:
+            logger.error(f"수동 처리 가이드 오류: {e}", exc_info=True)
+            QMessageBox.critical(self, "오류", f"수동 처리 가이드 표시 중 오류:\n{e}")
+
     # =========================================================================
     # 분석 결과 저장/로드
     # =========================================================================
@@ -905,21 +1091,67 @@ class MigrationAnalyzerDialog(QDialog):
         os.makedirs(base_dir, exist_ok=True)
         return base_dir
 
+    def _auto_save_result(self, result: AnalysisResult):
+        """분석 결과 자동 저장 (백그라운드, 기록 보관용)"""
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            auto_save_name = f"{result.schema}_{timestamp}.json"
+            auto_save_path = os.path.join(self._get_analysis_dir(), auto_save_name)
+
+            with open(auto_save_path, 'w', encoding='utf-8') as f:
+                json.dump(result.to_dict(), f, ensure_ascii=False, indent=2, default=str)
+
+            self._auto_saved_path = auto_save_path
+            self.add_log(f"💾 분석 결과 자동 저장: {auto_save_path}")
+            logger.info(f"분석 결과 자동 저장 완료: {auto_save_path}")
+
+        except Exception as e:
+            logger.error(f"분석 결과 자동 저장 오류: {e}", exc_info=True)
+            self._auto_saved_path = None
+
     def save_analysis_result(self):
-        """분석 결과 저장"""
+        """분석 결과 저장 (자동 저장 파일을 복사)"""
         if not self.analysis_result:
             QMessageBox.warning(self, "저장 오류", "저장할 분석 결과가 없습니다.")
             return
 
+        # 자동 저장된 파일이 없으면 직접 저장
+        if not self._auto_saved_path or not os.path.exists(self._auto_saved_path):
+            self._save_result_directly()
+            return
+
         # 기본 파일명 생성
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"{self.analysis_result.schema}_{timestamp}.json"
-        default_path = os.path.join(self._get_analysis_dir(), default_name)
+        default_name = os.path.basename(self._auto_saved_path)
 
         file_path, _ = QFileDialog.getSaveFileName(
             self,
             "분석 결과 저장",
-            default_path,
+            default_name,
+            "JSON 파일 (*.json);;모든 파일 (*.*)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            shutil.copy2(self._auto_saved_path, file_path)
+
+            self.add_log(f"💾 분석 결과 복사 완료: {file_path}")
+            QMessageBox.information(self, "저장 완료", f"분석 결과가 저장되었습니다.\n\n{file_path}")
+
+        except Exception as e:
+            logger.error(f"분석 결과 복사 오류: {e}", exc_info=True)
+            QMessageBox.critical(self, "저장 오류", f"파일 저장 실패:\n{e}")
+
+    def _save_result_directly(self):
+        """분석 결과 직접 저장 (자동 저장 실패 시 fallback)"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"{self.analysis_result.schema}_{timestamp}.json"
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self,
+            "분석 결과 저장",
+            default_name,
             "JSON 파일 (*.json);;모든 파일 (*.*)"
         )
 
@@ -965,8 +1197,8 @@ class MigrationAnalyzerDialog(QDialog):
             self.update_compatibility_table(result.compatibility_issues)
             self.update_fk_tree(result.fk_tree, result.schema)
             self.btn_save.setEnabled(True)
-            # 자동 수정 버튼 활성화
-            self.btn_auto_fix.setEnabled(len(result.compatibility_issues) > 0)
+            # 자동/수동 버튼 활성화
+            self._update_fix_buttons(result.compatibility_issues)
 
             self.add_log(f"📂 분석 결과 불러오기 완료: {file_path}")
             self.add_log(f"   스키마: {result.schema}, 분석일시: {result.analyzed_at}")
@@ -983,6 +1215,239 @@ class MigrationAnalyzerDialog(QDialog):
         except Exception as e:
             logger.error(f"분석 결과 불러오기 오류: {e}", exc_info=True)
             QMessageBox.critical(self, "불러오기 오류", f"파일 불러오기 실패:\n{e}")
+
+
+class ManualGuideDialog(QDialog):
+    """수동 처리 가이드 다이얼로그
+
+    자동 수정이 불가능한 이슈에 대한 수동 처리 방법을 안내합니다.
+    """
+
+    # 이슈 유형별 가이드
+    GUIDES = {
+        IssueType.AUTH_PLUGIN_ISSUE: {
+            "title": "인증 플러그인 이슈",
+            "description": "MySQL 8.4에서 mysql_native_password가 기본 비활성화됩니다.",
+            "solution": """**해결 방법:**
+
+1. **권장: caching_sha2_password로 변경**
+   ```sql
+   ALTER USER 'username'@'host' IDENTIFIED WITH caching_sha2_password BY '새_비밀번호';
+   ```
+
+2. **임시 해결: mysql_native_password 유지 (비권장)**
+   my.cnf에 추가:
+   ```
+   [mysqld]
+   mysql_native_password=ON
+   ```
+
+**주의:** 비밀번호를 모르면 사용자에게 새 비밀번호를 설정하도록 안내하세요.""",
+        },
+        IssueType.RESERVED_KEYWORD: {
+            "title": "예약어 충돌",
+            "description": "MySQL 8.4에서 새로운 예약어가 추가되어 기존 식별자와 충돌합니다.",
+            "solution": """**해결 방법:**
+
+1. **백틱(`)으로 감싸기**
+   ```sql
+   SELECT `groups` FROM users;  -- groups가 예약어인 경우
+   ```
+
+2. **이름 변경 (권장)**
+   ```sql
+   ALTER TABLE old_name RENAME TO new_name;
+   ALTER TABLE tbl RENAME COLUMN old_col TO new_col;
+   ```
+
+**주의:** 애플리케이션 코드에서도 해당 식별자를 사용하는 모든 곳을 수정해야 합니다.""",
+        },
+        IssueType.FK_NAME_LENGTH: {
+            "title": "FK 이름 길이 초과",
+            "description": "FK 제약조건 이름이 64자를 초과합니다.",
+            "solution": """**해결 방법:**
+
+1. **FK 삭제 후 짧은 이름으로 재생성**
+   ```sql
+   -- 기존 FK 삭제
+   ALTER TABLE child_table DROP FOREIGN KEY too_long_fk_name_xxx;
+
+   -- 짧은 이름으로 재생성
+   ALTER TABLE child_table
+   ADD CONSTRAINT fk_short_name
+   FOREIGN KEY (col) REFERENCES parent_table(col);
+   ```
+
+**팁:** FK 이름 규칙 예시: `fk_자식테이블_부모테이블` (64자 이내)""",
+        },
+        IssueType.PARTITION_ISSUE: {
+            "title": "파티션 이슈",
+            "description": "파티션 테이블에 호환성 문제가 있습니다.",
+            "solution": """**해결 방법:**
+
+1. **파티션 재구성**
+   ```sql
+   ALTER TABLE tbl REORGANIZE PARTITION ...;
+   ```
+
+2. **파티션 제거 후 재생성**
+   ```sql
+   ALTER TABLE tbl REMOVE PARTITIONING;
+   -- 새 파티션 스키마로 재생성
+   ```
+
+**주의:** 데이터 양이 많은 경우 시간이 오래 걸릴 수 있습니다. 유지보수 시간에 수행하세요.""",
+        },
+        IssueType.INDEX_ISSUE: {
+            "title": "인덱스 이슈",
+            "description": "인덱스에 호환성 문제가 있습니다.",
+            "solution": """**해결 방법:**
+
+1. **인덱스 재생성**
+   ```sql
+   DROP INDEX idx_name ON table_name;
+   CREATE INDEX idx_name ON table_name (columns);
+   ```
+
+2. **ALGORITHM=INPLACE 사용 (온라인 DDL)**
+   ```sql
+   ALTER TABLE tbl DROP INDEX idx, ADD INDEX idx(col), ALGORITHM=INPLACE;
+   ```""",
+        },
+    }
+
+    DEFAULT_GUIDE = {
+        "title": "알 수 없는 이슈",
+        "description": "이 이슈에 대한 자동 가이드가 없습니다.",
+        "solution": "MySQL 공식 문서를 참고하거나 DBA에게 문의하세요.",
+    }
+
+    def __init__(self, issues: list, parent=None):
+        super().__init__(parent)
+        self.issues = issues
+
+        self.setWindowTitle("📖 수동 처리 가이드")
+        self.setMinimumSize(700, 500)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 안내 텍스트
+        info_label = QLabel(
+            f"다음 {len(self.issues)}개 이슈는 자동 수정이 불가능합니다.\n"
+            f"아래 가이드를 참고하여 수동으로 처리하세요."
+        )
+        info_label.setStyleSheet("margin-bottom: 10px;")
+        layout.addWidget(info_label)
+
+        # 스플리터: 이슈 목록 | 가이드 내용
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        # 왼쪽: 이슈 목록
+        list_widget = QWidget()
+        list_layout = QVBoxLayout(list_widget)
+        list_layout.setContentsMargins(0, 0, 0, 0)
+
+        list_label = QLabel("이슈 목록")
+        list_label.setStyleSheet("font-weight: bold;")
+        list_layout.addWidget(list_label)
+
+        self.issue_list = QTableWidget()
+        self.issue_list.setColumnCount(2)
+        self.issue_list.setHorizontalHeaderLabels(["유형", "위치"])
+        self.issue_list.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.issue_list.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.issue_list.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.issue_list.itemSelectionChanged.connect(self.on_issue_selected)
+        list_layout.addWidget(self.issue_list)
+
+        splitter.addWidget(list_widget)
+
+        # 오른쪽: 가이드 내용
+        guide_widget = QWidget()
+        guide_layout = QVBoxLayout(guide_widget)
+        guide_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.guide_title = QLabel("가이드")
+        self.guide_title.setStyleSheet("font-weight: bold; font-size: 14px;")
+        guide_layout.addWidget(self.guide_title)
+
+        self.guide_content = QTextEdit()
+        self.guide_content.setReadOnly(True)
+        self.guide_content.setStyleSheet("""
+            QTextEdit {
+                font-family: 'Consolas', 'Monaco', monospace;
+                font-size: 12px;
+            }
+        """)
+        guide_layout.addWidget(self.guide_content)
+
+        splitter.addWidget(guide_widget)
+        splitter.setSizes([250, 450])
+
+        layout.addWidget(splitter)
+
+        # 닫기 버튼
+        btn_layout = QHBoxLayout()
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(self.accept)
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
+
+        # 이슈 목록 채우기
+        self.populate_issues()
+
+    def populate_issues(self):
+        """이슈 목록 채우기"""
+        type_names = {
+            IssueType.AUTH_PLUGIN_ISSUE: "인증 플러그인",
+            IssueType.RESERVED_KEYWORD: "예약어 충돌",
+            IssueType.FK_NAME_LENGTH: "FK 이름 길이",
+            IssueType.PARTITION_ISSUE: "파티션 이슈",
+            IssueType.INDEX_ISSUE: "인덱스 이슈",
+        }
+
+        self.issue_list.setRowCount(len(self.issues))
+
+        for i, issue in enumerate(self.issues):
+            type_name = type_names.get(issue.issue_type, str(issue.issue_type.value))
+            self.issue_list.setItem(i, 0, QTableWidgetItem(type_name))
+            self.issue_list.setItem(i, 1, QTableWidgetItem(issue.location))
+
+        # 첫 번째 이슈 선택
+        if self.issues:
+            self.issue_list.selectRow(0)
+
+    def on_issue_selected(self):
+        """이슈 선택 시 가이드 표시"""
+        selected = self.issue_list.selectedItems()
+        if not selected:
+            return
+
+        row = selected[0].row()
+        issue = self.issues[row]
+
+        # 가이드 가져오기
+        guide = self.GUIDES.get(issue.issue_type, self.DEFAULT_GUIDE)
+
+        self.guide_title.setText(f"📖 {guide['title']}")
+
+        content = f"""**위치:** {issue.location}
+
+**설명:** {issue.description}
+
+---
+
+{guide['solution']}
+"""
+        # Markdown 스타일 적용 (간단한 변환)
+        content = content.replace("```sql", '<pre style="background-color:#f0f0f0; padding:8px;">')
+        content = content.replace("```", "</pre>")
+        content = content.replace("**", "<b>").replace("**", "</b>")
+
+        self.guide_content.setHtml(content.replace("\n", "<br>"))
 
 
 class MigrationWizard:

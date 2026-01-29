@@ -1,12 +1,16 @@
 """
 마이그레이션 자동 수정 위저드 UI
 
-4단계 QWizard:
+5단계 QWizard:
 1. IssueSelectionPage: 수정할 이슈 선택
-2. FixOptionPage: 이슈별 수정 옵션 선택
-3. PreviewPage: SQL 미리보기 및 Dry-run
-4. ExecutionPage: 실제 실행 및 결과 표시
+2. CharsetFixPage: 문자셋 이슈 테이블 선택 (FK 안전 변경)
+3. FixOptionPage: 기타 이슈별 수정 옵션 선택
+4. PreviewPage: SQL 미리보기 및 Dry-run
+5. ExecutionPage: 실제 실행 및 결과 표시
 """
+
+import os
+from datetime import datetime
 
 from PyQt6.QtWidgets import (
     QWizard, QWizardPage, QVBoxLayout, QHBoxLayout, QFormLayout,
@@ -15,7 +19,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
     QWidget, QFrame, QSplitter, QMessageBox, QApplication,
     QTreeWidget, QTreeWidgetItem, QDialog, QDialogButtonBox,
-    QComboBox, QSpacerItem, QSizePolicy
+    QComboBox, QSpacerItem, QSizePolicy, QFileDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui import QFont, QColor, QIcon
@@ -27,13 +31,22 @@ from src.core.migration_constants import IssueType
 from src.core.migration_fix_wizard import (
     FixStrategy, FixOption, FixWizardStep,
     SmartFixGenerator, BatchFixExecutor, create_wizard_steps,
-    CollationFKGraphBuilder
+    CollationFKGraphBuilder, CharsetFixPlanBuilder, CharsetTableInfo,
+    FKSafeCharsetChanger
 )
 from src.ui.workers.fix_wizard_worker import FixWizardWorker
 
 
 class FixWizardDialog(QWizard):
-    """마이그레이션 자동 수정 위저드"""
+    """마이그레이션 자동 수정 위저드
+
+    5단계 QWizard:
+    1. IssueSelectionPage: 수정할 이슈 선택
+    2. CharsetFixPage: 문자셋 이슈 테이블 선택 (FK 안전 변경)
+    3. FixOptionPage: 이슈별 수정 옵션 선택 (문자셋 제외)
+    4. PreviewPage: SQL 미리보기 및 Dry-run
+    5. ExecutionPage: 실제 실행 및 결과 표시
+    """
 
     def __init__(
         self,
@@ -51,6 +64,14 @@ class FixWizardDialog(QWizard):
         self.wizard_steps: List[FixWizardStep] = []
         self.selected_issues: List[CompatibilityIssue] = []
         self._is_closing = False
+
+        # 문자셋 이슈 분리
+        self.charset_issues: List[CompatibilityIssue] = []
+        self.other_issues: List[CompatibilityIssue] = []
+
+        # 문자셋 수정 계획
+        self.charset_plan_builder: Optional[CharsetFixPlanBuilder] = None
+        self.charset_tables_to_fix: Set[str] = set()  # 실제 수정할 테이블
 
         self.init_ui()
 
@@ -89,24 +110,34 @@ class FixWizardDialog(QWizard):
     def init_ui(self):
         self.setWindowTitle("🔧 마이그레이션 자동 수정 위저드")
         self.setWizardStyle(QWizard.WizardStyle.ModernStyle)
-        self.resize(900, 650)
+        self.resize(900, 700)
 
-        # 페이지 추가
+        # 페이지 추가 (ID 저장)
         self.issue_page = IssueSelectionPage(self)
+        self.charset_fix_page = CharsetFixPage(self)
         self.option_page = FixOptionPage(self)
         self.preview_page = PreviewPage(self)
         self.execution_page = ExecutionPage(self)
 
-        self.addPage(self.issue_page)
-        self.addPage(self.option_page)
-        self.addPage(self.preview_page)
-        self.addPage(self.execution_page)
+        self.issue_page_id = self.addPage(self.issue_page)
+        self.charset_fix_page_id = self.addPage(self.charset_fix_page)
+        self.option_page_id = self.addPage(self.option_page)
+        self.preview_page_id = self.addPage(self.preview_page)
+        self.execution_page_id = self.addPage(self.execution_page)
 
         # 버튼 텍스트 변경
         self.setButtonText(QWizard.WizardButton.NextButton, "다음 >")
         self.setButtonText(QWizard.WizardButton.BackButton, "< 이전")
         self.setButtonText(QWizard.WizardButton.FinishButton, "완료")
         self.setButtonText(QWizard.WizardButton.CancelButton, "취소")
+
+    def has_charset_issues(self) -> bool:
+        """문자셋 이슈가 있는지 확인"""
+        return len(self.charset_issues) > 0
+
+    def has_other_issues(self) -> bool:
+        """문자셋 외 다른 이슈가 있는지 확인"""
+        return len(self.other_issues) > 0
 
 
 class IssueSelectionPage(QWizardPage):
@@ -136,13 +167,8 @@ class IssueSelectionPage(QWizardPage):
         self.chk_warning.setChecked(True)
         self.chk_warning.stateChanged.connect(self.filter_issues)
 
-        self.chk_auto_fixable = QCheckBox("자동 수정 가능만")
-        self.chk_auto_fixable.setChecked(False)
-        self.chk_auto_fixable.stateChanged.connect(self.filter_issues)
-
         filter_layout.addWidget(self.chk_error)
         filter_layout.addWidget(self.chk_warning)
-        filter_layout.addWidget(self.chk_auto_fixable)
         filter_layout.addStretch()
 
         layout.addWidget(filter_group)
@@ -258,17 +284,6 @@ class IssueSelectionPage(QWizardPage):
         """이슈 필터링"""
         show_error = self.chk_error.isChecked()
         show_warning = self.chk_warning.isChecked()
-        auto_fixable_only = self.chk_auto_fixable.isChecked()
-
-        auto_fixable_types = {
-            IssueType.INVALID_DATE,
-            IssueType.CHARSET_ISSUE,
-            IssueType.ZEROFILL_USAGE,
-            IssueType.FLOAT_PRECISION,
-            IssueType.INT_DISPLAY_WIDTH,
-            IssueType.DEPRECATED_ENGINE,
-            IssueType.ENUM_EMPTY_VALUE,
-        }
 
         for i, issue in enumerate(self.wizard_dialog.issues):
             visible = True
@@ -277,10 +292,6 @@ class IssueSelectionPage(QWizardPage):
             if issue.severity == "error" and not show_error:
                 visible = False
             elif issue.severity == "warning" and not show_warning:
-                visible = False
-
-            # 자동 수정 가능 필터
-            if auto_fixable_only and issue.issue_type not in auto_fixable_types:
                 visible = False
 
             self.table.setRowHidden(i, not visible)
@@ -338,12 +349,408 @@ class IssueSelectionPage(QWizardPage):
 
         self.wizard_dialog.selected_issues = selected
 
-        # 위저드 단계 생성
+        # 문자셋 이슈와 다른 이슈 분리
+        charset_issues = []
+        other_issues = []
+
+        for issue in selected:
+            if issue.issue_type == IssueType.CHARSET_ISSUE:
+                charset_issues.append(issue)
+            else:
+                other_issues.append(issue)
+
+        self.wizard_dialog.charset_issues = charset_issues
+        self.wizard_dialog.other_issues = other_issues
+
+        # 문자셋 수정 계획 빌더 초기화
+        if charset_issues:
+            # 원본 이슈 테이블 집합 추출
+            original_tables = set()
+            for issue in charset_issues:
+                parts = issue.location.split('.')
+                if len(parts) >= 2:
+                    original_tables.add(parts[1])  # schema.table → table
+
+            self.wizard_dialog.charset_plan_builder = CharsetFixPlanBuilder(
+                self.wizard_dialog.connector,
+                self.wizard_dialog.schema,
+                original_tables
+            )
+        else:
+            self.wizard_dialog.charset_plan_builder = None
+
+        # 다른 이슈에 대한 위저드 단계 생성 (문자셋 제외)
         self.wizard_dialog.wizard_steps = create_wizard_steps(
-            selected,
+            other_issues,
             self.wizard_dialog.connector,
             self.wizard_dialog.schema
         )
+
+        return True
+
+
+class CharsetFixPage(QWizardPage):
+    """2단계: 문자셋 변경 대상 테이블 선택
+
+    FK 안전 변경 방식으로 일괄 처리합니다.
+    - 모든 테이블이 기본 선택됨
+    - 체크 해제 시 = 건너뛰기
+    - 건너뛰기 시 FK 연쇄 영향 확인 다이얼로그 표시
+    """
+
+    def __init__(self, wizard: FixWizardDialog):
+        super().__init__(wizard)
+        self.wizard_dialog = wizard
+
+        self.setTitle("문자셋 변경 대상 테이블")
+        self.setSubTitle("FK 안전 변경 방식으로 일괄 처리됩니다. (FK DROP → charset 변경 → FK 재생성)")
+
+        self.table_checkboxes: Dict[str, QCheckBox] = {}
+        self.table_infos: List[CharsetTableInfo] = []
+        self._updating_checkboxes = False  # 연쇄 업데이트 중 플래그
+
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 안내 텍스트
+        info_frame = QFrame()
+        info_frame.setStyleSheet("""
+            QFrame {
+                background-color: #e8f4fd;
+                border: 1px solid #90caf9;
+                border-radius: 4px;
+                padding: 10px;
+            }
+        """)
+        info_layout = QVBoxLayout(info_frame)
+
+        info_label = QLabel(
+            "ℹ️ <b>FK 안전 변경 방식</b>으로 모든 테이블이 일괄 처리됩니다.<br>"
+            "체크 해제 시 해당 테이블을 건너뜁니다.<br>"
+            "FK 관계로 인해 연쇄적으로 건너뛰어야 하는 테이블이 있을 수 있습니다."
+        )
+        info_label.setWordWrap(True)
+        info_layout.addWidget(info_label)
+
+        layout.addWidget(info_frame)
+
+        # 테이블 목록 영역
+        self.table_group = QGroupBox("대상 테이블")
+        table_layout = QVBoxLayout(self.table_group)
+
+        # 스크롤 영역
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setMinimumHeight(300)
+
+        self.scroll_content = QWidget()
+        self.scroll_layout = QVBoxLayout(self.scroll_content)
+        self.scroll_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+
+        scroll_area.setWidget(self.scroll_content)
+        table_layout.addWidget(scroll_area)
+
+        layout.addWidget(self.table_group)
+
+        # 통계 라벨
+        stats_layout = QHBoxLayout()
+        self.lbl_stats = QLabel("선택됨: 0개 | 건너뛰기: 0개 | 총 FK: 0개")
+        self.lbl_stats.setStyleSheet("font-weight: bold; color: #333;")
+        stats_layout.addWidget(self.lbl_stats)
+        stats_layout.addStretch()
+        layout.addLayout(stats_layout)
+
+        # 버튼
+        btn_layout = QHBoxLayout()
+
+        btn_select_all = QPushButton("전체 선택")
+        btn_select_all.clicked.connect(self.select_all)
+
+        btn_deselect_all = QPushButton("전체 해제")
+        btn_deselect_all.clicked.connect(self.deselect_all)
+
+        btn_layout.addWidget(btn_select_all)
+        btn_layout.addWidget(btn_deselect_all)
+        btn_layout.addStretch()
+
+        layout.addLayout(btn_layout)
+
+    def initializePage(self):
+        """페이지 초기화"""
+        # 문자셋 이슈가 없으면 이 페이지 건너뛰기
+        if not self.wizard_dialog.has_charset_issues():
+            return
+
+        # 기존 체크박스 제거
+        for i in reversed(range(self.scroll_layout.count())):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if widget:
+                widget.deleteLater()
+        self.table_checkboxes.clear()
+
+        # 테이블 목록 빌드
+        plan_builder = self.wizard_dialog.charset_plan_builder
+        if not plan_builder:
+            return
+
+        self.table_infos = plan_builder.build_full_table_list()
+
+        # 테이블별 체크박스 생성
+        for info in self.table_infos:
+            widget = self._create_table_widget(info)
+            self.scroll_layout.addWidget(widget)
+
+        self.update_stats()
+
+    def _create_table_widget(self, info: CharsetTableInfo) -> QWidget:
+        """테이블 위젯 생성"""
+        widget = QFrame()
+        widget.setStyleSheet("""
+            QFrame {
+                background-color: #fafafa;
+                border: 1px solid #e0e0e0;
+                border-radius: 4px;
+                padding: 8px;
+                margin: 2px;
+            }
+            QFrame:hover {
+                background-color: #f0f0f0;
+            }
+        """)
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+
+        # 첫 번째 줄: 체크박스 + 테이블명 + 태그
+        header_layout = QHBoxLayout()
+
+        chk = QCheckBox()
+        chk.setChecked(not info.skip)
+        chk.stateChanged.connect(lambda state, t=info.table_name: self.on_table_check_changed(t, state))
+        self.table_checkboxes[info.table_name] = chk
+        header_layout.addWidget(chk)
+
+        # 테이블명
+        lbl_name = QLabel(f"<b>{info.table_name}</b>")
+        header_layout.addWidget(lbl_name)
+
+        # 태그: 원본 이슈 / FK 연관
+        if info.is_original_issue:
+            tag = QLabel("원본 이슈")
+            tag.setStyleSheet("""
+                QLabel {
+                    background-color: #e74c3c;
+                    color: white;
+                    padding: 2px 6px;
+                    border-radius: 3px;
+                    font-size: 10px;
+                }
+            """)
+        else:
+            tag = QLabel("FK 연관")
+            tag.setStyleSheet("""
+                QLabel {
+                    background-color: #3498db;
+                    color: white;
+                    padding: 2px 6px;
+                    border-radius: 3px;
+                    font-size: 10px;
+                }
+            """)
+        header_layout.addWidget(tag)
+        header_layout.addStretch()
+
+        # 현재 charset
+        lbl_charset = QLabel(f"{info.current_charset} / {info.current_collation}")
+        lbl_charset.setStyleSheet("color: #666; font-size: 11px;")
+        header_layout.addWidget(lbl_charset)
+
+        layout.addLayout(header_layout)
+
+        # 두 번째 줄: FK 관계
+        if info.fk_parents or info.fk_children:
+            fk_layout = QHBoxLayout()
+            fk_layout.setContentsMargins(24, 0, 0, 0)
+
+            fk_parts = []
+            if info.fk_parents:
+                fk_parts.append(f"부모: {', '.join(info.fk_parents)}")
+            if info.fk_children:
+                fk_parts.append(f"자식: {', '.join(info.fk_children)}")
+
+            lbl_fk = QLabel("└─ FK: " + " | ".join(fk_parts))
+            lbl_fk.setStyleSheet("color: #888; font-size: 10px;")
+            fk_layout.addWidget(lbl_fk)
+            fk_layout.addStretch()
+
+            layout.addLayout(fk_layout)
+
+        return widget
+
+    def on_table_check_changed(self, table_name: str, state: int):
+        """테이블 체크 상태 변경"""
+        if self._updating_checkboxes:
+            return
+
+        is_checked = (state == Qt.CheckState.Checked.value)
+
+        if not is_checked:
+            # 건너뛰기 선택 → 연쇄 확인
+            self._handle_skip_table(table_name)
+        else:
+            # 선택 복원
+            self._handle_restore_table(table_name)
+
+        self.update_stats()
+        self.completeChanged.emit()
+
+    def _handle_skip_table(self, table_name: str):
+        """테이블 건너뛰기 처리"""
+        plan_builder = self.wizard_dialog.charset_plan_builder
+        if not plan_builder:
+            return
+
+        # 연쇄 건너뛰기 테이블 계산
+        cascade_tables = plan_builder.get_cascade_skip_tables(table_name)
+
+        if cascade_tables:
+            # 확인 다이얼로그
+            cascade_list = '\n'.join(f"• {t}" for t in sorted(cascade_tables))
+            reply = QMessageBox.question(
+                self,
+                "연쇄 건너뛰기 확인",
+                f"'{table_name}' 테이블을 건너뛰면\n"
+                f"FK 관계로 인해 다음 테이블도 함께 건너뛰어야 합니다:\n\n"
+                f"{cascade_list}\n\n"
+                f"진행하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+            if reply == QMessageBox.StandardButton.Yes:
+                # 연쇄 테이블도 함께 건너뛰기
+                self._skip_tables({table_name} | cascade_tables)
+            else:
+                # 체크박스 복원
+                self._restore_checkbox(table_name)
+        else:
+            # 연쇄 영향 없음 → 바로 건너뛰기
+            self._skip_tables({table_name})
+
+    def _handle_restore_table(self, table_name: str):
+        """테이블 복원 처리 (건너뛰기 해제)"""
+        # table_infos에서 해당 테이블 찾아서 skip 해제
+        for info in self.table_infos:
+            if info.table_name == table_name:
+                info.skip = False
+                break
+
+    def _skip_tables(self, tables: Set[str]):
+        """테이블들을 건너뛰기 처리"""
+        self._updating_checkboxes = True
+        try:
+            for table in tables:
+                # table_infos 업데이트
+                for info in self.table_infos:
+                    if info.table_name == table:
+                        info.skip = True
+                        break
+
+                # 체크박스 업데이트
+                if table in self.table_checkboxes:
+                    self.table_checkboxes[table].setChecked(False)
+        finally:
+            self._updating_checkboxes = False
+
+    def _restore_checkbox(self, table_name: str):
+        """체크박스 복원 (건너뛰기 취소)"""
+        self._updating_checkboxes = True
+        try:
+            if table_name in self.table_checkboxes:
+                self.table_checkboxes[table_name].setChecked(True)
+        finally:
+            self._updating_checkboxes = False
+
+    def select_all(self):
+        """전체 선택"""
+        self._updating_checkboxes = True
+        try:
+            for info in self.table_infos:
+                info.skip = False
+            for chk in self.table_checkboxes.values():
+                chk.setChecked(True)
+        finally:
+            self._updating_checkboxes = False
+        self.update_stats()
+        self.completeChanged.emit()
+
+    def deselect_all(self):
+        """전체 해제"""
+        self._updating_checkboxes = True
+        try:
+            for info in self.table_infos:
+                info.skip = True
+            for chk in self.table_checkboxes.values():
+                chk.setChecked(False)
+        finally:
+            self._updating_checkboxes = False
+        self.update_stats()
+        self.completeChanged.emit()
+
+    def update_stats(self):
+        """통계 업데이트"""
+        total = len(self.table_infos)
+        selected = sum(1 for info in self.table_infos if not info.skip)
+        skipped = total - selected
+
+        # FK 개수 계산
+        fk_count = 0
+        if self.wizard_dialog.charset_plan_builder:
+            tables_to_fix = {info.table_name for info in self.table_infos if not info.skip}
+            if tables_to_fix:
+                changer = FKSafeCharsetChanger(
+                    self.wizard_dialog.connector,
+                    self.wizard_dialog.schema
+                )
+                fks = changer.get_related_fks(tables_to_fix)
+                fk_count = len(fks)
+
+        self.lbl_stats.setText(f"선택됨: {selected}개 | 건너뛰기: {skipped}개 | 총 FK: {fk_count}개")
+
+    def isComplete(self) -> bool:
+        """다음 단계 진행 가능 여부"""
+        # 문자셋 이슈가 없으면 무조건 통과
+        if not self.wizard_dialog.has_charset_issues():
+            return True
+
+        # 최소 1개 테이블 선택 필요
+        return any(not info.skip for info in self.table_infos)
+
+    def nextId(self) -> int:
+        """다음 페이지 결정
+
+        다른 이슈가 없으면 FixOptionPage 건너뛰기
+        """
+        # 문자셋 이슈가 없으면 다음 페이지(FixOptionPage)로
+        if not self.wizard_dialog.has_charset_issues():
+            # 다른 이슈도 없으면 PreviewPage로
+            if not self.wizard_dialog.has_other_issues():
+                return self.wizard_dialog.preview_page_id
+            return self.wizard_dialog.option_page_id
+
+        # 다른 이슈가 없으면 PreviewPage로
+        if not self.wizard_dialog.has_other_issues():
+            return self.wizard_dialog.preview_page_id
+
+        # 기본: 다음 페이지 (FixOptionPage)
+        return self.wizard_dialog.option_page_id
+
+    def validatePage(self) -> bool:
+        """페이지 유효성 검사 및 데이터 저장"""
+        # 선택된 테이블 저장
+        tables_to_fix = {info.table_name for info in self.table_infos if not info.skip}
+        self.wizard_dialog.charset_tables_to_fix = tables_to_fix
 
         return True
 
@@ -580,13 +987,15 @@ class IncludedTablesDialog(QDialog):
 
 
 class FixOptionPage(QWizardPage):
-    """2단계: 이슈별 수정 옵션 선택 (UX 개선 버전)
+    """3단계: 이슈별 수정 옵션 선택 (문자셋 제외)
 
     개선 사항:
     - 전체 일괄 옵션 적용
     - FK 연관 테이블 Tree 시각화
     - FK 연관테이블 일괄 변경 시 자동 포함 (옵션 선택만 건너뜀)
     - 자동 포함된 테이블 건너뛰기 네비게이션
+
+    참고: 문자셋 이슈는 CharsetFixPage에서 처리됨
     """
 
     def __init__(self, wizard: FixWizardDialog):
@@ -594,7 +1003,7 @@ class FixOptionPage(QWizardPage):
         self.wizard_dialog = wizard
 
         self.setTitle("수정 옵션 선택")
-        self.setSubTitle("각 이슈에 대한 수정 방법을 선택하세요.")
+        self.setSubTitle("각 이슈에 대한 수정 방법을 선택하세요. (문자셋 이슈는 이전 단계에서 처리됨)")
 
         self.current_index = 0
         self.option_buttons: List[QRadioButton] = []
@@ -748,24 +1157,17 @@ class FixOptionPage(QWizardPage):
         layout.addStretch()
 
     def initializePage(self):
-        """페이지 초기화"""
+        """페이지 초기화
+
+        참고: 문자셋 이슈는 CharsetFixPage에서 이미 처리됨.
+              wizard_steps에는 문자셋 제외 이슈만 포함됨.
+        """
         self.current_index = 0
         self._fk_graph_builder = None
 
-        # FK 그래프 빌더 초기화 (Collation 이슈가 있을 경우)
-        has_charset_issue = any(
-            s.issue_type == IssueType.CHARSET_ISSUE
-            for s in self.wizard_dialog.wizard_steps
-        )
-        if has_charset_issue and self.wizard_dialog.connector:
-            try:
-                self._fk_graph_builder = CollationFKGraphBuilder(
-                    self.wizard_dialog.connector,
-                    self.wizard_dialog.schema
-                )
-                self._fk_graph_builder.build_graph()
-            except Exception:
-                self._fk_graph_builder = None
+        # 다른 이슈가 없으면 이 페이지 건너뛰기 (show_current_issue에서 빈 상태 처리)
+        if not self.wizard_dialog.wizard_steps:
+            return
 
         # 첫 번째 미포함(옵션 선택 필요) 이슈로 이동
         self._move_to_first_not_included()
@@ -1077,8 +1479,24 @@ class FixOptionPage(QWizardPage):
         dialog = IncludedTablesDialog(self.wizard_dialog.wizard_steps, self)
         dialog.exec()
 
+    def isComplete(self) -> bool:
+        """다음 단계 진행 가능 여부"""
+        # 다른 이슈가 없으면 무조건 통과
+        if not self.wizard_dialog.wizard_steps:
+            return True
+        return True  # 옵션 선택은 validatePage에서 검증
+
+    def nextId(self) -> int:
+        """다음 페이지 결정"""
+        # 기본: 다음 페이지 (PreviewPage)
+        return self.wizard_dialog.preview_page_id
+
     def validatePage(self) -> bool:
         """페이지 유효성 검사"""
+        # 다른 이슈가 없으면 바로 통과
+        if not self.wizard_dialog.wizard_steps:
+            return True
+
         self.save_current_selection()
 
         # 모든 옵션 선택 필요 이슈에 옵션이 선택되었는지 확인
@@ -1098,7 +1516,11 @@ class FixOptionPage(QWizardPage):
 
 
 class PreviewPage(QWizardPage):
-    """3단계: SQL 미리보기 및 Dry-run"""
+    """4단계: SQL 미리보기 및 Dry-run
+
+    1. 문자셋 변경 SQL (FK 안전 변경)
+    2. 기타 이슈 수정 SQL
+    """
 
     def __init__(self, wizard: FixWizardDialog):
         super().__init__(wizard)
@@ -1174,62 +1596,85 @@ class PreviewPage(QWizardPage):
     def generate_sql_preview(self):
         """SQL 미리보기 생성
 
-        자동 포함된 테이블의 SQL은 원본 테이블의 SQL에 이미 포함되어 있으므로 중복 출력하지 않습니다.
+        1. 문자셋 변경 SQL (CharsetFixPage에서 선택한 테이블)
+        2. 기타 이슈 SQL (FixOptionPage에서 선택한 옵션)
         """
         lines = []
-        steps = self.wizard_dialog.wizard_steps
+        counter = 0
 
-        # 통계
-        total = len(steps)
-        included_count = sum(1 for s in steps if s.included_by is not None)
-        execute_count = sum(
+        # === 헤더 ===
+        lines.append("-- ==========================================")
+        lines.append("-- 마이그레이션 자동 수정 SQL")
+        lines.append(f"-- 스키마: {self.wizard_dialog.schema}")
+        lines.append("-- ==========================================")
+        lines.append("")
+
+        # === 1. 문자셋 변경 SQL ===
+        charset_tables = self.wizard_dialog.charset_tables_to_fix
+        if charset_tables:
+            lines.append("-- ===== Part 1: 문자셋 변경 (FK 안전 변경) =====")
+            lines.append(f"-- 대상 테이블: {len(charset_tables)}개")
+            lines.append(f"-- 테이블 목록: {', '.join(sorted(charset_tables))}")
+            lines.append("")
+
+            # FKSafeCharsetChanger를 사용하여 SQL 생성
+            changer = FKSafeCharsetChanger(
+                self.wizard_dialog.connector,
+                self.wizard_dialog.schema
+            )
+            sql_parts = changer.generate_safe_charset_sql(
+                charset_tables,
+                charset="utf8mb4",
+                collation="utf8mb4_unicode_ci"
+            )
+
+            for sql_line in sql_parts['full_sql']:
+                lines.append(sql_line)
+
+            lines.append("")
+            counter += 1
+
+        # === 2. 기타 이슈 SQL ===
+        steps = self.wizard_dialog.wizard_steps
+        other_execute_count = sum(
             1 for s in steps
             if s.selected_option and s.selected_option.strategy != FixStrategy.SKIP
             and s.included_by is None
         )
 
-        lines.append("-- ==========================================")
-        lines.append("-- 마이그레이션 자동 수정 SQL")
-        lines.append(f"-- 스키마: {self.wizard_dialog.schema}")
-        lines.append(f"-- 전체 이슈: {total}개")
-        lines.append(f"-- 실행 대상: {execute_count}개")
-        if included_count > 0:
-            lines.append(f"-- FK 일괄 변경에 자동 포함: {included_count}개")
-        lines.append("-- ==========================================")
-        lines.append("")
+        if steps:
+            lines.append("-- ===== Part 2: 기타 이슈 수정 =====")
+            lines.append(f"-- 대상 이슈: {other_execute_count}개")
+            lines.append("")
 
-        # 이미 출력한 SQL 추적 (FK 일괄 변경 중복 방지)
-        processed_sql_hashes: set = set()
-        counter = 0
+            # 이미 출력한 SQL 추적 (FK 일괄 변경 중복 방지)
+            processed_sql_hashes: set = set()
 
-        for step in steps:
-            # 자동 포함된 테이블은 건너뛰기 (원본 테이블의 SQL에 이미 포함됨)
-            if step.included_by is not None:
-                continue
-
-            if step.selected_option and step.selected_option.strategy != FixStrategy.SKIP:
-                sql = step.selected_option.sql_template or ""
-                if step.selected_option.requires_input and step.user_input:
-                    sql = sql.replace("{custom_date}", step.user_input)
-                    sql = sql.replace("{precision}", step.user_input)
-
-                # SQL 중복 체크
-                sql_hash = hash(sql)
-                if sql_hash in processed_sql_hashes:
+            for step in steps:
+                # 자동 포함된 테이블은 건너뛰기 (원본 테이블의 SQL에 이미 포함됨)
+                if step.included_by is not None:
                     continue
-                processed_sql_hashes.add(sql_hash)
 
-                counter += 1
-                lines.append(f"-- [{counter}] {step.location}")
-                lines.append(f"-- 전략: {step.selected_option.label}")
+                if step.selected_option and step.selected_option.strategy != FixStrategy.SKIP:
+                    sql = step.selected_option.sql_template or ""
+                    if step.selected_option.requires_input and step.user_input:
+                        sql = sql.replace("{custom_date}", step.user_input)
+                        sql = sql.replace("{precision}", step.user_input)
 
-                # FK 일괄 변경인 경우 포함된 테이블 명시
-                if step.selected_option.strategy == FixStrategy.COLLATION_FK_CASCADE:
-                    if step.selected_option.related_tables:
-                        lines.append(f"-- 포함 테이블: {', '.join(step.selected_option.related_tables)}")
+                    # SQL 중복 체크
+                    sql_hash = hash(sql)
+                    if sql_hash in processed_sql_hashes:
+                        continue
+                    processed_sql_hashes.add(sql_hash)
 
-                lines.append(sql)
-                lines.append("")
+                    counter += 1
+                    lines.append(f"-- [{counter}] {step.location}")
+                    lines.append(f"-- 전략: {step.selected_option.label}")
+                    lines.append(sql)
+                    lines.append("")
+
+        if counter == 0:
+            lines.append("-- (실행할 SQL이 없습니다)")
 
         self.txt_sql.setText("\n".join(lines))
         self.txt_dryrun.clear()
@@ -1247,7 +1692,8 @@ class PreviewPage(QWizardPage):
             connector=self.wizard_dialog.connector,
             schema=self.wizard_dialog.schema,
             steps=self.wizard_dialog.wizard_steps,
-            dry_run=True
+            dry_run=True,
+            charset_tables_to_fix=self.wizard_dialog.charset_tables_to_fix
         )
 
         self.worker.progress.connect(self.on_progress)
@@ -1267,24 +1713,36 @@ class PreviewPage(QWizardPage):
             self.txt_dryrun.append("")
             self.txt_dryrun.append("=" * 50)
             self.txt_dryrun.append(f"✅ Dry-run 완료")
-            self.txt_dryrun.append(f"  - 성공: {result.success_count}개")
-            self.txt_dryrun.append(f"  - 건너뛰기: {result.skip_count}개")
-            self.txt_dryrun.append(f"  - 예상 영향 행: {result.total_affected_rows:,}개")
+
+            # CombinedExecutionResult 또는 BatchExecutionResult 처리
+            if hasattr(result, 'charset_tables_count'):
+                # CombinedExecutionResult
+                if result.charset_tables_count > 0:
+                    self.txt_dryrun.append(f"  - 문자셋 변경: {result.charset_tables_count}개 테이블, {result.charset_fk_count}개 FK")
+                if result.other_result:
+                    self.txt_dryrun.append(f"  - 기타 이슈: 성공 {result.other_result.success_count}개, 건너뛰기 {result.other_result.skip_count}개")
+                self.txt_dryrun.append(f"  - 총 영향: {result.total_affected_rows:,}개")
+            else:
+                # BatchExecutionResult (하위 호환)
+                self.txt_dryrun.append(f"  - 성공: {result.success_count}개")
+                self.txt_dryrun.append(f"  - 건너뛰기: {result.skip_count}개")
+                self.txt_dryrun.append(f"  - 예상 영향 행: {result.total_affected_rows:,}개")
         else:
             self.txt_dryrun.append(f"❌ Dry-run 오류: {message}")
 
 
 class ExecutionPage(QWizardPage):
-    """4단계: 실제 실행 및 결과"""
+    """5단계: 실제 실행 및 결과"""
 
     def __init__(self, wizard: FixWizardDialog):
         super().__init__(wizard)
         self.wizard_dialog = wizard
         self.worker: Optional[FixWizardWorker] = None
         self.executed = False
+        self.rollback_sql_path: Optional[str] = None  # 저장된 Rollback SQL 경로
 
         self.setTitle("실행")
-        self.setSubTitle("수정 작업을 실행합니다. 이 작업은 되돌릴 수 없습니다.")
+        self.setSubTitle("수정 작업을 실행합니다. 문제 발생 시 Rollback SQL을 제공합니다.")
 
         self.setCommitPage(True)  # Commit 버튼 사용
 
@@ -1342,6 +1800,42 @@ class ExecutionPage(QWizardPage):
 
         layout.addWidget(self.grp_result)
 
+        # Rollback SQL 안내
+        self.grp_rollback = QGroupBox("🔄 Rollback SQL")
+        self.grp_rollback.setVisible(False)
+        rollback_layout = QVBoxLayout(self.grp_rollback)
+
+        self.lbl_rollback_info = QLabel()
+        self.lbl_rollback_info.setWordWrap(True)
+        self.lbl_rollback_info.setStyleSheet("""
+            QLabel {
+                background-color: #e8f4fd;
+                color: #1565c0;
+                padding: 10px;
+                border: 1px solid #90caf9;
+                border-radius: 4px;
+            }
+        """)
+        rollback_layout.addWidget(self.lbl_rollback_info)
+
+        rollback_btn_layout = QHBoxLayout()
+        self.btn_open_rollback = QPushButton("📂 파일 열기")
+        self.btn_open_rollback.clicked.connect(self.open_rollback_file)
+
+        self.btn_copy_rollback = QPushButton("📋 SQL 복사")
+        self.btn_copy_rollback.clicked.connect(self.copy_rollback_sql)
+
+        self.btn_save_rollback_as = QPushButton("💾 다른 위치에 저장")
+        self.btn_save_rollback_as.clicked.connect(self.save_rollback_as)
+
+        rollback_btn_layout.addWidget(self.btn_open_rollback)
+        rollback_btn_layout.addWidget(self.btn_copy_rollback)
+        rollback_btn_layout.addWidget(self.btn_save_rollback_as)
+        rollback_btn_layout.addStretch()
+
+        rollback_layout.addLayout(rollback_btn_layout)
+        layout.addWidget(self.grp_rollback)
+
         # 실행 버튼
         btn_layout = QHBoxLayout()
 
@@ -1367,17 +1861,23 @@ class ExecutionPage(QWizardPage):
         self.txt_log.clear()
         self.progress_bar.setValue(0)
         self.grp_result.setVisible(False)
+        self.grp_rollback.setVisible(False)
         self.executed = False
 
         # 실행할 작업 요약
+        charset_count = len(self.wizard_dialog.charset_tables_to_fix)
         steps = self.wizard_dialog.wizard_steps
-        execute_count = sum(1 for s in steps
-                           if s.selected_option and s.selected_option.strategy != FixStrategy.SKIP)
+        other_execute_count = sum(1 for s in steps
+                                  if s.selected_option and s.selected_option.strategy != FixStrategy.SKIP)
 
         self.txt_log.append(f"📋 실행 대기 중...")
-        self.txt_log.append(f"  - 총 이슈: {len(steps)}개")
-        self.txt_log.append(f"  - 실행 예정: {execute_count}개")
-        self.txt_log.append(f"  - 건너뛰기: {len(steps) - execute_count}개")
+        if charset_count > 0:
+            self.txt_log.append(f"  - 문자셋 변경: {charset_count}개 테이블 (FK 안전 변경)")
+        if steps:
+            self.txt_log.append(f"  - 기타 이슈: {other_execute_count}개")
+            skip_count = len(steps) - other_execute_count
+            if skip_count > 0:
+                self.txt_log.append(f"  - 건너뛰기: {skip_count}개")
         self.txt_log.append("")
         self.txt_log.append("'실행' 버튼을 클릭하여 수정을 적용하세요.")
 
@@ -1405,7 +1905,8 @@ class ExecutionPage(QWizardPage):
             connector=self.wizard_dialog.connector,
             schema=self.wizard_dialog.schema,
             steps=self.wizard_dialog.wizard_steps,
-            dry_run=False
+            dry_run=False,
+            charset_tables_to_fix=self.wizard_dialog.charset_tables_to_fix
         )
 
         self.worker.progress.connect(self.on_progress)
@@ -1430,17 +1931,146 @@ class ExecutionPage(QWizardPage):
 
             # 결과 요약 표시
             self.grp_result.setVisible(True)
-            self.lbl_total.setText(str(result.total_steps))
-            self.lbl_success.setText(f"{result.success_count}개")
-            self.lbl_fail.setText(f"{result.fail_count}개")
-            self.lbl_affected.setText(f"{result.total_affected_rows:,}개")
 
-            if result.fail_count > 0:
+            # CombinedExecutionResult 또는 BatchExecutionResult 처리
+            if hasattr(result, 'charset_tables_count'):
+                # CombinedExecutionResult
+                total_items = result.charset_tables_count
+                if result.other_result:
+                    total_items += result.other_result.total_steps
+
+                self.lbl_total.setText(str(total_items))
+                self.lbl_success.setText(f"{result.total_success_count}개")
+                self.lbl_fail.setText(f"{result.total_fail_count}개")
+                self.lbl_affected.setText(f"{result.total_affected_rows:,}개")
+
+                fail_count = result.total_fail_count
+            else:
+                # BatchExecutionResult (하위 호환)
+                self.lbl_total.setText(str(result.total_steps))
+                self.lbl_success.setText(f"{result.success_count}개")
+                self.lbl_fail.setText(f"{result.fail_count}개")
+                self.lbl_affected.setText(f"{result.total_affected_rows:,}개")
+                fail_count = result.fail_count
+
+            if fail_count > 0:
                 self.lbl_fail.setStyleSheet("color: #e74c3c; font-weight: bold;")
+
+            # Rollback SQL 저장 및 표시
+            rollback_sql = getattr(result, 'rollback_sql', '')
+            if rollback_sql:
+                self._save_and_show_rollback(rollback_sql)
         else:
             self.txt_log.append(f"❌ 실행 오류: {message}")
 
+            # 에러 발생 시에도 롤백 SQL 표시 (복원을 위해 중요!)
+            if result:
+                rollback_sql = getattr(result, 'rollback_sql', '')
+                if rollback_sql:
+                    self.txt_log.append("")
+                    self.txt_log.append("📋 롤백 SQL이 생성되었습니다. 복원에 사용하세요.")
+                    self._save_and_show_rollback(rollback_sql)
+
         self.completeChanged.emit()
+
+    def _get_rollback_dir(self) -> str:
+        """Rollback SQL 저장 디렉토리"""
+        if os.name == 'nt':
+            base_dir = os.path.join(
+                os.environ.get('LOCALAPPDATA', ''),
+                'TunnelForge', 'rollback'
+            )
+        else:
+            base_dir = os.path.join(
+                os.path.expanduser('~'),
+                '.config', 'tunnelforge', 'rollback'
+            )
+        os.makedirs(base_dir, exist_ok=True)
+        return base_dir
+
+    def _save_and_show_rollback(self, rollback_sql: str):
+        """Rollback SQL 저장 및 UI 표시"""
+        try:
+            # 파일명 생성
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            filename = f"rollback_{self.wizard_dialog.schema}_{timestamp}.sql"
+            rollback_dir = self._get_rollback_dir()
+            filepath = os.path.join(rollback_dir, filename)
+
+            # 파일 저장
+            with open(filepath, 'w', encoding='utf-8') as f:
+                f.write(rollback_sql)
+
+            self.rollback_sql_path = filepath
+            self._rollback_sql_content = rollback_sql
+
+            # UI 표시
+            self.grp_rollback.setVisible(True)
+            self.lbl_rollback_info.setText(
+                f"💡 <b>Rollback SQL이 자동 저장되었습니다.</b><br><br>"
+                f"문제 발생 시 아래 파일을 실행하여 변경사항을 되돌릴 수 있습니다:<br>"
+                f"<code>{filepath}</code><br><br>"
+                f"⚠️ DDL(ALTER TABLE)은 트랜잭션 롤백이 불가능하므로, "
+                f"문제 발생 시 이 SQL을 수동으로 실행하세요."
+            )
+
+            self.txt_log.append("")
+            self.txt_log.append(f"📝 Rollback SQL 저장됨: {filepath}")
+
+        except Exception as e:
+            self.txt_log.append(f"⚠️ Rollback SQL 저장 실패: {e}")
+            # 저장 실패해도 메모리에는 보관
+            self._rollback_sql_content = rollback_sql
+            self.grp_rollback.setVisible(True)
+            self.lbl_rollback_info.setText(
+                f"⚠️ Rollback SQL 파일 저장에 실패했습니다: {e}<br><br>"
+                f"'SQL 복사' 버튼으로 내용을 복사하여 수동으로 저장하세요."
+            )
+            self.btn_open_rollback.setEnabled(False)
+
+    def open_rollback_file(self):
+        """Rollback SQL 파일 열기"""
+        if self.rollback_sql_path and os.path.exists(self.rollback_sql_path):
+            if os.name == 'nt':
+                os.startfile(self.rollback_sql_path)
+            else:
+                import subprocess
+                subprocess.run(['xdg-open', self.rollback_sql_path])
+        else:
+            QMessageBox.warning(self, "파일 없음", "Rollback SQL 파일을 찾을 수 없습니다.")
+
+    def copy_rollback_sql(self):
+        """Rollback SQL 클립보드 복사"""
+        if hasattr(self, '_rollback_sql_content') and self._rollback_sql_content:
+            clipboard = QApplication.clipboard()
+            clipboard.setText(self._rollback_sql_content)
+            QMessageBox.information(self, "복사 완료", "Rollback SQL이 클립보드에 복사되었습니다.")
+        else:
+            QMessageBox.warning(self, "내용 없음", "복사할 Rollback SQL이 없습니다.")
+
+    def save_rollback_as(self):
+        """Rollback SQL 다른 위치에 저장"""
+        if not hasattr(self, '_rollback_sql_content') or not self._rollback_sql_content:
+            QMessageBox.warning(self, "내용 없음", "저장할 Rollback SQL이 없습니다.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default_name = f"rollback_{self.wizard_dialog.schema}_{timestamp}.sql"
+
+        filepath, _ = QFileDialog.getSaveFileName(
+            self,
+            "Rollback SQL 저장",
+            default_name,
+            "SQL 파일 (*.sql);;모든 파일 (*.*)"
+        )
+
+        if filepath:
+            try:
+                with open(filepath, 'w', encoding='utf-8') as f:
+                    f.write(self._rollback_sql_content)
+                QMessageBox.information(self, "저장 완료", f"Rollback SQL이 저장되었습니다:\n{filepath}")
+            except Exception as e:
+                QMessageBox.critical(self, "저장 실패", f"파일 저장 실패:\n{e}")
 
     def isComplete(self) -> bool:
         """완료 가능 여부"""

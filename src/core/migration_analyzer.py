@@ -400,7 +400,7 @@ class MigrationAnalyzer:
         FROM INFORMATION_SCHEMA.TABLES
         WHERE TABLE_SCHEMA = %s
             AND TABLE_TYPE = 'BASE TABLE'
-            AND (TABLE_COLLATION LIKE 'utf8_%%' OR TABLE_COLLATION LIKE 'utf8mb3_%%')
+            AND (TABLE_COLLATION LIKE 'utf8\\_%%' OR TABLE_COLLATION LIKE 'utf8mb3\\_%%')
         """
         tables = self.connector.execute(table_query, (schema,))
 
@@ -413,12 +413,16 @@ class MigrationAnalyzer:
                 suggestion="ALTER TABLE ... CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
             ))
 
-        # 컬럼 레벨 charset 확인
+        # 컬럼 레벨 charset 확인 (VIEW 제외, BASE TABLE만)
         column_query = """
-        SELECT TABLE_NAME, COLUMN_NAME, CHARACTER_SET_NAME, COLLATION_NAME
-        FROM INFORMATION_SCHEMA.COLUMNS
-        WHERE TABLE_SCHEMA = %s
-            AND CHARACTER_SET_NAME IN ('utf8', 'utf8mb3')
+        SELECT c.TABLE_NAME, c.COLUMN_NAME, c.CHARACTER_SET_NAME, c.COLLATION_NAME
+        FROM INFORMATION_SCHEMA.COLUMNS c
+        JOIN INFORMATION_SCHEMA.TABLES t
+            ON c.TABLE_NAME = t.TABLE_NAME
+            AND c.TABLE_SCHEMA = t.TABLE_SCHEMA
+        WHERE c.TABLE_SCHEMA = %s
+            AND c.CHARACTER_SET_NAME IN ('utf8', 'utf8mb3')
+            AND t.TABLE_TYPE = 'BASE TABLE'
         """
         columns = self.connector.execute(column_query, (schema,))
 
@@ -1246,7 +1250,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
                     print_tree(child, child_prefix, i == len(children) - 1, visited | {table})
 
         for i, root in enumerate(sorted(root_tables)):
-            print_tree(root, "", i == len(root_tables) - 1, {root})
+            print_tree(root, "", i == len(root_tables) - 1, set())
 
         return "\n".join(lines)
 

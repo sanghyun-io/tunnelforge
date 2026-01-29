@@ -27,6 +27,7 @@ class TunnelTreeWidget(QTreeWidget):
     tunnel_export = pyqtSignal(dict)             # Export 요청
     tunnel_import = pyqtSignal(dict)             # Import 요청
     tunnel_test = pyqtSignal(dict)               # 연결 테스트 요청
+    tunnel_duplicate = pyqtSignal(dict)          # 터널 복사 요청
     group_connect_all = pyqtSignal(str)          # 그룹 전체 연결
     group_disconnect_all = pyqtSignal(str)       # 그룹 전체 해제
     group_edit_requested = pyqtSignal(str)       # 그룹 수정 요청
@@ -299,6 +300,9 @@ class TunnelTreeWidget(QTreeWidget):
         elif item_type == self.ITEM_TYPE_TUNNEL:
             # 터널 컨텍스트 메뉴
             tunnel_data = item_data.get('data', {})
+
+            action_duplicate = menu.addAction("📋 복사하여 새로 만들기")
+            action_duplicate.triggered.connect(lambda: self.tunnel_duplicate.emit(tunnel_data))
 
             action_edit = menu.addAction("✏️ 수정")
             action_edit.triggered.connect(lambda: self.tunnel_edit_requested.emit(tunnel_data))
