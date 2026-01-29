@@ -3,11 +3,14 @@ SQL 쿼리 히스토리 관리
 - 실행한 쿼리 영구 저장
 - 히스토리 조회 (Chunk 지원)
 - 히스토리는 절대 삭제 불가 (영구 보관)
+- 고급 검색 (키워드, 날짜 범위, 성공/실패)
+- 즐겨찾기 기능
 """
 import os
 import json
+import uuid
 from datetime import datetime
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 
 
 class SQLHistory:
@@ -69,18 +72,21 @@ class SQLHistory:
             error: 에러 메시지 (실패 시)
 
         Returns:
-            생성된 히스토리 ID (timestamp)
+            생성된 히스토리 ID (UUID)
         """
         history = self._load_history()
 
+        history_id = str(uuid.uuid4())
         timestamp = datetime.now().isoformat()
         entry = {
+            'id': history_id,
             'timestamp': timestamp,
             'query': query,
             'success': success,
             'result_count': result_count,
             'execution_time': execution_time,
-            'status': status
+            'status': status,
+            'is_favorite': False
         }
 
         if error:
@@ -91,20 +97,21 @@ class SQLHistory:
 
         # 영구 보관 - 삭제 없음
         self._save_history(history)
-        return timestamp
+        return history_id
 
     def update_status(self, history_id: str, new_status: str):
         """
         히스토리 항목의 상태 업데이트
 
         Args:
-            history_id: 히스토리 ID (timestamp)
+            history_id: 히스토리 ID (UUID 또는 timestamp)
             new_status: 새 상태 ('committed', 'rolled_back')
         """
         history = self._load_history()
 
         for entry in history:
-            if entry.get('timestamp') == history_id:
+            # ID 또는 timestamp로 매칭 (하위 호환성)
+            if entry.get('id') == history_id or entry.get('timestamp') == history_id:
                 entry['status'] = new_status
                 break
 
@@ -125,7 +132,9 @@ class SQLHistory:
         ids_set = set(history_ids)
 
         for entry in history:
-            if entry.get('timestamp') in ids_set:
+            # ID 또는 timestamp로 매칭 (하위 호환성)
+            entry_id = entry.get('id') or entry.get('timestamp')
+            if entry_id in ids_set or entry.get('timestamp') in ids_set:
                 entry['status'] = new_status
 
         self._save_history(history)
@@ -196,3 +205,108 @@ class SQLHistory:
                     break
 
         return unique_queries
+
+    def search_advanced(
+        self,
+        keyword: Optional[str] = None,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        success_only: Optional[bool] = None,
+        favorites_only: bool = False,
+        limit: int = 50,
+        offset: int = 0
+    ) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        고급 검색 (다중 필터)
+
+        Args:
+            keyword: 쿼리 키워드 (대소문자 무시)
+            date_from: 시작 날짜
+            date_to: 종료 날짜
+            success_only: True=성공만, False=실패만, None=전체
+            favorites_only: 즐겨찾기만 조회
+            limit: 반환할 항목 수
+            offset: 시작 위치
+
+        Returns:
+            (결과 목록, 전체 결과 수) 튜플
+        """
+        history = self._load_history()
+        results = history
+
+        # 키워드 필터
+        if keyword:
+            keyword_lower = keyword.lower()
+            results = [r for r in results
+                       if keyword_lower in r.get('query', '').lower()]
+
+        # 날짜 범위 필터
+        if date_from:
+            results = [r for r in results
+                       if self._parse_timestamp(r.get('timestamp', '')) >= date_from]
+
+        if date_to:
+            # date_to를 하루의 끝으로 설정 (23:59:59)
+            date_to_end = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
+            results = [r for r in results
+                       if self._parse_timestamp(r.get('timestamp', '')) <= date_to_end]
+
+        # 성공/실패 필터
+        if success_only is not None:
+            results = [r for r in results if r.get('success') == success_only]
+
+        # 즐겨찾기 필터
+        if favorites_only:
+            results = [r for r in results if r.get('is_favorite', False)]
+
+        total = len(results)
+        return results[offset:offset + limit], total
+
+    def _parse_timestamp(self, timestamp_str: str) -> datetime:
+        """타임스탬프 문자열을 datetime으로 변환"""
+        try:
+            return datetime.fromisoformat(timestamp_str)
+        except (ValueError, TypeError):
+            return datetime.min
+
+    def toggle_favorite(self, history_id: str) -> bool:
+        """
+        즐겨찾기 토글
+
+        Args:
+            history_id: 히스토리 ID (UUID 또는 timestamp)
+
+        Returns:
+            새 즐겨찾기 상태
+        """
+        history = self._load_history()
+
+        for entry in history:
+            # ID 또는 timestamp로 매칭
+            if entry.get('id') == history_id or entry.get('timestamp') == history_id:
+                entry['is_favorite'] = not entry.get('is_favorite', False)
+                self._save_history(history)
+                return entry['is_favorite']
+
+        return False
+
+    def get_favorites(self, limit: int = 50, offset: int = 0) -> Tuple[List[Dict[str, Any]], int]:
+        """
+        즐겨찾기 항목 조회
+
+        Args:
+            limit: 반환할 항목 수
+            offset: 시작 위치
+
+        Returns:
+            (즐겨찾기 목록, 전체 즐겨찾기 수) 튜플
+        """
+        history = self._load_history()
+        favorites = [entry for entry in history if entry.get('is_favorite', False)]
+        total = len(favorites)
+        return favorites[offset:offset + limit], total
+
+    def get_favorite_count(self) -> int:
+        """즐겨찾기 총 개수 반환"""
+        history = self._load_history()
+        return sum(1 for entry in history if entry.get('is_favorite', False))
