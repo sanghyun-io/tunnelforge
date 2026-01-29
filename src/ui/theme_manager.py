@@ -25,11 +25,13 @@ class ThemeManager(QObject):
         return cls._instance
 
     def __init__(self):
-        # 이미 초기화된 경우 스킵
+        # QObject는 항상 먼저 초기화 (PyQt 요구사항)
+        super().__init__()
+
+        # 이미 초기화된 경우 나머지 스킵
         if hasattr(self, '_initialized') and self._initialized:
             return
 
-        super().__init__()
         self._initialized = True
         self._current_theme_type = ThemeType.SYSTEM
         self._current_colors = LIGHT_THEME
