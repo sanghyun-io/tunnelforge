@@ -266,6 +266,27 @@ class TunnelConfigDialog(QDialog):
             QMessageBox.information(self, "알림", "직접 연결 모드에서는 터널 테스트가 필요하지 않습니다.")
             return
 
+        # SSH 터널 모드 필수 필드 검증
+        ssh_host = temp_config.get('ssh_host', '').strip()
+        ssh_user = temp_config.get('ssh_user', '').strip()
+        remote_host = temp_config.get('remote_host', '').strip()
+
+        missing_fields = []
+        if not ssh_host:
+            missing_fields.append("SSH 호스트")
+        if not ssh_user:
+            missing_fields.append("SSH 사용자")
+        if not remote_host:
+            missing_fields.append("Target DB (Endpoint)")
+
+        if missing_fields:
+            QMessageBox.warning(
+                self,
+                "필수 필드 누락",
+                f"다음 필드를 입력해주세요:\n\n• " + "\n• ".join(missing_fields)
+            )
+            return
+
         dialog = TestProgressDialog(self, f"터널 테스트 - {temp_config.get('name', 'Unknown')}")
         worker = ConnectionTestWorker(TestType.TUNNEL_ONLY, temp_config, self.engine, None)
         worker.progress.connect(dialog.update_progress)
