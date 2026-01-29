@@ -320,9 +320,26 @@ class SchemaDiffDialog(QDialog):
             )
             success, _ = self._target_connector.connect()
             if not success:
+                # 소스 연결 정리 후 예외 발생
+                if self._source_connector:
+                    self._source_connector.disconnect()
+                    self._source_connector = None
                 raise Exception("타겟 연결 실패")
 
         except Exception as e:
+            # 연결 정리
+            if self._source_connector:
+                try:
+                    self._source_connector.disconnect()
+                except:
+                    pass
+                self._source_connector = None
+            if self._target_connector:
+                try:
+                    self._target_connector.disconnect()
+                except:
+                    pass
+                self._target_connector = None
             QMessageBox.critical(self, "연결 오류", f"DB 연결 실패: {e}")
             return
 

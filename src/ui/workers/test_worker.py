@@ -52,6 +52,7 @@ class ConnectionTestWorker(QThread):
         tid = self.config.get('id')
         is_direct = self.config.get('connection_mode') == 'direct'
         temp_server = None
+        connector = None
         result_success = False
         result_msg = ""
 
@@ -113,6 +114,13 @@ class ConnectionTestWorker(QThread):
                 result_msg = f"❌ DB 인증 실패\n\n{msg}"
 
         finally:
+            # 연결 정리
+            if connector:
+                try:
+                    connector.disconnect()
+                except:
+                    pass
+
             # 임시 터널 정리 (finished 전에 실행)
             if temp_server:
                 self.engine.close_temp_tunnel(temp_server)
@@ -127,6 +135,7 @@ class ConnectionTestWorker(QThread):
         tid = self.config.get('id')
         is_direct = self.config.get('connection_mode') == 'direct'
         temp_server = None
+        connector = None
         results = []
         result_success = False
         result_msg = ""
@@ -178,7 +187,6 @@ class ConnectionTestWorker(QThread):
             success, msg = connector.connect()
 
             if success:
-                connector.disconnect()
                 results.append(f"✅ 2. DB 인증 성공 ({db_user}@{host}:{port})")
                 result_success = True
                 result_msg = "\n".join(results) + "\n\n🎉 모든 테스트 통과!"
@@ -188,6 +196,13 @@ class ConnectionTestWorker(QThread):
                 result_msg = "\n".join(results)
 
         finally:
+            # 연결 정리
+            if connector:
+                try:
+                    connector.disconnect()
+                except:
+                    pass
+
             # 임시 터널 정리 (finished 전에 실행)
             if temp_server:
                 self.engine.close_temp_tunnel(temp_server)

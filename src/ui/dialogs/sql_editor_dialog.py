@@ -708,6 +708,7 @@ class SQLQueryWorker(QThread):
         from src.core.db_connector import MySQLConnector
         import pymysql
 
+        connector = None
         try:
             connector = MySQLConnector(self.host, self.port, self.user, self.password, self.database)
             success, msg = connector.connect()
@@ -770,8 +771,6 @@ class SQLQueryWorker(QThread):
                     self.query_result.emit(idx, [], [], str(e), 0, execution_time)
                     error_count += 1
 
-            connector.disconnect()
-
             if error_count == 0:
                 self.finished.emit(True, f"✅ {success_count}개 쿼리 실행 완료")
             else:
@@ -779,6 +778,14 @@ class SQLQueryWorker(QThread):
 
         except Exception as e:
             self.finished.emit(False, f"❌ 오류: {str(e)}")
+
+        finally:
+            # 연결 정리
+            if connector:
+                try:
+                    connector.disconnect()
+                except:
+                    pass
 
 
 # =====================================================================
@@ -1511,6 +1518,7 @@ class SQLEditorDialog(QDialog):
         self.validation_worker = None
         self.metadata_worker = None
         self.autocomplete_worker = None
+        self._metadata_connector = None  # 메타데이터 로드용 연결
 
         self.setWindowTitle(f"SQL 에디터 - {self.config.get('name', 'Unknown')}")
         self.setMinimumSize(1000, 700)
@@ -2039,28 +2047,34 @@ class SQLEditorDialog(QDialog):
                 port = self.engine.get_temp_tunnel_port(temp_server)
 
             connector = MySQLConnector(host, port, db_user, db_password)
-            success, msg = connector.connect()
+            try:
+                success, msg = connector.connect()
 
-            if success:
-                schemas = connector.get_schemas()
-                connector.disconnect()
+                if success:
+                    schemas = connector.get_schemas()
 
-                self.db_combo.clear()
-                self.db_combo.addItem("")  # 빈 항목
-                self.db_combo.addItems(schemas)
-                self.message_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
+                    self.db_combo.clear()
+                    self.db_combo.addItem("")  # 빈 항목
+                    self.db_combo.addItems(schemas)
+                    self.message_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
 
-                # 기본 스키마 자동 선택
-                default_schema = self.config.get('default_schema')
-                if default_schema:
-                    index = self.db_combo.findText(default_schema)
-                    if index >= 0:
-                        self.db_combo.setCurrentIndex(index)
-                        self.message_text.append(f"📌 기본 스키마 선택됨: {default_schema}")
-                        # 메타데이터 로드 (검증용)
-                        self._load_metadata(default_schema)
-            else:
-                self.message_text.append(f"❌ DB 연결 실패: {msg}")
+                    # 기본 스키마 자동 선택
+                    default_schema = self.config.get('default_schema')
+                    if default_schema:
+                        index = self.db_combo.findText(default_schema)
+                        if index >= 0:
+                            self.db_combo.setCurrentIndex(index)
+                            self.message_text.append(f"📌 기본 스키마 선택됨: {default_schema}")
+                            # 메타데이터 로드 (검증용)
+                            self._load_metadata(default_schema)
+                else:
+                    self.message_text.append(f"❌ DB 연결 실패: {msg}")
+            finally:
+                # 항상 연결 정리
+                try:
+                    connector.disconnect()
+                except:
+                    pass
 
         except Exception as e:
             self.message_text.append(f"❌ 오류: {str(e)}")
@@ -2873,10 +2887,21 @@ class SQLEditorDialog(QDialog):
             if not target_schema:
                 return
 
+            # 이전 연결 정리
+            if self._metadata_connector:
+                try:
+                    self._metadata_connector.disconnect()
+                except:
+                    pass
+                self._metadata_connector = None
+
             connector = MySQLConnector(host, port, db_user, db_password, target_schema)
             success, _ = connector.connect()
             if not success:
                 return
+
+            # 연결 저장 (워커 완료 후 정리용)
+            self._metadata_connector = connector
 
             # 메타데이터 로드 워커 시작
             self.metadata_provider.set_connector(connector)
@@ -2897,6 +2922,14 @@ class SQLEditorDialog(QDialog):
 
     def _on_metadata_loaded(self, metadata):
         """메타데이터 로드 완료"""
+        # 연결 정리 (메타데이터는 이미 메모리에 로드됨)
+        if self._metadata_connector:
+            try:
+                self._metadata_connector.disconnect()
+            except:
+                pass
+            self._metadata_connector = None
+
         # 캐시된 메타데이터 업데이트
         self.metadata_provider._metadata = metadata
 
@@ -2909,6 +2942,14 @@ class SQLEditorDialog(QDialog):
 
     def _on_metadata_error(self, error: str):
         """메타데이터 로드 오류"""
+        # 연결 정리
+        if self._metadata_connector:
+            try:
+                self._metadata_connector.disconnect()
+            except:
+                pass
+            self._metadata_connector = None
+
         self.validation_label.setText(f"⚠️ {error}")
 
     def _on_validation_requested(self, sql: str):
@@ -3030,5 +3071,13 @@ class SQLEditorDialog(QDialog):
         if self.autocomplete_worker and self.autocomplete_worker.isRunning():
             self.autocomplete_worker.cancel()
             self.autocomplete_worker.wait()
+
+        # 메타데이터 연결 정리
+        if self._metadata_connector:
+            try:
+                self._metadata_connector.disconnect()
+            except:
+                pass
+            self._metadata_connector = None
 
         event.accept()
