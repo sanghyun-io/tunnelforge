@@ -298,24 +298,140 @@ class TunnelManagerUI(QMainWindow):
 
     # --- 트리 위젯 시그널 핸들러 ---
     def _on_tree_db_connect(self, tunnel):
-        """트리에서 DB 연결 요청"""
-        self._connect_and_open_dialog(tunnel)
+        """트리에서 DB 연결 요청 - DB 연결 다이얼로그 열기"""
+        # 자격 증명 확인
+        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(
+                self, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
+            )
+            return
+
+        # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
+        is_direct = tunnel.get('connection_mode') == 'direct'
+        if not is_direct and not self.engine.is_running(tunnel['id']):
+            reply = QMessageBox.question(
+                self, "터널 연결",
+                f"'{tunnel['name']}' 터널이 연결되어 있지 않습니다.\n터널을 시작하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                success, msg = self.engine.start_tunnel(tunnel)
+                if not success:
+                    QMessageBox.critical(self, "오류", f"터널 시작 실패:\n{msg}")
+                    return
+                self.refresh_table()
+            else:
+                return
+
+        # DB 연결 다이얼로그 열기
+        from src.ui.dialogs.db_dialogs import DBConnectionDialog
+        dialog = DBConnectionDialog(self, tunnel_engine=self.engine, config_manager=self.config_mgr)
+        # 터널 모드 선택 및 해당 터널 선택
+        dialog.radio_tunnel.setChecked(True)
+        dialog.on_mode_changed()
+        # 해당 터널 찾아서 선택
+        for i in range(dialog.combo_tunnel.count()):
+            data = dialog.combo_tunnel.itemData(i)
+            if data and data.get('tunnel_id') == tunnel['id']:
+                dialog.combo_tunnel.setCurrentIndex(i)
+                break
+        dialog.exec()
 
     def _on_tree_sql_editor(self, tunnel):
         """트리에서 SQL 에디터 요청"""
-        self._open_sql_editor(tunnel)
+        self.open_sql_editor(tunnel)
 
     def _on_tree_export(self, tunnel):
         """트리에서 Export 요청"""
-        self.open_mysqlsh_wizard(tunnel)
+        self._context_shell_export(tunnel)
 
     def _on_tree_import(self, tunnel):
         """트리에서 Import 요청"""
-        self.open_mysqlsh_wizard(tunnel, start_tab=1)
+        self._context_shell_import(tunnel)
 
     def _on_tree_test_connection(self, tunnel):
         """트리에서 연결 테스트 요청"""
-        self._test_tunnel_connection(tunnel)
+        is_direct = tunnel.get('connection_mode') == 'direct'
+        tunnel_name = tunnel.get('name', '알 수 없음')
+
+        # 직접 연결 모드인 경우 DB 연결 테스트
+        if is_direct:
+            self._test_direct_connection(tunnel)
+            return
+
+        # SSH 터널 모드: 터널 연결 테스트
+        if self.engine.is_running(tunnel['id']):
+            # 이미 실행 중이면 성공
+            QMessageBox.information(
+                self, "연결 테스트",
+                f"✅ '{tunnel_name}' 터널이 이미 연결되어 있습니다."
+            )
+            return
+
+        # 터널 시작 시도
+        self.statusBar().showMessage(f"연결 테스트 중: {tunnel_name}...")
+        QApplication.processEvents()
+
+        success, msg = self.engine.start_tunnel(tunnel)
+        if success:
+            QMessageBox.information(
+                self, "연결 테스트",
+                f"✅ '{tunnel_name}' 터널 연결 성공!\n\n로컬 포트: {tunnel.get('local_port')}"
+            )
+            self.refresh_table()
+            self.statusBar().showMessage(f"연결 성공: {tunnel_name}")
+        else:
+            QMessageBox.warning(
+                self, "연결 테스트",
+                f"❌ '{tunnel_name}' 터널 연결 실패\n\n원인: {msg}"
+            )
+            self.statusBar().showMessage(f"연결 실패: {tunnel_name}")
+
+    def _test_direct_connection(self, tunnel):
+        """직접 연결 모드 테스트"""
+        tunnel_name = tunnel.get('name', '알 수 없음')
+
+        # 자격 증명 확인
+        user, password = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(
+                self, "경고",
+                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
+            )
+            return
+
+        host = tunnel.get('remote_host', '127.0.0.1')
+        port = tunnel.get('remote_port', 3306)
+
+        self.statusBar().showMessage(f"연결 테스트 중: {tunnel_name}...")
+        QApplication.processEvents()
+
+        try:
+            from src.core.db_connector import MySQLConnector
+            connector = MySQLConnector(host, port, user, password)
+            success, msg = connector.connect()
+            connector.disconnect()
+
+            if success:
+                QMessageBox.information(
+                    self, "연결 테스트",
+                    f"✅ '{tunnel_name}' DB 연결 성공!\n\n{host}:{port}"
+                )
+                self.statusBar().showMessage(f"연결 성공: {tunnel_name}")
+            else:
+                QMessageBox.warning(
+                    self, "연결 테스트",
+                    f"❌ '{tunnel_name}' DB 연결 실패\n\n원인: {msg}"
+                )
+                self.statusBar().showMessage(f"연결 실패: {tunnel_name}")
+        except Exception as e:
+            QMessageBox.critical(
+                self, "연결 테스트 오류",
+                f"❌ '{tunnel_name}' 연결 테스트 중 오류 발생\n\n{str(e)}"
+            )
+            self.statusBar().showMessage(f"연결 오류: {tunnel_name}")
 
     def _connect_all_in_group(self, group_id: str):
         """그룹 내 모든 터널 연결"""
