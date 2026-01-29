@@ -18,24 +18,17 @@ from src.core.db_connector import MySQLConnector
 # 새 상수 모듈에서 import (migration_constants.py)
 # ============================================================
 from src.core.migration_constants import (
-    REMOVED_SYS_VARS_84,
-    NEW_RESERVED_KEYWORDS_84,
     REMOVED_FUNCTIONS_84,
-    AUTH_PLUGINS,
-    OBSOLETE_SQL_MODES,
-    SYS_VARS_NEW_DEFAULTS_84,
     IssueType,
     INVALID_DATE_PATTERN,
     INVALID_DATETIME_PATTERN,
     ZEROFILL_PATTERN,
     FLOAT_PRECISION_PATTERN,
-    INT_DISPLAY_WIDTH_PATTERN,
     FK_NAME_LENGTH_PATTERN,
     AUTH_PLUGIN_PATTERN,
     FTS_TABLE_PREFIX_PATTERN,
     SUPER_PRIVILEGE_PATTERN,
     SYS_VAR_USAGE_PATTERN,
-    ALL_RESERVED_KEYWORDS,
 )
 
 # 규칙 모듈에서 import (선택적 - 에러 방지)
@@ -47,7 +40,7 @@ except ImportError:
 
 # 파서 모듈에서 import (선택적)
 try:
-    from src.core.migration_parsers import SQLParser, ParsedTable, ParsedIndex, ParsedForeignKey
+    from src.core.migration_parsers import SQLParser, ParsedTable
     PARSERS_AVAILABLE = True
 except ImportError:
     PARSERS_AVAILABLE = False
@@ -221,56 +214,114 @@ class MigrationAnalyzer:
 
         return tree
 
+    def _get_table_row_count(self, schema: str, table: str) -> int:
+        """테이블 대략적인 행 수 조회 (INFORMATION_SCHEMA 사용, 빠름)"""
+        query = f"""
+        SELECT TABLE_ROWS
+        FROM INFORMATION_SCHEMA.TABLES
+        WHERE TABLE_SCHEMA = '{schema}' AND TABLE_NAME = '{table}'
+        """
+        result = self.connector.execute(query)
+        return result[0]['TABLE_ROWS'] if result and result[0]['TABLE_ROWS'] else 0
+
     def find_orphan_records(
         self,
         schema: str,
-        sample_limit: int = 5
+        sample_limit: int = 5,
+        large_table_threshold: int = 500000  # 50만 행 이상이면 큰 테이블
     ) -> List[OrphanRecord]:
         """고아 레코드 탐지 (부모 없는 자식 레코드)"""
+        import time
         self._log("🔍 고아 레코드 탐지 중...")
 
         fk_list = self.get_foreign_keys(schema)
         orphans = []
 
         for i, fk in enumerate(fk_list, 1):
-            self._log(f"  검사 중: {fk.child_table}.{fk.child_column} → {fk.parent_table}.{fk.parent_column} ({i}/{len(fk_list)})")
+            try:
+                # 테이블 크기 사전 확인
+                child_rows = self._get_table_row_count(schema, fk.child_table)
+                parent_rows = self._get_table_row_count(schema, fk.parent_table)
+                is_large = child_rows > large_table_threshold or parent_rows > large_table_threshold
 
-            # 고아 레코드 수 조회
-            count_query = f"""
-            SELECT COUNT(*) as cnt
-            FROM `{schema}`.`{fk.child_table}` c
-            LEFT JOIN `{schema}`.`{fk.parent_table}` p
-                ON c.`{fk.child_column}` = p.`{fk.parent_column}`
-            WHERE c.`{fk.child_column}` IS NOT NULL
-                AND p.`{fk.parent_column}` IS NULL
-            """
-            result = self.connector.execute(count_query)
-            orphan_count = result[0]['cnt'] if result else 0
+                size_info = ""
+                if child_rows > 100000 or parent_rows > 100000:
+                    size_info = f" [자식:{child_rows:,}행, 부모:{parent_rows:,}행]"
 
-            if orphan_count > 0:
-                # 샘플 값 조회
-                sample_query = f"""
-                SELECT DISTINCT c.`{fk.child_column}` as orphan_value
-                FROM `{schema}`.`{fk.child_table}` c
-                LEFT JOIN `{schema}`.`{fk.parent_table}` p
-                    ON c.`{fk.child_column}` = p.`{fk.parent_column}`
-                WHERE c.`{fk.child_column}` IS NOT NULL
-                    AND p.`{fk.parent_column}` IS NULL
-                LIMIT {sample_limit}
-                """
-                samples = self.connector.execute(sample_query)
-                sample_values = [s['orphan_value'] for s in samples]
+                self._log(f"  검사 중: {fk.child_table}.{fk.child_column} → {fk.parent_table}.{fk.parent_column} ({i}/{len(fk_list)}){size_info}")
 
-                orphans.append(OrphanRecord(
-                    child_table=fk.child_table,
-                    child_column=fk.child_column,
-                    parent_table=fk.parent_table,
-                    parent_column=fk.parent_column,
-                    orphan_count=orphan_count,
-                    sample_values=sample_values
-                ))
+                start_time = time.time()
 
-                self._log(f"    ⚠️ 고아 레코드 발견: {orphan_count}개")
+                if is_large:
+                    # 큰 테이블: NOT EXISTS 사용 (더 빠름)
+                    self._log(f"    📊 대용량 테이블 - 최적화 쿼리 사용")
+                    count_query = f"""
+                    SELECT COUNT(*) as cnt
+                    FROM `{schema}`.`{fk.child_table}` c
+                    WHERE c.`{fk.child_column}` IS NOT NULL
+                        AND NOT EXISTS (
+                            SELECT 1 FROM `{schema}`.`{fk.parent_table}` p
+                            WHERE p.`{fk.parent_column}` = c.`{fk.child_column}`
+                        )
+                    """
+                else:
+                    # 일반 테이블: LEFT JOIN 사용
+                    count_query = f"""
+                    SELECT COUNT(*) as cnt
+                    FROM `{schema}`.`{fk.child_table}` c
+                    LEFT JOIN `{schema}`.`{fk.parent_table}` p
+                        ON c.`{fk.child_column}` = p.`{fk.parent_column}`
+                    WHERE c.`{fk.child_column}` IS NOT NULL
+                        AND p.`{fk.parent_column}` IS NULL
+                    """
+
+                result = self.connector.execute(count_query)
+                orphan_count = result[0]['cnt'] if result else 0
+
+                elapsed = time.time() - start_time
+                if elapsed > 3:  # 3초 이상 걸리면 경고
+                    self._log(f"    ⏱️ 쿼리 소요시간: {elapsed:.1f}초")
+
+                if orphan_count > 0:
+                    # 샘플 값 조회 (항상 LIMIT으로 제한)
+                    if is_large:
+                        sample_query = f"""
+                        SELECT DISTINCT c.`{fk.child_column}` as orphan_value
+                        FROM `{schema}`.`{fk.child_table}` c
+                        WHERE c.`{fk.child_column}` IS NOT NULL
+                            AND NOT EXISTS (
+                                SELECT 1 FROM `{schema}`.`{fk.parent_table}` p
+                                WHERE p.`{fk.parent_column}` = c.`{fk.child_column}`
+                            )
+                        LIMIT {sample_limit}
+                        """
+                    else:
+                        sample_query = f"""
+                        SELECT DISTINCT c.`{fk.child_column}` as orphan_value
+                        FROM `{schema}`.`{fk.child_table}` c
+                        LEFT JOIN `{schema}`.`{fk.parent_table}` p
+                            ON c.`{fk.child_column}` = p.`{fk.parent_column}`
+                        WHERE c.`{fk.child_column}` IS NOT NULL
+                            AND p.`{fk.parent_column}` IS NULL
+                        LIMIT {sample_limit}
+                        """
+                    samples = self.connector.execute(sample_query)
+                    sample_values = [s['orphan_value'] for s in samples]
+
+                    orphans.append(OrphanRecord(
+                        child_table=fk.child_table,
+                        child_column=fk.child_column,
+                        parent_table=fk.parent_table,
+                        parent_column=fk.parent_column,
+                        orphan_count=orphan_count,
+                        sample_values=sample_values
+                    ))
+
+                    self._log(f"    ⚠️ 고아 레코드 발견: {orphan_count}개")
+
+            except Exception as e:
+                self._log(f"    ❌ 검사 실패: {fk.child_table}.{fk.child_column} - {str(e)}")
+                continue
 
         return orphans
 
@@ -340,7 +391,7 @@ class MigrationAnalyzer:
                     severity="error",
                     location=f"{schema}.{table}",
                     description=f"테이블명 '{table}'이 MySQL 8.4 예약어와 충돌",
-                    suggestion=f"테이블명을 백틱으로 감싸거나 이름 변경 필요"
+                    suggestion="테이블명을 백틱으로 감싸거나 이름 변경 필요"
                 ))
 
         # 컬럼명 확인
@@ -589,32 +640,42 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         # 고아 레코드 검사
         if check_orphans and fk_list:
+            self._log("📌 [1/9] 고아 레코드 검사 시작...")
             result.orphan_records = self.find_orphan_records(schema)
+            self._log(f"✅ [1/9] 고아 레코드 검사 완료 (발견: {len(result.orphan_records)}건)")
 
         # 호환성 검사들 (기존)
         if check_charset:
+            self._log("📌 [2/9] 문자셋 이슈 검사...")
             result.compatibility_issues.extend(self.check_charset_issues(schema))
 
         if check_keywords:
+            self._log("📌 [3/9] 예약어 충돌 검사...")
             result.compatibility_issues.extend(self.check_reserved_keywords(schema))
 
         if check_routines:
+            self._log("📌 [4/9] 저장 프로시저/함수 검사...")
             result.compatibility_issues.extend(self.check_deprecated_in_routines(schema))
 
         if check_sql_mode:
+            self._log("📌 [5/9] SQL 모드 검사...")
             result.compatibility_issues.extend(self.check_sql_modes())
 
         # MySQL 8.4 Upgrade Checker 검사들 (신규)
         if check_auth_plugins:
+            self._log("📌 [6/9] 인증 플러그인 검사...")
             result.compatibility_issues.extend(self.check_auth_plugins())
 
         if check_zerofill:
+            self._log("📌 [7/9] ZEROFILL 속성 검사...")
             result.compatibility_issues.extend(self.check_zerofill_columns(schema))
 
         if check_float_precision:
+            self._log("📌 [8/9] FLOAT(M,D) 구문 검사...")
             result.compatibility_issues.extend(self.check_float_precision(schema))
 
         if check_fk_name_length:
+            self._log("📌 [9/9] FK 이름 길이 검사...")
             result.compatibility_issues.extend(self.check_fk_name_length(schema))
 
         # 정리 작업 생성 (고아 레코드에 대해)
@@ -623,7 +684,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
             cleanup = self.generate_cleanup_sql(orphan, ActionType.DELETE, schema, dry_run=True)
             result.cleanup_actions.append(cleanup)
 
-        self._log(f"✅ 분석 완료")
+        self._log("✅ 분석 완료")
         self._log(f"  - 고아 레코드: {len(result.orphan_records)}개 FK 관계에서 발견")
         self._log(f"  - 호환성 이슈: {len(result.compatibility_issues)}개")
 
@@ -656,7 +717,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
                         issue_type=IssueType.AUTH_PLUGIN_ISSUE,
                         severity="error",
                         location=f"'{user['User']}'@'{user['Host']}'",
-                        description=f"mysql_native_password 인증 사용 (8.4에서 기본 비활성화)",
+                        description="mysql_native_password 인증 사용 (8.4에서 기본 비활성화)",
                         suggestion="ALTER USER ... IDENTIFIED WITH caching_sha2_password"
                     ))
                 elif plugin == 'sha256_password':
@@ -664,7 +725,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
                         issue_type=IssueType.AUTH_PLUGIN_ISSUE,
                         severity="warning",
                         location=f"'{user['User']}'@'{user['Host']}'",
-                        description=f"sha256_password 인증 사용 (deprecated)",
+                        description="sha256_password 인증 사용 (deprecated)",
                         suggestion="ALTER USER ... IDENTIFIED WITH caching_sha2_password 권장"
                     ))
                 elif plugin == 'authentication_fido':
@@ -672,7 +733,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
                         issue_type=IssueType.AUTH_PLUGIN_ISSUE,
                         severity="error",
                         location=f"'{user['User']}'@'{user['Host']}'",
-                        description=f"authentication_fido 플러그인 사용 (8.4에서 제거됨)",
+                        description="authentication_fido 플러그인 사용 (8.4에서 제거됨)",
                         suggestion="authentication_webauthn 또는 다른 인증 방식으로 변경 필요"
                     ))
 
@@ -827,18 +888,27 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         root_tables = set(fk_tree.keys()) - all_children
 
-        def print_tree(table: str, prefix: str = "", is_last: bool = True):
+        def print_tree(table: str, prefix: str = "", is_last: bool = True, visited: set = None):
+            if visited is None:
+                visited = set()
+
             connector = "└── " if is_last else "├── "
+
+            # 순환 참조 감지
+            if table in visited:
+                lines.append(f"{prefix}{connector}🔄 {table} (순환 참조)")
+                return
+
             lines.append(f"{prefix}{connector}{table}")
 
             if table in fk_tree:
                 children = fk_tree[table]
                 child_prefix = prefix + ("    " if is_last else "│   ")
                 for i, child in enumerate(children):
-                    print_tree(child, child_prefix, i == len(children) - 1)
+                    print_tree(child, child_prefix, i == len(children) - 1, visited | {table})
 
         for i, root in enumerate(sorted(root_tables)):
-            print_tree(root, "", i == len(root_tables) - 1)
+            print_tree(root, "", i == len(root_tables) - 1, {root})
 
         return "\n".join(lines)
 
@@ -947,7 +1017,7 @@ class DumpFileAnalyzer:
         error_count = sum(1 for i in issues if i.severity == "error")
         warning_count = sum(1 for i in issues if i.severity == "warning")
 
-        self._log(f"✅ 덤프 분석 완료")
+        self._log("✅ 덤프 분석 완료")
         self._log(f"  - 오류: {error_count}개")
         self._log(f"  - 경고: {warning_count}개")
 
@@ -1516,7 +1586,7 @@ class TwoPassAnalyzer:
         error_count = sum(1 for i in all_issues if i.severity == "error")
         warning_count = sum(1 for i in all_issues if i.severity == "warning")
 
-        self._log(f"✅ 2-Pass 분석 완료")
+        self._log("✅ 2-Pass 분석 완료")
         self._log(f"  - 오류: {error_count}개")
         self._log(f"  - 경고: {warning_count}개")
 
