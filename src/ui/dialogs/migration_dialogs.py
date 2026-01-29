@@ -24,6 +24,9 @@ from src.core.migration_analyzer import (
     CompatibilityIssue, CleanupAction, ActionType, IssueType
 )
 from src.ui.workers.migration_worker import MigrationAnalyzerWorker, CleanupWorker
+from src.core.logger import get_logger
+
+logger = get_logger('migration_dialogs')
 
 
 class MigrationAnalyzerDialog(QDialog):
@@ -464,11 +467,15 @@ class MigrationAnalyzerDialog(QDialog):
 
     def on_analysis_complete(self, result: AnalysisResult):
         """분석 완료 시"""
-        self.analysis_result = result
-        self.update_overview(result)
-        self.update_orphans_table(result.orphan_records)
-        self.update_compatibility_table(result.compatibility_issues)
-        self.update_fk_tree(result.fk_tree, result.schema)
+        try:
+            self.analysis_result = result
+            self.update_overview(result)
+            self.update_orphans_table(result.orphan_records)
+            self.update_compatibility_table(result.compatibility_issues)
+            self.update_fk_tree(result.fk_tree, result.schema)
+        except Exception as e:
+            logger.error(f"분석 결과 UI 업데이트 오류: {e}", exc_info=True)
+            QMessageBox.critical(self, "오류", f"분석 결과 표시 중 오류 발생:\n{e}")
 
     def on_analysis_finished(self, success: bool, message: str):
         """분석 종료 시"""
@@ -622,15 +629,19 @@ class MigrationAnalyzerDialog(QDialog):
 
         root_tables = set(fk_tree.keys()) - all_children
 
-        def add_tree_items(parent_item, table: str):
+        def add_tree_items(parent_item, table: str, visited: set):
             if table in fk_tree:
                 for child in fk_tree[table]:
+                    # 순환 참조 방지
+                    if child in visited:
+                        child_item = QTreeWidgetItem(parent_item, [f"🔄 {child} (순환 참조)"])
+                        continue
                     child_item = QTreeWidgetItem(parent_item, [f"└── {child}"])
-                    add_tree_items(child_item, child)
+                    add_tree_items(child_item, child, visited | {child})
 
         for root in sorted(root_tables):
             root_item = QTreeWidgetItem(self.tree_fk, [f"📁 {root}"])
-            add_tree_items(root_item, root)
+            add_tree_items(root_item, root, {root})
 
         self.tree_fk.expandAll()
 
