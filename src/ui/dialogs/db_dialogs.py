@@ -1058,6 +1058,7 @@ class MySQLShellExportDialog(QDialog):
             self.progress_bar.setMaximum(total)
 
         self.progress_bar.setValue(current)
+        self.label_tables.setText(f"📋 테이블: {current} / {total} 완료")
         self.label_status.setText(f"✅ {table_name} ({current}/{total})")
         self._add_log(f"테이블 완료: {table_name} ({current}/{total})")
 
@@ -1086,14 +1087,32 @@ class MySQLShellExportDialog(QDialog):
             self.txt_log.addItem(f"✅ 완료: {message}")
             # 최종 진행률 100% 표시
             self.progress_bar.setValue(100)
+            self.progress_bar.setMaximum(100)  # 퍼센트 기준으로 재설정
             self.label_percent.setText("📊 진행률: 100%")
+            self.label_data.setText("📦 데이터: Export 완료")
+            self.label_speed.setText("⚡ 속도: -")
             self.label_status.setText("✅ Export 완료")
+            # 테이블 완료 수 계산 (done 상태인 테이블 수)
+            done_count = sum(1 for item in self.table_items.values()
+                           if item.text().startswith("✅"))
+            total_count = len(self.table_items)
+            if total_count > 0:
+                self.label_tables.setText(f"📋 테이블: {done_count} / {total_count} 완료")
             QMessageBox.information(
                 self, "Export 완료",
                 f"✅ Export가 완료되었습니다.\n\n폴더: {self.input_output_dir.text()}"
             )
         else:
             self.txt_log.addItem(f"❌ 실패: {message}")
+            self.label_data.setText("📦 데이터: Export 실패")
+            self.label_speed.setText("⚡ 속도: -")
+            self.label_status.setText("❌ Export 실패")
+            # 테이블 완료 수 계산
+            done_count = sum(1 for item in self.table_items.values()
+                           if item.text().startswith("✅"))
+            total_count = len(self.table_items)
+            if total_count > 0:
+                self.label_tables.setText(f"📋 테이블: {done_count} / {total_count} 완료")
             QMessageBox.warning(self, "Export 실패", f"❌ {message}")
 
             # GitHub 이슈 자동 보고
