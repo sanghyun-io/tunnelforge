@@ -5,6 +5,7 @@ MySQL 마이그레이션 분석기
 - MySQL 8.0.x → 8.4.x 호환성 검사 (Upgrade Checker 통합)
 - dry-run 지원
 - 덤프 파일 분석 (SQL/TSV)
+- 2-Pass 분석 아키텍처 (FK 크로스 검증)
 """
 import re
 from typing import List, Dict, Set, Tuple, Optional, Callable, Any
@@ -13,188 +14,60 @@ from enum import Enum
 from pathlib import Path
 from src.core.db_connector import MySQLConnector
 
-
 # ============================================================
-# MySQL 8.4 Upgrade Checker 상수 (constants.ts에서 포팅)
+# 새 상수 모듈에서 import (migration_constants.py)
 # ============================================================
-
-# MySQL 8.4에서 제거된 시스템 변수 (47개)
-REMOVED_SYS_VARS_84 = (
-    'avoid_temporal_upgrade',
-    'binlog_transaction_dependency_tracking',
-    'default_authentication_plugin',
-    'group_replication_ip_allowlist',
-    'group_replication_recovery_complete_at',
-    'have_openssl',
-    'have_ssl',
-    'innodb_log_file_size',
-    'innodb_log_files_in_group',
-    'keyring_file_data',
-    'keyring_file_data_file',
-    'keyring_encrypted_file_data',
-    'keyring_encrypted_file_password',
-    'keyring_okv_conf_dir',
-    'keyring_hashicorp_auth_path',
-    'keyring_hashicorp_ca_path',
-    'keyring_hashicorp_caching',
-    'keyring_hashicorp_commit_auth_path',
-    'keyring_hashicorp_commit_caching',
-    'keyring_hashicorp_commit_role_id',
-    'keyring_hashicorp_commit_server_url',
-    'keyring_hashicorp_commit_store_path',
-    'keyring_hashicorp_role_id',
-    'keyring_hashicorp_secret_id',
-    'keyring_hashicorp_server_url',
-    'keyring_hashicorp_store_path',
-    'keyring_aws_cmk_id',
-    'keyring_aws_conf_file',
-    'keyring_aws_data_file',
-    'keyring_aws_region',
-    'log_bin_use_v1_row_events',
-    'master_verify_checksum',
-    'old_alter_table',
-    'relay_log_info_file',
-    'relay_log_info_repository',
-    'replica_parallel_type',
-    'slave_parallel_type',
-    'slave_rows_search_algorithms',
-    'sql_slave_skip_counter',
-    'sync_master_info',
-    'sync_relay_log',
-    'sync_relay_log_info',
-    'transaction_write_set_extraction',
-    'binlog_format',
-    'log_slave_updates',
-    'replica_compressed_protocol',
-    'slave_compressed_protocol',
+from src.core.migration_constants import (
+    REMOVED_SYS_VARS_84,
+    NEW_RESERVED_KEYWORDS_84,
+    REMOVED_FUNCTIONS_84,
+    AUTH_PLUGINS,
+    OBSOLETE_SQL_MODES,
+    SYS_VARS_NEW_DEFAULTS_84,
+    IssueType,
+    INVALID_DATE_PATTERN,
+    INVALID_DATETIME_PATTERN,
+    ZEROFILL_PATTERN,
+    FLOAT_PRECISION_PATTERN,
+    INT_DISPLAY_WIDTH_PATTERN,
+    FK_NAME_LENGTH_PATTERN,
+    AUTH_PLUGIN_PATTERN,
+    FTS_TABLE_PREFIX_PATTERN,
+    SUPER_PRIVILEGE_PATTERN,
+    SYS_VAR_USAGE_PATTERN,
+    ALL_RESERVED_KEYWORDS,
 )
 
-# MySQL 8.4에서 추가된 새 예약어 (4개)
-NEW_RESERVED_KEYWORDS_84 = ('MANUAL', 'PARALLEL', 'QUALIFY', 'TABLESAMPLE')
+# 규칙 모듈에서 import (선택적 - 에러 방지)
+try:
+    from src.core.migration_rules import DataIntegrityRules, SchemaRules, StorageRules
+    RULES_AVAILABLE = True
+except ImportError:
+    RULES_AVAILABLE = False
 
-# MySQL 8.4에서 제거된 함수 (6개) - 기존 DEPRECATED_FUNCTIONS와 병합
-REMOVED_FUNCTIONS_84 = (
-    'PASSWORD', 'ENCODE', 'DECODE', 'DES_ENCRYPT', 'DES_DECRYPT',
-    'ENCRYPT', 'OLD_PASSWORD', 'MASTER_POS_WAIT'
-)
+# 파서 모듈에서 import (선택적)
+try:
+    from src.core.migration_parsers import SQLParser, ParsedTable, ParsedIndex, ParsedForeignKey
+    PARSERS_AVAILABLE = True
+except ImportError:
+    PARSERS_AVAILABLE = False
 
-# 인증 플러그인 상태
-AUTH_PLUGINS = {
-    'disabled': ['mysql_native_password'],  # 8.4에서 기본 비활성화
-    'removed': ['authentication_fido', 'authentication_fido_client'],  # 8.4에서 제거
-    'deprecated': ['sha256_password'],  # deprecated, caching_sha2_password 권장
-}
+# Fix Query 생성기 import (선택적)
+try:
+    from src.core.migration_fix_generator import FixQueryGenerator
+    FIX_GENERATOR_AVAILABLE = True
+except ImportError:
+    FIX_GENERATOR_AVAILABLE = False
 
-# 제거된/deprecated SQL 모드 (10개)
-OBSOLETE_SQL_MODES = (
-    'DB2', 'MAXDB', 'MSSQL', 'MYSQL323', 'MYSQL40',
-    'ORACLE', 'POSTGRESQL', 'NO_FIELD_OPTIONS', 'NO_KEY_OPTIONS',
-    'NO_TABLE_OPTIONS', 'NO_AUTO_CREATE_USER',
-)
-
-# 기본값이 변경된 시스템 변수
-SYS_VARS_NEW_DEFAULTS_84 = {
-    'binlog_transaction_dependency_tracking': {
-        'old': 'COMMIT_ORDER', 'new': 'removed (use replica_parallel_type)',
-    },
-    'replica_parallel_workers': {
-        'old': '0', 'new': '4',
-    },
-    'innodb_adaptive_hash_index': {
-        'old': 'ON', 'new': 'OFF',
-    },
-    'innodb_doublewrite_pages': {
-        'old': '(innodb_write_io_threads)', 'new': '128',
-    },
-    'innodb_flush_method': {
-        'old': 'fsync (Unix)', 'new': 'O_DIRECT (Linux)',
-    },
-    'innodb_io_capacity': {
-        'old': '200', 'new': '10000',
-    },
-    'innodb_io_capacity_max': {
-        'old': '2 * innodb_io_capacity', 'new': '2 * new default',
-    },
-    'innodb_log_buffer_size': {
-        'old': '16M', 'new': '64M',
-    },
-    'innodb_redo_log_capacity': {
-        'old': '100M', 'new': '100M (now replaces log_file_size * files)',
-    },
-    'group_replication_consistency': {
-        'old': 'EVENTUAL', 'new': 'BEFORE_ON_PRIMARY_FAILOVER',
-    },
-}
-
-# ============================================================
-# 덤프 파일 분석용 정규식 패턴 (rules.ts에서 포팅)
-# ============================================================
-
-# 0000-00-00 날짜 (잘못된 날짜)
-INVALID_DATE_PATTERN = re.compile(r"['\"]0000-00-00['\"]|^0000-00-00$", re.MULTILINE)
-INVALID_DATETIME_PATTERN = re.compile(r"['\"]0000-00-00 00:00:00['\"]|^0000-00-00 00:00:00$", re.MULTILINE)
-
-# ZEROFILL 속성
-ZEROFILL_PATTERN = re.compile(r'\bZEROFILL\b', re.IGNORECASE)
-
-# FLOAT(M,D), DOUBLE(M,D) 구문 (deprecated)
-FLOAT_PRECISION_PATTERN = re.compile(
-    r'\b(FLOAT|DOUBLE|REAL)\s*\(\s*\d+\s*,\s*\d+\s*\)',
-    re.IGNORECASE
-)
-
-# INT 표시 너비 (deprecated, TINYINT(1) 제외)
-INT_DISPLAY_WIDTH_PATTERN = re.compile(
-    r'\b(TINYINT|SMALLINT|MEDIUMINT|INT|INTEGER|BIGINT)\s*\(\s*(\d+)\s*\)',
-    re.IGNORECASE
-)
-
-# FK 이름 길이 (64자 초과)
-FK_NAME_LENGTH_PATTERN = re.compile(
-    r'CONSTRAINT\s+`?(\w{65,})`?\s+FOREIGN\s+KEY',
-    re.IGNORECASE
-)
-
-# mysql_native_password 인증 플러그인
-AUTH_PLUGIN_PATTERN = re.compile(
-    r"IDENTIFIED\s+(?:WITH\s+)?['\"]?(mysql_native_password|sha256_password|authentication_fido)['\"]?",
-    re.IGNORECASE
-)
-
-# FTS_ 접두사 테이블명 (내부 예약)
-FTS_TABLE_PREFIX_PATTERN = re.compile(r'CREATE\s+TABLE\s+`?FTS_', re.IGNORECASE)
-
-# GRANT 문의 SUPER 권한
-SUPER_PRIVILEGE_PATTERN = re.compile(r'\bGRANT\b.*\bSUPER\b', re.IGNORECASE)
-
-# 제거된 시스템 변수 사용 (SET/SELECT 문에서)
-SYS_VAR_USAGE_PATTERN = re.compile(
-    r"(?:SET|SELECT)\s+.*(?:@@(?:global|session)?\.)?" +
-    r"(" + "|".join(re.escape(v) for v in REMOVED_SYS_VARS_84) + r")\b",
-    re.IGNORECASE
-)
+# Report Exporter import (선택적)
+try:
+    from src.core.migration_report import ReportExporter
+    REPORT_EXPORTER_AVAILABLE = True
+except ImportError:
+    REPORT_EXPORTER_AVAILABLE = False
 
 
-class IssueType(Enum):
-    """문제 유형"""
-    # 기존 이슈 타입
-    ORPHAN_ROW = "orphan_row"  # 부모 없는 자식 레코드
-    DEPRECATED_FUNCTION = "deprecated_function"  # deprecated 함수 사용
-    CHARSET_ISSUE = "charset_issue"  # utf8mb3 → utf8mb4 필요
-    RESERVED_KEYWORD = "reserved_keyword"  # 예약어 충돌
-    SQL_MODE_ISSUE = "sql_mode_issue"  # deprecated SQL 모드
-
-    # MySQL 8.4 Upgrade Checker 이슈 타입 (신규)
-    REMOVED_SYS_VAR = "removed_sys_var"  # 제거된 시스템 변수
-    AUTH_PLUGIN_ISSUE = "auth_plugin_issue"  # 인증 플러그인 이슈
-    INVALID_DATE = "invalid_date"  # 0000-00-00 날짜
-    ZEROFILL_USAGE = "zerofill_usage"  # ZEROFILL 속성
-    FLOAT_PRECISION = "float_precision"  # FLOAT(M,D) 구문
-    INT_DISPLAY_WIDTH = "int_display_width"  # INT(11) 표시 너비
-    FK_NAME_LENGTH = "fk_name_length"  # FK 이름 64자 초과
-    FTS_TABLE_PREFIX = "fts_table_prefix"  # FTS_ 테이블명
-    SUPER_PRIVILEGE = "super_privilege"  # SUPER 권한 사용
-    DEFAULT_VALUE_CHANGE = "default_value_change"  # 기본값 변경됨
+# IssueType은 migration_constants에서 import됨
 
 
 class ActionType(Enum):
@@ -236,6 +109,12 @@ class CompatibilityIssue:
     location: str  # 테이블명 또는 위치
     description: str
     suggestion: str
+    fix_query: Optional[str] = None      # 수정 SQL
+    doc_link: Optional[str] = None       # 문서 링크
+    mysql_shell_check_id: Optional[str] = None  # MySQL Shell 체크 ID
+    code_snippet: Optional[str] = None   # 관련 코드
+    table_name: Optional[str] = None     # 테이블명
+    column_name: Optional[str] = None    # 컬럼명
 
 
 @dataclass
@@ -1267,3 +1146,423 @@ class DumpFileAnalyzer:
             return error_count, warning_count, info_count
         except Exception:
             return 0, 0, 0
+
+
+# ============================================================
+# 2-Pass 분석기 (Task 5)
+# ============================================================
+
+@dataclass
+class TableIndexInfo:
+    """테이블 인덱스 정보"""
+    schema: Optional[str]
+    table_name: str
+    index_name: str
+    columns: List[str]
+    is_unique: bool
+    is_primary: bool
+
+    def covers_columns(self, cols: List[str]) -> bool:
+        """주어진 컬럼들이 이 인덱스로 커버되는지 확인"""
+        cols_lower = [c.lower() for c in cols]
+        idx_cols_lower = [c.lower() for c in self.columns[:len(cols)]]
+        return cols_lower == idx_cols_lower
+
+
+@dataclass
+class TableCharsetInfo:
+    """테이블 charset 정보"""
+    schema: Optional[str]
+    table_name: str
+    charset: str
+    collation: Optional[str] = None
+    column_charsets: Dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class PendingFKCheck:
+    """지연된 FK 검증 정보"""
+    fk_name: str
+    source_schema: Optional[str]
+    source_table: str
+    source_columns: List[str]
+    ref_table: str
+    ref_columns: List[str]
+    location: str
+    line_number: Optional[int] = None
+
+
+class TwoPassAnalyzer:
+    """2-Pass 덤프 파일 분석기"""
+
+    def __init__(self):
+        # Pass 1 수집 데이터
+        self.table_indexes: Dict[str, List[TableIndexInfo]] = {}
+        self.table_charsets: Dict[str, TableCharsetInfo] = {}
+        self.known_tables: Set[str] = set()
+
+        # Pass 2 수집 데이터
+        self.pending_fk_checks: List[PendingFKCheck] = []
+
+        # 파서 (옵션)
+        self.sql_parser = None
+        if PARSERS_AVAILABLE:
+            self.sql_parser = SQLParser()
+
+        # 규칙 모듈 (옵션)
+        self.data_rules = None
+        self.schema_rules = None
+        self.storage_rules = None
+        if RULES_AVAILABLE:
+            self.data_rules = DataIntegrityRules()
+            self.schema_rules = SchemaRules()
+            self.storage_rules = StorageRules()
+
+        # Fix Query 생성기 (옵션)
+        self.fix_generator = None
+        if FIX_GENERATOR_AVAILABLE:
+            self.fix_generator = FixQueryGenerator()
+
+        # 콜백
+        self._progress_callback: Optional[Callable[[str], None]] = None
+        self._issue_callback: Optional[Callable[[CompatibilityIssue], None]] = None
+
+    def set_callbacks(
+        self,
+        progress_callback: Optional[Callable[[str], None]] = None,
+        issue_callback: Optional[Callable[[CompatibilityIssue], None]] = None
+    ):
+        """콜백 설정"""
+        self._progress_callback = progress_callback
+        self._issue_callback = issue_callback
+
+        # 규칙 모듈에도 콜백 전파
+        if self.data_rules and progress_callback:
+            self.data_rules.set_progress_callback(progress_callback)
+        if self.schema_rules and progress_callback:
+            self.schema_rules.set_progress_callback(progress_callback)
+        if self.storage_rules and progress_callback:
+            self.storage_rules.set_progress_callback(progress_callback)
+
+    def _log(self, message: str):
+        if self._progress_callback:
+            self._progress_callback(message)
+
+    def _report_issue(self, issue: CompatibilityIssue):
+        # Fix Query 생성
+        if self.fix_generator:
+            issue = self.fix_generator.generate(issue)
+
+        if self._issue_callback:
+            self._issue_callback(issue)
+
+    def clear_state(self):
+        """분석 상태 초기화"""
+        self.table_indexes.clear()
+        self.table_charsets.clear()
+        self.known_tables.clear()
+        self.pending_fk_checks.clear()
+
+    def _make_table_key(self, schema: Optional[str], table: str) -> str:
+        """테이블 조회 키 생성"""
+        if schema:
+            return f"{schema.lower()}.{table.lower()}"
+        return table.lower()
+
+    def _register_known_table(self, schema: Optional[str], table_name: str):
+        """알려진 테이블 등록"""
+        key = self._make_table_key(schema, table_name)
+        self.known_tables.add(key)
+
+    # ================================================================
+    # Pass 1: 메타데이터 수집
+    # ================================================================
+    def pass1_collect_metadata(self, files: List[Path]):
+        """Pass 1: 테이블 인덱스 및 charset 정보 수집"""
+        self._log("📊 Pass 1: 메타데이터 수집 중...")
+
+        for file_path in files:
+            if not file_path.suffix.lower() == '.sql':
+                continue
+
+            self._log(f"  수집 중: {file_path.name}")
+
+            try:
+                content = file_path.read_text(encoding='utf-8', errors='replace')
+
+                # CREATE TABLE 문 추출 및 파싱
+                if self.sql_parser:
+                    for sql in self.sql_parser.extract_create_table_statements(content):
+                        parsed = self.sql_parser.parse_table(sql)
+                        if parsed:
+                            self._collect_table_indexes(parsed)
+                            self._collect_table_charset(parsed)
+                            self._register_known_table(parsed.schema, parsed.name)
+                else:
+                    # 파서 없이 간단한 정규식으로 테이블명만 수집
+                    table_pattern = re.compile(
+                        r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+                        r'(?:`?(\w+)`?\.)?`?(\w+)`?',
+                        re.IGNORECASE
+                    )
+                    for match in table_pattern.finditer(content):
+                        schema = match.group(1)
+                        table_name = match.group(2)
+                        self._register_known_table(schema, table_name)
+
+            except Exception as e:
+                self._log(f"  ⚠️ 파일 읽기 오류: {file_path.name} - {str(e)}")
+
+        self._log(f"  ✅ 수집 완료: 테이블 {len(self.known_tables)}개")
+
+    def _collect_table_indexes(self, table: 'ParsedTable'):
+        """테이블의 인덱스 정보 수집"""
+        key = self._make_table_key(table.schema, table.name)
+
+        if key not in self.table_indexes:
+            self.table_indexes[key] = []
+
+        for idx in table.indexes:
+            self.table_indexes[key].append(TableIndexInfo(
+                schema=table.schema,
+                table_name=table.name,
+                index_name=idx.name,
+                columns=idx.columns,
+                is_unique=idx.is_unique,
+                is_primary=idx.is_primary
+            ))
+
+    def _collect_table_charset(self, table: 'ParsedTable'):
+        """테이블의 charset 정보 수집"""
+        key = self._make_table_key(table.schema, table.name)
+
+        column_charsets = {}
+        for col in table.columns:
+            if col.charset:
+                column_charsets[col.name] = col.charset
+
+        self.table_charsets[key] = TableCharsetInfo(
+            schema=table.schema,
+            table_name=table.name,
+            charset=table.charset or 'utf8mb4',
+            collation=table.collation,
+            column_charsets=column_charsets
+        )
+
+    # ================================================================
+    # Pass 2: 전체 분석 + FK 수집
+    # ================================================================
+    def pass2_full_analysis(self, files: List[Path]) -> List[CompatibilityIssue]:
+        """Pass 2: 전체 분석 및 FK 참조 수집"""
+        self._log("🔍 Pass 2: 전체 분석 중...")
+
+        all_issues = []
+
+        for file_path in files:
+            self._log(f"  분석 중: {file_path.name}")
+
+            try:
+                if file_path.suffix.lower() == '.sql':
+                    issues = self._analyze_sql_file_pass2(file_path)
+                elif file_path.suffix.lower() in ('.tsv', '.txt'):
+                    issues = self._analyze_data_file_pass2(file_path)
+                else:
+                    continue
+
+                all_issues.extend(issues)
+
+                # 실시간 이슈 리포트
+                for issue in issues:
+                    self._report_issue(issue)
+
+            except Exception as e:
+                self._log(f"  ⚠️ 파일 분석 오류: {file_path.name} - {str(e)}")
+
+        return all_issues
+
+    def _analyze_sql_file_pass2(self, file_path: Path) -> List[CompatibilityIssue]:
+        """SQL 파일 분석 (Pass 2)"""
+        issues = []
+        content = file_path.read_text(encoding='utf-8', errors='replace')
+        location = file_path.name
+
+        # 규칙 모듈 사용 가능 시 확장 검사
+        if self.schema_rules:
+            issues.extend(self.schema_rules.check_all_sql_content(content, location))
+
+        if self.storage_rules:
+            issues.extend(self.storage_rules.check_all_sql_content(content, location))
+
+        if self.data_rules:
+            issues.extend(self.data_rules.check_all_sql_content(content, location))
+
+        # FK 참조 수집 (크로스 검증용)
+        if self.sql_parser:
+            for sql in self.sql_parser.extract_create_table_statements(content):
+                parsed = self.sql_parser.parse_table(sql)
+                if parsed:
+                    self._collect_fk_references(parsed, location)
+
+        return issues
+
+    def _analyze_data_file_pass2(self, file_path: Path) -> List[CompatibilityIssue]:
+        """데이터 파일 분석 (Pass 2)"""
+        issues = []
+
+        if self.data_rules:
+            issues.extend(self.data_rules.check_all_data_file(file_path))
+
+        return issues
+
+    def _collect_fk_references(self, table: 'ParsedTable', location: str):
+        """테이블의 FK 참조 정보 수집"""
+        for fk in table.foreign_keys:
+            self.pending_fk_checks.append(PendingFKCheck(
+                fk_name=fk.name,
+                source_schema=table.schema,
+                source_table=table.name,
+                source_columns=fk.columns,
+                ref_table=fk.ref_table,
+                ref_columns=fk.ref_columns,
+                location=location
+            ))
+
+    # ================================================================
+    # Pass 2.5: 크로스 검증
+    # ================================================================
+    def pass2_5_cross_validate(self) -> List[CompatibilityIssue]:
+        """Pass 2.5: FK 크로스 검증"""
+        self._log("✅ Pass 2.5: FK 크로스 검증 중...")
+
+        issues = []
+
+        for fk in self.pending_fk_checks:
+            # FK 참조 테이블 존재 확인
+            ref_key = self._make_table_key(fk.source_schema, fk.ref_table)
+
+            if ref_key not in self.known_tables:
+                issue = CompatibilityIssue(
+                    issue_type=IssueType.FK_REF_NOT_FOUND,
+                    severity="error",
+                    location=fk.location,
+                    description=f"FK '{fk.fk_name}': 참조 테이블 '{fk.ref_table}' 미존재",
+                    suggestion="참조 테이블이 덤프에 포함되어 있는지 확인하세요",
+                    table_name=fk.source_table
+                )
+                issues.append(issue)
+                self._report_issue(issue)
+                continue
+
+            # FK 참조 컬럼이 PK/UNIQUE 인덱스인지 확인
+            if not self._is_valid_fk_reference(fk):
+                issue = CompatibilityIssue(
+                    issue_type=IssueType.FK_NON_UNIQUE_REF,
+                    severity="error",
+                    location=fk.location,
+                    description=f"FK '{fk.fk_name}': 참조 컬럼이 PK/UNIQUE 아님",
+                    suggestion=f"'{fk.ref_table}.{', '.join(fk.ref_columns)}'에 UNIQUE 인덱스 추가 필요",
+                    table_name=fk.source_table
+                )
+                issues.append(issue)
+                self._report_issue(issue)
+
+        self._log(f"  ✅ 크로스 검증 완료: 이슈 {len(issues)}개")
+        return issues
+
+    def _is_valid_fk_reference(self, fk: PendingFKCheck) -> bool:
+        """FK 참조가 유효한지 확인 (PK 또는 UNIQUE)"""
+        ref_key = self._make_table_key(fk.source_schema, fk.ref_table)
+        indexes = self.table_indexes.get(ref_key, [])
+
+        for idx in indexes:
+            if idx.is_primary or idx.is_unique:
+                if idx.covers_columns(fk.ref_columns):
+                    return True
+
+        return False
+
+    # ================================================================
+    # 통합 분석 메서드
+    # ================================================================
+    def analyze_dump_folder(self, dump_path: str) -> DumpAnalysisResult:
+        """덤프 폴더 2-Pass 분석"""
+        from datetime import datetime
+
+        self.clear_state()
+
+        path = Path(dump_path)
+        if not path.exists():
+            raise FileNotFoundError(f"덤프 폴더 없음: {dump_path}")
+
+        self._log(f"🔍 2-Pass 분석 시작: {dump_path}")
+
+        # 파일 목록 수집
+        sql_files = list(path.glob("*.sql"))
+        data_files = [f for f in path.glob("*.tsv") if not str(f).endswith('.zst')]
+
+        self._log(f"  SQL: {len(sql_files)}개, 데이터: {len(data_files)}개")
+
+        # Pass 1: 메타데이터 수집
+        self.pass1_collect_metadata(sql_files)
+
+        # Pass 2: 전체 분석
+        all_issues = self.pass2_full_analysis(sql_files + data_files)
+
+        # Pass 2.5: 크로스 검증
+        cross_issues = self.pass2_5_cross_validate()
+        all_issues.extend(cross_issues)
+
+        # 요약
+        error_count = sum(1 for i in all_issues if i.severity == "error")
+        warning_count = sum(1 for i in all_issues if i.severity == "warning")
+
+        self._log(f"✅ 2-Pass 분석 완료")
+        self._log(f"  - 오류: {error_count}개")
+        self._log(f"  - 경고: {warning_count}개")
+
+        # 결과 생성
+        return DumpAnalysisResult(
+            dump_path=str(dump_path),
+            analyzed_at=datetime.now().isoformat(),
+            total_sql_files=len(sql_files),
+            total_tsv_files=len(data_files),
+            compatibility_issues=all_issues
+        )
+
+
+# ============================================================
+# 확장 DumpFileAnalyzer (2-Pass 지원)
+# ============================================================
+
+class EnhancedDumpFileAnalyzer(DumpFileAnalyzer):
+    """확장 덤프 파일 분석기 (2-Pass 지원)"""
+
+    def __init__(self, use_two_pass: bool = True):
+        super().__init__()
+        self.use_two_pass = use_two_pass
+
+        if use_two_pass:
+            self._two_pass_analyzer = TwoPassAnalyzer()
+        else:
+            self._two_pass_analyzer = None
+
+    def analyze_dump_folder(self, dump_path: str) -> DumpAnalysisResult:
+        """덤프 폴더 분석 (2-Pass 또는 기존 방식)"""
+        if self.use_two_pass and self._two_pass_analyzer:
+            self._two_pass_analyzer.set_callbacks(
+                self._progress_callback,
+                self._issue_callback
+            )
+            return self._two_pass_analyzer.analyze_dump_folder(dump_path)
+        else:
+            # 기존 단일 패스 분석
+            return super().analyze_dump_folder(dump_path)
+
+    def export_report(self, result: DumpAnalysisResult, filepath: str, format: str = 'json'):
+        """분석 결과를 리포트로 내보내기"""
+        if REPORT_EXPORTER_AVAILABLE:
+            exporter = ReportExporter(result.compatibility_issues)
+            exporter.save_to_file(filepath, format)
+            return filepath
+        else:
+            raise ImportError("ReportExporter 모듈을 사용할 수 없습니다.")
