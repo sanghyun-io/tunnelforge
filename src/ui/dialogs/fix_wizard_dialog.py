@@ -412,11 +412,17 @@ class BatchOptionDialog(QDialog):
             common_options = self._get_common_options(type_steps[issue_type])
 
             combo = QComboBox()
-            for option in common_options:
+            recommended_index = 0  # 기본값
+
+            for i, option in enumerate(common_options):
                 label = option.label
                 if option.is_recommended:
                     label = f"⭐ {label} (권장)"
+                    recommended_index = i  # 권장 옵션 인덱스 저장
                 combo.addItem(label, option)
+
+            # 권장 옵션을 기본 선택 (특히 FK 일괄 변경)
+            combo.setCurrentIndex(recommended_index)
 
             group_layout.addWidget(combo)
             self.option_combos[issue_type] = combo

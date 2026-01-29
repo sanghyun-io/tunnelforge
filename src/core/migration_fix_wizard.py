@@ -513,12 +513,17 @@ class BatchFixExecutor:
 
     트랜잭션 기반으로 수정 SQL을 일괄 실행합니다.
     Dry-run 모드 지원.
+
+    개선사항:
+    - 문자셋 변경 시 FOREIGN_KEY_CHECKS=0으로 전체 감싸기
+    - FK 관계에 따른 실행 순서 최적화 (위상 정렬)
     """
 
     def __init__(self, connector: MySQLConnector, schema: str):
         self.connector = connector
         self.schema = schema
         self._progress_callback: Optional[Callable[[str], None]] = None
+        self._fk_graph_builder: Optional[CollationFKGraphBuilder] = None
 
     def set_progress_callback(self, callback: Callable[[str], None]):
         """진행 콜백 설정"""
@@ -528,6 +533,69 @@ class BatchFixExecutor:
         """진행 로그"""
         if self._progress_callback:
             self._progress_callback(message)
+
+    def _get_fk_graph_builder(self) -> CollationFKGraphBuilder:
+        """FK 그래프 빌더 (lazy init)"""
+        if self._fk_graph_builder is None:
+            self._fk_graph_builder = CollationFKGraphBuilder(self.connector, self.schema)
+            self._fk_graph_builder.build_graph()
+        return self._fk_graph_builder
+
+    def _has_charset_issues(self, steps: List[FixWizardStep]) -> bool:
+        """문자셋 이슈가 포함되어 있는지 확인"""
+        return any(
+            step.issue_type == IssueType.CHARSET_ISSUE
+            and step.selected_option
+            and step.selected_option.strategy != FixStrategy.SKIP
+            for step in steps
+        )
+
+    def _sort_steps_by_fk_order(self, steps: List[FixWizardStep]) -> List[FixWizardStep]:
+        """FK 관계에 따라 실행 순서 정렬 (부모 테이블 먼저)
+
+        위상 정렬을 사용하여 FK 참조 순서에 맞게 정렬합니다.
+        부모 테이블이 먼저 변경되어야 자식 테이블 변경 시 FK 충돌이 줄어듭니다.
+        """
+        # 문자셋 이슈만 정렬 대상
+        charset_steps = [s for s in steps if s.issue_type == IssueType.CHARSET_ISSUE]
+        other_steps = [s for s in steps if s.issue_type != IssueType.CHARSET_ISSUE]
+
+        if not charset_steps:
+            return steps
+
+        try:
+            fk_builder = self._get_fk_graph_builder()
+
+            # 테이블명 추출
+            table_to_step: Dict[str, FixWizardStep] = {}
+            for step in charset_steps:
+                table_name = step.location.split('.')[-1]
+                table_to_step[table_name] = step
+
+            # 위상 정렬
+            all_tables = set(table_to_step.keys())
+            sorted_tables = fk_builder.get_topological_order(all_tables)
+
+            # 정렬된 순서로 steps 재배치
+            sorted_charset_steps = []
+            for table in sorted_tables:
+                if table in table_to_step:
+                    sorted_charset_steps.append(table_to_step[table])
+
+            # 정렬되지 않은 테이블 추가 (FK 관계 없는 테이블)
+            sorted_set = set(sorted_tables)
+            for step in charset_steps:
+                table_name = step.location.split('.')[-1]
+                if table_name not in sorted_set:
+                    sorted_charset_steps.append(step)
+
+            self._log(f"  📊 FK 관계에 따라 {len(sorted_charset_steps)}개 테이블 정렬 완료")
+
+            return sorted_charset_steps + other_steps
+
+        except Exception as e:
+            self._log(f"  ⚠️ FK 정렬 실패, 원본 순서 유지: {e}")
+            return steps
 
     def execute_batch(
         self,
@@ -542,6 +610,10 @@ class BatchFixExecutor:
 
         Returns:
             BatchExecutionResult
+
+        개선사항:
+        - 문자셋 이슈 포함 시 FOREIGN_KEY_CHECKS=0 적용
+        - FK 관계에 따른 실행 순서 최적화
         """
         results: List[FixExecutionResult] = []
         success_count = 0
@@ -551,6 +623,21 @@ class BatchFixExecutor:
 
         mode = "[DRY-RUN]" if dry_run else "[실행]"
         self._log(f"🔧 {mode} 배치 수정 시작 ({len(steps)}개)")
+
+        # 문자셋 이슈 확인 및 FK_CHECKS 비활성화
+        has_charset = self._has_charset_issues(steps)
+        if has_charset and not dry_run:
+            self._log("  🔓 FOREIGN_KEY_CHECKS 비활성화 (문자셋 변경용)")
+            try:
+                with self.connector.connection.cursor() as cursor:
+                    cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+                self.connector.connection.commit()
+            except Exception as e:
+                self._log(f"  ⚠️ FK_CHECKS 비활성화 실패: {e}")
+
+        # FK 관계에 따른 실행 순서 정렬
+        if has_charset:
+            steps = self._sort_steps_by_fk_order(steps)
 
         for i, step in enumerate(steps, 1):
             # 건너뛰기 옵션 확인
@@ -604,6 +691,16 @@ class BatchFixExecutor:
             else:
                 fail_count += 1
                 self._log(f"    ❌ {result.message}")
+
+        # FOREIGN_KEY_CHECKS 복원
+        if has_charset and not dry_run:
+            self._log("  🔒 FOREIGN_KEY_CHECKS 복원")
+            try:
+                with self.connector.connection.cursor() as cursor:
+                    cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                self.connector.connection.commit()
+            except Exception as e:
+                self._log(f"  ⚠️ FK_CHECKS 복원 실패: {e}")
 
         return BatchExecutionResult(
             total_steps=len(steps),
