@@ -132,11 +132,6 @@ class TunnelManagerUI(QMainWindow):
         btn_add_tunnel.setStyleSheet(ButtonStyles.PRIMARY)
         btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
 
-        # [새로고침] 버튼 - Secondary 스타일 (중앙화)
-        btn_refresh = QPushButton("🔄 설정 로드")
-        btn_refresh.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_refresh.clicked.connect(self.reload_config)
-
         # [스키마 비교] 버튼 - Secondary 스타일
         btn_schema_diff = QPushButton("🔀 스키마 비교")
         btn_schema_diff.setStyleSheet(ButtonStyles.SECONDARY)
@@ -161,7 +156,6 @@ class TunnelManagerUI(QMainWindow):
         header_layout.addStretch()
         header_layout.addWidget(btn_add_group)
         header_layout.addWidget(btn_add_tunnel)
-        header_layout.addWidget(btn_refresh)
         header_layout.addWidget(btn_schema_diff)
         header_layout.addWidget(btn_migration)
         header_layout.addWidget(btn_schedule)
@@ -544,6 +538,34 @@ class TunnelManagerUI(QMainWindow):
                     self.tunnels[i] = updated_data
                     break
             self.save_and_refresh()
+
+    def duplicate_tunnel(self, tunnel):
+        """연결 설정 복사하여 새로 만들기"""
+        import copy
+        import uuid
+
+        # 기존 설정 복사
+        new_data = copy.deepcopy(tunnel)
+
+        # 새 ID 생성
+        new_data['id'] = str(uuid.uuid4())
+
+        # 이름에 (복사) 추가
+        original_name = tunnel.get('name', 'Unknown')
+        new_data['name'] = f"{original_name} (복사)"
+
+        # 다이얼로그에서 수정할 수 있도록 열기
+        dialog = TunnelConfigDialog(self, tunnel_data=new_data, tunnel_engine=self.engine)
+        dialog.setWindowTitle("연결 복사 - 새 연결 만들기")
+
+        if dialog.exec():
+            copied_data = dialog.get_data()
+            # ID가 변경되었을 수 있으므로 새 ID 유지
+            copied_data['id'] = new_data['id']
+            copied_data = self._process_credentials(copied_data)
+            self.tunnels.append(copied_data)
+            self.save_and_refresh()
+            self.statusBar().showMessage(f"✅ '{copied_data['name']}' 연결이 생성되었습니다.", 3000)
 
     def delete_tunnel(self, tunnel):
         """연결 삭제"""
@@ -971,6 +993,13 @@ class TunnelManagerUI(QMainWindow):
 
         tunnel = self.tunnels[row]
         menu = QMenu(self)
+
+        # 기본 작업
+        menu.addAction("📋 복사하여 새로 만들기", lambda: self.duplicate_tunnel(tunnel))
+        menu.addAction("✏️ 수정", lambda: self.edit_tunnel_dialog(tunnel))
+        menu.addAction("🗑️ 삭제", lambda: self.delete_tunnel(tunnel))
+
+        menu.addSeparator()
 
         # Shell Export/Import
         menu.addAction("🚀 Shell Export", lambda: self._context_shell_export(tunnel))
