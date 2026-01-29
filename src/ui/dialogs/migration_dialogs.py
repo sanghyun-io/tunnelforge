@@ -347,6 +347,22 @@ class MigrationAnalyzerDialog(QDialog):
         filter_layout.addWidget(self.chk_filter_warning)
         filter_layout.addWidget(self.chk_filter_info)
         filter_layout.addStretch()
+
+        # 자동 수정 위저드 버튼
+        self.btn_auto_fix = QPushButton("🔧 자동 수정 위저드")
+        self.btn_auto_fix.setStyleSheet("""
+            QPushButton {
+                background-color: #9b59b6; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #8e44ad; }
+            QPushButton:disabled { background-color: #bdc3c7; }
+        """)
+        self.btn_auto_fix.setToolTip("호환성 이슈를 대화형 위저드로 자동 수정합니다.")
+        self.btn_auto_fix.setEnabled(False)  # 분석 완료 후 활성화
+        self.btn_auto_fix.clicked.connect(self.open_fix_wizard)
+        filter_layout.addWidget(self.btn_auto_fix)
+
         layout.addLayout(filter_layout)
 
         # 이슈 테이블
@@ -495,6 +511,8 @@ class MigrationAnalyzerDialog(QDialog):
             self.update_fk_tree(result.fk_tree, result.schema)
             # 저장 버튼 활성화
             self.btn_save.setEnabled(True)
+            # 자동 수정 버튼 활성화 (호환성 이슈가 있을 때만)
+            self.btn_auto_fix.setEnabled(len(result.compatibility_issues) > 0)
         except Exception as e:
             logger.error(f"분석 결과 UI 업데이트 오류: {e}", exc_info=True)
             QMessageBox.critical(self, "오류", f"분석 결과 표시 중 오류 발생:\n{e}")
@@ -791,6 +809,50 @@ class MigrationAnalyzerDialog(QDialog):
         )
 
     # =========================================================================
+    # 자동 수정 위저드
+    # =========================================================================
+
+    def open_fix_wizard(self):
+        """자동 수정 위저드 열기"""
+        if not self.analysis_result:
+            QMessageBox.warning(self, "분석 필요", "먼저 스키마 분석을 실행하세요.")
+            return
+
+        if not self.analysis_result.compatibility_issues:
+            QMessageBox.information(self, "이슈 없음", "수정할 호환성 이슈가 없습니다.")
+            return
+
+        try:
+            from src.ui.dialogs.fix_wizard_dialog import FixWizardDialog
+
+            wizard = FixWizardDialog(
+                parent=self,
+                connector=self.connector,
+                issues=self.analysis_result.compatibility_issues,
+                schema=self.analysis_result.schema
+            )
+            result = wizard.exec()
+
+            if result:
+                # 위저드 완료 후 재분석 권장
+                reply = QMessageBox.question(
+                    self,
+                    "재분석",
+                    "수정이 완료되었습니다. 변경사항을 확인하기 위해 재분석하시겠습니까?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes
+                )
+                if reply == QMessageBox.StandardButton.Yes:
+                    self.start_analysis()
+
+        except ImportError as e:
+            logger.error(f"자동 수정 위저드 모듈 로드 실패: {e}", exc_info=True)
+            QMessageBox.critical(self, "오류", f"자동 수정 위저드를 불러올 수 없습니다:\n{e}")
+        except Exception as e:
+            logger.error(f"자동 수정 위저드 오류: {e}", exc_info=True)
+            QMessageBox.critical(self, "오류", f"자동 수정 위저드 실행 중 오류:\n{e}")
+
+    # =========================================================================
     # 분석 결과 저장/로드
     # =========================================================================
 
@@ -857,12 +919,14 @@ class MigrationAnalyzerDialog(QDialog):
 
             # UI 업데이트
             self.analysis_result = result
-            self.txt_schema.setText(result.schema)
+            self.combo_schema.setCurrentText(result.schema)
             self.update_overview(result)
             self.update_orphans_table(result.orphan_records)
             self.update_compatibility_table(result.compatibility_issues)
             self.update_fk_tree(result.fk_tree, result.schema)
             self.btn_save.setEnabled(True)
+            # 자동 수정 버튼 활성화
+            self.btn_auto_fix.setEnabled(len(result.compatibility_issues) > 0)
 
             self.add_log(f"📂 분석 결과 불러오기 완료: {file_path}")
             self.add_log(f"   스키마: {result.schema}, 분석일시: {result.analyzed_at}")
