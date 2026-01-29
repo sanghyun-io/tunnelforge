@@ -57,6 +57,10 @@ class FixWizardStep:
     selected_option: Optional[FixOption] = None
     user_input: Optional[str] = None                 # 사용자 입력값
 
+    # FK 연관 테이블 일괄 변경으로 인한 생략 정보
+    skipped_by: Optional[str] = None                 # 생략 원인 테이블명 (예: "companies")
+    skipped_reason: str = ""                         # 생략 사유 설명
+
 
 @dataclass
 class FixExecutionResult:

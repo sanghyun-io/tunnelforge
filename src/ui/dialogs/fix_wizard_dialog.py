@@ -13,18 +13,21 @@ from PyQt6.QtWidgets import (
     QLabel, QLineEdit, QPushButton, QRadioButton, QCheckBox,
     QButtonGroup, QGroupBox, QTextEdit, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
-    QWidget, QFrame, QSplitter, QMessageBox, QApplication
+    QWidget, QFrame, QSplitter, QMessageBox, QApplication,
+    QTreeWidget, QTreeWidgetItem, QDialog, QDialogButtonBox,
+    QComboBox, QSpacerItem, QSizePolicy
 )
 from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont, QColor
-from typing import List, Optional, Dict
+from PyQt6.QtGui import QFont, QColor, QIcon
+from typing import List, Optional, Dict, Set
 
 from src.core.db_connector import MySQLConnector
 from src.core.migration_analyzer import CompatibilityIssue
 from src.core.migration_constants import IssueType
 from src.core.migration_fix_wizard import (
     FixStrategy, FixOption, FixWizardStep,
-    SmartFixGenerator, BatchFixExecutor, create_wizard_steps
+    SmartFixGenerator, BatchFixExecutor, create_wizard_steps,
+    CollationFKGraphBuilder
 )
 from src.ui.workers.fix_wizard_worker import FixWizardWorker
 
@@ -252,15 +255,34 @@ class IssueSelectionPage(QWizardPage):
         self.update_count()
 
     def select_all(self):
-        """전체 선택"""
-        for i, chk in enumerate(self.checkboxes):
-            if not self.table.isRowHidden(i):
-                chk.setChecked(True)
+        """전체 선택 (대량 항목 최적화)"""
+        # UI 업데이트 일시 중지
+        self.table.setUpdatesEnabled(False)
+        try:
+            for i, chk in enumerate(self.checkboxes):
+                if not self.table.isRowHidden(i):
+                    # 시그널 차단하여 update_count() 반복 호출 방지
+                    chk.blockSignals(True)
+                    chk.setChecked(True)
+                    chk.blockSignals(False)
+        finally:
+            self.table.setUpdatesEnabled(True)
+        # 완료 후 한 번만 업데이트
+        self.update_count()
 
     def deselect_all(self):
-        """전체 해제"""
-        for chk in self.checkboxes:
-            chk.setChecked(False)
+        """전체 해제 (대량 항목 최적화)"""
+        # UI 업데이트 일시 중지
+        self.table.setUpdatesEnabled(False)
+        try:
+            for chk in self.checkboxes:
+                chk.blockSignals(True)
+                chk.setChecked(False)
+                chk.blockSignals(False)
+        finally:
+            self.table.setUpdatesEnabled(True)
+        # 완료 후 한 번만 업데이트
+        self.update_count()
 
     def update_count(self):
         """선택 개수 업데이트"""
@@ -293,8 +315,162 @@ class IssueSelectionPage(QWizardPage):
         return True
 
 
+class BatchOptionDialog(QDialog):
+    """전체 일괄 옵션 적용 다이얼로그
+
+    이슈 유형별로 기본 옵션을 선택하여 모든 이슈에 일괄 적용합니다.
+    """
+
+    def __init__(self, steps: List[FixWizardStep], parent=None):
+        super().__init__(parent)
+        self.steps = steps
+        self.option_combos: Dict[IssueType, QComboBox] = {}
+
+        self.setWindowTitle("전체 일괄 옵션 적용")
+        self.setMinimumWidth(500)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 안내 텍스트
+        info_label = QLabel(
+            "이슈 유형별로 기본 옵션을 선택하세요.\n"
+            "선택한 옵션이 해당 유형의 모든 이슈에 적용됩니다."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #666; margin-bottom: 10px;")
+        layout.addWidget(info_label)
+
+        # 이슈 유형별 그룹
+        type_counts: Dict[IssueType, int] = {}
+        type_options: Dict[IssueType, List[FixOption]] = {}
+
+        for step in self.steps:
+            if step.issue_type not in type_counts:
+                type_counts[step.issue_type] = 0
+                type_options[step.issue_type] = step.options
+            type_counts[step.issue_type] += 1
+
+        type_names = {
+            IssueType.INVALID_DATE: "잘못된 날짜",
+            IssueType.CHARSET_ISSUE: "문자셋 이슈",
+            IssueType.ZEROFILL_USAGE: "ZEROFILL 속성",
+            IssueType.FLOAT_PRECISION: "FLOAT 정밀도",
+            IssueType.INT_DISPLAY_WIDTH: "INT 표시 너비",
+            IssueType.DEPRECATED_ENGINE: "deprecated 엔진",
+            IssueType.ENUM_EMPTY_VALUE: "ENUM 빈 값",
+        }
+
+        for issue_type, count in type_counts.items():
+            type_name = type_names.get(issue_type, str(issue_type.value))
+            group = QGroupBox(f"{type_name} ({count}개)")
+            group_layout = QVBoxLayout(group)
+
+            combo = QComboBox()
+            options = type_options[issue_type]
+
+            for option in options:
+                label = option.label
+                if option.is_recommended:
+                    label = f"⭐ {label} (권장)"
+                combo.addItem(label, option)
+
+            group_layout.addWidget(combo)
+            self.option_combos[issue_type] = combo
+
+            layout.addWidget(group)
+
+        layout.addStretch()
+
+        # 버튼
+        btn_box = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel | QDialogButtonBox.StandardButton.Apply
+        )
+        btn_box.button(QDialogButtonBox.StandardButton.Apply).setText("적용")
+        btn_box.button(QDialogButtonBox.StandardButton.Cancel).setText("취소")
+        btn_box.accepted.connect(self.accept)
+        btn_box.rejected.connect(self.reject)
+        btn_box.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.apply_options)
+
+        layout.addWidget(btn_box)
+
+    def apply_options(self):
+        """선택된 옵션 적용"""
+        for step in self.steps:
+            if step.issue_type in self.option_combos:
+                combo = self.option_combos[step.issue_type]
+                selected_option = combo.currentData()
+                if selected_option:
+                    step.selected_option = selected_option
+
+        self.accept()
+
+
+class SkippedTablesDialog(QDialog):
+    """생략된 테이블 목록 다이얼로그
+
+    FK 연관테이블 일괄 변경으로 인해 자동 생략된 테이블 목록을 보여줍니다.
+    """
+
+    def __init__(self, steps: List[FixWizardStep], parent=None):
+        super().__init__(parent)
+        self.steps = steps
+
+        self.setWindowTitle("생략된 테이블 목록")
+        self.setMinimumSize(550, 400)
+        self.init_ui()
+
+    def init_ui(self):
+        layout = QVBoxLayout(self)
+
+        # 생략된 테이블 필터
+        skipped_steps = [s for s in self.steps if s.skipped_by is not None]
+
+        # 안내 텍스트
+        info_label = QLabel(
+            f"다음 {len(skipped_steps)}개 테이블은 FK 연관테이블 일괄 변경 옵션으로 인해\n"
+            "자동 생략되었습니다."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("margin-bottom: 10px;")
+        layout.addWidget(info_label)
+
+        # 테이블
+        table = QTableWidget()
+        table.setColumnCount(2)
+        table.setHorizontalHeaderLabels(["테이블명", "생략 원인"])
+        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
+        table.setRowCount(len(skipped_steps))
+        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+
+        for i, step in enumerate(skipped_steps):
+            table_name = step.location.split('.')[-1]
+            table.setItem(i, 0, QTableWidgetItem(table_name))
+            table.setItem(i, 1, QTableWidgetItem(f"'{step.skipped_by}'의 FK 일괄 변경"))
+
+        layout.addWidget(table)
+
+        # 닫기 버튼
+        btn_close = QPushButton("닫기")
+        btn_close.clicked.connect(self.accept)
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        btn_layout.addWidget(btn_close)
+        layout.addLayout(btn_layout)
+
+
 class FixOptionPage(QWizardPage):
-    """2단계: 이슈별 수정 옵션 선택"""
+    """2단계: 이슈별 수정 옵션 선택 (UX 개선 버전)
+
+    개선 사항:
+    - 전체 일괄 옵션 적용
+    - FK 연관 테이블 Tree 시각화
+    - FK 연관테이블 일괄 변경 시 자동 생략
+    - 생략된 테이블 건너뛰기 네비게이션
+    """
 
     def __init__(self, wizard: FixWizardDialog):
         super().__init__(wizard)
@@ -305,41 +481,127 @@ class FixOptionPage(QWizardPage):
 
         self.current_index = 0
         self.option_buttons: List[QRadioButton] = []
+        self.option_labels: List[QLabel] = []
         self.input_field: Optional[QLineEdit] = None
+        self._fk_graph_builder: Optional[CollationFKGraphBuilder] = None
 
         self.init_ui()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # 진행 표시
-        progress_layout = QHBoxLayout()
+        # === 상단 영역: 진행 표시 + 일괄 적용 버튼 ===
+        progress_group = QGroupBox()
+        progress_group.setStyleSheet("QGroupBox { border: 1px solid #ddd; border-radius: 4px; padding: 8px; }")
+        progress_layout = QVBoxLayout(progress_group)
+
+        # 진행률 텍스트 + 프로그레스바
+        progress_text_layout = QHBoxLayout()
         self.lbl_progress = QLabel("이슈 1 / 1")
-        self.lbl_progress.setStyleSheet("font-weight: bold; font-size: 14px;")
-        progress_layout.addWidget(self.lbl_progress)
-        progress_layout.addStretch()
-        layout.addLayout(progress_layout)
+        self.lbl_progress.setStyleSheet("font-weight: bold; font-size: 13px;")
+        progress_text_layout.addWidget(self.lbl_progress)
+        progress_text_layout.addStretch()
+        progress_layout.addLayout(progress_text_layout)
 
-        # 이슈 정보
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumHeight(8)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar {
+                border: none;
+                background-color: #e0e0e0;
+                border-radius: 4px;
+            }
+            QProgressBar::chunk {
+                background-color: #3498db;
+                border-radius: 4px;
+            }
+        """)
+        progress_layout.addWidget(self.progress_bar)
+
+        # 일괄 적용 버튼 영역
+        btn_layout = QHBoxLayout()
+        btn_layout.setContentsMargins(0, 8, 0, 0)
+
+        self.btn_batch_apply = QPushButton("📋 전체 일괄 적용")
+        self.btn_batch_apply.setToolTip("모든 이슈에 동일한 옵션을 일괄 적용합니다")
+        self.btn_batch_apply.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white; font-weight: bold;
+                padding: 6px 12px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        self.btn_batch_apply.clicked.connect(self.show_batch_option_dialog)
+
+        self.btn_show_skipped = QPushButton("👁️ 생략된 테이블 (0개)")
+        self.btn_show_skipped.setToolTip("FK 일괄 변경으로 자동 생략된 테이블 목록")
+        self.btn_show_skipped.setStyleSheet("""
+            QPushButton {
+                background-color: #95a5a6; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+            }
+            QPushButton:hover { background-color: #7f8c8d; }
+            QPushButton:disabled { background-color: #bdc3c7; }
+        """)
+        self.btn_show_skipped.clicked.connect(self.show_skipped_tables_dialog)
+
+        btn_layout.addWidget(self.btn_batch_apply)
+        btn_layout.addWidget(self.btn_show_skipped)
+        btn_layout.addStretch()
+        progress_layout.addLayout(btn_layout)
+
+        layout.addWidget(progress_group)
+
+        # === 중앙 영역: 이슈 정보 + FK Tree ===
         self.grp_issue = QGroupBox("현재 이슈")
-        issue_layout = QFormLayout(self.grp_issue)
+        issue_main_layout = QVBoxLayout(self.grp_issue)
 
+        # 이슈 기본 정보
+        issue_info_layout = QFormLayout()
         self.lbl_type = QLabel()
         self.lbl_location = QLabel()
+        self.lbl_location.setStyleSheet("font-weight: bold;")
         self.lbl_description = QLabel()
         self.lbl_description.setWordWrap(True)
 
-        issue_layout.addRow("유형:", self.lbl_type)
-        issue_layout.addRow("위치:", self.lbl_location)
-        issue_layout.addRow("설명:", self.lbl_description)
+        issue_info_layout.addRow("유형:", self.lbl_type)
+        issue_info_layout.addRow("위치:", self.lbl_location)
+        issue_info_layout.addRow("설명:", self.lbl_description)
+        issue_main_layout.addLayout(issue_info_layout)
 
+        # FK 연관 테이블 Tree (접을 수 있음)
+        self.fk_tree_group = QGroupBox("▼ FK 연관 테이블")
+        self.fk_tree_group.setCheckable(False)
+        fk_tree_layout = QVBoxLayout(self.fk_tree_group)
+
+        self.fk_tree = QTreeWidget()
+        self.fk_tree.setHeaderHidden(True)
+        self.fk_tree.setMaximumHeight(150)
+        self.fk_tree.setStyleSheet("""
+            QTreeWidget {
+                border: 1px solid #ddd;
+                border-radius: 4px;
+                background-color: #fafafa;
+            }
+            QTreeWidget::item {
+                padding: 2px;
+            }
+            QTreeWidget::item:selected {
+                background-color: #e3f2fd;
+                color: black;
+            }
+        """)
+        fk_tree_layout.addWidget(self.fk_tree)
+        self.fk_tree_group.setVisible(False)
+
+        issue_main_layout.addWidget(self.fk_tree_group)
         layout.addWidget(self.grp_issue)
 
-        # 옵션 선택
+        # === 하단 영역: 옵션 선택 ===
         self.grp_options = QGroupBox("수정 옵션")
         self.options_layout = QVBoxLayout(self.grp_options)
         self.btn_group = QButtonGroup(self)
-
         layout.addWidget(self.grp_options)
 
         # 사용자 입력 필드 (필요 시 표시)
@@ -352,7 +614,7 @@ class FixOptionPage(QWizardPage):
         self.input_group.setVisible(False)
         layout.addWidget(self.input_group)
 
-        # 네비게이션
+        # === 네비게이션 ===
         nav_layout = QHBoxLayout()
 
         self.btn_prev_issue = QPushButton("< 이전 이슈")
@@ -371,7 +633,62 @@ class FixOptionPage(QWizardPage):
     def initializePage(self):
         """페이지 초기화"""
         self.current_index = 0
+        self._fk_graph_builder = None
+
+        # FK 그래프 빌더 초기화 (Collation 이슈가 있을 경우)
+        has_charset_issue = any(
+            s.issue_type == IssueType.CHARSET_ISSUE
+            for s in self.wizard_dialog.wizard_steps
+        )
+        if has_charset_issue and self.wizard_dialog.connector:
+            try:
+                self._fk_graph_builder = CollationFKGraphBuilder(
+                    self.wizard_dialog.connector,
+                    self.wizard_dialog.schema
+                )
+                self._fk_graph_builder.build_graph()
+            except Exception:
+                self._fk_graph_builder = None
+
+        # 첫 번째 미생략 이슈로 이동
+        self._move_to_first_unskipped()
         self.show_current_issue()
+
+    def _move_to_first_unskipped(self):
+        """첫 번째 미생략 이슈로 이동"""
+        steps = self.wizard_dialog.wizard_steps
+        for i, step in enumerate(steps):
+            if step.skipped_by is None:
+                self.current_index = i
+                return
+        self.current_index = 0
+
+    def update_progress_display(self):
+        """진행률 업데이트"""
+        steps = self.wizard_dialog.wizard_steps
+        total = len(steps)
+        skipped = sum(1 for s in steps if s.skipped_by is not None)
+        active_total = total - skipped
+
+        # 현재 위치 (생략 제외 인덱스)
+        active_index = sum(
+            1 for i, s in enumerate(steps)
+            if i <= self.current_index and s.skipped_by is None
+        )
+
+        if active_total > 0:
+            self.lbl_progress.setText(
+                f"이슈 {active_index} / {active_total} "
+                f"(전체 {total}개 중 {skipped}개 자동 생략)"
+            )
+            self.progress_bar.setValue(int(active_index / active_total * 100))
+        else:
+            self.lbl_progress.setText(f"이슈 0 / 0 (전체 {total}개 모두 생략됨)")
+            self.progress_bar.setValue(100)
+
+        # 생략된 테이블 버튼 업데이트
+        self.btn_show_skipped.setText(f"👁️ 생략된 테이블 ({skipped}개)")
+        self.btn_show_skipped.setEnabled(skipped > 0)
 
     def show_current_issue(self):
         """현재 이슈 표시"""
@@ -382,7 +699,7 @@ class FixOptionPage(QWizardPage):
         step = steps[self.current_index]
 
         # 진행 표시 업데이트
-        self.lbl_progress.setText(f"이슈 {self.current_index + 1} / {len(steps)}")
+        self.update_progress_display()
 
         # 이슈 정보 업데이트
         type_names = {
@@ -399,16 +716,23 @@ class FixOptionPage(QWizardPage):
         self.lbl_location.setText(step.location)
         self.lbl_description.setText(step.description)
 
-        # 기존 옵션 버튼 제거
+        # FK Tree 업데이트 (Collation 이슈일 때만)
+        self._update_fk_tree(step)
+
+        # 기존 옵션 버튼 및 라벨 제거
         for btn in self.option_buttons:
             self.btn_group.removeButton(btn)
             self.options_layout.removeWidget(btn)
             btn.deleteLater()
         self.option_buttons.clear()
 
+        for lbl in self.option_labels:
+            self.options_layout.removeWidget(lbl)
+            lbl.deleteLater()
+        self.option_labels.clear()
+
         # 새 옵션 버튼 생성
         for i, option in enumerate(step.options):
-            # 권장 옵션 표시
             label = option.label
             if option.is_recommended:
                 label = f"⭐ {label}"
@@ -420,39 +744,152 @@ class FixOptionPage(QWizardPage):
             if step.selected_option and step.selected_option.strategy == option.strategy:
                 radio.setChecked(True)
             elif i == 0 and not step.selected_option:
-                # 첫 번째 옵션 기본 선택
                 radio.setChecked(True)
 
             radio.toggled.connect(lambda checked, opt=option: self.on_option_changed(checked, opt))
 
             self.btn_group.addButton(radio, i)
             self.options_layout.addWidget(radio)
+            self.option_buttons.append(radio)
 
             # 설명 라벨
-            desc_label = QLabel(f"    {option.description}")
+            desc_text = f"    {option.description}"
+
+            # FK 일괄 변경 옵션일 경우 경고 추가
+            if option.strategy == FixStrategy.COLLATION_FK_CASCADE and option.related_tables:
+                desc_text += f"\n    ⚠️ 위 {len(option.related_tables)}개 테이블은 자동으로 생략됩니다"
+
+            desc_label = QLabel(desc_text)
             desc_label.setWordWrap(True)
             desc_label.setStyleSheet("color: #666; font-size: 11px;")
             self.options_layout.addWidget(desc_label)
-
-            self.option_buttons.append(radio)
+            self.option_labels.append(desc_label)
 
         # 입력 필드 초기화
         self.update_input_field()
 
         # 네비게이션 버튼 상태
-        self.btn_prev_issue.setEnabled(self.current_index > 0)
-        self.btn_next_issue.setEnabled(self.current_index < len(steps) - 1)
+        self._update_nav_buttons()
+
+    def _update_fk_tree(self, step: FixWizardStep):
+        """FK 연관 테이블 Tree 업데이트"""
+        self.fk_tree.clear()
+
+        # Collation 이슈가 아니면 숨김
+        if step.issue_type != IssueType.CHARSET_ISSUE or not self._fk_graph_builder:
+            self.fk_tree_group.setVisible(False)
+            return
+
+        # 현재 테이블명 추출
+        location_parts = step.location.split('.')
+        if len(location_parts) < 2:
+            self.fk_tree_group.setVisible(False)
+            return
+
+        current_table = location_parts[1]
+
+        # 연관 테이블 가져오기
+        related_tables = self._fk_graph_builder.get_related_tables(current_table)
+
+        if not related_tables:
+            self.fk_tree_group.setVisible(False)
+            return
+
+        # Tree 구성
+        self.fk_tree_group.setTitle(f"▼ FK 연관 테이블 ({len(related_tables) + 1}개)")
+        self.fk_tree_group.setVisible(True)
+
+        # 루트 아이템 (현재 테이블 또는 부모 테이블)
+        all_tables = related_tables | {current_table}
+        ordered = self._fk_graph_builder.get_topological_order(all_tables)
+
+        # 계층 구조로 표시
+        root_item = QTreeWidgetItem(self.fk_tree)
+        root_item.setText(0, f"📁 {ordered[0]}")
+        root_item.setExpanded(True)
+
+        # 나머지 테이블을 자식으로 추가
+        for table in ordered[1:]:
+            child_item = QTreeWidgetItem(root_item)
+            if table == current_table:
+                child_item.setText(0, f"📄 {table}  ← 현재")
+                child_item.setForeground(0, QColor("#e74c3c"))
+            else:
+                child_item.setText(0, f"📄 {table}")
+
+        self.fk_tree.expandAll()
+
+    def _update_nav_buttons(self):
+        """네비게이션 버튼 상태 업데이트"""
+        steps = self.wizard_dialog.wizard_steps
+
+        # 이전 미생략 이슈 존재 여부
+        has_prev = any(
+            s.skipped_by is None
+            for s in steps[:self.current_index]
+        )
+
+        # 다음 미생략 이슈 존재 여부
+        has_next = any(
+            s.skipped_by is None
+            for s in steps[self.current_index + 1:]
+        )
+
+        self.btn_prev_issue.setEnabled(has_prev)
+        self.btn_next_issue.setEnabled(has_next)
 
     def on_option_changed(self, checked: bool, option: FixOption):
         """옵션 변경 시"""
-        if checked:
-            step = self.wizard_dialog.wizard_steps[self.current_index]
-            step.selected_option = option
-            self.update_input_field()
+        if not checked:
+            return
+
+        step = self.wizard_dialog.wizard_steps[self.current_index]
+        step.selected_option = option
+
+        # FK 일괄 변경 옵션인 경우
+        if option.strategy == FixStrategy.COLLATION_FK_CASCADE:
+            self._mark_related_tables_as_skipped(step, option)
+        else:
+            # 다른 옵션 선택 시 생략 해제
+            self._unmark_skipped_tables(step)
+
+        self.update_input_field()
+        self.update_progress_display()
+
+    def _mark_related_tables_as_skipped(self, source_step: FixWizardStep, option: FixOption):
+        """FK 연관 테이블들을 생략 처리"""
+        if not option.related_tables:
+            return
+
+        source_table = source_step.location.split('.')[-1]  # schema.table → table
+
+        for other_step in self.wizard_dialog.wizard_steps:
+            other_table = other_step.location.split('.')[-1]
+
+            # 연관 테이블인 경우 생략 처리 (현재 테이블 제외)
+            if other_table in option.related_tables and other_table != source_table:
+                other_step.skipped_by = source_table
+                other_step.skipped_reason = f"'{source_table}'의 FK 연관테이블 일괄 변경으로 생략"
+                other_step.selected_option = option  # 같은 옵션으로 설정
+
+    def _unmark_skipped_tables(self, source_step: FixWizardStep):
+        """이 테이블로 인해 생략된 테이블들의 생략 해제"""
+        source_table = source_step.location.split('.')[-1]
+
+        for other_step in self.wizard_dialog.wizard_steps:
+            if other_step.skipped_by == source_table:
+                other_step.skipped_by = None
+                other_step.skipped_reason = ""
+                other_step.selected_option = None  # 다시 선택하도록
 
     def update_input_field(self):
         """입력 필드 표시/숨김"""
-        step = self.wizard_dialog.wizard_steps[self.current_index]
+        steps = self.wizard_dialog.wizard_steps
+        if not steps or self.current_index >= len(steps):
+            self.input_group.setVisible(False)
+            return
+
+        step = steps[self.current_index]
         option = step.selected_option
 
         if option and option.requires_input:
@@ -464,11 +901,15 @@ class FixOptionPage(QWizardPage):
 
     def save_current_selection(self):
         """현재 선택 저장"""
-        step = self.wizard_dialog.wizard_steps[self.current_index]
+        steps = self.wizard_dialog.wizard_steps
+        if not steps or self.current_index >= len(steps):
+            return
+
+        step = steps[self.current_index]
 
         # 선택된 옵션 저장
         checked_id = self.btn_group.checkedId()
-        if checked_id >= 0 and checked_id < len(step.options):
+        if 0 <= checked_id < len(step.options):
             step.selected_option = step.options[checked_id]
 
         # 입력값 저장
@@ -476,30 +917,62 @@ class FixOptionPage(QWizardPage):
             step.user_input = self.input_field.text()
 
     def prev_issue(self):
-        """이전 이슈"""
+        """이전 이슈 (생략된 테이블 건너뛰기)"""
         self.save_current_selection()
-        if self.current_index > 0:
-            self.current_index -= 1
+
+        prev_idx = self.current_index - 1
+        steps = self.wizard_dialog.wizard_steps
+
+        while prev_idx >= 0:
+            if steps[prev_idx].skipped_by is None:
+                break
+            prev_idx -= 1
+
+        if prev_idx >= 0:
+            self.current_index = prev_idx
             self.show_current_issue()
 
     def next_issue(self):
-        """다음 이슈"""
+        """다음 이슈 (생략된 테이블 건너뛰기)"""
         self.save_current_selection()
-        if self.current_index < len(self.wizard_dialog.wizard_steps) - 1:
-            self.current_index += 1
+
+        next_idx = self.current_index + 1
+        steps = self.wizard_dialog.wizard_steps
+
+        while next_idx < len(steps):
+            if steps[next_idx].skipped_by is None:
+                break
+            next_idx += 1
+
+        if next_idx < len(steps):
+            self.current_index = next_idx
             self.show_current_issue()
+
+    def show_batch_option_dialog(self):
+        """전체 일괄 적용 다이얼로그 표시"""
+        dialog = BatchOptionDialog(self.wizard_dialog.wizard_steps, self)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            # 다이얼로그에서 적용된 옵션 반영
+            self.show_current_issue()
+
+    def show_skipped_tables_dialog(self):
+        """생략된 테이블 목록 다이얼로그 표시"""
+        dialog = SkippedTablesDialog(self.wizard_dialog.wizard_steps, self)
+        dialog.exec()
 
     def validatePage(self) -> bool:
         """페이지 유효성 검사"""
         self.save_current_selection()
 
-        # 모든 이슈에 옵션이 선택되었는지 확인
+        # 모든 미생략 이슈에 옵션이 선택되었는지 확인
         for step in self.wizard_dialog.wizard_steps:
+            if step.skipped_by is not None:
+                continue  # 생략된 이슈는 검사 스킵
+
             if not step.selected_option:
                 QMessageBox.warning(self, "선택 필요", f"'{step.location}'의 수정 옵션을 선택하세요.")
                 return False
 
-            # 입력 필드 검증
             if step.selected_option.requires_input and not step.user_input:
                 QMessageBox.warning(self, "입력 필요", f"'{step.location}'의 추가 입력값을 입력하세요.")
                 return False
@@ -582,24 +1055,61 @@ class PreviewPage(QWizardPage):
         self.generate_sql_preview()
 
     def generate_sql_preview(self):
-        """SQL 미리보기 생성"""
+        """SQL 미리보기 생성
+
+        생략된 테이블의 SQL은 중복 없이 한 번만 포함됩니다.
+        """
         lines = []
+        steps = self.wizard_dialog.wizard_steps
+
+        # 통계
+        total = len(steps)
+        skipped_count = sum(1 for s in steps if s.skipped_by is not None)
+        execute_count = sum(
+            1 for s in steps
+            if s.selected_option and s.selected_option.strategy != FixStrategy.SKIP
+            and s.skipped_by is None
+        )
+
         lines.append("-- ==========================================")
         lines.append("-- 마이그레이션 자동 수정 SQL")
         lines.append(f"-- 스키마: {self.wizard_dialog.schema}")
-        lines.append(f"-- 대상: {len(self.wizard_dialog.wizard_steps)}개 이슈")
+        lines.append(f"-- 전체 이슈: {total}개")
+        lines.append(f"-- 실행 대상: {execute_count}개")
+        if skipped_count > 0:
+            lines.append(f"-- FK 일괄 변경으로 생략: {skipped_count}개")
         lines.append("-- ==========================================")
         lines.append("")
 
-        for i, step in enumerate(self.wizard_dialog.wizard_steps, 1):
-            if step.selected_option and step.selected_option.strategy != FixStrategy.SKIP:
-                lines.append(f"-- [{i}] {step.location}")
-                lines.append(f"-- 전략: {step.selected_option.label}")
+        # 이미 출력한 SQL 추적 (FK 일괄 변경 중복 방지)
+        processed_sql_hashes: set = set()
+        counter = 0
 
+        for step in steps:
+            # 생략된 테이블은 건너뛰기 (원본 테이블에서 이미 처리됨)
+            if step.skipped_by is not None:
+                continue
+
+            if step.selected_option and step.selected_option.strategy != FixStrategy.SKIP:
                 sql = step.selected_option.sql_template or ""
                 if step.selected_option.requires_input and step.user_input:
                     sql = sql.replace("{custom_date}", step.user_input)
                     sql = sql.replace("{precision}", step.user_input)
+
+                # SQL 중복 체크
+                sql_hash = hash(sql)
+                if sql_hash in processed_sql_hashes:
+                    continue
+                processed_sql_hashes.add(sql_hash)
+
+                counter += 1
+                lines.append(f"-- [{counter}] {step.location}")
+                lines.append(f"-- 전략: {step.selected_option.label}")
+
+                # FK 일괄 변경인 경우 포함된 테이블 명시
+                if step.selected_option.strategy == FixStrategy.COLLATION_FK_CASCADE:
+                    if step.selected_option.related_tables:
+                        lines.append(f"-- 포함 테이블: {', '.join(step.selected_option.related_tables)}")
 
                 lines.append(sql)
                 lines.append("")
