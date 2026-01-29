@@ -5,7 +5,9 @@ SQL 에디터 다이얼로그
 - 실시간 테이블/컬럼 검증 (인라인 표시)
 - 자동완성 (Ctrl+Space)
 - 결과 테이블 표시
+- 멀티 탭 에디터 지원
 """
+import os
 import time
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
@@ -946,7 +948,7 @@ class SQLTransactionWorker(QThread):
 # 히스토리 다이얼로그
 # =====================================================================
 class HistoryDialog(QDialog):
-    """쿼리 히스토리 다이얼로그 (영구 보관, 삭제 불가)"""
+    """쿼리 히스토리 다이얼로그 (영구 보관, 고급 검색, 즐겨찾기)"""
     query_selected = pyqtSignal(str)
 
     ITEMS_PER_PAGE = 50  # 한 번에 로드할 항목 수
@@ -956,23 +958,108 @@ class HistoryDialog(QDialog):
         self.history_manager = history_manager
         self.current_offset = 0
         self.total_count = 0
+        self._history_items = []  # 현재 표시된 항목 데이터
+        self._is_searching = False  # 검색 모드 여부
         self.setWindowTitle("쿼리 히스토리")
-        self.setMinimumSize(700, 500)
+        self.setMinimumSize(800, 600)
         self.init_ui()
         self.load_history()
 
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # 상단 정보 바
+        # === 검색 필터 패널 ===
+        filter_group = QGroupBox("검색 필터")
+        filter_layout = QVBoxLayout(filter_group)
+
+        # 첫 번째 줄: 키워드, 날짜
+        row1 = QHBoxLayout()
+
+        row1.addWidget(QLabel("키워드:"))
+        self.keyword_edit = QLineEdit()
+        self.keyword_edit.setPlaceholderText("쿼리 내용으로 검색...")
+        self.keyword_edit.setMinimumWidth(200)
+        self.keyword_edit.returnPressed.connect(self._do_search)
+        row1.addWidget(self.keyword_edit)
+
+        row1.addWidget(QLabel("기간:"))
+
+        from PyQt6.QtWidgets import QDateEdit
+        from PyQt6.QtCore import QDate
+        self.date_from = QDateEdit()
+        self.date_from.setCalendarPopup(True)
+        self.date_from.setDate(QDate.currentDate().addMonths(-1))
+        self.date_from.setDisplayFormat("yyyy-MM-dd")
+        row1.addWidget(self.date_from)
+
+        row1.addWidget(QLabel("~"))
+
+        self.date_to = QDateEdit()
+        self.date_to.setCalendarPopup(True)
+        self.date_to.setDate(QDate.currentDate())
+        self.date_to.setDisplayFormat("yyyy-MM-dd")
+        row1.addWidget(self.date_to)
+
+        self.date_filter_check = QCheckBox("날짜 적용")
+        self.date_filter_check.setChecked(False)
+        row1.addWidget(self.date_filter_check)
+
+        row1.addStretch()
+        filter_layout.addLayout(row1)
+
+        # 두 번째 줄: 체크박스들, 버튼
+        row2 = QHBoxLayout()
+
+        self.success_check = QCheckBox("성공만")
+        row2.addWidget(self.success_check)
+
+        self.failure_check = QCheckBox("실패만")
+        row2.addWidget(self.failure_check)
+
+        self.favorites_check = QCheckBox("즐겨찾기만")
+        row2.addWidget(self.favorites_check)
+
+        row2.addStretch()
+
+        btn_search = QPushButton("🔍 검색")
+        btn_search.setStyleSheet("""
+            QPushButton {
+                background-color: #3498db; color: white;
+                padding: 6px 16px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """)
+        btn_search.clicked.connect(self._do_search)
+        row2.addWidget(btn_search)
+
+        btn_reset = QPushButton("초기화")
+        btn_reset.setStyleSheet("""
+            QPushButton {
+                background-color: #95a5a6; color: white;
+                padding: 6px 12px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #7f8c8d; }
+        """)
+        btn_reset.clicked.connect(self._reset_search)
+        row2.addWidget(btn_reset)
+
+        filter_layout.addLayout(row2)
+        layout.addWidget(filter_group)
+
+        # === 정보 바 ===
         info_layout = QHBoxLayout()
         self.info_label = QLabel("히스토리 로딩 중...")
         self.info_label.setStyleSheet("color: #666;")
         info_layout.addWidget(self.info_label)
+
+        self.fav_count_label = QLabel("⭐ 0")
+        self.fav_count_label.setStyleSheet("color: #f39c12; font-weight: bold;")
+        info_layout.addWidget(self.fav_count_label)
+
         info_layout.addStretch()
         layout.addLayout(info_layout)
 
-        # 히스토리 리스트
+        # === 히스토리 리스트 ===
         self.list_widget = QListWidget()
         self.list_widget.setStyleSheet("""
             QListWidget {
@@ -989,14 +1076,16 @@ class HistoryDialog(QDialog):
             }
         """)
         self.list_widget.itemDoubleClicked.connect(self.select_query)
+        self.list_widget.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.list_widget.customContextMenuRequested.connect(self._show_context_menu)
         layout.addWidget(self.list_widget)
 
-        # 미리보기
+        # === 미리보기 ===
         preview_group = QGroupBox("쿼리 미리보기")
         preview_layout = QVBoxLayout(preview_group)
         self.preview_text = QTextEdit()
         self.preview_text.setReadOnly(True)
-        self.preview_text.setMaximumHeight(150)
+        self.preview_text.setMaximumHeight(120)
         self.preview_text.setStyleSheet("""
             QTextEdit {
                 background-color: #2c3e50;
@@ -1011,7 +1100,7 @@ class HistoryDialog(QDialog):
         # 선택 시 미리보기 업데이트
         self.list_widget.currentRowChanged.connect(self.update_preview)
 
-        # 페이지네이션 버튼
+        # === 페이지네이션 ===
         page_layout = QHBoxLayout()
 
         self.btn_load_more = QPushButton("📜 더 보기")
@@ -1031,8 +1120,21 @@ class HistoryDialog(QDialog):
         page_layout.addStretch()
         layout.addLayout(page_layout)
 
-        # 하단 버튼
+        # === 하단 버튼 ===
         btn_layout = QHBoxLayout()
+
+        btn_fav_toggle = QPushButton("⭐ 즐겨찾기 토글")
+        btn_fav_toggle.setStyleSheet("""
+            QPushButton {
+                background-color: #f39c12; color: white;
+                padding: 8px 16px; border-radius: 4px;
+            }
+            QPushButton:hover { background-color: #d68910; }
+        """)
+        btn_fav_toggle.clicked.connect(self._toggle_favorite)
+        btn_layout.addWidget(btn_fav_toggle)
+
+        btn_layout.addStretch()
 
         btn_use = QPushButton("📋 에디터에 붙여넣기")
         btn_use.setStyleSheet("""
@@ -1043,36 +1145,42 @@ class HistoryDialog(QDialog):
             QPushButton:hover { background-color: #2980b9; }
         """)
         btn_use.clicked.connect(self.select_current)
+        btn_layout.addWidget(btn_use)
 
         btn_close = QPushButton("닫기")
         btn_close.clicked.connect(self.reject)
-
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_use)
         btn_layout.addWidget(btn_close)
+
         layout.addLayout(btn_layout)
 
     def load_history(self):
         """히스토리 초기 로드"""
         self.list_widget.clear()
+        self._history_items.clear()
         self.current_offset = 0
+        self._is_searching = False
         self._load_chunk()
+        self._update_fav_count()
 
     def _load_chunk(self):
         """히스토리 청크 로드"""
-        history, self.total_count = self.history_manager.get_history(
-            limit=self.ITEMS_PER_PAGE,
-            offset=self.current_offset
-        )
+        if self._is_searching:
+            self._load_search_chunk()
+        else:
+            history, self.total_count = self.history_manager.get_history(
+                limit=self.ITEMS_PER_PAGE,
+                offset=self.current_offset
+            )
 
-        for item in history:
-            self._add_history_item(item)
+            for item in history:
+                self._add_history_item(item)
+                self._history_items.append(item)
 
-        self.current_offset += len(history)
+            self.current_offset += len(history)
 
         # 정보 라벨 업데이트
         loaded = self.list_widget.count()
-        self.info_label.setText(f"📊 {loaded:,} / {self.total_count:,}개 표시 (전체 영구 보관)")
+        self.info_label.setText(f"📊 {loaded:,} / {self.total_count:,}개 표시")
 
         # 더 보기 버튼 표시/숨김
         has_more = self.current_offset < self.total_count
@@ -1081,10 +1189,57 @@ class HistoryDialog(QDialog):
             remaining = self.total_count - self.current_offset
             self.btn_load_more.setText(f"📜 더 보기 ({remaining:,}개 남음)")
 
+    def _load_search_chunk(self):
+        """검색 결과 청크 로드"""
+        from datetime import datetime
+
+        keyword = self.keyword_edit.text().strip() or None
+
+        date_from = None
+        date_to = None
+        if self.date_filter_check.isChecked():
+            date_from = datetime(
+                self.date_from.date().year(),
+                self.date_from.date().month(),
+                self.date_from.date().day()
+            )
+            date_to = datetime(
+                self.date_to.date().year(),
+                self.date_to.date().month(),
+                self.date_to.date().day()
+            )
+
+        success_only = None
+        if self.success_check.isChecked():
+            success_only = True
+        elif self.failure_check.isChecked():
+            success_only = False
+
+        favorites_only = self.favorites_check.isChecked()
+
+        results, self.total_count = self.history_manager.search_advanced(
+            keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
+            success_only=success_only,
+            favorites_only=favorites_only,
+            limit=self.ITEMS_PER_PAGE,
+            offset=self.current_offset
+        )
+
+        for item in results:
+            self._add_history_item(item)
+            self._history_items.append(item)
+
+        self.current_offset += len(results)
+
     def _add_history_item(self, item):
         """히스토리 항목 추가"""
-        # 표시 텍스트
-        timestamp = item.get('timestamp', '')[:19]  # YYYY-MM-DD HH:MM:SS
+        # 즐겨찾기 아이콘
+        fav_icon = "⭐" if item.get('is_favorite', False) else "☆"
+
+        # 타임스탬프
+        timestamp = item.get('timestamp', '')[:16]  # YYYY-MM-DD HH:MM
 
         # 상태 아이콘
         status = item.get('status', 'completed')
@@ -1099,19 +1254,91 @@ class HistoryDialog(QDialog):
         else:
             status_icon = "✅"
 
-        query_preview = item.get('query', '')[:70].replace('\n', ' ')
-        if len(item.get('query', '')) > 70:
+        # 쿼리 미리보기
+        query_preview = item.get('query', '')[:50].replace('\n', ' ')
+        if len(item.get('query', '')) > 50:
             query_preview += "..."
 
-        # 영향받은 행 수 표시
+        # 영향받은 행 수
         result_count = item.get('result_count', 0)
         count_str = f"({result_count}행)" if result_count > 0 else ""
 
-        display = f"{timestamp}  {status_icon} {count_str:>8}  {query_preview}"
+        display = f"{fav_icon} {timestamp}  {status_icon} {count_str:>8}  {query_preview}"
 
         list_item = QListWidgetItem(display)
         list_item.setData(Qt.ItemDataRole.UserRole, item.get('query', ''))
+        # 항목 ID 저장 (즐겨찾기 토글용)
+        list_item.setData(Qt.ItemDataRole.UserRole + 1, item.get('id') or item.get('timestamp'))
         self.list_widget.addItem(list_item)
+
+    def _do_search(self):
+        """검색 실행"""
+        self.list_widget.clear()
+        self._history_items.clear()
+        self.current_offset = 0
+        self._is_searching = True
+        self._load_chunk()
+
+    def _reset_search(self):
+        """검색 필터 초기화"""
+        self.keyword_edit.clear()
+        self.date_filter_check.setChecked(False)
+        self.success_check.setChecked(False)
+        self.failure_check.setChecked(False)
+        self.favorites_check.setChecked(False)
+        self.load_history()
+
+    def _toggle_favorite(self):
+        """현재 선택 항목 즐겨찾기 토글"""
+        row = self.list_widget.currentRow()
+        if row < 0:
+            return
+
+        item = self.list_widget.item(row)
+        history_id = item.data(Qt.ItemDataRole.UserRole + 1)
+        if history_id:
+            new_state = self.history_manager.toggle_favorite(history_id)
+
+            # 리스트 항목 텍스트 업데이트
+            text = item.text()
+            if new_state:
+                text = "⭐" + text[1:]
+            else:
+                text = "☆" + text[1:]
+            item.setText(text)
+
+            # 즐겨찾기 수 업데이트
+            self._update_fav_count()
+
+    def _update_fav_count(self):
+        """즐겨찾기 카운트 업데이트"""
+        fav_count = self.history_manager.get_favorite_count()
+        self.fav_count_label.setText(f"⭐ {fav_count}")
+
+    def _show_context_menu(self, pos):
+        """컨텍스트 메뉴 표시"""
+        item = self.list_widget.itemAt(pos)
+        if not item:
+            return
+
+        menu = QMenu(self)
+
+        fav_action = menu.addAction("⭐ 즐겨찾기 토글")
+        fav_action.triggered.connect(self._toggle_favorite)
+
+        copy_action = menu.addAction("📋 쿼리 복사")
+        copy_action.triggered.connect(lambda: self._copy_query(item))
+
+        use_action = menu.addAction("📝 에디터에 붙여넣기")
+        use_action.triggered.connect(self.select_current)
+
+        menu.exec(self.list_widget.mapToGlobal(pos))
+
+    def _copy_query(self, item):
+        """쿼리를 클립보드에 복사"""
+        query = item.data(Qt.ItemDataRole.UserRole)
+        if query:
+            QApplication.clipboard().setText(query)
 
     def load_more(self):
         """더 많은 히스토리 로드"""
@@ -1142,6 +1369,116 @@ class HistoryDialog(QDialog):
 
 
 # =====================================================================
+# SQL 에디터 탭 (개별 탭 위젯)
+# =====================================================================
+class SQLEditorTab(QWidget):
+    """단일 SQL 에디터 탭"""
+
+    modified_changed = pyqtSignal(bool)  # 수정 상태 변경
+    title_changed = pyqtSignal(str)  # 탭 제목 변경 요청
+
+    def __init__(self, parent=None, tab_index: int = 1):
+        super().__init__(parent)
+        self.file_path = None
+        self.is_modified = False
+        self._tab_index = tab_index
+
+        self._init_ui()
+
+    def _init_ui(self):
+        """UI 초기화"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # 에디터
+        self.editor = ValidatingCodeEditor()
+        self.editor.setPlaceholderText("SELECT * FROM table_name;\n-- Ctrl+Space: 자동완성")
+        self.editor.textChanged.connect(self._on_text_changed)
+        layout.addWidget(self.editor)
+
+        # 검증 상태 라벨
+        self.validation_label = QLabel("")
+        self.validation_label.setStyleSheet("color: #666; font-size: 11px; padding: 2px 4px;")
+        layout.addWidget(self.validation_label)
+
+    def _on_text_changed(self):
+        """텍스트 변경 시"""
+        if not self.is_modified:
+            self.is_modified = True
+            self.modified_changed.emit(True)
+            self.title_changed.emit(self.get_title())
+
+    def get_title(self) -> str:
+        """탭 제목 반환"""
+        if self.file_path:
+            name = os.path.basename(self.file_path)
+        else:
+            name = f"Query {self._tab_index}"
+        return f"{name} *" if self.is_modified else name
+
+    def set_tab_index(self, index: int):
+        """탭 인덱스 설정"""
+        self._tab_index = index
+        self.title_changed.emit(self.get_title())
+
+    def set_content(self, text: str):
+        """내용 설정 (수정 플래그 초기화)"""
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(text)
+        self.editor.blockSignals(False)
+        self.is_modified = False
+        self.title_changed.emit(self.get_title())
+
+    def get_content(self) -> str:
+        """내용 반환"""
+        return self.editor.toPlainText()
+
+    def load_file(self, file_path: str) -> bool:
+        """파일 불러오기"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                content = f.read()
+            self.editor.blockSignals(True)
+            self.editor.setPlainText(content)
+            self.editor.blockSignals(False)
+            self.file_path = file_path
+            self.is_modified = False
+            self.title_changed.emit(self.get_title())
+            return True
+        except Exception:
+            return False
+
+    def save_file(self, file_path: str = None) -> tuple:
+        """파일 저장
+
+        Returns:
+            (success, file_path, error_message)
+        """
+        target_path = file_path or self.file_path
+
+        if not target_path:
+            return False, None, "파일 경로가 지정되지 않았습니다."
+
+        try:
+            with open(target_path, 'w', encoding='utf-8') as f:
+                f.write(self.editor.toPlainText())
+            self.file_path = target_path
+            self.is_modified = False
+            self.modified_changed.emit(False)
+            self.title_changed.emit(self.get_title())
+            return True, target_path, None
+        except Exception as e:
+            return False, None, str(e)
+
+    def mark_saved(self):
+        """저장 완료 표시"""
+        self.is_modified = False
+        self.modified_changed.emit(False)
+        self.title_changed.emit(self.get_title())
+
+
+# =====================================================================
 # SQL 에디터 다이얼로그
 # =====================================================================
 class SQLEditorDialog(QDialog):
@@ -1154,8 +1491,7 @@ class SQLEditorDialog(QDialog):
         self.engine = tunnel_engine
         self.worker = None
         self.temp_server = None
-        self.current_file = None
-        self.is_modified = False
+        self._tab_counter = 0  # 탭 번호 카운터
 
         # 지속 연결 (트랜잭션 세션)
         self.db_connection = None
@@ -1298,22 +1634,42 @@ class SQLEditorDialog(QDialog):
         # --- 메인 스플리터 (에디터 + 결과) ---
         splitter = QSplitter(Qt.Orientation.Vertical)
 
-        # 에디터 영역
+        # 에디터 영역 (멀티 탭)
         editor_group = QGroupBox("SQL 쿼리")
         editor_layout = QVBoxLayout(editor_group)
         editor_layout.setContentsMargins(4, 8, 4, 4)
 
-        self.editor = ValidatingCodeEditor()
-        self.editor.setPlaceholderText("SELECT * FROM table_name;\n-- Ctrl+Space: 자동완성")
-        self.editor.textChanged.connect(self._on_text_changed)
-        self.editor.validation_requested.connect(self._on_validation_requested)
-        self.editor.autocomplete_requested.connect(self._on_autocomplete_requested)
-        editor_layout.addWidget(self.editor)
+        # 에디터 탭 위젯
+        self.editor_tabs = QTabWidget()
+        self.editor_tabs.setTabsClosable(True)
+        self.editor_tabs.setMovable(True)
+        self.editor_tabs.setDocumentMode(True)
+        self.editor_tabs.tabCloseRequested.connect(self._close_editor_tab)
+        self.editor_tabs.currentChanged.connect(self._on_editor_tab_changed)
 
-        # 검증 상태 라벨
-        self.validation_label = QLabel("")
-        self.validation_label.setStyleSheet("color: #666; font-size: 11px;")
-        editor_layout.addWidget(self.validation_label)
+        # 새 탭 버튼 (+)
+        self.new_tab_button = QPushButton("+")
+        self.new_tab_button.setFixedSize(24, 24)
+        self.new_tab_button.setToolTip("새 탭 (Ctrl+N)")
+        self.new_tab_button.setStyleSheet("""
+            QPushButton {
+                border: none;
+                background: transparent;
+                font-weight: bold;
+                font-size: 14px;
+            }
+            QPushButton:hover {
+                background: #e0e0e0;
+                border-radius: 4px;
+            }
+        """)
+        self.new_tab_button.clicked.connect(self._add_new_tab)
+        self.editor_tabs.setCornerWidget(self.new_tab_button, Qt.Corner.TopRightCorner)
+
+        # 첫 번째 탭 추가
+        self._add_new_tab()
+
+        editor_layout.addWidget(self.editor_tabs)
 
         splitter.addWidget(editor_group)
 
@@ -1469,9 +1825,185 @@ class SQLEditorDialog(QDialog):
         shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
         shortcut_save.activated.connect(self.save_file)
 
-    def _on_text_changed(self):
-        """텍스트 변경 시"""
-        self.is_modified = True
+        # Ctrl+Shift+S: 다른 이름으로 저장
+        shortcut_save_as = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        shortcut_save_as.activated.connect(self.save_file_as)
+
+        # Ctrl+N: 새 탭
+        shortcut_new_tab = QShortcut(QKeySequence("Ctrl+N"), self)
+        shortcut_new_tab.activated.connect(self._add_new_tab)
+
+        # Ctrl+W: 현재 탭 닫기
+        shortcut_close_tab = QShortcut(QKeySequence("Ctrl+W"), self)
+        shortcut_close_tab.activated.connect(self._close_current_tab)
+
+        # Ctrl+Tab: 다음 탭
+        shortcut_next_tab = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        shortcut_next_tab.activated.connect(self._next_tab)
+
+        # Ctrl+Shift+Tab: 이전 탭
+        shortcut_prev_tab = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
+        shortcut_prev_tab.activated.connect(self._prev_tab)
+
+    # =====================================================================
+    # 에디터 탭 관리
+    # =====================================================================
+    @property
+    def editor(self):
+        """현재 탭의 에디터 반환 (하위 호환성)"""
+        tab = self._current_tab()
+        return tab.editor if tab else None
+
+    @property
+    def validation_label(self):
+        """현재 탭의 검증 라벨 반환"""
+        tab = self._current_tab()
+        return tab.validation_label if tab else None
+
+    @property
+    def current_file(self):
+        """현재 탭의 파일 경로"""
+        tab = self._current_tab()
+        return tab.file_path if tab else None
+
+    @current_file.setter
+    def current_file(self, value):
+        """현재 탭의 파일 경로 설정"""
+        tab = self._current_tab()
+        if tab:
+            tab.file_path = value
+
+    @property
+    def is_modified(self):
+        """현재 탭의 수정 상태"""
+        tab = self._current_tab()
+        return tab.is_modified if tab else False
+
+    @is_modified.setter
+    def is_modified(self, value):
+        """현재 탭의 수정 상태 설정"""
+        tab = self._current_tab()
+        if tab:
+            tab.is_modified = value
+            if not value:
+                tab.title_changed.emit(tab.get_title())
+
+    def _current_tab(self) -> Optional[SQLEditorTab]:
+        """현재 에디터 탭 반환"""
+        return self.editor_tabs.currentWidget()
+
+    def _add_new_tab(self, file_path: str = None) -> SQLEditorTab:
+        """새 에디터 탭 추가"""
+        self._tab_counter += 1
+        tab = SQLEditorTab(self, self._tab_counter)
+
+        # 시그널 연결
+        tab.title_changed.connect(lambda title, t=tab: self._update_tab_title(t, title))
+        tab.editor.validation_requested.connect(self._on_validation_requested)
+        tab.editor.autocomplete_requested.connect(self._on_autocomplete_requested)
+
+        # 파일 로드
+        if file_path:
+            if tab.load_file(file_path):
+                self.message_text.append(f"📂 파일 열림: {file_path}")
+            else:
+                self.message_text.append(f"❌ 파일을 열 수 없습니다: {file_path}")
+
+        # 탭 추가
+        tab_title = tab.get_title()
+        index = self.editor_tabs.addTab(tab, tab_title)
+        self.editor_tabs.setCurrentIndex(index)
+
+        return tab
+
+    def _close_editor_tab(self, index: int):
+        """에디터 탭 닫기 요청"""
+        if self.editor_tabs.count() <= 1:
+            # 마지막 탭이면 새 빈 탭 추가 후 닫기
+            self._add_new_tab()
+
+        tab = self.editor_tabs.widget(index)
+        if tab and tab.is_modified:
+            reply = QMessageBox.question(
+                self, "저장 확인",
+                f"'{tab.get_title().rstrip(' *')}'의 변경사항을 저장하시겠습니까?",
+                QMessageBox.StandardButton.Save |
+                QMessageBox.StandardButton.Discard |
+                QMessageBox.StandardButton.Cancel
+            )
+            if reply == QMessageBox.StandardButton.Save:
+                if not self._save_tab(tab):
+                    return  # 저장 실패/취소
+            elif reply == QMessageBox.StandardButton.Cancel:
+                return
+
+        self.editor_tabs.removeTab(index)
+
+    def _close_current_tab(self):
+        """현재 탭 닫기"""
+        index = self.editor_tabs.currentIndex()
+        if index >= 0:
+            self._close_editor_tab(index)
+
+    def _next_tab(self):
+        """다음 탭으로 이동"""
+        current = self.editor_tabs.currentIndex()
+        count = self.editor_tabs.count()
+        if count > 1:
+            self.editor_tabs.setCurrentIndex((current + 1) % count)
+
+    def _prev_tab(self):
+        """이전 탭으로 이동"""
+        current = self.editor_tabs.currentIndex()
+        count = self.editor_tabs.count()
+        if count > 1:
+            self.editor_tabs.setCurrentIndex((current - 1) % count)
+
+    def _update_tab_title(self, tab: SQLEditorTab, title: str):
+        """탭 제목 업데이트"""
+        index = self.editor_tabs.indexOf(tab)
+        if index >= 0:
+            self.editor_tabs.setTabText(index, title)
+
+    def _on_editor_tab_changed(self, index: int):
+        """에디터 탭 변경 시"""
+        tab = self.editor_tabs.widget(index)
+        if tab:
+            # 현재 탭 파일 정보 윈도우 제목에 반영
+            file_info = tab.file_path or ""
+            if file_info:
+                self.setWindowTitle(f"SQL 에디터 - {self.config.get('name')} - {file_info}")
+            else:
+                self.setWindowTitle(f"SQL 에디터 - {self.config.get('name')}")
+
+            # 현재 탭의 내용으로 재검증
+            self._on_validation_requested(tab.editor.toPlainText())
+
+    def _save_tab(self, tab: SQLEditorTab) -> bool:
+        """특정 탭 저장"""
+        if tab.file_path:
+            success, path, error = tab.save_file()
+            if success:
+                self.message_text.append(f"💾 파일 저장됨: {path}")
+                return True
+            else:
+                QMessageBox.critical(self, "오류", f"파일을 저장할 수 없습니다:\n{error}")
+                return False
+        else:
+            # 새 파일명 요청
+            file_path, _ = QFileDialog.getSaveFileName(
+                self, "SQL 파일 저장", "",
+                "SQL 파일 (*.sql);;모든 파일 (*.*)"
+            )
+            if file_path:
+                success, path, error = tab.save_file(file_path)
+                if success:
+                    self.message_text.append(f"💾 파일 저장됨: {path}")
+                    return True
+                else:
+                    QMessageBox.critical(self, "오류", f"파일을 저장할 수 없습니다:\n{error}")
+                    return False
+            return False
 
     def refresh_databases(self):
         """데이터베이스 목록 새로고침"""
@@ -2236,52 +2768,56 @@ class SQLEditorDialog(QDialog):
             self.result_tabs.removeTab(index)
 
     def open_file(self):
-        """SQL 파일 열기"""
-        if self.is_modified:
-            reply = QMessageBox.question(
-                self, "확인", "저장되지 않은 변경사항이 있습니다. 계속하시겠습니까?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
-            if reply == QMessageBox.StandardButton.No:
-                return
-
+        """SQL 파일 열기 (새 탭에서)"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "SQL 파일 열기", "",
             "SQL 파일 (*.sql);;모든 파일 (*.*)"
         )
 
         if file_path:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    content = f.read()
-                self.editor.setPlainText(content)
-                self.current_file = file_path
-                self.is_modified = False
+            # 현재 탭이 빈 새 탭이면 거기에 로드, 아니면 새 탭 생성
+            current_tab = self._current_tab()
+            if current_tab and not current_tab.is_modified and not current_tab.file_path and not current_tab.editor.toPlainText().strip():
+                # 현재 탭에 로드
+                if current_tab.load_file(file_path):
+                    self.setWindowTitle(f"SQL 에디터 - {self.config.get('name')} - {file_path}")
+                    self.message_text.append(f"📂 파일 열림: {file_path}")
+                else:
+                    QMessageBox.critical(self, "오류", f"파일을 열 수 없습니다:\n{file_path}")
+            else:
+                # 새 탭에 로드
+                self._add_new_tab(file_path)
                 self.setWindowTitle(f"SQL 에디터 - {self.config.get('name')} - {file_path}")
-                self.message_text.append(f"📂 파일 열림: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"파일을 열 수 없습니다:\n{str(e)}")
 
     def save_file(self):
-        """SQL 파일 저장"""
-        if self.current_file:
-            file_path = self.current_file
-        else:
-            file_path, _ = QFileDialog.getSaveFileName(
-                self, "SQL 파일 저장", "",
-                "SQL 파일 (*.sql);;모든 파일 (*.*)"
-            )
+        """현재 탭 저장"""
+        tab = self._current_tab()
+        if not tab:
+            return
+
+        self._save_tab(tab)
+        # 윈도우 제목 업데이트
+        if tab.file_path:
+            self.setWindowTitle(f"SQL 에디터 - {self.config.get('name')} - {tab.file_path}")
+
+    def save_file_as(self):
+        """다른 이름으로 저장"""
+        tab = self._current_tab()
+        if not tab:
+            return
+
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "SQL 파일 저장", "",
+            "SQL 파일 (*.sql);;모든 파일 (*.*)"
+        )
 
         if file_path:
-            try:
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    f.write(self.editor.toPlainText())
-                self.current_file = file_path
-                self.is_modified = False
-                self.setWindowTitle(f"SQL 에디터 - {self.config.get('name')} - {file_path}")
-                self.message_text.append(f"💾 파일 저장됨: {file_path}")
-            except Exception as e:
-                QMessageBox.critical(self, "오류", f"파일을 저장할 수 없습니다:\n{str(e)}")
+            success, path, error = tab.save_file(file_path)
+            if success:
+                self.message_text.append(f"💾 파일 저장됨: {path}")
+                self.setWindowTitle(f"SQL 에디터 - {self.config.get('name')} - {path}")
+            else:
+                QMessageBox.critical(self, "오류", f"파일을 저장할 수 없습니다:\n{error}")
 
     def show_history(self):
         """히스토리 다이얼로그 표시"""
@@ -2454,12 +2990,20 @@ class SQLEditorDialog(QDialog):
                 event.ignore()
                 return
 
-        # 미커밋 + 파일수정 통합 확인
+        # 미커밋 + 모든 탭 수정 상태 확인
         warnings = []
         if self.pending_queries:
             warnings.append(f"미커밋 변경사항 {len(self.pending_queries)}건 (롤백됨)")
-        if self.is_modified:
-            warnings.append("저장되지 않은 SQL 편집 내용")
+
+        # 수정된 탭 목록 확인
+        modified_tabs = []
+        for i in range(self.editor_tabs.count()):
+            tab = self.editor_tabs.widget(i)
+            if tab and tab.is_modified:
+                modified_tabs.append(tab.get_title().rstrip(' *'))
+
+        if modified_tabs:
+            warnings.append(f"저장되지 않은 SQL 편집 내용 ({len(modified_tabs)}개 탭)")
 
         if warnings:
             msg = "\n".join(f"• {w}" for w in warnings)
