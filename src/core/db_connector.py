@@ -6,6 +6,10 @@ import time
 import pymysql
 from typing import List, Dict, Any, Optional, Tuple
 
+from src.core.logger import get_logger
+
+logger = get_logger('db_connector')
+
 
 class MetadataCache:
     """스키마/테이블 메타데이터 캐시 (TTL 기반)
@@ -186,7 +190,7 @@ class MySQLConnector:
 
                 return result
         except Exception as e:
-            print(f"스키마 조회 오류: {e}")
+            logger.error(f"스키마 조회 오류: {e}")
             return []
 
     def schema_exists(self, schema_name: str) -> bool:
@@ -237,7 +241,7 @@ class MySQLConnector:
 
                 return result
         except Exception as e:
-            print(f"테이블 조회 오류: {e}")
+            logger.error(f"테이블 조회 오류: {e}")
             return []
 
     def execute(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
@@ -250,7 +254,7 @@ class MySQLConnector:
                 cursor.execute(query, params)
                 return cursor.fetchall()
         except Exception as e:
-            print(f"쿼리 실행 오류: {e}")
+            logger.error(f"쿼리 실행 오류: {e}")
             return []
 
     def execute_many(self, query: str, data: List[tuple]) -> int:
@@ -264,7 +268,7 @@ class MySQLConnector:
                 self.connection.commit()
                 return cursor.rowcount
         except Exception as e:
-            print(f"배치 쿼리 오류: {e}")
+            logger.error(f"배치 쿼리 오류: {e}")
             return 0
 
     def get_db_version(self) -> Tuple[int, int, int]:
@@ -292,7 +296,7 @@ class MySQLConnector:
                     patch = int(parts[2]) if len(parts) > 2 else 0
                     return (major, minor, patch)
         except Exception as e:
-            print(f"버전 조회 오류: {e}")
+            logger.error(f"버전 조회 오류: {e}")
 
         return (0, 0, 0)
 
@@ -384,7 +388,7 @@ class MySQLConnector:
                     return result.get('Create Table', '')
             return ""
         except Exception as e:
-            print(f"CREATE TABLE 조회 오류: {e}")
+            logger.error(f"CREATE TABLE 조회 오류: {e}")
             return ""
 
     def get_table_data(self, table: str, schema: str = None, limit: int = None) -> List[Dict[str, Any]]:
@@ -444,3 +448,102 @@ def test_mysql_connection(host: str, port: int, user: str, password: str) -> Tup
     if success:
         connector.disconnect()
     return success, msg
+
+
+# =====================================================================
+# 풀 기반 커넥터
+# =====================================================================
+class PooledMySQLConnector(MySQLConnector):
+    """연결 풀을 사용하는 MySQL 커넥터
+
+    컨텍스트 매니저 사용 시 풀에서 연결을 획득하고 자동 반환
+    """
+
+    def __init__(self, host: str, port: int, user: str, password: str,
+                 database: str = None, use_cache: bool = True,
+                 max_connections: int = 5):
+        """
+        Args:
+            host: MySQL 호스트
+            port: MySQL 포트
+            user: MySQL 사용자
+            password: MySQL 비밀번호
+            database: 기본 데이터베이스
+            use_cache: 메타데이터 캐싱 사용 여부
+            max_connections: 최대 연결 수
+        """
+        super().__init__(host, port, user, password, database, use_cache)
+
+        from src.core.connection_pool import get_pool_registry
+
+        self._pool_registry = get_pool_registry()
+        self._pool = self._pool_registry.get_or_create_pool(
+            host, port, user, password, database,
+            max_connections=max_connections
+        )
+        self._from_pool = False  # 현재 연결이 풀에서 온 것인지
+
+    def connect(self) -> Tuple[bool, str]:
+        """풀에서 연결 획득"""
+        try:
+            self.connection = self._pool.get_connection()
+            self._from_pool = True
+            return True, "연결 성공 (풀)"
+        except Exception as e:
+            return False, f"연결 오류: {str(e)}"
+
+    def disconnect(self):
+        """연결을 풀에 반환 (또는 종료)"""
+        if self.connection:
+            if self._from_pool:
+                self._pool.return_connection(self.connection)
+                self._from_pool = False
+            else:
+                try:
+                    self.connection.close()
+                except Exception:
+                    pass
+            self.connection = None
+
+    def get_pool_stats(self) -> dict:
+        """현재 풀 상태 반환"""
+        return self._pool.get_stats()
+
+    def __enter__(self):
+        """컨텍스트 매니저 진입"""
+        self.connect()
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """컨텍스트 매니저 종료 - 풀에 반환"""
+        # 예외 발생 시 롤백
+        if exc_type is not None and self.connection:
+            try:
+                self.connection.rollback()
+            except Exception:
+                pass
+        self.disconnect()
+        return False
+
+
+def get_pooled_connector(
+    host: str, port: int, user: str, password: str,
+    database: str = None, max_connections: int = 5
+) -> PooledMySQLConnector:
+    """풀 기반 커넥터 생성 (편의 함수)
+
+    Args:
+        host: MySQL 호스트
+        port: MySQL 포트
+        user: MySQL 사용자
+        password: MySQL 비밀번호
+        database: 기본 데이터베이스
+        max_connections: 최대 연결 수
+
+    Returns:
+        PooledMySQLConnector 인스턴스
+    """
+    return PooledMySQLConnector(
+        host, port, user, password, database,
+        max_connections=max_connections
+    )
