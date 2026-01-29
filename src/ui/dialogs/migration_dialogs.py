@@ -45,9 +45,49 @@ class MigrationAnalyzerDialog(QDialog):
         self.analysis_result: Optional[AnalysisResult] = None
         self.worker: Optional[MigrationAnalyzerWorker] = None
         self.cleanup_worker: Optional[CleanupWorker] = None
+        self._is_closing = False  # 닫기 진행 중 플래그
 
         self.init_ui()
         self.load_schemas()
+
+    def closeEvent(self, event):
+        """다이얼로그 닫기 이벤트 - Worker 정리"""
+        self._is_closing = True
+
+        # 실행 중인 Worker가 있는지 확인
+        workers_running = []
+        if self.worker and self.worker.isRunning():
+            workers_running.append(("분석", self.worker))
+        if self.cleanup_worker and self.cleanup_worker.isRunning():
+            workers_running.append(("정리", self.cleanup_worker))
+
+        if workers_running:
+            # 사용자에게 확인
+            reply = QMessageBox.question(
+                self,
+                "작업 진행 중",
+                f"현재 {len(workers_running)}개의 작업이 진행 중입니다.\n"
+                "창을 닫으면 작업이 중단됩니다. 닫으시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+
+            if reply != QMessageBox.StandardButton.Yes:
+                self._is_closing = False
+                event.ignore()
+                return
+
+            # Worker 종료 대기
+            for name, worker in workers_running:
+                logger.info(f"🛑 {name} Worker 종료 대기 중...")
+                worker.quit()
+                if not worker.wait(3000):  # 3초 대기
+                    logger.warning(f"⚠️ {name} Worker가 시간 내에 종료되지 않음, 강제 종료")
+                    worker.terminate()
+                    worker.wait(1000)
+
+        logger.info("✅ MigrationAnalyzerDialog 정상 종료")
+        event.accept()
 
     def init_ui(self):
         layout = QVBoxLayout(self)

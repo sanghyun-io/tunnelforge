@@ -50,8 +50,41 @@ class FixWizardDialog(QWizard):
         # 위저드 단계 생성
         self.wizard_steps: List[FixWizardStep] = []
         self.selected_issues: List[CompatibilityIssue] = []
+        self._is_closing = False
 
         self.init_ui()
+
+    def closeEvent(self, event):
+        """위저드 닫기 이벤트 - Worker 정리"""
+        self._is_closing = True
+
+        # 실행 중인 Worker 확인
+        workers_running = []
+
+        # PreviewPage의 worker
+        if hasattr(self, 'preview_page') and self.preview_page.worker:
+            if self.preview_page.worker.isRunning():
+                workers_running.append(("미리보기", self.preview_page.worker))
+
+        # ExecutionPage의 worker
+        if hasattr(self, 'execution_page') and self.execution_page.worker:
+            if self.execution_page.worker.isRunning():
+                workers_running.append(("실행", self.execution_page.worker))
+
+        if workers_running:
+            from src.core.logger import get_logger
+            logger = get_logger('fix_wizard_dialog')
+
+            # Worker 종료 대기
+            for name, worker in workers_running:
+                logger.info(f"🛑 {name} Worker 종료 대기 중...")
+                worker.quit()
+                if not worker.wait(3000):  # 3초 대기
+                    logger.warning(f"⚠️ {name} Worker가 시간 내에 종료되지 않음, 강제 종료")
+                    worker.terminate()
+                    worker.wait(1000)
+
+        event.accept()
 
     def init_ui(self):
         self.setWindowTitle("🔧 마이그레이션 자동 수정 위저드")

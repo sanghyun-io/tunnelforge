@@ -1,17 +1,18 @@
 """
 터널 상태 모니터링
 - 연결 상태 실시간 감시
-- Latency 측정
+- Latency 측정 (MySQL ping 사용)
 - 자동 재연결
 - 이벤트 히스토리
 """
 import time
-import socket
 import threading
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Any
 from enum import Enum
+
+import pymysql
 
 from src.core.logger import get_logger
 
@@ -100,6 +101,9 @@ class TunnelMonitor:
         self._stop_event = threading.Event()
         self._lock = threading.Lock()
 
+        # Health check용 MySQL 연결 캐시 (터널별 1개씩 유지)
+        self._health_connections: Dict[str, Any] = {}
+
         # 설정에서 자동 재연결 설정 로드
         if config_manager:
             self._auto_reconnect = config_manager.get_app_setting(
@@ -156,7 +160,25 @@ class TunnelMonitor:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         self._thread = None
+
+        # Health check 연결 모두 정리
+        self._cleanup_all_health_connections()
         logger.info("터널 모니터링 중지")
+
+    def _cleanup_health_connection(self, tunnel_id: str):
+        """특정 터널의 health check 연결 정리"""
+        conn = self._health_connections.pop(tunnel_id, None)
+        if conn:
+            try:
+                conn.close()
+                logger.debug(f"Health check 연결 정리: {tunnel_id}")
+            except Exception:
+                pass
+
+    def _cleanup_all_health_connections(self):
+        """모든 health check 연결 정리"""
+        for tunnel_id in list(self._health_connections.keys()):
+            self._cleanup_health_connection(tunnel_id)
 
     def is_running(self) -> bool:
         """모니터링 실행 중 여부"""
@@ -269,6 +291,9 @@ class TunnelMonitor:
                         status.latency_ms = None
                         self._add_event(tunnel_id, "disconnected", "터널 연결 끊김")
 
+                        # Health check 연결 정리
+                        self._cleanup_health_connection(tunnel_id)
+
                         # 자동 재연결 시도
                         if self._auto_reconnect:
                             self._attempt_reconnect(tunnel_id)
@@ -283,10 +308,16 @@ class TunnelMonitor:
                         status.connected_at = None
                         status.latency_ms = None
                         self._add_event(tunnel_id, "disconnected", "터널 연결 종료")
+                        # Health check 연결 정리
+                        self._cleanup_health_connection(tunnel_id)
                         self._notify_callbacks(tunnel_id, status)
 
     def _measure_latency(self, tunnel_id: str) -> float:
-        """Latency 측정
+        """Latency 측정 (MySQL ping 사용)
+
+        MySQL ping을 사용하여 실제 DB 연결 응답 시간을 측정합니다.
+        TCP 소켓만 연결하면 MySQL handshake_error가 발생하므로,
+        정상적인 MySQL 프로토콜을 사용합니다.
 
         Args:
             tunnel_id: 터널 ID
@@ -299,44 +330,91 @@ class TunnelMonitor:
             if not config:
                 return -1
 
+            # DB 인증 정보 확인
+            db_username = config.get('db_username', '')
+            db_password = config.get('db_password', '')
+            db_name = config.get('db_name', '')
+
+            # 인증 정보가 없으면 측정 불가
+            if not db_username:
+                logger.debug(f"Latency 측정 스킵 (DB 인증 정보 없음): {tunnel_id}")
+                return -1
+
             connection_mode = config.get('connection_mode', 'ssh')
 
             if connection_mode == 'direct':
-                # Direct 모드: TCP 연결 시간 측정
                 host = config.get('remote_host', '')
                 port = int(config.get('remote_port', 3306))
-
-                start = time.time()
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
-                try:
-                    s.connect((host, port))
-                    latency = (time.time() - start) * 1000
-                finally:
-                    s.close()
-                return latency
             else:
-                # SSH 터널 모드: 로컬 포트 연결 시간 측정
+                # SSH 터널 모드: 로컬 포트 사용
                 local_port = config.get('local_port')
                 if not local_port:
                     return -1
+                host = '127.0.0.1'
+                port = int(local_port)
 
-                start = time.time()
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(5)
-                try:
-                    s.connect(('127.0.0.1', int(local_port)))
-                    latency = (time.time() - start) * 1000
-                finally:
-                    s.close()
+            # 캐시된 연결 사용 또는 새 연결 생성
+            conn = self._health_connections.get(tunnel_id)
+
+            # 연결이 없거나 끊어진 경우 재연결
+            if conn is None:
+                conn = self._create_health_connection(
+                    tunnel_id, host, port, db_username, db_password, db_name
+                )
+                if conn is None:
+                    return -1
+
+            # MySQL ping으로 latency 측정
+            start = time.time()
+            try:
+                conn.ping(reconnect=False)
+                latency = (time.time() - start) * 1000
                 return latency
+            except Exception as e:
+                logger.debug(f"MySQL ping 실패 ({tunnel_id}): {e}")
+                # 연결 끊김 - 캐시에서 제거
+                self._cleanup_health_connection(tunnel_id)
+                return -1
 
-        except socket.timeout:
-            logger.debug(f"Latency 측정 타임아웃: {tunnel_id}")
-            return -1
         except Exception as e:
             logger.debug(f"Latency 측정 오류 ({tunnel_id}): {e}")
             return -1
+
+    def _create_health_connection(
+        self, tunnel_id: str, host: str, port: int,
+        username: str, password: str, database: str
+    ) -> Optional[Any]:
+        """Health check용 MySQL 연결 생성
+
+        Args:
+            tunnel_id: 터널 ID
+            host: DB 호스트
+            port: DB 포트
+            username: DB 사용자명
+            password: DB 비밀번호
+            database: DB 이름
+
+        Returns:
+            pymysql Connection 또는 None
+        """
+        try:
+            conn = pymysql.connect(
+                host=host,
+                port=port,
+                user=username,
+                password=password,
+                database=database if database else None,
+                connect_timeout=5,
+                read_timeout=5,
+                write_timeout=5,
+                autocommit=True
+            )
+            self._health_connections[tunnel_id] = conn
+            logger.debug(f"Health check 연결 생성: {tunnel_id}")
+            return conn
+        except Exception as e:
+            logger.debug(f"Health check 연결 생성 실패 ({tunnel_id}): {e}")
+            return None
 
     def _attempt_reconnect(self, tunnel_id: str):
         """자동 재연결 시도
@@ -443,4 +521,6 @@ class TunnelMonitor:
                 self._add_event(tunnel_id, "error", f"연결 오류: {error}")
             else:
                 self._add_event(tunnel_id, "disconnected", "터널 연결 종료")
+            # Health check 연결 정리
+            self._cleanup_health_connection(tunnel_id)
             self._notify_callbacks(tunnel_id, status)
