@@ -5,7 +5,19 @@ UI 스타일시트 중앙화 모듈
 - CSS 파싱 중복 제거
 - 유지보수성 향상
 - 일관된 디자인 시스템 적용
+- 다크 모드 지원
 """
+
+from src.ui.themes import ThemeColors, LIGHT_THEME
+
+
+def get_current_colors() -> ThemeColors:
+    """현재 테마 색상 반환 (ThemeManager 순환 참조 방지)"""
+    try:
+        from src.ui.theme_manager import ThemeManager
+        return ThemeManager.instance().current_colors
+    except Exception:
+        return LIGHT_THEME
 
 
 class ButtonStyles:
@@ -358,3 +370,384 @@ def apply_label_style(label, style: str):
         style: LabelStyles 클래스의 스타일 상수
     """
     label.setStyleSheet(style)
+
+
+# =============================================================================
+# 동적 테마 스타일 생성 함수
+# =============================================================================
+
+def get_dynamic_button_style(variant: str, colors: ThemeColors = None) -> str:
+    """테마 기반 동적 버튼 스타일 생성
+
+    Args:
+        variant: 버튼 종류 ('primary', 'secondary', 'success', 'danger', 'warning')
+        colors: ThemeColors 객체 (None이면 현재 테마 사용)
+
+    Returns:
+        str: Qt StyleSheet 문자열
+    """
+    if colors is None:
+        colors = get_current_colors()
+
+    styles = {
+        'primary': f"""
+            QPushButton {{
+                background-color: {colors.primary}; color: white; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }}
+            QPushButton:hover {{ background-color: {colors.primary_hover}; }}
+            QPushButton:disabled {{ background-color: {colors.foreground_disabled}; color: {colors.background_secondary}; }}
+        """,
+        'secondary': f"""
+            QPushButton {{
+                background-color: {colors.background_tertiary}; color: {colors.foreground};
+                padding: 6px 16px; border-radius: 4px; border: 1px solid {colors.border};
+            }}
+            QPushButton:hover {{ background-color: {colors.border_light}; }}
+            QPushButton:disabled {{ background-color: {colors.background_secondary}; color: {colors.foreground_disabled}; }}
+        """,
+        'success': f"""
+            QPushButton {{
+                background-color: {colors.success}; color: white; font-weight: bold;
+                padding: 4px 12px; border-radius: 4px; border: none;
+            }}
+            QPushButton:hover {{ background-color: {colors.success_hover}; }}
+            QPushButton:disabled {{ background-color: {colors.success_light}; color: {colors.background_secondary}; }}
+        """,
+        'danger': f"""
+            QPushButton {{
+                background-color: {colors.danger}; color: white; font-weight: bold;
+                padding: 4px 12px; border-radius: 4px; border: none;
+            }}
+            QPushButton:hover {{ background-color: {colors.danger_hover}; }}
+            QPushButton:disabled {{ background-color: {colors.danger_light}; color: {colors.background_secondary}; }}
+        """,
+        'warning': f"""
+            QPushButton {{
+                background-color: {colors.warning}; color: {colors.foreground}; font-weight: bold;
+                padding: 6px 16px; border-radius: 4px; border: none;
+            }}
+            QPushButton:hover {{ background-color: {colors.warning_hover}; }}
+            QPushButton:disabled {{ background-color: {colors.warning_light}; color: {colors.foreground_disabled}; }}
+        """,
+        'delete': f"""
+            QPushButton {{
+                background-color: {colors.danger_light}; color: {colors.danger};
+                padding: 4px 10px; border-radius: 4px; border: 1px solid {colors.danger};
+            }}
+            QPushButton:hover {{ background-color: {colors.danger}; color: white; }}
+            QPushButton:disabled {{ background-color: {colors.background_secondary}; color: {colors.foreground_disabled}; }}
+        """,
+        'flat': f"""
+            QPushButton {{
+                background-color: transparent; color: {colors.primary};
+                padding: 4px 8px; border: none;
+            }}
+            QPushButton:hover {{ color: {colors.primary_hover}; text-decoration: underline; }}
+        """
+    }
+
+    return styles.get(variant, styles['secondary'])
+
+
+def get_dynamic_input_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 입력 필드 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QLineEdit, QSpinBox, QComboBox, QTextEdit, QPlainTextEdit {{
+            padding: 6px 10px;
+            border: 1px solid {colors.input_border};
+            border-radius: 4px;
+            background-color: {colors.input_background};
+            color: {colors.foreground};
+        }}
+        QLineEdit:focus, QSpinBox:focus, QComboBox:focus,
+        QTextEdit:focus, QPlainTextEdit:focus {{
+            border-color: {colors.input_border_focus};
+        }}
+        QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled,
+        QTextEdit:disabled, QPlainTextEdit:disabled {{
+            background-color: {colors.background_tertiary};
+            color: {colors.foreground_disabled};
+        }}
+        QComboBox::drop-down {{
+            border: none;
+            padding-right: 8px;
+        }}
+        QComboBox QAbstractItemView {{
+            background-color: {colors.input_background};
+            color: {colors.foreground};
+            selection-background-color: {colors.primary_light};
+            selection-color: {colors.foreground};
+            border: 1px solid {colors.input_border};
+        }}
+    """
+
+
+def get_dynamic_groupbox_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 그룹박스 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QGroupBox {{
+            font-weight: bold;
+            border: 1px solid {colors.border};
+            border-radius: 6px;
+            margin-top: 12px;
+            padding-top: 10px;
+            background-color: {colors.background};
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 5px;
+            color: {colors.foreground};
+        }}
+    """
+
+
+def get_dynamic_table_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 테이블 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QTableWidget, QTableView {{
+            border: 1px solid {colors.table_border};
+            gridline-color: {colors.table_gridline};
+            selection-background-color: {colors.table_selection};
+            background-color: {colors.background};
+            color: {colors.foreground};
+            alternate-background-color: {colors.table_row_alt};
+        }}
+        QTableWidget::item, QTableView::item {{
+            padding: 5px;
+        }}
+        QHeaderView::section {{
+            background-color: {colors.table_header};
+            padding: 8px;
+            border: none;
+            border-bottom: 1px solid {colors.table_border};
+            font-weight: bold;
+            color: {colors.foreground};
+        }}
+    """
+
+
+def get_dynamic_tab_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 탭 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QTabWidget::pane {{
+            border: 1px solid {colors.border};
+            border-radius: 4px;
+            background-color: {colors.background};
+        }}
+        QTabBar::tab {{
+            background-color: {colors.background_tertiary};
+            color: {colors.foreground};
+            padding: 8px 16px;
+            margin-right: 2px;
+            border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }}
+        QTabBar::tab:selected {{
+            background-color: {colors.background};
+            border: 1px solid {colors.border};
+            border-bottom: none;
+        }}
+        QTabBar::tab:hover:!selected {{
+            background-color: {colors.border_light};
+        }}
+    """
+
+
+def get_dynamic_dialog_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 다이얼로그 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QDialog {{
+            background-color: {colors.background_secondary};
+        }}
+        QLabel {{
+            color: {colors.foreground};
+        }}
+        QCheckBox {{
+            color: {colors.foreground};
+        }}
+        QRadioButton {{
+            color: {colors.foreground};
+        }}
+    """
+
+
+def get_dynamic_list_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 리스트 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QListWidget, QListView {{
+            border: 1px solid {colors.border};
+            border-radius: 4px;
+            background-color: {colors.background};
+            color: {colors.foreground};
+            outline: none;
+        }}
+        QListWidget::item, QListView::item {{
+            padding: 6px;
+            border-radius: 2px;
+        }}
+        QListWidget::item:selected, QListView::item:selected {{
+            background-color: {colors.table_selection};
+            color: {colors.foreground};
+        }}
+        QListWidget::item:hover, QListView::item:hover {{
+            background-color: {colors.background_tertiary};
+        }}
+    """
+
+
+def get_dynamic_scrollbar_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 스크롤바 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QScrollBar:vertical {{
+            border: none;
+            background-color: {colors.background_secondary};
+            width: 12px;
+            margin: 0px;
+        }}
+        QScrollBar::handle:vertical {{
+            background-color: {colors.scrollbar};
+            min-height: 20px;
+            border-radius: 6px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:vertical:hover {{
+            background-color: {colors.scrollbar_hover};
+        }}
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
+            height: 0px;
+        }}
+        QScrollBar:horizontal {{
+            border: none;
+            background-color: {colors.background_secondary};
+            height: 12px;
+            margin: 0px;
+        }}
+        QScrollBar::handle:horizontal {{
+            background-color: {colors.scrollbar};
+            min-width: 20px;
+            border-radius: 6px;
+            margin: 2px;
+        }}
+        QScrollBar::handle:horizontal:hover {{
+            background-color: {colors.scrollbar_hover};
+        }}
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{
+            width: 0px;
+        }}
+    """
+
+
+def get_dynamic_progress_style(colors: ThemeColors = None) -> str:
+    """테마 기반 동적 프로그레스바 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QProgressBar {{
+            border: 1px solid {colors.border};
+            border-radius: 4px;
+            text-align: center;
+            height: 20px;
+            background-color: {colors.background_tertiary};
+            color: {colors.foreground};
+        }}
+        QProgressBar::chunk {{
+            background-color: {colors.primary};
+            border-radius: 3px;
+        }}
+    """
+
+
+def get_dynamic_label_style(variant: str, colors: ThemeColors = None) -> str:
+    """테마 기반 동적 라벨 스타일
+
+    Args:
+        variant: 라벨 종류 ('title', 'success', 'error', 'warning', 'info', 'caption')
+        colors: ThemeColors 객체 (None이면 현재 테마 사용)
+    """
+    if colors is None:
+        colors = get_current_colors()
+
+    styles = {
+        'title': f"font-size: 20px; font-weight: bold; color: {colors.foreground};",
+        'section': f"font-weight: bold; color: {colors.foreground}; margin-top: 15px;",
+        'success': f"color: {colors.success}; font-weight: bold;",
+        'error': f"color: {colors.danger}; font-weight: bold;",
+        'warning': f"color: {colors.warning}; font-weight: bold;",
+        'info': f"color: {colors.primary};",
+        'caption': f"color: {colors.foreground_secondary}; font-size: 11px;",
+        'disabled': f"color: {colors.foreground_disabled};"
+    }
+
+    return styles.get(variant, f"color: {colors.foreground};")
+
+
+def get_full_app_style(colors: ThemeColors = None) -> str:
+    """앱 전체에 적용할 기본 스타일"""
+    if colors is None:
+        colors = get_current_colors()
+
+    return f"""
+        QWidget {{
+            background-color: {colors.background};
+            color: {colors.foreground};
+        }}
+        QMainWindow {{
+            background-color: {colors.background_secondary};
+        }}
+        QMenuBar {{
+            background-color: {colors.background_tertiary};
+            color: {colors.foreground};
+        }}
+        QMenuBar::item:selected {{
+            background-color: {colors.primary_light};
+        }}
+        QMenu {{
+            background-color: {colors.background};
+            color: {colors.foreground};
+            border: 1px solid {colors.border};
+        }}
+        QMenu::item:selected {{
+            background-color: {colors.primary_light};
+        }}
+        QToolTip {{
+            background-color: {colors.background_tertiary};
+            color: {colors.foreground};
+            border: 1px solid {colors.border};
+            padding: 4px;
+        }}
+        QStatusBar {{
+            background-color: {colors.background_tertiary};
+            color: {colors.foreground_secondary};
+        }}
+        {get_dynamic_input_style(colors)}
+        {get_dynamic_table_style(colors)}
+        {get_dynamic_tab_style(colors)}
+        {get_dynamic_list_style(colors)}
+        {get_dynamic_scrollbar_style(colors)}
+        {get_dynamic_progress_style(colors)}
+        {get_dynamic_groupbox_style(colors)}
+    """
