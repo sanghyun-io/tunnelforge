@@ -217,7 +217,6 @@ scripts/
   - Generates release notes automatically
   - Uploads all installers to GitHub Release:
     - `TunnelForge-Setup-{version}.exe` - 오프라인 설치
-    - `TunnelForge-Setup-latest.exe` - 항상 최신 (오프라인)
     - `TunnelForge-WebSetup.exe` - 온라인 설치 (부트스트래퍼)
 
 ### Update Checker

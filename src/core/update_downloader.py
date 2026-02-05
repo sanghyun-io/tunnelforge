@@ -15,8 +15,8 @@ from src.version import GITHUB_OWNER, GITHUB_REPO
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
-# 다운로드 대상 파일 패턴
-INSTALLER_FILENAME_PATTERN = "TunnelForge-Setup-latest.exe"
+# 다운로드 대상 파일 패턴 (버전별 파일명 사용)
+INSTALLER_FILENAME_PREFIX = "TunnelForge-Setup-"
 
 
 class DownloadError(Exception):
@@ -63,23 +63,17 @@ class UpdateDownloader:
             if not self.latest_version:
                 raise DownloadError("버전 정보를 찾을 수 없습니다")
 
-            # assets에서 설치 프로그램 찾기
+            # assets에서 설치 프로그램 찾기 (TunnelForge-Setup-{version}.exe)
             assets = release_data.get('assets', [])
             for asset in assets:
                 asset_name = asset.get('name', '')
-                if INSTALLER_FILENAME_PATTERN in asset_name or asset_name == INSTALLER_FILENAME_PATTERN:
+                # TunnelForge-Setup-로 시작하고 .exe로 끝나는 파일 (WebSetup 제외)
+                if (asset_name.startswith(INSTALLER_FILENAME_PREFIX) and
+                    asset_name.endswith('.exe') and
+                    'WebSetup' not in asset_name):
                     self.download_url = asset.get('browser_download_url')
                     self.file_size = asset.get('size', 0)
                     break
-
-            # Setup-latest.exe를 못 찾으면 Setup-{version}.exe 시도
-            if not self.download_url:
-                for asset in assets:
-                    asset_name = asset.get('name', '')
-                    if 'TunnelForge-Setup' in asset_name and asset_name.endswith('.exe'):
-                        self.download_url = asset.get('browser_download_url')
-                        self.file_size = asset.get('size', 0)
-                        break
 
             if not self.download_url:
                 raise DownloadError(

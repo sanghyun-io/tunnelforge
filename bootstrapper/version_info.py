@@ -14,5 +14,5 @@ GITHUB_REPO = "tunnelforge"
 RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
-# 다운로드 대상 파일 패턴
-INSTALLER_FILENAME_PATTERN = "TunnelForge-Setup-latest.exe"
+# 다운로드 대상 파일 패턴 (버전별 파일명 사용)
+INSTALLER_FILENAME_PREFIX = "TunnelForge-Setup-"
