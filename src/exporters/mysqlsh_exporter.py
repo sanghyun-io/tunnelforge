@@ -17,6 +17,9 @@ from datetime import datetime
 from typing import List, Dict, Set, Tuple, Callable, Optional
 from dataclasses import dataclass
 
+import pymysql
+from pymysql.cursors import DictCursor
+
 from src.core.db_connector import MySQLConnector
 from src.core.logger import get_logger
 
@@ -1231,6 +1234,37 @@ class MySQLShellImporter:
             if progress_callback:
                 progress_callback(f"DDL + Data Import 시작 (스레드: {threads}, 모드: {import_mode})")
 
+            # === FK 백업 및 삭제 (replace 모드에서만) ===
+            fk_backup = []
+            fk_connection = None
+
+            if import_mode == "replace" and tables_to_import:
+                try:
+                    if progress_callback:
+                        progress_callback("🔗 FK 제약조건 백업 중...")
+
+                    # PyMySQL 연결 생성
+                    fk_connection = pymysql.connect(
+                        host=self.config.host,
+                        port=self.config.port,
+                        user=self.config.user,
+                        password=self.config.password,
+                        database=final_target_schema,
+                        charset='utf8mb4',
+                        cursorclass=DictCursor
+                    )
+
+                    fk_backup = self._backup_and_drop_foreign_keys(
+                        final_target_schema,
+                        fk_connection,
+                        progress_callback
+                    )
+
+                except Exception as e:
+                    logger.warning(f"FK 백업 중 오류 (계속 진행): {e}")
+                    if progress_callback:
+                        progress_callback(f"⚠️ FK 백업 중 오류: {e} (계속 진행)")
+
             # loadDump 옵션 구성 (모드별)
             options = [
                 f"threads: {threads}",
@@ -1286,6 +1320,57 @@ class MySQLShellImporter:
                 dump_metadata,
                 table_chunk_progress_callback
             )
+
+            # === FK 재연결 ===
+            if success and fk_backup:
+                try:
+                    if progress_callback:
+                        progress_callback("🔗 FK 제약조건 재연결 중...")
+
+                    # 연결이 끊어졌으면 재연결
+                    if fk_connection is None or not fk_connection.open:
+                        fk_connection = pymysql.connect(
+                            host=self.config.host,
+                            port=self.config.port,
+                            user=self.config.user,
+                            password=self.config.password,
+                            database=final_target_schema,
+                            charset='utf8mb4',
+                            cursorclass=DictCursor
+                        )
+
+                    fk_success, fk_fail, failed_fks = self._restore_foreign_keys(
+                        final_target_schema,
+                        fk_backup,
+                        fk_connection,
+                        progress_callback
+                    )
+
+                    if progress_callback:
+                        progress_callback(f"🔗 FK 재연결 완료: 성공 {fk_success}, 실패 {fk_fail}")
+
+                    # 결과에 FK 상태 추가
+                    import_results['fk_restore'] = {
+                        'success': fk_success,
+                        'fail': fk_fail,
+                        'errors': failed_fks
+                    }
+
+                except Exception as e:
+                    logger.error(f"FK 재연결 중 오류: {e}")
+                    if progress_callback:
+                        progress_callback(f"⚠️ FK 재연결 중 오류: {e}")
+                    import_results['fk_restore'] = {
+                        'success': 0,
+                        'fail': len(fk_backup),
+                        'errors': [{'constraint_name': 'all', 'table': '', 'error': str(e)}]
+                    }
+                finally:
+                    if fk_connection:
+                        try:
+                            fk_connection.close()
+                        except Exception:
+                            pass
 
             if success and progress_callback:
                 progress_callback(f"✅ Import 완료 (DDL + Data, 모드: {import_mode})")
@@ -1388,6 +1473,168 @@ for (var i = 0; i < events.length; i++) {{
 
         except Exception as e:
             return False, f"객체 삭제 오류: {str(e)}"
+
+    def _get_all_foreign_keys(self, schema: str, connection) -> List[Dict]:
+        """
+        스키마 내 모든 FK 정보 조회 (ON DELETE/ON UPDATE 옵션 포함)
+
+        Args:
+            schema: 스키마명
+            connection: PyMySQL 연결 객체
+
+        Returns:
+            FK 정보 목록 [{CONSTRAINT_NAME, TABLE_NAME, COLUMN_NAME,
+                          REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME,
+                          UPDATE_RULE, DELETE_RULE}, ...]
+        """
+        query = """
+        SELECT
+            kcu.CONSTRAINT_NAME,
+            kcu.TABLE_NAME,
+            kcu.COLUMN_NAME,
+            kcu.REFERENCED_TABLE_NAME,
+            kcu.REFERENCED_COLUMN_NAME,
+            rc.UPDATE_RULE,
+            rc.DELETE_RULE
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+        JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+          ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+          AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
+        WHERE kcu.TABLE_SCHEMA = %s
+          AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+        ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME
+        """
+        try:
+            with connection.cursor() as cursor:
+                cursor.execute(query, (schema,))
+                rows = cursor.fetchall()
+                return [dict(row) for row in rows]
+        except Exception as e:
+            logger.error(f"FK 조회 실패: {e}")
+            return []
+
+    def _backup_and_drop_foreign_keys(
+        self,
+        schema: str,
+        connection,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> List[Dict]:
+        """
+        FK 전체 백업 후 삭제
+
+        Args:
+            schema: 스키마명
+            connection: PyMySQL 연결 객체
+            progress_callback: 진행 콜백
+
+        Returns:
+            백업된 FK 정보 목록 (재연결용)
+        """
+        fk_list = self._get_all_foreign_keys(schema, connection)
+
+        if not fk_list:
+            if progress_callback:
+                progress_callback("  └─ FK 제약조건 없음")
+            return []
+
+        if progress_callback:
+            progress_callback(f"  └─ {len(fk_list)}개 FK 제약조건 발견")
+
+        try:
+            with connection.cursor() as cursor:
+                # FK 체크 비활성화
+                cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
+
+                dropped_count = 0
+                for fk in fk_list:
+                    try:
+                        drop_sql = f"ALTER TABLE `{schema}`.`{fk['TABLE_NAME']}` DROP FOREIGN KEY `{fk['CONSTRAINT_NAME']}`"
+                        cursor.execute(drop_sql)
+                        dropped_count += 1
+                    except Exception as e:
+                        # 이미 삭제된 FK는 무시
+                        if "Can't DROP" not in str(e) and "doesn't exist" not in str(e):
+                            logger.warning(f"FK 삭제 실패: {fk['CONSTRAINT_NAME']} - {e}")
+
+                connection.commit()
+
+                if progress_callback:
+                    progress_callback(f"  └─ ✅ {dropped_count}개 FK 임시 삭제 완료")
+
+        except Exception as e:
+            logger.error(f"FK 삭제 중 오류: {e}")
+            if progress_callback:
+                progress_callback(f"  └─ ⚠️ FK 삭제 중 오류: {e}")
+
+        return fk_list
+
+    def _restore_foreign_keys(
+        self,
+        schema: str,
+        fk_list: List[Dict],
+        connection,
+        progress_callback: Optional[Callable[[str], None]] = None
+    ) -> Tuple[int, int, List[Dict]]:
+        """
+        FK 재연결 (실패해도 계속 진행 - 무중단)
+
+        Args:
+            schema: 스키마명
+            fk_list: 복원할 FK 정보 목록
+            connection: PyMySQL 연결 객체
+            progress_callback: 진행 콜백
+
+        Returns:
+            (성공 수, 실패 수, 실패 상세 목록)
+        """
+        if not fk_list:
+            return 0, 0, []
+
+        success_count = 0
+        fail_count = 0
+        failed_fks = []
+
+        try:
+            with connection.cursor() as cursor:
+                for fk in fk_list:
+                    # ON DELETE/ON UPDATE 옵션 포함
+                    on_delete = f"ON DELETE {fk.get('DELETE_RULE', 'RESTRICT')}"
+                    on_update = f"ON UPDATE {fk.get('UPDATE_RULE', 'RESTRICT')}"
+
+                    add_sql = f"""
+                    ALTER TABLE `{schema}`.`{fk['TABLE_NAME']}`
+                    ADD CONSTRAINT `{fk['CONSTRAINT_NAME']}`
+                    FOREIGN KEY (`{fk['COLUMN_NAME']}`)
+                    REFERENCES `{fk['REFERENCED_TABLE_NAME']}` (`{fk['REFERENCED_COLUMN_NAME']}`)
+                    {on_delete} {on_update}
+                    """
+
+                    try:
+                        cursor.execute(add_sql)
+                        connection.commit()
+                        success_count += 1
+                    except Exception as e:
+                        fail_count += 1
+                        error_info = {
+                            'constraint_name': fk['CONSTRAINT_NAME'],
+                            'table': fk['TABLE_NAME'],
+                            'column': fk['COLUMN_NAME'],
+                            'referenced_table': fk['REFERENCED_TABLE_NAME'],
+                            'error': str(e)
+                        }
+                        failed_fks.append(error_info)
+
+                        # 로그 기록 (무중단 - 다음 FK로 계속)
+                        logger.warning(f"FK 연결 실패: {fk['CONSTRAINT_NAME']} - {e}")
+
+                # FK 체크 다시 활성화
+                cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
+                connection.commit()
+
+        except Exception as e:
+            logger.error(f"FK 복원 중 오류: {e}")
+
+        return success_count, fail_count, failed_fks
 
     def _patch_timezone_in_dump(self, input_dir: str, progress_callback: Optional[Callable[[str], None]] = None) -> int:
         """
