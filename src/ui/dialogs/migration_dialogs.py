@@ -28,6 +28,7 @@ from src.core.migration_analyzer import (
     CompatibilityIssue, CleanupAction, ActionType, IssueType
 )
 from src.ui.workers.migration_worker import MigrationAnalyzerWorker, CleanupWorker
+from src.ui.dialogs.oneclick_migration_dialog import OneClickMigrationDialog
 from src.core.logger import get_logger
 
 logger = get_logger('migration_dialogs')
@@ -181,6 +182,24 @@ class MigrationAnalyzerDialog(QDialog):
         """)
         self.btn_analyze.clicked.connect(self.start_analysis)
         btn_layout.addWidget(self.btn_analyze)
+
+        # One-Click 마이그레이션 버튼
+        self.btn_oneclick = QPushButton("🚀 One-Click 마이그레이션")
+        self.btn_oneclick.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60; color: white; font-weight: bold;
+                padding: 8px 20px; border-radius: 4px; border: none;
+                font-size: 14px;
+            }
+            QPushButton:hover { background-color: #219a52; }
+            QPushButton:disabled { background-color: #bdc3c7; }
+        """)
+        self.btn_oneclick.setToolTip(
+            "한 번의 클릭으로 MySQL 8.0 → 8.4 마이그레이션을 자동 수행합니다.\n"
+            "사전 검사 → 분석 → 자동 수정 → 검증까지 전 과정을 자동화합니다."
+        )
+        self.btn_oneclick.clicked.connect(self.start_oneclick_migration)
+        btn_layout.addWidget(self.btn_oneclick)
 
         # 저장/불러오기 버튼
         self.btn_save = QPushButton("💾 결과 저장")
@@ -530,6 +549,17 @@ class MigrationAnalyzerDialog(QDialog):
         self.chk_zerofill.setEnabled(enabled)
         self.chk_float_precision.setEnabled(enabled)
         self.chk_fk_name_length.setEnabled(enabled)
+
+    def start_oneclick_migration(self):
+        """One-Click 마이그레이션 시작"""
+        schema = self.combo_schema.currentText()
+        if not schema:
+            QMessageBox.warning(self, "경고", "스키마를 선택하세요.")
+            return
+
+        # One-Click 마이그레이션 다이얼로그 실행
+        dialog = OneClickMigrationDialog(self, self.connector, schema)
+        dialog.exec()
 
     def start_analysis(self):
         """분석 시작"""

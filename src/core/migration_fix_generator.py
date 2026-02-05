@@ -60,6 +60,14 @@ class FixQueryGenerator:
             IssueType.LATIN1_CHARSET: self._gen_latin1_fix,
             IssueType.FK_NON_UNIQUE_REF: self._gen_fk_unique_fix,
             IssueType.SUPER_PRIVILEGE: self._gen_super_privilege_fix,
+            # 신규 추가 Fix Generator (7개)
+            IssueType.REMOVED_SYS_VAR: self._gen_removed_sysvar_fix,
+            IssueType.GROUPBY_ASC_DESC: self._gen_groupby_fix,
+            IssueType.SQL_CALC_FOUND_ROWS_USAGE: self._gen_found_rows_fix,
+            IssueType.PARTITION_ISSUE: self._gen_partition_fix,
+            IssueType.TIMESTAMP_RANGE: self._gen_timestamp_fix,
+            IssueType.BLOB_TEXT_DEFAULT: self._gen_blob_default_fix,
+            IssueType.DEPRECATED_FUNCTION: self._gen_deprecated_function_fix,
         }
 
         generator = generators.get(issue.issue_type)
@@ -191,6 +199,167 @@ WHERE `{issue.column_name}` = '0000-00-00';"""
 -- GRANT CONNECTION_ADMIN ON *.* TO 'user'@'host';  -- 연결 관리
 -- GRANT REPLICATION_SLAVE_ADMIN ON *.* TO 'user'@'host';  -- 복제
 -- GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'user'@'host';  -- 시스템 변수"""
+
+    def _gen_removed_sysvar_fix(self, issue) -> Optional[str]:
+        """제거된 시스템 변수 수정 가이드"""
+        # description에서 변수명 추출 시도
+        var_name = "unknown"
+        if hasattr(issue, 'description'):
+            import re
+            match = re.search(r"['\"]?(\w+)['\"]?", issue.description)
+            if match:
+                var_name = match.group(1)
+
+        return f"""-- 제거된 시스템 변수: {var_name}
+-- MySQL 8.4에서 이 변수는 제거되었습니다.
+
+-- 조치 사항:
+-- 1. my.cnf/my.ini 설정 파일에서 해당 변수 제거
+-- 2. 애플리케이션 코드에서 SET 문 제거
+-- 3. 대체 변수가 있는 경우 마이그레이션
+
+-- 설정 파일에서 제거:
+-- [mysqld]
+-- # {var_name} = value  -- 이 줄 제거 또는 주석 처리
+
+-- 참고: https://dev.mysql.com/doc/refman/8.4/en/added-deprecated-removed.html"""
+
+    def _gen_groupby_fix(self, issue) -> Optional[str]:
+        """GROUP BY ASC/DESC 수정 가이드"""
+        return """-- GROUP BY ASC/DESC는 MySQL 8.0에서 deprecated됨
+
+-- 변경 전:
+-- SELECT col1, COUNT(*) FROM table GROUP BY col1 ASC;
+
+-- 변경 후:
+-- SELECT col1, COUNT(*) FROM table GROUP BY col1 ORDER BY col1 ASC;
+
+-- 참고: GROUP BY의 ASC/DESC는 정렬 순서를 보장하지 않았습니다.
+-- 정렬이 필요하면 명시적으로 ORDER BY를 사용하세요."""
+
+    def _gen_found_rows_fix(self, issue) -> Optional[str]:
+        """SQL_CALC_FOUND_ROWS 대체 가이드"""
+        return """-- SQL_CALC_FOUND_ROWS와 FOUND_ROWS()는 deprecated됨
+
+-- 변경 전 (기존 패턴):
+-- SELECT SQL_CALC_FOUND_ROWS * FROM users WHERE status='active' LIMIT 10;
+-- SELECT FOUND_ROWS();
+
+-- 변경 후 (권장 패턴 1: 두 개의 쿼리):
+-- SELECT COUNT(*) FROM users WHERE status='active';  -- 전체 개수
+-- SELECT * FROM users WHERE status='active' LIMIT 10; -- 실제 데이터
+
+-- 변경 후 (권장 패턴 2: 윈도우 함수, MySQL 8.0+):
+-- SELECT *, COUNT(*) OVER() as total_count
+-- FROM users WHERE status='active' LIMIT 10;
+
+-- 참고: 대부분의 경우 두 개의 쿼리가 더 효율적입니다."""
+
+    def _gen_partition_fix(self, issue) -> Optional[str]:
+        """파티션 이슈 수정 가이드"""
+        table = getattr(issue, 'table_name', 'table_name')
+        return f"""-- 파티션 재구성 필요: {table}
+
+-- 1. 현재 파티션 구조 확인
+SELECT PARTITION_NAME, PARTITION_EXPRESSION, PARTITION_DESCRIPTION,
+       TABLE_ROWS, AVG_ROW_LENGTH
+FROM information_schema.partitions
+WHERE table_schema = DATABASE() AND table_name = '{table}';
+
+-- 2. 파티션 유형 확인
+SHOW CREATE TABLE `{table}`\\G
+
+-- 3. 필요 시 파티션 재구성 (예시)
+-- ALTER TABLE `{table}` REORGANIZE PARTITION p0, p1 INTO (
+--     PARTITION p0_new VALUES LESS THAN (2025),
+--     PARTITION p1_new VALUES LESS THAN (2026)
+-- );
+
+-- 참고: 파티션 변경은 데이터 양에 따라 시간이 오래 걸릴 수 있습니다.
+-- 대용량 테이블은 유지보수 시간에 작업을 권장합니다."""
+
+    def _gen_timestamp_fix(self, issue) -> Optional[str]:
+        """TIMESTAMP 범위 수정 SQL"""
+        table = getattr(issue, 'table_name', None)
+        column = getattr(issue, 'column_name', None)
+
+        if table and column:
+            return f"""-- TIMESTAMP 범위 이슈: {table}.{column}
+
+-- TIMESTAMP는 1970-01-01 00:00:01 ~ 2038-01-19 03:14:07 범위만 지원 (2038년 문제)
+-- 이 범위를 벗어나는 값이 있거나 필요하면 DATETIME으로 변경 권장
+
+-- 1. 범위 초과 데이터 확인:
+SELECT COUNT(*) FROM `{table}`
+WHERE `{column}` < '1970-01-01 00:00:01'
+   OR `{column}` > '2038-01-19 03:14:07';
+
+-- 2. DATETIME으로 타입 변경:
+ALTER TABLE `{table}` MODIFY COLUMN `{column}` DATETIME;
+
+-- 참고: TIMESTAMP는 시간대 변환이 자동 적용됩니다.
+-- DATETIME으로 변경 시 시간대 처리가 달라질 수 있으니 확인하세요."""
+
+        return """-- TIMESTAMP 범위 이슈 (2038년 문제)
+-- DATETIME으로 타입 변경을 권장합니다.
+-- ALTER TABLE table_name MODIFY COLUMN column_name DATETIME;"""
+
+    def _gen_blob_default_fix(self, issue) -> Optional[str]:
+        """BLOB/TEXT DEFAULT 수정 SQL"""
+        table = getattr(issue, 'table_name', None)
+        column = getattr(issue, 'column_name', None)
+
+        if table and column:
+            return f"""-- BLOB/TEXT 컬럼에는 DEFAULT 값을 지정할 수 없음: {table}.{column}
+
+-- DEFAULT 제거:
+ALTER TABLE `{table}` ALTER COLUMN `{column}` DROP DEFAULT;
+
+-- 또는 컬럼 재정의 (DEFAULT 없이):
+-- ALTER TABLE `{table}` MODIFY COLUMN `{column}` TEXT;
+
+-- 참고: INSERT 시 애플리케이션에서 명시적으로 값을 지정하도록 수정 필요
+-- 또는 트리거를 사용하여 기본값 설정 가능"""
+
+        return """-- BLOB/TEXT 컬럼에는 DEFAULT 값을 지정할 수 없습니다.
+-- ALTER TABLE ... ALTER COLUMN ... DROP DEFAULT;"""
+
+    def _gen_deprecated_function_fix(self, issue) -> Optional[str]:
+        """Deprecated 함수 대체 가이드"""
+        # 함수별 대체 방법 매핑
+        replacements = {
+            'PASSWORD': 'SHA2() 또는 애플리케이션 레벨 해싱',
+            'ENCODE': 'AES_ENCRYPT()',
+            'DECODE': 'AES_DECRYPT()',
+            'DES_ENCRYPT': 'AES_ENCRYPT()',
+            'DES_DECRYPT': 'AES_DECRYPT()',
+            'ENCRYPT': 'SHA2() 또는 caching_sha2_password',
+            'OLD_PASSWORD': 'caching_sha2_password 인증 사용',
+            'MASTER_POS_WAIT': 'SOURCE_POS_WAIT() (MySQL 8.0.26+)',
+        }
+
+        # description에서 함수명 추출
+        func_name = "unknown"
+        if hasattr(issue, 'description'):
+            for key in replacements.keys():
+                if key in issue.description.upper():
+                    func_name = key
+                    break
+
+        replacement = replacements.get(func_name, '대체 함수 확인 필요')
+
+        return f"""-- Deprecated 함수 '{func_name}' 사용 감지
+
+-- 대체 방법: {replacement}
+
+-- 함수별 대체 예시:
+-- PASSWORD() → 애플리케이션에서 bcrypt 또는 SHA256 사용
+-- ENCODE()/DECODE() → AES_ENCRYPT(str, key), AES_DECRYPT(str, key)
+-- DES_ENCRYPT()/DES_DECRYPT() → AES_ENCRYPT(), AES_DECRYPT()
+-- ENCRYPT() → SHA2(str, 256) 또는 애플리케이션 레벨 해싱
+-- MASTER_POS_WAIT() → SOURCE_POS_WAIT() (8.0.26+)
+
+-- 참고: 저장 프로시저/함수/트리거 내의 사용도 확인하세요."""
 
     def generate_all(self, issues: list) -> list:
         """여러 이슈에 대해 fix_query 일괄 생성"""
