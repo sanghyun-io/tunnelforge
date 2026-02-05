@@ -9,6 +9,7 @@ from .sql_validator import (
     SQLValidator, SQLAutoCompleter, SchemaMetadataProvider,
     SchemaMetadata, ValidationIssue, IssueSeverity
 )
+from .production_guard import ProductionGuard, Environment, SchemaConfirmDialog
 
 __all__ = [
     'ConfigManager', 'TunnelEngine', 'MySQLConnector', 'test_mysql_connection',
@@ -17,5 +18,6 @@ __all__ = [
     'MigrationAnalyzer', 'AnalysisResult', 'OrphanRecord', 'CleanupAction', 'ActionType',
     'SQLHistory',
     'SQLValidator', 'SQLAutoCompleter', 'SchemaMetadataProvider',
-    'SchemaMetadata', 'ValidationIssue', 'IssueSeverity'
+    'SchemaMetadata', 'ValidationIssue', 'IssueSeverity',
+    'ProductionGuard', 'Environment', 'SchemaConfirmDialog'
 ]

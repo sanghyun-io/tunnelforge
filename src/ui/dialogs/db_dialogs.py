@@ -1280,13 +1280,15 @@ class MySQLShellExportDialog(QDialog):
 class MySQLShellImportDialog(QDialog):
     """MySQL Shell Import 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None):
+    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None,
+                 tunnel_config: dict = None):
         super().__init__(parent)
         self.setWindowTitle("MySQL Shell Import (병렬 처리)")
         self.resize(600, 700)
 
         self.connector = connector
         self.config_manager = config_manager
+        self.tunnel_config = tunnel_config  # Production 환경 보호용
         self.worker: Optional[MySQLShellWorker] = None
 
         self.mysqlsh_installed, self.mysqlsh_msg = check_mysqlsh()
@@ -1546,10 +1548,13 @@ class MySQLShellImportDialog(QDialog):
         self.label_data = QLabel("📦 데이터: 0 MB / 0 MB")
         self.label_speed = QLabel("⚡ 속도: 0 rows/s")
         self.label_tables = QLabel("📋 테이블: 0 / 0 완료")
+        self.label_fk_status = QLabel("🔗 FK: 대기 중")
+        self.label_fk_status.setStyleSheet("color: #7f8c8d;")
         left_detail.addWidget(self.label_percent)
         left_detail.addWidget(self.label_data)
         left_detail.addWidget(self.label_speed)
         left_detail.addWidget(self.label_tables)
+        left_detail.addWidget(self.label_fk_status)
 
         detail_layout.addLayout(left_detail)
         detail_layout.addStretch()
@@ -1892,6 +1897,14 @@ class MySQLShellImportDialog(QDialog):
         log_entry = f"[{timestamp}] {msg}"
         self.log_entries.append(log_entry)
 
+    def _get_import_mode_text(self) -> str:
+        """현재 선택된 Import 모드 텍스트 반환"""
+        if self.radio_replace.isChecked():
+            return "전체 교체 Import"
+        elif self.radio_recreate.isChecked():
+            return "완전 재생성 Import"
+        return "증분 Import (병합)"
+
     def do_import(self, retry_tables: list = None):
         """Import 실행 (retry_tables가 주어지면 해당 테이블만 재시도)"""
         input_dir = self.input_dir.text()
@@ -1910,6 +1923,20 @@ class MySQLShellImportDialog(QDialog):
             if not target_schema:
                 QMessageBox.warning(self, "오류", "대상 스키마를 선택하세요.")
                 return
+
+        # Production 환경 확인
+        if self.tunnel_config:
+            from src.core.production_guard import ProductionGuard
+            guard = ProductionGuard(self)
+
+            schema_name = target_schema or "(원본 스키마)"
+            details = (f"Dump 폴더: {input_dir}<br>"
+                      f"Import 모드: {self._get_import_mode_text()}")
+
+            if not guard.confirm_dangerous_operation(
+                self.tunnel_config, "데이터 Import", schema_name, details
+            ):
+                return  # 사용자가 취소
 
         # 저장 (재시도용)
         self.last_input_dir = input_dir
@@ -2040,6 +2067,17 @@ class MySQLShellImportDialog(QDialog):
         self.txt_log.scrollToBottom()
         self.label_status.setText(msg)
         self._add_log(msg)
+
+        # FK 관련 메시지 감지 시 FK 상태 라벨 업데이트
+        if "FK 제약조건" in msg or "FK 재연결" in msg:
+            self.label_fk_status.setText(msg)
+            if "백업 중" in msg or "재연결 중" in msg:
+                self.label_fk_status.setStyleSheet("color: #3498db; font-weight: bold;")
+            elif "완료" in msg:
+                if "실패 0" in msg or ("성공" in msg and "실패" not in msg):
+                    self.label_fk_status.setStyleSheet("color: #27ae60; font-weight: bold;")
+                else:
+                    self.label_fk_status.setStyleSheet("color: #e67e22; font-weight: bold;")
 
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
@@ -2233,8 +2271,11 @@ class MySQLShellImportDialog(QDialog):
         """Import 완료 처리 (결과 저장 및 재시도 버튼 표시)"""
         self.import_results = results
 
-        # 실패한 테이블이 있는지 확인
-        failed_tables = [t for t, r in results.items() if r.get('status') == 'error']
+        # 실패한 테이블이 있는지 확인 (fk_restore는 제외)
+        failed_tables = [
+            t for t, r in results.items()
+            if t != 'fk_restore' and isinstance(r, dict) and r.get('status') == 'error'
+        ]
 
         if failed_tables:
             self.btn_retry.setVisible(True)
@@ -2247,10 +2288,11 @@ class MySQLShellImportDialog(QDialog):
         self.import_end_time = datetime.now()
         self.import_success = success
 
-        # 결과 요약
-        done_count = sum(1 for r in self.import_results.values() if r.get('status') == 'done')
-        error_count = sum(1 for r in self.import_results.values() if r.get('status') == 'error')
-        total_count = len(self.import_results)
+        # 결과 요약 (fk_restore 제외)
+        table_results = {k: v for k, v in self.import_results.items() if k != 'fk_restore' and isinstance(v, dict)}
+        done_count = sum(1 for r in table_results.values() if r.get('status') == 'done')
+        error_count = sum(1 for r in table_results.values() if r.get('status') == 'error')
+        total_count = len(table_results)
 
         self._add_log(f"{'='*60}")
         self._add_log(f"Import {'성공' if success else '실패'}")
@@ -2260,6 +2302,27 @@ class MySQLShellImportDialog(QDialog):
             self._add_log(f"소요 시간: {elapsed}")
         self._add_log(f"성공: {done_count}개 테이블")
         self._add_log(f"실패: {error_count}개 테이블")
+
+        # FK 복원 결과 표시
+        fk_restore = self.import_results.get('fk_restore', {})
+        if fk_restore:
+            fk_success = fk_restore.get('success', 0)
+            fk_fail = fk_restore.get('fail', 0)
+            fk_msg = f"🔗 FK 재연결: 성공 {fk_success}, 실패 {fk_fail}"
+            self.label_fk_status.setText(fk_msg)
+            self._add_log(f"FK 재연결: 성공 {fk_success}, 실패 {fk_fail}")
+
+            if fk_fail > 0:
+                self.label_fk_status.setStyleSheet("color: #e74c3c; font-weight: bold;")
+                self._add_log("⚠️ 일부 FK 연결에 실패했습니다:")
+                for err in fk_restore.get('errors', []):
+                    self._add_log(f"  - {err.get('constraint_name', 'unknown')}: {err.get('error', '')}")
+            else:
+                self.label_fk_status.setStyleSheet("color: #27ae60; font-weight: bold;")
+        else:
+            self.label_fk_status.setText("🔗 FK: -")
+            self.label_fk_status.setStyleSheet("color: #7f8c8d;")
+
         self._add_log(f"결과 메시지: {message}")
         self._add_log(f"{'='*60}")
 
@@ -2588,7 +2651,8 @@ class MySQLShellWizard:
         import_dialog = MySQLShellImportDialog(
             self.parent,
             connector=connector,
-            config_manager=self.config_manager
+            config_manager=self.config_manager,
+            tunnel_config=self.preselected_tunnel  # Production 환경 보호용
         )
         import_dialog.exec()
 

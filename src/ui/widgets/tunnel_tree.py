@@ -204,6 +204,15 @@ class TunnelTreeWidget(QTreeWidget):
 
         return item
 
+    def _get_environment_badge(self, environment: str) -> str:
+        """환경 배지 이모지 반환"""
+        badges = {
+            'production': '🔴 ',
+            'staging': '🟠 ',
+            'development': '🟢 ',
+        }
+        return badges.get(environment, '')
+
     def _create_tunnel_item(self, tunnel: dict) -> QTreeWidgetItem:
         """터널 아이템 생성"""
         item = QTreeWidgetItem()
@@ -216,8 +225,15 @@ class TunnelTreeWidget(QTreeWidget):
         # 상태 아이콘 (초기값: 연결 안됨)
         item.setText(0, "⚪")
 
-        # 이름
-        item.setText(1, tunnel.get('name', ''))
+        # 이름 (환경 배지 포함)
+        name = tunnel.get('name', '')
+        env = tunnel.get('environment')
+        env_badge = self._get_environment_badge(env)
+        item.setText(1, f"{env_badge}{name}" if env_badge else name)
+
+        # Production 환경은 빨간색 텍스트
+        if env == 'production':
+            item.setForeground(1, QColor("#c0392b"))
 
         # 로컬 포트 (connection_mode에 따라 다름)
         if tunnel.get('connection_mode') == 'direct':

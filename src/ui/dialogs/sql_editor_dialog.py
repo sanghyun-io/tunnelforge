@@ -2223,6 +2223,25 @@ class SQLEditorDialog(QDialog):
             QMessageBox.warning(self, "경고", "유효한 SQL 쿼리가 없습니다.")
             return
 
+        # Production 환경에서 위험 쿼리 확인
+        from src.core.production_guard import ProductionGuard
+        guard = ProductionGuard(self)
+
+        is_dangerous, keyword = guard.is_dangerous_query(sql_text)
+        if is_dangerous:
+            schema_name = self.db_combo.currentText() or "(미선택)"
+            preview = sql_text[:200] + "..." if len(sql_text) > 200 else sql_text
+            # HTML 특수문자 이스케이프
+            preview = preview.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+
+            if not guard.confirm_dangerous_operation(
+                self.config,
+                f"{keyword} 쿼리 실행",
+                schema_name,
+                f"<pre style='background: #f5f5f5; padding: 8px; border-radius: 4px; white-space: pre-wrap;'>{preview}</pre>"
+            ):
+                return  # 사용자가 취소
+
         # LIMIT 자동 적용
         limit_value = self._get_limit_value()
         if limit_value:

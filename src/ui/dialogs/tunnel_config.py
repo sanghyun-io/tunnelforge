@@ -2,7 +2,8 @@
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                              QDialogButtonBox, QFileDialog, QPushButton,
                              QHBoxLayout, QSpinBox, QLabel, QMessageBox, QApplication,
-                             QRadioButton, QCheckBox, QButtonGroup, QGroupBox, QWidget)
+                             QRadioButton, QCheckBox, QButtonGroup, QGroupBox, QWidget,
+                             QComboBox)
 from PyQt6.QtCore import Qt
 import uuid
 
@@ -119,6 +120,30 @@ class TunnelConfigDialog(QDialog):
         self.input_default_schema.setPlaceholderText("(선택사항) 예: my_database")
         form_layout.addRow("기본 스키마:", self.input_default_schema)
 
+        # --- 환경 설정 ---
+        lbl_env = QLabel("--- 환경 설정 ---")
+        lbl_env.setStyleSheet(LabelStyles.SECTION_HEADER)
+        form_layout.addRow(lbl_env)
+
+        self.combo_environment = QComboBox()
+        self.combo_environment.addItems([
+            "(미설정)",
+            "🔴 Production",
+            "🟠 Staging",
+            "🟢 Development"
+        ])
+        self.combo_environment.setToolTip(
+            "Production: 위험 작업 시 스키마명 직접 입력 필요\n"
+            "Staging: 위험 작업 시 확인 다이얼로그 표시\n"
+            "Development: 확인 없이 바로 실행"
+        )
+        # 기존 데이터에서 환경 값 로드
+        env_index_map = {None: 0, 'production': 1, 'staging': 2, 'development': 3}
+        self.combo_environment.setCurrentIndex(
+            env_index_map.get(self.tunnel_data.get('environment'), 0)
+        )
+        form_layout.addRow("환경:", self.combo_environment)
+
         # --- 4. 로컬 설정 ---
         self.lbl_local = QLabel("--- Local (내 컴퓨터) ---")
         self.lbl_local.setStyleSheet(LabelStyles.SECTION_HEADER)
@@ -227,6 +252,10 @@ class TunnelConfigDialog(QDialog):
 
     def get_data(self):
         """입력된 폼 데이터를 딕셔너리로 반환"""
+        # 환경 설정 매핑
+        env_map = {0: None, 1: 'production', 2: 'staging', 3: 'development'}
+        environment = env_map.get(self.combo_environment.currentIndex())
+
         data = {
             # ID가 없으면 새로 생성 (신규 추가), 있으면 기존 ID 유지 (수정)
             "id": self.tunnel_data.get('id', str(uuid.uuid4())),
@@ -239,7 +268,8 @@ class TunnelConfigDialog(QDialog):
             "remote_host": self.input_remote_host.text(),
             "remote_port": self.input_remote_port.value(),
             "local_port": self.input_local_port.value(),
-            "default_schema": self.input_default_schema.text().strip() or None
+            "default_schema": self.input_default_schema.text().strip() or None,
+            "environment": environment
         }
 
         # MySQL 자격 증명 (체크된 경우에만)
