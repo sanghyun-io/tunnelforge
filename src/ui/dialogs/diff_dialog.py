@@ -607,6 +607,18 @@ class SyncScriptDialog(QDialog):
         warning.setWordWrap(True)
         layout.addWidget(warning)
 
+        # 데이터 미복사 경고
+        data_warning = QLabel(
+            "📋 이 스크립트는 테이블 구조(DDL)만 동기화합니다.\n"
+            "데이터는 복사되지 않습니다. 데이터 이전은 Export/Import 기능을 사용하세요."
+        )
+        data_warning.setStyleSheet(
+            "background-color: #d1ecf1; color: #0c5460; "
+            "padding: 10px; border-radius: 4px; font-weight: bold;"
+        )
+        data_warning.setWordWrap(True)
+        layout.addWidget(data_warning)
+
         # 스크립트
         self.script_text = QTextEdit()
         self.script_text.setPlainText(self.script)
