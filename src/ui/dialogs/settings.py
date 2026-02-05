@@ -1,15 +1,19 @@
 """설정 관련 다이얼로그"""
 import os
+import subprocess
+import sys
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
                              QWidget, QTextBrowser, QSizePolicy, QTextEdit,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox)
+                             QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox,
+                             QProgressBar, QApplication)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QCursor, QFont
 from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
+from src.core.update_downloader import format_size
 from src.core.logger import get_log_file_path, get_log_dir, read_log_file, filter_log_by_level, clear_log_file
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
@@ -778,6 +782,76 @@ class SettingsDialog(QDialog):
         self.update_status_label.document().contentsChanged.connect(self._adjust_update_label_height)
         update_layout.addWidget(self.update_status_label)
 
+        # 다운로드 버튼 및 진행률 표시 (초기에는 숨김)
+        self.download_widget = QWidget()
+        download_layout = QVBoxLayout(self.download_widget)
+        download_layout.setContentsMargins(0, 10, 0, 0)
+
+        # 다운로드/설치 버튼 및 취소 버튼
+        download_btn_layout = QHBoxLayout()
+        self.btn_download = QPushButton("🔽 새 버전 다운로드")
+        self.btn_download.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60; color: white;
+                padding: 8px 16px; border-radius: 4px; border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #229954; }
+            QPushButton:disabled { background-color: #bdc3c7; }
+        """)
+        self.btn_download.clicked.connect(self._start_download)
+        download_btn_layout.addWidget(self.btn_download)
+
+        self.btn_cancel_download = QPushButton("취소")
+        self.btn_cancel_download.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c; color: white;
+                padding: 8px 12px; border-radius: 4px; border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """)
+        self.btn_cancel_download.clicked.connect(self._cancel_download)
+        self.btn_cancel_download.hide()
+        download_btn_layout.addWidget(self.btn_cancel_download)
+
+        download_btn_layout.addStretch()
+        download_layout.addLayout(download_btn_layout)
+
+        # 진행률 바
+        self.download_progress = QProgressBar()
+        self.download_progress.setMinimum(0)
+        self.download_progress.setMaximum(100)
+        self.download_progress.setTextVisible(True)
+        self.download_progress.setStyleSheet("""
+            QProgressBar {
+                border: 1px solid #bdc3c7;
+                border-radius: 4px;
+                text-align: center;
+                height: 20px;
+            }
+            QProgressBar::chunk {
+                background-color: #3498db;
+                border-radius: 3px;
+            }
+        """)
+        self.download_progress.hide()
+        download_layout.addWidget(self.download_progress)
+
+        # 다운로드 상세 정보
+        self.download_detail_label = QLabel("")
+        self.download_detail_label.setStyleSheet("font-size: 11px; color: #555;")
+        self.download_detail_label.hide()
+        download_layout.addWidget(self.download_detail_label)
+
+        self.download_widget.hide()
+        update_layout.addWidget(self.download_widget)
+
+        # 다운로드 관련 상태 변수 초기화
+        self._download_worker = None
+        self._downloaded_installer_path = None
+        self._latest_version = None
+
         layout.addWidget(update_group)
 
         # GitHub 링크
@@ -862,20 +936,155 @@ class SettingsDialog(QDialog):
             self.update_status_label.setHtml(
                 f'<div style="color: #e74c3c; font-size: 12px;">❌ {error_msg}</div>'
             )
+            self.download_widget.hide()
             return
 
         if needs_update:
+            self._latest_version = latest_version
             self.update_status_label.setHtml(
                 f'<div style="color: #27ae60; font-size: 12px;">'
-                f'✅ 새로운 버전 {latest_version}이 사용 가능합니다!<br>'
-                f'<a href="{download_url}" style="color: #3498db;">다운로드 페이지로 이동</a>'
+                f'✅ 새로운 버전 {latest_version}이 사용 가능합니다!'
                 f'</div>'
             )
+            # 다운로드 버튼 표시
+            self.download_widget.show()
+            self.btn_download.setText(f"🔽 v{latest_version} 다운로드")
+            self.btn_download.setEnabled(True)
+            self.download_progress.hide()
+            self.download_detail_label.hide()
+            self.btn_cancel_download.hide()
         else:
             self.update_status_label.setHtml(
                 f'<div style="color: #27ae60; font-size: 12px;">'
                 f'✅ 최신 버전({__version__})을 사용하고 있습니다.'
                 f'</div>'
+            )
+            self.download_widget.hide()
+
+    def _start_download(self):
+        """업데이트 다운로드 시작"""
+        from src.ui.workers import UpdateDownloadWorker
+
+        # UI 상태 변경
+        self.btn_check_update.setEnabled(False)
+        self.btn_download.setEnabled(False)
+        self.btn_download.setText("다운로드 준비 중...")
+        self.btn_cancel_download.show()
+        self.download_progress.setValue(0)
+        self.download_progress.show()
+        self.download_detail_label.setText("설치 파일 정보를 가져오는 중...")
+        self.download_detail_label.show()
+
+        # Worker 시작
+        self._download_worker = UpdateDownloadWorker()
+        self._download_worker.info_fetched.connect(self._on_download_info_fetched)
+        self._download_worker.progress.connect(self._on_download_progress)
+        self._download_worker.finished.connect(self._on_download_finished)
+        self._download_worker.start()
+
+    def _on_download_info_fetched(self, version: str, file_size: int):
+        """설치 프로그램 정보 수신"""
+        self.btn_download.setText("다운로드 중...")
+        size_str = format_size(file_size)
+        self.download_detail_label.setText(f"파일 크기: {size_str}")
+
+    def _on_download_progress(self, downloaded: int, total: int):
+        """다운로드 진행률 업데이트"""
+        if total > 0:
+            percent = int((downloaded / total) * 100)
+            self.download_progress.setValue(percent)
+            downloaded_str = format_size(downloaded)
+            total_str = format_size(total)
+            self.download_detail_label.setText(f"{downloaded_str} / {total_str}")
+
+    def _on_download_finished(self, success: bool, result: str):
+        """다운로드 완료 처리"""
+        self.btn_cancel_download.hide()
+
+        if success:
+            self._downloaded_installer_path = result
+            self.download_progress.setValue(100)
+            self.btn_download.setText("🚀 설치 시작")
+            self.btn_download.setEnabled(True)
+            self.btn_download.setStyleSheet("""
+                QPushButton {
+                    background-color: #9b59b6; color: white;
+                    padding: 8px 16px; border-radius: 4px; border: none;
+                    font-size: 12px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #8e44ad; }
+            """)
+            # 버튼 클릭 이벤트 변경
+            self.btn_download.clicked.disconnect()
+            self.btn_download.clicked.connect(self._launch_installer)
+            self.download_detail_label.setText("✅ 다운로드 완료! '설치 시작' 버튼을 클릭하세요.")
+        else:
+            self.download_progress.hide()
+            self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
+            self.btn_download.setEnabled(True)
+            self.btn_check_update.setEnabled(True)
+            self.download_detail_label.setText(f"❌ {result}")
+            self.download_detail_label.setStyleSheet("font-size: 11px; color: #e74c3c;")
+
+    def _cancel_download(self):
+        """다운로드 취소"""
+        if self._download_worker:
+            self._download_worker.cancel()
+            self._download_worker.wait()
+            self._download_worker = None
+
+        # UI 상태 복원
+        self.btn_cancel_download.hide()
+        self.download_progress.hide()
+        self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
+        self.btn_download.setEnabled(True)
+        self.btn_check_update.setEnabled(True)
+        self.download_detail_label.setText("다운로드가 취소되었습니다.")
+
+    def _launch_installer(self):
+        """설치 프로그램 실행 및 앱 종료"""
+        if not self._downloaded_installer_path or not os.path.exists(self._downloaded_installer_path):
+            QMessageBox.warning(
+                self,
+                "설치 오류",
+                "설치 파일을 찾을 수 없습니다.\n다시 다운로드해 주세요."
+            )
+            return
+
+        # 확인 다이얼로그
+        reply = QMessageBox.question(
+            self,
+            "설치 확인",
+            f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
+            "설치를 위해 현재 앱이 종료됩니다.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes
+        )
+
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        try:
+            # 설치 프로그램을 분리된 프로세스로 실행
+            if sys.platform == 'win32':
+                subprocess.Popen(
+                    [self._downloaded_installer_path],
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                )
+            else:
+                subprocess.Popen(
+                    [self._downloaded_installer_path],
+                    start_new_session=True
+                )
+
+            # 앱 종료
+            QApplication.instance().quit()
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "실행 오류",
+                f"설치 프로그램 실행에 실패했습니다:\n{str(e)}"
             )
 
     def _adjust_update_label_height(self):
