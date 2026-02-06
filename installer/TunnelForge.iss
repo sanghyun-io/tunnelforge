@@ -54,7 +54,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 ; 실행 중인 애플리케이션 자동 종료
 CloseApplications=force
 CloseApplicationsFilter=*.exe
-RestartApplications=yes
+RestartApplications=no
 
 [Languages]
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"

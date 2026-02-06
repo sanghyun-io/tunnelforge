@@ -1173,11 +1173,42 @@ class SettingsDialog(QDialog):
             return
 
         try:
-            # 설치 프로그램을 분리된 프로세스로 실행
             if sys.platform == 'win32':
+                # 앱 종료 후 인스톨러를 실행하는 배치 스크립트 생성
+                # PyInstaller _MEI 임시 디렉토리 정리 완료를 보장하기 위해
+                # 프로세스 종료를 폴링한 후 인스톨러를 실행
+                import tempfile
+                current_pid = os.getpid()
+                bat_path = os.path.join(
+                    tempfile.gettempdir(),
+                    f"tunnelforge_update_{current_pid}.bat"
+                )
+                bat_content = (
+                    "@echo off\r\n"
+                    "setlocal\r\n"
+                    f"set PID={current_pid}\r\n"
+                    f'set INSTALLER="{self._downloaded_installer_path}"\r\n'
+                    "set MAX_WAIT=30\r\n"
+                    "set COUNT=0\r\n"
+                    ":WAIT_LOOP\r\n"
+                    "tasklist /FI \"PID eq %PID%\" 2>NUL | find /I \"%PID%\" >NUL\r\n"
+                    "if errorlevel 1 goto LAUNCH\r\n"
+                    "set /A COUNT+=1\r\n"
+                    "if %COUNT% GEQ %MAX_WAIT% goto LAUNCH\r\n"
+                    "timeout /t 1 /nobreak >NUL\r\n"
+                    "goto WAIT_LOOP\r\n"
+                    ":LAUNCH\r\n"
+                    "timeout /t 1 /nobreak >NUL\r\n"
+                    "start \"\" %INSTALLER%\r\n"
+                    f'del /f /q "{bat_path}"\r\n'
+                )
+                with open(bat_path, 'w', encoding='ascii') as f:
+                    f.write(bat_content)
+
                 subprocess.Popen(
-                    [self._downloaded_installer_path],
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+                    ['cmd.exe', '/c', bat_path],
+                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
+                    close_fds=True
                 )
             else:
                 subprocess.Popen(
