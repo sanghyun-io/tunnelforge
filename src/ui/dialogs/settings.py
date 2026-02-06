@@ -372,6 +372,28 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(reconnect_group)
 
+        # Windows 시작 프로그램 설정 그룹
+        startup_group = QGroupBox("Windows 시작 프로그램")
+        startup_layout = QVBoxLayout(startup_group)
+
+        self.chk_startup = QCheckBox("Windows 시작 시 자동 실행")
+        self.chk_startup.setStyleSheet("font-size: 12px;")
+        self.chk_startup.setChecked(self._is_startup_registered())
+        startup_layout.addWidget(self.chk_startup)
+
+        startup_desc = QLabel(
+            "Windows 부팅 시 시스템 트레이에 최소화된 상태로 자동 시작됩니다."
+        )
+        startup_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
+        startup_desc.setWordWrap(True)
+        startup_layout.addWidget(startup_desc)
+
+        layout.addWidget(startup_group)
+
+        # Windows가 아닌 경우 숨김
+        if sys.platform != 'win32':
+            startup_group.setVisible(False)
+
         layout.addStretch()
 
         return tab
@@ -912,7 +934,72 @@ class SettingsDialog(QDialog):
         max_reconnect = self.spin_max_reconnect.value()
         self.config_mgr.set_app_setting('max_reconnect_attempts', max_reconnect)
 
+        # Windows 시작 프로그램 설정 저장
+        if sys.platform == 'win32':
+            self._set_startup_registry(self.chk_startup.isChecked())
+
         self.accept()
+
+    def _is_startup_registered(self) -> bool:
+        """레지스트리에 시작 프로그램 등록 여부 확인"""
+        if sys.platform != 'win32':
+            return False
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_READ
+            )
+            try:
+                winreg.QueryValueEx(key, "TunnelForge")
+                return True
+            except FileNotFoundError:
+                return False
+            finally:
+                winreg.CloseKey(key)
+        except Exception:
+            return False
+
+    def _set_startup_registry(self, enable: bool):
+        """레지스트리에 시작 프로그램 등록/해제"""
+        if sys.platform != 'win32':
+            return
+        try:
+            import winreg
+            key = winreg.OpenKey(
+                winreg.HKEY_CURRENT_USER,
+                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                0, winreg.KEY_SET_VALUE
+            )
+            try:
+                if enable:
+                    if getattr(sys, 'frozen', False):
+                        # PyInstaller 빌드: exe 직접 실행
+                        app_path = f'"{sys.executable}" --minimized'
+                    else:
+                        # 개발 환경: pythonw.exe로 콘솔 없이 실행
+                        python_dir = os.path.dirname(sys.executable)
+                        pythonw = os.path.join(python_dir, 'pythonw.exe')
+                        if not os.path.exists(pythonw):
+                            pythonw = sys.executable
+                        main_py = os.path.abspath(
+                            os.path.join(os.path.dirname(__file__), '..', '..', '..', 'main.py')
+                        )
+                        app_path = f'"{pythonw}" "{main_py}" --minimized'
+                    winreg.SetValueEx(key, "TunnelForge", 0, winreg.REG_SZ, app_path)
+                else:
+                    try:
+                        winreg.DeleteValue(key, "TunnelForge")
+                    except FileNotFoundError:
+                        pass
+            finally:
+                winreg.CloseKey(key)
+        except Exception as e:
+            QMessageBox.warning(
+                self, "시작 프로그램 설정 오류",
+                f"레지스트리 설정 중 오류가 발생했습니다:\n{str(e)}"
+            )
 
     def _check_for_updates(self):
         """업데이트 확인"""
@@ -1051,12 +1138,33 @@ class SettingsDialog(QDialog):
             )
             return
 
+        # 확인 메시지 구성 (활성 터널 경고 포함)
+        main_window = self.parent()
+        confirm_msg = (
+            f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
+            "설치를 위해 현재 앱이 종료됩니다."
+        )
+
+        if main_window and hasattr(main_window, 'engine'):
+            active_count = len(main_window.engine.active_tunnels)
+            if active_count > 0:
+                tunnel_names = []
+                for tid in main_window.engine.active_tunnels:
+                    config = main_window.engine.tunnel_configs.get(tid, {})
+                    tunnel_names.append(config.get('name', tid))
+                tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
+                confirm_msg = (
+                    f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
+                    f"⚠️ 현재 {active_count}개의 활성 터널이 연결 해제됩니다:\n"
+                    f"{tunnel_list}\n\n"
+                    "설치를 위해 현재 앱이 종료됩니다."
+                )
+
         # 확인 다이얼로그
         reply = QMessageBox.question(
             self,
             "설치 확인",
-            f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
-            "설치를 위해 현재 앱이 종료됩니다.",
+            confirm_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes
         )
@@ -1077,8 +1185,11 @@ class SettingsDialog(QDialog):
                     start_new_session=True
                 )
 
-            # 앱 종료
-            QApplication.instance().quit()
+            # closeEvent 우회하여 직접 종료 (CloseConfirmDialog 방지)
+            if main_window and hasattr(main_window, 'close_app'):
+                main_window.close_app()
+            else:
+                QApplication.instance().quit()  # fallback
 
         except Exception as e:
             QMessageBox.critical(

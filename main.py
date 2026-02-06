@@ -109,8 +109,12 @@ def main():
     logger.info(f"설정 파일 위치: {config_path}")
 
     # 3. UI 실행
+    start_minimized = '--minimized' in sys.argv
     window = TunnelManagerUI(config_mgr, tunnel_engine)
-    window.show()
+    if not start_minimized:
+        window.show()
+    else:
+        logger.info("--minimized 모드: 시스템 트레이에서 시작")
 
     # 4. 앱 루프 시작
     sys.exit(app.exec())
