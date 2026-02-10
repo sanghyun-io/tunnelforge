@@ -718,6 +718,7 @@ class SQLQueryWorker(QThread):
                 return
 
             self.progress.emit(f"✅ 연결 성공: {self.host}:{self.port}")
+            connector.connection.autocommit(True)
 
             total_queries = len(self.queries)
             success_count = 0
@@ -2271,6 +2272,14 @@ class SQLEditorDialog(QDialog):
         # 쿼리 실행
         import pymysql
         from datetime import datetime
+
+        # Fresh snapshot: 대기 중인 수정이 없고 모든 쿼리가 읽기 전용이면 스냅샷 갱신
+        all_read_only = all(not self._is_modification_query(q) for q in queries if q.strip())
+        if all_read_only and not self.pending_queries:
+            try:
+                self.db_connection.commit()
+            except Exception:
+                pass
 
         for idx, query in enumerate(queries):
             query = query.strip()
