@@ -254,13 +254,12 @@ class SchemaExtractor:
         """
 
         try:
-            success, result = self.connector.execute_query(query, (schema,))
-            if success:
-                for row in result:
-                    table_name = row[0] if isinstance(row, tuple) else row['TABLE_NAME']
-                    table_schema = self.extract_table_schema(schema, table_name)
-                    if table_schema:
-                        tables[table_name] = table_schema
+            result = self.connector.execute(query, (schema,))
+            for row in result:
+                table_name = row['TABLE_NAME']
+                table_schema = self.extract_table_schema(schema, table_name)
+                if table_schema:
+                    tables[table_name] = table_schema
         except Exception as e:
             logger.error(f"테이블 목록 조회 실패 ({schema}): {e}")
 
@@ -285,32 +284,19 @@ class SchemaExtractor:
 
         columns = []
         try:
-            success, result = self.connector.execute_query(query, (schema, table))
-            if success:
-                for row in result:
-                    if isinstance(row, tuple):
-                        col = ColumnInfo(
-                            name=row[0],
-                            data_type=row[1],
-                            nullable=(row[2] == 'YES'),
-                            default=row[3],
-                            extra=row[4] or '',
-                            key=row[5] or '',
-                            charset=row[6] or '',
-                            collation=row[7] or ''
-                        )
-                    else:
-                        col = ColumnInfo(
-                            name=row['COLUMN_NAME'],
-                            data_type=row['COLUMN_TYPE'],
-                            nullable=(row['IS_NULLABLE'] == 'YES'),
-                            default=row['COLUMN_DEFAULT'],
-                            extra=row['EXTRA'] or '',
-                            key=row['COLUMN_KEY'] or '',
-                            charset=row['CHARACTER_SET_NAME'] or '',
-                            collation=row['COLLATION_NAME'] or ''
-                        )
-                    columns.append(col)
+            result = self.connector.execute(query, (schema, table))
+            for row in result:
+                col = ColumnInfo(
+                    name=row['COLUMN_NAME'],
+                    data_type=row['COLUMN_TYPE'],
+                    nullable=(row['IS_NULLABLE'] == 'YES'),
+                    default=row['COLUMN_DEFAULT'],
+                    extra=row['EXTRA'] or '',
+                    key=row['COLUMN_KEY'] or '',
+                    charset=row['CHARACTER_SET_NAME'] or '',
+                    collation=row['COLLATION_NAME'] or ''
+                )
+                columns.append(col)
         except Exception as e:
             logger.error(f"컬럼 정보 조회 실패: {e}")
 
@@ -331,25 +317,21 @@ class SchemaExtractor:
 
         index_map = {}
         try:
-            success, result = self.connector.execute_query(query, (schema, table))
-            if success:
-                for row in result:
-                    if isinstance(row, tuple):
-                        idx_name, col_name, non_unique, idx_type = row
-                    else:
-                        idx_name = row['INDEX_NAME']
-                        col_name = row['COLUMN_NAME']
-                        non_unique = row['NON_UNIQUE']
-                        idx_type = row['INDEX_TYPE']
+            result = self.connector.execute(query, (schema, table))
+            for row in result:
+                idx_name = row['INDEX_NAME']
+                col_name = row['COLUMN_NAME']
+                non_unique = row['NON_UNIQUE']
+                idx_type = row['INDEX_TYPE']
 
-                    if idx_name not in index_map:
-                        index_map[idx_name] = IndexInfo(
-                            name=idx_name,
-                            columns=[],
-                            unique=(non_unique == 0),
-                            type=idx_type
-                        )
-                    index_map[idx_name].columns.append(col_name)
+                if idx_name not in index_map:
+                    index_map[idx_name] = IndexInfo(
+                        name=idx_name,
+                        columns=[],
+                        unique=(non_unique == 0),
+                        type=idx_type
+                    )
+                index_map[idx_name].columns.append(col_name)
         except Exception as e:
             logger.error(f"인덱스 정보 조회 실패: {e}")
 
@@ -377,30 +359,26 @@ class SchemaExtractor:
 
         fk_map = {}
         try:
-            success, result = self.connector.execute_query(query, (schema, table))
-            if success:
-                for row in result:
-                    if isinstance(row, tuple):
-                        fk_name, col, ref_table, ref_col, on_del, on_upd = row
-                    else:
-                        fk_name = row['CONSTRAINT_NAME']
-                        col = row['COLUMN_NAME']
-                        ref_table = row['REFERENCED_TABLE_NAME']
-                        ref_col = row['REFERENCED_COLUMN_NAME']
-                        on_del = row['DELETE_RULE']
-                        on_upd = row['UPDATE_RULE']
+            result = self.connector.execute(query, (schema, table))
+            for row in result:
+                fk_name = row['CONSTRAINT_NAME']
+                col = row['COLUMN_NAME']
+                ref_table = row['REFERENCED_TABLE_NAME']
+                ref_col = row['REFERENCED_COLUMN_NAME']
+                on_del = row['DELETE_RULE']
+                on_upd = row['UPDATE_RULE']
 
-                    if fk_name not in fk_map:
-                        fk_map[fk_name] = ForeignKeyInfo(
-                            name=fk_name,
-                            columns=[],
-                            ref_table=ref_table,
-                            ref_columns=[],
-                            on_delete=on_del,
-                            on_update=on_upd
-                        )
-                    fk_map[fk_name].columns.append(col)
-                    fk_map[fk_name].ref_columns.append(ref_col)
+                if fk_name not in fk_map:
+                    fk_map[fk_name] = ForeignKeyInfo(
+                        name=fk_name,
+                        columns=[],
+                        ref_table=ref_table,
+                        ref_columns=[],
+                        on_delete=on_del,
+                        on_update=on_upd
+                    )
+                fk_map[fk_name].columns.append(col)
+                fk_map[fk_name].ref_columns.append(ref_col)
         except Exception as e:
             logger.error(f"FK 정보 조회 실패: {e}")
 
@@ -415,14 +393,11 @@ class SchemaExtractor:
         """
 
         try:
-            success, result = self.connector.execute_query(query, (schema, table))
-            if success and result:
+            result = self.connector.execute(query, (schema, table))
+            if result:
                 row = result[0]
-                if isinstance(row, tuple):
-                    engine, collation = row
-                else:
-                    engine = row['ENGINE']
-                    collation = row['TABLE_COLLATION']
+                engine = row['ENGINE']
+                collation = row['TABLE_COLLATION']
 
                 # Collation에서 charset 추출
                 charset = collation.split('_')[0] if collation else 'utf8mb4'
@@ -434,12 +409,11 @@ class SchemaExtractor:
 
     def _get_row_count(self, schema: str, table: str) -> int:
         """테이블 행 수 조회"""
-        query = f"SELECT COUNT(*) FROM `{schema}`.`{table}`"
+        query = f"SELECT COUNT(*) as cnt FROM `{schema}`.`{table}`"
         try:
-            success, result = self.connector.execute_query(query)
-            if success and result:
-                row = result[0]
-                return row[0] if isinstance(row, tuple) else row['COUNT(*)']
+            result = self.connector.execute(query)
+            if result:
+                return result[0]['cnt']
         except Exception:
             pass
         return 0
