@@ -9,7 +9,6 @@ from .sql_validator import (
     SQLValidator, SQLAutoCompleter, SchemaMetadataProvider,
     SchemaMetadata, ValidationIssue, IssueSeverity
 )
-from .production_guard import ProductionGuard, Environment, SchemaConfirmDialog
 # One-Click 마이그레이션 모듈
 from .migration_preflight import PreflightChecker, PreflightResult, CheckResult, CheckSeverity
 from .migration_auto_recommend import AutoRecommendationEngine, RecommendationSummary
@@ -24,7 +23,6 @@ __all__ = [
     'SQLHistory',
     'SQLValidator', 'SQLAutoCompleter', 'SchemaMetadataProvider',
     'SchemaMetadata', 'ValidationIssue', 'IssueSeverity',
-    'ProductionGuard', 'Environment', 'SchemaConfirmDialog',
     # One-Click 마이그레이션
     'PreflightChecker', 'PreflightResult', 'CheckResult', 'CheckSeverity',
     'AutoRecommendationEngine', 'RecommendationSummary',
