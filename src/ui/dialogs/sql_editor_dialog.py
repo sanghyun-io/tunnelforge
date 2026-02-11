@@ -9,11 +9,12 @@ SQL 에디터 다이얼로그
 """
 import os
 import time
+import threading
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QGroupBox, QSplitter, QPlainTextEdit, QTextEdit, QWidget, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
-    QStatusBar, QApplication, QAbstractItemView, QListWidget, QListWidgetItem,
+    QStatusBar, QApplication, QAbstractItemView, QListWidget, QListWidgetItem, QProgressBar,
     QDialogButtonBox, QMenu, QCheckBox, QFrame, QToolTip, QLineEdit
 )
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QThread, QTimer, QPoint
@@ -1807,6 +1808,17 @@ class SQLEditorDialog(QDialog):
         splitter.setSizes([350, 300])
         layout.addWidget(splitter)
 
+        # --- 프로그레스 바 ---
+        self.progress_bar = QProgressBar()
+        self.progress_bar.setMaximumHeight(3)
+        self.progress_bar.setTextVisible(False)
+        self.progress_bar.setVisible(False)
+        self.progress_bar.setStyleSheet("""
+            QProgressBar { border: none; background-color: #ecf0f1; }
+            QProgressBar::chunk { background-color: #3498db; }
+        """)
+        layout.addWidget(self.progress_bar)
+
         # --- 상태바 ---
         self.status_bar = QStatusBar()
         self.status_bar.showMessage("준비됨")
@@ -2128,6 +2140,10 @@ class SQLEditorDialog(QDialog):
                 cursorclass=pymysql.cursors.DictCursor,
                 autocommit=False  # 수동 트랜잭션 관리
             )
+            # READ COMMITTED: 각 SELECT가 최신 커밋 데이터를 조회 (외부 변경 즉시 반영)
+            self.db_connection.cursor().execute(
+                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+            )
             self.message_text.append(f"✅ DB 연결 성공 (트랜잭션 모드): {host}:{port}")
             self._update_tx_status()
             return True, None
@@ -2275,13 +2291,9 @@ class SQLEditorDialog(QDialog):
         import pymysql
         from datetime import datetime
 
-        # Fresh snapshot: 대기 중인 수정이 없고 모든 쿼리가 읽기 전용이면 스냅샷 갱신
-        all_read_only = all(not self._is_modification_query(q) for q in queries if q.strip())
-        if all_read_only and not self.pending_queries:
-            try:
-                self.db_connection.commit()
-            except Exception:
-                pass
+        total = len(queries)
+        if total > 1:
+            self.progress_bar.setMaximum(total)
 
         for idx, query in enumerate(queries):
             query = query.strip()
@@ -2292,12 +2304,17 @@ class SQLEditorDialog(QDialog):
             preview = query[:60] + "..." if len(query) > 60 else query
             preview = preview.replace('\n', ' ')
 
+            # 진행률 업데이트
+            if total > 1:
+                self.progress_bar.setValue(idx)
+                self._exec_query_progress = f"{idx + 1}/{total}"
+
             start_time = time.time()
             query_type = self._get_query_type(query)
 
             try:
                 with self.db_connection.cursor() as db_cursor:
-                    db_cursor.execute(query)
+                    self._execute_query_in_thread(db_cursor, query)
 
                     if db_cursor.description:
                         # SELECT 결과
@@ -2350,11 +2367,17 @@ class SQLEditorDialog(QDialog):
                 self.message_text.append(f"❌ {str(e)}")
                 self.history_manager.add_query(query, False, 0, exec_time, error=str(e))
 
+            # 쿼리 완료 후 진행률 갱신
+            if total > 1:
+                self.progress_bar.setValue(idx + 1)
+                self._exec_query_progress = f"{idx + 1}/{total}"
+
         # 상태 업데이트
+        total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
         self._set_executing_state(False)
         self._update_tx_status()
         pending_count = len(self.pending_queries)
-        self.status_bar.showMessage(f"실행 완료 (미커밋 변경: {pending_count}건)")
+        self.status_bar.showMessage(f"✅ 실행 완료 ({total_elapsed:.1f}초, 미커밋 변경: {pending_count}건)")
 
     def _execute_with_autocommit(self, queries, sql_text):
         """자동 커밋 모드로 실행 (기존 워커 사용)"""
@@ -2389,6 +2412,7 @@ class SQLEditorDialog(QDialog):
                 self.result_tabs.removeTab(1)
 
             self._set_executing_state(True)
+            self.progress_bar.setMaximum(len(queries))
             self.message_text.append(f"\n{'='*50}")
             self.message_text.append(f"🚀 {len(queries)}개 쿼리 실행 (자동 커밋)")
             self.message_text.append(f"{'='*50}\n")
@@ -2639,13 +2663,15 @@ class SQLEditorDialog(QDialog):
             # INSERT/UPDATE/DELETE
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {affected}행 영향받음 ({exec_time:.3f}초)")
 
+        self.progress_bar.setValue(idx + 1)
         self.status_bar.showMessage(f"쿼리 {idx + 1} 완료 ({exec_time:.3f}초)")
 
     def _on_finished(self, success, msg):
         """실행 완료"""
+        total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
         self.message_text.append(f"\n{msg}")
-        self.status_bar.showMessage(msg)
         self._cleanup()
+        self.status_bar.showMessage(f"✅ {msg} ({total_elapsed:.1f}초)")
 
     def _is_modification_query(self, query):
         """수정 쿼리인지 확인 (SELECT가 아닌 쿼리)"""
@@ -2737,24 +2763,56 @@ class SQLEditorDialog(QDialog):
         """쿼리 실행 상태 UI 전환"""
         self.btn_execute_current.setEnabled(not is_executing)
         self.btn_execute_all.setEnabled(not is_executing)
+        self.progress_bar.setVisible(is_executing)
 
         if is_executing:
+            self.progress_bar.setValue(0)
+            self.progress_bar.setMaximum(0)  # indeterminate 모드 (단일 쿼리)
             self._exec_start_time = time.time()
+            self._exec_query_progress = None  # 다중 쿼리 진행률 (예: "2/5")
             self._exec_timer = QTimer()
             self._exec_timer.timeout.connect(self._update_elapsed_time)
             self._exec_timer.start(100)
             self.status_bar.showMessage("⏳ 쿼리 실행 중...")
         else:
+            self.progress_bar.setMaximum(100)  # determinate 복귀
+            self._exec_query_progress = None
             if hasattr(self, '_exec_timer') and self._exec_timer:
                 self._exec_timer.stop()
                 self._exec_timer = None
             self._exec_start_time = None
 
+    def _execute_query_in_thread(self, db_cursor, query):
+        """쿼리를 백그라운드 스레드에서 실행 (메인 스레드 UI 블록 방지)"""
+        result = {'done': False, 'error': None}
+
+        def run():
+            try:
+                db_cursor.execute(query)
+            except Exception as e:
+                result['error'] = e
+            finally:
+                result['done'] = True
+
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+
+        while not result['done']:
+            QApplication.processEvents()
+            thread.join(timeout=0.05)
+
+        if result['error']:
+            raise result['error']
+
     def _update_elapsed_time(self):
         """경과 시간 실시간 업데이트"""
         if self._exec_start_time:
             elapsed = time.time() - self._exec_start_time
-            self.status_bar.showMessage(f"⏳ 쿼리 실행 중... ({elapsed:.1f}초)")
+            progress = getattr(self, '_exec_query_progress', None)
+            if progress:
+                self.status_bar.showMessage(f"⏳ 쿼리 실행 중... ({progress}, {elapsed:.1f}초)")
+            else:
+                self.status_bar.showMessage(f"⏳ 쿼리 실행 중... ({elapsed:.1f}초)")
 
     def _cleanup(self):
         """정리"""
