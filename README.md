@@ -1,39 +1,50 @@
+<div align="center">
+
+<img src="assets/icon_512.png" width="128" alt="TunnelForge Logo" />
+
 # TunnelForge
 
-Secure database management through SSH tunnels with a simple GUI.
+**Secure database management through SSH tunnels — no CLI required.**
 
-[한국어](README.ko.md)
+[한국어](README.ko.md) · [English](README.md)
 
-![Python](https://img.shields.io/badge/Python-3.9+-blue.svg)
-![Platform](https://img.shields.io/badge/Platform-Windows-lightgrey.svg)
-![License](https://img.shields.io/badge/License-MIT-green.svg)
+[![GitHub Release](https://img.shields.io/github/v/release/sanghyun-io/tunnelforge?style=flat-square&logo=github&label=Release)](https://github.com/sanghyun-io/tunnelforge/releases/latest)
+[![Downloads](https://img.shields.io/github/downloads/sanghyun-io/tunnelforge/total?style=flat-square&logo=github&label=Downloads)](https://github.com/sanghyun-io/tunnelforge/releases)
+[![Build](https://img.shields.io/github/actions/workflow/status/sanghyun-io/tunnelforge/release.yml?style=flat-square&logo=githubactions&logoColor=white&label=Build)](https://github.com/sanghyun-io/tunnelforge/actions)
+[![License](https://img.shields.io/github/license/sanghyun-io/tunnelforge?style=flat-square&label=License)](LICENSE)
+[![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
+[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://github.com/sanghyun-io/tunnelforge/releases)
 
-## What is TunnelForge?
+</div>
 
-TunnelForge is a desktop application that simplifies secure database access through SSH tunnels. Connect to remote MySQL databases safely via bastion hosts without complex command-line configurations.
+---
 
-### Key Features
+## Features
 
-- **One-Click SSH Tunnel** - Connect to remote databases through bastion hosts with saved configurations
-- **Direct Connection** - Also supports direct database connections for local or accessible databases
-- **Fast Export/Import** - Leverage MySQL Shell's parallel processing for quick data transfers
-- **System Tray** - Runs quietly in background, always ready when you need it
+| | Feature | Description |
+|:-:|---------|-------------|
+| 🔐 | **SSH Tunnel** | One-click secure connection via bastion hosts. RSA, Ed25519, ECDSA keys supported. |
+| 🔗 | **Direct Connect** | Skip the tunnel — connect directly to local or accessible databases. |
+| ⚡ | **Parallel Export/Import** | Blazing-fast data transfers powered by MySQL Shell's parallel processing. |
+| 📅 | **[Scheduled Backup](SCHEDULE.md)** | Cron-style automated backups to keep your data safe. |
+| 🖥️ | **System Tray** | Runs quietly in the background, always one click away. |
+| 🔄 | **Auto Update** | Checks for new versions on startup so you never miss an update. |
+
+---
 
 ## Download
 
-### Online Install (Recommended, ~5MB)
+<div align="center">
 
-**[Download Web Installer](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe)**
+[![Web Installer](https://img.shields.io/badge/⬇_Web_Installer-Recommended_(~5MB)-2563EB?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-WebSetup.exe)
+&nbsp;&nbsp;
+[![Offline Installer](https://img.shields.io/badge/⬇_Offline_Installer-Full_Package_(~35MB)-6B7280?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-Setup-latest.exe)
 
-Automatically downloads and installs the latest version.
+[Browse all releases →](https://github.com/sanghyun-io/tunnelforge/releases)
 
-### Offline Install (~35MB)
+</div>
 
-**[Download Full Installer](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-Setup-latest.exe)**
-
-For environments without internet access.
-
-Browse all versions at [Releases](https://github.com/sanghyun-io/tunnelforge/releases).
+---
 
 ## Quick Start
 
@@ -43,55 +54,86 @@ Run the downloaded installer and follow the setup wizard.
 
 ### 2. Add a Tunnel
 
-1. Click **"Add Tunnel"** button
-2. Enter connection details:
-   - **Tunnel Name**: A friendly name (e.g., "Production DB")
-   - **Bastion Host**: Your SSH jump server address
-   - **SSH Key**: Path to your private key file
-   - **Database Host**: Target database server (as seen from bastion)
-   - **Database Credentials**: Username and password
+Click **"Add Tunnel"** and configure your connection:
 
-3. Click **Save**
+| Field | Description | Example |
+|-------|-------------|---------|
+| Tunnel Name | A friendly label | `Production DB` |
+| Bastion Host | SSH jump server | `bastion.example.com` |
+| SSH Key | Private key file path | `C:\Users\me\.ssh\id_rsa` |
+| DB Host | Target database (from bastion's perspective) | `db.internal:3306` |
+| DB Credentials | Username & password | `admin` / `••••` |
 
-### 3. Connect
+### 3. Connect & Go
 
-1. Select your tunnel from the list
-2. Click **"Connect"**
-3. Once connected, use the database tools:
-   - **Export** - Backup schemas or tables
-   - **Import** - Restore from backup files
+Select a tunnel → Click **"Connect"** → Use the database tools:
+- **Export** — Backup schemas or selected tables
+- **Import** — Restore from backup files
+
+---
+
+## How It Works
+
+```mermaid
+graph LR
+    A["🖥️ TunnelForge"] -->|SSH Tunnel| B["🔒 Bastion Host"]
+    B -->|Internal Network| C["🗄️ MySQL Server"]
+    A -->|"Export / Import"| D["📁 Local Files"]
+
+    style A fill:#2563EB,color:#fff,stroke:none
+    style B fill:#F97316,color:#fff,stroke:none
+    style C fill:#10B981,color:#fff,stroke:none
+    style D fill:#6B7280,color:#fff,stroke:none
+```
+
+---
 
 ## Tips
 
-### Managing Multiple Environments
+<details>
+<summary><b>Managing Multiple Environments</b></summary>
 
-Create separate tunnel configurations for each environment (Development, Staging, Production) with clear naming conventions.
+Create separate tunnel configs for each environment (Dev, Staging, Production) with clear naming — keep things organized.
 
-### Export Best Practices
+</details>
+
+<details>
+<summary><b>Export Best Practices</b></summary>
 
 - Use **schema-only export** for structure backups
 - Use **table selection** to export only what you need
 - Exports run in parallel for faster completion
 
-### System Tray
+</details>
 
-- Minimize to tray to keep tunnels running in background
-- Double-click tray icon to restore window
-- Right-click for quick actions
+<details>
+<summary><b>System Tray Usage</b></summary>
+
+- Minimize to tray to keep tunnels alive in the background
+- Double-click the tray icon to restore the window
+- Right-click for quick-action menu
+
+</details>
+
+---
 
 ## Requirements
 
-- Windows 10 or later
-- [MySQL Shell](https://dev.mysql.com/downloads/shell/) (for Export/Import features)
+| Requirement | Note |
+|-------------|------|
+| **Windows 10+** | Primary supported platform |
+| **[MySQL Shell](https://dev.mysql.com/downloads/shell/)** | Required for Export/Import features |
 
 ## Configuration
 
-Settings are stored in: `%LOCALAPPDATA%\TunnelForge\config.json`
+Settings are stored at: `%LOCALAPPDATA%\TunnelForge\config.json`
 
-## Contributing
+---
 
-See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup and guidelines.
+<div align="center">
 
-## License
+**[Contributing](CONTRIBUTING.md)** · **[License (MIT)](LICENSE)**
 
-MIT License - see [LICENSE](LICENSE) for details.
+Made with ❤️ for database engineers who value security.
+
+</div>
