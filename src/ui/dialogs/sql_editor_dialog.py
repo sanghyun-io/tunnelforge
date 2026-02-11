@@ -2264,6 +2264,8 @@ class SQLEditorDialog(QDialog):
             while self.result_tabs.count() > 1:
                 self.result_tabs.removeTab(1)
 
+        self._set_executing_state(True)
+
         query_label = "현재 쿼리" if single_query else f"{len(queries)}개 쿼리"
         self.message_text.append(f"\n{'─'*40}")
         self.message_text.append(f"🚀 {query_label} 실행")
@@ -2349,6 +2351,7 @@ class SQLEditorDialog(QDialog):
                 self.history_manager.add_query(query, False, 0, exec_time, error=str(e))
 
         # 상태 업데이트
+        self._set_executing_state(False)
         self._update_tx_status()
         pending_count = len(self.pending_queries)
         self.status_bar.showMessage(f"실행 완료 (미커밋 변경: {pending_count}건)")
@@ -2385,8 +2388,7 @@ class SQLEditorDialog(QDialog):
             while self.result_tabs.count() > 1:
                 self.result_tabs.removeTab(1)
 
-            self.btn_execute_current.setEnabled(False)
-            self.btn_execute_all.setEnabled(False)
+            self._set_executing_state(True)
             self.message_text.append(f"\n{'='*50}")
             self.message_text.append(f"🚀 {len(queries)}개 쿼리 실행 (자동 커밋)")
             self.message_text.append(f"{'='*50}\n")
@@ -2731,10 +2733,32 @@ class SQLEditorDialog(QDialog):
             self.db_connection = None
             self.pending_queries.clear()
 
+    def _set_executing_state(self, is_executing: bool):
+        """쿼리 실행 상태 UI 전환"""
+        self.btn_execute_current.setEnabled(not is_executing)
+        self.btn_execute_all.setEnabled(not is_executing)
+
+        if is_executing:
+            self._exec_start_time = time.time()
+            self._exec_timer = QTimer()
+            self._exec_timer.timeout.connect(self._update_elapsed_time)
+            self._exec_timer.start(100)
+            self.status_bar.showMessage("⏳ 쿼리 실행 중...")
+        else:
+            if hasattr(self, '_exec_timer') and self._exec_timer:
+                self._exec_timer.stop()
+                self._exec_timer = None
+            self._exec_start_time = None
+
+    def _update_elapsed_time(self):
+        """경과 시간 실시간 업데이트"""
+        if self._exec_start_time:
+            elapsed = time.time() - self._exec_start_time
+            self.status_bar.showMessage(f"⏳ 쿼리 실행 중... ({elapsed:.1f}초)")
+
     def _cleanup(self):
         """정리"""
-        self.btn_execute_current.setEnabled(True)
-        self.btn_execute_all.setEnabled(True)
+        self._set_executing_state(False)
 
         if self.temp_server:
             self.message_text.append("🛑 임시 터널 종료...")
