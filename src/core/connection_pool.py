@@ -176,6 +176,12 @@ class ConnectionPool:
             self._close_connection(conn)
             return
 
+        # 암묵적 트랜잭션 정리 (REPEATABLE READ 스냅샷 해제)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+
         # 풀에 반환
         try:
             self._connection_times[conn_id] = time.time()
@@ -394,12 +400,11 @@ class PooledConnection:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         if self._conn:
-            # 예외 발생 시 롤백
-            if exc_type is not None:
-                try:
-                    self._conn.rollback()
-                except Exception:
-                    pass
+            # 암묵적 트랜잭션 정리 (예외 여부 무관)
+            try:
+                self._conn.rollback()
+            except Exception:
+                pass
             self._pool.return_connection(self._conn)
             self._conn = None
         return False
