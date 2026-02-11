@@ -1203,17 +1203,19 @@ class SettingsDialog(QDialog):
                     "if errorlevel 1 goto RUN_INSTALLER\r\n"
                     "set /A COUNT+=1\r\n"
                     "if %COUNT% GEQ %MAX_WAIT% goto RUN_INSTALLER\r\n"
-                    "timeout /t 1 /nobreak >NUL\r\n"
+                    "ping -n 2 127.0.0.1 >NUL\r\n"
                     "goto WAIT_EXIT\r\n"
                     "\r\n"
                     "rem === Phase 2: Run installer silently and wait ===\r\n"
                     ":RUN_INSTALLER\r\n"
-                    "timeout /t 1 /nobreak >NUL\r\n"
+                    "ping -n 2 127.0.0.1 >NUL\r\n"
                     "%INSTALLER% /SILENT /NORESTART /SUPPRESSMSGBOXES\r\n"
                     "\r\n"
-                    "rem === Phase 3: Launch updated app ===\r\n"
-                    "timeout /t 2 /nobreak >NUL\r\n"
-                    "start \"\" %APP_EXE%\r\n"
+                    "rem === Phase 3: Launch updated app via explorer ===\r\n"
+                    "rem explorer.exe launches the app as if user double-clicked it,\r\n"
+                    "rem ensuring correct working directory and environment for PyInstaller\r\n"
+                    "ping -n 4 127.0.0.1 >NUL\r\n"
+                    "explorer.exe %APP_EXE%\r\n"
                     "\r\n"
                     "rem === Cleanup ===\r\n"
                     f'del /f /q "{bat_path}"\r\n'
@@ -1221,11 +1223,10 @@ class SettingsDialog(QDialog):
                 with open(bat_path, 'w', encoding='ascii') as f:
                     f.write(bat_content)
 
-                subprocess.Popen(
-                    ['cmd.exe', '/c', bat_path],
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                    close_fds=True
-                )
+                # os.startfile()은 Windows ShellExecuteEx를 사용하여
+                # 부모 프로세스와 완전히 독립된 프로세스를 생성
+                # (subprocess.Popen은 PyInstaller 종료 시 자식 프로세스도 종료됨)
+                os.startfile(bat_path)
             else:
                 subprocess.Popen(
                     [self._downloaded_installer_path],
