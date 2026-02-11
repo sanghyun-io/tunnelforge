@@ -1174,11 +1174,16 @@ class SettingsDialog(QDialog):
 
         try:
             if sys.platform == 'win32':
-                # 앱 종료 후 인스톨러를 실행하는 배치 스크립트 생성
-                # PyInstaller _MEI 임시 디렉토리 정리 완료를 보장하기 위해
-                # 프로세스 종료를 폴링한 후 인스톨러를 실행
+                # 배치 스크립트가 업데이트 전체 라이프사이클을 관리:
+                #   ① 기존 프로세스 종료 대기
+                #   ② 설치 프로그램 /SILENT 실행 (skipifsilent로 Inno Setup 자동 실행 방지)
+                #   ③ 설치 프로세스 완료 대기
+                #   ④ 앱 실행
+                # 이렇게 하면 Inno Setup의 [Run] 자동 실행과의 경합(race condition)을 방지하고
+                # PyInstaller _MEI 임시 디렉토리 충돌 문제를 해결
                 import tempfile
                 current_pid = os.getpid()
+                app_exe_path = sys.executable
                 bat_path = os.path.join(
                     tempfile.gettempdir(),
                     f"tunnelforge_update_{current_pid}.bat"
@@ -1188,28 +1193,40 @@ class SettingsDialog(QDialog):
                     "setlocal\r\n"
                     f"set PID={current_pid}\r\n"
                     f'set INSTALLER="{self._downloaded_installer_path}"\r\n'
+                    f'set APP_EXE="{app_exe_path}"\r\n'
                     "set MAX_WAIT=30\r\n"
                     "set COUNT=0\r\n"
-                    ":WAIT_LOOP\r\n"
+                    "\r\n"
+                    "rem === Phase 1: Wait for old process to exit ===\r\n"
+                    ":WAIT_EXIT\r\n"
                     "tasklist /FI \"PID eq %PID%\" 2>NUL | find /I \"%PID%\" >NUL\r\n"
-                    "if errorlevel 1 goto LAUNCH\r\n"
+                    "if errorlevel 1 goto RUN_INSTALLER\r\n"
                     "set /A COUNT+=1\r\n"
-                    "if %COUNT% GEQ %MAX_WAIT% goto LAUNCH\r\n"
-                    "timeout /t 1 /nobreak >NUL\r\n"
-                    "goto WAIT_LOOP\r\n"
-                    ":LAUNCH\r\n"
-                    "timeout /t 1 /nobreak >NUL\r\n"
-                    "start \"\" %INSTALLER%\r\n"
+                    "if %COUNT% GEQ %MAX_WAIT% goto RUN_INSTALLER\r\n"
+                    "ping -n 2 127.0.0.1 >NUL\r\n"
+                    "goto WAIT_EXIT\r\n"
+                    "\r\n"
+                    "rem === Phase 2: Run installer silently and wait ===\r\n"
+                    ":RUN_INSTALLER\r\n"
+                    "ping -n 2 127.0.0.1 >NUL\r\n"
+                    "%INSTALLER% /SILENT /NORESTART /SUPPRESSMSGBOXES\r\n"
+                    "\r\n"
+                    "rem === Phase 3: Launch updated app via explorer ===\r\n"
+                    "rem explorer.exe launches the app as if user double-clicked it,\r\n"
+                    "rem ensuring correct working directory and environment for PyInstaller\r\n"
+                    "ping -n 4 127.0.0.1 >NUL\r\n"
+                    "explorer.exe %APP_EXE%\r\n"
+                    "\r\n"
+                    "rem === Cleanup ===\r\n"
                     f'del /f /q "{bat_path}"\r\n'
                 )
                 with open(bat_path, 'w', encoding='ascii') as f:
                     f.write(bat_content)
 
-                subprocess.Popen(
-                    ['cmd.exe', '/c', bat_path],
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP,
-                    close_fds=True
-                )
+                # os.startfile()은 Windows ShellExecuteEx를 사용하여
+                # 부모 프로세스와 완전히 독립된 프로세스를 생성
+                # (subprocess.Popen은 PyInstaller 종료 시 자식 프로세스도 종료됨)
+                os.startfile(bat_path)
             else:
                 subprocess.Popen(
                     [self._downloaded_installer_path],
