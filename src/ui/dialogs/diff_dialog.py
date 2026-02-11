@@ -263,18 +263,9 @@ class SchemaDiffDialog(QDialog):
                 return
 
             # 스키마 목록 조회
-            query = """
-                SELECT SCHEMA_NAME
-                FROM INFORMATION_SCHEMA.SCHEMATA
-                WHERE SCHEMA_NAME NOT IN ('information_schema', 'mysql', 'performance_schema', 'sys')
-                ORDER BY SCHEMA_NAME
-            """
-            success, result = connector.execute_query(query)
-
-            if success:
-                for row in result:
-                    schema_name = row[0] if isinstance(row, tuple) else row['SCHEMA_NAME']
-                    schema_combo.addItem(schema_name)
+            schemas = connector.get_schemas(use_cache=False)
+            for schema_name in schemas:
+                schema_combo.addItem(schema_name)
 
             connector.disconnect()
 
