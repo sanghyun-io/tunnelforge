@@ -34,17 +34,33 @@ def _load_config_manager_module():
 
     logger_mod.get_logger = lambda _name: _DummyLogger()
 
-    sys.modules['src'] = src_pkg
-    sys.modules['src.core'] = core_pkg
-    sys.modules['src.core.logger'] = logger_mod
+    module_overrides = {
+        'src': src_pkg,
+        'src.core': core_pkg,
+        'src.core.logger': logger_mod,
+    }
+
+    original_modules = {
+        name: sys.modules.get(name)
+        for name in module_overrides
+    }
 
     module_name = 'config_manager_under_test'
     module_path = Path(__file__).resolve().parents[1] / 'src' / 'core' / 'config_manager.py'
-    spec = importlib.util.spec_from_file_location(module_name, module_path)
-    module = importlib.util.module_from_spec(spec)
-    assert spec and spec.loader
-    spec.loader.exec_module(module)
-    return module
+    try:
+        sys.modules.update(module_overrides)
+
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, original in original_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
 
 
 class TestCredentialEncryptor:
