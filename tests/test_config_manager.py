@@ -4,10 +4,63 @@ ConfigManager 테스트
 import pytest
 import os
 import json
+import importlib.util
+import types
 from unittest.mock import patch, MagicMock
 
 # 테스트 전 APP_DIR 패치를 위한 준비
 import sys
+from pathlib import Path
+
+
+def _load_config_manager_module():
+    """src.core 패키지 import 부작용 없이 config_manager만 로드"""
+    src_pkg = types.ModuleType('src')
+    core_pkg = types.ModuleType('src.core')
+    logger_mod = types.ModuleType('src.core.logger')
+
+    class _DummyLogger:
+        def debug(self, *args, **kwargs):
+            pass
+
+        def info(self, *args, **kwargs):
+            pass
+
+        def warning(self, *args, **kwargs):
+            pass
+
+        def error(self, *args, **kwargs):
+            pass
+
+    logger_mod.get_logger = lambda _name: _DummyLogger()
+
+    module_overrides = {
+        'src': src_pkg,
+        'src.core': core_pkg,
+        'src.core.logger': logger_mod,
+    }
+
+    original_modules = {
+        name: sys.modules.get(name)
+        for name in module_overrides
+    }
+
+    module_name = 'config_manager_under_test'
+    module_path = Path(__file__).resolve().parents[1] / 'src' / 'core' / 'config_manager.py'
+    try:
+        sys.modules.update(module_overrides)
+
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        assert spec and spec.loader
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        for name, original in original_modules.items():
+            if original is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = original
 
 
 class TestCredentialEncryptor:
@@ -19,16 +72,16 @@ class TestCredentialEncryptor:
         self.test_dir = tmp_path / 'TunnelForge'
         self.test_dir.mkdir()
 
-        # 환경 변수 패치
-        self.env_patch = patch.dict(os.environ, {'LOCALAPPDATA': str(tmp_path)})
+        # 환경 변수 패치 (OS별 설정 경로 분기 대응)
+        self.env_patch = patch.dict(
+            os.environ,
+            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path)}
+        )
         self.env_patch.start()
 
-        # 모듈 재로드를 위해 캐시 제거
-        if 'src.core.config_manager' in sys.modules:
-            del sys.modules['src.core.config_manager']
-
-        from src.core.config_manager import CredentialEncryptor
-        self.encryptor = CredentialEncryptor()
+        config_module = _load_config_manager_module()
+        Path(config_module.APP_DIR).mkdir(parents=True, exist_ok=True)
+        self.encryptor = config_module.CredentialEncryptor()
 
     def teardown_method(self):
         self.env_patch.stop()
@@ -75,16 +128,15 @@ class TestConfigManager:
         self.test_dir = tmp_path / 'TunnelForge'
         self.test_dir.mkdir()
 
-        # 환경 변수 패치
-        self.env_patch = patch.dict(os.environ, {'LOCALAPPDATA': str(tmp_path)})
+        # 환경 변수 패치 (OS별 설정 경로 분기 대응)
+        self.env_patch = patch.dict(
+            os.environ,
+            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path)}
+        )
         self.env_patch.start()
 
-        # 모듈 재로드
-        if 'src.core.config_manager' in sys.modules:
-            del sys.modules['src.core.config_manager']
-
-        from src.core.config_manager import ConfigManager
-        self.config_mgr = ConfigManager()
+        config_module = _load_config_manager_module()
+        self.config_mgr = config_module.ConfigManager()
 
     def teardown_method(self):
         self.env_patch.stop()
@@ -181,3 +233,132 @@ class TestConfigManager:
         """활성 터널 없는 경우 테스트"""
         result = self.config_mgr.get_last_active_tunnels()
         assert result == []
+
+    def test_export_config_success(self, tmp_path, sample_config_data):
+        """설정 내보내기 성공 테스트"""
+        self.config_mgr.save_config(sample_config_data)
+        export_file = tmp_path / 'exported_config.json'
+
+        success, msg = self.config_mgr.export_config(str(export_file))
+
+        assert success is True
+        assert export_file.exists()
+        assert "내보내기" in msg
+
+        with open(export_file, 'r', encoding='utf-8') as f:
+            exported_data = json.load(f)
+        assert exported_data == sample_config_data
+
+    def test_import_config_success(self, tmp_path, sample_config_data):
+        """설정 가져오기 성공 테스트"""
+        import_file = tmp_path / 'import_config.json'
+        with open(import_file, 'w', encoding='utf-8') as f:
+            json.dump(sample_config_data, f, ensure_ascii=False)
+
+        success, msg = self.config_mgr.import_config(str(import_file))
+
+        assert success is True
+        assert "가져오기" in msg
+        loaded = self.config_mgr.load_config()
+        assert loaded == sample_config_data
+
+    def test_import_config_missing_tunnels_field(self, tmp_path):
+        """tunnels 필드 누락 시 실패 테스트"""
+        invalid_file = tmp_path / 'invalid_config.json'
+        with open(invalid_file, 'w', encoding='utf-8') as f:
+            json.dump({'settings': {}}, f, ensure_ascii=False)
+
+        success, msg = self.config_mgr.import_config(str(invalid_file))
+
+        assert success is False
+        assert "tunnels" in msg
+
+
+    def test_export_config_missing_directory(self, tmp_path):
+        """존재하지 않는 폴더로 내보내기 시 실패"""
+        missing_dir = tmp_path / 'not_exists'
+        export_file = missing_dir / 'export.json'
+
+        success, msg = self.config_mgr.export_config(str(export_file))
+
+        assert success is False
+        assert "폴더" in msg
+
+    def test_import_config_invalid_root_type(self, tmp_path):
+        """JSON 루트가 객체가 아니면 실패"""
+        invalid_file = tmp_path / 'invalid_root.json'
+        with open(invalid_file, 'w', encoding='utf-8') as f:
+            json.dump([{'id': '1'}], f, ensure_ascii=False)
+
+        success, msg = self.config_mgr.import_config(str(invalid_file))
+
+        assert success is False
+        assert "JSON 객체" in msg
+
+    def test_import_config_tunnels_not_list(self, tmp_path):
+        """tunnels가 배열이 아니면 실패"""
+        invalid_file = tmp_path / 'invalid_tunnels.json'
+        with open(invalid_file, 'w', encoding='utf-8') as f:
+            json.dump({'tunnels': {}}, f, ensure_ascii=False)
+
+        success, msg = self.config_mgr.import_config(str(invalid_file))
+
+        assert success is False
+        assert "배열" in msg
+
+    def test_import_config_duplicate_tunnel_id(self, tmp_path):
+        """중복 터널 ID가 있으면 실패"""
+        invalid_file = tmp_path / 'duplicate_id.json'
+        dup_data = {
+            'tunnels': [
+                {
+                    'id': 'dup-id',
+                    'name': '서버1',
+                    'remote_host': 'db1.example.com',
+                    'remote_port': 3306,
+                },
+                {
+                    'id': 'dup-id',
+                    'name': '서버2',
+                    'remote_host': 'db2.example.com',
+                    'remote_port': 3307,
+                }
+            ]
+        }
+        with open(invalid_file, 'w', encoding='utf-8') as f:
+            json.dump(dup_data, f, ensure_ascii=False)
+
+        success, msg = self.config_mgr.import_config(str(invalid_file))
+
+        assert success is False
+        assert "중복된 터널 ID" in msg
+
+    def test_import_config_invalid_port_range(self, tmp_path):
+        """포트 범위가 유효하지 않으면 실패"""
+        invalid_file = tmp_path / 'invalid_port.json'
+        invalid_data = {
+            'tunnels': [
+                {
+                    'id': 'test-1',
+                    'name': '서버1',
+                    'remote_host': 'db1.example.com',
+                    'remote_port': 70000,
+                }
+            ]
+        }
+        with open(invalid_file, 'w', encoding='utf-8') as f:
+            json.dump(invalid_data, f, ensure_ascii=False)
+
+        success, msg = self.config_mgr.import_config(str(invalid_file))
+
+        assert success is False
+        assert "1~65535" in msg
+    def test_import_config_invalid_json(self, tmp_path):
+        """잘못된 JSON 파일 가져오기 실패 테스트"""
+        broken_file = tmp_path / 'broken.json'
+        broken_file.write_text('{invalid_json', encoding='utf-8')
+
+        success, msg = self.config_mgr.import_config(str(broken_file))
+
+        assert success is False
+        assert "JSON" in msg
