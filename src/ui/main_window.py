@@ -224,6 +224,8 @@ class TunnelManagerUI(QMainWindow):
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
             self.show()
             self.activateWindow()
+            # 숨겨진 상태에서 변경된 터널 상태를 UI에 반영
+            self.refresh_table()
 
     def _connect_tree_signals(self):
         """트리 위젯 시그널 연결"""
@@ -678,6 +680,10 @@ class TunnelManagerUI(QMainWindow):
         """닫기 버튼 클릭 시"""
         # 열 비율 저장
         self._save_column_ratios()
+
+        # 시스템 종료 시 활성 터널 목록이 유실되지 않도록 항상 먼저 저장
+        active_ids = list(self.engine.active_tunnels.keys())
+        self.config_mgr.save_active_tunnels(active_ids)
 
         close_action = self.config_mgr.get_app_setting('close_action', 'ask')
 
