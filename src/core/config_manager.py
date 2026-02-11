@@ -211,13 +211,81 @@ class ConfigManager:
         if not os.path.exists(CONFIG_FILE):
             return False, "설정 파일이 없습니다."
 
+        if not export_path:
+            return False, "내보내기 경로가 비어 있습니다."
+
+        normalized_export = os.path.abspath(export_path)
+        export_dir = os.path.dirname(normalized_export)
+
+        if export_dir and not os.path.isdir(export_dir):
+            return False, f"내보낼 폴더를 찾을 수 없습니다: {export_dir}"
+
+        if normalized_export == os.path.abspath(CONFIG_FILE):
+            return False, "현재 설정 파일과 동일한 경로로는 내보낼 수 없습니다."
+
         try:
-            shutil.copy2(CONFIG_FILE, export_path)
-            logger.info(f"설정 내보내기 완료: {export_path}")
-            return True, f"설정이 내보내기되었습니다: {export_path}"
+            shutil.copy2(CONFIG_FILE, normalized_export)
+            logger.info(f"설정 내보내기 완료: {normalized_export}")
+            return True, f"설정이 내보내기되었습니다: {normalized_export}"
         except Exception as e:
             logger.error(f"설정 내보내기 실패: {e}")
             return False, f"내보내기 중 오류 발생: {e}"
+
+    def _validate_port(self, value, field_name: str) -> Tuple[bool, str]:
+        """포트 유효성 검증"""
+        if not isinstance(value, int):
+            return False, f"{field_name}는 숫자여야 합니다."
+
+        if not 1 <= value <= 65535:
+            return False, f"{field_name}는 1~65535 범위여야 합니다."
+
+        return True, ""
+
+    def _validate_import_data(self, import_data) -> Tuple[bool, str]:
+        """가져올 설정 데이터 구조 검증"""
+        if not isinstance(import_data, dict):
+            return False, "유효하지 않은 설정 파일입니다. (JSON 객체 필요)"
+
+        tunnels = import_data.get('tunnels')
+        if tunnels is None:
+            return False, "유효하지 않은 설정 파일입니다. (tunnels 필드 누락)"
+
+        if not isinstance(tunnels, list):
+            return False, "유효하지 않은 설정 파일입니다. (tunnels는 배열이어야 함)"
+
+        seen_ids = set()
+        for idx, tunnel in enumerate(tunnels, start=1):
+            if not isinstance(tunnel, dict):
+                return False, f"유효하지 않은 터널 데이터입니다. ({idx}번째 항목)"
+
+            tunnel_id = tunnel.get('id')
+            if not tunnel_id or not isinstance(tunnel_id, str):
+                return False, f"터널 ID가 올바르지 않습니다. ({idx}번째 항목)"
+
+            if tunnel_id in seen_ids:
+                return False, f"중복된 터널 ID가 있습니다: {tunnel_id}"
+            seen_ids.add(tunnel_id)
+
+            required_fields = ['name', 'remote_host', 'remote_port']
+            missing_fields = [f for f in required_fields if not tunnel.get(f)]
+            if missing_fields:
+                missing = ', '.join(missing_fields)
+                return False, f"필수 필드가 누락되었습니다. ({idx}번째 항목: {missing})"
+
+            valid, msg = self._validate_port(tunnel.get('remote_port'), 'remote_port')
+            if not valid:
+                return False, f"{msg} ({idx}번째 항목)"
+
+            if 'local_port' in tunnel and tunnel.get('local_port') not in (None, ''):
+                valid, msg = self._validate_port(tunnel.get('local_port'), 'local_port')
+                if not valid:
+                    return False, f"{msg} ({idx}번째 항목)"
+
+        settings = import_data.get('settings')
+        if settings is not None and not isinstance(settings, dict):
+            return False, "유효하지 않은 설정 파일입니다. (settings는 객체여야 함)"
+
+        return True, ""
 
     def import_config(self, import_path: str) -> Tuple[bool, str]:
         """외부 파일에서 설정 가져오기
@@ -231,14 +299,17 @@ class ConfigManager:
         if not os.path.exists(import_path):
             return False, f"파일을 찾을 수 없습니다: {import_path}"
 
+        if not os.path.isfile(import_path):
+            return False, f"파일이 아닙니다: {import_path}"
+
         try:
             # 파일 유효성 검사
             with open(import_path, 'r', encoding='utf-8') as f:
                 import_data = json.load(f)
 
-            # 필수 필드 확인
-            if 'tunnels' not in import_data:
-                return False, "유효하지 않은 설정 파일입니다. (tunnels 필드 누락)"
+            is_valid, validation_msg = self._validate_import_data(import_data)
+            if not is_valid:
+                return False, validation_msg
 
             # 현재 설정 백업
             self._create_backup()
@@ -250,6 +321,8 @@ class ConfigManager:
 
         except json.JSONDecodeError:
             return False, "유효하지 않은 JSON 파일입니다."
+        except UnicodeDecodeError:
+            return False, "UTF-8 인코딩의 JSON 파일만 가져올 수 있습니다."
         except Exception as e:
             logger.error(f"설정 가져오기 실패: {e}")
             return False, f"가져오기 중 오류 발생: {e}"
