@@ -975,12 +975,40 @@ class FKSafeCharsetChanger:
             error_msg = str(e)
             log(f"❌ 오류 발생: {error_msg}")
 
-            # 롤백 SQL 생성 (스택을 역순으로 - LIFO)
+            # 자동 복구 시도: DROP된 FK 재생성
+            auto_recovered = False
+            auto_recovery_errors = []
+            if rollback_stack:
+                log("  🔄 자동 복구 시도: DROP된 FK 재생성 중...")
+                try:
+                    with self.connector.connection.cursor() as recovery_cursor:
+                        for recovery_fk_sql in reversed(rollback_stack):
+                            try:
+                                log(f"    🔸 {recovery_fk_sql[:60]}...")
+                                recovery_cursor.execute(recovery_fk_sql)
+                            except Exception as fk_err:
+                                auto_recovery_errors.append(f"{recovery_fk_sql[:40]}: {str(fk_err)[:60]}")
+                                log(f"    ❌ FK 복구 실패: {str(fk_err)[:80]}")
+                        self.connector.connection.commit()
+
+                    if not auto_recovery_errors:
+                        auto_recovered = True
+                        log("  ✅ 자동 복구 완료: 모든 FK 재생성 성공")
+                    else:
+                        log(f"  ⚠️ 부분 복구: {len(auto_recovery_errors)}개 FK 복구 실패")
+                except Exception as recovery_err:
+                    log(f"  ❌ 자동 복구 중 오류: {str(recovery_err)[:80]}")
+                    auto_recovery_errors.append(f"전체 복구 실패: {str(recovery_err)[:60]}")
+
+            # 롤백 SQL 생성 (수동 복구용)
             recovery_sql = self._build_recovery_sql(
                 rollback_stack, executed_drop, executed_alter, executed_add, error_msg
             )
 
-            log(f"  📋 롤백 SQL {len(rollback_stack)}개 생성됨")
+            if auto_recovered:
+                log(f"  ✅ 자동 복구 완료 - 수동 롤백 SQL 불필요")
+            else:
+                log(f"  📋 수동 롤백 SQL {len(rollback_stack)}개 생성됨")
 
             return False, f"오류: {error_msg}", {
                 'error': error_msg,
@@ -988,7 +1016,9 @@ class FKSafeCharsetChanger:
                 'executed_alter': executed_alter,
                 'executed_add': executed_add,
                 'recovery_sql': recovery_sql,
-                'rollback_stack': rollback_stack
+                'rollback_stack': rollback_stack,
+                'auto_recovered': auto_recovered,
+                'auto_recovery_errors': auto_recovery_errors
             }
 
     def _build_recovery_sql(
@@ -1236,9 +1266,9 @@ class BatchFixExecutor:
             results.append(result)
 
             if result.success:
+                success_count += 1
+                total_affected += result.affected_rows
                 if result.affected_rows > 0:
-                    success_count += 1
-                    total_affected += result.affected_rows
                     self._log(f"    ✅ {result.message} ({result.affected_rows}행)")
                 else:
                     self._log(f"    ✅ {result.message}")
@@ -1550,6 +1580,74 @@ class RollbackSQLGenerator:
         self._table_charset_cache[cache_key] = info
         return info
 
+    def _get_fk_sql_for_tables(self, schema: str, tables: List[str]) -> Tuple[List[str], List[str]]:
+        """대상 테이블의 FK DROP/ADD SQL 조회
+
+        Returns:
+            (drop_sqls, add_sqls) 튜플
+        """
+        if not tables or not self.connector:
+            return [], []
+
+        placeholders = ", ".join(["%s"] * len(tables))
+        query = f"""
+        SELECT
+            kcu.CONSTRAINT_NAME,
+            kcu.TABLE_NAME,
+            kcu.COLUMN_NAME,
+            kcu.REFERENCED_TABLE_NAME,
+            kcu.REFERENCED_COLUMN_NAME,
+            kcu.ORDINAL_POSITION,
+            rc.DELETE_RULE,
+            rc.UPDATE_RULE
+        FROM INFORMATION_SCHEMA.KEY_COLUMN_USAGE kcu
+        JOIN INFORMATION_SCHEMA.REFERENTIAL_CONSTRAINTS rc
+            ON kcu.CONSTRAINT_NAME = rc.CONSTRAINT_NAME
+            AND kcu.TABLE_SCHEMA = rc.CONSTRAINT_SCHEMA
+        WHERE kcu.TABLE_SCHEMA = %s
+            AND kcu.REFERENCED_TABLE_NAME IS NOT NULL
+            AND (kcu.TABLE_NAME IN ({placeholders}) OR kcu.REFERENCED_TABLE_NAME IN ({placeholders}))
+        ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME, kcu.ORDINAL_POSITION
+        """
+        try:
+            params = (schema,) + tuple(tables) + tuple(tables)
+            rows = self.connector.execute(query, params)
+        except Exception:
+            return [], []
+
+        # 복합 FK 그룹화
+        fk_map: Dict[str, Dict[str, Any]] = {}
+        for row in rows:
+            key = f"{row['TABLE_NAME']}.{row['CONSTRAINT_NAME']}"
+            if key not in fk_map:
+                fk_map[key] = {
+                    'constraint': row['CONSTRAINT_NAME'],
+                    'table': row['TABLE_NAME'],
+                    'columns': [],
+                    'ref_table': row['REFERENCED_TABLE_NAME'],
+                    'ref_columns': [],
+                    'on_delete': row.get('DELETE_RULE', 'RESTRICT'),
+                    'on_update': row.get('UPDATE_RULE', 'RESTRICT'),
+                }
+            fk_map[key]['columns'].append(row['COLUMN_NAME'])
+            fk_map[key]['ref_columns'].append(row['REFERENCED_COLUMN_NAME'])
+
+        drop_sqls = []
+        add_sqls = []
+        for fk in fk_map.values():
+            drop_sqls.append(
+                f"ALTER TABLE `{schema}`.`{fk['table']}` DROP FOREIGN KEY `{fk['constraint']}`;"
+            )
+            cols = ", ".join(f"`{c}`" for c in fk['columns'])
+            ref_cols = ", ".join(f"`{c}`" for c in fk['ref_columns'])
+            add_sqls.append(
+                f"ALTER TABLE `{schema}`.`{fk['table']}` ADD CONSTRAINT `{fk['constraint']}` "
+                f"FOREIGN KEY ({cols}) REFERENCES `{fk['ref_table']}` ({ref_cols}) "
+                f"ON DELETE {fk['on_delete']} ON UPDATE {fk['on_update']};"
+            )
+
+        return drop_sqls, add_sqls
+
     def capture_column_info(self, table: str, column: str) -> Dict[str, Any]:
         """컬럼의 현재 정보 캡처 (charset 포함)"""
         cache_key = f"{self.schema}.{table}.{column}"
@@ -1588,13 +1686,15 @@ class RollbackSQLGenerator:
     def generate_rollback_sql(
         self,
         step: 'FixWizardStep',
-        original_state: Optional[Dict[str, Any]] = None
+        original_state: Optional[Dict[str, Any]] = None,
+        all_pre_states: Optional[Dict[str, Dict[str, Any]]] = None
     ) -> str:
         """단일 step에 대한 Rollback SQL 생성
 
         Args:
             step: 실행된 FixWizardStep
             original_state: 변경 전 상태 (없으면 캐시에서 조회)
+            all_pre_states: 전체 pre-state 맵 (FK 일괄 변경 시 연관 테이블 상태 조회용)
 
         Returns:
             Rollback SQL 문자열
@@ -1666,14 +1766,29 @@ class RollbackSQLGenerator:
             lines.append("")
 
             # FK 안전 변경과 동일하게 FK DROP → 변경 → FK 재생성 구조
+            # FK SQL 조회 (concrete SQL 생성)
+            drop_sqls, add_sqls = [], []
             if strategy == FixStrategy.COLLATION_FK_SAFE:
-                lines.append("-- Phase 1: FK 임시 DROP (실행 시 생성된 FK DROP SQL과 동일)")
-                lines.append("-- (원본 실행 로그 참조)")
+                drop_sqls, add_sqls = self._get_fk_sql_for_tables(schema, related_tables)
+
+                lines.append("-- Phase 1: FK 임시 DROP")
+                if drop_sqls:
+                    for sql in drop_sqls:
+                        lines.append(sql)
+                else:
+                    lines.append("-- (FK 정의 조회 실패 - 원본 실행 로그 참조)")
                 lines.append("")
 
             lines.append("-- Phase 2: Charset 복원")
             for tbl in related_tables:
-                tbl_info = self.capture_table_charset(tbl)
+                # pre-state 우선 사용 (변경 전 상태), 없으면 현재 상태 캡처 (fallback)
+                tbl_location = f"{schema}.{tbl}"
+                if all_pre_states and tbl_location in all_pre_states:
+                    tbl_info = all_pre_states[tbl_location]
+                elif original_state and tbl == table:
+                    tbl_info = original_state
+                else:
+                    tbl_info = self.capture_table_charset(tbl)
                 orig_charset = tbl_info.get('charset', 'utf8mb3')
                 orig_collation = tbl_info.get('collation', 'utf8mb3_general_ci')
 
@@ -1685,8 +1800,12 @@ class RollbackSQLGenerator:
 
             if strategy == FixStrategy.COLLATION_FK_SAFE:
                 lines.append("")
-                lines.append("-- Phase 3: FK 재생성 (실행 시 생성된 FK ADD SQL과 동일)")
-                lines.append("-- (원본 실행 로그 참조)")
+                lines.append("-- Phase 3: FK 재생성")
+                if add_sqls:
+                    for sql in add_sqls:
+                        lines.append(sql)
+                else:
+                    lines.append("-- (FK 정의 조회 실패 - 원본 실행 로그 참조)")
 
         return "\n".join(lines)
 
@@ -1755,7 +1874,7 @@ class RollbackSQLGenerator:
             # 원본 상태 가져오기
             original_state = pre_states.get(location)
 
-            rollback_sql = self.generate_rollback_sql(step, original_state)
+            rollback_sql = self.generate_rollback_sql(step, original_state, all_pre_states=pre_states)
             if rollback_sql:
                 rollback_count += 1
                 lines.append(f"-- [{rollback_count}] {location}")

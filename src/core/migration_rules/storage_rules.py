@@ -11,32 +11,16 @@ MySQL 8.0 → 8.4 업그레이드 시 스토리지 엔진 관련 호환성 검�
 """
 
 import re
-from dataclasses import dataclass
 from typing import List, Optional, Callable, TYPE_CHECKING
 
 from ..migration_constants import (
     IssueType,
+    CompatibilityIssue,
     STORAGE_ENGINE_STATUS,
 )
 
 if TYPE_CHECKING:
     from ..db_connector import MySQLConnector
-
-
-@dataclass
-class CompatibilityIssue:
-    """호환성 문제"""
-    issue_type: IssueType
-    severity: str
-    location: str
-    description: str
-    suggestion: str
-    fix_query: Optional[str] = None
-    doc_link: Optional[str] = None
-    mysql_shell_check_id: Optional[str] = None
-    code_snippet: Optional[str] = None
-    table_name: Optional[str] = None
-    column_name: Optional[str] = None
 
 
 class StorageRules:

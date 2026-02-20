@@ -25,6 +25,7 @@ from typing import List, Optional, Callable, TYPE_CHECKING
 
 from ..migration_constants import (
     IssueType,
+    CompatibilityIssue,
     IDENTIFIER_LIMITS,
     ENUM_EMPTY_PATTERN,
     INVALID_DATE_PATTERN,
@@ -35,22 +36,6 @@ from ..migration_constants import (
 
 if TYPE_CHECKING:
     from ..db_connector import MySQLConnector
-
-
-@dataclass
-class CompatibilityIssue:
-    """호환성 문제"""
-    issue_type: IssueType
-    severity: str  # "error", "warning", "info"
-    location: str
-    description: str
-    suggestion: str
-    fix_query: Optional[str] = None
-    doc_link: Optional[str] = None
-    mysql_shell_check_id: Optional[str] = None
-    code_snippet: Optional[str] = None
-    table_name: Optional[str] = None
-    column_name: Optional[str] = None
 
 
 class DataIntegrityRules:
@@ -332,6 +317,13 @@ class DataIntegrityRules:
 
         except Exception as e:
             self._log(f"  ⚠️ 파일 읽기 오류: {file_path.name} - {str(e)}")
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.DATA_4BYTE_UTF8,
+                severity="info",
+                location=file_path.name,
+                description=f"4바이트 UTF-8 스캔 미완료: {str(e)[:80]}",
+                suggestion="파일 접근 권한/인코딩 확인 후 재검사 권장"
+            ))
 
         return issues
 
@@ -368,6 +360,13 @@ class DataIntegrityRules:
 
         except Exception as e:
             self._log(f"  ⚠️ 파일 읽기 오류: {file_path.name} - {str(e)}")
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.DATA_NULL_BYTE,
+                severity="info",
+                location=file_path.name,
+                description=f"NULL 바이트 스캔 미완료: {str(e)[:80]}",
+                suggestion="파일 접근 권한 확인 후 재검사 권장"
+            ))
 
         return issues
 
@@ -408,6 +407,13 @@ class DataIntegrityRules:
 
         except Exception as e:
             self._log(f"  ⚠️ 파일 읽기 오류: {file_path.name} - {str(e)}")
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.TIMESTAMP_RANGE,
+                severity="info",
+                location=file_path.name,
+                description=f"TIMESTAMP 범위 스캔 미완료: {str(e)[:80]}",
+                suggestion="파일 접근 권한/인코딩 확인 후 재검사 권장"
+            ))
 
         return issues
 
@@ -452,8 +458,8 @@ class DataIntegrityRules:
                         table_name=col['TABLE_NAME'],
                         column_name=col['COLUMN_NAME']
                     ))
-            except Exception:
-                pass  # 권한 등의 이유로 실패할 수 있음
+            except Exception as e:
+                self._log(f"    ⏭️ {col['TABLE_NAME']}.{col['COLUMN_NAME']} latin1 검사 스킵: {str(e)[:80]}")
 
         if issues:
             self._log(f"  ⚠️ latin1 비ASCII 데이터 {len(issues)}개 발견")
@@ -509,8 +515,8 @@ class DataIntegrityRules:
                             table_name=col['TABLE_NAME'],
                             column_name=col['COLUMN_NAME']
                         ))
-                except Exception:
-                    pass
+                except Exception as e:
+                    self._log(f"    ⏭️ {col['TABLE_NAME']}.{col['COLUMN_NAME']} ZEROFILL 검사 스킵: {str(e)[:80]}")
 
         if issues:
             self._log(f"  ⚠️ ZEROFILL 의존 데이터 {len(issues)}개 발견")

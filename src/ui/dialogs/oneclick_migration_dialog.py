@@ -181,49 +181,36 @@ class OneClickMigrationWorker(QThread):
             executed_count = 0
             total_executable = summary.auto_fixable
 
-            from src.core.migration_fix_wizard import BatchFixExecutor, FixStrategy
+            from src.core.migration_fix_wizard import BatchFixExecutor
 
-            executor = BatchFixExecutor(self.connector, self.schema, dry_run=self.dry_run)
+            executor = BatchFixExecutor(self.connector, self.schema)
+            executor.set_progress_callback(
+                lambda msg: self.log_message.emit(msg, STYLE_INFO)
+            )
 
-            for i, step in enumerate(steps):
-                if self._is_cancelled:
-                    break
+            batch_result = executor.execute_batch(steps, dry_run=self.dry_run)
 
-                if not step.selected_option:
-                    continue
-
-                if step.selected_option.strategy in [FixStrategy.SKIP, FixStrategy.MANUAL]:
-                    continue
-
-                sql = step.selected_option.sql_template
-                if not sql:
-                    continue
-
-                # 진행률 업데이트
-                pct = 50 + int((i / len(steps)) * 40)
-                self.progress.emit(pct, f"실행 중: {step.location}")
-
-                # SQL 실행
-                if not self.dry_run:
-                    try:
-                        result = executor.execute_single_sql(sql)
-                        if result.success:
-                            self.log_message.emit(f"  ✅ {step.location}", STYLE_SUCCESS)
-                            execution_log.append(f"[OK] {step.location}: {sql[:50]}...")
-                            executed_count += 1
-                        else:
-                            self.log_message.emit(f"  ❌ {step.location}: {result.error}", STYLE_ERROR)
-                            execution_log.append(f"[FAIL] {step.location}: {result.error}")
-                    except Exception as e:
-                        self.log_message.emit(f"  ❌ {step.location}: {str(e)}", STYLE_ERROR)
-                        execution_log.append(f"[ERROR] {step.location}: {str(e)}")
+            # BatchExecutionResult → execution_log 변환
+            executed_count = batch_result.success_count
+            for i, (step, result) in enumerate(zip(steps, batch_result.results)):
+                if result.success:
+                    if result.message != "건너뛰기" and result.message != "수동 처리 필요":
+                        execution_log.append(f"[OK] {step.location}: {result.sql_executed[:50]}...")
+                    else:
+                        execution_log.append(f"[SKIP] {step.location}: {result.message}")
                 else:
-                    self.log_message.emit(f"  🧪 [DRY-RUN] {step.location}", STYLE_MUTED)
-                    execution_log.append(f"[DRY-RUN] {step.location}")
-                    executed_count += 1
+                    execution_log.append(f"[FAIL] {step.location}: {result.error or result.message}")
+
+            # Rollback SQL이 있으면 로그에 기록
+            if batch_result.rollback_sql:
+                execution_log.append(f"\n-- Rollback SQL --\n{batch_result.rollback_sql}")
 
             self.progress.emit(90, "실행 완료")
-            self.log_message.emit(f"✅ 실행 완료: {executed_count}/{total_executable}개", STYLE_SUCCESS)
+            self.log_message.emit(
+                f"✅ 실행 완료: {executed_count}/{total_executable}개 "
+                f"(실패: {batch_result.fail_count}, 스킵: {batch_result.skip_count})",
+                STYLE_SUCCESS
+            )
 
             if self._is_cancelled:
                 self.log_message.emit("⚠️ 작업이 취소되었습니다.", STYLE_WARNING)
@@ -714,8 +701,9 @@ class OneClickMigrationDialog(QDialog):
         phases = [
             ("preflight", "1. 사전검사"),
             ("analysis", "2. 분석"),
-            ("execution", "3. 실행"),
-            ("validation", "4. 검증"),
+            ("recommendation", "3. 권장"),
+            ("execution", "4. 실행"),
+            ("validation", "5. 검증"),
         ]
 
         self.phase_labels = {}
@@ -738,7 +726,7 @@ class OneClickMigrationDialog(QDialog):
 
     def _update_phase_indicator(self, current_phase: str):
         """단계 표시 업데이트"""
-        phase_order = ["preflight", "analysis", "execution", "validation"]
+        phase_order = ["preflight", "analysis", "recommendation", "execution", "validation"]
 
         try:
             current_idx = phase_order.index(current_phase)

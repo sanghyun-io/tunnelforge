@@ -172,6 +172,70 @@ DEFAULT_RECOMMENDATION_RULES: Dict[IssueType, RecommendationRule] = {
         description="FK 이름을 64자 이하로 변경 필요",
         risk_base_score=20
     ),
+
+    # SQL Mode Issue - 수동 처리 (설정 파일)
+    IssueType.SQL_MODE_ISSUE: RecommendationRule(
+        strategy=FixStrategy.MANUAL,
+        reason=RecommendationReason.MANUAL_REQUIRED,
+        description="my.cnf에서 deprecated SQL 모드 제거 필요",
+        risk_base_score=15
+    ),
+
+    # FTS Table Prefix - 수동 처리 (테이블명 변경)
+    IssueType.FTS_TABLE_PREFIX: RecommendationRule(
+        strategy=FixStrategy.MANUAL,
+        reason=RecommendationReason.MANUAL_REQUIRED,
+        description="FTS_ 접두사는 InnoDB 내부 예약어 - 테이블명 변경 필요",
+        risk_base_score=30
+    ),
+
+    # FK Reference Not Found - 수동 처리
+    IssueType.FK_REF_NOT_FOUND: RecommendationRule(
+        strategy=FixStrategy.MANUAL,
+        reason=RecommendationReason.MANUAL_REQUIRED,
+        description="FK 참조 테이블이 존재하지 않음 - FK 제거 또는 테이블 생성 필요",
+        risk_base_score=50
+    ),
+
+    # Deprecated Function - 수동 처리 (코드 수정)
+    IssueType.DEPRECATED_FUNCTION: RecommendationRule(
+        strategy=FixStrategy.MANUAL,
+        reason=RecommendationReason.MANUAL_REQUIRED,
+        description="제거된 함수를 대체 함수로 변경 필요",
+        risk_base_score=30
+    ),
+
+    # YEAR(2) Type - 자동 수정 가능
+    IssueType.YEAR2_TYPE: RecommendationRule(
+        strategy=FixStrategy.MANUAL,
+        reason=RecommendationReason.STANDARD,
+        description="YEAR(4)로 자동 변환 (데이터 확인 필요)",
+        risk_base_score=15
+    ),
+
+    # Latin1 Charset - FK 안전 변경 권장
+    IssueType.LATIN1_CHARSET: RecommendationRule(
+        strategy=FixStrategy.COLLATION_FK_SAFE,
+        reason=RecommendationReason.FK_SAFE,
+        description="latin1 → utf8mb4 변환 권장",
+        risk_base_score=25
+    ),
+
+    # FK Non-Unique Reference - 수동 처리
+    IssueType.FK_NON_UNIQUE_REF: RecommendationRule(
+        strategy=FixStrategy.MANUAL,
+        reason=RecommendationReason.MANUAL_REQUIRED,
+        description="FK가 비고유 인덱스 참조 - 고유 인덱스 추가 필요",
+        risk_base_score=40
+    ),
+
+    # Index Too Large - 수동 처리
+    IssueType.INDEX_TOO_LARGE: RecommendationRule(
+        strategy=FixStrategy.MANUAL,
+        reason=RecommendationReason.MANUAL_REQUIRED,
+        description="인덱스 크기 초과 - 컬럼 길이 축소 또는 prefix 인덱스 사용",
+        risk_base_score=35
+    ),
 }
 
 

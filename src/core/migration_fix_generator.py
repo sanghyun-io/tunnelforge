@@ -7,36 +7,7 @@ Fix Query Generator 모듈
 import re
 from typing import Optional
 
-from .migration_constants import IssueType, DOC_LINKS
-
-
-class CompatibilityIssue:
-    """호환성 문제 (확장 버전)"""
-    def __init__(
-        self,
-        issue_type: IssueType,
-        severity: str,
-        location: str,
-        description: str,
-        suggestion: str,
-        fix_query: Optional[str] = None,
-        doc_link: Optional[str] = None,
-        mysql_shell_check_id: Optional[str] = None,
-        code_snippet: Optional[str] = None,
-        table_name: Optional[str] = None,
-        column_name: Optional[str] = None
-    ):
-        self.issue_type = issue_type
-        self.severity = severity
-        self.location = location
-        self.description = description
-        self.suggestion = suggestion
-        self.fix_query = fix_query
-        self.doc_link = doc_link
-        self.mysql_shell_check_id = mysql_shell_check_id
-        self.code_snippet = code_snippet
-        self.table_name = table_name
-        self.column_name = column_name
+from .migration_constants import IssueType, DOC_LINKS, CompatibilityIssue
 
 
 class FixQueryGenerator:
@@ -68,6 +39,9 @@ class FixQueryGenerator:
             IssueType.TIMESTAMP_RANGE: self._gen_timestamp_fix,
             IssueType.BLOB_TEXT_DEFAULT: self._gen_blob_default_fix,
             IssueType.DEPRECATED_FUNCTION: self._gen_deprecated_function_fix,
+            IssueType.SQL_MODE_ISSUE: self._gen_sql_mode_fix,
+            IssueType.FTS_TABLE_PREFIX: self._gen_fts_prefix_fix,
+            IssueType.FK_REF_NOT_FOUND: self._gen_fk_ref_not_found_fix,
         }
 
         generator = generators.get(issue.issue_type)
@@ -360,6 +334,29 @@ ALTER TABLE `{table}` ALTER COLUMN `{column}` DROP DEFAULT;
 -- MASTER_POS_WAIT() → SOURCE_POS_WAIT() (8.0.26+)
 
 -- 참고: 저장 프로시저/함수/트리거 내의 사용도 확인하세요."""
+
+    def _gen_sql_mode_fix(self, issue) -> Optional[str]:
+        """SQL 모드 수정 가이드"""
+        return f"""-- SQL 모드 이슈: {issue.description}
+-- MySQL 8.4에서 제거된 SQL 모드는 my.cnf에서 제거하고
+-- SET GLOBAL sql_mode 에서도 제외하세요.
+-- 현재 SQL 모드 확인: SELECT @@sql_mode;"""
+
+    def _gen_fts_prefix_fix(self, issue) -> Optional[str]:
+        """FTS_ 접두사 테이블명 수정 가이드"""
+        table = issue.table_name or issue.location.split('.')[-1] if issue.location else 'unknown'
+        return f"""-- FTS_ 접두사 테이블명: {table}
+-- 'FTS_' 접두사는 InnoDB 전문검색 내부 테이블에 예약되어 있습니다.
+-- 테이블명을 FTS_ 접두사가 없는 이름으로 변경하세요.
+-- RENAME TABLE `{table}` TO `renamed_{table}`;"""
+
+    def _gen_fk_ref_not_found_fix(self, issue) -> Optional[str]:
+        """FK 참조 테이블 미존재 수정 가이드"""
+        return f"""-- FK 참조 테이블 누락: {issue.description}
+-- 참조 대상 테이블이 존재하지 않습니다.
+-- 1. 참조 테이블을 먼저 생성하거나
+-- 2. FK 제약 조건을 제거하세요.
+-- ALTER TABLE ... DROP FOREIGN KEY ...;"""
 
     def generate_all(self, issues: list) -> list:
         """여러 이슈에 대해 fix_query 일괄 생성"""
