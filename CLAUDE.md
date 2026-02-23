@@ -145,7 +145,36 @@ tunnel-manager/
 
 ### Release Workflow
 
-**🚀 Smart Release (권장):**
+#### PR 라벨 기반 자동 릴리스 (기본 방식)
+
+PR에 라벨을 붙이면 머지 시 자동으로 릴리스가 진행됩니다.
+
+| 라벨 | 버전 bump | 예시 |
+|------|-----------|------|
+| `version:patch` | 1.11.0 → 1.11.1 | 버그 수정 |
+| `version:minor` | 1.11.0 → 1.12.0 | 새 기능 추가 |
+| `version:major` | 1.11.0 → 2.0.0 | Breaking changes |
+
+**자동화 흐름**:
+1. Feature PR에 `version:*` 라벨 추가
+2. PR 머지 → `auto-version.yml` 실행
+3. Release PR 자동 생성 (`chore: release vX.Y.Z`)
+4. Release PR 머지 → 태그 `vX.Y.Z` 자동 생성
+5. → `release.yml` 트리거 → GitHub Release + 인스톨러 빌드
+
+**라벨 최초 설정** (저장소당 1회):
+```bash
+bash scripts/setup-labels.sh
+```
+
+**주의사항**:
+- 복수 version 라벨 금지 (워크플로 에러 + PR 코멘트로 알림)
+- GitHub App 설정 필요 (`GH_APP_ID`, `GH_APP_PRIVATE_KEY` 시크릿)
+  - 필요 권한: `contents: write`, `pull-requests: write`
+
+#### 긴급 Fallback (수동 릴리스)
+
+자동 릴리스가 실패하거나 긴급 릴리스가 필요한 경우에만 사용:
 
 ```bash
 # GitHub와 자동 비교하여 스마트하게 릴리스
@@ -165,42 +194,43 @@ tunnel-manager/
 
 시나리오 C: 원격이 더 높음
 → 경고 메시지 출력 후 종료
-
-장점:
-✅ GitHub 버전 자동 확인
-✅ 실수 방지 (중복 릴리스, 버전 충돌)
-✅ 상황에 맞는 액션 제안
-✅ UX/DX 최적화
-
-GitHub Actions (automatic):
-- Verifies version consistency
-- Builds Windows EXE (PyInstaller)
-- Builds Windows Installer (Inno Setup)
-- Creates GitHub Release
-- Attaches installer to release
 ```
 
 ### Scripts 구조
 
 ```
 scripts/
-├── smart_release.py       # 🚀 스마트 릴리스 (Python, 권장)
-├── smart-release.sh       # 🚀 스마트 릴리스 (Bash, Python 없을 때)
+├── versioning.py          # 📦 공유 버저닝 모듈 (bump_version.py, smart_release.py 공용)
+├── bump_version.py        # ⚙️ GitHub Actions용 버전 bump CLI
+├── setup-labels.sh        # 🏷️ GitHub 저장소 version 라벨 생성 (최초 1회)
+├── smart_release.py       # 🚨 긴급 fallback용 수동 릴리스
+├── smart-release.sh       # 🚨 긴급 fallback (Bash 버전)
 ├── build-installer.ps1    # ⚠️ GitHub Actions 전용 (삭제 금지!)
 └── build-bootstrapper.ps1 # 부트스트래퍼(온라인 설치) 빌드
 ```
 
 ### Script 상세
 
-- **`scripts/smart_release.py`** - 🚀 Smart Release (권장)
-  - GitHub API로 최신 릴리스 확인
-  - 로컬 버전과 비교하여 적절한 액션 제안
+- **`scripts/versioning.py`** - 📦 공유 버저닝 모듈
+  - `read_version`, `write_version`, `sync_pyproject`, `bump_version`, `compare_versions`
+  - `bump_version.py`와 `smart_release.py`에서 공유 사용
+
+- **`scripts/bump_version.py`** - ⚙️ GitHub Actions용 버전 bump CLI
+  - `--bump-type patch|minor|major` 로 버전 증가
+  - `--dry-run` 옵션으로 파일 수정 없이 미리보기
+  - stdout: `new_version=X.Y.Z` (`$GITHUB_OUTPUT` 호환)
+
+- **`scripts/setup-labels.sh`** - 🏷️ GitHub 라벨 생성 (최초 1회)
+  - `version:major`, `version:minor`, `version:patch` 라벨 생성
+  - `--force` 옵션으로 멱등성 보장
+
+- **`scripts/smart_release.py`** - 🚨 긴급 fallback (권장 아님)
+  - 자동화 실패 시 수동 릴리스용
   - `/release` 스킬로 실행 가능
   - `--dry-run` 옵션으로 미리보기
 
 - **`scripts/smart-release.sh`** - Bash 버전
   - Python이 없을 때 대체용
-  - 동일한 기능 제공
 
 - **`scripts/build-installer.ps1`** - ⚠️ GitHub Actions 전용
   - `.github/workflows/release.yml`에서 사용
@@ -209,7 +239,12 @@ scripts/
 
 ### GitHub Actions
 
-- `.github/workflows/release.yml`: Automated build & release
+- **`.github/workflows/auto-version.yml`**: PR 라벨 기반 자동 버저닝
+  - `version:*` 라벨 PR 머지 시 Release PR 자동 생성
+  - Release PR 머지 시 태그 생성 → `release.yml` 트리거
+  - 멱등성 보장 (브랜치/태그 중복 방지)
+
+- **`.github/workflows/release.yml`**: Automated build & release
   - Triggered by `v*` tags (e.g., v1.0.2)
   - Builds on `windows-latest` runner
   - Installs Inno Setup via Chocolatey
