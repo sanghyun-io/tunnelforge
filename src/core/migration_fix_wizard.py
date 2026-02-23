@@ -1852,6 +1852,57 @@ class RollbackSQLGenerator:
         self._table_charset_cache: Dict[str, Dict[str, str]] = {}
         self._column_info_cache: Dict[str, Dict[str, Any]] = {}
 
+    @staticmethod
+    def _format_default_clause(col_info: Dict[str, Any]) -> str:
+        """COLUMN_DEFAULT 값 → DEFAULT 절 문자열 생성
+
+        INFORMATION_SCHEMA.COLUMNS의 COLUMN_DEFAULT는 문자열/None으로 저장됨.
+        타입에 따라 따옴표 여부를 결정하고, MySQL 함수/표현식은 따옴표 없이 출력.
+        """
+        default_val = col_info.get('COLUMN_DEFAULT')
+        col_type = (col_info.get('COLUMN_TYPE') or '').upper()
+        nullable = col_info.get('IS_NULLABLE') == 'YES'
+
+        if default_val is None:
+            return 'DEFAULT NULL' if nullable else ''
+
+        # MySQL 함수/표현식 → 따옴표 없이
+        unquoted_keywords = {
+            'CURRENT_TIMESTAMP', 'CURRENT_DATE', 'CURRENT_TIME',
+            'NOW', 'NOW()', 'UUID', 'UUID()', 'LOCALTIME', 'LOCALTIMESTAMP',
+        }
+        stripped = default_val.upper().rstrip('()')
+        if stripped in unquoted_keywords:
+            return f'DEFAULT {default_val}'
+
+        # 숫자형 → 따옴표 없이
+        numeric_prefixes = (
+            'INT', 'TINYINT', 'SMALLINT', 'MEDIUMINT', 'BIGINT',
+            'DECIMAL', 'FLOAT', 'DOUBLE', 'NUMERIC', 'BIT', 'YEAR', 'BOOL',
+        )
+        if any(col_type.startswith(t) for t in numeric_prefixes):
+            return f'DEFAULT {default_val}'
+
+        # 문자열/기타 → 작은따옴표로 감싸기 (내부 ' 이스케이프)
+        escaped = default_val.replace("'", "''")
+        return f"DEFAULT '{escaped}'"
+
+    @staticmethod
+    def _format_extra_clause(col_info: Dict[str, Any]) -> str:
+        """EXTRA 필드 → SQL 절 생성 (AUTO_INCREMENT, ON UPDATE 등)
+
+        'DEFAULT_GENERATED' 등 내부 마킹은 생략하고 유의미한 속성만 출력.
+        """
+        extra = (col_info.get('EXTRA') or '').lower()
+        if not extra:
+            return ''
+        parts = []
+        if 'auto_increment' in extra:
+            parts.append('AUTO_INCREMENT')
+        if 'on update current_timestamp' in extra:
+            parts.append('ON UPDATE CURRENT_TIMESTAMP')
+        return ' '.join(parts)
+
     def capture_table_charset(self, table: str) -> Dict[str, str]:
         """테이블의 현재 charset/collation 캡처"""
         cache_key = f"{self.schema}.{table}"
@@ -2037,13 +2088,24 @@ class RollbackSQLGenerator:
                     orig_collation = col_info.get('COLLATION_NAME', 'utf8mb3_general_ci')
                     col_type = col_info.get('COLUMN_TYPE', 'VARCHAR(255)')
                     nullable = 'NULL' if col_info.get('IS_NULLABLE') == 'YES' else 'NOT NULL'
+                    default_clause = self._format_default_clause(col_info)
+                    extra_clause = self._format_extra_clause(col_info)
+
+                    # 컬럼 정의: type nullable [default] [extra] charset collation
+                    col_def_parts = [col_type, nullable]
+                    if default_clause:
+                        col_def_parts.append(default_clause)
+                    if extra_clause:
+                        col_def_parts.append(extra_clause)
+                    col_def_parts.append(
+                        f"CHARACTER SET {orig_charset} COLLATE {orig_collation}"
+                    )
 
                     lines.append(f"-- Rollback: {table}.{column} 컬럼 charset 복원")
                     lines.append(f"-- 원본: {orig_charset} / {orig_collation}")
                     lines.append(
                         f"ALTER TABLE `{schema}`.`{table}` "
-                        f"MODIFY COLUMN `{column}` {col_type} {nullable} "
-                        f"CHARACTER SET {orig_charset} COLLATE {orig_collation};"
+                        f"MODIFY COLUMN `{column}` {' '.join(col_def_parts)};"
                     )
             else:
                 # 테이블 레벨 롤백
@@ -2083,13 +2145,23 @@ class RollbackSQLGenerator:
             lines.append("-- Phase 2: Charset 복원")
             for tbl in related_tables:
                 # pre-state 우선 사용 (변경 전 상태), 없으면 현재 상태 캡처 (fallback)
+                # 테이블 레벨 키(schema.table) 먼저 조회, 없으면 컬럼 레벨 키도 탐색
                 tbl_location = f"{schema}.{tbl}"
-                if all_pre_states and tbl_location in all_pre_states:
-                    tbl_info = all_pre_states[tbl_location]
-                elif original_state and tbl == table:
-                    tbl_info = original_state
-                else:
-                    tbl_info = self.capture_table_charset(tbl)
+                tbl_info = None
+                if all_pre_states:
+                    if tbl_location in all_pre_states:
+                        tbl_info = all_pre_states[tbl_location]
+                    else:
+                        # 컬럼 레벨 키 중 해당 테이블 소속 첫 번째 항목 사용
+                        for key, val in all_pre_states.items():
+                            if key.startswith(f"{tbl_location}."):
+                                tbl_info = val
+                                break
+                if tbl_info is None:
+                    if original_state and tbl == table:
+                        tbl_info = original_state
+                    else:
+                        tbl_info = self.capture_table_charset(tbl)
                 orig_charset = tbl_info.get('charset', 'utf8mb3')
                 orig_collation = tbl_info.get('collation', 'utf8mb3_general_ci')
 
@@ -2142,8 +2214,9 @@ class RollbackSQLGenerator:
         lines.append("")
         lines.append("")
 
-        # 이미 처리한 테이블 추적 (중복 방지)
-        processed_tables: Set[str] = set()
+        # 이미 처리한 테이블/컬럼 추적 (중복 방지)
+        processed_tables: Set[str] = set()      # 테이블 레벨 중복 방지
+        processed_locations: Set[str] = set()  # 컬럼 레벨 COLLATION_SINGLE 중복 방지
         rollback_count = 0
 
         for step in steps:
@@ -2158,19 +2231,28 @@ class RollbackSQLGenerator:
                 continue
 
             location = step.location
-            table = location.split('.')[1] if '.' in location else location
+            location_parts = location.split('.')
+            table = location_parts[1] if len(location_parts) > 1 else location
+            column = location_parts[2] if len(location_parts) > 2 else None
+            strategy = step.selected_option.strategy
 
-            # FK 일괄 변경의 경우 연관 테이블 모두 체크
-            if step.selected_option.strategy in (FixStrategy.COLLATION_FK_CASCADE, FixStrategy.COLLATION_FK_SAFE):
+            if strategy in (FixStrategy.COLLATION_FK_CASCADE, FixStrategy.COLLATION_FK_SAFE):
+                # FK 일괄 변경: 연관 테이블 전체를 테이블 단위로 중복 방지
                 tables_to_check = set(step.selected_option.related_tables or [table])
+                if tables_to_check & processed_tables:
+                    continue
+                processed_tables.update(tables_to_check)
+            elif strategy == FixStrategy.COLLATION_SINGLE and column:
+                # 컬럼 레벨: 같은 테이블의 여러 컬럼이 각각 롤백되어야 하므로
+                # 테이블 단위가 아닌 location 전체를 키로 사용
+                if location in processed_locations:
+                    continue
+                processed_locations.add(location)
             else:
-                tables_to_check = {table}
-
-            # 이미 처리한 테이블이면 건너뛰기
-            if tables_to_check & processed_tables:
-                continue
-
-            processed_tables.update(tables_to_check)
+                # 테이블 레벨: 테이블 단위 중복 방지
+                if table in processed_tables:
+                    continue
+                processed_tables.add(table)
 
             # 원본 상태 가져오기
             original_state = pre_states.get(location)

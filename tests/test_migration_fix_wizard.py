@@ -758,6 +758,120 @@ class TestRollbackSQLGenerator:
         sql = rollback_gen.generate_batch_rollback(steps, {})
         assert "롤백 가능한 변경사항이 없습니다" in sql
 
+    # --- Bug 1 regression: 같은 테이블의 여러 컬럼 ---
+    def test_generate_batch_rollback_multi_column_same_table(self, rollback_gen):
+        """Bug 1 회귀: 동일 테이블의 여러 컬럼이 모두 롤백 SQL에 포함돼야 한다"""
+        steps = [
+            _make_step(0, IssueType.CHARSET_ISSUE,
+                       location="test_db.users.name",
+                       selected_option=_make_option(FixStrategy.COLLATION_SINGLE)),
+            _make_step(1, IssueType.CHARSET_ISSUE,
+                       location="test_db.users.email",
+                       selected_option=_make_option(FixStrategy.COLLATION_SINGLE)),
+            _make_step(2, IssueType.CHARSET_ISSUE,
+                       location="test_db.users.bio",
+                       selected_option=_make_option(FixStrategy.COLLATION_SINGLE)),
+        ]
+        col_state = {
+            'CHARACTER_SET_NAME': 'utf8', 'COLLATION_NAME': 'utf8_general_ci',
+            'COLUMN_TYPE': 'varchar(255)', 'IS_NULLABLE': 'YES', 'COLUMN_DEFAULT': None,
+            'EXTRA': '',
+        }
+        pre_states = {
+            'test_db.users.name': col_state,
+            'test_db.users.email': col_state,
+            'test_db.users.bio': col_state,
+        }
+        sql = rollback_gen.generate_batch_rollback(steps, pre_states)
+        # 세 컬럼 모두 MODIFY COLUMN 절이 있어야 한다
+        assert sql.count('MODIFY COLUMN `name`') == 1
+        assert sql.count('MODIFY COLUMN `email`') == 1
+        assert sql.count('MODIFY COLUMN `bio`') == 1
+
+    # --- Bug 2 regression: DEFAULT / EXTRA 보존 ---
+    def test_format_default_clause_string(self, rollback_gen):
+        """문자열 DEFAULT → 따옴표 포함"""
+        col_info = {'COLUMN_DEFAULT': 'active', 'COLUMN_TYPE': 'varchar(20)',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT 'active'"
+
+    def test_format_default_clause_numeric(self, rollback_gen):
+        """숫자형 DEFAULT → 따옴표 없음"""
+        col_info = {'COLUMN_DEFAULT': '0', 'COLUMN_TYPE': 'int(11)',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT 0"
+
+    def test_format_default_clause_current_timestamp(self, rollback_gen):
+        """CURRENT_TIMESTAMP → 따옴표 없음"""
+        col_info = {'COLUMN_DEFAULT': 'CURRENT_TIMESTAMP', 'COLUMN_TYPE': 'timestamp',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT CURRENT_TIMESTAMP"
+
+    def test_format_default_clause_nullable_none(self, rollback_gen):
+        """IS_NULLABLE='YES', COLUMN_DEFAULT=None → DEFAULT NULL"""
+        col_info = {'COLUMN_DEFAULT': None, 'COLUMN_TYPE': 'varchar(255)',
+                    'IS_NULLABLE': 'YES'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT NULL"
+
+    def test_format_default_clause_not_null_none(self, rollback_gen):
+        """IS_NULLABLE='NO', COLUMN_DEFAULT=None → 빈 문자열"""
+        col_info = {'COLUMN_DEFAULT': None, 'COLUMN_TYPE': 'varchar(255)',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == ""
+
+    def test_format_extra_clause_auto_increment(self, rollback_gen):
+        """AUTO_INCREMENT → 포함"""
+        assert rollback_gen._format_extra_clause({'EXTRA': 'auto_increment'}) == 'AUTO_INCREMENT'
+
+    def test_format_extra_clause_on_update(self, rollback_gen):
+        """ON UPDATE CURRENT_TIMESTAMP → 포함"""
+        assert rollback_gen._format_extra_clause(
+            {'EXTRA': 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP'}
+        ) == 'ON UPDATE CURRENT_TIMESTAMP'
+
+    def test_format_extra_clause_empty(self, rollback_gen):
+        """EXTRA 없음 → 빈 문자열"""
+        assert rollback_gen._format_extra_clause({'EXTRA': ''}) == ''
+
+    def test_rollback_column_includes_default(self, rollback_gen):
+        """컬럼 롤백 SQL에 DEFAULT 절이 포함돼야 한다"""
+        step = _make_step(0, IssueType.CHARSET_ISSUE,
+                          location="test_db.users.status",
+                          selected_option=_make_option(FixStrategy.COLLATION_SINGLE))
+        original = {
+            'CHARACTER_SET_NAME': 'utf8',
+            'COLLATION_NAME': 'utf8_general_ci',
+            'COLUMN_TYPE': 'varchar(20)',
+            'IS_NULLABLE': 'NO',
+            'COLUMN_DEFAULT': 'active',
+            'EXTRA': '',
+        }
+        sql = rollback_gen.generate_rollback_sql(step, original_state=original)
+        assert "DEFAULT 'active'" in sql
+        assert "MODIFY COLUMN `status`" in sql
+
+    def test_rollback_column_on_update_preserved(self, rollback_gen):
+        """ON UPDATE CURRENT_TIMESTAMP가 롤백 SQL에 보존돼야 한다"""
+        step = _make_step(0, IssueType.CHARSET_ISSUE,
+                          location="test_db.users.updated_at",
+                          selected_option=_make_option(FixStrategy.COLLATION_SINGLE))
+        original = {
+            'CHARACTER_SET_NAME': 'utf8',
+            'COLLATION_NAME': 'utf8_general_ci',
+            'COLUMN_TYPE': 'timestamp',
+            'IS_NULLABLE': 'YES',
+            'COLUMN_DEFAULT': 'CURRENT_TIMESTAMP',
+            'EXTRA': 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP',
+        }
+        sql = rollback_gen.generate_rollback_sql(step, original_state=original)
+        assert "ON UPDATE CURRENT_TIMESTAMP" in sql
+        assert "DEFAULT CURRENT_TIMESTAMP" in sql
+
 
 # ============================================================
 # CharsetFixPlanBuilder 테스트
