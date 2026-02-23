@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tunnelforge"
-version = "1.11.42"
+version = "1.11.43"
 description = "SSH Tunnel and MySQL Database Manager"
 readme = "README.md"
 requires-python = ">=3.9"
