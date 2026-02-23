@@ -2,19 +2,19 @@ name: Auto Version
 
 # PR 라벨 기반 자동 버저닝
 #
-# Job 1 (create-release-pr):
-#   Feature PR에 version:* 라벨 → 머지 시 → Release PR 자동 생성
+# Job 1 (version-gate) — 필수 상태 체크:
+#   version:* 라벨 감지 → PR 브랜치에 bump 커밋 자동 추가
+#   브랜치 보호 규칙으로 이 체크가 통과해야만 머지 가능
 #
-# Job 2 (create-release-tag):
-#   Release PR 머지 시 → 태그 생성 → release.yml 트리거
+# Job 2 (create-tag):
+#   version:* 라벨이 있는 PR 머지 시 → 태그 생성 → release.yml 트리거
 
 on:
   pull_request:
-    types: [closed]
+    types: [labeled, unlabeled, opened, synchronize, reopened, closed]
 
-# 동시 실행 방지: 버저닝 작업은 직렬로 처리
 concurrency:
-  group: auto-version
+  group: auto-version-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 permissions:
@@ -23,25 +23,23 @@ permissions:
 
 jobs:
   # ──────────────────────────────────────────────
-  # Job 1: Feature PR 머지 → Release PR 생성
+  # Job 1: version-gate (Required Status Check)
+  # PR에 version:* 라벨 있으면 bump 커밋 추가,
+  # 없으면 그냥 통과 — 항상 성공으로 끝나야 머지 가능
   # ──────────────────────────────────────────────
-  create-release-pr:
-    # Feature PR이 머지됐고, version:* 라벨 중 하나가 있을 때
-    if: >
-      github.event.pull_request.merged == true &&
-      contains(toJSON(github.event.pull_request.labels.*.name), 'version:')
+  version-gate:
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Detect version label
-        id: detect
+      - name: Check version labels
+        id: check
         env:
           PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # version:* 라벨 추출
           VERSION_LABELS=$(echo "$PR_LABELS" | python3 -c "
           import json, sys
           labels = json.load(sys.stdin)
@@ -52,11 +50,9 @@ jobs:
 
           COUNT=$(echo "$VERSION_LABELS" | grep -c 'version:' || true)
           echo "감지된 version 라벨 수: $COUNT"
-          echo "$VERSION_LABELS"
 
           if [ "$COUNT" -gt 1 ]; then
-            echo "ERROR: 복수의 version 라벨이 감지되었습니다: $VERSION_LABELS"
-            # PR 코멘트로 에러 알림
+            echo "ERROR: 복수의 version 라벨 감지: $VERSION_LABELS"
             gh pr comment "$PR_NUMBER" --body \
               "⚠️ **Auto-version 실패**: 복수의 version 라벨이 감지되었습니다.
 
@@ -65,128 +61,90 @@ jobs:
           정확히 **1개**의 version 라벨만 허용됩니다:
           - \`version:patch\` — 버그 수정 (X.Y.Z+1)
           - \`version:minor\` — 새 기능 (X.Y+1.0)
-          - \`version:major\` — Breaking changes (X+1.0.0)
-
-          라벨을 수정 후 다음 PR에서 다시 시도하세요."
+          - \`version:major\` — Breaking changes (X+1.0.0)"
             exit 1
           fi
 
           if [ "$COUNT" -eq 0 ]; then
-            echo "version 라벨 없음. 건너뜁니다."
+            echo "version 라벨 없음. 버전 bump 불필요 — 통과."
             echo "bump_type=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
-          # bump_type 추출 (version:patch → patch)
           BUMP_TYPE=$(echo "$VERSION_LABELS" | head -1 | sed 's/version://')
           echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
           echo "감지된 bump_type: $BUMP_TYPE"
 
       - name: Generate GitHub App Token
+        if: steps.check.outputs.bump_type != ''
         id: app-token
         uses: actions/create-github-app-token@v1
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
-      - name: Checkout main
+      - name: Checkout PR branch
+        if: steps.check.outputs.bump_type != ''
         uses: actions/checkout@v4
         with:
           token: ${{ steps.app-token.outputs.token }}
-          ref: main
+          ref: ${{ github.event.pull_request.head.ref }}
           fetch-depth: 0
 
       - name: Set up Python
+        if: steps.check.outputs.bump_type != ''
         uses: actions/setup-python@v5
         with:
           python-version: '3.x'
 
-      - name: Bump version (dry-run to get new version)
-        id: bump-preview
-        run: |
-          python scripts/bump_version.py \
-            --bump-type ${{ steps.detect.outputs.bump_type }} \
-            --dry-run >> "$GITHUB_OUTPUT"
-
-      - name: Check idempotency (branch)
+      - name: Check if already bumped (idempotency)
+        if: steps.check.outputs.bump_type != ''
         id: idempotency
         env:
-          NEW_VERSION: ${{ steps.bump-preview.outputs.new_version }}
+          BUMP_TYPE: ${{ steps.check.outputs.bump_type }}
         run: |
-          BRANCH="release/v${NEW_VERSION}"
-          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
-            echo "브랜치 $BRANCH 가 이미 존재합니다. 건너뜁니다."
+          python scripts/bump_version.py --bump-type "$BUMP_TYPE" --dry-run > /tmp/bump_dry.txt
+          EXPECTED=$(grep 'new_version=' /tmp/bump_dry.txt | cut -d= -f2)
+          CURRENT=$(grep '__version__' src/version.py | cut -d'"' -f2)
+          echo "현재 버전: $CURRENT / 예상 bump 버전: $EXPECTED"
+
+          if [ "$CURRENT" = "$EXPECTED" ]; then
+            echo "이미 bump 완료. 건너뜁니다."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "new_version=$EXPECTED" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Bump version (actual)
-        if: steps.idempotency.outputs.skip != 'true'
-        id: bump
-        run: |
-          python scripts/bump_version.py \
-            --bump-type ${{ steps.detect.outputs.bump_type }} >> "$GITHUB_OUTPUT"
-
-      - name: Create release branch and PR
-        if: steps.idempotency.outputs.skip != 'true'
+      - name: Bump version and commit to PR branch
+        if: steps.check.outputs.bump_type != '' && steps.idempotency.outputs.skip != 'true'
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
-          BUMP_TYPE: ${{ steps.detect.outputs.bump_type }}
-          SOURCE_PR_NUMBER: ${{ github.event.pull_request.number }}
-          SOURCE_PR_TITLE: ${{ github.event.pull_request.title }}
+          BUMP_TYPE: ${{ steps.check.outputs.bump_type }}
+          NEW_VERSION: ${{ steps.idempotency.outputs.new_version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          BRANCH="release/v${NEW_VERSION}"
-          git checkout -b "$BRANCH"
+          python scripts/bump_version.py --bump-type "$BUMP_TYPE"
           git add src/version.py pyproject.toml
-          git commit -m "chore: release v${NEW_VERSION}"
-          git push origin "$BRANCH"
-
-          gh pr create \
-            --title "chore: release v${NEW_VERSION}" \
-            --body "## Release v${NEW_VERSION}
-
-          자동 생성된 릴리스 PR입니다.
-
-          | 항목 | 값 |
-          |------|-----|
-          | 버전 bump | \`${BUMP_TYPE}\` |
-          | 소스 PR | #${SOURCE_PR_NUMBER} (${SOURCE_PR_TITLE}) |
-          | 새 버전 | \`v${NEW_VERSION}\` |
-
-          이 PR이 머지되면 태그 \`v${NEW_VERSION}\`이 자동 생성되고 릴리스 빌드가 시작됩니다.
-
-          🤖 Generated by [auto-version.yml](.github/workflows/auto-version.yml)" \
-            --base main \
-            --head "$BRANCH"
-
+          git commit -m "chore: bump version to v${NEW_VERSION}"
+          git push origin "${{ github.event.pull_request.head.ref }}"
+          echo "버전 bump 완료: v${NEW_VERSION}"
 
   # ──────────────────────────────────────────────
-  # Job 2: Release PR 머지 → 태그 생성
+  # Job 2: create-tag
+  # version:* 라벨이 있는 PR 머지 시 태그 생성
+  # → release.yml 트리거
   # ──────────────────────────────────────────────
-  create-release-tag:
-    # Release PR (제목: "chore: release vX.Y.Z")이 머지됐을 때
+  create-tag:
     if: >
+      github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
-      startsWith(github.event.pull_request.title, 'chore: release v')
+      contains(toJSON(github.event.pull_request.labels.*.name), 'version:')
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
     steps:
-      - name: Extract version from PR title
-        id: extract
-        env:
-          PR_TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          # "chore: release v1.11.1" → "1.11.1"
-          VERSION=$(echo "$PR_TITLE" | sed 's/chore: release v//')
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "추출된 버전: $VERSION"
-
       - name: Generate GitHub App Token
         id: app-token
         uses: actions/create-github-app-token@v1
@@ -201,28 +159,19 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Check idempotency (tag)
-        id: idempotency
-        env:
-          VERSION: ${{ steps.extract.outputs.version }}
-        run: |
-          TAG="v${VERSION}"
-          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
-            echo "태그 $TAG 가 이미 존재합니다. 건너뜁니다."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Create and push tag
-        if: steps.idempotency.outputs.skip != 'true'
-        env:
-          VERSION: ${{ steps.extract.outputs.version }}
+      - name: Read version and create tag
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          VERSION=$(grep '__version__' src/version.py | cut -d'"' -f2)
           TAG="v${VERSION}"
+
+          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+            echo "태그 $TAG 이미 존재. 건너뜁니다."
+            exit 0
+          fi
+
           git tag -a "$TAG" -m "Release ${TAG}"
           git push origin "$TAG"
-          echo "태그 ${TAG} 생성 및 push 완료 → release.yml 트리거됨"
+          echo "태그 ${TAG} 생성 완료 → release.yml 트리거됨"
