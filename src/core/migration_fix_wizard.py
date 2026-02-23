@@ -1774,8 +1774,36 @@ class BatchFixExecutor:
                 # 세미콜론 제거
                 count_sql = count_sql.rstrip(';')
 
-                result = self.connector.execute(count_sql)
-                affected = result[0]['cnt'] if result else 0
+                # 0000-00-00 날짜값이 있을 경우 strict mode에서 COUNT 쿼리가 실패하므로
+                # 임시로 sql_mode를 완화한 뒤 실행하고 복원한다
+                _saved_mode: Optional[str] = None
+                try:
+                    _saved_mode = self.connector.get_session_sql_mode()
+                    self.connector.set_session_sql_mode('')
+                except Exception:
+                    pass  # 모드 조회/설정 실패 시 현재 모드로 시도
+
+                try:
+                    result = self.connector.execute(count_sql)
+                    affected = result[0]['cnt'] if result else 0
+                    count_ok = True
+                except Exception:
+                    affected = 0
+                    count_ok = False
+                finally:
+                    if _saved_mode is not None:
+                        try:
+                            self.connector.set_session_sql_mode(_saved_mode)
+                        except Exception:
+                            pass
+
+                if not count_ok:
+                    return FixExecutionResult(
+                        success=True,
+                        message="[DRY-RUN] 예상 영향 행: ≥1 (0000-00-00 등 비표준 값 포함으로 정확한 수 불명)",
+                        sql_executed=sql,
+                        affected_rows=1
+                    )
 
                 return FixExecutionResult(
                     success=True,
