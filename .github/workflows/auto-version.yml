@@ -28,7 +28,9 @@ jobs:
   # 없으면 그냥 통과 — 항상 성공으로 끝나야 머지 가능
   # ──────────────────────────────────────────────
   version-gate:
-    if: github.event.action != 'closed'
+    if: >
+      github.event.action != 'closed' &&
+      !startsWith(github.event.pull_request.head.commit.message, 'chore: bump version')
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
