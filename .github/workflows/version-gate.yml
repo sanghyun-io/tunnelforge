@@ -1,20 +1,16 @@
-name: Auto Version
+name: Version Gate
 
-# PR 라벨 기반 자동 버저닝
+# PR 라벨 기반 버전 bump — 필수 상태 체크
 #
-# Job 1 (version-gate) — 필수 상태 체크:
-#   version:* 라벨 감지 → PR 브랜치에 bump 커밋 자동 추가
-#   브랜치 보호 규칙으로 이 체크가 통과해야만 머지 가능
-#
-# Job 2 (create-tag):
-#   version:* 라벨이 있는 PR 머지 시 → 태그 생성 → release.yml 트리거
+# version:* 라벨이 있으면 PR 브랜치에 bump 커밋 자동 추가.
+# 브랜치 보호 규칙으로 이 체크가 통과해야만 머지 가능.
 
 on:
   pull_request:
-    types: [labeled, unlabeled, opened, synchronize, reopened, closed]
+    types: [labeled, unlabeled, opened, synchronize, reopened]
 
 concurrency:
-  group: auto-version-${{ github.event.pull_request.number }}
+  group: version-gate-${{ github.event.pull_request.number }}
   cancel-in-progress: false
 
 permissions:
@@ -22,13 +18,7 @@ permissions:
   pull-requests: write
 
 jobs:
-  # ──────────────────────────────────────────────
-  # Job 1: version-gate (Required Status Check)
-  # PR에 version:* 라벨 있으면 bump 커밋 추가,
-  # 없으면 그냥 통과 — 항상 성공으로 끝나야 머지 가능
-  # ──────────────────────────────────────────────
   version-gate:
-    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
@@ -138,48 +128,3 @@ jobs:
           git commit -m "chore: bump version to v${NEW_VERSION}"
           git push origin "${{ github.event.pull_request.head.ref }}"
           echo "버전 bump 완료: v${NEW_VERSION}"
-
-  # ──────────────────────────────────────────────
-  # Job 2: create-tag
-  # version:* 라벨이 있는 PR 머지 시 태그 생성
-  # → release.yml 트리거
-  # ──────────────────────────────────────────────
-  create-tag:
-    if: >
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      contains(toJSON(github.event.pull_request.labels.*.name), 'version:')
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v1
-        with:
-          app-id: ${{ secrets.RELEASER_APP_ID }}
-          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
-
-      - name: Checkout main
-        uses: actions/checkout@v4
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          ref: main
-          fetch-depth: 0
-
-      - name: Read version and create tag
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          VERSION=$(grep '__version__' src/version.py | cut -d'"' -f2)
-          TAG="v${VERSION}"
-
-          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
-            echo "태그 $TAG 이미 존재. 건너뜁니다."
-            exit 0
-          fi
-
-          git tag -a "$TAG" -m "Release ${TAG}"
-          git push origin "$TAG"
-          echo "태그 ${TAG} 생성 완료 → release.yml 트리거됨"

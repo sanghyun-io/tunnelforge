@@ -1,0 +1,50 @@
+name: Create Release Tag
+
+# version:* 라벨이 있는 PR 머지 시 태그 생성 → release.yml 트리거
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  create-tag:
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(toJSON(github.event.pull_request.labels.*.name), 'version:')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Read version and create tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          VERSION=$(grep '__version__' src/version.py | cut -d'"' -f2)
+          TAG="v${VERSION}"
+
+          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+            echo "태그 $TAG 이미 존재. 건너뜁니다."
+            exit 0
+          fi
+
+          git tag -a "$TAG" -m "Release ${TAG}"
+          git push origin "$TAG"
+          echo "태그 ${TAG} 생성 완료 → release.yml 트리거됨"
