@@ -18,8 +18,11 @@ from src.core.db_connector import MySQLConnector
 # 새 상수 모듈에서 import (migration_constants.py)
 # ============================================================
 from src.core.migration_constants import (
-    REMOVED_FUNCTIONS_84,
+    ALL_REMOVED_FUNCTIONS,
+    DEPRECATED_FUNCTIONS_84,
+    OBSOLETE_SQL_MODES,
     IssueType,
+    CompatibilityIssue,
     INVALID_DATE_PATTERN,
     INVALID_DATETIME_PATTERN,
     ZEROFILL_PATTERN,
@@ -94,20 +97,7 @@ class ForeignKeyInfo:
     on_update: str
 
 
-@dataclass
-class CompatibilityIssue:
-    """호환성 문제"""
-    issue_type: IssueType
-    severity: str  # "error", "warning", "info"
-    location: str  # 테이블명 또는 위치
-    description: str
-    suggestion: str
-    fix_query: Optional[str] = None      # 수정 SQL
-    doc_link: Optional[str] = None       # 문서 링크
-    mysql_shell_check_id: Optional[str] = None  # MySQL Shell 체크 ID
-    code_snippet: Optional[str] = None   # 관련 코드
-    table_name: Optional[str] = None     # 테이블명
-    column_name: Optional[str] = None    # 컬럼명
+# CompatibilityIssue는 migration_constants에서 import (단일 정의)
 
 
 @dataclass
@@ -201,7 +191,9 @@ class MigrationAnalyzer:
     """마이그레이션 분석기"""
 
     # MySQL 8.4에서 제거된/deprecated된 함수들 (전역 상수 사용)
-    DEPRECATED_FUNCTIONS = list(REMOVED_FUNCTIONS_84)
+    DEPRECATED_FUNCTIONS = list(ALL_REMOVED_FUNCTIONS)
+    # deprecated만 (경고 수준 차등화용)
+    _DEPRECATED_ONLY = set(DEPRECATED_FUNCTIONS_84)
 
     # MySQL 8.4에서 새로운 예약어들 (기존 22개 + 8.4 추가 4개)
     NEW_RESERVED_KEYWORDS = [
@@ -506,11 +498,15 @@ class MigrationAnalyzer:
 
             for func in self.DEPRECATED_FUNCTIONS:
                 if func in definition:
+                    # removed vs deprecated 차등화
+                    is_deprecated_only = func in self._DEPRECATED_ONLY
+                    severity = "warning" if is_deprecated_only else "error"
+                    label = "deprecated" if is_deprecated_only else "removed"
                     issues.append(CompatibilityIssue(
                         issue_type=IssueType.DEPRECATED_FUNCTION,
-                        severity="error",
+                        severity=severity,
                         location=f"{routine['ROUTINE_TYPE']} {schema}.{routine['ROUTINE_NAME']}",
-                        description=f"deprecated 함수 '{func}' 사용 중",
+                        description=f"{label} 함수 '{func}' 사용 중",
                         suggestion=f"'{func}' 함수를 대체 함수로 변경 필요"
                     ))
 
@@ -527,17 +523,13 @@ class MigrationAnalyzer:
 
         issues = []
 
-        # deprecated SQL 모드들
-        deprecated_modes = [
-            'NO_AUTO_CREATE_USER',  # 8.0에서 제거됨
-            'NO_FIELD_OPTIONS',
-            'NO_KEY_OPTIONS',
-            'NO_TABLE_OPTIONS',
-        ]
+        # deprecated SQL 모드들 (상수 모듈의 OBSOLETE_SQL_MODES 사용)
+        deprecated_modes = OBSOLETE_SQL_MODES
 
         result = self.connector.execute("SELECT @@sql_mode as sql_mode")
         if result:
-            current_modes = result[0]['sql_mode'].split(',')
+            sql_mode_raw = result[0].get('sql_mode') or ''
+            current_modes = sql_mode_raw.split(',') if sql_mode_raw else []
 
             for mode in current_modes:
                 mode = mode.strip()
@@ -700,6 +692,54 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         self._log(f"📊 스키마 '{schema}' 분석 시작...")
 
+        # INFORMATION_SCHEMA 조회 시 COLUMN_DEFAULT '0000-00-00' 값이 있으면
+        # MySQL strict mode(NO_ZERO_DATE)가 1525 오류를 발생시킴.
+        # 분석 단계는 READ-ONLY이므로 세션 sql_mode를 임시 완화 후 복원.
+        original_sql_mode = self.connector.get_session_sql_mode()
+        self.connector.set_session_sql_mode('')
+
+        try:
+            return self._analyze_schema_impl(
+                schema=schema,
+                check_orphans=check_orphans,
+                check_charset=check_charset,
+                check_keywords=check_keywords,
+                check_routines=check_routines,
+                check_sql_mode=check_sql_mode,
+                check_auth_plugins=check_auth_plugins,
+                check_zerofill=check_zerofill,
+                check_float_precision=check_float_precision,
+                check_fk_name_length=check_fk_name_length,
+                check_invalid_dates=check_invalid_dates,
+                check_year2=check_year2,
+                check_deprecated_engines=check_deprecated_engines,
+                check_enum_empty=check_enum_empty,
+                check_timestamp_range=check_timestamp_range,
+            )
+        finally:
+            self.connector.set_session_sql_mode(original_sql_mode)
+
+    def _analyze_schema_impl(
+        self,
+        schema: str,
+        check_orphans: bool = True,
+        check_charset: bool = True,
+        check_keywords: bool = True,
+        check_routines: bool = True,
+        check_sql_mode: bool = True,
+        check_auth_plugins: bool = True,
+        check_zerofill: bool = True,
+        check_float_precision: bool = True,
+        check_fk_name_length: bool = True,
+        check_invalid_dates: bool = True,
+        check_year2: bool = True,
+        check_deprecated_engines: bool = True,
+        check_enum_empty: bool = True,
+        check_timestamp_range: bool = True
+    ) -> 'AnalysisResult':
+        """analyze_schema 내부 구현 (sql_mode 완화 상태에서 실행)"""
+        from datetime import datetime
+
         # 기본 정보 수집
         tables = self.connector.get_tables(schema)
         fk_list = self.get_foreign_keys(schema)
@@ -802,7 +842,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
         query = """
         SELECT User, Host, plugin
         FROM mysql.user
-        WHERE plugin IN ('mysql_native_password', 'sha256_password', 'authentication_fido')
+        WHERE plugin IN ('mysql_native_password', 'sha256_password', 'authentication_fido', 'authentication_fido_client')
         """
         try:
             users = self.connector.execute(query)
@@ -826,12 +866,12 @@ AND `{orphan.child_column}` IS NOT NULL"""
                         description="sha256_password 인증 사용 (deprecated)",
                         suggestion="ALTER USER ... IDENTIFIED WITH caching_sha2_password 권장"
                     ))
-                elif plugin == 'authentication_fido':
+                elif plugin in ('authentication_fido', 'authentication_fido_client'):
                     issues.append(CompatibilityIssue(
                         issue_type=IssueType.AUTH_PLUGIN_ISSUE,
                         severity="error",
                         location=f"'{user['User']}'@'{user['Host']}'",
-                        description="authentication_fido 플러그인 사용 (8.4에서 제거됨)",
+                        description=f"{plugin} 플러그인 사용 (8.4에서 제거됨)",
                         suggestion="authentication_webauthn 또는 다른 인증 방식으로 변경 필요"
                     ))
 
@@ -1067,7 +1107,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         for col in columns:
             issues.append(CompatibilityIssue(
-                issue_type=IssueType.REMOVED_SYS_VAR,  # 적절한 타입 사용
+                issue_type=IssueType.YEAR2_TYPE,
                 severity="error",
                 location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
                 description="YEAR(2) 타입 사용 - MySQL 8.0에서 제거됨",
@@ -1114,7 +1154,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
             if engine in deprecated_engines:
                 severity, suggestion = deprecated_engines[engine]
                 issues.append(CompatibilityIssue(
-                    issue_type=IssueType.DEFAULT_VALUE_CHANGE,  # 적절한 타입 사용
+                    issue_type=IssueType.DEPRECATED_ENGINE,
                     severity=severity,
                     location=f"{schema}.{table['TABLE_NAME']}",
                     description=f"deprecated 스토리지 엔진: {engine}",
@@ -1147,7 +1187,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         for col in columns:
             issues.append(CompatibilityIssue(
-                issue_type=IssueType.DEFAULT_VALUE_CHANGE,
+                issue_type=IssueType.ENUM_EMPTY_VALUE,
                 severity="warning",
                 location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
                 description="ENUM에 빈 문자열('') 정의됨",
@@ -1194,7 +1234,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
                 if count > 0:
                     issues.append(CompatibilityIssue(
-                        issue_type=IssueType.INVALID_DATE,
+                        issue_type=IssueType.TIMESTAMP_RANGE,
                         severity="error",
                         location=f"{schema}.{table}.{column}",
                         description=f"TIMESTAMP 범위 초과 데이터 {count:,}개 (2038년 문제)",
@@ -1204,7 +1244,8 @@ AND `{orphan.child_column}` IS NOT NULL"""
                         fix_query=f"ALTER TABLE `{schema}`.`{table}` MODIFY `{column}` DATETIME;"
                     ))
 
-            except Exception:
+            except Exception as e:
+                self._log(f"    ⏭️ {table}.{column} TIMESTAMP 검사 스킵: {str(e)[:80]}")
                 continue
 
         if issues:
@@ -1419,12 +1460,21 @@ class DumpFileAnalyzer:
             # 4. 인증 플러그인 검사
             for match in AUTH_PLUGIN_PATTERN.finditer(content):
                 plugin = match.group(1).lower()
-                severity = "error" if plugin == "mysql_native_password" else "warning"
+                # removed(fido 계열)=error, disabled(native)=error, deprecated(sha256)=warning
+                if plugin in ('authentication_fido', 'authentication_fido_client'):
+                    severity = "error"
+                    desc = f"{plugin} 플러그인 사용 (8.4에서 제거됨)"
+                elif plugin == 'mysql_native_password':
+                    severity = "error"
+                    desc = f"{plugin} 인증 사용 (8.4에서 기본 비활성화)"
+                else:
+                    severity = "warning"
+                    desc = f"{plugin} 인증 사용 (deprecated)"
                 issues.append(CompatibilityIssue(
                     issue_type=IssueType.AUTH_PLUGIN_ISSUE,
                     severity=severity,
                     location=f"{file_path.name}",
-                    description=f"인증 플러그인: {plugin}",
+                    description=desc,
                     suggestion="caching_sha2_password 사용 권장"
                 ))
 
@@ -1556,7 +1606,8 @@ class DumpFileAnalyzer:
             warning_count = sum(1 for i in result.compatibility_issues if i.severity == "warning")
             info_count = sum(1 for i in result.compatibility_issues if i.severity == "info")
             return error_count, warning_count, info_count
-        except Exception:
+        except Exception as e:
+            self._log(f"  ⚠️ 요약 카운트 오류: {str(e)[:80]}")
             return 0, 0, 0
 
 
@@ -1605,9 +1656,13 @@ class PendingFKCheck:
 
 
 class TwoPassAnalyzer:
-    """2-Pass 덤프 파일 분석기"""
+    """2-Pass 덤프 파일 분석기
 
-    def __init__(self):
+    connector가 없으면 content-based 분석만 수행하고,
+    connector가 주입되면 live DB 기반 규칙 검사도 활성화됩니다.
+    """
+
+    def __init__(self, connector: Optional[MySQLConnector] = None):
         # Pass 1 수집 데이터
         self.table_indexes: Dict[str, List[TableIndexInfo]] = {}
         self.table_charsets: Dict[str, TableCharsetInfo] = {}
@@ -1616,19 +1671,22 @@ class TwoPassAnalyzer:
         # Pass 2 수집 데이터
         self.pending_fk_checks: List[PendingFKCheck] = []
 
+        # DB 커넥터 (옵션 - live DB 규칙 검사용)
+        self.connector = connector
+
         # 파서 (옵션)
         self.sql_parser = None
         if PARSERS_AVAILABLE:
             self.sql_parser = SQLParser()
 
-        # 규칙 모듈 (옵션)
+        # 규칙 모듈 (옵션) - connector가 있으면 live DB 검사도 활성화
         self.data_rules = None
         self.schema_rules = None
         self.storage_rules = None
         if RULES_AVAILABLE:
-            self.data_rules = DataIntegrityRules()
-            self.schema_rules = SchemaRules()
-            self.storage_rules = StorageRules()
+            self.data_rules = DataIntegrityRules(connector=connector)
+            self.schema_rules = SchemaRules(connector=connector)
+            self.storage_rules = StorageRules(connector=connector)
 
         # Fix Query 생성기 (옵션)
         self.fix_generator = None

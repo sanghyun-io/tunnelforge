@@ -5,8 +5,9 @@ mysql-upgrade-checker 프로젝트에서 포팅된 상수와 패턴 정의.
 MySQL 8.0.x → 8.4.x 업그레이드 호환성 검사에 사용.
 """
 import re
+from dataclasses import dataclass
 from enum import Enum
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 # ============================================================
 # MySQL 8.4에서 제거된 시스템 변수 (47개)
@@ -78,12 +79,32 @@ RESERVED_KEYWORDS_80: Tuple[str, ...] = (
 ALL_RESERVED_KEYWORDS: Tuple[str, ...] = RESERVED_KEYWORDS_80 + NEW_RESERVED_KEYWORDS_84
 
 # ============================================================
-# MySQL 8.4에서 제거된 함수 (8개)
+# MySQL 8.4에서 제거된 함수
 # ============================================================
+# 8.0 → 8.4 마이그레이션 시 확인 필요한 모든 제거 함수
+# (8.0.x 마이너 버전에서 이미 제거된 것 포함)
 REMOVED_FUNCTIONS_84: Tuple[str, ...] = (
-    'PASSWORD', 'ENCODE', 'DECODE', 'DES_ENCRYPT', 'DES_DECRYPT',
-    'ENCRYPT', 'OLD_PASSWORD', 'MASTER_POS_WAIT',
+    # Note: MASTER_POS_WAIT는 8.4에서 deprecated alias이지 removed가 아님 → DEPRECATED_FUNCTIONS_84로 이동
 )
+
+# 8.4에서 deprecated된 함수 (아직 동작하나 deprecated 경고)
+DEPRECATED_FUNCTIONS_84: Tuple[str, ...] = (
+    'MASTER_POS_WAIT',  # deprecated alias, SOURCE_POS_WAIT() 사용 권장
+)
+
+# 8.0.x 마이너 버전에서 이미 제거된 함수 (8.0 → 8.4 마이그레이션 시 참고)
+REMOVED_FUNCTIONS_80X: Tuple[str, ...] = (
+    'ENCODE',          # 8.0.3에서 제거
+    'DECODE',          # 8.0.3에서 제거
+    'DES_ENCRYPT',     # 8.0.3에서 제거
+    'DES_DECRYPT',     # 8.0.3에서 제거
+    'ENCRYPT',         # 8.0.3에서 제거
+    'PASSWORD',        # 8.0.11에서 제거
+    'OLD_PASSWORD',    # 5.7에서 제거
+)
+
+# 마이그레이션 검사 시 사용할 전체 제거/deprecated 함수 목록
+ALL_REMOVED_FUNCTIONS: Tuple[str, ...] = REMOVED_FUNCTIONS_84 + REMOVED_FUNCTIONS_80X + DEPRECATED_FUNCTIONS_84
 
 # ============================================================
 # 인증 플러그인 상태
@@ -108,9 +129,7 @@ OBSOLETE_SQL_MODES: Tuple[str, ...] = (
 # 기본값이 변경된 시스템 변수
 # ============================================================
 SYS_VARS_NEW_DEFAULTS_84: Dict[str, Dict[str, str]] = {
-    'binlog_transaction_dependency_tracking': {
-        'old': 'COMMIT_ORDER', 'new': 'removed (use replica_parallel_type)',
-    },
+    # Note: binlog_transaction_dependency_tracking은 REMOVED_SYS_VARS_84에 포함 (제거됨)
     'replica_parallel_workers': {
         'old': '0', 'new': '4',
     },
@@ -137,6 +156,13 @@ SYS_VARS_NEW_DEFAULTS_84: Dict[str, Dict[str, str]] = {
     },
     'group_replication_consistency': {
         'old': 'EVENTUAL', 'new': 'BEFORE_ON_PRIMARY_FAILOVER',
+    },
+    'innodb_change_buffering': {
+        'old': 'all', 'new': 'none',
+    },
+    # Note: log_error_verbosity는 8.4에서도 기본값 2 유지 (변경 없음, 삭제)
+    'explicit_defaults_for_timestamp': {
+        'old': 'OFF', 'new': 'ON',
     },
 }
 
@@ -293,6 +319,25 @@ class IssueType(Enum):
 
 
 # ============================================================
+# 호환성 문제 데이터 클래스 (단일 정의, 전 모듈 공용)
+# ============================================================
+@dataclass
+class CompatibilityIssue:
+    """호환성 문제 - 전 모듈에서 이 클래스를 import하여 사용"""
+    issue_type: IssueType
+    severity: str  # "error", "warning", "info"
+    location: str  # 테이블명 또는 위치
+    description: str
+    suggestion: str
+    fix_query: Optional[str] = None      # 수정 SQL
+    doc_link: Optional[str] = None       # 문서 링크
+    mysql_shell_check_id: Optional[str] = None  # MySQL Shell 체크 ID
+    code_snippet: Optional[str] = None   # 관련 코드
+    table_name: Optional[str] = None     # 테이블명
+    column_name: Optional[str] = None    # 컬럼명
+
+
+# ============================================================
 # 덤프 파일 분석용 정규식 패턴
 # ============================================================
 
@@ -329,7 +374,7 @@ FK_NAME_LENGTH_PATTERN = re.compile(
 
 # mysql_native_password 인증 플러그인
 AUTH_PLUGIN_PATTERN = re.compile(
-    r"IDENTIFIED\s+(?:WITH\s+)?['\"]?(mysql_native_password|sha256_password|authentication_fido)['\"]?",
+    r"IDENTIFIED\s+(?:WITH\s+)?['\"]?(mysql_native_password|sha256_password|authentication_fido|authentication_fido_client)['\"]?",
     re.IGNORECASE
 )
 

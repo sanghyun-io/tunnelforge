@@ -23,11 +23,11 @@ MySQL 8.0 → 8.4 업그레이드 시 스키마 및 객체 관련 호환성 검�
 - S24-S25: Definer 검사
 """
 
-from dataclasses import dataclass
 from typing import List, Optional, Callable, Dict, TYPE_CHECKING
 
 from ..migration_constants import (
     IssueType,
+    CompatibilityIssue,
     INDEX_SIZE_LIMITS,
     CHARSET_BYTES_PER_CHAR,
     MYSQL_SCHEMA_TABLES,
@@ -38,27 +38,11 @@ from ..migration_constants import (
     CONTROL_CHAR_PATTERN,
     BLOB_TEXT_DEFAULT_PATTERN,
     GENERATED_COLUMN_PATTERN,
-    REMOVED_FUNCTIONS_84,
+    ALL_REMOVED_FUNCTIONS,
 )
 
 if TYPE_CHECKING:
     from ..db_connector import MySQLConnector
-
-
-@dataclass
-class CompatibilityIssue:
-    """호환성 문제"""
-    issue_type: IssueType
-    severity: str
-    location: str
-    description: str
-    suggestion: str
-    fix_query: Optional[str] = None
-    doc_link: Optional[str] = None
-    mysql_shell_check_id: Optional[str] = None
-    code_snippet: Optional[str] = None
-    table_name: Optional[str] = None
-    column_name: Optional[str] = None
 
 
 class SchemaRules:
@@ -427,7 +411,7 @@ class SchemaRules:
 
         for match in GENERATED_COLUMN_PATTERN.finditer(content):
             expression = match.group(1).upper()
-            for func in REMOVED_FUNCTIONS_84:
+            for func in ALL_REMOVED_FUNCTIONS:
                 if func in expression:
                     issues.append(CompatibilityIssue(
                         issue_type=IssueType.GENERATED_COLUMN_ISSUE,
