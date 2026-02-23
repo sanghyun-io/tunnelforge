@@ -1,0 +1,230 @@
+name: Auto Version
+
+# PR 라벨 기반 자동 버저닝
+#
+# Job 1 (create-release-pr):
+#   Feature PR에 version:* 라벨 → 머지 시 → Release PR 자동 생성
+#
+# Job 2 (create-release-tag):
+#   Release PR 머지 시 → 태그 생성 → release.yml 트리거
+
+on:
+  pull_request:
+    types: [closed]
+
+# 동시 실행 방지: 버저닝 작업은 직렬로 처리
+concurrency:
+  group: auto-version
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  # ──────────────────────────────────────────────
+  # Job 1: Feature PR 머지 → Release PR 생성
+  # ──────────────────────────────────────────────
+  create-release-pr:
+    # Feature PR이 머지됐고, version:* 라벨 중 하나가 있을 때
+    if: >
+      github.event.pull_request.merged == true &&
+      contains(toJSON(github.event.pull_request.labels.*.name), 'version:')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Detect version label
+        id: detect
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # version:* 라벨 추출
+          VERSION_LABELS=$(echo "$PR_LABELS" | python3 -c "
+          import json, sys
+          labels = json.load(sys.stdin)
+          version_labels = [l for l in labels if l.startswith('version:')]
+          for l in version_labels:
+              print(l)
+          ")
+
+          COUNT=$(echo "$VERSION_LABELS" | grep -c 'version:' || true)
+          echo "감지된 version 라벨 수: $COUNT"
+          echo "$VERSION_LABELS"
+
+          if [ "$COUNT" -gt 1 ]; then
+            echo "ERROR: 복수의 version 라벨이 감지되었습니다: $VERSION_LABELS"
+            # PR 코멘트로 에러 알림
+            gh pr comment "$PR_NUMBER" --body \
+              "⚠️ **Auto-version 실패**: 복수의 version 라벨이 감지되었습니다.
+
+          감지된 라벨: \`$(echo $VERSION_LABELS | tr '\n' ' ')\`
+
+          정확히 **1개**의 version 라벨만 허용됩니다:
+          - \`version:patch\` — 버그 수정 (X.Y.Z+1)
+          - \`version:minor\` — 새 기능 (X.Y+1.0)
+          - \`version:major\` — Breaking changes (X+1.0.0)
+
+          라벨을 수정 후 다음 PR에서 다시 시도하세요."
+            exit 1
+          fi
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "version 라벨 없음. 건너뜁니다."
+            echo "bump_type=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # bump_type 추출 (version:patch → patch)
+          BUMP_TYPE=$(echo "$VERSION_LABELS" | head -1 | sed 's/version://')
+          echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
+          echo "감지된 bump_type: $BUMP_TYPE"
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Bump version (dry-run to get new version)
+        id: bump-preview
+        run: |
+          python scripts/bump_version.py \
+            --bump-type ${{ steps.detect.outputs.bump_type }} \
+            --dry-run >> "$GITHUB_OUTPUT"
+
+      - name: Check idempotency (branch)
+        id: idempotency
+        env:
+          NEW_VERSION: ${{ steps.bump-preview.outputs.new_version }}
+        run: |
+          BRANCH="release/v${NEW_VERSION}"
+          if git ls-remote --heads origin "$BRANCH" | grep -q "$BRANCH"; then
+            echo "브랜치 $BRANCH 가 이미 존재합니다. 건너뜁니다."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump version (actual)
+        if: steps.idempotency.outputs.skip != 'true'
+        id: bump
+        run: |
+          python scripts/bump_version.py \
+            --bump-type ${{ steps.detect.outputs.bump_type }} >> "$GITHUB_OUTPUT"
+
+      - name: Create release branch and PR
+        if: steps.idempotency.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+          BUMP_TYPE: ${{ steps.detect.outputs.bump_type }}
+          SOURCE_PR_NUMBER: ${{ github.event.pull_request.number }}
+          SOURCE_PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          BRANCH="release/v${NEW_VERSION}"
+          git checkout -b "$BRANCH"
+          git add src/version.py pyproject.toml
+          git commit -m "chore: release v${NEW_VERSION}"
+          git push origin "$BRANCH"
+
+          gh pr create \
+            --title "chore: release v${NEW_VERSION}" \
+            --body "## Release v${NEW_VERSION}
+
+          자동 생성된 릴리스 PR입니다.
+
+          | 항목 | 값 |
+          |------|-----|
+          | 버전 bump | \`${BUMP_TYPE}\` |
+          | 소스 PR | #${SOURCE_PR_NUMBER} (${SOURCE_PR_TITLE}) |
+          | 새 버전 | \`v${NEW_VERSION}\` |
+
+          이 PR이 머지되면 태그 \`v${NEW_VERSION}\`이 자동 생성되고 릴리스 빌드가 시작됩니다.
+
+          🤖 Generated by [auto-version.yml](.github/workflows/auto-version.yml)" \
+            --base main \
+            --head "$BRANCH"
+
+          # auto-merge 활성화 (squash merge)
+          gh pr merge "$BRANCH" --auto --squash
+
+  # ──────────────────────────────────────────────
+  # Job 2: Release PR 머지 → 태그 생성
+  # ──────────────────────────────────────────────
+  create-release-tag:
+    # Release PR (제목: "chore: release vX.Y.Z")이 머지됐을 때
+    if: >
+      github.event.pull_request.merged == true &&
+      startsWith(github.event.pull_request.title, 'chore: release v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Extract version from PR title
+        id: extract
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          # "chore: release v1.11.1" → "1.11.1"
+          VERSION=$(echo "$PR_TITLE" | sed 's/chore: release v//')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "추출된 버전: $VERSION"
+
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: main
+          fetch-depth: 0
+
+      - name: Check idempotency (tag)
+        id: idempotency
+        env:
+          VERSION: ${{ steps.extract.outputs.version }}
+        run: |
+          TAG="v${VERSION}"
+          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
+            echo "태그 $TAG 가 이미 존재합니다. 건너뜁니다."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create and push tag
+        if: steps.idempotency.outputs.skip != 'true'
+        env:
+          VERSION: ${{ steps.extract.outputs.version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          TAG="v${VERSION}"
+          git tag -a "$TAG" -m "Release ${TAG}"
+          git push origin "$TAG"
+          echo "태그 ${TAG} 생성 및 push 완료 → release.yml 트리거됨"
