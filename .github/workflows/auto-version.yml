@@ -11,7 +11,7 @@ name: Auto Version
 
 on:
   pull_request:
-    types: [labeled, unlabeled, opened, synchronize, reopened, closed]
+    types: [labeled, unlabeled, closed]
 
 concurrency:
   group: auto-version-${{ github.event.pull_request.number }}
@@ -28,9 +28,7 @@ jobs:
   # 없으면 그냥 통과 — 항상 성공으로 끝나야 머지 가능
   # ──────────────────────────────────────────────
   version-gate:
-    if: >
-      github.event.action != 'closed' &&
-      !startsWith(github.event.pull_request.head.commit.message, 'chore: bump version')
+    if: github.event.action != 'closed'
     runs-on: ubuntu-latest
     timeout-minutes: 10
 
