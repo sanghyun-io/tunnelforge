@@ -164,8 +164,6 @@ jobs:
             --base main \
             --head "$BRANCH"
 
-          # auto-merge 활성화 (squash merge)
-          gh pr merge "$BRANCH" --auto --squash
 
   # ──────────────────────────────────────────────
   # Job 2: Release PR 머지 → 태그 생성
