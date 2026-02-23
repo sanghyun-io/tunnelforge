@@ -37,6 +37,7 @@ from src.ui.dialogs.tunnel_status_dialog import TunnelStatusDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
 from src.core.scheduler import BackupScheduler
 from src.core.tunnel_monitor import TunnelMonitor
+from src.core.mysql_login_path import MysqlLoginPathManager
 
 
 class StartupUpdateCheckerThread(QThread):
@@ -69,6 +70,9 @@ class TunnelManagerUI(QMainWindow):
 
         self._update_checker_thread = None
 
+        # MySQL 로그인 경로 매니저 초기화
+        self._login_path_mgr = MysqlLoginPathManager()
+
         # ThemeManager 초기화
         self._init_theme_manager()
 
@@ -85,6 +89,8 @@ class TunnelManagerUI(QMainWindow):
         self.init_ui()
         self.init_tray()
         self._check_update_on_startup()
+        # 이전 세션 크래시 등으로 남은 로그인 경로 정리 후 자동 연결
+        self._login_path_mgr.cleanup_all_tf_paths()
         self._auto_connect_tunnels()
         logger.info("UI 초기화 완료")
 
@@ -648,6 +654,7 @@ class TunnelManagerUI(QMainWindow):
         if success:
             self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
             self.tray_icon.showMessage("TunnelForge", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
+            self._register_login_path(tunnel_config)
         else:
             self.statusBar().showMessage(f"연결 실패: {msg}")
             QMessageBox.critical(self, "연결 오류", f"터널 연결에 실패했습니다.\n\n원인: {msg}")
@@ -656,8 +663,49 @@ class TunnelManagerUI(QMainWindow):
 
     def stop_tunnel(self, tunnel_config):
         self.engine.stop_tunnel(tunnel_config['id'])
+        self._remove_login_path(tunnel_config)
         self.statusBar().showMessage(f"연결 종료: {tunnel_config['name']}")
         self.refresh_table()
+
+    def _register_login_path(self, tunnel_config):
+        """터널 연결 후 mysql_config_editor에 로그인 경로 등록"""
+        if not self._login_path_mgr.is_available():
+            return
+
+        tid = tunnel_config['id']
+        user, password = self.config_mgr.get_tunnel_credentials(tid)
+        if not user or not password:
+            return
+
+        host, port = self.engine.get_connection_info(tid)
+        if not port:
+            return
+        if not host:
+            host = '127.0.0.1'
+
+        ok, result = self._login_path_mgr.register(port, host, user, password)
+        if ok:
+            logger.info(f"로그인 경로 등록 완료: {result}")
+        else:
+            logger.warning(f"로그인 경로 등록 실패: {result}")
+
+    def _remove_login_path(self, tunnel_config):
+        """터널 종료 후 mysql_config_editor에서 로그인 경로 제거"""
+        if not self._login_path_mgr.is_available():
+            return
+
+        # stop_tunnel 이후엔 engine에서 config가 이미 제거되므로 tunnel_config에서 직접 읽음
+        if tunnel_config.get('connection_mode') == 'direct':
+            port = int(tunnel_config.get('remote_port', 0))
+        else:
+            port = int(tunnel_config.get('local_port', 0))
+
+        if not port:
+            return
+
+        ok, result = self._login_path_mgr.remove(port)
+        if not ok:
+            logger.warning(f"로그인 경로 제거 실패: {result}")
 
     def reload_config(self):
         self.config_data = self.config_mgr.load_config()
@@ -722,6 +770,7 @@ class TunnelManagerUI(QMainWindow):
         if hasattr(self, 'tunnel_monitor') and self.tunnel_monitor:
             self.tunnel_monitor.stop_monitoring()
 
+        self._login_path_mgr.cleanup_all_tf_paths()
         self.engine.stop_all()
         self.tray_icon.hide()
         # 모든 창 닫고 종료
@@ -953,6 +1002,7 @@ class TunnelManagerUI(QMainWindow):
             if success:
                 connected.append(tunnel['name'])
                 logger.info(f"자동 연결 성공: {tunnel['name']}")
+                self._register_login_path(tunnel)
             else:
                 skipped.append((tunnel['name'], msg))
                 logger.warning(f"자동 연결 스킵: {tunnel['name']} - {msg}")
