@@ -152,6 +152,12 @@ class FakeMySQLConnector:
     def rollback(self):
         self._rolled_back = True
 
+    def get_session_sql_mode(self) -> str:
+        return ''
+
+    def set_session_sql_mode(self, mode: str) -> bool:
+        return True
+
 
 @pytest.fixture
 def fake_connector():
