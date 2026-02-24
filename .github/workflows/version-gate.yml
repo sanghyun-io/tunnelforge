@@ -84,18 +84,20 @@ jobs:
             echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
           fi
 
-          # PR 커밋 히스토리 체크 (페이지네이션 적용)
+          # PR 커밋 히스토리 체크 (페이지네이션 적용, 최신 bump만 검증)
           BUMP_MSGS=$(gh api --paginate \
             "repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits" \
             --jq '.[].commit.message' | grep "^chore: bump version" || true)
           if [ -n "$BUMP_MSGS" ]; then
-            if echo "$BUMP_MSGS" | grep -q "\[$BUMP_TYPE\]" || \
-               ! echo "$BUMP_MSGS" | grep -qE "\[(patch|minor|major)\]"; then
-              echo "PR에 이미 bump 커밋 존재 (타입 일치 또는 레거시). 체크 통과."
+            # 최신 bump 커밋만 확인 (API는 시간순 반환, tail -1 = 가장 최근)
+            LATEST_BUMP=$(echo "$BUMP_MSGS" | tail -1)
+            if echo "$LATEST_BUMP" | grep -q "\[$BUMP_TYPE\]" || \
+               ! echo "$LATEST_BUMP" | grep -qE "\[(patch|minor|major)\]"; then
+              echo "PR의 최신 bump 커밋이 현재 라벨과 일치 (또는 레거시). 체크 통과."
               echo "bump_type=" >> "$GITHUB_OUTPUT"
               exit 0
             fi
-            echo "기존 bump 커밋이 현재 라벨과 불일치. 재bump 필요."
+            echo "최신 bump 커밋이 현재 라벨과 불일치. 재bump 필요."
             echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
           fi
 
