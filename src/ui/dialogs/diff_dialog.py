@@ -242,19 +242,24 @@ class SchemaDiffDialog(QDialog):
             schema_combo.addItem("(터널 연결 필요)")
             return
 
-        # 연결 정보 가져오기
-        conn_info = self.tunnel_engine.get_connection_info(tunnel_id)
-        if not conn_info:
+        # 연결 정보 가져오기 (tuple: host, port)
+        host, port = self.tunnel_engine.get_connection_info(tunnel_id)
+        if not host:
             schema_combo.addItem("(연결 정보 없음)")
             return
 
+        # DB 자격 증명 조회
+        db_user, db_password = self.config_manager.get_tunnel_credentials(tunnel_id)
+        if not db_user:
+            schema_combo.addItem("(자격 증명 없음)")
+            return
+
         # DB 연결
+        connector = None
         try:
             connector = MySQLConnector(
-                host=conn_info.get('host', '127.0.0.1'),
-                port=conn_info.get('local_port', 3306),
-                user=conn_info.get('db_user', 'root'),
-                password=conn_info.get('db_password', '')
+                host=host, port=port,
+                user=db_user, password=db_password
             )
 
             success, msg = connector.connect()
@@ -267,11 +272,15 @@ class SchemaDiffDialog(QDialog):
             for schema_name in schemas:
                 schema_combo.addItem(schema_name)
 
-            connector.disconnect()
-
         except Exception as e:
             logger.error(f"스키마 로드 실패: {e}")
             schema_combo.addItem("(오류)")
+        finally:
+            if connector:
+                try:
+                    connector.disconnect()
+                except Exception:
+                    pass
 
     def _start_compare(self):
         """비교 시작"""
@@ -290,24 +299,23 @@ class SchemaDiffDialog(QDialog):
 
         # 연결 생성
         try:
-            source_conn = self.tunnel_engine.get_connection_info(source_tunnel_id)
-            target_conn = self.tunnel_engine.get_connection_info(target_tunnel_id)
+            source_host, source_port = self.tunnel_engine.get_connection_info(source_tunnel_id)
+            source_user, source_pw = self.config_manager.get_tunnel_credentials(source_tunnel_id)
+
+            target_host, target_port = self.tunnel_engine.get_connection_info(target_tunnel_id)
+            target_user, target_pw = self.config_manager.get_tunnel_credentials(target_tunnel_id)
 
             self._source_connector = MySQLConnector(
-                host=source_conn.get('host', '127.0.0.1'),
-                port=source_conn.get('local_port', 3306),
-                user=source_conn.get('db_user', 'root'),
-                password=source_conn.get('db_password', '')
+                host=source_host, port=source_port,
+                user=source_user, password=source_pw
             )
             success, _ = self._source_connector.connect()
             if not success:
                 raise Exception("소스 연결 실패")
 
             self._target_connector = MySQLConnector(
-                host=target_conn.get('host', '127.0.0.1'),
-                port=target_conn.get('local_port', 3306),
-                user=target_conn.get('db_user', 'root'),
-                password=target_conn.get('db_password', '')
+                host=target_host, port=target_port,
+                user=target_user, password=target_pw
             )
             success, _ = self._target_connector.connect()
             if not success:
