@@ -6,14 +6,14 @@ stdin 파이프가 통하지 않습니다. 대신 Python cryptography 라이브�
 .mylogin.cnf 파일을 직접 읽고 써서 subprocess 없이 동작합니다.
 
 파일 포맷 (MySQL 공식 binary format):
-  [4 bytes] key_len (uint32 LE, 보통 20)
-  [key_len bytes] random login_key
-  [반복]:
-    [4 bytes] plaintext_len (uint32 LE)
-    [ceil(plaintext_len/16)*16 bytes] AES-128-ECB 암호화 데이터 (NULL 패딩)
+  [4 bytes] unused (0x00000000, 읽기 시 무시)
+  [20 bytes] random login_key
+  [줄 단위 반복]:
+    [4 bytes uint32 LE] ciphertext 길이
+    [ciphertext 길이 bytes] AES-128-ECB + PKCS#7 패딩으로 암호화된 1줄
 
 AES 키 = login_key 바이트를 16바이트에 XOR 누적한 값
-패딩 방식: MySQL NULL padding — trailing \\x00으로 16바이트 정렬
+패딩 방식: PKCS#7 (mysql_config_editor / mysql CLI와 호환)
 """
 import os
 import struct
@@ -28,7 +28,7 @@ logger = get_logger('mysql_login_path')
 
 _PREFIX = 'tf_'
 _KEY_LEN = 20        # login key 길이 (고정)
-_HEADER_LEN = 4      # 파일 앞 4바이트 reserved/version (= 0x00000000)
+_HEADER_LEN = 4      # 파일 앞 4바이트 key_len (uint32 LE, = _KEY_LEN)
 _KEY_OFFSET = _HEADER_LEN          # key 시작 위치
 _DATA_OFFSET = _KEY_OFFSET + _KEY_LEN  # 데이터 섹션 시작 위치 (= 24)
 
@@ -60,13 +60,13 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
     .mylogin.cnf 복호화.
 
     파일 포맷:
-      [4 bytes]  reserved (= 0x00000000)
+      [4 bytes]  unused (읽기 시 무시)
       [20 bytes] login key
       [줄 단위 반복]:
         [4 bytes uint32 LE] ciphertext 길이
-        [ciphertext 길이 bytes] AES-128-ECB + NULL padding으로 암호화된 1줄
+        [ciphertext 길이 bytes] AES-128-ECB + PKCS#7 패딩 암호화된 1줄
 
-    패딩 방식: MySQL NULL padding — trailing \\x00 제거 (PKCS#7 아님)
+    PKCS#7 unpadding 시도 후 실패하면 legacy NULL padding으로 fallback.
 
     Returns:
         (login_key, ini_text) — 파일 없으면 (새 랜덤 키, '')
@@ -81,6 +81,7 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
         return secrets.token_bytes(_KEY_LEN), ''
 
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
 
     login_key = raw[_KEY_OFFSET:_DATA_OFFSET]
     aes_key = _derive_aes_key(login_key)
@@ -98,8 +99,12 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
             cipher = Cipher(algorithms.AES(aes_key), modes.ECB())
             dec = cipher.decryptor()
             padded_plain = dec.update(ciphertext) + dec.finalize()
-            # MySQL NULL padding: trailing \x00 제거
-            plain = padded_plain.rstrip(b'\x00')
+            # PKCS#7 unpadding 시도, 실패 시 legacy NULL padding fallback
+            try:
+                unpadder = PKCS7(128).unpadder()
+                plain = unpadder.update(padded_plain) + unpadder.finalize()
+            except ValueError:
+                plain = padded_plain.rstrip(b'\x00')
             lines.append(plain.decode('utf-8', errors='replace'))
         except Exception as e:
             # 포맷 불일치(이전 버전, 손상 등) 시 해당 청크만 건너뜀
@@ -110,12 +115,14 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
 
 
 def _write_cnf(login_key: bytes, ini_text: str, path: str = _MYLOGIN_CNF):
-    """INI 텍스트를 줄 단위로 AES-128-ECB + NULL 패딩으로 암호화하여 .mylogin.cnf 저장.
+    """INI 텍스트를 줄 단위로 AES-128-ECB + PKCS#7 패딩으로 암호화하여 .mylogin.cnf 저장.
 
+    mysql_config_editor / mysql CLI와 호환되는 공식 포맷으로 기록합니다.
     원자적 쓰기: temp 파일에 먼저 쓴 뒤 os.replace()로 교체하여
     쓰기 중단 시 기존 파일을 보존합니다.
     """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography.hazmat.primitives.padding import PKCS7
 
     aes_key = _derive_aes_key(login_key)
 
@@ -132,17 +139,14 @@ def _write_cnf(login_key: bytes, ini_text: str, path: str = _MYLOGIN_CNF):
     tmp_path = path + '.tmp'
     try:
         with open(tmp_path, 'wb') as f:
-            f.write(b'\x00' * _HEADER_LEN)  # 4바이트 reserved
+            f.write(b'\x00' * _HEADER_LEN)  # 4바이트 unused (MySQL 공식: 0)
             f.write(login_key)
 
-            # 줄 단위 개별 암호화 (MySQL NULL padding: 16바이트 정렬)
+            # 줄 단위 개별 암호화 (PKCS#7 패딩: mysql_config_editor 호환)
             for line in text.splitlines(keepends=True):
                 plain = line.encode('utf-8')
-                # NULL 패딩: 16배수가 아니면 \x00으로 채움
-                pad_len = 16 - (len(plain) % 16)
-                if pad_len == 16:
-                    pad_len = 0  # 이미 16배수이면 패딩 불필요
-                padded = plain + b'\x00' * pad_len
+                padder = PKCS7(128).padder()
+                padded = padder.update(plain) + padder.finalize()
 
                 enc = Cipher(algorithms.AES(aes_key), modes.ECB()).encryptor()
                 ciphertext = enc.update(padded) + enc.finalize()
@@ -151,7 +155,15 @@ def _write_cnf(login_key: bytes, ini_text: str, path: str = _MYLOGIN_CNF):
                 f.write(ciphertext)
 
         # 원자적 교체: rename 기반으로 기존 파일 보호
-        os.replace(tmp_path, path)
+        try:
+            os.replace(tmp_path, path)
+        except OSError:
+            # Windows에서 os.replace()가 WinError 5로 실패할 수 있음
+            # (MoveFileExW MOVEFILE_REPLACE_EXISTING 권한 문제)
+            # fallback: remove + rename
+            if os.path.exists(path):
+                os.remove(path)
+            os.rename(tmp_path, path)
     except Exception:
         # 쓰기 실패 시 temp 파일 정리
         try:

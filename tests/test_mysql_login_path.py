@@ -172,33 +172,31 @@ class TestMissingFile:
 # ---------------------------------------------------------------------------
 
 class TestAtomicWrite:
-    def test_write_interrupted_existing_file_preserved(self, cnf_path, monkeypatch):
-        """쓰기 중 os.replace 실패 시 기존 파일 내용이 보존돼야 함"""
+    def test_write_replace_fails_fallback_succeeds(self, cnf_path, monkeypatch):
+        """os.replace 실패 시 remove+rename fallback으로 정상 쓰기돼야 함"""
         # 1. 초기 상태 쓰기
         login_key = secrets.token_bytes(_KEY_LEN)
         initial_sections = {'tf_3306': {'host': '127.0.0.1', 'user': 'root', 'password': 'pw', 'port': '3306'}}
         _write_cnf(login_key, _build_ini(initial_sections), path=cnf_path)
 
-        # 2. os.replace를 실패하도록 주입
+        # 2. os.replace만 실패하도록 주입 (fallback rename은 정상 동작)
         def fail_replace(src, dst):
-            raise OSError("simulated disk full")
+            raise OSError("simulated replace failure")
 
         monkeypatch.setattr(os, 'replace', fail_replace)
 
-        # 3. 새 엔트리 쓰기 시도 — 실패해야 함
+        # 3. 새 엔트리 쓰기 — fallback으로 성공해야 함
         new_sections = {'tf_3307': {'host': '127.0.0.1', 'user': 'admin', 'password': 'pw2', 'port': '3307'}}
-        with pytest.raises(OSError):
-            _write_cnf(login_key, _build_ini(new_sections), path=cnf_path)
+        _write_cnf(login_key, _build_ini(new_sections), path=cnf_path)
 
-        # 4. temp 파일이 남아있지 않아야 함 (cleanup 확인)
-        assert not os.path.exists(cnf_path + '.tmp'), "쓰기 실패 후 temp 파일이 남아있음"
+        # 4. temp 파일이 남아있지 않아야 함
+        assert not os.path.exists(cnf_path + '.tmp'), "fallback 후 temp 파일이 남아있음"
 
-        # 5. 기존 파일 내용이 보존돼야 함
+        # 5. 새 내용이 반영돼야 함
         monkeypatch.undo()
         _, ini_text = _read_cnf(path=cnf_path)
         parsed = _parse_ini(ini_text)
-        assert 'tf_3306' in parsed, "쓰기 실패 후 기존 엔트리가 손실됨"
-        assert 'tf_3307' not in parsed, "실패한 쓰기의 내용이 반영됨"
+        assert 'tf_3307' in parsed, "fallback 쓰기 후 새 엔트리가 없음"
 
     def test_no_tmp_file_on_success(self, cnf_path):
         """정상 쓰기 후 temp 파일이 남아있지 않아야 함"""
