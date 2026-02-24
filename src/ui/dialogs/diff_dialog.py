@@ -390,13 +390,13 @@ class SchemaDiffDialog(QDialog):
             if self._source_connector:
                 try:
                     self._source_connector.disconnect()
-                except:
+                except Exception:
                     pass
                 self._source_connector = None
             if self._target_connector:
                 try:
                     self._target_connector.disconnect()
-                except:
+                except Exception:
                     pass
                 self._target_connector = None
             QMessageBox.critical(self, "연결 오류", f"DB 연결 실패: {e}")
@@ -721,13 +721,13 @@ class SchemaDiffDialog(QDialog):
         if self._source_connector:
             try:
                 self._source_connector.disconnect()
-            except:
+            except Exception:
                 pass
 
         if self._target_connector:
             try:
                 self._target_connector.disconnect()
-            except:
+            except Exception:
                 pass
 
         super().closeEvent(event)
