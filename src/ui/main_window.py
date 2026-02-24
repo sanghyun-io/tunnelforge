@@ -662,8 +662,11 @@ class TunnelManagerUI(QMainWindow):
         self.refresh_table()
 
     def stop_tunnel(self, tunnel_config):
-        self.engine.stop_tunnel(tunnel_config['id'])
-        self._remove_login_path(tunnel_config)
+        tid = tunnel_config['id']
+        # engine stop 전에 실제 활성 포트 저장 (stop 후엔 engine에서 조회 불가)
+        _, active_port = self.engine.get_connection_info(tid)
+        self.engine.stop_tunnel(tid)
+        self._remove_login_path(tunnel_config, active_port)
         self.statusBar().showMessage(f"연결 종료: {tunnel_config['name']}")
         self.refresh_table()
 
@@ -689,13 +692,19 @@ class TunnelManagerUI(QMainWindow):
         else:
             logger.warning(f"로그인 경로 등록 실패: {result}")
 
-    def _remove_login_path(self, tunnel_config):
-        """터널 종료 후 mysql_config_editor에서 로그인 경로 제거"""
+    def _remove_login_path(self, tunnel_config, active_port=None):
+        """터널 종료 후 mysql_config_editor에서 로그인 경로 제거.
+
+        active_port: stop_tunnel() 전에 engine.get_connection_info()로 가져온 실제 포트.
+                     전달되면 tunnel_config 기반 폴백보다 우선 사용.
+        """
         if not self._login_path_mgr.is_available():
             return
 
-        # stop_tunnel 이후엔 engine에서 config가 이미 제거되므로 tunnel_config에서 직접 읽음
-        if tunnel_config.get('connection_mode') == 'direct':
+        if active_port:
+            port = active_port
+        elif tunnel_config.get('connection_mode') == 'direct':
+            # stop 후엔 engine에서 조회 불가 — tunnel_config에서 직접 읽음
             port = int(tunnel_config.get('remote_port', 0))
         else:
             port = int(tunnel_config.get('local_port', 0))

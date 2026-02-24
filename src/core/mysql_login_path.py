@@ -10,15 +10,16 @@ stdin 파이프가 통하지 않습니다. 대신 Python cryptography 라이브�
   [key_len bytes] random login_key
   [반복]:
     [4 bytes] plaintext_len (uint32 LE)
-    [ceil(plaintext_len/16)*16 bytes] AES-128-ECB 암호화 데이터 (null 패딩)
+    [ceil(plaintext_len/16)*16 bytes] AES-128-ECB 암호화 데이터 (NULL 패딩)
 
 AES 키 = login_key 바이트를 16바이트에 XOR 누적한 값
+패딩 방식: MySQL NULL padding — trailing \\x00으로 16바이트 정렬
 """
 import os
 import struct
 import secrets
+import threading
 import configparser
-from io import StringIO
 from typing import Dict, Tuple
 
 from src.core.logger import get_logger
@@ -63,7 +64,9 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
       [20 bytes] login key
       [줄 단위 반복]:
         [4 bytes uint32 LE] ciphertext 길이
-        [ciphertext 길이 bytes] AES-128-ECB + PKCS#7 패딩으로 암호화된 1줄
+        [ciphertext 길이 bytes] AES-128-ECB + NULL padding으로 암호화된 1줄
+
+    패딩 방식: MySQL NULL padding — trailing \\x00 제거 (PKCS#7 아님)
 
     Returns:
         (login_key, ini_text) — 파일 없으면 (새 랜덤 키, '')
@@ -77,9 +80,7 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
     if len(raw) < _DATA_OFFSET:
         return secrets.token_bytes(_KEY_LEN), ''
 
-    from cryptography.hazmat.primitives import padding as aes_padding
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
 
     login_key = raw[_KEY_OFFSET:_DATA_OFFSET]
     aes_key = _derive_aes_key(login_key)
@@ -94,26 +95,27 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
         offset += cipher_len
 
         try:
-            cipher = Cipher(algorithms.AES(aes_key), modes.ECB(), backend=default_backend())
+            cipher = Cipher(algorithms.AES(aes_key), modes.ECB())
             dec = cipher.decryptor()
             padded_plain = dec.update(ciphertext) + dec.finalize()
-
-            unpadder = aes_padding.PKCS7(128).unpadder()
-            plain = unpadder.update(padded_plain) + unpadder.finalize()
+            # MySQL NULL padding: trailing \x00 제거
+            plain = padded_plain.rstrip(b'\x00')
             lines.append(plain.decode('utf-8', errors='replace'))
-        except Exception:
-            # 포맷 불일치(이전 버전 등) 시 해당 청크 무시하고 빈 섹션으로 처리
-            lines.clear()
-            break
+        except Exception as e:
+            # 포맷 불일치(이전 버전, 손상 등) 시 해당 청크만 건너뜀
+            logger.warning(f"MySQL login path 청크 복호화 실패 (건너뜀): {e}")
+            continue
 
     return login_key, ''.join(lines)
 
 
 def _write_cnf(login_key: bytes, ini_text: str, path: str = _MYLOGIN_CNF):
-    """INI 텍스트를 줄 단위로 AES-128-ECB + PKCS#7로 암호화하여 .mylogin.cnf 저장"""
-    from cryptography.hazmat.primitives import padding as aes_padding
+    """INI 텍스트를 줄 단위로 AES-128-ECB + NULL 패딩으로 암호화하여 .mylogin.cnf 저장.
+
+    원자적 쓰기: temp 파일에 먼저 쓴 뒤 os.replace()로 교체하여
+    쓰기 중단 시 기존 파일을 보존합니다.
+    """
     from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-    from cryptography.hazmat.backends import default_backend
 
     aes_key = _derive_aes_key(login_key)
 
@@ -122,22 +124,42 @@ def _write_cnf(login_key: bytes, ini_text: str, path: str = _MYLOGIN_CNF):
     if text and not text.endswith('\n'):
         text += '\n'
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, 'wb') as f:
-        f.write(b'\x00' * _HEADER_LEN)  # 4바이트 reserved
-        f.write(login_key)
+    # dirname guard: 부모 디렉토리가 없으면 생성
+    parent_dir = os.path.dirname(path)
+    if parent_dir:
+        os.makedirs(parent_dir, exist_ok=True)
 
-        # 줄 단위 개별 암호화
-        for line in text.splitlines(keepends=True):
-            plain = line.encode('utf-8')
-            padder = aes_padding.PKCS7(128).padder()
-            padded = padder.update(plain) + padder.finalize()
+    tmp_path = path + '.tmp'
+    try:
+        with open(tmp_path, 'wb') as f:
+            f.write(b'\x00' * _HEADER_LEN)  # 4바이트 reserved
+            f.write(login_key)
 
-            enc = Cipher(algorithms.AES(aes_key), modes.ECB(), backend=default_backend()).encryptor()
-            ciphertext = enc.update(padded) + enc.finalize()
+            # 줄 단위 개별 암호화 (MySQL NULL padding: 16바이트 정렬)
+            for line in text.splitlines(keepends=True):
+                plain = line.encode('utf-8')
+                # NULL 패딩: 16배수가 아니면 \x00으로 채움
+                pad_len = 16 - (len(plain) % 16)
+                if pad_len == 16:
+                    pad_len = 0  # 이미 16배수이면 패딩 불필요
+                padded = plain + b'\x00' * pad_len
 
-            f.write(struct.pack('<I', len(ciphertext)))
-            f.write(ciphertext)
+                enc = Cipher(algorithms.AES(aes_key), modes.ECB()).encryptor()
+                ciphertext = enc.update(padded) + enc.finalize()
+
+                f.write(struct.pack('<I', len(ciphertext)))
+                f.write(ciphertext)
+
+        # 원자적 교체: rename 기반으로 기존 파일 보호
+        os.replace(tmp_path, path)
+    except Exception:
+        # 쓰기 실패 시 temp 파일 정리
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError as cleanup_err:
+            logger.debug(f"임시 파일 정리 실패: {cleanup_err}")
+        raise
 
     if os.name != 'nt':
         os.chmod(path, 0o600)
@@ -180,6 +202,11 @@ class MysqlLoginPathManager:
         mgr.cleanup_all_tf_paths()  # tf_ 전체 제거
     """
 
+    def __init__(self, cnf_path: str = None):
+        # in-process 동시 접근 보호 (파일 수준 원자성은 _write_cnf의 os.replace()로 보장)
+        self._lock = threading.Lock()
+        self._cnf_path = cnf_path or _MYLOGIN_CNF
+
     def is_available(self) -> bool:
         """cryptography 라이브러리 사용 가능 여부 (의존성으로 항상 True)"""
         try:
@@ -210,15 +237,16 @@ class MysqlLoginPathManager:
 
         login_path = self.get_login_path_name(port)
         try:
-            login_key, ini_text = _read_cnf()
-            sections = _parse_ini(ini_text)
-            sections[login_path] = {
-                'host': host,
-                'user': user,
-                'password': password,
-                'port': str(port),
-            }
-            _write_cnf(login_key, _build_ini(sections))
+            with self._lock:
+                login_key, ini_text = _read_cnf(path=self._cnf_path)
+                sections = _parse_ini(ini_text)
+                sections[login_path] = {
+                    'host': host,
+                    'user': user,
+                    'password': password,
+                    'port': str(port),
+                }
+                _write_cnf(login_key, _build_ini(sections), path=self._cnf_path)
             logger.info(f"MySQL 로그인 경로 등록: {login_path} ({host}:{port})")
             return True, login_path
         except Exception as e:
@@ -232,12 +260,13 @@ class MysqlLoginPathManager:
         """
         login_path = self.get_login_path_name(port)
         try:
-            login_key, ini_text = _read_cnf()
-            sections = _parse_ini(ini_text)
-            if login_path not in sections:
-                return True, login_path  # 이미 없음
-            del sections[login_path]
-            _write_cnf(login_key, _build_ini(sections))
+            with self._lock:
+                login_key, ini_text = _read_cnf(path=self._cnf_path)
+                sections = _parse_ini(ini_text)
+                if login_path not in sections:
+                    return True, login_path  # 이미 없음
+                del sections[login_path]
+                _write_cnf(login_key, _build_ini(sections), path=self._cnf_path)
             logger.info(f"MySQL 로그인 경로 제거: {login_path}")
             return True, login_path
         except Exception as e:
@@ -252,15 +281,17 @@ class MysqlLoginPathManager:
             제거된 경로 수
         """
         try:
-            login_key, ini_text = _read_cnf()
-            sections = _parse_ini(ini_text)
-            tf_keys = [s for s in sections if s.startswith(_PREFIX)]
-            if not tf_keys:
-                return 0
-            for k in tf_keys:
-                del sections[k]
-                logger.info(f"MySQL 로그인 경로 정리: {k}")
-            _write_cnf(login_key, _build_ini(sections))
-            return len(tf_keys)
-        except Exception:
+            with self._lock:
+                login_key, ini_text = _read_cnf(path=self._cnf_path)
+                sections = _parse_ini(ini_text)
+                tf_keys = [s for s in sections if s.startswith(_PREFIX)]
+                if not tf_keys:
+                    return 0
+                for k in tf_keys:
+                    del sections[k]
+                    logger.info(f"MySQL 로그인 경로 정리: {k}")
+                _write_cnf(login_key, _build_ini(sections), path=self._cnf_path)
+                return len(tf_keys)
+        except Exception as e:
+            logger.warning(f"MySQL 로그인 경로 cleanup 실패: {e}")
             return 0
