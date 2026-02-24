@@ -459,8 +459,8 @@ class TestCompareLevelIntegration:
         )
 
         table_diff = diffs[0]
-        # 인덱스/FK 비교가 포함됨
-        assert len(table_diff.index_diffs) > 0 or len(table_diff.fk_diffs) > 0 or True
+        # 인덱스/FK 비교가 포함됨 (Standard에서는 인덱스 비교 수행)
+        assert len(table_diff.index_diffs) > 0
         # Standard에서는 charset/collation 비교 안 함
         for col_diff in table_diff.column_diffs:
             for d in col_diff.differences:
