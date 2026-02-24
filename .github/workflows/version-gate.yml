@@ -39,6 +39,15 @@ jobs:
             exit 0
           fi
 
+          # PR 커밋 히스토리에서 bump 커밋 존재 여부 확인 (HEAD 아닌 커밋 위에 새 커밋이 쌓인 경우 대응)
+          BUMP_EXISTS=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits" \
+            --jq '.[].commit.message' | grep "^chore: bump version" || true)
+          if [ -n "$BUMP_EXISTS" ]; then
+            echo "PR에 이미 bump 커밋 존재. 체크 통과."
+            echo "bump_type=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           VERSION_LABELS=$(echo "$PR_LABELS" | python3 -c "
           import json, sys
           labels = json.load(sys.stdin)
@@ -102,15 +111,18 @@ jobs:
         env:
           BUMP_TYPE: ${{ steps.check.outputs.bump_type }}
         run: |
-          python scripts/bump_version.py --bump-type "$BUMP_TYPE" --dry-run > /tmp/bump_dry.txt
-          EXPECTED=$(grep 'new_version=' /tmp/bump_dry.txt | cut -d= -f2)
+          # main 브랜치의 base 버전과 현재 버전 비교 (이미 bump된 경우 스킵)
+          BASE_VERSION=$(git show origin/main:src/version.py | grep '__version__' | cut -d'"' -f2)
           CURRENT=$(grep '__version__' src/version.py | cut -d'"' -f2)
-          echo "현재 버전: $CURRENT / 예상 bump 버전: $EXPECTED"
+          echo "base 버전(main): $BASE_VERSION / 현재 버전: $CURRENT"
 
-          if [ "$CURRENT" = "$EXPECTED" ]; then
-            echo "이미 bump 완료. 건너뜁니다."
+          if [ "$BASE_VERSION" != "$CURRENT" ]; then
+            echo "버전이 이미 변경됨 ($BASE_VERSION → $CURRENT). 건너뜁니다."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            python scripts/bump_version.py --bump-type "$BUMP_TYPE" --dry-run > /tmp/bump_dry.txt
+            EXPECTED=$(grep 'new_version=' /tmp/bump_dry.txt | cut -d= -f2)
+            echo "예상 bump 버전: $EXPECTED"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "new_version=$EXPECTED" >> "$GITHUB_OUTPUT"
           fi
