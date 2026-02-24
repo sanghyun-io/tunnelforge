@@ -1,7 +1,8 @@
 """
 스키마 비교 다이얼로그 테스트
+- _resolve_connection_params(): 연결 파라미터 검증 헬퍼
 - _load_schemas(): tuple 언패킹 + try/finally cleanup 검증
-- _start_compare(): tuple 언패킹 + credentials 조회 검증
+- _start_compare(): 사전 검증 + tuple 언패킹 + credentials 조회 검증
 """
 import pytest
 from unittest.mock import MagicMock, patch, call
@@ -54,6 +55,41 @@ def dialog(sample_tunnels, mock_tunnel_engine, mock_config_manager):
             config_manager=mock_config_manager,
         )
     return dlg
+
+
+# ============================================================
+# _resolve_connection_params() 테스트
+# ============================================================
+
+class TestResolveConnectionParams:
+    """_resolve_connection_params() 헬퍼 테스트"""
+
+    def test_success(self, dialog, mock_tunnel_engine, mock_config_manager):
+        """정상: (True, host, port, user, password) 반환"""
+        result = dialog._resolve_connection_params('tunnel-1')
+        assert result[0] is True
+        assert result[1:] == ('127.0.0.1', 3307, 'testuser', 'testpass')
+
+    def test_tunnel_not_running(self, dialog, mock_tunnel_engine):
+        """터널 미실행 시 실패"""
+        mock_tunnel_engine.is_running.return_value = False
+        result = dialog._resolve_connection_params('tunnel-1')
+        assert result[0] is False
+        assert result[1] == "터널 연결 필요"
+
+    def test_no_host(self, dialog, mock_tunnel_engine):
+        """host가 None일 때 실패"""
+        mock_tunnel_engine.get_connection_info.return_value = (None, None)
+        result = dialog._resolve_connection_params('tunnel-1')
+        assert result[0] is False
+        assert result[1] == "연결 정보 없음"
+
+    def test_no_credentials(self, dialog, mock_config_manager):
+        """자격 증명 없을 때 실패"""
+        mock_config_manager.get_tunnel_credentials.return_value = ('', '')
+        result = dialog._resolve_connection_params('tunnel-1')
+        assert result[0] is False
+        assert result[1] == "자격 증명 없음"
 
 
 # ============================================================
@@ -251,3 +287,64 @@ class TestStartCompare:
 
             # connector가 정리되었는지 확인
             assert dialog._source_connector is None
+
+    def test_source_tunnel_not_running_shows_warning(
+        self, dialog, mock_tunnel_engine
+    ):
+        """소스 터널 미실행 시 경고 메시지 표시 후 리턴"""
+        mock_tunnel_engine.is_running.return_value = False
+
+        with patch('src.ui.dialogs.diff_dialog.QMessageBox') as MockMsg:
+            dialog.source_schema_combo.clear()
+            dialog.source_schema_combo.addItem('db1')
+            dialog.target_schema_combo.clear()
+            dialog.target_schema_combo.addItem('db2')
+
+            dialog._start_compare()
+
+            MockMsg.warning.assert_called_once()
+            assert "소스" in MockMsg.warning.call_args[0][2]
+
+    def test_target_no_credentials_shows_warning(
+        self, dialog, mock_tunnel_engine, mock_config_manager
+    ):
+        """타겟 자격 증명 없을 때 경고 메시지"""
+        # 소스는 정상, 타겟만 credentials 없음
+        mock_config_manager.get_tunnel_credentials.side_effect = [
+            ('user', 'pass'),  # source OK
+            ('', ''),          # target fail
+        ]
+
+        with patch('src.ui.dialogs.diff_dialog.QMessageBox') as MockMsg:
+            dialog.source_schema_combo.clear()
+            dialog.source_schema_combo.addItem('db1')
+            dialog.target_schema_combo.clear()
+            dialog.target_schema_combo.addItem('db2')
+
+            dialog._start_compare()
+
+            MockMsg.warning.assert_called_once()
+            assert "타겟" in MockMsg.warning.call_args[0][2]
+
+    def test_target_connect_failure_cleans_up_both(
+        self, dialog, mock_tunnel_engine, mock_config_manager
+    ):
+        """타겟 연결 실패 시 소스/타겟 모두 정리"""
+        with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConn, \
+             patch('src.ui.dialogs.diff_dialog.QMessageBox'):
+            mock_src = MagicMock()
+            mock_src.connect.return_value = (True, 'OK')
+            mock_tgt = MagicMock()
+            mock_tgt.connect.return_value = (False, '타겟 실패')
+            MockConn.side_effect = [mock_src, mock_tgt]
+
+            dialog.source_schema_combo.clear()
+            dialog.source_schema_combo.addItem('db1')
+            dialog.target_schema_combo.clear()
+            dialog.target_schema_combo.addItem('db2')
+
+            with patch.object(dialog, '_compare_thread', None):
+                dialog._start_compare()
+
+            assert dialog._source_connector is None
+            assert dialog._target_connector is None
