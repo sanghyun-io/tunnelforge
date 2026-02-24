@@ -31,23 +31,7 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # bump 커밋이 HEAD면 즉시 통과 (synchronize 재귀 방지)
-          HEAD_MSG=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}" --jq .commit.message 2>/dev/null || true)
-          if echo "$HEAD_MSG" | grep -q "^chore: bump version"; then
-            echo "HEAD가 bump 커밋. 체크 통과."
-            echo "bump_type=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
-          # PR 커밋 히스토리에서 bump 커밋 존재 여부 확인 (HEAD 아닌 커밋 위에 새 커밋이 쌓인 경우 대응)
-          BUMP_EXISTS=$(gh api "repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits" \
-            --jq '.[].commit.message' | grep "^chore: bump version" || true)
-          if [ -n "$BUMP_EXISTS" ]; then
-            echo "PR에 이미 bump 커밋 존재. 체크 통과."
-            echo "bump_type=" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-
+          # === Step 1: 라벨 검증 (최우선) ===
           VERSION_LABELS=$(echo "$PR_LABELS" | python3 -c "
           import json, sys
           labels = json.load(sys.stdin)
@@ -80,8 +64,42 @@ jobs:
           fi
 
           BUMP_TYPE=$(echo "$VERSION_LABELS" | head -1 | sed 's/version://')
-          echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
           echo "감지된 bump_type: $BUMP_TYPE"
+
+          # === Step 2: 기존 bump 커밋 확인 (라벨 정합성 포함) ===
+          # bump 커밋 메시지에 [patch]/[minor]/[major] 트레일러로 타입 검증.
+          # 트레일러 없는 레거시 bump 커밋도 호환 처리.
+
+          # HEAD 체크 (synchronize 재귀 방지)
+          HEAD_MSG=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}" \
+            --jq .commit.message 2>/dev/null || true)
+          if echo "$HEAD_MSG" | grep -q "^chore: bump version"; then
+            if echo "$HEAD_MSG" | grep -q "\[$BUMP_TYPE\]" || \
+               ! echo "$HEAD_MSG" | grep -qE "\[(patch|minor|major)\]"; then
+              echo "HEAD가 bump 커밋 (타입 일치 또는 레거시). 체크 통과."
+              echo "bump_type=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "HEAD가 다른 타입의 bump 커밋. 재bump 필요."
+            echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          # PR 커밋 히스토리 체크 (페이지네이션 적용)
+          BUMP_MSGS=$(gh api --paginate \
+            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits" \
+            --jq '.[].commit.message' | grep "^chore: bump version" || true)
+          if [ -n "$BUMP_MSGS" ]; then
+            if echo "$BUMP_MSGS" | grep -q "\[$BUMP_TYPE\]" || \
+               ! echo "$BUMP_MSGS" | grep -qE "\[(patch|minor|major)\]"; then
+              echo "PR에 이미 bump 커밋 존재 (타입 일치 또는 레거시). 체크 통과."
+              echo "bump_type=" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            echo "기존 bump 커밋이 현재 라벨과 불일치. 재bump 필요."
+            echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
 
       - name: Generate GitHub App Token
         if: steps.check.outputs.bump_type != ''
@@ -110,16 +128,30 @@ jobs:
         id: bump
         env:
           BUMP_TYPE: ${{ steps.check.outputs.bump_type }}
+          NEEDS_REBUMP: ${{ steps.check.outputs.needs_rebump }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
-          # main 브랜치의 base 버전과 현재 버전 비교 (이미 bump된 경우 스킵)
-          BASE_VERSION=$(git show origin/main:src/version.py | grep '__version__' | cut -d'"' -f2)
-          CURRENT=$(grep '__version__' src/version.py | cut -d'"' -f2)
-          echo "base 버전(main): $BASE_VERSION / 현재 버전: $CURRENT"
+          set -euo pipefail
 
-          if [ "$BASE_VERSION" != "$CURRENT" ]; then
+          # base 브랜치 버전 조회 (동적 — hardcoded origin/main 제거)
+          BASE_VERSION=$(git show "origin/${BASE_REF}:src/version.py" | grep '__version__' | cut -d'"' -f2)
+          CURRENT=$(grep '__version__' src/version.py | cut -d'"' -f2)
+          echo "base 버전(${BASE_REF}): $BASE_VERSION / 현재 버전: $CURRENT"
+
+          # 빈 값 검증 (파싱 실패 시 즉시 실패)
+          if [ -z "$BASE_VERSION" ] || [ -z "$CURRENT" ]; then
+            echo "ERROR: 버전 파싱 실패 (base='$BASE_VERSION', current='$CURRENT')"
+            exit 1
+          fi
+
+          if [ "$BASE_VERSION" != "$CURRENT" ] && [ "$NEEDS_REBUMP" != "true" ]; then
             echo "버전이 이미 변경됨 ($BASE_VERSION → $CURRENT). 건너뜁니다."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
+            if [ "$NEEDS_REBUMP" = "true" ]; then
+              echo "라벨 변경으로 인한 재bump. base 버전으로 복원 후 재bump."
+              git checkout "origin/${BASE_REF}" -- src/version.py pyproject.toml
+            fi
             python scripts/bump_version.py --bump-type "$BUMP_TYPE" --dry-run > /tmp/bump_dry.txt
             EXPECTED=$(grep 'new_version=' /tmp/bump_dry.txt | cut -d= -f2)
             echo "예상 bump 버전: $EXPECTED"
@@ -137,6 +169,6 @@ jobs:
 
           python scripts/bump_version.py --bump-type "${{ steps.check.outputs.bump_type }}"
           git add src/version.py pyproject.toml
-          git commit -m "chore: bump version to v${NEW_VERSION}"
+          git commit -m "chore: bump version to v${NEW_VERSION} [${{ steps.check.outputs.bump_type }}]"
           git push origin "${{ github.event.pull_request.head.ref }}"
           echo "버전 bump 완료: v${NEW_VERSION}"
