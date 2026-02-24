@@ -15,6 +15,10 @@ app = QApplication.instance() or QApplication(sys.argv)
 
 
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
+from src.core.schema_diff import (
+    CompareLevel, SeveritySummary, VersionContext,
+    DiffType, TableDiff, ColumnDiff, ColumnInfo, DiffSeverity,
+)
 
 
 @pytest.fixture
@@ -348,3 +352,58 @@ class TestStartCompare:
 
             assert dialog._source_connector is None
             assert dialog._target_connector is None
+
+
+# ============================================================
+# _on_compare_finished() 테스트
+# ============================================================
+
+class TestOnCompareFinished:
+    """_on_compare_finished() 시그널 인자 변경 반영 테스트"""
+
+    def test_accepts_three_args(self, dialog):
+        """summary, version_ctx 인자 수신 확인"""
+        diffs = [TableDiff(table_name="t1", diff_type=DiffType.UNCHANGED)]
+        summary = SeveritySummary(critical=0, warning=1, info=2)
+        version_ctx = VersionContext(
+            source_version=(8, 4, 6),
+            target_version=(8, 0, 42),
+            source_version_str="8.4.6",
+            target_version_str="8.0.42",
+        )
+
+        dialog._on_compare_finished(diffs, summary, version_ctx)
+
+        assert dialog._diffs == diffs
+        assert dialog._severity_summary == summary
+        assert dialog._version_ctx == version_ctx
+
+    def test_severity_bar_visible_with_issues(self, dialog):
+        """심각도 이슈가 있으면 요약 바 표시"""
+        diffs = [TableDiff(table_name="t1", diff_type=DiffType.ADDED,
+                           source_schema=MagicMock())]
+        summary = SeveritySummary(critical=1, warning=0, info=0)
+        version_ctx = VersionContext()
+
+        dialog._on_compare_finished(diffs, summary, version_ctx)
+
+        # isHidden() 사용: 다이얼로그가 show()되지 않아 isVisible()은 항상 False
+        assert not dialog.severity_bar.isHidden()
+        assert "Critical: 1" in dialog.severity_bar.text()
+
+    def test_severity_bar_hidden_no_issues(self, dialog):
+        """심각도 이슈가 없으면 요약 바 숨김"""
+        diffs = [TableDiff(table_name="t1", diff_type=DiffType.UNCHANGED)]
+        summary = SeveritySummary(critical=0, warning=0, info=0)
+        version_ctx = VersionContext()
+
+        dialog._on_compare_finished(diffs, summary, version_ctx)
+
+        assert dialog.severity_bar.isHidden()
+
+    def test_compare_level_combo_exists(self, dialog):
+        """비교 수준 콤보박스 존재 확인"""
+        assert hasattr(dialog, 'level_combo')
+        assert dialog.level_combo.count() == 3
+        # Standard가 기본값
+        assert dialog.level_combo.currentData() == CompareLevel.STANDARD
