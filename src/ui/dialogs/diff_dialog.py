@@ -18,7 +18,8 @@ from PyQt6.QtGui import QFont, QColor
 
 from src.core.schema_diff import (
     SchemaExtractor, SchemaComparator, SyncScriptGenerator,
-    TableDiff, DiffType
+    TableDiff, DiffType, DiffSeverity, CompareLevel,
+    SeverityClassifier, VersionContext, SeveritySummary
 )
 from src.core.db_connector import MySQLConnector
 from src.core.logger import get_logger
@@ -30,19 +31,30 @@ class SchemaCompareThread(QThread):
     """스키마 비교 백그라운드 스레드"""
 
     progress = pyqtSignal(str)
-    finished = pyqtSignal(list)  # List[TableDiff]
+    finished = pyqtSignal(list, object, object)  # diffs, SeveritySummary, VersionContext
     error = pyqtSignal(str)
 
     def __init__(self, source_connector, target_connector,
-                 source_schema: str, target_schema: str):
+                 source_schema: str, target_schema: str,
+                 compare_level: CompareLevel = CompareLevel.STANDARD):
         super().__init__()
         self.source_connector = source_connector
         self.target_connector = target_connector
         self.source_schema = source_schema
         self.target_schema = target_schema
+        self.compare_level = compare_level
 
     def run(self):
         try:
+            # MySQL 버전 감지
+            self.progress.emit("MySQL 버전 확인 중...")
+            version_ctx = VersionContext(
+                source_version=self.source_connector.get_db_version(),
+                target_version=self.target_connector.get_db_version(),
+                source_version_str=self.source_connector.get_db_version_string(),
+                target_version_str=self.target_connector.get_db_version_string(),
+            )
+
             self.progress.emit("소스 스키마 추출 중...")
             source_extractor = SchemaExtractor(self.source_connector)
             source_tables = source_extractor.extract_all_tables(self.source_schema)
@@ -53,9 +65,16 @@ class SchemaCompareThread(QThread):
 
             self.progress.emit("스키마 비교 중...")
             comparator = SchemaComparator()
-            diffs = comparator.compare_schemas(source_tables, target_tables)
+            diffs = comparator.compare_schemas(
+                source_tables, target_tables, self.compare_level
+            )
 
-            self.finished.emit(diffs)
+            # 심각도 분류
+            self.progress.emit("심각도 분류 중...")
+            classifier = SeverityClassifier(version_ctx)
+            diffs, summary = classifier.classify(diffs)
+
+            self.finished.emit(diffs, summary, version_ctx)
 
         except Exception as e:
             self.error.emit(str(e))
@@ -82,6 +101,8 @@ class SchemaDiffDialog(QDialog):
         self._target_connector = None
         self._diffs = []
         self._compare_thread = None
+        self._severity_summary = None
+        self._version_ctx = None
 
         self._setup_ui()
         self._connect_signals()
@@ -133,6 +154,18 @@ class SchemaDiffDialog(QDialog):
         target_layout.addRow("스키마:", self.target_schema_combo)
 
         conn_layout.addLayout(target_layout)
+
+        # 비교 수준 선택
+        level_layout = QFormLayout()
+        self.level_combo = QComboBox()
+        self.level_combo.addItem("Quick (빠른 비교)", CompareLevel.QUICK)
+        self.level_combo.addItem("Standard (표준)", CompareLevel.STANDARD)
+        self.level_combo.addItem("Strict (엄격)", CompareLevel.STRICT)
+        self.level_combo.setCurrentIndex(1)  # Standard 기본
+        self.level_combo.setMinimumWidth(140)
+        level_layout.addRow("비교 수준:", self.level_combo)
+        conn_layout.addLayout(level_layout)
+
         conn_layout.addStretch()
 
         # 비교 버튼
@@ -154,6 +187,15 @@ class SchemaDiffDialog(QDialog):
         self.progress_label = QLabel("")
         self.progress_label.setStyleSheet("color: #3498db; font-size: 12px;")
         layout.addWidget(self.progress_label)
+
+        # 심각도 요약 바
+        self.severity_bar = QLabel("")
+        self.severity_bar.setStyleSheet(
+            "background-color: #f8f9fa; padding: 6px 12px; "
+            "border-radius: 4px; font-size: 12px;"
+        )
+        self.severity_bar.setVisible(False)
+        layout.addWidget(self.severity_bar)
 
         # 결과 영역 (스플리터)
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -365,12 +407,16 @@ class SchemaDiffDialog(QDialog):
         self.script_btn.setEnabled(False)
         self.diff_tree.clear()
         self.detail_text.clear()
+        self.severity_bar.setVisible(False)
         self.progress_label.setText("비교 시작...")
+
+        # 비교 수준
+        compare_level = self.level_combo.currentData()
 
         # 백그라운드 스레드에서 비교
         self._compare_thread = SchemaCompareThread(
             self._source_connector, self._target_connector,
-            source_schema, target_schema
+            source_schema, target_schema, compare_level
         )
         self._compare_thread.progress.connect(self._on_progress)
         self._compare_thread.finished.connect(self._on_compare_finished)
@@ -381,14 +427,65 @@ class SchemaDiffDialog(QDialog):
         """진행 상태 업데이트"""
         self.progress_label.setText(message)
 
-    def _on_compare_finished(self, diffs: List[TableDiff]):
+    def _on_compare_finished(self, diffs, summary, version_ctx):
         """비교 완료"""
         self._diffs = diffs
+        self._severity_summary = summary
+        self._version_ctx = version_ctx
         self.compare_btn.setEnabled(True)
         self.script_btn.setEnabled(True)
         self.progress_label.setText("비교 완료")
 
+        self._update_severity_bar(summary, version_ctx)
         self._display_results(diffs)
+
+    def _update_severity_bar(self, summary: SeveritySummary, version_ctx: VersionContext):
+        """심각도 요약 바 업데이트"""
+        parts = []
+        if summary.critical > 0:
+            parts.append(f"🔴 Critical: {summary.critical}")
+        if summary.warning > 0:
+            parts.append(f"🟡 Warning: {summary.warning}")
+        if summary.info > 0:
+            parts.append(f"ℹ️ Info: {summary.info}")
+
+        version_info = ""
+        if version_ctx.source_version_str or version_ctx.target_version_str:
+            version_info = (
+                f"  |  소스: MySQL {version_ctx.source_version_str}"
+                f"  →  타겟: MySQL {version_ctx.target_version_str}"
+            )
+
+        if parts:
+            bar_text = " | ".join(parts) + version_info
+
+            # Critical이 있으면 배경색 변경
+            if summary.critical > 0:
+                self.severity_bar.setStyleSheet(
+                    "background-color: #ffeaea; padding: 6px 12px; "
+                    "border-radius: 4px; font-size: 12px; border: 1px solid #f5c6cb;"
+                )
+            else:
+                self.severity_bar.setStyleSheet(
+                    "background-color: #f8f9fa; padding: 6px 12px; "
+                    "border-radius: 4px; font-size: 12px;"
+                )
+
+            self.severity_bar.setText(bar_text)
+            self.severity_bar.setVisible(True)
+        else:
+            self.severity_bar.setVisible(False)
+
+    def _get_severity_icon(self, severity: Optional[DiffSeverity]) -> str:
+        """심각도에 따른 아이콘"""
+        if severity is None:
+            return ""
+        icons = {
+            DiffSeverity.CRITICAL: "🔴",
+            DiffSeverity.WARNING: "🟡",
+            DiffSeverity.INFO: "ℹ️",
+        }
+        return icons.get(severity, "")
 
     def _on_compare_error(self, error: str):
         """비교 오류"""
@@ -437,12 +534,15 @@ class SchemaDiffDialog(QDialog):
                 for col_diff in diff.column_diffs:
                     if col_diff.diff_type != DiffType.UNCHANGED:
                         col_icon = self._get_diff_icon(col_diff.diff_type)
+                        sev_icon = self._get_severity_icon(col_diff.severity)
+                        sev_suffix = f" {sev_icon}" if sev_icon else ""
                         col_item = QTreeWidgetItem([
-                            f"  {col_icon} {col_diff.column_name}",
+                            f"  {col_icon} {col_diff.column_name}{sev_suffix}",
                             col_diff.diff_type.value,
                             ""
                         ])
                         col_item.setData(0, Qt.ItemDataRole.UserRole, col_diff)
+                        self._apply_severity_background(col_item, col_diff.severity)
                         item.addChild(col_item)
 
             # 인덱스 차이
@@ -450,12 +550,15 @@ class SchemaDiffDialog(QDialog):
                 for idx_diff in diff.index_diffs:
                     if idx_diff.diff_type != DiffType.UNCHANGED:
                         idx_icon = self._get_diff_icon(idx_diff.diff_type)
+                        sev_icon = self._get_severity_icon(idx_diff.severity)
+                        sev_suffix = f" {sev_icon}" if sev_icon else ""
                         idx_item = QTreeWidgetItem([
-                            f"  {idx_icon} [IDX] {idx_diff.index_name}",
+                            f"  {idx_icon} [IDX] {idx_diff.index_name}{sev_suffix}",
                             idx_diff.diff_type.value,
                             ""
                         ])
                         idx_item.setData(0, Qt.ItemDataRole.UserRole, idx_diff)
+                        self._apply_severity_background(idx_item, idx_diff.severity)
                         item.addChild(idx_item)
 
             # FK 차이
@@ -463,12 +566,15 @@ class SchemaDiffDialog(QDialog):
                 for fk_diff in diff.fk_diffs:
                     if fk_diff.diff_type != DiffType.UNCHANGED:
                         fk_icon = self._get_diff_icon(fk_diff.diff_type)
+                        sev_icon = self._get_severity_icon(fk_diff.severity)
+                        sev_suffix = f" {sev_icon}" if sev_icon else ""
                         fk_item = QTreeWidgetItem([
-                            f"  {fk_icon} [FK] {fk_diff.fk_name}",
+                            f"  {fk_icon} [FK] {fk_diff.fk_name}{sev_suffix}",
                             fk_diff.diff_type.value,
                             ""
                         ])
                         fk_item.setData(0, Qt.ItemDataRole.UserRole, fk_diff)
+                        self._apply_severity_background(fk_item, fk_diff.severity)
                         item.addChild(fk_item)
 
             self.diff_tree.addTopLevelItem(item)
@@ -482,6 +588,17 @@ class SchemaDiffDialog(QDialog):
             f"총 {len(diffs)}개 테이블: "
             f"🟢 추가 {added}, 🟡 수정 {modified}, 🔴 삭제 {removed}, ⚪ 동일 {unchanged}"
         )
+
+    def _apply_severity_background(
+        self, item: QTreeWidgetItem, severity: Optional[DiffSeverity]
+    ):
+        """심각도에 따라 트리 항목 배경색 설정"""
+        if severity == DiffSeverity.CRITICAL:
+            for col in range(3):
+                item.setBackground(col, QColor("#ffeaea"))
+        elif severity == DiffSeverity.WARNING:
+            for col in range(3):
+                item.setBackground(col, QColor("#fff8e1"))
 
     def _get_diff_icon(self, diff_type: DiffType) -> str:
         """차이 유형에 따른 아이콘"""
@@ -554,6 +671,10 @@ class SchemaDiffDialog(QDialog):
 
         lines.append(f"상태: {diff.diff_type.value}")
 
+        if hasattr(diff, 'severity') and diff.severity:
+            sev_icon = self._get_severity_icon(diff.severity)
+            lines.append(f"심각도: {sev_icon} {diff.severity.value}")
+
         if diff.differences:
             lines.append("\n[변경 내용]")
             for d in diff.differences:
@@ -571,6 +692,20 @@ class SchemaDiffDialog(QDialog):
         """동기화 스크립트 생성"""
         if not self._diffs:
             return
+
+        # Critical 이슈가 있으면 경고
+        if self._severity_summary and self._severity_summary.has_critical:
+            reply = QMessageBox.warning(
+                self,
+                "Critical 이슈 감지",
+                f"🔴 Critical 이슈 {self._severity_summary.critical}건이 발견되었습니다.\n"
+                "Import 실패 위험이 있는 변경 사항이 포함되어 있습니다.\n\n"
+                "그래도 동기화 스크립트를 생성하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         target_schema = self.target_schema_combo.currentText()
         generator = SyncScriptGenerator()

@@ -4,6 +4,7 @@
 - 테이블/컬럼/인덱스/FK 차이 분석
 - 동기화 SQL 스크립트 생성
 """
+import re
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional, Tuple
 from enum import Enum
@@ -11,6 +12,41 @@ from enum import Enum
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
+
+
+class DiffSeverity(Enum):
+    """차이 심각도"""
+    CRITICAL = "critical"   # Import 실패 위험
+    WARNING = "warning"     # 성능/무결성 영향
+    INFO = "info"           # 무시 가능
+
+
+class CompareLevel(Enum):
+    """비교 수준"""
+    QUICK = "quick"         # 테이블/컬럼 존재성, 타입만
+    STANDARD = "standard"   # + 인덱스, FK, 기본값
+    STRICT = "strict"       # + charset, collation
+
+
+@dataclass
+class VersionContext:
+    """MySQL 버전 컨텍스트"""
+    source_version: Tuple[int, int, int] = (0, 0, 0)
+    target_version: Tuple[int, int, int] = (0, 0, 0)
+    source_version_str: str = ""
+    target_version_str: str = ""
+
+
+@dataclass
+class SeveritySummary:
+    """심각도 요약"""
+    critical: int = 0
+    warning: int = 0
+    info: int = 0
+
+    @property
+    def has_critical(self) -> bool:
+        return self.critical > 0
 
 
 class DiffType(Enum):
@@ -139,6 +175,7 @@ class ColumnDiff:
     source_info: Optional[ColumnInfo] = None
     target_info: Optional[ColumnInfo] = None
     differences: List[str] = field(default_factory=list)
+    severity: Optional[DiffSeverity] = None
 
 
 @dataclass
@@ -149,6 +186,7 @@ class IndexDiff:
     source_info: Optional[IndexInfo] = None
     target_info: Optional[IndexInfo] = None
     differences: List[str] = field(default_factory=list)
+    severity: Optional[DiffSeverity] = None
 
 
 @dataclass
@@ -159,6 +197,7 @@ class ForeignKeyDiff:
     source_info: Optional[ForeignKeyInfo] = None
     target_info: Optional[ForeignKeyInfo] = None
     differences: List[str] = field(default_factory=list)
+    severity: Optional[DiffSeverity] = None
 
 
 @dataclass
@@ -173,6 +212,7 @@ class TableDiff:
     fk_diffs: List[ForeignKeyDiff] = field(default_factory=list)
     row_count_source: int = 0
     row_count_target: int = 0
+    severity: Optional[DiffSeverity] = None
 
     def has_differences(self) -> bool:
         """차이가 있는지 확인"""
@@ -422,12 +462,18 @@ class SchemaExtractor:
 class SchemaComparator:
     """스키마 비교기"""
 
-    def compare_tables(self, source: TableSchema, target: TableSchema) -> TableDiff:
+    def compare_tables(
+        self,
+        source: TableSchema,
+        target: TableSchema,
+        compare_level: CompareLevel = CompareLevel.STANDARD
+    ) -> TableDiff:
         """두 테이블 스키마 비교
 
         Args:
             source: 소스 테이블 스키마
             target: 타겟 테이블 스키마
+            compare_level: 비교 수준
 
         Returns:
             TableDiff
@@ -442,13 +488,16 @@ class SchemaComparator:
         )
 
         # 컬럼 비교
-        diff.column_diffs = self._compare_columns(source.columns, target.columns)
+        diff.column_diffs = self._compare_columns(
+            source.columns, target.columns, compare_level
+        )
 
-        # 인덱스 비교
-        diff.index_diffs = self._compare_indexes(source.indexes, target.indexes)
-
-        # FK 비교
-        diff.fk_diffs = self._compare_foreign_keys(source.foreign_keys, target.foreign_keys)
+        # 인덱스/FK 비교 (Quick 모드에서는 스킵)
+        if compare_level in (CompareLevel.STANDARD, CompareLevel.STRICT):
+            diff.index_diffs = self._compare_indexes(source.indexes, target.indexes)
+            diff.fk_diffs = self._compare_foreign_keys(
+                source.foreign_keys, target.foreign_keys
+            )
 
         # 전체 상태 결정
         if diff.has_differences():
@@ -459,13 +508,15 @@ class SchemaComparator:
     def compare_schemas(
         self,
         source_tables: Dict[str, TableSchema],
-        target_tables: Dict[str, TableSchema]
+        target_tables: Dict[str, TableSchema],
+        compare_level: CompareLevel = CompareLevel.STANDARD
     ) -> List[TableDiff]:
         """두 스키마 전체 비교
 
         Args:
             source_tables: 소스 테이블 딕셔너리
             target_tables: 타겟 테이블 딕셔너리
+            compare_level: 비교 수준
 
         Returns:
             TableDiff 목록
@@ -496,7 +547,7 @@ class SchemaComparator:
                 )
             else:
                 # 둘 다 있음 (상세 비교)
-                diff = self.compare_tables(source, target)
+                diff = self.compare_tables(source, target, compare_level)
 
             diffs.append(diff)
 
@@ -505,7 +556,8 @@ class SchemaComparator:
     def _compare_columns(
         self,
         source_cols: List[ColumnInfo],
-        target_cols: List[ColumnInfo]
+        target_cols: List[ColumnInfo],
+        compare_level: CompareLevel = CompareLevel.STANDARD
     ) -> List[ColumnDiff]:
         """컬럼 비교"""
         diffs = []
@@ -535,19 +587,30 @@ class SchemaComparator:
                 # 상세 비교
                 differences = []
 
+                # 타입 비교 (모든 레벨)
                 if src.data_type.lower() != tgt.data_type.lower():
                     differences.append(f"타입: {src.data_type} → {tgt.data_type}")
 
-                if src.nullable != tgt.nullable:
-                    src_null = "NULL" if src.nullable else "NOT NULL"
-                    tgt_null = "NULL" if tgt.nullable else "NOT NULL"
-                    differences.append(f"Nullable: {src_null} → {tgt_null}")
+                # Quick 모드: 타입만 비교
+                if compare_level != CompareLevel.QUICK:
+                    if src.nullable != tgt.nullable:
+                        src_null = "NULL" if src.nullable else "NOT NULL"
+                        tgt_null = "NULL" if tgt.nullable else "NOT NULL"
+                        differences.append(f"Nullable: {src_null} → {tgt_null}")
 
-                if src.default != tgt.default:
-                    differences.append(f"Default: {src.default} → {tgt.default}")
+                    if src.default != tgt.default:
+                        differences.append(f"Default: {src.default} → {tgt.default}")
 
-                if src.extra.lower() != tgt.extra.lower():
-                    differences.append(f"Extra: {src.extra} → {tgt.extra}")
+                    if src.extra.lower() != tgt.extra.lower():
+                        differences.append(f"Extra: {src.extra} → {tgt.extra}")
+
+                # Strict 모드: charset + collation 추가 비교
+                if compare_level == CompareLevel.STRICT:
+                    if src.charset and tgt.charset and src.charset.lower() != tgt.charset.lower():
+                        differences.append(f"Charset: {src.charset} → {tgt.charset}")
+
+                    if src.collation and tgt.collation and src.collation.lower() != tgt.collation.lower():
+                        differences.append(f"Collation: {src.collation} → {tgt.collation}")
 
                 if differences:
                     diffs.append(ColumnDiff(
@@ -684,6 +747,179 @@ class SchemaComparator:
                     ))
 
         return diffs
+
+
+class SeverityClassifier:
+    """비교 결과에 심각도를 부여하는 후처리 레이어"""
+
+    # display width만 다른 integer 계열 타입
+    _INTEGER_TYPES = frozenset([
+        'tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint'
+    ])
+
+    def __init__(self, version_context: Optional[VersionContext] = None):
+        self.version_context = version_context
+
+    def classify(
+        self, diffs: List[TableDiff]
+    ) -> Tuple[List[TableDiff], SeveritySummary]:
+        """비교 결과에 심각도 부여
+
+        Args:
+            diffs: TableDiff 목록
+
+        Returns:
+            (심각도 부여된 diffs, SeveritySummary)
+        """
+        summary = SeveritySummary()
+
+        for table_diff in diffs:
+            # 테이블 레벨 심각도
+            table_diff.severity = self._classify_table(table_diff)
+            if table_diff.severity:
+                self._count(summary, table_diff.severity)
+
+            # 컬럼 심각도
+            for col_diff in table_diff.column_diffs:
+                col_diff.severity = self._classify_column(col_diff)
+                if col_diff.severity:
+                    self._count(summary, col_diff.severity)
+
+            # 인덱스 심각도
+            for idx_diff in table_diff.index_diffs:
+                idx_diff.severity = self._classify_index(idx_diff)
+                if idx_diff.severity:
+                    self._count(summary, idx_diff.severity)
+
+            # FK 심각도
+            for fk_diff in table_diff.fk_diffs:
+                fk_diff.severity = self._classify_fk(fk_diff)
+                if fk_diff.severity:
+                    self._count(summary, fk_diff.severity)
+
+        return diffs, summary
+
+    def _count(self, summary: SeveritySummary, severity: DiffSeverity):
+        """심각도 카운트 증가"""
+        if severity == DiffSeverity.CRITICAL:
+            summary.critical += 1
+        elif severity == DiffSeverity.WARNING:
+            summary.warning += 1
+        elif severity == DiffSeverity.INFO:
+            summary.info += 1
+
+    def _classify_table(self, diff: TableDiff) -> Optional[DiffSeverity]:
+        """테이블 레벨 심각도 분류"""
+        if diff.diff_type in (DiffType.ADDED, DiffType.REMOVED):
+            return DiffSeverity.CRITICAL
+        return None
+
+    def _classify_column(self, diff: ColumnDiff) -> Optional[DiffSeverity]:
+        """컬럼 심각도 분류"""
+        if diff.diff_type == DiffType.UNCHANGED:
+            return None
+        if diff.diff_type in (DiffType.ADDED, DiffType.REMOVED):
+            return DiffSeverity.CRITICAL
+
+        # MODIFIED: 각 변경 항목별 심각도 판단
+        max_severity = None
+
+        for d in diff.differences:
+            if d.startswith("타입:"):
+                sev = self._classify_type_change(d, diff)
+            elif d.startswith("Nullable:"):
+                sev = DiffSeverity.WARNING
+            elif d.startswith("Default:"):
+                sev = DiffSeverity.WARNING
+            elif d.startswith("Extra:"):
+                sev = self._classify_extra_change(d)
+            elif d.startswith("Charset:") or d.startswith("Collation:"):
+                sev = DiffSeverity.WARNING
+            else:
+                sev = DiffSeverity.WARNING
+
+            max_severity = self._max_severity(max_severity, sev)
+
+        return max_severity
+
+    def _classify_type_change(
+        self, diff_text: str, col_diff: ColumnDiff
+    ) -> DiffSeverity:
+        """타입 변경 심각도 판단"""
+        src_type = col_diff.source_info.data_type if col_diff.source_info else ""
+        tgt_type = col_diff.target_info.data_type if col_diff.target_info else ""
+
+        if self._is_display_width_only_diff(src_type, tgt_type):
+            return DiffSeverity.INFO
+
+        # base type이 다르면 Critical
+        src_base = re.sub(r'\(.*?\)', '', src_type).strip().lower()
+        tgt_base = re.sub(r'\(.*?\)', '', tgt_type).strip().lower()
+
+        if src_base != tgt_base:
+            return DiffSeverity.CRITICAL
+
+        # 같은 base type이지만 size/precision이 다른 경우
+        return DiffSeverity.WARNING
+
+    def _is_display_width_only_diff(self, src: str, tgt: str) -> bool:
+        """int(11) vs int 같은 display width만 다른지 확인"""
+        # display width 제거 후 비교
+        src_stripped = re.sub(r'\(\d+\)', '', src).strip().lower()
+        tgt_stripped = re.sub(r'\(\d+\)', '', tgt).strip().lower()
+
+        if src_stripped != tgt_stripped:
+            return False
+
+        # base type이 integer 계열인지 확인
+        # "int unsigned" -> "int"
+        base_type = src_stripped.split()[0] if src_stripped else ""
+        return base_type in self._INTEGER_TYPES
+
+    def _classify_extra_change(self, diff_text: str) -> DiffSeverity:
+        """Extra 필드 변경 심각도 판단"""
+        diff_lower = diff_text.lower()
+        if 'auto_increment' in diff_lower:
+            return DiffSeverity.CRITICAL
+        return DiffSeverity.WARNING
+
+    def _classify_index(self, diff: IndexDiff) -> Optional[DiffSeverity]:
+        """인덱스 심각도 분류"""
+        if diff.diff_type == DiffType.UNCHANGED:
+            return None
+
+        # PRIMARY KEY 변경은 Critical
+        if diff.index_name.upper() == 'PRIMARY':
+            return DiffSeverity.CRITICAL
+
+        # 기타 인덱스 변경은 Warning
+        return DiffSeverity.WARNING
+
+    def _classify_fk(self, diff: ForeignKeyDiff) -> Optional[DiffSeverity]:
+        """FK 심각도 분류"""
+        if diff.diff_type == DiffType.UNCHANGED:
+            return None
+        return DiffSeverity.WARNING
+
+    def _max_severity(
+        self,
+        current: Optional[DiffSeverity],
+        new: Optional[DiffSeverity]
+    ) -> Optional[DiffSeverity]:
+        """두 심각도 중 더 높은 값 반환"""
+        if current is None:
+            return new
+        if new is None:
+            return current
+
+        order = {
+            DiffSeverity.CRITICAL: 3,
+            DiffSeverity.WARNING: 2,
+            DiffSeverity.INFO: 1,
+        }
+        if order.get(new, 0) > order.get(current, 0):
+            return new
+        return current
 
 
 class SyncScriptGenerator:
