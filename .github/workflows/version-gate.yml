@@ -1,0 +1,130 @@
+name: Version Gate
+
+# PR 라벨 기반 버전 bump — 필수 상태 체크
+#
+# version:* 라벨이 있으면 PR 브랜치에 bump 커밋 자동 추가.
+# 브랜치 보호 규칙으로 이 체크가 통과해야만 머지 가능.
+
+on:
+  pull_request:
+    types: [labeled, unlabeled, opened, synchronize, reopened]
+
+concurrency:
+  group: version-gate-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  version-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Check version labels
+        id: check
+        env:
+          PR_LABELS: ${{ toJSON(github.event.pull_request.labels.*.name) }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # bump 커밋이 HEAD면 즉시 통과 (synchronize 재귀 방지)
+          HEAD_MSG=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}" --jq .commit.message 2>/dev/null || true)
+          if echo "$HEAD_MSG" | grep -q "^chore: bump version"; then
+            echo "HEAD가 bump 커밋. 체크 통과."
+            echo "bump_type=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          VERSION_LABELS=$(echo "$PR_LABELS" | python3 -c "
+          import json, sys
+          labels = json.load(sys.stdin)
+          version_labels = [l for l in labels if l.startswith('version:')]
+          for l in version_labels:
+              print(l)
+          ")
+
+          COUNT=$(echo "$VERSION_LABELS" | grep -c 'version:' || true)
+          echo "감지된 version 라벨 수: $COUNT"
+
+          if [ "$COUNT" -gt 1 ]; then
+            echo "ERROR: 복수의 version 라벨 감지: $VERSION_LABELS"
+            gh pr comment "$PR_NUMBER" --body \
+              "⚠️ **Auto-version 실패**: 복수의 version 라벨이 감지되었습니다.
+
+          감지된 라벨: \`$(echo $VERSION_LABELS | tr '\n' ' ')\`
+
+          정확히 **1개**의 version 라벨만 허용됩니다:
+          - \`version:patch\` — 버그 수정 (X.Y.Z+1)
+          - \`version:minor\` — 새 기능 (X.Y+1.0)
+          - \`version:major\` — Breaking changes (X+1.0.0)"
+            exit 1
+          fi
+
+          if [ "$COUNT" -eq 0 ]; then
+            echo "version 라벨 없음. 버전 bump 불필요 — 통과."
+            echo "bump_type=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          BUMP_TYPE=$(echo "$VERSION_LABELS" | head -1 | sed 's/version://')
+          echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
+          echo "감지된 bump_type: $BUMP_TYPE"
+
+      - name: Generate GitHub App Token
+        if: steps.check.outputs.bump_type != ''
+        id: app-token
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Checkout PR branch
+        if: steps.check.outputs.bump_type != ''
+        uses: actions/checkout@v4
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          ref: ${{ github.event.pull_request.head.ref }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        if: steps.check.outputs.bump_type != ''
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Check if already bumped & bump version (idempotent)
+        if: steps.check.outputs.bump_type != ''
+        id: bump
+        env:
+          BUMP_TYPE: ${{ steps.check.outputs.bump_type }}
+        run: |
+          python scripts/bump_version.py --bump-type "$BUMP_TYPE" --dry-run > /tmp/bump_dry.txt
+          EXPECTED=$(grep 'new_version=' /tmp/bump_dry.txt | cut -d= -f2)
+          CURRENT=$(grep '__version__' src/version.py | cut -d'"' -f2)
+          echo "현재 버전: $CURRENT / 예상 bump 버전: $EXPECTED"
+
+          if [ "$CURRENT" = "$EXPECTED" ]; then
+            echo "이미 bump 완료. 건너뜁니다."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "new_version=$EXPECTED" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit and push bump to PR branch
+        if: steps.check.outputs.bump_type != '' && steps.bump.outputs.skip != 'true'
+        env:
+          NEW_VERSION: ${{ steps.bump.outputs.new_version }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          python scripts/bump_version.py --bump-type "${{ steps.check.outputs.bump_type }}"
+          git add src/version.py pyproject.toml
+          git commit -m "chore: bump version to v${NEW_VERSION}"
+          git push origin "${{ github.event.pull_request.head.ref }}"
+          echo "버전 bump 완료: v${NEW_VERSION}"

@@ -4,6 +4,7 @@ One-Click MySQL 8.0 → 8.4 마이그레이션 다이얼로그
 한 번의 클릭으로 Pre-flight → Analysis → Execution → Validation까지
 전체 마이그레이션 프로세스를 자동으로 실행합니다.
 """
+import threading
 from datetime import datetime
 from typing import Optional, List, Any
 
@@ -23,6 +24,7 @@ from src.core.migration_state_tracker import (
     MigrationStateTracker, MigrationState, MigrationPhase, get_state_tracker
 )
 from src.core.migration_validator import PostMigrationValidator, MigrationReport
+from src.core.oneclick_log import create_oneclick_logger, close_oneclick_logger
 
 
 # 스타일 상수
@@ -41,6 +43,7 @@ class OneClickMigrationWorker(QThread):
     log_message = pyqtSignal(str, str)  # message, style
     preflight_result = pyqtSignal(object)  # PreflightResult
     analysis_result = pyqtSignal(int, int, int)  # total, auto_fixable, manual
+    execution_plan_ready = pyqtSignal(object, object)  # steps, summary (Phase 3 완료 후 일시 정지)
     finished = pyqtSignal(bool, object)  # success, MigrationReport
 
     def __init__(
@@ -58,19 +61,32 @@ class OneClickMigrationWorker(QThread):
         self._is_cancelled = False
         self._started_at: Optional[datetime] = None
         self._pre_issues: List[Any] = []
+        self._execution_gate = threading.Event()  # Phase 3→4 사용자 확인 게이트
 
     def cancel(self):
         """작업 취소 요청"""
         self._is_cancelled = True
+        self._execution_gate.set()  # 대기 중이면 즉시 해제
+
+    def resume_execution(self):
+        """실행 재개 (ExecutionPlanWidget에서 호출)"""
+        self._execution_gate.set()
 
     def run(self):
         """전체 프로세스 실행"""
+        _mig_logger = None
+        _log_path = ""
         try:
             self._started_at = datetime.now()
+
+            # per-run 로그 파일 생성
+            _mig_logger, _log_path = create_oneclick_logger(self.schema)
+            _mig_logger.info(f"=== One-Click 마이그레이션 시작: schema={self.schema}, dry_run={self.dry_run} ===")
 
             # Phase 1: Pre-flight
             self.phase_changed.emit(MigrationPhase.PREFLIGHT, "사전 검사")
             self.log_message.emit("🔍 Pre-flight 검사 시작...", STYLE_INFO)
+            _mig_logger.info("[Phase 1] Pre-flight 검사 시작")
 
             preflight = PreflightChecker(self.connector)
             preflight.set_progress_callback(lambda msg: self.log_message.emit(msg, STYLE_MUTED))
@@ -82,10 +98,12 @@ class OneClickMigrationWorker(QThread):
                 self.log_message.emit("❌ Pre-flight 검사 실패", STYLE_ERROR)
                 for error in result.errors:
                     self.log_message.emit(f"  - {error}", STYLE_ERROR)
+                _mig_logger.error(f"[Phase 1] Pre-flight 실패: {result.errors}")
                 self.finished.emit(False, None)
                 return
 
             self.log_message.emit("✅ Pre-flight 검사 통과", STYLE_SUCCESS)
+            _mig_logger.info("[Phase 1] Pre-flight 통과")
             self.progress.emit(20, "Pre-flight 완료")
 
             if self._is_cancelled:
@@ -96,6 +114,7 @@ class OneClickMigrationWorker(QThread):
             # Phase 2: Analysis
             self.phase_changed.emit(MigrationPhase.ANALYSIS, "분석")
             self.log_message.emit("📊 스키마 분석 중...", STYLE_INFO)
+            _mig_logger.info("[Phase 2] 스키마 분석 시작")
 
             from src.core.migration_analyzer import MigrationAnalyzer
             analyzer = MigrationAnalyzer(self.connector)
@@ -106,6 +125,7 @@ class OneClickMigrationWorker(QThread):
             issue_count = len(self._pre_issues)
 
             self.log_message.emit(f"📋 발견된 이슈: {issue_count}개", STYLE_INFO)
+            _mig_logger.info(f"[Phase 2] 분석 완료 - 이슈 {issue_count}개")
             self.progress.emit(40, f"분석 완료 - {issue_count}개 이슈")
 
             if issue_count == 0:
@@ -164,10 +184,23 @@ class OneClickMigrationWorker(QThread):
 
             self.progress.emit(50, "권장 옵션 선택 완료")
 
+            # Phase 3→4 사이: 실행 계획 확인 대기
+            # 사용자가 "실행 시작" 버튼을 누를 때까지 일시 정지
+            self._execution_gate.clear()
+            self.execution_plan_ready.emit(steps, summary)
+            _mig_logger.info("[Phase 3→4] 실행 계획 확인 대기 중...")
+
+            # 취소 체크하며 대기 (100ms 간격)
+            while not self._execution_gate.wait(timeout=0.1):
+                if self._is_cancelled:
+                    break
+
             if self._is_cancelled:
                 self.log_message.emit("⚠️ 작업이 취소되었습니다.", STYLE_WARNING)
                 self.finished.emit(False, None)
                 return
+
+            _mig_logger.info("[Phase 3→4] 실행 계획 확인 완료 - 실행 시작")
 
             # Phase 4: Execution
             self.phase_changed.emit(MigrationPhase.EXECUTION, "실행")
@@ -191,15 +224,30 @@ class OneClickMigrationWorker(QThread):
             batch_result = executor.execute_batch(steps, dry_run=self.dry_run)
 
             # BatchExecutionResult → execution_log 변환
+            # result.location을 직접 사용 (FK 정렬 후 step↔result 매핑 오류 방지)
+            _mig_logger.info(f"[Phase 4] 실행 완료 - 성공:{batch_result.success_count} 실패:{batch_result.fail_count} 스킵:{batch_result.skip_count}")
             executed_count = batch_result.success_count
-            for i, (step, result) in enumerate(zip(steps, batch_result.results)):
+            for result in batch_result.results:
+                loc = result.location or "<unknown>"
                 if result.success:
-                    if result.message != "건너뛰기" and result.message != "수동 처리 필요":
-                        execution_log.append(f"[OK] {step.location}: {result.sql_executed[:50]}...")
+                    if result.message not in ("건너뛰기", "수동 처리 필요"):
+                        sql_preview = result.sql_executed[:50]
+                        suffix = "..." if len(result.sql_executed) > 50 else ""
+                        execution_log.append(f"[OK] {loc}: {sql_preview}{suffix}")
+                        _mig_logger.info(
+                            f"[OK] location={loc} affected_rows={result.affected_rows}\n"
+                            f"     SQL: {result.sql_executed}"
+                        )
                     else:
-                        execution_log.append(f"[SKIP] {step.location}: {result.message}")
+                        reason = f"{result.message}: {result.description}" if result.description else result.message
+                        execution_log.append(f"[SKIP] {loc}: {reason}")
+                        _mig_logger.info(f"[SKIP] location={loc} reason={reason}")
                 else:
-                    execution_log.append(f"[FAIL] {step.location}: {result.error or result.message}")
+                    execution_log.append(f"[FAIL] {loc}: {result.error or result.message}")
+                    _mig_logger.error(
+                        f"[FAIL] location={loc} error={result.error or result.message}\n"
+                        f"       SQL: {result.sql_executed}"
+                    )
 
             # Rollback SQL이 있으면 로그에 기록
             if batch_result.rollback_sql:
@@ -220,6 +268,7 @@ class OneClickMigrationWorker(QThread):
             # Phase 5: Validation
             self.phase_changed.emit(MigrationPhase.VALIDATION, "검증")
             self.log_message.emit("🔍 마이그레이션 결과 검증 중...", STYLE_INFO)
+            _mig_logger.info("[Phase 5] 검증 시작")
 
             validator = PostMigrationValidator(self.connector)
             validation = validator.validate(self.schema, self._pre_issues)
@@ -231,11 +280,13 @@ class OneClickMigrationWorker(QThread):
                 self._started_at,
                 execution_log
             )
+            report.execution_log_path = _log_path
 
             self.progress.emit(100, "검증 완료")
 
             if validation.all_fixed:
                 self.log_message.emit("✅ 모든 이슈가 해결되었습니다!", STYLE_SUCCESS)
+                _mig_logger.info("[Phase 5] 모든 이슈 해결됨")
             else:
                 self.log_message.emit(
                     f"⚠️ 남은 이슈: {len(validation.remaining_issues)}개",
@@ -246,12 +297,22 @@ class OneClickMigrationWorker(QThread):
                         f"⚠️ 새 이슈: {len(validation.new_issues)}개",
                         STYLE_WARNING
                     )
+                _mig_logger.warning(
+                    f"[Phase 5] 남은 이슈: {len(validation.remaining_issues)}개, "
+                    f"새 이슈: {len(validation.new_issues)}개"
+                )
 
+            _mig_logger.info(f"=== 마이그레이션 완료: success={report.success} ===")
             self.finished.emit(report.success, report)
 
         except Exception as e:
+            if _mig_logger:
+                _mig_logger.exception(f"마이그레이션 오류: {e}")
             self.log_message.emit(f"❌ 오류 발생: {str(e)}", STYLE_ERROR)
             self.finished.emit(False, None)
+        finally:
+            if _mig_logger:
+                close_oneclick_logger(_mig_logger)
 
     def _create_empty_report(self) -> MigrationReport:
         """이슈가 없을 때 빈 리포트 생성"""
@@ -534,6 +595,11 @@ class ResultWidget(QWidget):
         self.stats_label = QLabel("")
         summary_layout.addWidget(self.stats_label)
 
+        self.log_path_label = QLabel("")
+        self.log_path_label.setStyleSheet("color: #7f8c8d; font-size: 10px;")
+        self.log_path_label.setWordWrap(True)
+        summary_layout.addWidget(self.log_path_label)
+
         layout.addWidget(self.summary_group)
 
         # 리포트 다운로드 버튼
@@ -572,6 +638,11 @@ class ResultWidget(QWidget):
         )
         self.stats_label.setText(stats)
 
+        if report.execution_log_path:
+            self.log_path_label.setText(f"📋 실행 로그: {report.execution_log_path}")
+        else:
+            self.log_path_label.setText("")
+
     def _download_html(self):
         """HTML 리포트 다운로드"""
         if not self._report:
@@ -607,6 +678,126 @@ class ResultWidget(QWidget):
             QMessageBox.information(self, "저장 완료", f"리포트가 저장되었습니다:\n{path}")
 
 
+class ExecutionPlanWidget(QWidget):
+    """실행 계획 확인 위젯 (Phase 3 완료 후 사용자 확인)"""
+
+    start_requested = pyqtSignal()  # "실행 시작" 버튼 클릭
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        title = QLabel("📋 실행 계획 확인")
+        title.setFont(QFont("", 14, QFont.Weight.Bold))
+        layout.addWidget(title)
+
+        desc = QLabel("아래 내용을 확인 후 실행을 시작하세요.")
+        desc.setStyleSheet("color: #7f8c8d;")
+        layout.addWidget(desc)
+
+        # 자동 실행 대상
+        self.auto_group = QGroupBox("🔧 자동 실행 대상 (0개)")
+        auto_layout = QVBoxLayout(self.auto_group)
+        self.auto_text = QTextEdit()
+        self.auto_text.setReadOnly(True)
+        self.auto_text.setMaximumHeight(120)
+        self.auto_text.setStyleSheet("font-size: 11px;")
+        auto_layout.addWidget(self.auto_text)
+        layout.addWidget(self.auto_group)
+
+        # 조치 불필요 (SKIP)
+        self.skip_group = QGroupBox("ℹ️ 조치 불필요 (MySQL 8.4에서 자동 처리) (0개)")
+        skip_layout = QVBoxLayout(self.skip_group)
+        self.skip_label = QLabel("")
+        self.skip_label.setWordWrap(True)
+        self.skip_label.setStyleSheet("color: #7f8c8d; font-size: 11px;")
+        skip_layout.addWidget(self.skip_label)
+        layout.addWidget(self.skip_group)
+
+        # 마이그레이션 후 처리 필요
+        self.manual_group = QGroupBox("📋 마이그레이션 후 수동 처리 필요 (0개)")
+        manual_layout = QVBoxLayout(self.manual_group)
+        manual_note = QLabel("⚠️ 아래 항목은 DB가 아닌 애플리케이션 또는 설정 변경이 필요합니다.")
+        manual_note.setStyleSheet("color: #e67e22; font-size: 11px;")
+        manual_note.setWordWrap(True)
+        manual_layout.addWidget(manual_note)
+        self.manual_text = QTextEdit()
+        self.manual_text.setReadOnly(True)
+        self.manual_text.setMaximumHeight(100)
+        self.manual_text.setStyleSheet("font-size: 11px;")
+        manual_layout.addWidget(self.manual_text)
+        layout.addWidget(self.manual_group)
+
+        # 실행 버튼
+        btn_layout = QHBoxLayout()
+        self.btn_execute = QPushButton("▶ 실행 시작")
+        self.btn_execute.setStyleSheet("""
+            QPushButton {
+                background-color: #27ae60;
+                color: white;
+                font-weight: bold;
+                padding: 8px 24px;
+                border-radius: 4px;
+                border: none;
+            }
+            QPushButton:hover { background-color: #219a52; }
+        """)
+        self.btn_execute.clicked.connect(self.start_requested)
+        btn_layout.addWidget(self.btn_execute)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        layout.addStretch()
+
+    def update_plan(self, steps, summary):
+        """실행 계획 데이터로 UI 업데이트"""
+        from src.core.migration_fix_wizard import FixStrategy
+
+        auto_items = []
+        skip_items = []
+        manual_items = []
+
+        for step in steps:
+            if not step.selected_option:
+                manual_items.append(f"• {step.location}: {step.description}")
+                continue
+
+            strategy = step.selected_option.strategy
+            sql = step.selected_option.sql_template or ""
+
+            if strategy == FixStrategy.SKIP:
+                skip_items.append(f"• {step.location}: {step.selected_option.description}")
+            elif strategy == FixStrategy.COLLATION_FK_SAFE:
+                # FK 안전 변경: sql_template이 주석("--")으로 시작하므로 자동 실행으로 분류
+                auto_items.append(f"• {step.location}: {step.selected_option.label}")
+            elif not sql or sql.startswith("--"):
+                # SQL이 없거나 주석인 경우 → 마이그레이션 후 수동 처리
+                manual_items.append(
+                    f"• {step.location}: {step.selected_option.description or step.description}"
+                )
+            else:
+                auto_items.append(f"• {step.location}: {step.selected_option.label}")
+
+        self.auto_group.setTitle(f"🔧 자동 실행 대상 ({len(auto_items)}개)")
+        self.auto_text.setPlainText("\n".join(auto_items) if auto_items else "(없음)")
+
+        self.skip_group.setTitle(f"ℹ️ 조치 불필요 (MySQL 8.4에서 자동 처리) ({len(skip_items)}개)")
+        self.skip_label.setText("\n".join(skip_items) if skip_items else "(없음)")
+        self.skip_group.setVisible(bool(skip_items))
+
+        self.manual_group.setTitle(f"📋 마이그레이션 후 수동 처리 필요 ({len(manual_items)}개)")
+        self.manual_text.setPlainText("\n".join(manual_items) if manual_items else "(없음)")
+        self.manual_group.setVisible(bool(manual_items))
+
+        # 실행 버튼 활성화 여부
+        self.btn_execute.setEnabled(bool(auto_items))
+        if not auto_items:
+            self.btn_execute.setText("실행할 항목 없음")
+
+
 class OneClickMigrationDialog(QDialog):
     """One-Click 마이그레이션 다이얼로그"""
 
@@ -632,11 +823,13 @@ class OneClickMigrationDialog(QDialog):
 
         self.preflight_widget = PreflightWidget()
         self.analysis_widget = AnalysisWidget()
+        self.execution_plan_widget = ExecutionPlanWidget()
         self.execution_widget = ExecutionWidget()
         self.result_widget = ResultWidget()
 
         self.stack.addWidget(self.preflight_widget)
         self.stack.addWidget(self.analysis_widget)
+        self.stack.addWidget(self.execution_plan_widget)
         self.stack.addWidget(self.execution_widget)
         self.stack.addWidget(self.result_widget)
 
@@ -775,6 +968,10 @@ class OneClickMigrationDialog(QDialog):
         self.chk_dry_run.setEnabled(False)
         self.chk_backup.setEnabled(False)
 
+        # UI 초기화 (재실행 시 이전 로그 제거)
+        self.execution_widget.log_text.clear()
+        self.execution_widget.update_progress(0, "시작 중...")
+
         # 실행 위젯으로 전환
         self.stack.setCurrentWidget(self.execution_widget)
 
@@ -791,6 +988,7 @@ class OneClickMigrationDialog(QDialog):
         self.worker.log_message.connect(self._on_log)
         self.worker.preflight_result.connect(self._on_preflight_result)
         self.worker.analysis_result.connect(self._on_analysis_result)
+        self.worker.execution_plan_ready.connect(self._on_execution_plan_ready)
         self.worker.finished.connect(self._on_finished)
 
         self.worker.start()
@@ -809,19 +1007,29 @@ class OneClickMigrationDialog(QDialog):
                 self.worker.cancel()
                 self.btn_cancel.setEnabled(False)
 
+    def closeEvent(self, event):
+        """다이얼로그 닫기 이벤트 처리"""
+        if self.worker and self.worker.isRunning():
+            reply = QMessageBox.question(
+                self, "작업 중",
+                "마이그레이션이 실행 중입니다. 종료하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                event.ignore()
+                return
+            self.worker.cancel()
+            self.worker.quit()
+            if not self.worker.wait(3000):
+                self.worker.terminate()
+                self.worker.wait(1000)
+        event.accept()
+
     def _on_phase_changed(self, phase: str, phase_name: str):
         """단계 변경 핸들러"""
         self._update_phase_indicator(phase)
-
-        # 화면 전환
-        if phase == MigrationPhase.PREFLIGHT:
-            self.stack.setCurrentWidget(self.preflight_widget)
-        elif phase == MigrationPhase.ANALYSIS:
-            self.stack.setCurrentWidget(self.analysis_widget)
-        elif phase in [MigrationPhase.EXECUTION, MigrationPhase.RECOMMENDATION]:
-            self.stack.setCurrentWidget(self.execution_widget)
-        elif phase == MigrationPhase.VALIDATION:
-            self.stack.setCurrentWidget(self.execution_widget)
+        # One-Click 모드: execution_widget에서 전체 로그를 계속 표시
+        # phase_indicator가 현재 단계를 이미 표시하므로 화면 전환 불필요
 
     def _on_progress(self, percent: int, message: str):
         """진행률 핸들러"""
@@ -838,6 +1046,26 @@ class OneClickMigrationDialog(QDialog):
     def _on_analysis_result(self, total: int, auto_fixable: int, manual: int):
         """분석 결과 핸들러"""
         self.analysis_widget.update_result(total, auto_fixable, manual)
+
+    def _on_execution_plan_ready(self, steps, summary):
+        """실행 계획 준비 완료 핸들러 (Phase 3→4 사이 일시 정지)"""
+        self.execution_plan_widget.update_plan(steps, summary)
+        self.stack.setCurrentWidget(self.execution_plan_widget)
+
+        # "실행 시작" 버튼 연결 (한 번만 연결하기 위해 disconnect 후 connect)
+        try:
+            self.execution_plan_widget.start_requested.disconnect()
+        except (TypeError, RuntimeError):
+            pass
+        self.execution_plan_widget.start_requested.connect(self._on_start_execution_confirmed)
+
+    def _on_start_execution_confirmed(self):
+        """사용자가 실행 계획 확인 후 "실행 시작" 클릭"""
+        # 실행 로그 위젯으로 전환
+        self.stack.setCurrentWidget(self.execution_widget)
+        # Worker 재개
+        if self.worker:
+            self.worker.resume_execution()
 
     def _on_finished(self, success: bool, report):
         """완료 핸들러"""

@@ -692,6 +692,54 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         self._log(f"📊 스키마 '{schema}' 분석 시작...")
 
+        # INFORMATION_SCHEMA 조회 시 COLUMN_DEFAULT '0000-00-00' 값이 있으면
+        # MySQL strict mode(NO_ZERO_DATE)가 1525 오류를 발생시킴.
+        # 분석 단계는 READ-ONLY이므로 세션 sql_mode를 임시 완화 후 복원.
+        original_sql_mode = self.connector.get_session_sql_mode()
+        self.connector.set_session_sql_mode('')
+
+        try:
+            return self._analyze_schema_impl(
+                schema=schema,
+                check_orphans=check_orphans,
+                check_charset=check_charset,
+                check_keywords=check_keywords,
+                check_routines=check_routines,
+                check_sql_mode=check_sql_mode,
+                check_auth_plugins=check_auth_plugins,
+                check_zerofill=check_zerofill,
+                check_float_precision=check_float_precision,
+                check_fk_name_length=check_fk_name_length,
+                check_invalid_dates=check_invalid_dates,
+                check_year2=check_year2,
+                check_deprecated_engines=check_deprecated_engines,
+                check_enum_empty=check_enum_empty,
+                check_timestamp_range=check_timestamp_range,
+            )
+        finally:
+            self.connector.set_session_sql_mode(original_sql_mode)
+
+    def _analyze_schema_impl(
+        self,
+        schema: str,
+        check_orphans: bool = True,
+        check_charset: bool = True,
+        check_keywords: bool = True,
+        check_routines: bool = True,
+        check_sql_mode: bool = True,
+        check_auth_plugins: bool = True,
+        check_zerofill: bool = True,
+        check_float_precision: bool = True,
+        check_fk_name_length: bool = True,
+        check_invalid_dates: bool = True,
+        check_year2: bool = True,
+        check_deprecated_engines: bool = True,
+        check_enum_empty: bool = True,
+        check_timestamp_range: bool = True
+    ) -> 'AnalysisResult':
+        """analyze_schema 내부 구현 (sql_mode 완화 상태에서 실행)"""
+        from datetime import datetime
+
         # 기본 정보 수집
         tables = self.connector.get_tables(schema)
         fk_list = self.get_foreign_keys(schema)

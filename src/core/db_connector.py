@@ -244,6 +244,35 @@ class MySQLConnector:
             logger.error(f"테이블 조회 오류: {e}")
             return []
 
+    def get_session_sql_mode(self) -> str:
+        """현재 세션 SQL 모드 조회"""
+        if not self.connection:
+            return ''
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT @@SESSION.sql_mode AS sql_mode")
+                row = cursor.fetchone()
+                return row['sql_mode'] if row else ''
+        except Exception:
+            return ''
+
+    def set_session_sql_mode(self, mode: str) -> bool:
+        """세션 SQL 모드 설정
+
+        INFORMATION_SCHEMA 조회 전 strict mode 완화 등에 사용.
+        Args:
+            mode: 설정할 sql_mode 문자열 (빈 문자열이면 모든 제한 해제)
+        """
+        if not self.connection:
+            return False
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SET SESSION sql_mode = %s", (mode,))
+            return True
+        except Exception as e:
+            logger.warning(f"sql_mode 설정 오류: {e}")
+            return False
+
     def execute(self, query: str, params: tuple = None) -> List[Dict[str, Any]]:
         """쿼리 실행 및 결과 반환"""
         if not self.connection:

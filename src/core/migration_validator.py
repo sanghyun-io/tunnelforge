@@ -42,6 +42,7 @@ class MigrationReport:
     success: bool = False
     execution_log: List[str] = field(default_factory=list)
     duration_seconds: float = 0.0
+    execution_log_path: str = ""  # 전체 실행 로그 파일 경로
 
     def get_summary(self) -> Dict[str, Any]:
         """리포트 요약 반환"""
@@ -227,30 +228,46 @@ class PostMigrationValidator:
         # 이슈 목록을 HTML 테이블로 변환하는 헬퍼
         def issues_to_html(issues: List[Any], title: str) -> str:
             if not issues:
-                return f"<p>없음</p>"
+                return "<p>없음</p>"
+
+            severity_colors = {
+                'error': '#e74c3c',
+                'warning': '#f39c12',
+                'info': '#3498db',
+            }
 
             rows = []
-            for issue in issues[:50]:  # 최대 50개만 표시
+            for issue in issues:
                 issue_type = getattr(issue, 'issue_type', 'N/A')
                 if hasattr(issue_type, 'value'):
                     issue_type = issue_type.value
                 location = getattr(issue, 'location', 'N/A')
                 description = getattr(issue, 'description', 'N/A')
+                severity = getattr(issue, 'severity', '')
+                suggestion = getattr(issue, 'suggestion', '')
+
+                sev_color = severity_colors.get(str(severity).lower(), '#7f8c8d')
+                sev_badge = f'<span style="background-color:{sev_color};color:white;padding:2px 6px;border-radius:3px;font-size:0.85em;">{severity}</span>' if severity else ''
 
                 rows.append(f"""
                 <tr>
                     <td>{issue_type}</td>
-                    <td>{location}</td>
-                    <td>{description[:100]}...</td>
+                    <td style="font-family:monospace;font-size:0.9em;">{location}</td>
+                    <td>{sev_badge}</td>
+                    <td>{description}</td>
+                    <td style="font-family:monospace;font-size:0.85em;color:#555;">{suggestion}</td>
                 </tr>
                 """)
 
             return f"""
-            <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse;">
+            <p style="color:#7f8c8d;font-size:0.9em;">총 {len(issues)}개</p>
+            <table border="1" cellpadding="5" cellspacing="0" style="border-collapse: collapse; width:100%;">
                 <tr style="background-color: #f0f0f0;">
                     <th>타입</th>
                     <th>위치</th>
+                    <th>심각도</th>
                     <th>설명</th>
+                    <th>수정 방법</th>
                 </tr>
                 {''.join(rows)}
             </table>
@@ -369,6 +386,9 @@ class PostMigrationValidator:
 
         <h2>🆕 새로 발견된 이슈 ({len(report.new_issues)}개)</h2>
         {issues_to_html(report.new_issues, "새 이슈")}
+
+        <h2>📋 실행 로그</h2>
+        <div style="background-color:#1e1e1e;color:#d4d4d4;padding:15px;border-radius:6px;font-family:monospace;font-size:0.85em;max-height:400px;overflow-y:auto;white-space:pre-wrap;">{chr(10).join(report.execution_log) if report.execution_log else "로그 없음"}</div>
 
         <div class="footer">
             <p>이 리포트는 TunnelForge MySQL 마이그레이션 도구에 의해 생성되었습니다.</p>

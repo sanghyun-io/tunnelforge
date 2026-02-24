@@ -758,6 +758,120 @@ class TestRollbackSQLGenerator:
         sql = rollback_gen.generate_batch_rollback(steps, {})
         assert "롤백 가능한 변경사항이 없습니다" in sql
 
+    # --- Bug 1 regression: 같은 테이블의 여러 컬럼 ---
+    def test_generate_batch_rollback_multi_column_same_table(self, rollback_gen):
+        """Bug 1 회귀: 동일 테이블의 여러 컬럼이 모두 롤백 SQL에 포함돼야 한다"""
+        steps = [
+            _make_step(0, IssueType.CHARSET_ISSUE,
+                       location="test_db.users.name",
+                       selected_option=_make_option(FixStrategy.COLLATION_SINGLE)),
+            _make_step(1, IssueType.CHARSET_ISSUE,
+                       location="test_db.users.email",
+                       selected_option=_make_option(FixStrategy.COLLATION_SINGLE)),
+            _make_step(2, IssueType.CHARSET_ISSUE,
+                       location="test_db.users.bio",
+                       selected_option=_make_option(FixStrategy.COLLATION_SINGLE)),
+        ]
+        col_state = {
+            'CHARACTER_SET_NAME': 'utf8', 'COLLATION_NAME': 'utf8_general_ci',
+            'COLUMN_TYPE': 'varchar(255)', 'IS_NULLABLE': 'YES', 'COLUMN_DEFAULT': None,
+            'EXTRA': '',
+        }
+        pre_states = {
+            'test_db.users.name': col_state,
+            'test_db.users.email': col_state,
+            'test_db.users.bio': col_state,
+        }
+        sql = rollback_gen.generate_batch_rollback(steps, pre_states)
+        # 세 컬럼 모두 MODIFY COLUMN 절이 있어야 한다
+        assert sql.count('MODIFY COLUMN `name`') == 1
+        assert sql.count('MODIFY COLUMN `email`') == 1
+        assert sql.count('MODIFY COLUMN `bio`') == 1
+
+    # --- Bug 2 regression: DEFAULT / EXTRA 보존 ---
+    def test_format_default_clause_string(self, rollback_gen):
+        """문자열 DEFAULT → 따옴표 포함"""
+        col_info = {'COLUMN_DEFAULT': 'active', 'COLUMN_TYPE': 'varchar(20)',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT 'active'"
+
+    def test_format_default_clause_numeric(self, rollback_gen):
+        """숫자형 DEFAULT → 따옴표 없음"""
+        col_info = {'COLUMN_DEFAULT': '0', 'COLUMN_TYPE': 'int(11)',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT 0"
+
+    def test_format_default_clause_current_timestamp(self, rollback_gen):
+        """CURRENT_TIMESTAMP → 따옴표 없음"""
+        col_info = {'COLUMN_DEFAULT': 'CURRENT_TIMESTAMP', 'COLUMN_TYPE': 'timestamp',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT CURRENT_TIMESTAMP"
+
+    def test_format_default_clause_nullable_none(self, rollback_gen):
+        """IS_NULLABLE='YES', COLUMN_DEFAULT=None → DEFAULT NULL"""
+        col_info = {'COLUMN_DEFAULT': None, 'COLUMN_TYPE': 'varchar(255)',
+                    'IS_NULLABLE': 'YES'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == "DEFAULT NULL"
+
+    def test_format_default_clause_not_null_none(self, rollback_gen):
+        """IS_NULLABLE='NO', COLUMN_DEFAULT=None → 빈 문자열"""
+        col_info = {'COLUMN_DEFAULT': None, 'COLUMN_TYPE': 'varchar(255)',
+                    'IS_NULLABLE': 'NO'}
+        result = rollback_gen._format_default_clause(col_info)
+        assert result == ""
+
+    def test_format_extra_clause_auto_increment(self, rollback_gen):
+        """AUTO_INCREMENT → 포함"""
+        assert rollback_gen._format_extra_clause({'EXTRA': 'auto_increment'}) == 'AUTO_INCREMENT'
+
+    def test_format_extra_clause_on_update(self, rollback_gen):
+        """ON UPDATE CURRENT_TIMESTAMP → 포함"""
+        assert rollback_gen._format_extra_clause(
+            {'EXTRA': 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP'}
+        ) == 'ON UPDATE CURRENT_TIMESTAMP'
+
+    def test_format_extra_clause_empty(self, rollback_gen):
+        """EXTRA 없음 → 빈 문자열"""
+        assert rollback_gen._format_extra_clause({'EXTRA': ''}) == ''
+
+    def test_rollback_column_includes_default(self, rollback_gen):
+        """컬럼 롤백 SQL에 DEFAULT 절이 포함돼야 한다"""
+        step = _make_step(0, IssueType.CHARSET_ISSUE,
+                          location="test_db.users.status",
+                          selected_option=_make_option(FixStrategy.COLLATION_SINGLE))
+        original = {
+            'CHARACTER_SET_NAME': 'utf8',
+            'COLLATION_NAME': 'utf8_general_ci',
+            'COLUMN_TYPE': 'varchar(20)',
+            'IS_NULLABLE': 'NO',
+            'COLUMN_DEFAULT': 'active',
+            'EXTRA': '',
+        }
+        sql = rollback_gen.generate_rollback_sql(step, original_state=original)
+        assert "DEFAULT 'active'" in sql
+        assert "MODIFY COLUMN `status`" in sql
+
+    def test_rollback_column_on_update_preserved(self, rollback_gen):
+        """ON UPDATE CURRENT_TIMESTAMP가 롤백 SQL에 보존돼야 한다"""
+        step = _make_step(0, IssueType.CHARSET_ISSUE,
+                          location="test_db.users.updated_at",
+                          selected_option=_make_option(FixStrategy.COLLATION_SINGLE))
+        original = {
+            'CHARACTER_SET_NAME': 'utf8',
+            'COLLATION_NAME': 'utf8_general_ci',
+            'COLUMN_TYPE': 'timestamp',
+            'IS_NULLABLE': 'YES',
+            'COLUMN_DEFAULT': 'CURRENT_TIMESTAMP',
+            'EXTRA': 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP',
+        }
+        sql = rollback_gen.generate_rollback_sql(step, original_state=original)
+        assert "ON UPDATE CURRENT_TIMESTAMP" in sql
+        assert "DEFAULT CURRENT_TIMESTAMP" in sql
+
 
 # ============================================================
 # CharsetFixPlanBuilder 테스트
@@ -929,3 +1043,166 @@ class TestDataclasses:
             is_original_issue=True,
         )
         assert info.skip is False
+
+
+# ============================================================
+# Session Guard & 2-Phase Bookkeeping Fault-Injection 테스트
+# ============================================================
+def _make_charset_step(idx, col_name, table="users", schema="test_db"):
+    """COLLATION_SINGLE column-level 스텝 헬퍼"""
+    return _make_step(
+        idx, IssueType.CHARSET_ISSUE,
+        location=f"{schema}.{table}.{col_name}",
+        selected_option=_make_option(
+            FixStrategy.COLLATION_SINGLE,
+            sql_template=(
+                f"ALTER TABLE `{schema}`.`{table}`"
+                f" MODIFY COLUMN `{col_name}` VARCHAR(255) CHARACTER SET utf8mb4;"
+            ),
+            modify_clause=f"`{col_name}` VARCHAR(255) CHARACTER SET utf8mb4",
+        )
+    )
+
+
+def _make_executor_with_session_mocks():
+    """dry_run=False 지원을 위해 세션 메서드가 mocking된 executor 반환"""
+    conn = FakeMySQLConnector()
+    conn.query_results = {'KEY_COLUMN_USAGE': []}
+    conn.get_session_sql_mode = MagicMock(return_value='STRICT_TRANS_TABLES')
+    conn.set_session_sql_mode = MagicMock(return_value=True)
+    return BatchFixExecutor(conn, "test_db")
+
+
+class TestSessionGuardFaultInjection:
+    """_session_guard try/finally 및 2-phase bookkeeping 오류 주입 테스트"""
+
+    def test_session_restored_on_exception_in_main_loop(self):
+        """메인 루프 도중 예외가 발생해도 sql_mode가 복원된다"""
+        executor = _make_executor_with_session_mocks()
+        step = _make_step(
+            0, IssueType.CHARSET_ISSUE,
+            location="test_db.users",
+            selected_option=_make_option(
+                FixStrategy.COLLATION_SINGLE,
+                sql_template="ALTER TABLE `test_db`.`users` CONVERT TO CHARACTER SET utf8mb4;",
+            )
+        )
+
+        with patch.object(executor, '_execute_single', side_effect=RuntimeError("injected")):
+            with pytest.raises(RuntimeError):
+                executor.execute_batch([step], dry_run=False)
+
+        # set_session_sql_mode 호출 시퀀스: [call('')(설정), call('STRICT...')(복원)]
+        # 마지막 호출이 원래 sql_mode로 복원이어야 함
+        calls = executor.connector.set_session_sql_mode.call_args_list
+        assert len(calls) >= 1
+        assert calls[-1].args[0] == 'STRICT_TRANS_TABLES', (
+            f"마지막 복원 호출이 원래 sql_mode여야 함: {calls}"
+        )
+
+    def test_session_restored_with_empty_original_sql_mode(self):
+        """original sql_mode='' 일 때도 복원 호출된다 (빈 문자열 falsy 버그 방지)"""
+        executor = _make_executor_with_session_mocks()
+        executor.connector.get_session_sql_mode = MagicMock(return_value='')
+        step = _make_step(
+            0, IssueType.CHARSET_ISSUE,
+            location="test_db.users",
+            selected_option=_make_option(
+                FixStrategy.COLLATION_SINGLE,
+                sql_template="ALTER TABLE `test_db`.`users` CONVERT TO CHARACTER SET utf8mb4;",
+            )
+        )
+
+        with patch.object(executor, '_execute_single', side_effect=RuntimeError("injected")):
+            with pytest.raises(RuntimeError):
+                executor.execute_batch([step], dry_run=False)
+
+        # '' is not None → 빈 문자열로도 복원 호출되어야 함
+        calls = executor.connector.set_session_sql_mode.call_args_list
+        assert len(calls) >= 1, "set_session_sql_mode가 한 번도 호출되지 않음"
+        assert calls[-1].args[0] == '', (
+            f"마지막 복원 호출이 빈 문자열이어야 함: {calls}"
+        )
+
+    def test_collation_single_merge_all_steps_in_results(self):
+        """같은 테이블 3개 column이 병합될 때 모든 step이 results에 정확히 1번 포함된다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {'KEY_COLUMN_USAGE': []}
+        executor = BatchFixExecutor(conn, "test_db")
+
+        steps = [_make_charset_step(i, f"col{i}") for i in range(3)]
+
+        result = executor.execute_batch(steps, dry_run=True)
+
+        assert result.total_steps == 3
+        assert len(result.results) == 3
+        assert result.success_count + result.fail_count + result.skip_count == 3
+
+    def test_merge_fallback_all_steps_in_results(self):
+        """병합 ALTER 실패 시 fallback 개별 실행으로 모든 step이 results에 포함된다"""
+        executor = _make_executor_with_session_mocks()
+
+        steps = [_make_charset_step(i, f"col{i}") for i in range(2)]
+
+        def _execute_side_effect(sql):
+            # 두 컬럼을 한꺼번에 포함하는 merged SQL은 실패
+            if '`col0`' in sql and '`col1`' in sql:
+                return FixExecutionResult(
+                    success=False, message="merge failed", sql_executed=sql
+                )
+            return FixExecutionResult(
+                success=True, message="실행 완료", sql_executed=sql, affected_rows=1
+            )
+
+        with patch.object(executor, '_execute_single', side_effect=_execute_side_effect):
+            result = executor.execute_batch(steps, dry_run=False)
+
+        assert result.total_steps == 2
+        assert len(result.results) == 2
+        assert result.success_count == 2
+        assert result.fail_count == 0
+
+    def test_no_duplicate_step_processing_after_merge(self):
+        """병합 처리된 step은 메인 루프에서 중복 처리되지 않는다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {'KEY_COLUMN_USAGE': []}
+        executor = BatchFixExecutor(conn, "test_db")
+
+        steps = [_make_charset_step(i, f"col{i}") for i in range(2)]
+
+        executed_sqls = []
+
+        def _execute_side_effect(sql):
+            executed_sqls.append(sql)
+            return FixExecutionResult(
+                success=True, message="실행 완료", sql_executed=sql, affected_rows=1
+            )
+
+        with patch.object(executor, '_execute_single', side_effect=_execute_side_effect):
+            result = executor.execute_batch(steps, dry_run=False)
+
+        # 병합되면 1번만 _execute_single 호출 (2번이 아님)
+        assert len(executed_sqls) == 1, (
+            f"병합된 step이 중복 실행됨: {len(executed_sqls)}번 호출"
+        )
+        assert result.total_steps == 2
+        assert len(result.results) == 2
+
+    def test_accounting_consistent_after_mixed_steps(self):
+        """SKIP + COLLATION_SINGLE 혼합 시 accounting이 일관적이다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {'KEY_COLUMN_USAGE': []}
+        executor = BatchFixExecutor(conn, "test_db")
+
+        steps = [
+            _make_step(0, IssueType.INT_DISPLAY_WIDTH,
+                       selected_option=_make_option(FixStrategy.SKIP)),
+            _make_charset_step(1, "name"),
+            _make_charset_step(2, "email"),  # 같은 테이블 → 병합
+        ]
+
+        result = executor.execute_batch(steps, dry_run=True)
+
+        assert result.total_steps == 3
+        assert len(result.results) == 3
+        assert result.success_count + result.fail_count + result.skip_count == 3
