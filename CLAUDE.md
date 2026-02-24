@@ -157,10 +157,9 @@ PR에 라벨을 붙이면 머지 시 자동으로 릴리스가 진행됩니다.
 
 **자동화 흐름**:
 1. Feature PR에 `version:*` 라벨 추가
-2. PR 머지 → `auto-version.yml` 실행
-3. Release PR 자동 생성 (`chore: release vX.Y.Z`)
-4. Release PR 머지 → 태그 `vX.Y.Z` 자동 생성
-5. → `release.yml` 트리거 → GitHub Release + 인스톨러 빌드
+2. `version-gate.yml` 실행 → PR 브랜치에 `chore: bump version to vX.Y.Z [patch]` 커밋 자동 push
+3. PR 머지 → `create-release-tag.yml` 실행 → `src/version.py`에서 버전 읽어 태그 `vX.Y.Z` 생성
+4. → `release.yml` 트리거 → GitHub Release + 인스톨러 빌드
 
 **라벨 최초 설정** (저장소당 1회):
 ```bash
@@ -169,7 +168,7 @@ bash scripts/setup-labels.sh
 
 **주의사항**:
 - 복수 version 라벨 금지 (워크플로 에러 + PR 코멘트로 알림)
-- GitHub App 설정 필요 (`GH_APP_ID`, `GH_APP_PRIVATE_KEY` 시크릿)
+- GitHub App 설정 필요 (`RELEASER_APP_ID`, `RELEASER_APP_PRIVATE_KEY` 시크릿)
   - 필요 권한: `contents: write`, `pull-requests: write`
 
 #### 긴급 Fallback (수동 릴리스)
@@ -239,18 +238,23 @@ scripts/
 
 ### GitHub Actions
 
-- **`.github/workflows/auto-version.yml`**: PR 라벨 기반 자동 버저닝
-  - `version:*` 라벨 PR 머지 시 Release PR 자동 생성
-  - Release PR 머지 시 태그 생성 → `release.yml` 트리거
-  - 멱등성 보장 (브랜치/태그 중복 방지)
+- **`.github/workflows/version-gate.yml`**: PR 라벨 기반 버전 bump
+  - `version:*` 라벨 감지 시 PR 브랜치에 bump 커밋 자동 push
+  - 복수 라벨 검증, 중복 bump 방지 (멱등성)
+  - 브랜치 보호 규칙의 필수 상태 체크로 사용
 
-- **`.github/workflows/release.yml`**: Automated build & release
-  - Triggered by `v*` tags (e.g., v1.0.2)
-  - Builds on `windows-latest` runner
-  - Installs Inno Setup via Chocolatey
-  - Builds offline installer (~35MB) and bootstrapper (~5MB)
-  - Generates release notes automatically
-  - Uploads all installers to GitHub Release:
+- **`.github/workflows/create-release-tag.yml`**: PR 머지 시 태그 생성
+  - `version:*` 라벨이 있는 PR 머지 시 실행
+  - `src/version.py`에서 버전 읽어 `vX.Y.Z` 태그 생성
+  - → `release.yml` 트리거
+
+- **`.github/workflows/release.yml`**: 빌드 및 릴리스
+  - `v*` 태그로 트리거 (e.g., v1.0.2)
+  - `windows-latest` 러너에서 빌드
+  - Inno Setup (Chocolatey로 설치) 사용
+  - 오프라인 인스톨러 (~35MB) + 부트스트래퍼 (~5MB) 빌드
+  - 릴리스 노트 자동 생성
+  - GitHub Release에 업로드:
     - `TunnelForge-Setup-{version}.exe` - 오프라인 설치
     - `TunnelForge-WebSetup.exe` - 온라인 설치 (부트스트래퍼)
 
