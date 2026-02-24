@@ -54,6 +54,7 @@ class DiffType(Enum):
     ADDED = "added"       # 타겟에 추가 필요
     REMOVED = "removed"   # 타겟에서 삭제 필요
     MODIFIED = "modified"
+    RENAMED = "renamed"   # 이름만 변경 (내용 동일)
     UNCHANGED = "unchanged"
 
 
@@ -187,6 +188,7 @@ class IndexDiff:
     target_info: Optional[IndexInfo] = None
     differences: List[str] = field(default_factory=list)
     severity: Optional[DiffSeverity] = None
+    old_name: Optional[str] = None  # RENAMED 시 타겟 측 이전 이름
 
 
 @dataclass
@@ -198,6 +200,7 @@ class ForeignKeyDiff:
     target_info: Optional[ForeignKeyInfo] = None
     differences: List[str] = field(default_factory=list)
     severity: Optional[DiffSeverity] = None
+    old_name: Optional[str] = None  # RENAMED 시 타겟 측 이전 이름
 
 
 @dataclass
@@ -630,59 +633,119 @@ class SchemaComparator:
 
         return diffs
 
+    @staticmethod
+    def _index_content_key(idx: IndexInfo) -> tuple:
+        """인덱스의 내용 기반 키 (이름 제외)"""
+        return (tuple(c.lower() for c in idx.columns), idx.unique, idx.type)
+
+    @staticmethod
+    def _fk_content_key(fk: ForeignKeyInfo) -> tuple:
+        """FK의 내용 기반 키 (이름 제외)"""
+        return (
+            tuple(c.lower() for c in fk.columns),
+            fk.ref_table.lower(),
+            tuple(c.lower() for c in fk.ref_columns),
+            fk.on_delete,
+            fk.on_update,
+        )
+
     def _compare_indexes(
         self,
         source_idx: List[IndexInfo],
         target_idx: List[IndexInfo]
     ) -> List[IndexDiff]:
-        """인덱스 비교"""
+        """인덱스 비교 (rename 감지 포함)"""
         diffs = []
 
         source_map = {i.name.lower(): i for i in source_idx}
         target_map = {i.name.lower(): i for i in target_idx}
 
-        all_idx = set(source_map.keys()) | set(target_map.keys())
+        # 1단계: 이름으로 매칭
+        matched_source = set()
+        matched_target = set()
 
-        for idx_name in sorted(all_idx):
-            src = source_map.get(idx_name)
-            tgt = target_map.get(idx_name)
+        common_names = set(source_map.keys()) & set(target_map.keys())
+        for idx_name in sorted(common_names):
+            src = source_map[idx_name]
+            tgt = target_map[idx_name]
+            matched_source.add(idx_name)
+            matched_target.add(idx_name)
 
-            if src and not tgt:
+            differences = []
+            if src.columns != tgt.columns:
+                differences.append(f"컬럼: {src.columns} → {tgt.columns}")
+            if src.unique != tgt.unique:
+                differences.append(f"Unique: {src.unique} → {tgt.unique}")
+
+            if differences:
                 diffs.append(IndexDiff(
                     index_name=src.name,
-                    diff_type=DiffType.ADDED,
-                    source_info=src
+                    diff_type=DiffType.MODIFIED,
+                    source_info=src,
+                    target_info=tgt,
+                    differences=differences
                 ))
-            elif tgt and not src:
+            else:
+                diffs.append(IndexDiff(
+                    index_name=src.name,
+                    diff_type=DiffType.UNCHANGED,
+                    source_info=src,
+                    target_info=tgt
+                ))
+
+        # 2단계: 미매칭 항목에서 rename 감지
+        unmatched_source = {k: v for k, v in source_map.items() if k not in matched_source}
+        unmatched_target = {k: v for k, v in target_map.items() if k not in matched_target}
+
+        # 타겟 미매칭을 내용 기반으로 인덱싱
+        target_by_content = {}
+        for tgt_name, tgt in unmatched_target.items():
+            key = self._index_content_key(tgt)
+            target_by_content.setdefault(key, []).append(tgt_name)
+
+        renamed_target = set()
+        source_added = []
+
+        for src_name in sorted(unmatched_source.keys()):
+            src = unmatched_source[src_name]
+            content_key = self._index_content_key(src)
+            candidates = target_by_content.get(content_key, [])
+            # 아직 매칭 안 된 후보 찾기
+            match_found = False
+            for tgt_name in candidates:
+                if tgt_name not in renamed_target:
+                    tgt = unmatched_target[tgt_name]
+                    renamed_target.add(tgt_name)
+                    diffs.append(IndexDiff(
+                        index_name=src.name,
+                        diff_type=DiffType.RENAMED,
+                        source_info=src,
+                        target_info=tgt,
+                        differences=[f"이름 변경: {tgt.name} → {src.name}"],
+                        old_name=tgt.name
+                    ))
+                    match_found = True
+                    break
+
+            if not match_found:
+                source_added.append(src)
+
+        # 3단계: 남은 미매칭 → ADDED / REMOVED
+        for src in source_added:
+            diffs.append(IndexDiff(
+                index_name=src.name,
+                diff_type=DiffType.ADDED,
+                source_info=src
+            ))
+
+        for tgt_name in sorted(unmatched_target.keys()):
+            if tgt_name not in renamed_target:
+                tgt = unmatched_target[tgt_name]
                 diffs.append(IndexDiff(
                     index_name=tgt.name,
                     diff_type=DiffType.REMOVED,
                     target_info=tgt
                 ))
-            else:
-                differences = []
-
-                if src.columns != tgt.columns:
-                    differences.append(f"컬럼: {src.columns} → {tgt.columns}")
-
-                if src.unique != tgt.unique:
-                    differences.append(f"Unique: {src.unique} → {tgt.unique}")
-
-                if differences:
-                    diffs.append(IndexDiff(
-                        index_name=src.name,
-                        diff_type=DiffType.MODIFIED,
-                        source_info=src,
-                        target_info=tgt,
-                        differences=differences
-                    ))
-                else:
-                    diffs.append(IndexDiff(
-                        index_name=src.name,
-                        diff_type=DiffType.UNCHANGED,
-                        source_info=src,
-                        target_info=tgt
-                    ))
 
         return diffs
 
@@ -691,60 +754,101 @@ class SchemaComparator:
         source_fks: List[ForeignKeyInfo],
         target_fks: List[ForeignKeyInfo]
     ) -> List[ForeignKeyDiff]:
-        """외래 키 비교"""
+        """외래 키 비교 (rename 감지 포함)"""
         diffs = []
 
         source_map = {f.name.lower(): f for f in source_fks}
         target_map = {f.name.lower(): f for f in target_fks}
 
-        all_fks = set(source_map.keys()) | set(target_map.keys())
+        # 1단계: 이름으로 매칭
+        matched_source = set()
+        matched_target = set()
 
-        for fk_name in sorted(all_fks):
-            src = source_map.get(fk_name)
-            tgt = target_map.get(fk_name)
+        common_names = set(source_map.keys()) & set(target_map.keys())
+        for fk_name in sorted(common_names):
+            src = source_map[fk_name]
+            tgt = target_map[fk_name]
+            matched_source.add(fk_name)
+            matched_target.add(fk_name)
 
-            if src and not tgt:
+            differences = []
+            if src.ref_table != tgt.ref_table:
+                differences.append(f"참조 테이블: {src.ref_table} → {tgt.ref_table}")
+            if src.columns != tgt.columns:
+                differences.append(f"컬럼: {src.columns} → {tgt.columns}")
+            if src.on_delete != tgt.on_delete:
+                differences.append(f"ON DELETE: {src.on_delete} → {tgt.on_delete}")
+            if src.on_update != tgt.on_update:
+                differences.append(f"ON UPDATE: {src.on_update} → {tgt.on_update}")
+
+            if differences:
                 diffs.append(ForeignKeyDiff(
                     fk_name=src.name,
-                    diff_type=DiffType.ADDED,
-                    source_info=src
+                    diff_type=DiffType.MODIFIED,
+                    source_info=src,
+                    target_info=tgt,
+                    differences=differences
                 ))
-            elif tgt and not src:
+            else:
+                diffs.append(ForeignKeyDiff(
+                    fk_name=src.name,
+                    diff_type=DiffType.UNCHANGED,
+                    source_info=src,
+                    target_info=tgt
+                ))
+
+        # 2단계: 미매칭 항목에서 rename 감지
+        unmatched_source = {k: v for k, v in source_map.items() if k not in matched_source}
+        unmatched_target = {k: v for k, v in target_map.items() if k not in matched_target}
+
+        target_by_content = {}
+        for tgt_name, tgt in unmatched_target.items():
+            key = self._fk_content_key(tgt)
+            target_by_content.setdefault(key, []).append(tgt_name)
+
+        renamed_target = set()
+        source_added = []
+
+        for src_name in sorted(unmatched_source.keys()):
+            src = unmatched_source[src_name]
+            content_key = self._fk_content_key(src)
+            candidates = target_by_content.get(content_key, [])
+
+            match_found = False
+            for tgt_name in candidates:
+                if tgt_name not in renamed_target:
+                    tgt = unmatched_target[tgt_name]
+                    renamed_target.add(tgt_name)
+                    diffs.append(ForeignKeyDiff(
+                        fk_name=src.name,
+                        diff_type=DiffType.RENAMED,
+                        source_info=src,
+                        target_info=tgt,
+                        differences=[f"이름 변경: {tgt.name} → {src.name}"],
+                        old_name=tgt.name
+                    ))
+                    match_found = True
+                    break
+
+            if not match_found:
+                source_added.append(src)
+
+        # 3단계: 남은 미매칭 → ADDED / REMOVED
+        for src in source_added:
+            diffs.append(ForeignKeyDiff(
+                fk_name=src.name,
+                diff_type=DiffType.ADDED,
+                source_info=src
+            ))
+
+        for tgt_name in sorted(unmatched_target.keys()):
+            if tgt_name not in renamed_target:
+                tgt = unmatched_target[tgt_name]
                 diffs.append(ForeignKeyDiff(
                     fk_name=tgt.name,
                     diff_type=DiffType.REMOVED,
                     target_info=tgt
                 ))
-            else:
-                differences = []
-
-                if src.ref_table != tgt.ref_table:
-                    differences.append(f"참조 테이블: {src.ref_table} → {tgt.ref_table}")
-
-                if src.columns != tgt.columns:
-                    differences.append(f"컬럼: {src.columns} → {tgt.columns}")
-
-                if src.on_delete != tgt.on_delete:
-                    differences.append(f"ON DELETE: {src.on_delete} → {tgt.on_delete}")
-
-                if src.on_update != tgt.on_update:
-                    differences.append(f"ON UPDATE: {src.on_update} → {tgt.on_update}")
-
-                if differences:
-                    diffs.append(ForeignKeyDiff(
-                        fk_name=src.name,
-                        diff_type=DiffType.MODIFIED,
-                        source_info=src,
-                        target_info=tgt,
-                        differences=differences
-                    ))
-                else:
-                    diffs.append(ForeignKeyDiff(
-                        fk_name=src.name,
-                        diff_type=DiffType.UNCHANGED,
-                        source_info=src,
-                        target_info=tgt
-                    ))
 
         return diffs
 
@@ -888,6 +992,10 @@ class SeverityClassifier:
         if diff.diff_type == DiffType.UNCHANGED:
             return None
 
+        # 이름만 변경은 Info (내용 동일)
+        if diff.diff_type == DiffType.RENAMED:
+            return DiffSeverity.INFO
+
         # PRIMARY KEY 변경은 Critical
         if diff.index_name.upper() == 'PRIMARY':
             return DiffSeverity.CRITICAL
@@ -899,6 +1007,11 @@ class SeverityClassifier:
         """FK 심각도 분류"""
         if diff.diff_type == DiffType.UNCHANGED:
             return None
+
+        # 이름만 변경은 Info (내용 동일)
+        if diff.diff_type == DiffType.RENAMED:
+            return DiffSeverity.INFO
+
         return DiffSeverity.WARNING
 
     def _max_severity(
@@ -962,6 +1075,13 @@ class SyncScriptGenerator:
                         fk_drops.append(
                             f"ALTER TABLE `{target_schema}`.`{diff.table_name}` "
                             f"DROP FOREIGN KEY `{fk_diff.fk_name}`;"
+                        )
+                    elif fk_diff.diff_type == DiffType.RENAMED and fk_diff.old_name:
+                        # FK rename = DROP old + ADD new (MySQL에 RENAME FK 없음)
+                        fk_drops.append(
+                            f"ALTER TABLE `{target_schema}`.`{diff.table_name}` "
+                            f"DROP FOREIGN KEY `{fk_diff.old_name}`; "
+                            f"-- renamed → {fk_diff.fk_name}"
                         )
 
         if fk_drops:
@@ -1040,6 +1160,12 @@ class SyncScriptGenerator:
                         alter_statements.append(
                             f"ALTER TABLE `{target_schema}`.`{diff.table_name}` ADD {idx_sql};"
                         )
+                    elif idx_diff.diff_type == DiffType.RENAMED and idx_diff.old_name:
+                        # MySQL 5.7+ RENAME INDEX
+                        alter_statements.append(
+                            f"ALTER TABLE `{target_schema}`.`{diff.table_name}` "
+                            f"RENAME INDEX `{idx_diff.old_name}` TO `{idx_diff.index_name}`;"
+                        )
 
         if alter_statements:
             lines.append("-- 컬럼/인덱스 변경")
@@ -1057,7 +1183,7 @@ class SyncScriptGenerator:
                     )
             elif diff.diff_type == DiffType.MODIFIED:
                 for fk_diff in diff.fk_diffs:
-                    if fk_diff.diff_type in [DiffType.ADDED, DiffType.MODIFIED]:
+                    if fk_diff.diff_type in [DiffType.ADDED, DiffType.MODIFIED, DiffType.RENAMED]:
                         if fk_diff.source_info:
                             fk_adds.append(
                                 f"ALTER TABLE `{target_schema}`.`{diff.table_name}` "

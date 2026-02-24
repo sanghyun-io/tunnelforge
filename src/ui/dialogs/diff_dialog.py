@@ -552,8 +552,14 @@ class SchemaDiffDialog(QDialog):
                         idx_icon = self._get_diff_icon(idx_diff.diff_type)
                         sev_icon = self._get_severity_icon(idx_diff.severity)
                         sev_suffix = f" {sev_icon}" if sev_icon else ""
+                        # RENAMED: old_name → new_name 표시
+                        if idx_diff.diff_type == DiffType.RENAMED and idx_diff.old_name:
+                            label = (f"  {idx_icon} [IDX] {idx_diff.old_name} "
+                                     f"→ {idx_diff.index_name}{sev_suffix}")
+                        else:
+                            label = f"  {idx_icon} [IDX] {idx_diff.index_name}{sev_suffix}"
                         idx_item = QTreeWidgetItem([
-                            f"  {idx_icon} [IDX] {idx_diff.index_name}{sev_suffix}",
+                            label,
                             idx_diff.diff_type.value,
                             ""
                         ])
@@ -568,8 +574,14 @@ class SchemaDiffDialog(QDialog):
                         fk_icon = self._get_diff_icon(fk_diff.diff_type)
                         sev_icon = self._get_severity_icon(fk_diff.severity)
                         sev_suffix = f" {sev_icon}" if sev_icon else ""
+                        # RENAMED: old_name → new_name 표시
+                        if fk_diff.diff_type == DiffType.RENAMED and fk_diff.old_name:
+                            label = (f"  {fk_icon} [FK] {fk_diff.old_name} "
+                                     f"→ {fk_diff.fk_name}{sev_suffix}")
+                        else:
+                            label = f"  {fk_icon} [FK] {fk_diff.fk_name}{sev_suffix}"
                         fk_item = QTreeWidgetItem([
-                            f"  {fk_icon} [FK] {fk_diff.fk_name}{sev_suffix}",
+                            label,
                             fk_diff.diff_type.value,
                             ""
                         ])
@@ -606,6 +618,7 @@ class SchemaDiffDialog(QDialog):
             DiffType.ADDED: "🟢",
             DiffType.REMOVED: "🔴",
             DiffType.MODIFIED: "🟡",
+            DiffType.RENAMED: "🔄",
             DiffType.UNCHANGED: "⚪"
         }
         return icons.get(diff_type, "")
@@ -670,6 +683,10 @@ class SchemaDiffDialog(QDialog):
             lines.append(f"FK: {diff.fk_name}")
 
         lines.append(f"상태: {diff.diff_type.value}")
+
+        # RENAMED인 경우 이전 이름 표시
+        if hasattr(diff, 'old_name') and diff.old_name:
+            lines.append(f"이전 이름: {diff.old_name}")
 
         if hasattr(diff, 'severity') and diff.severity:
             sev_icon = self._get_severity_icon(diff.severity)
