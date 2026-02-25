@@ -60,9 +60,11 @@ class GitHubIssueReporter:
         instance._github_app = github_app
         return instance
 
-    def _refresh_headers_if_needed(self):
+    def _refresh_headers_if_needed(self, force: bool = False):
         """GitHub App 사용 시 헤더 갱신"""
         if self._github_app:
+            if force:
+                self._github_app.get_installation_token(force_refresh=True)
             self._headers = self._github_app.get_headers()
 
     @staticmethod
@@ -400,6 +402,12 @@ class GitHubIssueReporter:
         except requests.RequestException as e:
             return False, f"코멘트 추가 실패: {str(e)}"
 
+    def _is_auth_error(self, exc: Exception) -> bool:
+        """401/403 인증 오류인지 확인"""
+        if hasattr(exc, 'response') and exc.response is not None:
+            return exc.response.status_code in (401, 403)
+        return False
+
     def report_error(self, error_type: str, error_message: str,
                      context: Optional[Dict] = None) -> Tuple[bool, str]:
         """
@@ -408,6 +416,7 @@ class GitHubIssueReporter:
         1. 오류 요약
         2. 유사 이슈 검색
         3. 없으면 생성, 있으면 코멘트 추가
+        4. 401/403 시 토큰 갱신 후 1회 재시도
 
         Args:
             error_type: "export" 또는 "import"
@@ -425,26 +434,39 @@ class GitHubIssueReporter:
             return False, "GitHub App이 설정되지 않았습니다"
 
         try:
-            # 1. 오류 요약
-            summary = self.summarize_error(error_type, error_message, context)
-
-            # 2. 유사 이슈 검색
-            similar_issue = self.find_similar_issue(summary)
-
-            if similar_issue:
-                # 3a. 기존 이슈에 코멘트 추가
-                issue_number = similar_issue.get('number')
-                success, msg = self.add_comment(issue_number, summary)
-                if success:
-                    return True, f"기존 이슈 #{issue_number}에 코멘트 추가됨"
-                return False, msg
-            else:
-                # 3b. 새 이슈 생성
-                success, msg, issue_number = self.create_issue(summary)
-                return success, msg
-
+            return self._do_report(error_type, error_message, context)
+        except requests.RequestException as e:
+            # 401/403 인증 오류 시 토큰 갱신 후 1회 재시도
+            if self._github_app and self._is_auth_error(e):
+                try:
+                    self._refresh_headers_if_needed(force=True)
+                    return self._do_report(error_type, error_message, context)
+                except Exception as retry_e:
+                    return False, f"토큰 갱신 후 재시도 실패: {str(retry_e)}"
+            return False, f"오류 리포트 실패: {str(e)}"
         except Exception as e:
             return False, f"오류 리포트 실패: {str(e)}"
+
+    def _do_report(self, error_type: str, error_message: str,
+                   context: Optional[Dict] = None) -> Tuple[bool, str]:
+        """실제 리포트 수행 (report_error에서 호출)"""
+        # 1. 오류 요약
+        summary = self.summarize_error(error_type, error_message, context)
+
+        # 2. 유사 이슈 검색
+        similar_issue = self.find_similar_issue(summary)
+
+        if similar_issue:
+            # 3a. 기존 이슈에 코멘트 추가
+            issue_number = similar_issue.get('number')
+            success, msg = self.add_comment(issue_number, summary)
+            if success:
+                return True, f"기존 이슈 #{issue_number}에 코멘트 추가됨"
+            return False, msg
+        else:
+            # 3b. 새 이슈 생성
+            success, msg, issue_number = self.create_issue(summary)
+            return success, msg
 
 
 def get_reporter_from_config(config_manager) -> Optional[GitHubIssueReporter]:
