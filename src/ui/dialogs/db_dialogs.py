@@ -1179,34 +1179,29 @@ class MySQLShellExportDialog(QDialog):
         self.txt_log.scrollToBottom()
 
     def _report_error_to_github(self, error_type: str, error_message: str):
-        """GitHub 이슈 자동 보고"""
+        """GitHub 이슈 자동 보고 (백그라운드)"""
         if not self.config_manager:
             return
 
-        try:
-            from src.core.github_issue_reporter import get_reporter_from_config
+        context = {
+            'schema': self.export_schema,
+            'tables': self.export_tables,
+            'mode': '전체 스키마' if self.radio_full.isChecked() else '선택 테이블'
+        }
 
-            reporter = get_reporter_from_config(self.config_manager)
-            if not reporter:
-                return  # 자동 보고 비활성화 또는 설정 미완료
+        from src.ui.workers.github_worker import GitHubReportWorker
+        self._github_worker = GitHubReportWorker(
+            self.config_manager, error_type, error_message, context
+        )
+        self._github_worker.finished.connect(self._on_github_report_finished)
+        self._github_worker.start()
 
-            # 컨텍스트 정보 수집
-            context = {
-                'schema': self.export_schema,
-                'tables': self.export_tables,
-                'mode': '전체 스키마' if self.radio_full.isChecked() else '선택 테이블'
-            }
-
-            # 오류 리포트
-            success, result_msg = reporter.report_error(error_type, error_message, context)
-
-            if success:
-                self._add_log(f"🐙 GitHub: {result_msg}")
-            else:
-                self._add_log(f"⚠️ GitHub 이슈 보고 실패: {result_msg}")
-
-        except Exception as e:
-            self._add_log(f"⚠️ GitHub 이슈 보고 중 오류: {str(e)}")
+    def _on_github_report_finished(self, success: bool, message: str):
+        """GitHub 이슈 보고 완료 콜백"""
+        if success:
+            self._add_log(f"🐙 GitHub: {message}")
+        else:
+            self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
 
     def save_log(self):
         """로그를 파일로 저장"""
@@ -2353,44 +2348,40 @@ class MySQLShellImportDialog(QDialog):
             self._report_error_to_github("import", message, error_count)
 
     def _report_error_to_github(self, error_type: str, error_message: str, error_count: int = 0):
-        """GitHub 이슈 자동 보고"""
+        """GitHub 이슈 자동 보고 (백그라운드)"""
         if not self.config_manager:
             return
 
-        try:
-            from src.core.github_issue_reporter import get_reporter_from_config
+        # 실패한 테이블 목록
+        failed_tables = [t for t, r in self.import_results.items() if r.get('status') == 'error']
+        failed_messages = [r.get('message', '') for t, r in self.import_results.items() if r.get('status') == 'error']
 
-            reporter = get_reporter_from_config(self.config_manager)
-            if not reporter:
-                return  # 자동 보고 비활성화 또는 설정 미완료
+        # 컨텍스트 정보 수집
+        target_schema = self.combo_target_schema.currentText() if not self.chk_use_original.isChecked() else "(원본 스키마)"
+        context = {
+            'schema': target_schema,
+            'failed_tables': failed_tables,
+            'mode': self._get_import_mode_text()
+        }
 
-            # 실패한 테이블 목록
-            failed_tables = [t for t, r in self.import_results.items() if r.get('status') == 'error']
-            failed_messages = [r.get('message', '') for t, r in self.import_results.items() if r.get('status') == 'error']
+        # 오류 메시지 조합 (첫 3개 실패 메시지)
+        combined_error = error_message
+        if failed_messages:
+            combined_error += "\n\n실패한 테이블 오류:\n" + "\n".join(failed_messages[:3])
 
-            # 컨텍스트 정보 수집
-            target_schema = self.combo_target_schema.currentText() if not self.chk_use_original.isChecked() else "(원본 스키마)"
-            context = {
-                'schema': target_schema,
-                'failed_tables': failed_tables,
-                'mode': self._get_import_mode_text()
-            }
+        from src.ui.workers.github_worker import GitHubReportWorker
+        self._github_worker = GitHubReportWorker(
+            self.config_manager, error_type, combined_error, context
+        )
+        self._github_worker.finished.connect(self._on_github_report_finished)
+        self._github_worker.start()
 
-            # 오류 메시지 조합 (첫 3개 실패 메시지)
-            combined_error = error_message
-            if failed_messages:
-                combined_error += "\n\n실패한 테이블 오류:\n" + "\n".join(failed_messages[:3])
-
-            # 오류 리포트
-            success, result_msg = reporter.report_error(error_type, combined_error, context)
-
-            if success:
-                self._add_log(f"🐙 GitHub: {result_msg}")
-            else:
-                self._add_log(f"⚠️ GitHub 이슈 보고 실패: {result_msg}")
-
-        except Exception as e:
-            self._add_log(f"⚠️ GitHub 이슈 보고 중 오류: {str(e)}")
+    def _on_github_report_finished(self, success: bool, message: str):
+        """GitHub 이슈 보고 완료 콜백"""
+        if success:
+            self._add_log(f"🐙 GitHub: {message}")
+        else:
+            self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
 
     def _get_import_mode_text(self) -> str:
         """Import 모드 텍스트 반환"""
