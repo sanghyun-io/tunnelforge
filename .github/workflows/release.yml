@@ -72,6 +72,16 @@ jobs:
 
           echo "✅ GitHub App credentials configured"
 
+      - name: Embed GitHub App credentials
+        if: ${{ vars.GH_APP_ID != '' }}
+        env:
+          GITHUB_APP_ID: ${{ vars.GH_APP_ID }}
+          GITHUB_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          GITHUB_APP_PRIVATE_KEY: secrets/github-app.pem
+          GITHUB_REPO: ${{ vars.GH_ISSUE_REPO || github.repository }}
+        run: |
+          python scripts/embed_github_credentials.py
+
       - name: Build with PyInstaller
         run: |
           python -m PyInstaller tunnel-manager.spec
