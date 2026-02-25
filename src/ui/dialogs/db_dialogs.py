@@ -1201,13 +1201,12 @@ class MySQLShellExportDialog(QDialog):
             success, result_msg = reporter.report_error(error_type, error_message, context)
 
             if success:
-                self.txt_log.addItem(f"🐙 GitHub: {result_msg}")
-                self._add_log(f"GitHub 이슈 보고: {result_msg}")
+                self._add_log(f"🐙 GitHub: {result_msg}")
             else:
-                self._add_log(f"GitHub 이슈 보고 실패: {result_msg}")
+                self._add_log(f"⚠️ GitHub 이슈 보고 실패: {result_msg}")
 
         except Exception as e:
-            self._add_log(f"GitHub 이슈 보고 중 오류: {str(e)}")
+            self._add_log(f"⚠️ GitHub 이슈 보고 중 오류: {str(e)}")
 
     def save_log(self):
         """로그를 파일로 저장"""
@@ -2386,13 +2385,12 @@ class MySQLShellImportDialog(QDialog):
             success, result_msg = reporter.report_error(error_type, combined_error, context)
 
             if success:
-                self.txt_log.addItem(f"🐙 GitHub: {result_msg}")
-                self._add_log(f"GitHub 이슈 보고: {result_msg}")
+                self._add_log(f"🐙 GitHub: {result_msg}")
             else:
-                self._add_log(f"GitHub 이슈 보고 실패: {result_msg}")
+                self._add_log(f"⚠️ GitHub 이슈 보고 실패: {result_msg}")
 
         except Exception as e:
-            self._add_log(f"GitHub 이슈 보고 중 오류: {str(e)}")
+            self._add_log(f"⚠️ GitHub 이슈 보고 중 오류: {str(e)}")
 
     def _get_import_mode_text(self) -> str:
         """Import 모드 텍스트 반환"""
