@@ -21,7 +21,7 @@ GitHub App을 사용한 인증은 Personal Access Token보다 안전합니다:
 import os
 import time
 from typing import Optional, Tuple
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 try:
@@ -204,10 +204,10 @@ class GitHubAppAuth:
         if not HAS_REQUESTS:
             return None
 
-        # 캐시된 토큰이 유효한지 확인
+        # 캐시된 토큰이 유효한지 확인 (UTC 기준)
         if not force_refresh and self._cached_token and self._token_expires_at:
             # 만료 5분 전까지는 캐시 사용
-            if datetime.now() < self._token_expires_at - timedelta(minutes=5):
+            if datetime.now(timezone.utc) < self._token_expires_at - timedelta(minutes=5):
                 return self._cached_token
 
         try:
@@ -230,13 +230,13 @@ class GitHubAppAuth:
             # 권한 정보 캐싱
             self._cached_permissions = data.get('permissions', {})
 
-            # 만료 시간 파싱
+            # 만료 시간 파싱 (UTC aware 유지)
             expires_at_str = data.get('expires_at')  # ISO 8601 형식
             if expires_at_str:
-                # "2024-01-01T12:00:00Z" 형식
+                # "2024-01-01T12:00:00Z" → UTC aware datetime
                 self._token_expires_at = datetime.fromisoformat(
                     expires_at_str.replace('Z', '+00:00')
-                ).replace(tzinfo=None)
+                )
 
             return self._cached_token
 
