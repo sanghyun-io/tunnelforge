@@ -44,10 +44,14 @@ class StartupUpdateCheckerThread(QThread):
     """앱 시작 시 업데이트 확인 백그라운드 스레드"""
     update_available = pyqtSignal(str, str)  # latest_version, download_url
 
+    def __init__(self, config_manager=None):
+        super().__init__()
+        self._config_manager = config_manager
+
     def run(self):
         try:
             from src.core.update_checker import UpdateChecker
-            checker = UpdateChecker()
+            checker = UpdateChecker(config_manager=self._config_manager)
             needs_update, latest_version, download_url, error_msg = checker.check_update()
 
             if needs_update and latest_version and download_url:
@@ -980,7 +984,7 @@ class TunnelManagerUI(QMainWindow):
             return
 
         # 백그라운드 스레드에서 확인
-        self._update_checker_thread = StartupUpdateCheckerThread()
+        self._update_checker_thread = StartupUpdateCheckerThread(config_manager=self.config_mgr)
         self._update_checker_thread.update_available.connect(self._on_startup_update_available)
         self._update_checker_thread.start()
 
