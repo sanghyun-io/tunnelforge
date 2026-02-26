@@ -90,10 +90,14 @@ class UpdateCheckerThread(QThread):
     """업데이트 확인 백그라운드 스레드"""
     update_checked = pyqtSignal(bool, str, str, str)  # needs_update, latest_version, download_url, error_msg
 
+    def __init__(self, config_manager=None):
+        super().__init__()
+        self._config_manager = config_manager
+
     def run(self):
         try:
             from src.core.update_checker import UpdateChecker
-            checker = UpdateChecker()
+            checker = UpdateChecker(config_manager=self._config_manager)
             needs_update, latest_version, download_url, error_msg = checker.check_update()
             self.update_checked.emit(needs_update, latest_version or "", download_url or "", error_msg or "")
         except Exception as e:
@@ -1010,7 +1014,7 @@ class SettingsDialog(QDialog):
         )
 
         # 백그라운드 스레드에서 확인
-        self._update_checker_thread = UpdateCheckerThread()
+        self._update_checker_thread = UpdateCheckerThread(config_manager=self.config_mgr)
         self._update_checker_thread.update_checked.connect(self._on_update_checked)
         self._update_checker_thread.start()
 
@@ -1063,7 +1067,7 @@ class SettingsDialog(QDialog):
         self.download_detail_label.show()
 
         # Worker 시작
-        self._download_worker = UpdateDownloadWorker()
+        self._download_worker = UpdateDownloadWorker(config_manager=self.config_mgr)
         self._download_worker.info_fetched.connect(self._on_download_info_fetched)
         self._download_worker.progress.connect(self._on_download_progress)
         self._download_worker.finished.connect(self._on_download_finished)

@@ -335,10 +335,30 @@ class ConfigManager:
     def get_config_path(self):
         return CONFIG_FILE
 
+    # 네트워크 타임아웃 기본값
+    DEFAULT_NETWORK_TIMEOUT_CHECK = 5     # 업데이트 확인 타임아웃 (초)
+    DEFAULT_NETWORK_TIMEOUT_DOWNLOAD = 10  # 파일 다운로드 API 타임아웃 (초)
+
     def get_app_setting(self, key, default=None):
         """앱 설정 값 조회"""
         config = self.load_config()
         return config.get('settings', {}).get(key, default)
+
+    def get_network_timeout_check(self) -> int:
+        """업데이트 확인 네트워크 타임아웃 반환 (초)"""
+        value = self.get_app_setting('network_timeout_check', self.DEFAULT_NETWORK_TIMEOUT_CHECK)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return self.DEFAULT_NETWORK_TIMEOUT_CHECK
+
+    def get_network_timeout_download(self) -> int:
+        """파일 다운로드 API 네트워크 타임아웃 반환 (초)"""
+        value = self.get_app_setting('network_timeout_download', self.DEFAULT_NETWORK_TIMEOUT_DOWNLOAD)
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return self.DEFAULT_NETWORK_TIMEOUT_DOWNLOAD
 
     def set_app_setting(self, key, value):
         """앱 설정 값 저장 (기존 설정 유지)"""

@@ -13,10 +13,18 @@ class UpdateChecker:
     """GitHub Releases를 통한 업데이트 확인"""
 
     RELEASES_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
-    TIMEOUT = 5  # 네트워크 요청 타임아웃 (초)
+    DEFAULT_TIMEOUT = 5  # 기본 네트워크 요청 타임아웃 (초)
 
-    def __init__(self):
+    def __init__(self, config_manager=None):
         self.current_version = __version__
+        self._config_manager = config_manager
+
+    @property
+    def timeout(self) -> int:
+        """네트워크 요청 타임아웃 (초) - 설정 파일에서 읽거나 기본값 사용"""
+        if self._config_manager is not None:
+            return self._config_manager.get_network_timeout_check()
+        return self.DEFAULT_TIMEOUT
 
     def check_update(self) -> Tuple[bool, Optional[str], Optional[str], Optional[str]]:
         """최신 버전 확인
@@ -32,7 +40,7 @@ class UpdateChecker:
         """
         try:
             # GitHub API 호출
-            response = requests.get(self.RELEASES_URL, timeout=self.TIMEOUT)
+            response = requests.get(self.RELEASES_URL, timeout=self.timeout)
             response.raise_for_status()
 
             release_data = response.json()
@@ -71,7 +79,7 @@ class UpdateChecker:
             릴리스 정보 딕셔너리 또는 None (실패 시)
         """
         try:
-            response = requests.get(self.RELEASES_URL, timeout=self.TIMEOUT)
+            response = requests.get(self.RELEASES_URL, timeout=self.timeout)
             response.raise_for_status()
             return response.json()
         except Exception:
