@@ -106,6 +106,22 @@ REMOVED_FUNCTIONS_80X: Tuple[str, ...] = (
 # 마이그레이션 검사 시 사용할 전체 제거/deprecated 함수 목록
 ALL_REMOVED_FUNCTIONS: Tuple[str, ...] = REMOVED_FUNCTIONS_84 + REMOVED_FUNCTIONS_80X + DEPRECATED_FUNCTIONS_84
 
+# MySQL 8.4에서 generated column 내 동작이 변경된 함수
+# (mysql-upgrade-checker의 CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS 참조)
+# 이 함수들은 generated column 표현식에서 사용 시 8.4 업그레이드 후 결과가 달라질 수 있음
+CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS: Tuple[str, ...] = (
+    'IF',
+    'IFNULL',
+    'NULLIF',
+    'CASE',
+    'COALESCE',
+    'GREATEST',
+    'LEAST',
+    'BIT_AND',
+    'BIT_OR',
+    'BIT_XOR',
+)
+
 # ============================================================
 # 인증 플러그인 상태
 # ============================================================

@@ -39,6 +39,7 @@ from ..migration_constants import (
     BLOB_TEXT_DEFAULT_PATTERN,
     GENERATED_COLUMN_PATTERN,
     ALL_REMOVED_FUNCTIONS,
+    CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS,
 )
 
 if TYPE_CHECKING:
@@ -406,11 +407,27 @@ class SchemaRules:
     # S16: 생성 컬럼 함수 검사 (덤프 파일)
     # ================================================================
     def check_generated_column_functions(self, content: str, location: str) -> List[CompatibilityIssue]:
-        """생성 컬럼에서 deprecated 함수 사용 확인"""
+        """생성 컬럼에서 동작 변경 함수 사용 확인
+
+        MySQL 8.4에서 generated column 내 동작이 변경된 함수를 검사합니다.
+        (IF, IFNULL, CASE, COALESCE 등 — mysql-upgrade-checker 참조)
+        """
         issues = []
 
         for match in GENERATED_COLUMN_PATTERN.finditer(content):
             expression = match.group(1).upper()
+            # 8.4에서 동작이 변경된 함수 검사
+            for func in CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS:
+                if func in expression:
+                    issues.append(CompatibilityIssue(
+                        issue_type=IssueType.GENERATED_COLUMN_ISSUE,
+                        severity="warning",
+                        location=location,
+                        description=f"생성 컬럼에 8.4 동작 변경 함수 사용: {func}",
+                        suggestion=f"'{func}' 함수의 8.4 동작 변경 확인 필요 (타입 추론 규칙 변경)",
+                        code_snippet=match.group(0)[:80]
+                    ))
+            # 제거된 함수 검사 (PASSWORD, ENCRYPT 등)
             for func in ALL_REMOVED_FUNCTIONS:
                 if func in expression:
                     issues.append(CompatibilityIssue(
