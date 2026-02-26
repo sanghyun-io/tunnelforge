@@ -99,7 +99,7 @@ class TunnelMonitor:
         self._callbacks: List[Callable[[str, TunnelStatus], None]] = []
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # RLock: 재진입 가능 (on_tunnel_connected 등 내부 중첩 호출 대응)
 
         # Health check용 MySQL 연결 캐시 (터널별 1개씩 유지)
         self._health_connections: Dict[str, Any] = {}
