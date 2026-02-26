@@ -492,46 +492,99 @@ class DataIntegrityRules:
     # ================================================================
     # D09: latin1 비ASCII 데이터 검사 (라이브 DB)
     # ================================================================
+
+    # 컬럼 수 상한: 이 수를 초과하면 부분 스캔 경고를 표시
+    _MAX_COLUMNS_TO_CHECK = 50
+
     def check_latin1_non_ascii(self, schema: str) -> List[CompatibilityIssue]:
-        """latin1 컬럼에서 비ASCII 데이터 확인"""
+        """latin1 컬럼에서 비ASCII 데이터 확인 (배치 쿼리 방식)"""
         if not self.connector:
             return []
 
         self._log("🔍 latin1 비ASCII 데이터 검사 중...")
         issues = []
 
-        # latin1 컬럼 찾기
+        # latin1 컬럼 전체 목록 수집 (단일 INFORMATION_SCHEMA 쿼리)
         query = """
         SELECT TABLE_NAME, COLUMN_NAME
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = %s
             AND CHARACTER_SET_NAME = 'latin1'
             AND DATA_TYPE IN ('varchar', 'char', 'text', 'mediumtext', 'longtext')
+        ORDER BY TABLE_NAME, COLUMN_NAME
         """
         columns = self.connector.execute(query, (schema,))
 
-        for col in columns:
-            # 비ASCII 데이터 샘플 확인 (성능을 위해 LIMIT 사용)
+        if not columns:
+            self._log("  ✅ latin1 비ASCII 데이터 없음")
+            return issues
+
+        # 컬럼 수 상한 적용
+        partial_scan = len(columns) > self._MAX_COLUMNS_TO_CHECK
+        if partial_scan:
+            self._log(
+                f"  ⚠️ latin1 컬럼 {len(columns)}개 감지 — "
+                f"상위 {self._MAX_COLUMNS_TO_CHECK}개만 스캔 (부분 스캔)"
+            )
+            columns = columns[: self._MAX_COLUMNS_TO_CHECK]
+
+        # 테이블별로 컬럼을 묶어 배치 처리 (테이블당 1회 쿼리)
+        from itertools import groupby
+
+        def _table_key(col):
+            return col['TABLE_NAME']
+
+        for table_name, col_group in groupby(columns, key=_table_key):
+            col_list = list(col_group)
+            # 각 컬럼에 대한 REGEXP 조건을 OR로 결합하여 단일 쿼리로 처리
+            conditions = " OR ".join(
+                f"`{c['COLUMN_NAME']}` REGEXP '[^\\x00-\\x7F]'"
+                for c in col_list
+            )
+            # 테이블당 비ASCII가 있는 컬럼을 한 번에 식별
+            select_cols = ", ".join(
+                f"MAX(`{c['COLUMN_NAME']}` REGEXP '[^\\x00-\\x7F]') AS `{c['COLUMN_NAME']}`"
+                for c in col_list
+            )
+            batch_query = (
+                f"SELECT {select_cols} "
+                f"FROM `{schema}`.`{table_name}` "
+                f"WHERE {conditions} "
+                f"LIMIT 1"
+            )
             try:
-                check_query = f"""
-                SELECT COUNT(*) as cnt
-                FROM `{schema}`.`{col['TABLE_NAME']}`
-                WHERE `{col['COLUMN_NAME']}` REGEXP '[^\x00-\x7F]'
-                LIMIT 1
-                """
-                result = self.connector.execute(check_query)
-                if result and result[0]['cnt'] > 0:
-                    issues.append(CompatibilityIssue(
-                        issue_type=IssueType.LATIN1_NON_ASCII,
-                        severity="warning",
-                        location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
-                        description="latin1 컬럼에 비ASCII 데이터 존재",
-                        suggestion="utf8mb4 변환 전 데이터 인코딩 확인 필요",
-                        table_name=col['TABLE_NAME'],
-                        column_name=col['COLUMN_NAME']
-                    ))
+                result = self.connector.execute(batch_query)
+                if result:
+                    row = result[0]
+                    for col in col_list:
+                        col_name = col['COLUMN_NAME']
+                        if row.get(col_name):
+                            issues.append(CompatibilityIssue(
+                                issue_type=IssueType.LATIN1_NON_ASCII,
+                                severity="warning",
+                                location=f"{schema}.{table_name}.{col_name}",
+                                description="latin1 컬럼에 비ASCII 데이터 존재",
+                                suggestion="utf8mb4 변환 전 데이터 인코딩 확인 필요",
+                                table_name=table_name,
+                                column_name=col_name
+                            ))
             except Exception as e:
-                self._log(f"    ⏭️ {col['TABLE_NAME']}.{col['COLUMN_NAME']} latin1 검사 스킵: {str(e)[:80]}")
+                self._log(
+                    f"    ⏭️ {table_name} latin1 배치 검사 스킵: {str(e)[:80]}"
+                )
+
+        if partial_scan:
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.LATIN1_NON_ASCII,
+                severity="info",
+                location=schema,
+                description=(
+                    f"latin1 컬럼이 {self._MAX_COLUMNS_TO_CHECK}개를 초과하여 "
+                    f"부분 스캔만 수행되었습니다. 나머지 컬럼은 수동 확인 권장."
+                ),
+                suggestion="SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                           "WHERE TABLE_SCHEMA='<db>' AND CHARACTER_SET_NAME='latin1' 로 전체 목록 확인"
+            ))
 
         if issues:
             self._log(f"  ⚠️ latin1 비ASCII 데이터 {len(issues)}개 발견")
@@ -544,51 +597,111 @@ class DataIntegrityRules:
     # D10: ZEROFILL 데이터 의존성 검사 (라이브 DB)
     # ================================================================
     def check_zerofill_data_dependency(self, schema: str) -> List[CompatibilityIssue]:
-        """ZEROFILL 컬럼의 실제 데이터가 패딩에 의존하는지 확인"""
+        """ZEROFILL 컬럼의 실제 데이터가 패딩에 의존하는지 확인 (배치 쿼리 방식)"""
         if not self.connector:
             return []
 
         self._log("🔍 ZEROFILL 데이터 의존성 검사 중...")
         issues = []
 
-        # ZEROFILL 컬럼 찾기
+        # ZEROFILL 컬럼 전체 목록 수집 (단일 INFORMATION_SCHEMA 쿼리)
         query = """
         SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = %s
             AND COLUMN_TYPE LIKE '%%ZEROFILL%%'
+        ORDER BY TABLE_NAME, COLUMN_NAME
         """
         columns = self.connector.execute(query, (schema,))
 
+        if not columns:
+            self._log("  ✅ ZEROFILL 의존 데이터 없음")
+            return issues
+
+        # 너비 정보 사전 파싱 — 너비를 알 수 없는 컬럼은 건너뜀
+        parsed_cols = []
         for col in columns:
-            # 표시 너비 추출
             width_match = re.search(r'\((\d+)\)', col['COLUMN_TYPE'])
             if width_match:
-                width = int(width_match.group(1))
-                # 선행 0이 필요한 값이 있는지 샘플링
-                try:
-                    # LPAD로 비교하여 현재 값이 실제로 선행 0에 의존하는지 확인
-                    check_query = f"""
-                    SELECT COUNT(*) as cnt
-                    FROM `{schema}`.`{col['TABLE_NAME']}`
-                    WHERE LENGTH(CAST(`{col['COLUMN_NAME']}` AS CHAR)) < {width}
-                        AND `{col['COLUMN_NAME']}` IS NOT NULL
-                        AND `{col['COLUMN_NAME']}` > 0
-                    LIMIT 100
-                    """
-                    result = self.connector.execute(check_query)
-                    if result and result[0]['cnt'] > 0:
-                        issues.append(CompatibilityIssue(
-                            issue_type=IssueType.ZEROFILL_USAGE,
-                            severity="warning",
-                            location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
-                            description=f"ZEROFILL 패딩에 의존하는 데이터 존재 (너비: {width})",
-                            suggestion="ZEROFILL 제거 시 LPAD() 함수로 애플리케이션에서 처리 필요",
-                            table_name=col['TABLE_NAME'],
-                            column_name=col['COLUMN_NAME']
-                        ))
-                except Exception as e:
-                    self._log(f"    ⏭️ {col['TABLE_NAME']}.{col['COLUMN_NAME']} ZEROFILL 검사 스킵: {str(e)[:80]}")
+                parsed_cols.append({
+                    'TABLE_NAME': col['TABLE_NAME'],
+                    'COLUMN_NAME': col['COLUMN_NAME'],
+                    'width': int(width_match.group(1)),
+                })
+
+        if not parsed_cols:
+            self._log("  ✅ ZEROFILL 의존 데이터 없음")
+            return issues
+
+        # 컬럼 수 상한 적용
+        partial_scan = len(parsed_cols) > self._MAX_COLUMNS_TO_CHECK
+        if partial_scan:
+            self._log(
+                f"  ⚠️ ZEROFILL 컬럼 {len(parsed_cols)}개 감지 — "
+                f"상위 {self._MAX_COLUMNS_TO_CHECK}개만 스캔 (부분 스캔)"
+            )
+            parsed_cols = parsed_cols[: self._MAX_COLUMNS_TO_CHECK]
+
+        # 테이블별로 컬럼을 묶어 배치 처리 (테이블당 1회 쿼리)
+        from itertools import groupby
+
+        def _table_key(col):
+            return col['TABLE_NAME']
+
+        for table_name, col_group in groupby(parsed_cols, key=_table_key):
+            col_list = list(col_group)
+            # 각 컬럼의 패딩 의존 여부를 단일 SELECT로 판별
+            # LENGTH(CAST(col AS CHAR)) < width 인 행이 존재하면 패딩 의존
+            select_parts = []
+            for c in col_list:
+                w = c['width']
+                cname = c['COLUMN_NAME']
+                select_parts.append(
+                    f"MAX(CASE WHEN LENGTH(CAST(`{cname}` AS CHAR)) < {w} "
+                    f"AND `{cname}` IS NOT NULL AND `{cname}` > 0 THEN 1 ELSE 0 END) "
+                    f"AS `{cname}`"
+                )
+            batch_query = (
+                f"SELECT {', '.join(select_parts)} "
+                f"FROM `{schema}`.`{table_name}` "
+                f"LIMIT 100"
+            )
+            try:
+                result = self.connector.execute(batch_query)
+                if result:
+                    row = result[0]
+                    for col in col_list:
+                        col_name = col['COLUMN_NAME']
+                        if row.get(col_name):
+                            issues.append(CompatibilityIssue(
+                                issue_type=IssueType.ZEROFILL_USAGE,
+                                severity="warning",
+                                location=f"{schema}.{table_name}.{col_name}",
+                                description=(
+                                    f"ZEROFILL 패딩에 의존하는 데이터 존재 "
+                                    f"(너비: {col['width']})"
+                                ),
+                                suggestion="ZEROFILL 제거 시 LPAD() 함수로 애플리케이션에서 처리 필요",
+                                table_name=table_name,
+                                column_name=col_name
+                            ))
+            except Exception as e:
+                self._log(
+                    f"    ⏭️ {table_name} ZEROFILL 배치 검사 스킵: {str(e)[:80]}"
+                )
+
+        if partial_scan:
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.ZEROFILL_USAGE,
+                severity="info",
+                location=schema,
+                description=(
+                    f"ZEROFILL 컬럼이 {self._MAX_COLUMNS_TO_CHECK}개를 초과하여 "
+                    f"부분 스캔만 수행되었습니다. 나머지 컬럼은 수동 확인 권장."
+                ),
+                suggestion="SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                           "WHERE TABLE_SCHEMA='<db>' AND COLUMN_TYPE LIKE '%ZEROFILL%' 로 전체 목록 확인"
+            ))
 
         if issues:
             self._log(f"  ⚠️ ZEROFILL 의존 데이터 {len(issues)}개 발견")
