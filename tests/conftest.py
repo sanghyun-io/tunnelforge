@@ -4,7 +4,16 @@ pytest 공용 fixtures
 import pytest
 import os
 import json
+from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+
+@pytest.fixture
+def canonical_constants():
+    """mysql-upgrade-checker canonical 상수 기준값 로드"""
+    fixture_path = Path(__file__).parent / "fixtures" / "canonical_constants.json"
+    with open(fixture_path, encoding="utf-8") as f:
+        return json.load(f)
 
 
 @pytest.fixture
