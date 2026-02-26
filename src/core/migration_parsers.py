@@ -3,11 +3,18 @@ SQL 파서 모듈
 
 CREATE TABLE, CREATE USER, GRANT 문을 파싱하여 구조화된 정보를 제공합니다.
 mysql-upgrade-checker의 파서 로직을 Python으로 포팅.
+
+추가 파서:
+- ConfigFileParser: MySQL .cnf/.ini 설정 파일 파서
+- DumpMetadataParser: mysqlsh @.json 메타데이터 파서
 """
 
+import configparser
+import json
 import re
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple, Union
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 
 @dataclass
