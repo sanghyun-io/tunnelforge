@@ -1787,12 +1787,17 @@ class TwoPassAnalyzer:
 
                 # CREATE TABLE 문 추출 및 파싱
                 if self.sql_parser:
+                    _had_silent_parse_failure = False
                     for sql in self.sql_parser.extract_create_table_statements(content):
                         parsed = self.sql_parser.parse_table(sql)
                         if parsed:
                             self._collect_table_indexes(parsed)
                             self._collect_table_charset(parsed)
                             self._register_known_table(parsed.schema, parsed.name)
+                        else:
+                            _had_silent_parse_failure = True  # parse_table() None 반환 = silent 실패
+                    if _had_silent_parse_failure:
+                        self._incomplete_metadata_files.add(str(file_path))
                 else:
                     # 파서 없이 간단한 정규식으로 테이블명만 수집
                     table_pattern = re.compile(
