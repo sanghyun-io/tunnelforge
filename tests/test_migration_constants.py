@@ -12,6 +12,7 @@ from src.core.migration_constants import (
     RESERVED_KEYWORDS_80,
     ALL_RESERVED_KEYWORDS,
     ALL_REMOVED_FUNCTIONS,
+    REMOVED_FUNCTIONS_84,
     DEPRECATED_FUNCTIONS_84,
     REMOVED_FUNCTIONS_80X,
     OBSOLETE_SQL_MODES,
@@ -546,3 +547,71 @@ class TestDeprecatedSyntaxPatterns:
         pattern = DEPRECATED_SYNTAX_PATTERNS['FOUND_ROWS_FUNC']
         assert pattern.search("SELECT FOUND_ROWS()")
         assert not pattern.search("SELECT COUNT(*)")
+
+
+# ============================================================
+# Canonical Parity 테스트 (mysql-upgrade-checker 기준값 대비)
+# ============================================================
+class TestCanonicalParity:
+    """mysql-upgrade-checker canonical 값과의 parity 검증.
+
+    canonical_constants.json에 정의된 기준값이 migration_constants.py에
+    모두 포함되어 있는지 검증합니다. 기준값보다 많은 항목은 허용하되,
+    기준값에 있는 항목이 누락되면 실패합니다.
+    """
+
+    def test_removed_sys_vars_parity(self, canonical_constants):
+        """REMOVED_SYS_VARS_84가 canonical 기준값을 모두 포함하는지 검증"""
+        canonical = set(canonical_constants["removed_sys_vars"])
+        actual = set(REMOVED_SYS_VARS_84)
+        missing = canonical - actual
+        assert not missing, f"REMOVED_SYS_VARS_84에 누락된 항목: {missing}"
+
+    def test_removed_functions_84_parity(self, canonical_constants):
+        """REMOVED_FUNCTIONS_84가 canonical 기준값을 모두 포함하는지 검증"""
+        canonical = set(canonical_constants["removed_functions_84"])
+        actual = set(REMOVED_FUNCTIONS_84)
+        missing = canonical - actual
+        assert not missing, f"REMOVED_FUNCTIONS_84에 누락된 항목: {missing}"
+
+    def test_deprecated_functions_84_parity(self, canonical_constants):
+        """DEPRECATED_FUNCTIONS_84가 canonical 기준값을 모두 포함하는지 검증"""
+        canonical = set(canonical_constants["deprecated_functions_84"])
+        actual = set(DEPRECATED_FUNCTIONS_84)
+        missing = canonical - actual
+        assert not missing, f"DEPRECATED_FUNCTIONS_84에 누락된 항목: {missing}"
+
+    def test_removed_functions_80x_parity(self, canonical_constants):
+        """REMOVED_FUNCTIONS_80X가 canonical 기준값을 모두 포함하는지 검증"""
+        canonical = set(canonical_constants["removed_functions_80x"])
+        actual = set(REMOVED_FUNCTIONS_80X)
+        missing = canonical - actual
+        assert not missing, f"REMOVED_FUNCTIONS_80X에 누락된 항목: {missing}"
+
+    def test_new_reserved_keywords_84_parity(self, canonical_constants):
+        """NEW_RESERVED_KEYWORDS_84가 canonical 기준값을 모두 포함하는지 검증"""
+        canonical = set(canonical_constants["new_reserved_keywords_84"])
+        actual = set(NEW_RESERVED_KEYWORDS_84)
+        missing = canonical - actual
+        assert not missing, f"NEW_RESERVED_KEYWORDS_84에 누락된 항목: {missing}"
+
+    def test_obsolete_sql_modes_parity(self, canonical_constants):
+        """OBSOLETE_SQL_MODES가 canonical 기준값을 모두 포함하는지 검증"""
+        canonical = set(canonical_constants["obsolete_sql_modes"])
+        actual = set(OBSOLETE_SQL_MODES)
+        missing = canonical - actual
+        assert not missing, f"OBSOLETE_SQL_MODES에 누락된 항목: {missing}"
+
+    def test_canonical_fixture_is_loadable(self, canonical_constants):
+        """canonical_constants fixture가 정상적으로 로드되는지 검증"""
+        assert "removed_sys_vars" in canonical_constants
+        assert "removed_functions_84" in canonical_constants
+        assert "deprecated_functions_84" in canonical_constants
+        assert "removed_functions_80x" in canonical_constants
+        assert "new_reserved_keywords_84" in canonical_constants
+        assert "obsolete_sql_modes" in canonical_constants
+
+    def test_removed_sys_vars_no_duplicates_vs_canonical(self, canonical_constants):
+        """canonical 기준값 자체에 중복이 없는지 검증"""
+        canonical = canonical_constants["removed_sys_vars"]
+        assert len(set(canonical)) == len(canonical), "canonical removed_sys_vars에 중복 항목 있음"
