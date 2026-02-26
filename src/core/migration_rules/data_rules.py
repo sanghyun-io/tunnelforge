@@ -200,8 +200,9 @@ class DataIntegrityRules:
             if not enum_col_indices:
                 continue
 
-            # VALUES 행 검사
+            # VALUES 행 검사 (per-INSERT 로컬 플래그로 교차 오염 방지)
             rest = content[insert_match.end():]
+            found_in_current_insert = False
             for row_match in self._VALUES_ROW_PATTERN.finditer(rest[:5000]):
                 values = [v.strip() for v in row_match.group(1).split(',')]
                 for idx in enum_col_indices:
@@ -221,9 +222,10 @@ class DataIntegrityRules:
                                 table_name=table_name,
                                 column_name=cols[idx]
                             ))
+                            found_in_current_insert = True
                             break  # 테이블당 한 번만 보고
-                if issues:
-                    break  # 첫 발견 후 다음 INSERT로
+                if found_in_current_insert:
+                    break  # 이 INSERT에서 이미 발견 → 다음 INSERT로
 
         return issues
 
