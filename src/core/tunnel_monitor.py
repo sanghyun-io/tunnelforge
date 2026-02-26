@@ -15,6 +15,7 @@ from enum import Enum
 import pymysql
 
 from src.core.logger import get_logger
+from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 
 logger = get_logger(__name__)
 
@@ -344,13 +345,13 @@ class TunnelMonitor:
 
             if connection_mode == 'direct':
                 host = config.get('remote_host', '')
-                port = int(config.get('remote_port', 3306))
+                port = int(config.get('remote_port', DEFAULT_MYSQL_PORT))
             else:
                 # SSH 터널 모드: 로컬 포트 사용
                 local_port = config.get('local_port')
                 if not local_port:
                     return -1
-                host = '127.0.0.1'
+                host = DEFAULT_LOCAL_HOST
                 port = int(local_port)
 
             # 캐시된 연결 사용 또는 새 연결 생성
