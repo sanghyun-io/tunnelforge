@@ -317,6 +317,15 @@ class IssueType(Enum):
     TRIGGER_OLD_SYNTAX = "trigger_old_syntax"  # 트리거 구식 구문
     EVENT_OLD_SYNTAX = "event_old_syntax"  # 이벤트 구식 구문
 
+    # 신규 이슈 타입 (이슈 #63)
+    PARTITION_PREFIX_KEY = "partition_prefix_key"  # 파티션 키에 prefix 인덱스 사용
+    EMPTY_DOT_TABLE_SYNTAX = "empty_dot_table_syntax"  # 스키마 생략 dot 구문 (.tableName)
+    INNODB_ROW_FORMAT = "innodb_row_format"  # REDUNDANT/COMPACT ROW_FORMAT (DYNAMIC 권장)
+    DEPRECATED_TEMPORAL_DELIMITER = "deprecated_temporal_delimiter"  # deprecated 날짜 구분자
+    INVALID_ENGINE_FK = "invalid_engine_fk"  # 비InnoDB 엔진에 FK 사용
+    ROUTINE_SYNTAX_KEYWORD = "routine_syntax_keyword"  # 루틴 이름이 예약어와 충돌
+    INVALID_57_NAME_MULTIPLE_DOTS = "invalid_57_name_multiple_dots"  # 식별자에 연속 점(..) 사용
+
 
 # ============================================================
 # 호환성 문제 데이터 클래스 (단일 정의, 전 모듈 공용)
@@ -433,6 +442,58 @@ GENERATED_COLUMN_PATTERN = re.compile(
 )
 
 # ============================================================
+# 신규 패턴 (이슈 #63)
+# ============================================================
+
+# PARTITION BY KEY/RANGE/LIST with prefix index 패턴
+# PARTITION BY KEY (prefix_col(N)) 또는 KEY (col(N)) 형태 감지
+PARTITION_PREFIX_KEY_PATTERN = re.compile(
+    r'PARTITION\s+BY\s+(?:LINEAR\s+)?KEY\s*\([^)]*\w+\s*\(\s*\d+\s*\)[^)]*\)',
+    re.IGNORECASE
+)
+
+# 스키마 생략 dot 구문 패턴 (`.tableName` 형태)
+# FROM 또는 JOIN 뒤에 오는 .table_name 참조 (스키마 없이 점으로 시작)
+EMPTY_DOT_TABLE_SYNTAX_PATTERN = re.compile(
+    r'(?:FROM|JOIN)\s+\.\s*`?\w+`?',
+    re.IGNORECASE
+)
+
+# INNODB ROW_FORMAT REDUNDANT/COMPACT 패턴
+INNODB_ROW_FORMAT_PATTERN = re.compile(
+    r'\bROW_FORMAT\s*=\s*(REDUNDANT|COMPACT)\b',
+    re.IGNORECASE
+)
+
+# deprecated 날짜 구분자 패턴 (@ 또는 / 또는 ! 등 비표준 구분자 사용)
+# MySQL은 일반적으로 - 또는 / 허용하나 @ ! # 등은 비표준
+DEPRECATED_TEMPORAL_DELIMITER_PATTERN = re.compile(
+    r"'(\d{4})\s*[@!#]\s*(\d{1,2})\s*[@!#]\s*(\d{1,2})'",
+    re.IGNORECASE
+)
+
+# 비InnoDB 엔진 테이블에 FOREIGN KEY 정의 패턴
+# CREATE TABLE ... ENGINE=MyISAM/MEMORY/ARCHIVE ... FOREIGN KEY
+INVALID_ENGINE_FK_PATTERN = re.compile(
+    r'CREATE\s+TABLE\s+[^;]+?FOREIGN\s+KEY[^;]+?ENGINE\s*=\s*(MyISAM|MEMORY|ARCHIVE|CSV)\b'
+    r'|CREATE\s+TABLE\s+[^;]+?ENGINE\s*=\s*(MyISAM|MEMORY|ARCHIVE|CSV)\b[^;]+?FOREIGN\s+KEY',
+    re.IGNORECASE | re.DOTALL
+)
+
+# 저장 프로시저/함수/이벤트/트리거 이름이 예약어와 충돌하는 패턴
+# CREATE PROCEDURE/FUNCTION `keyword` 또는 CREATE PROCEDURE/FUNCTION keyword
+ROUTINE_SYNTAX_KEYWORD_PATTERN = re.compile(
+    r'CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|EVENT|TRIGGER)\s+`?(\w+)`?',
+    re.IGNORECASE
+)
+
+# 식별자에 연속 점(..) 사용 패턴 (schema..table 또는 ..table 형태)
+INVALID_57_NAME_MULTIPLE_DOTS_PATTERN = re.compile(
+    r'`?[\w$]+`?\s*\.\.\s*`?[\w$]+`?',
+    re.IGNORECASE
+)
+
+# ============================================================
 # MySQL Shell Check ID 매핑
 # ============================================================
 MYSQL_SHELL_CHECK_IDS: Dict[IssueType, str] = {
@@ -454,6 +515,13 @@ MYSQL_SHELL_CHECK_IDS: Dict[IssueType, str] = {
     IssueType.SQL_CALC_FOUND_ROWS_USAGE: "sqlCalcFoundRows",
     IssueType.FK_NON_UNIQUE_REF: "fkNonUniqueRef",
     IssueType.FK_REF_NOT_FOUND: "fkRefNotFound",
+    IssueType.PARTITION_PREFIX_KEY: "partitionPrefixKey",
+    IssueType.EMPTY_DOT_TABLE_SYNTAX: "emptyDotTableSyntax",
+    IssueType.INNODB_ROW_FORMAT: "innodbRowFormat",
+    IssueType.DEPRECATED_TEMPORAL_DELIMITER: "deprecatedTemporalDelimiter",
+    IssueType.INVALID_ENGINE_FK: "invalidEngineFk",
+    IssueType.ROUTINE_SYNTAX_KEYWORD: "routineSyntaxKeyword",
+    IssueType.INVALID_57_NAME_MULTIPLE_DOTS: "invalid57NameMultipleDots",
 }
 
 # ============================================================
