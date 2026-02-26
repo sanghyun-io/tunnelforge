@@ -7,6 +7,7 @@ import pymysql
 from typing import List, Dict, Any, Optional, Tuple
 
 from src.core.logger import get_logger
+from src.core.constants import SYSTEM_SCHEMAS
 
 logger = get_logger('db_connector')
 
@@ -180,7 +181,7 @@ class MySQLConnector:
         try:
             with self.connection.cursor() as cursor:
                 cursor.execute("SHOW DATABASES")
-                exclude = {'information_schema', 'mysql', 'performance_schema', 'sys'}
+                exclude = SYSTEM_SCHEMAS
                 result = [row['Database'] for row in cursor.fetchall()
                           if row['Database'] not in exclude]
 

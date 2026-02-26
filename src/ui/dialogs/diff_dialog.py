@@ -199,9 +199,11 @@ class PixelLoadingWidget(QWidget):
         px = self.PX
         cx = w // 2
 
-        # DB icon positions
-        src_x = cx - 80
-        tgt_x = cx + 52
+        # DB icon positions (중앙 대칭 배치, DB 아이콘 너비 = 7*px = 28px)
+        db_icon_w = 7 * px      # 28px
+        half_gap = 52           # 중앙에서 각 아이콘까지의 거리
+        src_x = cx - half_gap - db_icon_w   # 소스: 중앙 왼쪽
+        tgt_x = cx + half_gap               # 타겟: 중앙 오른쪽
         db_y = 2
 
         # Source DB
@@ -625,8 +627,12 @@ class SchemaDiffDialog(QDialog):
             QMessageBox.critical(self, "연결 오류", f"DB 연결 실패: {e}")
             return
 
-        # UI 업데이트
+        # UI 업데이트 - 비교 중 입력 비활성화
         self.compare_btn.setEnabled(False)
+        self.source_tunnel_combo.setEnabled(False)
+        self.source_schema_combo.setEnabled(False)
+        self.target_tunnel_combo.setEnabled(False)
+        self.target_schema_combo.setEnabled(False)
         self.script_btn.setEnabled(False)
         self.diff_tree.clear()
         self.detail_text.clear()
@@ -657,6 +663,10 @@ class SchemaDiffDialog(QDialog):
         self._severity_summary = summary
         self._version_ctx = version_ctx
         self.compare_btn.setEnabled(True)
+        self.source_tunnel_combo.setEnabled(True)
+        self.source_schema_combo.setEnabled(True)
+        self.target_tunnel_combo.setEnabled(True)
+        self.target_schema_combo.setEnabled(True)
         self.script_btn.setEnabled(True)
         self.loading_widget.stop()
         self.progress_label.setText("✅ 비교 완료")
@@ -715,6 +725,10 @@ class SchemaDiffDialog(QDialog):
     def _on_compare_error(self, error: str):
         """비교 오류"""
         self.compare_btn.setEnabled(True)
+        self.source_tunnel_combo.setEnabled(True)
+        self.source_schema_combo.setEnabled(True)
+        self.target_tunnel_combo.setEnabled(True)
+        self.target_schema_combo.setEnabled(True)
         self.loading_widget.stop()
         self.progress_label.setText("")
         QMessageBox.critical(self, "비교 오류", f"스키마 비교 실패: {error}")

@@ -27,14 +27,22 @@ class DownloadError(Exception):
 class UpdateDownloader:
     """GitHub Releases에서 설치 프로그램 다운로드"""
 
-    TIMEOUT = 10  # API 요청 타임아웃 (초)
+    DEFAULT_TIMEOUT = 10  # 기본 API 요청 타임아웃 (초)
     CHUNK_SIZE = 8192  # 다운로드 청크 크기 (바이트)
 
-    def __init__(self):
+    def __init__(self, config_manager=None):
         self.latest_version: Optional[str] = None
         self.download_url: Optional[str] = None
         self.file_size: int = 0
         self._cancelled = False
+        self._config_manager = config_manager
+
+    @property
+    def timeout(self) -> int:
+        """API 요청 타임아웃 (초) - 설정 파일에서 읽거나 기본값 사용"""
+        if self._config_manager is not None:
+            return self._config_manager.get_network_timeout_download()
+        return self.DEFAULT_TIMEOUT
 
     def cancel(self):
         """다운로드 취소"""
@@ -52,7 +60,7 @@ class UpdateDownloader:
         try:
             response = requests.get(
                 RELEASES_API_URL,
-                timeout=self.TIMEOUT,
+                timeout=self.timeout,
                 headers={'Accept': 'application/vnd.github.v3+json'}
             )
             response.raise_for_status()

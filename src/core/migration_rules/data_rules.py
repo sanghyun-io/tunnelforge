@@ -146,15 +146,87 @@ class DataIntegrityRules:
     # ================================================================
     # D03: ENUM 숫자 인덱스 사용 검사
     # ================================================================
+    # ENUM 컬럼 정의 패턴: `col_name` enum('a','b','c')
+    _ENUM_COL_PATTERN = re.compile(
+        r'`(\w+)`\s+enum\s*\(([^)]+)\)',
+        re.IGNORECASE
+    )
+    # INSERT 문 패턴: INSERT INTO `table` (cols) VALUES (vals)
+    _INSERT_PATTERN = re.compile(
+        r'INSERT\s+INTO\s+`?(\w+)`?\s*\(([^)]+)\)\s*VALUES\s*',
+        re.IGNORECASE
+    )
+    # VALUES 행 패턴
+    _VALUES_ROW_PATTERN = re.compile(r'\(([^)]+)\)')
+
     def check_enum_numeric_index(self, content: str, location: str) -> List[CompatibilityIssue]:
-        """INSERT 문에서 ENUM 컬럼에 숫자 인덱스 사용 확인"""
+        """INSERT 문에서 ENUM 컬럼에 숫자 인덱스 사용 확인
+
+        CREATE TABLE의 ENUM 정의와 INSERT VALUES를 결합하여
+        ENUM 컬럼에 숫자 값(인덱스)이 삽입되는 경우를 감지합니다.
+        MySQL 8.4에서 ENUM 인덱스 동작 변경으로 인한 잠재적 문제를 경고합니다.
+        """
         issues = []
 
-        # INSERT ... VALUES (1, ...) 같은 숫자만 있는 패턴 감지는 복잡
-        # 간단히 경고만 제공 (실제로는 스키마 정보 필요)
-        # numeric_pattern은 향후 스키마 정보와 함께 사용될 예정
-        # ENUM 컬럼에 숫자 삽입은 스키마 정보 없이는 감지 어려움
-        # 일반적인 경고만 로깅
+        # Step 1: content에서 ENUM 컬럼이 있는 테이블 수집
+        # table_name -> set of enum column names
+        enum_columns: dict = {}
+        for table_match in re.finditer(
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?\s*\((.+?)\)\s*(?:ENGINE|DEFAULT|;)',
+            content, re.IGNORECASE | re.DOTALL
+        ):
+            table_name = table_match.group(1).lower()
+            body = table_match.group(2)
+            for col_match in self._ENUM_COL_PATTERN.finditer(body):
+                col_name = col_match.group(1).lower()
+                if table_name not in enum_columns:
+                    enum_columns[table_name] = set()
+                enum_columns[table_name].add(col_name)
+
+        if not enum_columns:
+            return issues
+
+        # Step 2: INSERT 문에서 ENUM 컬럼 위치의 값이 숫자인지 확인
+        for insert_match in self._INSERT_PATTERN.finditer(content):
+            table_name = insert_match.group(1).lower()
+            if table_name not in enum_columns:
+                continue
+
+            cols = [c.strip().strip('`').lower() for c in insert_match.group(2).split(',')]
+            enum_col_indices = [
+                i for i, col in enumerate(cols)
+                if col in enum_columns[table_name]
+            ]
+            if not enum_col_indices:
+                continue
+
+            # VALUES 행 검사 (per-INSERT 로컬 플래그로 교차 오염 방지)
+            rest = content[insert_match.end():]
+            found_in_current_insert = False
+            for row_match in self._VALUES_ROW_PATTERN.finditer(rest[:5000]):
+                values = [v.strip() for v in row_match.group(1).split(',')]
+                for idx in enum_col_indices:
+                    if idx < len(values):
+                        val = values[idx].strip()
+                        # 숫자 값인지 확인 (따옴표 없는 순수 숫자)
+                        if val.isdigit() and int(val) > 0:
+                            issues.append(CompatibilityIssue(
+                                issue_type=IssueType.ENUM_NUMERIC_INDEX,
+                                severity="warning",
+                                location=location,
+                                description=(
+                                    f"ENUM 컬럼 '{cols[idx]}'에 숫자 인덱스 값 {val} 사용 "
+                                    f"(테이블: {table_name})"
+                                ),
+                                suggestion="ENUM 컬럼에는 문자열 값을 사용하세요. 숫자 인덱스는 8.4에서 동작이 변경될 수 있습니다.",
+                                table_name=table_name,
+                                column_name=cols[idx]
+                            ))
+                            found_in_current_insert = True
+                            break  # 테이블당 한 번만 보고
+                if found_in_current_insert:
+                    break  # 이 INSERT에서 이미 발견 → 다음 INSERT로
+
         return issues
 
     # ================================================================
@@ -292,9 +364,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'rb') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
 
                     # 4바이트 UTF-8 시퀀스: 0xF0-0xF4로 시작
@@ -313,6 +387,15 @@ class DataIntegrityRules:
                     description=f"4바이트 UTF-8 문자 발견 (이모지 등): {count_4byte}개 행",
                     suggestion="utf8mb3 테이블은 4바이트 문자 저장 불가, utf8mb4로 변환 필요",
                     code_snippet=f"라인: {', '.join(map(str, sample_lines[:3]))}"
+                ))
+
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"4바이트 UTF-8 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
                 ))
 
         except Exception as e:
@@ -339,9 +422,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'rb') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
                     if b'\x00' in line:
                         null_count += 1
@@ -356,6 +441,15 @@ class DataIntegrityRules:
                     description=f"NULL 바이트 포함 데이터: {null_count}개 행",
                     suggestion="NULL 바이트는 문자열 필드에서 문제 발생 가능, 데이터 정제 필요",
                     code_snippet=f"라인: {', '.join(map(str, sample_lines[:3]))}"
+                ))
+
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"NULL 바이트 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
                 ))
 
         except Exception as e:
@@ -382,9 +476,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
 
                     for match in TIMESTAMP_PATTERN.finditer(line):
@@ -405,6 +501,15 @@ class DataIntegrityRules:
                     code_snippet=f"값: {', '.join(sample_values[:3])}"
                 ))
 
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"TIMESTAMP 범위 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
+                ))
+
         except Exception as e:
             self._log(f"  ⚠️ 파일 읽기 오류: {file_path.name} - {str(e)}")
             issues.append(CompatibilityIssue(
@@ -420,46 +525,99 @@ class DataIntegrityRules:
     # ================================================================
     # D09: latin1 비ASCII 데이터 검사 (라이브 DB)
     # ================================================================
+
+    # 컬럼 수 상한: 이 수를 초과하면 부분 스캔 경고를 표시
+    _MAX_COLUMNS_TO_CHECK = 50
+
     def check_latin1_non_ascii(self, schema: str) -> List[CompatibilityIssue]:
-        """latin1 컬럼에서 비ASCII 데이터 확인"""
+        """latin1 컬럼에서 비ASCII 데이터 확인 (배치 쿼리 방식)"""
         if not self.connector:
             return []
 
         self._log("🔍 latin1 비ASCII 데이터 검사 중...")
         issues = []
 
-        # latin1 컬럼 찾기
+        # latin1 컬럼 전체 목록 수집 (단일 INFORMATION_SCHEMA 쿼리)
         query = """
         SELECT TABLE_NAME, COLUMN_NAME
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = %s
             AND CHARACTER_SET_NAME = 'latin1'
             AND DATA_TYPE IN ('varchar', 'char', 'text', 'mediumtext', 'longtext')
+        ORDER BY TABLE_NAME, COLUMN_NAME
         """
         columns = self.connector.execute(query, (schema,))
 
-        for col in columns:
-            # 비ASCII 데이터 샘플 확인 (성능을 위해 LIMIT 사용)
+        if not columns:
+            self._log("  ✅ latin1 비ASCII 데이터 없음")
+            return issues
+
+        # 컬럼 수 상한 적용
+        partial_scan = len(columns) > self._MAX_COLUMNS_TO_CHECK
+        if partial_scan:
+            self._log(
+                f"  ⚠️ latin1 컬럼 {len(columns)}개 감지 — "
+                f"상위 {self._MAX_COLUMNS_TO_CHECK}개만 스캔 (부분 스캔)"
+            )
+            columns = columns[: self._MAX_COLUMNS_TO_CHECK]
+
+        # 테이블별로 컬럼을 묶어 배치 처리 (테이블당 1회 쿼리)
+        from itertools import groupby
+
+        def _table_key(col):
+            return col['TABLE_NAME']
+
+        for table_name, col_group in groupby(columns, key=_table_key):
+            col_list = list(col_group)
+            # 각 컬럼에 대한 REGEXP 조건을 OR로 결합하여 단일 쿼리로 처리
+            conditions = " OR ".join(
+                f"`{c['COLUMN_NAME']}` REGEXP '[^\\x00-\\x7F]'"
+                for c in col_list
+            )
+            # 테이블당 비ASCII가 있는 컬럼을 한 번에 식별
+            select_cols = ", ".join(
+                f"MAX(`{c['COLUMN_NAME']}` REGEXP '[^\\x00-\\x7F]') AS `{c['COLUMN_NAME']}`"
+                for c in col_list
+            )
+            batch_query = (
+                f"SELECT {select_cols} "
+                f"FROM `{schema}`.`{table_name}` "
+                f"WHERE {conditions} "
+                f"LIMIT 1"
+            )
             try:
-                check_query = f"""
-                SELECT COUNT(*) as cnt
-                FROM `{schema}`.`{col['TABLE_NAME']}`
-                WHERE `{col['COLUMN_NAME']}` REGEXP '[^\x00-\x7F]'
-                LIMIT 1
-                """
-                result = self.connector.execute(check_query)
-                if result and result[0]['cnt'] > 0:
-                    issues.append(CompatibilityIssue(
-                        issue_type=IssueType.LATIN1_NON_ASCII,
-                        severity="warning",
-                        location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
-                        description="latin1 컬럼에 비ASCII 데이터 존재",
-                        suggestion="utf8mb4 변환 전 데이터 인코딩 확인 필요",
-                        table_name=col['TABLE_NAME'],
-                        column_name=col['COLUMN_NAME']
-                    ))
+                result = self.connector.execute(batch_query)
+                if result:
+                    row = result[0]
+                    for col in col_list:
+                        col_name = col['COLUMN_NAME']
+                        if row.get(col_name):
+                            issues.append(CompatibilityIssue(
+                                issue_type=IssueType.LATIN1_NON_ASCII,
+                                severity="warning",
+                                location=f"{schema}.{table_name}.{col_name}",
+                                description="latin1 컬럼에 비ASCII 데이터 존재",
+                                suggestion="utf8mb4 변환 전 데이터 인코딩 확인 필요",
+                                table_name=table_name,
+                                column_name=col_name
+                            ))
             except Exception as e:
-                self._log(f"    ⏭️ {col['TABLE_NAME']}.{col['COLUMN_NAME']} latin1 검사 스킵: {str(e)[:80]}")
+                self._log(
+                    f"    ⏭️ {table_name} latin1 배치 검사 스킵: {str(e)[:80]}"
+                )
+
+        if partial_scan:
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.LATIN1_NON_ASCII,
+                severity="info",
+                location=schema,
+                description=(
+                    f"latin1 컬럼이 {self._MAX_COLUMNS_TO_CHECK}개를 초과하여 "
+                    f"부분 스캔만 수행되었습니다. 나머지 컬럼은 수동 확인 권장."
+                ),
+                suggestion="SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                           "WHERE TABLE_SCHEMA='<db>' AND CHARACTER_SET_NAME='latin1' 로 전체 목록 확인"
+            ))
 
         if issues:
             self._log(f"  ⚠️ latin1 비ASCII 데이터 {len(issues)}개 발견")
@@ -472,51 +630,111 @@ class DataIntegrityRules:
     # D10: ZEROFILL 데이터 의존성 검사 (라이브 DB)
     # ================================================================
     def check_zerofill_data_dependency(self, schema: str) -> List[CompatibilityIssue]:
-        """ZEROFILL 컬럼의 실제 데이터가 패딩에 의존하는지 확인"""
+        """ZEROFILL 컬럼의 실제 데이터가 패딩에 의존하는지 확인 (배치 쿼리 방식)"""
         if not self.connector:
             return []
 
         self._log("🔍 ZEROFILL 데이터 의존성 검사 중...")
         issues = []
 
-        # ZEROFILL 컬럼 찾기
+        # ZEROFILL 컬럼 전체 목록 수집 (단일 INFORMATION_SCHEMA 쿼리)
         query = """
         SELECT TABLE_NAME, COLUMN_NAME, COLUMN_TYPE
         FROM INFORMATION_SCHEMA.COLUMNS
         WHERE TABLE_SCHEMA = %s
             AND COLUMN_TYPE LIKE '%%ZEROFILL%%'
+        ORDER BY TABLE_NAME, COLUMN_NAME
         """
         columns = self.connector.execute(query, (schema,))
 
+        if not columns:
+            self._log("  ✅ ZEROFILL 의존 데이터 없음")
+            return issues
+
+        # 너비 정보 사전 파싱 — 너비를 알 수 없는 컬럼은 건너뜀
+        parsed_cols = []
         for col in columns:
-            # 표시 너비 추출
             width_match = re.search(r'\((\d+)\)', col['COLUMN_TYPE'])
             if width_match:
-                width = int(width_match.group(1))
-                # 선행 0이 필요한 값이 있는지 샘플링
-                try:
-                    # LPAD로 비교하여 현재 값이 실제로 선행 0에 의존하는지 확인
-                    check_query = f"""
-                    SELECT COUNT(*) as cnt
-                    FROM `{schema}`.`{col['TABLE_NAME']}`
-                    WHERE LENGTH(CAST(`{col['COLUMN_NAME']}` AS CHAR)) < {width}
-                        AND `{col['COLUMN_NAME']}` IS NOT NULL
-                        AND `{col['COLUMN_NAME']}` > 0
-                    LIMIT 100
-                    """
-                    result = self.connector.execute(check_query)
-                    if result and result[0]['cnt'] > 0:
-                        issues.append(CompatibilityIssue(
-                            issue_type=IssueType.ZEROFILL_USAGE,
-                            severity="warning",
-                            location=f"{schema}.{col['TABLE_NAME']}.{col['COLUMN_NAME']}",
-                            description=f"ZEROFILL 패딩에 의존하는 데이터 존재 (너비: {width})",
-                            suggestion="ZEROFILL 제거 시 LPAD() 함수로 애플리케이션에서 처리 필요",
-                            table_name=col['TABLE_NAME'],
-                            column_name=col['COLUMN_NAME']
-                        ))
-                except Exception as e:
-                    self._log(f"    ⏭️ {col['TABLE_NAME']}.{col['COLUMN_NAME']} ZEROFILL 검사 스킵: {str(e)[:80]}")
+                parsed_cols.append({
+                    'TABLE_NAME': col['TABLE_NAME'],
+                    'COLUMN_NAME': col['COLUMN_NAME'],
+                    'width': int(width_match.group(1)),
+                })
+
+        if not parsed_cols:
+            self._log("  ✅ ZEROFILL 의존 데이터 없음")
+            return issues
+
+        # 컬럼 수 상한 적용
+        partial_scan = len(parsed_cols) > self._MAX_COLUMNS_TO_CHECK
+        if partial_scan:
+            self._log(
+                f"  ⚠️ ZEROFILL 컬럼 {len(parsed_cols)}개 감지 — "
+                f"상위 {self._MAX_COLUMNS_TO_CHECK}개만 스캔 (부분 스캔)"
+            )
+            parsed_cols = parsed_cols[: self._MAX_COLUMNS_TO_CHECK]
+
+        # 테이블별로 컬럼을 묶어 배치 처리 (테이블당 1회 쿼리)
+        from itertools import groupby
+
+        def _table_key(col):
+            return col['TABLE_NAME']
+
+        for table_name, col_group in groupby(parsed_cols, key=_table_key):
+            col_list = list(col_group)
+            # 각 컬럼의 패딩 의존 여부를 단일 SELECT로 판별
+            # LENGTH(CAST(col AS CHAR)) < width 인 행이 존재하면 패딩 의존
+            select_parts = []
+            for c in col_list:
+                w = c['width']
+                cname = c['COLUMN_NAME']
+                select_parts.append(
+                    f"MAX(CASE WHEN LENGTH(CAST(`{cname}` AS CHAR)) < {w} "
+                    f"AND `{cname}` IS NOT NULL AND `{cname}` > 0 THEN 1 ELSE 0 END) "
+                    f"AS `{cname}`"
+                )
+            batch_query = (
+                f"SELECT {', '.join(select_parts)} "
+                f"FROM `{schema}`.`{table_name}` "
+                f"LIMIT 100"
+            )
+            try:
+                result = self.connector.execute(batch_query)
+                if result:
+                    row = result[0]
+                    for col in col_list:
+                        col_name = col['COLUMN_NAME']
+                        if row.get(col_name):
+                            issues.append(CompatibilityIssue(
+                                issue_type=IssueType.ZEROFILL_USAGE,
+                                severity="warning",
+                                location=f"{schema}.{table_name}.{col_name}",
+                                description=(
+                                    f"ZEROFILL 패딩에 의존하는 데이터 존재 "
+                                    f"(너비: {col['width']})"
+                                ),
+                                suggestion="ZEROFILL 제거 시 LPAD() 함수로 애플리케이션에서 처리 필요",
+                                table_name=table_name,
+                                column_name=col_name
+                            ))
+            except Exception as e:
+                self._log(
+                    f"    ⏭️ {table_name} ZEROFILL 배치 검사 스킵: {str(e)[:80]}"
+                )
+
+        if partial_scan:
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.ZEROFILL_USAGE,
+                severity="info",
+                location=schema,
+                description=(
+                    f"ZEROFILL 컬럼이 {self._MAX_COLUMNS_TO_CHECK}개를 초과하여 "
+                    f"부분 스캔만 수행되었습니다. 나머지 컬럼은 수동 확인 권장."
+                ),
+                suggestion="SELECT TABLE_NAME, COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                           "WHERE TABLE_SCHEMA='<db>' AND COLUMN_TYPE LIKE '%ZEROFILL%' 로 전체 목록 확인"
+            ))
 
         if issues:
             self._log(f"  ⚠️ ZEROFILL 의존 데이터 {len(issues)}개 발견")
@@ -537,9 +755,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
 
                     # 0000-00-00 패턴
@@ -564,6 +784,15 @@ class DataIntegrityRules:
                     description=f"잘못된 날짜 값 발견: {invalid_count}개 행 (0000-00-00 등)",
                     suggestion="NO_ZERO_DATE SQL 모드 활성화 시 오류 발생, 유효한 날짜로 변환 필요",
                     code_snippet=f"값: {', '.join(sample_values[:3])}"
+                ))
+
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"DATETIME 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
                 ))
 
         except Exception as e:
@@ -592,6 +821,7 @@ class DataIntegrityRules:
         issues = []
         issues.extend(self.check_enum_empty_in_sql(content, location))
         issues.extend(self.check_enum_empty_insert(content, location))
+        issues.extend(self.check_enum_numeric_index(content, location))
         return issues
 
     def check_all_data_file(self, file_path: Path) -> List[CompatibilityIssue]:

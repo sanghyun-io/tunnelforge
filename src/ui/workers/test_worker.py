@@ -118,7 +118,7 @@ class ConnectionTestWorker(QThread):
             if connector:
                 try:
                     connector.disconnect()
-                except:
+                except Exception:
                     pass
 
             # 임시 터널 정리 (finished 전에 실행)
@@ -200,7 +200,7 @@ class ConnectionTestWorker(QThread):
             if connector:
                 try:
                     connector.disconnect()
-                except:
+                except Exception:
                     pass
 
             # 임시 터널 정리 (finished 전에 실행)

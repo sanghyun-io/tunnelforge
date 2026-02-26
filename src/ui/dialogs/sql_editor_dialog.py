@@ -786,7 +786,7 @@ class SQLQueryWorker(QThread):
             if connector:
                 try:
                     connector.disconnect()
-                except:
+                except Exception:
                     pass
 
 
@@ -918,7 +918,7 @@ class SQLTransactionWorker(QThread):
                 try:
                     self.connector.connection.rollback()
                     self.connector.disconnect()
-                except:
+                except Exception:
                     pass
             self.finished.emit(False, f"❌ 오류: {str(e)}")
 
@@ -2086,7 +2086,7 @@ class SQLEditorDialog(QDialog):
                 # 항상 연결 정리
                 try:
                     connector.disconnect()
-                except:
+                except Exception:
                     pass
 
         except Exception as e:
@@ -2754,7 +2754,7 @@ class SQLEditorDialog(QDialog):
 
                     self.message_text.append(f"↩️ 연결 종료 - {pending_count}건 자동 롤백됨")
                 self.db_connection.close()
-            except:
+            except Exception:
                 pass
             self.db_connection = None
             self.pending_queries.clear()
@@ -3001,7 +3001,7 @@ class SQLEditorDialog(QDialog):
             if self._metadata_connector:
                 try:
                     self._metadata_connector.disconnect()
-                except:
+                except Exception:
                     pass
                 self._metadata_connector = None
 
@@ -3036,7 +3036,7 @@ class SQLEditorDialog(QDialog):
         if self._metadata_connector:
             try:
                 self._metadata_connector.disconnect()
-            except:
+            except Exception:
                 pass
             self._metadata_connector = None
 
@@ -3056,7 +3056,7 @@ class SQLEditorDialog(QDialog):
         if self._metadata_connector:
             try:
                 self._metadata_connector.disconnect()
-            except:
+            except Exception:
                 pass
             self._metadata_connector = None
 
@@ -3186,7 +3186,7 @@ class SQLEditorDialog(QDialog):
         if self._metadata_connector:
             try:
                 self._metadata_connector.disconnect()
-            except:
+            except Exception:
                 pass
             self._metadata_connector = None
 

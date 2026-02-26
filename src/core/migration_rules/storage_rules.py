@@ -8,6 +8,7 @@ MySQL 8.0 → 8.4 업그레이드 시 스토리지 엔진 관련 호환성 검�
 - S13: FEDERATED 엔진
 - S14: 파티션 공유 테이블스페이스
 - S15: 비네이티브 파티셔닝
+- S16: 비InnoDB 엔진에 FK 사용 (이슈 #63)
 """
 
 import re
@@ -17,6 +18,7 @@ from ..migration_constants import (
     IssueType,
     CompatibilityIssue,
     STORAGE_ENGINE_STATUS,
+    INVALID_ENGINE_FK_PATTERN,
 )
 
 if TYPE_CHECKING:
@@ -183,6 +185,38 @@ class StorageRules:
         return issues
 
     # ================================================================
+    # S16: 비InnoDB 엔진에 FK 사용 검사 (덤프 파일, 이슈 #63)
+    # ================================================================
+    def check_invalid_engine_fk(self, content: str, location: str) -> List[CompatibilityIssue]:
+        """비InnoDB 엔진(MyISAM, MEMORY, ARCHIVE)을 사용하는 테이블에 FK 정의 확인"""
+        issues = []
+
+        # CREATE TABLE 단위로 분리하여 검사
+        # FK와 비InnoDB 엔진이 동일 CREATE TABLE 구문 내에 있는지 확인
+        create_table_pattern = re.compile(
+            r'CREATE\s+TABLE\s+`?(\w+)`?\s*\([^;]+?\)\s*[^;]*ENGINE\s*=\s*(MyISAM|MEMORY|ARCHIVE|CSV)[^;]*;',
+            re.IGNORECASE | re.DOTALL
+        )
+
+        for match in create_table_pattern.finditer(content):
+            table_body = match.group(0)
+            table_name = match.group(1)
+            engine = match.group(2).upper()
+
+            # 해당 CREATE TABLE 내에 FOREIGN KEY가 있는지 확인
+            if re.search(r'\bFOREIGN\s+KEY\b', table_body, re.IGNORECASE):
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.INVALID_ENGINE_FK,
+                    severity="error",
+                    location=location,
+                    description=f"비InnoDB 엔진({engine})을 사용하는 테이블 '{table_name}'에 FOREIGN KEY 정의",
+                    suggestion=f"ALTER TABLE `{table_name}` ENGINE=InnoDB 또는 FOREIGN KEY 제거",
+                    table_name=table_name
+                ))
+
+        return issues
+
+    # ================================================================
     # 엔진별 통계 조회 (정보성)
     # ================================================================
     def get_engine_statistics(self, schema: str) -> dict:
@@ -224,4 +258,6 @@ class StorageRules:
         issues = []
         issues.extend(self.check_deprecated_engines_in_sql(content, location))
         issues.extend(self.check_partition_non_native(content, location))
+        # 신규 규칙 (이슈 #63)
+        issues.extend(self.check_invalid_engine_fk(content, location))
         return issues

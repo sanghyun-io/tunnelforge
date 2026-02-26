@@ -20,9 +20,9 @@ class UpdateDownloadWorker(QThread):
     progress = pyqtSignal(int, int)        # downloaded, total
     finished = pyqtSignal(bool, str)       # success, file_path or error
 
-    def __init__(self):
+    def __init__(self, config_manager=None):
         super().__init__()
-        self.downloader = UpdateDownloader()
+        self.downloader = UpdateDownloader(config_manager=config_manager)
         self._cancelled = False
 
     def run(self):

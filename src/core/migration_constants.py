@@ -10,16 +10,30 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 # ============================================================
-# MySQL 8.4에서 제거된 시스템 변수 (47개)
+# MySQL 8.4에서 제거된 시스템 변수 (64개)
 # ============================================================
 REMOVED_SYS_VARS_84: Tuple[str, ...] = (
+    'authentication_fido_rp_id',
     'avoid_temporal_upgrade',
     'binlog_transaction_dependency_tracking',
+    'daemon_memcached_enable_binlog',
+    'daemon_memcached_engine_lib_name',
+    'daemon_memcached_engine_lib_path',
+    'daemon_memcached_option',
+    'daemon_memcached_r_batch_size',
+    'daemon_memcached_w_batch_size',
     'default_authentication_plugin',
+    'expire_logs_days',
     'group_replication_ip_allowlist',
+    'group_replication_primary_member',
     'group_replication_recovery_complete_at',
     'have_openssl',
     'have_ssl',
+    'innodb_api_bk_commit_interval',
+    'innodb_api_disable_rowlock',
+    'innodb_api_enable_binlog',
+    'innodb_api_enable_mdl',
+    'innodb_api_trx_level',
     'innodb_log_file_size',
     'innodb_log_files_in_group',
     'keyring_file_data',
@@ -43,12 +57,18 @@ REMOVED_SYS_VARS_84: Tuple[str, ...] = (
     'keyring_aws_conf_file',
     'keyring_aws_data_file',
     'keyring_aws_region',
+    'language',
     'log_bin_use_v1_row_events',
+    'master_info_repository',
     'master_verify_checksum',
+    'new',
+    'old',
     'old_alter_table',
+    'old_style_user_limits',
     'relay_log_info_file',
     'relay_log_info_repository',
     'replica_parallel_type',
+    'show_old_temporals',
     'slave_parallel_type',
     'slave_rows_search_algorithms',
     'sql_slave_skip_counter',
@@ -81,30 +101,47 @@ ALL_RESERVED_KEYWORDS: Tuple[str, ...] = RESERVED_KEYWORDS_80 + NEW_RESERVED_KEY
 # ============================================================
 # MySQL 8.4에서 제거된 함수
 # ============================================================
-# 8.0 → 8.4 마이그레이션 시 확인 필요한 모든 제거 함수
-# (8.0.x 마이너 버전에서 이미 제거된 것 포함)
+# mysql-upgrade-checker 참조 구현과 통일된 분류 체계
+# 8.0.x에서 deprecated → 8.4에서 완전 제거된 함수
 REMOVED_FUNCTIONS_84: Tuple[str, ...] = (
-    # Note: MASTER_POS_WAIT는 8.4에서 deprecated alias이지 removed가 아님 → DEPRECATED_FUNCTIONS_84로 이동
+    'PASSWORD',        # 8.0.11 deprecated → 8.4 제거
+    'ENCRYPT',         # 8.0.3 deprecated → 8.4 제거
+    'ENCODE',          # 8.0.3 deprecated → 8.4 제거
+    'DECODE',          # 8.0.3 deprecated → 8.4 제거
+    'DES_ENCRYPT',     # 8.0.3 deprecated → 8.4 제거
+    'DES_DECRYPT',     # 8.0.3 deprecated → 8.4 제거
 )
 
 # 8.4에서 deprecated된 함수 (아직 동작하나 deprecated 경고)
 DEPRECATED_FUNCTIONS_84: Tuple[str, ...] = (
-    'MASTER_POS_WAIT',  # deprecated alias, SOURCE_POS_WAIT() 사용 권장
+    'MASTER_POS_WAIT',      # deprecated alias, SOURCE_POS_WAIT() 사용 권장
+    'FOUND_ROWS',           # deprecated, COUNT(*) 별도 쿼리 사용 권장
+    'SQL_CALC_FOUND_ROWS',  # deprecated, COUNT(*) 별도 쿼리 사용 권장
 )
 
-# 8.0.x 마이너 버전에서 이미 제거된 함수 (8.0 → 8.4 마이그레이션 시 참고)
+# 8.0 이전에 이미 제거된 함수 (5.7 → 8.0 마이그레이션 잔존 확인용)
 REMOVED_FUNCTIONS_80X: Tuple[str, ...] = (
-    'ENCODE',          # 8.0.3에서 제거
-    'DECODE',          # 8.0.3에서 제거
-    'DES_ENCRYPT',     # 8.0.3에서 제거
-    'DES_DECRYPT',     # 8.0.3에서 제거
-    'ENCRYPT',         # 8.0.3에서 제거
-    'PASSWORD',        # 8.0.11에서 제거
     'OLD_PASSWORD',    # 5.7에서 제거
 )
 
 # 마이그레이션 검사 시 사용할 전체 제거/deprecated 함수 목록
 ALL_REMOVED_FUNCTIONS: Tuple[str, ...] = REMOVED_FUNCTIONS_84 + REMOVED_FUNCTIONS_80X + DEPRECATED_FUNCTIONS_84
+
+# MySQL 8.4에서 generated column 내 동작이 변경된 함수
+# (mysql-upgrade-checker의 CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS 참조)
+# 이 함수들은 generated column 표현식에서 사용 시 8.4 업그레이드 후 결과가 달라질 수 있음
+CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS: Tuple[str, ...] = (
+    'IF',
+    'IFNULL',
+    'NULLIF',
+    'CASE',
+    'COALESCE',
+    'GREATEST',
+    'LEAST',
+    'BIT_AND',
+    'BIT_OR',
+    'BIT_XOR',
+)
 
 # ============================================================
 # 인증 플러그인 상태
@@ -146,13 +183,13 @@ SYS_VARS_NEW_DEFAULTS_84: Dict[str, Dict[str, str]] = {
         'old': '200', 'new': '10000',
     },
     'innodb_io_capacity_max': {
-        'old': '2 * innodb_io_capacity', 'new': '2 * new default',
+        'old': '2000', 'new': '20000',
     },
     'innodb_log_buffer_size': {
         'old': '16M', 'new': '64M',
     },
     'innodb_redo_log_capacity': {
-        'old': '100M', 'new': '100M (now replaces log_file_size * files)',
+        'old': '100M (innodb_log_file_size * innodb_log_files_in_group)', 'new': '100M',
     },
     'group_replication_consistency': {
         'old': 'EVENTUAL', 'new': 'BEFORE_ON_PRIMARY_FAILOVER',
@@ -230,9 +267,38 @@ MYSQL_SCHEMA_TABLES: Tuple[str, ...] = (
 # 스토리지 엔진 상태
 # ============================================================
 STORAGE_ENGINE_STATUS: Dict[str, any] = {
-    'deprecated': ['MyISAM', 'ARCHIVE', 'BLACKHOLE', 'FEDERATED'],
+    'deprecated': ['MyISAM', 'ARCHIVE', 'BLACKHOLE', 'FEDERATED', 'MERGE', 'EXAMPLE', 'NDB'],
     'recommended': 'InnoDB',
     'warning_engines': ['MEMORY', 'CSV'],
+}
+
+# 엔진별 상세 정책 (severity, suggestion)
+# migration_analyzer.py의 check_deprecated_engines와 storage_rules.py가 공유하는 단일 소스
+ENGINE_POLICIES: Dict[str, Dict[str, str]] = {
+    'MyISAM': {
+        'severity': 'warning',
+        'suggestion': 'InnoDB로 변환 권장 (트랜잭션/FK 지원)',
+    },
+    'ARCHIVE': {
+        'severity': 'warning',
+        'suggestion': 'InnoDB로 변환 권장',
+    },
+    'BLACKHOLE': {
+        'severity': 'info',
+        'suggestion': '테스트/복제용 엔진 - 필요시 유지',
+    },
+    'FEDERATED': {
+        'severity': 'warning',
+        'suggestion': 'MySQL 8.4에서 제거 예정',
+    },
+    'MERGE': {
+        'severity': 'error',
+        'suggestion': 'MySQL 8.4에서 제거됨 - InnoDB 파티셔닝으로 대체',
+    },
+    'MEMORY': {
+        'severity': 'info',
+        'suggestion': '임시 테이블용으로는 유지 가능',
+    },
 }
 
 # ============================================================
@@ -311,11 +377,23 @@ class IssueType(Enum):
     FK_NON_UNIQUE_REF = "fk_non_unique_ref"  # FK 비고유 참조
     FK_REF_NOT_FOUND = "fk_ref_not_found"  # FK 참조 테이블 미존재
 
+    # 스캔 관련
+    SCAN_TRUNCATED = "scan_truncated"  # 스캔 행 수 제한으로 중단됨
+
     # Definer 관련
     ROUTINE_DEFINER_MISSING = "routine_definer_missing"  # 루틴 definer 누락
     VIEW_DEFINER_MISSING = "view_definer_missing"  # 뷰 definer 누락
     TRIGGER_OLD_SYNTAX = "trigger_old_syntax"  # 트리거 구식 구문
     EVENT_OLD_SYNTAX = "event_old_syntax"  # 이벤트 구식 구문
+
+    # 신규 이슈 타입 (이슈 #63)
+    PARTITION_PREFIX_KEY = "partition_prefix_key"  # 파티션 키에 prefix 인덱스 사용
+    EMPTY_DOT_TABLE_SYNTAX = "empty_dot_table_syntax"  # 스키마 생략 dot 구문 (.tableName)
+    INNODB_ROW_FORMAT = "innodb_row_format"  # REDUNDANT/COMPACT ROW_FORMAT (DYNAMIC 권장)
+    DEPRECATED_TEMPORAL_DELIMITER = "deprecated_temporal_delimiter"  # deprecated 날짜 구분자
+    INVALID_ENGINE_FK = "invalid_engine_fk"  # 비InnoDB 엔진에 FK 사용
+    ROUTINE_SYNTAX_KEYWORD = "routine_syntax_keyword"  # 루틴 이름이 예약어와 충돌
+    INVALID_57_NAME_MULTIPLE_DOTS = "invalid_57_name_multiple_dots"  # 식별자에 연속 점(..) 사용
 
 
 # ============================================================
@@ -433,6 +511,58 @@ GENERATED_COLUMN_PATTERN = re.compile(
 )
 
 # ============================================================
+# 신규 패턴 (이슈 #63)
+# ============================================================
+
+# PARTITION BY KEY/RANGE/LIST with prefix index 패턴
+# PARTITION BY KEY (prefix_col(N)) 또는 KEY (col(N)) 형태 감지
+PARTITION_PREFIX_KEY_PATTERN = re.compile(
+    r'PARTITION\s+BY\s+(?:LINEAR\s+)?KEY\s*\([^)]*\w+\s*\(\s*\d+\s*\)[^)]*\)',
+    re.IGNORECASE
+)
+
+# 스키마 생략 dot 구문 패턴 (`.tableName` 형태)
+# FROM 또는 JOIN 뒤에 오는 .table_name 참조 (스키마 없이 점으로 시작)
+EMPTY_DOT_TABLE_SYNTAX_PATTERN = re.compile(
+    r'(?:FROM|JOIN)\s+\.\s*`?\w+`?',
+    re.IGNORECASE
+)
+
+# INNODB ROW_FORMAT REDUNDANT/COMPACT 패턴
+INNODB_ROW_FORMAT_PATTERN = re.compile(
+    r'\bROW_FORMAT\s*=\s*(REDUNDANT|COMPACT)\b',
+    re.IGNORECASE
+)
+
+# deprecated 날짜 구분자 패턴 (@ 또는 / 또는 ! 등 비표준 구분자 사용)
+# MySQL은 일반적으로 - 또는 / 허용하나 @ ! # 등은 비표준
+DEPRECATED_TEMPORAL_DELIMITER_PATTERN = re.compile(
+    r"'(\d{4})\s*[@!#]\s*(\d{1,2})\s*[@!#]\s*(\d{1,2})'",
+    re.IGNORECASE
+)
+
+# 비InnoDB 엔진 테이블에 FOREIGN KEY 정의 패턴
+# CREATE TABLE ... ENGINE=MyISAM/MEMORY/ARCHIVE ... FOREIGN KEY
+INVALID_ENGINE_FK_PATTERN = re.compile(
+    r'CREATE\s+TABLE\s+[^;]+?FOREIGN\s+KEY[^;]+?ENGINE\s*=\s*(MyISAM|MEMORY|ARCHIVE|CSV)\b'
+    r'|CREATE\s+TABLE\s+[^;]+?ENGINE\s*=\s*(MyISAM|MEMORY|ARCHIVE|CSV)\b[^;]+?FOREIGN\s+KEY',
+    re.IGNORECASE | re.DOTALL
+)
+
+# 저장 프로시저/함수/이벤트/트리거 이름이 예약어와 충돌하는 패턴
+# CREATE PROCEDURE/FUNCTION `keyword` 또는 CREATE PROCEDURE/FUNCTION keyword
+ROUTINE_SYNTAX_KEYWORD_PATTERN = re.compile(
+    r'CREATE\s+(?:DEFINER\s*=\s*\S+\s+)?(?:PROCEDURE|FUNCTION|EVENT|TRIGGER)\s+`?(\w+)`?',
+    re.IGNORECASE
+)
+
+# 식별자에 연속 점(..) 사용 패턴 (schema..table 또는 ..table 형태)
+INVALID_57_NAME_MULTIPLE_DOTS_PATTERN = re.compile(
+    r'`?[\w$]+`?\s*\.\.\s*`?[\w$]+`?',
+    re.IGNORECASE
+)
+
+# ============================================================
 # MySQL Shell Check ID 매핑
 # ============================================================
 MYSQL_SHELL_CHECK_IDS: Dict[IssueType, str] = {
@@ -454,6 +584,13 @@ MYSQL_SHELL_CHECK_IDS: Dict[IssueType, str] = {
     IssueType.SQL_CALC_FOUND_ROWS_USAGE: "sqlCalcFoundRows",
     IssueType.FK_NON_UNIQUE_REF: "fkNonUniqueRef",
     IssueType.FK_REF_NOT_FOUND: "fkRefNotFound",
+    IssueType.PARTITION_PREFIX_KEY: "partitionPrefixKey",
+    IssueType.EMPTY_DOT_TABLE_SYNTAX: "emptyDotTableSyntax",
+    IssueType.INNODB_ROW_FORMAT: "innodbRowFormat",
+    IssueType.DEPRECATED_TEMPORAL_DELIMITER: "deprecatedTemporalDelimiter",
+    IssueType.INVALID_ENGINE_FK: "invalidEngineFk",
+    IssueType.ROUTINE_SYNTAX_KEYWORD: "routineSyntaxKeyword",
+    IssueType.INVALID_57_NAME_MULTIPLE_DOTS: "invalid57NameMultipleDots",
 }
 
 # ============================================================
