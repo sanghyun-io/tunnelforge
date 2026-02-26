@@ -146,15 +146,87 @@ class DataIntegrityRules:
     # ================================================================
     # D03: ENUM 숫자 인덱스 사용 검사
     # ================================================================
+    # ENUM 컬럼 정의 패턴: `col_name` enum('a','b','c')
+    _ENUM_COL_PATTERN = re.compile(
+        r'`(\w+)`\s+enum\s*\(([^)]+)\)',
+        re.IGNORECASE
+    )
+    # INSERT 문 패턴: INSERT INTO `table` (cols) VALUES (vals)
+    _INSERT_PATTERN = re.compile(
+        r'INSERT\s+INTO\s+`?(\w+)`?\s*\(([^)]+)\)\s*VALUES\s*',
+        re.IGNORECASE
+    )
+    # VALUES 행 패턴
+    _VALUES_ROW_PATTERN = re.compile(r'\(([^)]+)\)')
+
     def check_enum_numeric_index(self, content: str, location: str) -> List[CompatibilityIssue]:
-        """INSERT 문에서 ENUM 컬럼에 숫자 인덱스 사용 확인"""
+        """INSERT 문에서 ENUM 컬럼에 숫자 인덱스 사용 확인
+
+        CREATE TABLE의 ENUM 정의와 INSERT VALUES를 결합하여
+        ENUM 컬럼에 숫자 값(인덱스)이 삽입되는 경우를 감지합니다.
+        MySQL 8.4에서 ENUM 인덱스 동작 변경으로 인한 잠재적 문제를 경고합니다.
+        """
         issues = []
 
-        # INSERT ... VALUES (1, ...) 같은 숫자만 있는 패턴 감지는 복잡
-        # 간단히 경고만 제공 (실제로는 스키마 정보 필요)
-        # numeric_pattern은 향후 스키마 정보와 함께 사용될 예정
-        # ENUM 컬럼에 숫자 삽입은 스키마 정보 없이는 감지 어려움
-        # 일반적인 경고만 로깅
+        # Step 1: content에서 ENUM 컬럼이 있는 테이블 수집
+        # table_name -> set of enum column names
+        enum_columns: dict = {}
+        for table_match in re.finditer(
+            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?\s*\((.+?)\)\s*(?:ENGINE|DEFAULT|;)',
+            content, re.IGNORECASE | re.DOTALL
+        ):
+            table_name = table_match.group(1).lower()
+            body = table_match.group(2)
+            for col_match in self._ENUM_COL_PATTERN.finditer(body):
+                col_name = col_match.group(1).lower()
+                if table_name not in enum_columns:
+                    enum_columns[table_name] = set()
+                enum_columns[table_name].add(col_name)
+
+        if not enum_columns:
+            return issues
+
+        # Step 2: INSERT 문에서 ENUM 컬럼 위치의 값이 숫자인지 확인
+        for insert_match in self._INSERT_PATTERN.finditer(content):
+            table_name = insert_match.group(1).lower()
+            if table_name not in enum_columns:
+                continue
+
+            cols = [c.strip().strip('`').lower() for c in insert_match.group(2).split(',')]
+            enum_col_indices = [
+                i for i, col in enumerate(cols)
+                if col in enum_columns[table_name]
+            ]
+            if not enum_col_indices:
+                continue
+
+            # VALUES 행 검사 (per-INSERT 로컬 플래그로 교차 오염 방지)
+            rest = content[insert_match.end():]
+            found_in_current_insert = False
+            for row_match in self._VALUES_ROW_PATTERN.finditer(rest[:5000]):
+                values = [v.strip() for v in row_match.group(1).split(',')]
+                for idx in enum_col_indices:
+                    if idx < len(values):
+                        val = values[idx].strip()
+                        # 숫자 값인지 확인 (따옴표 없는 순수 숫자)
+                        if val.isdigit() and int(val) > 0:
+                            issues.append(CompatibilityIssue(
+                                issue_type=IssueType.ENUM_NUMERIC_INDEX,
+                                severity="warning",
+                                location=location,
+                                description=(
+                                    f"ENUM 컬럼 '{cols[idx]}'에 숫자 인덱스 값 {val} 사용 "
+                                    f"(테이블: {table_name})"
+                                ),
+                                suggestion="ENUM 컬럼에는 문자열 값을 사용하세요. 숫자 인덱스는 8.4에서 동작이 변경될 수 있습니다.",
+                                table_name=table_name,
+                                column_name=cols[idx]
+                            ))
+                            found_in_current_insert = True
+                            break  # 테이블당 한 번만 보고
+                if found_in_current_insert:
+                    break  # 이 INSERT에서 이미 발견 → 다음 INSERT로
+
         return issues
 
     # ================================================================
@@ -592,6 +664,7 @@ class DataIntegrityRules:
         issues = []
         issues.extend(self.check_enum_empty_in_sql(content, location))
         issues.extend(self.check_enum_empty_insert(content, location))
+        issues.extend(self.check_enum_numeric_index(content, location))
         return issues
 
     def check_all_data_file(self, file_path: Path) -> List[CompatibilityIssue]:
