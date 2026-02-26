@@ -377,6 +377,9 @@ class IssueType(Enum):
     FK_NON_UNIQUE_REF = "fk_non_unique_ref"  # FK 비고유 참조
     FK_REF_NOT_FOUND = "fk_ref_not_found"  # FK 참조 테이블 미존재
 
+    # 스캔 관련
+    SCAN_TRUNCATED = "scan_truncated"  # 스캔 행 수 제한으로 중단됨
+
     # Definer 관련
     ROUTINE_DEFINER_MISSING = "routine_definer_missing"  # 루틴 definer 누락
     VIEW_DEFINER_MISSING = "view_definer_missing"  # 뷰 definer 누락
