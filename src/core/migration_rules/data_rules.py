@@ -292,9 +292,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'rb') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
 
                     # 4바이트 UTF-8 시퀀스: 0xF0-0xF4로 시작
@@ -313,6 +315,15 @@ class DataIntegrityRules:
                     description=f"4바이트 UTF-8 문자 발견 (이모지 등): {count_4byte}개 행",
                     suggestion="utf8mb3 테이블은 4바이트 문자 저장 불가, utf8mb4로 변환 필요",
                     code_snippet=f"라인: {', '.join(map(str, sample_lines[:3]))}"
+                ))
+
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"4바이트 UTF-8 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
                 ))
 
         except Exception as e:
@@ -339,9 +350,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'rb') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
                     if b'\x00' in line:
                         null_count += 1
@@ -356,6 +369,15 @@ class DataIntegrityRules:
                     description=f"NULL 바이트 포함 데이터: {null_count}개 행",
                     suggestion="NULL 바이트는 문자열 필드에서 문제 발생 가능, 데이터 정제 필요",
                     code_snippet=f"라인: {', '.join(map(str, sample_lines[:3]))}"
+                ))
+
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"NULL 바이트 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
                 ))
 
         except Exception as e:
@@ -382,9 +404,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
 
                     for match in TIMESTAMP_PATTERN.finditer(line):
@@ -403,6 +427,15 @@ class DataIntegrityRules:
                     description=f"TIMESTAMP 범위 초과 값: {out_of_range_count}개",
                     suggestion="TIMESTAMP는 1970-2038 범위만 지원, DATETIME 사용 권장",
                     code_snippet=f"값: {', '.join(sample_values[:3])}"
+                ))
+
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"TIMESTAMP 범위 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
                 ))
 
         except Exception as e:
@@ -537,9 +570,11 @@ class DataIntegrityRules:
         max_samples = 3
 
         try:
+            truncated = False
             with open(file_path, 'r', encoding='utf-8', errors='replace') as f:
                 for line_num, line in enumerate(f, 1):
                     if line_num > max_lines:
+                        truncated = True
                         break
 
                     # 0000-00-00 패턴
@@ -564,6 +599,15 @@ class DataIntegrityRules:
                     description=f"잘못된 날짜 값 발견: {invalid_count}개 행 (0000-00-00 등)",
                     suggestion="NO_ZERO_DATE SQL 모드 활성화 시 오류 발생, 유효한 날짜로 변환 필요",
                     code_snippet=f"값: {', '.join(sample_values[:3])}"
+                ))
+
+            if truncated:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="info",
+                    location=file_path.name,
+                    description=f"DATETIME 스캔이 {max_lines}행에서 중단됨 (전체 파일 미검사)",
+                    suggestion="전체 파일을 검사하려면 max_lines 설정을 조정하거나 데이터베이스에서 직접 확인하세요"
                 ))
 
         except Exception as e:

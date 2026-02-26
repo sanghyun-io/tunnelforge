@@ -1419,6 +1419,20 @@ class DumpFileAnalyzer:
         issues = []
 
         try:
+            # 대용량 파일 가드레일: 100MB 초과 시 경고 후 스킵
+            MAX_SQL_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+            file_size = file_path.stat().st_size
+            if file_size > MAX_SQL_FILE_SIZE:
+                self._log(f"  ⚠️ 파일 크기 초과 ({file_size // (1024*1024)}MB > 100MB): {file_path.name} - 스키마 분석 스킵")
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.SCAN_TRUNCATED,
+                    severity="warning",
+                    location=file_path.name,
+                    description=f"SQL 파일이 너무 큼 ({file_size // (1024*1024)}MB): 스키마 호환성 검사 스킵",
+                    suggestion="파일을 분할하거나 라이브 DB 모드로 직접 분석하세요"
+                ))
+                return issues
+
             content = file_path.read_text(encoding='utf-8', errors='replace')
 
             # 1. ZEROFILL 속성 검사
@@ -1758,6 +1772,13 @@ class TwoPassAnalyzer:
             self._log(f"  수집 중: {file_path.name}")
 
             try:
+                # 대용량 파일 가드레일: 100MB 초과 시 경고 후 스킵
+                MAX_SQL_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+                file_size = file_path.stat().st_size
+                if file_size > MAX_SQL_FILE_SIZE:
+                    self._log(f"  ⚠️ 파일 크기 초과 ({file_size // (1024*1024)}MB > 100MB): {file_path.name} - 메타데이터 수집 스킵")
+                    continue
+
                 content = file_path.read_text(encoding='utf-8', errors='replace')
 
                 # CREATE TABLE 문 추출 및 파싱
@@ -1853,6 +1874,21 @@ class TwoPassAnalyzer:
     def _analyze_sql_file_pass2(self, file_path: Path) -> List[CompatibilityIssue]:
         """SQL 파일 분석 (Pass 2)"""
         issues = []
+
+        # 대용량 파일 가드레일: 100MB 초과 시 경고 후 스킵
+        MAX_SQL_FILE_SIZE = 100 * 1024 * 1024  # 100MB
+        file_size = file_path.stat().st_size
+        if file_size > MAX_SQL_FILE_SIZE:
+            self._log(f"  ⚠️ 파일 크기 초과 ({file_size // (1024*1024)}MB > 100MB): {file_path.name} - Pass2 분석 스킵")
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.SCAN_TRUNCATED,
+                severity="warning",
+                location=file_path.name,
+                description=f"SQL 파일이 너무 큼 ({file_size // (1024*1024)}MB): 데이터 무결성 검사 스킵",
+                suggestion="파일을 분할하거나 라이브 DB 모드로 직접 분석하세요"
+            ))
+            return issues
+
         content = file_path.read_text(encoding='utf-8', errors='replace')
         location = file_path.name
 
