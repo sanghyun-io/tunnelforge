@@ -15,6 +15,7 @@ from datetime import datetime
 import os
 
 from src.core.db_connector import MySQLConnector
+from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 from src.exporters.mysqlsh_exporter import (
     MySQLShellChecker, MySQLShellConfig, check_mysqlsh,
     ForeignKeyResolver, OrphanRecordInfo
@@ -73,10 +74,10 @@ class DBConnectionDialog(QDialog):
         conn_group = QGroupBox("연결 정보")
         form_layout = QFormLayout(conn_group)
 
-        self.input_host = QLineEdit("127.0.0.1")
+        self.input_host = QLineEdit(DEFAULT_LOCAL_HOST)
         self.input_port = QSpinBox()
         self.input_port.setRange(1, 65535)
-        self.input_port.setValue(3306)
+        self.input_port.setValue(DEFAULT_MYSQL_PORT)
 
         self.input_user = QLineEdit()
         self.input_user.setPlaceholderText("MySQL 사용자명")

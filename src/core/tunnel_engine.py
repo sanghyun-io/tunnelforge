@@ -4,6 +4,7 @@ import socket
 import os
 
 from src.core.logger import get_logger
+from src.core.constants import DEFAULT_LOCAL_HOST
 
 logger = get_logger('tunnel_engine')
 
@@ -196,7 +197,7 @@ class TunnelEngine:
         if config.get('connection_mode') == 'direct':
             return config['remote_host'], int(config['remote_port'])
         else:
-            return '127.0.0.1', int(config['local_port'])
+            return DEFAULT_LOCAL_HOST, int(config['local_port'])
 
     def create_temp_tunnel(self, config):
         """
@@ -217,7 +218,7 @@ class TunnelEngine:
                 ssh_username=config['bastion_user'],
                 ssh_pkey=pkey_obj,
                 remote_bind_address=(config['remote_host'], int(config['remote_port'])),
-                local_bind_address=('127.0.0.1', 0)  # 0 = 자동 할당
+                local_bind_address=(DEFAULT_LOCAL_HOST, 0)  # 0 = 자동 할당
             )
 
             temp_server.start()
@@ -310,7 +311,7 @@ class TunnelEngine:
                 ssh_username=config['bastion_user'],
                 ssh_pkey=pkey_obj,  # 경로 대신 키 객체 전달
                 remote_bind_address=(config['remote_host'], int(config['remote_port'])),
-                local_bind_address=('127.0.0.1', 0)
+                local_bind_address=(DEFAULT_LOCAL_HOST, 0)
             )
 
             connection_logs.append("🚀 Bastion Host 연결 시도...")
@@ -322,7 +323,7 @@ class TunnelEngine:
                 connection_logs.append("🔗 Target DB 포트 연결 시도...")
                 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 s.settimeout(3)
-                s.connect(('127.0.0.1', temp_server.local_bind_port))
+                s.connect((DEFAULT_LOCAL_HOST, temp_server.local_bind_port))
                 s.close()
                 db_msg = "✅ 2. Target DB 포트 도달 성공"
                 connection_logs.append(db_msg)

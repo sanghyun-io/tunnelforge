@@ -17,6 +17,7 @@ from enum import Enum
 from typing import List, Dict, Any, Optional, Callable, Tuple
 
 from src.core.logger import get_logger
+from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 
 logger = get_logger(__name__)
 
@@ -453,8 +454,8 @@ class BackupScheduler:
 
             # MySQLShell Export 실행
             config = MySQLShellConfig(
-                host=conn_info.get('host', '127.0.0.1'),
-                port=conn_info.get('local_port', 3306),
+                host=conn_info.get('host', DEFAULT_LOCAL_HOST),
+                port=conn_info.get('local_port', DEFAULT_MYSQL_PORT),
                 user=conn_info.get('db_user', 'root'),
                 password=conn_info.get('db_password', ''),
                 schema=schedule.schema
@@ -658,8 +659,8 @@ class BackupScheduler:
 
             # DB 연결
             connector = MySQLConnector(
-                host=conn_info.get('host', '127.0.0.1'),
-                port=conn_info.get('local_port', 3306),
+                host=conn_info.get('host', DEFAULT_LOCAL_HOST),
+                port=conn_info.get('local_port', DEFAULT_MYSQL_PORT),
                 user=conn_info.get('db_user', 'root'),
                 password=conn_info.get('db_password', ''),
                 database=schedule.schema if schedule.schema else None

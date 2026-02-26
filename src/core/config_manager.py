@@ -7,6 +7,7 @@ from typing import List, Tuple, Optional
 from cryptography.fernet import Fernet
 
 from src.core.logger import get_logger
+from src.core.constants import DEFAULT_MYSQL_PORT
 
 logger = get_logger('config_manager')
 
@@ -83,7 +84,7 @@ class ConfigManager:
                         "bastion_user": "ec2-user",
                         "bastion_key": "", # 키 파일 경로 비어있음
                         "remote_host": "rds-endpoint.amazonaws.com",
-                        "remote_port": 3306,
+                        "remote_port": DEFAULT_MYSQL_PORT,
                         "local_port": 3308
                     }
                 ]
