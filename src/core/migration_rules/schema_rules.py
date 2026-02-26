@@ -2,7 +2,7 @@
 스키마/객체 규칙 모듈
 
 MySQL 8.0 → 8.4 업그레이드 시 스키마 및 객체 관련 호환성 검사 규칙.
-30개 규칙 구현:
+36개 규칙 구현:
 - S01: YEAR(2) 데이터 타입
 - S02: latin1 charset 권장
 - S03-S04: 인덱스 크기 초과
@@ -21,6 +21,12 @@ MySQL 8.0 → 8.4 업그레이드 시 스키마 및 객체 관련 호환성 검�
 - S22: JSON_TABLE 구문
 - S23: MySQL 스키마 충돌
 - S24-S25: Definer 검사
+- S26: 파티션 키에 prefix 인덱스 사용 (이슈 #63)
+- S27: 스키마 생략 dot 구문 (이슈 #63)
+- S28: InnoDB ROW_FORMAT REDUNDANT/COMPACT (이슈 #63)
+- S29: deprecated 날짜 구분자 (이슈 #63)
+- S30: 루틴 이름이 예약어와 충돌 (이슈 #63)
+- S31: 식별자에 연속 점(..) 사용 (이슈 #63)
 """
 
 from typing import List, Optional, Callable, Dict, TYPE_CHECKING
@@ -40,6 +46,13 @@ from ..migration_constants import (
     GENERATED_COLUMN_PATTERN,
     ALL_REMOVED_FUNCTIONS,
     CHANGED_FUNCTIONS_IN_GENERATED_COLUMNS,
+    ALL_RESERVED_KEYWORDS,
+    PARTITION_PREFIX_KEY_PATTERN,
+    EMPTY_DOT_TABLE_SYNTAX_PATTERN,
+    INNODB_ROW_FORMAT_PATTERN,
+    DEPRECATED_TEMPORAL_DELIMITER_PATTERN,
+    ROUTINE_SYNTAX_KEYWORD_PATTERN,
+    INVALID_57_NAME_MULTIPLE_DOTS_PATTERN,
 )
 
 if TYPE_CHECKING:
@@ -620,6 +633,139 @@ class SchemaRules:
         return issues
 
     # ================================================================
+    # S26: 파티션 키에 prefix 인덱스 사용 검사 (덤프 파일)
+    # ================================================================
+    def check_partition_prefix_key(self, content: str, location: str) -> List[CompatibilityIssue]:
+        """파티션 키에 prefix 인덱스 사용 확인 (8.0.21 deprecated, 8.4 제거됨)"""
+        issues = []
+
+        for match in PARTITION_PREFIX_KEY_PATTERN.finditer(content):
+            line_start = content.rfind('\n', 0, match.start()) + 1
+            line_end = content.find('\n', match.end())
+            line = content[line_start:line_end].strip()
+
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.PARTITION_PREFIX_KEY,
+                severity="error",
+                location=location,
+                description="파티션 KEY에 prefix 인덱스 사용 (8.4에서 제거됨)",
+                suggestion="파티션 키 컬럼에서 길이 지정(prefix) 제거 필요",
+                code_snippet=line[:100]
+            ))
+
+        return issues
+
+    # ================================================================
+    # S27: 스키마 생략 dot 구문 검사 (덤프 파일)
+    # ================================================================
+    def check_empty_dot_table_syntax(self, content: str, location: str) -> List[CompatibilityIssue]:
+        """스키마 생략 dot 구문 (.tableName) 사용 확인"""
+        issues = []
+
+        for match in EMPTY_DOT_TABLE_SYNTAX_PATTERN.finditer(content):
+            line_start = content.rfind('\n', 0, match.start()) + 1
+            line_end = content.find('\n', match.end())
+            line = content[line_start:line_end].strip()
+
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.EMPTY_DOT_TABLE_SYNTAX,
+                severity="error",
+                location=location,
+                description=f"스키마 생략 dot 구문 사용: {match.group(0).strip()}",
+                suggestion="스키마명을 명시적으로 지정 (예: schema_name.table_name)",
+                code_snippet=line[:100]
+            ))
+
+        return issues
+
+    # ================================================================
+    # S28: InnoDB ROW_FORMAT REDUNDANT/COMPACT 검사 (덤프 파일)
+    # ================================================================
+    def check_innodb_row_format(self, content: str, location: str) -> List[CompatibilityIssue]:
+        """REDUNDANT/COMPACT ROW_FORMAT 사용 확인 (DYNAMIC 권장)"""
+        issues = []
+
+        for match in INNODB_ROW_FORMAT_PATTERN.finditer(content):
+            row_format = match.group(1).upper()
+            line_start = content.rfind('\n', 0, match.start()) + 1
+            line_end = content.find('\n', match.end())
+            line = content[line_start:line_end].strip()
+
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.INNODB_ROW_FORMAT,
+                severity="warning",
+                location=location,
+                description=f"InnoDB ROW_FORMAT={row_format} 사용 (DYNAMIC 권장)",
+                suggestion="ROW_FORMAT=DYNAMIC으로 변경 권장 (더 나은 성능과 호환성)",
+                code_snippet=line[:100]
+            ))
+
+        return issues
+
+    # ================================================================
+    # S29: deprecated 날짜 구분자 검사 (덤프 파일)
+    # ================================================================
+    def check_deprecated_temporal_delimiter(self, content: str, location: str) -> List[CompatibilityIssue]:
+        """deprecated 날짜 구분자 사용 확인 (@ ! # 등 비표준 구분자)"""
+        issues = []
+
+        for match in DEPRECATED_TEMPORAL_DELIMITER_PATTERN.finditer(content):
+            line_start = content.rfind('\n', 0, match.start()) + 1
+            line_end = content.find('\n', match.end())
+            line = content[line_start:line_end].strip()
+
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.DEPRECATED_TEMPORAL_DELIMITER,
+                severity="error",
+                location=location,
+                description=f"deprecated 날짜 구분자 사용: {match.group(0)}",
+                suggestion="날짜 구분자로 '-' 또는 '/' 사용 권장 (예: '2024-01-01')",
+                code_snippet=line[:100]
+            ))
+
+        return issues
+
+    # ================================================================
+    # S30: 루틴 이름이 예약어와 충돌 검사 (덤프 파일)
+    # ================================================================
+    def check_routine_syntax_keyword(self, content: str, location: str) -> List[CompatibilityIssue]:
+        """저장 프로시저/함수/트리거/이벤트 이름이 MySQL 예약어와 충돌하는지 확인"""
+        issues = []
+
+        for match in ROUTINE_SYNTAX_KEYWORD_PATTERN.finditer(content):
+            routine_name = match.group(1).upper()
+            if routine_name in ALL_RESERVED_KEYWORDS:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.ROUTINE_SYNTAX_KEYWORD,
+                    severity="error",
+                    location=location,
+                    description=f"루틴 이름 '{routine_name}'이 MySQL 예약어와 충돌",
+                    suggestion=f"루틴 이름을 예약어가 아닌 이름으로 변경 필요 (예약어: {routine_name})",
+                    code_snippet=match.group(0)[:80]
+                ))
+
+        return issues
+
+    # ================================================================
+    # S31: 식별자에 연속 점(..) 사용 검사 (덤프 파일)
+    # ================================================================
+    def check_invalid_57_name_multiple_dots(self, content: str, location: str) -> List[CompatibilityIssue]:
+        """식별자에 연속 점(..) 사용 확인 (schema..table 또는 ..table 형태)"""
+        issues = []
+
+        for match in INVALID_57_NAME_MULTIPLE_DOTS_PATTERN.finditer(content):
+            identifier = match.group(0)
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.INVALID_57_NAME_MULTIPLE_DOTS,
+                severity="error",
+                location=location,
+                description=f"식별자에 연속 점(..) 사용: {identifier}",
+                suggestion="연속 점 구문 제거 및 올바른 스키마.테이블 형식 사용 (예: schema.table)"
+            ))
+
+        return issues
+
+    # ================================================================
     # 통합 검사 메서드
     # ================================================================
     def check_all_live_db(self, schema: str) -> List[CompatibilityIssue]:
@@ -648,4 +794,11 @@ class SchemaRules:
         issues.extend(self.check_control_char_names(content, location))
         issues.extend(self.check_generated_column_functions(content, location))
         issues.extend(self.check_blob_text_default(content, location))
+        # 신규 규칙 (이슈 #63)
+        issues.extend(self.check_partition_prefix_key(content, location))
+        issues.extend(self.check_empty_dot_table_syntax(content, location))
+        issues.extend(self.check_innodb_row_format(content, location))
+        issues.extend(self.check_deprecated_temporal_delimiter(content, location))
+        issues.extend(self.check_routine_syntax_keyword(content, location))
+        issues.extend(self.check_invalid_57_name_multiple_dots(content, location))
         return issues
