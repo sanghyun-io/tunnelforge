@@ -853,7 +853,7 @@ class ScheduleListDialog(QDialog):
                     self.table.setItem(row, 3, QTableWidgetItem(
                         next_run.strftime('%Y-%m-%d %H:%M')
                     ))
-                except:
+                except ValueError:
                     self.table.setItem(row, 3, QTableWidgetItem("-"))
             else:
                 self.table.setItem(row, 3, QTableWidgetItem("-"))
@@ -865,7 +865,7 @@ class ScheduleListDialog(QDialog):
                     self.table.setItem(row, 4, QTableWidgetItem(
                         last_run.strftime('%Y-%m-%d %H:%M')
                     ))
-                except:
+                except ValueError:
                     self.table.setItem(row, 4, QTableWidgetItem("-"))
             else:
                 self.table.setItem(row, 4, QTableWidgetItem("-"))
