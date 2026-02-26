@@ -4,22 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tunnelforge"
-version = "1.13.5"
+version = "1.14.0"
 description = "SSH Tunnel and MySQL Database Manager"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
-authors = [{name = "sanghyun-io"}]
-keywords = ["ssh", "mysql", "tunnel", "database", "migration", "PyQt6"]
-classifiers = [
-    "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
-    "Programming Language :: Python :: 3.12",
-    "Operating System :: Microsoft :: Windows",
-    "Topic :: Database",
-]
+authors = []
 dependencies = [
     "PyQt6>=6.4.0",
     "sshtunnel>=0.4.0",
@@ -39,11 +29,6 @@ dev = [
     "pytest-mock>=3.0.0",
     "pytest-cov>=4.0.0",
 ]
-
-[project.urls]
-Homepage = "https://github.com/sanghyun-io/tunnelforge"
-Repository = "https://github.com/sanghyun-io/tunnelforge"
-Issues = "https://github.com/sanghyun-io/tunnelforge/issues"
 
 [project.scripts]
 tunnelforge = "main:main"
