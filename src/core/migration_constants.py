@@ -10,16 +10,30 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 # ============================================================
-# MySQL 8.4에서 제거된 시스템 변수 (47개)
+# MySQL 8.4에서 제거된 시스템 변수 (64개)
 # ============================================================
 REMOVED_SYS_VARS_84: Tuple[str, ...] = (
+    'authentication_fido_rp_id',
     'avoid_temporal_upgrade',
     'binlog_transaction_dependency_tracking',
+    'daemon_memcached_enable_binlog',
+    'daemon_memcached_engine_lib_name',
+    'daemon_memcached_engine_lib_path',
+    'daemon_memcached_option',
+    'daemon_memcached_r_batch_size',
+    'daemon_memcached_w_batch_size',
     'default_authentication_plugin',
+    'expire_logs_days',
     'group_replication_ip_allowlist',
+    'group_replication_primary_member',
     'group_replication_recovery_complete_at',
     'have_openssl',
     'have_ssl',
+    'innodb_api_bk_commit_interval',
+    'innodb_api_disable_rowlock',
+    'innodb_api_enable_binlog',
+    'innodb_api_enable_mdl',
+    'innodb_api_trx_level',
     'innodb_log_file_size',
     'innodb_log_files_in_group',
     'keyring_file_data',
@@ -43,12 +57,18 @@ REMOVED_SYS_VARS_84: Tuple[str, ...] = (
     'keyring_aws_conf_file',
     'keyring_aws_data_file',
     'keyring_aws_region',
+    'language',
     'log_bin_use_v1_row_events',
+    'master_info_repository',
     'master_verify_checksum',
+    'new',
+    'old',
     'old_alter_table',
+    'old_style_user_limits',
     'relay_log_info_file',
     'relay_log_info_repository',
     'replica_parallel_type',
+    'show_old_temporals',
     'slave_parallel_type',
     'slave_rows_search_algorithms',
     'sql_slave_skip_counter',
@@ -163,13 +183,13 @@ SYS_VARS_NEW_DEFAULTS_84: Dict[str, Dict[str, str]] = {
         'old': '200', 'new': '10000',
     },
     'innodb_io_capacity_max': {
-        'old': '2 * innodb_io_capacity', 'new': '2 * new default',
+        'old': '2000', 'new': '20000',
     },
     'innodb_log_buffer_size': {
         'old': '16M', 'new': '64M',
     },
     'innodb_redo_log_capacity': {
-        'old': '100M', 'new': '100M (now replaces log_file_size * files)',
+        'old': '100M (innodb_log_file_size * innodb_log_files_in_group)', 'new': '100M',
     },
     'group_replication_consistency': {
         'old': 'EVENTUAL', 'new': 'BEFORE_ON_PRIMARY_FAILOVER',
@@ -247,7 +267,7 @@ MYSQL_SCHEMA_TABLES: Tuple[str, ...] = (
 # 스토리지 엔진 상태
 # ============================================================
 STORAGE_ENGINE_STATUS: Dict[str, any] = {
-    'deprecated': ['MyISAM', 'ARCHIVE', 'BLACKHOLE', 'FEDERATED'],
+    'deprecated': ['MyISAM', 'ARCHIVE', 'BLACKHOLE', 'FEDERATED', 'MERGE', 'EXAMPLE', 'NDB'],
     'recommended': 'InnoDB',
     'warning_engines': ['MEMORY', 'CSV'],
 }
