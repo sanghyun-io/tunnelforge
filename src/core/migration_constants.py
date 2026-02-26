@@ -81,25 +81,26 @@ ALL_RESERVED_KEYWORDS: Tuple[str, ...] = RESERVED_KEYWORDS_80 + NEW_RESERVED_KEY
 # ============================================================
 # MySQL 8.4에서 제거된 함수
 # ============================================================
-# 8.0 → 8.4 마이그레이션 시 확인 필요한 모든 제거 함수
-# (8.0.x 마이너 버전에서 이미 제거된 것 포함)
+# mysql-upgrade-checker 참조 구현과 통일된 분류 체계
+# 8.0.x에서 deprecated → 8.4에서 완전 제거된 함수
 REMOVED_FUNCTIONS_84: Tuple[str, ...] = (
-    # Note: MASTER_POS_WAIT는 8.4에서 deprecated alias이지 removed가 아님 → DEPRECATED_FUNCTIONS_84로 이동
+    'PASSWORD',        # 8.0.11 deprecated → 8.4 제거
+    'ENCRYPT',         # 8.0.3 deprecated → 8.4 제거
+    'ENCODE',          # 8.0.3 deprecated → 8.4 제거
+    'DECODE',          # 8.0.3 deprecated → 8.4 제거
+    'DES_ENCRYPT',     # 8.0.3 deprecated → 8.4 제거
+    'DES_DECRYPT',     # 8.0.3 deprecated → 8.4 제거
 )
 
 # 8.4에서 deprecated된 함수 (아직 동작하나 deprecated 경고)
 DEPRECATED_FUNCTIONS_84: Tuple[str, ...] = (
-    'MASTER_POS_WAIT',  # deprecated alias, SOURCE_POS_WAIT() 사용 권장
+    'MASTER_POS_WAIT',      # deprecated alias, SOURCE_POS_WAIT() 사용 권장
+    'FOUND_ROWS',           # deprecated, COUNT(*) 별도 쿼리 사용 권장
+    'SQL_CALC_FOUND_ROWS',  # deprecated, COUNT(*) 별도 쿼리 사용 권장
 )
 
-# 8.0.x 마이너 버전에서 이미 제거된 함수 (8.0 → 8.4 마이그레이션 시 참고)
+# 8.0 이전에 이미 제거된 함수 (5.7 → 8.0 마이그레이션 잔존 확인용)
 REMOVED_FUNCTIONS_80X: Tuple[str, ...] = (
-    'ENCODE',          # 8.0.3에서 제거
-    'DECODE',          # 8.0.3에서 제거
-    'DES_ENCRYPT',     # 8.0.3에서 제거
-    'DES_DECRYPT',     # 8.0.3에서 제거
-    'ENCRYPT',         # 8.0.3에서 제거
-    'PASSWORD',        # 8.0.11에서 제거
     'OLD_PASSWORD',    # 5.7에서 제거
 )
 
