@@ -32,6 +32,7 @@ from src.core.migration_constants import (
     FTS_TABLE_PREFIX_PATTERN,
     SUPER_PRIVILEGE_PATTERN,
     SYS_VAR_USAGE_PATTERN,
+    ENGINE_POLICIES,
 )
 
 # 규칙 모듈에서 import (선택적 - 에러 방지)
@@ -1130,16 +1131,6 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         issues = []
 
-        # deprecated 엔진 목록
-        deprecated_engines = {
-            'MyISAM': ('warning', 'InnoDB로 변환 권장 (트랜잭션/FK 지원)'),
-            'ARCHIVE': ('warning', 'InnoDB로 변환 권장'),
-            'BLACKHOLE': ('info', '테스트/복제용 엔진 - 필요시 유지'),
-            'FEDERATED': ('warning', 'MySQL 8.4에서 제거 예정'),
-            'MERGE': ('error', 'MySQL 8.4에서 제거됨 - InnoDB 파티셔닝으로 대체'),
-            'MEMORY': ('info', '임시 테이블용으로는 유지 가능'),
-        }
-
         query = """
         SELECT TABLE_NAME, ENGINE
         FROM INFORMATION_SCHEMA.TABLES
@@ -1151,8 +1142,10 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         for table in tables:
             engine = table['ENGINE']
-            if engine in deprecated_engines:
-                severity, suggestion = deprecated_engines[engine]
+            if engine in ENGINE_POLICIES:
+                policy = ENGINE_POLICIES[engine]
+                severity = policy['severity']
+                suggestion = policy['suggestion']
                 issues.append(CompatibilityIssue(
                     issue_type=IssueType.DEPRECATED_ENGINE,
                     severity=severity,

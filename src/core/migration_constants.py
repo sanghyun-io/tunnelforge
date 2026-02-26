@@ -272,6 +272,35 @@ STORAGE_ENGINE_STATUS: Dict[str, any] = {
     'warning_engines': ['MEMORY', 'CSV'],
 }
 
+# 엔진별 상세 정책 (severity, suggestion)
+# migration_analyzer.py의 check_deprecated_engines와 storage_rules.py가 공유하는 단일 소스
+ENGINE_POLICIES: Dict[str, Dict[str, str]] = {
+    'MyISAM': {
+        'severity': 'warning',
+        'suggestion': 'InnoDB로 변환 권장 (트랜잭션/FK 지원)',
+    },
+    'ARCHIVE': {
+        'severity': 'warning',
+        'suggestion': 'InnoDB로 변환 권장',
+    },
+    'BLACKHOLE': {
+        'severity': 'info',
+        'suggestion': '테스트/복제용 엔진 - 필요시 유지',
+    },
+    'FEDERATED': {
+        'severity': 'warning',
+        'suggestion': 'MySQL 8.4에서 제거 예정',
+    },
+    'MERGE': {
+        'severity': 'error',
+        'suggestion': 'MySQL 8.4에서 제거됨 - InnoDB 파티셔닝으로 대체',
+    },
+    'MEMORY': {
+        'severity': 'info',
+        'suggestion': '임시 테이블용으로는 유지 가능',
+    },
+}
+
 # ============================================================
 # 문자셋 관련 상수
 # ============================================================
