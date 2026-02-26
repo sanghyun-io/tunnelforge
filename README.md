@@ -21,14 +21,47 @@
 
 ## Features
 
+### Connection & Tunnel Management
+
 | | Feature | Description |
 |:-:|---------|-------------|
 | 🔐 | **SSH Tunnel** | One-click secure connection via bastion hosts. RSA, Ed25519, ECDSA keys supported. |
 | 🔗 | **Direct Connect** | Skip the tunnel — connect directly to local or accessible databases. |
+| 📡 | **Tunnel Monitoring** | Real-time tunnel health monitoring with auto-reconnect on failure. |
+| 🖥️ | **System Tray** | Runs quietly in the background, always one click away. |
+
+### Schema Management
+
+| | Feature | Description |
+|:-:|---------|-------------|
+| 🔍 | **Schema Diff** | Visual side-by-side schema comparison between any two databases. |
+| 🔄 | **Schema Sync** | Generate and execute sync scripts to align schemas across environments. |
+| 🎨 | **Pixel Art Loading** | Fun pixel-art DB animation while comparing schemas. |
+
+### Migration Tools
+
+| | Feature | Description |
+|:-:|---------|-------------|
+| 🚀 | **One-Click Migration** | Automated MySQL 5.7/8.0 to 8.4 migration with pre-flight checks. |
+| 🛡️ | **Pre-flight Analysis** | 30+ compatibility rules detect issues before migration starts. |
+| 💡 | **Auto-Recommend** | Smart fix suggestions with one-click apply for detected issues. |
+| 📊 | **Migration Report** | Detailed HTML/JSON reports of all compatibility findings. |
+
+### Data Tools
+
+| | Feature | Description |
+|:-:|---------|-------------|
 | ⚡ | **Parallel Export/Import** | Blazing-fast data transfers powered by MySQL Shell's parallel processing. |
 | 📅 | **[Scheduled Backup](SCHEDULE.md)** | Cron-style automated backups to keep your data safe. |
-| 🖥️ | **System Tray** | Runs quietly in the background, always one click away. |
+| 📝 | **SQL Editor** | Built-in SQL editor with syntax highlighting and query history. |
+| 🛡️ | **Production Guard** | Safety prompts and confirmations for production database operations. |
+
+### General
+
+| | Feature | Description |
+|:-:|---------|-------------|
 | 🔄 | **Auto Update** | Checks for new versions on startup so you never miss an update. |
+| 🐛 | **Issue Reporter** | Built-in GitHub issue reporting with automatic diagnostics. |
 
 ---
 
