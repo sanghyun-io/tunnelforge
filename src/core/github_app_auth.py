@@ -308,7 +308,7 @@ class GitHubAppAuth:
                     error_detail = e.response.json().get('message', '')
                     if error_detail:
                         error_msg = f"{error_msg}: {error_detail}"
-                except:
+                except (ValueError, Exception):
                     pass
             return False, f"연결 실패: {error_msg}"
         except Exception as e:

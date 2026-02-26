@@ -353,7 +353,7 @@ class GitHubIssueReporter:
                 try:
                     error_detail = e.response.json().get('message', '')
                     error_msg = f"{error_msg}: {error_detail}"
-                except:
+                except (ValueError, Exception):
                     pass
             return False, f"이슈 생성 실패: {error_msg}", None
 
