@@ -1681,6 +1681,8 @@ class TwoPassAnalyzer:
         self.table_indexes: Dict[str, List[TableIndexInfo]] = {}
         self.table_charsets: Dict[str, TableCharsetInfo] = {}
         self.known_tables: Set[str] = set()
+        # 100MB 초과로 skip된 파일 추적 (FK 검증 게이팅에 사용)
+        self._skipped_large_files: Set[str] = set()
 
         # Pass 2 수집 데이터
         self.pending_fk_checks: List[PendingFKCheck] = []
@@ -1746,6 +1748,7 @@ class TwoPassAnalyzer:
         self.table_charsets.clear()
         self.known_tables.clear()
         self.pending_fk_checks.clear()
+        self._skipped_large_files.clear()
 
     def _make_table_key(self, schema: Optional[str], table: str) -> str:
         """테이블 조회 키 생성"""
@@ -1777,6 +1780,7 @@ class TwoPassAnalyzer:
                 file_size = file_path.stat().st_size
                 if file_size > MAX_SQL_FILE_SIZE:
                     self._log(f"  ⚠️ 파일 크기 초과 ({file_size // (1024*1024)}MB > 100MB): {file_path.name} - 메타데이터 수집 스킵")
+                    self._skipped_large_files.add(str(file_path))  # FK 검증 게이팅용 추적
                     continue
 
                 content = file_path.read_text(encoding='utf-8', errors='replace')
@@ -1940,6 +1944,11 @@ class TwoPassAnalyzer:
         """Pass 2.5: FK 크로스 검증"""
         self._log("✅ Pass 2.5: FK 크로스 검증 중...")
 
+        # 메타데이터 불완전 여부 확인 (대용량 파일 skip 여부)
+        has_incomplete_metadata = bool(self._skipped_large_files)
+        if has_incomplete_metadata:
+            self._log(f"  ⚠️ 메타데이터 불완전: {len(self._skipped_large_files)}개 파일이 크기 초과로 스킵됨 → FK 검증 신뢰도 저하")
+
         issues = []
 
         for fk in self.pending_fk_checks:
@@ -1947,14 +1956,28 @@ class TwoPassAnalyzer:
             ref_key = self._make_table_key(fk.source_schema, fk.ref_table)
 
             if ref_key not in self.known_tables:
-                issue = CompatibilityIssue(
-                    issue_type=IssueType.FK_REF_NOT_FOUND,
-                    severity="error",
-                    location=fk.location,
-                    description=f"FK '{fk.fk_name}': 참조 테이블 '{fk.ref_table}' 미존재",
-                    suggestion="참조 테이블이 덤프에 포함되어 있는지 확인하세요",
-                    table_name=fk.source_table
-                )
+                if has_incomplete_metadata:
+                    # 메타데이터 불완전 시: hard error → warning(SCAN_TRUNCATED)으로 downgrade
+                    issue = CompatibilityIssue(
+                        issue_type=IssueType.SCAN_TRUNCATED,
+                        severity="warning",
+                        location=fk.location,
+                        description=(
+                            f"FK '{fk.fk_name}': 참조 테이블 '{fk.ref_table}' 확인 불가 "
+                            f"(대용량 파일 {len(self._skipped_large_files)}개가 스킵되어 메타데이터 불완전)"
+                        ),
+                        suggestion="스킵된 대용량 파일을 분할하거나 수동으로 참조 테이블 존재 여부를 확인하세요",
+                        table_name=fk.source_table
+                    )
+                else:
+                    issue = CompatibilityIssue(
+                        issue_type=IssueType.FK_REF_NOT_FOUND,
+                        severity="error",
+                        location=fk.location,
+                        description=f"FK '{fk.fk_name}': 참조 테이블 '{fk.ref_table}' 미존재",
+                        suggestion="참조 테이블이 덤프에 포함되어 있는지 확인하세요",
+                        table_name=fk.source_table
+                    )
                 issues.append(issue)
                 self._report_issue(issue)
                 continue
