@@ -1652,6 +1652,7 @@ class PendingFKCheck:
     ref_table: str
     ref_columns: List[str]
     location: str
+    ref_schema: Optional[str] = None
     line_number: Optional[int] = None
 
 
@@ -1894,7 +1895,8 @@ class TwoPassAnalyzer:
                 source_columns=fk.columns,
                 ref_table=fk.ref_table,
                 ref_columns=fk.ref_columns,
-                location=location
+                location=location,
+                ref_schema=fk.ref_schema,
             ))
 
     # ================================================================
@@ -1907,8 +1909,9 @@ class TwoPassAnalyzer:
         issues = []
 
         for fk in self.pending_fk_checks:
-            # FK 참조 테이블 존재 확인
-            ref_key = self._make_table_key(fk.source_schema, fk.ref_table)
+            # FK 참조 테이블 존재 확인 (ref_schema 우선, 없으면 source_schema로 fallback)
+            effective_schema = fk.ref_schema if fk.ref_schema else fk.source_schema
+            ref_key = self._make_table_key(effective_schema, fk.ref_table)
 
             if ref_key not in self.known_tables:
                 issue = CompatibilityIssue(
@@ -1941,7 +1944,8 @@ class TwoPassAnalyzer:
 
     def _is_valid_fk_reference(self, fk: PendingFKCheck) -> bool:
         """FK 참조가 유효한지 확인 (PK 또는 UNIQUE)"""
-        ref_key = self._make_table_key(fk.source_schema, fk.ref_table)
+        effective_schema = fk.ref_schema if fk.ref_schema else fk.source_schema
+        ref_key = self._make_table_key(effective_schema, fk.ref_table)
         indexes = self.table_indexes.get(ref_key, [])
 
         for idx in indexes:
