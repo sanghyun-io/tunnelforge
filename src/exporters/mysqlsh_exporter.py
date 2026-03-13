@@ -1417,7 +1417,6 @@ class MySQLShellImporter:
                     # OFF → SET GLOBAL 시도
                     try:
                         cursor.execute("SET GLOBAL local_infile = ON")
-                        conn.commit()
                         return True, ""
                     except pymysql.err.OperationalError as e:
                         err_code = e.args[0] if e.args else 0
@@ -1431,8 +1430,15 @@ class MySQLShellImporter:
                         raise
             finally:
                 conn.close()
-        except pymysql.err.OperationalError:
-            raise
+        except pymysql.err.OperationalError as e:
+            err_code = e.args[0] if e.args else 0
+            err_msg = e.args[1] if len(e.args) > 1 else str(e)
+            return False, (
+                f"local_infile 설정 확인 중 DB 오류가 발생했습니다 (Error {err_code}: {err_msg}).\n\n"
+                "해결 방법:\n"
+                "  • AWS RDS: 파라미터 그룹에서 'local_infile = 1' 설정 후 DB 재시작\n"
+                "  • On-premise: my.cnf에 'local_infile = 1' 추가 후 MySQL 재시작"
+            )
         except Exception as e:
             # 연결 자체 실패 등 — import 진행 중에 더 명확한 오류가 발생하므로 통과
             logger.warning(f"local_infile 점검 중 오류 (계속 진행): {e}")
