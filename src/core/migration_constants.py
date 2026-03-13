@@ -465,7 +465,7 @@ SUPER_PRIVILEGE_PATTERN = re.compile(r'\bGRANT\b.*\bSUPER\b', re.IGNORECASE | re
 # 제거된 시스템 변수 사용 (SET/SELECT 문에서)
 SYS_VAR_USAGE_PATTERN = re.compile(
     r"(?:SET|SELECT)\s+.*(?:@@(?:global|session)?\.)?" +
-    r"(" + "|".join(re.escape(v) for v in REMOVED_SYS_VARS_84) + r")\b",
+    r"(" + "|".join(re.escape(v) for v in REMOVED_SYS_VARS_84) + r")\b(?!\s*\.)",
     re.IGNORECASE
 )
 

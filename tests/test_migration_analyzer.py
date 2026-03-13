@@ -478,8 +478,8 @@ class TestDumpFileAnalyzer:
 class TestDumpFileAnalyzerSqlPatterns:
     """SQL 파일 내 각 패턴 탐지 상세 테스트"""
 
-    def _analyze_sql(self, content: str, tmp_path) -> list:
-        sql_file = tmp_path / "test.sql"
+    def _analyze_sql(self, content: str, tmp_path, file_name: str = "test.sql") -> list:
+        sql_file = tmp_path / file_name
         sql_file.write_text(content, encoding='utf-8')
         return DumpFileAnalyzer()._analyze_sql_file(sql_file)
 
@@ -524,3 +524,19 @@ class TestDumpFileAnalyzerSqlPatterns:
             "SET @@global.binlog_format = 'ROW';", tmp_path
         )
         assert any(i.issue_type == IssueType.REMOVED_SYS_VAR for i in issues)
+
+    def test_trigger_new_old_row_references_not_flagged_as_sys_vars(self, tmp_path):
+        issues = self._analyze_sql(
+            """
+            CREATE TRIGGER trg_orders_bu
+            BEFORE UPDATE ON orders
+            FOR EACH ROW
+            BEGIN
+                SET NEW.updated_at = NOW();
+                SET OLD.status = 'archived';
+            END;
+            """,
+            tmp_path,
+            "orders.triggers.sql",
+        )
+        assert not any(i.issue_type == IssueType.REMOVED_SYS_VAR for i in issues)
