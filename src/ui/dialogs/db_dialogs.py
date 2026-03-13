@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from typing import List, Optional
 from datetime import datetime
+import json
 import os
 
 from src.core.db_connector import MySQLConnector
@@ -1895,7 +1896,6 @@ class MySQLShellImportDialog(QDialog):
     def _get_dump_schema_name(self, dump_dir: str) -> str:
         """덤프 디렉토리의 @.done.json에서 원본 스키마명 읽기"""
         try:
-            import json
             done_json_path = os.path.join(dump_dir, '@.done.json')
             if not os.path.exists(done_json_path):
                 return ""
