@@ -12,6 +12,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 from typing import List, Optional
 from datetime import datetime
+import json
 import os
 
 from src.core.db_connector import MySQLConnector
@@ -1892,6 +1893,21 @@ class MySQLShellImportDialog(QDialog):
         log_entry = f"[{timestamp}] {msg}"
         self.log_entries.append(log_entry)
 
+    def _get_dump_schema_name(self, dump_dir: str) -> str:
+        """덤프 디렉토리의 @.done.json에서 원본 스키마명 읽기"""
+        try:
+            done_json_path = os.path.join(dump_dir, '@.done.json')
+            if not os.path.exists(done_json_path):
+                return ""
+            with open(done_json_path, 'r', encoding='utf-8') as f:
+                done_data = json.load(f)
+            table_data_bytes = done_data.get('tableDataBytes', {})
+            for schema_name in table_data_bytes.keys():
+                return schema_name
+            return ""
+        except Exception:
+            return ""
+
     def _get_import_mode_text(self) -> str:
         """현재 선택된 Import 모드 텍스트 반환"""
         if self.radio_replace.isChecked():
@@ -1924,7 +1940,11 @@ class MySQLShellImportDialog(QDialog):
             from src.core.production_guard import ProductionGuard
             guard = ProductionGuard(self)
 
-            schema_name = target_schema or "(원본 스키마)"
+            if target_schema:
+                schema_name = target_schema
+            else:
+                # 원본 스키마명 사용 - 덤프에서 실제 스키마명 읽기
+                schema_name = self._get_dump_schema_name(input_dir) or "(원본 스키마)"
             details = (f"Dump 폴더: {input_dir}<br>"
                       f"Import 모드: {self._get_import_mode_text()}")
 
