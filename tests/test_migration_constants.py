@@ -523,6 +523,8 @@ class TestSysVarUsagePattern:
     @pytest.mark.parametrize("text,expected", [
         ("SET @@global.binlog_format = 'ROW'", True),
         ("SELECT @@session.old_alter_table", True),
+        ("SET NEW.updated_at = NOW()", False),
+        ("SET OLD.status = 'archived'", False),
         ("SET innodb_buffer_pool_size = 128M", False),
     ])
     def test_match(self, text, expected):
