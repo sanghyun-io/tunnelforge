@@ -1185,6 +1185,12 @@ class MySQLShellImporter:
             if not final_target_schema:
                 return False, "대상 스키마를 지정할 수 없습니다.", import_results
 
+            # local_infile 사전 점검 (RDS Error 1227 방지)
+            # DROP/CREATE 같은 파괴적 작업 이전에 실패해야 스키마 손상을 방지
+            local_infile_ok, local_infile_err = self._check_and_enable_local_infile()
+            if not local_infile_ok:
+                return False, local_infile_err, import_results
+
             # Import 모드별 처리
             if import_mode == "recreate":
                 # 완전 재생성: 스키마 DROP 후 재생성
@@ -1293,12 +1299,12 @@ class MySQLShellImporter:
             options_str = ", ".join(options)
             input_dir_escaped = input_dir.replace('\\', '/')
 
-            # mysqlsh 명령 구성 (local_infile 활성화 필요)
+            # mysqlsh 명령 구성
+            # local_infile은 _check_and_enable_local_infile()에서 사전 확인됨
             # Timezone 설정이 있으면 util.loadDump 이전에 실행
             timezone_cmd = f'session.runSql("{timezone_sql}");' if timezone_sql else ""
 
             js_code = f"""
-                session.runSql("SET GLOBAL local_infile = ON");
                 {timezone_cmd}
                 util.loadDump("{input_dir_escaped}", {{
                     {options_str}
@@ -1379,6 +1385,64 @@ class MySQLShellImporter:
 
         except Exception as e:
             return False, f"Import 오류: {str(e)}", import_results
+
+    def _check_and_enable_local_infile(self) -> Tuple[bool, str]:
+        """
+        local_infile 설정을 확인하고, OFF인 경우 활성화를 시도합니다.
+
+        RDS 환경에서는 SUPER 권한이 없어 SET GLOBAL이 실패(Error 1227)할 수 있으므로
+        mysqlsh JS 코드에서 직접 실행하는 대신 사전에 점검합니다.
+
+        Returns:
+            (성공여부, 에러메시지)
+            - True, "" : local_infile이 ON이거나 SET GLOBAL 성공
+            - False, msg : SET GLOBAL 실패 (권한 없음) — 해결 방법 포함
+        """
+        try:
+            conn = pymysql.connect(
+                host=self.config.host,
+                port=self.config.port,
+                user=self.config.user,
+                password=self.config.password,
+                charset='utf8mb4',
+                cursorclass=DictCursor
+            )
+            try:
+                with conn.cursor() as cursor:
+                    cursor.execute("SHOW GLOBAL VARIABLES LIKE 'local_infile'")
+                    row = cursor.fetchone()
+                    if row and row.get('Value', '').upper() == 'ON':
+                        return True, ""
+
+                    # OFF → SET GLOBAL 시도
+                    try:
+                        cursor.execute("SET GLOBAL local_infile = ON")
+                        return True, ""
+                    except pymysql.err.OperationalError as e:
+                        err_code = e.args[0] if e.args else 0
+                        if err_code == 1227:
+                            return False, (
+                                "local_infile이 비활성화되어 있으며, SET GLOBAL 권한이 없습니다 (Error 1227).\n\n"
+                                "해결 방법:\n"
+                                "  • AWS RDS: 파라미터 그룹에서 'local_infile = 1' 설정 후 DB 재시작\n"
+                                "  • On-premise: my.cnf에 'local_infile = 1' 추가 후 MySQL 재시작"
+                            )
+                        raise
+            finally:
+                conn.close()
+        except pymysql.err.OperationalError as e:
+            err_code = e.args[0] if e.args else 0
+            err_msg = e.args[1] if len(e.args) > 1 else str(e)
+            return False, (
+                f"local_infile 설정 확인 중 DB 오류가 발생했습니다 (Error {err_code}: {err_msg}).\n\n"
+                "해결 방법:\n"
+                "  • AWS RDS: 파라미터 그룹에서 'local_infile = 1' 설정 후 DB 재시작\n"
+                "  • On-premise: my.cnf에 'local_infile = 1' 추가 후 MySQL 재시작"
+            )
+        except Exception as e:
+            # 연결 자체 실패 등 — import 진행 중에 더 명확한 오류가 발생하므로 통과
+            logger.warning(f"local_infile 점검 중 오류 (계속 진행): {e}")
+            return True, ""
 
     def _drop_and_recreate_schema(
         self,
