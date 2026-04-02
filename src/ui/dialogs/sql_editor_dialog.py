@@ -1552,8 +1552,6 @@ class SQLEditorDialog(QDialog):
 
         self.db_combo = QComboBox()
         self.db_combo.setMinimumWidth(200)
-        self.db_combo.setEditable(True)
-        self.db_combo.setPlaceholderText("데이터베이스 선택...")
         self.db_combo.currentTextChanged.connect(self._on_schema_changed)
         conn_bar.addWidget(self.db_combo)
 
@@ -2067,7 +2065,6 @@ class SQLEditorDialog(QDialog):
                     schemas = connector.get_schemas()
 
                     self.db_combo.clear()
-                    self.db_combo.addItem("")  # 빈 항목
                     self.db_combo.addItems(schemas)
                     self.message_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
 
@@ -2078,8 +2075,12 @@ class SQLEditorDialog(QDialog):
                         if index >= 0:
                             self.db_combo.setCurrentIndex(index)
                             self.message_text.append(f"📌 기본 스키마 선택됨: {default_schema}")
-                            # 메타데이터 로드 (검증용)
-                            self._load_metadata(default_schema)
+                        else:
+                            self.message_text.append(f"⚠️ 기본 스키마 '{default_schema}'를 찾을 수 없습니다.")
+                    # 메타데이터 로드 (선택된 스키마 기준)
+                    selected = self.db_combo.currentText()
+                    if selected:
+                        self._load_metadata(selected)
                 else:
                     self.message_text.append(f"❌ DB 연결 실패: {msg}")
             finally:
