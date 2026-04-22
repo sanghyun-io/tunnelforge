@@ -457,7 +457,27 @@ class TunnelMonitor:
                 return
 
             try:
-                success, msg = self.tunnel_engine.start_tunnel(tunnel_id)
+                # start_tunnel은 config dict를 요구함. stop_tunnel이 tunnel_configs를
+                # 삭제하므로, 반드시 stop 호출 전에 config를 조회/보관한다.
+                config = self.tunnel_engine.tunnel_configs.get(tunnel_id)
+                if not config:
+                    with self._lock:
+                        status.state = TunnelState.ERROR
+                        status.error_message = "재연결 실패: 터널 설정을 찾을 수 없음"
+                        self._add_event(
+                            tunnel_id, "error", status.error_message
+                        )
+                        self._notify_callbacks(tunnel_id, status)
+                    return
+
+                # 끊긴 stale server 객체와 tunnel_configs 엔트리를 정리하여
+                # 포트 충돌 및 객체 누수를 방지한다.
+                self.tunnel_engine.stop_tunnel(tunnel_id)
+
+                # 자동 재연결은 포트 재사용 상황이라 포트 충돌 체크를 건너뛴다.
+                success, msg = self.tunnel_engine.start_tunnel(
+                    config, check_port=False
+                )
 
                 with self._lock:
                     if success:
