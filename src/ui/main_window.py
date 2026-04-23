@@ -377,22 +377,21 @@ class TunnelManagerUI(QMainWindow):
             )
             return
 
-        # 터널 시작 시도
+        # 임시 터널로 연결 테스트 (실제 터널은 시작하지 않음)
         self.statusBar().showMessage(f"연결 테스트 중: {tunnel_name}...")
         QApplication.processEvents()
 
-        success, msg = self.engine.start_tunnel(tunnel)
+        success, msg = self.engine.test_connection(tunnel)
         if success:
             QMessageBox.information(
                 self, "연결 테스트",
-                f"✅ '{tunnel_name}' 터널 연결 성공!\n\n로컬 포트: {tunnel.get('local_port')}"
+                f"✅ '{tunnel_name}' 터널 연결 테스트 성공!\n\n{msg}"
             )
-            self.refresh_table()
             self.statusBar().showMessage(f"연결 성공: {tunnel_name}")
         else:
             QMessageBox.warning(
                 self, "연결 테스트",
-                f"❌ '{tunnel_name}' 터널 연결 실패\n\n원인: {msg}"
+                f"❌ '{tunnel_name}' 터널 연결 실패\n\n{msg}"
             )
             self.statusBar().showMessage(f"연결 실패: {tunnel_name}")
 
