@@ -2777,6 +2777,32 @@ class SQLEditorDialog(QDialog):
         if pending_count == 0 and cell_edit_count == 0:
             return
 
+        # Production 환경 가드 (셀 편집에 한함 — pending_queries는 실행 시점에 이미 통과)
+        if table_edits:
+            from src.core.production_guard import ProductionGuard
+            guard = ProductionGuard(self)
+
+            # 관여 스키마별로 그룹화
+            schemas_with_tables = {}
+            for tbl_widget, ctx in table_edits:
+                schema_key = ctx['schema'] or (self.db_combo.currentText() or '')
+                schemas_with_tables.setdefault(schema_key, []).append(
+                    (ctx['table'], len(ctx['pending_edits']))
+                )
+
+            for schema, tables_info in schemas_with_tables.items():
+                details = '<br>'.join(
+                    f'• <code>{t}</code>: {n}개 셀 변경'
+                    for t, n in tables_info
+                )
+                if not guard.confirm_dangerous_operation(
+                    self.config,
+                    "셀 편집 커밋 (UPDATE)",
+                    schema or '(기본 스키마)',
+                    f"대상 테이블:<br>{details}"
+                ):
+                    return  # 사용자 취소 — 커밋 중단
+
         try:
             # 셀 편집이 있으면 같은 트랜잭션에서 UPDATE 실행
             if table_edits:
