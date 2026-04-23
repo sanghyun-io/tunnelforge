@@ -1227,10 +1227,19 @@ class SettingsDialog(QDialog):
                 with open(bat_path, 'w', encoding='ascii') as f:
                     f.write(bat_content)
 
-                # os.startfile()은 Windows ShellExecuteEx를 사용하여
-                # 부모 프로세스와 완전히 독립된 프로세스를 생성
-                # (subprocess.Popen은 PyInstaller 종료 시 자식 프로세스도 종료됨)
-                os.startfile(bat_path)
+                # cmd.exe로 bat 실행:
+                # - CREATE_NO_WINDOW: 콘솔 창 숨김 (UX 개선)
+                # - DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: 부모(TunnelForge)
+                #   종료 후에도 독립 실행 (main.py 복구 모드와 동일 패턴)
+                subprocess.Popen(
+                    ['cmd.exe', '/c', bat_path],
+                    creationflags=(
+                        subprocess.CREATE_NO_WINDOW
+                        | subprocess.DETACHED_PROCESS
+                        | subprocess.CREATE_NEW_PROCESS_GROUP
+                    ),
+                    close_fds=True,
+                )
             else:
                 subprocess.Popen(
                     [self._downloaded_installer_path],
