@@ -2468,6 +2468,26 @@ class SQLEditorDialog(QDialog):
         # 행 높이 확보 (편집 시 텍스트 잘림 방지)
         table.verticalHeader().setDefaultSectionSize(28)
 
+        # 셀 편집기(QLineEdit) 스타일 — 셀 경계 내에 정확히 맞도록
+        table.setStyleSheet("""
+            QTableWidget {
+                gridline-color: #ddd;
+                font-size: 12px;
+            }
+            QTableWidget::item:selected {
+                background-color: #3498db;
+                color: white;
+            }
+            QTableWidget QLineEdit {
+                padding: 1px 4px;
+                margin: 0px;
+                border: 2px solid #2196F3;
+                background: white;
+                color: #000;
+                font-size: 12px;
+            }
+        """)
+
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         table.customContextMenuRequested.connect(
             lambda pos, t=table, c=columns: self._show_table_context_menu(pos, t, c)
@@ -2490,8 +2510,15 @@ class SQLEditorDialog(QDialog):
     def _update_tx_status(self):
         """트랜잭션 상태 UI 업데이트"""
         pending_count = len(self.pending_queries)
+        try:
+            cell_edit_count = sum(
+                len(ctx['pending_edits'])
+                for _, ctx in self._collect_all_pending_edits()
+            )
+        except Exception:
+            cell_edit_count = 0
 
-        if pending_count > 0:
+        if pending_count > 0 or cell_edit_count > 0:
             self.tx_status_frame.setStyleSheet("""
                 QFrame {
                     background-color: #FFF3CD;
@@ -2500,19 +2527,30 @@ class SQLEditorDialog(QDialog):
                 }
             """)
             self.tx_status_icon.setText("⚠️")
-            self.tx_info_label.setText(f"미커밋 변경: {pending_count}건")
+
+            # 라벨 분기: 쿼리 + 셀 편집 / 쿼리만 / 편집만
+            if pending_count > 0 and cell_edit_count > 0:
+                label_text = f"미커밋 변경: 쿼리 {pending_count}건, 셀 편집 {cell_edit_count}건"
+            elif pending_count > 0:
+                label_text = f"미커밋 변경: {pending_count}건"
+            else:
+                label_text = f"미커밋 변경: 셀 편집 {cell_edit_count}건"
+
+            self.tx_info_label.setText(label_text)
             self.tx_info_label.setStyleSheet("color: #856404; font-weight: bold; background: transparent; border: none;")
             self.btn_commit.setEnabled(True)
             self.btn_rollback.setEnabled(True)
-            self.btn_toggle_pending.setVisible(True)
+            self.btn_toggle_pending.setVisible(pending_count > 0)
 
-            # 미커밋 쿼리 목록 업데이트
+            # 미커밋 쿼리 목록 업데이트 (DML만 — 셀 편집은 노랑 배경/*N으로 별도 표시)
             self.pending_list_widget.clear()
             for pq in self.pending_queries:
                 preview = pq['query'][:50] + "..." if len(pq['query']) > 50 else pq['query']
                 preview = preview.replace('\n', ' ')
                 item_text = f"[{pq['timestamp']}] {pq['type']} ({pq['affected']}행) - {preview}"
                 self.pending_list_widget.addItem(item_text)
+            if pending_count == 0:
+                self.pending_list_widget.setVisible(False)
         else:
             self.tx_status_frame.setStyleSheet("""
                 QFrame {
@@ -2666,7 +2704,7 @@ class SQLEditorDialog(QDialog):
                 lambda t=table, c=columns: self._copy_table_data(t, c, False)
             )
 
-            # 셀 복사 허용
+            # 셀 복사 허용 + 편집기(QLineEdit) 스타일 — 셀 경계 내에 정확히 맞도록
             table.setStyleSheet("""
                 QTableWidget {
                     gridline-color: #ddd;
@@ -2675,6 +2713,14 @@ class SQLEditorDialog(QDialog):
                 QTableWidget::item:selected {
                     background-color: #3498db;
                     color: white;
+                }
+                QTableWidget QLineEdit {
+                    padding: 1px 4px;
+                    margin: 0px;
+                    border: 2px solid #2196F3;
+                    background: white;
+                    color: #000;
+                    font-size: 12px;
                 }
             """)
 
@@ -2720,13 +2766,42 @@ class SQLEditorDialog(QDialog):
         return any(query_upper.startswith(kw) for kw in modification_keywords)
 
     def _do_commit(self):
-        """트랜잭션 커밋"""
-        if not self.db_connection or not self.pending_queries:
+        """트랜잭션 커밋 — DML pending_queries + 모든 탭의 셀 편집을 동일 트랜잭션에서 처리"""
+        if not self.db_connection or not self.db_connection.open:
             return
 
         pending_count = len(self.pending_queries)
+        table_edits = self._collect_all_pending_edits()
+        cell_edit_count = sum(len(ctx['pending_edits']) for _, ctx in table_edits)
+
+        if pending_count == 0 and cell_edit_count == 0:
+            return
 
         try:
+            # 셀 편집이 있으면 같은 트랜잭션에서 UPDATE 실행
+            if table_edits:
+                with self.db_connection.cursor() as cursor:
+                    failed = self._execute_cell_edits_in_txn(cursor, table_edits)
+                if failed:
+                    self.db_connection.rollback()
+                    msg = '\n'.join(
+                        f'행 {r + 1}: {err}' for _, r, err in failed[:10]
+                    )
+                    extra = f"\n... (총 {len(failed)}건 실패)" if len(failed) > 10 else ""
+                    QMessageBox.critical(
+                        self, "커밋 실패",
+                        f"셀 편집 적용 실패 — 전체 롤백되었습니다"
+                        f"{'  (미커밋 쿼리 ' + str(pending_count) + '건 포함)' if pending_count else ''}:\n\n{msg}{extra}"
+                    )
+                    # 롤백 후 상태 정리
+                    history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
+                    if history_ids:
+                        self.history_manager.update_status_batch(history_ids, 'rolled_back')
+                    self.pending_queries.clear()
+                    self._update_tx_status()
+                    return
+
+            # 최종 커밋 (DML + 셀 편집 UPDATE 모두 포함)
             self.db_connection.commit()
 
             # 히스토리 상태 업데이트
@@ -2734,24 +2809,50 @@ class SQLEditorDialog(QDialog):
             if history_ids:
                 self.history_manager.update_status_batch(history_ids, 'committed')
 
-            self.message_text.append(f"\n✅ 커밋 완료! ({pending_count}건 변경사항 적용됨)")
+            # 셀 편집 UI 후처리 (UserRole 갱신 + 시각 초기화)
+            self._finalize_cell_edits(table_edits)
+
+            # 완료 메시지
+            parts = []
+            if pending_count > 0:
+                parts.append(f"쿼리 {pending_count}건")
+            if cell_edit_count > 0:
+                parts.append(f"셀 편집 {cell_edit_count}건")
+            self.message_text.append(f"\n✅ 커밋 완료! ({', '.join(parts)} 적용됨)")
             self.status_bar.showMessage("커밋 완료")
+
             self.pending_queries.clear()
             self._update_tx_status()
         except Exception as e:
+            try:
+                self.db_connection.rollback()
+            except Exception:
+                pass
             self.message_text.append(f"❌ 커밋 실패: {str(e)}")
             QMessageBox.critical(self, "커밋 오류", f"커밋에 실패했습니다:\n{str(e)}")
 
     def _do_rollback(self):
-        """트랜잭션 롤백"""
-        if not self.db_connection or not self.pending_queries:
+        """트랜잭션 롤백 — DML + 셀 편집 모두 원복"""
+        if not self.db_connection or not self.db_connection.open:
             return
 
         pending_count = len(self.pending_queries)
+        table_edits = self._collect_all_pending_edits()
+        cell_edit_count = sum(len(ctx['pending_edits']) for _, ctx in table_edits)
+
+        if pending_count == 0 and cell_edit_count == 0:
+            return
+
+        parts = []
+        if pending_count > 0:
+            parts.append(f"쿼리 {pending_count}건")
+        if cell_edit_count > 0:
+            parts.append(f"셀 편집 {cell_edit_count}건")
+        summary = ', '.join(parts)
 
         reply = QMessageBox.question(
             self, "롤백 확인",
-            f"정말 롤백하시겠습니까?\n{pending_count}건의 변경사항이 취소됩니다.",
+            f"정말 롤백하시겠습니까?\n{summary} 모두 취소됩니다.",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
         if reply != QMessageBox.StandardButton.Yes:
@@ -2765,7 +2866,11 @@ class SQLEditorDialog(QDialog):
             if history_ids:
                 self.history_manager.update_status_batch(history_ids, 'rolled_back')
 
-            self.message_text.append(f"\n↩️ 롤백 완료! ({pending_count}건 변경사항 취소됨)")
+            # 각 테이블 셀 편집 시각/값 복원 (DB 롤백 여부와 무관하게 UI 복원)
+            for table, _ in table_edits:
+                self._discard_pending_edits(table)
+
+            self.message_text.append(f"\n↩️ 롤백 완료! ({summary} 취소됨)")
             self.status_bar.showMessage("롤백 완료")
             self.pending_queries.clear()
             self._update_tx_status()
@@ -2872,13 +2977,13 @@ class SQLEditorDialog(QDialog):
             pending = len(ctx['pending_edits'])
             menu.addSeparator()
             if pending > 0:
-                apply_action = menu.addAction(f"💾 변경사항 적용 ({pending}건)")
-                apply_action.triggered.connect(lambda: self._apply_pending_edits(table))
                 discard_action = menu.addAction(f"↩️ 변경사항 취소 ({pending}건)")
                 discard_action.triggered.connect(lambda: self._discard_pending_edits(table))
+                info = menu.addAction("💡 커밋은 하단 '✅ 커밋' 버튼")
+                info.setEnabled(False)
             else:
                 info = menu.addAction(
-                    f"✏️ 편집 가능 — `{ctx['table']}` (셀 더블클릭)"
+                    f"✏️ 편집 가능 — `{ctx['table']}` (더블클릭 · 커밋은 하단)"
                 )
                 info.setEnabled(False)
         else:
@@ -3130,6 +3235,7 @@ class SQLEditorDialog(QDialog):
                 item.setForeground(QColor('#000000'))
 
         self._update_edit_tab_title(table)
+        self._update_tx_status()
 
     def _update_edit_tab_title(self, table):
         """결과 탭 제목에 변경사항 개수 표시"""
@@ -3144,153 +3250,90 @@ class SQLEditorDialog(QDialog):
         n = len(ctx['pending_edits'])
         self.result_tabs.setTabText(idx, f"{base} *{n}" if n > 0 else base)
 
-    def _apply_pending_edits(self, table):
-        """변경사항을 UPDATE 쿼리로 DB에 반영 (트랜잭션)"""
-        ctx = getattr(table, '_edit_context', None)
-        if ctx is None or not ctx['pending_edits']:
-            return
+    def _collect_all_pending_edits(self):
+        """편집 변경사항이 있는 모든 결과 탭 수집.
 
-        if not self.db_connection or not self.db_connection.open:
-            QMessageBox.warning(self, '경고', 'DB 연결이 끊어졌습니다.')
-            return
+        반환: [(table, edit_ctx), ...] — pending_edits가 비어있지 않은 것만.
+        index 0은 메시지 탭이므로 제외.
+        """
+        results = []
+        for idx in range(1, self.result_tabs.count()):
+            widget = self.result_tabs.widget(idx)
+            if not isinstance(widget, QTableWidget):
+                continue
+            ctx = getattr(widget, '_edit_context', None)
+            if ctx and ctx['pending_edits']:
+                results.append((widget, ctx))
+        return results
 
-        if self.pending_queries:
-            QMessageBox.warning(
-                self, '경고',
-                '미커밋 쿼리가 있습니다. 먼저 커밋 또는 롤백 후 다시 시도하세요.'
-            )
-            return
+    def _execute_cell_edits_in_txn(self, cursor, table_edits):
+        """셀 편집 목록을 주어진 cursor로 UPDATE 실행.
 
-        # 행별로 묶기
-        by_row = {}
-        for (row, col), value in ctx['pending_edits'].items():
-            by_row.setdefault(row, {})[col] = value
-
-        schema, tbl = ctx['schema'], ctx['table']
-        qualified = f"`{schema}`.`{tbl}`" if schema else f"`{tbl}`"
-        columns = ctx['columns']
-        pk_cols = ctx['pk_columns']
-        pk_indices = ctx['pk_indices']
-
-        # 미리보기 생성
-        preview = []
-        for row_idx in sorted(by_row):
-            col_values = by_row[row_idx]
-            set_parts = []
-            for c, v in col_values.items():
-                set_parts.append(
-                    f"`{columns[c]}`=" + ('NULL' if v is None else repr(v))
-                )
-            where_parts = []
-            for i, pk_idx in enumerate(pk_indices):
-                itm = table.item(row_idx, pk_idx)
-                raw = itm.data(Qt.ItemDataRole.UserRole) if itm else None
-                where_parts.append(
-                    f"`{pk_cols[i]}`=" + ('NULL' if raw is None else repr(raw))
-                )
-            preview.append(
-                f"UPDATE {qualified} SET {', '.join(set_parts)} "
-                f"WHERE {' AND '.join(where_parts)};"
-            )
-        preview_text = '\n'.join(preview[:20])
-        if len(preview) > 20:
-            preview_text += f"\n... (총 {len(preview)}건)"
-
-        reply = QMessageBox.question(
-            self, '변경사항 적용',
-            f"{len(preview)}개 행을 UPDATE 합니다.\n\n{preview_text}\n\n실행할까요?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        # 실행 (트랜잭션)
-        prev_autocommit = True
-        try:
-            prev_autocommit = self.db_connection.get_autocommit()
-        except Exception:
-            prev_autocommit = True
-
+        동일 트랜잭션 내에서 실행되므로 autocommit/commit 관리는 호출자 책임.
+        반환: failed 리스트 [(table, row_idx, error_msg), ...]. 비어있으면 전체 성공.
+        """
         failed = []
-        success_count = 0
-        try:
-            self.db_connection.autocommit(False)
-            with self.db_connection.cursor() as cursor:
-                for row_idx in sorted(by_row):
-                    col_values = by_row[row_idx]
-                    set_parts = []
-                    params = []
-                    for c, v in col_values.items():
-                        set_parts.append(f"`{columns[c]}`=%s")
-                        params.append(v)
-                    where_parts = []
-                    for i, pk_idx in enumerate(pk_indices):
-                        itm = table.item(row_idx, pk_idx)
-                        raw = itm.data(Qt.ItemDataRole.UserRole) if itm else None
-                        if raw is None:
-                            where_parts.append(f"`{pk_cols[i]}` IS NULL")
-                        else:
-                            where_parts.append(f"`{pk_cols[i]}`=%s")
-                            params.append(raw)
-                    sql = (
-                        f"UPDATE {qualified} SET {', '.join(set_parts)} "
-                        f"WHERE {' AND '.join(where_parts)}"
-                    )
-                    try:
-                        affected = cursor.execute(sql, params)
-                        if affected == 1:
-                            success_count += 1
-                        else:
-                            failed.append((row_idx, f'영향받은 행 수: {affected}'))
-                    except Exception as e:
-                        failed.append((row_idx, str(e)))
+        for table, ctx in table_edits:
+            schema, tbl = ctx['schema'], ctx['table']
+            qualified = f"`{schema}`.`{tbl}`" if schema else f"`{tbl}`"
+            columns = ctx['columns']
+            pk_cols = ctx['pk_columns']
+            pk_indices = ctx['pk_indices']
 
-            if failed:
-                self.db_connection.rollback()
-                msg = '\n'.join(f'행 {r + 1}: {err}' for r, err in failed[:10])
-                QMessageBox.critical(
-                    self, '실패',
-                    f'변경사항 적용 실패 (전체 롤백됨):\n\n{msg}'
+            # 행별로 묶기
+            by_row = {}
+            for (row, col), value in ctx['pending_edits'].items():
+                by_row.setdefault(row, {})[col] = value
+
+            for row_idx in sorted(by_row):
+                col_values = by_row[row_idx]
+                set_parts = []
+                params = []
+                for c, v in col_values.items():
+                    set_parts.append(f"`{columns[c]}`=%s")
+                    params.append(v)
+                where_parts = []
+                for i, pk_idx in enumerate(pk_indices):
+                    itm = table.item(row_idx, pk_idx)
+                    raw = itm.data(Qt.ItemDataRole.UserRole) if itm else None
+                    if raw is None:
+                        where_parts.append(f"`{pk_cols[i]}` IS NULL")
+                    else:
+                        where_parts.append(f"`{pk_cols[i]}`=%s")
+                        params.append(raw)
+                sql = (
+                    f"UPDATE {qualified} SET {', '.join(set_parts)} "
+                    f"WHERE {' AND '.join(where_parts)}"
                 )
-                return
+                try:
+                    affected = cursor.execute(sql, params)
+                    if affected != 1:
+                        failed.append((table, row_idx, f'영향받은 행 수: {affected}'))
+                except Exception as e:
+                    failed.append((table, row_idx, str(e)))
+        return failed
 
-            self.db_connection.commit()
-
-        except Exception as e:
+    def _finalize_cell_edits(self, table_edits):
+        """커밋 성공 후 각 테이블의 UserRole 갱신 + 시각 초기화."""
+        for table, ctx in table_edits:
+            table.blockSignals(True)
             try:
-                self.db_connection.rollback()
-            except Exception:
-                pass
-            QMessageBox.critical(self, '오류', f'UPDATE 실행 중 오류:\n{e}')
-            return
-        finally:
-            try:
-                self.db_connection.autocommit(prev_autocommit)
-            except Exception:
-                pass
-
-        # 성공 처리: 원본값 갱신 + 시각 초기화
-        table.blockSignals(True)
-        try:
-            for (row, col), new_value in ctx['pending_edits'].items():
-                item = table.item(row, col)
-                if item is None:
-                    continue
-                item.setData(Qt.ItemDataRole.UserRole, new_value)
-                if new_value is None:
-                    item.setText('NULL')
-                    item.setForeground(QColor('#888888'))
-                else:
-                    item.setText(str(new_value))
-                    item.setForeground(QColor('#000000'))
-                item.setBackground(QColor(0, 0, 0, 0))
-        finally:
-            table.blockSignals(False)
-
-        ctx['pending_edits'].clear()
-        self._update_edit_tab_title(table)
-        self.message_text.append(f"✅ {success_count}개 행 UPDATE 적용 완료")
+                for (row, col), new_value in ctx['pending_edits'].items():
+                    item = table.item(row, col)
+                    if item is None:
+                        continue
+                    item.setData(Qt.ItemDataRole.UserRole, new_value)
+                    if new_value is None:
+                        item.setText('NULL')
+                        item.setForeground(QColor('#888888'))
+                    else:
+                        item.setText(str(new_value))
+                        item.setForeground(QColor('#000000'))
+                    item.setBackground(QColor(0, 0, 0, 0))
+            finally:
+                table.blockSignals(False)
+            ctx['pending_edits'].clear()
+            self._update_edit_tab_title(table)
 
     def _discard_pending_edits(self, table):
         """변경사항 취소 — 원본값으로 되돌림"""
@@ -3315,6 +3358,7 @@ class SQLEditorDialog(QDialog):
             table.blockSignals(False)
         ctx['pending_edits'].clear()
         self._update_edit_tab_title(table)
+        self._update_tx_status()
 
     def close_result_tab(self, index):
         """결과 탭 닫기"""
