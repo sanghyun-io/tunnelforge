@@ -2325,7 +2325,7 @@ class SQLEditorDialog(QDialog):
                         exec_time = time.time() - start_time
 
                         tab_idx = self.result_tabs.count()
-                        self._add_result_table(tab_idx, columns, row_list, exec_time)
+                        self._add_result_table(tab_idx, columns, row_list, exec_time, query)
                         self.message_text.append(f"✅ {len(rows)}행 반환 ({exec_time:.3f}초)")
                         self.message_text.append(f"   └ {preview}")
 
@@ -2438,7 +2438,7 @@ class SQLEditorDialog(QDialog):
                 return kw
         return 'OTHER'
 
-    def _add_result_table(self, idx, columns, rows, exec_time):
+    def _add_result_table(self, idx, columns, rows, exec_time, query=''):
         """결과 테이블 탭 추가"""
         table = QTableWidget()
         table.setColumnCount(len(columns))
@@ -2465,14 +2465,27 @@ class SQLEditorDialog(QDialog):
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
+        # 행 높이 확보 (편집 시 텍스트 잘림 방지)
+        table.verticalHeader().setDefaultSectionSize(28)
+
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         table.customContextMenuRequested.connect(
             lambda pos, t=table, c=columns: self._show_table_context_menu(pos, t, c)
         )
 
+        # Ctrl+C: 선택한 모든 셀을 탭 구분으로 복사
+        copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
+        copy_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+        copy_shortcut.activated.connect(
+            lambda t=table, c=columns: self._copy_table_data(t, c, False)
+        )
+
         tab_name = f"결과 {idx + 1} ({len(rows)}행)"
         self.result_tabs.addTab(table, tab_name)
         self.result_tabs.setCurrentWidget(table)
+
+        # 편집 가능성 분석 + 설정
+        self._setup_result_table_editability(table, query, columns, rows)
 
     def _update_tx_status(self):
         """트랜잭션 상태 UI 업데이트"""
@@ -2637,10 +2650,20 @@ class SQLEditorDialog(QDialog):
             table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
             table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
+            # 행 높이 확보 (편집 시 텍스트 잘림 방지)
+            table.verticalHeader().setDefaultSectionSize(28)
+
             # 컨텍스트 메뉴 설정 (우클릭 복사)
             table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
             table.customContextMenuRequested.connect(
                 lambda pos, t=table, c=columns: self._show_table_context_menu(pos, t, c)
+            )
+
+            # Ctrl+C: 우클릭 복사와 동일하게 선택한 모든 셀을 탭 구분으로 복사
+            copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
+            copy_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
+            copy_shortcut.activated.connect(
+                lambda t=table, c=columns: self._copy_table_data(t, c, False)
             )
 
             # 셀 복사 허용
@@ -2658,6 +2681,15 @@ class SQLEditorDialog(QDialog):
             tab_name = f"결과 {idx + 1} ({len(rows)}행)"
             self.result_tabs.addTab(table, tab_name)
             self.result_tabs.setCurrentWidget(table)
+
+            # 편집 가능성 분석 + 설정 (워커에 실행된 원본 쿼리 사용)
+            worker_query = ''
+            if self.worker is not None and hasattr(self.worker, 'queries'):
+                try:
+                    worker_query = self.worker.queries[idx]
+                except (IndexError, TypeError):
+                    worker_query = ''
+            self._setup_result_table_editability(table, worker_query, columns, rows)
 
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {len(rows)}행 반환 ({exec_time:.3f}초)")
         else:
@@ -2834,6 +2866,26 @@ class SQLEditorDialog(QDialog):
         copy_header_action = menu.addAction("📋 헤더 포함 복사")
         copy_header_action.triggered.connect(lambda: self._copy_table_data(table, columns, True))
 
+        # 편집 기능 메뉴
+        ctx = getattr(table, '_edit_context', None)
+        if ctx is not None:
+            pending = len(ctx['pending_edits'])
+            menu.addSeparator()
+            if pending > 0:
+                apply_action = menu.addAction(f"💾 변경사항 적용 ({pending}건)")
+                apply_action.triggered.connect(lambda: self._apply_pending_edits(table))
+                discard_action = menu.addAction(f"↩️ 변경사항 취소 ({pending}건)")
+                discard_action.triggered.connect(lambda: self._discard_pending_edits(table))
+            else:
+                info = menu.addAction(
+                    f"✏️ 편집 가능 — `{ctx['table']}` (셀 더블클릭)"
+                )
+                info.setEnabled(False)
+        else:
+            menu.addSeparator()
+            info = menu.addAction("🔒 읽기 전용 (단일 테이블 SELECT + PK 필요)")
+            info.setEnabled(False)
+
         menu.exec(table.mapToGlobal(position))
 
     def _copy_table_data(self, table, columns, include_header):
@@ -2886,6 +2938,383 @@ class SQLEditorDialog(QDialog):
             lines.append('\t'.join(row_data))
 
         QApplication.clipboard().setText('\n'.join(lines))
+
+    # =====================================================================
+    # 결과 테이블 편집 (MVP: 단일 테이블 SELECT + PK 있을 때만 허용)
+    # =====================================================================
+    def _analyze_query_editability(self, query):
+        """SELECT 쿼리에서 편집 가능한 단일 테이블 정보 추출.
+
+        반환: {'schema': str|None, 'table': str} 또는 None
+        """
+        if not query:
+            return None
+
+        # 주석 제거
+        q = re.sub(r'/\*.*?\*/', ' ', query, flags=re.DOTALL)
+        q = re.sub(r'--[^\n]*', ' ', q)
+        q_norm = q.strip().rstrip(';').strip()
+        if not q_norm:
+            return None
+
+        q_upper = q_norm.upper()
+        if not q_upper.startswith('SELECT'):
+            return None
+
+        # 복잡 구조 거부 (JOIN / UNION / GROUP BY / HAVING / DISTINCT / 집계)
+        forbidden_patterns = [
+            r'\bJOIN\b', r'\bUNION\b', r'\bGROUP\s+BY\b',
+            r'\bHAVING\b', r'\bDISTINCT\b',
+        ]
+        for pat in forbidden_patterns:
+            if re.search(pat, q_upper):
+                return None
+        if re.search(r'\b(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(', q_upper):
+            return None
+
+        # FROM 절 테이블 이름 추출: `schema`.`table` 또는 schema.table 또는 table
+        m = re.search(
+            r'\bFROM\s+(`[^`]+`|"[^"]+"|[\w$]+)(\s*\.\s*(`[^`]+`|"[^"]+"|[\w$]+))?',
+            q_norm, re.IGNORECASE
+        )
+        if not m:
+            return None
+
+        # FROM 뒤에 서브쿼리 괄호가 붙는 경우 거부
+        after_from = q_norm[m.start():]
+        from_kw_end = re.search(r'\bFROM\s+', after_from, re.IGNORECASE).end()
+        if after_from[from_kw_end:].lstrip().startswith('('):
+            return None
+
+        part1 = m.group(1).strip().strip('`"')
+        part2 = m.group(3).strip().strip('`"') if m.group(3) else None
+        schema, table = (part1, part2) if part2 else (None, part1)
+
+        # 여러 테이블(콤마 결합) 거부 - FROM 뒤 WHERE 이전 구간에 쉼표 있으면 탈락
+        rest = q_norm[m.end():]
+        stop = re.search(r'\b(WHERE|ORDER|LIMIT|GROUP|HAVING|FOR)\b', rest, re.IGNORECASE)
+        rest_check = rest[:stop.start()] if stop else rest
+        if ',' in rest_check:
+            return None
+
+        return {'schema': schema, 'table': table}
+
+    def _fetch_primary_keys(self, schema, table):
+        """INFORMATION_SCHEMA에서 테이블의 PK 컬럼명 조회"""
+        if not self.db_connection or not self.db_connection.open:
+            return []
+        try:
+            with self.db_connection.cursor() as cursor:
+                if schema:
+                    cursor.execute(
+                        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_KEY='PRI' "
+                        "ORDER BY ORDINAL_POSITION",
+                        (schema, table)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_KEY='PRI' "
+                        "ORDER BY ORDINAL_POSITION",
+                        (table,)
+                    )
+                rows = cursor.fetchall()
+        except Exception:
+            return []
+
+        pks = []
+        for row in rows:
+            if isinstance(row, dict):
+                pks.append(row.get('COLUMN_NAME') or row.get('column_name'))
+            else:
+                pks.append(row[0])
+        return [p for p in pks if p]
+
+    def _setup_result_table_editability(self, table, query, columns, rows):
+        """결과 테이블에 편집 기능 설정.
+
+        편집 가능 조건: 단일 테이블 SELECT + PK 존재 + 모든 PK 컬럼이 결과에 포함.
+        조건 미충족 시 전체 읽기 전용.
+        """
+        edit_ctx = None
+        analysis = self._analyze_query_editability(query)
+        if analysis and self.db_connection and self.db_connection.open:
+            pk_cols = self._fetch_primary_keys(analysis['schema'], analysis['table'])
+            if pk_cols:
+                col_lower = [c.lower() for c in columns]
+                pk_indices = []
+                all_present = True
+                for pk in pk_cols:
+                    if pk.lower() in col_lower:
+                        pk_indices.append(col_lower.index(pk.lower()))
+                    else:
+                        all_present = False
+                        break
+                if all_present:
+                    edit_ctx = {
+                        'schema': analysis['schema'],
+                        'table': analysis['table'],
+                        'pk_columns': pk_cols,
+                        'pk_indices': pk_indices,
+                        'columns': list(columns),
+                        'pending_edits': {},
+                    }
+
+        if edit_ctx is not None:
+            # 원본값을 UserRole에 저장 + PK 셀은 편집 불가 플래그
+            table.blockSignals(True)
+            try:
+                for r in range(len(rows)):
+                    for c in range(len(columns)):
+                        item = table.item(r, c)
+                        if item is None:
+                            continue
+                        item.setData(Qt.ItemDataRole.UserRole, rows[r][c])
+                        if c in edit_ctx['pk_indices']:
+                            item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+            finally:
+                table.blockSignals(False)
+
+            table._edit_context = edit_ctx
+            table.setEditTriggers(
+                QAbstractItemView.EditTrigger.DoubleClicked
+                | QAbstractItemView.EditTrigger.EditKeyPressed
+                | QAbstractItemView.EditTrigger.AnyKeyPressed
+            )
+            table.itemChanged.connect(
+                lambda item, t=table: self._on_result_cell_changed(t, item)
+            )
+        else:
+            table._edit_context = None
+            table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+
+    def _on_result_cell_changed(self, table, item):
+        """셀 편집 시 변경사항 트래킹 + 시각 표시"""
+        ctx = getattr(table, '_edit_context', None)
+        if ctx is None:
+            return
+        row, col = item.row(), item.column()
+        if col in ctx['pk_indices']:
+            return
+
+        original = item.data(Qt.ItemDataRole.UserRole)
+        new_text = item.text()
+        if new_text.upper() == 'NULL':
+            new_value, is_null = None, True
+        else:
+            new_value, is_null = new_text, False
+
+        orig_is_null = original is None
+        if is_null and orig_is_null:
+            changed = False
+        elif is_null != orig_is_null:
+            changed = True
+        else:
+            changed = str(original) != str(new_value)
+
+        key = (row, col)
+        if changed:
+            ctx['pending_edits'][key] = new_value
+            item.setBackground(QColor('#FFF59D'))
+            if is_null:
+                item.setForeground(QColor('#888888'))
+            else:
+                item.setForeground(QColor('#000000'))
+        else:
+            ctx['pending_edits'].pop(key, None)
+            item.setBackground(QColor(0, 0, 0, 0))
+            if orig_is_null:
+                item.setForeground(QColor('#888888'))
+            else:
+                item.setForeground(QColor('#000000'))
+
+        self._update_edit_tab_title(table)
+
+    def _update_edit_tab_title(self, table):
+        """결과 탭 제목에 변경사항 개수 표시"""
+        ctx = getattr(table, '_edit_context', None)
+        if ctx is None:
+            return
+        idx = self.result_tabs.indexOf(table)
+        if idx < 0:
+            return
+        current = self.result_tabs.tabText(idx)
+        base = re.sub(r'\s*\*\d+$', '', current)
+        n = len(ctx['pending_edits'])
+        self.result_tabs.setTabText(idx, f"{base} *{n}" if n > 0 else base)
+
+    def _apply_pending_edits(self, table):
+        """변경사항을 UPDATE 쿼리로 DB에 반영 (트랜잭션)"""
+        ctx = getattr(table, '_edit_context', None)
+        if ctx is None or not ctx['pending_edits']:
+            return
+
+        if not self.db_connection or not self.db_connection.open:
+            QMessageBox.warning(self, '경고', 'DB 연결이 끊어졌습니다.')
+            return
+
+        if self.pending_queries:
+            QMessageBox.warning(
+                self, '경고',
+                '미커밋 쿼리가 있습니다. 먼저 커밋 또는 롤백 후 다시 시도하세요.'
+            )
+            return
+
+        # 행별로 묶기
+        by_row = {}
+        for (row, col), value in ctx['pending_edits'].items():
+            by_row.setdefault(row, {})[col] = value
+
+        schema, tbl = ctx['schema'], ctx['table']
+        qualified = f"`{schema}`.`{tbl}`" if schema else f"`{tbl}`"
+        columns = ctx['columns']
+        pk_cols = ctx['pk_columns']
+        pk_indices = ctx['pk_indices']
+
+        # 미리보기 생성
+        preview = []
+        for row_idx in sorted(by_row):
+            col_values = by_row[row_idx]
+            set_parts = []
+            for c, v in col_values.items():
+                set_parts.append(
+                    f"`{columns[c]}`=" + ('NULL' if v is None else repr(v))
+                )
+            where_parts = []
+            for i, pk_idx in enumerate(pk_indices):
+                itm = table.item(row_idx, pk_idx)
+                raw = itm.data(Qt.ItemDataRole.UserRole) if itm else None
+                where_parts.append(
+                    f"`{pk_cols[i]}`=" + ('NULL' if raw is None else repr(raw))
+                )
+            preview.append(
+                f"UPDATE {qualified} SET {', '.join(set_parts)} "
+                f"WHERE {' AND '.join(where_parts)};"
+            )
+        preview_text = '\n'.join(preview[:20])
+        if len(preview) > 20:
+            preview_text += f"\n... (총 {len(preview)}건)"
+
+        reply = QMessageBox.question(
+            self, '변경사항 적용',
+            f"{len(preview)}개 행을 UPDATE 합니다.\n\n{preview_text}\n\n실행할까요?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # 실행 (트랜잭션)
+        prev_autocommit = True
+        try:
+            prev_autocommit = self.db_connection.get_autocommit()
+        except Exception:
+            prev_autocommit = True
+
+        failed = []
+        success_count = 0
+        try:
+            self.db_connection.autocommit(False)
+            with self.db_connection.cursor() as cursor:
+                for row_idx in sorted(by_row):
+                    col_values = by_row[row_idx]
+                    set_parts = []
+                    params = []
+                    for c, v in col_values.items():
+                        set_parts.append(f"`{columns[c]}`=%s")
+                        params.append(v)
+                    where_parts = []
+                    for i, pk_idx in enumerate(pk_indices):
+                        itm = table.item(row_idx, pk_idx)
+                        raw = itm.data(Qt.ItemDataRole.UserRole) if itm else None
+                        if raw is None:
+                            where_parts.append(f"`{pk_cols[i]}` IS NULL")
+                        else:
+                            where_parts.append(f"`{pk_cols[i]}`=%s")
+                            params.append(raw)
+                    sql = (
+                        f"UPDATE {qualified} SET {', '.join(set_parts)} "
+                        f"WHERE {' AND '.join(where_parts)}"
+                    )
+                    try:
+                        affected = cursor.execute(sql, params)
+                        if affected == 1:
+                            success_count += 1
+                        else:
+                            failed.append((row_idx, f'영향받은 행 수: {affected}'))
+                    except Exception as e:
+                        failed.append((row_idx, str(e)))
+
+            if failed:
+                self.db_connection.rollback()
+                msg = '\n'.join(f'행 {r + 1}: {err}' for r, err in failed[:10])
+                QMessageBox.critical(
+                    self, '실패',
+                    f'변경사항 적용 실패 (전체 롤백됨):\n\n{msg}'
+                )
+                return
+
+            self.db_connection.commit()
+
+        except Exception as e:
+            try:
+                self.db_connection.rollback()
+            except Exception:
+                pass
+            QMessageBox.critical(self, '오류', f'UPDATE 실행 중 오류:\n{e}')
+            return
+        finally:
+            try:
+                self.db_connection.autocommit(prev_autocommit)
+            except Exception:
+                pass
+
+        # 성공 처리: 원본값 갱신 + 시각 초기화
+        table.blockSignals(True)
+        try:
+            for (row, col), new_value in ctx['pending_edits'].items():
+                item = table.item(row, col)
+                if item is None:
+                    continue
+                item.setData(Qt.ItemDataRole.UserRole, new_value)
+                if new_value is None:
+                    item.setText('NULL')
+                    item.setForeground(QColor('#888888'))
+                else:
+                    item.setText(str(new_value))
+                    item.setForeground(QColor('#000000'))
+                item.setBackground(QColor(0, 0, 0, 0))
+        finally:
+            table.blockSignals(False)
+
+        ctx['pending_edits'].clear()
+        self._update_edit_tab_title(table)
+        self.message_text.append(f"✅ {success_count}개 행 UPDATE 적용 완료")
+
+    def _discard_pending_edits(self, table):
+        """변경사항 취소 — 원본값으로 되돌림"""
+        ctx = getattr(table, '_edit_context', None)
+        if ctx is None or not ctx['pending_edits']:
+            return
+        table.blockSignals(True)
+        try:
+            for (row, col) in list(ctx['pending_edits'].keys()):
+                item = table.item(row, col)
+                if item is None:
+                    continue
+                orig = item.data(Qt.ItemDataRole.UserRole)
+                if orig is None:
+                    item.setText('NULL')
+                    item.setForeground(QColor('#888888'))
+                else:
+                    item.setText(str(orig))
+                    item.setForeground(QColor('#000000'))
+                item.setBackground(QColor(0, 0, 0, 0))
+        finally:
+            table.blockSignals(False)
+        ctx['pending_edits'].clear()
+        self._update_edit_tab_title(table)
 
     def close_result_tab(self, index):
         """결과 탭 닫기"""
