@@ -361,9 +361,14 @@ class TunnelTreeWidget(QTreeWidget):
             # 그룹 더블클릭: 접기/펼치기
             item.setExpanded(not item.isExpanded())
         elif item_type == self.ITEM_TYPE_TUNNEL:
-            # 터널 더블클릭: 수정 다이얼로그
+            # 터널 더블클릭: 연결 상태에 따라 분기
+            # - 🟢 (연결됨) → SQL 에디터 열기
+            # - 그 외 → 수정 다이얼로그 (기존 동작)
             tunnel_data = item_data.get('data', {})
-            self.tunnel_edit_requested.emit(tunnel_data)
+            if item.text(0) == "🟢":
+                self.tunnel_sql_editor.emit(tunnel_data)
+            else:
+                self.tunnel_edit_requested.emit(tunnel_data)
 
     def _on_item_expanded(self, item):
         """아이템 확장됨"""
