@@ -4,7 +4,7 @@ import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QMessageBox, QSystemTrayIcon,
                              QMenu, QApplication)
-from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot
+from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QTimer, Qt
 from PyQt6.QtGui import QAction, QIcon
 
 from src.ui.styles import ButtonStyles, LabelStyles, get_full_app_style
@@ -124,6 +124,8 @@ class TunnelManagerUI(QMainWindow):
 
         # 메인 위젯 설정
         central_widget = QWidget()
+        central_widget.setAutoFillBackground(True)
+        central_widget.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout(central_widget)
 
@@ -174,6 +176,7 @@ class TunnelManagerUI(QMainWindow):
 
         # --- 트리 위젯 설정 (터널 그룹핑 지원) ---
         self.tunnel_tree = TunnelTreeWidget(self)
+        self.tunnel_tree.viewport().setAttribute(Qt.WidgetAttribute.WA_StaticContents, False)
 
         # 기본 열 비율 설정
         self._default_column_ratios = [0.05, 0.20, 0.08, 0.25, 0.12, 0.10, 0.20]
@@ -302,6 +305,8 @@ class TunnelManagerUI(QMainWindow):
             h_box.addWidget(btn_del)
 
             self.tunnel_tree.set_tunnel_buttons(tid, container)
+
+        self._schedule_repaint()
 
     # --- 트리 위젯 시그널 핸들러 ---
     def _on_tree_db_connect(self, tunnel):
@@ -728,13 +733,14 @@ class TunnelManagerUI(QMainWindow):
     def showEvent(self, event):
         """창 표시 시 초기 열 비율 적용"""
         super().showEvent(event)
-        from PyQt6.QtCore import QTimer
         QTimer.singleShot(50, self._apply_column_ratios)
+        self._schedule_repaint()
 
     def resizeEvent(self, event):
         """창 크기 변경 시 열 비율 유지"""
         super().resizeEvent(event)
         self._apply_column_ratios()
+        self._schedule_repaint()
 
     def closeEvent(self, event):
         """닫기 버튼 클릭 시"""
@@ -960,6 +966,20 @@ class TunnelManagerUI(QMainWindow):
                 self.table.setColumnWidth(i, max(width, 30))  # 최소 30px
         finally:
             self._resizing_columns = False
+
+    def _schedule_repaint(self):
+        """resize/refresh 직후 남는 이전 프레임 잔상을 제거한다."""
+        QTimer.singleShot(0, self._force_repaint)
+
+    def _force_repaint(self):
+        """메인 영역과 트리 viewport를 명시적으로 다시 그린다."""
+        central = self.centralWidget()
+        if central:
+            central.update()
+        if hasattr(self, 'tunnel_tree'):
+            self.tunnel_tree.viewport().update()
+            self.tunnel_tree.update()
+        self.update()
 
     def _on_column_resized(self, index, old_size, new_size):
         """사용자가 열 너비를 조정했을 때 비율 업데이트"""

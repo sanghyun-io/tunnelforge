@@ -97,6 +97,7 @@ class TunnelTreeWidget(QTreeWidget):
             groups: 그룹 목록
             ungrouped_order: 그룹에 속하지 않은 터널 ID 순서
         """
+        self._clear_item_widgets()
         self.clear()
         self._tunnel_items.clear()
         self._group_items.clear()
@@ -154,6 +155,21 @@ class TunnelTreeWidget(QTreeWidget):
                 self._tunnel_items[tunnel['id']] = tunnel_item
 
             self._ungrouped_header.setExpanded(True)
+
+    def _clear_item_widgets(self):
+        """clear() 전에 setItemWidget으로 붙인 버튼 위젯을 명시적으로 제거."""
+        def clear_for_item(item: QTreeWidgetItem):
+            for column in range(self.columnCount()):
+                widget = self.itemWidget(item, column)
+                if widget is not None:
+                    self.removeItemWidget(item, column)
+                    widget.setParent(None)
+                    widget.deleteLater()
+            for child_index in range(item.childCount()):
+                clear_for_item(item.child(child_index))
+
+        for top_index in range(self.topLevelItemCount()):
+            clear_for_item(self.topLevelItem(top_index))
 
     def _create_group_item(self, group: dict) -> QTreeWidgetItem:
         """그룹 아이템 생성"""
