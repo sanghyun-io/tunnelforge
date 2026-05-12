@@ -9,6 +9,7 @@ scripts/versioning.py 및 scripts/bump_version.py 단위 테스트
 - CLI 통합 (subprocess)
 """
 
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -238,6 +239,13 @@ class TestBumpVersionCLI:
         )
         return result.returncode, result.stdout.strip(), result.stderr.strip()
 
+    def current_version(self):
+        version_file = Path(self.PROJECT_ROOT) / "src" / "version.py"
+        content = version_file.read_text(encoding='utf-8')
+        match = re.search(r'__version__\s*=\s*[\'"]([^\'"]+)[\'"]', content)
+        assert match is not None
+        return tuple(int(part) for part in match.group(1).split('.'))
+
     def test_dry_run_exit_zero(self):
         code, stdout, _ = self.run_cli("--bump-type", "patch", "--dry-run")
         assert code == 0
@@ -248,16 +256,18 @@ class TestBumpVersionCLI:
 
     def test_dry_run_patch(self):
         _, stdout, _ = self.run_cli("--bump-type", "patch", "--dry-run")
-        # 현재 버전(1.11.0)의 patch 결과
-        assert "new_version=1.11.1" in stdout
+        major, minor, patch = self.current_version()
+        assert f"new_version={major}.{minor}.{patch + 1}" in stdout
 
     def test_dry_run_minor(self):
         _, stdout, _ = self.run_cli("--bump-type", "minor", "--dry-run")
-        assert "new_version=1.12.0" in stdout
+        major, minor, _ = self.current_version()
+        assert f"new_version={major}.{minor + 1}.0" in stdout
 
     def test_dry_run_major(self):
         _, stdout, _ = self.run_cli("--bump-type", "major", "--dry-run")
-        assert "new_version=2.0.0" in stdout
+        major, _, _ = self.current_version()
+        assert f"new_version={major + 1}.0.0" in stdout
 
     def test_dry_run_no_file_modification(self):
         """dry-run 시 src/version.py가 수정되지 않아야 한다."""

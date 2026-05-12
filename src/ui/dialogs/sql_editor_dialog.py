@@ -1501,6 +1501,8 @@ class SQLEditorDialog(QDialog):
         self.worker = None
         self.temp_server = None
         self._tab_counter = 0  # 탭 번호 카운터
+        self._result_counter = 0  # 결과 탭 번호 카운터
+        self._message_collapsed = True
 
         # 지속 연결 (트랜잭션 세션)
         self.db_connection = None
@@ -1686,11 +1688,26 @@ class SQLEditorDialog(QDialog):
         result_layout = QVBoxLayout(result_group)
         result_layout.setContentsMargins(4, 8, 4, 4)
 
-        self.result_tabs = QTabWidget()
-        self.result_tabs.setTabsClosable(True)
-        self.result_tabs.tabCloseRequested.connect(self.close_result_tab)
+        # 메시지 영역 (결과 탭과 분리, 초기 축소)
+        self.btn_toggle_message = QPushButton("▶ 메시지")
+        self.btn_toggle_message.setToolTip("메시지 영역 펼치기")
+        self.btn_toggle_message.setStyleSheet("""
+            QPushButton {
+                text-align: left;
+                background-color: #34495e;
+                color: #ecf0f1;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 10px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #3f5870;
+            }
+        """)
+        self.btn_toggle_message.clicked.connect(self._toggle_message_panel)
+        result_layout.addWidget(self.btn_toggle_message)
 
-        # 메시지 탭 (항상 표시)
         self.message_text = QTextEdit()
         self.message_text.setReadOnly(True)
         self.message_text.setStyleSheet("""
@@ -1701,9 +1718,17 @@ class SQLEditorDialog(QDialog):
                 font-size: 12px;
             }
         """)
-        self.result_tabs.addTab(self.message_text, "📋 메시지")
-        # 메시지 탭은 닫기 버튼 숨김
-        self.result_tabs.tabBar().setTabButton(0, self.result_tabs.tabBar().ButtonPosition.RightSide, None)
+        result_layout.addWidget(self.message_text)
+        self._set_message_panel_collapsed(True)
+
+        self.result_tabs = QTabWidget()
+        self.result_tabs.setTabsClosable(True)
+        self.result_tabs.setMovable(True)
+        self.result_tabs.tabCloseRequested.connect(self.close_result_tab)
+
+        result_tab_bar = self.result_tabs.tabBar()
+        result_tab_bar.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        result_tab_bar.customContextMenuRequested.connect(self._show_result_tab_context_menu)
 
         result_layout.addWidget(self.result_tabs)
 
@@ -2278,8 +2303,7 @@ class SQLEditorDialog(QDialog):
 
         # 단일 쿼리 실행 시 결과 탭 유지, 전체 실행 시 초기화
         if not single_query:
-            while self.result_tabs.count() > 1:
-                self.result_tabs.removeTab(1)
+            self._clear_result_tabs()
 
         self._set_executing_state(True)
 
@@ -2324,8 +2348,7 @@ class SQLEditorDialog(QDialog):
                         row_list = [[row.get(col) for col in columns] for row in rows]
                         exec_time = time.time() - start_time
 
-                        tab_idx = self.result_tabs.count()
-                        self._add_result_table(tab_idx, columns, row_list, exec_time, query)
+                        self._add_result_table(columns, row_list, exec_time, query)
                         self.message_text.append(f"✅ {len(rows)}행 반환 ({exec_time:.3f}초)")
                         self.message_text.append(f"   └ {preview}")
 
@@ -2409,8 +2432,7 @@ class SQLEditorDialog(QDialog):
 
             database = self.db_combo.currentText().strip() or None
 
-            while self.result_tabs.count() > 1:
-                self.result_tabs.removeTab(1)
+            self._clear_result_tabs()
 
             self._set_executing_state(True)
             self.progress_bar.setMaximum(len(queries))
@@ -2438,7 +2460,7 @@ class SQLEditorDialog(QDialog):
                 return kw
         return 'OTHER'
 
-    def _add_result_table(self, idx, columns, rows, exec_time, query=''):
+    def _add_result_table(self, columns, rows, exec_time, query=''):
         """결과 테이블 탭 추가"""
         table = QTableWidget()
         table.setColumnCount(len(columns))
@@ -2500,12 +2522,53 @@ class SQLEditorDialog(QDialog):
             lambda t=table, c=columns: self._copy_table_data(t, c, False)
         )
 
-        tab_name = f"결과 {idx + 1} ({len(rows)}행)"
+        self._result_counter += 1
+        tab_name = f"결과 {self._result_counter} ({len(rows)}행)"
         self.result_tabs.addTab(table, tab_name)
         self.result_tabs.setCurrentWidget(table)
 
         # 편집 가능성 분석 + 설정
         self._setup_result_table_editability(table, query, columns, rows)
+
+    def _clear_result_tabs(self):
+        """모든 결과 탭 삭제"""
+        while self.result_tabs.count() > 0:
+            self.result_tabs.removeTab(0)
+        self._result_counter = 0
+
+    def _set_message_panel_collapsed(self, collapsed: bool):
+        """메시지 영역 접힘/펼침 상태 적용"""
+        self._message_collapsed = collapsed
+        if collapsed:
+            self.btn_toggle_message.setText("▶ 메시지")
+            self.btn_toggle_message.setToolTip("메시지 영역 펼치기")
+            self.message_text.setMinimumHeight(44)
+            self.message_text.setMaximumHeight(68)
+        else:
+            self.btn_toggle_message.setText("▼ 메시지")
+            self.btn_toggle_message.setToolTip("메시지 영역 접기")
+            self.message_text.setMinimumHeight(120)
+            self.message_text.setMaximumHeight(220)
+
+    def _toggle_message_panel(self):
+        """메시지 영역 펼치기/접기"""
+        self._set_message_panel_collapsed(not self._message_collapsed)
+
+    def _show_result_tab_context_menu(self, position):
+        """결과 탭 컨텍스트 메뉴"""
+        tab_bar = self.result_tabs.tabBar()
+        tab_index = tab_bar.tabAt(position)
+
+        menu = QMenu(self)
+        delete_action = menu.addAction("삭제")
+        delete_action.setEnabled(tab_index >= 0)
+        delete_action.triggered.connect(lambda: self.close_result_tab(tab_index))
+
+        clear_action = menu.addAction("전체 삭제")
+        clear_action.setEnabled(self.result_tabs.count() > 0)
+        clear_action.triggered.connect(self._clear_result_tabs)
+
+        menu.exec(tab_bar.mapToGlobal(position))
 
     def _update_tx_status(self):
         """트랜잭션 상태 UI 업데이트"""
@@ -2659,75 +2722,6 @@ class SQLEditorDialog(QDialog):
         if error:
             self.message_text.append(f"❌ 쿼리 {idx + 1}: {error}")
         elif columns:
-            # SELECT 결과 - 테이블 탭 추가
-            table = QTableWidget()
-            table.setColumnCount(len(columns))
-            table.setHorizontalHeaderLabels(columns)
-            table.setRowCount(len(rows))
-
-            for r, row in enumerate(rows):
-                for c, value in enumerate(row):
-                    item = QTableWidgetItem(str(value) if value is not None else "NULL")
-                    if value is None:
-                        item.setForeground(QColor("#888888"))
-                    table.setItem(r, c, item)
-
-            # 컬럼 너비 설정
-            header = table.horizontalHeader()
-            header.setSectionsMovable(True)  # 컬럼 드래그 이동 활성화
-            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)  # 수동 조절 가능
-            header.setStretchLastSection(False)
-            table.resizeColumnsToContents()  # 초기 너비는 내용에 맞게
-            # 초기 렌더링 시 400px 초과 컬럼 제한 (이후 자유 조정 가능)
-            for col in range(len(columns)):
-                if header.sectionSize(col) > 400:
-                    header.resizeSection(col, 400)
-
-            table.setAlternatingRowColors(True)
-            # 셀 단위 드래그 선택 (기존: SelectRows)
-            table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
-            table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
-
-            # 행 높이 확보 (편집 시 텍스트 잘림 방지)
-            table.verticalHeader().setDefaultSectionSize(28)
-
-            # 컨텍스트 메뉴 설정 (우클릭 복사)
-            table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-            table.customContextMenuRequested.connect(
-                lambda pos, t=table, c=columns: self._show_table_context_menu(pos, t, c)
-            )
-
-            # Ctrl+C: 우클릭 복사와 동일하게 선택한 모든 셀을 탭 구분으로 복사
-            copy_shortcut = QShortcut(QKeySequence.StandardKey.Copy, table)
-            copy_shortcut.setContext(Qt.ShortcutContext.WidgetShortcut)
-            copy_shortcut.activated.connect(
-                lambda t=table, c=columns: self._copy_table_data(t, c, False)
-            )
-
-            # 셀 복사 허용 + 편집기(QLineEdit) 스타일 — 셀 경계 내에 정확히 맞도록
-            table.setStyleSheet("""
-                QTableWidget {
-                    gridline-color: #ddd;
-                    font-size: 12px;
-                }
-                QTableWidget::item:selected {
-                    background-color: #3498db;
-                    color: white;
-                }
-                QTableWidget QLineEdit {
-                    padding: 1px 4px;
-                    margin: 0px;
-                    border: 2px solid #2196F3;
-                    background: white;
-                    color: #000;
-                    font-size: 12px;
-                }
-            """)
-
-            tab_name = f"결과 {idx + 1} ({len(rows)}행)"
-            self.result_tabs.addTab(table, tab_name)
-            self.result_tabs.setCurrentWidget(table)
-
             # 편집 가능성 분석 + 설정 (워커에 실행된 원본 쿼리 사용)
             worker_query = ''
             if self.worker is not None and hasattr(self.worker, 'queries'):
@@ -2735,7 +2729,7 @@ class SQLEditorDialog(QDialog):
                     worker_query = self.worker.queries[idx]
                 except (IndexError, TypeError):
                     worker_query = ''
-            self._setup_result_table_editability(table, worker_query, columns, rows)
+            self._add_result_table(columns, rows, exec_time, worker_query)
 
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {len(rows)}행 반환 ({exec_time:.3f}초)")
         else:
@@ -3280,10 +3274,9 @@ class SQLEditorDialog(QDialog):
         """편집 변경사항이 있는 모든 결과 탭 수집.
 
         반환: [(table, edit_ctx), ...] — pending_edits가 비어있지 않은 것만.
-        index 0은 메시지 탭이므로 제외.
         """
         results = []
-        for idx in range(1, self.result_tabs.count()):
+        for idx in range(self.result_tabs.count()):
             widget = self.result_tabs.widget(idx)
             if not isinstance(widget, QTableWidget):
                 continue
@@ -3388,8 +3381,10 @@ class SQLEditorDialog(QDialog):
 
     def close_result_tab(self, index):
         """결과 탭 닫기"""
-        if index > 0:  # 메시지 탭은 닫지 않음
+        if 0 <= index < self.result_tabs.count():
             self.result_tabs.removeTab(index)
+        if self.result_tabs.count() == 0:
+            self._result_counter = 0
 
     def open_file(self):
         """SQL 파일 열기 (새 탭에서)"""
