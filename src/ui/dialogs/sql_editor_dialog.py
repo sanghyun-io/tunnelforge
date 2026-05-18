@@ -2150,7 +2150,9 @@ class SQLEditorDialog(QDialog):
                 port,
                 db_user,
                 db_password,
-                self.config.get('default_database') if db_engine == 'postgresql' else None,
+                self.config.get('default_database') or (
+                    self.config.get('default_schema') if db_engine == 'mysql' else None
+                ),
             )
             try:
                 success, msg = connector.connect()
