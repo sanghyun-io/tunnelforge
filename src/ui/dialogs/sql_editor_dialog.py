@@ -2144,6 +2144,7 @@ class SQLEditorDialog(QDialog):
             if error:
                 self.message_text.append(f"❌ {error}")
                 return
+            db_engine = self._db_engine()
             connector = self._create_db_connector(
                 host,
                 port,
