@@ -107,7 +107,7 @@ class TestExtractCoreError:
         result = reporter._extract_core_error(msg)
         assert 'ERROR 1045' in result
 
-    def test_mysqlsh_error(self, reporter):
+    def test_external_tool_error(self, reporter):
         msg = "Error: Shell.connect: Cannot open database"
         result = reporter._extract_core_error(msg)
         assert 'Shell.connect' in result

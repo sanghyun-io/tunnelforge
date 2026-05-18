@@ -1,7 +1,7 @@
 """
 migration_report.py 단위 테스트
 
-ReportExporter 검증 — JSON, CSV, MySQL Shell, SQL, HTML 출력 및 파일 저장.
+ReportExporter 검증 — JSON, CSV, Upgrade Check, SQL, HTML 출력 및 파일 저장.
 DB 의존성 없음. CompatibilityIssue 객체를 직접 생성하여 테스트.
 """
 import csv
@@ -239,57 +239,57 @@ class TestExportCsv:
 
 
 # ============================================================
-# export_mysql_shell
+# export_upgrade_check
 # ============================================================
-class TestExportMysqlShell:
+class TestExportUpgradeCheck:
     def test_header_present(self, mixed_exporter):
-        text = mixed_exporter.export_mysql_shell()
+        text = mixed_exporter.export_upgrade_check()
         assert "MySQL Server Upgrade Compatibility Check" in text
 
     def test_source_path_default(self, mixed_exporter):
-        text = mixed_exporter.export_mysql_shell()
+        text = mixed_exporter.export_upgrade_check()
         assert "dump-analysis" in text
 
     def test_custom_source_path(self, mixed_exporter):
-        text = mixed_exporter.export_mysql_shell(source_path="/data/backup")
+        text = mixed_exporter.export_upgrade_check(source_path="/data/backup")
         assert "/data/backup" in text
 
     def test_summary_section(self, mixed_exporter):
-        text = mixed_exporter.export_mysql_shell()
+        text = mixed_exporter.export_upgrade_check()
         assert "Summary" in text
         assert "Errors:" in text
         assert "Warnings:" in text
 
     def test_error_message_when_errors(self):
         exporter = ReportExporter([make_issue(severity="error")])
-        text = exporter.export_mysql_shell()
+        text = exporter.export_upgrade_check()
         assert "errors that need to be fixed" in text
 
     def test_warning_message_when_warnings_only(self):
         exporter = ReportExporter([make_issue(severity="warning")])
-        text = exporter.export_mysql_shell()
+        text = exporter.export_upgrade_check()
         assert "warnings" in text.lower()
 
     def test_clean_message_when_no_issues(self, empty_exporter):
-        text = empty_exporter.export_mysql_shell()
+        text = empty_exporter.export_upgrade_check()
         assert "No issues found" in text
 
     def test_doc_link_included(self):
         exporter = ReportExporter([
             make_issue(doc_link="https://dev.mysql.com/doc/")
         ])
-        text = exporter.export_mysql_shell()
+        text = exporter.export_upgrade_check()
         assert "https://dev.mysql.com/doc/" in text
 
     def test_location_shown_in_output(self, single_exporter):
-        text = single_exporter.export_mysql_shell()
+        text = single_exporter.export_upgrade_check()
         assert "testdb.users" in text
 
     def test_large_group_truncated(self):
         """11개 이상 이슈는 ... and N more 표시"""
         issues = [make_issue(location=f"db.t{i}") for i in range(15)]
         exporter = ReportExporter(issues)
-        text = exporter.export_mysql_shell()
+        text = exporter.export_upgrade_check()
         assert "more" in text
 
 
@@ -312,10 +312,10 @@ class TestGroupByCheckId:
         grouped = empty_exporter._group_by_check_id()
         assert grouped == {}
 
-    def test_mysql_shell_check_id_attr(self):
-        """mysql_shell_check_id 속성이 있으면 우선 사용"""
+    def test_upgrade_check_id_attr(self):
+        """upgrade_check_id 속성이 있으면 우선 사용"""
         issue = make_issue()
-        issue.mysql_shell_check_id = "customCheckId"
+        issue.upgrade_check_id = "customCheckId"
 
         exporter = ReportExporter([issue])
         grouped = exporter._group_by_check_id()
@@ -433,9 +433,9 @@ class TestSaveToFile:
         content = Path(filepath).read_text(encoding="utf-8")
         assert "Type" in content
 
-    def test_save_mysql_shell(self, mixed_exporter, tmp_path):
+    def test_save_upgrade_check(self, mixed_exporter, tmp_path):
         filepath = str(tmp_path / "report.txt")
-        mixed_exporter.save_to_file(filepath, "mysql_shell")
+        mixed_exporter.save_to_file(filepath, "upgrade_check")
         content = Path(filepath).read_text(encoding="utf-8")
         assert "MySQL Server Upgrade" in content
 
@@ -467,7 +467,7 @@ class TestSaveToFile:
 class TestSaveAllFormats:
     def test_saves_all_5_formats(self, mixed_exporter, tmp_path):
         saved = mixed_exporter.save_all_formats(str(tmp_path))
-        assert set(saved.keys()) == {"json", "csv", "mysql_shell", "sql", "html"}
+        assert set(saved.keys()) == {"json", "csv", "upgrade_check", "sql", "html"}
 
     def test_all_files_exist(self, mixed_exporter, tmp_path):
         saved = mixed_exporter.save_all_formats(str(tmp_path))
@@ -514,7 +514,7 @@ class TestUncoveredPaths:
     def test_group_by_check_id_unknown_fallback(self):
         """issue_type 속성이 없는 이슈는 'unknown'으로 그룹화"""
         from types import SimpleNamespace
-        # issue_type 속성 없음, mysql_shell_check_id도 없음
+        # issue_type 속성 없음, upgrade_check_id도 없음
         issue = SimpleNamespace(
             severity="warning",
             location="db.t",

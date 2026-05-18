@@ -3,8 +3,9 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QLineEdit,
                              QDialogButtonBox, QFileDialog, QPushButton,
                              QHBoxLayout, QSpinBox, QLabel, QMessageBox, QApplication,
                              QRadioButton, QCheckBox, QButtonGroup, QGroupBox, QWidget,
-                             QComboBox)
+                             QComboBox, QMenu)
 from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QAction
 import uuid
 
 from src.ui.styles import ButtonStyles, LabelStyles
@@ -100,6 +101,13 @@ class TunnelConfigDialog(QDialog):
         form_layout.addRow(self.lbl_bastion_user, self.input_bastion_user)
         form_layout.addRow(self.lbl_bastion_key, self.key_layout_widget)
 
+        self.bastion_templates = self._load_bastion_templates()
+        self.btn_copy_bastion = QPushButton("다른 연결 복사")
+        self.btn_copy_bastion.setToolTip("기존 연결의 Bastion Host, Port, SSH User, SSH Key를 복사합니다")
+        self.btn_copy_bastion.clicked.connect(self._show_bastion_copy_menu)
+        self.btn_copy_bastion.setEnabled(bool(self.bastion_templates))
+        form_layout.addRow("", self.btn_copy_bastion)
+
         # --- 3. RDS/Remote 정보 ---
         lbl_remote = QLabel("--- Target DB (목적지) ---")
         lbl_remote.setStyleSheet(LabelStyles.SECTION_HEADER)
@@ -115,9 +123,21 @@ class TunnelConfigDialog(QDialog):
         form_layout.addRow("Endpoint:", self.input_remote_host)
         form_layout.addRow("DB Port:", self.input_remote_port)
 
+        self.combo_db_engine = QComboBox()
+        self.combo_db_engine.addItem("DB Engine 선택", None)
+        self.combo_db_engine.addItem("MySQL", "mysql")
+        self.combo_db_engine.addItem("PostgreSQL", "postgresql")
+        engine_index = self.combo_db_engine.findData(self.tunnel_data.get('db_engine'))
+        self.combo_db_engine.setCurrentIndex(engine_index if engine_index >= 0 else 0)
+        form_layout.addRow("DB Engine:", self.combo_db_engine)
+
         # 기본 스키마 (선택사항)
+        self.input_default_database = QLineEdit(self.tunnel_data.get('default_database', ''))
+        self.input_default_database.setPlaceholderText("(PostgreSQL 선택사항) 예: postgres 또는 appdb")
+        form_layout.addRow("기본 DB 이름:", self.input_default_database)
+
         self.input_default_schema = QLineEdit(self.tunnel_data.get('default_schema', ''))
-        self.input_default_schema.setPlaceholderText("(선택사항) 예: my_database")
+        self.input_default_schema.setPlaceholderText("(선택사항) MySQL DB명 또는 PostgreSQL schema명")
         form_layout.addRow("기본 스키마:", self.input_default_schema)
 
         # --- 환경 설정 ---
@@ -161,24 +181,24 @@ class TunnelConfigDialog(QDialog):
         self.btn_tunnel_test.clicked.connect(self._test_tunnel_only)
         form_layout.addRow("", self.btn_tunnel_test)
 
-        # --- 5. MySQL 인증 정보 (선택 사항) ---
-        lbl_mysql = QLabel("--- MySQL 인증 정보 (선택 사항) ---")
+        # --- 5. DB 인증 정보 (선택 사항) ---
+        lbl_mysql = QLabel("--- DB 인증 정보 (선택 사항) ---")
         lbl_mysql.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_mysql)
 
-        self.chk_save_credentials = QCheckBox("MySQL 자격 증명 저장")
+        self.chk_save_credentials = QCheckBox("DB 자격 증명 저장")
         self.chk_save_credentials.setToolTip("암호화하여 저장합니다")
         self.chk_save_credentials.toggled.connect(self._on_save_credentials_toggled)
         form_layout.addRow(self.chk_save_credentials)
 
         self.input_db_user = QLineEdit(self.tunnel_data.get('db_user', ''))
-        self.input_db_user.setPlaceholderText("MySQL 사용자명")
+        self.input_db_user.setPlaceholderText("DB 사용자명")
         self.input_db_user.setEnabled(False)
         form_layout.addRow("DB User:", self.input_db_user)
 
         self.input_db_password = QLineEdit()
         self.input_db_password.setEchoMode(QLineEdit.EchoMode.Password)
-        self.input_db_password.setPlaceholderText("MySQL 비밀번호")
+        self.input_db_password.setPlaceholderText("DB 비밀번호")
         self.input_db_password.setEnabled(False)
         form_layout.addRow("DB Password:", self.input_db_password)
 
@@ -231,10 +251,12 @@ class TunnelConfigDialog(QDialog):
             self.lbl_bastion, self.lbl_bastion_host, self.input_bastion_host,
             self.lbl_bastion_port, self.input_bastion_port,
             self.lbl_bastion_user, self.input_bastion_user,
-            self.lbl_bastion_key, self.key_layout_widget
+            self.lbl_bastion_key, self.key_layout_widget,
+            self.btn_copy_bastion
         ]
         for widget in bastion_widgets:
             widget.setEnabled(is_ssh_mode)
+        self.btn_copy_bastion.setEnabled(is_ssh_mode and bool(self.bastion_templates))
 
         # Local Port 토글
         local_widgets = [self.lbl_local, self.lbl_local_port, self.input_local_port]
@@ -250,24 +272,75 @@ class TunnelConfigDialog(QDialog):
             self.input_db_user.clear()
             self.input_db_password.clear()
 
+    def _load_bastion_templates(self):
+        current_id = self.tunnel_data.get('id')
+        templates = []
+        for tunnel in self._available_tunnels():
+            if tunnel.get('id') == current_id:
+                continue
+            if tunnel.get('connection_mode', 'ssh_tunnel') == 'direct':
+                continue
+            if not tunnel.get('bastion_host'):
+                continue
+            templates.append(tunnel)
+        return templates
+
+    def _available_tunnels(self):
+        parent = self.parent()
+        if parent is not None and hasattr(parent, 'tunnels'):
+            return parent.tunnels
+        if parent is not None and hasattr(parent, 'config_mgr'):
+            try:
+                return parent.config_mgr.load_config().get('tunnels', [])
+            except Exception:
+                return []
+        return []
+
+    def _show_bastion_copy_menu(self):
+        if not self.bastion_templates:
+            QMessageBox.information(self, "다른 연결 복사", "복사할 수 있는 SSH 터널 연결이 없습니다.")
+            return
+
+        menu = QMenu(self)
+        for tunnel in self.bastion_templates:
+            action = QAction(tunnel.get('name', '이름 없음'), menu)
+            action.triggered.connect(lambda checked=False, t=tunnel: self._copy_bastion_from_tunnel(t))
+            menu.addAction(action)
+        menu.exec(self.btn_copy_bastion.mapToGlobal(self.btn_copy_bastion.rect().bottomLeft()))
+
+    def _copy_bastion_from_tunnel(self, tunnel):
+        self.radio_ssh_tunnel.setChecked(True)
+        self.input_bastion_host.setText(tunnel.get('bastion_host', ''))
+        self.input_bastion_port.setValue(int(tunnel.get('bastion_port', 22)))
+        self.input_bastion_user.setText(tunnel.get('bastion_user', ''))
+        self.input_bastion_key.setText(tunnel.get('bastion_key', ''))
+        self.on_mode_changed()
+
     def get_data(self):
         """입력된 폼 데이터를 딕셔너리로 반환"""
         # 환경 설정 매핑
         env_map = {0: None, 1: 'production', 2: 'staging', 3: 'development'}
         environment = env_map.get(self.combo_environment.currentIndex())
 
+        is_direct = self.radio_direct.isChecked()
+        remote_host = self.input_remote_host.text().strip()
+        if is_direct and not remote_host:
+            remote_host = "127.0.0.1"
+
         data = {
             # ID가 없으면 새로 생성 (신규 추가), 있으면 기존 ID 유지 (수정)
             "id": self.tunnel_data.get('id', str(uuid.uuid4())),
             "name": self.input_name.text(),
-            "connection_mode": "direct" if self.radio_direct.isChecked() else "ssh_tunnel",
+            "connection_mode": "direct" if is_direct else "ssh_tunnel",
             "bastion_host": self.input_bastion_host.text(),
             "bastion_port": self.input_bastion_port.value(),
             "bastion_user": self.input_bastion_user.text(),
             "bastion_key": self.input_bastion_key.text(),
-            "remote_host": self.input_remote_host.text(),
+            "remote_host": remote_host,
             "remote_port": self.input_remote_port.value(),
             "local_port": self.input_local_port.value(),
+            "db_engine": self.combo_db_engine.currentData(),
+            "default_database": self.input_default_database.text().strip() or None,
             "default_schema": self.input_default_schema.text().strip() or None,
             "environment": environment
         }
@@ -283,6 +356,12 @@ class TunnelConfigDialog(QDialog):
 
         return data
 
+    def accept(self):
+        if not self.combo_db_engine.currentData():
+            QMessageBox.warning(self, "필수 항목 누락", "DB Engine을 선택해주세요.\nMySQL 또는 PostgreSQL을 명시해야 합니다.")
+            return
+        super().accept()
+
     def _test_tunnel_only(self):
         """SSH 터널만 테스트 (Local 포트까지 확인)"""
         if not self.engine:
@@ -293,7 +372,7 @@ class TunnelConfigDialog(QDialog):
 
         # 직접 연결 모드면 터널 테스트 불필요
         if temp_config.get('connection_mode') == 'direct':
-            QMessageBox.information(self, "알림", "직접 연결 모드에서는 터널 테스트가 필요하지 않습니다.")
+            QMessageBox.information(self, "터널 테스트", "직접 연결 모드는 SSH 터널 테스트가 필요하지 않습니다.\nDB 인증 테스트 또는 통합 테스트를 실행해주세요.")
             return
 
         # SSH 터널 모드 필수 필드 검증
@@ -320,7 +399,7 @@ class TunnelConfigDialog(QDialog):
         dialog = TestProgressDialog(self, f"터널 테스트 - {temp_config.get('name', 'Unknown')}")
         worker = ConnectionTestWorker(TestType.TUNNEL_ONLY, temp_config, self.engine, None)
         worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(lambda s, m: dialog.show_result(s, m))
+        worker.finished.connect(lambda s, m: self._on_test_finished(dialog, s, m))
         worker.start()
         dialog.exec()
 
@@ -331,6 +410,9 @@ class TunnelConfigDialog(QDialog):
             return
 
         temp_config = self.get_data()
+        if not temp_config.get('db_engine'):
+            QMessageBox.warning(self, "필수 항목 누락", "DB Engine을 먼저 선택해주세요.")
+            return
 
         # DB 자격 증명 확인
         db_user = self.input_db_user.text()
@@ -375,7 +457,7 @@ class TunnelConfigDialog(QDialog):
 
         worker = ConnectionTestWorker(TestType.DB_ONLY, temp_config, self.engine, temp_config_mgr)
         worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(lambda s, m: dialog.show_result(s, m))
+        worker.finished.connect(lambda s, m: self._on_test_finished(dialog, s, m))
         worker.start()
         dialog.exec()
 
@@ -386,6 +468,9 @@ class TunnelConfigDialog(QDialog):
             return
 
         temp_config = self.get_data()
+        if not temp_config.get('db_engine'):
+            QMessageBox.warning(self, "필수 항목 누락", "DB Engine을 먼저 선택해주세요.")
+            return
         dialog = TestProgressDialog(self, f"통합 테스트 - {temp_config.get('name', 'Unknown')}")
 
         # DB 자격 증명 확인 (선택 사항)
@@ -419,6 +504,9 @@ class TunnelConfigDialog(QDialog):
 
         worker = ConnectionTestWorker(TestType.INTEGRATED, temp_config, self.engine, temp_config_mgr)
         worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(lambda s, m: dialog.show_result(s, m))
+        worker.finished.connect(lambda s, m: self._on_test_finished(dialog, s, m))
         worker.start()
         dialog.exec()
+
+    def _on_test_finished(self, dialog, success: bool, message: str):
+        dialog.show_result(success, message)

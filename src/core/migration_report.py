@@ -1,7 +1,7 @@
 """
 Report Exporter 모듈
 
-분석 결과를 다양한 형식(JSON, CSV, MySQL Shell 호환, SQL)으로 내보냅니다.
+분석 결과를 다양한 형식(JSON, CSV, Upgrade Check, SQL)으로 내보냅니다.
 """
 
 import json
@@ -11,7 +11,7 @@ from datetime import datetime
 from typing import Dict
 from pathlib import Path
 
-from .migration_constants import MYSQL_SHELL_CHECK_IDS
+from .migration_constants import UPGRADE_CHECK_IDS
 
 
 class ReportExporter:
@@ -113,10 +113,10 @@ class ReportExporter:
         return output.getvalue()
 
     # ================================================================
-    # MySQL Shell 호환 리포트
+    # Upgrade Check 호환 리포트
     # ================================================================
-    def export_mysql_shell(self, source_path: str = "dump-analysis") -> str:
-        """MySQL Shell 호환 형식 리포트"""
+    def export_upgrade_check(self, source_path: str = "dump-analysis") -> str:
+        """Upgrade Check 호환 형식 리포트"""
         lines = []
 
         lines.append("=" * 70)
@@ -175,14 +175,14 @@ class ReportExporter:
         return "\n".join(lines)
 
     def _group_by_check_id(self) -> Dict[str, list]:
-        """mysql_shell_check_id 또는 issue_type 기준 그룹화"""
+        """upgrade_check_id 또는 issue_type 기준 그룹화"""
         grouped = {}
         for issue in self.issues:
-            # mysql_shell_check_id가 있으면 사용, 없으면 issue_type 사용
-            if hasattr(issue, 'mysql_shell_check_id') and issue.mysql_shell_check_id:
-                check_id = issue.mysql_shell_check_id
+            # upgrade_check_id가 있으면 사용, 없으면 issue_type 사용
+            if hasattr(issue, 'upgrade_check_id') and issue.upgrade_check_id:
+                check_id = issue.upgrade_check_id
             elif hasattr(issue, 'issue_type'):
-                check_id = MYSQL_SHELL_CHECK_IDS.get(issue.issue_type, issue.issue_type.value)
+                check_id = UPGRADE_CHECK_IDS.get(issue.issue_type, issue.issue_type.value)
             else:
                 check_id = 'unknown'
 
@@ -328,7 +328,7 @@ class ReportExporter:
         exporters = {
             'json': self.export_json,
             'csv': self.export_csv,
-            'mysql_shell': self.export_mysql_shell,
+            'upgrade_check': self.export_upgrade_check,
             'sql': self.export_fix_queries_sql,
             'html': self.export_html,
         }
@@ -358,7 +358,7 @@ class ReportExporter:
         formats = {
             'json': f'upgrade_check_{timestamp}.json',
             'csv': f'upgrade_check_{timestamp}.csv',
-            'mysql_shell': f'upgrade_check_{timestamp}.txt',
+            'upgrade_check': f'upgrade_check_{timestamp}.txt',
             'sql': f'fix_queries_{timestamp}.sql',
             'html': f'upgrade_check_{timestamp}.html',
         }

@@ -40,14 +40,9 @@ hiddenimports = [
     'cryptography.hazmat.primitives.asymmetric.ec',
     'cryptography.hazmat.primitives.asymmetric.dsa',
 
-    # 데이터베이스 관련
-    'pymysql',
-    'pymysql.cursors',
-    'pymysql.converters',
-
     # 기타 의존성
     'requests',
-    'PyJWT',
+    'jwt',
     'dotenv',
 ]
 
@@ -66,11 +61,17 @@ datas = [
     (os.path.join(project_root, 'assets'), 'assets'),  # 아이콘 및 리소스 파일
 ]
 
+core_suffix = '.exe' if os.name == 'nt' else ''
+tunnelforge_core_exe = os.path.join(project_root, 'migration_core', 'target', 'release', f'tunnelforge-core{core_suffix}')
+binaries = []
+if os.path.exists(tunnelforge_core_exe):
+    binaries.append((tunnelforge_core_exe, '.'))
+
 # Analysis: 실행 파일에 포함될 내용 분석
 a = Analysis(
     [os.path.join(project_root, 'main.py')],  # 메인 스크립트
     pathex=[project_root],  # 추가 모듈 검색 경로
-    binaries=[],  # 추가 바이너리 파일 (필요시)
+    binaries=binaries,  # Rust DB core service
     datas=datas,  # 리소스 파일
     hiddenimports=hiddenimports,  # 숨겨진 import
     hookspath=[],  # 커스텀 PyInstaller 훅 경로

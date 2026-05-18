@@ -244,6 +244,75 @@ class TunnelEngine:
             return temp_server.local_bind_port
         return None
 
+    def test_target_reachable_from_bastion(self, config, timeout: int = 5):
+        """Bastion에서 Target DB 포트로 direct-tcpip 채널을 열 수 있는지 확인합니다."""
+        if config.get('connection_mode') == 'direct':
+            return self._test_direct_connection(config)
+
+        client = None
+        channel = None
+        target_host = config.get('remote_host')
+        target_port = int(config.get('remote_port', 0) or 0)
+        bastion_host = config.get('bastion_host')
+        bastion_port = int(config.get('bastion_port', 22) or 22)
+        bastion_user = config.get('bastion_user')
+
+        try:
+            pkey_obj = self._load_private_key(config['bastion_key'])
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            client.connect(
+                hostname=bastion_host,
+                port=bastion_port,
+                username=bastion_user,
+                pkey=pkey_obj,
+                timeout=timeout,
+                banner_timeout=timeout,
+                auth_timeout=timeout,
+            )
+
+            transport = client.get_transport()
+            if not transport or not transport.is_active():
+                return False, "Bastion SSH transport가 활성 상태가 아닙니다."
+
+            channel = transport.open_channel(
+                "direct-tcpip",
+                (target_host, target_port),
+                (DEFAULT_LOCAL_HOST, 0),
+                timeout=timeout,
+            )
+            return True, f"Bastion에서 Target DB 포트 도달 성공: {target_host}:{target_port}"
+
+        except paramiko.ssh_exception.ChannelException as e:
+            return False, (
+                f"Bastion에서 Target DB 포트로 SSH 채널을 열지 못했습니다.\n"
+                f"대상: {target_host}:{target_port}\n"
+                f"원인: {type(e).__name__}: {str(e)}"
+            )
+        except socket.timeout as e:
+            return False, (
+                f"Bastion에서 Target DB 포트 연결이 시간 초과되었습니다.\n"
+                f"대상: {target_host}:{target_port}\n"
+                f"원인: {type(e).__name__}: {str(e)}"
+            )
+        except Exception as e:
+            return False, (
+                f"Bastion에서 Target DB 포트 도달성 확인 실패\n"
+                f"대상: {target_host}:{target_port}\n"
+                f"원인: {type(e).__name__}: {str(e)}"
+            )
+        finally:
+            if channel:
+                try:
+                    channel.close()
+                except Exception:
+                    pass
+            if client:
+                try:
+                    client.close()
+                except Exception:
+                    pass
+
     def get_active_tunnels(self):
         """활성화된 터널/연결 목록 반환 (DB Export용)"""
         result = []
@@ -319,16 +388,13 @@ class TunnelEngine:
             bastion_msg = "✅ 1. Bastion Host 연결 성공"
             connection_logs.append(bastion_msg)
 
-            try:
-                connection_logs.append("🔗 Target DB 포트 연결 시도...")
-                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                s.settimeout(3)
-                s.connect((DEFAULT_LOCAL_HOST, temp_server.local_bind_port))
-                s.close()
+            connection_logs.append("🔗 Bastion에서 Target DB 포트 연결 시도...")
+            target_success, target_msg = self.test_target_reachable_from_bastion(config, timeout=5)
+            if target_success:
                 db_msg = "✅ 2. Target DB 포트 도달 성공"
-                connection_logs.append(db_msg)
-            except Exception as e:
-                db_msg = f"❌ 2. Target DB 연결 실패\n원인: {type(e).__name__}: {str(e)}"
+                connection_logs.append(f"{db_msg}\n{target_msg}")
+            else:
+                db_msg = f"❌ 2. Target DB 연결 실패\n원인: {target_msg}"
                 connection_logs.append(db_msg)
                 logs_summary = "\n".join(connection_logs)
                 return False, f"{bastion_msg}\n{db_msg}\n\n📋 전체 로그:\n{logs_summary}"

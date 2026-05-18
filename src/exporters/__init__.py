@@ -1,11 +1,12 @@
-from .mysqlsh_exporter import (
-    MySQLShellChecker, MySQLShellConfig, MySQLShellExporter,
-    MySQLShellImporter, ForeignKeyResolver, check_mysqlsh,
+from .rust_dump_exporter import (
+    RustDumpChecker, RustDumpConfig, RustDumpExporter,
+    RustDumpImporter, ForeignKeyResolver, check_rust_dump,
     export_schema, export_tables, import_dump
 )
 
 __all__ = [
-    'MySQLShellChecker', 'MySQLShellConfig', 'MySQLShellExporter',
-    'MySQLShellImporter', 'ForeignKeyResolver', 'check_mysqlsh',
+    'RustDumpChecker', 'RustDumpConfig',
+    'RustDumpExporter', 'RustDumpImporter', 'ForeignKeyResolver',
+    'check_rust_dump',
     'export_schema', 'export_tables', 'import_dump'
 ]

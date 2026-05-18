@@ -6,7 +6,7 @@ mysql-upgrade-checker의 파서 로직을 Python으로 포팅.
 
 추가 파서:
 - ConfigFileParser: MySQL .cnf/.ini 설정 파일 파서
-- DumpMetadataParser: mysqlsh @.json 메타데이터 파서
+- DumpMetadataParser: dump @.json 메타데이터 파서
 """
 
 import configparser

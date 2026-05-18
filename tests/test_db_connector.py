@@ -6,6 +6,25 @@ import pytest
 from unittest.mock import MagicMock, patch, call
 
 
+class FakeFacade:
+    def __init__(self, fail: Exception = None):
+        self.fail = fail
+        self.closed = []
+
+    def open_connection(self, endpoint):
+        if self.fail:
+            raise self.fail
+        self.endpoint = endpoint
+        return "conn-1"
+
+    def close_connection(self, connection_id):
+        self.closed.append(connection_id)
+        return True
+
+    def execute_on_connection(self, connection_id, sql):
+        return []
+
+
 # =====================================================================
 # MetadataCache 테스트
 # =====================================================================
@@ -122,36 +141,31 @@ class TestMySQLConnector:
 
     def test_connect_success(self):
         """연결 성공 테스트"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_connect.return_value = mock_conn
+        self.connector._facade = FakeFacade()
 
-            success, msg = self.connector.connect()
+        success, msg = self.connector.connect()
 
-            assert success is True
-            assert '성공' in msg
-            assert self.connector.connection is mock_conn
+        assert success is True
+        assert '성공' in msg
+        assert self.connector.connection is not None
 
     def test_connect_mysql_error(self):
         """MySQL 에러 발생 시 실패 반환"""
-        import pymysql
-        with patch('pymysql.connect') as mock_connect:
-            mock_connect.side_effect = pymysql.Error(1045, "Access denied")
+        self.connector._facade = FakeFacade(Exception("Access denied"))
 
-            success, msg = self.connector.connect()
+        success, msg = self.connector.connect()
 
-            assert success is False
-            assert '1045' in msg or 'MySQL' in msg
+        assert success is False
+        assert 'Access denied' in msg or 'MySQL' in msg
 
     def test_connect_general_error(self):
         """일반 예외 발생 시 실패 반환"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_connect.side_effect = Exception("Connection refused")
+        self.connector._facade = FakeFacade(Exception("Connection refused"))
 
-            success, msg = self.connector.connect()
+        success, msg = self.connector.connect()
 
-            assert success is False
-            assert '오류' in msg
+        assert success is False
+        assert '오류' in msg
 
     def test_disconnect_closes_connection(self):
         """연결 종료 확인"""
@@ -323,14 +337,12 @@ class TestMySQLConnector:
 
     def test_context_manager_connects_and_disconnects(self):
         """컨텍스트 매니저 연결/해제 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_connect.return_value = mock_conn
+        self.connector._facade = FakeFacade()
 
-            with self.connector:
-                assert self.connector.connection is not None
+        with self.connector:
+            assert self.connector.connection is not None
 
-            assert self.connector.connection is None
+        assert self.connector.connection is None
 
     def test_get_db_version_returns_tuple(self):
         """DB 버전 튜플 반환 확인"""

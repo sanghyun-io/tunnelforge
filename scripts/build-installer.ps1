@@ -1,4 +1,4 @@
-﻿<#
+<#
 #############################################################################
 # ⚠️  DO NOT DELETE - GitHub Actions 전용 스크립트
 #
@@ -18,9 +18,10 @@
 
     빌드 프로세스:
     1. src/version.py에서 버전 읽기
-    2. PyInstaller로 실행 파일(.exe) 빌드
-    3. 버전을 installer/TunnelForge.iss에 동기화
-    4. Inno Setup으로 Windows Installer(.exe) 생성
+    2. Rust tunnelforge-core DB service 빌드
+    3. PyInstaller로 실행 파일(.exe) 빌드
+    4. 버전을 installer/TunnelForge.iss에 동기화
+    5. Inno Setup으로 Windows Installer(.exe) 생성
 
     출력 파일:
     - dist\TunnelForge.exe (실행 파일)
@@ -99,8 +100,9 @@ if ($Help) {
     Write-Host ""
     Write-Host "빌드 프로세스:" -ForegroundColor Yellow
     Write-Host "  1. src/version.py에서 버전 읽기" -ForegroundColor Gray
-    Write-Host "  2. PyInstaller로 EXE 빌드" -ForegroundColor Gray
-    Write-Host "  3. Inno Setup으로 Windows Installer 생성" -ForegroundColor Gray
+    Write-Host "  2. Rust tunnelforge-core DB service 빌드" -ForegroundColor Gray
+    Write-Host "  3. PyInstaller로 EXE 빌드" -ForegroundColor Gray
+    Write-Host "  4. Inno Setup으로 Windows Installer 생성" -ForegroundColor Gray
     Write-Host ""
     Write-Host "출력:" -ForegroundColor Yellow
     Write-Host "  - dist\TunnelForge.exe                    (실행 파일)" -ForegroundColor Gray
@@ -155,9 +157,34 @@ if ($Clean) {
     Write-Host ""
 }
 
-# PyInstaller로 EXE 빌드
+# Rust helper 빌드
 if (-not $SkipPyInstaller) {
-    Write-Host "[2/5] PyInstaller로 실행 파일 빌드 중..." -ForegroundColor Yellow
+    Write-Host "[2/6] Rust tunnelforge-core DB service 빌드 중..." -ForegroundColor Yellow
+
+    $cargoCheck = cargo --version 2>&1
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ❌ Cargo가 설치되지 않았습니다." -ForegroundColor Red
+        Write-Host "  Rust 설치 후 다시 실행하세요: https://rustup.rs/" -ForegroundColor Yellow
+        exit 1
+    }
+
+    Write-Host "  Cargo 버전: $cargoCheck" -ForegroundColor Gray
+    cargo build --manifest-path migration_core\Cargo.toml --release
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ❌ tunnelforge-core 빌드 실패" -ForegroundColor Red
+        exit 1
+    }
+
+    if (-not (Test-Path "migration_core\target\release\tunnelforge-core.exe")) {
+        Write-Host "  ❌ tunnelforge-core.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "  ✅ tunnelforge-core DB service 빌드 완료" -ForegroundColor Green
+    Write-Host ""
+
+    Write-Host "[3/6] PyInstaller로 실행 파일 빌드 중..." -ForegroundColor Yellow
 
     # PyInstaller 설치 확인
     $pyinstallerCheck = python -m PyInstaller --version 2>&1
@@ -187,7 +214,7 @@ if (-not $SkipPyInstaller) {
     Write-Host "  ✅ EXE 빌드 완료: dist\TunnelForge.exe ($($exeSize.ToString('0.0')) MB)" -ForegroundColor Green
     Write-Host ""
 } else {
-    Write-Host "[2/5] PyInstaller 빌드 건너뛰기 (-SkipPyInstaller)" -ForegroundColor Gray
+    Write-Host "[2/6] Rust helper/PyInstaller 빌드 건너뛰기 (-SkipPyInstaller)" -ForegroundColor Gray
 
     # EXE 파일 존재 확인
     if (-not (Test-Path "dist\TunnelForge.exe")) {
@@ -201,7 +228,7 @@ if (-not $SkipPyInstaller) {
 }
 
 # Inno Setup 경로 찾기
-Write-Host "[3/5] Inno Setup 확인 중..." -ForegroundColor Yellow
+Write-Host "[4/6] Inno Setup 확인 중..." -ForegroundColor Yellow
 
 $InnoSetupPaths = @(
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
@@ -238,7 +265,7 @@ Write-Host "  버전: $innoVersion" -ForegroundColor Gray
 Write-Host ""
 
 # version.py에서 버전 추출 및 동기화
-Write-Host "[4/4] 버전 정보 동기화 중..." -ForegroundColor Yellow
+Write-Host "[5/6] 버전 정보 동기화 중..." -ForegroundColor Yellow
 
 # version.py에서 버전 추출
 $versionPy = "src\version.py"
@@ -271,7 +298,7 @@ Write-Host "  ✅ $issFile 버전 업데이트 완료: $version" -ForegroundColo
 Write-Host ""
 
 # Inno Setup으로 Installer 컴파일
-Write-Host "[5/5] Windows Installer 생성 중..." -ForegroundColor Yellow
+Write-Host "[6/6] Windows Installer 생성 중..." -ForegroundColor Yellow
 
 & $ISCC "installer\TunnelForge.iss"
 

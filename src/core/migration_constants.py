@@ -10,30 +10,16 @@ from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
 # ============================================================
-# MySQL 8.4에서 제거된 시스템 변수 (64개)
+# MySQL 8.4에서 제거된 시스템 변수 (47개)
 # ============================================================
 REMOVED_SYS_VARS_84: Tuple[str, ...] = (
-    'authentication_fido_rp_id',
     'avoid_temporal_upgrade',
     'binlog_transaction_dependency_tracking',
-    'daemon_memcached_enable_binlog',
-    'daemon_memcached_engine_lib_name',
-    'daemon_memcached_engine_lib_path',
-    'daemon_memcached_option',
-    'daemon_memcached_r_batch_size',
-    'daemon_memcached_w_batch_size',
     'default_authentication_plugin',
-    'expire_logs_days',
     'group_replication_ip_allowlist',
-    'group_replication_primary_member',
     'group_replication_recovery_complete_at',
     'have_openssl',
     'have_ssl',
-    'innodb_api_bk_commit_interval',
-    'innodb_api_disable_rowlock',
-    'innodb_api_enable_binlog',
-    'innodb_api_enable_mdl',
-    'innodb_api_trx_level',
     'innodb_log_file_size',
     'innodb_log_files_in_group',
     'keyring_file_data',
@@ -57,18 +43,12 @@ REMOVED_SYS_VARS_84: Tuple[str, ...] = (
     'keyring_aws_conf_file',
     'keyring_aws_data_file',
     'keyring_aws_region',
-    'language',
     'log_bin_use_v1_row_events',
-    'master_info_repository',
     'master_verify_checksum',
-    'new',
-    'old',
     'old_alter_table',
-    'old_style_user_limits',
     'relay_log_info_file',
     'relay_log_info_repository',
     'replica_parallel_type',
-    'show_old_temporals',
     'slave_parallel_type',
     'slave_rows_search_algorithms',
     'sql_slave_skip_counter',
@@ -121,6 +101,12 @@ DEPRECATED_FUNCTIONS_84: Tuple[str, ...] = (
 
 # 8.0 이전에 이미 제거된 함수 (5.7 → 8.0 마이그레이션 잔존 확인용)
 REMOVED_FUNCTIONS_80X: Tuple[str, ...] = (
+    'ENCODE',
+    'DECODE',
+    'DES_ENCRYPT',
+    'DES_DECRYPT',
+    'ENCRYPT',
+    'PASSWORD',
     'OLD_PASSWORD',    # 5.7에서 제거
 )
 
@@ -409,7 +395,7 @@ class CompatibilityIssue:
     suggestion: str
     fix_query: Optional[str] = None      # 수정 SQL
     doc_link: Optional[str] = None       # 문서 링크
-    mysql_shell_check_id: Optional[str] = None  # MySQL Shell 체크 ID
+    upgrade_check_id: Optional[str] = None      # Upgrade check ID
     code_snippet: Optional[str] = None   # 관련 코드
     table_name: Optional[str] = None     # 테이블명
     column_name: Optional[str] = None    # 컬럼명
@@ -563,9 +549,9 @@ INVALID_57_NAME_MULTIPLE_DOTS_PATTERN = re.compile(
 )
 
 # ============================================================
-# MySQL Shell Check ID 매핑
+# Upgrade check ID 매핑
 # ============================================================
-MYSQL_SHELL_CHECK_IDS: Dict[IssueType, str] = {
+UPGRADE_CHECK_IDS: Dict[IssueType, str] = {
     IssueType.REMOVED_SYS_VAR: "removedSysVars",
     IssueType.AUTH_PLUGIN_ISSUE: "authMethodUsage",
     IssueType.CHARSET_ISSUE: "utf8mb3",

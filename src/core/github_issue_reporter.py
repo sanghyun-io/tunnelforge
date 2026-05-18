@@ -161,10 +161,10 @@ class GitHubIssueReporter:
         if mysql_error:
             return mysql_error.group(1).strip()
 
-        # mysqlsh 오류 패턴
-        mysqlsh_error = re.search(r'(?:Error|ERROR):\s*(.+?)(?:\n|$)', message)
-        if mysqlsh_error:
-            return mysqlsh_error.group(1).strip()
+        # 외부 도구 오류 패턴
+        tool_error = re.search(r'(?:Error|ERROR):\s*(.+?)(?:\n|$)', message)
+        if tool_error:
+            return tool_error.group(1).strip()
 
         # Duplicate entry 등 특정 패턴
         dup_error = re.search(r"(Duplicate entry .+ for key .+)", message)

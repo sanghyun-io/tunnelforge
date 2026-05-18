@@ -1,13 +1,13 @@
-"""MySQL Shell 작업 스레드"""
+"""Rust DB Core 작업 스레드"""
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from src.exporters.mysqlsh_exporter import (
-    MySQLShellConfig, MySQLShellExporter, MySQLShellImporter
+from src.exporters.rust_dump_exporter import (
+    RustDumpConfig, RustDumpExporter, RustDumpImporter
 )
 
 
-class MySQLShellWorker(QThread):
-    """MySQL Shell 작업 스레드"""
+class RustDumpWorker(QThread):
+    """Rust DB Core 작업 스레드"""
     progress = pyqtSignal(str)  # 진행 메시지
     table_progress = pyqtSignal(int, int, str)  # current, total, table_name
     finished = pyqtSignal(bool, str)  # success, message
@@ -16,11 +16,11 @@ class MySQLShellWorker(QThread):
     detail_progress = pyqtSignal(dict)  # {'percent': 92, 'mb_done': 88.95, 'mb_total': 96.69, 'rows_sec': 285, 'speed': '1.5 MB/s'}
     table_status = pyqtSignal(str, str, str)  # table_name, status ('pending'/'loading'/'done'/'error'), message
     import_finished = pyqtSignal(bool, str, dict)  # success, message, results {'table_name': {'status': 'done'/'error', 'message': ''}}
-    raw_output = pyqtSignal(str)  # mysqlsh 실시간 출력
+    raw_output = pyqtSignal(str)  # rust_dump 실시간 출력
     metadata_analyzed = pyqtSignal(dict)  # dump 메타데이터 분석 결과 (chunk_counts, table_sizes, total_bytes, schema)
     table_chunk_progress = pyqtSignal(str, int, int)  # table_name, completed_chunks, total_chunks (테이블별 chunk 진행률)
 
-    def __init__(self, task_type: str, config: MySQLShellConfig, **kwargs):
+    def __init__(self, task_type: str, config: RustDumpConfig, **kwargs):
         super().__init__()
         self.task_type = task_type
         self.config = config
@@ -35,7 +35,7 @@ class MySQLShellWorker(QThread):
 
         try:
             if self.task_type == "export_schema":
-                exporter = MySQLShellExporter(self.config)
+                exporter = RustDumpExporter(self.config)
 
                 # 상세 콜백 함수들
                 def detail_callback(info: dict):
@@ -61,7 +61,7 @@ class MySQLShellWorker(QThread):
                 self.finished.emit(success, msg)
 
             elif self.task_type == "export_tables":
-                exporter = MySQLShellExporter(self.config)
+                exporter = RustDumpExporter(self.config)
 
                 # 상세 콜백 함수들
                 def detail_callback(info: dict):
@@ -89,7 +89,7 @@ class MySQLShellWorker(QThread):
                 self.finished.emit(success, msg)
 
             elif self.task_type == "import":
-                importer = MySQLShellImporter(self.config)
+                importer = RustDumpImporter(self.config)
 
                 # 상세 콜백 함수들
                 def detail_callback(info: dict):

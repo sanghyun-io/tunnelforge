@@ -157,7 +157,7 @@ class AnalysisResult:
                 suggestion=i['suggestion'],
                 fix_query=i.get('fix_query'),
                 doc_link=i.get('doc_link'),
-                mysql_shell_check_id=i.get('mysql_shell_check_id'),
+                upgrade_check_id=i.get('upgrade_check_id'),
                 code_snippet=i.get('code_snippet'),
                 table_name=i.get('table_name'),
                 column_name=i.get('column_name')
@@ -1305,7 +1305,7 @@ class DumpAnalysisResult:
 
 class DumpFileAnalyzer:
     """
-    mysqlsh 덤프 파일 분석기
+    dump 파일 분석기
 
     덤프 폴더의 SQL/TSV 파일을 분석하여 MySQL 8.4 호환성 이슈를 탐지합니다.
     """
@@ -1337,7 +1337,7 @@ class DumpFileAnalyzer:
         덤프 폴더 전체 분석
 
         Args:
-            dump_path: mysqlsh 덤프 폴더 경로
+            dump_path: dump 폴더 경로
 
         Returns:
             DumpAnalysisResult

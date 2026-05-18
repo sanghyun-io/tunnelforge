@@ -47,8 +47,6 @@ class ConnectionTestWorker(QThread):
 
     def _test_db(self):
         """DB 인증 테스트 (터널 경유)"""
-        from src.core.db_connector import MySQLConnector
-
         tid = self.config.get('id')
         is_direct = self.config.get('connection_mode') == 'direct'
         temp_server = None
@@ -67,7 +65,7 @@ class ConnectionTestWorker(QThread):
             # 연결 정보 결정
             if is_direct:
                 # 직접 연결 모드
-                host = self.config['remote_host']
+                host = self.config.get('remote_host') or '127.0.0.1'
                 port = int(self.config['remote_port'])
                 self.progress.emit(f"🔗 직접 연결 모드: {host}:{port}")
             elif self.engine.is_running(tid):
@@ -75,6 +73,14 @@ class ConnectionTestWorker(QThread):
                 host, port = self.engine.get_connection_info(tid)
                 self.progress.emit(f"🔗 활성 터널 사용: localhost:{port}")
             else:
+                self.progress.emit("🔎 Bastion → Target DB 포트 도달성 확인 중...")
+                reachable, reach_msg = self.engine.test_target_reachable_from_bastion(self.config)
+                if not reachable:
+                    result_success = False
+                    result_msg = f"❌ Target DB 포트 도달 실패\n\n{reach_msg}\n\n{self._aws_reachability_hint()}"
+                    return
+                self.progress.emit(f"✅ {reach_msg}")
+
                 # 임시 터널 생성
                 self.progress.emit("🔗 임시 SSH 터널 생성 중...")
                 success, temp_server, error = self.engine.create_temp_tunnel(self.config)
@@ -87,9 +93,10 @@ class ConnectionTestWorker(QThread):
                 port = self.engine.get_temp_tunnel_port(temp_server)
                 self.progress.emit(f"✅ 임시 터널 생성됨: localhost:{port}")
 
-            # MySQL 연결 테스트
-            self.progress.emit(f"🔐 MySQL 인증 테스트 중... ({db_user}@{host}:{port})")
-            connector = MySQLConnector(host, port, db_user, db_password)
+            engine = self._resolve_db_engine(host, port)
+            connector = self._create_connector(engine, host, port, db_user, db_password)
+            engine_label = self._engine_label(engine)
+            self.progress.emit(f"🔐 {engine_label} 인증 테스트 중... ({db_user}@{host}:{port})")
             success, msg = connector.connect()
 
             if success:
@@ -107,6 +114,7 @@ class ConnectionTestWorker(QThread):
                 connector.disconnect()
                 result_success = True
                 result_msg = f"✅ DB 인증 성공!\n\n사용자: {db_user}\n호스트: {host}:{port}"
+                result_msg += f"\n엔진: {engine_label}"
                 if default_schema:
                     result_msg += f"\n스키마: {default_schema}"
             else:
@@ -130,8 +138,6 @@ class ConnectionTestWorker(QThread):
 
     def _test_integrated(self):
         """통합 테스트 (터널 + DB)"""
-        from src.core.db_connector import MySQLConnector
-
         tid = self.config.get('id')
         is_direct = self.config.get('connection_mode') == 'direct'
         temp_server = None
@@ -167,11 +173,20 @@ class ConnectionTestWorker(QThread):
 
             # 연결 정보 결정
             if is_direct:
-                host = self.config['remote_host']
+                host = self.config.get('remote_host') or '127.0.0.1'
                 port = int(self.config['remote_port'])
             elif self.engine.is_running(tid):
                 host, port = self.engine.get_connection_info(tid)
             else:
+                self.progress.emit("🔎 Bastion → Target DB 포트 도달성 확인 중...")
+                reachable, reach_msg = self.engine.test_target_reachable_from_bastion(self.config)
+                if not reachable:
+                    results.append(f"❌ 2. Target DB 포트 도달 실패: {reach_msg}")
+                    result_success = False
+                    result_msg = "\n".join(results) + f"\n\n{self._aws_reachability_hint()}"
+                    return
+                self.progress.emit(f"✅ {reach_msg}")
+
                 # 임시 터널 생성
                 success, temp_server, error = self.engine.create_temp_tunnel(self.config)
                 if not success:
@@ -182,12 +197,12 @@ class ConnectionTestWorker(QThread):
                 host = '127.0.0.1'
                 port = self.engine.get_temp_tunnel_port(temp_server)
 
-            # MySQL 연결
-            connector = MySQLConnector(host, port, db_user, db_password)
+            engine = self._resolve_db_engine(host, port)
+            connector = self._create_connector(engine, host, port, db_user, db_password)
             success, msg = connector.connect()
 
             if success:
-                results.append(f"✅ 2. DB 인증 성공 ({db_user}@{host}:{port})")
+                results.append(f"✅ 2. {self._engine_label(engine)} DB 인증 성공 ({db_user}@{host}:{port})")
                 result_success = True
                 result_msg = "\n".join(results) + "\n\n🎉 모든 테스트 통과!"
             else:
@@ -209,6 +224,35 @@ class ConnectionTestWorker(QThread):
 
             # 모든 정리 후 결과 전달
             self.finished.emit(result_success, result_msg)
+
+    def _resolve_db_engine(self, host: str, port: int) -> str:
+        engine = self.config.get('db_engine')
+        if engine in ('mysql', 'postgresql'):
+            return engine
+        raise ValueError("DB Engine을 먼저 선택해주세요. 연결 설정에서 MySQL 또는 PostgreSQL을 명시해야 합니다.")
+
+    def _create_connector(self, engine: str, host: str, port: int, user: str, password: str):
+        from src.core.db_core_service import RustDbConnector
+
+        if engine == 'postgresql':
+            database = self.config.get('default_database') or 'postgres'
+            schema = self.config.get('default_schema') or ''
+            return RustDbConnector(engine, host, port, user, password, database, schema)
+        database = self.config.get('default_schema')
+        return RustDbConnector(engine, host, port, user, password, database or '')
+
+    def _engine_label(self, engine: str) -> str:
+        return 'PostgreSQL' if engine == 'postgresql' else 'MySQL'
+
+    def _aws_reachability_hint(self) -> str:
+        return (
+            "AWS 점검 포인트:\n"
+            "- RDS Security Group 인바운드 5432 소스가 Bastion의 Security Group 또는 private IP인지 확인\n"
+            "- Bastion Security Group 아웃바운드가 RDS 5432로 허용되는지 확인\n"
+            "- RDS와 Bastion이 같은 VPC/피어링/라우팅 경로에 있는지 확인\n"
+            "- NACL이 5432 및 응답 ephemeral port를 막지 않는지 확인\n"
+            "- RDS 엔드포인트와 포트, 기본 DB 이름이 맞는지 확인"
+        )
 
 
 class SQLExecutionWorker(QThread):
@@ -236,7 +280,7 @@ class SQLExecutionWorker(QThread):
                 self.finished.emit(False,
                     "❌ mysql CLI를 찾을 수 없습니다.\n\n"
                     "MySQL Client가 설치되어 있고 PATH에 등록되어 있는지 확인해주세요.\n"
-                    "- Windows: MySQL Installer에서 MySQL Server 또는 MySQL Shell 설치\n"
+                    "- Windows: MySQL Installer에서 MySQL Server 설치\n"
                     "- Mac: brew install mysql-client\n"
                     "- Linux: apt install mysql-client")
                 return

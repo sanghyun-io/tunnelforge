@@ -25,7 +25,7 @@
 |:-:|------|------|
 | 🔐 | **SSH 터널** | 원클릭으로 Bastion 호스트를 통한 보안 연결. RSA, Ed25519, ECDSA 키 지원. |
 | 🔗 | **직접 연결** | 터널 없이 로컬 또는 접근 가능한 DB에 바로 연결. |
-| ⚡ | **병렬 Export/Import** | MySQL Shell의 병렬 처리로 초고속 데이터 전송. |
+| ⚡ | **병렬 Export/Import** | Rust DB Core의 병렬 처리로 초고속 데이터 전송. |
 | 📅 | **[스케줄 백업](SCHEDULE.md)** | Cron 스타일 자동 백업으로 데이터를 안전하게 보관. |
 | 🖥️ | **시스템 트레이** | 백그라운드에서 조용히 실행, 필요할 때 바로 사용. |
 | 🔄 | **자동 업데이트 확인** | 시작 시 새 버전을 확인하여 항상 최신 상태 유지. |
@@ -122,7 +122,7 @@ graph LR
 | 요구 사항 | 비고 |
 |----------|------|
 | **Windows 10+** | 기본 지원 플랫폼 |
-| **[MySQL Shell](https://dev.mysql.com/downloads/shell/)** | Export/Import 기능 사용 시 필요 |
+| **Rust DB Core 바이너리** | Export/Import 기능용으로 TunnelForge에 빌드/패키징됨 |
 
 ## 설정 파일 위치
 

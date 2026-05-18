@@ -25,7 +25,7 @@ from src.core.migration_constants import (
     STORAGE_ENGINE_STATUS,
     MYSQL_SCHEMA_TABLES,
     DEPRECATED_SYNTAX_PATTERNS,
-    MYSQL_SHELL_CHECK_IDS,
+    UPGRADE_CHECK_IDS,
     DOC_LINKS,
     IssueType,
     CompatibilityIssue,
@@ -273,7 +273,7 @@ class TestCompatibilityIssue:
             suggestion="sugg",
             fix_query="UPDATE ...",
             doc_link="https://...",
-            mysql_shell_check_id="zeroDates",
+            upgrade_check_id="zeroDates",
             code_snippet="code",
             table_name="t",
             column_name="c",
@@ -285,19 +285,19 @@ class TestCompatibilityIssue:
 # ============================================================
 # 매핑 테스트
 # ============================================================
-class TestMysqlShellCheckIds:
-    """MYSQL_SHELL_CHECK_IDS 매핑 검증"""
+class TestUpgradeCheckIds:
+    """UPGRADE_CHECK_IDS 매핑 검증"""
 
     def test_all_keys_are_issue_type(self):
-        for key in MYSQL_SHELL_CHECK_IDS:
+        for key in UPGRADE_CHECK_IDS:
             assert isinstance(key, IssueType)
 
     def test_all_values_are_strings(self):
-        for val in MYSQL_SHELL_CHECK_IDS.values():
+        for val in UPGRADE_CHECK_IDS.values():
             assert isinstance(val, str)
 
     def test_known_mapping(self):
-        assert MYSQL_SHELL_CHECK_IDS[IssueType.REMOVED_SYS_VAR] == "removedSysVars"
+        assert UPGRADE_CHECK_IDS[IssueType.REMOVED_SYS_VAR] == "removedSysVars"
 
 
 class TestDocLinks:

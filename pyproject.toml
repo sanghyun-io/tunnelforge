@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tunnelforge"
-version = "1.15.7"
-description = "SSH Tunnel and MySQL Database Manager"
+version = "2.0.0"
+description = "SSH Tunnel and Rust DB Core Manager"
 readme = "README.md"
 requires-python = ">=3.9"
 license = {text = "MIT"}
@@ -15,7 +15,6 @@ dependencies = [
     "sshtunnel>=0.4.0",
     "paramiko>=3.0.0,<4.0.0",
     "cryptography>=40.0.0",
-    "pymysql>=1.0.0",
     "requests>=2.28.0",
     "PyJWT>=2.8.0",
     "python-dotenv>=1.0.0",

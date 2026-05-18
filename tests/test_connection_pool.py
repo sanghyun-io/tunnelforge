@@ -7,6 +7,23 @@ from queue import Queue
 from unittest.mock import MagicMock, patch, PropertyMock
 
 
+class FakeFacade:
+    def __init__(self):
+        self.open_count = 0
+        self.closed = []
+
+    def open_connection(self, endpoint):
+        self.open_count += 1
+        return f"conn-{self.open_count}"
+
+    def close_connection(self, connection_id):
+        self.closed.append(connection_id)
+        return True
+
+    def execute_on_connection(self, connection_id, sql):
+        return []
+
+
 # =====================================================================
 # ConnectionPool 테스트
 # =====================================================================
@@ -16,27 +33,22 @@ class TestConnectionPool:
 
     @pytest.fixture(autouse=True)
     def setup(self):
-        """각 테스트 전 pymysql Mock으로 ConnectionPool 생성"""
-        with patch('pymysql.connect') as self.mock_connect:
-            self.mock_conn = MagicMock()
-            self.mock_conn.ping.return_value = None
-            self.mock_conn.rollback.return_value = None
-            self.mock_conn.close.return_value = None
-            self.mock_connect.return_value = self.mock_conn
-
-            from src.core.connection_pool import ConnectionPool
-            self.pool = ConnectionPool(
-                host='127.0.0.1',
-                port=3306,
-                user='test_user',
-                password='test_pass',
-                database='test_db',
-                max_connections=3,
-                min_connections=1,
-                idle_timeout=300,
-                connect_timeout=10
-            )
-            yield
+        """각 테스트 전 Rust DB Core facade fake으로 ConnectionPool 생성"""
+        from src.core.connection_pool import ConnectionPool
+        self.pool = ConnectionPool(
+            host='127.0.0.1',
+            port=3306,
+            user='test_user',
+            password='test_pass',
+            database='test_db',
+            max_connections=3,
+            min_connections=1,
+            idle_timeout=300,
+            connect_timeout=10
+        )
+        self.fake_facade = FakeFacade()
+        self.pool._facade = self.fake_facade
+        yield
 
     def test_pool_key_format(self):
         """풀 키 형식 확인"""
@@ -53,31 +65,20 @@ class TestConnectionPool:
 
     def test_get_connection_creates_new(self):
         """새 연결 생성 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_conn.ping.return_value = None
-            mock_connect.return_value = mock_conn
+        conn = self.pool.get_connection()
 
-            conn = self.pool.get_connection()
-
-            assert conn is not None
-            stats = self.pool.get_stats()
-            assert stats['total_created'] == 1
-            assert stats['in_use'] == 1
+        assert conn is not None
+        stats = self.pool.get_stats()
+        assert stats['total_created'] == 1
+        assert stats['in_use'] == 1
 
     def test_return_connection_decrements_in_use(self):
         """연결 반환 시 in_use 감소 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_conn.ping.return_value = None
-            mock_conn.rollback.return_value = None
-            mock_connect.return_value = mock_conn
+        conn = self.pool.get_connection()
+        assert self.pool.get_stats()['in_use'] == 1
 
-            conn = self.pool.get_connection()
-            assert self.pool.get_stats()['in_use'] == 1
-
-            self.pool.return_connection(conn)
-            assert self.pool.get_stats()['in_use'] == 0
+        self.pool.return_connection(conn)
+        assert self.pool.get_stats()['in_use'] == 0
 
     def test_return_none_connection_is_noop(self):
         """None 연결 반환 시 아무 일도 없음"""
@@ -87,74 +88,50 @@ class TestConnectionPool:
 
     def test_return_invalid_connection_discards(self):
         """무효 연결 반환 시 폐기 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_conn.ping.return_value = None
-            mock_connect.return_value = mock_conn
+        conn = self.pool.get_connection()
 
-            conn = self.pool.get_connection()
+        # 반환 전에 연결을 무효화
+        conn.open = False
 
-            # 반환 전에 연결을 무효화
-            mock_conn.ping.side_effect = Exception("Connection lost")
+        self.pool.return_connection(conn)
 
-            self.pool.return_connection(conn)
-
-            # 풀에 들어가지 않아야 함
-            assert self.pool._pool.qsize() == 0
+        # 풀에 들어가지 않아야 함
+        assert self.pool._pool.qsize() == 0
 
     def test_get_connection_reuses_from_pool(self):
         """반환된 연결 재사용 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_conn.ping.return_value = None
-            mock_conn.rollback.return_value = None
-            mock_connect.return_value = mock_conn
+        # 첫 번째 획득
+        conn1 = self.pool.get_connection()
+        self.pool.return_connection(conn1)
 
-            # 첫 번째 획득
-            conn1 = self.pool.get_connection()
-            self.pool.return_connection(conn1)
-
-            # 두 번째 획득 (풀에서 재사용)
-            conn2 = self.pool.get_connection()
-            assert conn2 is conn1
-            # 새로 생성되지 않음
-            assert mock_connect.call_count == 1
+        # 두 번째 획득 (풀에서 재사용)
+        conn2 = self.pool.get_connection()
+        assert conn2 is conn1
+        # 새로 생성되지 않음
+        assert self.fake_facade.open_count == 1
 
     def test_max_connections_respected(self):
         """최대 연결 수 제한 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conns = [MagicMock() for _ in range(3)]
-            for c in mock_conns:
-                c.ping.return_value = None
-                c.rollback.return_value = None
-            mock_connect.side_effect = mock_conns
+        # 최대 3개까지 획득
+        conns = []
+        for _ in range(3):
+            conns.append(self.pool.get_connection())
 
-            # 최대 3개까지 획득
-            conns = []
-            for _ in range(3):
-                conns.append(self.pool.get_connection())
+        assert self.pool.get_stats()['total_created'] == 3
 
-            assert self.pool.get_stats()['total_created'] == 3
-
-            # 4번째 획득 시 타임아웃 발생해야 함
-            with pytest.raises(Exception, match="연결 풀 고갈"):
-                self.pool.get_connection(timeout=0.1)
+        # 4번째 획득 시 타임아웃 발생해야 함
+        with pytest.raises(Exception, match="연결 풀 고갈"):
+            self.pool.get_connection(timeout=0.1)
 
     def test_close_all_terminates_connections(self):
         """모든 연결 종료 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_conn.ping.return_value = None
-            mock_conn.rollback.return_value = None
-            mock_connect.return_value = mock_conn
+        conn = self.pool.get_connection()
+        self.pool.return_connection(conn)
 
-            conn = self.pool.get_connection()
-            self.pool.return_connection(conn)
+        self.pool.close_all()
 
-            self.pool.close_all()
-
-            # 풀이 비어 있어야 함
-            assert self.pool._pool.qsize() == 0
+        # 풀이 비어 있어야 함
+        assert self.pool._pool.qsize() == 0
 
     def test_validate_connection_success(self):
         """유효한 연결 검증 성공"""
@@ -199,27 +176,21 @@ class TestConnectionPool:
 
     def test_cleanup_idle_connections_removes_expired(self):
         """만료된 유휴 연결 정리 확인"""
-        with patch('pymysql.connect') as mock_connect:
-            mock_conn = MagicMock()
-            mock_conn.ping.return_value = None
-            mock_conn.rollback.return_value = None
-            mock_connect.return_value = mock_conn
+        conn = self.pool.get_connection()
+        self.pool.return_connection(conn)
 
-            conn = self.pool.get_connection()
-            self.pool.return_connection(conn)
+        # 시간을 과거로 설정하여 타임아웃 유발
+        conn_id = id(conn)
+        self.pool._connection_times[conn_id] = time.time() - 400
 
-            # 시간을 과거로 설정하여 타임아웃 유발
-            conn_id = id(conn)
-            self.pool._connection_times[conn_id] = time.time() - 400
+        initial_count = self.pool._pool.qsize()
+        self.pool._cleanup_idle_connections()
 
-            initial_count = self.pool._pool.qsize()
-            self.pool._cleanup_idle_connections()
-
-            # min_connections 이하로 내려가면 유지하므로 조건 확인
-            # min_connections=1이고 풀에 1개 있으면 유지됨
-            # 이 경우 1개 있고 min=1이므로 유지
-            # 실제 동작은 "최소 연결 유지" 로직 따름
-            assert self.pool._pool.qsize() >= 0
+        # min_connections 이하로 내려가면 유지하므로 조건 확인
+        # min_connections=1이고 풀에 1개 있으면 유지됨
+        # 이 경우 1개 있고 min=1이므로 유지
+        # 실제 동작은 "최소 연결 유지" 로직 따름
+        assert self.pool._pool.qsize() >= 0
 
 
 # =====================================================================

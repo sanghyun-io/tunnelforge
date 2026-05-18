@@ -51,7 +51,7 @@
 
 | | Feature | Description |
 |:-:|---------|-------------|
-| ⚡ | **Parallel Export/Import** | Blazing-fast data transfers powered by MySQL Shell's parallel processing. |
+| ⚡ | **Parallel Export/Import** | Blazing-fast data transfers powered by Rust DB Core's parallel processing. |
 | 📅 | **[Scheduled Backup](SCHEDULE.md)** | Cron-style automated backups to keep your data safe. |
 | 📝 | **SQL Editor** | Built-in SQL editor with syntax highlighting and query history. |
 | 🛡️ | **Production Guard** | Safety prompts and confirmations for production database operations. |
@@ -155,7 +155,7 @@ Create separate tunnel configs for each environment (Dev, Staging, Production) w
 | Requirement | Note |
 |-------------|------|
 | **Windows 10+** | Primary supported platform |
-| **[MySQL Shell](https://dev.mysql.com/downloads/shell/)** | Required for Export/Import features |
+| **Rust DB Core binary** | Built and packaged with TunnelForge for Export/Import features |
 
 ## Configuration
 

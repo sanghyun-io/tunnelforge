@@ -8,9 +8,8 @@ import threading
 from queue import Queue, Empty
 from threading import Lock, Event
 from typing import Dict, Optional
-import pymysql
-from pymysql.connections import Connection
 
+from src.core.db_core_service import DbCoreFacade, DbEndpoint, RustDbConnection
 from src.core.logger import get_logger
 
 logger = get_logger(__name__)
@@ -55,6 +54,7 @@ class ConnectionPool:
         self._in_use_count = 0
         self._lock = Lock()
         self._connection_times: Dict[int, float] = {}  # conn_id -> last_used
+        self._facade = DbCoreFacade()
 
         # 연결 정보 저장
         self._conn_params = {
@@ -63,9 +63,7 @@ class ConnectionPool:
             'user': user,
             'password': password,
             'database': database,
-            'charset': 'utf8mb4',
             'connect_timeout': connect_timeout,
-            'cursorclass': pymysql.cursors.DictCursor,
         }
 
         # 풀 키 (레지스트리용)
@@ -77,10 +75,19 @@ class ConnectionPool:
 
         logger.info(f"연결 풀 생성: {self._pool_key} (max={max_connections})")
 
-    def _create_connection(self) -> Connection:
+    def _create_connection(self) -> RustDbConnection:
         """새 연결 생성"""
         try:
-            conn = pymysql.connect(**self._conn_params)
+            endpoint = DbEndpoint(
+                engine="mysql",
+                host=self._conn_params['host'],
+                port=int(self._conn_params['port']),
+                user=self._conn_params['user'],
+                password=self._conn_params['password'],
+                database=self._conn_params.get('database') or "",
+            )
+            connection_id = self._facade.open_connection(endpoint)
+            conn = RustDbConnection(endpoint, self._facade, connection_id)
             conn_id = id(conn)
             self._connection_times[conn_id] = time.time()
             logger.debug(f"새 연결 생성: {conn_id}")
@@ -89,7 +96,7 @@ class ConnectionPool:
             logger.error(f"연결 생성 실패: {e}")
             raise
 
-    def _validate_connection(self, conn: Connection) -> bool:
+    def _validate_connection(self, conn: RustDbConnection) -> bool:
         """연결 유효성 확인 (ping)"""
         try:
             conn.ping(reconnect=False)
@@ -97,13 +104,13 @@ class ConnectionPool:
         except Exception:
             return False
 
-    def _is_idle_timeout(self, conn: Connection) -> bool:
+    def _is_idle_timeout(self, conn: RustDbConnection) -> bool:
         """유휴 타임아웃 초과 여부"""
         conn_id = id(conn)
         last_used = self._connection_times.get(conn_id, 0)
         return (time.time() - last_used) > self._idle_timeout
 
-    def get_connection(self, timeout: float = 5.0) -> Connection:
+    def get_connection(self, timeout: float = 5.0) -> RustDbConnection:
         """풀에서 연결 획득
 
         Args:
@@ -157,7 +164,7 @@ class ConnectionPool:
             logger.error(f"연결 풀 고갈: {self._pool_key}")
             raise Exception(f"연결 풀 고갈 (max={self._max_connections})")
 
-    def return_connection(self, conn: Connection):
+    def return_connection(self, conn: RustDbConnection):
         """연결을 풀에 반환
 
         Args:
@@ -191,7 +198,7 @@ class ConnectionPool:
             # 풀이 가득 찬 경우 (드문 상황)
             self._close_connection(conn)
 
-    def _close_connection(self, conn: Connection):
+    def _close_connection(self, conn: RustDbConnection):
         """연결 종료 및 정리"""
         try:
             conn_id = id(conn)
@@ -394,7 +401,7 @@ class PooledConnection:
         self._pool = pool
         self._conn = None
 
-    def __enter__(self) -> Connection:
+    def __enter__(self) -> RustDbConnection:
         self._conn = self._pool.get_connection()
         return self._conn
 
