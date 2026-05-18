@@ -2635,8 +2635,13 @@ class RustDumpWizard:
             )
             return None, None
 
+        db_engine = tunnel.get('db_engine')
+        database = tunnel.get('default_database') or (
+            tunnel.get('default_schema') if db_engine == 'mysql' else None
+        )
+
         # MySQLConnector 생성 및 연결
-        connector = MySQLConnector(host, port, db_user, db_password)
+        connector = MySQLConnector(host, port, db_user, db_password, database)
         success, msg = connector.connect()
 
         if not success:

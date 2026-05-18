@@ -154,3 +154,57 @@ def test_refresh_databases_uses_configured_engine(monkeypatch):
         assert connector.disconnected is True
     finally:
         close_dialog(dialog)
+
+
+def test_refresh_databases_passes_mysql_default_database(monkeypatch):
+    refresh_databases = SQLEditorDialog.refresh_databases
+
+    class FakeConnector:
+        def connect(self):
+            return True, "ok"
+
+        def get_schemas(self):
+            return ["tf_source84"]
+
+        def disconnect(self):
+            pass
+
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", lambda self: None)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("root", "tunnelpass")
+    tunnel_engine = MagicMock()
+    created = {}
+
+    dialog = SQLEditorDialog(
+        None,
+        {
+            "id": "mysql84-test",
+            "name": "MySQL 8.4 테스트",
+            "connection_mode": "direct",
+            "remote_host": "127.0.0.1",
+            "remote_port": 33406,
+            "db_engine": "mysql",
+            "default_database": "tf_source84",
+        },
+        config_manager,
+        tunnel_engine,
+    )
+    try:
+        dialog.refresh_databases = refresh_databases.__get__(dialog, SQLEditorDialog)
+        dialog._resolve_db_target = MagicMock(return_value=("127.0.0.1", 33406, None, None))
+        dialog._create_db_connector = MagicMock(
+            side_effect=lambda *args: created.setdefault("args", args) and FakeConnector()
+        )
+        dialog._load_metadata = MagicMock()
+
+        dialog.refresh_databases()
+
+        assert created["args"] == (
+            "127.0.0.1",
+            33406,
+            "root",
+            "tunnelpass",
+            "tf_source84",
+        )
+    finally:
+        close_dialog(dialog)
