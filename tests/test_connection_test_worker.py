@@ -56,3 +56,35 @@ def test_postgresql_core_connector_uses_default_database_not_schema(monkeypatch)
     assert captured["engine"] == "postgresql"
     assert captured["database"] == "appdb"
     assert captured["schema"] == "analytics"
+
+
+def test_mysql_core_connector_uses_default_database(monkeypatch):
+    captured = {}
+
+    class FakeRustDbConnector:
+        def __init__(self, engine, host, port, user, password, database, schema=""):
+            captured["engine"] = engine
+            captured["database"] = database
+            captured["schema"] = schema
+
+    import types
+    import sys
+
+    fake_module = types.SimpleNamespace(RustDbConnector=FakeRustDbConnector)
+    monkeypatch.setitem(sys.modules, "src.core.db_core_service", fake_module)
+    worker = ConnectionTestWorker(
+        TestType.DB_ONLY,
+        {
+            "db_engine": "mysql",
+            "default_database": "tf_source84",
+            "default_schema": "",
+        },
+        tunnel_engine=None,
+        config_manager=None,
+    )
+
+    worker._create_connector("mysql", "127.0.0.1", 33406, "root", "pw")
+
+    assert captured["engine"] == "mysql"
+    assert captured["database"] == "tf_source84"
+    assert captured["schema"] == ""

@@ -318,7 +318,7 @@ class TestProgressDialog(QDialog):
     def __init__(self, parent, title: str = "연결 테스트"):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.setMinimumSize(400, 200)
+        self.setMinimumSize(480, 320)
         self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowCloseButtonHint)
 
         layout = QVBoxLayout(self)
@@ -336,8 +336,8 @@ class TestProgressDialog(QDialog):
         # 상세 로그
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(100)
-        layout.addWidget(self.log_text)
+        self.log_text.setMinimumHeight(180)
+        layout.addWidget(self.log_text, 1)
 
         # 결과 버튼 (초기 숨김)
         self.btn_close = QPushButton("닫기")

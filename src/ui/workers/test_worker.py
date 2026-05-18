@@ -238,7 +238,7 @@ class ConnectionTestWorker(QThread):
             database = self.config.get('default_database') or 'postgres'
             schema = self.config.get('default_schema') or ''
             return RustDbConnector(engine, host, port, user, password, database, schema)
-        database = self.config.get('default_schema')
+        database = self.config.get('default_database') or self.config.get('default_schema')
         return RustDbConnector(engine, host, port, user, password, database or '')
 
     def _engine_label(self, engine: str) -> str:
