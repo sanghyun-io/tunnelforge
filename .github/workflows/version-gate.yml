@@ -26,6 +26,9 @@ jobs:
       - name: Checkout PR
         uses: actions/checkout@v4
 
+      - name: Install ripgrep
+        run: sudo apt-get update && sudo apt-get install -y ripgrep
+
       - name: Run Rust Core regression gate
         shell: pwsh
         run: ./scripts/rust-core-regression-gate.ps1
