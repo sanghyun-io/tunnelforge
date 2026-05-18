@@ -92,3 +92,65 @@ def test_result_tabs_can_be_deleted_and_cleared(monkeypatch):
         assert dialog.result_tabs.tabText(0).startswith("결과 1")
     finally:
         close_dialog(dialog)
+
+
+def test_refresh_databases_uses_configured_engine(monkeypatch):
+    refresh_databases = SQLEditorDialog.refresh_databases
+
+    class FakeConnector:
+        def __init__(self):
+            self.disconnected = False
+
+        def connect(self):
+            return True, "ok"
+
+        def get_schemas(self):
+            return ["tf_target"]
+
+        def disconnect(self):
+            self.disconnected = True
+
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", lambda self: None)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("postgres", "tunnelpass")
+    tunnel_engine = MagicMock()
+    connector = FakeConnector()
+    created = {}
+
+    dialog = SQLEditorDialog(
+        None,
+        {
+            "id": "pg-test",
+            "name": "PostgreSQL 테스트",
+            "connection_mode": "direct",
+            "remote_host": "127.0.0.1",
+            "remote_port": 35432,
+            "db_engine": "postgresql",
+            "default_database": "tf_target",
+        },
+        config_manager,
+        tunnel_engine,
+    )
+    try:
+        dialog.refresh_databases = refresh_databases.__get__(dialog, SQLEditorDialog)
+        dialog._resolve_db_target = MagicMock(return_value=("127.0.0.1", 35432, None, None))
+        def create_connector(*args):
+            created["args"] = args
+            return connector
+
+        dialog._create_db_connector = MagicMock(side_effect=create_connector)
+        dialog._load_metadata = MagicMock()
+
+        dialog.refresh_databases()
+
+        assert created["args"] == (
+            "127.0.0.1",
+            35432,
+            "postgres",
+            "tunnelpass",
+            "tf_target",
+        )
+        assert dialog.db_combo.findText("tf_target") >= 0
+        assert connector.disconnected is True
+    finally:
+        close_dialog(dialog)

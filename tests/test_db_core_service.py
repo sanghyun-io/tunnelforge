@@ -3,6 +3,7 @@ import json
 
 from src.core.db_core_service import (
     DbCoreFacade,
+    DbCoreServiceError,
     DbCoreServiceClient,
     DbEndpoint,
     RustDbConnector,
@@ -42,6 +43,26 @@ def test_client_sends_jsonl_and_returns_result():
     assert sent["command"] == "service.hello"
     assert result["success"] is True
     assert events[0]["event"] == "phase"
+
+
+def test_client_reports_missing_core_executable_cleanly():
+    def missing_executable(*args, **kwargs):
+        raise FileNotFoundError("missing")
+
+    client = DbCoreServiceClient(
+        executable="missing-tunnelforge-core.exe",
+        popen_factory=missing_executable,
+    )
+
+    try:
+        client.request("service.hello")
+    except DbCoreServiceError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("DbCoreServiceError was not raised")
+
+    assert "Rust DB Core 실행 파일을 찾을 수 없습니다" in message
+    assert "missing-tunnelforge-core.exe" in message
 
 
 def test_facade_uses_connection_test_protocol():

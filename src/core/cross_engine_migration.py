@@ -155,6 +155,9 @@ def db_core_executable() -> str:
 
     if hasattr(sys, "_MEIPASS"):
         candidate_dirs.append(Path(sys._MEIPASS))  # type: ignore[attr-defined]
+    if getattr(sys, "frozen", False):
+        candidate_dirs.append(Path(sys.executable).resolve().parent)
+        candidate_dirs.append(Path.cwd())
 
     root = project_root()
     candidate_dirs.extend([

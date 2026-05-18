@@ -1,4 +1,6 @@
 import json
+import os
+import sys
 
 import pytest
 
@@ -7,6 +9,7 @@ from src.core.cross_engine_migration import (
     HelperProtocolError,
     MigrationDirection,
     build_helper_request,
+    db_core_executable,
     load_resume_state,
     next_workflow_command,
     parse_helper_event,
@@ -192,3 +195,19 @@ def test_state_key_from_payload_is_filename_safe():
     assert " " not in key
     assert "mysql" in key
     assert "postgresql" in key
+
+
+def test_db_core_executable_checks_frozen_app_directory(monkeypatch, tmp_path):
+    exe_name = "tunnelforge-core.exe" if os.name == "nt" else "tunnelforge-core"
+    app_dir = tmp_path / "TunnelForge"
+    app_dir.mkdir()
+    core = app_dir / exe_name
+    core.write_text("", encoding="utf-8")
+    app_exe = app_dir / ("TunnelForge.exe" if os.name == "nt" else "TunnelForge")
+    app_exe.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "executable", str(app_exe))
+    monkeypatch.delattr(sys, "_MEIPASS", raising=False)
+
+    assert db_core_executable() == str(core)
