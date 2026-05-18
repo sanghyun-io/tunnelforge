@@ -461,7 +461,9 @@ class TunnelManagerUI(QMainWindow):
                 )
                 self.statusBar().showMessage(f"연결 테스트 중단: {tunnel_name}")
                 return
-            database = tunnel.get('default_database') if engine == 'postgresql' else tunnel.get('default_schema')
+            database = tunnel.get('default_database') or (
+                tunnel.get('default_schema') if engine == 'mysql' else None
+            )
             connector = self._create_db_connector(engine, host, int(port), user, password, database)
             success, msg = connector.connect()
             connector.disconnect()
