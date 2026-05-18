@@ -14,6 +14,27 @@ class DbCoreServiceError(RuntimeError):
     """Raised when the Rust DB core service cannot complete a request."""
 
 
+SUPPORTED_DB_ENGINES = {"mysql", "postgresql"}
+
+
+def normalize_db_engine(engine: Optional[str], port: Optional[int] = None) -> str:
+    """Return the Rust core engine id used by DB-facing product paths."""
+    value = str(engine or "").strip().lower()
+    if value in ("postgres", "postgresql", "pg"):
+        return "postgresql"
+    if value in ("mysql", "mariadb"):
+        return "mysql"
+    if int(port or 0) == 5432:
+        return "postgresql"
+    return "mysql"
+
+
+def default_database_for_engine(engine: str, database: Optional[str] = None) -> str:
+    if database:
+        return database
+    return "postgres" if normalize_db_engine(engine) == "postgresql" else ""
+
+
 @dataclass(frozen=True)
 class DbEndpoint:
     engine: str
@@ -162,21 +183,58 @@ class DbCoreFacade:
         differences = result.get("differences")
         return [item for item in differences if isinstance(item, dict)] if isinstance(differences, list) else []
 
-    def execute_query(self, endpoint: DbEndpoint, sql: str) -> List[Dict[str, Any]]:
+    def execute_query(
+        self,
+        endpoint: DbEndpoint,
+        sql: str,
+        params: Optional[Sequence[Any]] = None,
+    ) -> List[Dict[str, Any]]:
         result = self.client.request(
             "query.execute",
-            {"connection": endpoint.to_payload(), "sql": sql},
+            {"connection": endpoint.to_payload(), "sql": sql, "params": list(params or [])},
         )
         rows = result.get("rows")
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
-    def execute_on_connection(self, connection_id: str, sql: str) -> List[Dict[str, Any]]:
+    def execute_on_connection(
+        self,
+        connection_id: str,
+        sql: str,
+        params: Optional[Sequence[Any]] = None,
+    ) -> List[Dict[str, Any]]:
         result = self.client.request(
             "query.execute",
-            {"connection_id": connection_id, "sql": sql},
+            {"connection_id": connection_id, "sql": sql, "params": list(params or [])},
         )
         rows = result.get("rows")
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+    def execute_on_connection_streaming(
+        self,
+        connection_id: str,
+        sql: str,
+        params: Optional[Sequence[Any]] = None,
+        row_batch_size: int = 500,
+        on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+    ) -> Dict[str, Any]:
+        def handle_event(payload: Dict[str, Any]) -> None:
+            if payload.get("event") != "row_batch" or not on_batch:
+                return
+            rows = payload.get("rows")
+            if isinstance(rows, list):
+                on_batch([row for row in rows if isinstance(row, dict)])
+
+        return self.client.request(
+            "query.execute",
+            {
+                "connection_id": connection_id,
+                "sql": sql,
+                "params": list(params or []),
+                "stream_rows": True,
+                "row_batch_size": int(row_batch_size),
+            },
+            on_event=handle_event,
+        )
 
     def run_migration(
         self,
@@ -273,9 +331,123 @@ class RustDbConnector:
     def schema_exists(self, schema_name: Optional[str]) -> bool:
         if not schema_name:
             return True
-        schema = self.facade.inspect_schema(self.endpoint)
-        tables = schema.get("tables")
-        return isinstance(tables, list)
+        if not self.connection:
+            success, _ = self.connect()
+            if not success:
+                return False
+        try:
+            with self.connection.cursor() as cursor:
+                if self.endpoint.engine == "postgresql":
+                    cursor.execute(
+                        "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
+                        (schema_name,),
+                    )
+                else:
+                    cursor.execute("SHOW DATABASES LIKE %s", (schema_name,))
+                return cursor.fetchone() is not None
+        except Exception:
+            return False
+
+    def get_schemas(self, use_cache: bool = True) -> List[str]:
+        if not self.connection:
+            success, _ = self.connect()
+            if not success:
+                return []
+        try:
+            with self.connection.cursor() as cursor:
+                if self.endpoint.engine == "postgresql":
+                    cursor.execute(
+                        "SELECT schema_name FROM information_schema.schemata "
+                        "WHERE schema_name <> 'information_schema' "
+                        "AND schema_name NOT LIKE 'pg_%' "
+                        "ORDER BY schema_name"
+                    )
+                    return [str(row.get("schema_name")) for row in cursor.fetchall()]
+                cursor.execute("SHOW DATABASES")
+                excluded = {"information_schema", "performance_schema", "mysql", "sys"}
+                return [
+                    str(row.get("Database"))
+                    for row in cursor.fetchall()
+                    if str(row.get("Database")) not in excluded
+                ]
+        except Exception:
+            return []
+
+    def get_tables(self, schema: Optional[str] = None, use_cache: bool = True) -> List[str]:
+        endpoint = self.endpoint
+        if schema:
+            endpoint = DbEndpoint(
+                engine=self.endpoint.engine,
+                host=self.endpoint.host,
+                port=self.endpoint.port,
+                user=self.endpoint.user,
+                password=self.endpoint.password,
+                database=self.endpoint.database if self.endpoint.engine == "postgresql" else schema,
+                schema=schema if self.endpoint.engine == "postgresql" else "",
+            )
+        return self.facade.list_tables(endpoint)
+
+    def get_db_version(self) -> str:
+        if not self.connection:
+            success, _ = self.connect()
+            if not success:
+                return ""
+        try:
+            with self.connection.cursor() as cursor:
+                cursor.execute("SELECT VERSION() AS version" if self.endpoint.engine == "mysql" else "SELECT version() AS version")
+                row = cursor.fetchone() or {}
+                return str(row.get("version", ""))
+        except Exception:
+            return ""
+
+    def get_column_names(self, table: str, schema: Optional[str] = None) -> List[str]:
+        if not self.connection:
+            success, _ = self.connect()
+            if not success:
+                return []
+        try:
+            with self.connection.cursor() as cursor:
+                if self.endpoint.engine == "postgresql":
+                    cursor.execute(
+                        "SELECT column_name FROM information_schema.columns "
+                        "WHERE table_schema = %s AND table_name = %s "
+                        "ORDER BY ordinal_position",
+                        (schema or self.endpoint.schema or "public", table),
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT COLUMN_NAME AS column_name FROM information_schema.columns "
+                        "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s "
+                        "ORDER BY ORDINAL_POSITION",
+                        (schema or self.endpoint.database, table),
+                    )
+                return [str(row.get("column_name")) for row in cursor.fetchall()]
+        except Exception:
+            return []
+
+
+def create_rust_db_connector(
+    engine: Optional[str],
+    host: str,
+    port: int,
+    user: str,
+    password: str,
+    database: Optional[str] = None,
+    schema: str = "",
+    facade: Optional[DbCoreFacade] = None,
+) -> RustDbConnector:
+    """Create an engine-aware Rust connector for UI/orchestration code."""
+    resolved_engine = normalize_db_engine(engine, port)
+    return RustDbConnector(
+        resolved_engine,
+        host,
+        int(port),
+        user,
+        password,
+        default_database_for_engine(resolved_engine, database),
+        schema,
+        facade=facade,
+    )
 
 
 class RustDbConnection:
@@ -287,6 +459,7 @@ class RustDbConnection:
         self.connection_id = connection_id
         self.open = True
         self._autocommit = True
+        self._in_transaction = False
 
     def cursor(self) -> "RustDbCursor":
         return RustDbCursor(self)
@@ -303,13 +476,38 @@ class RustDbConnection:
     def commit(self) -> None:
         if self.open:
             self.facade.execute_on_connection(self.connection_id, "COMMIT")
+            self._in_transaction = False
+            if not self._autocommit:
+                self._begin_transaction()
 
     def rollback(self) -> None:
         if self.open:
             self.facade.execute_on_connection(self.connection_id, "ROLLBACK")
+            self._in_transaction = False
+            if not self._autocommit:
+                self._begin_transaction()
 
     def autocommit(self, enabled: bool) -> None:
         self._autocommit = bool(enabled)
+        if not self.open:
+            return
+        if self.endpoint.engine == "mysql":
+            self.facade.execute_on_connection(
+                self.connection_id,
+                "SET autocommit = 1" if enabled else "SET autocommit = 0",
+            )
+            self._in_transaction = not enabled
+        elif enabled:
+            if self._in_transaction:
+                self.facade.execute_on_connection(self.connection_id, "COMMIT")
+            self._in_transaction = False
+        else:
+            self._begin_transaction()
+
+    def _begin_transaction(self) -> None:
+        if self.open and not self._in_transaction:
+            self.facade.execute_on_connection(self.connection_id, "BEGIN")
+            self._in_transaction = True
 
     def select_db(self, database: str) -> None:
         self.endpoint = DbEndpoint(
@@ -341,14 +539,14 @@ class RustDbCursor:
         return False
 
     def execute(self, query: str, params: Optional[Sequence[Any]] = None) -> int:
-        sql = bind_sql_params(query, params)
         self._rows = self.connection.facade.execute_on_connection(
             self.connection.connection_id,
-            sql,
+            query,
+            params=params,
         )
         if self._rows:
             self.description = [(column,) for column in self._rows[0].keys()]
-        elif query_returns_rows(sql):
+        elif query_returns_rows(query):
             self.description = []
         else:
             self.description = None

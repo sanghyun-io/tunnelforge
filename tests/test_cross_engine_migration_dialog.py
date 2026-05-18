@@ -147,6 +147,42 @@ def test_inspect_result_enables_report_and_updates_schema():
         dialog.close()
 
 
+def test_empty_schema_runs_inspect_before_requested_plan(monkeypatch):
+    dialog = make_dialog()
+    started = []
+    schema = {
+        "tables": [{"name": "users", "columns": [{"name": "id", "type": "int"}]}]
+    }
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QTimer.singleShot",
+        lambda _msec, callback: callback(),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda command, payload, workflow=False: started.append((command, payload, workflow)),
+    )
+
+    try:
+        dialog._start_command("plan")
+        assert started[0][0] == "inspect"
+        assert dialog._pending_after_inspect == "plan"
+
+        dialog._on_result({
+            "event": "result",
+            "command": "inspect",
+            "success": True,
+            "schema": schema,
+        })
+
+        assert started[1][0] == "plan"
+        assert started[1][1]["schema"] == schema
+        assert "Rust Core 검사 완료" in dialog.lbl_schema_status.text()
+    finally:
+        dialog.close()
+
+
 def test_migrate_result_saves_resume_state(monkeypatch, tmp_path):
     saved = {}
 

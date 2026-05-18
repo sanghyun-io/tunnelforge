@@ -23,7 +23,22 @@ from PyQt6.QtGui import (
     QTextCursor, QKeySequence, QShortcut, QPen, QTextFormat
 )
 import re
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
+
+from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+
+
+def create_sql_editor_connector(engine, host, port, user, password, database=None):
+    db_engine = normalize_db_engine(engine, port)
+    return create_rust_db_connector(
+        db_engine,
+        host,
+        port,
+        user,
+        password,
+        database,
+        schema=database if db_engine == "postgresql" else "",
+    )
 
 
 # =====================================================================
@@ -696,8 +711,9 @@ class SQLQueryWorker(QThread):
     query_result = pyqtSignal(int, list, list, str, int, float)  # idx, columns, rows, error, affected, time
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries):
+    def __init__(self, host, port, user, password, database, queries, engine="mysql"):
         super().__init__()
+        self.engine = normalize_db_engine(engine, port)
         self.host = host
         self.port = port
         self.user = user
@@ -706,11 +722,16 @@ class SQLQueryWorker(QThread):
         self.queries = queries  # List of query strings
 
     def run(self):
-        from src.core.db_connector import MySQLConnector
-
         connector = None
         try:
-            connector = MySQLConnector(self.host, self.port, self.user, self.password, self.database)
+            connector = create_sql_editor_connector(
+                self.engine,
+                self.host,
+                self.port,
+                self.user,
+                self.password,
+                self.database,
+            )
             success, msg = connector.connect()
 
             if not success:
@@ -733,6 +754,25 @@ class SQLQueryWorker(QThread):
 
                 start_time = time.time()
                 try:
+                    if query_returns_rows(query):
+                        rows = []
+
+                        def collect_batch(batch):
+                            rows.extend(batch)
+
+                        connector.connection.facade.execute_on_connection_streaming(
+                            connector.connection.connection_id,
+                            query,
+                            row_batch_size=500,
+                            on_batch=collect_batch,
+                        )
+                        columns = list(rows[0].keys()) if rows else []
+                        row_list = [[row.get(col) for col in columns] for row in rows]
+                        execution_time = time.time() - start_time
+                        self.query_result.emit(idx, columns, row_list, "", len(row_list), execution_time)
+                        success_count += 1
+                        continue
+
                     # 직접 커서 사용하여 실행
                     with connector.connection.cursor() as cursor:
                         cursor.execute(query)
@@ -795,8 +835,9 @@ class SQLTransactionWorker(QThread):
     ready_for_confirm = pyqtSignal()  # 커밋 대기 상태
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries):
+    def __init__(self, host, port, user, password, database, queries, engine="mysql"):
         super().__init__()
+        self.engine = normalize_db_engine(engine, port)
         self.host = host
         self.port = port
         self.user = user
@@ -808,11 +849,16 @@ class SQLTransactionWorker(QThread):
         self.should_commit = None  # None: 대기 중, True: 커밋, False: 롤백
 
     def run(self):
-        from src.core.db_connector import MySQLConnector
-
         try:
             # autocommit=False로 연결
-            self.connector = MySQLConnector(self.host, self.port, self.user, self.password, self.database)
+            self.connector = create_sql_editor_connector(
+                self.engine,
+                self.host,
+                self.port,
+                self.user,
+                self.password,
+                self.database,
+            )
             success, msg = self.connector.connect()
 
             if not success:
@@ -1513,6 +1559,54 @@ class SQLEditorDialog(QDialog):
         self.setup_shortcuts()
         self.refresh_databases()
 
+    def _db_engine(self) -> str:
+        """Return the configured DB engine for Rust Core calls."""
+        return normalize_db_engine(self.config.get('db_engine'), self.config.get('remote_port'))
+
+    def _db_credentials(self) -> Tuple[str, str]:
+        tid = self.config.get('id')
+        return self.config_mgr.get_tunnel_credentials(tid)
+
+    def _resolve_db_target(
+        self,
+        allow_temp_tunnel: bool,
+        keep_temp_tunnel: bool = False,
+        log_temp_tunnel: bool = False,
+    ) -> Tuple[Optional[str], Optional[int], object, Optional[str]]:
+        tid = self.config.get('id')
+        if self.config.get('connection_mode') == 'direct':
+            return self.config['remote_host'], int(self.config['remote_port']), None, None
+        if self.engine.is_running(tid):
+            host, port = self.engine.get_connection_info(tid)
+            return host, int(port), None, None
+        if not allow_temp_tunnel:
+            return None, None, None, None
+
+        if log_temp_tunnel:
+            self.message_text.append("🔗 임시 터널 생성 중...")
+            QApplication.processEvents()
+        success, temp_server, error = self.engine.create_temp_tunnel(self.config)
+        if not success:
+            return None, None, None, f"터널 생성 실패: {error}"
+        host = '127.0.0.1'
+        port = int(self.engine.get_temp_tunnel_port(temp_server))
+        if keep_temp_tunnel:
+            self.temp_server = temp_server
+            temp_server = None
+        if log_temp_tunnel:
+            self.message_text.append(f"✅ 임시 터널: localhost:{port}")
+        return host, port, temp_server, None
+
+    def _create_db_connector(self, host, port, user, password, database=None):
+        return create_sql_editor_connector(
+            self._db_engine(),
+            host,
+            port,
+            user,
+            password,
+            database,
+        )
+
     def init_ui(self):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
@@ -2034,38 +2128,29 @@ class SQLEditorDialog(QDialog):
 
     def refresh_databases(self):
         """데이터베이스 목록 새로고침"""
-        from src.core.db_connector import MySQLConnector
-
-        tid = self.config.get('id')
-        db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
+        db_user, db_password = self._db_credentials()
 
         if not db_user:
             self.message_text.append("⚠️ DB 자격 증명이 설정되지 않았습니다.")
             return
 
-        is_direct = self.config.get('connection_mode') == 'direct'
         temp_server = None
 
         try:
             self.message_text.append("📋 데이터베이스 목록 조회 중...")
             QApplication.processEvents()
 
-            # 연결 정보 결정
-            if is_direct:
-                host = self.config['remote_host']
-                port = int(self.config['remote_port'])
-            elif self.engine.is_running(tid):
-                host, port = self.engine.get_connection_info(tid)
-            else:
-                # 임시 터널 생성
-                success, temp_server, error = self.engine.create_temp_tunnel(self.config)
-                if not success:
-                    self.message_text.append(f"❌ 터널 생성 실패: {error}")
-                    return
-                host = '127.0.0.1'
-                port = self.engine.get_temp_tunnel_port(temp_server)
-
-            connector = MySQLConnector(host, port, db_user, db_password)
+            host, port, temp_server, error = self._resolve_db_target(allow_temp_tunnel=True)
+            if error:
+                self.message_text.append(f"❌ {error}")
+                return
+            connector = self._create_db_connector(
+                host,
+                port,
+                db_user,
+                db_password,
+                self.config.get('default_database') if db_engine == 'postgresql' else None,
+            )
             try:
                 success, msg = connector.connect()
 
@@ -2109,37 +2194,30 @@ class SQLEditorDialog(QDialog):
         if self.db_connection and self.db_connection.open:
             return True, None
 
-        tid = self.config.get('id')
-        db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
+        db_user, db_password = self._db_credentials()
 
         if not db_user:
             return False, "DB 자격 증명이 설정되지 않았습니다."
 
-        is_direct = self.config.get('connection_mode') == 'direct'
-
         try:
-            # 연결 정보 결정
-            if is_direct:
-                host = self.config['remote_host']
-                port = int(self.config['remote_port'])
-            elif self.engine.is_running(tid):
-                host, port = self.engine.get_connection_info(tid)
-            else:
-                # 임시 터널 생성
-                self.message_text.append("🔗 임시 터널 생성 중...")
-                QApplication.processEvents()
-                success, self.temp_server, error = self.engine.create_temp_tunnel(self.config)
-                if not success:
-                    return False, f"터널 생성 실패: {error}"
-                host = '127.0.0.1'
-                port = self.engine.get_temp_tunnel_port(self.temp_server)
-                self.message_text.append(f"✅ 임시 터널: localhost:{port}")
+            host, port, _temp_server, error = self._resolve_db_target(
+                allow_temp_tunnel=True,
+                keep_temp_tunnel=True,
+                log_temp_tunnel=True,
+            )
+            if error:
+                return False, error
 
             database = self.db_combo.currentText().strip() or None
 
-            from src.core.db_connector import MySQLConnector
-
-            connector = MySQLConnector(host, port, db_user, db_password, database)
+            db_engine = self._db_engine()
+            connector = self._create_db_connector(
+                host,
+                port,
+                db_user,
+                db_password,
+                database,
+            )
             success, msg = connector.connect()
             if not success:
                 return False, msg
@@ -2147,9 +2225,14 @@ class SQLEditorDialog(QDialog):
             self._db_connector = connector
             self.db_connection.autocommit(False)
             # READ COMMITTED: 각 SELECT가 최신 커밋 데이터를 조회 (외부 변경 즉시 반영)
-            self.db_connection.cursor().execute(
-                "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
-            )
+            if db_engine == 'postgresql':
+                self.db_connection.cursor().execute(
+                    "SET TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                )
+            else:
+                self.db_connection.cursor().execute(
+                    "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
+                )
             self.message_text.append(f"✅ DB 연결 성공 (트랜잭션 모드): {host}:{port}")
             self._update_tx_status()
             return True, None
@@ -2375,30 +2458,21 @@ class SQLEditorDialog(QDialog):
 
     def _execute_with_autocommit(self, queries, sql_text):
         """자동 커밋 모드로 실행 (기존 워커 사용)"""
-        tid = self.config.get('id')
-        db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
+        db_user, db_password = self._db_credentials()
 
         if not db_user:
             QMessageBox.warning(self, "경고", "DB 자격 증명이 설정되지 않았습니다.")
             return
 
-        is_direct = self.config.get('connection_mode') == 'direct'
-
         try:
-            if is_direct:
-                host = self.config['remote_host']
-                port = int(self.config['remote_port'])
-            elif self.engine.is_running(tid):
-                host, port = self.engine.get_connection_info(tid)
-            else:
-                self.message_text.append("🔗 임시 터널 생성 중...")
-                QApplication.processEvents()
-                success, self.temp_server, error = self.engine.create_temp_tunnel(self.config)
-                if not success:
-                    self.message_text.append(f"❌ 터널 생성 실패: {error}")
-                    return
-                host = '127.0.0.1'
-                port = self.engine.get_temp_tunnel_port(self.temp_server)
+            host, port, _temp_server, error = self._resolve_db_target(
+                allow_temp_tunnel=True,
+                keep_temp_tunnel=True,
+                log_temp_tunnel=True,
+            )
+            if error:
+                self.message_text.append(f"❌ {error}")
+                return
 
             database = self.db_combo.currentText().strip() or None
 
@@ -2410,7 +2484,15 @@ class SQLEditorDialog(QDialog):
             self.message_text.append(f"🚀 {len(queries)}개 쿼리 실행 (자동 커밋)")
             self.message_text.append(f"{'='*50}\n")
 
-            self.worker = SQLQueryWorker(host, port, db_user, db_password, database, queries)
+            self.worker = SQLQueryWorker(
+                host,
+                port,
+                db_user,
+                db_password,
+                database,
+                queries,
+                engine=self._db_engine(),
+            )
             self.worker.progress.connect(self._on_progress)
             self.worker.query_result.connect(self._on_query_result)
             self.worker.finished.connect(self._on_finished)
@@ -3435,7 +3517,6 @@ class SQLEditorDialog(QDialog):
 
     def _load_metadata(self, schema: str = None):
         """메타데이터 백그라운드 로드"""
-        from src.core.db_connector import MySQLConnector
         from src.ui.workers.validation_worker import MetadataLoadWorker
 
         # 기존 워커 취소
@@ -3444,22 +3525,14 @@ class SQLEditorDialog(QDialog):
             self.metadata_worker.wait()
 
         # 연결 확보
-        tid = self.config.get('id')
-        db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
+        db_user, db_password = self._db_credentials()
 
         if not db_user:
             return
 
-        is_direct = self.config.get('connection_mode') == 'direct'
-
         try:
-            if is_direct:
-                host = self.config['remote_host']
-                port = int(self.config['remote_port'])
-            elif self.engine.is_running(tid):
-                host, port = self.engine.get_connection_info(tid)
-            else:
-                # 터널 미실행 시 스킵
+            host, port, _temp_server, error = self._resolve_db_target(allow_temp_tunnel=False)
+            if error or not host or not port:
                 return
 
             target_schema = schema or self.db_combo.currentText().strip()
@@ -3474,7 +3547,13 @@ class SQLEditorDialog(QDialog):
                     pass
                 self._metadata_connector = None
 
-            connector = MySQLConnector(host, port, db_user, db_password, target_schema)
+            connector = self._create_db_connector(
+                host,
+                port,
+                db_user,
+                db_password,
+                target_schema,
+            )
             success, _ = connector.connect()
             if not success:
                 return

@@ -47,6 +47,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._last_checkpoint_path = None
         self._workflow_active = False
         self._current_command: Optional[str] = None
+        self._pending_after_inspect: Optional[str] = None
         self._execution_unlocked = False
         self.setWindowTitle("DB 전환")
         self.resize(900, 700)
@@ -93,11 +94,17 @@ class CrossEngineMigrationDialog(QDialog):
         option_layout.addStretch()
         layout.addWidget(option_group)
 
-        schema_group = QGroupBox("Normalized schema JSON")
+        schema_group = QGroupBox("스키마 검사 결과")
         schema_layout = QVBoxLayout(schema_group)
         load_layout = QHBoxLayout()
+        self.lbl_schema_status = QLabel("Source DB를 검사하면 Rust Core가 정규화한 스키마가 자동으로 채워집니다.")
+        schema_layout.addWidget(self.lbl_schema_status)
         self.btn_load_schema = QPushButton("JSON 불러오기")
+        self.btn_auto_inspect = QPushButton("Source 자동 검사")
         self.btn_load_schema.clicked.connect(self._load_schema_json)
+        self.btn_auto_inspect.clicked.connect(lambda: self._start_command("inspect"))
+        self.btn_auto_inspect.setToolTip("선택한 Source DB를 Rust Core schema.inspect로 검사합니다.")
+        load_layout.addWidget(self.btn_auto_inspect)
         load_layout.addWidget(self.btn_load_schema)
         load_layout.addStretch()
         schema_layout.addLayout(load_layout)
@@ -243,6 +250,13 @@ class CrossEngineMigrationDialog(QDialog):
             QMessageBox.warning(self, "작업 진행 중", "이미 실행 중인 작업이 있습니다.")
             return
 
+        if command not in ("inspect", "migrate") and self._schema_is_empty():
+            self._pending_after_inspect = command
+            self._workflow_active = workflow
+            self._append_log(f"[inspect] 스키마가 비어 있어 Source 자동 검사를 먼저 실행합니다.")
+            self._start_command("inspect", workflow=False)
+            return
+
         if command == "migrate":
             if not self._execution_unlocked:
                 QMessageBox.warning(
@@ -301,6 +315,8 @@ class CrossEngineMigrationDialog(QDialog):
         if schema is not None:
             self.txt_schema.setPlainText(json.dumps(schema, ensure_ascii=False, indent=2))
             self._set_execution_unlocked(False)
+            table_count = len(schema.get("tables", [])) if isinstance(schema.get("tables"), list) else 0
+            self.lbl_schema_status.setText(f"Rust Core 검사 완료: {table_count}개 테이블")
             self._append_log("스키마 검사 결과를 입력에 반영했습니다.")
         unsupported_objects = payload.get("unsupported_objects")
         if isinstance(unsupported_objects, list):
@@ -320,6 +336,11 @@ class CrossEngineMigrationDialog(QDialog):
             else:
                 self._append_log("차단 이슈가 있어 DB 변경 실행은 계속 잠겨 있습니다.")
         self._append_log(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        if payload.get("command") == "inspect" and payload.get("success") and self._pending_after_inspect:
+            next_command = self._pending_after_inspect
+            self._pending_after_inspect = None
+            QTimer.singleShot(0, lambda: self._start_command(next_command, workflow=self._workflow_active))
 
     def _append_readiness_summary(self, payload: Dict):
         directions = payload.get("directions")
@@ -429,6 +450,7 @@ class CrossEngineMigrationDialog(QDialog):
     def _set_running(self, running: bool):
         for button in (
             self.btn_full_run,
+            self.btn_auto_inspect,
             self.btn_inspect,
             self.btn_preflight,
             self.btn_readiness,
@@ -459,6 +481,14 @@ class CrossEngineMigrationDialog(QDialog):
     def _lock_execution_due_to_input_change(self):
         if self._execution_unlocked:
             self._set_execution_unlocked(False)
+
+    def _schema_is_empty(self) -> bool:
+        try:
+            schema = json.loads(self.txt_schema.toPlainText() or "{}")
+        except json.JSONDecodeError:
+            return False
+        tables = schema.get("tables") if isinstance(schema, dict) else None
+        return not isinstance(tables, list) or len(tables) == 0
 
     def _connect_endpoint_lock_signals(self, form: "EndpointForm"):
         form.combo_tunnel.currentIndexChanged.connect(self._lock_execution_due_to_input_change)

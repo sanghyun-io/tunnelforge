@@ -6,6 +6,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QGroupBox, QProgressBar, QMessageBox)
 from PyQt6.QtCore import Qt
 
+from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+
 
 class SQLExecutionDialog(QDialog):
     """SQL 파일 실행 다이얼로그"""
@@ -155,8 +157,6 @@ class SQLExecutionDialog(QDialog):
 
     def refresh_databases(self):
         """데이터베이스 목록 새로고침"""
-        from src.core.db_connector import MySQLConnector
-
         tid = self.config.get('id')
         db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
 
@@ -184,7 +184,15 @@ class SQLExecutionDialog(QDialog):
                 host = '127.0.0.1'
                 port = self.engine.get_temp_tunnel_port(temp_server)
 
-            connector = MySQLConnector(host, port, db_user, db_password)
+            db_engine = normalize_db_engine(self.config.get('db_engine'), self.config.get('remote_port'))
+            connector = create_rust_db_connector(
+                db_engine,
+                host,
+                port,
+                db_user,
+                db_password,
+                self.config.get('default_database') if db_engine == 'postgresql' else None,
+            )
             success, msg = connector.connect()
 
             if success:

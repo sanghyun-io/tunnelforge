@@ -488,6 +488,81 @@ class TestBackupScheduler:
         queries = self.scheduler._parse_sql_queries('SELECT 1;')
         assert queries == ['SELECT 1']
 
+    def test_sql_query_task_uses_engine_aware_rust_connector(self, monkeypatch):
+        """예약 SQL 실행은 터널의 db_engine을 Rust Core connector로 전달"""
+        created = {}
+
+        class FakeCursor:
+            description = [("value",)]
+            rowcount = 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def execute(self, query):
+                self.query = query
+
+            def fetchall(self):
+                return [{"value": 1}]
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+            def commit(self):
+                pass
+
+        class FakeConnector:
+            connection = FakeConnection()
+
+            def connect(self):
+                return True, "ok"
+
+            def disconnect(self):
+                pass
+
+        def fake_create(engine, host, port, user, password, database=None, schema=""):
+            created.update({
+                "engine": engine,
+                "host": host,
+                "port": port,
+                "user": user,
+                "database": database,
+                "schema": schema,
+            })
+            return FakeConnector()
+
+        self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 15432)
+        self.mock_engine.tunnel_configs = {
+            "tunnel-001": {
+                "db_engine": "postgresql",
+                "remote_port": 5432,
+                "db_username": "pg_user",
+                "db_password": "pg_pw",
+            }
+        }
+        monkeypatch.setattr("src.core.scheduler.create_rust_db_connector", fake_create)
+
+        schedule = self.ScheduleConfig(
+            id="sql-001",
+            name="SQL",
+            tunnel_id="tunnel-001",
+            schema="analytics",
+            task_type="sql_query",
+            sql_query="SELECT 1",
+            result_format="none",
+        )
+
+        success, _ = self.scheduler._execute_sql_query(schedule)
+
+        assert success is True
+        assert created["engine"] == "postgresql"
+        assert created["user"] == "pg_user"
+        assert created["schema"] == "analytics"
+
     def test_add_schedule_sets_next_run_for_enabled(self):
         """활성화된 스케줄 추가 시 next_run 계산"""
         schedule = self._make_schedule(enabled=True)
