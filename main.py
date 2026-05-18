@@ -86,16 +86,32 @@ def main():
 
     from src.core import ConfigManager, TunnelEngine
     from src.core.logger import get_logger
+    from src.core.single_instance import SingleInstanceGuard
     from src.ui.main_window import TunnelManagerUI
 
     # 루트 로거 초기화
     logger = get_logger('main')
 
     # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
-    ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('tunnelforge.1.0')
+    if sys.platform == 'win32':
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('tunnelforge.1.0')
 
     app = QApplication(sys.argv)
     app.setWindowIcon(QIcon('assets/icon.ico'))  # 또는 'assets/icon.png'
+
+    single_instance_guard = SingleInstanceGuard(parent=app)
+    if single_instance_guard.is_secondary:
+        if SingleInstanceGuard.notify_existing_instance():
+            logger.info("이미 실행 중인 TunnelForge 인스턴스에 창 활성화를 요청했습니다.")
+        else:
+            logger.warning("TunnelForge가 이미 실행 중이지만 창 활성화 요청을 보내지 못했습니다.")
+        return 0
+
+    pending_activation_requests = []
+    single_instance_guard.activation_requested.connect(
+        lambda: pending_activation_requests.append(True)
+    )
+    app.aboutToQuit.connect(single_instance_guard.close)
 
     # 애플리케이션가 닫혀도 마지막 창이 닫힐 때까지 종료되지 않도록 설정 (트레이 아이콘 때문)
     app.setQuitOnLastWindowClosed(False)
@@ -111,10 +127,13 @@ def main():
     # 3. UI 실행
     start_minimized = '--minimized' in sys.argv
     window = TunnelManagerUI(config_mgr, tunnel_engine)
+    single_instance_guard.activation_requested.connect(window.bring_to_front)
     if not start_minimized:
         window.show()
     else:
         logger.info("--minimized 모드: 시스템 트레이에서 시작")
+    if pending_activation_requests:
+        window.bring_to_front()
 
     # 4. 앱 루프 시작
     sys.exit(app.exec())

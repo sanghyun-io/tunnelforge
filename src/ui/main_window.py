@@ -232,13 +232,39 @@ class TunnelManagerUI(QMainWindow):
         self.tray_icon.activated.connect(self._on_tray_activated)
         self.tray_icon.show()
 
+    def bring_to_front(self):
+        """숨김/최소화 상태의 메인 창을 전면으로 복원합니다."""
+        if self.isMinimized():
+            self.showNormal()
+        else:
+            self.show()
+
+        self.setWindowState(
+            (self.windowState() & ~Qt.WindowState.WindowMinimized)
+            | Qt.WindowState.WindowActive
+        )
+        self.raise_()
+        self.activateWindow()
+        self._force_windows_foreground()
+        self.refresh_table()
+
+    def _force_windows_foreground(self):
+        if sys.platform != 'win32':
+            return
+
+        try:
+            import ctypes
+
+            hwnd = int(self.winId())
+            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            ctypes.windll.user32.SetForegroundWindow(hwnd)
+        except Exception as exc:
+            logger.debug(f"창 전면 이동 실패: {exc}")
+
     def _on_tray_activated(self, reason):
         """트레이 아이콘 클릭 시"""
         if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.show()
-            self.activateWindow()
-            # 숨겨진 상태에서 변경된 터널 상태를 UI에 반영
-            self.refresh_table()
+            self.bring_to_front()
 
     def _connect_tree_signals(self):
         """트리 위젯 시그널 연결"""
@@ -792,8 +818,11 @@ class TunnelManagerUI(QMainWindow):
         self.engine.stop_all()
         self.tray_icon.hide()
         # 모든 창 닫고 종료
-        import sys
-        sys.exit(0)
+        app = QApplication.instance()
+        if app:
+            app.quit()
+        else:
+            sys.exit(0)
 
     # =========================================================================
     # 스케줄 백업 관련 메서드
