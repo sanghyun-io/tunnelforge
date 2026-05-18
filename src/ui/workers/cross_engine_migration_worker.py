@@ -41,6 +41,7 @@ class CrossEngineMigrationWorker(QThread):
         self._popen_factory = popen_factory or subprocess.Popen
         self._process: Optional[subprocess.Popen] = None
         self._cancelled = False
+        self._last_checkpoint: Optional[Dict[str, Any]] = None
 
     def cancel(self):
         self._cancelled = True
@@ -85,10 +86,12 @@ class CrossEngineMigrationWorker(QThread):
                 elif event.event == "table_progress":
                     self.table_progress.emit(event.table or "", event.status or "")
                     if isinstance(event.payload.get("state"), dict):
+                        self._last_checkpoint = event.payload["state"]
                         self.checkpoint.emit(event.payload["state"])
                 elif event.event == "row_progress":
                     self.row_progress.emit(event.table or "", int(event.rows or 0), event.total)
                     if isinstance(event.payload.get("state"), dict):
+                        self._last_checkpoint = event.payload["state"]
                         self.checkpoint.emit(event.payload["state"])
                 elif event.event == "issue" and event.issue:
                     self.issue.emit(event.issue)
@@ -117,4 +120,6 @@ class CrossEngineMigrationWorker(QThread):
             if self._cancelled:
                 success = False
                 final_payload = {"cancelled": True}
+                if self._last_checkpoint:
+                    final_payload["state"] = self._last_checkpoint
             self.finished.emit(success, final_payload)

@@ -18,6 +18,7 @@ from typing import List, Dict, Any, Optional, Callable, Tuple
 
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
+from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 
 logger = get_logger(__name__)
 
@@ -637,8 +638,6 @@ class BackupScheduler:
         Returns:
             (success, message)
         """
-        from src.core.db_connector import MySQLConnector
-
         logger.info(f"SQL 쿼리 실행 시작: {schedule.name}")
 
         try:
@@ -651,6 +650,8 @@ class BackupScheduler:
                     self._log_backup(schedule, False, error_msg)
                     return False, error_msg
 
+            config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(schedule.tunnel_id, {})
+
             # 연결 정보 가져오기
             conn_info = self.tunnel_engine.get_connection_info(schedule.tunnel_id)
             if not conn_info:
@@ -659,13 +660,28 @@ class BackupScheduler:
                 self._log_backup(schedule, False, error_msg)
                 return False, error_msg
 
+            if isinstance(conn_info, dict):
+                host = conn_info.get('host', DEFAULT_LOCAL_HOST)
+                port = int(conn_info.get('local_port') or conn_info.get('port') or DEFAULT_MYSQL_PORT)
+                user = conn_info.get('db_user') or conn_info.get('db_username') or config.get('db_username') or 'root'
+                password = conn_info.get('db_password') or config.get('db_password') or ''
+            else:
+                host, port = conn_info
+                port = int(port or DEFAULT_MYSQL_PORT)
+                user = config.get('db_user') or config.get('db_username') or 'root'
+                password = config.get('db_password') or ''
+
+            engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port') or port)
+
             # DB 연결
-            connector = MySQLConnector(
-                host=conn_info.get('host', DEFAULT_LOCAL_HOST),
-                port=conn_info.get('local_port', DEFAULT_MYSQL_PORT),
-                user=conn_info.get('db_user', 'root'),
-                password=conn_info.get('db_password', ''),
-                database=schedule.schema if schedule.schema else None
+            connector = create_rust_db_connector(
+                engine,
+                host or DEFAULT_LOCAL_HOST,
+                port,
+                user,
+                password,
+                schedule.schema if schedule.schema else None,
+                schema=schedule.schema if engine == 'postgresql' else "",
             )
 
             success, msg = connector.connect()
@@ -788,13 +804,18 @@ class BackupScheduler:
 
             with connector.connection.cursor() as cursor:
                 # 타임아웃 설정 (MySQL 8.0+)
+                engine = getattr(getattr(connector, "connection", None), "endpoint", None)
+                engine_name = getattr(engine, "engine", "mysql")
                 if schedule.query_timeout > 0:
                     try:
-                        cursor.execute(
-                            f"SET SESSION MAX_EXECUTION_TIME = {schedule.query_timeout * 1000}"
-                        )
+                        if engine_name == "postgresql":
+                            cursor.execute(f"SET statement_timeout = {schedule.query_timeout * 1000}")
+                        else:
+                            cursor.execute(
+                                f"SET SESSION MAX_EXECUTION_TIME = {schedule.query_timeout * 1000}"
+                            )
                     except Exception:
-                        # MAX_EXECUTION_TIME 미지원 시 무시
+                        # 엔진별 statement timeout 미지원 시 무시
                         pass
 
                 # 쿼리 실행

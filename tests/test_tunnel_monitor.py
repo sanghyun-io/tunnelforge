@@ -354,6 +354,39 @@ class TestTunnelMonitor:
         result = self.monitor._measure_latency('tunnel1')
         assert result == -1
 
+    def test_create_health_connection_uses_configured_db_engine(self, monkeypatch):
+        """Health check는 MySQL 고정 대신 Rust Core engine을 사용"""
+        created = {}
+
+        class FakeConnection:
+            def autocommit(self, enabled):
+                self.autocommit_enabled = enabled
+
+            def close(self):
+                pass
+
+        class FakeConnector:
+            def __init__(self):
+                self.connection = FakeConnection()
+
+            def connect(self):
+                return True, "ok"
+
+        def fake_create(engine, host, port, user, password, database=None, schema=""):
+            created["engine"] = engine
+            created["database"] = database
+            return FakeConnector()
+
+        monkeypatch.setattr("src.core.tunnel_monitor.create_rust_db_connector", fake_create)
+
+        conn = self.monitor._create_health_connection(
+            "pg-tunnel", "postgresql", "127.0.0.1", 5432, "user", "pw", "analytics"
+        )
+
+        assert conn is not None
+        assert created["engine"] == "postgresql"
+        assert created["database"] == "analytics"
+
     def test_attempt_reconnect_exceeds_max(self):
         """최대 재연결 시도 초과 시 ERROR 상태로 전환"""
         from src.core.tunnel_monitor import TunnelStatus, TunnelState

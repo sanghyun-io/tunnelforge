@@ -1,7 +1,14 @@
 import io
 import json
 
-from src.core.db_core_service import DbCoreFacade, DbCoreServiceClient, DbEndpoint, RustDbConnector
+from src.core.db_core_service import (
+    DbCoreFacade,
+    DbCoreServiceClient,
+    DbEndpoint,
+    RustDbConnector,
+    create_rust_db_connector,
+    normalize_db_engine,
+)
 
 
 class FakeProcess:
@@ -94,3 +101,64 @@ def test_rust_connector_masks_success_message_shape():
     assert success is True
     assert message == "연결 성공"
     assert fake.endpoint.engine == "postgresql"
+
+
+def test_execute_on_connection_sends_params_to_core_protocol():
+    process = FakeProcess([
+        '{"event":"result","command":"query.execute","success":true,"rows":[{"id":1}]}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+
+    rows = facade.execute_on_connection("conn-1", "SELECT * FROM users WHERE id = %s", params=[1])
+
+    sent = json.loads(process.stdin.getvalue().strip())
+    assert rows == [{"id": 1}]
+    assert sent["payload"]["connection_id"] == "conn-1"
+    assert sent["payload"]["params"] == [1]
+
+
+def test_execute_on_connection_streaming_collects_row_batches():
+    process = FakeProcess([
+        '{"event":"row_batch","rows":[{"id":1}],"total":2}',
+        '{"event":"row_batch","rows":[{"id":2}],"total":2}',
+        '{"event":"result","command":"query.execute","success":true,"rows_streamed":2}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    batches = []
+
+    result = facade.execute_on_connection_streaming(
+        "conn-1",
+        "SELECT * FROM users",
+        row_batch_size=1,
+        on_batch=batches.append,
+    )
+
+    sent = json.loads(process.stdin.getvalue().strip())
+    assert sent["payload"]["stream_rows"] is True
+    assert sent["payload"]["row_batch_size"] == 1
+    assert batches == [[{"id": 1}], [{"id": 2}]]
+    assert result["rows_streamed"] == 2
+
+
+def test_create_rust_db_connector_resolves_postgresql_engine_from_config():
+    connector = create_rust_db_connector(
+        "postgres",
+        "db.local",
+        5432,
+        "user",
+        "pw",
+        schema="analytics",
+    )
+
+    assert normalize_db_engine("pg") == "postgresql"
+    assert connector.endpoint.engine == "postgresql"
+    assert connector.endpoint.database == "postgres"
+    assert connector.endpoint.schema == "analytics"

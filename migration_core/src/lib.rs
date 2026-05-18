@@ -657,15 +657,10 @@ impl CoreService {
                     "message": format!("unknown connection_id: {connection_id}")
                 })];
             };
-            return match execute_query_adapter(adapter, sql) {
-                Ok(rows) => vec![json!({
-                    "event": "result",
-                    "request_id": request.request_id,
-                    "command": "query.execute",
-                    "success": true,
-                    "rows": rows,
-                    "rows_affected": 0
-                })],
+            let params = query_params(&request.payload);
+            let bound_sql = bind_query_params(sql, &params);
+            return match execute_query_adapter(adapter, &bound_sql) {
+                Ok(rows) => query_result_events(request, rows),
                 Err(err) => vec![json!({
                     "event": "error",
                     "request_id": request.request_id,
@@ -1036,15 +1031,10 @@ fn query_execute(request: &Request) -> Vec<Value> {
         }
     };
 
-    match execute_query_live(&endpoint, sql) {
-        Ok(rows) => vec![json!({
-            "event": "result",
-            "request_id": request.request_id,
-            "command": "query.execute",
-            "success": true,
-            "rows": rows,
-            "rows_affected": 0
-        })],
+    let params = query_params(&request.payload);
+    let bound_sql = bind_query_params(sql, &params);
+    match execute_query_live(&endpoint, &bound_sql) {
+        Ok(rows) => query_result_events(request, rows),
         Err(err) => vec![json!({
             "event": "error",
             "request_id": request.request_id,
@@ -1053,12 +1043,61 @@ fn query_execute(request: &Request) -> Vec<Value> {
     }
 }
 
+fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
+    let stream_rows = request
+        .payload
+        .get("stream_rows")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !stream_rows {
+        return vec![json!({
+            "event": "result",
+            "request_id": request.request_id,
+            "command": "query.execute",
+            "success": true,
+            "rows": rows,
+            "rows_affected": 0
+        })];
+    }
+
+    let batch_size = request
+        .payload
+        .get("row_batch_size")
+        .and_then(Value::as_u64)
+        .unwrap_or(500)
+        .max(1) as usize;
+    let total = rows.len();
+    let mut events = Vec::new();
+    for (index, chunk) in rows.chunks(batch_size).enumerate() {
+        events.push(json!({
+            "event": "row_batch",
+            "request_id": request.request_id,
+            "command": "query.execute",
+            "batch_index": index,
+            "rows": chunk,
+            "total": total
+        }));
+    }
+    events.push(json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": "query.execute",
+        "success": true,
+        "rows": [],
+        "rows_streamed": total,
+        "rows_affected": 0
+    }));
+    events
+}
+
 fn query_cancel(request: &Request) -> Vec<Value> {
     vec![json!({
         "event": "result",
         "request_id": request.request_id,
         "command": "query.cancel",
         "success": true,
+        "cancelled": false,
+        "message": "No asynchronous query is registered for this JSONL worker",
         "job_id": request.payload.get("job_id").cloned().unwrap_or(Value::Null)
     })]
 }
@@ -1069,6 +1108,8 @@ fn job_cancel(request: &Request) -> Vec<Value> {
         "request_id": request.request_id,
         "command": "job.cancel",
         "success": true,
+        "cancelled": false,
+        "message": "UI workers cancel long-running Rust jobs by terminating the isolated core process",
         "job_id": request.payload.get("job_id").cloned().unwrap_or(Value::Null)
     })]
 }
@@ -1372,6 +1413,43 @@ fn request_endpoint(request: &Request) -> Result<Endpoint, String> {
         }
     }
     endpoint_from_value(&request.payload)
+}
+
+fn query_params(payload: &Value) -> Vec<Value> {
+    payload
+        .get("params")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn bind_query_params(sql: &str, params: &[Value]) -> String {
+    if params.is_empty() {
+        return sql.to_string();
+    }
+    let mut rendered = sql.to_string();
+    for (index, value) in params.iter().enumerate() {
+        let literal = sql_json_literal(value);
+        rendered = rendered.replacen("%s", &literal, 1);
+        rendered = rendered.replace(&format!("${}", index + 1), &literal);
+    }
+    rendered
+}
+
+fn sql_json_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(item) => {
+            if *item {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Value::Number(item) => item.to_string(),
+        Value::String(item) => format!("'{}'", item.replace('\\', "\\\\").replace('\'', "''")),
+        other => format!("'{}'", other.to_string().replace('\\', "\\\\").replace('\'', "''")),
+    }
 }
 
 fn connection_id(endpoint: &Endpoint) -> String {
@@ -2353,6 +2431,7 @@ fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
                     "request_id": request.request_id,
                     "command": "migrate",
                     "success": result.success,
+                    "cancelled": !result.success && options.cancel_after_chunks.is_some() && result.issues.is_empty(),
                     "rows_copied": result.rows_copied,
                     "chunks_copied": result.chunks_copied,
                     "state": result.state,
@@ -2410,6 +2489,7 @@ fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "request_id": request.request_id,
         "command": "migrate",
         "success": result.success,
+        "cancelled": !result.success && options.cancel_after_chunks.is_some() && result.issues.is_empty(),
         "rows_copied": result.rows_copied,
         "chunks_copied": result.chunks_copied,
         "state": result.state,
@@ -4783,6 +4863,34 @@ mod tests {
 
         assert_eq!(result["command"], "query.execute");
         assert_eq!(result["rows"][0]["name"], "alpha");
+    }
+
+    #[test]
+    fn query_param_binding_is_owned_by_core_protocol() {
+        let sql = bind_query_params(
+            "SELECT * FROM users WHERE id = %s AND name = $2",
+            &[json!(7), json!("O'Reilly")],
+        );
+
+        assert_eq!(sql, "SELECT * FROM users WHERE id = 7 AND name = 'O''Reilly'");
+    }
+
+    #[test]
+    fn query_result_streams_row_batches_when_requested() {
+        let events = query_result_events(
+            &Request {
+                command: "query.execute".to_string(),
+                request_id: Some("query-1".to_string()),
+                payload: json!({"stream_rows": true, "row_batch_size": 1}),
+            },
+            vec![json!({"id": 1}), json!({"id": 2})],
+        );
+
+        assert_eq!(events[0]["event"], "row_batch");
+        assert_eq!(events[0]["rows"][0]["id"], 1);
+        assert_eq!(events[1]["event"], "row_batch");
+        assert_eq!(events[2]["event"], "result");
+        assert_eq!(events[2]["rows_streamed"], 2);
     }
 
     #[test]

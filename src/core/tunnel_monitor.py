@@ -1,7 +1,7 @@
 """
 터널 상태 모니터링
 - 연결 상태 실시간 감시
-- Latency 측정 (MySQL ping 사용)
+- Latency 측정 (Rust DB Core health connection 사용)
 - 자동 재연결
 - 이벤트 히스토리
 """
@@ -12,7 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
 from enum import Enum
 
-from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 
@@ -101,7 +101,7 @@ class TunnelMonitor:
         self._stop_event = threading.Event()
         self._lock = threading.RLock()  # RLock: 재진입 가능 (on_tunnel_connected 등 내부 중첩 호출 대응)
 
-        # Health check용 MySQL 연결 캐시 (터널별 1개씩 유지)
+        # Health check용 Rust DB Core 연결 캐시 (터널별 1개씩 유지)
         self._health_connections: Dict[str, Any] = {}
 
         # 설정에서 자동 재연결 설정 로드
@@ -313,11 +313,9 @@ class TunnelMonitor:
                         self._notify_callbacks(tunnel_id, status)
 
     def _measure_latency(self, tunnel_id: str) -> float:
-        """Latency 측정 (MySQL ping 사용)
+        """Latency 측정 (Rust DB Core 연결 사용)
 
-        MySQL ping을 사용하여 실제 DB 연결 응답 시간을 측정합니다.
-        TCP 소켓만 연결하면 MySQL handshake_error가 발생하므로,
-        정상적인 MySQL 프로토콜을 사용합니다.
+        MySQL/PostgreSQL 모두 실제 DB 프로토콜 연결을 통해 응답 시간을 측정합니다.
 
         Args:
             tunnel_id: 터널 ID
@@ -333,7 +331,8 @@ class TunnelMonitor:
             # DB 인증 정보 확인
             db_username = config.get('db_username', '')
             db_password = config.get('db_password', '')
-            db_name = config.get('db_name', '')
+            db_name = config.get('db_name') or config.get('default_database') or config.get('default_schema') or ''
+            db_engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port'))
 
             # 인증 정보가 없으면 측정 불가
             if not db_username:
@@ -359,19 +358,19 @@ class TunnelMonitor:
             # 연결이 없거나 끊어진 경우 재연결
             if conn is None:
                 conn = self._create_health_connection(
-                    tunnel_id, host, port, db_username, db_password, db_name
+                    tunnel_id, db_engine, host, port, db_username, db_password, db_name
                 )
                 if conn is None:
                     return -1
 
-            # MySQL ping으로 latency 측정
+            # Rust Core connection ping으로 latency 측정
             start = time.time()
             try:
                 conn.ping(reconnect=False)
                 latency = (time.time() - start) * 1000
                 return latency
             except Exception as e:
-                logger.debug(f"MySQL ping 실패 ({tunnel_id}): {e}")
+                logger.debug(f"DB ping 실패 ({tunnel_id}): {e}")
                 # 연결 끊김 - 캐시에서 제거
                 self._cleanup_health_connection(tunnel_id)
                 return -1
@@ -381,10 +380,10 @@ class TunnelMonitor:
             return -1
 
     def _create_health_connection(
-        self, tunnel_id: str, host: str, port: int,
+        self, tunnel_id: str, engine: str, host: str, port: int,
         username: str, password: str, database: str
     ) -> Optional[Any]:
-        """Health check용 MySQL 연결 생성
+        """Health check용 DB 연결 생성
 
         Args:
             tunnel_id: 터널 ID
@@ -398,7 +397,14 @@ class TunnelMonitor:
             DB connection 또는 None
         """
         try:
-            connector = MySQLConnector(host, port, username, password, database if database else None)
+            connector = create_rust_db_connector(
+                engine,
+                host,
+                port,
+                username,
+                password,
+                database if database else None,
+            )
             success, message = connector.connect()
             if not success or connector.connection is None:
                 logger.debug(f"Health check 연결 생성 실패 ({tunnel_id}): {message}")
