@@ -40,6 +40,7 @@ Thumbs.db
 # Project specific
 *.log
 config.json
+migration_core/target/
 *.exe
 *.spec
 !tunnel-manager.spec  # PyInstaller 빌드 설정 파일은 커밋
