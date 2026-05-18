@@ -1,5 +1,6 @@
 """Client facade for the Rust TunnelForge DB core service."""
 import json
+import os
 import subprocess
 import threading
 import uuid
@@ -73,15 +74,24 @@ class DbCoreServiceClient:
     def start(self) -> None:
         if self._process and self._process.poll() is None:
             return
-        self._process = self._popen_factory(
-            [self.executable],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-        )
+        try:
+            self._process = self._popen_factory(
+                [self.executable],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            )
+        except FileNotFoundError as exc:
+            raise DbCoreServiceError(
+                "Rust DB Core 실행 파일을 찾을 수 없습니다: "
+                f"{self.executable}\n"
+                "소스 실행이면 `cargo build --manifest-path migration_core\\Cargo.toml --release`를 먼저 실행하고, "
+                "설치본이면 배포 패키지에 tunnelforge-core.exe가 포함되어 있는지 확인하세요."
+            ) from exc
 
     def request(
         self,
