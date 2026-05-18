@@ -28,7 +28,8 @@ def get_resource_path(relative_path):
 
 from src.ui.dialogs.tunnel_config import TunnelConfigDialog
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
-from src.ui.dialogs.db_dialogs import MySQLShellWizard
+from src.ui.dialogs.db_dialogs import RustDumpWizard
+from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationWizard
 from src.ui.dialogs.migration_dialogs import MigrationWizard
 from src.ui.dialogs.test_dialogs import SQLExecutionDialog
 from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
@@ -154,6 +155,11 @@ class TunnelManagerUI(QMainWindow):
         btn_migration.setStyleSheet(ButtonStyles.SECONDARY)
         btn_migration.clicked.connect(self.open_migration_analyzer)
 
+        # [DB 전환] 버튼 - Secondary 스타일
+        btn_db_transition = QPushButton("DB 전환")
+        btn_db_transition.setStyleSheet(ButtonStyles.SECONDARY)
+        btn_db_transition.clicked.connect(self.open_cross_engine_migration)
+
         # [스케줄] 버튼 - Secondary 스타일
         btn_schedule = QPushButton("📅 스케줄")
         btn_schedule.setStyleSheet(ButtonStyles.SECONDARY)
@@ -170,6 +176,7 @@ class TunnelManagerUI(QMainWindow):
         header_layout.addWidget(btn_add_tunnel)
         header_layout.addWidget(btn_schema_diff)
         header_layout.addWidget(btn_migration)
+        header_layout.addWidget(btn_db_transition)
         header_layout.addWidget(btn_schedule)
         header_layout.addWidget(btn_settings)
         layout.addLayout(header_layout)
@@ -439,22 +446,30 @@ class TunnelManagerUI(QMainWindow):
             )
             return
 
-        host = tunnel.get('remote_host', '127.0.0.1')
+        host = tunnel.get('remote_host') or '127.0.0.1'
         port = tunnel.get('remote_port', 3306)
 
         self.statusBar().showMessage(f"연결 테스트 중: {tunnel_name}...")
         QApplication.processEvents()
 
         try:
-            from src.core.db_connector import MySQLConnector
-            connector = MySQLConnector(host, port, user, password)
+            engine = tunnel.get('db_engine') or 'mysql'
+            if engine not in ('mysql', 'postgresql'):
+                QMessageBox.warning(
+                    self, "연결 테스트",
+                    f"❌ '{tunnel_name}' DB Engine이 설정되어 있지 않습니다.\n\n연결 설정에서 MySQL 또는 PostgreSQL을 먼저 선택해주세요."
+                )
+                self.statusBar().showMessage(f"연결 테스트 중단: {tunnel_name}")
+                return
+            database = tunnel.get('default_database') if engine == 'postgresql' else tunnel.get('default_schema')
+            connector = self._create_db_connector(engine, host, int(port), user, password, database)
             success, msg = connector.connect()
             connector.disconnect()
 
             if success:
                 QMessageBox.information(
                     self, "연결 테스트",
-                    f"✅ '{tunnel_name}' DB 연결 성공!\n\n{host}:{port}"
+                    f"✅ '{tunnel_name}' DB 연결 성공!\n\n{engine} {host}:{port}"
                 )
                 self.statusBar().showMessage(f"연결 성공: {tunnel_name}")
             else:
@@ -469,6 +484,11 @@ class TunnelManagerUI(QMainWindow):
                 f"❌ '{tunnel_name}' 연결 테스트 중 오류 발생\n\n{str(e)}"
             )
             self.statusBar().showMessage(f"연결 오류: {tunnel_name}")
+
+    def _create_db_connector(self, engine, host, port, user, password, database=None):
+        from src.core.db_core_service import RustDbConnector
+
+        return RustDbConnector(engine, host, port, user, password, database)
 
     def _connect_all_in_group(self, group_id: str):
         """그룹 내 모든 터널 연결"""
@@ -654,18 +674,18 @@ class TunnelManagerUI(QMainWindow):
         dialog = SettingsDialog(self, config_manager=self.config_mgr)
         dialog.exec()
 
-    def open_mysqlsh_export(self):
-        """MySQL Shell Export 마법사 열기 (병렬 처리)"""
-        wizard = MySQLShellWizard(
+    def open_rust_dump_export(self):
+        """Rust DB Core Export 마법사 열기 (병렬 처리)"""
+        wizard = RustDumpWizard(
             parent=self,
             tunnel_engine=self.engine,
             config_manager=self.config_mgr
         )
         wizard.start_export()
 
-    def open_mysqlsh_import(self):
-        """MySQL Shell Import 마법사 열기"""
-        wizard = MySQLShellWizard(
+    def open_rust_dump_import(self):
+        """Rust DB Core Import 마법사 열기"""
+        wizard = RustDumpWizard(
             parent=self,
             tunnel_engine=self.engine,
             config_manager=self.config_mgr
@@ -675,6 +695,14 @@ class TunnelManagerUI(QMainWindow):
     def open_migration_analyzer(self):
         """마이그레이션 분석기 열기"""
         MigrationWizard.start(
+            parent=self,
+            tunnel_engine=self.engine,
+            config_manager=self.config_mgr
+        )
+
+    def open_cross_engine_migration(self):
+        """DB 전환 마법사 열기"""
+        CrossEngineMigrationWizard.start(
             parent=self,
             tunnel_engine=self.engine,
             config_manager=self.config_mgr
@@ -1197,7 +1225,7 @@ class TunnelManagerUI(QMainWindow):
                 return
             self.refresh_table()
 
-        wizard = MySQLShellWizard(
+        wizard = RustDumpWizard(
             parent=self,
             tunnel_engine=self.engine,
             config_manager=self.config_mgr,
@@ -1225,7 +1253,7 @@ class TunnelManagerUI(QMainWindow):
                 return
             self.refresh_table()
 
-        wizard = MySQLShellWizard(
+        wizard = RustDumpWizard(
             parent=self,
             tunnel_engine=self.engine,
             config_manager=self.config_mgr,
@@ -1253,7 +1281,7 @@ class TunnelManagerUI(QMainWindow):
                 return
             self.refresh_table()
 
-        wizard = MySQLShellWizard(
+        wizard = RustDumpWizard(
             parent=self,
             tunnel_engine=self.engine,
             config_manager=self.config_mgr,

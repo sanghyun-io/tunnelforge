@@ -12,8 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Callable, Any
 from enum import Enum
 
-import pymysql
-
+from src.core.db_connector import MySQLConnector
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 
@@ -396,20 +395,16 @@ class TunnelMonitor:
             database: DB 이름
 
         Returns:
-            pymysql Connection 또는 None
+            DB connection 또는 None
         """
         try:
-            conn = pymysql.connect(
-                host=host,
-                port=port,
-                user=username,
-                password=password,
-                database=database if database else None,
-                connect_timeout=5,
-                read_timeout=5,
-                write_timeout=5,
-                autocommit=True
-            )
+            connector = MySQLConnector(host, port, username, password, database if database else None)
+            success, message = connector.connect()
+            if not success or connector.connection is None:
+                logger.debug(f"Health check 연결 생성 실패 ({tunnel_id}): {message}")
+                return None
+            connector.connection.autocommit(True)
+            conn = connector.connection
             self._health_connections[tunnel_id] = conn
             logger.debug(f"Health check 연결 생성: {tunnel_id}")
             return conn

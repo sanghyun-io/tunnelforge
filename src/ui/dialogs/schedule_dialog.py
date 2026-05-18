@@ -167,7 +167,7 @@ class ScheduleEditDialog(QDialog):
         type_layout = QHBoxLayout(type_group)
 
         self.task_type_group = QButtonGroup(self)
-        self.backup_radio = QRadioButton("🗄️ 백업 (MySQL Shell Export)")
+        self.backup_radio = QRadioButton("🗄️ 백업 (Rust DB Core Export)")
         self.sql_radio = QRadioButton("📝 SQL 쿼리 실행")
         self.backup_radio.setChecked(True)
 
@@ -836,7 +836,7 @@ class ScheduleListDialog(QDialog):
                 type_item.setToolTip("SQL 쿼리 실행")
             else:
                 type_item = QTableWidgetItem("🗄️ 백업")
-                type_item.setToolTip("MySQL Shell Export")
+                type_item.setToolTip("Rust DB Core Export")
             self.table.setItem(row, 0, type_item)
 
             # 이름

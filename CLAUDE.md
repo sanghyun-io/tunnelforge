@@ -7,7 +7,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-TunnelForge - Python PyQt6 GUI application for managing SSH tunnels and MySQL database connections. Enables secure remote database access through SSH bastion hosts with database export functionality.
+TunnelForge - Python PyQt6 GUI application for managing SSH tunnels and MySQL/PostgreSQL database operations. UI orchestration stays in Python/PyQt, while DB auth, schema inspection, SQL execution, dump/import, and cross-engine migration run through the Rust `tunnelforge-core` JSONL service.
+
+## Current Project Memory
+
+- Rust Core migration is the active architecture baseline. Treat `tunnelforge-core` as the DB operation owner and keep Python/PyQt focused on UI, orchestration, signals, and dialogs.
+- Do not reintroduce direct Python DB driver hot paths, external dump tool paths, or the retired helper alias in `src/`, tests, packaging, or user-facing docs.
+- Export/import uses `src/exporters/rust_dump_exporter.py` and the Rust JSONL commands `dump.run` / `dump.import`.
+- Cross-engine migration uses the Rust core service for inspect, preflight, plan, migrate, verify, and resume.
+- Packaging should include the single Rust DB core binary `tunnelforge-core(.exe)`. The previous helper alias has been removed from package/test expectations.
+- Regression checks used for this transition: no legacy DB driver/tool/helper names in active code/docs, Rust tests/build pass, and full Python `pytest` passes.
 
 ## Commands
 
@@ -58,9 +67,10 @@ main.py (Entry Point)
 │   ├── TunnelEngine (tunnel_engine.py)
 │   │   ├── SSHTunnelForwarder for SSH tunnel mode
 │   │   └── Direct connection mode support
-│   └── MySQLConnector (db_connector.py) - PyMySQL wrapper
+│   ├── DbCoreFacade (db_core_service.py) - Rust DB core JSONL facade
+│   └── DB connector shims - compatibility wrappers over Rust core
 ├── src/exporters/
-│   └── MySQLShellExporter (mysqlsh_exporter.py) - Parallel export via mysqlsh
+│   └── RustDumpExporter (rust_dump_exporter.py) - dump/import via Rust core
 └── src/ui/
     ├── TunnelManagerUI (main_window.py)
     ├── dialogs/
@@ -68,23 +78,25 @@ main.py (Entry Point)
     │   ├── settings.py - Settings, close confirm dialogs
     │   └── db_dialogs.py - DB connection, export/import wizards
     └── workers/
-        └── mysql_worker.py - QThread worker for mysqlsh operations
+        └── rust_dump_worker.py - QThread worker for Rust dump/import operations
 ```
 
 ### Key Components
 
 - **TunnelEngine** (`src/core/tunnel_engine.py`): Manages SSH tunnel lifecycle. Supports RSA, Ed25519, ECDSA keys via Paramiko. Two modes: SSH tunnel through bastion or direct connection.
 
-- **MySQLShellExporter** (`src/exporters/mysqlsh_exporter.py`): Parallel export/import using MySQL Shell CLI. `ForeignKeyResolver` auto-includes parent tables for partial exports.
+- **DbCoreFacade** (`src/core/db_core_service.py`): Long-lived JSONL client for `tunnelforge-core`. DB credentials, schema calls, SQL execution, dump/import, and migration commands go through this facade.
 
-- **UI Threading**: Long operations (exports) run in `QThread` (`src/ui/workers/mysql_worker.py`) to keep UI responsive. Worker classes emit signals for progress updates.
+- **RustDumpExporter** (`src/exporters/rust_dump_exporter.py`): Export/import wrapper over Rust `dump.run` and `dump.import`. `ForeignKeyResolver` auto-includes parent tables for partial exports.
+
+- **UI Threading**: Long operations run in `QThread` workers such as `src/ui/workers/rust_dump_worker.py` and `src/ui/workers/cross_engine_migration_worker.py` to keep UI responsive.
 
 ### Connection Flow
 
 1. User configures tunnel (bastion host, SSH key, target DB)
 2. TunnelEngine establishes SSHTunnelForwarder
-3. MySQLConnector connects via tunnel's local port
-4. Export wizards use mysqlsh for parallel processing
+3. PyQt opens a Rust DB core facade session against the tunnel's local port
+4. Export/import, schema, SQL, and migration flows call `tunnelforge-core`
 
 ## Project Structure
 
@@ -97,10 +109,11 @@ tunnel-manager/
 │   │   ├── __init__.py
 │   │   ├── config_manager.py
 │   │   ├── tunnel_engine.py
+│   │   ├── db_core_service.py
 │   │   └── db_connector.py
 │   ├── exporters/              # DB Export/Import
 │   │   ├── __init__.py
-│   │   └── mysqlsh_exporter.py
+│   │   └── rust_dump_exporter.py
 │   └── ui/                     # PyQt6 UI
 │       ├── __init__.py
 │       ├── main_window.py
@@ -111,7 +124,7 @@ tunnel-manager/
 │       │   └── db_dialogs.py
 │       └── workers/
 │           ├── __init__.py
-│           └── mysql_worker.py
+│           └── rust_dump_worker.py
 ├── bootstrapper/               # Online installer (bootstrapper)
 │   ├── __init__.py
 │   ├── version_info.py         # Bootstrapper version & GitHub info

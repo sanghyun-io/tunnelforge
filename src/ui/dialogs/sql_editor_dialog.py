@@ -707,7 +707,6 @@ class SQLQueryWorker(QThread):
 
     def run(self):
         from src.core.db_connector import MySQLConnector
-        import pymysql
 
         connector = None
         try:
@@ -762,12 +761,6 @@ class SQLQueryWorker(QThread):
                             self.query_result.emit(idx, [], [], "", affected, execution_time)
                             success_count += 1
 
-                except pymysql.Error as e:
-                    execution_time = time.time() - start_time
-                    error_msg = f"MySQL 오류 ({e.args[0]}): {e.args[1] if len(e.args) > 1 else str(e)}"
-                    self.query_result.emit(idx, [], [], error_msg, 0, execution_time)
-                    error_count += 1
-
                 except Exception as e:
                     execution_time = time.time() - start_time
                     self.query_result.emit(idx, [], [], str(e), 0, execution_time)
@@ -816,7 +809,6 @@ class SQLTransactionWorker(QThread):
 
     def run(self):
         from src.core.db_connector import MySQLConnector
-        import pymysql
 
         try:
             # autocommit=False로 연결
@@ -871,16 +863,6 @@ class SQLTransactionWorker(QThread):
                             # 미리보기 정보 전송
                             preview_info = query[:100] + ("..." if len(query) > 100 else "")
                             self.preview_result.emit(idx, query_type, affected, execution_time, preview_info)
-
-                except pymysql.Error as e:
-                    execution_time = time.time() - start_time
-                    error_msg = f"MySQL 오류 ({e.args[0]}): {e.args[1] if len(e.args) > 1 else str(e)}"
-                    self.error_result.emit(idx, error_msg, execution_time)
-                    # 오류 발생 시 롤백
-                    self.connector.connection.rollback()
-                    self.connector.disconnect()
-                    self.finished.emit(False, "❌ 오류 발생, 트랜잭션 롤백됨")
-                    return
 
                 except Exception as e:
                     execution_time = time.time() - start_time
@@ -1506,6 +1488,7 @@ class SQLEditorDialog(QDialog):
 
         # 지속 연결 (트랜잭션 세션)
         self.db_connection = None
+        self._db_connector = None
         self.pending_queries = []  # 미커밋 쿼리 목록: [(query, type, affected, timestamp, history_id), ...]
 
         # 히스토리 매니저
@@ -2154,18 +2137,15 @@ class SQLEditorDialog(QDialog):
 
             database = self.db_combo.currentText().strip() or None
 
-            # PyMySQL 직접 연결 (autocommit=False)
-            import pymysql
-            self.db_connection = pymysql.connect(
-                host=host,
-                port=port,
-                user=db_user,
-                password=db_password,
-                database=database,
-                charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor,
-                autocommit=False  # 수동 트랜잭션 관리
-            )
+            from src.core.db_connector import MySQLConnector
+
+            connector = MySQLConnector(host, port, db_user, db_password, database)
+            success, msg = connector.connect()
+            if not success:
+                return False, msg
+            self.db_connection = connector.connection
+            self._db_connector = connector
+            self.db_connection.autocommit(False)
             # READ COMMITTED: 각 SELECT가 최신 커밋 데이터를 조회 (외부 변경 즉시 반영)
             self.db_connection.cursor().execute(
                 "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
@@ -2313,7 +2293,6 @@ class SQLEditorDialog(QDialog):
         self.message_text.append(f"{'─'*40}")
 
         # 쿼리 실행
-        import pymysql
         from datetime import datetime
 
         total = len(queries)
@@ -2376,15 +2355,6 @@ class SQLEditorDialog(QDialog):
 
                         self.message_text.append(f"📝 [{query_type}] {affected}행 영향 ({exec_time:.3f}초) - 미커밋")
                         self.message_text.append(f"   └ {preview}")
-
-            except pymysql.Error as e:
-                exec_time = time.time() - start_time
-                error_msg = f"MySQL 오류 ({e.args[0]}): {e.args[1] if len(e.args) > 1 else str(e)}"
-                self.message_text.append(f"❌ {error_msg}")
-                self.message_text.append(f"   └ {preview}")
-
-                # 히스토리 저장 (실패)
-                self.history_manager.add_query(query, False, 0, exec_time, error=error_msg)
 
             except Exception as e:
                 exec_time = time.time() - start_time
@@ -2911,10 +2881,14 @@ class SQLEditorDialog(QDialog):
                         self.history_manager.update_status_batch(history_ids, 'rolled_back')
 
                     self.message_text.append(f"↩️ 연결 종료 - {pending_count}건 자동 롤백됨")
-                self.db_connection.close()
+                if self._db_connector:
+                    self._db_connector.disconnect()
+                else:
+                    self.db_connection.close()
             except Exception:
                 pass
             self.db_connection = None
+            self._db_connector = None
             self.pending_queries.clear()
 
     def _set_executing_state(self, is_executing: bool):

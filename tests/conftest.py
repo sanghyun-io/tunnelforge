@@ -104,18 +104,6 @@ def mock_paramiko_key():
         yield mock
 
 
-@pytest.fixture
-def mock_subprocess_mysqlsh():
-    """mysqlsh subprocess Mock"""
-    with patch('subprocess.run') as mock:
-        mock_result = MagicMock()
-        mock_result.returncode = 0
-        mock_result.stdout = 'Ver 8.0.32'
-        mock_result.stderr = ''
-        mock.return_value = mock_result
-        yield mock
-
-
 # ============================================================
 # Migration 테스트용 Fixtures
 # ============================================================

@@ -3,11 +3,11 @@ MySQL 데이터베이스 연결 클래스
 - 메타데이터 캐싱 (TTL 기반) 지원
 """
 import time
-import pymysql
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.logger import get_logger
 from src.core.constants import SYSTEM_SCHEMAS
+from src.core.db_core_service import DbCoreFacade, DbEndpoint, RustDbConnection
 
 logger = get_logger('db_connector')
 
@@ -102,7 +102,8 @@ class MySQLConnector:
         self.user = user
         self.password = password
         self.database = database
-        self.connection: Optional[pymysql.Connection] = None
+        self.connection: Optional[RustDbConnection] = None
+        self._facade = DbCoreFacade()
 
         # 캐싱 설정
         self._use_cache = use_cache
@@ -112,23 +113,19 @@ class MySQLConnector:
     def connect(self) -> Tuple[bool, str]:
         """데이터베이스 연결"""
         try:
-            self.connection = pymysql.connect(
+            endpoint = DbEndpoint(
+                engine="mysql",
                 host=self.host,
-                port=self.port,
+                port=int(self.port),
                 user=self.user,
                 password=self.password,
-                database=self.database,
-                charset='utf8mb4',
-                cursorclass=pymysql.cursors.DictCursor,
-                connect_timeout=10
+                database=self.database or "",
             )
+            connection_id = self._facade.open_connection(endpoint)
+            self.connection = RustDbConnection(endpoint, self._facade, connection_id)
             return True, "연결 성공"
-        except pymysql.Error as e:
-            error_code = e.args[0] if e.args else 0
-            error_msg = e.args[1] if len(e.args) > 1 else str(e)
-            return False, f"MySQL 오류 ({error_code}): {error_msg}"
         except Exception as e:
-            return False, f"연결 오류: {str(e)}"
+            return False, f"MySQL 오류: {str(e)}"
 
     def disconnect(self):
         """연결 종료"""

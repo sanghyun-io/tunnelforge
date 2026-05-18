@@ -229,9 +229,9 @@ TunnelForge의 스케줄 백업 기능을 사용하면 데이터베이스를 자
 - 백업 전 충분한 디스크 공간 확보
 - 보관 정책을 적절히 설정하여 디스크 부족 방지
 
-### MySQL Shell 필요
+### Rust DB Core 필요
 
-Export/Import 기능은 [MySQL Shell](https://dev.mysql.com/downloads/shell/)이 필요합니다.
+Export/Import 기능은 앱에 포함된 `tunnelforge-core` Rust DB Core Service를 사용합니다.
 
 ## 문제 해결
 
@@ -246,7 +246,7 @@ Export/Import 기능은 [MySQL Shell](https://dev.mysql.com/downloads/shell/)이
 1. 백업 로그에서 오류 메시지 확인
 2. 터널 연결이 정상인지 확인
 3. 출력 경로에 쓰기 권한이 있는지 확인
-4. MySQL Shell이 설치되어 있는지 확인
+4. 배포 패키지에 `tunnelforge-core.exe`가 포함되어 있는지 확인
 
 ### Cron 표현식 오류
 

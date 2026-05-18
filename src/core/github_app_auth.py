@@ -206,8 +206,12 @@ class GitHubAppAuth:
 
         # 캐시된 토큰이 유효한지 확인 (UTC 기준)
         if not force_refresh and self._cached_token and self._token_expires_at:
+            expires_at = self._token_expires_at
+            now = datetime.now(timezone.utc)
+            if expires_at.tzinfo is None:
+                now = datetime.now()
             # 만료 5분 전까지는 캐시 사용
-            if datetime.now(timezone.utc) < self._token_expires_at - timedelta(minutes=5):
+            if now < expires_at - timedelta(minutes=5):
                 return self._cached_token
 
         try:

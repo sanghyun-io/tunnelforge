@@ -424,7 +424,7 @@ class BackupScheduler:
         Returns:
             (success, message)
         """
-        from src.exporters.mysqlsh_exporter import MySQLShellExporter, MySQLShellConfig
+        from src.exporters.rust_dump_exporter import RustDumpExporter, RustDumpConfig
 
         logger.info(f"백업 시작: {schedule.name}")
 
@@ -452,8 +452,8 @@ class BackupScheduler:
             output_subdir = os.path.join(schedule.output_dir, f"{schedule.name}_{timestamp}")
             os.makedirs(output_subdir, exist_ok=True)
 
-            # MySQLShell Export 실행
-            config = MySQLShellConfig(
+            # RustDump Export 실행
+            config = RustDumpConfig(
                 host=conn_info.get('host', DEFAULT_LOCAL_HOST),
                 port=conn_info.get('local_port', DEFAULT_MYSQL_PORT),
                 user=conn_info.get('db_user', 'root'),
@@ -461,19 +461,21 @@ class BackupScheduler:
                 schema=schedule.schema
             )
 
-            exporter = MySQLShellExporter(config)
+            exporter = RustDumpExporter(config)
 
-            # 테이블 지정 여부
             if schedule.tables:
-                tables_param = schedule.tables
+                success, result, _ = exporter.export_tables(
+                    schema=schedule.schema,
+                    tables=schedule.tables,
+                    output_dir=output_subdir,
+                    threads=4
+                )
             else:
-                tables_param = None  # 전체
-
-            success, result = exporter.export_tables(
-                output_dir=output_subdir,
-                tables=tables_param,
-                parallel=4
-            )
+                success, result = exporter.export_full_schema(
+                    schema=schedule.schema,
+                    output_dir=output_subdir,
+                    threads=4
+                )
 
             if success:
                 # 백업 정리

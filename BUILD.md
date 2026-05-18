@@ -17,6 +17,7 @@
 
 - Python 3.9 이상
 - pip (Python 패키지 관리자)
+- Rust toolchain (`cargo`) - `tunnelforge-core` DB service 빌드용
 - Windows OS (다른 OS의 경우 PyInstaller 옵션 조정 필요)
 
 ---
@@ -69,12 +70,12 @@ pyinstaller --name "TunnelForge" ^
             --windowed ^
             --icon "assets/icon.ico" ^
             --add-data "assets;assets" ^
+            --add-binary "migration_core\target\release\tunnelforge-core.exe;." ^
             --hidden-import "PyQt6.QtCore" ^
             --hidden-import "PyQt6.QtGui" ^
             --hidden-import "PyQt6.QtWidgets" ^
             --hidden-import "sshtunnel" ^
             --hidden-import "paramiko" ^
-            --hidden-import "pymysql" ^
             main.py
 ```
 
@@ -84,6 +85,7 @@ pyinstaller --name "TunnelForge" ^
 - `--windowed`: 콘솔 창 숨김 (GUI 전용)
 - `--icon`: 실행 파일 아이콘
 - `--add-data`: 리소스 파일 포함 (형식: `소스경로;대상경로`)
+- `--add-binary`: Rust DB Core 실행 파일 포함
 - `--hidden-import`: PyInstaller가 자동으로 감지하지 못하는 모듈 명시
 
 ---
@@ -171,7 +173,6 @@ a = Analysis(
         'PyQt6.QtWidgets',
         'sshtunnel',
         'paramiko',
-        'pymysql',
         'xxx',  # 누락된 모듈 추가
     ],
 )
@@ -280,6 +281,8 @@ pyinstaller tunnel-manager.spec
 - [ ] 개발 의존성 설치 (`pip install -e ".[dev]"`)
 - [ ] 애플리케이션 정상 실행 확인 (`python main.py`)
 - [ ] 리소스 파일(아이콘 등) 경로 확인
+- [ ] Rust DB Core 빌드 확인 (`cargo build --manifest-path migration_core\Cargo.toml --release`)
+- [ ] `tunnelforge-core.exe`가 PyInstaller/Installer에 포함되는지 확인
 - [ ] Spec 파일 옵션 검토
 
 빌드 후 확인 사항:
@@ -315,6 +318,7 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 ```
 [build-installer.ps1 실행]
     ↓
+    ├─→ Rust DB Core 빌드 → migration_core/target/release/tunnelforge-core.exe 생성
     ├─→ PyInstaller 실행 → dist/TunnelForge.exe 생성
     └─→ Inno Setup 실행 → TunnelForge.iss 읽기 → output/Installer.exe 생성
 ```
@@ -338,10 +342,11 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 ```
 
 **이 스크립트가 자동으로 하는 일:**
-1. ✅ PyInstaller로 `TunnelForge.exe` 빌드
-2. ✅ Inno Setup으로 `TunnelForge-Setup-1.0.0.exe` 생성
-3. ✅ 빌드 과정 상태를 실시간으로 표시
-4. ✅ 에러 발생 시 명확한 해결 방법 안내
+1. ✅ Rust DB Core `tunnelforge-core.exe` 빌드
+2. ✅ PyInstaller로 `TunnelForge.exe` 빌드
+3. ✅ Inno Setup으로 `TunnelForge-Setup-1.0.0.exe` 생성
+4. ✅ 빌드 과정 상태를 실시간으로 표시
+5. ✅ 에러 발생 시 명확한 해결 방법 안내
 
 **스크립트 옵션:**
 
@@ -361,11 +366,15 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 자동화 스크립트를 사용하지 않고 직접 각 단계를 실행하는 방법입니다.
 
 ```powershell
-# 1단계: PyInstaller로 EXE 빌드
+# 1단계: Rust DB Core 빌드
+cargo build --manifest-path migration_core\Cargo.toml --release
+# → 결과: migration_core\target\release\tunnelforge-core.exe
+
+# 2단계: PyInstaller로 EXE 빌드
 pyinstaller tunnel-manager.spec
 # → 결과: dist/TunnelForge.exe
 
-# 2단계: Inno Setup 컴파일러로 .iss 파일을 읽어서 Installer 생성
+# 3단계: Inno Setup 컴파일러로 .iss 파일을 읽어서 Installer 생성
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\TunnelForge.iss
 # → 결과: output/TunnelForge-Setup-1.0.0.exe
 ```

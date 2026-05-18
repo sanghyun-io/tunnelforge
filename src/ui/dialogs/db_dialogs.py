@@ -16,12 +16,13 @@ import json
 import os
 
 from src.core.db_connector import MySQLConnector
+from src.core.postgres_connector import PostgresConnector
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
-from src.exporters.mysqlsh_exporter import (
-    MySQLShellChecker, MySQLShellConfig, check_mysqlsh,
+from src.exporters.rust_dump_exporter import (
+    RustDumpChecker, RustDumpConfig, check_rust_dump,
     ForeignKeyResolver, OrphanRecordInfo
 )
-from src.ui.workers.mysql_worker import MySQLShellWorker
+from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
 
@@ -35,7 +36,7 @@ class DBConnectionDialog(QDialog):
 
         self.tunnel_engine = tunnel_engine
         self.config_manager = config_manager
-        self.connector: Optional[MySQLConnector] = None
+        self.connector = None
 
         self.init_ui()
 
@@ -80,17 +81,26 @@ class DBConnectionDialog(QDialog):
         self.input_port.setRange(1, 65535)
         self.input_port.setValue(DEFAULT_MYSQL_PORT)
 
+        self.combo_engine = QComboBox()
+        self.combo_engine.addItem("MySQL", "mysql")
+        self.combo_engine.addItem("PostgreSQL", "postgresql")
+
         self.input_user = QLineEdit()
-        self.input_user.setPlaceholderText("MySQL 사용자명")
+        self.input_user.setPlaceholderText("DB 사용자명")
 
         self.input_password = QLineEdit()
         self.input_password.setEchoMode(QLineEdit.EchoMode.Password)
         self.input_password.setPlaceholderText("비밀번호")
 
+        self.input_database = QLineEdit()
+        self.input_database.setPlaceholderText("(선택) DB 이름")
+
         form_layout.addRow("Host:", self.input_host)
         form_layout.addRow("Port:", self.input_port)
+        form_layout.addRow("DB Engine:", self.combo_engine)
         form_layout.addRow("User:", self.input_user)
         form_layout.addRow("Password:", self.input_password)
+        form_layout.addRow("Database:", self.input_database)
 
         layout.addWidget(conn_group)
 
@@ -151,7 +161,8 @@ class DBConnectionDialog(QDialog):
             self.radio_tunnel.setEnabled(False)
         else:
             for t in tunnels:
-                display = f"{t['name']} ({t['host']}:{t['port']})"
+                engine = self._engine_from_tunnel(t).upper() if self._engine_from_tunnel(t) else "DB"
+                display = f"{t['name']} ({engine}, {t['host']}:{t['port']})"
                 self.combo_tunnel.addItem(display, t)
             self.radio_tunnel.setEnabled(True)
             # 터널 선택 변경 시 Host/Port 및 자격 증명 자동 채우기
@@ -171,6 +182,11 @@ class DBConnectionDialog(QDialog):
             # 저장된 자격 증명 자동 채우기
             if 'tunnel_id' in current_data:
                 self._fill_saved_credentials(current_data['tunnel_id'])
+                config = getattr(self.tunnel_engine, "tunnel_configs", {}).get(current_data['tunnel_id'], {})
+                self._apply_engine_from_config(config)
+                database = config.get('default_database') or config.get('default_schema')
+                if database:
+                    self.input_database.setText(database or "")
 
     def _fill_saved_credentials(self, tunnel_id: str):
         """저장된 자격 증명 자동 채우기"""
@@ -198,6 +214,11 @@ class DBConnectionDialog(QDialog):
             # 저장된 자격 증명 자동 채우기
             if 'tunnel_id' in tunnel_data:
                 self._fill_saved_credentials(tunnel_data['tunnel_id'])
+                config = getattr(self.tunnel_engine, "tunnel_configs", {}).get(tunnel_data['tunnel_id'], {})
+                self._apply_engine_from_config(config)
+                database = config.get('default_database') or config.get('default_schema')
+                if database:
+                    self.input_database.setText(database or "")
 
     def test_connection(self):
         """연결 테스트"""
@@ -205,6 +226,7 @@ class DBConnectionDialog(QDialog):
         port = self.input_port.value()
         user = self.input_user.text()
         password = self.input_password.text()
+        database = self.input_database.text().strip() or None
 
         if not user:
             QMessageBox.warning(self, "입력 오류", "사용자명을 입력하세요.")
@@ -213,14 +235,15 @@ class DBConnectionDialog(QDialog):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         try:
-            connector = MySQLConnector(host, port, user, password)
+            engine = self._current_engine(host, port)
+            connector = self._create_connector(engine, host, port, user, password, database)
             success, msg = connector.connect()
             connector.disconnect()
 
             QApplication.restoreOverrideCursor()
 
             if success:
-                QMessageBox.information(self, "연결 성공", f"✅ {msg}")
+                QMessageBox.information(self, "연결 성공", f"✅ {self._engine_label(engine)} {msg}")
             else:
                 QMessageBox.warning(self, "연결 실패", f"❌ {msg}")
         except Exception as e:
@@ -233,6 +256,7 @@ class DBConnectionDialog(QDialog):
         port = self.input_port.value()
         user = self.input_user.text()
         password = self.input_password.text()
+        database = self.input_database.text().strip() or None
 
         if not user:
             QMessageBox.warning(self, "입력 오류", "사용자명을 입력하세요.")
@@ -241,7 +265,8 @@ class DBConnectionDialog(QDialog):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         try:
-            self.connector = MySQLConnector(host, port, user, password)
+            engine = self._current_engine(host, port)
+            self.connector = self._create_connector(engine, host, port, user, password, database)
             success, msg = self.connector.connect()
 
             QApplication.restoreOverrideCursor()
@@ -260,6 +285,38 @@ class DBConnectionDialog(QDialog):
         """연결된 커넥터 반환"""
         return self.connector
 
+    def _engine_from_tunnel(self, tunnel_data: dict) -> Optional[str]:
+        tunnel_id = tunnel_data.get('tunnel_id')
+        config = getattr(self.tunnel_engine, "tunnel_configs", {}).get(tunnel_id, {})
+        engine = config.get('db_engine')
+        return engine if engine in ('mysql', 'postgresql') else None
+
+    def _apply_engine_from_config(self, config: dict):
+        engine = config.get('db_engine')
+        index = self.combo_engine.findData(engine)
+        if index >= 0:
+            self.combo_engine.setCurrentIndex(index)
+
+    def _current_engine(self, host: str, port: int) -> str:
+        if self.radio_tunnel.isChecked() and self.combo_tunnel.currentData():
+            tunnel_data = self.combo_tunnel.currentData()
+            engine = self._engine_from_tunnel(tunnel_data)
+            if engine:
+                return engine
+            raise ValueError("선택한 터널에 DB Engine이 설정되어 있지 않습니다.\n터널 연결 설정에서 MySQL 또는 PostgreSQL을 먼저 선택해주세요.")
+        engine = self.combo_engine.currentData()
+        if engine in ("mysql", "postgresql"):
+            return engine
+        raise ValueError("DB Engine을 선택해주세요.")
+
+    def _create_connector(self, engine: str, host: str, port: int, user: str, password: str, database: str = None):
+        if engine == "postgresql":
+            return PostgresConnector(host, port, user, password, database)
+        return MySQLConnector(host, port, user, password, database)
+
+    def _engine_label(self, engine: str) -> str:
+        return "PostgreSQL" if engine == "postgresql" else "MySQL"
+
     def get_connection_identifier(self) -> str:
         """
         연결 식별자 반환
@@ -276,22 +333,22 @@ class DBConnectionDialog(QDialog):
 
 
 # ============================================================
-# MySQL Shell 기반 Export/Import 다이얼로그
+# Rust DB Core 기반 Export/Import 다이얼로그
 # ============================================================
 
-class MySQLShellExportDialog(QDialog):
-    """MySQL Shell Export 다이얼로그"""
+class RustDumpExportDialog(QDialog):
+    """Rust DB Core Export 다이얼로그"""
 
     def __init__(self, parent=None, connector: MySQLConnector = None,
                  config_manager=None, connection_info: str = ""):
         super().__init__(parent)
-        self.setWindowTitle("MySQL Shell Export (병렬 처리)")
+        self.setWindowTitle("Rust DB Core Export (병렬 처리)")
         self.resize(600, 650)
 
         self.connector = connector
         self.config_manager = config_manager
         self.connection_info = connection_info  # 터널명 또는 host_port
-        self.worker: Optional[MySQLShellWorker] = None
+        self.worker: Optional[RustDumpWorker] = None
 
         # 로그 수집용 변수
         self.log_entries: List[str] = []
@@ -301,8 +358,8 @@ class MySQLShellExportDialog(QDialog):
         self.export_schema: str = ""
         self.export_tables: List[str] = []
 
-        # mysqlsh 설치 확인
-        self.mysqlsh_installed, self.mysqlsh_msg = check_mysqlsh()
+        # rust_dump 설치 확인
+        self.rust_dump_installed, self.rust_dump_msg = check_rust_dump()
 
         self.init_ui()
         self.load_schemas()
@@ -340,15 +397,15 @@ class MySQLShellExportDialog(QDialog):
         container_layout = QVBoxLayout(self.config_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
 
-        # --- mysqlsh 상태 표시 ---
-        status_group = QGroupBox("MySQL Shell 상태")
+        # --- rust_dump 상태 표시 ---
+        status_group = QGroupBox("Rust DB Core 상태")
         status_layout = QVBoxLayout(status_group)
 
-        if self.mysqlsh_installed:
-            status_label = QLabel(f"✅ {self.mysqlsh_msg}")
+        if self.rust_dump_installed:
+            status_label = QLabel(f"✅ {self.rust_dump_msg}")
             status_label.setStyleSheet("color: green;")
         else:
-            status_label = QLabel(f"❌ {self.mysqlsh_msg}")
+            status_label = QLabel(f"❌ {self.rust_dump_msg}")
             status_label.setStyleSheet("color: red;")
 
             btn_guide = QPushButton("설치 가이드 보기")
@@ -664,7 +721,7 @@ class MySQLShellExportDialog(QDialog):
             QPushButton:hover { background-color: #229954; }
         """)
         self.btn_export.clicked.connect(self.do_export)
-        self.btn_export.setEnabled(self.mysqlsh_installed)
+        self.btn_export.setEnabled(self.rust_dump_installed)
 
         self.btn_save_log = QPushButton("📄 로그 저장")
         self.btn_save_log.setStyleSheet("""
@@ -730,7 +787,7 @@ class MySQLShellExportDialog(QDialog):
     def _get_base_output_dir(self) -> str:
         """기본 출력 디렉토리 (부모 폴더)"""
         if self.config_manager:
-            saved = self.config_manager.get_app_setting('mysqlsh_export_base_dir')
+            saved = self.config_manager.get_app_setting('rust_dump_export_base_dir')
             if saved:
                 return saved
         import os
@@ -790,11 +847,11 @@ class MySQLShellExportDialog(QDialog):
         if not self.config_manager:
             return
 
-        mode = self.config_manager.get_app_setting('mysqlsh_export_folder_mode', 'auto')
-        use_name = self.config_manager.get_app_setting('mysqlsh_export_folder_use_name', True)
-        use_schema = self.config_manager.get_app_setting('mysqlsh_export_folder_use_schema', True)
-        use_timestamp = self.config_manager.get_app_setting('mysqlsh_export_folder_use_timestamp', True)
-        manual_name = self.config_manager.get_app_setting('mysqlsh_export_folder_manual_name', '')
+        mode = self.config_manager.get_app_setting('rust_dump_export_folder_mode', 'auto')
+        use_name = self.config_manager.get_app_setting('rust_dump_export_folder_use_name', True)
+        use_schema = self.config_manager.get_app_setting('rust_dump_export_folder_use_schema', True)
+        use_timestamp = self.config_manager.get_app_setting('rust_dump_export_folder_use_timestamp', True)
+        manual_name = self.config_manager.get_app_setting('rust_dump_export_folder_manual_name', '')
 
         if mode == 'manual':
             self.radio_manual_naming.setChecked(True)
@@ -812,11 +869,11 @@ class MySQLShellExportDialog(QDialog):
             return
 
         mode = 'manual' if self.radio_manual_naming.isChecked() else 'auto'
-        self.config_manager.set_app_setting('mysqlsh_export_folder_mode', mode)
-        self.config_manager.set_app_setting('mysqlsh_export_folder_use_name', self.chk_name.isChecked())
-        self.config_manager.set_app_setting('mysqlsh_export_folder_use_schema', self.chk_schema.isChecked())
-        self.config_manager.set_app_setting('mysqlsh_export_folder_use_timestamp', self.chk_timestamp.isChecked())
-        self.config_manager.set_app_setting('mysqlsh_export_folder_manual_name', self.input_manual_folder.text())
+        self.config_manager.set_app_setting('rust_dump_export_folder_mode', mode)
+        self.config_manager.set_app_setting('rust_dump_export_folder_use_name', self.chk_name.isChecked())
+        self.config_manager.set_app_setting('rust_dump_export_folder_use_schema', self.chk_schema.isChecked())
+        self.config_manager.set_app_setting('rust_dump_export_folder_use_timestamp', self.chk_timestamp.isChecked())
+        self.config_manager.set_app_setting('rust_dump_export_folder_manual_name', self.input_manual_folder.text())
 
     def _on_naming_mode_changed(self):
         """폴더 네이밍 모드 변경 시"""
@@ -863,12 +920,12 @@ class MySQLShellExportDialog(QDialog):
         if folder:
             self.input_base_dir.setText(folder)
             if self.config_manager:
-                self.config_manager.set_app_setting('mysqlsh_export_base_dir', folder)
+                self.config_manager.set_app_setting('rust_dump_export_base_dir', folder)
             self._update_output_dir_preview()
 
     def show_install_guide(self):
-        guide = MySQLShellChecker.get_install_guide()
-        QMessageBox.information(self, "MySQL Shell 설치 가이드", guide)
+        guide = RustDumpChecker.get_install_guide()
+        QMessageBox.information(self, "Rust DB Core 설치 가이드", guide)
 
     def on_type_changed(self):
         is_partial = self.radio_partial.isChecked()
@@ -959,7 +1016,7 @@ class MySQLShellExportDialog(QDialog):
 
         # 설정 저장
         if self.config_manager:
-            self.config_manager.set_app_setting('mysqlsh_export_dir', output_dir)
+            self.config_manager.set_app_setting('rust_dump_export_dir', output_dir)
 
         # 로그 수집 초기화
         self.log_entries.clear()
@@ -972,7 +1029,7 @@ class MySQLShellExportDialog(QDialog):
 
         # 로그 헤더 추가
         self._add_log(f"{'='*60}")
-        self._add_log("MySQL Shell Export 시작")
+        self._add_log("Rust DB Core Export 시작")
         self._add_log(f"시작 시간: {self.export_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
         self._add_log(f"스키마: {schema}")
         self._add_log(f"Export 유형: {'전체 스키마' if self.radio_full.isChecked() else '선택 테이블'}")
@@ -1006,8 +1063,8 @@ class MySQLShellExportDialog(QDialog):
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Export 준비 중...")
 
-        # MySQL Shell 설정
-        config = MySQLShellConfig(
+        # Rust DB Core 설정
+        config = RustDumpConfig(
             host="127.0.0.1",  # 터널 통해 로컬 접속
             port=self.connector.port if hasattr(self.connector, 'port') else 3306,
             user=self.connector.user if hasattr(self.connector, 'user') else "root",
@@ -1016,7 +1073,7 @@ class MySQLShellExportDialog(QDialog):
 
         # 작업 스레드 시작
         if self.radio_full.isChecked():
-            self.worker = MySQLShellWorker(
+            self.worker = RustDumpWorker(
                 "export_schema", config,
                 schema=schema,
                 output_dir=output_dir,
@@ -1024,7 +1081,7 @@ class MySQLShellExportDialog(QDialog):
                 compression=self.combo_compression.currentText()
             )
         else:
-            self.worker = MySQLShellWorker(
+            self.worker = RustDumpWorker(
                 "export_tables", config,
                 schema=schema,
                 tables=self.get_selected_tables(),
@@ -1173,7 +1230,7 @@ class MySQLShellExportDialog(QDialog):
             self._add_log(f"테이블 [{table_name}] {status_text}")
 
     def on_raw_output(self, line: str):
-        """mysqlsh 실시간 출력 처리 (로그에 추가)"""
+        """rust_dump 실시간 출력 처리 (로그에 추가)"""
         # 너무 많은 로그 방지 (최대 500줄)
         if self.txt_log.count() > 500:
             self.txt_log.takeItem(0)
@@ -1231,7 +1288,7 @@ class MySQLShellExportDialog(QDialog):
             with open(file_path, 'w', encoding='utf-8') as f:
                 # 헤더 정보
                 f.write("=" * 70 + "\n")
-                f.write("MySQL Shell Export Log\n")
+                f.write("Rust DB Core Export Log\n")
                 f.write("=" * 70 + "\n\n")
 
                 f.write(f"스키마: {self.export_schema}\n")
@@ -1273,21 +1330,21 @@ class MySQLShellExportDialog(QDialog):
         event.accept()
 
 
-class MySQLShellImportDialog(QDialog):
-    """MySQL Shell Import 다이얼로그"""
+class RustDumpImportDialog(QDialog):
+    """Rust DB Core Import 다이얼로그"""
 
     def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None,
                  tunnel_config: dict = None):
         super().__init__(parent)
-        self.setWindowTitle("MySQL Shell Import (병렬 처리)")
+        self.setWindowTitle("Rust DB Core Import (병렬 처리)")
         self.resize(600, 700)
 
         self.connector = connector
         self.config_manager = config_manager
         self.tunnel_config = tunnel_config  # Production 환경 보호용
-        self.worker: Optional[MySQLShellWorker] = None
+        self.worker: Optional[RustDumpWorker] = None
 
-        self.mysqlsh_installed, self.mysqlsh_msg = check_mysqlsh()
+        self.rust_dump_installed, self.rust_dump_msg = check_rust_dump()
 
         # Import 결과 저장 (재시도용)
         self.import_results: dict = {}
@@ -1343,15 +1400,15 @@ class MySQLShellImportDialog(QDialog):
         container_layout = QVBoxLayout(self.config_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
 
-        # --- mysqlsh 상태 ---
-        status_group = QGroupBox("MySQL Shell 상태")
+        # --- rust_dump 상태 ---
+        status_group = QGroupBox("Rust DB Core 상태")
         status_layout = QVBoxLayout(status_group)
 
-        if self.mysqlsh_installed:
-            status_label = QLabel(f"✅ {self.mysqlsh_msg}")
+        if self.rust_dump_installed:
+            status_label = QLabel(f"✅ {self.rust_dump_msg}")
             status_label.setStyleSheet("color: green;")
         else:
-            status_label = QLabel(f"❌ {self.mysqlsh_msg}")
+            status_label = QLabel(f"❌ {self.rust_dump_msg}")
             status_label.setStyleSheet("color: red;")
 
         status_layout.addWidget(status_label)
@@ -1362,7 +1419,7 @@ class MySQLShellImportDialog(QDialog):
         input_layout = QHBoxLayout(input_group)
 
         self.input_dir = QLineEdit()
-        self.input_dir.setPlaceholderText("mysqlsh dump 폴더 선택...")
+        self.input_dir.setPlaceholderText("rust_dump dump 폴더 선택...")
 
         btn_browse = QPushButton("선택")
         btn_browse.setStyleSheet("""
@@ -1445,18 +1502,18 @@ class MySQLShellImportDialog(QDialog):
         tz_layout = QVBoxLayout(tz_group)
 
         self.btn_tz_group = QButtonGroup(self)
-        
+
         # 1. 자동 감지 (권장)
         self.radio_tz_auto = QRadioButton("자동 감지 및 보정 (권장)")
         self.radio_tz_auto.setChecked(True)
         self.radio_tz_auto.setToolTip("서버가 지역명 타임존을 지원하지 않으면 자동으로 +09:00(KST)로 보정합니다.")
-        
+
         # 2. 강제 KST
         self.radio_tz_kst = QRadioButton("강제 KST (+09:00)")
-        
+
         # 3. 강제 UTC
         self.radio_tz_utc = QRadioButton("강제 UTC (+00:00)")
-        
+
         # 4. 설정 안 함
         self.radio_tz_none = QRadioButton("설정 안 함 (서버 기본값)")
 
@@ -1681,7 +1738,7 @@ class MySQLShellImportDialog(QDialog):
             QPushButton:hover { background-color: #d35400; }
         """)
         self.btn_import.clicked.connect(self.do_import)
-        self.btn_import.setEnabled(self.mysqlsh_installed)
+        self.btn_import.setEnabled(self.rust_dump_installed)
 
         self.btn_save_log = QPushButton("📄 로그 저장")
         self.btn_save_log.setStyleSheet("""
@@ -1877,7 +1934,7 @@ class MySQLShellImportDialog(QDialog):
         """
         if not self.connector:
             return False
-            
+
         try:
             # mysql.time_zone_name 테이블에서 Asia/Seoul 조회
             # 단순히 테이블 존재 여부만 보지 않고 실제 데이터가 있는지 확인
@@ -1992,7 +2049,7 @@ class MySQLShellImportDialog(QDialog):
 
             # 로그 헤더 추가
             self._add_log(f"{'='*60}")
-            self._add_log("MySQL Shell Import 시작")
+            self._add_log("Rust DB Core Import 시작")
             self._add_log(f"시작 시간: {self.import_start_time.strftime('%Y-%m-%d %H:%M:%S')}")
             self._add_log(f"Dump 폴더: {input_dir}")
             self._add_log(f"대상 스키마: {target_schema if target_schema else '원본 스키마명 사용'}")
@@ -2009,8 +2066,8 @@ class MySQLShellImportDialog(QDialog):
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Import 준비 중...")
 
-        # MySQL Shell 설정
-        config = MySQLShellConfig(
+        # Rust DB Core 설정
+        config = RustDumpConfig(
             host="127.0.0.1",
             port=self.connector.port if hasattr(self.connector, 'port') else 3306,
             user=self.connector.user if hasattr(self.connector, 'user') else "root",
@@ -2054,7 +2111,7 @@ class MySQLShellImportDialog(QDialog):
             import_mode = "merge"  # 재시도 시에는 병합 모드 사용
 
         # 작업 스레드 시작
-        self.worker = MySQLShellWorker(
+        self.worker = RustDumpWorker(
             "import", config,
             input_dir=input_dir,
             target_schema=target_schema,
@@ -2235,14 +2292,14 @@ class MySQLShellImportDialog(QDialog):
             item.setText(display_text)
 
     def on_raw_output(self, line: str):
-        """mysqlsh 실시간 출력 처리 (로그에 추가)"""
+        """rust_dump 실시간 출력 처리 (로그에 추가)"""
         # 너무 많은 로그 방지 (최대 500줄)
         if self.txt_log.count() > 500:
             self.txt_log.takeItem(0)
         self.txt_log.addItem(line)
         self.txt_log.scrollToBottom()
         # raw output도 로그에 기록
-        self._add_log(f"[mysqlsh] {line}")
+        self._add_log(f"[rust_dump] {line}")
 
     def on_metadata_analyzed(self, metadata: dict):
         """
@@ -2490,7 +2547,7 @@ class MySQLShellImportDialog(QDialog):
             with open(file_path, 'w', encoding='utf-8') as f:
                 # 헤더 정보
                 f.write("=" * 70 + "\n")
-                f.write("MySQL Shell Import Log\n")
+                f.write("Rust DB Core Import Log\n")
                 f.write("=" * 70 + "\n\n")
 
                 f.write(f"Dump 폴더: {self.last_input_dir}\n")
@@ -2538,8 +2595,8 @@ class MySQLShellImportDialog(QDialog):
         event.accept()
 
 
-class MySQLShellWizard:
-    """MySQL Shell Export/Import 마법사"""
+class RustDumpWizard:
+    """Rust DB Core Export/Import 마법사"""
 
     def __init__(self, parent=None, tunnel_engine=None, config_manager=None, preselected_tunnel=None):
         self.parent = parent
@@ -2623,7 +2680,7 @@ class MySQLShellWizard:
             connection_info = conn_dialog.get_connection_identifier()
 
         # 2단계: Export
-        export_dialog = MySQLShellExportDialog(
+        export_dialog = RustDumpExportDialog(
             self.parent,
             connector=connector,
             config_manager=self.config_manager,
@@ -2658,7 +2715,7 @@ class MySQLShellWizard:
                 return False
 
         # 2단계: Import
-        import_dialog = MySQLShellImportDialog(
+        import_dialog = RustDumpImportDialog(
             self.parent,
             connector=connector,
             config_manager=self.config_manager,

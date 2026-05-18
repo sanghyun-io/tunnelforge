@@ -85,6 +85,7 @@ class ConfigManager:
                         "bastion_key": "", # 키 파일 경로 비어있음
                         "remote_host": "rds-endpoint.amazonaws.com",
                         "remote_port": DEFAULT_MYSQL_PORT,
+                        "db_engine": "mysql",
                         "local_port": 3308
                     }
                 ]
@@ -281,6 +282,10 @@ class ConfigManager:
                 valid, msg = self._validate_port(tunnel.get('local_port'), 'local_port')
                 if not valid:
                     return False, f"{msg} ({idx}번째 항목)"
+
+            db_engine = tunnel.get('db_engine')
+            if db_engine not in (None, '', 'mysql', 'postgresql'):
+                return False, f"db_engine은 mysql 또는 postgresql이어야 합니다. ({idx}번째 항목)"
 
         settings = import_data.get('settings')
         if settings is not None and not isinstance(settings, dict):

@@ -1,0 +1,398 @@
+import json
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest
+from PyQt6.QtWidgets import QApplication
+
+from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationDialog
+
+
+app = QApplication.instance() or QApplication(sys.argv)
+
+
+class FakeTunnelEngine:
+    def __init__(self):
+        self.tunnel_configs = {
+            "source": {
+                "id": "source",
+                "name": "Source DB",
+                "connection_mode": "direct",
+                "remote_host": "127.0.0.1",
+                "remote_port": 3306,
+                "local_port": 3306,
+                "db_engine": "mysql",
+                "default_schema": "source_db",
+            },
+            "target": {
+                "id": "target",
+                "name": "Target DB",
+                "connection_mode": "direct",
+                "remote_host": "127.0.0.1",
+                "remote_port": 5432,
+                "local_port": 5432,
+                "db_engine": "postgresql",
+                "default_schema": "target_db",
+            },
+        }
+        self.started = set()
+
+    def get_active_tunnels(self):
+        return []
+
+    def is_running(self, tunnel_id):
+        return tunnel_id in self.started
+
+    def start_tunnel(self, config):
+        self.started.add(config["id"])
+        return True, "연결 성공"
+
+    def get_connection_info(self, tunnel_id):
+        config = self.tunnel_configs[tunnel_id]
+        return config["remote_host"], int(config["remote_port"])
+
+
+class FakeConfigManager:
+    def __init__(self, tunnel_engine):
+        self.tunnel_engine = tunnel_engine
+
+    def load_config(self):
+        return {"tunnels": list(self.tunnel_engine.tunnel_configs.values())}
+
+    def get_tunnel_credentials(self, tunnel_id):
+        return f"{tunnel_id}_user", f"{tunnel_id}_password"
+
+
+def make_dialog():
+    tunnel_engine = FakeTunnelEngine()
+    dialog = CrossEngineMigrationDialog(
+        tunnel_engine=tunnel_engine,
+        config_manager=FakeConfigManager(tunnel_engine),
+    )
+    dialog.source_form.combo_tunnel.setCurrentIndex(1)
+    dialog.target_form.combo_tunnel.setCurrentIndex(1)
+    return dialog
+
+
+def test_dialog_initial_button_states_and_running_toggle():
+    dialog = make_dialog()
+    try:
+        assert not dialog.btn_save_report.isEnabled()
+        assert not dialog.btn_cancel.isEnabled()
+        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.source_form.combo_engine.isEnabled()
+        assert not dialog.target_form.combo_engine.isEnabled()
+        assert dialog._payload()["guide_options"]["row_limit"] == 20
+        assert dialog._payload()["source"]["schema"] == "source_db"
+        assert dialog._payload()["target"]["database"] == "postgres"
+        assert dialog._payload()["target"]["schema"] == "target_db"
+        assert dialog.target_form.combo_tunnel.count() == 2
+        assert "PostgreSQL" in dialog.target_form.combo_tunnel.itemText(1)
+
+        dialog._set_running(True)
+
+        assert not dialog.btn_full_run.isEnabled()
+        assert not dialog.btn_inspect.isEnabled()
+        assert not dialog.btn_readiness.isEnabled()
+        assert not dialog.btn_guide.isEnabled()
+        assert not dialog.btn_migrate.isEnabled()
+        assert dialog.btn_cancel.isEnabled()
+
+        dialog._set_running(False)
+
+        assert dialog.btn_full_run.isEnabled()
+        assert dialog.btn_inspect.isEnabled()
+        assert dialog.btn_readiness.isEnabled()
+        assert dialog.btn_guide.isEnabled()
+        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_cancel.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_inspect_result_enables_report_and_updates_schema():
+    dialog = make_dialog()
+    schema = {
+        "tables": [
+            {
+                "name": "users",
+                "columns": [
+                    {
+                        "name": "id",
+                        "type": "int",
+                        "nullable": False,
+                        "primary_key": True,
+                    }
+                ],
+            }
+        ]
+    }
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "inspect",
+            "success": True,
+            "schema": schema,
+            "unsupported_objects": ["view:active_users"],
+        })
+
+        assert dialog.btn_save_report.isEnabled()
+        assert json.loads(dialog.txt_schema.toPlainText()) == schema
+        assert dialog._payload()["unsupported_objects"] == ["view:active_users"]
+        assert "스키마 검사 결과를 입력에 반영했습니다." in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_migrate_result_saves_resume_state(monkeypatch, tmp_path):
+    saved = {}
+
+    def fake_save_resume_state(key, state):
+        saved["key"] = key
+        saved["state"] = state
+        return tmp_path / "resume.json"
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.save_resume_state",
+        fake_save_resume_state,
+    )
+
+    dialog = make_dialog()
+    state = {"tables": [{"table": "users", "completed": False, "rows_copied": 5000}]}
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "migrate",
+            "success": False,
+            "state": state,
+        })
+
+        assert saved["state"] == state
+        assert saved["key"]
+        assert "재개 상태 저장" in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_resume_migration_loads_state_and_starts_migrate(monkeypatch):
+    state = {"tables": [{"table": "users", "completed": False, "rows_copied": 5000}]}
+    started = {}
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.load_resume_state",
+        lambda key: state,
+    )
+
+    dialog = make_dialog()
+    dialog.txt_schema.setPlainText(json.dumps({
+        "tables": [{"name": "users", "columns": [{"name": "id", "type": "int"}]}]
+    }))
+    monkeypatch.setattr(dialog, "_confirm_migration_execution", lambda: True)
+
+    def fake_start(command, payload, workflow=False):
+        started["command"] = command
+        started["payload"] = payload
+        started["workflow"] = workflow
+
+    monkeypatch.setattr(dialog, "_start_command_with_payload", fake_start)
+
+    try:
+        dialog._resume_migration()
+
+        assert started["command"] == "migrate"
+        assert started["payload"]["state"] == state
+        assert started["workflow"] is False
+    finally:
+        dialog.close()
+
+
+def test_migrate_command_requires_confirmation(monkeypatch):
+    dialog = make_dialog()
+    started = []
+    dialog._set_execution_unlocked(True)
+    monkeypatch.setattr(dialog, "_confirm_migration_execution", lambda: False)
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+
+    try:
+        dialog._start_command("migrate")
+
+        assert started == []
+        assert dialog._workflow_active is False
+        assert dialog._current_command is None
+    finally:
+        dialog.close()
+
+
+def test_db_change_unlocks_after_preflight_success_and_locks_on_input_change():
+    dialog = make_dialog()
+    try:
+        assert not dialog.btn_migrate.isEnabled()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": True,
+            "issues": [],
+        })
+
+        assert dialog.btn_migrate.isEnabled()
+        assert "DB 변경 실행을 사용할 수 있습니다" in dialog.lbl_execution_lock.text()
+
+        dialog.source_form.input_database.setText("changed_schema")
+
+        assert not dialog.btn_migrate.isEnabled()
+        assert "사전 점검 또는 계획 생성 성공 후" in dialog.lbl_execution_lock.text()
+    finally:
+        dialog.close()
+
+
+def test_plan_failure_keeps_db_change_locked():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "plan",
+            "success": False,
+            "issues": [{"blocking": True}],
+        })
+
+        assert not dialog.btn_migrate.isEnabled()
+        assert "차단 이슈가 있어" in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_tunnel_selection_fills_endpoint_fields_from_configured_list():
+    class FakeTunnelEngine:
+        tunnel_configs = {
+            "pg": {
+                "remote_port": 5432,
+                "default_schema": "analytics",
+            }
+        }
+
+        def get_active_tunnels(self):
+            return []
+
+        def is_running(self, tunnel_id):
+            return False
+
+    class FakeConfigManager:
+        def load_config(self):
+            return {"tunnels": [{
+                "id": "pg",
+                "name": "PG 분석",
+                "connection_mode": "direct",
+                "remote_host": "127.0.0.1",
+                "remote_port": 5432,
+                "db_engine": "postgresql",
+                "default_schema": "analytics",
+            }]}
+
+        def get_tunnel_credentials(self, tunnel_id):
+            assert tunnel_id == "pg"
+            return "pg_user", "pg_password"
+
+    dialog = CrossEngineMigrationDialog(
+        tunnel_engine=FakeTunnelEngine(),
+        config_manager=FakeConfigManager(),
+    )
+    try:
+        dialog.source_form.combo_tunnel.setCurrentIndex(1)
+
+        assert dialog.source_form.engine().value == "postgresql"
+        assert dialog.source_form.input_host.text() == "127.0.0.1"
+        assert dialog.source_form.input_port.value() == 5432
+        assert dialog.source_form.input_user.text() == "pg_user"
+        assert dialog.source_form.input_password.text() == "pg_password"
+        assert dialog.source_form.input_database.text() == "postgres"
+        assert dialog.source_form.input_schema.text() == "analytics"
+    finally:
+        dialog.close()
+
+
+def test_readiness_result_logs_direction_summary():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "readiness",
+            "success": False,
+            "directions": [
+                {
+                    "direction": "mysql_to_postgresql",
+                    "success": True,
+                    "table_count": 3,
+                    "issues": [{"blocking": False}],
+                },
+                {
+                    "direction": "postgresql_to_mysql",
+                    "success": False,
+                    "table_count": 2,
+                    "issues": [{"blocking": True}, {"blocking": False}],
+                },
+            ],
+        })
+
+        log = dialog.txt_log.toPlainText()
+        assert "[양방향 점검 결과]" in log
+        assert "mysql_to_postgresql: 가능" in log
+        assert "postgresql_to_mysql: 불가" in log
+    finally:
+        dialog.close()
+
+
+def test_guide_result_logs_summary():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "guide",
+            "success": True,
+            "directions": [{
+                "direction": "mysql_to_postgresql",
+                "success": True,
+                "guide": {
+                    "create_table_sql": ["CREATE TABLE users(id int);"],
+                    "tables": [{"table": "users", "row_samples": [{"id": "1"}]}],
+                },
+            }],
+        })
+
+        log = dialog.txt_log.toPlainText()
+        assert "[상세 가이드]" in log
+        assert "mysql_to_postgresql" in log
+        assert "table guide 1개" in log
+    finally:
+        dialog.close()
+
+
+def test_save_report_writes_text_report(monkeypatch, tmp_path):
+    report_path = tmp_path / "report.txt"
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QFileDialog.getSaveFileName",
+        lambda *args, **kwargs: (str(report_path), "Text Files (*.txt)"),
+    )
+
+    dialog = make_dialog()
+    dialog.last_result = {
+        "event": "result",
+        "command": "verify",
+        "success": True,
+        "mismatches": [],
+    }
+    try:
+        dialog._save_report()
+
+        assert report_path.exists()
+        assert "Command: verify" in Path(report_path).read_text(encoding="utf-8")
+        assert "결과 저장 완료" in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()

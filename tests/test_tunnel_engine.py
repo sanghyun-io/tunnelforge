@@ -172,3 +172,36 @@ class TestTunnelEngine:
         assert success is True
         assert server is None  # 직접 연결은 터널 불필요
         assert error == ""
+
+    def test_target_reachable_from_bastion_success(self, sample_tunnel_config):
+        """Bastion에서 Target DB 포트 도달성 확인 성공"""
+        with patch.object(self.engine, '_load_private_key', return_value=MagicMock()):
+            with patch('src.core.tunnel_engine.paramiko.SSHClient') as mock_client_cls:
+                mock_client = MagicMock()
+                mock_transport = MagicMock()
+                mock_transport.is_active.return_value = True
+                mock_transport.open_channel.return_value = MagicMock()
+                mock_client.get_transport.return_value = mock_transport
+                mock_client_cls.return_value = mock_client
+
+                success, msg = self.engine.test_target_reachable_from_bastion(sample_tunnel_config)
+
+                assert success is True
+                assert "도달 성공" in msg
+                mock_transport.open_channel.assert_called_once()
+
+    def test_target_reachable_from_bastion_failure(self, sample_tunnel_config):
+        """Bastion에서 Target DB 포트 도달성 확인 실패"""
+        with patch.object(self.engine, '_load_private_key', return_value=MagicMock()):
+            with patch('src.core.tunnel_engine.paramiko.SSHClient') as mock_client_cls:
+                mock_client = MagicMock()
+                mock_transport = MagicMock()
+                mock_transport.is_active.return_value = True
+                mock_transport.open_channel.side_effect = socket.timeout("timed out")
+                mock_client.get_transport.return_value = mock_transport
+                mock_client_cls.return_value = mock_client
+
+                success, msg = self.engine.test_target_reachable_from_bastion(sample_tunnel_config)
+
+                assert success is False
+                assert "시간 초과" in msg

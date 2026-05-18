@@ -7,6 +7,7 @@ Thank you for your interest in contributing! This guide covers development setup
 ### Requirements
 
 - Python 3.9+
+- Rust toolchain (`cargo`) for building `tunnelforge-core`
 - Git
 - [Inno Setup 6](https://jrsoftware.org/isinfo.php) (for building Windows installer)
 
@@ -46,14 +47,16 @@ tunnel-manager/
 │   ├── core/               # Business logic
 │   │   ├── config_manager.py   # Configuration management
 │   │   ├── tunnel_engine.py    # SSH tunnel engine
-│   │   └── db_connector.py     # MySQL connection
+│   │   ├── db_core_service.py  # Rust DB core JSONL facade
+│   │   └── db_connector.py     # Compatibility wrapper over Rust core
 │   ├── exporters/          # DB Export/Import
-│   │   └── mysqlsh_exporter.py
+│   │   └── rust_dump_exporter.py
 │   └── ui/                 # PyQt6 UI
 │       ├── main_window.py
 │       ├── dialogs/
 │       └── workers/
 ├── assets/                 # Icons and resources
+├── migration_core/         # Rust tunnelforge-core DB service
 ├── installer/              # Inno Setup configuration
 └── scripts/                # Build and release scripts
 ```
