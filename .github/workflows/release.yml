@@ -11,16 +11,16 @@ permissions:
 jobs:
   build-windows-installer:
     name: Build Windows Installer
-    runs-on: windows-latest
+    runs-on: windows-2025
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0  # 전체 히스토리 (릴리스 노트 생성용)
 
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -281,7 +281,7 @@ jobs:
           echo "============================================="
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           name: v${{ steps.get_version.outputs.version }}
           body_path: release_notes.md

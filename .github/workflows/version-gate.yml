@@ -19,12 +19,12 @@ permissions:
 
 jobs:
   rust-core-regression-gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -34,7 +34,7 @@ jobs:
         run: ./scripts/rust-core-regression-gate.ps1
 
   version-gate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
 
     steps:
@@ -121,14 +121,14 @@ jobs:
       - name: Generate GitHub App Token
         if: steps.check.outputs.bump_type != ''
         id: app-token
-        uses: actions/create-github-app-token@v1
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - name: Checkout PR branch
         if: steps.check.outputs.bump_type != ''
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           token: ${{ steps.app-token.outputs.token }}
           ref: ${{ github.event.pull_request.head.ref }}
@@ -136,7 +136,7 @@ jobs:
 
       - name: Set up Python
         if: steps.check.outputs.bump_type != ''
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: '3.x'
 
