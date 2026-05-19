@@ -30,12 +30,12 @@ logger = get_logger("db_dialogs")
 
 
 def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tables: int) -> int:
-    """Avoid showing 100% while table completion proves export is still running."""
+    """Avoid inflated estimated-row progress while table completion proves export is still running."""
     bounded = max(0, min(int(percent), 100))
-    if total_tables <= 0 or completed_tables >= total_tables or bounded < 100:
+    if total_tables <= 0 or completed_tables >= total_tables:
         return bounded
     table_cap = int(((completed_tables + 1) / total_tables) * 100)
-    return max(1, min(table_cap, 99))
+    return min(bounded, max(1, min(table_cap, 99)))
 
 
 def format_export_row_labels(processed_rows: int, estimated_total_rows: int) -> tuple[str, str]:

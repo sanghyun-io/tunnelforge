@@ -12,6 +12,10 @@ def test_cap_incomplete_export_percent_prevents_early_100():
     assert cap_incomplete_export_percent(100, completed_tables=35, total_tables=208) == 17
 
 
+def test_cap_incomplete_export_percent_prevents_early_99():
+    assert cap_incomplete_export_percent(99, completed_tables=40, total_tables=208) == 19
+
+
 def test_cap_incomplete_export_percent_allows_final_100():
     assert cap_incomplete_export_percent(100, completed_tables=208, total_tables=208) == 100
 
