@@ -1222,13 +1222,19 @@ class RustDumpExportDialog(QDialog):
         if table:
             rows_done = int(info.get("rows_done") or 0)
             table_total = int(info.get("rows_total") or 0)
-            if table_total and table not in self.export_table_totals:
-                self.export_table_totals[table] = table_total
-                self.export_total_rows = max(
-                    self.export_total_rows,
-                    sum(self.export_table_totals.values()),
-                )
             if table_total:
+                previous_total = int(self.export_table_totals.get(table) or 0)
+                self.export_table_totals[table] = table_total
+                if previous_total:
+                    self.export_total_rows = max(
+                        0,
+                        self.export_total_rows - previous_total + table_total,
+                    )
+                else:
+                    self.export_total_rows = max(
+                        self.export_total_rows,
+                        sum(self.export_table_totals.values()),
+                    )
                 rows_done = min(rows_done, table_total)
             self.export_table_done[table] = max(self.export_table_done.get(table, 0), rows_done)
 

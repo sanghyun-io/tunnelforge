@@ -1174,13 +1174,34 @@ fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     }
 }
 
-fn dump_table_row_counts(endpoint: &Endpoint, tables: &[NormalizedTable]) -> BTreeMap<String, u64> {
+fn dump_table_row_estimates(
+    endpoint: &Endpoint,
+    tables: &[NormalizedTable],
+) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
-    if let Ok(mut adapter) = LiveAdapter::connect(endpoint) {
-        for table in tables {
-            let count = adapter.row_count(&table.name).unwrap_or(0).max(0) as u64;
-            counts.insert(table.name.clone(), count);
-        }
+    if endpoint.engine != "mysql" || tables.is_empty() {
+        return counts;
+    }
+    let mut conn = match LiveAdapter::connect(endpoint) {
+        Ok(LiveAdapter::MySql(conn)) => conn,
+        _ => return counts,
+    };
+    let schema_name = endpoint.schema.as_deref().unwrap_or(&endpoint.database);
+    let table_names = tables
+        .iter()
+        .map(|table| sql_literal(&Value::String(table.name.clone())))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) FROM information_schema.tables WHERE TABLE_SCHEMA = {} AND TABLE_NAME IN ({})",
+        sql_literal(&Value::String(schema_name.to_string())),
+        table_names
+    );
+    let Ok(rows) = conn.query::<(String, u64), _>(sql) else {
+        return counts;
+    };
+    for (table, rows) in rows {
+        counts.insert(table, rows);
     }
     counts
 }
@@ -1273,7 +1294,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         return Err("dump.run found no tables to export".to_string());
     }
 
-    let row_counts = dump_table_row_counts(&endpoint, &schema.tables);
+    let row_counts = dump_table_row_estimates(&endpoint, &schema.tables);
     emit(dump_plan_event(
         request.request_id.clone(),
         &schema.tables,
