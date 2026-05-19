@@ -360,6 +360,16 @@ class RustDumpExportDialog(QDialog):
         self.export_success: Optional[bool] = None
         self.export_schema: str = ""
         self.export_tables: List[str] = []
+        self.export_table_totals: dict = {}
+        self.export_table_done: dict = {}
+        self.export_table_status: dict = {}
+        self.export_total_rows: int = 0
+        self.export_completed_tables: int = 0
+        self.export_total_tables: int = 0
+        self.export_last_percent: int = 0
+        self.export_telemetry_events: List[dict] = []
+        self.export_table_started_at: dict = {}
+        self.export_table_finished_at: dict = {}
 
         # rust_dump 설치 확인
         self.rust_dump_installed, self.rust_dump_msg = check_rust_dump()
@@ -1028,6 +1038,16 @@ class RustDumpExportDialog(QDialog):
         self.export_success = None
         self.export_schema = schema
         self.export_tables = self.get_selected_tables() if self.radio_partial.isChecked() else []
+        self.export_table_totals = {}
+        self.export_table_done = {}
+        self.export_table_status = {}
+        self.export_total_rows = 0
+        self.export_completed_tables = 0
+        self.export_total_tables = 0
+        self.export_last_percent = 0
+        self.export_telemetry_events = []
+        self.export_table_started_at = {}
+        self.export_table_finished_at = {}
         self.btn_save_log.setEnabled(False)
 
         # 로그 헤더 추가
@@ -1060,9 +1080,9 @@ class RustDumpExportDialog(QDialog):
         # 프로그레스 바 초기화
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(100)
-        self.label_percent.setText("📊 진행률: 0%")
-        self.label_data.setText("📦 데이터: 0 MB / 0 MB")
-        self.label_speed.setText("⚡ 속도: 0 MB/s")
+        self.label_percent.setText("📊 전체 진행률: 0%")
+        self.label_data.setText("📦 데이터: 0 / 0 rows")
+        self.label_speed.setText("⚡ 속도: 0 rows/s")
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Export 준비 중...")
 
@@ -1116,14 +1136,14 @@ class RustDumpExportDialog(QDialog):
 
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
-        # 프로그레스 바 최대값 설정 (처음 호출 시)
-        if self.progress_bar.maximum() != total:
-            self.progress_bar.setMaximum(total)
-
-        self.progress_bar.setValue(current)
-        self.label_tables.setText(f"📋 테이블: {current} / {total} 완료")
-        self.label_status.setText(f"✅ {table_name} ({current}/{total})")
-        self._add_log(f"테이블 완료: {table_name} ({current}/{total})")
+        self.export_completed_tables = max(self.export_completed_tables, current)
+        self.export_total_tables = max(self.export_total_tables, total)
+        self.label_tables.setText(
+            f"📋 테이블: {self.export_completed_tables} / {self.export_total_tables} 완료"
+        )
+        self._add_log(
+            f"테이블 완료: {table_name} ({self.export_completed_tables}/{self.export_total_tables})"
+        )
 
     def on_finished(self, success: bool, message: str):
         # 로그 기록
@@ -1151,7 +1171,7 @@ class RustDumpExportDialog(QDialog):
             # 최종 진행률 100% 표시
             self.progress_bar.setValue(100)
             self.progress_bar.setMaximum(100)  # 퍼센트 기준으로 재설정
-            self.label_percent.setText("📊 진행률: 100%")
+            self.label_percent.setText("📊 전체 진행률: 100%")
             self.label_data.setText("📦 데이터: Export 완료")
             self.label_speed.setText("⚡ 속도: -")
             self.label_status.setText("✅ Export 완료")
@@ -1183,24 +1203,67 @@ class RustDumpExportDialog(QDialog):
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
-        percent = info.get('percent', 0)
-        mb_done = info.get('mb_done', 0)
-        mb_total = info.get('mb_total', 0)
-        speed = info.get('speed', '0 B/s')
+        if info.get("event") == "dump_plan":
+            tables = info.get("tables") or []
+            self.export_table_totals = {
+                str(item.get("name")): int(item.get("rows") or 0)
+                for item in tables
+                if item.get("name")
+            }
+            self.export_table_done = {name: 0 for name in self.export_table_totals}
+            self.export_total_rows = int(info.get("rows_total") or sum(self.export_table_totals.values()))
+            self.export_total_tables = int(info.get("tables_total") or len(self.export_table_totals))
+            self.label_tables.setText(f"📋 테이블: 0 / {self.export_total_tables} 완료")
+            self.label_data.setText(f"📦 데이터: 0 / {self.export_total_rows:,} rows")
+            self.label_status.setText("Export 계획 수립 완료")
+            return
 
-        self.progress_bar.setValue(percent)
-        self.label_percent.setText(f"📊 진행률: {percent}%")
+        table = str(info.get("table") or "")
+        if table:
+            rows_done = int(info.get("rows_done") or 0)
+            table_total = int(info.get("rows_total") or 0)
+            if table_total and table not in self.export_table_totals:
+                self.export_table_totals[table] = table_total
+                self.export_total_rows = max(
+                    self.export_total_rows,
+                    sum(self.export_table_totals.values()),
+                )
+            if table_total:
+                rows_done = min(rows_done, table_total)
+            self.export_table_done[table] = max(self.export_table_done.get(table, 0), rows_done)
 
-        # Export는 데이터 크기를 표시하지 않음 (rows만 표시되므로)
-        if mb_done == 0 and mb_total == 0:
-            self.label_data.setText("📦 데이터: Export 진행 중...")
+        overall_done = sum(self.export_table_done.values())
+        if self.export_total_rows > 0:
+            computed_percent = int((overall_done / self.export_total_rows) * 100)
         else:
-            self.label_data.setText(f"📦 데이터: {mb_done:.2f} MB / {mb_total:.2f} MB")
+            computed_percent = int(info.get("percent") or 0)
+        percent = max(self.export_last_percent, min(computed_percent, 100))
+        self.export_last_percent = percent
 
-        self.label_speed.setText(f"⚡ 속도: {speed}")
+        self.progress_bar.setMaximum(100)
+        self.progress_bar.setValue(percent)
+        self.label_percent.setText(f"📊 전체 진행률: {percent}%")
+        self.label_data.setText(f"📦 데이터: {overall_done:,} / {self.export_total_rows:,} rows")
+        self.label_speed.setText(f"⚡ 속도: {info.get('speed', 'Rust DB Core')}")
+
+        if table:
+            table_total = self.export_table_totals.get(table) or int(info.get("rows_total") or 0)
+            table_percent = (
+                int((self.export_table_done.get(table, 0) / table_total) * 100)
+                if table_total else 0
+            )
+            self.label_status.setText(f"🔄 {table} ({table_percent}%)")
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트"""
+        now = datetime.now()
+        self.export_table_status[table_name] = status
+        if status == "loading":
+            self.export_table_started_at.setdefault(table_name, now)
+            self.label_status.setText(f"🔄 {table_name}")
+        elif status in ("done", "error"):
+            self.export_table_finished_at[table_name] = now
+
         # 상태별 아이콘 및 스타일
         status_icons = {
             'pending': '⏳',
