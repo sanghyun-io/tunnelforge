@@ -41,6 +41,21 @@ def create_sql_editor_connector(engine, host, port, user, password, database=Non
     )
 
 
+def format_metadata_db_version(db_version) -> str:
+    if isinstance(db_version, (tuple, list)):
+        major = db_version[0] if len(db_version) > 0 else 0
+        minor = db_version[1] if len(db_version) > 1 else 0
+        return f"{major}.{minor}"
+
+    text = str(db_version or "").strip()
+    if not text:
+        return "unknown"
+    match = re.search(r"(\d+)(?:\.(\d+))?", text)
+    if match:
+        return f"{match.group(1)}.{match.group(2) or 0}"
+    return text
+
+
 # =====================================================================
 # SQL 구문 하이라이터
 # =====================================================================
@@ -3595,7 +3610,7 @@ class SQLEditorDialog(QDialog):
         self.metadata_provider._metadata = metadata
 
         table_count = len(metadata.tables)
-        version = f"{metadata.db_version[0]}.{metadata.db_version[1]}"
+        version = format_metadata_db_version(metadata.db_version)
         self.validation_label.setText(f"✅ {table_count}개 테이블 로드됨 (MySQL {version})")
 
         # 현재 SQL 재검증

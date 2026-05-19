@@ -5,6 +5,7 @@ from src.ui.dialogs.db_dialogs import (
     cap_incomplete_export_percent,
     format_export_row_labels,
     format_export_table_status,
+    next_export_percent,
 )
 
 
@@ -18,6 +19,15 @@ def test_cap_incomplete_export_percent_prevents_early_99():
 
 def test_cap_incomplete_export_percent_allows_final_100():
     assert cap_incomplete_export_percent(100, completed_tables=208, total_tables=208) == 100
+
+
+def test_next_export_percent_reduces_stale_99_when_table_count_is_incomplete():
+    assert next_export_percent(
+        last_percent=99,
+        computed_percent=99,
+        completed_tables=40,
+        total_tables=208,
+    ) == 19
 
 
 def test_format_export_row_labels_separates_done_and_estimate():

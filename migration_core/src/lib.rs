@@ -606,12 +606,14 @@ fn default_dump_data_format() -> String {
 
 pub struct CoreService {
     connections: BTreeMap<String, LiveAdapter>,
+    next_connection_sequence: u64,
 }
 
 impl CoreService {
     pub fn new() -> Self {
         Self {
             connections: BTreeMap::new(),
+            next_connection_sequence: 1,
         }
     }
 
@@ -639,9 +641,10 @@ impl CoreService {
                 })]
             }
         };
-        let id = connection_id(&endpoint);
         match LiveAdapter::connect(&endpoint) {
             Ok(adapter) => {
+                let id = unique_connection_id(&endpoint, self.next_connection_sequence);
+                self.next_connection_sequence = self.next_connection_sequence.saturating_add(1);
                 self.connections.insert(id.clone(), adapter);
                 vec![json!({
                     "event": "result",
@@ -2217,6 +2220,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
 
+    let restore_local_infile = ensure_mysql_local_infile_for_import(&mut adapter)?;
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
         for (index, table_manifest) in tables.iter().enumerate() {
@@ -2298,8 +2302,11 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         Ok(())
     })();
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
+    let restore_local_infile_result =
+        restore_mysql_local_infile_after_import(&mut adapter, restore_local_infile);
     import_result?;
     restore_result?;
+    restore_local_infile_result?;
 
     Ok(json!({
         "event": "result",
@@ -2449,6 +2456,44 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
             "SET SESSION unique_checks=0".to_string(),
         ]
     }
+}
+
+fn mysql_local_infile_sql(enabled: bool) -> String {
+    format!(
+        "SET GLOBAL local_infile={}",
+        if enabled { "ON" } else { "OFF" }
+    )
+}
+
+fn set_mysql_local_infile(conn: &mut mysql::PooledConn, enabled: bool) -> Result<(), String> {
+    conn.query_drop(mysql_local_infile_sql(enabled))
+        .map_err(|err| format!("mysql local_infile tuning error: {err}"))
+}
+
+fn ensure_mysql_local_infile_for_import(adapter: &mut LiveAdapter) -> Result<bool, String> {
+    let LiveAdapter::MySql(conn) = adapter else {
+        return Ok(false);
+    };
+    if mysql_local_infile_enabled(conn) {
+        return Ok(false);
+    }
+    if set_mysql_local_infile(conn, true).is_err() {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+fn restore_mysql_local_infile_after_import(
+    adapter: &mut LiveAdapter,
+    should_restore: bool,
+) -> Result<(), String> {
+    let LiveAdapter::MySql(conn) = adapter else {
+        return Ok(());
+    };
+    if should_restore {
+        set_mysql_local_infile(conn, false)?;
+    }
+    Ok(())
 }
 
 fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> Result<(), String> {
@@ -2738,6 +2783,10 @@ fn connection_id(endpoint: &Endpoint) -> String {
     hasher.update(endpoint.database.as_bytes());
     hasher.update(endpoint_schema(endpoint).as_bytes());
     format!("conn-{}", hex::encode(&hasher.finalize()[..8]))
+}
+
+fn unique_connection_id(endpoint: &Endpoint, sequence: u64) -> String {
+    format!("{}-{}", connection_id(endpoint), sequence)
 }
 
 fn redact_endpoint_secret(message: &str, endpoint: &Endpoint) -> String {
@@ -7156,6 +7205,26 @@ mod tests {
     }
 
     #[test]
+    fn stateful_connection_ids_are_unique_for_same_endpoint() {
+        let endpoint = Endpoint {
+            engine: "mysql".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            database: "app".to_string(),
+            schema: None,
+        };
+
+        let first = unique_connection_id(&endpoint, 1);
+        let second = unique_connection_id(&endpoint, 2);
+
+        assert_ne!(first, second);
+        assert!(first.starts_with(&connection_id(&endpoint)));
+        assert!(second.starts_with(&connection_id(&endpoint)));
+    }
+
+    #[test]
     fn query_result_streams_row_batches_when_requested() {
         let events = query_result_events(
             &Request {
@@ -8009,6 +8078,12 @@ mod tests {
                 "SET SESSION foreign_key_checks=1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn mysql_dump_import_can_temporarily_enable_local_infile() {
+        assert_eq!(mysql_local_infile_sql(true), "SET GLOBAL local_infile=ON");
+        assert_eq!(mysql_local_infile_sql(false), "SET GLOBAL local_infile=OFF");
     }
 
     #[test]

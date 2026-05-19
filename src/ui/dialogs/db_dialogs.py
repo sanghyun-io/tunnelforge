@@ -38,6 +38,19 @@ def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tab
     return min(bounded, max(1, min(table_cap, 99)))
 
 
+def next_export_percent(
+    last_percent: int,
+    computed_percent: int,
+    completed_tables: int,
+    total_tables: int,
+) -> int:
+    """Advance export progress without letting stale early estimates stick at 99%."""
+    candidate = max(max(0, int(last_percent)), max(0, min(int(computed_percent), 100)))
+    if total_tables > 0 and completed_tables < total_tables:
+        return min(candidate, cap_incomplete_export_percent(100, completed_tables, total_tables))
+    return candidate
+
+
 def format_export_row_labels(processed_rows: int, estimated_total_rows: int) -> tuple[str, str]:
     processed = max(0, int(processed_rows))
     estimated = max(0, int(estimated_total_rows))
@@ -1298,7 +1311,12 @@ class RustDumpExportDialog(QDialog):
             self.export_completed_tables,
             self.export_total_tables,
         )
-        percent = max(self.export_last_percent, min(computed_percent, 100))
+        percent = next_export_percent(
+            self.export_last_percent,
+            computed_percent,
+            self.export_completed_tables,
+            self.export_total_tables,
+        )
         self.export_last_percent = percent
 
         self.progress_bar.setMaximum(100)

@@ -6,7 +6,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
+from src.core.sql_validator import SchemaMetadata
+from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog, format_metadata_db_version
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -206,5 +207,27 @@ def test_refresh_databases_passes_mysql_default_database(monkeypatch):
             "tunnelpass",
             "tf_source84",
         )
+    finally:
+        close_dialog(dialog)
+
+
+def test_format_metadata_db_version_tolerates_empty_rust_version():
+    assert format_metadata_db_version("") == "unknown"
+    assert format_metadata_db_version("8.4.7") == "8.4"
+    assert format_metadata_db_version((16, 2, 0)) == "16.2"
+
+
+def test_metadata_loaded_does_not_crash_on_empty_version(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        metadata = SchemaMetadata()
+        metadata.tables = {"users"}
+        metadata.db_version = ""
+        dialog._on_validation_requested = MagicMock()
+
+        dialog._on_metadata_loaded(metadata)
+
+        assert "1개 테이블 로드됨" in dialog.validation_label.text()
+        assert "unknown" in dialog.validation_label.text()
     finally:
         close_dialog(dialog)
