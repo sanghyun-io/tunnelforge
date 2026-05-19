@@ -168,8 +168,13 @@ struct DumpRange {
 }
 
 enum DumpRangeEvent {
-    Progress(Value),
-    Done { rows: u64 },
+    Done {
+        chunk_index: u64,
+        rows: u64,
+        stream_ms: u64,
+        range_start: String,
+        range_end: String,
+    },
     Error(String),
 }
 
@@ -1420,6 +1425,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 table_total,
                 chunk_size,
                 data_format.to_string(),
+                threads,
                 request_id.clone(),
                 sender.clone(),
             ));
@@ -1452,6 +1458,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                         table_total,
                         chunk_size,
                         data_format.to_string(),
+                        threads,
                         request_id.clone(),
                         sender.clone(),
                     ));
@@ -1471,6 +1478,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                         table_total,
                         chunk_size,
                         data_format.to_string(),
+                        threads,
                         request_id.clone(),
                         sender.clone(),
                     ));
@@ -1508,6 +1516,33 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<Option<(Vec<DumpTableManifest>, u64, u64)>, String> {
+    Ok(dump_mysql_table_parallel_ranges(
+        endpoint,
+        output_path,
+        table,
+        0,
+        1,
+        chunk_size,
+        data_format,
+        threads,
+        request_id,
+        |event| emit(event),
+    )?
+    .map(|(manifest, rows, chunks)| (vec![manifest], rows, chunks)))
+}
+
+fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    output_path: &Path,
+    table: &NormalizedTable,
+    index: usize,
+    table_total: usize,
+    chunk_size: usize,
+    data_format: &str,
+    threads: usize,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<Option<(DumpTableManifest, u64, u64)>, String> {
     let Some(pk_column) = single_numeric_primary_key(table) else {
         return Ok(None);
     };
@@ -1520,7 +1555,7 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
         .query_first::<u64, _>(count_sql("mysql", &table.name))
         .map(|count| count.unwrap_or(0))
         .unwrap_or(0);
-    if table_row_count == 0 {
+    if !should_use_pk_range_dump(table, table_row_count, chunk_size) {
         return Ok(None);
     }
     let Some((min_key, max_key)) = mysql_numeric_min_max(&mut conn, &table.name, pk_column)? else {
@@ -1535,12 +1570,12 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
         "request_id": request_id,
         "table": table.name,
         "status": "dumping",
-        "current": 1,
-        "total": 1,
+        "current": index + 1,
+        "total": table_total,
         "strategy": "pk_range_parallel"
     }));
 
-    let table_path = format!("0001_{}", safe_dump_component(&table.name));
+    let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
     let table_dir = output_path.join(&table_path);
     fs::create_dir_all(&table_dir)
         .map_err(|err| format!("failed to create dump table dir: {err}"))?;
@@ -1565,8 +1600,6 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
                 pk_column.to_string(),
                 range,
                 data_format.to_string(),
-                request_id.clone(),
-                table_row_count,
                 sender.clone(),
             ));
             active += 1;
@@ -1577,11 +1610,31 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
 
     while completed < total_ranges && active > 0 {
         match receiver.recv() {
-            Ok(DumpRangeEvent::Progress(event)) => emit(event),
-            Ok(DumpRangeEvent::Done { rows }) => {
+            Ok(DumpRangeEvent::Done {
+                chunk_index,
+                rows,
+                stream_ms,
+                range_start,
+                range_end,
+            }) => {
                 rows_dumped += rows;
                 completed += 1;
                 active = active.saturating_sub(1);
+                emit(json!({
+                    "event": "row_progress",
+                    "request_id": request_id,
+                    "table": table.name,
+                    "rows": rows_dumped,
+                    "total": table_row_count,
+                    "chunk_rows": rows,
+                    "chunks_done": completed,
+                    "chunks_total": total_ranges,
+                    "stream_ms": stream_ms,
+                    "chunk_index": chunk_index,
+                    "range_start": range_start,
+                    "range_end": range_end,
+                    "strategy": "pk_range_parallel"
+                }));
                 if let Some(range) = pending.pop_front() {
                     handles.push(spawn_mysql_range_worker(
                         endpoint.clone(),
@@ -1591,8 +1644,6 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
                         pk_column.to_string(),
                         range,
                         data_format.to_string(),
-                        request_id.clone(),
-                        table_row_count,
                         sender.clone(),
                     ));
                     active += 1;
@@ -1619,18 +1670,18 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
         "request_id": request_id,
         "table": table.name,
         "status": "completed",
-        "current": 1,
-        "total": 1,
+        "current": index + 1,
+        "total": table_total,
         "strategy": "pk_range_parallel"
     }));
 
     Ok(Some((
-        vec![DumpTableManifest {
+        DumpTableManifest {
             name: table.name.clone(),
             path: table_path,
             rows: rows_dumped,
             chunks: total_ranges as u64,
-        }],
+        },
         rows_dumped,
         total_ranges as u64,
     )))
@@ -1644,8 +1695,6 @@ fn spawn_mysql_range_worker(
     pk_column: String,
     range: DumpRange,
     data_format: String,
-    request_id: Option<String>,
-    table_row_count: u64,
     sender: mpsc::Sender<DumpRangeEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -1660,20 +1709,13 @@ fn spawn_mysql_range_worker(
         );
         match result {
             Ok((rows, stream_ms)) => {
-                let _ = sender.send(DumpRangeEvent::Progress(json!({
-                    "event": "row_progress",
-                    "request_id": request_id,
-                    "table": table.name,
-                    "rows": rows,
-                    "total": table_row_count,
-                    "chunk_rows": rows,
-                    "stream_ms": stream_ms,
-                    "chunk_index": range.chunk_index,
-                    "range_start": range.start.to_string(),
-                    "range_end": range.end.to_string(),
-                    "strategy": "pk_range_parallel"
-                })));
-                let _ = sender.send(DumpRangeEvent::Done { rows });
+                let _ = sender.send(DumpRangeEvent::Done {
+                    chunk_index: range.chunk_index,
+                    rows,
+                    stream_ms,
+                    range_start: range.start.to_string(),
+                    range_end: range.end.to_string(),
+                });
             }
             Err(err) => {
                 let _ = sender.send(DumpRangeEvent::Error(err));
@@ -1730,11 +1772,30 @@ fn spawn_dump_table_worker(
     table_total: usize,
     chunk_size: usize,
     data_format: String,
+    threads: usize,
     request_id: Option<String>,
     sender: mpsc::Sender<DumpTableEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
+            if endpoint.engine == "mysql" {
+                if let Some(result) = dump_mysql_table_parallel_ranges(
+                    &endpoint,
+                    &output_path,
+                    &table,
+                    index,
+                    table_total,
+                    chunk_size,
+                    &data_format,
+                    threads,
+                    request_id.clone(),
+                    |event| {
+                        let _ = sender.send(DumpTableEvent::Progress(event));
+                    },
+                )? {
+                    return Ok(result);
+                }
+            }
             let mut adapter = LiveAdapter::connect(&endpoint)?;
             dump_one_table(
                 &mut adapter,
@@ -4869,6 +4930,11 @@ fn is_integer_key_type(type_name: &str) -> bool {
         || type_name.starts_with("serial")
 }
 
+fn should_use_pk_range_dump(table: &NormalizedTable, row_count: u64, chunk_size: usize) -> bool {
+    let threshold = (chunk_size as u64).saturating_mul(2);
+    row_count >= threshold && single_numeric_primary_key(table).is_some()
+}
+
 fn mysql_numeric_min_max(
     conn: &mut mysql::PooledConn,
     table: &str,
@@ -6527,6 +6593,44 @@ mod tests {
         };
 
         assert_eq!(single_numeric_primary_key(&table), None);
+    }
+
+    #[test]
+    fn large_numeric_pk_table_is_range_dump_candidate() {
+        let table = NormalizedTable {
+            name: "events".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "bigint".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        assert!(should_use_pk_range_dump(&table, 200_000, 50_000));
+    }
+
+    #[test]
+    fn small_numeric_pk_table_stays_whole_table_candidate() {
+        let table = NormalizedTable {
+            name: "small_events".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "bigint".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        assert!(!should_use_pk_range_dump(&table, 10_000, 50_000));
     }
 
     #[test]
