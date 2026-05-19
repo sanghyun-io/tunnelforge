@@ -193,6 +193,9 @@ class TestRustDumpExporter:
         assert facade.payload["source"]["engine"] == "mysql"
         assert facade.payload["source"]["database"] == "app"
         assert facade.payload["output_dir"].endswith("dump")
+        assert facade.payload["threads"] == 4
+        assert facade.payload["chunk_size"] == 50000
+        assert facade.payload["data_format"] == "tsv"
         assert "2" in msg
 
     def test_export_tables_passes_selected_tables_to_rust_dump(self, tmp_path):
@@ -218,6 +221,9 @@ class TestRustDumpExporter:
         assert success is True
         assert tables == ['users', 'orders']
         assert facade.payload["tables"] == ['users', 'orders']
+        assert facade.payload["threads"] == 4
+        assert facade.payload["chunk_size"] == 50000
+        assert facade.payload["data_format"] == "tsv"
 
 
 class TestRustDumpImporter:
@@ -261,6 +267,7 @@ class TestRustDumpImporter:
         assert success is True
         assert facade.payload["target"]["database"] == "app"
         assert facade.payload["input_dir"] == str(dump_dir)
+        assert facade.payload["threads"] == 4
         assert results["users"]["status"] == "done"
         assert "1" in msg
 

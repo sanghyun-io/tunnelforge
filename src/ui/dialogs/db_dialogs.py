@@ -18,12 +18,15 @@ import os
 from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
+from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, RustDumpConfig, check_rust_dump,
     ForeignKeyResolver, OrphanRecordInfo
 )
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
+
+logger = get_logger("db_dialogs")
 
 
 class DBConnectionDialog(QDialog):
@@ -1236,6 +1239,7 @@ class RustDumpExportDialog(QDialog):
             self.txt_log.takeItem(0)
         self.txt_log.addItem(line)
         self.txt_log.scrollToBottom()
+        logger.debug("[rust_dump] %s", line)
 
     def _report_error_to_github(self, error_type: str, error_message: str):
         """GitHub 이슈 자동 보고 (백그라운드)"""

@@ -1,13 +1,15 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use mysql::prelude::Queryable;
+use mysql::{prelude::Queryable, LocalInfileHandler};
 use postgres::{error::SqlState, NoTls};
 
 #[derive(Debug, Deserialize)]
@@ -129,6 +131,8 @@ pub struct MigrationResult {
 pub struct DumpManifest {
     pub format: String,
     pub format_version: u32,
+    #[serde(default = "default_dump_data_format")]
+    pub data_format: String,
     pub source_engine: String,
     pub database: String,
     pub schema: NormalizedSchema,
@@ -143,6 +147,39 @@ pub struct DumpTableManifest {
     pub path: String,
     pub rows: u64,
     pub chunks: u64,
+}
+
+enum DumpTableEvent {
+    Progress(Value),
+    Done {
+        index: usize,
+        manifest: DumpTableManifest,
+        rows: u64,
+        chunks: u64,
+    },
+    Error(String),
+}
+
+#[derive(Debug, Clone)]
+struct DumpRange {
+    chunk_index: u64,
+    start: i128,
+    end: i128,
+}
+
+enum DumpRangeEvent {
+    Progress(Value),
+    Done { rows: u64 },
+    Error(String),
+}
+
+enum ImportChunkEvent {
+    Done {
+        chunk_index: u64,
+        rows: u64,
+        load_ms: u64,
+    },
+    Error(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -459,15 +496,11 @@ impl MigrationAdapter for LiveAdapter {
         if rows.is_empty() {
             return Ok(());
         }
-        let engine = self.engine();
-        let sql = insert_rows_literal_sql_for_table(engine, table, &rows);
         match self {
+            Self::PostgreSql(client) => copy_rows_to_postgres(client, table, &rows),
             Self::MySql(conn) => conn
-                .query_drop(sql)
+                .query_drop(insert_rows_literal_sql_for_table("mysql", table, &rows))
                 .map_err(|err| format!("mysql insert error: {err}")),
-            Self::PostgreSql(client) => client
-                .batch_execute(&sql)
-                .map_err(|err| format!("postgresql insert error: {err}")),
         }
     }
 
@@ -556,7 +589,11 @@ fn default_mode() -> String {
 }
 
 fn default_chunk_size() -> usize {
-    5000
+    10_000
+}
+
+fn default_dump_data_format() -> String {
+    "jsonl".to_string()
 }
 
 pub struct CoreService {
@@ -1147,12 +1184,28 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         .map(|value| value as usize)
         .unwrap_or_else(default_chunk_size)
         .max(1);
+    let threads = request
+        .payload
+        .get("threads")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(4)
+        .max(1);
     let overwrite = request
         .payload
         .get("overwrite")
         .and_then(Value::as_bool)
         .unwrap_or(false);
     let selected_tables = string_list(request.payload.get("tables"));
+    let data_format = request
+        .payload
+        .get("data_format")
+        .and_then(Value::as_str)
+        .unwrap_or("tsv")
+        .to_ascii_lowercase();
+    if !matches!(data_format.as_str(), "jsonl" | "tsv") {
+        return Err(format!("unsupported dump data_format: {data_format}"));
+    }
 
     let output_path = Path::new(output_dir);
     if output_path.exists() {
@@ -1176,89 +1229,66 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         let selected: BTreeSet<String> = selected_tables.into_iter().collect();
         schema.tables.retain(|table| selected.contains(&table.name));
     }
+    schema = dependency_ordered_schema(&schema);
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
     }
 
-    let mut adapter = LiveAdapter::connect(&endpoint)?;
-    let mut table_manifests = Vec::new();
-    let mut total_rows = 0_u64;
-    let mut total_chunks = 0_u64;
     let table_total = schema.tables.len();
-
-    for (index, table) in schema.tables.iter().enumerate() {
-        emit(json!({
-            "event": "table_progress",
-            "request_id": request.request_id,
-            "table": table.name,
-            "status": "dumping",
-            "current": index + 1,
-            "total": table_total
-        }));
-        let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
-        let table_dir = output_path.join(&table_path);
-        fs::create_dir_all(&table_dir)
-            .map_err(|err| format!("failed to create dump table dir: {err}"))?;
-
-        let table_row_count = adapter.row_count(&table.name).unwrap_or(0) as u64;
-        let key_columns = key_columns(table);
-        let use_keyset = !key_columns.is_empty();
-        let mut last_key: Option<String> = None;
-        let mut offset = 0_usize;
-        let mut rows_dumped = 0_u64;
-        let mut chunks_dumped = 0_u64;
-
-        loop {
-            let rows = if use_keyset {
-                adapter.read_rows_after_key(table, &key_columns, last_key.as_deref(), chunk_size)?
-            } else {
-                adapter.read_rows(table, offset, chunk_size)?
-            };
-            if rows.is_empty() {
-                break;
+    let (table_manifests, total_rows, total_chunks) =
+        if endpoint.engine == "mysql" && threads > 1 && table_total == 1 {
+            match dump_single_mysql_table_parallel(
+                &endpoint,
+                output_path,
+                &schema.tables[0],
+                chunk_size,
+                &data_format,
+                threads,
+                request.request_id.clone(),
+                |event| emit(event),
+            )? {
+                Some(result) => result,
+                None => {
+                    let mut adapter = LiveAdapter::connect(&endpoint)?;
+                    dump_tables_sequential(
+                        &mut adapter,
+                        output_path,
+                        &schema.tables,
+                        chunk_size,
+                        &data_format,
+                        request.request_id.clone(),
+                        |event| emit(event),
+                    )?
+                }
             }
-            chunks_dumped += 1;
-            let chunk_name = format!("chunk_{chunks_dumped:06}.jsonl");
-            write_jsonl_rows(&table_dir.join(&chunk_name), &rows)?;
-
-            let copied_now = rows.len();
-            rows_dumped += copied_now as u64;
-            total_rows += copied_now as u64;
-            total_chunks += 1;
-            if use_keyset {
-                last_key = rows.last().and_then(|row| row_key_token(row, &key_columns));
-            } else {
-                offset += copied_now;
-            }
-
-            emit(json!({
-                "event": "row_progress",
-                "request_id": request.request_id,
-                "table": table.name,
-                "rows": rows_dumped,
-                "total": table_row_count
-            }));
-        }
-
-        table_manifests.push(DumpTableManifest {
-            name: table.name.clone(),
-            path: table_path,
-            rows: rows_dumped,
-            chunks: chunks_dumped,
-        });
-        emit(json!({
-            "event": "table_progress",
-            "request_id": request.request_id,
-            "table": table.name,
-            "status": "completed",
-            "current": index + 1,
-            "total": table_total
-        }));
-    }
+        } else if threads > 1 && table_total > 1 {
+            dump_tables_parallel(
+                &endpoint,
+                output_path,
+                &schema.tables,
+                chunk_size,
+                &data_format,
+                threads,
+                request.request_id.clone(),
+                |event| emit(event),
+            )?
+        } else {
+            let mut adapter = LiveAdapter::connect(&endpoint)?;
+            dump_tables_sequential(
+                &mut adapter,
+                output_path,
+                &schema.tables,
+                chunk_size,
+                &data_format,
+                request.request_id.clone(),
+                |event| emit(event),
+            )?
+        };
 
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
-        format_version: 1,
+        format_version: if data_format == "jsonl" { 1 } else { 2 },
+        data_format,
         source_engine: endpoint.engine.clone(),
         database: endpoint.database.clone(),
         schema,
@@ -1281,6 +1311,654 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         "chunks_dumped": total_chunks,
         "manifest": "_tunnelforge_dump.json"
     }))
+}
+
+fn dump_tables_sequential<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    output_path: &Path,
+    tables: &[NormalizedTable],
+    chunk_size: usize,
+    data_format: &str,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
+    let mut manifests = Vec::new();
+    let mut total_rows = 0_u64;
+    let mut total_chunks = 0_u64;
+    let table_total = tables.len();
+
+    for (index, table) in tables.iter().enumerate() {
+        let (manifest, rows, chunks) = dump_one_table(
+            adapter,
+            output_path,
+            table,
+            index,
+            table_total,
+            chunk_size,
+            data_format,
+            request_id.clone(),
+            |event| emit(event),
+        )?;
+        manifests.push(manifest);
+        total_rows += rows;
+        total_chunks += chunks;
+    }
+
+    Ok((manifests, total_rows, total_chunks))
+}
+
+fn dump_tables_parallel<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    output_path: &Path,
+    tables: &[NormalizedTable],
+    chunk_size: usize,
+    data_format: &str,
+    threads: usize,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
+    let table_total = tables.len();
+    let max_threads = threads.max(1).min(table_total);
+    let mut pending = (0..table_total).collect::<VecDeque<_>>();
+    let mut active = 0_usize;
+    let mut completed = 0_usize;
+    let mut total_rows = 0_u64;
+    let mut total_chunks = 0_u64;
+    let mut first_error: Option<String> = None;
+    let mut manifests: Vec<Option<DumpTableManifest>> = vec![None; table_total];
+    let mut handles = Vec::new();
+    let (sender, receiver) = mpsc::channel::<DumpTableEvent>();
+
+    while active < max_threads {
+        if let Some(index) = pending.pop_front() {
+            handles.push(spawn_dump_table_worker(
+                endpoint.clone(),
+                output_path.to_path_buf(),
+                tables[index].clone(),
+                index,
+                table_total,
+                chunk_size,
+                data_format.to_string(),
+                request_id.clone(),
+                sender.clone(),
+            ));
+            active += 1;
+        } else {
+            break;
+        }
+    }
+
+    while completed < table_total && active > 0 {
+        match receiver.recv() {
+            Ok(DumpTableEvent::Progress(event)) => emit(event),
+            Ok(DumpTableEvent::Done {
+                index,
+                manifest,
+                rows,
+                chunks,
+            }) => {
+                manifests[index] = Some(manifest);
+                total_rows += rows;
+                total_chunks += chunks;
+                completed += 1;
+                active = active.saturating_sub(1);
+                if let Some(next_index) = pending.pop_front() {
+                    handles.push(spawn_dump_table_worker(
+                        endpoint.clone(),
+                        output_path.to_path_buf(),
+                        tables[next_index].clone(),
+                        next_index,
+                        table_total,
+                        chunk_size,
+                        data_format.to_string(),
+                        request_id.clone(),
+                        sender.clone(),
+                    ));
+                    active += 1;
+                }
+            }
+            Ok(DumpTableEvent::Error(err)) => {
+                first_error.get_or_insert(err);
+                completed += 1;
+                active = active.saturating_sub(1);
+                if let Some(next_index) = pending.pop_front() {
+                    handles.push(spawn_dump_table_worker(
+                        endpoint.clone(),
+                        output_path.to_path_buf(),
+                        tables[next_index].clone(),
+                        next_index,
+                        table_total,
+                        chunk_size,
+                        data_format.to_string(),
+                        request_id.clone(),
+                        sender.clone(),
+                    ));
+                    active += 1;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    Ok((
+        manifests
+            .into_iter()
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(|| "parallel dump did not produce all table manifests".to_string())?,
+        total_rows,
+        total_chunks,
+    ))
+}
+
+fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    output_path: &Path,
+    table: &NormalizedTable,
+    chunk_size: usize,
+    data_format: &str,
+    threads: usize,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<Option<(Vec<DumpTableManifest>, u64, u64)>, String> {
+    let Some(pk_column) = single_numeric_primary_key(table) else {
+        return Ok(None);
+    };
+
+    let mut conn = match LiveAdapter::connect(endpoint)? {
+        LiveAdapter::MySql(conn) => conn,
+        LiveAdapter::PostgreSql(_) => return Ok(None),
+    };
+    let table_row_count = conn
+        .query_first::<u64, _>(count_sql("mysql", &table.name))
+        .map(|count| count.unwrap_or(0))
+        .unwrap_or(0);
+    if table_row_count == 0 {
+        return Ok(None);
+    }
+    let Some((min_key, max_key)) = mysql_numeric_min_max(&mut conn, &table.name, pk_column)? else {
+        return Ok(None);
+    };
+    if min_key > max_key {
+        return Ok(None);
+    }
+
+    emit(json!({
+        "event": "table_progress",
+        "request_id": request_id,
+        "table": table.name,
+        "status": "dumping",
+        "current": 1,
+        "total": 1,
+        "strategy": "pk_range_parallel"
+    }));
+
+    let table_path = format!("0001_{}", safe_dump_component(&table.name));
+    let table_dir = output_path.join(&table_path);
+    fs::create_dir_all(&table_dir)
+        .map_err(|err| format!("failed to create dump table dir: {err}"))?;
+    let ranges = pk_ranges(min_key, max_key, table_row_count, chunk_size);
+    let total_ranges = ranges.len();
+    let max_threads = threads.max(1).min(total_ranges.max(1));
+    let mut pending = ranges.into_iter().collect::<VecDeque<_>>();
+    let mut active = 0_usize;
+    let mut completed = 0_usize;
+    let mut rows_dumped = 0_u64;
+    let mut first_error: Option<String> = None;
+    let mut handles = Vec::new();
+    let (sender, receiver) = mpsc::channel::<DumpRangeEvent>();
+
+    while active < max_threads {
+        if let Some(range) = pending.pop_front() {
+            handles.push(spawn_mysql_range_worker(
+                endpoint.clone(),
+                output_path.to_path_buf(),
+                table.clone(),
+                table_path.clone(),
+                pk_column.to_string(),
+                range,
+                data_format.to_string(),
+                request_id.clone(),
+                table_row_count,
+                sender.clone(),
+            ));
+            active += 1;
+        } else {
+            break;
+        }
+    }
+
+    while completed < total_ranges && active > 0 {
+        match receiver.recv() {
+            Ok(DumpRangeEvent::Progress(event)) => emit(event),
+            Ok(DumpRangeEvent::Done { rows }) => {
+                rows_dumped += rows;
+                completed += 1;
+                active = active.saturating_sub(1);
+                if let Some(range) = pending.pop_front() {
+                    handles.push(spawn_mysql_range_worker(
+                        endpoint.clone(),
+                        output_path.to_path_buf(),
+                        table.clone(),
+                        table_path.clone(),
+                        pk_column.to_string(),
+                        range,
+                        data_format.to_string(),
+                        request_id.clone(),
+                        table_row_count,
+                        sender.clone(),
+                    ));
+                    active += 1;
+                }
+            }
+            Ok(DumpRangeEvent::Error(err)) => {
+                first_error.get_or_insert(err);
+                completed += 1;
+                active = active.saturating_sub(1);
+            }
+            Err(_) => break,
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+
+    emit(json!({
+        "event": "table_progress",
+        "request_id": request_id,
+        "table": table.name,
+        "status": "completed",
+        "current": 1,
+        "total": 1,
+        "strategy": "pk_range_parallel"
+    }));
+
+    Ok(Some((
+        vec![DumpTableManifest {
+            name: table.name.clone(),
+            path: table_path,
+            rows: rows_dumped,
+            chunks: total_ranges as u64,
+        }],
+        rows_dumped,
+        total_ranges as u64,
+    )))
+}
+
+fn spawn_mysql_range_worker(
+    endpoint: Endpoint,
+    output_path: std::path::PathBuf,
+    table: NormalizedTable,
+    table_path: String,
+    pk_column: String,
+    range: DumpRange,
+    data_format: String,
+    request_id: Option<String>,
+    table_row_count: u64,
+    sender: mpsc::Sender<DumpRangeEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let result = dump_mysql_range_chunk(
+            &endpoint,
+            &output_path,
+            &table,
+            &table_path,
+            &pk_column,
+            &range,
+            &data_format,
+        );
+        match result {
+            Ok((rows, stream_ms)) => {
+                let _ = sender.send(DumpRangeEvent::Progress(json!({
+                    "event": "row_progress",
+                    "request_id": request_id,
+                    "table": table.name,
+                    "rows": rows,
+                    "total": table_row_count,
+                    "chunk_rows": rows,
+                    "stream_ms": stream_ms,
+                    "chunk_index": range.chunk_index,
+                    "range_start": range.start.to_string(),
+                    "range_end": range.end.to_string(),
+                    "strategy": "pk_range_parallel"
+                })));
+                let _ = sender.send(DumpRangeEvent::Done { rows });
+            }
+            Err(err) => {
+                let _ = sender.send(DumpRangeEvent::Error(err));
+            }
+        }
+    })
+}
+
+fn dump_mysql_range_chunk(
+    endpoint: &Endpoint,
+    output_path: &Path,
+    table: &NormalizedTable,
+    table_path: &str,
+    pk_column: &str,
+    range: &DumpRange,
+    data_format: &str,
+) -> Result<(u64, u64), String> {
+    let mut conn = match LiveAdapter::connect(endpoint)? {
+        LiveAdapter::MySql(conn) => conn,
+        LiveAdapter::PostgreSql(_) => {
+            return Err("pk range dump requires mysql endpoint".to_string())
+        }
+    };
+    let chunk_path = output_path
+        .join(table_path)
+        .join(dump_chunk_name(range.chunk_index, data_format));
+    let mut file =
+        File::create(&chunk_path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    let columns = column_names(table);
+    let sql = select_chunk_text_range_sql("mysql", table, pk_column, range.start, range.end);
+    let stream_started = Instant::now();
+    let result = conn
+        .query_iter(sql)
+        .map_err(|err| format!("mysql range select chunk error: {err}"))?;
+    let mut rows = 0_u64;
+    for row in result {
+        let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
+        if data_format == "tsv" {
+            write_mysql_text_row_tsv(&mut file, row)?;
+        } else {
+            let row_json = mysql_row_to_json(&columns, row);
+            write_dump_row(&mut file, table, &row_json, data_format)?;
+        }
+        rows += 1;
+    }
+    Ok((rows, stream_started.elapsed().as_millis() as u64))
+}
+
+fn spawn_dump_table_worker(
+    endpoint: Endpoint,
+    output_path: std::path::PathBuf,
+    table: NormalizedTable,
+    index: usize,
+    table_total: usize,
+    chunk_size: usize,
+    data_format: String,
+    request_id: Option<String>,
+    sender: mpsc::Sender<DumpTableEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let result = (|| {
+            let mut adapter = LiveAdapter::connect(&endpoint)?;
+            dump_one_table(
+                &mut adapter,
+                &output_path,
+                &table,
+                index,
+                table_total,
+                chunk_size,
+                &data_format,
+                request_id,
+                |event| {
+                    let _ = sender.send(DumpTableEvent::Progress(event));
+                },
+            )
+        })();
+        match result {
+            Ok((manifest, rows, chunks)) => {
+                let _ = sender.send(DumpTableEvent::Done {
+                    index,
+                    manifest,
+                    rows,
+                    chunks,
+                });
+            }
+            Err(err) => {
+                let _ = sender.send(DumpTableEvent::Error(err));
+            }
+        }
+    })
+}
+
+fn dump_one_table<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    output_path: &Path,
+    table: &NormalizedTable,
+    index: usize,
+    table_total: usize,
+    chunk_size: usize,
+    data_format: &str,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(DumpTableManifest, u64, u64), String> {
+    if let LiveAdapter::MySql(conn) = adapter {
+        return dump_one_mysql_table(
+            conn,
+            output_path,
+            table,
+            index,
+            table_total,
+            chunk_size,
+            data_format,
+            request_id,
+            emit,
+        );
+    }
+
+    emit(json!({
+        "event": "table_progress",
+        "request_id": request_id,
+        "table": table.name,
+        "status": "dumping",
+        "current": index + 1,
+        "total": table_total
+    }));
+    let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
+    let table_dir = output_path.join(&table_path);
+    fs::create_dir_all(&table_dir)
+        .map_err(|err| format!("failed to create dump table dir: {err}"))?;
+
+    let table_row_count = adapter.row_count(&table.name).unwrap_or(0) as u64;
+    let key_columns = key_columns(table);
+    let use_keyset = !key_columns.is_empty();
+    let mut last_key: Option<String> = None;
+    let mut offset = 0_usize;
+    let mut rows_dumped = 0_u64;
+    let mut chunks_dumped = 0_u64;
+
+    loop {
+        let read_started = Instant::now();
+        let rows = if use_keyset {
+            adapter.read_rows_after_key(table, &key_columns, last_key.as_deref(), chunk_size)?
+        } else {
+            adapter.read_rows(table, offset, chunk_size)?
+        };
+        let read_ms = read_started.elapsed().as_millis() as u64;
+        if rows.is_empty() {
+            break;
+        }
+        chunks_dumped += 1;
+        let chunk_name = dump_chunk_name(chunks_dumped, data_format);
+        let write_started = Instant::now();
+        write_dump_rows(&table_dir.join(&chunk_name), table, &rows, data_format)?;
+        let write_ms = write_started.elapsed().as_millis() as u64;
+
+        let copied_now = rows.len();
+        rows_dumped += copied_now as u64;
+        if use_keyset {
+            last_key = rows.last().and_then(|row| row_key_token(row, &key_columns));
+        } else {
+            offset += copied_now;
+        }
+
+        emit(json!({
+            "event": "row_progress",
+            "request_id": request_id,
+            "table": table.name,
+            "rows": rows_dumped,
+            "total": table_row_count,
+            "chunk_rows": copied_now,
+            "read_ms": read_ms,
+            "write_ms": write_ms
+        }));
+    }
+
+    emit(json!({
+        "event": "table_progress",
+        "request_id": request_id,
+        "table": table.name,
+        "status": "completed",
+        "current": index + 1,
+        "total": table_total
+    }));
+
+    Ok((
+        DumpTableManifest {
+            name: table.name.clone(),
+            path: table_path,
+            rows: rows_dumped,
+            chunks: chunks_dumped,
+        },
+        rows_dumped,
+        chunks_dumped,
+    ))
+}
+
+fn dump_one_mysql_table<F: FnMut(Value)>(
+    conn: &mut mysql::PooledConn,
+    output_path: &Path,
+    table: &NormalizedTable,
+    index: usize,
+    table_total: usize,
+    chunk_size: usize,
+    data_format: &str,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(DumpTableManifest, u64, u64), String> {
+    emit(json!({
+        "event": "table_progress",
+        "request_id": request_id,
+        "table": table.name,
+        "status": "dumping",
+        "current": index + 1,
+        "total": table_total
+    }));
+    let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
+    let table_dir = output_path.join(&table_path);
+    fs::create_dir_all(&table_dir)
+        .map_err(|err| format!("failed to create dump table dir: {err}"))?;
+
+    let table_row_count = conn
+        .query_first::<u64, _>(count_sql("mysql", &table.name))
+        .map(|count| count.unwrap_or(0))
+        .unwrap_or(0);
+    let columns = column_names(table);
+    let key_columns = key_columns(table);
+    let use_keyset = !key_columns.is_empty();
+    let mut last_key: Option<String> = None;
+    let mut offset = 0_usize;
+    let mut rows_dumped = 0_u64;
+    let mut chunks_dumped = 0_u64;
+
+    loop {
+        chunks_dumped += 1;
+        let chunk_name = dump_chunk_name(chunks_dumped, data_format);
+        let chunk_path = table_dir.join(&chunk_name);
+        let mut file = File::create(&chunk_path)
+            .map_err(|err| format!("failed to create dump chunk: {err}"))?;
+
+        let stream_started = Instant::now();
+        let last_values = last_key.as_deref().and_then(decode_key_token);
+        let sql = if use_keyset {
+            select_chunk_text_after_key_sql(
+                "mysql",
+                table,
+                &key_columns,
+                last_values.as_deref(),
+                chunk_size,
+            )
+        } else {
+            select_chunk_text_sql("mysql", table, &key_columns)
+        };
+        let sql = if use_keyset {
+            sql
+        } else {
+            sql.replacen('?', &(chunk_size as u64).to_string(), 1)
+                .replacen('?', &(offset as u64).to_string(), 1)
+        };
+        let result = if use_keyset {
+            conn.query_iter(sql)
+                .map_err(|err| format!("mysql keyset select chunk error: {err}"))?
+        } else {
+            conn.query_iter(sql)
+                .map_err(|err| format!("mysql select chunk error: {err}"))?
+        };
+
+        let mut chunk_rows = 0_usize;
+        let mut next_key: Option<String> = None;
+        for row in result {
+            let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
+            if data_format == "tsv" && !use_keyset {
+                write_mysql_text_row_tsv(&mut file, row)?;
+            } else {
+                let row_json = mysql_row_to_json(&columns, row);
+                if use_keyset {
+                    next_key = row_key_token(&row_json, &key_columns);
+                }
+                write_dump_row(&mut file, table, &row_json, data_format)?;
+            }
+            chunk_rows += 1;
+        }
+        let stream_ms = stream_started.elapsed().as_millis() as u64;
+
+        if chunk_rows == 0 {
+            fs::remove_file(&chunk_path).ok();
+            chunks_dumped -= 1;
+            break;
+        }
+
+        rows_dumped += chunk_rows as u64;
+        if use_keyset {
+            last_key = next_key;
+        } else {
+            offset += chunk_rows;
+        }
+
+        emit(json!({
+            "event": "row_progress",
+            "request_id": request_id,
+            "table": table.name,
+            "rows": rows_dumped,
+            "total": table_row_count,
+            "chunk_rows": chunk_rows,
+            "stream_ms": stream_ms
+        }));
+    }
+
+    emit(json!({
+        "event": "table_progress",
+        "request_id": request_id,
+        "table": table.name,
+        "status": "completed",
+        "current": index + 1,
+        "total": table_total
+    }));
+
+    Ok((
+        DumpTableManifest {
+            name: table.name.clone(),
+            path: table_path,
+            rows: rows_dumped,
+            chunks: chunks_dumped,
+        },
+        rows_dumped,
+        chunks_dumped,
+    ))
 }
 
 fn dump_import_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
@@ -1321,12 +1999,23 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
-    if manifest.format != "tunnelforge-dump" || manifest.format_version != 1 {
+    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2) {
         return Err("unsupported dump manifest format".to_string());
+    }
+    let data_format = manifest.data_format.to_ascii_lowercase();
+    if !matches!(data_format.as_str(), "jsonl" | "tsv") {
+        return Err(format!("unsupported dump data_format: {data_format}"));
     }
 
     let selected_tables = string_list(request.payload.get("tables"));
     let selected: BTreeSet<String> = selected_tables.into_iter().collect();
+    let threads = request
+        .payload
+        .get("threads")
+        .and_then(Value::as_u64)
+        .map(|value| value as usize)
+        .unwrap_or(4)
+        .max(1);
     let tables: Vec<DumpTableManifest> = manifest
         .tables
         .iter()
@@ -1337,6 +2026,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         return Err("dump.import found no tables to import".to_string());
     }
 
+    let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
@@ -1365,11 +2055,37 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
         adapter.create_table(table, &ddl)?;
 
+        if data_format == "tsv" && !has_binary_columns(table) {
+            if let LiveAdapter::MySql(conn) = &mut adapter {
+                let (rows, chunks) = import_mysql_tsv_table(
+                    &endpoint,
+                    conn,
+                    input_path,
+                    table,
+                    table_manifest,
+                    threads,
+                    request.request_id.clone(),
+                    |event| emit(event),
+                )?;
+                rows_imported += rows;
+                chunks_imported += chunks;
+                emit(json!({
+                    "event": "table_progress",
+                    "request_id": request.request_id,
+                    "table": table.name,
+                    "status": "completed",
+                    "current": index + 1,
+                    "total": table_total
+                }));
+                continue;
+            }
+        }
+
         for chunk_index in 1..=table_manifest.chunks {
             let chunk_path = input_path
                 .join(&table_manifest.path)
-                .join(format!("chunk_{chunk_index:06}.jsonl"));
-            let rows = read_jsonl_rows(&chunk_path)?;
+                .join(dump_chunk_name(chunk_index, &data_format));
+            let rows = read_dump_rows(&chunk_path, table, &data_format)?;
             let row_count = rows.len();
             adapter.insert_rows(table, rows)?;
             rows_imported += row_count as u64;
@@ -1404,6 +2120,222 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "rows_imported": rows_imported,
         "chunks_imported": chunks_imported
     }))
+}
+
+fn import_mysql_tsv_table<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    conn: &mut mysql::PooledConn,
+    input_path: &Path,
+    table: &NormalizedTable,
+    table_manifest: &DumpTableManifest,
+    threads: usize,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(u64, u64), String> {
+    if threads > 1 && table_manifest.chunks > 1 {
+        return import_mysql_tsv_table_parallel(
+            endpoint,
+            input_path,
+            table,
+            table_manifest,
+            threads,
+            request_id,
+            emit,
+        );
+    }
+
+    let mut rows_imported = 0_u64;
+    let mut chunks_imported = 0_u64;
+    for chunk_index in 1..=table_manifest.chunks {
+        let chunk_path = input_path
+            .join(&table_manifest.path)
+            .join(dump_chunk_name(chunk_index, "tsv"));
+        let started = Instant::now();
+        let rows = load_mysql_tsv_chunk(conn, table, &chunk_path)?;
+        rows_imported += rows;
+        chunks_imported += 1;
+        emit(json!({
+            "event": "row_progress",
+            "request_id": request_id,
+            "table": table.name,
+            "rows": rows_imported,
+            "total": table_manifest.rows,
+            "chunk_rows": rows,
+            "load_ms": started.elapsed().as_millis() as u64,
+            "strategy": "load_data_local_infile"
+        }));
+    }
+    Ok((rows_imported, chunks_imported))
+}
+
+fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    input_path: &Path,
+    table: &NormalizedTable,
+    table_manifest: &DumpTableManifest,
+    threads: usize,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(u64, u64), String> {
+    let max_threads = threads.max(1).min(table_manifest.chunks as usize);
+    let mut pending = (1..=table_manifest.chunks).collect::<VecDeque<_>>();
+    let mut active = 0_usize;
+    let mut completed = 0_u64;
+    let mut rows_imported = 0_u64;
+    let mut first_error: Option<String> = None;
+    let mut handles = Vec::new();
+    let (sender, receiver) = mpsc::channel::<ImportChunkEvent>();
+
+    while active < max_threads {
+        if let Some(chunk_index) = pending.pop_front() {
+            handles.push(spawn_mysql_import_chunk_worker(
+                endpoint.clone(),
+                input_path.to_path_buf(),
+                table.clone(),
+                table_manifest.path.clone(),
+                chunk_index,
+                sender.clone(),
+            ));
+            active += 1;
+        } else {
+            break;
+        }
+    }
+
+    while completed < table_manifest.chunks && active > 0 {
+        match receiver.recv() {
+            Ok(ImportChunkEvent::Done {
+                chunk_index,
+                rows,
+                load_ms,
+            }) => {
+                rows_imported += rows;
+                completed += 1;
+                active = active.saturating_sub(1);
+                emit(json!({
+                    "event": "row_progress",
+                    "request_id": request_id,
+                    "table": table.name,
+                    "rows": rows_imported,
+                    "total": table_manifest.rows,
+                    "chunk_rows": rows,
+                    "chunks_done": completed,
+                    "chunks_total": table_manifest.chunks,
+                    "chunk_index": chunk_index,
+                    "load_ms": load_ms,
+                    "strategy": "parallel_load_data_local_infile"
+                }));
+                if let Some(next_chunk) = pending.pop_front() {
+                    handles.push(spawn_mysql_import_chunk_worker(
+                        endpoint.clone(),
+                        input_path.to_path_buf(),
+                        table.clone(),
+                        table_manifest.path.clone(),
+                        next_chunk,
+                        sender.clone(),
+                    ));
+                    active += 1;
+                }
+            }
+            Ok(ImportChunkEvent::Error(err)) => {
+                first_error.get_or_insert(err);
+                completed += 1;
+                active = active.saturating_sub(1);
+            }
+            Err(_) => break,
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+    if let Some(err) = first_error {
+        return Err(err);
+    }
+    Ok((rows_imported, completed))
+}
+
+fn spawn_mysql_import_chunk_worker(
+    endpoint: Endpoint,
+    input_path: std::path::PathBuf,
+    table: NormalizedTable,
+    table_path: String,
+    chunk_index: u64,
+    sender: mpsc::Sender<ImportChunkEvent>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let result = (|| {
+            let mut conn = match LiveAdapter::connect(&endpoint)? {
+                LiveAdapter::MySql(conn) => conn,
+                LiveAdapter::PostgreSql(_) => {
+                    return Err("mysql TSV import requires mysql endpoint".to_string())
+                }
+            };
+            let chunk_path = input_path
+                .join(&table_path)
+                .join(dump_chunk_name(chunk_index, "tsv"));
+            let started = Instant::now();
+            let rows = load_mysql_tsv_chunk(&mut conn, &table, &chunk_path)?;
+            Ok((rows, started.elapsed().as_millis() as u64))
+        })();
+        match result {
+            Ok((rows, load_ms)) => {
+                let _ = sender.send(ImportChunkEvent::Done {
+                    chunk_index,
+                    rows,
+                    load_ms,
+                });
+            }
+            Err(err) => {
+                let _ = sender.send(ImportChunkEvent::Error(err));
+            }
+        }
+    })
+}
+
+fn load_mysql_tsv_chunk(
+    conn: &mut mysql::PooledConn,
+    table: &NormalizedTable,
+    chunk_path: &Path,
+) -> Result<u64, String> {
+    let path = chunk_path.to_path_buf();
+    conn.set_local_infile_handler(Some(LocalInfileHandler::new(move |_, stream| {
+        let mut file = File::open(&path)?;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            stream.write_all(&buffer[..read])?;
+        }
+        Ok(())
+    })));
+    let sql = load_data_local_infile_sql("mysql", table, "tunnelforge_chunk");
+    let result = conn
+        .query_drop(sql)
+        .map(|_| conn.affected_rows())
+        .map_err(|err| format!("mysql LOAD DATA error: {err}"));
+    conn.set_local_infile_handler(None);
+    result
+}
+
+pub fn load_data_local_infile_sql(
+    engine: &str,
+    table: &NormalizedTable,
+    file_name: &str,
+) -> String {
+    let columns = column_names(table)
+        .iter()
+        .map(|column| quote_ident(engine, column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "LOAD DATA LOCAL INFILE {} INTO TABLE {} CHARACTER SET utf8mb4 FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' LINES TERMINATED BY '\\n' ({})",
+        sql_literal(&Value::String(file_name.to_string())),
+        quote_ident(engine, &table.name),
+        columns
+    )
 }
 
 fn request_endpoint(request: &Request) -> Result<Endpoint, String> {
@@ -1448,7 +2380,10 @@ fn sql_json_literal(value: &Value) -> String {
         }
         Value::Number(item) => item.to_string(),
         Value::String(item) => format!("'{}'", item.replace('\\', "\\\\").replace('\'', "''")),
-        other => format!("'{}'", other.to_string().replace('\\', "\\\\").replace('\'', "''")),
+        other => format!(
+            "'{}'",
+            other.to_string().replace('\\', "\\\\").replace('\'', "''")
+        ),
     }
 }
 
@@ -2343,13 +3278,10 @@ fn build_table_guides<A: MigrationAdapter>(
 fn plan(request: &Request) -> Vec<Value> {
     let source = read_engine(&request.payload, "source_engine");
     let target = read_engine(&request.payload, "target_engine");
-    let schema = parse_schema(&request.payload["schema"]).unwrap_or_default();
+    let schema =
+        dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
     let ddl = generate_schema_ddl(&schema, &source, &target);
-    let table_order: Vec<String> = schema
-        .tables
-        .iter()
-        .map(|table| table.name.clone())
-        .collect();
+    let table_order = table_dependency_order(&schema);
 
     vec![
         phase_event(request, "plan", "migration plan generation started"),
@@ -2370,7 +3302,9 @@ fn plan(request: &Request) -> Vec<Value> {
 fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(phase_event(request, "migrate", "migration started"));
     if request.payload.get("source").is_some() && request.payload.get("target").is_some() {
-        let schema = parse_schema(&request.payload["schema"]).unwrap_or_default();
+        let schema = dependency_ordered_schema(
+            &parse_schema(&request.payload["schema"]).unwrap_or_default(),
+        );
         let options = parse_options(&request.payload);
         let resume_state = request
             .payload
@@ -2454,7 +3388,8 @@ fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         return;
     }
 
-    let schema = parse_schema(&request.payload["schema"]).unwrap_or_default();
+    let schema =
+        dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
     let options = parse_options(&request.payload);
     let resume_state = request
         .payload
@@ -2808,19 +3743,20 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
         };
     }
 
+    let ordered_schema = dependency_ordered_schema(schema);
     let mut state = resume_state
         .cloned()
-        .unwrap_or_else(|| initial_state(schema));
+        .unwrap_or_else(|| initial_state(&ordered_schema));
     let mut rows_copied = 0;
     let mut chunks_copied = 0;
     let chunk_size = options.chunk_size.max(1);
     let ddl = if source_engine.is_empty() || target_engine.is_empty() {
         Vec::new()
     } else {
-        generate_schema_ddl(schema, source_engine, target_engine)
+        generate_schema_ddl(&ordered_schema, source_engine, target_engine)
     };
 
-    for (table_index, table) in schema.tables.iter().enumerate() {
+    for (table_index, table) in ordered_schema.tables.iter().enumerate() {
         let state_index = state
             .tables
             .iter()
@@ -2916,25 +3852,33 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
     }
 
     state.current_phase = "completed".to_string();
-    for sql in generate_sequence_reset_ddl(schema, target_engine) {
+    for sql in generate_sequence_reset_ddl(&ordered_schema, target_engine) {
         if let Err(err) = target.execute_sql(&sql) {
-            let table = schema.tables.first().cloned().unwrap_or(NormalizedTable {
-                name: "sequence_reset".to_string(),
-                columns: Vec::new(),
-                indexes: Vec::new(),
-                foreign_keys: Vec::new(),
-            });
+            let table = ordered_schema
+                .tables
+                .first()
+                .cloned()
+                .unwrap_or(NormalizedTable {
+                    name: "sequence_reset".to_string(),
+                    columns: Vec::new(),
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                });
             return migration_error_result(state, rows_copied, chunks_copied, &table, err);
         }
     }
-    for sql in generate_post_data_ddl(schema, target_engine) {
+    for sql in generate_post_data_ddl(&ordered_schema, target_engine) {
         if let Err(err) = target.execute_sql(&sql) {
-            let table = schema.tables.first().cloned().unwrap_or(NormalizedTable {
-                name: "post_data_ddl".to_string(),
-                columns: Vec::new(),
-                indexes: Vec::new(),
-                foreign_keys: Vec::new(),
-            });
+            let table = ordered_schema
+                .tables
+                .first()
+                .cloned()
+                .unwrap_or(NormalizedTable {
+                    name: "post_data_ddl".to_string(),
+                    columns: Vec::new(),
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                });
             return migration_error_result(state, rows_copied, chunks_copied, &table, err);
         }
     }
@@ -3630,6 +4574,53 @@ fn mysql_value_to_json(value: mysql::Value) -> Value {
     }
 }
 
+fn write_mysql_text_row_tsv<W: Write>(writer: &mut W, row: mysql::Row) -> Result<(), String> {
+    let values = row.unwrap();
+    for (index, value) in values.into_iter().enumerate() {
+        if index > 0 {
+            writer
+                .write_all(b"\t")
+                .map_err(|err| format!("failed to write dump row: {err}"))?;
+        }
+        let field = mysql_value_to_tsv_field(value);
+        writer
+            .write_all(field.as_bytes())
+            .map_err(|err| format!("failed to write dump row: {err}"))?;
+    }
+    writer
+        .write_all(b"\n")
+        .map_err(|err| format!("failed to write dump row: {err}"))
+}
+
+fn mysql_value_to_tsv_field(value: mysql::Value) -> String {
+    match value {
+        mysql::Value::NULL => "\\N".to_string(),
+        mysql::Value::Bytes(value) => escape_tsv_text(&String::from_utf8_lossy(&value)),
+        mysql::Value::Int(value) => value.to_string(),
+        mysql::Value::UInt(value) => value.to_string(),
+        mysql::Value::Float(value) => value.to_string(),
+        mysql::Value::Double(value) => value.to_string(),
+        mysql::Value::Date(year, month, day, hour, minute, second, micros) => {
+            let text = if hour == 0 && minute == 0 && second == 0 && micros == 0 {
+                format!("{year:04}-{month:02}-{day:02}")
+            } else {
+                format!(
+                    "{year:04}-{month:02}-{day:02} {hour:02}:{minute:02}:{second:02}.{:06}",
+                    micros
+                )
+            };
+            escape_tsv_text(&text)
+        }
+        mysql::Value::Time(negative, days, hours, minutes, seconds, micros) => {
+            let sign = if negative { "-" } else { "" };
+            escape_tsv_text(&format!(
+                "{sign}{days} {hours:02}:{minutes:02}:{seconds:02}.{:06}",
+                micros
+            ))
+        }
+    }
+}
+
 fn postgres_row_to_json(columns: &[String], row: &postgres::Row) -> Value {
     let mut object = Map::new();
     for (index, column) in columns.iter().enumerate() {
@@ -3643,6 +4634,7 @@ fn postgres_row_to_json(columns: &[String], row: &postgres::Row) -> Value {
 }
 
 pub fn initial_state(schema: &NormalizedSchema) -> ResumeState {
+    let schema = dependency_ordered_schema(schema);
     ResumeState {
         direction: "".to_string(),
         current_phase: "data".to_string(),
@@ -3657,6 +4649,109 @@ pub fn initial_state(schema: &NormalizedSchema) -> ResumeState {
             })
             .collect(),
     }
+}
+
+pub fn table_dependency_order(schema: &NormalizedSchema) -> Vec<String> {
+    let (ordered, _) = table_dependency_order_indices(schema);
+    ordered
+        .into_iter()
+        .map(|index| schema.tables[index].name.clone())
+        .collect()
+}
+
+pub fn dependency_ordered_schema(schema: &NormalizedSchema) -> NormalizedSchema {
+    let (ordered, _) = table_dependency_order_indices(schema);
+    NormalizedSchema {
+        tables: ordered
+            .into_iter()
+            .map(|index| schema.tables[index].clone())
+            .collect(),
+    }
+}
+
+fn dependency_ordered_dump_tables(
+    schema: &NormalizedSchema,
+    tables: Vec<DumpTableManifest>,
+) -> Vec<DumpTableManifest> {
+    let mut by_name = tables
+        .into_iter()
+        .map(|table| (table.name.clone(), table))
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered = Vec::new();
+    for table_name in table_dependency_order(schema) {
+        if let Some(table) = by_name.remove(&table_name) {
+            ordered.push(table);
+        }
+    }
+    ordered.extend(by_name.into_values());
+    ordered
+}
+
+fn table_dependency_order_indices(schema: &NormalizedSchema) -> (Vec<usize>, Vec<String>) {
+    let table_count = schema.tables.len();
+    if table_count <= 1 {
+        return ((0..table_count).collect(), Vec::new());
+    }
+
+    let table_index = schema
+        .tables
+        .iter()
+        .enumerate()
+        .map(|(index, table)| (table.name.clone(), index))
+        .collect::<BTreeMap<_, _>>();
+    let mut dependents = vec![Vec::<usize>::new(); table_count];
+    let mut seen_edges = BTreeSet::new();
+    let mut indegree = vec![0_usize; table_count];
+
+    for (child_index, table) in schema.tables.iter().enumerate() {
+        for fk in &table.foreign_keys {
+            let Some(parent_index) = table_index.get(&fk.referenced_table).copied() else {
+                continue;
+            };
+            if parent_index == child_index {
+                continue;
+            }
+            if seen_edges.insert((parent_index, child_index)) {
+                dependents[parent_index].push(child_index);
+                indegree[child_index] += 1;
+            }
+        }
+    }
+
+    let mut ready = VecDeque::new();
+    for (index, degree) in indegree.iter().enumerate() {
+        if *degree == 0 {
+            ready.push_back(index);
+        }
+    }
+
+    let mut ordered = Vec::with_capacity(table_count);
+    while let Some(index) = ready.pop_front() {
+        ordered.push(index);
+        dependents[index].sort_unstable();
+        for child_index in &dependents[index] {
+            indegree[*child_index] -= 1;
+            if indegree[*child_index] == 0 {
+                ready.push_back(*child_index);
+            }
+        }
+    }
+
+    if ordered.len() == table_count {
+        return (ordered, Vec::new());
+    }
+
+    let ordered_set = ordered.iter().copied().collect::<BTreeSet<_>>();
+    let cyclic = (0..table_count)
+        .filter(|index| !ordered_set.contains(index))
+        .map(|index| schema.tables[index].name.clone())
+        .collect::<Vec<_>>();
+    for index in 0..table_count {
+        if !ordered_set.contains(&index) {
+            ordered.push(index);
+        }
+    }
+    (ordered, cyclic)
 }
 
 fn parse_schema(value: &Value) -> Result<NormalizedSchema, serde_json::Error> {
@@ -3705,6 +4800,85 @@ fn safe_dump_component(value: &str) -> String {
     }
 }
 
+fn single_numeric_primary_key(table: &NormalizedTable) -> Option<&str> {
+    let primary_columns = table
+        .columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .collect::<Vec<_>>();
+    if primary_columns.len() != 1 {
+        return None;
+    }
+    let column = primary_columns[0];
+    if is_integer_key_type(&column.type_name) {
+        Some(column.name.as_str())
+    } else {
+        None
+    }
+}
+
+fn is_integer_key_type(type_name: &str) -> bool {
+    let type_name = type_name.trim().to_ascii_lowercase();
+    type_name.starts_with("tinyint")
+        || type_name.starts_with("smallint")
+        || type_name.starts_with("mediumint")
+        || type_name.starts_with("int")
+        || type_name.starts_with("integer")
+        || type_name.starts_with("bigint")
+        || type_name.starts_with("serial")
+}
+
+fn mysql_numeric_min_max(
+    conn: &mut mysql::PooledConn,
+    table: &str,
+    column: &str,
+) -> Result<Option<(i128, i128)>, String> {
+    let sql = format!(
+        "SELECT CAST(MIN({}) AS CHAR), CAST(MAX({}) AS CHAR) FROM {}",
+        quote_ident("mysql", column),
+        quote_ident("mysql", column),
+        quote_ident("mysql", table)
+    );
+    let result = conn
+        .query_first::<(Option<String>, Option<String>), _>(sql)
+        .map_err(|err| format!("mysql pk range inspect error: {err}"))?;
+    let Some((Some(min), Some(max))) = result else {
+        return Ok(None);
+    };
+    let min = min
+        .parse::<i128>()
+        .map_err(|err| format!("mysql pk min parse error: {err}"))?;
+    let max = max
+        .parse::<i128>()
+        .map_err(|err| format!("mysql pk max parse error: {err}"))?;
+    Ok(Some((min, max)))
+}
+
+fn pk_ranges(min_key: i128, max_key: i128, row_count: u64, chunk_size: usize) -> Vec<DumpRange> {
+    let chunk_count = ((row_count as usize).saturating_add(chunk_size.saturating_sub(1))
+        / chunk_size.max(1))
+    .max(1);
+    let span = max_key.saturating_sub(min_key).saturating_add(1);
+    let width = ((span + chunk_count as i128 - 1) / chunk_count as i128).max(1);
+    let mut ranges = Vec::new();
+    let mut start = min_key;
+    let mut chunk_index = 1_u64;
+    while start <= max_key {
+        let end = start.saturating_add(width - 1).min(max_key);
+        ranges.push(DumpRange {
+            chunk_index,
+            start,
+            end,
+        });
+        chunk_index += 1;
+        if end == max_key {
+            break;
+        }
+        start = end + 1;
+    }
+    ranges
+}
+
 fn current_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3726,6 +4900,53 @@ fn read_dump_manifest(input_path: &Path) -> Result<DumpManifest, String> {
     serde_json::from_reader(file).map_err(|err| format!("failed to parse dump manifest: {err}"))
 }
 
+fn dump_chunk_name(index: u64, data_format: &str) -> String {
+    let extension = if data_format == "tsv" { "tsv" } else { "jsonl" };
+    format!("chunk_{index:06}.{extension}")
+}
+
+fn write_dump_rows(
+    path: &Path,
+    table: &NormalizedTable,
+    rows: &[Value],
+    data_format: &str,
+) -> Result<(), String> {
+    if data_format == "tsv" {
+        write_tsv_rows(path, table, rows)
+    } else {
+        write_jsonl_rows(path, rows)
+    }
+}
+
+fn write_dump_row<W: Write>(
+    writer: &mut W,
+    table: &NormalizedTable,
+    row: &Value,
+    data_format: &str,
+) -> Result<(), String> {
+    if data_format == "tsv" {
+        write_tsv_row(writer, table, row)
+    } else {
+        serde_json::to_writer(&mut *writer, row)
+            .map_err(|err| format!("failed to encode dump row: {err}"))?;
+        writer
+            .write_all(b"\n")
+            .map_err(|err| format!("failed to write dump row: {err}"))
+    }
+}
+
+fn read_dump_rows(
+    path: &Path,
+    table: &NormalizedTable,
+    data_format: &str,
+) -> Result<Vec<Value>, String> {
+    if data_format == "tsv" {
+        read_tsv_rows(path, table)
+    } else {
+        read_jsonl_rows(path)
+    }
+}
+
 fn write_jsonl_rows(path: &Path, rows: &[Value]) -> Result<(), String> {
     let mut file =
         File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
@@ -3736,6 +4957,115 @@ fn write_jsonl_rows(path: &Path, rows: &[Value]) -> Result<(), String> {
             .map_err(|err| format!("failed to write dump row: {err}"))?;
     }
     Ok(())
+}
+
+fn write_tsv_rows(path: &Path, table: &NormalizedTable, rows: &[Value]) -> Result<(), String> {
+    let mut file =
+        File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    for row in rows {
+        write_tsv_row(&mut file, table, row)?;
+    }
+    Ok(())
+}
+
+fn write_tsv_row<W: Write>(
+    writer: &mut W,
+    table: &NormalizedTable,
+    row: &Value,
+) -> Result<(), String> {
+    let object = row.as_object();
+    for (index, column) in table.columns.iter().enumerate() {
+        if index > 0 {
+            writer
+                .write_all(b"\t")
+                .map_err(|err| format!("failed to write dump row: {err}"))?;
+        }
+        let value = object
+            .and_then(|object| object.get(&column.name))
+            .unwrap_or(&Value::Null);
+        let field = tsv_field(value);
+        writer
+            .write_all(field.as_bytes())
+            .map_err(|err| format!("failed to write dump row: {err}"))?;
+    }
+    writer
+        .write_all(b"\n")
+        .map_err(|err| format!("failed to write dump row: {err}"))
+}
+
+fn tsv_field(value: &Value) -> String {
+    if value.is_null() {
+        return "\\N".to_string();
+    }
+    let text = match value {
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
+        Value::Null => unreachable!(),
+    };
+    escape_tsv_text(&text)
+}
+
+fn escape_tsv_text(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\t', "\\t")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+}
+
+fn read_tsv_rows(path: &Path, table: &NormalizedTable) -> Result<Vec<Value>, String> {
+    let file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
+    let reader = BufReader::new(file);
+    let columns = column_names(table);
+    let mut rows = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("failed to read dump row: {err}"))?;
+        if line.is_empty() {
+            continue;
+        }
+        let fields = split_tsv_line(&line);
+        let mut object = Map::new();
+        for (index, column) in columns.iter().enumerate() {
+            let value = fields
+                .get(index)
+                .map(|field| unescape_tsv_field(field))
+                .unwrap_or(Value::Null);
+            object.insert(column.clone(), value);
+        }
+        rows.push(Value::Object(object));
+    }
+    Ok(rows)
+}
+
+fn split_tsv_line(line: &str) -> Vec<String> {
+    line.split('\t').map(ToString::to_string).collect()
+}
+
+fn unescape_tsv_field(field: &str) -> Value {
+    if field == "\\N" {
+        return Value::Null;
+    }
+    let mut output = String::new();
+    let mut chars = field.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            output.push(ch);
+            continue;
+        }
+        match chars.next() {
+            Some('t') => output.push('\t'),
+            Some('n') => output.push('\n'),
+            Some('r') => output.push('\r'),
+            Some('\\') => output.push('\\'),
+            Some(other) => {
+                output.push('\\');
+                output.push(other);
+            }
+            None => output.push('\\'),
+        }
+    }
+    Value::String(output)
 }
 
 fn read_jsonl_rows(path: &Path) -> Result<Vec<Value>, String> {
@@ -4044,6 +5374,58 @@ pub fn select_chunk_text_after_key_sql(
     )
 }
 
+pub fn select_chunk_text_range_sql(
+    engine: &str,
+    table: &NormalizedTable,
+    key_column: &str,
+    start: i128,
+    end: i128,
+) -> String {
+    let projected_columns = table
+        .columns
+        .iter()
+        .map(|column| {
+            if is_binary_type(&column.type_name) && engine == "postgresql" {
+                format!(
+                    "encode({}, 'hex') AS {}",
+                    quote_ident(engine, &column.name),
+                    quote_ident(engine, &column.name)
+                )
+            } else if is_binary_type(&column.type_name) {
+                format!(
+                    "HEX({}) AS {}",
+                    quote_ident(engine, &column.name),
+                    quote_ident(engine, &column.name)
+                )
+            } else if engine == "postgresql" {
+                format!(
+                    "{}::text AS {}",
+                    quote_ident(engine, &column.name),
+                    quote_ident(engine, &column.name)
+                )
+            } else {
+                format!(
+                    "CAST({} AS CHAR) AS {}",
+                    quote_ident(engine, &column.name),
+                    quote_ident(engine, &column.name)
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let key_ref = quote_column_ref(engine, &table.name, key_column);
+    format!(
+        "SELECT {} FROM {} WHERE {} >= {} AND {} <= {} ORDER BY {}",
+        projected_columns,
+        quote_ident(engine, &table.name),
+        key_ref,
+        start,
+        key_ref,
+        end,
+        key_ref
+    )
+}
+
 fn keyset_predicates(
     engine: &str,
     table: &str,
@@ -4170,6 +5552,92 @@ pub fn insert_rows_literal_sql_for_table(
     )
 }
 
+fn copy_rows_to_postgres(
+    client: &mut postgres::Client,
+    table: &NormalizedTable,
+    rows: &[Value],
+) -> Result<(), String> {
+    let sql = copy_rows_csv_sql("postgresql", table);
+    let mut writer = client
+        .copy_in(&sql)
+        .map_err(|err| format!("postgresql copy start error: {err}"))?;
+    for row in rows {
+        let line = copy_csv_line_for_table("postgresql", table, row);
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|err| format!("postgresql copy write error: {err}"))?;
+    }
+    writer
+        .finish()
+        .map(|_| ())
+        .map_err(|err| format!("postgresql copy finish error: {err}"))
+}
+
+pub fn copy_rows_csv_sql(target_engine: &str, table: &NormalizedTable) -> String {
+    let columns = column_names(table)
+        .iter()
+        .map(|column| quote_ident(target_engine, column))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "COPY {} ({}) FROM STDIN WITH (FORMAT csv, NULL '\\N')",
+        quote_ident(target_engine, &table.name),
+        columns
+    )
+}
+
+pub fn copy_csv_line_for_table(
+    target_engine: &str,
+    table: &NormalizedTable,
+    row: &Value,
+) -> String {
+    let fields = table
+        .columns
+        .iter()
+        .map(|column| match row {
+            Value::Object(object) => copy_csv_field_for_column(
+                target_engine,
+                &column.type_name,
+                object.get(&column.name).unwrap_or(&Value::Null),
+            ),
+            _ => "\\N".to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("{fields}\n")
+}
+
+pub fn copy_csv_field_for_column(target_engine: &str, source_type: &str, value: &Value) -> String {
+    if value.is_null() {
+        return "\\N".to_string();
+    }
+    let mut text = match value {
+        Value::Bool(value) => value.to_string(),
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => value.clone(),
+        Value::Array(_) | Value::Object(_) => value.to_string(),
+        Value::Null => unreachable!(),
+    };
+
+    let source_type = source_type.to_ascii_lowercase();
+    if target_engine == "postgresql" && source_type.starts_with("tinyint(1)") {
+        if text == "1" || text.eq_ignore_ascii_case("true") {
+            text = "true".to_string();
+        } else if text == "0" || text.eq_ignore_ascii_case("false") {
+            text = "false".to_string();
+        }
+    }
+    if target_engine == "postgresql" && is_binary_type(&source_type) {
+        text = format!("\\x{}", text.trim());
+    }
+
+    csv_quote(&text)
+}
+
+fn csv_quote(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
 pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Value) -> String {
     if let Value::String(text) = value {
         let source_type = source_type.to_ascii_lowercase();
@@ -4206,6 +5674,13 @@ pub fn is_binary_type(type_name: &str) -> bool {
         || type_name.contains("binary")
         || type_name == "bytea"
         || type_name.starts_with("varbinary")
+}
+
+fn has_binary_columns(table: &NormalizedTable) -> bool {
+    table
+        .columns
+        .iter()
+        .any(|column| is_binary_type(&column.type_name))
 }
 
 pub fn is_decimal_type(type_name: &str) -> bool {
@@ -4711,6 +6186,24 @@ mod tests {
         }
     }
 
+    fn empty_table(name: &str, foreign_keys: Vec<NormalizedForeignKey>) -> NormalizedTable {
+        NormalizedTable {
+            name: name.to_string(),
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys,
+        }
+    }
+
+    fn fk(name: &str, referenced_table: &str) -> NormalizedForeignKey {
+        NormalizedForeignKey {
+            name: name.to_string(),
+            columns: vec!["parent_id".to_string()],
+            referenced_table: referenced_table.to_string(),
+            referenced_columns: vec!["id".to_string()],
+        }
+    }
+
     #[test]
     fn service_hello_advertises_core_protocol() {
         let result = handle_request(Request {
@@ -4748,6 +6241,7 @@ mod tests {
         let manifest = DumpManifest {
             format: "tunnelforge-dump".to_string(),
             format_version: 1,
+            data_format: "jsonl".to_string(),
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
@@ -4774,12 +6268,91 @@ mod tests {
     }
 
     #[test]
+    fn tsv_dump_rows_roundtrip_with_nulls_and_escaped_text() {
+        let dir =
+            std::env::temp_dir().join(format!("tunnelforge-tsv-test-{}", current_unix_seconds()));
+        fs::create_dir_all(&dir).unwrap();
+        let table = NormalizedTable {
+            name: "notes".to_string(),
+            columns: vec![
+                NormalizedColumn {
+                    name: "id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                },
+                NormalizedColumn {
+                    name: "body".to_string(),
+                    type_name: "text".to_string(),
+                    default_value: None,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                },
+                NormalizedColumn {
+                    name: "empty".to_string(),
+                    type_name: "varchar(8)".to_string(),
+                    default_value: None,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                },
+            ],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        let rows = vec![json!({"id": "1", "body": "a\tb\nc\\d", "empty": null})];
+        let path = dir.join("chunk_000001.tsv");
+
+        write_dump_rows(&path, &table, &rows, "tsv").unwrap();
+        assert_eq!(read_dump_rows(&path, &table, "tsv").unwrap(), rows);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn dump_path_components_are_filesystem_safe() {
         assert_eq!(
             safe_dump_component("orders/detail:2026"),
             "orders_detail_2026"
         );
         assert_eq!(safe_dump_component(""), "table");
+    }
+
+    #[test]
+    fn dump_import_manifest_tables_follow_fk_dependency_order() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+                empty_table("users", Vec::new()),
+            ],
+        };
+        let tables = vec![
+            DumpTableManifest {
+                name: "orders".to_string(),
+                path: "0001_orders".to_string(),
+                rows: 1,
+                chunks: 1,
+            },
+            DumpTableManifest {
+                name: "users".to_string(),
+                path: "0002_users".to_string(),
+                rows: 1,
+                chunks: 1,
+            },
+        ];
+
+        let ordered = dependency_ordered_dump_tables(&schema, tables);
+
+        assert_eq!(
+            ordered
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["users", "orders"]
+        );
     }
 
     #[test]
@@ -4800,6 +6373,143 @@ mod tests {
         assert_eq!(result["command"], "migration.plan");
         assert_eq!(result["success"], true);
         assert_eq!(result["plan"]["table_order"], json!(["users"]));
+    }
+
+    #[test]
+    fn dependency_order_puts_referenced_parent_tables_first() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("line_items", vec![fk("fk_line_items_orders", "orders")]),
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+                empty_table("audit_log", Vec::new()),
+                empty_table("users", Vec::new()),
+            ],
+        };
+
+        assert_eq!(
+            table_dependency_order(&schema),
+            vec!["audit_log", "users", "orders", "line_items"]
+        );
+    }
+
+    #[test]
+    fn dependency_order_keeps_all_tables_when_cycle_exists() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("a", vec![fk("fk_a_b", "b")]),
+                empty_table("b", vec![fk("fk_b_a", "a")]),
+                empty_table("root", Vec::new()),
+            ],
+        };
+
+        let (ordered, cyclic) = table_dependency_order_indices(&schema);
+
+        assert_eq!(
+            ordered
+                .into_iter()
+                .map(|index| schema.tables[index].name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root", "a", "b"]
+        );
+        assert_eq!(cyclic, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn numeric_single_primary_key_is_parallel_dump_eligible() {
+        let table = NormalizedTable {
+            name: "big_items".to_string(),
+            columns: vec![
+                NormalizedColumn {
+                    name: "id".to_string(),
+                    type_name: "bigint unsigned".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                },
+                NormalizedColumn {
+                    name: "tenant_id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                },
+            ],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        assert_eq!(single_numeric_primary_key(&table), Some("id"));
+    }
+
+    #[test]
+    fn composite_primary_key_is_not_parallel_range_eligible() {
+        let table = NormalizedTable {
+            name: "items".to_string(),
+            columns: vec![
+                NormalizedColumn {
+                    name: "tenant_id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                },
+                NormalizedColumn {
+                    name: "id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                },
+            ],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        assert_eq!(single_numeric_primary_key(&table), None);
+    }
+
+    #[test]
+    fn pk_ranges_split_numeric_span_into_contiguous_chunks() {
+        let ranges = pk_ranges(1, 100, 100, 25);
+
+        assert_eq!(ranges.len(), 4);
+        assert_eq!(ranges[0].chunk_index, 1);
+        assert_eq!((ranges[0].start, ranges[0].end), (1, 25));
+        assert_eq!((ranges[3].start, ranges[3].end), (76, 100));
+    }
+
+    #[test]
+    fn migration_plan_reports_fk_dependency_order() {
+        let result = handle_request(Request {
+            command: "migration.plan".to_string(),
+            request_id: Some("plan-fk".to_string()),
+            payload: json!({
+                "source_engine": "mysql",
+                "target_engine": "postgresql",
+                "schema": {
+                    "tables": [{
+                        "name": "orders",
+                        "foreign_keys": [{
+                            "name": "fk_orders_users",
+                            "columns": ["user_id"],
+                            "referenced_table": "users",
+                            "referenced_columns": ["id"]
+                        }]
+                    }, {
+                        "name": "users"
+                    }]
+                }
+            }),
+        })
+        .into_iter()
+        .find(|event| event.get("event") == Some(&json!("result")))
+        .unwrap();
+
+        assert_eq!(result["plan"]["table_order"], json!(["users", "orders"]));
     }
 
     #[test]
@@ -4872,7 +6582,10 @@ mod tests {
             &[json!(7), json!("O'Reilly")],
         );
 
-        assert_eq!(sql, "SELECT * FROM users WHERE id = 7 AND name = 'O''Reilly'");
+        assert_eq!(
+            sql,
+            "SELECT * FROM users WHERE id = 7 AND name = 'O''Reilly'"
+        );
     }
 
     #[test]
@@ -5151,6 +6864,45 @@ mod tests {
         assert_eq!(result.chunks_copied, 2);
         assert_eq!(target.row_count("users"), 3);
         assert!(result.state.tables[0].completed);
+    }
+
+    #[test]
+    fn migration_creates_and_copies_parent_tables_before_children() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+                empty_table("users", Vec::new()),
+            ],
+        };
+        let source = MemoryAdapter::from_value(Some(&json!({
+            "orders": [{"id": 10, "parent_id": 1}],
+            "users": [{"id": 1}]
+        })));
+        let mut target = MemoryAdapter::default();
+
+        let result = migrate_memory(
+            &schema,
+            &MigrationOptions {
+                mode: "create_only".to_string(),
+                chunk_size: 100,
+                cancel_after_chunks: None,
+            },
+            None,
+            &source,
+            &mut target,
+        );
+
+        assert!(result.success);
+        assert_eq!(target.created_tables, vec!["users", "orders"]);
+        assert_eq!(
+            result
+                .state
+                .tables
+                .iter()
+                .map(|table| table.table.as_str())
+                .collect::<Vec<_>>(),
+            vec!["users", "orders"]
+        );
     }
 
     #[test]
@@ -5651,6 +7403,26 @@ mod tests {
         assert_eq!(
             select_chunk_text_sql("mysql", &schema().tables[0], &key_columns),
             "SELECT CAST(`id` AS CHAR) AS `id`, CAST(`name` AS CHAR) AS `name` FROM `users` ORDER BY `id` LIMIT ? OFFSET ?"
+        );
+    }
+
+    #[test]
+    fn text_range_sql_filters_by_numeric_primary_key() {
+        let table = schema().tables[0].clone();
+
+        assert_eq!(
+            select_chunk_text_range_sql("mysql", &table, "id", 101, 200),
+            "SELECT CAST(`id` AS CHAR) AS `id`, CAST(`name` AS CHAR) AS `name` FROM `users` WHERE `users`.`id` >= 101 AND `users`.`id` <= 200 ORDER BY `users`.`id`"
+        );
+    }
+
+    #[test]
+    fn load_data_sql_uses_local_infile_and_tsv_options() {
+        let table = schema().tables[0].clone();
+
+        assert_eq!(
+            load_data_local_infile_sql("mysql", &table, "chunk.tsv"),
+            "LOAD DATA LOCAL INFILE 'chunk.tsv' INTO TABLE `users` CHARACTER SET utf8mb4 FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' LINES TERMINATED BY '\\n' (`id`, `name`)"
         );
     }
 

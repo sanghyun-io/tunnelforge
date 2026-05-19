@@ -82,7 +82,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.spin_chunk_size = QSpinBox()
         self.spin_chunk_size.setRange(100, 100000)
         self.spin_chunk_size.setSingleStep(1000)
-        self.spin_chunk_size.setValue(5000)
+        self.spin_chunk_size.setValue(10000)
         self.spin_guide_row_limit = QSpinBox()
         self.spin_guide_row_limit.setRange(1, 1000)
         self.spin_guide_row_limit.setValue(20)
