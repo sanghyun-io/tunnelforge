@@ -558,8 +558,8 @@ class RustDumpExportDialog(QDialog):
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
         self.combo_compression = QComboBox()
-        self.combo_compression.addItems(["none"])
-        self.combo_compression.setToolTip("Rust DB Core dump는 현재 무압축 TSV 포맷을 사용합니다.")
+        self.combo_compression.addItems(["none", "zstd"])
+        self.combo_compression.setToolTip("Rust DB Core dump 압축 방식입니다. zstd는 디스크 사용량을 줄이고 import 시 스트리밍 해제됩니다.")
         option_layout.addRow("압축 방식:", self.combo_compression)
 
         container_layout.addWidget(option_group)

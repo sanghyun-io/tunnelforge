@@ -348,6 +348,7 @@ class RustDumpExporter:
         tables: Optional[List[str]],
         threads: int = 8,
         chunk_size: int = 50000,
+        compression: str = "none",
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -361,6 +362,7 @@ class RustDumpExporter:
             "threads": max(1, int(threads)),
             "chunk_size": max(1000, int(chunk_size)),
             "data_format": "tsv",
+            "compression": compression if compression in {"none", "zstd"} else "none",
         }
         if tables:
             payload["tables"] = tables
@@ -401,6 +403,7 @@ class RustDumpExporter:
                 output_dir=output_dir,
                 tables=None,
                 threads=threads,
+                compression=compression,
                 progress_callback=progress_callback,
                 table_progress_callback=table_progress_callback,
                 detail_callback=detail_callback,
@@ -443,6 +446,7 @@ class RustDumpExporter:
                 output_dir=output_dir,
                 tables=final_tables,
                 threads=threads,
+                compression=compression,
                 progress_callback=progress_callback,
                 table_progress_callback=table_progress_callback,
                 detail_callback=detail_callback,

@@ -196,7 +196,30 @@ class TestRustDumpExporter:
         assert facade.payload["threads"] == 8
         assert facade.payload["chunk_size"] == 50000
         assert facade.payload["data_format"] == "tsv"
+        assert facade.payload["compression"] == "none"
         assert "2" in msg
+
+    def test_export_full_schema_passes_zstd_compression_to_rust_dump(self, tmp_path):
+        """압축 선택이 Rust dump.run payload로 전달됨"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_dumped": 1}
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        exporter = RustDumpExporter(config, facade=facade)
+
+        success, _ = exporter.export_full_schema(
+            'app',
+            str(tmp_path / 'dump'),
+            compression='zstd',
+        )
+
+        assert success is True
+        assert facade.payload["compression"] == "zstd"
 
     def test_export_tables_passes_selected_tables_to_rust_dump(self, tmp_path):
         """부분 export가 선택 테이블 목록을 Rust core에 전달"""
@@ -224,6 +247,7 @@ class TestRustDumpExporter:
         assert facade.payload["threads"] == 8
         assert facade.payload["chunk_size"] == 50000
         assert facade.payload["data_format"] == "tsv"
+        assert facade.payload["compression"] == "none"
 
 
 class TestRustDumpImporter:

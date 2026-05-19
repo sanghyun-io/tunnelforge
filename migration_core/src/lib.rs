@@ -3,7 +3,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
@@ -136,6 +136,8 @@ pub struct DumpManifest {
     pub format_version: u32,
     #[serde(default = "default_dump_data_format")]
     pub data_format: String,
+    #[serde(default = "default_dump_compression")]
+    pub compression: String,
     pub source_engine: String,
     pub database: String,
     pub schema: NormalizedSchema,
@@ -602,6 +604,10 @@ fn default_chunk_size() -> usize {
 
 fn default_dump_data_format() -> String {
     "jsonl".to_string()
+}
+
+fn default_dump_compression() -> String {
+    "none".to_string()
 }
 
 pub struct CoreService {
@@ -1272,6 +1278,15 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     if !matches!(data_format.as_str(), "jsonl" | "tsv") {
         return Err(format!("unsupported dump data_format: {data_format}"));
     }
+    let compression = request
+        .payload
+        .get("compression")
+        .and_then(Value::as_str)
+        .unwrap_or("none")
+        .to_ascii_lowercase();
+    if !matches!(compression.as_str(), "none" | "zstd") {
+        return Err(format!("unsupported dump compression: {compression}"));
+    }
 
     let output_path = Path::new(output_dir);
     if output_path.exists() {
@@ -1308,7 +1323,8 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     ));
 
     let table_total = schema.tables.len();
-    let parallel_limits = dump_parallel_limits(threads, table_total);
+    let parallel_limits =
+        adaptive_dump_parallel_limits(threads, table_total, chunk_size, &row_counts);
     let export_tables = if threads > 1 && table_total > 1 {
         dump_schedule_order(&schema.tables, &row_counts)
     } else {
@@ -1322,6 +1338,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 &export_tables[0],
                 chunk_size,
                 &data_format,
+                &compression,
                 parallel_limits.range_workers_per_table,
                 request.request_id.clone(),
                 |event| emit(event),
@@ -1335,6 +1352,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                         &export_tables,
                         chunk_size,
                         &data_format,
+                        &compression,
                         request.request_id.clone(),
                         |event| emit(event),
                     )?
@@ -1347,6 +1365,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 &export_tables,
                 chunk_size,
                 &data_format,
+                &compression,
                 parallel_limits.table_workers,
                 parallel_limits.range_workers_per_table,
                 request.request_id.clone(),
@@ -1360,6 +1379,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 &export_tables,
                 chunk_size,
                 &data_format,
+                &compression,
                 request.request_id.clone(),
                 |event| emit(event),
             )?
@@ -1369,6 +1389,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         format: "tunnelforge-dump".to_string(),
         format_version: if data_format == "jsonl" { 1 } else { 2 },
         data_format,
+        compression,
         source_engine: endpoint.engine.clone(),
         database: endpoint.database.clone(),
         schema,
@@ -1386,6 +1407,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         "output_dir": output_dir,
         "format": manifest.format,
         "format_version": manifest.format_version,
+        "compression": manifest.compression,
         "tables": manifest.tables.len(),
         "rows_dumped": total_rows,
         "chunks_dumped": total_chunks,
@@ -1399,6 +1421,7 @@ fn dump_tables_sequential<F: FnMut(Value)>(
     tables: &[NormalizedTable],
     chunk_size: usize,
     data_format: &str,
+    compression: &str,
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
@@ -1416,6 +1439,7 @@ fn dump_tables_sequential<F: FnMut(Value)>(
             table_total,
             chunk_size,
             data_format,
+            compression,
             request_id.clone(),
             |event| emit(event),
         )?;
@@ -1456,6 +1480,33 @@ fn dump_parallel_limits(threads: usize, table_total: usize) -> DumpParallelLimit
     }
 }
 
+fn adaptive_dump_parallel_limits(
+    threads: usize,
+    table_total: usize,
+    chunk_size: usize,
+    row_counts: &BTreeMap<String, u64>,
+) -> DumpParallelLimits {
+    let baseline = dump_parallel_limits(threads, table_total);
+    let thread_budget = threads.max(1);
+    if table_total <= 1 || row_counts.is_empty() {
+        return baseline;
+    }
+    let chunk_size = chunk_size.max(1) as u64;
+    let max_estimated_chunks = row_counts
+        .values()
+        .copied()
+        .map(|rows| rows.saturating_add(chunk_size - 1) / chunk_size)
+        .max()
+        .unwrap_or(0);
+    if max_estimated_chunks >= (thread_budget as u64).saturating_mul(2) {
+        return DumpParallelLimits {
+            table_workers: 1,
+            range_workers_per_table: thread_budget,
+        };
+    }
+    baseline
+}
+
 fn dump_schedule_order(
     tables: &[NormalizedTable],
     row_counts: &BTreeMap<String, u64>,
@@ -1482,6 +1533,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
     tables: &[NormalizedTable],
     chunk_size: usize,
     data_format: &str,
+    compression: &str,
     table_threads: usize,
     range_threads: usize,
     request_id: Option<String>,
@@ -1509,6 +1561,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 table_total,
                 chunk_size,
                 data_format.to_string(),
+                compression.to_string(),
                 range_threads,
                 request_id.clone(),
                 sender.clone(),
@@ -1542,6 +1595,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                         table_total,
                         chunk_size,
                         data_format.to_string(),
+                        compression.to_string(),
                         range_threads,
                         request_id.clone(),
                         sender.clone(),
@@ -1562,6 +1616,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                         table_total,
                         chunk_size,
                         data_format.to_string(),
+                        compression.to_string(),
                         range_threads,
                         request_id.clone(),
                         sender.clone(),
@@ -1596,6 +1651,7 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
     table: &NormalizedTable,
     chunk_size: usize,
     data_format: &str,
+    compression: &str,
     threads: usize,
     request_id: Option<String>,
     mut emit: F,
@@ -1608,6 +1664,7 @@ fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
         1,
         chunk_size,
         data_format,
+        compression,
         threads,
         request_id,
         |event| emit(event),
@@ -1623,6 +1680,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
     table_total: usize,
     chunk_size: usize,
     data_format: &str,
+    compression: &str,
     threads: usize,
     request_id: Option<String>,
     mut emit: F,
@@ -1684,6 +1742,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                 pk_column.to_string(),
                 range,
                 data_format.to_string(),
+                compression.to_string(),
                 sender.clone(),
             ));
             active += 1;
@@ -1728,6 +1787,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                         pk_column.to_string(),
                         range,
                         data_format.to_string(),
+                        compression.to_string(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -1779,6 +1839,7 @@ fn spawn_mysql_range_worker(
     pk_column: String,
     range: DumpRange,
     data_format: String,
+    compression: String,
     sender: mpsc::Sender<DumpRangeEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -1790,6 +1851,7 @@ fn spawn_mysql_range_worker(
             &pk_column,
             &range,
             &data_format,
+            &compression,
         );
         match result {
             Ok((rows, stream_ms)) => {
@@ -1816,6 +1878,7 @@ fn dump_mysql_range_chunk(
     pk_column: &str,
     range: &DumpRange,
     data_format: &str,
+    compression: &str,
 ) -> Result<(u64, u64), String> {
     let mut conn = match LiveAdapter::connect(endpoint)? {
         LiveAdapter::MySql(conn) => conn,
@@ -1823,12 +1886,12 @@ fn dump_mysql_range_chunk(
             return Err("pk range dump requires mysql endpoint".to_string())
         }
     };
-    let chunk_path = output_path
-        .join(table_path)
-        .join(dump_chunk_name(range.chunk_index, data_format));
-    let file =
-        File::create(&chunk_path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
-    let mut file = BufWriter::new(file);
+    let chunk_path = output_path.join(table_path).join(dump_chunk_name(
+        range.chunk_index,
+        data_format,
+        compression,
+    ));
+    let mut file = open_dump_writer(&chunk_path, compression)?;
     let columns = column_names(table);
     let sql = select_chunk_text_range_sql("mysql", table, pk_column, range.start, range.end);
     let stream_started = Instant::now();
@@ -1857,6 +1920,7 @@ fn spawn_dump_table_worker(
     table_total: usize,
     chunk_size: usize,
     data_format: String,
+    compression: String,
     range_threads: usize,
     request_id: Option<String>,
     sender: mpsc::Sender<DumpTableEvent>,
@@ -1872,6 +1936,7 @@ fn spawn_dump_table_worker(
                     table_total,
                     chunk_size,
                     &data_format,
+                    &compression,
                     range_threads,
                     request_id.clone(),
                     |event| {
@@ -1890,6 +1955,7 @@ fn spawn_dump_table_worker(
                 table_total,
                 chunk_size,
                 &data_format,
+                &compression,
                 request_id,
                 |event| {
                     let _ = sender.send(DumpTableEvent::Progress(event));
@@ -1920,6 +1986,7 @@ fn dump_one_table<F: FnMut(Value)>(
     table_total: usize,
     chunk_size: usize,
     data_format: &str,
+    compression: &str,
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<(DumpTableManifest, u64, u64), String> {
@@ -1932,6 +1999,7 @@ fn dump_one_table<F: FnMut(Value)>(
             table_total,
             chunk_size,
             data_format,
+            compression,
             request_id,
             emit,
         );
@@ -1970,9 +2038,15 @@ fn dump_one_table<F: FnMut(Value)>(
             break;
         }
         chunks_dumped += 1;
-        let chunk_name = dump_chunk_name(chunks_dumped, data_format);
+        let chunk_name = dump_chunk_name(chunks_dumped, data_format, compression);
         let write_started = Instant::now();
-        write_dump_rows(&table_dir.join(&chunk_name), table, &rows, data_format)?;
+        write_dump_rows(
+            &table_dir.join(&chunk_name),
+            table,
+            &rows,
+            data_format,
+            compression,
+        )?;
         let write_ms = write_started.elapsed().as_millis() as u64;
 
         let copied_now = rows.len();
@@ -2024,6 +2098,7 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
     table_total: usize,
     chunk_size: usize,
     data_format: &str,
+    compression: &str,
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<(DumpTableManifest, u64, u64), String> {
@@ -2054,11 +2129,9 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
 
     loop {
         chunks_dumped += 1;
-        let chunk_name = dump_chunk_name(chunks_dumped, data_format);
+        let chunk_name = dump_chunk_name(chunks_dumped, data_format, compression);
         let chunk_path = table_dir.join(&chunk_name);
-        let file = File::create(&chunk_path)
-            .map_err(|err| format!("failed to create dump chunk: {err}"))?;
-        let mut file = BufWriter::new(file);
+        let mut file = open_dump_writer(&chunk_path, compression)?;
 
         let stream_started = Instant::now();
         let last_values = last_key.as_deref().and_then(decode_key_token);
@@ -2194,6 +2267,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     if !matches!(data_format.as_str(), "jsonl" | "tsv") {
         return Err(format!("unsupported dump data_format: {data_format}"));
     }
+    let compression = manifest.compression.to_ascii_lowercase();
+    if !matches!(compression.as_str(), "none" | "zstd") {
+        return Err(format!("unsupported dump compression: {compression}"));
+    }
 
     let selected_tables = string_list(request.payload.get("tables"));
     let selected: BTreeSet<String> = selected_tables.into_iter().collect();
@@ -2254,6 +2331,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                         input_path,
                         table,
                         table_manifest,
+                        &compression,
                         threads,
                         request.request_id.clone(),
                         |event| emit(event),
@@ -2273,10 +2351,12 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             }
 
             for chunk_index in 1..=table_manifest.chunks {
-                let chunk_path = input_path
-                    .join(&table_manifest.path)
-                    .join(dump_chunk_name(chunk_index, &data_format));
-                let rows = read_dump_rows(&chunk_path, table, &data_format)?;
+                let chunk_path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+                    chunk_index,
+                    &data_format,
+                    &compression,
+                ));
+                let rows = read_dump_rows(&chunk_path, table, &data_format, &compression)?;
                 let row_count = rows.len();
                 adapter.insert_rows(table, rows)?;
                 rows_imported += row_count as u64;
@@ -2327,6 +2407,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     input_path: &Path,
     table: &NormalizedTable,
     table_manifest: &DumpTableManifest,
+    compression: &str,
     threads: usize,
     request_id: Option<String>,
     mut emit: F,
@@ -2343,6 +2424,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             input_path,
             table,
             table_manifest,
+            compression,
             request_id,
             emit,
         );
@@ -2354,6 +2436,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             input_path,
             table,
             table_manifest,
+            compression,
             threads,
             request_id.clone(),
             |event| emit(event),
@@ -2372,6 +2455,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     input_path,
                     table,
                     table_manifest,
+                    compression,
                     request_id,
                     emit,
                 )
@@ -2383,11 +2467,13 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
     for chunk_index in 1..=table_manifest.chunks {
-        let chunk_path = input_path
-            .join(&table_manifest.path)
-            .join(dump_chunk_name(chunk_index, "tsv"));
+        let chunk_path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+            chunk_index,
+            "tsv",
+            compression,
+        ));
         let started = Instant::now();
-        let rows = match load_mysql_tsv_chunk(conn, table, &chunk_path) {
+        let rows = match load_mysql_tsv_chunk(conn, table, &chunk_path, compression) {
             Ok(rows) => rows,
             Err(err) if is_mysql_local_infile_disabled_error(&err) => {
                 emit(json!({
@@ -2401,6 +2487,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     input_path,
                     table,
                     table_manifest,
+                    compression,
                     request_id,
                     emit,
                 );
@@ -2511,17 +2598,20 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
     input_path: &Path,
     table: &NormalizedTable,
     table_manifest: &DumpTableManifest,
+    compression: &str,
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
     for chunk_index in 1..=table_manifest.chunks {
-        let chunk_path = input_path
-            .join(&table_manifest.path)
-            .join(dump_chunk_name(chunk_index, "tsv"));
+        let chunk_path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+            chunk_index,
+            "tsv",
+            compression,
+        ));
         let started = Instant::now();
-        let rows = insert_mysql_tsv_chunk_with_batches(conn, table, &chunk_path)?;
+        let rows = insert_mysql_tsv_chunk_with_batches(conn, table, &chunk_path, compression)?;
         rows_imported += rows;
         chunks_imported += 1;
         emit(json!({
@@ -2542,10 +2632,12 @@ fn insert_mysql_tsv_chunk_with_batches(
     conn: &mut mysql::PooledConn,
     table: &NormalizedTable,
     chunk_path: &Path,
+    compression: &str,
 ) -> Result<u64, String> {
     stream_tsv_rows_in_batches(
         chunk_path,
         table,
+        compression,
         MYSQL_INSERT_FALLBACK_BATCH_ROWS,
         MYSQL_INSERT_FALLBACK_BATCH_BYTES,
         |rows| {
@@ -2560,6 +2652,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     input_path: &Path,
     table: &NormalizedTable,
     table_manifest: &DumpTableManifest,
+    compression: &str,
     threads: usize,
     request_id: Option<String>,
     mut emit: F,
@@ -2581,6 +2674,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                 table.clone(),
                 table_manifest.path.clone(),
                 chunk_index,
+                compression.to_string(),
                 sender.clone(),
             ));
             active += 1;
@@ -2619,6 +2713,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                         table.clone(),
                         table_manifest.path.clone(),
                         next_chunk,
+                        compression.to_string(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -2648,6 +2743,7 @@ fn spawn_mysql_import_chunk_worker(
     table: NormalizedTable,
     table_path: String,
     chunk_index: u64,
+    compression: String,
     sender: mpsc::Sender<ImportChunkEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
@@ -2658,11 +2754,13 @@ fn spawn_mysql_import_chunk_worker(
                     return Err("mysql TSV import requires mysql endpoint".to_string())
                 }
             };
-            let chunk_path = input_path
-                .join(&table_path)
-                .join(dump_chunk_name(chunk_index, "tsv"));
+            let chunk_path = input_path.join(&table_path).join(dump_chunk_name(
+                chunk_index,
+                "tsv",
+                &compression,
+            ));
             let started = Instant::now();
-            let rows = load_mysql_tsv_chunk(&mut conn, &table, &chunk_path)?;
+            let rows = load_mysql_tsv_chunk(&mut conn, &table, &chunk_path, &compression)?;
             Ok((rows, started.elapsed().as_millis() as u64))
         })();
         match result {
@@ -2684,18 +2782,14 @@ fn load_mysql_tsv_chunk(
     conn: &mut mysql::PooledConn,
     table: &NormalizedTable,
     chunk_path: &Path,
+    compression: &str,
 ) -> Result<u64, String> {
     let path = chunk_path.to_path_buf();
+    let compression = compression.to_string();
     conn.set_local_infile_handler(Some(LocalInfileHandler::new(move |_, stream| {
-        let mut file = File::open(&path)?;
-        let mut buffer = [0_u8; 64 * 1024];
-        loop {
-            let read = file.read(&mut buffer)?;
-            if read == 0 {
-                break;
-            }
-            stream.write_all(&buffer[..read])?;
-        }
+        let mut reader = open_dump_reader(&path, &compression)
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
+        std::io::copy(&mut reader, stream)?;
         Ok(())
     })));
     let sql = load_data_local_infile_sql("mysql", table, "tunnelforge_chunk");
@@ -5296,9 +5390,36 @@ fn read_dump_manifest(input_path: &Path) -> Result<DumpManifest, String> {
     serde_json::from_reader(file).map_err(|err| format!("failed to parse dump manifest: {err}"))
 }
 
-fn dump_chunk_name(index: u64, data_format: &str) -> String {
+fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
     let extension = if data_format == "tsv" { "tsv" } else { "jsonl" };
-    format!("chunk_{index:06}.{extension}")
+    if compression == "zstd" {
+        format!("chunk_{index:06}.{extension}.zst")
+    } else {
+        format!("chunk_{index:06}.{extension}")
+    }
+}
+
+fn open_dump_writer(path: &Path, compression: &str) -> Result<Box<dyn Write>, String> {
+    let file = File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    let writer = BufWriter::new(file);
+    match compression {
+        "none" => Ok(Box::new(writer)),
+        "zstd" => zstd::stream::write::Encoder::new(writer, 0)
+            .map(|encoder| Box::new(encoder.auto_finish()) as Box<dyn Write>)
+            .map_err(|err| format!("failed to create zstd dump encoder: {err}")),
+        other => Err(format!("unsupported dump compression: {other}")),
+    }
+}
+
+fn open_dump_reader(path: &Path, compression: &str) -> Result<Box<dyn BufRead>, String> {
+    let file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
+    match compression {
+        "none" => Ok(Box::new(BufReader::new(file))),
+        "zstd" => zstd::stream::read::Decoder::new(file)
+            .map(|decoder| Box::new(BufReader::new(decoder)) as Box<dyn BufRead>)
+            .map_err(|err| format!("failed to create zstd dump decoder: {err}")),
+        other => Err(format!("unsupported dump compression: {other}")),
+    }
 }
 
 fn write_dump_rows(
@@ -5306,11 +5427,12 @@ fn write_dump_rows(
     table: &NormalizedTable,
     rows: &[Value],
     data_format: &str,
+    compression: &str,
 ) -> Result<(), String> {
     if data_format == "tsv" {
-        write_tsv_rows(path, table, rows)
+        write_tsv_rows(path, table, rows, compression)
     } else {
-        write_jsonl_rows(path, rows)
+        write_jsonl_rows(path, rows, compression)
     }
 }
 
@@ -5335,17 +5457,17 @@ fn read_dump_rows(
     path: &Path,
     table: &NormalizedTable,
     data_format: &str,
+    compression: &str,
 ) -> Result<Vec<Value>, String> {
     if data_format == "tsv" {
-        read_tsv_rows(path, table)
+        read_tsv_rows(path, table, compression)
     } else {
-        read_jsonl_rows(path)
+        read_jsonl_rows(path, compression)
     }
 }
 
-fn write_jsonl_rows(path: &Path, rows: &[Value]) -> Result<(), String> {
-    let file = File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
-    let mut file = BufWriter::new(file);
+fn write_jsonl_rows(path: &Path, rows: &[Value], compression: &str) -> Result<(), String> {
+    let mut file = open_dump_writer(path, compression)?;
     for row in rows {
         serde_json::to_writer(&mut file, row)
             .map_err(|err| format!("failed to encode dump row: {err}"))?;
@@ -5355,9 +5477,13 @@ fn write_jsonl_rows(path: &Path, rows: &[Value]) -> Result<(), String> {
     Ok(())
 }
 
-fn write_tsv_rows(path: &Path, table: &NormalizedTable, rows: &[Value]) -> Result<(), String> {
-    let file = File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
-    let mut file = BufWriter::new(file);
+fn write_tsv_rows(
+    path: &Path,
+    table: &NormalizedTable,
+    rows: &[Value],
+    compression: &str,
+) -> Result<(), String> {
+    let mut file = open_dump_writer(path, compression)?;
     for row in rows {
         write_tsv_row(&mut file, table, row)?;
     }
@@ -5410,9 +5536,12 @@ fn escape_tsv_text(text: &str) -> String {
         .replace('\r', "\\r")
 }
 
-fn read_tsv_rows(path: &Path, table: &NormalizedTable) -> Result<Vec<Value>, String> {
-    let file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
-    let reader = BufReader::new(file);
+fn read_tsv_rows(
+    path: &Path,
+    table: &NormalizedTable,
+    compression: &str,
+) -> Result<Vec<Value>, String> {
+    let reader = open_dump_reader(path, compression)?;
     let mut rows = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read dump row: {err}"))?;
@@ -5427,12 +5556,12 @@ fn read_tsv_rows(path: &Path, table: &NormalizedTable) -> Result<Vec<Value>, Str
 fn stream_tsv_rows_in_batches<F: FnMut(&[Value]) -> Result<(), String>>(
     path: &Path,
     table: &NormalizedTable,
+    compression: &str,
     max_rows: usize,
     max_bytes: usize,
     mut insert_batch: F,
 ) -> Result<u64, String> {
-    let file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
-    let reader = BufReader::new(file);
+    let reader = open_dump_reader(path, compression)?;
     let max_rows = max_rows.max(1);
     let max_bytes = max_bytes.max(1024);
     let mut batch = Vec::new();
@@ -5507,9 +5636,8 @@ fn unescape_tsv_field(field: &str) -> Value {
     Value::String(output)
 }
 
-fn read_jsonl_rows(path: &Path) -> Result<Vec<Value>, String> {
-    let file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
-    let reader = BufReader::new(file);
+fn read_jsonl_rows(path: &Path, compression: &str) -> Result<Vec<Value>, String> {
+    let reader = open_dump_reader(path, compression)?;
     let mut rows = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read dump row: {err}"))?;
@@ -6687,6 +6815,7 @@ mod tests {
             format: "tunnelforge-dump".to_string(),
             format_version: 1,
             data_format: "jsonl".to_string(),
+            compression: "none".to_string(),
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
@@ -6706,8 +6835,8 @@ mod tests {
         fs::create_dir_all(&table_dir).unwrap();
         let rows = vec![json!({"id": 1}), json!({"id": 2})];
         let chunk_path = table_dir.join("chunk_000001.jsonl");
-        write_jsonl_rows(&chunk_path, &rows).unwrap();
-        assert_eq!(read_jsonl_rows(&chunk_path).unwrap(), rows);
+        write_jsonl_rows(&chunk_path, &rows, "none").unwrap();
+        assert_eq!(read_jsonl_rows(&chunk_path, "none").unwrap(), rows);
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -6744,6 +6873,19 @@ mod tests {
         assert_eq!(limits.table_workers, 2);
         assert_eq!(limits.range_workers_per_table, 4);
         assert!(limits.estimated_mysql_connections() <= 10);
+    }
+
+    #[test]
+    fn adaptive_dump_limits_prioritize_range_workers_for_heavy_chunked_tables() {
+        let mut counts = BTreeMap::new();
+        counts.insert("huge".to_string(), 2_000_000);
+        counts.insert("medium".to_string(), 500_000);
+        counts.insert("tiny".to_string(), 10);
+
+        let limits = adaptive_dump_parallel_limits(8, 208, 50_000, &counts);
+
+        assert_eq!(limits.table_workers, 1);
+        assert_eq!(limits.range_workers_per_table, 8);
     }
 
     #[test]
@@ -6830,11 +6972,12 @@ mod tests {
                 json!({"id": "3", "name": "c"}),
             ],
             "tsv",
+            "none",
         )
         .unwrap();
         let mut batches = Vec::new();
 
-        let rows = stream_tsv_rows_in_batches(&path, &table, 2, 1024, |batch| {
+        let rows = stream_tsv_rows_in_batches(&path, &table, "none", 2, 1024, |batch| {
             batches.push(batch.len());
             Ok(())
         })
@@ -6884,9 +7027,53 @@ mod tests {
         let rows = vec![json!({"id": "1", "body": "a\tb\nc\\d", "empty": null})];
         let path = dir.join("chunk_000001.tsv");
 
-        write_dump_rows(&path, &table, &rows, "tsv").unwrap();
-        assert_eq!(read_dump_rows(&path, &table, "tsv").unwrap(), rows);
+        write_dump_rows(&path, &table, &rows, "tsv", "none").unwrap();
+        assert_eq!(read_dump_rows(&path, &table, "tsv", "none").unwrap(), rows);
 
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn zstd_tsv_dump_rows_roundtrip_and_uses_compressed_extension() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-zstd-tsv-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let table = NormalizedTable {
+            name: "users".to_string(),
+            columns: vec![
+                NormalizedColumn {
+                    name: "id".to_string(),
+                    type_name: "bigint".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                },
+                NormalizedColumn {
+                    name: "notes".to_string(),
+                    type_name: "text".to_string(),
+                    default_value: None,
+                    nullable: true,
+                    primary_key: false,
+                    unique: false,
+                },
+            ],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        let rows = vec![
+            json!({"id": "1", "notes": "hello\tworld"}),
+            json!({"id": "2", "notes": "line\nbreak"}),
+        ];
+        let chunk_name = dump_chunk_name(1, "tsv", "zstd");
+        assert_eq!(chunk_name, "chunk_000001.tsv.zst");
+        let path = dir.join(chunk_name);
+
+        write_dump_rows(&path, &table, &rows, "tsv", "zstd").unwrap();
+
+        assert_eq!(read_dump_rows(&path, &table, "tsv", "zstd").unwrap(), rows);
         fs::remove_dir_all(&dir).unwrap();
     }
 
