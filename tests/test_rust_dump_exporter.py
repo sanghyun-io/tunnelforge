@@ -356,3 +356,48 @@ class TestTableProgressTracker:
 
         assert size == 0
         assert chunks == 1  # 기본값
+
+
+class TestCoreEventForwarding:
+    """Rust Core event forwarding contract tests"""
+
+    def test_emit_core_event_forwards_dump_plan_to_detail_callback(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        details = []
+        emit_core_event(
+            {
+                "event": "dump_plan",
+                "tables_total": 2,
+                "rows_total": 150,
+                "tables": [{"name": "a", "rows": 100}, {"name": "b", "rows": 50}],
+            },
+            detail_callback=details.append,
+        )
+
+        assert details == [{
+            "event": "dump_plan",
+            "tables_total": 2,
+            "rows_total": 150,
+            "tables": [{"name": "a", "rows": 100}, {"name": "b", "rows": 50}],
+        }]
+
+    def test_emit_core_event_counts_only_completed_table_progress(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        table_progress = []
+        statuses = []
+
+        emit_core_event(
+            {"event": "table_progress", "table": "users", "status": "dumping", "current": 1, "total": 2},
+            table_progress_callback=lambda current, total, table: table_progress.append((current, total, table)),
+            table_status_callback=lambda table, status, message: statuses.append((table, status, message)),
+        )
+        emit_core_event(
+            {"event": "table_progress", "table": "users", "status": "completed", "current": 1, "total": 2},
+            table_progress_callback=lambda current, total, table: table_progress.append((current, total, table)),
+            table_status_callback=lambda table, status, message: statuses.append((table, status, message)),
+        )
+
+        assert table_progress == [(1, 2, "users")]
+        assert statuses == [("users", "loading", ""), ("users", "done", "")]

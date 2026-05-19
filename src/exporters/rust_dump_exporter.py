@@ -658,14 +658,22 @@ def emit_core_event(
     if raw_output_callback:
         raw_output_callback(json.dumps(event, ensure_ascii=False))
 
-    if event_type == "phase" and progress_callback:
+    if event_type == "dump_plan":
+        if detail_callback:
+            detail_callback({
+                "event": "dump_plan",
+                "tables_total": int(event.get("tables_total") or 0),
+                "rows_total": int(event.get("rows_total") or 0),
+                "tables": event.get("tables") if isinstance(event.get("tables"), list) else [],
+            })
+    elif event_type == "phase" and progress_callback:
         progress_callback(str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중..."))
     elif event_type == "table_progress":
         current = int(event.get("current") or 0)
         total = int(event.get("total") or 0)
         status = str(event.get("status") or "")
         ui_status = "loading" if status in ("dumping", "importing") else "done" if status == "completed" else status
-        if table_progress_callback:
+        if table_progress_callback and status == "completed":
             table_progress_callback(current, total, table)
         if table_status_callback and table:
             table_status_callback(table, ui_status, "")
@@ -680,11 +688,18 @@ def emit_core_event(
         percent = int((rows / total) * 100) if total else 0
         if detail_callback:
             detail_callback({
+                "event": "row_progress",
+                "table": table,
                 "percent": min(percent, 100),
                 "rows_done": rows,
                 "rows_total": total,
+                "chunk_rows": chunk_rows,
                 "rows_sec": rows_sec,
                 "speed": f"{rows_sec:,} rows/s" if rows_sec else "Rust DB Core",
+                "chunk_index": event.get("chunk_index"),
+                "chunks_done": event.get("chunks_done"),
+                "chunks_total": event.get("chunks_total"),
+                "strategy": event.get("strategy"),
                 "stream_ms": event.get("stream_ms"),
                 "read_ms": event.get("read_ms"),
                 "write_ms": event.get("write_ms"),
