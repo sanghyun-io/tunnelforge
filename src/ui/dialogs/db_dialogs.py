@@ -1297,20 +1297,23 @@ class RustDumpExportDialog(QDialog):
 
     def on_raw_output(self, line: str):
         """rust_dump 실시간 출력 처리 (로그에 추가)"""
+        is_telemetry_event = False
         try:
             event = json.loads(line)
         except Exception:
             event = None
         if isinstance(event, dict) and event.get("event") in {"dump_plan", "row_progress", "table_progress"}:
+            is_telemetry_event = True
             for key in ("password", "credentials"):
                 event.pop(key, None)
             self.export_telemetry_events.append(event)
 
-        # 너무 많은 로그 방지 (최대 500줄)
-        if self.txt_log.count() > 500:
-            self.txt_log.takeItem(0)
-        self.txt_log.addItem(line)
-        self.txt_log.scrollToBottom()
+        if not is_telemetry_event:
+            # 너무 많은 로그 방지 (최대 500줄)
+            if self.txt_log.count() > 500:
+                self.txt_log.takeItem(0)
+            self.txt_log.addItem(line)
+            self.txt_log.scrollToBottom()
         logger.debug("[rust_dump] %s", line)
 
     def _report_error_to_github(self, error_type: str, error_message: str):
