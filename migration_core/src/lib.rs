@@ -1169,6 +1169,40 @@ fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     }
 }
 
+fn dump_table_row_counts(endpoint: &Endpoint, tables: &[NormalizedTable]) -> BTreeMap<String, u64> {
+    let mut counts = BTreeMap::new();
+    if let Ok(mut adapter) = LiveAdapter::connect(endpoint) {
+        for table in tables {
+            let count = adapter.row_count(&table.name).unwrap_or(0).max(0) as u64;
+            counts.insert(table.name.clone(), count);
+        }
+    }
+    counts
+}
+
+fn dump_plan_event(
+    request_id: Option<String>,
+    tables: &[NormalizedTable],
+    row_counts: &BTreeMap<String, u64>,
+) -> Value {
+    let rows_total = tables
+        .iter()
+        .map(|table| row_counts.get(&table.name).copied().unwrap_or(0))
+        .sum::<u64>();
+    json!({
+        "event": "dump_plan",
+        "request_id": request_id,
+        "tables_total": tables.len(),
+        "rows_total": rows_total,
+        "tables": tables.iter().map(|table| {
+            json!({
+                "name": table.name,
+                "rows": row_counts.get(&table.name).copied().unwrap_or(0)
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
 fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
     let endpoint = request_endpoint(request)?;
     let output_dir = request
@@ -1233,6 +1267,13 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
     }
+
+    let row_counts = dump_table_row_counts(&endpoint, &schema.tables);
+    emit(dump_plan_event(
+        request.request_id.clone(),
+        &schema.tables,
+        &row_counts,
+    ));
 
     let table_total = schema.tables.len();
     let (table_manifests, total_rows, total_chunks) =
@@ -6265,6 +6306,22 @@ mod tests {
         assert_eq!(read_jsonl_rows(&chunk_path).unwrap(), rows);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_plan_event_reports_table_and_row_totals() {
+        let schema = schema();
+        let mut counts = BTreeMap::new();
+        counts.insert("users".to_string(), 42_u64);
+
+        let event = dump_plan_event(Some("req-1".to_string()), &schema.tables, &counts);
+
+        assert_eq!(event["event"], "dump_plan");
+        assert_eq!(event["request_id"], "req-1");
+        assert_eq!(event["tables_total"], 1);
+        assert_eq!(event["rows_total"], 42);
+        assert_eq!(event["tables"][0]["name"], "users");
+        assert_eq!(event["tables"][0]["rows"], 42);
     }
 
     #[test]
