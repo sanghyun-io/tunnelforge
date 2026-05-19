@@ -1241,6 +1241,37 @@ fn dump_plan_event(
     })
 }
 
+fn dump_schedule_event(
+    request_id: Option<String>,
+    scheduled_tables: &[NormalizedTable],
+    row_counts: &BTreeMap<String, u64>,
+    limits: DumpParallelLimits,
+    threads: usize,
+    chunk_size: usize,
+    data_format: &str,
+    compression: &str,
+) -> Value {
+    let chunk_size = chunk_size.max(1) as u64;
+    json!({
+        "event": "dump_schedule",
+        "request_id": request_id,
+        "threads": threads,
+        "table_workers": limits.table_workers,
+        "range_workers_per_table": limits.range_workers_per_table,
+        "chunk_size": chunk_size,
+        "data_format": data_format,
+        "compression": compression,
+        "scheduled_tables": scheduled_tables.iter().take(12).map(|table| {
+            let rows = row_counts.get(&table.name).copied().unwrap_or(0);
+            json!({
+                "name": table.name,
+                "rows": rows,
+                "estimated_chunks": rows.saturating_add(chunk_size - 1) / chunk_size
+            })
+        }).collect::<Vec<_>>()
+    })
+}
+
 fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
     let endpoint = request_endpoint(request)?;
     let output_dir = request
@@ -1330,6 +1361,16 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     } else {
         schema.tables.clone()
     };
+    emit(dump_schedule_event(
+        request.request_id.clone(),
+        &export_tables,
+        &row_counts,
+        parallel_limits,
+        threads,
+        chunk_size,
+        &data_format,
+        &compression,
+    ));
     let (table_manifests, total_rows, total_chunks) =
         if endpoint.engine == "mysql" && threads > 1 && table_total == 1 {
             match dump_single_mysql_table_parallel(
@@ -6900,6 +6941,38 @@ mod tests {
         assert_eq!(event["rows_total"], 42);
         assert_eq!(event["tables"][0]["name"], "users");
         assert_eq!(event["tables"][0]["rows"], 42);
+    }
+
+    #[test]
+    fn dump_schedule_event_reports_adaptive_workers_and_top_tables() {
+        let tables = vec![
+            empty_table("huge", Vec::new()),
+            empty_table("medium", Vec::new()),
+            empty_table("tiny", Vec::new()),
+        ];
+        let mut counts = BTreeMap::new();
+        counts.insert("huge".to_string(), 2_000_000);
+        counts.insert("medium".to_string(), 500_000);
+        counts.insert("tiny".to_string(), 10);
+        let limits = adaptive_dump_parallel_limits(8, 3, 50_000, &counts);
+
+        let event = dump_schedule_event(
+            Some("req-1".to_string()),
+            &tables,
+            &counts,
+            limits,
+            8,
+            50_000,
+            "tsv",
+            "zstd",
+        );
+
+        assert_eq!(event["event"], "dump_schedule");
+        assert_eq!(event["compression"], "zstd");
+        assert_eq!(event["table_workers"], 1);
+        assert_eq!(event["range_workers_per_table"], 8);
+        assert_eq!(event["scheduled_tables"][0]["name"], "huge");
+        assert_eq!(event["scheduled_tables"][0]["estimated_chunks"], 40);
     }
 
     #[test]

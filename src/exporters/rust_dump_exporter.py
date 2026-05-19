@@ -670,6 +670,18 @@ def emit_core_event(
                 "rows_total": int(event.get("rows_total") or 0),
                 "tables": event.get("tables") if isinstance(event.get("tables"), list) else [],
             })
+    elif event_type == "dump_schedule":
+        if detail_callback:
+            detail_callback({
+                "event": "dump_schedule",
+                "threads": int(event.get("threads") or 0),
+                "table_workers": int(event.get("table_workers") or 0),
+                "range_workers_per_table": int(event.get("range_workers_per_table") or 0),
+                "chunk_size": int(event.get("chunk_size") or 0),
+                "data_format": str(event.get("data_format") or ""),
+                "compression": str(event.get("compression") or ""),
+                "scheduled_tables": event.get("scheduled_tables") if isinstance(event.get("scheduled_tables"), list) else [],
+            })
     elif event_type == "phase" and progress_callback:
         progress_callback(str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중..."))
     elif event_type == "table_progress":

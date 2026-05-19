@@ -425,3 +425,35 @@ class TestCoreEventForwarding:
 
         assert table_progress == [(1, 2, "users")]
         assert statuses == [("users", "loading", ""), ("users", "done", "")]
+
+    def test_emit_core_event_forwards_dump_schedule_detail(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        details = []
+
+        emit_core_event(
+            {
+                "event": "dump_schedule",
+                "threads": 8,
+                "table_workers": 2,
+                "range_workers_per_table": 4,
+                "chunk_size": 50000,
+                "data_format": "tsv",
+                "compression": "zstd",
+                "scheduled_tables": [{"name": "huge", "rows": 100, "estimated_chunks": 1}],
+            },
+            detail_callback=details.append,
+        )
+
+        assert details == [
+            {
+                "event": "dump_schedule",
+                "threads": 8,
+                "table_workers": 2,
+                "range_workers_per_table": 4,
+                "chunk_size": 50000,
+                "data_format": "tsv",
+                "compression": "zstd",
+                "scheduled_tables": [{"name": "huge", "rows": 100, "estimated_chunks": 1}],
+            }
+        ]

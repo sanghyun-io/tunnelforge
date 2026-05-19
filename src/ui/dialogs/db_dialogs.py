@@ -1385,7 +1385,12 @@ class RustDumpExportDialog(QDialog):
             event = json.loads(line)
         except Exception:
             event = None
-        if isinstance(event, dict) and event.get("event") in {"dump_plan", "row_progress", "table_progress"}:
+        if isinstance(event, dict) and event.get("event") in {
+            "dump_plan",
+            "dump_schedule",
+            "row_progress",
+            "table_progress",
+        }:
             is_telemetry_event = True
             for key in ("password", "credentials"):
                 event.pop(key, None)
@@ -1465,6 +1470,12 @@ class RustDumpExportDialog(QDialog):
             })
         return sorted(summaries, key=lambda item: item["elapsed_ms"], reverse=True)
 
+    def _export_schedule_summary(self) -> Optional[dict]:
+        for event in self.export_telemetry_events:
+            if event.get("event") == "dump_schedule":
+                return event
+        return None
+
     def save_log(self):
         """로그를 파일로 저장"""
         if not self.log_entries:
@@ -1516,6 +1527,22 @@ class RustDumpExportDialog(QDialog):
                 f.write(f"총 rows: {self.export_total_rows:,}\n")
                 f.write(f"완료 rows: {sum(self.export_table_done.values()):,}\n")
                 f.write(f"수집 이벤트: {len(self.export_telemetry_events):,}\n")
+                schedule = self._export_schedule_summary()
+                if schedule:
+                    f.write("\nAdaptive Schedule\n")
+                    f.write(
+                        f"- format={schedule.get('data_format')}, "
+                        f"compression={schedule.get('compression')}, "
+                        f"threads={schedule.get('threads')}, "
+                        f"table_workers={schedule.get('table_workers')}, "
+                        f"range_workers/table={schedule.get('range_workers_per_table')}, "
+                        f"chunk_size={schedule.get('chunk_size')}\n"
+                    )
+                    for item in (schedule.get("scheduled_tables") or [])[:8]:
+                        f.write(
+                            f"  - {item.get('name')}: {int(item.get('rows') or 0):,} rows, "
+                            f"{int(item.get('estimated_chunks') or 0):,} chunks\n"
+                        )
                 f.write("\n느린 테이블 Top 10\n")
                 for item in self._export_slow_table_summaries()[:10]:
                     f.write(
