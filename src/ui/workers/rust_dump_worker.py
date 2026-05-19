@@ -50,7 +50,7 @@ class RustDumpWorker(QThread):
                 success, msg = exporter.export_full_schema(
                     self.kwargs['schema'],
                     self.kwargs['output_dir'],
-                    self.kwargs.get('threads', 4),
+                    self.kwargs.get('threads', 8),
                     self.kwargs.get('compression', 'none'),
                     callback,
                     table_callback,
@@ -77,7 +77,7 @@ class RustDumpWorker(QThread):
                     self.kwargs['schema'],
                     self.kwargs['tables'],
                     self.kwargs['output_dir'],
-                    self.kwargs.get('threads', 4),
+                    self.kwargs.get('threads', 8),
                     self.kwargs.get('compression', 'none'),
                     self.kwargs.get('include_fk_parents', True),
                     callback,
@@ -110,7 +110,7 @@ class RustDumpWorker(QThread):
                 success, msg, results = importer.import_dump(
                     self.kwargs['input_dir'],
                     self.kwargs.get('target_schema'),
-                    self.kwargs.get('threads', 4),
+                    self.kwargs.get('threads', 8),
                     self.kwargs.get('import_mode', 'replace'),
                     self.kwargs.get('timezone_sql'),
                     callback,

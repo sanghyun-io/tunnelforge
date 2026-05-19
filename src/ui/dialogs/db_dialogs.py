@@ -1698,7 +1698,7 @@ class RustDumpImportDialog(QDialog):
 
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 16)
-        self.spin_threads.setValue(4)
+        self.spin_threads.setValue(8)
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
         container_layout.addWidget(option_group)

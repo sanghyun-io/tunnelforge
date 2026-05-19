@@ -1252,7 +1252,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         .get("threads")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or(4)
+        .unwrap_or(8)
         .max(1);
     let overwrite = request
         .payload
@@ -1444,7 +1444,7 @@ fn dump_parallel_limits(threads: usize, table_total: usize) -> DumpParallelLimit
     } else if table_total <= thread_budget {
         table_total
     } else {
-        ((thread_budget as f64).sqrt().ceil() as usize).clamp(1, table_total)
+        (thread_budget / 4).max(1).min(table_total)
     };
     let range_workers_per_table = (thread_budget / table_workers).max(1);
     DumpParallelLimits {
@@ -2199,7 +2199,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .get("threads")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or(4)
+        .unwrap_or(8)
         .max(1);
     let tables: Vec<DumpTableManifest> = manifest
         .tables
@@ -2217,82 +2217,89 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
 
-    for (index, table_manifest) in tables.iter().enumerate() {
-        let table = manifest
-            .schema
-            .tables
-            .iter()
-            .find(|table| table.name == table_manifest.name)
-            .ok_or_else(|| format!("manifest schema missing table {}", table_manifest.name))?;
-        emit(json!({
-            "event": "table_progress",
-            "request_id": request.request_id,
-            "table": table.name,
-            "status": "importing",
-            "current": index + 1,
-            "total": table_total
-        }));
-
-        if matches!(mode, "replace" | "recreate") {
-            adapter.execute_sql(&drop_table_sql(adapter.engine(), &table.name))?;
-        }
-        let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
-            .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
-        adapter.create_table(table, &ddl)?;
-
-        if data_format == "tsv" && !has_binary_columns(table) {
-            if let LiveAdapter::MySql(conn) = &mut adapter {
-                let (rows, chunks) = import_mysql_tsv_table(
-                    &endpoint,
-                    conn,
-                    input_path,
-                    table,
-                    table_manifest,
-                    threads,
-                    request.request_id.clone(),
-                    |event| emit(event),
-                )?;
-                rows_imported += rows;
-                chunks_imported += chunks;
-                emit(json!({
-                    "event": "table_progress",
-                    "request_id": request.request_id,
-                    "table": table.name,
-                    "status": "completed",
-                    "current": index + 1,
-                    "total": table_total
-                }));
-                continue;
-            }
-        }
-
-        for chunk_index in 1..=table_manifest.chunks {
-            let chunk_path = input_path
-                .join(&table_manifest.path)
-                .join(dump_chunk_name(chunk_index, &data_format));
-            let rows = read_dump_rows(&chunk_path, table, &data_format)?;
-            let row_count = rows.len();
-            adapter.insert_rows(table, rows)?;
-            rows_imported += row_count as u64;
-            chunks_imported += 1;
+    set_mysql_import_session_tuning(&mut adapter, false)?;
+    let import_result = (|| -> Result<(), String> {
+        for (index, table_manifest) in tables.iter().enumerate() {
+            let table = manifest
+                .schema
+                .tables
+                .iter()
+                .find(|table| table.name == table_manifest.name)
+                .ok_or_else(|| format!("manifest schema missing table {}", table_manifest.name))?;
             emit(json!({
-                "event": "row_progress",
+                "event": "table_progress",
                 "request_id": request.request_id,
                 "table": table.name,
-                "rows": rows_imported,
-                "total": table_manifest.rows
+                "status": "importing",
+                "current": index + 1,
+                "total": table_total
+            }));
+
+            if matches!(mode, "replace" | "recreate") {
+                adapter.execute_sql(&drop_table_sql(adapter.engine(), &table.name))?;
+            }
+            let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
+                .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
+            adapter.create_table(table, &ddl)?;
+
+            if data_format == "tsv" && !has_binary_columns(table) {
+                if let LiveAdapter::MySql(conn) = &mut adapter {
+                    let (rows, chunks) = import_mysql_tsv_table(
+                        &endpoint,
+                        conn,
+                        input_path,
+                        table,
+                        table_manifest,
+                        threads,
+                        request.request_id.clone(),
+                        |event| emit(event),
+                    )?;
+                    rows_imported += rows;
+                    chunks_imported += chunks;
+                    emit(json!({
+                        "event": "table_progress",
+                        "request_id": request.request_id,
+                        "table": table.name,
+                        "status": "completed",
+                        "current": index + 1,
+                        "total": table_total
+                    }));
+                    continue;
+                }
+            }
+
+            for chunk_index in 1..=table_manifest.chunks {
+                let chunk_path = input_path
+                    .join(&table_manifest.path)
+                    .join(dump_chunk_name(chunk_index, &data_format));
+                let rows = read_dump_rows(&chunk_path, table, &data_format)?;
+                let row_count = rows.len();
+                adapter.insert_rows(table, rows)?;
+                rows_imported += row_count as u64;
+                chunks_imported += 1;
+                emit(json!({
+                    "event": "row_progress",
+                    "request_id": request.request_id,
+                    "table": table.name,
+                    "rows": rows_imported,
+                    "total": table_manifest.rows
+                }));
+            }
+
+            emit(json!({
+                "event": "table_progress",
+                "request_id": request.request_id,
+                "table": table.name,
+                "status": "completed",
+                "current": index + 1,
+                "total": table_total
             }));
         }
-
-        emit(json!({
-            "event": "table_progress",
-            "request_id": request.request_id,
-            "table": table.name,
-            "status": "completed",
-            "current": index + 1,
-            "total": table_total
-        }));
-    }
+        Ok(())
+    })();
+    let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
+    import_result?;
+    restore_result?;
 
     Ok(json!({
         "event": "result",
@@ -2428,6 +2435,30 @@ fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
         || lower.contains("loading local data is disabled")
         || lower.contains("local infile")
             && (lower.contains("disabled") || lower.contains("not allowed"))
+}
+
+fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
+    if restore {
+        vec![
+            "SET SESSION unique_checks=1".to_string(),
+            "SET SESSION foreign_key_checks=1".to_string(),
+        ]
+    } else {
+        vec![
+            "SET SESSION foreign_key_checks=0".to_string(),
+            "SET SESSION unique_checks=0".to_string(),
+        ]
+    }
+}
+
+fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> Result<(), String> {
+    if !matches!(adapter, LiveAdapter::MySql(_)) {
+        return Ok(());
+    }
+    for sql in mysql_import_session_tuning_sql(restore) {
+        adapter.execute_sql(&sql)?;
+    }
+    Ok(())
 }
 
 fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
@@ -6658,6 +6689,15 @@ mod tests {
     }
 
     #[test]
+    fn eight_thread_full_schema_prefers_range_parallelism_for_large_tables() {
+        let limits = dump_parallel_limits(8, 208);
+
+        assert_eq!(limits.table_workers, 2);
+        assert_eq!(limits.range_workers_per_table, 4);
+        assert!(limits.estimated_mysql_connections() <= 10);
+    }
+
+    #[test]
     fn small_table_selection_keeps_range_parallelism_within_thread_budget() {
         let limits = dump_parallel_limits(16, 2);
 
@@ -7950,6 +7990,24 @@ mod tests {
         assert_eq!(
             load_data_local_infile_sql("mysql", &table, "chunk.tsv"),
             "LOAD DATA LOCAL INFILE 'chunk.tsv' INTO TABLE `users` CHARACTER SET utf8mb4 FIELDS TERMINATED BY '\\t' ESCAPED BY '\\\\' LINES TERMINATED BY '\\n' (`id`, `name`)"
+        );
+    }
+
+    #[test]
+    fn mysql_dump_import_uses_fast_session_tuning_statements() {
+        assert_eq!(
+            mysql_import_session_tuning_sql(false),
+            vec![
+                "SET SESSION foreign_key_checks=0".to_string(),
+                "SET SESSION unique_checks=0".to_string(),
+            ]
+        );
+        assert_eq!(
+            mysql_import_session_tuning_sql(true),
+            vec![
+                "SET SESSION unique_checks=1".to_string(),
+                "SET SESSION foreign_key_checks=1".to_string(),
+            ]
         );
     }
 
