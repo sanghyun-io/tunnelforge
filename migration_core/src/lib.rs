@@ -1492,12 +1492,27 @@ fn adaptive_dump_parallel_limits(
         return baseline;
     }
     let chunk_size = chunk_size.max(1) as u64;
+    let heavy_tables = row_counts
+        .values()
+        .copied()
+        .filter(|rows| {
+            rows.saturating_add(chunk_size - 1) / chunk_size
+                >= (thread_budget as u64).saturating_mul(2)
+        })
+        .count();
     let max_estimated_chunks = row_counts
         .values()
         .copied()
         .map(|rows| rows.saturating_add(chunk_size - 1) / chunk_size)
         .max()
         .unwrap_or(0);
+    if heavy_tables > 1 {
+        let table_workers = heavy_tables.min(thread_budget / 2).max(1).min(table_total);
+        return DumpParallelLimits {
+            table_workers,
+            range_workers_per_table: (thread_budget / table_workers).max(1),
+        };
+    }
     if max_estimated_chunks >= (thread_budget as u64).saturating_mul(2) {
         return DumpParallelLimits {
             table_workers: 1,
@@ -6916,6 +6931,19 @@ mod tests {
 
         assert_eq!(limits.table_workers, 1);
         assert_eq!(limits.range_workers_per_table, 8);
+    }
+
+    #[test]
+    fn adaptive_dump_limits_keep_multiple_heavy_tables_in_parallel() {
+        let mut counts = BTreeMap::new();
+        counts.insert("huge_a".to_string(), 2_000_000);
+        counts.insert("huge_b".to_string(), 1_900_000);
+        counts.insert("tiny".to_string(), 10);
+
+        let limits = adaptive_dump_parallel_limits(8, 208, 50_000, &counts);
+
+        assert_eq!(limits.table_workers, 2);
+        assert_eq!(limits.range_workers_per_table, 4);
     }
 
     #[test]
