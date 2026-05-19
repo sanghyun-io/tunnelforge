@@ -1297,6 +1297,15 @@ class RustDumpExportDialog(QDialog):
 
     def on_raw_output(self, line: str):
         """rust_dump 실시간 출력 처리 (로그에 추가)"""
+        try:
+            event = json.loads(line)
+        except Exception:
+            event = None
+        if isinstance(event, dict) and event.get("event") in {"dump_plan", "row_progress", "table_progress"}:
+            for key in ("password", "credentials"):
+                event.pop(key, None)
+            self.export_telemetry_events.append(event)
+
         # 너무 많은 로그 방지 (최대 500줄)
         if self.txt_log.count() > 500:
             self.txt_log.takeItem(0)
@@ -1328,6 +1337,47 @@ class RustDumpExportDialog(QDialog):
             self._add_log(f"🐙 GitHub: {message}")
         else:
             self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
+
+    def _export_table_duration_seconds(self, table_name: str) -> float:
+        start = self.export_table_started_at.get(table_name)
+        end = self.export_table_finished_at.get(table_name)
+        if not start or not end:
+            return 0.0
+        return max(0.0, (end - start).total_seconds())
+
+    def _export_slow_table_summaries(self) -> List[dict]:
+        summaries = []
+        for table, total_rows in self.export_table_totals.items():
+            summaries.append({
+                "table": table,
+                "rows": total_rows,
+                "done": self.export_table_done.get(table, 0),
+                "duration_sec": self._export_table_duration_seconds(table),
+            })
+        return sorted(summaries, key=lambda item: item["duration_sec"], reverse=True)
+
+    def _export_slow_chunk_summaries(self) -> List[dict]:
+        summaries = []
+        for event in self.export_telemetry_events:
+            if event.get("event") != "row_progress":
+                continue
+            elapsed_ms = int(
+                event.get("stream_ms")
+                or event.get("read_ms")
+                or event.get("write_ms")
+                or event.get("load_ms")
+                or 0
+            )
+            if elapsed_ms <= 0:
+                continue
+            summaries.append({
+                "table": str(event.get("table") or ""),
+                "chunk_index": event.get("chunk_index"),
+                "chunk_rows": int(event.get("chunk_rows") or 0),
+                "elapsed_ms": elapsed_ms,
+                "strategy": str(event.get("strategy") or ""),
+            })
+        return sorted(summaries, key=lambda item: item["elapsed_ms"], reverse=True)
 
     def save_log(self):
         """로그를 파일로 저장"""
@@ -1373,6 +1423,27 @@ class RustDumpExportDialog(QDialog):
                 if self.export_start_time and self.export_end_time:
                     elapsed = self.export_end_time - self.export_start_time
                     f.write(f"소요 시간: {elapsed}\n")
+
+                f.write("\n" + "=" * 70 + "\n")
+                f.write("Export Telemetry Summary\n")
+                f.write("=" * 70 + "\n")
+                f.write(f"총 rows: {self.export_total_rows:,}\n")
+                f.write(f"완료 rows: {sum(self.export_table_done.values()):,}\n")
+                f.write(f"수집 이벤트: {len(self.export_telemetry_events):,}\n")
+                f.write("\n느린 테이블 Top 10\n")
+                for item in self._export_slow_table_summaries()[:10]:
+                    f.write(
+                        f"- {item['table']}: {item['duration_sec']:.1f}s, "
+                        f"{item['done']:,}/{item['rows']:,} rows\n"
+                    )
+                f.write("\n느린 Chunk Top 10\n")
+                for item in self._export_slow_chunk_summaries()[:10]:
+                    chunk = item["chunk_index"] if item["chunk_index"] is not None else "-"
+                    f.write(
+                        f"- {item['table']} chunk {chunk}: "
+                        f"{item['elapsed_ms']}ms, {item['chunk_rows']:,} rows, "
+                        f"{item['strategy'] or 'default'}\n"
+                    )
 
                 f.write("\n" + "=" * 70 + "\n")
                 f.write("상세 로그\n")
