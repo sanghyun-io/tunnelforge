@@ -2658,7 +2658,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     mut emit: F,
 ) -> Result<(u64, u64), String> {
     let max_threads = threads.max(1).min(table_manifest.chunks as usize);
-    let mut pending = (1..=table_manifest.chunks).collect::<VecDeque<_>>();
+    let mut pending = adaptive_import_chunk_order(input_path, table_manifest, "tsv", compression);
     let mut active = 0_usize;
     let mut completed = 0_u64;
     let mut rows_imported = 0_u64;
@@ -2735,6 +2735,36 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
         return Err(err);
     }
     Ok((rows_imported, completed))
+}
+
+fn adaptive_import_chunk_order(
+    input_path: &Path,
+    table_manifest: &DumpTableManifest,
+    data_format: &str,
+    compression: &str,
+) -> VecDeque<u64> {
+    let mut chunks = (1..=table_manifest.chunks)
+        .map(|chunk_index| {
+            let path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+                chunk_index,
+                data_format,
+                compression,
+            ));
+            let bytes = fs::metadata(path)
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            (chunk_index, bytes)
+        })
+        .collect::<Vec<_>>();
+    chunks.sort_by(|(left_index, left_bytes), (right_index, right_bytes)| {
+        right_bytes
+            .cmp(left_bytes)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    chunks
+        .into_iter()
+        .map(|(chunk_index, _)| chunk_index)
+        .collect()
 }
 
 fn spawn_mysql_import_chunk_worker(
@@ -7074,6 +7104,31 @@ mod tests {
         write_dump_rows(&path, &table, &rows, "tsv", "zstd").unwrap();
 
         assert_eq!(read_dump_rows(&path, &table, "tsv", "zstd").unwrap(), rows);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn adaptive_import_chunk_order_prefers_larger_chunk_files() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-import-order-test-{}",
+            current_unix_seconds()
+        ));
+        let table_dir = dir.join("0001_users");
+        fs::create_dir_all(&table_dir).unwrap();
+        fs::write(table_dir.join("chunk_000001.tsv"), b"1\n").unwrap();
+        fs::write(table_dir.join("chunk_000002.tsv"), vec![b'x'; 1024]).unwrap();
+        fs::write(table_dir.join("chunk_000003.tsv"), vec![b'y'; 64]).unwrap();
+        let manifest = DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 3,
+            chunks: 3,
+        };
+
+        assert_eq!(
+            adaptive_import_chunk_order(&dir, &manifest, "tsv", "none"),
+            vec![2, 3, 1]
+        );
         fs::remove_dir_all(&dir).unwrap();
     }
 
