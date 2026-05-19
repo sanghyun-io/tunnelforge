@@ -374,6 +374,7 @@ class RustDumpExportDialog(QDialog):
         self.export_table_status: dict = {}
         self.export_total_rows: int = 0
         self.export_completed_tables: int = 0
+        self.export_completed_table_names: set = set()
         self.export_total_tables: int = 0
         self.export_last_percent: int = 0
         self.export_telemetry_events: List[dict] = []
@@ -523,7 +524,8 @@ class RustDumpExportDialog(QDialog):
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
         self.combo_compression = QComboBox()
-        self.combo_compression.addItems(["zstd", "gzip", "none"])
+        self.combo_compression.addItems(["none"])
+        self.combo_compression.setToolTip("Rust DB Core dump는 현재 무압축 TSV 포맷을 사용합니다.")
         option_layout.addRow("압축 방식:", self.combo_compression)
 
         container_layout.addWidget(option_group)
@@ -1052,6 +1054,7 @@ class RustDumpExportDialog(QDialog):
         self.export_table_status = {}
         self.export_total_rows = 0
         self.export_completed_tables = 0
+        self.export_completed_table_names = set()
         self.export_total_tables = 0
         self.export_last_percent = 0
         self.export_telemetry_events = []
@@ -1145,7 +1148,12 @@ class RustDumpExportDialog(QDialog):
 
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
-        self.export_completed_tables = max(self.export_completed_tables, current)
+        if table_name:
+            self.export_completed_table_names.add(table_name)
+        self.export_completed_tables = max(
+            self.export_completed_tables,
+            len(self.export_completed_table_names),
+        )
         self.export_total_tables = max(self.export_total_tables, total)
         self.label_tables.setText(
             f"📋 테이블: {self.export_completed_tables} / {self.export_total_tables} 완료"

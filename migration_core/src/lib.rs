@@ -12,6 +12,9 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use mysql::{prelude::Queryable, LocalInfileHandler};
 use postgres::{error::SqlState, NoTls};
 
+const MYSQL_INSERT_FALLBACK_BATCH_ROWS: usize = 500;
+const MYSQL_INSERT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
+
 #[derive(Debug, Deserialize)]
 pub struct Request {
     pub command: String,
@@ -1303,12 +1306,17 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
 
     let table_total = schema.tables.len();
     let parallel_limits = dump_parallel_limits(threads, table_total);
+    let export_tables = if threads > 1 && table_total > 1 {
+        dump_schedule_order(&schema.tables, &row_counts)
+    } else {
+        schema.tables.clone()
+    };
     let (table_manifests, total_rows, total_chunks) =
         if endpoint.engine == "mysql" && threads > 1 && table_total == 1 {
             match dump_single_mysql_table_parallel(
                 &endpoint,
                 output_path,
-                &schema.tables[0],
+                &export_tables[0],
                 chunk_size,
                 &data_format,
                 parallel_limits.range_workers_per_table,
@@ -1321,7 +1329,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                     dump_tables_sequential(
                         &mut adapter,
                         output_path,
-                        &schema.tables,
+                        &export_tables,
                         chunk_size,
                         &data_format,
                         request.request_id.clone(),
@@ -1333,7 +1341,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             dump_tables_parallel(
                 &endpoint,
                 output_path,
-                &schema.tables,
+                &export_tables,
                 chunk_size,
                 &data_format,
                 parallel_limits.table_workers,
@@ -1346,7 +1354,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             dump_tables_sequential(
                 &mut adapter,
                 output_path,
-                &schema.tables,
+                &export_tables,
                 chunk_size,
                 &data_format,
                 request.request_id.clone(),
@@ -1431,12 +1439,38 @@ impl DumpParallelLimits {
 
 fn dump_parallel_limits(threads: usize, table_total: usize) -> DumpParallelLimits {
     let thread_budget = threads.max(1);
-    let table_workers = thread_budget.min(table_total.max(1));
+    let table_workers = if table_total <= 1 {
+        1
+    } else if table_total <= thread_budget {
+        table_total
+    } else {
+        ((thread_budget as f64).sqrt().ceil() as usize).clamp(1, table_total)
+    };
     let range_workers_per_table = (thread_budget / table_workers).max(1);
     DumpParallelLimits {
         table_workers,
         range_workers_per_table,
     }
+}
+
+fn dump_schedule_order(
+    tables: &[NormalizedTable],
+    row_counts: &BTreeMap<String, u64>,
+) -> Vec<NormalizedTable> {
+    let mut indexed = tables
+        .iter()
+        .cloned()
+        .enumerate()
+        .collect::<Vec<(usize, NormalizedTable)>>();
+    indexed.sort_by(|(left_index, left), (right_index, right)| {
+        row_counts
+            .get(&right.name)
+            .copied()
+            .unwrap_or(0)
+            .cmp(&row_counts.get(&left.name).copied().unwrap_or(0))
+            .then_with(|| left_index.cmp(right_index))
+    });
+    indexed.into_iter().map(|(_, table)| table).collect()
 }
 
 fn dump_tables_parallel<F: FnMut(Value)>(
@@ -2281,16 +2315,53 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
+    if !mysql_local_infile_enabled(conn) {
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": "MySQL local_infile is disabled; using Rust INSERT fallback"
+        }));
+        return import_mysql_tsv_table_insert_fallback(
+            conn,
+            input_path,
+            table,
+            table_manifest,
+            request_id,
+            emit,
+        );
+    }
+
     if threads > 1 && table_manifest.chunks > 1 {
-        return import_mysql_tsv_table_parallel(
+        let result = import_mysql_tsv_table_parallel(
             endpoint,
             input_path,
             table,
             table_manifest,
             threads,
-            request_id,
-            emit,
+            request_id.clone(),
+            |event| emit(event),
         );
+        return match result {
+            Ok(result) => Ok(result),
+            Err(err) if is_mysql_local_infile_disabled_error(&err) => {
+                emit(json!({
+                    "event": "phase",
+                    "request_id": request_id,
+                    "phase": "dump_import",
+                    "message": "MySQL LOAD DATA LOCAL is disabled; using Rust INSERT fallback"
+                }));
+                import_mysql_tsv_table_insert_fallback(
+                    conn,
+                    input_path,
+                    table,
+                    table_manifest,
+                    request_id,
+                    emit,
+                )
+            }
+            Err(err) => Err(err),
+        };
     }
 
     let mut rows_imported = 0_u64;
@@ -2300,7 +2371,26 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             .join(&table_manifest.path)
             .join(dump_chunk_name(chunk_index, "tsv"));
         let started = Instant::now();
-        let rows = load_mysql_tsv_chunk(conn, table, &chunk_path)?;
+        let rows = match load_mysql_tsv_chunk(conn, table, &chunk_path) {
+            Ok(rows) => rows,
+            Err(err) if is_mysql_local_infile_disabled_error(&err) => {
+                emit(json!({
+                    "event": "phase",
+                    "request_id": request_id,
+                    "phase": "dump_import",
+                    "message": "MySQL LOAD DATA LOCAL is disabled; using Rust INSERT fallback"
+                }));
+                return import_mysql_tsv_table_insert_fallback(
+                    conn,
+                    input_path,
+                    table,
+                    table_manifest,
+                    request_id,
+                    emit,
+                );
+            }
+            Err(err) => return Err(err),
+        };
         rows_imported += rows;
         chunks_imported += 1;
         emit(json!({
@@ -2315,6 +2405,76 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         }));
     }
     Ok((rows_imported, chunks_imported))
+}
+
+fn mysql_local_infile_enabled(conn: &mut mysql::PooledConn) -> bool {
+    conn.query_first::<(String, String), _>("SHOW VARIABLES LIKE 'local_infile'")
+        .ok()
+        .flatten()
+        .map(|(_, value)| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "on" | "1" | "true" | "yes"
+            )
+        })
+        .unwrap_or(true)
+}
+
+fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("3948")
+        || lower.contains("loading local data is disabled")
+        || lower.contains("local infile")
+            && (lower.contains("disabled") || lower.contains("not allowed"))
+}
+
+fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
+    conn: &mut mysql::PooledConn,
+    input_path: &Path,
+    table: &NormalizedTable,
+    table_manifest: &DumpTableManifest,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(u64, u64), String> {
+    let mut rows_imported = 0_u64;
+    let mut chunks_imported = 0_u64;
+    for chunk_index in 1..=table_manifest.chunks {
+        let chunk_path = input_path
+            .join(&table_manifest.path)
+            .join(dump_chunk_name(chunk_index, "tsv"));
+        let started = Instant::now();
+        let rows = insert_mysql_tsv_chunk_with_batches(conn, table, &chunk_path)?;
+        rows_imported += rows;
+        chunks_imported += 1;
+        emit(json!({
+            "event": "row_progress",
+            "request_id": request_id,
+            "table": table.name,
+            "rows": rows_imported,
+            "total": table_manifest.rows,
+            "chunk_rows": rows,
+            "load_ms": started.elapsed().as_millis() as u64,
+            "strategy": "insert_fallback"
+        }));
+    }
+    Ok((rows_imported, chunks_imported))
+}
+
+fn insert_mysql_tsv_chunk_with_batches(
+    conn: &mut mysql::PooledConn,
+    table: &NormalizedTable,
+    chunk_path: &Path,
+) -> Result<u64, String> {
+    stream_tsv_rows_in_batches(
+        chunk_path,
+        table,
+        MYSQL_INSERT_FALLBACK_BATCH_ROWS,
+        MYSQL_INSERT_FALLBACK_BATCH_BYTES,
+        |rows| {
+            conn.query_drop(insert_rows_literal_sql_for_table("mysql", table, rows))
+                .map_err(|err| format!("mysql insert fallback error: {err}"))
+        },
+    )
 }
 
 fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
@@ -5171,25 +5331,68 @@ fn escape_tsv_text(text: &str) -> String {
 fn read_tsv_rows(path: &Path, table: &NormalizedTable) -> Result<Vec<Value>, String> {
     let file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
     let reader = BufReader::new(file);
-    let columns = column_names(table);
     let mut rows = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read dump row: {err}"))?;
         if line.is_empty() {
             continue;
         }
-        let fields = split_tsv_line(&line);
-        let mut object = Map::new();
-        for (index, column) in columns.iter().enumerate() {
-            let value = fields
-                .get(index)
-                .map(|field| unescape_tsv_field(field))
-                .unwrap_or(Value::Null);
-            object.insert(column.clone(), value);
-        }
-        rows.push(Value::Object(object));
+        rows.push(tsv_line_to_row(&line, table));
     }
     Ok(rows)
+}
+
+fn stream_tsv_rows_in_batches<F: FnMut(&[Value]) -> Result<(), String>>(
+    path: &Path,
+    table: &NormalizedTable,
+    max_rows: usize,
+    max_bytes: usize,
+    mut insert_batch: F,
+) -> Result<u64, String> {
+    let file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
+    let reader = BufReader::new(file);
+    let max_rows = max_rows.max(1);
+    let max_bytes = max_bytes.max(1024);
+    let mut batch = Vec::new();
+    let mut batch_bytes = 0_usize;
+    let mut total_rows = 0_u64;
+
+    for line in reader.lines() {
+        let line = line.map_err(|err| format!("failed to read dump row: {err}"))?;
+        if line.is_empty() {
+            continue;
+        }
+        let row_bytes = line.len() + 1;
+        if !batch.is_empty() && (batch.len() >= max_rows || batch_bytes + row_bytes > max_bytes) {
+            insert_batch(&batch)?;
+            total_rows += batch.len() as u64;
+            batch.clear();
+            batch_bytes = 0;
+        }
+        batch.push(tsv_line_to_row(&line, table));
+        batch_bytes += row_bytes;
+    }
+
+    if !batch.is_empty() {
+        insert_batch(&batch)?;
+        total_rows += batch.len() as u64;
+    }
+
+    Ok(total_rows)
+}
+
+fn tsv_line_to_row(line: &str, table: &NormalizedTable) -> Value {
+    let columns = column_names(table);
+    let fields = split_tsv_line(line);
+    let mut object = Map::new();
+    for (index, column) in columns.iter().enumerate() {
+        let value = fields
+            .get(index)
+            .map(|field| unescape_tsv_field(field))
+            .unwrap_or(Value::Null);
+        object.insert(column.clone(), value);
+    }
+    Value::Object(object)
 }
 
 fn split_tsv_line(line: &str) -> Vec<String> {
@@ -6441,9 +6644,9 @@ mod tests {
     fn full_schema_dump_splits_thread_budget_between_tables_and_ranges() {
         let limits = dump_parallel_limits(16, 208);
 
-        assert_eq!(limits.table_workers, 16);
-        assert_eq!(limits.range_workers_per_table, 1);
-        assert!(limits.estimated_mysql_connections() <= 32);
+        assert_eq!(limits.table_workers, 4);
+        assert_eq!(limits.range_workers_per_table, 4);
+        assert!(limits.estimated_mysql_connections() <= 20);
     }
 
     #[test]
@@ -6462,6 +6665,87 @@ mod tests {
         assert_eq!(limits.table_workers, 1);
         assert_eq!(limits.range_workers_per_table, 16);
         assert!(limits.estimated_mysql_connections() <= 17);
+    }
+
+    #[test]
+    fn dump_scheduler_starts_largest_estimated_tables_first() {
+        let mut tables = vec![
+            NormalizedTable {
+                name: "tiny".to_string(),
+                columns: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+            },
+            NormalizedTable {
+                name: "huge".to_string(),
+                columns: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+            },
+            NormalizedTable {
+                name: "medium".to_string(),
+                columns: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+            },
+        ];
+        let mut counts = BTreeMap::new();
+        counts.insert("tiny".to_string(), 10);
+        counts.insert("huge".to_string(), 1_000_000);
+        counts.insert("medium".to_string(), 50_000);
+
+        tables = dump_schedule_order(&tables, &counts);
+
+        assert_eq!(
+            tables
+                .iter()
+                .map(|table| table.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["huge", "medium", "tiny"]
+        );
+    }
+
+    #[test]
+    fn local_infile_disabled_error_is_detected_for_fallback_import() {
+        assert!(is_mysql_local_infile_disabled_error(
+            "mysql LOAD DATA error: MySqlError { ERROR 3948 (42000): Loading local data is disabled; this must be enabled on both the client and server sides }"
+        ));
+        assert!(!is_mysql_local_infile_disabled_error(
+            "mysql LOAD DATA error: duplicate key"
+        ));
+    }
+
+    #[test]
+    fn tsv_insert_fallback_streams_rows_in_limited_batches() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-tsv-fallback-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let table = schema().tables[0].clone();
+        let path = dir.join("chunk_000001.tsv");
+        write_dump_rows(
+            &path,
+            &table,
+            &[
+                json!({"id": "1", "name": "a"}),
+                json!({"id": "2", "name": "b"}),
+                json!({"id": "3", "name": "c"}),
+            ],
+            "tsv",
+        )
+        .unwrap();
+        let mut batches = Vec::new();
+
+        let rows = stream_tsv_rows_in_batches(&path, &table, 2, 1024, |batch| {
+            batches.push(batch.len());
+            Ok(())
+        })
+        .unwrap();
+
+        assert_eq!(rows, 3);
+        assert_eq!(batches, vec![2, 1]);
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
