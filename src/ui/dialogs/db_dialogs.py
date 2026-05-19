@@ -38,6 +38,27 @@ def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tab
     return max(1, min(table_cap, 99))
 
 
+def format_export_row_labels(processed_rows: int, estimated_total_rows: int) -> tuple[str, str]:
+    processed = max(0, int(processed_rows))
+    estimated = max(0, int(estimated_total_rows))
+    processed_label = f"📦 처리 rows: {processed:,} rows"
+    if estimated:
+        estimate_label = f"📐 예상 전체: 약 {estimated:,} rows"
+    else:
+        estimate_label = "📐 예상 전체: 계산 중..."
+    return processed_label, estimate_label
+
+
+def format_export_table_status(table: str, rows_done: int, rows_total: int) -> str:
+    table_name = table or "-"
+    done = max(0, int(rows_done))
+    total = max(0, int(rows_total))
+    if total:
+        percent = min(int((done / total) * 100), 100)
+        return f"🔄 현재: {table_name} {done:,} / {total:,} rows ({percent}%)"
+    return f"🔄 현재: {table_name} {done:,} rows"
+
+
 class DBConnectionDialog(QDialog):
     """DB 연결 다이얼로그"""
 
@@ -520,7 +541,7 @@ class RustDumpExportDialog(QDialog):
 
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 16)
-        self.spin_threads.setValue(4)
+        self.spin_threads.setValue(8)
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
         self.combo_compression = QComboBox()
@@ -640,11 +661,13 @@ class RustDumpExportDialog(QDialog):
         left_detail = QVBoxLayout()
         self.label_percent = QLabel("📊 진행률: 0%")
         self.label_percent.setStyleSheet("font-weight: bold; font-size: 12pt;")
-        self.label_data = QLabel("📦 데이터: 0 MB / 0 MB")
+        self.label_data = QLabel("📦 처리 rows: 0 rows")
+        self.label_estimated_rows = QLabel("📐 예상 전체: 계산 중...")
         self.label_speed = QLabel("⚡ 속도: 0 MB/s")
         self.label_tables = QLabel("📋 테이블: 0 / 0 완료")
         left_detail.addWidget(self.label_percent)
         left_detail.addWidget(self.label_data)
+        left_detail.addWidget(self.label_estimated_rows)
         left_detail.addWidget(self.label_speed)
         left_detail.addWidget(self.label_tables)
 
@@ -1093,7 +1116,9 @@ class RustDumpExportDialog(QDialog):
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(100)
         self.label_percent.setText("📊 전체 진행률: 0%")
-        self.label_data.setText("📦 데이터: 0 / 0 rows")
+        data_label, estimate_label = format_export_row_labels(0, 0)
+        self.label_data.setText(data_label)
+        self.label_estimated_rows.setText(estimate_label)
         self.label_speed.setText("⚡ 속도: 0 rows/s")
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Export 준비 중...")
@@ -1189,7 +1214,12 @@ class RustDumpExportDialog(QDialog):
             self.progress_bar.setValue(100)
             self.progress_bar.setMaximum(100)  # 퍼센트 기준으로 재설정
             self.label_percent.setText("📊 전체 진행률: 100%")
-            self.label_data.setText("📦 데이터: Export 완료")
+            data_label, estimate_label = format_export_row_labels(
+                sum(self.export_table_done.values()),
+                self.export_total_rows,
+            )
+            self.label_data.setText(data_label)
+            self.label_estimated_rows.setText(estimate_label)
             self.label_speed.setText("⚡ 속도: -")
             self.label_status.setText("✅ Export 완료")
             # 테이블 완료 수 계산 (done 상태인 테이블 수)
@@ -1205,6 +1235,7 @@ class RustDumpExportDialog(QDialog):
         else:
             self.txt_log.addItem(f"❌ 실패: {message}")
             self.label_data.setText("📦 데이터: Export 실패")
+            self.label_estimated_rows.setText("📐 예상 전체: -")
             self.label_speed.setText("⚡ 속도: -")
             self.label_status.setText("❌ Export 실패")
             # 테이블 완료 수 계산
@@ -1231,7 +1262,9 @@ class RustDumpExportDialog(QDialog):
             self.export_total_rows = int(info.get("rows_total") or sum(self.export_table_totals.values()))
             self.export_total_tables = int(info.get("tables_total") or len(self.export_table_totals))
             self.label_tables.setText(f"📋 테이블: 0 / {self.export_total_tables} 완료")
-            self.label_data.setText(f"📦 데이터: 0 / {self.export_total_rows:,} rows")
+            data_label, estimate_label = format_export_row_labels(0, self.export_total_rows)
+            self.label_data.setText(data_label)
+            self.label_estimated_rows.setText(estimate_label)
             self.label_status.setText("Export 계획 수립 완료")
             return
 
@@ -1271,16 +1304,20 @@ class RustDumpExportDialog(QDialog):
         self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(percent)
         self.label_percent.setText(f"📊 전체 진행률: {percent}%")
-        self.label_data.setText(f"📦 데이터: {overall_done:,} / {self.export_total_rows:,} rows")
+        data_label, estimate_label = format_export_row_labels(overall_done, self.export_total_rows)
+        self.label_data.setText(data_label)
+        self.label_estimated_rows.setText(estimate_label)
         self.label_speed.setText(f"⚡ 속도: {info.get('speed', 'Rust DB Core')}")
 
         if table:
             table_total = self.export_table_totals.get(table) or int(info.get("rows_total") or 0)
-            table_percent = (
-                int((self.export_table_done.get(table, 0) / table_total) * 100)
-                if table_total else 0
+            self.label_status.setText(
+                format_export_table_status(
+                    table,
+                    self.export_table_done.get(table, 0),
+                    table_total,
+                )
             )
-            self.label_status.setText(f"🔄 {table} ({table_percent}%)")
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트"""

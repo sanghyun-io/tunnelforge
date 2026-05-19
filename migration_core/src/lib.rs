@@ -3,7 +3,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
@@ -1823,8 +1823,9 @@ fn dump_mysql_range_chunk(
     let chunk_path = output_path
         .join(table_path)
         .join(dump_chunk_name(range.chunk_index, data_format));
-    let mut file =
+    let file =
         File::create(&chunk_path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    let mut file = BufWriter::new(file);
     let columns = column_names(table);
     let sql = select_chunk_text_range_sql("mysql", table, pk_column, range.start, range.end);
     let stream_started = Instant::now();
@@ -2052,8 +2053,9 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
         chunks_dumped += 1;
         let chunk_name = dump_chunk_name(chunks_dumped, data_format);
         let chunk_path = table_dir.join(&chunk_name);
-        let mut file = File::create(&chunk_path)
+        let file = File::create(&chunk_path)
             .map_err(|err| format!("failed to create dump chunk: {err}"))?;
+        let mut file = BufWriter::new(file);
 
         let stream_started = Instant::now();
         let last_values = last_key.as_deref().and_then(decode_key_token);
@@ -5262,8 +5264,8 @@ fn read_dump_rows(
 }
 
 fn write_jsonl_rows(path: &Path, rows: &[Value]) -> Result<(), String> {
-    let mut file =
-        File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    let file = File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    let mut file = BufWriter::new(file);
     for row in rows {
         serde_json::to_writer(&mut file, row)
             .map_err(|err| format!("failed to encode dump row: {err}"))?;
@@ -5274,8 +5276,8 @@ fn write_jsonl_rows(path: &Path, rows: &[Value]) -> Result<(), String> {
 }
 
 fn write_tsv_rows(path: &Path, table: &NormalizedTable, rows: &[Value]) -> Result<(), String> {
-    let mut file =
-        File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    let file = File::create(path).map_err(|err| format!("failed to create dump chunk: {err}"))?;
+    let mut file = BufWriter::new(file);
     for row in rows {
         write_tsv_row(&mut file, table, row)?;
     }
@@ -5624,6 +5626,8 @@ pub fn select_chunk_text_sql(
                     quote_ident(engine, &column.name),
                     quote_ident(engine, &column.name)
                 )
+            } else if engine == "mysql" {
+                quote_ident(engine, &column.name)
             } else {
                 format!(
                     "CAST({} AS CHAR) AS {}",
@@ -5687,6 +5691,8 @@ pub fn select_chunk_text_after_key_sql(
                     quote_ident(engine, &column.name),
                     quote_ident(engine, &column.name)
                 )
+            } else if engine == "mysql" {
+                quote_ident(engine, &column.name)
             } else {
                 format!(
                     "CAST({} AS CHAR) AS {}",
@@ -5760,6 +5766,8 @@ pub fn select_chunk_text_range_sql(
                     quote_ident(engine, &column.name),
                     quote_ident(engine, &column.name)
                 )
+            } else if engine == "mysql" {
+                quote_ident(engine, &column.name)
             } else {
                 format!(
                     "CAST({} AS CHAR) AS {}",
@@ -7921,7 +7929,7 @@ mod tests {
         );
         assert_eq!(
             select_chunk_text_sql("mysql", &schema().tables[0], &key_columns),
-            "SELECT CAST(`id` AS CHAR) AS `id`, CAST(`name` AS CHAR) AS `name` FROM `users` ORDER BY `id` LIMIT ? OFFSET ?"
+            "SELECT `id`, `name` FROM `users` ORDER BY `id` LIMIT ? OFFSET ?"
         );
     }
 
@@ -7931,7 +7939,7 @@ mod tests {
 
         assert_eq!(
             select_chunk_text_range_sql("mysql", &table, "id", 101, 200),
-            "SELECT CAST(`id` AS CHAR) AS `id`, CAST(`name` AS CHAR) AS `name` FROM `users` WHERE `users`.`id` >= 101 AND `users`.`id` <= 200 ORDER BY `users`.`id`"
+            "SELECT `id`, `name` FROM `users` WHERE `users`.`id` >= 101 AND `users`.`id` <= 200 ORDER BY `users`.`id`"
         );
     }
 
@@ -7973,7 +7981,7 @@ mod tests {
 
         assert_eq!(
             select_chunk_text_sql("mysql", &table, &["id".to_string()]),
-            "SELECT CAST(`id` AS CHAR) AS `id`, HEX(`payload`) AS `payload` FROM `files` ORDER BY `id` LIMIT ? OFFSET ?"
+            "SELECT `id`, HEX(`payload`) AS `payload` FROM `files` ORDER BY `id` LIMIT ? OFFSET ?"
         );
         assert_eq!(
             select_chunk_text_sql("postgresql", &table, &["id".to_string()]),

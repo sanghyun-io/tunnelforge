@@ -1,6 +1,11 @@
 from unittest.mock import MagicMock
 
-from src.ui.dialogs.db_dialogs import RustDumpWizard, cap_incomplete_export_percent
+from src.ui.dialogs.db_dialogs import (
+    RustDumpWizard,
+    cap_incomplete_export_percent,
+    format_export_row_labels,
+    format_export_table_status,
+)
 
 
 def test_cap_incomplete_export_percent_prevents_early_100():
@@ -9,6 +14,27 @@ def test_cap_incomplete_export_percent_prevents_early_100():
 
 def test_cap_incomplete_export_percent_allows_final_100():
     assert cap_incomplete_export_percent(100, completed_tables=208, total_tables=208) == 100
+
+
+def test_format_export_row_labels_separates_done_and_estimate():
+    assert format_export_row_labels(3_250_000, 8_900_000) == (
+        "📦 처리 rows: 3,250,000 rows",
+        "📐 예상 전체: 약 8,900,000 rows",
+    )
+
+
+def test_format_export_row_labels_handles_unknown_estimate():
+    assert format_export_row_labels(42, 0) == (
+        "📦 처리 rows: 42 rows",
+        "📐 예상 전체: 계산 중...",
+    )
+
+
+def test_format_export_table_status_includes_current_table_rows():
+    assert (
+        format_export_table_status("qe_view_factors_result", 450_000, 1_946_153)
+        == "🔄 현재: qe_view_factors_result 450,000 / 1,946,153 rows (23%)"
+    )
 
 
 def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
