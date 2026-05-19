@@ -1,6 +1,14 @@
 from unittest.mock import MagicMock
 
-from src.ui.dialogs.db_dialogs import RustDumpWizard
+from src.ui.dialogs.db_dialogs import RustDumpWizard, cap_incomplete_export_percent
+
+
+def test_cap_incomplete_export_percent_prevents_early_100():
+    assert cap_incomplete_export_percent(100, completed_tables=35, total_tables=208) == 17
+
+
+def test_cap_incomplete_export_percent_allows_final_100():
+    assert cap_incomplete_export_percent(100, completed_tables=208, total_tables=208) == 100
 
 
 def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):

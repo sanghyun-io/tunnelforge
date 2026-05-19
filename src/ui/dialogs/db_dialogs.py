@@ -29,6 +29,15 @@ from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 logger = get_logger("db_dialogs")
 
 
+def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tables: int) -> int:
+    """Avoid showing 100% while table completion proves export is still running."""
+    bounded = max(0, min(int(percent), 100))
+    if total_tables <= 0 or completed_tables >= total_tables or bounded < 100:
+        return bounded
+    table_cap = int(((completed_tables + 1) / total_tables) * 100)
+    return max(1, min(table_cap, 99))
+
+
 class DBConnectionDialog(QDialog):
     """DB 연결 다이얼로그"""
 
@@ -1243,6 +1252,11 @@ class RustDumpExportDialog(QDialog):
             computed_percent = int((overall_done / self.export_total_rows) * 100)
         else:
             computed_percent = int(info.get("percent") or 0)
+        computed_percent = cap_incomplete_export_percent(
+            computed_percent,
+            self.export_completed_tables,
+            self.export_total_tables,
+        )
         percent = max(self.export_last_percent, min(computed_percent, 100))
         self.export_last_percent = percent
 

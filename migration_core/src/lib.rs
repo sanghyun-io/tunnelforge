@@ -1302,6 +1302,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     ));
 
     let table_total = schema.tables.len();
+    let parallel_limits = dump_parallel_limits(threads, table_total);
     let (table_manifests, total_rows, total_chunks) =
         if endpoint.engine == "mysql" && threads > 1 && table_total == 1 {
             match dump_single_mysql_table_parallel(
@@ -1310,7 +1311,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 &schema.tables[0],
                 chunk_size,
                 &data_format,
-                threads,
+                parallel_limits.range_workers_per_table,
                 request.request_id.clone(),
                 |event| emit(event),
             )? {
@@ -1335,7 +1336,8 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 &schema.tables,
                 chunk_size,
                 &data_format,
-                threads,
+                parallel_limits.table_workers,
+                parallel_limits.range_workers_per_table,
                 request.request_id.clone(),
                 |event| emit(event),
             )?
@@ -1414,18 +1416,42 @@ fn dump_tables_sequential<F: FnMut(Value)>(
     Ok((manifests, total_rows, total_chunks))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DumpParallelLimits {
+    table_workers: usize,
+    range_workers_per_table: usize,
+}
+
+impl DumpParallelLimits {
+    #[cfg(test)]
+    fn estimated_mysql_connections(&self) -> usize {
+        self.table_workers * (self.range_workers_per_table + 1)
+    }
+}
+
+fn dump_parallel_limits(threads: usize, table_total: usize) -> DumpParallelLimits {
+    let thread_budget = threads.max(1);
+    let table_workers = thread_budget.min(table_total.max(1));
+    let range_workers_per_table = (thread_budget / table_workers).max(1);
+    DumpParallelLimits {
+        table_workers,
+        range_workers_per_table,
+    }
+}
+
 fn dump_tables_parallel<F: FnMut(Value)>(
     endpoint: &Endpoint,
     output_path: &Path,
     tables: &[NormalizedTable],
     chunk_size: usize,
     data_format: &str,
-    threads: usize,
+    table_threads: usize,
+    range_threads: usize,
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
     let table_total = tables.len();
-    let max_threads = threads.max(1).min(table_total);
+    let max_threads = table_threads.max(1).min(table_total);
     let mut pending = (0..table_total).collect::<VecDeque<_>>();
     let mut active = 0_usize;
     let mut completed = 0_usize;
@@ -1446,7 +1472,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 table_total,
                 chunk_size,
                 data_format.to_string(),
-                threads,
+                range_threads,
                 request_id.clone(),
                 sender.clone(),
             ));
@@ -1479,7 +1505,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                         table_total,
                         chunk_size,
                         data_format.to_string(),
-                        threads,
+                        range_threads,
                         request_id.clone(),
                         sender.clone(),
                     ));
@@ -1499,7 +1525,7 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                         table_total,
                         chunk_size,
                         data_format.to_string(),
-                        threads,
+                        range_threads,
                         request_id.clone(),
                         sender.clone(),
                     ));
@@ -1793,7 +1819,7 @@ fn spawn_dump_table_worker(
     table_total: usize,
     chunk_size: usize,
     data_format: String,
-    threads: usize,
+    range_threads: usize,
     request_id: Option<String>,
     sender: mpsc::Sender<DumpTableEvent>,
 ) -> thread::JoinHandle<()> {
@@ -1808,7 +1834,7 @@ fn spawn_dump_table_worker(
                     table_total,
                     chunk_size,
                     &data_format,
-                    threads,
+                    range_threads,
                     request_id.clone(),
                     |event| {
                         let _ = sender.send(DumpTableEvent::Progress(event));
@@ -6409,6 +6435,33 @@ mod tests {
         assert_eq!(event["rows_total"], 42);
         assert_eq!(event["tables"][0]["name"], "users");
         assert_eq!(event["tables"][0]["rows"], 42);
+    }
+
+    #[test]
+    fn full_schema_dump_splits_thread_budget_between_tables_and_ranges() {
+        let limits = dump_parallel_limits(16, 208);
+
+        assert_eq!(limits.table_workers, 16);
+        assert_eq!(limits.range_workers_per_table, 1);
+        assert!(limits.estimated_mysql_connections() <= 32);
+    }
+
+    #[test]
+    fn small_table_selection_keeps_range_parallelism_within_thread_budget() {
+        let limits = dump_parallel_limits(16, 2);
+
+        assert_eq!(limits.table_workers, 2);
+        assert_eq!(limits.range_workers_per_table, 8);
+        assert!(limits.estimated_mysql_connections() <= 18);
+    }
+
+    #[test]
+    fn single_table_dump_uses_full_range_parallelism() {
+        let limits = dump_parallel_limits(16, 1);
+
+        assert_eq!(limits.table_workers, 1);
+        assert_eq!(limits.range_workers_per_table, 16);
+        assert!(limits.estimated_mysql_connections() <= 17);
     }
 
     #[test]
