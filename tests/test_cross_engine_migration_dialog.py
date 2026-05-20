@@ -222,6 +222,68 @@ def test_verify_result_shows_mismatch_examples_before_summary():
         dialog.close()
 
 
+def test_verify_failure_with_malformed_differences_shows_unknown_format_message():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "verify",
+            "success": False,
+            "mismatches": ["bad-entry", None],
+            "row_count_differences": ["bad-entry", None],
+        })
+
+        text = dialog.txt_verify_result.toPlainText()
+        assert "검증 통과" not in text
+        assert "검증 실패: Rust Core가 비교 차이 상세를 반환하지 않았습니다." in text
+    finally:
+        dialog.close()
+
+
+def test_verify_finished_failure_marks_stale_result_and_disables_save_report():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "verify",
+            "success": True,
+            "mismatches": [],
+            "row_count_differences": [],
+        })
+        assert dialog.btn_save_report.isEnabled()
+
+        dialog._current_command = "verify"
+        dialog._on_finished(False, {})
+
+        text = dialog.txt_verify_result.toPlainText()
+        assert "검증 실패: 새 검증 결과를 받지 못했습니다." in text
+        assert dialog.last_result is None
+        assert not dialog.btn_save_report.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_verify_step_has_single_visible_verify_trigger_and_save_report_reachable():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("verify")
+        dialog.show()
+        app.processEvents()
+
+        visible_verify_buttons = [
+            button
+            for button in dialog.step_pages["verify"].findChildren(QPushButton)
+            if button.text() == "검증" and button.isVisible()
+        ]
+
+        assert visible_verify_buttons == [dialog.btn_run_verify]
+        assert dialog.btn_run_verify is dialog.btn_verify
+        assert dialog.btn_save_report.isVisible()
+        assert_widget_reachable(dialog.btn_save_report, dialog)
+    finally:
+        dialog.close()
+
+
 def test_step_pages_keep_current_step_actions_reachable():
     dialog = make_dialog()
     step_actions = {

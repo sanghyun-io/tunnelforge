@@ -444,12 +444,20 @@ class CrossEngineMigrationDialog(QDialog):
                 lines.append("")
             lines.append("Row count 차이")
             lines.extend(row_diff_lines)
-        if not lines:
+        if not lines and payload.get("success") is True:
             lines.append("검증 통과: Source와 Target 데이터가 일치합니다.")
+        elif not lines:
+            lines.append("검증 실패: Rust Core가 비교 차이 상세를 반환하지 않았습니다.")
         return "\n".join(lines)
 
     def _update_verification_result(self, payload: Dict):
         self.txt_verify_result.setPlainText(self._verification_result_text(payload))
+
+    def _mark_verify_result_stale(self):
+        self.txt_verify_result.setPlainText("검증 실패: 새 검증 결과를 받지 못했습니다.")
+        if isinstance(self.last_result, dict) and self.last_result.get("command") == "verify":
+            self.last_result = None
+            self.btn_save_report.setEnabled(False)
 
     def _selected_direction(self) -> MigrationDirection:
         return MigrationDirection.from_engines(self.source_form.engine(), self.target_form.engine())
@@ -735,6 +743,8 @@ class CrossEngineMigrationDialog(QDialog):
         self._set_running(False)
         if self._current_command == "plan" and not success:
             self._reset_plan_summary_after_failure()
+        if self._current_command == "verify" and not success:
+            self._mark_verify_result_stale()
         self._append_log("완료" if success else "실패")
         if self._workflow_active and self._current_command:
             next_command = next_workflow_command(self._current_command, success)
