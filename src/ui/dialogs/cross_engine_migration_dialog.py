@@ -23,6 +23,7 @@ from PyQt6.QtWidgets import (
 
 from src.core.cross_engine_migration import (
     DatabaseEngine,
+    MigrationDirection,
     load_resume_state,
     next_workflow_command,
     make_connection_payload,
@@ -159,6 +160,22 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_log.setReadOnly(True)
         self.txt_log.setMaximumBlockCount(1000)
         self.step_page_layouts["execute"].addWidget(self.txt_log, 1)
+
+        self.safety_group = QGroupBox("전환 가능 여부 점검")
+        safety_layout = QVBoxLayout(self.safety_group)
+        self.lbl_safety_summary = QLabel("아직 전환 가능 여부를 점검하지 않았습니다.")
+        self.lbl_safety_summary.setWordWrap(True)
+        self.lbl_target_safety = QLabel("Target 상태를 아직 확인하지 않았습니다.")
+        self.lbl_target_safety.setWordWrap(True)
+        self.btn_target_advanced = QPushButton("고급 설정 열기")
+        self.btn_target_advanced.hide()
+        self.btn_run_safety = QPushButton("전환 가능 여부 점검")
+        self.btn_run_safety.clicked.connect(lambda: self._start_command("preflight"))
+        safety_layout.addWidget(self.lbl_safety_summary)
+        safety_layout.addWidget(self.lbl_target_safety)
+        safety_layout.addWidget(self.btn_target_advanced)
+        safety_layout.addWidget(self.btn_run_safety)
+        self.step_page_layouts["safety"].addWidget(self.safety_group)
 
         action_group = QGroupBox("작업 순서")
         action_layout = QVBoxLayout(action_group)
@@ -300,6 +317,57 @@ class CrossEngineMigrationDialog(QDialog):
     def _update_source_summary(self, schema: Dict):
         unsupported = [str(item) for item in self.unsupported_objects]
         self.lbl_source_summary.setText(self._schema_summary_text(schema, unsupported))
+
+    def _selected_direction(self) -> MigrationDirection:
+        return MigrationDirection.from_engines(self.source_form.engine(), self.target_form.engine())
+
+    def _direction_display(self, direction: MigrationDirection) -> str:
+        if direction == MigrationDirection.MYSQL_TO_POSTGRESQL:
+            return "MySQL -> PostgreSQL"
+        return "PostgreSQL -> MySQL"
+
+    def _selected_direction_result(self, payload: Dict) -> Optional[Dict]:
+        directions = payload.get("directions")
+        if not isinstance(directions, list):
+            return None
+        selected = self._selected_direction().value
+        for direction in directions:
+            if isinstance(direction, dict) and direction.get("direction") == selected:
+                return direction
+        return None
+
+    def _issue_counts(self, issues) -> Dict[str, int]:
+        if not isinstance(issues, list):
+            return {"blocking": 0, "warnings": 0}
+        blocking_count = sum(1 for issue in issues if isinstance(issue, dict) and issue.get("blocking"))
+        warning_count = sum(1 for issue in issues if isinstance(issue, dict) and not issue.get("blocking"))
+        return {"blocking": blocking_count, "warnings": warning_count}
+
+    def _is_target_non_empty_issue(self, issue) -> bool:
+        if not isinstance(issue, dict):
+            return False
+        location = str(issue.get("location", "")).lower()
+        message = str(issue.get("message", "")).lower()
+        text = f"{location} {message}"
+        has_target = "target" in text
+        has_non_empty = any(marker in text for marker in ("not empty", "non-empty", "existing"))
+        return has_target and has_non_empty
+
+    def _update_target_safety_from_issues(self, issues) -> bool:
+        issue_list = issues if isinstance(issues, list) else []
+        target_blocked = any(self._is_target_non_empty_issue(issue) for issue in issue_list)
+        if target_blocked:
+            self.lbl_target_safety.setText(
+                "Target에 기존 테이블 또는 데이터가 있습니다. 기본 설정에서는 빈 Target만 전환을 실행할 수 있습니다."
+            )
+            self.btn_target_advanced.setVisible(True)
+            self._show_step("safety")
+            if not self.isVisible():
+                self.show()
+            return True
+        self.lbl_target_safety.setText("Target 상태 확인 완료: 기존 테이블 또는 데이터 차단 이슈가 없습니다.")
+        self.btn_target_advanced.setVisible(False)
+        return False
 
     def _next_enabled_for_current_step(self) -> bool:
         if self.worker and self.worker.isRunning():
@@ -468,12 +536,14 @@ class CrossEngineMigrationDialog(QDialog):
         if payload.get("command") == "guide":
             self._append_guide_summary(payload)
         if payload.get("command") in ("preflight", "plan"):
-            self._set_execution_unlocked(bool(payload.get("success")))
+            target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
+            self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)
             if self._execution_unlocked:
                 self._append_log("사전 확인이 완료되어 DB 변경 실행이 활성화되었습니다.")
             else:
                 self._append_log("차단 이슈가 있어 DB 변경 실행은 계속 잠겨 있습니다.")
-        self._append_log(json.dumps(payload, ensure_ascii=False, indent=2))
+        if payload.get("command") != "readiness":
+            self._append_log(json.dumps(payload, ensure_ascii=False, indent=2))
 
         if payload.get("command") == "inspect" and payload.get("success") and self._pending_after_inspect:
             next_command = self._pending_after_inspect
@@ -481,29 +551,20 @@ class CrossEngineMigrationDialog(QDialog):
             QTimer.singleShot(0, lambda: self._start_command(next_command, workflow=self._workflow_active))
 
     def _append_readiness_summary(self, payload: Dict):
-        directions = payload.get("directions")
-        if not isinstance(directions, list):
+        selected = self._selected_direction_result(payload)
+        if not selected:
             return
-        self._append_log("[양방향 점검 결과]")
-        for direction in directions:
-            if not isinstance(direction, dict):
-                continue
-            status = "가능" if direction.get("success") else "불가"
-            issues = direction.get("issues")
-            blocking_count = 0
-            warning_count = 0
-            if isinstance(issues, list):
-                blocking_count = sum(
-                    1 for issue in issues if isinstance(issue, dict) and issue.get("blocking")
-                )
-                warning_count = sum(
-                    1 for issue in issues if isinstance(issue, dict) and not issue.get("blocking")
-                )
-            self._append_log(
-                f"- {direction.get('direction', '')}: {status} "
-                f"(tables={direction.get('table_count', 0)}, "
-                f"blocking={blocking_count}, warnings={warning_count})"
-            )
+        direction = self._selected_direction()
+        status = "가능" if selected.get("success") else "불가"
+        counts = self._issue_counts(selected.get("issues"))
+        summary = (
+            f"{self._direction_display(direction)} {status} "
+            f"(tables={selected.get('table_count', 0)}, "
+            f"blocking={counts['blocking']}, warnings={counts['warnings']})"
+        )
+        self.lbl_safety_summary.setText(summary)
+        self._append_log("[전환 가능 여부 점검]")
+        self._append_log(summary)
 
     def _append_guide_summary(self, payload: Dict):
         directions = payload.get("directions")
@@ -592,6 +653,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_inspect,
             self.btn_preflight,
             self.btn_readiness,
+            self.btn_run_safety,
             self.btn_guide,
             self.btn_plan,
             self.btn_migrate,

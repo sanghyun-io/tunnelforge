@@ -552,7 +552,7 @@ def test_tunnel_selection_fills_endpoint_fields_from_configured_list():
         dialog.close()
 
 
-def test_readiness_result_logs_direction_summary():
+def test_readiness_result_shows_only_selected_direction_summary():
     dialog = make_dialog()
     try:
         dialog._on_result({
@@ -564,21 +564,47 @@ def test_readiness_result_logs_direction_summary():
                     "direction": "mysql_to_postgresql",
                     "success": True,
                     "table_count": 3,
-                    "issues": [{"blocking": False}],
+                    "issues": [{"blocking": False, "message": "index prefix requires review"}],
                 },
                 {
                     "direction": "postgresql_to_mysql",
                     "success": False,
                     "table_count": 2,
-                    "issues": [{"blocking": True}, {"blocking": False}],
+                    "issues": [{"blocking": True, "message": "reverse issue"}],
                 },
             ],
         })
 
+        text = dialog.lbl_safety_summary.text()
         log = dialog.txt_log.toPlainText()
-        assert "[양방향 점검 결과]" in log
-        assert "mysql_to_postgresql: 가능" in log
-        assert "postgresql_to_mysql: 불가" in log
+        assert "MySQL -> PostgreSQL 가능" in text
+        assert "warnings=1" in text
+        assert "postgresql_to_mysql" not in text
+        assert "reverse issue" not in log
+    finally:
+        dialog.close()
+
+
+def test_preflight_blocks_execution_when_target_is_not_empty():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "location": "target.public",
+                    "message": "target schema is not empty",
+                    "blocking": True,
+                }
+            ],
+        })
+
+        assert not dialog.btn_migrate.isEnabled()
+        assert "Target에 기존 테이블 또는 데이터가 있습니다" in dialog.lbl_target_safety.text()
+        assert dialog.btn_target_advanced.isVisible()
     finally:
         dialog.close()
 
