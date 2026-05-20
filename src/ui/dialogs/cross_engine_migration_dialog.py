@@ -376,6 +376,9 @@ class CrossEngineMigrationDialog(QDialog):
     def _update_plan_summary(self, payload: Dict):
         self.lbl_plan_summary.setText(self._plan_summary_text(payload))
 
+    def _reset_plan_summary_after_failure(self):
+        self.lbl_plan_summary.setText("실행 계획 생성에 실패했습니다. 다시 계획 생성을 실행해 주세요.")
+
     def _selected_direction(self) -> MigrationDirection:
         return MigrationDirection.from_engines(self.source_form.engine(), self.target_form.engine())
 
@@ -652,6 +655,8 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _on_finished(self, success: bool, payload):
         self._set_running(False)
+        if self._current_command == "plan" and not success:
+            self._reset_plan_summary_after_failure()
         self._append_log("완료" if success else "실패")
         if self._workflow_active and self._current_command:
             next_command = next_workflow_command(self._current_command, success)

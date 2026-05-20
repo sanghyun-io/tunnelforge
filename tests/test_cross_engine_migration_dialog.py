@@ -565,6 +565,81 @@ def test_plan_result_renders_meaningful_conversion_changes():
         dialog.close()
 
 
+def test_plan_summary_ignores_malformed_tables_and_rows():
+    dialog = make_dialog()
+    try:
+        text = dialog._plan_summary_text({
+            "event": "result",
+            "command": "plan",
+            "success": True,
+            "plan": {
+                "tables": [
+                    {"name": "users", "estimated_rows": 1000},
+                    "orders",
+                    {"name": "logs", "rows": "not-a-number"},
+                    {"name": "events", "estimated_rows": True, "rows": 250},
+                    {"name": "audit", "rows": 500},
+                    None,
+                ],
+                "type_mappings": [
+                    {"source_type": "varchar", "target_type": "text"},
+                    "bad-mapping",
+                    {"source_type": "json", "target_type": ""},
+                ],
+            },
+        })
+
+        assert "전환 대상 테이블 4개" in text
+        assert "예상 rows 1,750" in text
+        assert "varchar -> text" in text
+    finally:
+        dialog.close()
+
+
+def test_plan_summary_handles_missing_or_partial_plan_payload():
+    dialog = make_dialog()
+    try:
+        text = dialog._plan_summary_text({
+            "event": "result",
+            "command": "plan",
+            "success": True,
+            "plan": {"tables": None, "type_mappings": None, "ddl_order": "create foreign keys"},
+        })
+
+        assert "전환 대상 테이블 0개" in text
+        assert "예상 rows 0" in text
+
+        dialog._on_result({"event": "result", "command": "plan", "success": True})
+
+        assert "전환 대상 테이블 0개" in dialog.lbl_plan_summary.text()
+    finally:
+        dialog.close()
+
+
+def test_plan_failure_finished_clears_stale_success_summary():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "plan",
+            "success": True,
+            "plan": {
+                "tables": [{"name": "users", "estimated_rows": 1000}],
+                "type_mappings": [{"source_type": "int", "target_type": "bigint"}],
+            },
+        })
+        assert "int -> bigint" in dialog.lbl_plan_summary.text()
+
+        dialog._current_command = "plan"
+        dialog._on_finished(False, {})
+
+        text = dialog.lbl_plan_summary.text()
+        assert "실행 계획 생성에 실패했습니다" in text
+        assert "int -> bigint" not in text
+    finally:
+        dialog.close()
+
+
 def test_tunnel_selection_fills_endpoint_fields_from_configured_list():
     class FakeTunnelEngine:
         tunnel_configs = {
