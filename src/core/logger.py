@@ -9,6 +9,7 @@ TunnelForge 통합 로깅 시스템
 import logging
 import os
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 
 # 로그 디렉토리 경로
@@ -26,6 +27,34 @@ LOG_DATE_FORMAT = '%Y-%m-%d %H:%M:%S'
 
 # 루트 로거 설정 여부
 _root_configured = False
+
+
+class WindowsSafeRotatingFileHandler(RotatingFileHandler):
+    """Keep logging when Windows blocks log rollover file renames."""
+
+    def __init__(self, *args, rollover_retry_seconds: float = 60.0, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rollover_retry_seconds = rollover_retry_seconds
+        self._rollover_retry_at = 0.0
+
+    def shouldRollover(self, record: logging.LogRecord) -> int:
+        if self._rollover_retry_at and time.monotonic() < self._rollover_retry_at:
+            return 0
+        return super().shouldRollover(record)
+
+    def doRollover(self) -> None:
+        try:
+            super().doRollover()
+            self._rollover_retry_at = 0.0
+        except PermissionError:
+            self._rollover_retry_at = time.monotonic() + self.rollover_retry_seconds
+            if self.stream:
+                try:
+                    self.stream.close()
+                finally:
+                    self.stream = None
+            if not self.delay:
+                self.stream = self._open()
 
 
 def get_logger(name: str) -> logging.Logger:
@@ -69,7 +98,7 @@ def _setup_root_logger():
 
     # 파일 핸들러 (RotatingFileHandler)
     try:
-        file_handler = RotatingFileHandler(
+        file_handler = WindowsSafeRotatingFileHandler(
             LOG_FILE,
             maxBytes=5 * 1024 * 1024,  # 5MB
             backupCount=3,
