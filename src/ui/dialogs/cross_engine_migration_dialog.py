@@ -268,11 +268,21 @@ class CrossEngineMigrationDialog(QDialog):
         execute_action_layout.addStretch()
         self.step_page_layouts["execute"].insertLayout(0, execute_action_layout)
 
+        self.verify_group = QGroupBox("검증 및 결과 저장")
+        verify_layout = QVBoxLayout(self.verify_group)
+        self.lbl_verify_mode = QLabel("기본 검증: strict row/key/value 비교")
+        self.txt_verify_result = QPlainTextEdit()
+        self.txt_verify_result.setReadOnly(True)
+        self.txt_verify_result.setPlaceholderText("검증 실행 후 mismatch 예시와 요약이 표시됩니다.")
+        self.btn_run_verify = self.btn_verify
         verify_action_layout = QHBoxLayout()
-        verify_action_layout.addWidget(self.btn_verify)
+        verify_action_layout.addWidget(self.btn_run_verify)
         verify_action_layout.addWidget(self.btn_save_report)
         verify_action_layout.addStretch()
-        self.step_page_layouts["verify"].addLayout(verify_action_layout)
+        verify_layout.addWidget(self.lbl_verify_mode)
+        verify_layout.addLayout(verify_action_layout)
+        verify_layout.addWidget(self.txt_verify_result, 1)
+        self.step_page_layouts["verify"].addWidget(self.verify_group, 1)
 
         control_layout.addWidget(self.btn_full_run)
         control_layout.addStretch()
@@ -395,6 +405,51 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _reset_plan_summary_after_failure(self):
         self.lbl_plan_summary.setText("실행 계획 생성에 실패했습니다. 다시 계획 생성을 실행해 주세요.")
+
+    def _verification_result_text(self, payload: Dict) -> str:
+        mismatch_lines: List[str] = []
+        raw_mismatches = payload.get("mismatches")
+        if isinstance(raw_mismatches, list):
+            for mismatch in raw_mismatches[:20]:
+                if not isinstance(mismatch, dict):
+                    continue
+                table = mismatch.get("table", "")
+                key = mismatch.get("key", "")
+                column = mismatch.get("column", "")
+                source_value = mismatch.get("source_value", "")
+                target_value = mismatch.get("target_value", "")
+                difference = mismatch.get("difference", "")
+                mismatch_lines.append(
+                    f"- {table} / {key} / {column}: "
+                    f"source={source_value}, target={target_value}, type={difference}"
+                )
+
+        row_diff_lines: List[str] = []
+        raw_row_diffs = payload.get("row_count_differences")
+        if isinstance(raw_row_diffs, list):
+            for diff in raw_row_diffs:
+                if not isinstance(diff, dict):
+                    continue
+                row_diff_lines.append(
+                    f"- {diff.get('table', '')}: "
+                    f"source {diff.get('source_rows', 0)}, target {diff.get('target_rows', 0)}"
+                )
+
+        lines: List[str] = []
+        if mismatch_lines:
+            lines.append("Mismatch 예시")
+            lines.extend(mismatch_lines)
+        if row_diff_lines:
+            if lines:
+                lines.append("")
+            lines.append("Row count 차이")
+            lines.extend(row_diff_lines)
+        if not lines:
+            lines.append("검증 통과: Source와 Target 데이터가 일치합니다.")
+        return "\n".join(lines)
+
+    def _update_verification_result(self, payload: Dict):
+        self.txt_verify_result.setPlainText(self._verification_result_text(payload))
 
     def _selected_direction(self) -> MigrationDirection:
         return MigrationDirection.from_engines(self.source_form.engine(), self.target_form.engine())
@@ -523,6 +578,10 @@ class CrossEngineMigrationDialog(QDialog):
             "guide_options": {
                 "row_limit": self.spin_guide_row_limit.value(),
             },
+            "verify_options": {
+                "mode": "strict",
+                "mismatch_limit": 20,
+            },
         }
         if self.unsupported_objects:
             payload["unsupported_objects"] = list(self.unsupported_objects)
@@ -622,6 +681,8 @@ class CrossEngineMigrationDialog(QDialog):
             self._append_guide_summary(payload)
         if payload.get("command") == "plan":
             self._update_plan_summary(payload)
+        if payload.get("command") == "verify":
+            self._update_verification_result(payload)
         if payload.get("command") in ("preflight", "plan"):
             target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
             self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)

@@ -184,6 +184,44 @@ def test_wizard_navigation_preserves_payload_and_step_controls():
         dialog.close()
 
 
+def test_payload_uses_strict_verification_by_default():
+    dialog = make_dialog()
+    try:
+        payload = dialog._payload()
+        assert payload["verify_options"]["mode"] == "strict"
+        assert payload["verify_options"]["mismatch_limit"] == 20
+    finally:
+        dialog.close()
+
+
+def test_verify_result_shows_mismatch_examples_before_summary():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "verify",
+            "success": False,
+            "mismatches": [
+                {
+                    "table": "users",
+                    "key": "id=7",
+                    "column": "email",
+                    "source_value": "a@example.com",
+                    "target_value": "b@example.com",
+                    "difference": "value_mismatch",
+                }
+            ],
+            "row_count_differences": [{"table": "orders", "source_rows": 10, "target_rows": 9}],
+        })
+
+        text = dialog.txt_verify_result.toPlainText()
+        mismatch_index = text.index("users / id=7 / email")
+        summary_index = text.index("orders: source 10, target 9")
+        assert mismatch_index < summary_index
+    finally:
+        dialog.close()
+
+
 def test_step_pages_keep_current_step_actions_reachable():
     dialog = make_dialog()
     step_actions = {
