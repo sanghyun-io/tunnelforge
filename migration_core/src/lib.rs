@@ -436,7 +436,7 @@ impl MigrationAdapter for LiveAdapter {
                     {
                         Ok(0)
                     } else {
-                        Err(format!("postgresql count error: {err}"))
+                        Err(format_postgres_error("postgresql count error", &err))
                     }
                 }),
         }
@@ -460,7 +460,7 @@ impl MigrationAdapter for LiveAdapter {
                 {
                     Ok(())
                 } else {
-                    Err(format!("postgresql create table error: {err}"))
+                    Err(format_postgres_error("postgresql create table error", &err))
                 }
             }),
         }
@@ -489,7 +489,7 @@ impl MigrationAdapter for LiveAdapter {
                 let sql = select_chunk_text_sql("postgresql", table, &key_columns);
                 let rows = client
                     .query(&sql, &[&(limit as i64), &(offset as i64)])
-                    .map_err(|err| format!("postgresql select chunk error: {err}"))?;
+                    .map_err(|err| format_postgres_error("postgresql select chunk error", &err))?;
                 Ok(rows
                     .into_iter()
                     .map(|row| postgres_row_to_json(&columns, &row))
@@ -543,9 +543,9 @@ impl MigrationAdapter for LiveAdapter {
                     last_values.as_deref(),
                     limit,
                 );
-                let rows = client
-                    .query(&sql, &[])
-                    .map_err(|err| format!("postgresql keyset select chunk error: {err}"))?;
+                let rows = client.query(&sql, &[]).map_err(|err| {
+                    format_postgres_error("postgresql keyset select chunk error", &err)
+                })?;
                 Ok(rows
                     .into_iter()
                     .map(|row| postgres_row_to_json(&columns, &row))
@@ -576,7 +576,7 @@ impl MigrationAdapter for LiveAdapter {
                 .map_err(|err| format!("mysql SQL execution error: {err}")),
             Self::PostgreSql(client) => client
                 .batch_execute(sql)
-                .map_err(|err| format!("postgresql SQL execution error: {err}")),
+                .map_err(|err| format_postgres_error("postgresql SQL execution error", &err)),
         }
     }
 }
@@ -5720,6 +5720,11 @@ pub fn normalize_value_for_type(source_type: &str, value: Option<&Value>) -> Val
             return Value::String(normalize_timestamp_text(&text));
         }
     }
+    if let Value::String(text) = value {
+        if text.contains('\0') && !is_binary_type(&source_type) {
+            return Value::String(sanitize_postgresql_text(text));
+        }
+    }
     value.clone()
 }
 
@@ -7037,7 +7042,7 @@ fn copy_rows_to_postgres(
     let sql = copy_rows_csv_sql("postgresql", table);
     let mut writer = client
         .copy_in(&sql)
-        .map_err(|err| format!("postgresql copy start error: {err}"))?;
+        .map_err(|err| format_postgres_error("postgresql copy start error", &err))?;
     for row in rows {
         let line = copy_csv_line_for_table("postgresql", table, row);
         writer
@@ -7047,7 +7052,34 @@ fn copy_rows_to_postgres(
     writer
         .finish()
         .map(|_| ())
-        .map_err(|err| format!("postgresql copy finish error: {err}"))
+        .map_err(|err| format_postgres_error("postgresql copy finish error", &err))
+}
+
+fn format_postgres_error(context: &str, err: &postgres::Error) -> String {
+    let mut parts = vec![format!("{context}: {err}")];
+    if let Some(db_error) = err.as_db_error() {
+        parts.push(format!("code={}", db_error.code().code()));
+        parts.push(format!("message={}", db_error.message()));
+        if let Some(detail) = db_error.detail() {
+            parts.push(format!("detail={detail}"));
+        }
+        if let Some(hint) = db_error.hint() {
+            parts.push(format!("hint={hint}"));
+        }
+        if let Some(where_) = db_error.where_() {
+            parts.push(format!("context={where_}"));
+        }
+        if let Some(table) = db_error.table() {
+            parts.push(format!("table={table}"));
+        }
+        if let Some(column) = db_error.column() {
+            parts.push(format!("column={column}"));
+        }
+        if let Some(constraint) = db_error.constraint() {
+            parts.push(format!("constraint={constraint}"));
+        }
+    }
+    parts.join("; ")
 }
 
 pub fn copy_rows_csv_sql(target_engine: &str, table: &NormalizedTable) -> String {
@@ -7107,12 +7139,19 @@ pub fn copy_csv_field_for_column(target_engine: &str, source_type: &str, value: 
     if target_engine == "postgresql" && is_binary_type(&source_type) {
         text = format!("\\x{}", text.trim());
     }
+    if target_engine == "postgresql" && !is_binary_type(&source_type) {
+        text = sanitize_postgresql_text(&text);
+    }
 
     csv_quote(&text)
 }
 
 fn csv_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn sanitize_postgresql_text(value: &str) -> String {
+    value.replace('\0', "")
 }
 
 pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Value) -> String {
@@ -7140,6 +7179,9 @@ pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Va
             if text == "0" || text.eq_ignore_ascii_case("false") {
                 return "FALSE".to_string();
             }
+        }
+        if target_engine == "postgresql" {
+            return sql_literal(&Value::String(sanitize_postgresql_text(text)));
         }
     }
     sql_literal(value)
@@ -9345,6 +9387,57 @@ mod tests {
         })));
         let mut target = MemoryAdapter::from_value(Some(&json!({
             "ledger": [{"id": 1, "amount": "1.23"}, {"id": 2, "amount": "0"}]
+        })));
+
+        let mismatches = verify_with_adapters(&schema, &mut source, &mut target, 10);
+
+        assert_eq!(mismatches, Vec::<Value>::new());
+    }
+
+    #[test]
+    fn postgresql_text_output_removes_mysql_nul_bytes() {
+        assert_eq!(
+            copy_csv_field_for_column("postgresql", "varchar(255)", &json!("ab\0cd")),
+            "\"abcd\""
+        );
+        assert_eq!(
+            sql_literal_for_column("postgresql", "text", &json!("ab\0cd")),
+            "'abcd'"
+        );
+    }
+
+    #[test]
+    fn typed_verify_treats_postgresql_nul_sanitized_text_as_equal() {
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "logs".to_string(),
+                columns: vec![
+                    NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    },
+                    NormalizedColumn {
+                        name: "message".to_string(),
+                        type_name: "text".to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    },
+                ],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+            }],
+        };
+        let mut source = MemoryAdapter::from_value(Some(&json!({
+            "logs": [{"id": 1, "message": "before\0after"}]
+        })));
+        let mut target = MemoryAdapter::from_value(Some(&json!({
+            "logs": [{"id": 1, "message": "beforeafter"}]
         })));
 
         let mismatches = verify_with_adapters(&schema, &mut source, &mut target, 10);
