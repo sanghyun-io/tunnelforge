@@ -311,12 +311,24 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_safety_log.setMaximumBlockCount(80)
         self.txt_safety_log.setFixedHeight(110)
         self.txt_safety_log.setPlaceholderText("전환 가능 여부 점검의 최근 진행 상황이 표시됩니다.")
-        self.target_advanced_panel = QLabel(
+        self.target_advanced_panel = QWidget()
+        target_advanced_layout = QVBoxLayout(self.target_advanced_panel)
+        target_advanced_layout.setContentsMargins(0, 0, 0, 0)
+        self.lbl_target_advanced_help = QLabel(
             "Target이 비어 있지 않으면 기존 테이블을 정리한 뒤 다시 점검하세요. "
-            "create_only 해제는 기존 데이터와 섞일 수 있어 권장하지 않습니다."
+            "정리는 Source schema에 포함된 대상 테이블만 FK 의존성 역순으로 삭제합니다."
         )
-        self.target_advanced_panel.setObjectName("MutedHelp")
-        self.target_advanced_panel.setWordWrap(True)
+        self.lbl_target_advanced_help.setObjectName("MutedHelp")
+        self.lbl_target_advanced_help.setWordWrap(True)
+        cleanup_layout = QHBoxLayout()
+        self.input_cleanup_schema = QLineEdit()
+        self.input_cleanup_schema.setPlaceholderText("Target schema 이름 입력")
+        self.btn_cleanup_target = QPushButton("기존 Target 테이블 정리")
+        self.btn_cleanup_target.clicked.connect(self._cleanup_target_from_safety)
+        cleanup_layout.addWidget(self.input_cleanup_schema, 1)
+        cleanup_layout.addWidget(self.btn_cleanup_target)
+        target_advanced_layout.addWidget(self.lbl_target_advanced_help)
+        target_advanced_layout.addLayout(cleanup_layout)
         self.target_advanced_panel.hide()
         self.btn_target_advanced = QPushButton("고급 설정 열기")
         self.btn_target_advanced.hide()
@@ -697,7 +709,9 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_safety_summary.setText(summary)
 
     def _open_target_advanced_options(self):
-        self.target_advanced_panel.setVisible(not self.target_advanced_panel.isVisible())
+        visible = not self.target_advanced_panel.isVisible()
+        self.target_advanced_panel.setVisible(visible)
+        self.btn_target_advanced.setText("고급 설정 닫기" if visible else "고급 설정 열기")
 
     def _next_enabled_for_current_step(self) -> bool:
         if self.worker and self.worker.isRunning():
@@ -1010,6 +1024,9 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_cleanup_failed.hide()
             self.lbl_migration_result.setText("실패한 전환 정리가 완료되었습니다. 전환 가능 여부 점검을 다시 실행하세요.")
             self.lbl_migration_result.show()
+            self.lbl_safety_summary.setText("Target 정리 완료: 전환 가능 여부 점검을 다시 실행하세요.")
+            self.lbl_target_safety.setText("Target 정리가 완료되었습니다. 다시 점검해 빈 Target 상태를 확인하세요.")
+            self._append_safety_log("Target 정리 완료")
         self._append_log("완료" if success else "실패")
         if self._workflow_active and finished_command:
             next_command = next_workflow_command(finished_command, success)
@@ -1067,6 +1084,21 @@ class CrossEngineMigrationDialog(QDialog):
             return
         self._start_command_with_payload("cleanup", payload)
 
+    def _cleanup_target_from_safety(self):
+        if self.input_cleanup_schema.text().strip() != self._target_approval_schema():
+            QMessageBox.warning(
+                self,
+                "승인 필요",
+                "Target schema 이름을 정확히 입력해야 기존 Target 테이블 정리를 실행할 수 있습니다.",
+            )
+            return
+        try:
+            payload = self._payload(prepare_tunnels=True)
+        except ValueError as exc:
+            QMessageBox.warning(self, "입력 오류", str(exc))
+            return
+        self._start_command_with_payload("cleanup", payload)
+
     def _save_report(self):
         if not self.last_result:
             return
@@ -1099,6 +1131,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_preflight,
             self.btn_readiness,
             self.btn_run_safety,
+            self.btn_cleanup_target,
             self.btn_guide,
             self.btn_plan,
             self.btn_migrate,
@@ -1192,6 +1225,7 @@ class CrossEngineMigrationDialog(QDialog):
         if command == "preflight":
             self.txt_safety_log.clear()
             self.target_advanced_panel.hide()
+            self.btn_target_advanced.setText("고급 설정 열기")
 
     def _update_migration_result_summary(self, payload: Dict):
         issues = payload.get("issues")

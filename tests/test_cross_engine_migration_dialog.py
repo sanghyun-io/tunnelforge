@@ -1372,7 +1372,74 @@ def test_target_advanced_button_expands_inline_without_leaving_safety_step():
 
         assert dialog.current_step_id == "safety"
         assert dialog.target_advanced_panel.isVisible()
-        assert "Target이 비어 있지 않으면" in dialog.target_advanced_panel.text()
+        assert dialog.btn_target_advanced.text() == "고급 설정 닫기"
+        assert "Target이 비어 있지 않으면" in dialog.lbl_target_advanced_help.text()
+
+        dialog.btn_target_advanced.click()
+
+        assert not dialog.target_advanced_panel.isVisible()
+        assert dialog.btn_target_advanced.text() == "고급 설정 열기"
+    finally:
+        dialog.close()
+
+
+def test_safety_advanced_cleanup_requires_schema_approval(monkeypatch):
+    dialog = make_dialog()
+    started = []
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda command, payload, workflow=False: started.append((command, payload, workflow)),
+    )
+    try:
+        dialog.show()
+        app.processEvents()
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "location": "target.public",
+                    "message": "target schema is not empty",
+                    "blocking": True,
+                }
+            ],
+        })
+        dialog.btn_target_advanced.click()
+
+        dialog.btn_cleanup_target.click()
+
+        assert started == []
+        assert warnings
+
+        dialog.input_cleanup_schema.setText("target_db")
+        dialog.btn_cleanup_target.click()
+
+        assert started[0][0] == "cleanup"
+    finally:
+        dialog.close()
+
+
+def test_cleanup_finished_updates_safety_screen_when_started_from_safety_step():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("safety")
+        dialog.lbl_safety_summary.setText("점검 실패: 차단 이슈 3개, 경고 0개")
+        dialog.lbl_target_safety.setText("Target에 기존 테이블 또는 데이터가 있습니다.")
+        dialog._current_command = "cleanup"
+
+        dialog._on_finished(True, {"command": "cleanup", "success": True})
+
+        assert "Target 정리 완료" in dialog.lbl_safety_summary.text()
+        assert "다시 점검" in dialog.lbl_target_safety.text()
+        assert "Target 정리 완료" in dialog.txt_safety_log.toPlainText()
     finally:
         dialog.close()
 
