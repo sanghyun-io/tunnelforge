@@ -322,7 +322,7 @@ def test_step_pages_keep_current_step_actions_reachable():
     dialog = make_dialog()
     step_actions = {
         "inspect": [dialog.btn_auto_inspect, dialog.btn_load_schema, dialog.btn_inspect],
-        "safety": [dialog.btn_readiness, dialog.btn_run_safety],
+        "safety": [dialog.btn_run_safety],
         "plan": [dialog.btn_guide, dialog.btn_plan],
         "execute": [dialog.btn_migrate, dialog.btn_resume],
         "verify": [dialog.btn_verify, dialog.btn_save_report],
@@ -1053,8 +1053,17 @@ def test_safety_step_exposes_only_primary_preflight_action_by_default():
         dialog.show()
         app.processEvents()
 
+        visible_button_texts = [
+            button.text()
+            for button in dialog.step_pages["safety"].findChildren(QPushButton)
+            if button.isVisible()
+        ]
+
+        assert all("양방향" not in text for text in visible_button_texts)
         assert dialog.btn_run_safety.isVisible()
         assert_widget_reachable(dialog.btn_run_safety, dialog)
+        assert not dialog.btn_readiness.isVisible()
+        assert dialog.btn_readiness.parentWidget() is None
         assert not dialog.btn_preflight.isVisible()
         assert dialog.btn_preflight.parentWidget() is None
     finally:

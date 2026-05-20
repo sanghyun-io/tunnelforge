@@ -253,10 +253,6 @@ class CrossEngineMigrationDialog(QDialog):
         self.step_page_layouts["plan"].addWidget(option_group)
 
         load_layout.insertWidget(0, self.btn_inspect)
-        safety_action_layout = QHBoxLayout()
-        safety_action_layout.addWidget(self.btn_readiness)
-        safety_action_layout.addStretch()
-        self.step_page_layouts["safety"].addLayout(safety_action_layout)
 
         plan_action_layout = QHBoxLayout()
         plan_action_layout.addWidget(self.btn_guide)
