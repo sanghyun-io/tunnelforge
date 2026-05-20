@@ -6,7 +6,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtWidgets import QApplication, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
 from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationDialog
 
@@ -205,6 +205,25 @@ def test_step_pages_keep_current_step_actions_reachable():
             assert isinstance(dialog.step_pages[step_id], QWidget)
             for button in buttons:
                 assert_widget_reachable(button, dialog)
+    finally:
+        dialog.close()
+
+
+def test_plan_step_has_single_visible_plan_trigger():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("plan")
+        dialog.show()
+        app.processEvents()
+
+        visible_plan_buttons = [
+            button
+            for button in dialog.step_pages["plan"].findChildren(QPushButton)
+            if button.text() == "계획 생성" and button.isVisible()
+        ]
+
+        assert visible_plan_buttons == [dialog.btn_run_plan]
+        assert dialog.btn_plan is dialog.btn_run_plan
     finally:
         dialog.close()
 
@@ -499,6 +518,49 @@ def test_plan_failure_keeps_db_change_locked():
 
         assert not dialog.btn_migrate.isEnabled()
         assert "차단 이슈가 있어" in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_plan_result_renders_meaningful_conversion_changes():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "plan",
+            "success": True,
+            "plan": {
+                "tables": [
+                    {"name": "users", "estimated_rows": 1000},
+                    {"name": "orders", "estimated_rows": 2500},
+                ],
+                "type_mappings": [
+                    {
+                        "table": "users",
+                        "column": "id",
+                        "source_type": "int unsigned",
+                        "target_type": "bigint",
+                        "note": "unsigned widening",
+                    },
+                    {
+                        "table": "users",
+                        "column": "payload",
+                        "source_type": "json",
+                        "target_type": "jsonb",
+                        "note": "json normalization",
+                    },
+                ],
+                "ddl_order": ["create tables", "load data", "create foreign keys"],
+            },
+            "issues": [{"blocking": False, "message": "index prefix length converted"}],
+        })
+
+        text = dialog.lbl_plan_summary.text()
+        assert "전환 대상 테이블 2개" in text
+        assert "예상 rows 3,500" in text
+        assert "int unsigned -> bigint" in text
+        assert "json -> jsonb" in text
+        assert "FK/index는 데이터 적재 후 생성" in text
     finally:
         dialog.close()
 

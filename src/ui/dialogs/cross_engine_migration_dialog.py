@@ -126,7 +126,6 @@ class CrossEngineMigrationDialog(QDialog):
         option_layout.addWidget(QLabel("Guide rows:"))
         option_layout.addWidget(self.spin_guide_row_limit)
         option_layout.addStretch()
-        self.step_page_layouts["plan"].addWidget(option_group)
 
         schema_group = QGroupBox("스키마 검사 결과")
         schema_layout = QVBoxLayout(schema_group)
@@ -191,6 +190,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_readiness = QPushButton("양방향 점검")
         self.btn_guide = QPushButton("상세 가이드")
         self.btn_plan = QPushButton("계획 생성")
+        self.btn_run_plan = self.btn_plan
         self.btn_migrate = QPushButton("DB 변경 실행")
         self.btn_resume = QPushButton("재개(DB 변경)")
         self.btn_verify = QPushButton("검증")
@@ -225,6 +225,15 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_cancel.setEnabled(False)
         self._update_execution_state(False)
 
+        self.plan_group = QGroupBox("실행 계획 확인")
+        plan_layout = QVBoxLayout(self.plan_group)
+        self.lbl_plan_summary = QLabel("아직 실행 계획을 생성하지 않았습니다.")
+        self.lbl_plan_summary.setWordWrap(True)
+        plan_layout.addWidget(self.lbl_plan_summary)
+        plan_layout.addWidget(self.btn_run_plan)
+        self.step_page_layouts["plan"].addWidget(self.plan_group)
+        self.step_page_layouts["plan"].addWidget(option_group)
+
         load_layout.insertWidget(0, self.btn_inspect)
         safety_action_layout = QHBoxLayout()
         safety_action_layout.addWidget(self.btn_readiness)
@@ -233,7 +242,6 @@ class CrossEngineMigrationDialog(QDialog):
 
         plan_action_layout = QHBoxLayout()
         plan_action_layout.addWidget(self.btn_guide)
-        plan_action_layout.addWidget(self.btn_plan)
         plan_action_layout.addStretch()
         self.step_page_layouts["plan"].addLayout(plan_action_layout)
 
@@ -317,6 +325,56 @@ class CrossEngineMigrationDialog(QDialog):
     def _update_source_summary(self, schema: Dict):
         unsupported = [str(item) for item in self.unsupported_objects]
         self.lbl_source_summary.setText(self._schema_summary_text(schema, unsupported))
+
+    def _plan_tables(self, payload: Dict) -> List[Dict]:
+        raw_plan = payload.get("plan")
+        plan: Dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+        raw_tables = plan.get("tables")
+        tables: List[Any] = cast(List[Any], raw_tables) if isinstance(raw_tables, list) else []
+        return [table for table in tables if isinstance(table, dict)]
+
+    def _plan_type_mappings(self, payload: Dict) -> List[Dict]:
+        raw_plan = payload.get("plan")
+        plan: Dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+        raw_mappings = plan.get("type_mappings")
+        mappings: List[Any] = cast(List[Any], raw_mappings) if isinstance(raw_mappings, list) else []
+        return [mapping for mapping in mappings if isinstance(mapping, dict)]
+
+    def _plan_summary_text(self, payload: Dict) -> str:
+        tables = self._plan_tables(payload)
+        mappings = self._plan_type_mappings(payload)
+        estimated_rows = 0
+        for table in tables:
+            raw_rows = table.get("estimated_rows")
+            if not isinstance(raw_rows, int) or isinstance(raw_rows, bool):
+                raw_rows = table.get("rows")
+            if isinstance(raw_rows, int) and not isinstance(raw_rows, bool):
+                estimated_rows += raw_rows
+
+        lines = [
+            f"전환 대상 테이블 {len(tables)}개",
+            f"예상 rows {estimated_rows:,}",
+        ]
+        mapping_summaries: List[str] = []
+        for mapping in mappings:
+            source_type = str(mapping.get("source_type", "")).strip()
+            target_type = str(mapping.get("target_type", "")).strip()
+            if source_type and target_type:
+                mapping_summaries.append(f"{source_type} -> {target_type}")
+        if mapping_summaries:
+            lines.append("타입 변환: " + ", ".join(mapping_summaries[:8]))
+
+        raw_plan = payload.get("plan")
+        plan: Dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+        raw_ddl_order = plan.get("ddl_order")
+        ddl_order: List[Any] = cast(List[Any], raw_ddl_order) if isinstance(raw_ddl_order, list) else []
+        ddl_order_text = " ".join(str(item).lower() for item in ddl_order)
+        if "foreign" in ddl_order_text or "fk" in ddl_order_text:
+            lines.append("FK/index는 데이터 적재 후 생성")
+        return "\n".join(lines)
+
+    def _update_plan_summary(self, payload: Dict):
+        self.lbl_plan_summary.setText(self._plan_summary_text(payload))
 
     def _selected_direction(self) -> MigrationDirection:
         return MigrationDirection.from_engines(self.source_form.engine(), self.target_form.engine())
@@ -542,6 +600,8 @@ class CrossEngineMigrationDialog(QDialog):
             self._append_readiness_summary(payload)
         if payload.get("command") == "guide":
             self._append_guide_summary(payload)
+        if payload.get("command") == "plan":
+            self._update_plan_summary(payload)
         if payload.get("command") in ("preflight", "plan"):
             target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
             self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)
