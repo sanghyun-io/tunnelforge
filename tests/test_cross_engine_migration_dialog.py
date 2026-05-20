@@ -122,6 +122,7 @@ def test_dialog_initial_button_states_and_running_toggle():
         assert not dialog.btn_save_report.isEnabled()
         assert not dialog.btn_cancel.isEnabled()
         assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_full_run.isVisible()
         assert not dialog.source_form.combo_engine.isEnabled()
         assert not dialog.target_form.combo_engine.isEnabled()
         assert dialog._payload()["guide_options"]["row_limit"] == 20
@@ -133,21 +134,42 @@ def test_dialog_initial_button_states_and_running_toggle():
 
         dialog._set_running(True)
 
-        assert not dialog.btn_full_run.isEnabled()
         assert not dialog.btn_inspect.isEnabled()
-        assert not dialog.btn_readiness.isEnabled()
-        assert not dialog.btn_guide.isEnabled()
+        assert not dialog.btn_preflight.isEnabled()
+        assert not dialog.btn_plan.isEnabled()
         assert not dialog.btn_migrate.isEnabled()
         assert dialog.btn_cancel.isEnabled()
+        assert not dialog.btn_next.isEnabled()
 
         dialog._set_running(False)
 
-        assert dialog.btn_full_run.isEnabled()
         assert dialog.btn_inspect.isEnabled()
-        assert dialog.btn_readiness.isEnabled()
-        assert dialog.btn_guide.isEnabled()
+        assert dialog.btn_preflight.isEnabled()
+        assert dialog.btn_plan.isEnabled()
         assert not dialog.btn_migrate.isEnabled()
         assert not dialog.btn_cancel.isEnabled()
+        assert dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_wizard_navigation_preserves_payload_and_step_controls():
+    dialog = make_dialog()
+    try:
+        assert dialog.current_step_id == "connections"
+        assert dialog.btn_previous.isEnabled() is False
+        assert dialog.btn_next.isEnabled() is True
+
+        dialog._go_next_step()
+
+        assert dialog.current_step_id == "inspect"
+        assert dialog.btn_previous.isEnabled() is True
+        assert dialog._payload()["guide_options"]["row_limit"] == 20
+
+        dialog._go_previous_step()
+
+        assert dialog.current_step_id == "connections"
+        assert dialog.btn_previous.isEnabled() is False
     finally:
         dialog.close()
 

@@ -91,10 +91,20 @@ class CrossEngineMigrationDialog(QDialog):
         )
         endpoint_layout.addWidget(self.source_form)
         endpoint_layout.addWidget(self.target_form)
-        layout.addLayout(endpoint_layout)
         self.lbl_direction_summary = QLabel()
         self.lbl_direction_summary.setStyleSheet("font-weight: 600;")
         layout.addWidget(self.lbl_direction_summary)
+
+        self.page_container = QWidget()
+        self.page_layout = QVBoxLayout(self.page_container)
+        layout.addWidget(self.page_container, 1)
+        for step_id in self.step_ids:
+            page = QWidget()
+            page_layout = QVBoxLayout(page)
+            page_layout.setContentsMargins(0, 0, 0, 0)
+            self.step_pages[step_id] = page
+            self.page_layout.addWidget(page)
+        self.step_pages["connections"].layout().addLayout(endpoint_layout)
 
         option_group = QGroupBox("실행 옵션")
         option_layout = QHBoxLayout(option_group)
@@ -113,7 +123,7 @@ class CrossEngineMigrationDialog(QDialog):
         option_layout.addWidget(QLabel("Guide rows:"))
         option_layout.addWidget(self.spin_guide_row_limit)
         option_layout.addStretch()
-        layout.addWidget(option_group)
+        self.step_pages["plan"].layout().addWidget(option_group)
 
         schema_group = QGroupBox("스키마 검사 결과")
         schema_layout = QVBoxLayout(schema_group)
@@ -133,12 +143,12 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_schema.setPlaceholderText('{"tables":[{"name":"users","columns":[{"name":"id","type":"int(11)","nullable":false,"primary_key":true}]}]}')
         self.txt_schema.setPlainText('{"tables":[]}')
         schema_layout.addWidget(self.txt_schema)
-        layout.addWidget(schema_group, 1)
+        self.step_pages["inspect"].layout().addWidget(schema_group, 1)
 
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setMaximumBlockCount(1000)
-        layout.addWidget(self.txt_log, 1)
+        self.step_pages["execute"].layout().addWidget(self.txt_log, 1)
 
         action_group = QGroupBox("작업 순서")
         action_layout = QVBoxLayout(action_group)
@@ -210,6 +220,10 @@ class CrossEngineMigrationDialog(QDialog):
         step_layout.addWidget(step_prepare, 2)
         step_layout.addWidget(step_execute, 2)
         step_layout.addWidget(step_verify, 2)
+        step_check.hide()
+        step_prepare.hide()
+        step_execute.hide()
+        step_verify.hide()
         action_layout.addLayout(step_layout)
 
         control_layout.addWidget(self.btn_full_run)
@@ -250,15 +264,24 @@ class CrossEngineMigrationDialog(QDialog):
         if hasattr(self, "lbl_direction_summary"):
             self.lbl_direction_summary.setText(self._direction_label())
 
+    def _next_enabled_for_current_step(self) -> bool:
+        if self.worker and self.worker.isRunning():
+            return False
+        if self.current_step_id == "execute":
+            return self._execution_unlocked and self._approval_matches_target_schema()
+        return True
+
     def _show_step(self, step_id: str):
         self.current_step_id = step_id
         for page_id, page in self.step_pages.items():
             page.setVisible(page_id == step_id)
         if hasattr(self, "btn_previous"):
-            self.btn_previous.setEnabled(self._current_step_index() > 0)
+            running = bool(self.worker and self.worker.isRunning())
+            self.btn_previous.setEnabled(self._current_step_index() > 0 and not running)
         if hasattr(self, "btn_next"):
             is_last = self._current_step_index() == len(self.step_ids) - 1
             self.btn_next.setText("완료" if is_last else "다음")
+            self.btn_next.setEnabled(self._next_enabled_for_current_step())
         self._refresh_direction_summary()
 
     def _go_previous_step(self):
@@ -537,6 +560,10 @@ class CrossEngineMigrationDialog(QDialog):
             button.setEnabled(not running)
         self._update_execution_state(running)
         self.btn_cancel.setEnabled(running)
+        if hasattr(self, "btn_previous"):
+            self.btn_previous.setEnabled((not running) and self._current_step_index() > 0)
+        if hasattr(self, "btn_next"):
+            self.btn_next.setEnabled((not running) and self._next_enabled_for_current_step())
 
     def _set_execution_unlocked(self, unlocked: bool):
         self._execution_unlocked = unlocked
@@ -551,6 +578,9 @@ class CrossEngineMigrationDialog(QDialog):
                 self.lbl_execution_lock.setText("점검이 통과되어 DB 변경 실행을 사용할 수 있습니다.")
             else:
                 self.lbl_execution_lock.setText("DB 변경 실행은 사전 점검 또는 계획 생성 성공 후 활성화됩니다.")
+
+    def _approval_matches_target_schema(self) -> bool:
+        return True
 
     def _lock_execution_due_to_input_change(self):
         if self._execution_unlocked:
