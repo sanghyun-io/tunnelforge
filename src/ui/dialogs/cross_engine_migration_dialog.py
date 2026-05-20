@@ -169,6 +169,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_target_safety.setWordWrap(True)
         self.btn_target_advanced = QPushButton("고급 설정 열기")
         self.btn_target_advanced.hide()
+        self.btn_target_advanced.clicked.connect(self._open_target_advanced_options)
         self.btn_run_safety = QPushButton("전환 가능 여부 점검")
         self.btn_run_safety.clicked.connect(lambda: self._start_command("preflight"))
         safety_layout.addWidget(self.lbl_safety_summary)
@@ -227,7 +228,6 @@ class CrossEngineMigrationDialog(QDialog):
         load_layout.insertWidget(0, self.btn_inspect)
         safety_action_layout = QHBoxLayout()
         safety_action_layout.addWidget(self.btn_readiness)
-        safety_action_layout.addWidget(self.btn_preflight)
         safety_action_layout.addStretch()
         self.step_page_layouts["safety"].addLayout(safety_action_layout)
 
@@ -346,6 +346,8 @@ class CrossEngineMigrationDialog(QDialog):
     def _is_target_non_empty_issue(self, issue) -> bool:
         if not isinstance(issue, dict):
             return False
+        if issue.get("blocking") is not True:
+            return False
         location = str(issue.get("location", "")).lower()
         message = str(issue.get("message", "")).lower()
         text = f"{location} {message}"
@@ -368,6 +370,11 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_target_safety.setText("Target 상태 확인 완료: 기존 테이블 또는 데이터 차단 이슈가 없습니다.")
         self.btn_target_advanced.setVisible(False)
         return False
+
+    def _open_target_advanced_options(self):
+        self._show_step("plan")
+        self.spin_chunk_size.setFocus(Qt.FocusReason.OtherFocusReason)
+        self._append_log("고급 Target 처리 설정은 실행 옵션에서 확인합니다.")
 
     def _next_enabled_for_current_step(self) -> bool:
         if self.worker and self.worker.isRunning():

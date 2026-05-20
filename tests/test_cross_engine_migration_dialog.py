@@ -188,7 +188,7 @@ def test_step_pages_keep_current_step_actions_reachable():
     dialog = make_dialog()
     step_actions = {
         "inspect": [dialog.btn_auto_inspect, dialog.btn_load_schema, dialog.btn_inspect],
-        "safety": [dialog.btn_readiness, dialog.btn_preflight],
+        "safety": [dialog.btn_readiness, dialog.btn_run_safety],
         "plan": [dialog.btn_guide, dialog.btn_plan],
         "execute": [dialog.btn_migrate, dialog.btn_resume],
         "verify": [dialog.btn_verify, dialog.btn_save_report],
@@ -605,6 +605,70 @@ def test_preflight_blocks_execution_when_target_is_not_empty():
         assert not dialog.btn_migrate.isEnabled()
         assert "Target에 기존 테이블 또는 데이터가 있습니다" in dialog.lbl_target_safety.text()
         assert dialog.btn_target_advanced.isVisible()
+    finally:
+        dialog.close()
+
+
+def test_preflight_success_with_nonblocking_target_warning_unlocks_execution():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": True,
+            "issues": [
+                {
+                    "severity": "warning",
+                    "location": "target.public",
+                    "message": "target has existing advisory metadata",
+                    "blocking": False,
+                }
+            ],
+        })
+
+        assert dialog.btn_migrate.isEnabled()
+        assert "기존 테이블 또는 데이터 차단 이슈가 없습니다" in dialog.lbl_target_safety.text()
+        assert not dialog.btn_target_advanced.isVisible()
+    finally:
+        dialog.close()
+
+
+def test_target_advanced_button_moves_to_plan_step_and_logs_context():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "location": "target.public",
+                    "message": "target schema is not empty",
+                    "blocking": True,
+                }
+            ],
+        })
+
+        dialog.btn_target_advanced.click()
+
+        assert dialog.current_step_id == "plan"
+        assert "고급 Target 처리 설정은 실행 옵션에서 확인합니다" in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_safety_step_exposes_only_primary_preflight_action_by_default():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("safety")
+        dialog.show()
+        app.processEvents()
+
+        assert dialog.btn_run_safety.isVisible()
+        assert_widget_reachable(dialog.btn_run_safety, dialog)
+        assert not dialog.btn_preflight.isVisible()
+        assert dialog.btn_preflight.parentWidget() is None
     finally:
         dialog.close()
 
