@@ -17,6 +17,8 @@ from src.core.logger import get_logger
 
 logger = get_logger("rust_dump_exporter")
 
+DEFAULT_DUMP_COMPRESSION = "zstd"
+
 
 @dataclass
 class RustDumpConfig:
@@ -348,7 +350,7 @@ class RustDumpExporter:
         tables: Optional[List[str]],
         threads: int = 8,
         chunk_size: int = 50000,
-        compression: str = "none",
+        compression: str = DEFAULT_DUMP_COMPRESSION,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -362,7 +364,7 @@ class RustDumpExporter:
             "threads": max(1, int(threads)),
             "chunk_size": max(1000, int(chunk_size)),
             "data_format": "tsv",
-            "compression": compression if compression in {"none", "zstd"} else "none",
+            "compression": compression if compression in {"none", "zstd"} else DEFAULT_DUMP_COMPRESSION,
         }
         if tables:
             payload["tables"] = tables
@@ -390,7 +392,7 @@ class RustDumpExporter:
         schema: str,
         output_dir: str,
         threads: int = 8,
-        compression: str = "none",
+        compression: str = DEFAULT_DUMP_COMPRESSION,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -424,7 +426,7 @@ class RustDumpExporter:
         tables: List[str],
         output_dir: str,
         threads: int = 8,
-        compression: str = "none",
+        compression: str = DEFAULT_DUMP_COMPRESSION,
         include_fk_parents: bool = True,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -511,12 +513,17 @@ class RustDumpImporter:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             chunk_counts = {}
             table_sizes = {}
+            table_rows = {}
             total_bytes = 0
+            total_rows = 0
             for table in manifest.get("tables", []):
                 table_name = str(table.get("name", ""))
                 if not table_name:
                     continue
                 chunk_counts[table_name] = int(table.get("chunks") or 0)
+                rows = int(table.get("rows") or 0)
+                table_rows[table_name] = rows
+                total_rows += rows
                 table_dir = Path(dump_dir) / str(table.get("path", ""))
                 size = sum(path.stat().st_size for path in table_dir.glob("chunk_*.*"))
                 table_sizes[table_name] = size
@@ -524,7 +531,9 @@ class RustDumpImporter:
             return {
                 "chunk_counts": chunk_counts,
                 "table_sizes": table_sizes,
+                "table_rows": table_rows,
                 "total_bytes": total_bytes,
+                "total_rows": total_rows,
                 "schema": manifest.get("database", ""),
                 "format": manifest.get("format", ""),
                 "format_version": manifest.get("format_version", 0),
@@ -699,7 +708,7 @@ def emit_core_event(
         rows = int(event.get("rows") or 0)
         total = int(event.get("total") or 0)
         chunk_rows = int(event.get("chunk_rows") or 0)
-        elapsed_ms = int(event.get("stream_ms") or event.get("read_ms") or 0)
+        elapsed_ms = int(event.get("stream_ms") or event.get("read_ms") or event.get("load_ms") or 0)
         rows_sec = int((chunk_rows * 1000) / elapsed_ms) if chunk_rows and elapsed_ms else 0
         percent = int((rows / total) * 100) if total else 0
         if detail_callback:
@@ -720,8 +729,10 @@ def emit_core_event(
                 "read_ms": event.get("read_ms"),
                 "write_ms": event.get("write_ms"),
             })
-        if table_chunk_progress_callback and table:
-            table_chunk_progress_callback(table, rows, total)
+        chunks_done = int(event.get("chunks_done") or 0)
+        chunks_total = int(event.get("chunks_total") or 0)
+        if table_chunk_progress_callback and table and chunks_done and chunks_total:
+            table_chunk_progress_callback(table, chunks_done, chunks_total)
 
 
 def check_rust_dump() -> Tuple[bool, str]:

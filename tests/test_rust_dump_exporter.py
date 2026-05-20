@@ -1,6 +1,7 @@
 """
 RustDumpExporter 테스트
 """
+import json
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -196,7 +197,7 @@ class TestRustDumpExporter:
         assert facade.payload["threads"] == 8
         assert facade.payload["chunk_size"] == 50000
         assert facade.payload["data_format"] == "tsv"
-        assert facade.payload["compression"] == "none"
+        assert facade.payload["compression"] == "zstd"
         assert "2" in msg
 
     def test_export_full_schema_passes_zstd_compression_to_rust_dump(self, tmp_path):
@@ -247,7 +248,7 @@ class TestRustDumpExporter:
         assert facade.payload["threads"] == 8
         assert facade.payload["chunk_size"] == 50000
         assert facade.payload["data_format"] == "tsv"
-        assert facade.payload["compression"] == "none"
+        assert facade.payload["compression"] == "zstd"
 
 
 class TestRustDumpImporter:
@@ -294,6 +295,65 @@ class TestRustDumpImporter:
         assert facade.payload["threads"] == 8
         assert results["users"]["status"] == "done"
         assert "1" in msg
+
+    def test_import_row_progress_reports_chunk_counts_to_callback(self):
+        """Import row_progress는 rows/total이 아니라 chunks_done/chunks_total을 chunk callback으로 전달한다."""
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        chunk_events = []
+
+        emit_core_event(
+            {
+                "event": "row_progress",
+                "table": "df_subs",
+                "rows": 100_000,
+                "total": 387_398,
+                "chunk_rows": 50_000,
+                "chunks_done": 2,
+                "chunks_total": 8,
+                "chunk_index": 4,
+                "load_ms": 1250,
+                "strategy": "parallel_load_data_local_infile",
+            },
+            table_chunk_progress_callback=lambda table, done, total: chunk_events.append(
+                (table, done, total)
+            ),
+        )
+
+        assert chunk_events == [("df_subs", 2, 8)]
+
+    def test_import_metadata_reports_table_rows_and_total_rows(self, tmp_path):
+        """Import 대시보드가 전체 row 진행률을 계산할 수 있도록 manifest rows를 전달한다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        users_dir = dump_dir / "0001_users"
+        orders_dir = dump_dir / "0002_orders"
+        users_dir.mkdir(parents=True)
+        orders_dir.mkdir(parents=True)
+        (users_dir / "chunk_000001.tsv").write_text("1\ta\n", encoding="utf-8")
+        (orders_dir / "chunk_000001.tsv").write_text("1\t1\n", encoding="utf-8")
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 2,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "0001_users", "rows": 1, "chunks": 1},
+                        {"name": "orders", "path": "0002_orders", "rows": 2, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+
+        metadata = importer._analyze_dump_metadata(str(dump_dir))
+
+        assert metadata["table_rows"] == {"users": 1, "orders": 2}
+        assert metadata["total_rows"] == 3
 
 
 class TestConvenienceFunctions:

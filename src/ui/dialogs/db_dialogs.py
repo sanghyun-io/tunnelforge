@@ -21,7 +21,7 @@ from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, RustDumpConfig, check_rust_dump,
-    ForeignKeyResolver, OrphanRecordInfo
+    ForeignKeyResolver, OrphanRecordInfo, DEFAULT_DUMP_COMPRESSION
 )
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
@@ -51,6 +51,29 @@ def next_export_percent(
     return candidate
 
 
+def export_overall_percent(
+    last_percent: int,
+    overall_done: int,
+    total_rows: int,
+    fallback_percent: int,
+    completed_tables: int,
+    total_tables: int,
+) -> int:
+    """Return monotonic overall export progress from rows when estimates are available."""
+    done = max(0, int(overall_done))
+    total = max(0, int(total_rows))
+    if total > 0:
+        computed = min(int((done / total) * 100), 100)
+        return max(max(0, int(last_percent)), computed)
+
+    computed = cap_incomplete_export_percent(
+        int(fallback_percent),
+        completed_tables,
+        total_tables,
+    )
+    return next_export_percent(last_percent, computed, completed_tables, total_tables)
+
+
 def format_export_row_labels(processed_rows: int, estimated_total_rows: int) -> tuple[str, str]:
     processed = max(0, int(processed_rows))
     estimated = max(0, int(estimated_total_rows))
@@ -70,6 +93,114 @@ def format_export_table_status(table: str, rows_done: int, rows_total: int) -> s
         percent = min(int((done / total) * 100), 100)
         return f"🔄 현재: {table_name} {done:,} / {total:,} rows ({percent}%)"
     return f"🔄 현재: {table_name} {done:,} rows"
+
+
+def format_import_row_labels(info: dict) -> tuple[str, str, str]:
+    """Format import progress as row and chunk metrics instead of byte counters."""
+    table = str(info.get("table") or "-")
+    rows_done = max(0, int(info.get("rows_done") or 0))
+    rows_total = max(0, int(info.get("rows_total") or 0))
+    chunk_rows = max(0, int(info.get("chunk_rows") or 0))
+    chunks_done = int(info.get("chunks_done") or 0)
+    chunks_total = int(info.get("chunks_total") or 0)
+    rows_sec = max(0, int(info.get("rows_sec") or 0))
+    strategy = str(info.get("strategy") or "")
+
+    if rows_total:
+        data_label = f"📦 처리 rows: {rows_done:,} / {rows_total:,} rows"
+    else:
+        data_label = f"📦 처리 rows: {rows_done:,} rows"
+    speed_label = f"⚡ 속도: {rows_sec:,} rows/s" if rows_sec else "⚡ 속도: 계산 중..."
+
+    if chunks_done and chunks_total:
+        status = f"{chunks_done}/{chunks_total} chunks"
+    else:
+        status = "chunk 진행 중"
+    if chunk_rows:
+        status = f"{status}, +{chunk_rows:,} rows"
+    if strategy:
+        status = f"{status}, {strategy}"
+    return data_label, speed_label, f"🔄 현재: {table} {status}"
+
+
+def import_overall_percent(table_rows_done: dict, table_rows_total: dict) -> int:
+    done = sum(max(0, int(value or 0)) for value in table_rows_done.values())
+    total = sum(max(0, int(value or 0)) for value in table_rows_total.values())
+    if total <= 0:
+        return 0
+    return min(int((done / total) * 100), 100)
+
+
+def format_export_visible_telemetry(event: dict) -> Optional[str]:
+    """Convert Rust dump telemetry into a concise visible log line."""
+    event_type = event.get("event")
+    if event_type == "dump_schedule":
+        scheduler = str(event.get("scheduler") or "")
+        scheduler_part = f", scheduler={scheduler}" if scheduler else ""
+        return (
+            f"스케줄: {event.get('data_format') or '-'}"
+            f"/{event.get('compression') or '-'}{scheduler_part}, "
+            f"threads={int(event.get('threads') or 0)}, "
+            f"table_workers={int(event.get('table_workers') or 0)}, "
+            f"range_workers/table={int(event.get('range_workers_per_table') or 0)}"
+        )
+
+    if event_type == "table_progress":
+        table = str(event.get("table") or "-")
+        status = str(event.get("status") or "")
+        current = int(event.get("current") or 0)
+        total = int(event.get("total") or 0)
+        strategy = str(event.get("strategy") or "")
+        suffix = f", {strategy}" if strategy else ""
+        if status == "dumping":
+            return f"{table}: export 시작 ({current}/{total}){suffix}"
+        if status == "completed":
+            return f"{table}: export 완료 ({current}/{total}){suffix}"
+        return None
+
+    if event_type != "row_progress":
+        return None
+
+    table = str(event.get("table") or "-")
+    rows_done = max(0, int(event.get("rows") or 0))
+    rows_total = max(0, int(event.get("total") or 0))
+    chunk_rows = max(0, int(event.get("chunk_rows") or 0))
+    chunks_done = int(event.get("chunks_done") or 0)
+    chunks_total = int(event.get("chunks_total") or 0)
+    chunk_index = int(event.get("chunk_index") or 0)
+    strategy = str(event.get("strategy") or "")
+    elapsed_ms = int(
+        event.get("stream_ms")
+        or event.get("read_ms")
+        or event.get("write_ms")
+        or event.get("load_ms")
+        or 0
+    )
+
+    if rows_total:
+        percent = min(int((rows_done / rows_total) * 100), 100)
+        row_part = f"{rows_done:,} / {rows_total:,} rows ({percent}%)"
+    else:
+        row_part = f"{rows_done:,} rows"
+
+    if chunks_done and chunks_total:
+        chunk_part = f"{chunks_done}/{chunks_total} chunks"
+    elif chunk_index:
+        chunk_part = f"chunk {chunk_index}"
+    else:
+        chunk_part = f"{chunk_rows:,} rows"
+
+    detail_parts = []
+    if chunk_rows:
+        if elapsed_ms:
+            detail_parts.append(f"{chunk_rows:,} rows in {elapsed_ms / 1000:.1f}s")
+        else:
+            detail_parts.append(f"{chunk_rows:,} rows")
+    if strategy:
+        detail_parts.append(strategy)
+
+    details = f", {', '.join(detail_parts)}" if detail_parts else ""
+    return f"{table}: {chunk_part}, {row_part}{details}"
 
 
 class DBConnectionDialog(QDialog):
@@ -559,6 +690,7 @@ class RustDumpExportDialog(QDialog):
 
         self.combo_compression = QComboBox()
         self.combo_compression.addItems(["none", "zstd"])
+        self.combo_compression.setCurrentText(DEFAULT_DUMP_COMPRESSION)
         self.combo_compression.setToolTip("Rust DB Core dump 압축 방식입니다. zstd는 디스크 사용량을 줄이고 import 시 스트리밍 해제됩니다.")
         option_layout.addRow("압축 방식:", self.combo_compression)
 
@@ -1302,18 +1434,11 @@ class RustDumpExportDialog(QDialog):
             self.export_table_done[table] = max(self.export_table_done.get(table, 0), rows_done)
 
         overall_done = sum(self.export_table_done.values())
-        if self.export_total_rows > 0:
-            computed_percent = int((overall_done / self.export_total_rows) * 100)
-        else:
-            computed_percent = int(info.get("percent") or 0)
-        computed_percent = cap_incomplete_export_percent(
-            computed_percent,
-            self.export_completed_tables,
-            self.export_total_tables,
-        )
-        percent = next_export_percent(
+        percent = export_overall_percent(
             self.export_last_percent,
-            computed_percent,
+            overall_done,
+            self.export_total_rows,
+            int(info.get("percent") or 0),
             self.export_completed_tables,
             self.export_total_tables,
         )
@@ -1381,6 +1506,7 @@ class RustDumpExportDialog(QDialog):
     def on_raw_output(self, line: str):
         """rust_dump 실시간 출력 처리 (로그에 추가)"""
         is_telemetry_event = False
+        visible_summary = None
         try:
             event = json.loads(line)
         except Exception:
@@ -1395,8 +1521,16 @@ class RustDumpExportDialog(QDialog):
             for key in ("password", "credentials"):
                 event.pop(key, None)
             self.export_telemetry_events.append(event)
+            visible_summary = format_export_visible_telemetry(event)
 
-        if not is_telemetry_event:
+        if visible_summary:
+            # 너무 많은 로그 방지 (최대 500줄)
+            if self.txt_log.count() > 500:
+                self.txt_log.takeItem(0)
+            self.txt_log.addItem(visible_summary)
+            self.txt_log.scrollToBottom()
+            self._add_log(visible_summary)
+        elif not is_telemetry_event:
             # 너무 많은 로그 방지 (최대 500줄)
             if self.txt_log.count() > 500:
                 self.txt_log.takeItem(0)
@@ -1611,6 +1745,8 @@ class RustDumpImportDialog(QDialog):
 
         # 메타데이터 정보
         self.dump_metadata: Optional[dict] = None
+        self.import_table_rows_done: dict = {}
+        self.import_table_rows_total: dict = {}
 
         # 테이블별 chunk 진행률 추적
         self.table_chunk_progress: dict = {}  # {table_name: (completed, total)}
@@ -2409,16 +2545,19 @@ class RustDumpImportDialog(QDialog):
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
-        percent = info.get('percent', 0)
-        mb_done = info.get('mb_done', 0)
-        mb_total = info.get('mb_total', 0)
-        rows_sec = info.get('rows_sec', 0)
-        speed = info.get('speed', '0 B/s')
+        table = str(info.get('table') or "")
+        if table:
+            self.import_table_rows_done[table] = max(0, int(info.get('rows_done') or 0))
+        percent = import_overall_percent(self.import_table_rows_done, self.import_table_rows_total)
+        if percent == 0:
+            percent = info.get('percent', 0)
+        data_label, speed_label, status_label = format_import_row_labels(info)
 
         self.progress_bar.setValue(percent)
-        self.label_percent.setText(f"📊 진행률: {percent}%")
-        self.label_data.setText(f"📦 데이터: {mb_done:.2f} MB / {mb_total:.2f} MB")
-        self.label_speed.setText(f"⚡ 속도: {rows_sec:,} rows/s | {speed}")
+        self.label_percent.setText(f"📊 전체 진행률: {percent}%")
+        self.label_data.setText(data_label)
+        self.label_speed.setText(speed_label)
+        self.label_status.setText(status_label)
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트 (메타데이터 정보 포함)"""
@@ -2565,6 +2704,10 @@ class RustDumpImportDialog(QDialog):
         }
         """
         self.dump_metadata = metadata
+        self.import_table_rows_total = {
+            str(table): int(rows or 0)
+            for table, rows in (metadata.get('table_rows') or {}).items()
+        }
 
         # 대용량 테이블 정보를 테이블 상태 목록에 표시
         if metadata and 'table_sizes' in metadata:

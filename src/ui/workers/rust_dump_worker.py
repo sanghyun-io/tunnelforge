@@ -2,7 +2,7 @@
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.exporters.rust_dump_exporter import (
-    RustDumpConfig, RustDumpExporter, RustDumpImporter
+    DEFAULT_DUMP_COMPRESSION, RustDumpConfig, RustDumpExporter, RustDumpImporter
 )
 
 
@@ -51,7 +51,7 @@ class RustDumpWorker(QThread):
                     self.kwargs['schema'],
                     self.kwargs['output_dir'],
                     self.kwargs.get('threads', 8),
-                    self.kwargs.get('compression', 'none'),
+                    self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
                     callback,
                     table_callback,
                     detail_callback,
@@ -78,7 +78,7 @@ class RustDumpWorker(QThread):
                     self.kwargs['tables'],
                     self.kwargs['output_dir'],
                     self.kwargs.get('threads', 8),
-                    self.kwargs.get('compression', 'none'),
+                    self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
                     self.kwargs.get('include_fk_parents', True),
                     callback,
                     table_callback,

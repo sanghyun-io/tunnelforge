@@ -40,6 +40,7 @@ Thumbs.db
 # Project specific
 *.log
 config.json
+.superpowers/
 migration_core/target/
 *.exe
 *.spec
