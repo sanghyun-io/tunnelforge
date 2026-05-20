@@ -403,6 +403,10 @@ class CrossEngineMigrationDialog(QDialog):
     def _reset_plan_summary_after_failure(self):
         self.lbl_plan_summary.setText("실행 계획 생성에 실패했습니다. 다시 계획 생성을 실행해 주세요.")
 
+    def _reset_plan_summary_after_input_change(self):
+        if hasattr(self, "lbl_plan_summary"):
+            self.lbl_plan_summary.setText("아직 실행 계획을 생성하지 않았습니다.")
+
     def _verification_result_text(self, payload: Dict) -> str:
         mismatch_lines: List[str] = []
         raw_mismatches = payload.get("mismatches")
@@ -454,6 +458,22 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_verify_result.setPlainText("검증 실패: 새 검증 결과를 받지 못했습니다.")
         if isinstance(self.last_result, dict) and self.last_result.get("command") == "verify":
             self.last_result = None
+            self.btn_save_report.setEnabled(False)
+
+    def _mark_verify_result_stale_after_input_change(self):
+        if not hasattr(self, "txt_verify_result"):
+            return
+        if self.txt_verify_result.toPlainText().strip():
+            self.txt_verify_result.setPlainText("입력 정보가 변경되어 새 검증이 필요합니다.")
+        else:
+            self.txt_verify_result.clear()
+
+    def _invalidate_stale_reports_after_input_change(self):
+        self._reset_plan_summary_after_input_change()
+        self._mark_verify_result_stale_after_input_change()
+        if isinstance(self.last_result, dict) and self.last_result.get("command") in ("plan", "verify"):
+            self.last_result = None
+        if not self.last_result and hasattr(self, "btn_save_report"):
             self.btn_save_report.setEnabled(False)
 
     def _selected_direction(self) -> MigrationDirection:
@@ -881,6 +901,7 @@ class CrossEngineMigrationDialog(QDialog):
     def _lock_execution_due_to_input_change(self):
         if self._execution_unlocked:
             self._set_execution_unlocked(False)
+        self._invalidate_stale_reports_after_input_change()
 
     def _schema_is_empty(self) -> bool:
         try:

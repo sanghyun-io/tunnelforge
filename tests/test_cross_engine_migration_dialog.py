@@ -703,6 +703,58 @@ def test_execute_approval_invalidates_when_target_schema_changes():
         dialog.close()
 
 
+def test_schema_change_invalidates_stale_plan_and_verify_reports():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "plan",
+            "success": True,
+            "plan": {
+                "tables": [{"name": "users", "estimated_rows": 1000}],
+                "type_mappings": [{"source_type": "int", "target_type": "bigint"}],
+            },
+            "issues": [],
+        })
+        assert dialog._execution_unlocked
+        assert "int -> bigint" in dialog.lbl_plan_summary.text()
+        assert dialog.last_result["command"] == "plan"
+        assert dialog.btn_save_report.isEnabled()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "verify",
+            "success": False,
+            "mismatches": [
+                {
+                    "table": "users",
+                    "key": "id=7",
+                    "column": "email",
+                    "source_value": "a@example.com",
+                    "target_value": "b@example.com",
+                    "difference": "value_mismatch",
+                }
+            ],
+            "row_count_differences": [],
+        })
+        assert "users / id=7 / email" in dialog.txt_verify_result.toPlainText()
+        assert dialog.last_result["command"] == "verify"
+        assert dialog.btn_save_report.isEnabled()
+
+        dialog.target_form.input_schema.setText("changed_target")
+
+        assert not dialog._execution_unlocked
+        assert "int -> bigint" not in dialog.lbl_plan_summary.text()
+        assert "아직 실행 계획을 생성하지 않았습니다." in dialog.lbl_plan_summary.text()
+        verify_text = dialog.txt_verify_result.toPlainText()
+        assert "users / id=7 / email" not in verify_text
+        assert "새 검증이 필요합니다" in verify_text
+        assert dialog.last_result is None
+        assert not dialog.btn_save_report.isEnabled()
+    finally:
+        dialog.close()
+
+
 def test_execution_progress_prioritizes_current_table_and_chunk():
     dialog = make_dialog()
     try:
