@@ -1,6 +1,6 @@
 """MySQL <-> PostgreSQL migration dialog."""
 import json
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
@@ -49,7 +49,25 @@ class CrossEngineMigrationDialog(QDialog):
         self._current_command: Optional[str] = None
         self._pending_after_inspect: Optional[str] = None
         self._execution_unlocked = False
-        self.setWindowTitle("DB 전환")
+        self.step_ids: List[str] = [
+            "connections",
+            "inspect",
+            "safety",
+            "plan",
+            "execute",
+            "verify",
+        ]
+        self.step_titles: List[str] = [
+            "1. 연결 선택",
+            "2. Source 구조 분석",
+            "3. 전환 가능 여부 점검",
+            "4. 실행 계획 확인",
+            "5. 승인 및 전환 실행",
+            "6. 검증 및 결과 저장",
+        ]
+        self.current_step_id = self.step_ids[0]
+        self.step_pages: Dict[str, QWidget] = {}
+        self.setWindowTitle("DB 전환 마법사")
         self.resize(900, 700)
         self._setup_ui()
 
@@ -74,6 +92,9 @@ class CrossEngineMigrationDialog(QDialog):
         endpoint_layout.addWidget(self.source_form)
         endpoint_layout.addWidget(self.target_form)
         layout.addLayout(endpoint_layout)
+        self.lbl_direction_summary = QLabel()
+        self.lbl_direction_summary.setStyleSheet("font-weight: 600;")
+        layout.addWidget(self.lbl_direction_summary)
 
         option_group = QGroupBox("실행 옵션")
         option_layout = QHBoxLayout(option_group)
@@ -147,6 +168,9 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_save_report = QPushButton("결과 저장")
         self.btn_cancel = QPushButton("취소")
         self.btn_close = QPushButton("닫기")
+        self.btn_previous = QPushButton("이전")
+        self.btn_next = QPushButton("다음")
+        self.btn_full_run.hide()
         self.btn_migrate.setToolTip("대상 DB에 스키마 생성과 데이터 적재를 실행합니다.")
         self.btn_resume.setToolTip("저장된 상태부터 대상 DB 변경 작업을 재개합니다.")
         self.btn_migrate.setStyleSheet(
@@ -166,6 +190,8 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_save_report.clicked.connect(self._save_report)
         self.btn_cancel.clicked.connect(self._cancel_worker)
         self.btn_close.clicked.connect(self.close)
+        self.btn_previous.clicked.connect(self._go_previous_step)
+        self.btn_next.clicked.connect(self._go_next_step)
         self.btn_save_report.setEnabled(False)
         self.btn_cancel.setEnabled(False)
         self._update_execution_state(False)
@@ -188,6 +214,8 @@ class CrossEngineMigrationDialog(QDialog):
 
         control_layout.addWidget(self.btn_full_run)
         control_layout.addStretch()
+        control_layout.addWidget(self.btn_previous)
+        control_layout.addWidget(self.btn_next)
         control_layout.addWidget(self.btn_cancel)
         control_layout.addWidget(self.btn_close)
         action_layout.addLayout(control_layout)
@@ -198,6 +226,48 @@ class CrossEngineMigrationDialog(QDialog):
         self._connect_endpoint_lock_signals(self.target_form)
         self.source_form.combo_tunnel.currentIndexChanged.connect(self._sync_target_engine_filter)
         self._sync_target_engine_filter()
+        self.source_form.input_schema.textChanged.connect(self._refresh_direction_summary)
+        self.source_form.input_database.textChanged.connect(self._refresh_direction_summary)
+        self.target_form.input_schema.textChanged.connect(self._refresh_direction_summary)
+        self.target_form.input_database.textChanged.connect(self._refresh_direction_summary)
+        self._show_step("connections")
+
+    def _current_step_index(self) -> int:
+        return self.step_ids.index(self.current_step_id)
+
+    def _direction_label(self) -> str:
+        source_engine = "MySQL" if self.source_form.engine() == DatabaseEngine.MYSQL else "PostgreSQL"
+        target_engine = "MySQL" if self.target_form.engine() == DatabaseEngine.MYSQL else "PostgreSQL"
+        source_schema = self.source_form.input_schema.text().strip() or self.source_form.input_database.text().strip()
+        target_schema = self.target_form.input_schema.text().strip() or self.target_form.input_database.text().strip()
+        return f"{source_engine} {source_schema} -> {target_engine} {target_schema}"
+
+    def _refresh_direction_summary(self):
+        if hasattr(self, "lbl_direction_summary"):
+            self.lbl_direction_summary.setText(self._direction_label())
+
+    def _show_step(self, step_id: str):
+        self.current_step_id = step_id
+        for page_id, page in self.step_pages.items():
+            page.setVisible(page_id == step_id)
+        if hasattr(self, "btn_previous"):
+            self.btn_previous.setEnabled(self._current_step_index() > 0)
+        if hasattr(self, "btn_next"):
+            is_last = self._current_step_index() == len(self.step_ids) - 1
+            self.btn_next.setText("완료" if is_last else "다음")
+        self._refresh_direction_summary()
+
+    def _go_previous_step(self):
+        index = self._current_step_index()
+        if index > 0:
+            self._show_step(self.step_ids[index - 1])
+
+    def _go_next_step(self):
+        index = self._current_step_index()
+        if index >= len(self.step_ids) - 1:
+            self.close()
+            return
+        self._show_step(self.step_ids[index + 1])
 
     def _load_schema_json(self):
         path, _ = QFileDialog.getOpenFileName(

@@ -77,6 +77,27 @@ def make_dialog():
     return dialog
 
 
+def test_dialog_starts_as_guided_wizard_without_full_run_button():
+    dialog = make_dialog()
+    try:
+        assert dialog.windowTitle() == "DB 전환 마법사"
+        assert dialog.current_step_id == "connections"
+        assert dialog.step_titles == [
+            "1. 연결 선택",
+            "2. Source 구조 분석",
+            "3. 전환 가능 여부 점검",
+            "4. 실행 계획 확인",
+            "5. 승인 및 전환 실행",
+            "6. 검증 및 결과 저장",
+        ]
+        assert not dialog.btn_full_run.isVisible()
+        assert dialog.btn_previous.text() == "이전"
+        assert dialog.btn_next.text() == "다음"
+        assert dialog.lbl_direction_summary.text() == "MySQL source_db -> PostgreSQL target_db"
+    finally:
+        dialog.close()
+
+
 def test_dialog_initial_button_states_and_running_toggle():
     dialog = make_dialog()
     try:
