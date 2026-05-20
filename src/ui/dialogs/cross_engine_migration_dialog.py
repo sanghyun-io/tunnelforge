@@ -155,6 +155,22 @@ class CrossEngineMigrationDialog(QDialog):
         schema_layout.addWidget(self.txt_schema)
         self.step_page_layouts["inspect"].addWidget(schema_group, 1)
 
+        self.execution_group = QGroupBox("승인 및 전환 실행")
+        execution_layout = QVBoxLayout(self.execution_group)
+        self.lbl_execution_warning = QLabel("대상 schema 이름을 정확히 입력해야 DB 변경 실행이 활성화됩니다.")
+        self.lbl_execution_warning.setWordWrap(True)
+        self.input_approval_schema = QLineEdit()
+        self.input_approval_schema.setPlaceholderText("Target schema 이름 입력")
+        self.lbl_execution_phase = QLabel("실행 전")
+        self.lbl_current_table = QLabel("현재 테이블: -")
+        self.lbl_current_rows = QLabel("현재 rows: -")
+        execution_layout.addWidget(self.lbl_execution_warning)
+        execution_layout.addWidget(self.input_approval_schema)
+        execution_layout.addWidget(self.lbl_execution_phase)
+        execution_layout.addWidget(self.lbl_current_table)
+        execution_layout.addWidget(self.lbl_current_rows)
+        self.step_page_layouts["execute"].addWidget(self.execution_group)
+
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setMaximumBlockCount(1000)
@@ -223,6 +239,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_next.clicked.connect(self._go_next_step)
         self.btn_save_report.setEnabled(False)
         self.btn_cancel.setEnabled(False)
+        self.input_approval_schema.textChanged.connect(self._update_execution_state_from_approval)
         self._update_execution_state(False)
 
         self.plan_group = QGroupBox("실행 계획 확인")
@@ -560,9 +577,9 @@ class CrossEngineMigrationDialog(QDialog):
         self._append_log(f"[{command}] 시작")
         self._set_running(True)
         self.worker = CrossEngineMigrationWorker(command, payload)
-        self.worker.phase_changed.connect(lambda phase, message: self._append_log(f"[phase:{phase}] {message}"))
-        self.worker.table_progress.connect(lambda table, status: self._append_log(f"[table:{table}] {status}"))
-        self.worker.row_progress.connect(lambda table, rows, total: self._append_log(f"[rows:{table}] {rows}/{total if total is not None else '?'}"))
+        self.worker.phase_changed.connect(self._on_phase_changed)
+        self.worker.table_progress.connect(self._on_table_progress)
+        self.worker.row_progress.connect(self._on_row_progress)
         self.worker.checkpoint.connect(self._save_checkpoint)
         self.worker.issue.connect(lambda issue: self._append_log(f"[{issue.severity}] {issue.location}: {issue.message}"))
         self.worker.failed.connect(lambda message: self._append_log(f"[error] {message}"))
@@ -667,14 +684,14 @@ class CrossEngineMigrationDialog(QDialog):
                 self._current_command = None
 
     def _confirm_migration_execution(self) -> bool:
-        reply = QMessageBox.question(
+        if self._approval_matches_target_schema():
+            return True
+        QMessageBox.warning(
             self,
-            "DB 전환 실행 확인",
-            "대상 데이터베이스에 스키마 생성 및 데이터 적재를 실행합니다. 계속하시겠습니까?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
+            "승인 필요",
+            "Target schema 이름을 정확히 입력해야 DB 변경을 실행할 수 있습니다.",
         )
-        return reply == QMessageBox.StandardButton.Yes
+        return False
 
     def _cancel_worker(self):
         if self.worker and self.worker.isRunning():
@@ -746,16 +763,49 @@ class CrossEngineMigrationDialog(QDialog):
         self._update_execution_state(running)
 
     def _update_execution_state(self, running: bool):
+        approved = self._approval_matches_target_schema() if hasattr(self, "input_approval_schema") else True
+        can_execute = (not running) and self._execution_unlocked and approved
         if hasattr(self, "btn_migrate"):
-            self.btn_migrate.setEnabled((not running) and self._execution_unlocked)
+            self.btn_migrate.setEnabled(can_execute)
         if hasattr(self, "lbl_execution_lock"):
             if self._execution_unlocked:
-                self.lbl_execution_lock.setText("점검이 통과되어 DB 변경 실행을 사용할 수 있습니다.")
+                self.lbl_execution_lock.setText(
+                    "점검이 통과되었습니다. Target schema 이름 입력 후 DB 변경 실행을 사용할 수 있습니다."
+                )
             else:
                 self.lbl_execution_lock.setText("DB 변경 실행은 사전 점검 또는 계획 생성 성공 후 활성화됩니다.")
+        if hasattr(self, "btn_next"):
+            self.btn_next.setEnabled(self._next_enabled_for_current_step())
 
     def _approval_matches_target_schema(self) -> bool:
-        return True
+        expected = self.target_form.input_schema.text().strip() or self.target_form.input_database.text().strip()
+        if not expected:
+            expected = (
+                "public"
+                if self.target_form.engine() == DatabaseEngine.POSTGRESQL
+                else self.target_form.input_database.text().strip()
+            )
+        if not hasattr(self, "input_approval_schema"):
+            return False
+        return self.input_approval_schema.text().strip() == expected
+
+    def _update_execution_state_from_approval(self):
+        self._update_execution_state(bool(self.worker and self.worker.isRunning()))
+        if hasattr(self, "btn_next"):
+            self.btn_next.setEnabled(self._next_enabled_for_current_step())
+
+    def _on_phase_changed(self, phase: str, message: str):
+        self.lbl_execution_phase.setText(message or phase)
+        self._append_log(f"[phase:{phase}] {message}")
+
+    def _on_table_progress(self, table: str, status: str):
+        self.lbl_current_table.setText(f"현재 테이블: {table} ({status})")
+        self._append_log(f"[table:{table}] {status}")
+
+    def _on_row_progress(self, table: str, rows: int, total):
+        total_text = f"{int(total):,}" if total is not None else "?"
+        self.lbl_current_rows.setText(f"현재 rows: {int(rows):,} / {total_text} rows")
+        self._append_log(f"[rows:{table}] {rows}/{total if total is not None else '?'}")
 
     def _lock_execution_due_to_input_change(self):
         if self._execution_unlocked:

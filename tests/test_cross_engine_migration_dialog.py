@@ -462,11 +462,10 @@ def test_resume_migration_loads_state_and_starts_migrate(monkeypatch):
         dialog.close()
 
 
-def test_migrate_command_requires_confirmation(monkeypatch):
+def test_execute_requires_exact_target_schema_text_before_migrate(monkeypatch):
     dialog = make_dialog()
     started = []
     dialog._set_execution_unlocked(True)
-    monkeypatch.setattr(dialog, "_confirm_migration_execution", lambda: False)
     monkeypatch.setattr(
         dialog,
         "_start_command_with_payload",
@@ -474,11 +473,36 @@ def test_migrate_command_requires_confirmation(monkeypatch):
     )
 
     try:
+        dialog._show_step("execute")
+
+        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
+
+        dialog.input_approval_schema.setText("wrong")
+
+        assert not dialog.btn_migrate.isEnabled()
+
+        dialog.input_approval_schema.setText("target_db")
+
+        assert dialog.btn_migrate.isEnabled()
         dialog._start_command("migrate")
 
-        assert started == []
-        assert dialog._workflow_active is False
-        assert dialog._current_command is None
+        assert started
+        assert started[0][0][0] == "migrate"
+    finally:
+        dialog.close()
+
+
+def test_execution_progress_prioritizes_current_table_and_chunk():
+    dialog = make_dialog()
+    try:
+        dialog._on_phase_changed("copy", "copying data")
+        dialog._on_table_progress("users", "running")
+        dialog._on_row_progress("users", 5000, 20000)
+
+        assert "users" in dialog.lbl_current_table.text()
+        assert "5,000 / 20,000 rows" in dialog.lbl_current_rows.text()
+        assert "copying data" in dialog.lbl_execution_phase.text()
     finally:
         dialog.close()
 
@@ -495,8 +519,12 @@ def test_db_change_unlocks_after_preflight_success_and_locks_on_input_change():
             "issues": [],
         })
 
+        assert not dialog.btn_migrate.isEnabled()
+        assert "Target schema 이름 입력 후" in dialog.lbl_execution_lock.text()
+
+        dialog.input_approval_schema.setText("target_db")
+
         assert dialog.btn_migrate.isEnabled()
-        assert "DB 변경 실행을 사용할 수 있습니다" in dialog.lbl_execution_lock.text()
 
         dialog.source_form.input_database.setText("changed_schema")
 
@@ -762,6 +790,9 @@ def test_preflight_success_with_nonblocking_target_warning_unlocks_execution():
                 }
             ],
         })
+
+        assert not dialog.btn_migrate.isEnabled()
+        dialog.input_approval_schema.setText("target_db")
 
         assert dialog.btn_migrate.isEnabled()
         assert "기존 테이블 또는 데이터 차단 이슈가 없습니다" in dialog.lbl_target_safety.text()
