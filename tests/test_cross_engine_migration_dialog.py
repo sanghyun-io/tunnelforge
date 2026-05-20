@@ -8,6 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PyQt6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
+from src.core.cross_engine_migration import MigrationIssue
 from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationDialog
 
 
@@ -286,6 +287,77 @@ def test_wizard_next_requires_current_step_completion():
             "mismatches": [],
         })
         assert dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_safety_step_shows_activity_bar_and_recent_log_while_preflight_runs():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("safety")
+        dialog.show()
+        app.processEvents()
+
+        assert not dialog.safety_activity_bar.isVisible()
+
+        dialog._current_command = "preflight"
+        dialog._set_running(True)
+        app.processEvents()
+
+        assert dialog.safety_activity_bar.isVisible()
+        assert dialog.safety_activity_bar.minimum() == 0
+        assert dialog.safety_activity_bar.maximum() == 0
+        assert "전환 가능 여부 점검 중" in dialog.lbl_safety_activity.text()
+        assert "전환 가능 여부 점검을 시작했습니다" in dialog.txt_safety_log.toPlainText()
+        assert not dialog.btn_run_safety.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_safety_activity_updates_from_preflight_phase_and_stops_on_finish():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("safety")
+        dialog.show()
+        app.processEvents()
+
+        dialog._current_command = "preflight"
+        dialog._set_running(True)
+        dialog._on_phase_changed("preflight", "checking target state")
+        before_tick = dialog.lbl_safety_activity.text()
+
+        assert "Target 상태 확인 중" in before_tick
+        assert "Target 상태 확인 중" in dialog.txt_safety_log.toPlainText()
+
+        dialog._tick_safety_activity()
+
+        assert dialog.lbl_safety_activity.text() != before_tick
+
+        dialog._on_finished(True, {"command": "preflight", "success": True})
+        app.processEvents()
+
+        assert not dialog.safety_activity_bar.isVisible()
+        assert "점검 완료" in dialog.lbl_safety_activity.text()
+    finally:
+        dialog.close()
+
+
+def test_safety_issue_is_visible_in_recent_log():
+    dialog = make_dialog()
+    issue = MigrationIssue(
+        severity="warning",
+        location="target",
+        message="existing table check skipped",
+    )
+    try:
+        dialog._show_step("safety")
+        dialog._current_command = "preflight"
+        dialog._set_running(True)
+
+        dialog._on_issue(issue)
+
+        assert "[warning] target: existing table check skipped" in dialog.txt_safety_log.toPlainText()
+        assert "[warning] target: existing table check skipped" in dialog.txt_log.toPlainText()
     finally:
         dialog.close()
 

@@ -838,7 +838,7 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         }
         "job.cancel" => emit_all_events(job_cancel(&request), emit),
         "inspect" => emit_all_events(inspect(&request), emit),
-        "preflight" => emit_all_events(preflight(&request), emit),
+        "preflight" => preflight_streaming(&request, emit),
         "readiness" => emit_all_events(readiness(&request), emit),
         "guide" => emit_all_events(guide(&request), emit),
         "plan" => emit_all_events(plan(&request), emit),
@@ -4072,31 +4072,50 @@ fn inspect_postgresql_unsupported_objects(
     Ok(objects)
 }
 
-fn preflight(request: &Request) -> Vec<Value> {
-    let mut events = vec![phase_event(
+fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
+    emit(phase_event(
         request,
         "preflight",
         "preflight checks started",
-    )];
+    ));
     let mut issues = preflight_issues(&request.payload);
+    emit(phase_event(
+        request,
+        "preflight",
+        "schema compatibility checks completed",
+    ));
+    emit(phase_event(
+        request,
+        "preflight",
+        "checking target state",
+    ));
     issues.extend(live_preflight_issues(&request.payload));
+    emit(phase_event(
+        request,
+        "preflight",
+        "target state checks completed",
+    ));
 
     for issue in &issues {
-        events.push(json!({
+        emit(json!({
             "event": "issue",
             "request_id": request.request_id,
             "issue": issue
         }));
     }
 
-    events.push(json!({
+    emit(phase_event(
+        request,
+        "preflight",
+        "preflight result ready",
+    ));
+    emit(json!({
         "event": "result",
         "request_id": request.request_id,
         "command": "preflight",
         "success": !issues.iter().any(|issue| issue.blocking),
         "issues": issues
     }));
-    events
 }
 
 fn readiness(request: &Request) -> Vec<Value> {
@@ -9481,6 +9500,40 @@ mod tests {
         assert_eq!(unsupported.severity, "warning");
         assert!(!unsupported.blocking);
         assert!(issues.iter().any(|issue| issue.location == "users_grants"));
+    }
+
+    #[test]
+    fn preflight_emits_actionable_phase_events_before_result() {
+        let events = handle_request(Request {
+            command: "preflight".to_string(),
+            request_id: Some("preflight-1".to_string()),
+            payload: json!({
+                "source_engine": "mysql",
+                "target_engine": "postgresql",
+                "schema": {"tables": []},
+                "options": {"mode": "append"}
+            }),
+        });
+
+        let phase_messages: Vec<&str> = events
+            .iter()
+            .filter(|event| event.get("event") == Some(&json!("phase")))
+            .filter_map(|event| event.get("message").and_then(Value::as_str))
+            .collect();
+        let result_index = events
+            .iter()
+            .position(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+        let last_phase_index = events
+            .iter()
+            .rposition(|event| event.get("event") == Some(&json!("phase")))
+            .unwrap();
+
+        assert!(phase_messages.contains(&"preflight checks started"));
+        assert!(phase_messages.contains(&"schema compatibility checks completed"));
+        assert!(phase_messages.contains(&"target state checks completed"));
+        assert!(phase_messages.contains(&"preflight result ready"));
+        assert!(last_phase_index < result_index);
     }
 
     #[test]

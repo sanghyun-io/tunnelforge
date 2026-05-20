@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSpinBox,
     QVBoxLayout,
@@ -52,6 +53,11 @@ class CrossEngineMigrationDialog(QDialog):
         self._pending_after_inspect: Optional[str] = None
         self._execution_unlocked = False
         self._verify_result_received = False
+        self._safety_activity_base = ""
+        self._safety_activity_dots = 0
+        self.safety_activity_timer = QTimer(self)
+        self.safety_activity_timer.setInterval(450)
+        self.safety_activity_timer.timeout.connect(self._tick_safety_activity)
         self.step_ids: List[str] = [
             "connections",
             "inspect",
@@ -285,10 +291,22 @@ class CrossEngineMigrationDialog(QDialog):
 
         self.safety_group = QGroupBox("전환 가능 여부 점검")
         safety_layout = QVBoxLayout(self.safety_group)
+        safety_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         self.lbl_safety_summary = QLabel("아직 전환 가능 여부를 점검하지 않았습니다.")
         self.lbl_safety_summary.setWordWrap(True)
         self.lbl_target_safety = QLabel("Target 상태를 아직 확인하지 않았습니다.")
         self.lbl_target_safety.setWordWrap(True)
+        self.lbl_safety_activity = QLabel("대기 중")
+        self.lbl_safety_activity.setObjectName("MutedHelp")
+        self.lbl_safety_activity.setWordWrap(True)
+        self.safety_activity_bar = QProgressBar()
+        self.safety_activity_bar.setRange(0, 0)
+        self.safety_activity_bar.hide()
+        self.txt_safety_log = QPlainTextEdit()
+        self.txt_safety_log.setReadOnly(True)
+        self.txt_safety_log.setMaximumBlockCount(80)
+        self.txt_safety_log.setFixedHeight(110)
+        self.txt_safety_log.setPlaceholderText("전환 가능 여부 점검의 최근 진행 상황이 표시됩니다.")
         self.btn_target_advanced = QPushButton("고급 설정 열기")
         self.btn_target_advanced.hide()
         self.btn_target_advanced.clicked.connect(self._open_target_advanced_options)
@@ -296,6 +314,9 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_run_safety.clicked.connect(lambda: self._start_command("preflight"))
         safety_layout.addWidget(self.lbl_safety_summary)
         safety_layout.addWidget(self.lbl_target_safety)
+        safety_layout.addWidget(self.lbl_safety_activity)
+        safety_layout.addWidget(self.safety_activity_bar)
+        safety_layout.addWidget(self.txt_safety_log)
         safety_layout.addWidget(self.btn_target_advanced)
         safety_layout.addWidget(self.btn_run_safety)
         self.step_page_layouts["safety"].addWidget(self.safety_group)
@@ -838,8 +859,9 @@ class CrossEngineMigrationDialog(QDialog):
         self.worker.table_progress.connect(self._on_table_progress)
         self.worker.row_progress.connect(self._on_row_progress)
         self.worker.checkpoint.connect(self._save_checkpoint)
-        self.worker.issue.connect(lambda issue: self._append_log(f"[{issue.severity}] {issue.location}: {issue.message}"))
-        self.worker.failed.connect(lambda message: self._append_log(f"[error] {message}"))
+        self.worker.issue.connect(self._on_issue)
+        self.worker.log_message.connect(self._append_log)
+        self.worker.failed.connect(self._on_worker_failed)
         self.worker.result.connect(self._on_result)
         self.worker.finished.connect(self._on_finished)
         self.worker.start()
@@ -940,6 +962,8 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _on_finished(self, success: bool, payload):
         self._set_running(False)
+        if self._current_command == "preflight":
+            self._finish_safety_activity(success)
         if self._current_command == "plan" and not success:
             self._step_completed["plan"] = False
             self._reset_plan_summary_after_failure()
@@ -1010,6 +1034,8 @@ class CrossEngineMigrationDialog(QDialog):
             QMessageBox.critical(self, "저장 실패", str(exc))
 
     def _set_running(self, running: bool):
+        if self._current_command == "preflight" and running:
+            self._start_safety_activity("전환 가능 여부 점검 중")
         for button in (
             self.btn_full_run,
             self.btn_auto_inspect,
@@ -1071,6 +1097,20 @@ class CrossEngineMigrationDialog(QDialog):
     def _on_phase_changed(self, phase: str, message: str):
         self.lbl_execution_phase.setText(message or phase)
         self._append_log(f"[phase:{phase}] {message}")
+        if phase == "preflight" or self._current_command == "preflight":
+            self._update_safety_activity(message or phase)
+
+    def _on_issue(self, issue):
+        line = f"[{issue.severity}] {issue.location}: {issue.message}"
+        self._append_log(line)
+        if self._current_command == "preflight":
+            self._append_safety_log(line)
+
+    def _on_worker_failed(self, message: str):
+        line = f"[error] {message}"
+        self._append_log(line)
+        if self._current_command == "preflight":
+            self._append_safety_log(line)
 
     def _on_table_progress(self, table: str, status: str):
         self.lbl_current_table.setText(f"현재 테이블: {table} ({status})")
@@ -1120,6 +1160,57 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _append_log(self, message: str):
         self.txt_log.appendPlainText(message)
+
+    def _append_safety_log(self, message: str):
+        if hasattr(self, "txt_safety_log"):
+            self.txt_safety_log.appendPlainText(message)
+
+    def _safety_activity_text(self, message: str) -> str:
+        text = (message or "").strip()
+        lowered = text.lower()
+        if "target state" in lowered and "completed" not in lowered:
+            return "Target 상태 확인 중"
+        if "target state" in lowered:
+            return "Target 상태 확인 완료"
+        if "schema compatibility" in lowered:
+            return "Source schema 호환성 확인 완료"
+        if "result ready" in lowered:
+            return "점검 결과 정리 중"
+        if "preflight checks started" in lowered or lowered == "preflight":
+            return "전환 가능 여부 점검 중"
+        return text or "전환 가능 여부 점검 중"
+
+    def _start_safety_activity(self, message: str):
+        self._safety_activity_base = self._safety_activity_text(message)
+        self._safety_activity_dots = 0
+        self.lbl_safety_activity.setText(self._safety_activity_base)
+        self.safety_activity_bar.show()
+        if not self.safety_activity_timer.isActive():
+            self.safety_activity_timer.start()
+        if "전환 가능 여부 점검을 시작했습니다" not in self.txt_safety_log.toPlainText():
+            self._append_safety_log("전환 가능 여부 점검을 시작했습니다.")
+
+    def _update_safety_activity(self, message: str):
+        self._safety_activity_base = self._safety_activity_text(message)
+        self._safety_activity_dots = 0
+        self.lbl_safety_activity.setText(self._safety_activity_base)
+        self._append_safety_log(self._safety_activity_base)
+
+    def _tick_safety_activity(self):
+        if not self._safety_activity_base:
+            return
+        self._safety_activity_dots = (self._safety_activity_dots % 3) + 1
+        self.lbl_safety_activity.setText(
+            f"{self._safety_activity_base}{'.' * self._safety_activity_dots}"
+        )
+
+    def _finish_safety_activity(self, success: bool):
+        self.safety_activity_timer.stop()
+        self.safety_activity_bar.hide()
+        self._safety_activity_base = ""
+        text = "점검 완료" if success else "점검 실패"
+        self.lbl_safety_activity.setText(text)
+        self._append_safety_log(text)
 
     def closeEvent(self, a0: Optional[QCloseEvent]):
         assert a0 is not None
