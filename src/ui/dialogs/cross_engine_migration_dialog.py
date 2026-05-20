@@ -274,13 +274,12 @@ class CrossEngineMigrationDialog(QDialog):
         schema_data: Dict[str, Any] = schema if isinstance(schema, dict) else {}
         raw_tables = schema_data.get("tables")
         tables: List[Any] = cast(List[Any], raw_tables) if isinstance(raw_tables, list) else []
-        table_count = len(tables)
+        valid_tables: List[Dict[str, Any]] = [table for table in tables if isinstance(table, dict)]
+        table_count = len(valid_tables)
         column_count = 0
         index_count = 0
         foreign_key_count = 0
-        for table in tables:
-            if not isinstance(table, dict):
-                continue
+        for table in valid_tables:
             raw_columns = table.get("columns")
             columns: List[Any] = cast(List[Any], raw_columns) if isinstance(raw_columns, list) else []
             raw_indexes = table.get("indexes")
@@ -460,6 +459,8 @@ class CrossEngineMigrationDialog(QDialog):
                 self._append_log(
                     f"지원 제외 객체 {len(self.unsupported_objects)}개를 preflight warning 대상으로 저장했습니다."
                 )
+        elif payload.get("command") == "inspect":
+            self.unsupported_objects = []
         if schema is not None:
             self._update_source_summary(schema)
         if payload.get("command") == "readiness":

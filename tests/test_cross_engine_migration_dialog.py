@@ -295,6 +295,56 @@ def test_inspect_result_shows_readable_source_summary_and_hides_json_by_default(
         dialog.close()
 
 
+def test_source_summary_counts_only_valid_tables_and_handles_partial_schema():
+    dialog = make_dialog()
+    schema = {
+        "tables": [
+            {"name": "users", "columns": [{"name": "id"}], "indexes": "bad", "foreign_keys": []},
+            "not-a-table",
+            {"name": "orders", "columns": None, "indexes": [{"name": "idx_orders"}]},
+            None,
+            {"name": "logs", "foreign_keys": [{"name": "fk_logs_users"}]},
+        ]
+    }
+    try:
+        summary = dialog._schema_summary_text(schema, ["view:active_users"])
+
+        assert "테이블 3개" in summary
+        assert "컬럼 1개" in summary
+        assert "인덱스 1개" in summary
+        assert "FK 1개" in summary
+        assert "지원 제외 1개" in summary
+    finally:
+        dialog.close()
+
+
+def test_inspect_result_clears_stale_unsupported_objects_when_next_inspect_omits_them():
+    dialog = make_dialog()
+    first_schema = {"tables": [{"name": "users", "columns": [{"name": "id"}]}]}
+    second_schema = {"tables": [{"name": "orders", "columns": [{"name": "id"}]}]}
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "inspect",
+            "success": True,
+            "schema": first_schema,
+            "unsupported_objects": ["view:active_users"],
+        })
+        assert dialog._payload()["unsupported_objects"] == ["view:active_users"]
+
+        dialog._on_result({
+            "event": "result",
+            "command": "inspect",
+            "success": True,
+            "schema": second_schema,
+        })
+
+        assert "지원 제외 0개" in dialog.lbl_source_summary.text()
+        assert "unsupported_objects" not in dialog._payload()
+    finally:
+        dialog.close()
+
+
 def test_empty_schema_runs_inspect_before_requested_plan(monkeypatch):
     dialog = make_dialog()
     started = []
