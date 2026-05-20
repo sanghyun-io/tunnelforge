@@ -2,6 +2,7 @@ import json
 import os
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -575,6 +576,10 @@ def test_inspect_result_enables_report_and_updates_schema():
         ]
     }
     try:
+        dialog._show_step("inspect")
+        dialog.show()
+        app.processEvents()
+
         dialog._on_result({
             "event": "result",
             "command": "inspect",
@@ -586,6 +591,7 @@ def test_inspect_result_enables_report_and_updates_schema():
         assert dialog.btn_save_report.isEnabled()
         assert json.loads(dialog.txt_schema.toPlainText()) == schema
         assert "테이블 1개" in dialog.lbl_source_summary.text()
+        assert not dialog.btn_auto_inspect.isVisible()
         assert dialog._payload()["unsupported_objects"] == ["view:active_users"]
         assert "스키마 검사 결과를 입력에 반영했습니다." in dialog.txt_log.toPlainText()
     finally:
@@ -756,6 +762,74 @@ def test_migrate_result_saves_resume_state(monkeypatch, tmp_path):
         assert saved["key"]
         assert "재개 상태 저장" in dialog.txt_log.toPlainText()
     finally:
+        dialog.close()
+
+
+def test_migrate_failure_shows_human_readable_issue_and_cleanup_action():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("execute")
+        dialog.show()
+        app.processEvents()
+        dialog._on_result({
+            "event": "result",
+            "command": "migrate",
+            "success": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "location": "localized_strings",
+                    "message": "postgresql insert error: duplicate key",
+                    "suggestion": "Clean the failed target tables and retry.",
+                    "blocking": True,
+                }
+            ],
+            "state": {"tables": [{"table": "localized_strings", "completed": False}]},
+        })
+
+        assert "DB 변경 실패" in dialog.lbl_execution_phase.text()
+        assert "localized_strings" in dialog.lbl_current_table.text()
+        assert "duplicate key" in dialog.txt_log.toPlainText()
+        assert dialog.btn_cleanup_failed.isVisible()
+    finally:
+        dialog.close()
+
+
+def test_command_start_resets_stale_execution_state():
+    dialog = make_dialog()
+    try:
+        dialog.lbl_execution_phase.setText("이전 실패")
+        dialog.lbl_current_table.setText("현재 테이블: old_table (completed)")
+        dialog.lbl_current_rows.setText("현재 rows: 30,000 / 54,429 rows")
+        dialog.txt_log.setPlainText("old json payload")
+        dialog.btn_cleanup_failed.show()
+
+        dialog._reset_command_ui("migrate")
+
+        assert "DB 변경 준비 중" in dialog.lbl_execution_phase.text()
+        assert dialog.lbl_current_table.text() == "현재 테이블: -"
+        assert dialog.lbl_current_rows.text() == "현재 rows: -"
+        assert dialog.txt_log.toPlainText() == ""
+        assert not dialog.btn_cleanup_failed.isVisible()
+    finally:
+        dialog.close()
+
+
+def test_finished_clears_worker_before_refreshing_navigation_hint():
+    class StillRunningWorker:
+        def isRunning(self):
+            return True
+
+    dialog = make_dialog()
+    try:
+        dialog.worker = cast(Any, StillRunningWorker())
+        dialog._current_command = "migrate"
+        dialog._on_finished(False, {"command": "migrate", "success": False})
+
+        assert dialog.worker is None
+        assert "현재 작업이 실행 중입니다" not in dialog.lbl_next_hint.text()
+    finally:
+        dialog.worker = None
         dialog.close()
 
 
@@ -1270,9 +1344,11 @@ def test_preflight_success_with_nonblocking_target_warning_unlocks_execution():
         dialog.close()
 
 
-def test_target_advanced_button_moves_to_plan_step_and_logs_context():
+def test_target_advanced_button_expands_inline_without_leaving_safety_step():
     dialog = make_dialog()
     try:
+        dialog.show()
+        app.processEvents()
         dialog._on_result({
             "event": "result",
             "command": "preflight",
@@ -1289,8 +1365,41 @@ def test_target_advanced_button_moves_to_plan_step_and_logs_context():
 
         dialog.btn_target_advanced.click()
 
-        assert dialog.current_step_id == "plan"
-        assert "고급 Target 처리 설정은 실행 옵션에서 확인합니다" in dialog.txt_log.toPlainText()
+        assert dialog.current_step_id == "safety"
+        assert dialog.target_advanced_panel.isVisible()
+        assert "Target이 비어 있지 않으면" in dialog.target_advanced_panel.text()
+    finally:
+        dialog.close()
+
+
+def test_cleanup_failed_migration_requires_schema_approval(monkeypatch):
+    dialog = make_dialog()
+    started = []
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda command, payload, workflow=False: started.append((command, payload, workflow)),
+    )
+    try:
+        dialog._show_step("execute")
+        dialog.show()
+        app.processEvents()
+        dialog.btn_cleanup_failed.show()
+
+        dialog._cleanup_failed_migration()
+
+        assert started == []
+        assert warnings
+
+        dialog.input_approval_schema.setText("target_db")
+        dialog._cleanup_failed_migration()
+
+        assert started[0][0] == "cleanup"
     finally:
         dialog.close()
 

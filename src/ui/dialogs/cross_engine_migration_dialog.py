@@ -277,11 +277,15 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_execution_phase = QLabel("실행 전")
         self.lbl_current_table = QLabel("현재 테이블: -")
         self.lbl_current_rows = QLabel("현재 rows: -")
+        self.lbl_migration_result = QLabel("")
+        self.lbl_migration_result.setWordWrap(True)
+        self.lbl_migration_result.hide()
         execution_layout.addWidget(self.lbl_execution_warning)
         execution_layout.addWidget(self.input_approval_schema)
         execution_layout.addWidget(self.lbl_execution_phase)
         execution_layout.addWidget(self.lbl_current_table)
         execution_layout.addWidget(self.lbl_current_rows)
+        execution_layout.addWidget(self.lbl_migration_result)
         self.step_page_layouts["execute"].addWidget(self.execution_group)
 
         self.txt_log = QPlainTextEdit()
@@ -307,6 +311,13 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_safety_log.setMaximumBlockCount(80)
         self.txt_safety_log.setFixedHeight(110)
         self.txt_safety_log.setPlaceholderText("전환 가능 여부 점검의 최근 진행 상황이 표시됩니다.")
+        self.target_advanced_panel = QLabel(
+            "Target이 비어 있지 않으면 기존 테이블을 정리한 뒤 다시 점검하세요. "
+            "create_only 해제는 기존 데이터와 섞일 수 있어 권장하지 않습니다."
+        )
+        self.target_advanced_panel.setObjectName("MutedHelp")
+        self.target_advanced_panel.setWordWrap(True)
+        self.target_advanced_panel.hide()
         self.btn_target_advanced = QPushButton("고급 설정 열기")
         self.btn_target_advanced.hide()
         self.btn_target_advanced.clicked.connect(self._open_target_advanced_options)
@@ -317,6 +328,7 @@ class CrossEngineMigrationDialog(QDialog):
         safety_layout.addWidget(self.lbl_safety_activity)
         safety_layout.addWidget(self.safety_activity_bar)
         safety_layout.addWidget(self.txt_safety_log)
+        safety_layout.addWidget(self.target_advanced_panel)
         safety_layout.addWidget(self.btn_target_advanced)
         safety_layout.addWidget(self.btn_run_safety)
         self.step_page_layouts["safety"].addWidget(self.safety_group)
@@ -341,6 +353,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_run_plan = self.btn_plan
         self.btn_migrate = QPushButton("DB 변경 실행")
         self.btn_resume = QPushButton("재개(DB 변경)")
+        self.btn_cleanup_failed = QPushButton("실패한 전환 정리")
         self.btn_verify = QPushButton("검증")
         self.btn_save_report = QPushButton("결과 저장")
         self.btn_cancel = QPushButton("취소")
@@ -352,6 +365,8 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_full_run.hide()
         self.btn_migrate.setToolTip("대상 DB에 스키마 생성과 데이터 적재를 실행합니다.")
         self.btn_resume.setToolTip("저장된 상태부터 대상 DB 변경 작업을 재개합니다.")
+        self.btn_cleanup_failed.setToolTip("실패한 전환에서 생성된 Target 테이블을 정리합니다.")
+        self.btn_cleanup_failed.hide()
         self.btn_migrate.setStyleSheet(
             "QPushButton { background-color: #b42318; color: white; font-weight: 600; }"
             "QPushButton:disabled { background-color: #d0d5dd; color: #667085; }"
@@ -365,6 +380,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_plan.clicked.connect(lambda: self._start_command("plan"))
         self.btn_migrate.clicked.connect(lambda: self._start_command("migrate"))
         self.btn_resume.clicked.connect(self._resume_migration)
+        self.btn_cleanup_failed.clicked.connect(self._cleanup_failed_migration)
         self.btn_verify.clicked.connect(lambda: self._start_command("verify"))
         self.btn_save_report.clicked.connect(self._save_report)
         self.btn_cancel.clicked.connect(self._cancel_worker)
@@ -396,6 +412,7 @@ class CrossEngineMigrationDialog(QDialog):
         execute_action_layout = QHBoxLayout()
         execute_action_layout.addWidget(self.btn_migrate)
         execute_action_layout.addWidget(self.btn_resume)
+        execute_action_layout.addWidget(self.btn_cleanup_failed)
         execute_action_layout.addStretch()
         self.step_page_layouts["execute"].insertLayout(0, execute_action_layout)
 
@@ -672,9 +689,7 @@ class CrossEngineMigrationDialog(QDialog):
         return False
 
     def _open_target_advanced_options(self):
-        self._show_step("plan")
-        self.spin_chunk_size.setFocus(Qt.FocusReason.OtherFocusReason)
-        self._append_log("고급 Target 처리 설정은 실행 옵션에서 확인합니다.")
+        self.target_advanced_panel.setVisible(not self.target_advanced_panel.isVisible())
 
     def _next_enabled_for_current_step(self) -> bool:
         if self.worker and self.worker.isRunning():
@@ -852,6 +867,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._current_command = command
         if command == "verify":
             self._verify_result_received = False
+        self._reset_command_ui(command)
         self._append_log(f"[{command}] 시작")
         self._set_running(True)
         self.worker = CrossEngineMigrationWorker(command, payload)
@@ -884,6 +900,8 @@ class CrossEngineMigrationDialog(QDialog):
             self._set_execution_unlocked(False)
             table_count = len(schema.get("tables", [])) if isinstance(schema.get("tables"), list) else 0
             self.lbl_schema_status.setText(f"Rust Core 검사 완료: {table_count}개 테이블")
+            if payload.get("success"):
+                self.btn_auto_inspect.hide()
             self._append_log("스키마 검사 결과를 입력에 반영했습니다.")
         unsupported_objects = payload.get("unsupported_objects")
         if isinstance(unsupported_objects, list):
@@ -918,7 +936,8 @@ class CrossEngineMigrationDialog(QDialog):
                 self._append_log("차단 이슈가 있어 DB 변경 실행은 계속 잠겨 있습니다.")
         if payload.get("command") == "migrate":
             self._step_completed["execute"] = bool(payload.get("success"))
-        if payload.get("command") != "readiness":
+            self._update_migration_result_summary(payload)
+        if payload.get("command") not in ("readiness", "migrate"):
             self._append_log(json.dumps(payload, ensure_ascii=False, indent=2))
         self._refresh_navigation_state()
 
@@ -961,25 +980,38 @@ class CrossEngineMigrationDialog(QDialog):
             )
 
     def _on_finished(self, success: bool, payload):
+        finished_command = self._current_command
+        self.worker = None
         self._set_running(False)
-        if self._current_command == "preflight":
+        if finished_command == "preflight":
             self._finish_safety_activity(success)
-        if self._current_command == "plan" and not success:
+        if finished_command == "plan" and not success:
             self._step_completed["plan"] = False
             self._reset_plan_summary_after_failure()
-        if self._current_command == "verify" and not success and not self._verify_result_received:
+        if finished_command == "verify" and not success and not self._verify_result_received:
             self._step_completed["verify"] = False
             self._mark_verify_result_stale()
-        if self._current_command == "migrate" and not success:
+        if finished_command == "migrate" and not success:
             self._step_completed["execute"] = False
+            if not self.lbl_migration_result.isVisible():
+                self.lbl_migration_result.setText("DB 변경 실패: Rust Core가 상세 실패 원인을 반환하지 않았습니다.")
+                self.lbl_migration_result.show()
+                self.btn_cleanup_failed.show()
+        if finished_command == "cleanup" and success:
+            self.btn_cleanup_failed.hide()
+            self.lbl_migration_result.setText("실패한 전환 정리가 완료되었습니다. 전환 가능 여부 점검을 다시 실행하세요.")
+            self.lbl_migration_result.show()
         self._append_log("완료" if success else "실패")
-        if self._workflow_active and self._current_command:
-            next_command = next_workflow_command(self._current_command, success)
+        if self._workflow_active and finished_command:
+            next_command = next_workflow_command(finished_command, success)
             if next_command:
                 QTimer.singleShot(0, lambda: self._start_command(next_command, workflow=True))
             else:
                 self._workflow_active = False
                 self._current_command = None
+        elif finished_command == "cleanup":
+            self._current_command = None
+        self._refresh_navigation_state()
 
     def _confirm_migration_execution(self) -> bool:
         if self._approval_matches_target_schema():
@@ -1010,6 +1042,21 @@ class CrossEngineMigrationDialog(QDialog):
             return
         payload["state"] = state
         self._start_command_with_payload("migrate", payload)
+
+    def _cleanup_failed_migration(self):
+        if not self._approval_matches_target_schema():
+            QMessageBox.warning(
+                self,
+                "승인 필요",
+                "Target schema 이름을 정확히 입력해야 실패한 전환 정리를 실행할 수 있습니다.",
+            )
+            return
+        try:
+            payload = self._payload(prepare_tunnels=True)
+        except ValueError as exc:
+            QMessageBox.warning(self, "입력 오류", str(exc))
+            return
+        self._start_command_with_payload("cleanup", payload)
 
     def _save_report(self):
         if not self.last_result:
@@ -1047,6 +1094,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_plan,
             self.btn_migrate,
             self.btn_resume,
+            self.btn_cleanup_failed,
             self.btn_verify,
         ):
             button.setEnabled(not running)
@@ -1120,6 +1168,69 @@ class CrossEngineMigrationDialog(QDialog):
         total_text = f"{int(total):,}" if total is not None else "?"
         self.lbl_current_rows.setText(f"현재 rows: {int(rows):,} / {total_text} rows")
         self._append_log(f"[rows:{table}] {rows}/{total if total is not None else '?'}")
+
+    def _reset_command_ui(self, command: str):
+        if command in ("migrate", "cleanup"):
+            self.lbl_execution_phase.setText("DB 변경 준비 중" if command == "migrate" else "정리 준비 중")
+            self.lbl_current_table.setText("현재 테이블: -")
+            self.lbl_current_rows.setText("현재 rows: -")
+            self.lbl_migration_result.clear()
+            self.lbl_migration_result.hide()
+            self.txt_log.clear()
+            self.btn_cleanup_failed.hide()
+        if command == "inspect":
+            self.btn_auto_inspect.show()
+        if command == "preflight":
+            self.txt_safety_log.clear()
+            self.target_advanced_panel.hide()
+
+    def _update_migration_result_summary(self, payload: Dict):
+        issues = payload.get("issues")
+        issue_list: List[Dict[str, Any]] = (
+            [cast(Dict[str, Any], issue) for issue in issues if isinstance(issue, dict)]
+            if isinstance(issues, list)
+            else []
+        )
+        success = bool(payload.get("success"))
+        if success:
+            self.lbl_execution_phase.setText("DB 변경 완료")
+            self.lbl_migration_result.setText("DB 변경이 완료되었습니다. 다음 단계에서 검증을 실행하세요.")
+            self.lbl_migration_result.show()
+            self.btn_cleanup_failed.hide()
+            return
+
+        first_issue: Dict[str, Any] = issue_list[0] if issue_list else {}
+        location = str(first_issue.get("location", "")).strip()
+        message = str(first_issue.get("message", "")).strip()
+        suggestion = str(first_issue.get("suggestion", "")).strip()
+        raw_state = payload.get("state")
+        state: Dict[str, Any] = cast(Dict[str, Any], raw_state) if isinstance(raw_state, dict) else {}
+        raw_tables = state.get("tables")
+        tables: List[Any] = cast(List[Any], raw_tables) if isinstance(raw_tables, list) else []
+        failed_table = location or next(
+            (
+                str(table.get("table", ""))
+                for table in tables
+                if isinstance(table, dict) and not table.get("completed")
+            ),
+            "",
+        )
+        self.lbl_execution_phase.setText("DB 변경 실패")
+        if failed_table:
+            self.lbl_current_table.setText(f"실패 테이블: {failed_table}")
+        lines = ["DB 변경 실패"]
+        if failed_table:
+            lines.append(f"실패 위치: {failed_table}")
+        if message:
+            lines.append(f"원인: {message}")
+        if suggestion:
+            lines.append(f"다음 행동: {suggestion}")
+        else:
+            lines.append("다음 행동: Target 정리 후 전환 가능 여부 점검부터 다시 실행하세요.")
+        self.lbl_migration_result.setText("\n".join(lines))
+        self.lbl_migration_result.show()
+        self.btn_cleanup_failed.show()
+        self._append_log("\n".join(lines))
 
     def _lock_execution_due_to_input_change(self):
         for step_id in self._step_completed:

@@ -825,6 +825,15 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "migration.plan" => emit_all_events(alias_events(&request, "plan"), emit),
         "migration.verify" => emit_all_events(alias_events(&request, "verify"), emit),
         "migration.resume" => emit_all_events(alias_events(&request, "resume"), emit),
+        "migration.cleanup" => {
+            let alias = Request {
+                command: "cleanup".to_string(),
+                request_id: request.request_id.clone(),
+                payload: request.payload.clone(),
+            };
+            let command = request.command.clone();
+            cleanup_streaming(&alias, |event| emit(rewrite_result_command(event, &command)));
+        }
         "migration.run" => {
             let alias = Request {
                 command: "migrate".to_string(),
@@ -845,6 +854,7 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "migrate" => migrate_streaming(&request, emit),
         "verify" => emit_all_events(verify(&request), emit),
         "resume" => emit_all_events(resume(&request), emit),
+        "cleanup" => cleanup_streaming(&request, emit),
         other => emit(json!({
             "event": "error",
             "request_id": request.request_id,
@@ -4761,6 +4771,67 @@ fn resume(request: &Request) -> Vec<Value> {
             "next_table": next_table
         }),
     ]
+}
+
+fn cleanup_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
+    emit(phase_event(request, "cleanup", "failed migration cleanup started"));
+    let schema = dependency_ordered_schema(
+        &parse_schema(&request.payload["schema"]).unwrap_or_default(),
+    );
+    let target_engine = read_engine(&request.payload, "target_engine");
+    let mut dropped_tables = Vec::new();
+
+    if request.payload.get("target").is_some() {
+        let target_endpoint = match request
+            .payload
+            .get("target")
+            .map(endpoint_from_value)
+            .transpose()
+        {
+            Ok(Some(endpoint)) => endpoint,
+            Ok(None) => unreachable!(),
+            Err(err) => {
+                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
+                return;
+            }
+        };
+        let mut target = match LiveAdapter::connect(&target_endpoint) {
+            Ok(target) => target,
+            Err(err) => {
+                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
+                return;
+            }
+        };
+        for table in schema.tables.iter().rev() {
+            emit(json!({
+                "event": "table_progress",
+                "request_id": request.request_id,
+                "table": table.name,
+                "status": "dropping"
+            }));
+            if let Err(err) = target.execute_sql(&drop_table_sql(&target_endpoint.engine, &table.name)) {
+                emit(json!({
+                    "event": "error",
+                    "request_id": request.request_id,
+                    "message": format!("cleanup drop table {} failed: {err}", table.name)
+                }));
+                return;
+            }
+            dropped_tables.push(table.name.clone());
+        }
+    } else {
+        dropped_tables.extend(schema.tables.iter().rev().map(|table| table.name.clone()));
+    }
+
+    emit(phase_event(request, "cleanup", "failed migration cleanup completed"));
+    emit(json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": "cleanup",
+        "success": true,
+        "target_engine": target_engine,
+        "dropped_tables": dropped_tables
+    }));
 }
 
 fn phase_event(request: &Request, phase: &str, message: &str) -> Value {
@@ -9534,6 +9605,47 @@ mod tests {
         assert!(phase_messages.contains(&"target state checks completed"));
         assert!(phase_messages.contains(&"preflight result ready"));
         assert!(last_phase_index < result_index);
+    }
+
+    #[test]
+    fn cleanup_command_drops_target_tables_in_reverse_dependency_order() {
+        let events = handle_request(Request {
+            command: "cleanup".to_string(),
+            request_id: Some("cleanup-1".to_string()),
+            payload: json!({
+                "target_engine": "postgresql",
+                "schema": {
+                    "tables": [
+                        {
+                            "name": "parents",
+                            "columns": [{"name": "id", "type": "int", "primary_key": true}]
+                        },
+                        {
+                            "name": "children",
+                            "columns": [
+                                {"name": "id", "type": "int", "primary_key": true},
+                                {"name": "parent_id", "type": "int"}
+                            ],
+                            "foreign_keys": [{
+                                "name": "children_parent_id_fk",
+                                "columns": ["parent_id"],
+                                "referenced_table": "parents",
+                                "referenced_columns": ["id"]
+                            }]
+                        }
+                    ]
+                }
+            }),
+        });
+
+        let result = events
+            .iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["command"], "cleanup");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["dropped_tables"], json!(["children", "parents"]));
     }
 
     #[test]
