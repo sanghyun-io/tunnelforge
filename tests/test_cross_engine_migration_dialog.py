@@ -462,6 +462,37 @@ def test_resume_migration_loads_state_and_starts_migrate(monkeypatch):
         dialog.close()
 
 
+def test_resume_migration_requires_matching_target_schema_approval(monkeypatch):
+    state = {"tables": [{"table": "users", "completed": False, "rows_copied": 5000}]}
+    started = []
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.load_resume_state",
+        lambda key: state,
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+
+    dialog = make_dialog()
+    dialog.txt_schema.setPlainText(json.dumps({
+        "tables": [{"name": "users", "columns": [{"name": "id", "type": "int"}]}]
+    }))
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda *args, **kwargs: started.append((args, kwargs)),
+    )
+
+    try:
+        dialog._resume_migration()
+
+        assert started == []
+    finally:
+        dialog.close()
+
+
 def test_execute_requires_exact_target_schema_text_before_migrate(monkeypatch):
     dialog = make_dialog()
     started = []
@@ -493,6 +524,51 @@ def test_execute_requires_exact_target_schema_text_before_migrate(monkeypatch):
         dialog.close()
 
 
+def test_execute_approval_uses_public_when_postgresql_target_schema_blank():
+    dialog = make_dialog()
+    try:
+        dialog.target_form.input_schema.setText("")
+        dialog.target_form.input_database.setText("postgres")
+        dialog._set_execution_unlocked(True)
+        dialog._show_step("execute")
+
+        dialog.input_approval_schema.setText("postgres")
+
+        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
+
+        dialog.input_approval_schema.setText("public")
+
+        assert dialog.btn_migrate.isEnabled()
+        assert dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_execute_approval_invalidates_when_target_schema_changes():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("execute")
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": True,
+            "issues": [],
+        })
+        dialog.input_approval_schema.setText("target_db")
+
+        assert dialog.btn_migrate.isEnabled()
+        assert dialog.btn_next.isEnabled()
+
+        dialog.target_form.input_schema.setText("changed_target")
+
+        assert not dialog._approval_matches_target_schema()
+        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()
+
+
 def test_execution_progress_prioritizes_current_table_and_chunk():
     dialog = make_dialog()
     try:
@@ -503,6 +579,16 @@ def test_execution_progress_prioritizes_current_table_and_chunk():
         assert "users" in dialog.lbl_current_table.text()
         assert "5,000 / 20,000 rows" in dialog.lbl_current_rows.text()
         assert "copying data" in dialog.lbl_execution_phase.text()
+    finally:
+        dialog.close()
+
+
+def test_execution_row_progress_shows_unknown_total():
+    dialog = make_dialog()
+    try:
+        dialog._on_row_progress("users", 5000, None)
+
+        assert "5,000 / ? rows" in dialog.lbl_current_rows.text()
     finally:
         dialog.close()
 

@@ -777,17 +777,17 @@ class CrossEngineMigrationDialog(QDialog):
         if hasattr(self, "btn_next"):
             self.btn_next.setEnabled(self._next_enabled_for_current_step())
 
+    def _target_approval_schema(self) -> str:
+        schema = self.target_form.input_schema.text().strip()
+        database = self.target_form.input_database.text().strip()
+        if self.target_form.engine() == DatabaseEngine.POSTGRESQL:
+            return schema or "public"
+        return schema or database
+
     def _approval_matches_target_schema(self) -> bool:
-        expected = self.target_form.input_schema.text().strip() or self.target_form.input_database.text().strip()
-        if not expected:
-            expected = (
-                "public"
-                if self.target_form.engine() == DatabaseEngine.POSTGRESQL
-                else self.target_form.input_database.text().strip()
-            )
         if not hasattr(self, "input_approval_schema"):
             return False
-        return self.input_approval_schema.text().strip() == expected
+        return self.input_approval_schema.text().strip() == self._target_approval_schema()
 
     def _update_execution_state_from_approval(self):
         self._update_execution_state(bool(self.worker and self.worker.isRunning()))
