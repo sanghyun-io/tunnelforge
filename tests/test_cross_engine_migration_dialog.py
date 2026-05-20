@@ -6,7 +6,7 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QVBoxLayout, QWidget
 
 from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationDialog
 
@@ -75,6 +75,16 @@ def make_dialog():
     dialog.source_form.combo_tunnel.setCurrentIndex(1)
     dialog.target_form.combo_tunnel.setCurrentIndex(1)
     return dialog
+
+
+def assert_widget_reachable(widget, dialog):
+    current = widget
+    while current is not None:
+        assert not current.isHidden(), current.objectName() or current.__class__.__name__
+        if current is dialog:
+            return
+        current = current.parentWidget()
+    raise AssertionError("widget is not parented under dialog")
 
 
 def test_dialog_starts_as_guided_wizard_without_full_run_button():
@@ -170,6 +180,31 @@ def test_wizard_navigation_preserves_payload_and_step_controls():
 
         assert dialog.current_step_id == "connections"
         assert dialog.btn_previous.isEnabled() is False
+    finally:
+        dialog.close()
+
+
+def test_step_pages_keep_current_step_actions_reachable():
+    dialog = make_dialog()
+    step_actions = {
+        "inspect": [dialog.btn_auto_inspect, dialog.btn_load_schema, dialog.btn_inspect],
+        "safety": [dialog.btn_readiness, dialog.btn_preflight],
+        "plan": [dialog.btn_guide, dialog.btn_plan],
+        "execute": [dialog.btn_migrate, dialog.btn_resume],
+        "verify": [dialog.btn_verify, dialog.btn_save_report],
+    }
+    try:
+        dialog.show()
+        app.processEvents()
+        assert set(dialog.step_page_layouts) == set(dialog.step_ids)
+        assert all(isinstance(layout, QVBoxLayout) for layout in dialog.step_page_layouts.values())
+
+        for step_id, buttons in step_actions.items():
+            dialog._show_step(step_id)
+            app.processEvents()
+            assert isinstance(dialog.step_pages[step_id], QWidget)
+            for button in buttons:
+                assert_widget_reachable(button, dialog)
     finally:
         dialog.close()
 

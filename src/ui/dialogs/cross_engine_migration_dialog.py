@@ -67,6 +67,7 @@ class CrossEngineMigrationDialog(QDialog):
         ]
         self.current_step_id = self.step_ids[0]
         self.step_pages: Dict[str, QWidget] = {}
+        self.step_page_layouts: Dict[str, QVBoxLayout] = {}
         self.setWindowTitle("DB 전환 마법사")
         self.resize(900, 700)
         self._setup_ui()
@@ -103,8 +104,9 @@ class CrossEngineMigrationDialog(QDialog):
             page_layout = QVBoxLayout(page)
             page_layout.setContentsMargins(0, 0, 0, 0)
             self.step_pages[step_id] = page
+            self.step_page_layouts[step_id] = page_layout
             self.page_layout.addWidget(page)
-        self.step_pages["connections"].layout().addLayout(endpoint_layout)
+        self.step_page_layouts["connections"].addLayout(endpoint_layout)
 
         option_group = QGroupBox("실행 옵션")
         option_layout = QHBoxLayout(option_group)
@@ -123,7 +125,7 @@ class CrossEngineMigrationDialog(QDialog):
         option_layout.addWidget(QLabel("Guide rows:"))
         option_layout.addWidget(self.spin_guide_row_limit)
         option_layout.addStretch()
-        self.step_pages["plan"].layout().addWidget(option_group)
+        self.step_page_layouts["plan"].addWidget(option_group)
 
         schema_group = QGroupBox("스키마 검사 결과")
         schema_layout = QVBoxLayout(schema_group)
@@ -143,27 +145,18 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_schema.setPlaceholderText('{"tables":[{"name":"users","columns":[{"name":"id","type":"int(11)","nullable":false,"primary_key":true}]}]}')
         self.txt_schema.setPlainText('{"tables":[]}')
         schema_layout.addWidget(self.txt_schema)
-        self.step_pages["inspect"].layout().addWidget(schema_group, 1)
+        self.step_page_layouts["inspect"].addWidget(schema_group, 1)
 
         self.txt_log = QPlainTextEdit()
         self.txt_log.setReadOnly(True)
         self.txt_log.setMaximumBlockCount(1000)
-        self.step_pages["execute"].layout().addWidget(self.txt_log, 1)
+        self.step_page_layouts["execute"].addWidget(self.txt_log, 1)
 
         action_group = QGroupBox("작업 순서")
         action_layout = QVBoxLayout(action_group)
         self.lbl_execution_lock = QLabel("DB 변경 실행은 사전 점검 또는 계획 생성 성공 후 활성화됩니다.")
         action_layout.addWidget(self.lbl_execution_lock)
 
-        step_layout = QHBoxLayout()
-        step_check = QGroupBox("1. 점검")
-        step_check_layout = QHBoxLayout(step_check)
-        step_prepare = QGroupBox("2. 계획/가이드")
-        step_prepare_layout = QHBoxLayout(step_prepare)
-        step_execute = QGroupBox("3. DB 변경")
-        step_execute_layout = QHBoxLayout(step_execute)
-        step_verify = QGroupBox("4. 검증/저장")
-        step_verify_layout = QHBoxLayout(step_verify)
         control_layout = QHBoxLayout()
 
         self.btn_full_run = QPushButton("전체 실행")
@@ -206,25 +199,30 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_cancel.setEnabled(False)
         self._update_execution_state(False)
 
-        step_check_layout.addWidget(self.btn_readiness)
-        step_check_layout.addWidget(self.btn_inspect)
-        step_check_layout.addWidget(self.btn_preflight)
-        step_prepare_layout.addWidget(self.btn_guide)
-        step_prepare_layout.addWidget(self.btn_plan)
-        step_execute_layout.addWidget(self.btn_migrate)
-        step_execute_layout.addWidget(self.btn_resume)
-        step_verify_layout.addWidget(self.btn_verify)
-        step_verify_layout.addWidget(self.btn_save_report)
+        load_layout.insertWidget(0, self.btn_inspect)
+        safety_action_layout = QHBoxLayout()
+        safety_action_layout.addWidget(self.btn_readiness)
+        safety_action_layout.addWidget(self.btn_preflight)
+        safety_action_layout.addStretch()
+        self.step_page_layouts["safety"].addLayout(safety_action_layout)
 
-        step_layout.addWidget(step_check, 3)
-        step_layout.addWidget(step_prepare, 2)
-        step_layout.addWidget(step_execute, 2)
-        step_layout.addWidget(step_verify, 2)
-        step_check.hide()
-        step_prepare.hide()
-        step_execute.hide()
-        step_verify.hide()
-        action_layout.addLayout(step_layout)
+        plan_action_layout = QHBoxLayout()
+        plan_action_layout.addWidget(self.btn_guide)
+        plan_action_layout.addWidget(self.btn_plan)
+        plan_action_layout.addStretch()
+        self.step_page_layouts["plan"].addLayout(plan_action_layout)
+
+        execute_action_layout = QHBoxLayout()
+        execute_action_layout.addWidget(self.btn_migrate)
+        execute_action_layout.addWidget(self.btn_resume)
+        execute_action_layout.addStretch()
+        self.step_page_layouts["execute"].insertLayout(0, execute_action_layout)
+
+        verify_action_layout = QHBoxLayout()
+        verify_action_layout.addWidget(self.btn_verify)
+        verify_action_layout.addWidget(self.btn_save_report)
+        verify_action_layout.addStretch()
+        self.step_page_layouts["verify"].addLayout(verify_action_layout)
 
         control_layout.addWidget(self.btn_full_run)
         control_layout.addStretch()
