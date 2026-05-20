@@ -1,6 +1,6 @@
 """MySQL <-> PostgreSQL migration dialog."""
 import json
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 from PyQt6.QtCore import QTimer, Qt
 from PyQt6.QtWidgets import (
@@ -271,7 +271,9 @@ class CrossEngineMigrationDialog(QDialog):
             self.lbl_direction_summary.setText(self._direction_label())
 
     def _schema_summary_text(self, schema: Dict, unsupported_objects: List[str]) -> str:
-        tables = schema.get("tables") if isinstance(schema.get("tables"), list) else []
+        schema_data: Dict[str, Any] = schema if isinstance(schema, dict) else {}
+        raw_tables = schema_data.get("tables")
+        tables: List[Any] = cast(List[Any], raw_tables) if isinstance(raw_tables, list) else []
         table_count = len(tables)
         column_count = 0
         index_count = 0
@@ -279,9 +281,14 @@ class CrossEngineMigrationDialog(QDialog):
         for table in tables:
             if not isinstance(table, dict):
                 continue
-            columns = table.get("columns") if isinstance(table.get("columns"), list) else []
-            indexes = table.get("indexes") if isinstance(table.get("indexes"), list) else []
-            foreign_keys = table.get("foreign_keys") if isinstance(table.get("foreign_keys"), list) else []
+            raw_columns = table.get("columns")
+            columns: List[Any] = cast(List[Any], raw_columns) if isinstance(raw_columns, list) else []
+            raw_indexes = table.get("indexes")
+            indexes: List[Any] = cast(List[Any], raw_indexes) if isinstance(raw_indexes, list) else []
+            raw_foreign_keys = table.get("foreign_keys")
+            foreign_keys: List[Any] = (
+                cast(List[Any], raw_foreign_keys) if isinstance(raw_foreign_keys, list) else []
+            )
             column_count += len(columns)
             index_count += len(indexes)
             foreign_key_count += len(foreign_keys)
