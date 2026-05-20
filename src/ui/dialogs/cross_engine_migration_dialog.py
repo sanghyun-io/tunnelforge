@@ -71,6 +71,13 @@ class CrossEngineMigrationDialog(QDialog):
         self.current_step_id = self.step_ids[0]
         self.step_pages: Dict[str, QWidget] = {}
         self.step_page_layouts: Dict[str, QVBoxLayout] = {}
+        self._step_completed: Dict[str, bool] = {
+            "inspect": False,
+            "safety": False,
+            "plan": False,
+            "execute": False,
+            "verify": False,
+        }
         self.setWindowTitle("DB 전환 마법사")
         self.resize(900, 700)
         self._setup_ui()
@@ -538,9 +545,31 @@ class CrossEngineMigrationDialog(QDialog):
     def _next_enabled_for_current_step(self) -> bool:
         if self.worker and self.worker.isRunning():
             return False
+        if self.current_step_id == "connections":
+            return self._connection_step_ready()
+        if self.current_step_id == "inspect":
+            return self._step_completed.get("inspect", False)
+        if self.current_step_id == "safety":
+            return self._step_completed.get("safety", False)
+        if self.current_step_id == "plan":
+            return self._step_completed.get("plan", False)
         if self.current_step_id == "execute":
-            return self._execution_unlocked and self._approval_matches_target_schema()
-        return True
+            return self._step_completed.get("execute", False)
+        if self.current_step_id == "verify":
+            return self._step_completed.get("verify", False)
+        return False
+
+    def _connection_step_ready(self) -> bool:
+        source_selected = bool(self.source_form.combo_tunnel.currentData())
+        target_selected = bool(self.target_form.combo_tunnel.currentData())
+        return source_selected and target_selected and self.source_form.engine() != self.target_form.engine()
+
+    def _refresh_navigation_state(self):
+        if hasattr(self, "btn_previous"):
+            running = bool(self.worker and self.worker.isRunning())
+            self.btn_previous.setEnabled(self._current_step_index() > 0 and not running)
+        if hasattr(self, "btn_next"):
+            self.btn_next.setEnabled(self._next_enabled_for_current_step())
 
     def _show_step(self, step_id: str):
         self.current_step_id = step_id
@@ -561,6 +590,8 @@ class CrossEngineMigrationDialog(QDialog):
             self._show_step(self.step_ids[index - 1])
 
     def _go_next_step(self):
+        if hasattr(self, "btn_next") and not self.btn_next.isEnabled():
+            return
         index = self._current_step_index()
         if index >= len(self.step_ids) - 1:
             self.close()
@@ -580,6 +611,8 @@ class CrossEngineMigrationDialog(QDialog):
             with open(path, encoding="utf-8") as f:
                 data = json.load(f)
             self.txt_schema.setPlainText(json.dumps(data, ensure_ascii=False, indent=2))
+            self._step_completed["inspect"] = not self._schema_is_empty()
+            self._refresh_navigation_state()
         except Exception as exc:
             QMessageBox.critical(self, "불러오기 실패", str(exc))
 
@@ -688,6 +721,7 @@ class CrossEngineMigrationDialog(QDialog):
         schema = schema_from_inspect_result(payload)
         if schema is not None:
             self.txt_schema.setPlainText(json.dumps(schema, ensure_ascii=False, indent=2))
+            self._step_completed["inspect"] = bool(payload.get("success")) and not self._schema_is_empty()
             self._set_execution_unlocked(False)
             table_count = len(schema.get("tables", [])) if isinstance(schema.get("tables"), list) else 0
             self.lbl_schema_status.setText(f"Rust Core 검사 완료: {table_count}개 테이블")
@@ -708,19 +742,26 @@ class CrossEngineMigrationDialog(QDialog):
         if payload.get("command") == "guide":
             self._append_guide_summary(payload)
         if payload.get("command") == "plan":
+            self._step_completed["plan"] = bool(payload.get("success"))
             self._update_plan_summary(payload)
         if payload.get("command") == "verify":
             self._verify_result_received = True
+            self._step_completed["verify"] = True
             self._update_verification_result(payload)
         if payload.get("command") in ("preflight", "plan"):
             target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
+            if payload.get("command") == "preflight":
+                self._step_completed["safety"] = bool(payload.get("success")) and not target_blocked
             self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)
             if self._execution_unlocked:
                 self._append_log("사전 확인이 완료되어 DB 변경 실행이 활성화되었습니다.")
             else:
                 self._append_log("차단 이슈가 있어 DB 변경 실행은 계속 잠겨 있습니다.")
+        if payload.get("command") == "migrate":
+            self._step_completed["execute"] = bool(payload.get("success"))
         if payload.get("command") != "readiness":
             self._append_log(json.dumps(payload, ensure_ascii=False, indent=2))
+        self._refresh_navigation_state()
 
         if payload.get("command") == "inspect" and payload.get("success") and self._pending_after_inspect:
             next_command = self._pending_after_inspect
@@ -763,9 +804,13 @@ class CrossEngineMigrationDialog(QDialog):
     def _on_finished(self, success: bool, payload):
         self._set_running(False)
         if self._current_command == "plan" and not success:
+            self._step_completed["plan"] = False
             self._reset_plan_summary_after_failure()
         if self._current_command == "verify" and not success and not self._verify_result_received:
+            self._step_completed["verify"] = False
             self._mark_verify_result_stale()
+        if self._current_command == "migrate" and not success:
+            self._step_completed["execute"] = False
         self._append_log("완료" if success else "실패")
         if self._workflow_active and self._current_command:
             next_command = next_workflow_command(self._current_command, success)
@@ -900,9 +945,12 @@ class CrossEngineMigrationDialog(QDialog):
         self._append_log(f"[rows:{table}] {rows}/{total if total is not None else '?'}")
 
     def _lock_execution_due_to_input_change(self):
+        for step_id in self._step_completed:
+            self._step_completed[step_id] = False
         if self._execution_unlocked:
             self._set_execution_unlocked(False)
         self._invalidate_stale_reports_after_input_change()
+        self._refresh_navigation_state()
 
     def _schema_is_empty(self) -> bool:
         try:

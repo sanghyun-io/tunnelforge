@@ -174,12 +174,89 @@ def test_wizard_navigation_preserves_payload_and_step_controls():
 
         assert dialog.current_step_id == "inspect"
         assert dialog.btn_previous.isEnabled() is True
+        assert not dialog.btn_next.isEnabled()
         assert dialog._payload()["guide_options"]["row_limit"] == 20
 
         dialog._go_previous_step()
 
         assert dialog.current_step_id == "connections"
         assert dialog.btn_previous.isEnabled() is False
+    finally:
+        dialog.close()
+
+
+def test_wizard_next_requires_current_step_completion():
+    dialog = make_dialog()
+    schema = {"tables": [{"name": "users", "columns": [{"name": "id", "type": "int"}]}]}
+    try:
+        dialog._show_step("inspect")
+        assert not dialog.btn_next.isEnabled()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "inspect",
+            "success": True,
+            "schema": schema,
+        })
+        assert dialog.btn_next.isEnabled()
+
+        dialog._show_step("safety")
+        assert not dialog.btn_next.isEnabled()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": True,
+            "issues": [],
+        })
+        assert dialog.btn_next.isEnabled()
+
+        dialog._show_step("plan")
+        assert not dialog.btn_next.isEnabled()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "plan",
+            "success": True,
+            "plan": {"tables": [{"name": "users", "estimated_rows": 1}]},
+            "issues": [],
+        })
+        assert dialog.btn_next.isEnabled()
+
+        dialog._show_step("execute")
+        dialog.input_approval_schema.setText("target_db")
+        assert dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "migrate",
+            "success": True,
+        })
+        assert dialog.btn_next.isEnabled()
+
+        dialog._show_step("verify")
+        assert not dialog.btn_next.isEnabled()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "verify",
+            "success": True,
+            "mismatches": [],
+        })
+        assert dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_wizard_next_does_not_advance_when_step_is_incomplete():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("inspect")
+
+        dialog._go_next_step()
+
+        assert dialog.current_step_id == "inspect"
     finally:
         dialog.close()
 
@@ -674,7 +751,7 @@ def test_execute_approval_uses_public_when_postgresql_target_schema_blank():
         dialog.input_approval_schema.setText("public")
 
         assert dialog.btn_migrate.isEnabled()
-        assert dialog.btn_next.isEnabled()
+        assert not dialog.btn_next.isEnabled()
     finally:
         dialog.close()
 
@@ -692,7 +769,7 @@ def test_execute_approval_invalidates_when_target_schema_changes():
         dialog.input_approval_schema.setText("target_db")
 
         assert dialog.btn_migrate.isEnabled()
-        assert dialog.btn_next.isEnabled()
+        assert not dialog.btn_next.isEnabled()
 
         dialog.target_form.input_schema.setText("changed_target")
 
