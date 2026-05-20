@@ -1311,6 +1311,9 @@ def test_preflight_blocks_execution_when_target_is_not_empty():
         })
 
         assert not dialog.btn_migrate.isEnabled()
+        assert "점검 실패" in dialog.lbl_safety_summary.text()
+        assert "차단 이슈 1개" in dialog.lbl_safety_summary.text()
+        assert "아직 전환 가능 여부를 점검하지 않았습니다" not in dialog.lbl_safety_summary.text()
         assert "Target에 기존 테이블 또는 데이터가 있습니다" in dialog.lbl_target_safety.text()
         assert dialog.btn_target_advanced.isVisible()
     finally:
@@ -1338,6 +1341,8 @@ def test_preflight_success_with_nonblocking_target_warning_unlocks_execution():
         dialog.input_approval_schema.setText("target_db")
 
         assert dialog.btn_migrate.isEnabled()
+        assert "점검 통과" in dialog.lbl_safety_summary.text()
+        assert "경고 1개" in dialog.lbl_safety_summary.text()
         assert "기존 테이블 또는 데이터 차단 이슈가 없습니다" in dialog.lbl_target_safety.text()
         assert not dialog.btn_target_advanced.isVisible()
     finally:

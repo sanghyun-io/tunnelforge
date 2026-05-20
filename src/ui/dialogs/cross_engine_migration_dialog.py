@@ -688,6 +688,14 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_target_advanced.setVisible(False)
         return False
 
+    def _update_preflight_summary(self, payload: Dict, target_blocked: bool):
+        counts = self._issue_counts(payload.get("issues"))
+        if bool(payload.get("success")) and not target_blocked:
+            summary = f"점검 통과: 차단 이슈 0개, 경고 {counts['warnings']}개"
+        else:
+            summary = f"점검 실패: 차단 이슈 {counts['blocking']}개, 경고 {counts['warnings']}개"
+        self.lbl_safety_summary.setText(summary)
+
     def _open_target_advanced_options(self):
         self.target_advanced_panel.setVisible(not self.target_advanced_panel.isVisible())
 
@@ -929,6 +937,7 @@ class CrossEngineMigrationDialog(QDialog):
             target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
             if payload.get("command") == "preflight":
                 self._step_completed["safety"] = bool(payload.get("success")) and not target_blocked
+                self._update_preflight_summary(payload, target_blocked)
             self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)
             if self._execution_unlocked:
                 self._append_log("사전 확인이 완료되어 DB 변경 실행이 활성화되었습니다.")
