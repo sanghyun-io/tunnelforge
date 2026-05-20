@@ -132,6 +132,12 @@ class CrossEngineMigrationDialog(QDialog):
         load_layout = QHBoxLayout()
         self.lbl_schema_status = QLabel("Source DB를 검사하면 Rust Core가 정규화한 스키마가 자동으로 채워집니다.")
         schema_layout.addWidget(self.lbl_schema_status)
+        self.lbl_source_summary = QLabel("아직 Source 구조를 분석하지 않았습니다.")
+        self.lbl_source_summary.setWordWrap(True)
+        schema_layout.addWidget(self.lbl_source_summary)
+        self.chk_show_schema_json = QCheckBox("고급 설정: Normalized schema JSON 보기")
+        self.chk_show_schema_json.setChecked(False)
+        schema_layout.addWidget(self.chk_show_schema_json)
         self.btn_load_schema = QPushButton("JSON 불러오기")
         self.btn_auto_inspect = QPushButton("Source 자동 검사")
         self.btn_load_schema.clicked.connect(self._load_schema_json)
@@ -144,6 +150,8 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_schema = QPlainTextEdit()
         self.txt_schema.setPlaceholderText('{"tables":[{"name":"users","columns":[{"name":"id","type":"int(11)","nullable":false,"primary_key":true}]}]}')
         self.txt_schema.setPlainText('{"tables":[]}')
+        self.txt_schema.setVisible(False)
+        self.chk_show_schema_json.toggled.connect(self.txt_schema.setVisible)
         schema_layout.addWidget(self.txt_schema)
         self.step_page_layouts["inspect"].addWidget(schema_group, 1)
 
@@ -261,6 +269,31 @@ class CrossEngineMigrationDialog(QDialog):
     def _refresh_direction_summary(self):
         if hasattr(self, "lbl_direction_summary"):
             self.lbl_direction_summary.setText(self._direction_label())
+
+    def _schema_summary_text(self, schema: Dict, unsupported_objects: List[str]) -> str:
+        tables = schema.get("tables") if isinstance(schema.get("tables"), list) else []
+        table_count = len(tables)
+        column_count = 0
+        index_count = 0
+        foreign_key_count = 0
+        for table in tables:
+            if not isinstance(table, dict):
+                continue
+            columns = table.get("columns") if isinstance(table.get("columns"), list) else []
+            indexes = table.get("indexes") if isinstance(table.get("indexes"), list) else []
+            foreign_keys = table.get("foreign_keys") if isinstance(table.get("foreign_keys"), list) else []
+            column_count += len(columns)
+            index_count += len(indexes)
+            foreign_key_count += len(foreign_keys)
+        return (
+            f"테이블 {table_count}개, 컬럼 {column_count}개, "
+            f"인덱스 {index_count}개, FK {foreign_key_count}개, "
+            f"지원 제외 {len(unsupported_objects)}개"
+        )
+
+    def _update_source_summary(self, schema: Dict):
+        unsupported = [str(item) for item in self.unsupported_objects]
+        self.lbl_source_summary.setText(self._schema_summary_text(schema, unsupported))
 
     def _next_enabled_for_current_step(self) -> bool:
         if self.worker and self.worker.isRunning():
@@ -420,6 +453,8 @@ class CrossEngineMigrationDialog(QDialog):
                 self._append_log(
                     f"지원 제외 객체 {len(self.unsupported_objects)}개를 preflight warning 대상으로 저장했습니다."
                 )
+        if schema is not None:
+            self._update_source_summary(schema)
         if payload.get("command") == "readiness":
             self._append_readiness_summary(payload)
         if payload.get("command") == "guide":

@@ -237,8 +237,60 @@ def test_inspect_result_enables_report_and_updates_schema():
 
         assert dialog.btn_save_report.isEnabled()
         assert json.loads(dialog.txt_schema.toPlainText()) == schema
+        assert "테이블 1개" in dialog.lbl_source_summary.text()
         assert dialog._payload()["unsupported_objects"] == ["view:active_users"]
         assert "스키마 검사 결과를 입력에 반영했습니다." in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_inspect_result_shows_readable_source_summary_and_hides_json_by_default():
+    dialog = make_dialog()
+    schema = {
+        "tables": [
+            {
+                "name": "users",
+                "columns": [
+                    {"name": "id", "type": "int", "nullable": False, "primary_key": True},
+                    {"name": "email", "type": "varchar(255)", "nullable": False},
+                ],
+                "indexes": [{"name": "idx_users_email"}],
+                "foreign_keys": [],
+            },
+            {
+                "name": "orders",
+                "columns": [{"name": "user_id", "type": "int", "foreign_key": True}],
+                "indexes": [],
+                "foreign_keys": [{"name": "fk_orders_users"}],
+            },
+        ]
+    }
+    try:
+        dialog._show_step("inspect")
+        dialog.show()
+        app.processEvents()
+        assert not dialog.txt_schema.isVisible()
+
+        dialog._on_result({
+            "event": "result",
+            "command": "inspect",
+            "success": True,
+            "schema": schema,
+            "unsupported_objects": ["view:active_users"],
+        })
+
+        summary = dialog.lbl_source_summary.text()
+        assert "테이블 2개" in summary
+        assert "컬럼 3개" in summary
+        assert "인덱스 1개" in summary
+        assert "FK 1개" in summary
+        assert "지원 제외 1개" in summary
+        assert json.loads(dialog.txt_schema.toPlainText()) == schema
+
+        dialog.chk_show_schema_json.setChecked(True)
+        app.processEvents()
+
+        assert dialog.txt_schema.isVisible()
     finally:
         dialog.close()
 
