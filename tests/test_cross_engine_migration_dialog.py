@@ -1373,7 +1373,8 @@ def test_target_advanced_button_expands_inline_without_leaving_safety_step():
         assert dialog.current_step_id == "safety"
         assert dialog.target_advanced_panel.isVisible()
         assert dialog.btn_target_advanced.text() == "고급 설정 닫기"
-        assert "Target이 비어 있지 않으면" in dialog.lbl_target_advanced_help.text()
+        assert "DB 변경 실행 직전에" in dialog.lbl_target_advanced_help.text()
+        assert dialog.chk_cleanup_before_migrate.isVisible()
 
         dialog.btn_target_advanced.click()
 
@@ -1383,14 +1384,9 @@ def test_target_advanced_button_expands_inline_without_leaving_safety_step():
         dialog.close()
 
 
-def test_safety_advanced_cleanup_requires_schema_approval(monkeypatch):
+def test_safety_advanced_cleanup_is_planned_not_executed(monkeypatch):
     dialog = make_dialog()
     started = []
-    warnings = []
-    monkeypatch.setattr(
-        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
-        lambda *args, **kwargs: warnings.append(args),
-    )
     monkeypatch.setattr(
         dialog,
         "_start_command_with_payload",
@@ -1414,37 +1410,38 @@ def test_safety_advanced_cleanup_requires_schema_approval(monkeypatch):
         })
         dialog.btn_target_advanced.click()
 
-        dialog.btn_cleanup_target.click()
+        dialog.chk_cleanup_before_migrate.setChecked(True)
+        payload = dialog._payload()
 
+        assert payload["execution_options"]["cleanup_before_migrate"] is True
         assert started == []
-        assert warnings
-
-        dialog.input_cleanup_schema.setText("target_db")
-        dialog.btn_cleanup_target.click()
-
-        assert started[0][0] == "cleanup"
     finally:
         dialog.close()
 
 
-def test_cleanup_finished_updates_safety_screen_when_started_from_safety_step():
+def test_migrate_payload_includes_cleanup_before_migrate_option(monkeypatch):
     dialog = make_dialog()
+    started = []
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda command, payload, workflow=False: started.append((command, payload, workflow)),
+    )
     try:
-        dialog._show_step("safety")
-        dialog.lbl_safety_summary.setText("점검 실패: 차단 이슈 3개, 경고 0개")
-        dialog.lbl_target_safety.setText("Target에 기존 테이블 또는 데이터가 있습니다.")
-        dialog._current_command = "cleanup"
+        dialog._set_execution_unlocked(True)
+        dialog._show_step("execute")
+        dialog.input_approval_schema.setText("target_db")
+        dialog.chk_cleanup_before_migrate.setChecked(True)
 
-        dialog._on_finished(True, {"command": "cleanup", "success": True})
+        dialog._start_command("migrate")
 
-        assert "Target 정리 완료" in dialog.lbl_safety_summary.text()
-        assert "다시 점검" in dialog.lbl_target_safety.text()
-        assert "Target 정리 완료" in dialog.txt_safety_log.toPlainText()
+        assert started[0][0] == "migrate"
+        assert started[0][1]["execution_options"]["cleanup_before_migrate"] is True
     finally:
         dialog.close()
 
 
-def test_cleanup_failed_migration_requires_schema_approval(monkeypatch):
+def test_failed_migration_cleanup_action_plans_cleanup_for_next_migrate(monkeypatch):
     dialog = make_dialog()
     started = []
     warnings = []
@@ -1471,7 +1468,9 @@ def test_cleanup_failed_migration_requires_schema_approval(monkeypatch):
         dialog.input_approval_schema.setText("target_db")
         dialog._cleanup_failed_migration()
 
-        assert started[0][0] == "cleanup"
+        assert started == []
+        assert dialog.chk_cleanup_before_migrate.isChecked()
+        assert "DB 변경 실행 전에 Target 정리를 수행합니다" in dialog.lbl_migration_result.text()
     finally:
         dialog.close()
 

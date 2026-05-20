@@ -315,20 +315,14 @@ class CrossEngineMigrationDialog(QDialog):
         target_advanced_layout = QVBoxLayout(self.target_advanced_panel)
         target_advanced_layout.setContentsMargins(0, 0, 0, 0)
         self.lbl_target_advanced_help = QLabel(
-            "Target이 비어 있지 않으면 기존 테이블을 정리한 뒤 다시 점검하세요. "
-            "정리는 Source schema에 포함된 대상 테이블만 FK 의존성 역순으로 삭제합니다."
+            "DB 변경 실행 직전에 기존 Target 테이블을 정리하도록 계획할 수 있습니다. "
+            "실행 버튼을 누르기 전까지 DB는 변경되지 않습니다."
         )
         self.lbl_target_advanced_help.setObjectName("MutedHelp")
         self.lbl_target_advanced_help.setWordWrap(True)
-        cleanup_layout = QHBoxLayout()
-        self.input_cleanup_schema = QLineEdit()
-        self.input_cleanup_schema.setPlaceholderText("Target schema 이름 입력")
-        self.btn_cleanup_target = QPushButton("기존 Target 테이블 정리")
-        self.btn_cleanup_target.clicked.connect(self._cleanup_target_from_safety)
-        cleanup_layout.addWidget(self.input_cleanup_schema, 1)
-        cleanup_layout.addWidget(self.btn_cleanup_target)
+        self.chk_cleanup_before_migrate = QCheckBox("DB 변경 실행 직전에 기존 Target 테이블 정리")
         target_advanced_layout.addWidget(self.lbl_target_advanced_help)
-        target_advanced_layout.addLayout(cleanup_layout)
+        target_advanced_layout.addWidget(self.chk_cleanup_before_migrate)
         self.target_advanced_panel.hide()
         self.btn_target_advanced = QPushButton("고급 설정 열기")
         self.btn_target_advanced.hide()
@@ -828,6 +822,7 @@ class CrossEngineMigrationDialog(QDialog):
             "execution_options": {
                 "mode": "create_only" if self.chk_create_only.isChecked() else "append",
                 "chunk_size": self.spin_chunk_size.value(),
+                "cleanup_before_migrate": self.chk_cleanup_before_migrate.isChecked(),
             },
             "guide_options": {
                 "row_limit": self.spin_guide_row_limit.value(),
@@ -1077,27 +1072,11 @@ class CrossEngineMigrationDialog(QDialog):
                 "Target schema 이름을 정확히 입력해야 실패한 전환 정리를 실행할 수 있습니다.",
             )
             return
-        try:
-            payload = self._payload(prepare_tunnels=True)
-        except ValueError as exc:
-            QMessageBox.warning(self, "입력 오류", str(exc))
-            return
-        self._start_command_with_payload("cleanup", payload)
-
-    def _cleanup_target_from_safety(self):
-        if self.input_cleanup_schema.text().strip() != self._target_approval_schema():
-            QMessageBox.warning(
-                self,
-                "승인 필요",
-                "Target schema 이름을 정확히 입력해야 기존 Target 테이블 정리를 실행할 수 있습니다.",
-            )
-            return
-        try:
-            payload = self._payload(prepare_tunnels=True)
-        except ValueError as exc:
-            QMessageBox.warning(self, "입력 오류", str(exc))
-            return
-        self._start_command_with_payload("cleanup", payload)
+        self.chk_cleanup_before_migrate.setChecked(True)
+        self.lbl_migration_result.setText(
+            "다음 DB 변경 실행 전에 Target 정리를 수행합니다. Target schema 이름을 확인한 뒤 DB 변경 실행을 다시 눌러 주세요."
+        )
+        self.lbl_migration_result.show()
 
     def _save_report(self):
         if not self.last_result:
@@ -1131,7 +1110,6 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_preflight,
             self.btn_readiness,
             self.btn_run_safety,
-            self.btn_cleanup_target,
             self.btn_guide,
             self.btn_plan,
             self.btn_migrate,

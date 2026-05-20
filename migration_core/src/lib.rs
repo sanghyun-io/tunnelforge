@@ -121,6 +121,8 @@ pub struct MigrationOptions {
     pub chunk_size: usize,
     #[serde(default)]
     pub cancel_after_chunks: Option<usize>,
+    #[serde(default)]
+    pub cleanup_before_migrate: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -832,7 +834,9 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
                 payload: request.payload.clone(),
             };
             let command = request.command.clone();
-            cleanup_streaming(&alias, |event| emit(rewrite_result_command(event, &command)));
+            cleanup_streaming(&alias, |event| {
+                emit(rewrite_result_command(event, &command))
+            });
         }
         "migration.run" => {
             let alias = Request {
@@ -4094,11 +4098,7 @@ fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "preflight",
         "schema compatibility checks completed",
     ));
-    emit(phase_event(
-        request,
-        "preflight",
-        "checking target state",
-    ));
+    emit(phase_event(request, "preflight", "checking target state"));
     issues.extend(live_preflight_issues(&request.payload));
     emit(phase_event(
         request,
@@ -4114,11 +4114,7 @@ fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         }));
     }
 
-    emit(phase_event(
-        request,
-        "preflight",
-        "preflight result ready",
-    ));
+    emit(phase_event(request, "preflight", "preflight result ready"));
     emit(json!({
         "event": "result",
         "request_id": request.request_id,
@@ -4487,6 +4483,7 @@ fn plan(request: &Request) -> Vec<Value> {
         dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
     let ddl = generate_schema_ddl(&schema, &source, &target);
     let table_order = table_dependency_order(&schema);
+    let tables = plan_table_summaries(request, &schema);
 
     vec![
         phase_event(request, "plan", "migration plan generation started"),
@@ -4497,11 +4494,43 @@ fn plan(request: &Request) -> Vec<Value> {
             "success": true,
             "plan": {
                 "ddl": ddl,
+                "tables": tables,
                 "table_order": table_order,
                 "execution_options": parse_options(&request.payload)
             }
         }),
     ]
+}
+
+fn plan_table_summaries(request: &Request, schema: &NormalizedSchema) -> Vec<Value> {
+    let mut rows_by_table = BTreeMap::<String, usize>::new();
+    if let Some(source_data) = request.payload.get("source_data") {
+        let source = MemoryAdapter::from_value(Some(source_data));
+        for table in &schema.tables {
+            rows_by_table.insert(table.name.clone(), source.row_count(&table.name));
+        }
+    } else if let Some(source_value) = request.payload.get("source") {
+        if let Ok(source_endpoint) = endpoint_from_value(source_value) {
+            if let Ok(mut source) = LiveAdapter::connect(&source_endpoint) {
+                for table in &schema.tables {
+                    if let Ok(rows) = source.row_count(&table.name) {
+                        rows_by_table.insert(table.name.clone(), rows);
+                    }
+                }
+            }
+        }
+    }
+
+    schema
+        .tables
+        .iter()
+        .map(|table| {
+            json!({
+                "name": table.name,
+                "estimated_rows": rows_by_table.get(&table.name).copied().unwrap_or(0)
+            })
+        })
+        .collect()
 }
 
 fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
@@ -4552,6 +4581,20 @@ fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
                         json!({"event": "error", "request_id": request.request_id, "message": err}),
                     );
                     return;
+                }
+                if options.cleanup_before_migrate {
+                    if let Err(err) = cleanup_target_tables(
+                        &schema,
+                        &mut target,
+                        &target_endpoint.engine,
+                        &mut emit,
+                        request,
+                    ) {
+                        emit(
+                            json!({"event": "error", "request_id": request.request_id, "message": err}),
+                        );
+                        return;
+                    }
                 }
                 let mut checkpoint =
                     |event: Value| emit(add_request_id(event, &request.request_id));
@@ -4774,10 +4817,13 @@ fn resume(request: &Request) -> Vec<Value> {
 }
 
 fn cleanup_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
-    emit(phase_event(request, "cleanup", "failed migration cleanup started"));
-    let schema = dependency_ordered_schema(
-        &parse_schema(&request.payload["schema"]).unwrap_or_default(),
-    );
+    emit(phase_event(
+        request,
+        "cleanup",
+        "failed migration cleanup started",
+    ));
+    let schema =
+        dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
     let target_engine = read_engine(&request.payload, "target_engine");
     let mut dropped_tables = Vec::new();
 
@@ -4802,28 +4848,28 @@ fn cleanup_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
                 return;
             }
         };
-        for table in schema.tables.iter().rev() {
-            emit(json!({
-                "event": "table_progress",
-                "request_id": request.request_id,
-                "table": table.name,
-                "status": "dropping"
-            }));
-            if let Err(err) = target.execute_sql(&drop_table_sql(&target_endpoint.engine, &table.name)) {
-                emit(json!({
-                    "event": "error",
-                    "request_id": request.request_id,
-                    "message": format!("cleanup drop table {} failed: {err}", table.name)
-                }));
+        match cleanup_target_tables(
+            &schema,
+            &mut target,
+            &target_endpoint.engine,
+            &mut emit,
+            request,
+        ) {
+            Ok(tables) => dropped_tables.extend(tables),
+            Err(err) => {
+                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
                 return;
             }
-            dropped_tables.push(table.name.clone());
         }
     } else {
         dropped_tables.extend(schema.tables.iter().rev().map(|table| table.name.clone()));
     }
 
-    emit(phase_event(request, "cleanup", "failed migration cleanup completed"));
+    emit(phase_event(
+        request,
+        "cleanup",
+        "failed migration cleanup completed",
+    ));
     emit(json!({
         "event": "result",
         "request_id": request.request_id,
@@ -4832,6 +4878,29 @@ fn cleanup_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "target_engine": target_engine,
         "dropped_tables": dropped_tables
     }));
+}
+
+fn cleanup_target_tables<F: FnMut(Value)>(
+    schema: &NormalizedSchema,
+    target: &mut LiveAdapter,
+    target_engine: &str,
+    emit: &mut F,
+    request: &Request,
+) -> Result<Vec<String>, String> {
+    let mut dropped_tables = Vec::new();
+    for table in schema.tables.iter().rev() {
+        emit(json!({
+            "event": "table_progress",
+            "request_id": request.request_id,
+            "table": table.name,
+            "status": "dropping"
+        }));
+        target
+            .execute_sql(&drop_table_sql(target_engine, &table.name))
+            .map_err(|err| format!("cleanup drop table {} failed: {err}", table.name))?;
+        dropped_tables.push(table.name.clone());
+    }
+    Ok(dropped_tables)
 }
 
 fn phase_event(request: &Request, phase: &str, message: &str) -> Value {
@@ -4953,6 +5022,17 @@ fn live_preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
             }];
         }
     };
+    if options.cleanup_before_migrate {
+        return vec![MigrationIssue {
+            severity: "warning".to_string(),
+            location: "target".to_string(),
+            message: "target cleanup is planned before migration".to_string(),
+            suggestion:
+                "Review the plan and start DB migration only when target cleanup is intended."
+                    .to_string(),
+            blocking: false,
+        }];
+    }
     create_only_issues_with_adapter(&schema, &options, &mut target)
 }
 
@@ -5187,7 +5267,6 @@ fn create_only_issues_with_adapter<T: MigrationAdapter>(
     if options.mode != "create_only" {
         return Vec::new();
     }
-
     let mut issues = Vec::new();
     for table in &schema.tables {
         match target.row_count(&table.name) {
@@ -6032,6 +6111,7 @@ fn parse_options(payload: &Value) -> MigrationOptions {
             mode: default_mode(),
             chunk_size: default_chunk_size(),
             cancel_after_chunks: None,
+            cleanup_before_migrate: false,
         })
 }
 
@@ -8133,6 +8213,43 @@ mod tests {
         assert_eq!(result["command"], "migration.plan");
         assert_eq!(result["success"], true);
         assert_eq!(result["plan"]["table_order"], json!(["users"]));
+        assert_eq!(result["plan"]["tables"][0]["name"], "users");
+    }
+
+    #[test]
+    fn migration_plan_reports_tables_and_estimated_rows() {
+        let result = handle_request(Request {
+            command: "plan".to_string(),
+            request_id: Some("plan-rows".to_string()),
+            payload: json!({
+                "source_engine": "mysql",
+                "target_engine": "postgresql",
+                "schema": {
+                    "tables": [{
+                        "name": "users",
+                        "columns": [{"name": "id", "type": "int", "primary_key": true}]
+                    }, {
+                        "name": "orders",
+                        "columns": [{"name": "id", "type": "int", "primary_key": true}]
+                    }]
+                },
+                "source_data": {
+                    "users": [{"id": 1}, {"id": 2}],
+                    "orders": [{"id": 10}]
+                }
+            }),
+        })
+        .into_iter()
+        .find(|event| event.get("event") == Some(&json!("result")))
+        .unwrap();
+
+        assert_eq!(
+            result["plan"]["tables"],
+            json!([
+                {"name": "users", "estimated_rows": 2},
+                {"name": "orders", "estimated_rows": 1}
+            ])
+        );
     }
 
     #[test]
@@ -8666,6 +8783,30 @@ mod tests {
                 mode: "create_only".to_string(),
                 chunk_size: 2,
                 cancel_after_chunks: None,
+                cleanup_before_migrate: false,
+            },
+            None,
+            &source,
+            &mut target,
+        );
+
+        assert!(!result.success);
+        assert_eq!(result.rows_copied, 0);
+        assert!(result.issues.iter().any(|issue| issue.blocking));
+        assert_eq!(target.row_count("users"), 1);
+    }
+
+    #[test]
+    fn create_only_still_requires_empty_target_without_live_cleanup() {
+        let source = MemoryAdapter::from_value(Some(&json!({"users": [{"id": 1}]})));
+        let mut target = MemoryAdapter::from_value(Some(&json!({"users": [{"id": 9}]})));
+        let result = migrate_memory(
+            &schema(),
+            &MigrationOptions {
+                mode: "create_only".to_string(),
+                chunk_size: 2,
+                cancel_after_chunks: None,
+                cleanup_before_migrate: true,
             },
             None,
             &source,
@@ -8690,6 +8831,7 @@ mod tests {
                 mode: "create_only".to_string(),
                 chunk_size: 2,
                 cancel_after_chunks: None,
+                cleanup_before_migrate: false,
             },
             None,
             &source,
@@ -8723,6 +8865,7 @@ mod tests {
                 mode: "create_only".to_string(),
                 chunk_size: 100,
                 cancel_after_chunks: None,
+                cleanup_before_migrate: false,
             },
             None,
             &source,
@@ -8786,6 +8929,7 @@ mod tests {
                 mode: "create_only".to_string(),
                 chunk_size: 2,
                 cancel_after_chunks: Some(1),
+                cleanup_before_migrate: false,
             },
             None,
             &source,
@@ -8800,6 +8944,7 @@ mod tests {
                 mode: "append".to_string(),
                 chunk_size: 2,
                 cancel_after_chunks: None,
+                cleanup_before_migrate: false,
             },
             Some(&first.state),
             &source,
@@ -8825,6 +8970,7 @@ mod tests {
                 mode: "create_only".to_string(),
                 chunk_size: 5_000,
                 cancel_after_chunks: Some(2),
+                cleanup_before_migrate: false,
             },
             None,
             &source,
@@ -8841,6 +8987,7 @@ mod tests {
                 mode: "append".to_string(),
                 chunk_size: 5_000,
                 cancel_after_chunks: None,
+                cleanup_before_migrate: false,
             },
             Some(&first.state),
             &source,
@@ -9030,6 +9177,7 @@ mod tests {
                 mode: "append".to_string(),
                 chunk_size: 2,
                 cancel_after_chunks: Some(1),
+                cleanup_before_migrate: false,
             },
             None,
             &source,
@@ -9049,6 +9197,7 @@ mod tests {
                 mode: "append".to_string(),
                 chunk_size: 2,
                 cancel_after_chunks: None,
+                cleanup_before_migrate: false,
             },
             Some(&first.state),
             &source,
