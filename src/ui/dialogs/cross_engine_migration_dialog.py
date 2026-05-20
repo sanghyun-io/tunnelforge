@@ -145,6 +145,25 @@ class CrossEngineMigrationDialog(QDialog):
                 color: #98a2b3;
                 border: 1px solid #e4e7ec;
             }
+            QPushButton#PrimaryActionButton {
+                background-color: #16a34a;
+                border: 1px solid #15803d;
+                color: #ffffff;
+                font-weight: 600;
+                min-height: 32px;
+            }
+            QPushButton#PrimaryActionButton:hover:enabled {
+                background-color: #15803d;
+            }
+            QPushButton#PrimaryActionButton:disabled {
+                background-color: #dcfce7;
+                color: #86efac;
+                border: 1px solid #bbf7d0;
+            }
+            QLabel#NextHint {
+                color: #475467;
+                font-weight: 600;
+            }
         """)
 
     def _setup_ui(self):
@@ -219,23 +238,27 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_source_summary.setObjectName("MutedHelp")
         self.lbl_source_summary.setWordWrap(True)
         schema_layout.addWidget(self.lbl_source_summary)
-        self.chk_show_schema_json = QCheckBox("고급 설정: Normalized schema JSON 보기")
+        self.chk_show_schema_json = QCheckBox("고급 설정: schema JSON 및 수동 검사 도구 보기")
         self.chk_show_schema_json.setChecked(False)
         schema_layout.addWidget(self.chk_show_schema_json)
         self.btn_load_schema = QPushButton("JSON 불러오기")
-        self.btn_auto_inspect = QPushButton("Source 자동 검사")
+        self.btn_auto_inspect = QPushButton("Source 구조 분석 시작")
+        self.btn_auto_inspect.setObjectName("PrimaryActionButton")
         self.btn_load_schema.clicked.connect(self._load_schema_json)
         self.btn_auto_inspect.clicked.connect(lambda: self._start_command("inspect"))
-        self.btn_auto_inspect.setToolTip("선택한 Source DB를 Rust Core schema.inspect로 검사합니다.")
+        self.btn_auto_inspect.setToolTip("선택한 Source DB를 Rust Core로 분석합니다.")
         load_layout.addWidget(self.btn_auto_inspect)
-        load_layout.addWidget(self.btn_load_schema)
         load_layout.addStretch()
         schema_layout.addLayout(load_layout)
+        self.schema_advanced_layout = QHBoxLayout()
+        self.schema_advanced_layout.addWidget(self.btn_load_schema)
+        self.schema_advanced_layout.addStretch()
+        schema_layout.addLayout(self.schema_advanced_layout)
         self.txt_schema = QPlainTextEdit()
         self.txt_schema.setPlaceholderText('{"tables":[{"name":"users","columns":[{"name":"id","type":"int(11)","nullable":false,"primary_key":true}]}]}')
         self.txt_schema.setPlainText('{"tables":[]}')
         self.txt_schema.setVisible(False)
-        self.chk_show_schema_json.toggled.connect(self.txt_schema.setVisible)
+        self.chk_show_schema_json.toggled.connect(self._set_schema_advanced_visible)
         schema_layout.addWidget(self.txt_schema)
         self.step_page_layouts["inspect"].addWidget(schema_group, 1)
 
@@ -281,6 +304,10 @@ class CrossEngineMigrationDialog(QDialog):
         action_layout = QVBoxLayout(action_group)
         self.lbl_execution_lock = QLabel("DB 변경 실행은 사전 점검 또는 계획 생성 성공 후 활성화됩니다.")
         action_layout.addWidget(self.lbl_execution_lock)
+        self.lbl_next_hint = QLabel("")
+        self.lbl_next_hint.setObjectName("NextHint")
+        self.lbl_next_hint.setWordWrap(True)
+        action_layout.addWidget(self.lbl_next_hint)
 
         control_layout = QHBoxLayout()
 
@@ -337,7 +364,8 @@ class CrossEngineMigrationDialog(QDialog):
         self.step_page_layouts["plan"].addWidget(self.plan_group)
         self.step_page_layouts["plan"].addWidget(option_group)
 
-        load_layout.insertWidget(0, self.btn_inspect)
+        self.schema_advanced_layout.insertWidget(0, self.btn_inspect)
+        self._set_schema_advanced_visible(False)
 
         plan_action_layout = QHBoxLayout()
         plan_action_layout.addWidget(self.btn_guide)
@@ -434,6 +462,14 @@ class CrossEngineMigrationDialog(QDialog):
     def _update_source_summary(self, schema: Dict):
         unsupported = [str(item) for item in self.unsupported_objects]
         self.lbl_source_summary.setText(self._schema_summary_text(schema, unsupported))
+
+    def _set_schema_advanced_visible(self, visible: bool):
+        if hasattr(self, "txt_schema"):
+            self.txt_schema.setVisible(visible)
+        if hasattr(self, "btn_load_schema"):
+            self.btn_load_schema.setVisible(visible)
+        if hasattr(self, "btn_inspect"):
+            self.btn_inspect.setVisible(visible)
 
     def _plan_tables(self, payload: Dict) -> List[Dict]:
         raw_plan = payload.get("plan")
@@ -647,6 +683,29 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_previous.setEnabled(self._current_step_index() > 0 and not running)
         if hasattr(self, "btn_next"):
             self.btn_next.setEnabled(self._next_enabled_for_current_step())
+        if hasattr(self, "lbl_next_hint"):
+            self.lbl_next_hint.setText(self._next_hint_text())
+
+    def _next_hint_text(self) -> str:
+        if self.worker and self.worker.isRunning():
+            return "현재 작업이 실행 중입니다. 완료될 때까지 기다려 주세요."
+        if self._next_enabled_for_current_step():
+            return "현재 단계가 완료되었습니다. 다음 단계로 이동할 수 있습니다."
+        if self.current_step_id == "connections":
+            return "Source와 Target 연결을 모두 선택하면 다음 단계로 이동할 수 있습니다."
+        if self.current_step_id == "inspect":
+            return "Source 구조 분석이 완료되면 다음 단계로 이동할 수 있습니다."
+        if self.current_step_id == "safety":
+            return "전환 가능 여부 점검이 통과되면 다음 단계로 이동할 수 있습니다."
+        if self.current_step_id == "plan":
+            return "실행 계획 생성이 완료되면 다음 단계로 이동할 수 있습니다."
+        if self.current_step_id == "execute":
+            if not self._approval_matches_target_schema():
+                return "Target schema 이름을 정확히 입력한 뒤 DB 변경 실행을 눌러 주세요."
+            return "DB 변경 실행이 완료되면 다음 단계로 이동할 수 있습니다."
+        if self.current_step_id == "verify":
+            return "검증 결과를 받은 뒤 완료할 수 있습니다."
+        return ""
 
     def _show_step(self, step_id: str):
         self.current_step_id = step_id
@@ -659,6 +718,7 @@ class CrossEngineMigrationDialog(QDialog):
             is_last = self._current_step_index() == len(self.step_ids) - 1
             self.btn_next.setText("완료" if is_last else "다음")
             self.btn_next.setEnabled(self._next_enabled_for_current_step())
+        self._refresh_navigation_state()
         self._refresh_direction_summary()
 
     def _go_previous_step(self):

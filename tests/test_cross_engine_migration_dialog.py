@@ -116,9 +116,35 @@ def test_inspect_step_explains_required_action_before_next():
     try:
         dialog._show_step("inspect")
 
+        assert dialog.btn_auto_inspect.text() == "Source 구조 분석 시작"
+        assert dialog.btn_auto_inspect.objectName() == "PrimaryActionButton"
         assert "Source 자동 검사" in dialog.lbl_inspect_step_help.text()
         assert "완료되면 다음 단계로 이동할 수 있습니다" in dialog.lbl_inspect_step_help.text()
+        assert "Source 구조 분석이 완료되면" in dialog.lbl_next_hint.text()
         assert not dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_inspect_step_hides_advanced_schema_actions_until_requested():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("inspect")
+        dialog.show()
+        app.processEvents()
+
+        assert_widget_reachable(dialog.btn_auto_inspect, dialog)
+        assert dialog.btn_auto_inspect.isVisible()
+        assert not dialog.btn_inspect.isVisible()
+        assert not dialog.btn_load_schema.isVisible()
+        assert not dialog.txt_schema.isVisible()
+
+        dialog.chk_show_schema_json.setChecked(True)
+        app.processEvents()
+
+        assert dialog.btn_inspect.isVisible()
+        assert dialog.btn_load_schema.isVisible()
+        assert dialog.txt_schema.isVisible()
     finally:
         dialog.close()
 
@@ -413,7 +439,7 @@ def test_verify_step_has_single_visible_verify_trigger_and_save_report_reachable
 def test_step_pages_keep_current_step_actions_reachable():
     dialog = make_dialog()
     step_actions = {
-        "inspect": [dialog.btn_auto_inspect, dialog.btn_load_schema, dialog.btn_inspect],
+        "inspect": [dialog.btn_auto_inspect],
         "safety": [dialog.btn_run_safety],
         "plan": [dialog.btn_guide, dialog.btn_plan],
         "execute": [dialog.btn_migrate, dialog.btn_resume],
@@ -431,6 +457,11 @@ def test_step_pages_keep_current_step_actions_reachable():
             assert isinstance(dialog.step_pages[step_id], QWidget)
             for button in buttons:
                 assert_widget_reachable(button, dialog)
+            if step_id == "inspect":
+                dialog.chk_show_schema_json.setChecked(True)
+                app.processEvents()
+                assert_widget_reachable(dialog.btn_load_schema, dialog)
+                assert_widget_reachable(dialog.btn_inspect, dialog)
     finally:
         dialog.close()
 
