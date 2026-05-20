@@ -3,6 +3,7 @@ import json
 from typing import Any, Dict, List, Optional, cast
 
 from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -935,7 +936,8 @@ class CrossEngineMigrationDialog(QDialog):
     def _append_log(self, message: str):
         self.txt_log.appendPlainText(message)
 
-    def closeEvent(self, event):
+    def closeEvent(self, a0: Optional[QCloseEvent]):
+        assert a0 is not None
         if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(
                 self,
@@ -945,13 +947,13 @@ class CrossEngineMigrationDialog(QDialog):
                 QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
-                event.ignore()
+                a0.ignore()
                 return
             self.worker.cancel()
             if not self.worker.wait(3000):
                 self.worker.terminate()
                 self.worker.wait(1000)
-        event.accept()
+        a0.accept()
 
 
 class EndpointForm(QGroupBox):
@@ -1066,10 +1068,11 @@ class EndpointForm(QGroupBox):
     def _tunnel_display(self, config: Dict, active_info: Optional[Dict] = None) -> str:
         name = config.get("name") or (active_info or {}).get("name") or config.get("id", "Unknown")
         engine = self._known_engine(config, active_info)
+        engine_key = engine or ""
         engine_label = {
             "mysql": "MySQL",
             "postgresql": "PostgreSQL",
-        }.get(engine, "엔진 미확인")
+        }.get(engine_key, "엔진 미확인")
         if active_info:
             host = active_info.get("host", "")
             port = active_info.get("port", "")

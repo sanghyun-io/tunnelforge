@@ -718,6 +718,7 @@ def test_schema_change_invalidates_stale_plan_and_verify_reports():
         })
         assert dialog._execution_unlocked
         assert "int -> bigint" in dialog.lbl_plan_summary.text()
+        assert dialog.last_result is not None
         assert dialog.last_result["command"] == "plan"
         assert dialog.btn_save_report.isEnabled()
 
@@ -738,6 +739,7 @@ def test_schema_change_invalidates_stale_plan_and_verify_reports():
             "row_count_differences": [],
         })
         assert "users / id=7 / email" in dialog.txt_verify_result.toPlainText()
+        assert dialog.last_result is not None
         assert dialog.last_result["command"] == "verify"
         assert dialog.btn_save_report.isEnabled()
 
