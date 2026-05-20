@@ -226,6 +226,10 @@ class CrossEngineMigrationDialog(QDialog):
         self._connect_endpoint_lock_signals(self.target_form)
         self.source_form.combo_tunnel.currentIndexChanged.connect(self._sync_target_engine_filter)
         self._sync_target_engine_filter()
+        self.source_form.combo_tunnel.currentIndexChanged.connect(self._refresh_direction_summary)
+        self.source_form.combo_engine.currentIndexChanged.connect(self._refresh_direction_summary)
+        self.target_form.combo_tunnel.currentIndexChanged.connect(self._refresh_direction_summary)
+        self.target_form.combo_engine.currentIndexChanged.connect(self._refresh_direction_summary)
         self.source_form.input_schema.textChanged.connect(self._refresh_direction_summary)
         self.source_form.input_database.textChanged.connect(self._refresh_direction_summary)
         self.target_form.input_schema.textChanged.connect(self._refresh_direction_summary)
@@ -574,10 +578,12 @@ class CrossEngineMigrationDialog(QDialog):
         source_data = self.source_form.combo_tunnel.currentData()
         if not source_data:
             self.target_form.set_engine_filter(None)
+            self._refresh_direction_summary()
             return
         source_engine = self.source_form.engine().value
         target_engine = "postgresql" if source_engine == "mysql" else "mysql"
         self.target_form.set_engine_filter({target_engine})
+        self._refresh_direction_summary()
 
     def _append_log(self, message: str):
         self.txt_log.appendPlainText(message)

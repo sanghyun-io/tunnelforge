@@ -98,6 +98,24 @@ def test_dialog_starts_as_guided_wizard_without_full_run_button():
         dialog.close()
 
 
+def test_direction_summary_updates_when_engine_or_tunnel_state_changes():
+    dialog = make_dialog()
+    try:
+        source_pg_index = dialog.source_form.combo_engine.findData("postgresql")
+        assert source_pg_index >= 0
+
+        dialog.source_form.combo_engine.setCurrentIndex(source_pg_index)
+
+        assert dialog.lbl_direction_summary.text() == "PostgreSQL source_db -> PostgreSQL target_db"
+
+        dialog.source_form.combo_tunnel.setCurrentIndex(0)
+        dialog.source_form.combo_tunnel.setCurrentIndex(1)
+
+        assert dialog.lbl_direction_summary.text() == "MySQL source_db -> PostgreSQL target_db"
+    finally:
+        dialog.close()
+
+
 def test_dialog_initial_button_states_and_running_toggle():
     dialog = make_dialog()
     try:
