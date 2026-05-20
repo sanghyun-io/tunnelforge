@@ -50,6 +50,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._current_command: Optional[str] = None
         self._pending_after_inspect: Optional[str] = None
         self._execution_unlocked = False
+        self._verify_result_received = False
         self.step_ids: List[str] = [
             "connections",
             "inspect",
@@ -641,6 +642,8 @@ class CrossEngineMigrationDialog(QDialog):
 
         self._workflow_active = workflow or self._workflow_active
         self._current_command = command
+        if command == "verify":
+            self._verify_result_received = False
         self._append_log(f"[{command}] 시작")
         self._set_running(True)
         self.worker = CrossEngineMigrationWorker(command, payload)
@@ -690,6 +693,7 @@ class CrossEngineMigrationDialog(QDialog):
         if payload.get("command") == "plan":
             self._update_plan_summary(payload)
         if payload.get("command") == "verify":
+            self._verify_result_received = True
             self._update_verification_result(payload)
         if payload.get("command") in ("preflight", "plan"):
             target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
@@ -743,7 +747,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._set_running(False)
         if self._current_command == "plan" and not success:
             self._reset_plan_summary_after_failure()
-        if self._current_command == "verify" and not success:
+        if self._current_command == "verify" and not success and not self._verify_result_received:
             self._mark_verify_result_stale()
         self._append_log("완료" if success else "실패")
         if self._workflow_active and self._current_command:

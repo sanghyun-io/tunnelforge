@@ -253,12 +253,46 @@ def test_verify_finished_failure_marks_stale_result_and_disables_save_report():
         assert dialog.btn_save_report.isEnabled()
 
         dialog._current_command = "verify"
+        dialog._verify_result_received = False
         dialog._on_finished(False, {})
 
         text = dialog.txt_verify_result.toPlainText()
         assert "검증 실패: 새 검증 결과를 받지 못했습니다." in text
         assert dialog.last_result is None
         assert not dialog.btn_save_report.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_verify_finished_failure_preserves_failed_result_with_mismatches():
+    dialog = make_dialog()
+    payload = {
+        "event": "result",
+        "command": "verify",
+        "success": False,
+        "mismatches": [
+            {
+                "table": "users",
+                "key": "id=7",
+                "column": "email",
+                "source_value": "a@example.com",
+                "target_value": "b@example.com",
+                "difference": "value_mismatch",
+            }
+        ],
+        "row_count_differences": [],
+    }
+    try:
+        dialog._on_result(payload)
+
+        dialog._current_command = "verify"
+        dialog._on_finished(False, payload)
+
+        text = dialog.txt_verify_result.toPlainText()
+        assert "users / id=7 / email" in text
+        assert "새 검증 결과를 받지 못했습니다" not in text
+        assert dialog.btn_save_report.isEnabled()
+        assert dialog.last_result is payload
     finally:
         dialog.close()
 
