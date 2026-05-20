@@ -82,8 +82,74 @@ class CrossEngineMigrationDialog(QDialog):
         self.resize(900, 700)
         self._setup_ui()
 
+    def _apply_wizard_style(self):
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #f8fafc;
+            }
+            QGroupBox {
+                background-color: #ffffff;
+                border: 1px solid #d0d5dd;
+                border-radius: 6px;
+                margin-top: 10px;
+                padding: 12px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 4px;
+                color: #101828;
+                font-weight: 600;
+            }
+            QLabel#StepHelp {
+                color: #344054;
+                font-weight: 600;
+                padding: 8px 0;
+            }
+            QLabel#MutedHelp {
+                color: #667085;
+            }
+            QPushButton {
+                min-height: 26px;
+                padding: 4px 12px;
+                border: 1px solid #98a2b3;
+                border-radius: 3px;
+                background-color: #ffffff;
+                color: #182230;
+            }
+            QPushButton:hover:enabled {
+                background-color: #f2f4f7;
+            }
+            QPushButton:disabled {
+                background-color: #e4e7ec;
+                color: #98a2b3;
+                border: 1px solid #d0d5dd;
+            }
+            QPushButton#WizardNextButton {
+                background-color: #2563eb;
+                border: 1px solid #1d4ed8;
+                color: #ffffff;
+                font-weight: 600;
+            }
+            QPushButton#WizardNextButton:hover:enabled {
+                background-color: #1d4ed8;
+            }
+            QPushButton#WizardNextButton:disabled {
+                background-color: #e4e7ec;
+                color: #98a2b3;
+                border: 1px solid #d0d5dd;
+                font-weight: 600;
+            }
+            QPushButton#WizardBackButton:disabled {
+                background-color: #f2f4f7;
+                color: #98a2b3;
+                border: 1px solid #e4e7ec;
+            }
+        """)
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
+        self._apply_wizard_style()
 
         endpoint_layout = QHBoxLayout()
         self.source_form = EndpointForm(
@@ -138,10 +204,19 @@ class CrossEngineMigrationDialog(QDialog):
 
         schema_group = QGroupBox("스키마 검사 결과")
         schema_layout = QVBoxLayout(schema_group)
+        schema_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
         load_layout = QHBoxLayout()
+        self.lbl_inspect_step_help = QLabel(
+            "Source 자동 검사를 실행해 Rust Core가 구조를 분석해야 합니다. 완료되면 다음 단계로 이동할 수 있습니다."
+        )
+        self.lbl_inspect_step_help.setObjectName("StepHelp")
+        self.lbl_inspect_step_help.setWordWrap(True)
+        schema_layout.addWidget(self.lbl_inspect_step_help)
         self.lbl_schema_status = QLabel("Source DB를 검사하면 Rust Core가 정규화한 스키마가 자동으로 채워집니다.")
+        self.lbl_schema_status.setObjectName("MutedHelp")
         schema_layout.addWidget(self.lbl_schema_status)
         self.lbl_source_summary = QLabel("아직 Source 구조를 분석하지 않았습니다.")
+        self.lbl_source_summary.setObjectName("MutedHelp")
         self.lbl_source_summary.setWordWrap(True)
         schema_layout.addWidget(self.lbl_source_summary)
         self.chk_show_schema_json = QCheckBox("고급 설정: Normalized schema JSON 보기")
@@ -224,6 +299,8 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_close = QPushButton("닫기")
         self.btn_previous = QPushButton("이전")
         self.btn_next = QPushButton("다음")
+        self.btn_previous.setObjectName("WizardBackButton")
+        self.btn_next.setObjectName("WizardNextButton")
         self.btn_full_run.hide()
         self.btn_migrate.setToolTip("대상 DB에 스키마 생성과 데이터 적재를 실행합니다.")
         self.btn_resume.setToolTip("저장된 상태부터 대상 DB 변경 작업을 재개합니다.")

@@ -104,6 +104,21 @@ def test_dialog_starts_as_guided_wizard_without_full_run_button():
         assert dialog.btn_previous.text() == "이전"
         assert dialog.btn_next.text() == "다음"
         assert dialog.lbl_direction_summary.text() == "MySQL source_db -> PostgreSQL target_db"
+        assert dialog.btn_next.objectName() == "WizardNextButton"
+        assert "QPushButton:disabled" in dialog.styleSheet()
+        assert "background-color: #e4e7ec" in dialog.styleSheet()
+    finally:
+        dialog.close()
+
+
+def test_inspect_step_explains_required_action_before_next():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("inspect")
+
+        assert "Source 자동 검사" in dialog.lbl_inspect_step_help.text()
+        assert "완료되면 다음 단계로 이동할 수 있습니다" in dialog.lbl_inspect_step_help.text()
+        assert not dialog.btn_next.isEnabled()
     finally:
         dialog.close()
 
