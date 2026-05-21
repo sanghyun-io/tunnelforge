@@ -408,8 +408,12 @@ def test_verify_result_shows_mismatch_examples_before_summary():
         })
 
         text = dialog.txt_verify_result.toPlainText()
-        mismatch_index = text.index("users / id=7 / email")
-        summary_index = text.index("orders: source 10, target 9")
+        mismatch_index = text.index("테이블: users")
+        assert "Key: id=7" in text
+        assert "Column: email" in text
+        assert "Source: a@example.com" in text
+        assert "Target: b@example.com" in text
+        summary_index = text.index("orders: Source 10 rows / Target 9 rows")
         assert mismatch_index < summary_index
     finally:
         dialog.close()
@@ -482,7 +486,8 @@ def test_verify_finished_failure_preserves_failed_result_with_mismatches():
         dialog._on_finished(False, payload)
 
         text = dialog.txt_verify_result.toPlainText()
-        assert "users / id=7 / email" in text
+        assert "테이블: users" in text
+        assert "Key: id=7" in text
         assert "새 검증 결과를 받지 못했습니다" not in text
         assert dialog.btn_save_report.isEnabled()
         assert dialog.last_result is payload
@@ -797,6 +802,34 @@ def test_migrate_failure_shows_human_readable_issue_and_cleanup_action():
         dialog.close()
 
 
+def test_migrate_failure_summarizes_database_error_details():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("execute")
+        dialog.show()
+        app.processEvents()
+        dialog._on_result({
+            "event": "result",
+            "command": "migrate",
+            "success": False,
+            "message": "postgresql copy finish error: db error",
+            "table": "log_entry",
+            "code": "22021",
+            "detail": "invalid byte sequence for encoding UTF8: 0x00",
+            "context": "COPY log_entry, line 34055",
+            "state": {"tables": [{"table": "log_entry", "completed": False}]},
+        })
+
+        summary = dialog.lbl_migration_result.text()
+        assert "실패 위치: log_entry" in summary
+        assert "원인: postgresql copy finish error: db error" in summary
+        assert "PostgreSQL 오류 코드: 22021" in summary
+        assert "상세: invalid byte sequence for encoding UTF8: 0x00" in summary
+        assert "위치: COPY log_entry, line 34055" in summary
+    finally:
+        dialog.close()
+
+
 def test_command_start_resets_stale_execution_state():
     dialog = make_dialog()
     try:
@@ -1033,7 +1066,7 @@ def test_schema_change_invalidates_stale_plan_and_verify_reports():
             ],
             "row_count_differences": [],
         })
-        assert "users / id=7 / email" in dialog.txt_verify_result.toPlainText()
+        assert "테이블: users" in dialog.txt_verify_result.toPlainText()
         assert dialog.last_result is not None
         assert dialog.last_result["command"] == "verify"
         assert dialog.btn_save_report.isEnabled()
@@ -1044,7 +1077,7 @@ def test_schema_change_invalidates_stale_plan_and_verify_reports():
         assert "int -> bigint" not in dialog.lbl_plan_summary.text()
         assert "아직 실행 계획을 생성하지 않았습니다." in dialog.lbl_plan_summary.text()
         verify_text = dialog.txt_verify_result.toPlainText()
-        assert "users / id=7 / email" not in verify_text
+        assert "테이블: users" not in verify_text
         assert "새 검증이 필요합니다" in verify_text
         assert dialog.last_result is None
         assert not dialog.btn_save_report.isEnabled()
@@ -1662,5 +1695,6 @@ def test_save_report_writes_text_report(monkeypatch, tmp_path):
         assert report_path.exists()
         assert "Command: verify" in Path(report_path).read_text(encoding="utf-8")
         assert "결과 저장 완료" in dialog.txt_log.toPlainText()
+        assert "결과 저장 완료" in dialog.txt_verify_log.toPlainText()
     finally:
         dialog.close()

@@ -8511,7 +8511,7 @@ mod tests {
     }
 
     #[test]
-    fn zstd_dump_level_matches_mysqlsh_default() {
+    fn zstd_dump_level_uses_fast_default() {
         assert_eq!(MYSQL_DUMP_ZSTD_LEVEL, 1);
     }
 

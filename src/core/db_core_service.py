@@ -16,6 +16,26 @@ class DbCoreServiceError(RuntimeError):
     """Raised when the Rust DB core service cannot complete a request."""
 
 
+def _format_error_event(payload: Dict[str, Any]) -> str:
+    message = str(payload.get("message") or payload.get("error") or "DB core service error")
+    details: List[str] = []
+    for key, label in (
+        ("code", "code"),
+        ("detail", "detail"),
+        ("hint", "hint"),
+        ("context", "context"),
+        ("table", "table"),
+        ("column", "column"),
+        ("constraint", "constraint"),
+    ):
+        value = payload.get(key)
+        if value not in (None, ""):
+            details.append(f"{label}={value}")
+    if not details:
+        return message
+    return f"{message} ({'; '.join(details)})"
+
+
 SUPPORTED_DB_ENGINES = {"mysql", "postgresql"}
 
 
@@ -153,7 +173,7 @@ class DbCoreServiceClient:
                 if event.event == "result":
                     return event.payload
                 if event.event == "error":
-                    raise DbCoreServiceError(event.message)
+                    raise DbCoreServiceError(_format_error_event(event.payload))
 
     def shutdown(self) -> None:
         process = self._process

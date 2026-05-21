@@ -66,6 +66,35 @@ def test_client_reports_missing_core_executable_cleanly():
     assert "missing-tunnelforge-core.exe" in message
 
 
+def test_client_error_includes_database_error_details():
+    process = FakeProcess([
+        json.dumps({
+            "event": "error",
+            "request_id": "req-1",
+            "message": "postgresql connection error: db error",
+            "code": "3D000",
+            "detail": "database public does not exist",
+            "context": "connection.open",
+        }),
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+
+    try:
+        client.request("connection.open", request_id="req-1")
+    except DbCoreServiceError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("DbCoreServiceError was not raised")
+
+    assert "postgresql connection error: db error" in message
+    assert "code=3D000" in message
+    assert "database public does not exist" in message
+    assert "connection.open" in message
+
+
 def test_facade_uses_connection_test_protocol():
     process = FakeProcess([
         '{"event":"result","command":"connection.test","success":true,"message":"connection successful"}',

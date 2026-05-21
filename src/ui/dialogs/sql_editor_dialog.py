@@ -1660,7 +1660,9 @@ class SQLEditorDialog(QDialog):
 
         conn_bar.addWidget(QLabel(f"🔗 {mode_label}: {host_info}"))
         conn_bar.addWidget(QLabel(f"👤 {db_user or '(미설정)'}"))
-        conn_bar.addWidget(QLabel("📂 DB:"))
+        selector_text = "📂 Schema:" if self._db_engine() == "postgresql" else "📂 DB:"
+        self.db_selector_label = QLabel(selector_text)
+        conn_bar.addWidget(self.db_selector_label)
 
         self.db_combo = QComboBox()
         self.db_combo.setMinimumWidth(200)

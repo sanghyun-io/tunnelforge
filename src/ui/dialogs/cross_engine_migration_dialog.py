@@ -591,6 +591,12 @@ class CrossEngineMigrationDialog(QDialog):
         if hasattr(self, "lbl_plan_summary"):
             self.lbl_plan_summary.setText("아직 실행 계획을 생성하지 않았습니다.")
 
+    def _display_value(self, value: Any, limit: int = 160) -> str:
+        text = str(value)
+        if len(text) <= limit:
+            return text
+        return text[: limit - 3] + "..."
+
     def _verification_result_text(self, payload: Dict) -> str:
         mismatch_lines: List[str] = []
         raw_mismatches = payload.get("mismatches")
@@ -604,10 +610,16 @@ class CrossEngineMigrationDialog(QDialog):
                 source_value = mismatch.get("source_value", "")
                 target_value = mismatch.get("target_value", "")
                 difference = mismatch.get("difference", "")
-                mismatch_lines.append(
-                    f"- {table} / {key} / {column}: "
-                    f"source={source_value}, target={target_value}, type={difference}"
-                )
+                lines = [
+                    f"- 테이블: {table}",
+                    f"  Key: {key}",
+                    f"  Column: {column}",
+                    f"  Source: {self._display_value(source_value)}",
+                    f"  Target: {self._display_value(target_value)}",
+                ]
+                if difference:
+                    lines.append(f"  차이 유형: {difference}")
+                mismatch_lines.append("\n".join(lines))
 
         row_diff_lines: List[str] = []
         raw_row_diffs = payload.get("row_count_differences")
@@ -615,9 +627,12 @@ class CrossEngineMigrationDialog(QDialog):
             for diff in raw_row_diffs:
                 if not isinstance(diff, dict):
                     continue
+                source_rows = int(diff.get("source_rows", 0) or 0)
+                target_rows = int(diff.get("target_rows", 0) or 0)
+                delta = source_rows - target_rows
                 row_diff_lines.append(
-                    f"- {diff.get('table', '')}: "
-                    f"source {diff.get('source_rows', 0)}, target {diff.get('target_rows', 0)}"
+                    f"- {diff.get('table', '')}: Source {source_rows:,} rows / "
+                    f"Target {target_rows:,} rows / 차이 {delta:+,}"
                 )
 
         lines: List[str] = []
@@ -1185,6 +1200,8 @@ class CrossEngineMigrationDialog(QDialog):
             with open(path, "w", encoding="utf-8") as f:
                 f.write(content)
             self._append_log(f"결과 저장 완료: {path}")
+            if self.last_result.get("command") == "verify":
+                self._append_verify_log(f"결과 저장 완료: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "저장 실패", str(exc))
 
@@ -1336,9 +1353,12 @@ class CrossEngineMigrationDialog(QDialog):
             return
 
         first_issue: Dict[str, Any] = issue_list[0] if issue_list else {}
-        location = str(first_issue.get("location", "")).strip()
-        message = str(first_issue.get("message", "")).strip()
-        suggestion = str(first_issue.get("suggestion", "")).strip()
+        location = str(first_issue.get("location") or payload.get("table") or payload.get("location") or "").strip()
+        message = str(first_issue.get("message") or payload.get("message") or payload.get("error") or "").strip()
+        suggestion = str(first_issue.get("suggestion") or payload.get("suggestion") or "").strip()
+        error_code = str(payload.get("code") or first_issue.get("code") or "").strip()
+        detail = str(payload.get("detail") or first_issue.get("detail") or "").strip()
+        context = str(payload.get("context") or first_issue.get("context") or "").strip()
         raw_state = payload.get("state")
         state: Dict[str, Any] = cast(Dict[str, Any], raw_state) if isinstance(raw_state, dict) else {}
         raw_tables = state.get("tables")
@@ -1359,6 +1379,12 @@ class CrossEngineMigrationDialog(QDialog):
             lines.append(f"실패 위치: {failed_table}")
         if message:
             lines.append(f"원인: {message}")
+        if error_code:
+            lines.append(f"PostgreSQL 오류 코드: {error_code}")
+        if detail:
+            lines.append(f"상세: {detail}")
+        if context:
+            lines.append(f"위치: {context}")
         if suggestion:
             lines.append(f"다음 행동: {suggestion}")
         else:

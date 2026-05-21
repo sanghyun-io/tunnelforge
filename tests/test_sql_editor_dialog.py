@@ -89,6 +89,32 @@ def test_query_result_collapses_log_and_updates_summary(monkeypatch):
         close_dialog(dialog)
 
 
+def test_postgresql_header_labels_selector_as_schema(monkeypatch):
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", lambda self: None)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("postgres", "tunnelpass")
+    tunnel_engine = MagicMock()
+
+    dialog = SQLEditorDialog(
+        None,
+        {
+            "id": "pg-test",
+            "name": "PostgreSQL 테스트",
+            "connection_mode": "direct",
+            "remote_host": "127.0.0.1",
+            "remote_port": 35432,
+            "db_engine": "postgresql",
+            "default_database": "tf_target",
+        },
+        config_manager,
+        tunnel_engine,
+    )
+    try:
+        assert dialog.db_selector_label.text() == "📂 Schema:"
+    finally:
+        close_dialog(dialog)
+
+
 def test_result_tabs_can_be_deleted_and_cleared(monkeypatch):
     dialog = make_dialog(monkeypatch)
     try:

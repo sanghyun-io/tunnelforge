@@ -471,6 +471,26 @@ class TestSQLAutoCompleter(unittest.TestCase):
         self.assertNotIn('keyword', types, "table. 뒤에서 키워드가 포함되면 안됨")
         self.assertNotIn('function', types, "table. 뒤에서 함수가 포함되면 안됨")
 
+    def test_autocomplete_after_alias_dot(self):
+        """[SUCCESS] alias. 뒤 → alias가 가리키는 테이블 컬럼"""
+        sql = "SELECT u. FROM users u"
+        cursor_pos = len("SELECT u.")
+        completions = self.completer.get_completions(sql, cursor_pos)
+
+        column_labels = [c['label'] for c in completions if c['type'] == 'column']
+        self.assertIn('email', column_labels)
+        self.assertIn('name', column_labels)
+        self.assertNotIn('total_amount', column_labels)
+
+    def test_autocomplete_after_schema_dot_in_table_context(self):
+        """[SUCCESS] FROM schema. 뒤 → 테이블 목록"""
+        sql = "SELECT * FROM public."
+        completions = self.completer.get_completions(sql, len(sql))
+
+        table_labels = [c['label'] for c in completions if c['type'] == 'table']
+        self.assertIn('users', table_labels)
+        self.assertIn('orders', table_labels)
+
     def test_autocomplete_after_select(self):
         """[SUCCESS] SELECT 뒤 → 컬럼/키워드"""
         sql = "SELECT "
