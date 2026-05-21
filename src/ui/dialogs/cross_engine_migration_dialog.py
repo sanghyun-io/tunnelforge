@@ -1073,6 +1073,10 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _on_finished(self, success: bool, payload):
         finished_command = self._current_command
+        if not self._wait_for_worker_finish():
+            self._set_running(True)
+            self._refresh_navigation_state()
+            return
         self.worker = None
         self._set_running(False)
         if finished_command == "preflight":
@@ -1107,6 +1111,16 @@ class CrossEngineMigrationDialog(QDialog):
         elif finished_command == "cleanup":
             self._current_command = None
         self._refresh_navigation_state()
+
+    def _wait_for_worker_finish(self) -> bool:
+        worker = self.worker
+        if worker is None or not worker.isRunning():
+            return True
+        if worker.wait(5000):
+            return True
+        else:
+            self._append_log("작업 thread 종료 대기가 시간 초과되었습니다.")
+            return False
 
     def _confirm_migration_execution(self) -> bool:
         if self._approval_matches_target_schema():
@@ -1190,6 +1204,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_resume,
             self.btn_cleanup_failed,
             self.btn_verify,
+            self.btn_close,
         ):
             button.setEnabled(not running)
         self._update_execution_state(running)

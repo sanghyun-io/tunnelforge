@@ -817,21 +817,43 @@ def test_command_start_resets_stale_execution_state():
         dialog.close()
 
 
-def test_finished_clears_worker_before_refreshing_navigation_hint():
-    class StillRunningWorker:
+def test_finished_waits_for_worker_to_stop_before_clearing_reference():
+    class FinishingWorker:
+        def __init__(self):
+            self.wait_timeout = None
+            self.running = True
+
         def isRunning(self):
+            return self.running
+
+        def wait(self, timeout):
+            self.wait_timeout = timeout
+            self.running = False
             return True
 
     dialog = make_dialog()
+    worker = FinishingWorker()
     try:
-        dialog.worker = cast(Any, StillRunningWorker())
+        dialog.worker = cast(Any, worker)
         dialog._current_command = "migrate"
         dialog._on_finished(False, {"command": "migrate", "success": False})
 
+        assert worker.wait_timeout == 5000
         assert dialog.worker is None
         assert "현재 작업이 실행 중입니다" not in dialog.lbl_next_hint.text()
     finally:
         dialog.worker = None
+        dialog.close()
+
+
+def test_close_button_is_disabled_while_worker_runs():
+    dialog = make_dialog()
+    try:
+        dialog._current_command = "verify"
+        dialog._set_running(True)
+
+        assert not dialog.btn_close.isEnabled()
+    finally:
         dialog.close()
 
 
