@@ -321,6 +321,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_target_advanced_help.setObjectName("MutedHelp")
         self.lbl_target_advanced_help.setWordWrap(True)
         self.chk_cleanup_before_migrate = QCheckBox("DB 변경 실행 직전에 기존 Target 테이블 정리")
+        self.chk_cleanup_before_migrate.toggled.connect(self._on_cleanup_before_migrate_toggled)
         target_advanced_layout.addWidget(self.lbl_target_advanced_help)
         target_advanced_layout.addWidget(self.chk_cleanup_before_migrate)
         self.target_advanced_panel.hide()
@@ -702,6 +703,35 @@ class CrossEngineMigrationDialog(QDialog):
             summary = f"점검 실패: 차단 이슈 {counts['blocking']}개, 경고 {counts['warnings']}개"
         self.lbl_safety_summary.setText(summary)
 
+    def _blocking_preflight_issues(self):
+        if not isinstance(self.last_result, dict) or self.last_result.get("command") != "preflight":
+            return []
+        issues = self.last_result.get("issues")
+        if not isinstance(issues, list):
+            return []
+        return [issue for issue in issues if isinstance(issue, dict) and issue.get("blocking") is True]
+
+    def _cleanup_plan_resolves_safety_blockers(self) -> bool:
+        if not self.chk_cleanup_before_migrate.isChecked():
+            return False
+        blocking_issues = self._blocking_preflight_issues()
+        return bool(blocking_issues) and all(
+            self._is_target_non_empty_issue(issue) for issue in blocking_issues
+        )
+
+    def _safety_step_complete(self) -> bool:
+        return self._step_completed.get("safety", False) or self._cleanup_plan_resolves_safety_blockers()
+
+    def _on_cleanup_before_migrate_toggled(self, checked: bool):
+        if checked and self._cleanup_plan_resolves_safety_blockers():
+            self.lbl_target_safety.setText(
+                "Target 정리를 실행 직전에 수행하도록 계획했습니다. 실행 버튼을 누르기 전까지 DB는 변경되지 않습니다."
+            )
+        elif self.last_result and self.last_result.get("command") == "preflight":
+            target_blocked = self._update_target_safety_from_issues(self.last_result.get("issues"))
+            self._update_preflight_summary(self.last_result, target_blocked)
+        self._refresh_navigation_state()
+
     def _open_target_advanced_options(self):
         visible = not self.target_advanced_panel.isVisible()
         self.target_advanced_panel.setVisible(visible)
@@ -715,7 +745,7 @@ class CrossEngineMigrationDialog(QDialog):
         if self.current_step_id == "inspect":
             return self._step_completed.get("inspect", False)
         if self.current_step_id == "safety":
-            return self._step_completed.get("safety", False)
+            return self._safety_step_complete()
         if self.current_step_id == "plan":
             return self._step_completed.get("plan", False)
         if self.current_step_id == "execute":
@@ -741,14 +771,16 @@ class CrossEngineMigrationDialog(QDialog):
     def _next_hint_text(self) -> str:
         if self.worker and self.worker.isRunning():
             return "현재 작업이 실행 중입니다. 완료될 때까지 기다려 주세요."
-        if self._next_enabled_for_current_step():
-            return "현재 단계가 완료되었습니다. 다음 단계로 이동할 수 있습니다."
         if self.current_step_id == "connections":
             return "Source와 Target 연결을 모두 선택하면 다음 단계로 이동할 수 있습니다."
         if self.current_step_id == "inspect":
             return "Source 구조 분석이 완료되면 다음 단계로 이동할 수 있습니다."
         if self.current_step_id == "safety":
+            if self._cleanup_plan_resolves_safety_blockers():
+                return "Target 정리를 실행 직전에 수행하도록 계획했습니다. 다음 단계로 이동할 수 있습니다."
             return "전환 가능 여부 점검이 통과되면 다음 단계로 이동할 수 있습니다."
+        if self._next_enabled_for_current_step():
+            return "현재 단계가 완료되었습니다. 다음 단계로 이동할 수 있습니다."
         if self.current_step_id == "plan":
             return "실행 계획 생성이 완료되면 다음 단계로 이동할 수 있습니다."
         if self.current_step_id == "execute":

@@ -1415,6 +1415,33 @@ def test_safety_advanced_cleanup_is_planned_not_executed(monkeypatch):
 
         assert payload["execution_options"]["cleanup_before_migrate"] is True
         assert started == []
+        assert dialog.btn_next.isEnabled()
+        assert "Target 정리를 실행 직전에 수행하도록 계획했습니다" in dialog.lbl_next_hint.text()
+    finally:
+        dialog.close()
+
+
+def test_safety_cleanup_plan_does_not_unlock_unrelated_blocking_issue():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("safety")
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "location": "orders.amount",
+                    "message": "unsupported precision conversion",
+                    "blocking": True,
+                }
+            ],
+        })
+
+        dialog.chk_cleanup_before_migrate.setChecked(True)
+
+        assert not dialog.btn_next.isEnabled()
     finally:
         dialog.close()
 
