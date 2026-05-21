@@ -355,6 +355,33 @@ class TestRustDumpImporter:
         assert metadata["table_rows"] == {"users": 1, "orders": 2}
         assert metadata["total_rows"] == 3
 
+    def test_import_metadata_rejects_manifest_path_outside_dump_dir(self, tmp_path):
+        """악의적 manifest path가 dump 폴더 밖 chunk를 참조하면 metadata 분석을 거부한다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        outside_dir = tmp_path / "outside"
+        dump_dir.mkdir()
+        outside_dir.mkdir()
+        (outside_dir / "chunk_000001.tsv").write_text("secret\n", encoding="utf-8")
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 2,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "../outside", "rows": 1, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+
+        assert importer._analyze_dump_metadata(str(dump_dir)) is None
+
 
 class TestConvenienceFunctions:
     """편의 함수 테스트"""

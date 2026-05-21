@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -1504,20 +1504,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     }
 
     let output_path = Path::new(output_dir);
-    if output_path.exists() {
-        if overwrite {
-            fs::remove_dir_all(output_path)
-                .map_err(|err| format!("failed to clear dump output_dir: {err}"))?;
-        } else {
-            let mut entries = fs::read_dir(output_path)
-                .map_err(|err| format!("failed to inspect dump output_dir: {err}"))?;
-            if entries.next().is_some() {
-                return Err("dump output_dir already exists and is not empty".to_string());
-            }
-        }
-    }
-    fs::create_dir_all(output_path)
-        .map_err(|err| format!("failed to create dump output_dir: {err}"))?;
+    prepare_dump_output_dir(output_path, overwrite)?;
 
     let inspection = inspect_live(&endpoint)?;
     let mut schema = inspection.schema;
@@ -1675,6 +1662,49 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         "chunks_dumped": total_chunks,
         "manifest": "_tunnelforge_dump.json"
     }))
+}
+
+fn prepare_dump_output_dir(output_path: &Path, overwrite: bool) -> Result<(), String> {
+    if output_path.as_os_str().is_empty() || output_path.parent().is_none() {
+        return Err("refusing to use unsafe dump output_dir".to_string());
+    }
+    if output_path.exists() {
+        let mut entries = fs::read_dir(output_path)
+            .map_err(|err| format!("failed to inspect dump output_dir: {err}"))?;
+        let is_empty = entries.next().is_none();
+        if !is_empty {
+            if !overwrite {
+                return Err("dump output_dir already exists and is not empty".to_string());
+            }
+            if !has_tunnelforge_dump_manifest(output_path) {
+                return Err(
+                    "refusing to overwrite output_dir without TunnelForge dump manifest"
+                        .to_string(),
+                );
+            }
+            fs::remove_dir_all(output_path)
+                .map_err(|err| format!("failed to clear dump output_dir: {err}"))?;
+        }
+    }
+    fs::create_dir_all(output_path)
+        .map_err(|err| format!("failed to create dump output_dir: {err}"))
+}
+
+fn has_tunnelforge_dump_manifest(output_path: &Path) -> bool {
+    let manifest_path = output_path.join("_tunnelforge_dump.json");
+    let Ok(file) = File::open(manifest_path) else {
+        return false;
+    };
+    serde_json::from_reader::<_, Value>(file)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("format")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("tunnelforge-dump")
 }
 
 fn dump_tables_sequential<F: FnMut(Value)>(
@@ -2972,7 +3002,6 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
 
-    let restore_local_infile = ensure_mysql_local_infile_for_import(&mut adapter)?;
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
         for (index, table_manifest) in tables.iter().enumerate() {
@@ -3026,11 +3055,13 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             }
 
             for chunk_index in 1..=table_manifest.chunks {
-                let chunk_path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+                let chunk_path = dump_manifest_chunk_path(
+                    input_path,
+                    &table_manifest.path,
                     chunk_index,
                     &data_format,
                     &compression,
-                ));
+                )?;
                 let rows = read_dump_rows(&chunk_path, table, &data_format, &compression)?;
                 let row_count = rows.len();
                 adapter.insert_rows(table, rows)?;
@@ -3057,11 +3088,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         Ok(())
     })();
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
-    let restore_local_infile_result =
-        restore_mysql_local_infile_after_import(&mut adapter, restore_local_infile);
     import_result?;
     restore_result?;
-    restore_local_infile_result?;
 
     Ok(json!({
         "event": "result",
@@ -3142,11 +3170,13 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
     for chunk_index in 1..=table_manifest.chunks {
-        let chunk_path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+        let chunk_path = dump_manifest_chunk_path(
+            input_path,
+            &table_manifest.path,
             chunk_index,
             "tsv",
             compression,
-        ));
+        )?;
         let started = Instant::now();
         let rows = match load_mysql_tsv_chunk(conn, table, &chunk_path, compression) {
             Ok(rows) => rows,
@@ -3220,44 +3250,6 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
     }
 }
 
-fn mysql_local_infile_sql(enabled: bool) -> String {
-    format!(
-        "SET GLOBAL local_infile={}",
-        if enabled { "ON" } else { "OFF" }
-    )
-}
-
-fn set_mysql_local_infile(conn: &mut mysql::PooledConn, enabled: bool) -> Result<(), String> {
-    conn.query_drop(mysql_local_infile_sql(enabled))
-        .map_err(|err| format!("mysql local_infile tuning error: {err}"))
-}
-
-fn ensure_mysql_local_infile_for_import(adapter: &mut LiveAdapter) -> Result<bool, String> {
-    let LiveAdapter::MySql(conn) = adapter else {
-        return Ok(false);
-    };
-    if mysql_local_infile_enabled(conn) {
-        return Ok(false);
-    }
-    if set_mysql_local_infile(conn, true).is_err() {
-        return Ok(false);
-    }
-    Ok(true)
-}
-
-fn restore_mysql_local_infile_after_import(
-    adapter: &mut LiveAdapter,
-    should_restore: bool,
-) -> Result<(), String> {
-    let LiveAdapter::MySql(conn) = adapter else {
-        return Ok(());
-    };
-    if should_restore {
-        set_mysql_local_infile(conn, false)?;
-    }
-    Ok(())
-}
-
 fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> Result<(), String> {
     if !matches!(adapter, LiveAdapter::MySql(_)) {
         return Ok(());
@@ -3280,11 +3272,13 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
     for chunk_index in 1..=table_manifest.chunks {
-        let chunk_path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+        let chunk_path = dump_manifest_chunk_path(
+            input_path,
+            &table_manifest.path,
             chunk_index,
             "tsv",
             compression,
-        ));
+        )?;
         let started = Instant::now();
         let rows = insert_mysql_tsv_chunk_with_batches(conn, table, &chunk_path, compression)?;
         rows_imported += rows;
@@ -3420,12 +3414,16 @@ fn adaptive_import_chunk_order(
 ) -> VecDeque<u64> {
     let mut chunks = (1..=table_manifest.chunks)
         .map(|chunk_index| {
-            let path = input_path.join(&table_manifest.path).join(dump_chunk_name(
+            let path = dump_manifest_chunk_path(
+                input_path,
+                &table_manifest.path,
                 chunk_index,
                 data_format,
                 compression,
-            ));
-            let bytes = fs::metadata(path)
+            );
+            let bytes = path
+                .ok()
+                .and_then(|path| fs::metadata(path).ok())
                 .map(|metadata| metadata.len())
                 .unwrap_or(0);
             (chunk_index, bytes)
@@ -3459,11 +3457,13 @@ fn spawn_mysql_import_chunk_worker(
                     return Err("mysql TSV import requires mysql endpoint".to_string())
                 }
             };
-            let chunk_path = input_path.join(&table_path).join(dump_chunk_name(
+            let chunk_path = dump_manifest_chunk_path(
+                &input_path,
+                &table_path,
                 chunk_index,
                 "tsv",
                 &compression,
-            ));
+            )?;
             let started = Instant::now();
             let rows = load_mysql_tsv_chunk(&mut conn, &table, &chunk_path, &compression)?;
             Ok((rows, started.elapsed().as_millis() as u64))
@@ -6353,7 +6353,39 @@ fn write_dump_manifest(output_path: &Path, manifest: &DumpManifest) -> Result<()
 fn read_dump_manifest(input_path: &Path) -> Result<DumpManifest, String> {
     let path = input_path.join("_tunnelforge_dump.json");
     let file = File::open(&path).map_err(|err| format!("failed to open dump manifest: {err}"))?;
-    serde_json::from_reader(file).map_err(|err| format!("failed to parse dump manifest: {err}"))
+    let manifest: DumpManifest = serde_json::from_reader(file)
+        .map_err(|err| format!("failed to parse dump manifest: {err}"))?;
+    for table in &manifest.tables {
+        validate_dump_table_path(&table.path)?;
+    }
+    Ok(manifest)
+}
+
+fn validate_dump_table_path(path: &str) -> Result<(), String> {
+    let table_path = Path::new(path);
+    if path.trim().is_empty() || table_path.is_absolute() {
+        return Err(format!("unsafe dump table path: {path}"));
+    }
+    for component in table_path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => return Err(format!("unsafe dump table path: {path}")),
+        }
+    }
+    Ok(())
+}
+
+fn dump_manifest_chunk_path(
+    input_path: &Path,
+    table_path: &str,
+    chunk_index: u64,
+    data_format: &str,
+    compression: &str,
+) -> Result<PathBuf, String> {
+    validate_dump_table_path(table_path)?;
+    Ok(input_path
+        .join(table_path)
+        .join(dump_chunk_name(chunk_index, data_format, compression)))
 }
 
 fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
@@ -7842,6 +7874,71 @@ mod tests {
         assert_eq!(read_jsonl_rows(&chunk_path, "none").unwrap(), rows);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_manifest_rejects_table_paths_outside_dump_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-traversal-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            tables: vec![DumpTableManifest {
+                name: "users".to_string(),
+                path: "../outside".to_string(),
+                rows: 1,
+                chunks: 1,
+            }],
+        };
+        write_dump_manifest(&dir, &manifest).unwrap();
+
+        let err = read_dump_manifest(&dir).unwrap_err();
+
+        assert!(err.contains("unsafe dump table path"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn mysql_dump_import_does_not_build_global_local_infile_statement() {
+        let source = include_str!("lib.rs");
+        let forbidden = ["SET", "GLOBAL", "local_infile"].join(" ");
+
+        assert!(!source.contains(&forbidden));
+    }
+
+    #[test]
+    fn dump_overwrite_rejects_non_dump_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-overwrite-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let keep_file = dir.join("keep.txt");
+        fs::write(&keep_file, "keep").unwrap();
+
+        let err = prepare_dump_output_dir(&dir, true).unwrap_err();
+
+        assert!(err.contains("refusing to overwrite"));
+        assert!(keep_file.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_output_rejects_empty_directory_path() {
+        let err = prepare_dump_output_dir(Path::new(""), false).unwrap_err();
+
+        assert!(err.contains("unsafe dump output_dir"));
     }
 
     #[test]
@@ -9616,9 +9713,10 @@ mod tests {
     }
 
     #[test]
-    fn mysql_dump_import_can_temporarily_enable_local_infile() {
-        assert_eq!(mysql_local_infile_sql(true), "SET GLOBAL local_infile=ON");
-        assert_eq!(mysql_local_infile_sql(false), "SET GLOBAL local_infile=OFF");
+    fn mysql_dump_import_uses_fallback_when_local_infile_is_disabled() {
+        assert!(is_mysql_local_infile_disabled_error(
+            "ERROR 3948 (42000): Loading local data is disabled"
+        ));
     }
 
     #[test]

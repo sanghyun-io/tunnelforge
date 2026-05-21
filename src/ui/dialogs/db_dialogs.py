@@ -992,31 +992,50 @@ class RustDumpExportDialog(QDialog):
         """
         import os
         from datetime import datetime
+        from pathlib import Path
 
         base_dir = self._get_base_output_dir()
+
+        def safe_component(value: str) -> str:
+            safe = value.replace(':', '_').replace('/', '_').replace('\\', '_')
+            safe = safe.replace('*', '_').replace('?', '_').replace('"', '_')
+            safe = safe.replace('<', '_').replace('>', '_').replace('|', '_')
+            safe = safe.strip().strip(".")
+            return safe if safe not in {".", ".."} else ""
+
+        def safe_join(folder_name: str) -> str:
+            fallback = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            folder_name = safe_component(folder_name) or fallback
+            base_path = Path(base_dir).expanduser().resolve()
+            output_path = (base_path / folder_name).resolve()
+            try:
+                if not output_path.is_relative_to(base_path):
+                    output_path = (base_path / fallback).resolve()
+            except ValueError:
+                output_path = (base_path / fallback).resolve()
+            return str(output_path)
 
         # 수동 모드일 경우
         if hasattr(self, 'radio_manual_naming') and self.radio_manual_naming.isChecked():
             manual_name = self.input_manual_folder.text().strip()
             if manual_name:
-                # 파일명에 사용할 수 없는 문자 제거
-                safe_name = manual_name.replace(':', '_').replace('/', '_').replace('\\', '_')
-                safe_name = safe_name.replace('*', '_').replace('?', '_').replace('"', '_')
-                safe_name = safe_name.replace('<', '_').replace('>', '_').replace('|', '_')
-                return os.path.join(base_dir, safe_name)
-            return os.path.join(base_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                return safe_join(manual_name)
+            return safe_join(f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
         # 자동 모드
         parts = []
 
         # name (연결 정보)
         if hasattr(self, 'chk_name') and self.chk_name.isChecked() and self.connection_info:
-            safe_conn = self.connection_info.replace(':', '_').replace('/', '_').replace('\\', '_')
-            parts.append(safe_conn)
+            safe_conn = safe_component(self.connection_info)
+            if safe_conn:
+                parts.append(safe_conn)
 
         # schema
         if hasattr(self, 'chk_schema') and self.chk_schema.isChecked() and schema:
-            parts.append(schema)
+            safe_schema = safe_component(schema)
+            if safe_schema:
+                parts.append(safe_schema)
 
         # timestamp
         if hasattr(self, 'chk_timestamp') and self.chk_timestamp.isChecked():
@@ -1028,7 +1047,7 @@ class RustDumpExportDialog(QDialog):
             parts.append(f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
         folder_name = "_".join(parts)
-        return os.path.join(base_dir, folder_name)
+        return safe_join(folder_name)
 
     def _get_default_output_dir(self) -> str:
         """기본 출력 디렉토리 (초기값)"""

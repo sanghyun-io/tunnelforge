@@ -20,6 +20,20 @@ logger = get_logger("rust_dump_exporter")
 DEFAULT_DUMP_COMPRESSION = "zstd"
 
 
+def _safe_dump_child_dir(dump_dir: str, table_path: str) -> Optional[Path]:
+    base_path = Path(dump_dir).resolve()
+    table_path_obj = Path(table_path)
+    if not table_path or table_path_obj.is_absolute() or any(part == ".." for part in table_path_obj.parts):
+        return None
+    child_path = (base_path / table_path_obj).resolve()
+    try:
+        if not child_path.is_relative_to(base_path):
+            return None
+    except ValueError:
+        return None
+    return child_path
+
+
 @dataclass
 class RustDumpConfig:
     """Connection settings for Rust DB Core dump operations."""
@@ -524,7 +538,9 @@ class RustDumpImporter:
                 rows = int(table.get("rows") or 0)
                 table_rows[table_name] = rows
                 total_rows += rows
-                table_dir = Path(dump_dir) / str(table.get("path", ""))
+                table_dir = _safe_dump_child_dir(dump_dir, str(table.get("path", "")))
+                if table_dir is None:
+                    return None
                 size = sum(path.stat().st_size for path in table_dir.glob("chunk_*.*"))
                 table_sizes[table_name] = size
                 total_bytes += size

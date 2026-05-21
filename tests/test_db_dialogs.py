@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from PyQt6.QtWidgets import QApplication
@@ -150,6 +151,23 @@ def test_rust_dump_export_dialog_defaults_to_zstd():
     dialog = RustDumpExportDialog()
 
     assert dialog.combo_compression.currentText() == "zstd"
+    dialog.close()
+
+
+def test_rust_dump_export_dialog_rejects_parent_manual_folder(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(tmp_path) if key == "rust_dump_export_base_dir" else default
+    )
+    dialog = RustDumpExportDialog(config_manager=config_manager)
+
+    dialog.radio_manual_naming.setChecked(True)
+    dialog.input_manual_folder.setText("..")
+
+    generated = Path(dialog._generate_output_dir("dataflare")).resolve()
+    assert generated.is_relative_to(tmp_path.resolve())
+    assert generated != tmp_path.parent.resolve()
     dialog.close()
 
 
