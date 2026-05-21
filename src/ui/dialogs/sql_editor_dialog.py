@@ -28,7 +28,7 @@ from typing import List, Dict, Optional, Tuple
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 
 
-def create_sql_editor_connector(engine, host, port, user, password, database=None):
+def create_sql_editor_connector(engine, host, port, user, password, database=None, schema=None):
     db_engine = normalize_db_engine(engine, port)
     return create_rust_db_connector(
         db_engine,
@@ -37,7 +37,7 @@ def create_sql_editor_connector(engine, host, port, user, password, database=Non
         user,
         password,
         database,
-        schema=database if db_engine == "postgresql" else "",
+        schema=(schema or "") if db_engine == "postgresql" else "",
     )
 
 
@@ -726,7 +726,7 @@ class SQLQueryWorker(QThread):
     query_result = pyqtSignal(int, list, list, str, int, float)  # idx, columns, rows, error, affected, time
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries, engine="mysql"):
+    def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None):
         super().__init__()
         self.engine = normalize_db_engine(engine, port)
         self.host = host
@@ -734,6 +734,7 @@ class SQLQueryWorker(QThread):
         self.user = user
         self.password = password
         self.database = database
+        self.schema = schema
         self.queries = queries  # List of query strings
 
     def run(self):
@@ -746,6 +747,7 @@ class SQLQueryWorker(QThread):
                 self.user,
                 self.password,
                 self.database,
+                self.schema,
             )
             success, msg = connector.connect()
 
@@ -850,7 +852,7 @@ class SQLTransactionWorker(QThread):
     ready_for_confirm = pyqtSignal()  # 커밋 대기 상태
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries, engine="mysql"):
+    def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None):
         super().__init__()
         self.engine = normalize_db_engine(engine, port)
         self.host = host
@@ -858,6 +860,7 @@ class SQLTransactionWorker(QThread):
         self.user = user
         self.password = password
         self.database = database
+        self.schema = schema
         self.queries = queries
         self.connector = None
         self.pending_commit = False
@@ -873,6 +876,7 @@ class SQLTransactionWorker(QThread):
                 self.user,
                 self.password,
                 self.database,
+                self.schema,
             )
             success, msg = self.connector.connect()
 
@@ -1612,7 +1616,7 @@ class SQLEditorDialog(QDialog):
             self.message_text.append(f"✅ 임시 터널: localhost:{port}")
         return host, port, temp_server, None
 
-    def _create_db_connector(self, host, port, user, password, database=None):
+    def _create_db_connector(self, host, port, user, password, database=None, schema=None):
         return create_sql_editor_connector(
             self._db_engine(),
             host,
@@ -1620,6 +1624,20 @@ class SQLEditorDialog(QDialog):
             user,
             password,
             database,
+            schema,
+        )
+
+    def _database_and_schema_for_selection(self, selected: Optional[str] = None) -> Tuple[Optional[str], str]:
+        db_engine = self._db_engine()
+        selected_name = (selected or "").strip()
+        if db_engine == "postgresql":
+            return (
+                self.config.get("default_database") or "postgres",
+                selected_name or self.config.get("default_schema") or "public",
+            )
+        return (
+            selected_name or self.config.get("default_database") or self.config.get("default_schema"),
+            "",
         )
 
     def init_ui(self):
@@ -2160,14 +2178,16 @@ class SQLEditorDialog(QDialog):
                 self.message_text.append(f"❌ {error}")
                 return
             db_engine = self._db_engine()
+            connect_database, connect_schema = self._database_and_schema_for_selection(
+                self.config.get('default_schema') if db_engine == 'postgresql' else None
+            )
             connector = self._create_db_connector(
                 host,
                 port,
                 db_user,
                 db_password,
-                self.config.get('default_database') or (
-                    self.config.get('default_schema') if db_engine == 'mysql' else None
-                ),
+                connect_database,
+                connect_schema,
             )
             try:
                 success, msg = connector.connect()
@@ -2226,7 +2246,8 @@ class SQLEditorDialog(QDialog):
             if error:
                 return False, error
 
-            database = self.db_combo.currentText().strip() or None
+            selected = self.db_combo.currentText().strip()
+            database, schema = self._database_and_schema_for_selection(selected)
 
             db_engine = self._db_engine()
             connector = self._create_db_connector(
@@ -2235,6 +2256,7 @@ class SQLEditorDialog(QDialog):
                 db_user,
                 db_password,
                 database,
+                schema,
             )
             success, msg = connector.connect()
             if not success:
@@ -2492,7 +2514,8 @@ class SQLEditorDialog(QDialog):
                 self.message_text.append(f"❌ {error}")
                 return
 
-            database = self.db_combo.currentText().strip() or None
+            selected = self.db_combo.currentText().strip()
+            database, schema = self._database_and_schema_for_selection(selected)
 
             self._clear_result_tabs()
 
@@ -2510,6 +2533,7 @@ class SQLEditorDialog(QDialog):
                 database,
                 queries,
                 engine=self._db_engine(),
+                schema=schema,
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.query_result.connect(self._on_query_result)
@@ -3565,12 +3589,14 @@ class SQLEditorDialog(QDialog):
                     pass
                 self._metadata_connector = None
 
+            database, connector_schema = self._database_and_schema_for_selection(target_schema)
             connector = self._create_db_connector(
                 host,
                 port,
                 db_user,
                 db_password,
-                target_schema,
+                database,
+                connector_schema,
             )
             success, _ = connector.connect()
             if not success:

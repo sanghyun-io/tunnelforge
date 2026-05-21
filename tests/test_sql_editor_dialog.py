@@ -106,7 +106,7 @@ def test_refresh_databases_uses_configured_engine(monkeypatch):
             return True, "ok"
 
         def get_schemas(self):
-            return ["tf_target"]
+            return ["public"]
 
         def disconnect(self):
             self.disconnected = True
@@ -150,9 +150,72 @@ def test_refresh_databases_uses_configured_engine(monkeypatch):
             "postgres",
             "tunnelpass",
             "tf_target",
+            "public",
         )
-        assert dialog.db_combo.findText("tf_target") >= 0
+        assert dialog.db_combo.findText("public") >= 0
         assert connector.disconnected is True
+    finally:
+        close_dialog(dialog)
+
+
+def test_postgresql_query_connection_uses_database_and_selected_schema(monkeypatch):
+    class FakeCursor:
+        def execute(self, sql):
+            self.sql = sql
+
+    class FakeConnection:
+        open = False
+
+        def __init__(self):
+            self.autocommit_value = None
+            self.cursor_obj = FakeCursor()
+
+        def autocommit(self, value):
+            self.autocommit_value = value
+
+        def cursor(self):
+            return self.cursor_obj
+
+    class FakeConnector:
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        def connect(self):
+            self.connection.open = True
+            return True, "ok"
+
+    dialog = make_dialog(monkeypatch)
+    connector = FakeConnector()
+    created = {}
+    try:
+        dialog.config.update(
+            {
+                "db_engine": "postgresql",
+                "remote_port": 35432,
+                "default_database": "tf_target",
+                "default_schema": None,
+            }
+        )
+        dialog.db_combo.clear()
+        dialog.db_combo.addItem("public")
+        dialog.db_combo.setCurrentText("public")
+        dialog._resolve_db_target = MagicMock(return_value=("127.0.0.1", 35432, None, None))
+        dialog._create_db_connector = MagicMock(
+            side_effect=lambda *args: created.setdefault("args", args) and connector
+        )
+
+        success, error = dialog._ensure_connection()
+
+        assert success is True
+        assert error is None
+        assert created["args"] == (
+            "127.0.0.1",
+            35432,
+            "testuser",
+            "testpass",
+            "tf_target",
+            "public",
+        )
     finally:
         close_dialog(dialog)
 
@@ -206,6 +269,7 @@ def test_refresh_databases_passes_mysql_default_database(monkeypatch):
             "root",
             "tunnelpass",
             "tf_source84",
+            "",
         )
     finally:
         close_dialog(dialog)
