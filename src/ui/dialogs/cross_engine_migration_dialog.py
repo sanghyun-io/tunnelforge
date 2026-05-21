@@ -359,7 +359,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_plan = QPushButton("계획 생성")
         self.btn_run_plan = self.btn_plan
         self.btn_migrate = QPushButton("DB 변경 실행")
-        self.btn_resume = QPushButton("재개(DB 변경)")
+        self.btn_resume = QPushButton("중단 지점부터 재개")
         self.btn_cleanup_failed = QPushButton("실패한 전환 정리")
         self.btn_verify = QPushButton("검증")
         self.btn_save_report = QPushButton("결과 저장")
@@ -370,6 +370,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_previous.setObjectName("WizardBackButton")
         self.btn_next.setObjectName("WizardNextButton")
         self.btn_full_run.hide()
+        self.btn_migrate.hide()
         self.btn_migrate.setToolTip("대상 DB에 스키마 생성과 데이터 적재를 실행합니다.")
         self.btn_resume.setToolTip("저장된 상태부터 대상 DB 변경 작업을 재개합니다.")
         self.btn_cleanup_failed.setToolTip("실패한 전환에서 생성된 Target 테이블을 정리합니다.")
@@ -416,12 +417,11 @@ class CrossEngineMigrationDialog(QDialog):
         plan_action_layout.addStretch()
         self.step_page_layouts["plan"].addLayout(plan_action_layout)
 
-        execute_action_layout = QHBoxLayout()
-        execute_action_layout.addWidget(self.btn_migrate)
-        execute_action_layout.addWidget(self.btn_resume)
-        execute_action_layout.addWidget(self.btn_cleanup_failed)
-        execute_action_layout.addStretch()
-        self.step_page_layouts["execute"].insertLayout(0, execute_action_layout)
+        execute_secondary_layout = QHBoxLayout()
+        execute_secondary_layout.addWidget(self.btn_resume)
+        execute_secondary_layout.addWidget(self.btn_cleanup_failed)
+        execute_secondary_layout.addStretch()
+        execution_layout.addLayout(execute_secondary_layout)
 
         self.verify_group = QGroupBox("검증 및 결과 저장")
         verify_layout = QVBoxLayout(self.verify_group)
@@ -749,10 +749,23 @@ class CrossEngineMigrationDialog(QDialog):
         if self.current_step_id == "plan":
             return self._step_completed.get("plan", False)
         if self.current_step_id == "execute":
-            return self._step_completed.get("execute", False)
+            return self._step_completed.get("execute", False) or self._can_start_migration_from_execute_step()
         if self.current_step_id == "verify":
             return self._step_completed.get("verify", False)
         return False
+
+    def _can_start_migration_from_execute_step(self) -> bool:
+        running = bool(self.worker and self.worker.isRunning())
+        return (not running) and self._execution_unlocked and self._approval_matches_target_schema()
+
+    def _next_button_text(self) -> str:
+        if self.current_step_id == "verify":
+            return "완료"
+        if self.current_step_id == "execute":
+            if self._step_completed.get("execute", False):
+                return "검증 단계로 이동"
+            return "DB 변경 실행"
+        return "다음"
 
     def _connection_step_ready(self) -> bool:
         source_selected = bool(self.source_form.combo_tunnel.currentData())
@@ -764,6 +777,7 @@ class CrossEngineMigrationDialog(QDialog):
             running = bool(self.worker and self.worker.isRunning())
             self.btn_previous.setEnabled(self._current_step_index() > 0 and not running)
         if hasattr(self, "btn_next"):
+            self.btn_next.setText(self._next_button_text())
             self.btn_next.setEnabled(self._next_enabled_for_current_step())
         if hasattr(self, "lbl_next_hint"):
             self.lbl_next_hint.setText(self._next_hint_text())
@@ -799,8 +813,7 @@ class CrossEngineMigrationDialog(QDialog):
             running = bool(self.worker and self.worker.isRunning())
             self.btn_previous.setEnabled(self._current_step_index() > 0 and not running)
         if hasattr(self, "btn_next"):
-            is_last = self._current_step_index() == len(self.step_ids) - 1
-            self.btn_next.setText("완료" if is_last else "다음")
+            self.btn_next.setText(self._next_button_text())
             self.btn_next.setEnabled(self._next_enabled_for_current_step())
         self._refresh_navigation_state()
         self._refresh_direction_summary()
@@ -812,6 +825,9 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _go_next_step(self):
         if hasattr(self, "btn_next") and not self.btn_next.isEnabled():
+            return
+        if self.current_step_id == "execute" and not self._step_completed.get("execute", False):
+            self._start_command("migrate")
             return
         index = self._current_step_index()
         if index >= len(self.step_ids) - 1:

@@ -269,7 +269,8 @@ def test_wizard_next_requires_current_step_completion():
         dialog._show_step("execute")
         dialog.input_approval_schema.setText("target_db")
         assert dialog.btn_migrate.isEnabled()
-        assert not dialog.btn_next.isEnabled()
+        assert dialog.btn_next.isEnabled()
+        assert dialog.btn_next.text() == "DB 변경 실행"
 
         dialog._on_result({
             "event": "result",
@@ -277,6 +278,7 @@ def test_wizard_next_requires_current_step_completion():
             "success": True,
         })
         assert dialog.btn_next.isEnabled()
+        assert dialog.btn_next.text() == "검증 단계로 이동"
 
         dialog._show_step("verify")
         assert not dialog.btn_next.isEnabled()
@@ -515,7 +517,7 @@ def test_step_pages_keep_current_step_actions_reachable():
         "inspect": [dialog.btn_auto_inspect],
         "safety": [dialog.btn_run_safety],
         "plan": [dialog.btn_guide, dialog.btn_plan],
-        "execute": [dialog.btn_migrate, dialog.btn_resume],
+        "execute": [dialog.btn_resume],
         "verify": [dialog.btn_verify, dialog.btn_save_report],
     }
     try:
@@ -943,7 +945,8 @@ def test_execute_approval_uses_public_when_postgresql_target_schema_blank():
         dialog.input_approval_schema.setText("public")
 
         assert dialog.btn_migrate.isEnabled()
-        assert not dialog.btn_next.isEnabled()
+        assert dialog.btn_next.isEnabled()
+        assert dialog.btn_next.text() == "DB 변경 실행"
     finally:
         dialog.close()
 
@@ -961,7 +964,8 @@ def test_execute_approval_invalidates_when_target_schema_changes():
         dialog.input_approval_schema.setText("target_db")
 
         assert dialog.btn_migrate.isEnabled()
-        assert not dialog.btn_next.isEnabled()
+        assert dialog.btn_next.isEnabled()
+        assert dialog.btn_next.text() == "DB 변경 실행"
 
         dialog.target_form.input_schema.setText("changed_target")
 
@@ -1460,10 +1464,53 @@ def test_migrate_payload_includes_cleanup_before_migrate_option(monkeypatch):
         dialog.input_approval_schema.setText("target_db")
         dialog.chk_cleanup_before_migrate.setChecked(True)
 
-        dialog._start_command("migrate")
+        dialog._go_next_step()
 
         assert started[0][0] == "migrate"
         assert started[0][1]["execution_options"]["cleanup_before_migrate"] is True
+    finally:
+        dialog.close()
+
+
+def test_execute_step_uses_bottom_next_button_as_db_change_cta(monkeypatch):
+    dialog = make_dialog()
+    started = []
+    monkeypatch.setattr(
+        dialog,
+        "_start_command_with_payload",
+        lambda command, payload, workflow=False: started.append((command, payload, workflow)),
+    )
+    try:
+        dialog._set_execution_unlocked(True)
+        dialog._show_step("execute")
+
+        assert not dialog.btn_migrate.isVisible()
+        assert dialog.btn_next.text() == "DB 변경 실행"
+        assert not dialog.btn_next.isEnabled()
+
+        dialog.input_approval_schema.setText("target_db")
+
+        assert dialog.btn_next.isEnabled()
+        dialog._go_next_step()
+
+        assert started[0][0] == "migrate"
+        assert dialog.current_step_id == "execute"
+    finally:
+        dialog.close()
+
+
+def test_execute_step_next_moves_to_verify_after_migration_success():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("execute")
+        dialog._on_result({"event": "result", "command": "migrate", "success": True})
+
+        assert dialog.btn_next.text() == "검증 단계로 이동"
+        assert dialog.btn_next.isEnabled()
+
+        dialog._go_next_step()
+
+        assert dialog.current_step_id == "verify"
     finally:
         dialog.close()
 
