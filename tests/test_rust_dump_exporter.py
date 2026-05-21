@@ -382,6 +382,40 @@ class TestRustDumpImporter:
 
         assert importer._analyze_dump_metadata(str(dump_dir)) is None
 
+    def test_import_metadata_rejects_chunk_symlink_outside_dump_dir(self, tmp_path):
+        """dump 폴더 내부 chunk symlink가 외부 파일을 가리키면 metadata 분석을 거부한다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        table_dir = dump_dir / "0001_users"
+        outside_dir = tmp_path / "outside"
+        table_dir.mkdir(parents=True)
+        outside_dir.mkdir()
+        outside_file = outside_dir / "chunk_000001.tsv"
+        outside_file.write_text("secret\n", encoding="utf-8")
+        chunk_link = table_dir / "chunk_000001.tsv"
+        try:
+            chunk_link.symlink_to(outside_file)
+        except OSError:
+            return
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 2,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "0001_users", "rows": 1, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+
+        assert importer._analyze_dump_metadata(str(dump_dir)) is None
+
 
 class TestConvenienceFunctions:
     """편의 함수 테스트"""

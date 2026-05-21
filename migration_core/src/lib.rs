@@ -3,7 +3,7 @@ use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
@@ -16,6 +16,7 @@ const MYSQL_INSERT_FALLBACK_BATCH_ROWS: usize = 500;
 const MYSQL_INSERT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const MYSQL_DUMP_TARGET_BYTES_PER_CHUNK: u64 = 64_000_000;
 const MYSQL_DUMP_ZSTD_LEVEL: i32 = 1;
+const DUMP_DIR_MARKER: &str = ".tunnelforge_dump_dir";
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -156,6 +157,8 @@ pub struct DumpTableManifest {
     pub path: String,
     pub rows: u64,
     pub chunks: u64,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub chunk_sha256: BTreeMap<String, String>,
 }
 
 enum DumpTableEvent {
@@ -183,6 +186,7 @@ enum DumpRangeEvent {
         stream_ms: u64,
         range_start: String,
         range_end: String,
+        checksum: String,
     },
     Error(String),
 }
@@ -196,6 +200,7 @@ enum DumpGlobalEvent {
         stream_ms: u64,
         range_start: String,
         range_end: String,
+        checksum: String,
     },
     TableDone {
         index: usize,
@@ -232,6 +237,7 @@ struct DumpGlobalTableState {
     chunks_done: u64,
     avg_row_bytes: u64,
     work_ms: u64,
+    chunk_sha256: BTreeMap<String, String>,
     manifest: Option<DumpTableManifest>,
 }
 
@@ -1676,26 +1682,47 @@ fn prepare_dump_output_dir(output_path: &Path, overwrite: bool) -> Result<(), St
             if !overwrite {
                 return Err("dump output_dir already exists and is not empty".to_string());
             }
-            if !has_tunnelforge_dump_manifest(output_path) {
+            if !has_tunnelforge_dump_marker(output_path) {
                 return Err(
-                    "refusing to overwrite output_dir without TunnelForge dump manifest"
-                        .to_string(),
+                    "refusing to overwrite output_dir without TunnelForge dump marker".to_string(),
                 );
             }
-            fs::remove_dir_all(output_path)
-                .map_err(|err| format!("failed to clear dump output_dir: {err}"))?;
+            remove_dump_output_dir(output_path)?;
         }
     }
     fs::create_dir_all(output_path)
         .map_err(|err| format!("failed to create dump output_dir: {err}"))
 }
 
-fn has_tunnelforge_dump_manifest(output_path: &Path) -> bool {
+fn remove_dump_output_dir(output_path: &Path) -> Result<(), String> {
+    let confirmed_dump_dir = output_path;
+    fs::remove_dir_all(confirmed_dump_dir)
+        .map_err(|err| format!("failed to clear dump output_dir: {err}"))
+}
+
+fn has_tunnelforge_dump_marker(output_path: &Path) -> bool {
+    let marker_path = output_path.join(DUMP_DIR_MARKER);
     let manifest_path = output_path.join("_tunnelforge_dump.json");
-    let Ok(file) = File::open(manifest_path) else {
+    let Ok(marker_file) = File::open(marker_path) else {
         return false;
     };
-    serde_json::from_reader::<_, Value>(file)
+    let marker_ok = serde_json::from_reader::<_, Value>(marker_file)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("format")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .as_deref()
+        == Some("tunnelforge-dump-dir");
+    if !marker_ok {
+        return false;
+    }
+    let Ok(manifest_file) = File::open(manifest_path) else {
+        return false;
+    };
+    serde_json::from_reader::<_, Value>(manifest_file)
         .ok()
         .and_then(|value| {
             value
@@ -2042,6 +2069,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
             chunks_done: 0,
             avg_row_bytes,
             work_ms: 0,
+            chunk_sha256: BTreeMap::new(),
             manifest: None,
         });
     }
@@ -2123,12 +2151,17 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 stream_ms,
                 range_start,
                 range_end,
+                checksum,
             }) => {
                 let table = &tables[table_index];
                 let state = &mut states[table_index];
                 state.rows_dumped += rows;
                 state.chunks_done += 1;
                 state.work_ms = state.work_ms.saturating_add(stream_ms.max(1));
+                state.chunk_sha256.insert(
+                    dump_chunk_name(chunk_index, data_format, compression),
+                    checksum,
+                );
                 completed_work += 1;
                 active = active.saturating_sub(1);
                 emit(json!({
@@ -2152,6 +2185,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                         path: state.table_path.clone(),
                         rows: state.rows_dumped,
                         chunks: state.chunks_done,
+                        chunk_sha256: state.chunk_sha256.clone(),
                     });
                     emit(json!({
                         "event": "table_progress",
@@ -2345,6 +2379,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
     let mut active = 0_usize;
     let mut completed = 0_usize;
     let mut rows_dumped = 0_u64;
+    let mut chunk_sha256 = BTreeMap::new();
     let mut first_error: Option<String> = None;
     let mut handles = Vec::new();
     let (sender, receiver) = mpsc::channel::<DumpRangeEvent>();
@@ -2376,10 +2411,15 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                 stream_ms,
                 range_start,
                 range_end,
+                checksum,
             }) => {
                 rows_dumped += rows;
                 completed += 1;
                 active = active.saturating_sub(1);
+                chunk_sha256.insert(
+                    dump_chunk_name(chunk_index, data_format, compression),
+                    checksum,
+                );
                 emit(json!({
                     "event": "row_progress",
                     "request_id": request_id,
@@ -2442,6 +2482,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
             path: table_path,
             rows: rows_dumped,
             chunks: total_ranges as u64,
+            chunk_sha256,
         },
         rows_dumped,
         total_ranges as u64,
@@ -2471,13 +2512,14 @@ fn spawn_mysql_range_worker(
             &compression,
         );
         match result {
-            Ok((rows, stream_ms)) => {
+            Ok((rows, stream_ms, checksum)) => {
                 let _ = sender.send(DumpRangeEvent::Done {
                     chunk_index: range.chunk_index,
                     rows,
                     stream_ms,
                     range_start: range.start.to_string(),
                     range_end: range.end.to_string(),
+                    checksum,
                 });
             }
             Err(err) => {
@@ -2515,7 +2557,7 @@ fn spawn_dump_global_worker(
                 &compression,
             );
             match result {
-                Ok((rows, stream_ms)) => {
+                Ok((rows, stream_ms, checksum)) => {
                     let _ = sender.send(DumpGlobalEvent::RangeDone {
                         table_index: work.table_index,
                         chunk_index: range.chunk_index,
@@ -2523,6 +2565,7 @@ fn spawn_dump_global_worker(
                         stream_ms,
                         range_start: range.start.to_string(),
                         range_end: range.end.to_string(),
+                        checksum,
                     });
                 }
                 Err(err) => {
@@ -2584,7 +2627,7 @@ fn dump_mysql_range_chunk(
     range: &DumpRange,
     data_format: &str,
     compression: &str,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64, String), String> {
     let mut conn = match LiveAdapter::connect(endpoint)? {
         LiveAdapter::MySql(conn) => conn,
         LiveAdapter::PostgreSql(_) => {
@@ -2596,7 +2639,6 @@ fn dump_mysql_range_chunk(
         data_format,
         compression,
     ));
-    let mut file = open_dump_writer(&chunk_path, compression)?;
     let columns = column_names(table);
     let sql = select_chunk_text_range_sql("mysql", table, pk_column, range.start, range.end);
     let stream_started = Instant::now();
@@ -2604,17 +2646,21 @@ fn dump_mysql_range_chunk(
         .query_iter(sql)
         .map_err(|err| format!("mysql range select chunk error: {err}"))?;
     let mut rows = 0_u64;
-    for row in result {
-        let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
-        if data_format == "tsv" {
-            write_mysql_text_row_tsv(&mut file, row)?;
-        } else {
-            let row_json = mysql_row_to_json(&columns, row);
-            write_dump_row(&mut file, table, &row_json, data_format)?;
+    {
+        let mut file = open_dump_writer(&chunk_path, compression)?;
+        for row in result {
+            let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
+            if data_format == "tsv" {
+                write_mysql_text_row_tsv(&mut file, row)?;
+            } else {
+                let row_json = mysql_row_to_json(&columns, row);
+                write_dump_row(&mut file, table, &row_json, data_format)?;
+            }
+            rows += 1;
         }
-        rows += 1;
     }
-    Ok((rows, stream_started.elapsed().as_millis() as u64))
+    let checksum = sha256_file(&chunk_path)?;
+    Ok((rows, stream_started.elapsed().as_millis() as u64, checksum))
 }
 
 fn spawn_dump_table_worker(
@@ -2730,6 +2776,7 @@ fn dump_one_table<F: FnMut(Value)>(
     let mut offset = 0_usize;
     let mut rows_dumped = 0_u64;
     let mut chunks_dumped = 0_u64;
+    let mut chunk_sha256 = BTreeMap::new();
 
     loop {
         let read_started = Instant::now();
@@ -2745,13 +2792,14 @@ fn dump_one_table<F: FnMut(Value)>(
         chunks_dumped += 1;
         let chunk_name = dump_chunk_name(chunks_dumped, data_format, compression);
         let write_started = Instant::now();
-        write_dump_rows(
+        let checksum = write_dump_rows(
             &table_dir.join(&chunk_name),
             table,
             &rows,
             data_format,
             compression,
         )?;
+        chunk_sha256.insert(chunk_name, checksum);
         let write_ms = write_started.elapsed().as_millis() as u64;
 
         let copied_now = rows.len();
@@ -2789,6 +2837,7 @@ fn dump_one_table<F: FnMut(Value)>(
             path: table_path,
             rows: rows_dumped,
             chunks: chunks_dumped,
+            chunk_sha256,
         },
         rows_dumped,
         chunks_dumped,
@@ -2831,12 +2880,12 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
     let mut offset = 0_usize;
     let mut rows_dumped = 0_u64;
     let mut chunks_dumped = 0_u64;
+    let mut chunk_sha256 = BTreeMap::new();
 
     loop {
         chunks_dumped += 1;
         let chunk_name = dump_chunk_name(chunks_dumped, data_format, compression);
         let chunk_path = table_dir.join(&chunk_name);
-        let mut file = open_dump_writer(&chunk_path, compression)?;
 
         let stream_started = Instant::now();
         let last_values = last_key.as_deref().and_then(decode_key_token);
@@ -2867,18 +2916,21 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
 
         let mut chunk_rows = 0_usize;
         let mut next_key: Option<String> = None;
-        for row in result {
-            let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
-            if data_format == "tsv" && !use_keyset {
-                write_mysql_text_row_tsv(&mut file, row)?;
-            } else {
-                let row_json = mysql_row_to_json(&columns, row);
-                if use_keyset {
-                    next_key = row_key_token(&row_json, &key_columns);
+        {
+            let mut file = open_dump_writer(&chunk_path, compression)?;
+            for row in result {
+                let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
+                if data_format == "tsv" && !use_keyset {
+                    write_mysql_text_row_tsv(&mut file, row)?;
+                } else {
+                    let row_json = mysql_row_to_json(&columns, row);
+                    if use_keyset {
+                        next_key = row_key_token(&row_json, &key_columns);
+                    }
+                    write_dump_row(&mut file, table, &row_json, data_format)?;
                 }
-                write_dump_row(&mut file, table, &row_json, data_format)?;
+                chunk_rows += 1;
             }
-            chunk_rows += 1;
         }
         let stream_ms = stream_started.elapsed().as_millis() as u64;
 
@@ -2887,6 +2939,8 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
             chunks_dumped -= 1;
             break;
         }
+        let checksum = sha256_file(&chunk_path)?;
+        chunk_sha256.insert(chunk_name, checksum);
 
         rows_dumped += chunk_rows as u64;
         if use_keyset {
@@ -2921,6 +2975,7 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
             path: table_path,
             rows: rows_dumped,
             chunks: chunks_dumped,
+            chunk_sha256,
         },
         rows_dumped,
         chunks_dumped,
@@ -2997,6 +3052,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     }
 
     let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
+    validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
@@ -3120,7 +3176,9 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
-            "message": "MySQL local_infile is disabled; using Rust INSERT fallback"
+            "message": "MySQL local_infile is disabled; using safe Rust INSERT fallback",
+            "strategy": "insert_fallback",
+            "performance": "safe_fallback"
         }));
         return import_mysql_tsv_table_insert_fallback(
             conn,
@@ -3151,7 +3209,9 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     "event": "phase",
                     "request_id": request_id,
                     "phase": "dump_import",
-                    "message": "MySQL LOAD DATA LOCAL is disabled; using Rust INSERT fallback"
+                    "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
+                    "strategy": "insert_fallback",
+                    "performance": "safe_fallback"
                 }));
                 import_mysql_tsv_table_insert_fallback(
                     conn,
@@ -3185,7 +3245,9 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     "event": "phase",
                     "request_id": request_id,
                     "phase": "dump_import",
-                    "message": "MySQL LOAD DATA LOCAL is disabled; using Rust INSERT fallback"
+                    "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
+                    "strategy": "insert_fallback",
+                    "performance": "safe_fallback"
                 }));
                 return import_mysql_tsv_table_insert_fallback(
                     conn,
@@ -6343,6 +6405,18 @@ fn current_unix_seconds() -> u64 {
 }
 
 fn write_dump_manifest(output_path: &Path, manifest: &DumpManifest) -> Result<(), String> {
+    let marker_path = output_path.join(DUMP_DIR_MARKER);
+    let marker_file =
+        File::create(&marker_path).map_err(|err| format!("failed to create dump marker: {err}"))?;
+    serde_json::to_writer_pretty(
+        marker_file,
+        &json!({
+            "format": "tunnelforge-dump-dir",
+            "created_by": "tunnelforge-core",
+            "version": 1
+        }),
+    )
+    .map_err(|err| format!("failed to write dump marker: {err}"))?;
     let path = output_path.join("_tunnelforge_dump.json");
     let file =
         File::create(&path).map_err(|err| format!("failed to create dump manifest: {err}"))?;
@@ -6383,9 +6457,59 @@ fn dump_manifest_chunk_path(
     compression: &str,
 ) -> Result<PathBuf, String> {
     validate_dump_table_path(table_path)?;
-    Ok(input_path
-        .join(table_path)
-        .join(dump_chunk_name(chunk_index, data_format, compression)))
+    let base_path = fs::canonicalize(input_path)
+        .map_err(|err| format!("failed to validate dump input_dir: {err}"))?;
+    let raw_path =
+        input_path
+            .join(table_path)
+            .join(dump_chunk_name(chunk_index, data_format, compression));
+    let chunk_path = fs::canonicalize(&raw_path)
+        .map_err(|err| format!("failed to validate dump chunk: {err}"))?;
+    if !chunk_path.starts_with(&base_path) {
+        return Err(format!(
+            "dump chunk path is outside dump directory: {}",
+            raw_path.display()
+        ));
+    }
+    if !chunk_path.is_file() {
+        return Err(format!(
+            "dump chunk path is not a file: {}",
+            raw_path.display()
+        ));
+    }
+    Ok(chunk_path)
+}
+
+fn validate_dump_manifest_chunks(
+    input_path: &Path,
+    tables: &[DumpTableManifest],
+    data_format: &str,
+    compression: &str,
+) -> Result<(), String> {
+    for table in tables {
+        for chunk_index in 1..=table.chunks {
+            let chunk_name = dump_chunk_name(chunk_index, data_format, compression);
+            let chunk_path = dump_manifest_chunk_path(
+                input_path,
+                &table.path,
+                chunk_index,
+                data_format,
+                compression,
+            )?;
+            if let Some(expected) = table.chunk_sha256.get(&chunk_name) {
+                let actual = sha256_file(&chunk_path)?;
+                if !expected.eq_ignore_ascii_case(&actual) {
+                    return Err(format!(
+                        "dump chunk checksum mismatch: {} expected {} got {}",
+                        chunk_path.display(),
+                        expected,
+                        actual
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
@@ -6426,7 +6550,7 @@ fn write_dump_rows(
     rows: &[Value],
     data_format: &str,
     compression: &str,
-) -> Result<(), String> {
+) -> Result<String, String> {
     if data_format == "tsv" {
         write_tsv_rows(path, table, rows, compression)
     } else {
@@ -6464,15 +6588,17 @@ fn read_dump_rows(
     }
 }
 
-fn write_jsonl_rows(path: &Path, rows: &[Value], compression: &str) -> Result<(), String> {
-    let mut file = open_dump_writer(path, compression)?;
-    for row in rows {
-        serde_json::to_writer(&mut file, row)
-            .map_err(|err| format!("failed to encode dump row: {err}"))?;
-        file.write_all(b"\n")
-            .map_err(|err| format!("failed to write dump row: {err}"))?;
+fn write_jsonl_rows(path: &Path, rows: &[Value], compression: &str) -> Result<String, String> {
+    {
+        let mut file = open_dump_writer(path, compression)?;
+        for row in rows {
+            serde_json::to_writer(&mut file, row)
+                .map_err(|err| format!("failed to encode dump row: {err}"))?;
+            file.write_all(b"\n")
+                .map_err(|err| format!("failed to write dump row: {err}"))?;
+        }
     }
-    Ok(())
+    sha256_file(path)
 }
 
 fn write_tsv_rows(
@@ -6480,12 +6606,30 @@ fn write_tsv_rows(
     table: &NormalizedTable,
     rows: &[Value],
     compression: &str,
-) -> Result<(), String> {
-    let mut file = open_dump_writer(path, compression)?;
-    for row in rows {
-        write_tsv_row(&mut file, table, row)?;
+) -> Result<String, String> {
+    {
+        let mut file = open_dump_writer(path, compression)?;
+        for row in rows {
+            write_tsv_row(&mut file, table, row)?;
+        }
     }
-    Ok(())
+    sha256_file(path)
+}
+
+fn sha256_file(path: &Path) -> Result<String, String> {
+    let mut file = File::open(path).map_err(|err| format!("failed to open dump chunk: {err}"))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|err| format!("failed to read dump chunk: {err}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
 }
 
 fn write_tsv_row<W: Write>(
@@ -7861,6 +8005,7 @@ mod tests {
                 path: "0001_users".to_string(),
                 rows: 2,
                 chunks: 1,
+                chunk_sha256: BTreeMap::new(),
             }],
         };
         write_dump_manifest(&dir, &manifest).unwrap();
@@ -7899,6 +8044,7 @@ mod tests {
                 path: "../outside".to_string(),
                 rows: 1,
                 chunks: 1,
+                chunk_sha256: BTreeMap::new(),
             }],
         };
         write_dump_manifest(&dir, &manifest).unwrap();
@@ -7906,6 +8052,156 @@ mod tests {
         let err = read_dump_manifest(&dir).unwrap_err();
 
         assert!(err.contains("unsafe dump table path"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_manifest_validation_rejects_symlinked_chunk_outside_dump_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-symlink-test-{}",
+            current_unix_seconds()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-symlink-outside-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("chunk_000001.tsv"), b"1\toutside\n").unwrap();
+        let link_dir = dir.join("0001_users");
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_dir(&outside, &link_dir);
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&outside, &link_dir);
+        if link_result.is_err() {
+            fs::remove_dir_all(&dir).ok();
+            fs::remove_dir_all(&outside).ok();
+            return;
+        }
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "none".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            tables: vec![DumpTableManifest {
+                name: "users".to_string(),
+                path: "0001_users".to_string(),
+                rows: 1,
+                chunks: 1,
+                chunk_sha256: BTreeMap::new(),
+            }],
+        };
+
+        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none").unwrap_err();
+
+        assert!(err.contains("outside dump directory"));
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn dump_manifest_validation_rejects_missing_chunk_before_import() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-missing-chunk-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(dir.join("0001_users")).unwrap();
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "none".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            tables: vec![DumpTableManifest {
+                name: "users".to_string(),
+                path: "0001_users".to_string(),
+                rows: 1,
+                chunks: 1,
+                chunk_sha256: BTreeMap::new(),
+            }],
+        };
+
+        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none").unwrap_err();
+
+        assert!(err.contains("failed to validate dump chunk"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_manifest_validation_rejects_checksum_mismatch() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-checksum-test-{}",
+            current_unix_seconds()
+        ));
+        let table_dir = dir.join("0001_users");
+        fs::create_dir_all(&table_dir).unwrap();
+        fs::write(table_dir.join("chunk_000001.tsv"), b"1\tactual\n").unwrap();
+        let mut checksums = BTreeMap::new();
+        checksums.insert("chunk_000001.tsv".to_string(), "00".repeat(32));
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "none".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            tables: vec![DumpTableManifest {
+                name: "users".to_string(),
+                path: "0001_users".to_string(),
+                rows: 1,
+                chunks: 1,
+                chunk_sha256: checksums,
+            }],
+        };
+
+        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none").unwrap_err();
+
+        assert!(err.contains("checksum mismatch"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_manifest_validation_accepts_matching_chunk_checksum() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-checksum-ok-test-{}",
+            current_unix_seconds()
+        ));
+        let table_dir = dir.join("0001_users");
+        fs::create_dir_all(&table_dir).unwrap();
+        let table = schema().tables[0].clone();
+        let chunk_path = table_dir.join("chunk_000001.tsv");
+        let checksum = write_dump_rows(
+            &chunk_path,
+            &table,
+            &[json!({"id": 1, "name": "actual"})],
+            "tsv",
+            "none",
+        )
+        .unwrap();
+        let mut checksums = BTreeMap::new();
+        checksums.insert("chunk_000001.tsv".to_string(), checksum);
+        let manifest = DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 1,
+            chunks: 1,
+            chunk_sha256: checksums,
+        };
+
+        validate_dump_manifest_chunks(&dir, &[manifest], "tsv", "none").unwrap();
+
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -7931,6 +8227,80 @@ mod tests {
 
         assert!(err.contains("refusing to overwrite"));
         assert!(keep_file.exists());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_overwrite_requires_manifest_and_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-marker-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("_tunnelforge_dump.json"),
+            r#"{"format":"tunnelforge-dump"}"#,
+        )
+        .unwrap();
+
+        let err = prepare_dump_output_dir(&dir, true).unwrap_err();
+
+        assert!(err.contains("without TunnelForge dump marker"));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn write_dump_manifest_writes_overwrite_marker() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-write-marker-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "none".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            tables: Vec::new(),
+        };
+
+        write_dump_manifest(&dir, &manifest).unwrap();
+
+        assert!(dir.join(".tunnelforge_dump_dir").is_file());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn dump_overwrite_allows_marked_dump_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-overwrite-marker-ok-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "none".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            tables: Vec::new(),
+        };
+        write_dump_manifest(&dir, &manifest).unwrap();
+        fs::write(dir.join("old_chunk.tsv"), b"old").unwrap();
+
+        prepare_dump_output_dir(&dir, true).unwrap();
+
+        assert!(dir.is_dir());
+        assert!(!dir.join("old_chunk.tsv").exists());
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -8339,6 +8709,7 @@ mod tests {
             path: "0001_users".to_string(),
             rows: 3,
             chunks: 3,
+            chunk_sha256: BTreeMap::new(),
         };
 
         assert_eq!(
@@ -8371,12 +8742,14 @@ mod tests {
                 path: "0001_orders".to_string(),
                 rows: 1,
                 chunks: 1,
+                chunk_sha256: BTreeMap::new(),
             },
             DumpTableManifest {
                 name: "users".to_string(),
                 path: "0002_users".to_string(),
                 rows: 1,
                 chunks: 1,
+                chunk_sha256: BTreeMap::new(),
             },
         ];
 

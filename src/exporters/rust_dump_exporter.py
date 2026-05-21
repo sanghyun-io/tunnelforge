@@ -23,7 +23,11 @@ DEFAULT_DUMP_COMPRESSION = "zstd"
 def _safe_dump_child_dir(dump_dir: str, table_path: str) -> Optional[Path]:
     base_path = Path(dump_dir).resolve()
     table_path_obj = Path(table_path)
-    if not table_path or table_path_obj.is_absolute() or any(part == ".." for part in table_path_obj.parts):
+    if (
+        not table_path
+        or table_path_obj.is_absolute()
+        or any(part == ".." for part in table_path_obj.parts)
+    ):
         return None
     child_path = (base_path / table_path_obj).resolve()
     try:
@@ -32,6 +36,17 @@ def _safe_dump_child_dir(dump_dir: str, table_path: str) -> Optional[Path]:
     except ValueError:
         return None
     return child_path
+
+
+def _safe_dump_child_file(dump_dir: str, path: Path) -> Optional[Path]:
+    base_path = Path(dump_dir).resolve()
+    file_path = path.resolve()
+    try:
+        if not file_path.is_relative_to(base_path):
+            return None
+    except ValueError:
+        return None
+    return file_path if file_path.is_file() else None
 
 
 @dataclass
@@ -541,7 +556,12 @@ class RustDumpImporter:
                 table_dir = _safe_dump_child_dir(dump_dir, str(table.get("path", "")))
                 if table_dir is None:
                     return None
-                size = sum(path.stat().st_size for path in table_dir.glob("chunk_*.*"))
+                size = 0
+                for path in table_dir.glob("chunk_*.*"):
+                    safe_file = _safe_dump_child_file(dump_dir, path)
+                    if safe_file is None:
+                        return None
+                    size += safe_file.stat().st_size
                 table_sizes[table_name] = size
                 total_bytes += size
             return {

@@ -105,6 +105,12 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
     chunks_total = int(info.get("chunks_total") or 0)
     rows_sec = max(0, int(info.get("rows_sec") or 0))
     strategy = str(info.get("strategy") or "")
+    strategy_labels = {
+        "insert_fallback": "안전 INSERT fallback",
+        "load_data_local_infile": "LOAD DATA LOCAL",
+        "parallel_load_data_local_infile": "병렬 LOAD DATA LOCAL",
+    }
+    strategy_label = strategy_labels.get(strategy, strategy)
 
     if rows_total:
         data_label = f"📦 처리 rows: {rows_done:,} / {rows_total:,} rows"
@@ -118,8 +124,8 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
         status = "chunk 진행 중"
     if chunk_rows:
         status = f"{status}, +{chunk_rows:,} rows"
-    if strategy:
-        status = f"{status}, {strategy}"
+    if strategy_label:
+        status = f"{status}, {strategy_label}"
     return data_label, speed_label, f"🔄 현재: {table} {status}"
 
 

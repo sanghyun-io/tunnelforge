@@ -97,8 +97,22 @@ def test_format_import_row_labels_separates_rows_chunks_and_strategy():
     assert labels == (
         "📦 처리 rows: 100,000 / 387,398 rows",
         "⚡ 속도: 40,000 rows/s",
-        "🔄 현재: df_subs 2/8 chunks, +50,000 rows, parallel_load_data_local_infile",
+        "🔄 현재: df_subs 2/8 chunks, +50,000 rows, 병렬 LOAD DATA LOCAL",
     )
+
+
+def test_format_import_row_labels_explains_safe_insert_fallback():
+    labels = format_import_row_labels({
+        "table": "df_subs",
+        "rows_done": 50_000,
+        "rows_total": 100_000,
+        "chunk_rows": 50_000,
+        "chunks_done": 1,
+        "chunks_total": 2,
+        "strategy": "insert_fallback",
+    })
+
+    assert labels[2] == "🔄 현재: df_subs 1/2 chunks, +50,000 rows, 안전 INSERT fallback"
 
 
 def test_import_overall_percent_uses_all_table_row_totals():
