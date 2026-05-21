@@ -4734,8 +4734,15 @@ fn verify(request: &Request) -> Vec<Value> {
             LiveAdapter::connect(&target_endpoint),
         ) {
             (Ok(mut source), Ok(mut target)) => {
-                let mismatches =
-                    verify_with_adapters(&schema, &mut source, &mut target, options.chunk_size);
+                let mut emit =
+                    |event: Value| events.push(add_request_id(event, &request.request_id));
+                let mismatches = verify_with_adapters_reporting(
+                    &schema,
+                    &mut source,
+                    &mut target,
+                    options.chunk_size,
+                    &mut emit,
+                );
                 events.push(json!({
                     "event": "result",
                     "request_id": request.request_id,
@@ -4756,9 +4763,11 @@ fn verify(request: &Request) -> Vec<Value> {
     if request.payload.get("source_data").is_some() && request.payload.get("target_data").is_some()
     {
         let schema = parse_schema(&request.payload["schema"]).unwrap_or_default();
-        let source = MemoryAdapter::from_value(request.payload.get("source_data"));
-        let target = MemoryAdapter::from_value(request.payload.get("target_data"));
-        let mismatches = verify_memory(&schema, &source, &target);
+        let mut source = MemoryAdapter::from_value(request.payload.get("source_data"));
+        let mut target = MemoryAdapter::from_value(request.payload.get("target_data"));
+        let mut emit = |event: Value| events.push(add_request_id(event, &request.request_id));
+        let mismatches =
+            verify_with_adapters_reporting(&schema, &mut source, &mut target, 1000, &mut emit);
         events.push(json!({
             "event": "result",
             "request_id": request.request_id,
@@ -5333,9 +5342,25 @@ pub fn verify_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
     target: &mut T,
     chunk_size: usize,
 ) -> Vec<Value> {
+    let mut emit = |_event: Value| {};
+    verify_with_adapters_reporting(schema, source, target, chunk_size, &mut emit)
+}
+
+fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+    schema: &NormalizedSchema,
+    source: &mut S,
+    target: &mut T,
+    chunk_size: usize,
+    emit: &mut F,
+) -> Vec<Value> {
     let mut mismatches = Vec::new();
     let chunk_size = chunk_size.max(1);
     for table in &schema.tables {
+        emit(json!({
+            "event": "table_progress",
+            "table": table.name,
+            "status": "verifying"
+        }));
         let source_count = match source.row_count(&table.name) {
             Ok(count) => count,
             Err(err) => {
@@ -5360,6 +5385,14 @@ pub fn verify_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
                 continue;
             }
         };
+        let total_rows = source_count.max(target_count);
+        let mut verified_rows = 0usize;
+        emit(json!({
+            "event": "row_progress",
+            "table": table.name,
+            "rows": verified_rows,
+            "total": total_rows
+        }));
         if source_count != target_count {
             mismatches.push(json!({
                 "table": table.name,
@@ -5398,6 +5431,18 @@ pub fn verify_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
             for mismatch in compare_digest_counts(&source_counts, &target_counts) {
                 mismatches.push(with_table(&table.name, mismatch));
             }
+            verified_rows = total_rows;
+            emit(json!({
+                "event": "row_progress",
+                "table": table.name,
+                "rows": verified_rows,
+                "total": total_rows
+            }));
+            emit(json!({
+                "event": "table_progress",
+                "table": table.name,
+                "status": "completed"
+            }));
             continue;
         }
 
@@ -5446,6 +5491,13 @@ pub fn verify_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
                 &source_rows,
                 &target_rows,
             ));
+            verified_rows += source_rows.len().max(target_rows.len());
+            emit(json!({
+                "event": "row_progress",
+                "table": table.name,
+                "rows": verified_rows.min(total_rows),
+                "total": total_rows
+            }));
             let next_key = source_rows
                 .last()
                 .or_else(|| target_rows.last())
@@ -5455,6 +5507,11 @@ pub fn verify_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
             }
             last_key = next_key;
         }
+        emit(json!({
+            "event": "table_progress",
+            "table": table.name,
+            "status": "completed"
+        }));
     }
     mismatches
 }
@@ -9168,6 +9225,41 @@ mod tests {
         assert!(target.read_after_limits.iter().all(|limit| *limit == 2));
         assert!(source.max_returned <= 2);
         assert!(target.max_returned <= 2);
+    }
+
+    #[test]
+    fn verify_command_emits_progress_before_result() {
+        let events = handle_request(Request {
+            command: "verify".to_string(),
+            request_id: Some("verify-progress".to_string()),
+            payload: json!({
+                "source_engine": "mysql",
+                "target_engine": "postgresql",
+                "schema": schema(),
+                "source_data": {"users": [{"id": 1, "name": "a"}]},
+                "target_data": {"users": [{"id": 1, "name": "a"}]},
+            }),
+        });
+
+        let table_progress = events
+            .iter()
+            .position(|event| event.get("event") == Some(&json!("table_progress")))
+            .unwrap();
+        let row_progress = events
+            .iter()
+            .rposition(|event| event.get("event") == Some(&json!("row_progress")))
+            .unwrap();
+        let result = events
+            .iter()
+            .position(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert!(table_progress < result);
+        assert!(row_progress < result);
+        assert_eq!(events[row_progress]["table"], "users");
+        assert_eq!(events[row_progress]["rows"], 1);
+        assert_eq!(events[row_progress]["total"], 1);
+        assert_eq!(events[row_progress]["request_id"], "verify-progress");
     }
 
     #[test]

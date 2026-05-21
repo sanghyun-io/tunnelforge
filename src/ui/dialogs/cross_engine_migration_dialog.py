@@ -426,6 +426,18 @@ class CrossEngineMigrationDialog(QDialog):
         self.verify_group = QGroupBox("검증 및 결과 저장")
         verify_layout = QVBoxLayout(self.verify_group)
         self.lbl_verify_mode = QLabel("기본 검증: strict row/key/value 비교")
+        self.lbl_verify_status = QLabel("검증 대기 중")
+        self.lbl_verify_table = QLabel("현재 테이블: -")
+        self.lbl_verify_rows = QLabel("검증 rows: -")
+        self.lbl_verify_mismatch = QLabel("Mismatch: -")
+        self.verify_activity_bar = QProgressBar()
+        self.verify_activity_bar.setRange(0, 0)
+        self.verify_activity_bar.hide()
+        self.txt_verify_log = QPlainTextEdit()
+        self.txt_verify_log.setReadOnly(True)
+        self.txt_verify_log.setMaximumBlockCount(120)
+        self.txt_verify_log.setFixedHeight(110)
+        self.txt_verify_log.setPlaceholderText("검증 진행 상황이 표시됩니다.")
         self.txt_verify_result = QPlainTextEdit()
         self.txt_verify_result.setReadOnly(True)
         self.txt_verify_result.setPlaceholderText("검증 실행 후 mismatch 예시와 요약이 표시됩니다.")
@@ -435,6 +447,12 @@ class CrossEngineMigrationDialog(QDialog):
         verify_action_layout.addWidget(self.btn_save_report)
         verify_action_layout.addStretch()
         verify_layout.addWidget(self.lbl_verify_mode)
+        verify_layout.addWidget(self.lbl_verify_status)
+        verify_layout.addWidget(self.verify_activity_bar)
+        verify_layout.addWidget(self.lbl_verify_table)
+        verify_layout.addWidget(self.lbl_verify_rows)
+        verify_layout.addWidget(self.lbl_verify_mismatch)
+        verify_layout.addWidget(self.txt_verify_log)
         verify_layout.addLayout(verify_action_layout)
         verify_layout.addWidget(self.txt_verify_result, 1)
         self.step_page_layouts["verify"].addWidget(self.verify_group, 1)
@@ -618,13 +636,21 @@ class CrossEngineMigrationDialog(QDialog):
         return "\n".join(lines)
 
     def _update_verification_result(self, payload: Dict):
+        mismatches = payload.get("mismatches")
+        mismatch_count = len(mismatches) if isinstance(mismatches, list) else 0
+        self.verify_activity_bar.hide()
+        self.lbl_verify_status.setText("검증 완료" if bool(payload.get("success")) else "검증 완료: 불일치 확인 필요")
+        self.lbl_verify_mismatch.setText(f"Mismatch: {mismatch_count:,}개")
+        self._append_verify_log("검증 완료")
         self.txt_verify_result.setPlainText(self._verification_result_text(payload))
 
     def _mark_verify_result_stale(self):
+        self.verify_activity_bar.hide()
+        self.lbl_verify_status.setText("검증 실패")
         self.txt_verify_result.setPlainText("검증 실패: 새 검증 결과를 받지 못했습니다.")
         if isinstance(self.last_result, dict) and self.last_result.get("command") == "verify":
             self.last_result = None
-            self.btn_save_report.setEnabled(False)
+        self.btn_save_report.setEnabled(False)
 
     def _mark_verify_result_stale_after_input_change(self):
         if not hasattr(self, "txt_verify_result"):
@@ -1215,6 +1241,10 @@ class CrossEngineMigrationDialog(QDialog):
         self._append_log(f"[phase:{phase}] {message}")
         if phase == "preflight" or self._current_command == "preflight":
             self._update_safety_activity(message or phase)
+        if phase == "verify" or self._current_command == "verify":
+            self.lbl_verify_status.setText(message or phase)
+            self.verify_activity_bar.show()
+            self._append_verify_log(f"[phase:{phase}] {message}")
 
     def _on_issue(self, issue):
         line = f"[{issue.severity}] {issue.location}: {issue.message}"
@@ -1227,13 +1257,23 @@ class CrossEngineMigrationDialog(QDialog):
         self._append_log(line)
         if self._current_command == "preflight":
             self._append_safety_log(line)
+        if self._current_command == "verify":
+            self._append_verify_log(line)
 
     def _on_table_progress(self, table: str, status: str):
+        if self._current_command == "verify":
+            self.lbl_verify_table.setText(f"현재 테이블: {table} ({status})")
+            self._append_verify_log(f"[table:{table}] {status}")
+            return
         self.lbl_current_table.setText(f"현재 테이블: {table} ({status})")
         self._append_log(f"[table:{table}] {status}")
 
     def _on_row_progress(self, table: str, rows: int, total):
         total_text = f"{int(total):,}" if total is not None else "?"
+        if self._current_command == "verify":
+            self.lbl_verify_rows.setText(f"검증 rows: {int(rows):,} / {total_text} rows")
+            self._append_verify_log(f"[rows:{table}] {rows}/{total if total is not None else '?'}")
+            return
         self.lbl_current_rows.setText(f"현재 rows: {int(rows):,} / {total_text} rows")
         self._append_log(f"[rows:{table}] {rows}/{total if total is not None else '?'}")
 
@@ -1252,6 +1292,18 @@ class CrossEngineMigrationDialog(QDialog):
             self.txt_safety_log.clear()
             self.target_advanced_panel.hide()
             self.btn_target_advanced.setText("고급 설정 열기")
+        if command == "verify":
+            self.lbl_verify_status.setText("검증 준비 중")
+            self.lbl_verify_table.setText("현재 테이블: -")
+            self.lbl_verify_rows.setText("검증 rows: -")
+            self.lbl_verify_mismatch.setText("Mismatch: -")
+            self.verify_activity_bar.show()
+            self.txt_verify_log.clear()
+            self.txt_verify_result.clear()
+
+    def _append_verify_log(self, text: str):
+        if hasattr(self, "txt_verify_log"):
+            self.txt_verify_log.appendPlainText(text)
 
     def _update_migration_result_summary(self, payload: Dict):
         issues = payload.get("issues")

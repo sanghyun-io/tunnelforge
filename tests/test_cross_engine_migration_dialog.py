@@ -1054,6 +1054,28 @@ def test_execution_row_progress_shows_unknown_total():
         dialog.close()
 
 
+def test_verify_progress_updates_status_panel():
+    dialog = make_dialog()
+    try:
+        dialog._show_step("verify")
+        dialog.show()
+        app.processEvents()
+        dialog._current_command = "verify"
+
+        dialog._reset_command_ui("verify")
+        dialog._on_phase_changed("verify", "checking table counts")
+        dialog._on_table_progress("users", "verifying")
+        dialog._on_row_progress("users", 5000, 20000)
+
+        assert dialog.verify_activity_bar.isVisible()
+        assert "checking table counts" in dialog.lbl_verify_status.text()
+        assert "users" in dialog.lbl_verify_table.text()
+        assert "5,000 / 20,000 rows" in dialog.lbl_verify_rows.text()
+        assert "[rows:users] 5000/20000" in dialog.txt_verify_log.toPlainText()
+    finally:
+        dialog.close()
+
+
 def test_db_change_unlocks_after_preflight_success_and_locks_on_input_change():
     dialog = make_dialog()
     try:
