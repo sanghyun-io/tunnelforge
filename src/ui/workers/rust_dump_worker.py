@@ -2,7 +2,7 @@
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.exporters.rust_dump_exporter import (
-    RustDumpConfig, RustDumpExporter, RustDumpImporter
+    DEFAULT_DUMP_COMPRESSION, RustDumpConfig, RustDumpExporter, RustDumpImporter
 )
 
 
@@ -50,8 +50,8 @@ class RustDumpWorker(QThread):
                 success, msg = exporter.export_full_schema(
                     self.kwargs['schema'],
                     self.kwargs['output_dir'],
-                    self.kwargs.get('threads', 4),
-                    self.kwargs.get('compression', 'zstd'),
+                    self.kwargs.get('threads', 8),
+                    self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
                     callback,
                     table_callback,
                     detail_callback,
@@ -77,8 +77,8 @@ class RustDumpWorker(QThread):
                     self.kwargs['schema'],
                     self.kwargs['tables'],
                     self.kwargs['output_dir'],
-                    self.kwargs.get('threads', 4),
-                    self.kwargs.get('compression', 'zstd'),
+                    self.kwargs.get('threads', 8),
+                    self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
                     self.kwargs.get('include_fk_parents', True),
                     callback,
                     table_callback,
@@ -110,7 +110,7 @@ class RustDumpWorker(QThread):
                 success, msg, results = importer.import_dump(
                     self.kwargs['input_dir'],
                     self.kwargs.get('target_schema'),
-                    self.kwargs.get('threads', 4),
+                    self.kwargs.get('threads', 8),
                     self.kwargs.get('import_mode', 'replace'),
                     self.kwargs.get('timezone_sql'),
                     callback,

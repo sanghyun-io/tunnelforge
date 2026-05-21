@@ -520,6 +520,9 @@ class SQLAutoCompleter:
             if target_table:
                 # 특정 테이블의 컬럼
                 real_table = metadata.get_table_name(target_table)
+                if not real_table:
+                    aliases = self._extract_table_aliases(sql, metadata)
+                    real_table = aliases.get(target_table.lower())
                 if real_table and real_table in metadata.columns:
                     for col in sorted(metadata.columns[real_table]):
                         if self._matches_prefix(col, prefix):
@@ -570,6 +573,13 @@ class SQLAutoCompleter:
         """커서 앞 컨텍스트 분석"""
         text_upper = text_before.upper()
 
+        # FROM schema. / JOIN schema. 뒤에서는 schema-qualified table 이름을 제안
+        if re.search(r'\b(FROM|JOIN)\s+`?\w+`?\.\w*$', text_upper):
+            return {'type': 'table'}
+
+        if re.search(r'\b(LEFT|RIGHT|INNER|OUTER|CROSS)\s+JOIN\s+`?\w+`?\.\w*$', text_upper):
+            return {'type': 'table'}
+
         # table. 뒤인지 확인 (table.col 입력 중)
         dot_match = re.search(r'`?(\w+)`?\.\w*$', text_before)
         if dot_match:
@@ -614,3 +624,23 @@ class SQLAutoCompleter:
                 tables.append(real_table)
 
         return tables
+
+    def _extract_table_aliases(self, sql: str, metadata: SchemaMetadata) -> Dict[str, str]:
+        """테이블 별칭 추출 (별칭 → 테이블명)."""
+        aliases = {}
+        pattern = r'\b(?:FROM|JOIN)\s+(?:`?(\w+)`?\.)?`?(\w+)`?\s+(?:AS\s+)?`?(\w+)`?'
+        keywords = {
+            'WHERE', 'ON', 'AND', 'OR', 'SET', 'VALUES',
+            'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS',
+            'JOIN', 'ORDER', 'GROUP', 'HAVING', 'LIMIT',
+        }
+
+        for match in re.finditer(pattern, sql, re.IGNORECASE):
+            table = match.group(2)
+            alias = match.group(3)
+            if alias and alias.upper() not in keywords:
+                aliases[alias.lower()] = table
+
+        for table in metadata.tables:
+            aliases[table.lower()] = table
+        return aliases

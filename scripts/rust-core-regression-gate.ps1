@@ -74,7 +74,26 @@ try {
         }
     }
 
+    $securityForbidden = @(
+        "SET GLOBAL local_infile",
+        "mysql_local_infile_sql",
+        "ensure_mysql_local_infile_for_import",
+        "restore_mysql_local_infile_after_import",
+        "input_path.join(&table_manifest.path)",
+        "remove_dir_all(output_path)"
+    )
+    foreach ($pattern in $securityForbidden) {
+        $hits = & rg -n -F $pattern migration_core/src src tests
+        if ($LASTEXITCODE -eq 0) {
+            Write-Error "Rust Core security regression gate failed: forbidden pattern '$pattern' found.`n$hits"
+        }
+        if ($LASTEXITCODE -gt 1) {
+            exit $LASTEXITCODE
+        }
+    }
+
     Write-Output "Rust Core regression gate passed."
+    exit 0
 } finally {
     Pop-Location
 }

@@ -28,7 +28,7 @@ from typing import List, Dict, Optional, Tuple
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 
 
-def create_sql_editor_connector(engine, host, port, user, password, database=None):
+def create_sql_editor_connector(engine, host, port, user, password, database=None, schema=None):
     db_engine = normalize_db_engine(engine, port)
     return create_rust_db_connector(
         db_engine,
@@ -37,8 +37,23 @@ def create_sql_editor_connector(engine, host, port, user, password, database=Non
         user,
         password,
         database,
-        schema=database if db_engine == "postgresql" else "",
+        schema=(schema or "") if db_engine == "postgresql" else "",
     )
+
+
+def format_metadata_db_version(db_version) -> str:
+    if isinstance(db_version, (tuple, list)):
+        major = db_version[0] if len(db_version) > 0 else 0
+        minor = db_version[1] if len(db_version) > 1 else 0
+        return f"{major}.{minor}"
+
+    text = str(db_version or "").strip()
+    if not text:
+        return "unknown"
+    match = re.search(r"(\d+)(?:\.(\d+))?", text)
+    if match:
+        return f"{match.group(1)}.{match.group(2) or 0}"
+    return text
 
 
 # =====================================================================
@@ -711,7 +726,7 @@ class SQLQueryWorker(QThread):
     query_result = pyqtSignal(int, list, list, str, int, float)  # idx, columns, rows, error, affected, time
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries, engine="mysql"):
+    def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None):
         super().__init__()
         self.engine = normalize_db_engine(engine, port)
         self.host = host
@@ -719,6 +734,7 @@ class SQLQueryWorker(QThread):
         self.user = user
         self.password = password
         self.database = database
+        self.schema = schema
         self.queries = queries  # List of query strings
 
     def run(self):
@@ -731,6 +747,7 @@ class SQLQueryWorker(QThread):
                 self.user,
                 self.password,
                 self.database,
+                self.schema,
             )
             success, msg = connector.connect()
 
@@ -835,7 +852,7 @@ class SQLTransactionWorker(QThread):
     ready_for_confirm = pyqtSignal()  # 커밋 대기 상태
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries, engine="mysql"):
+    def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None):
         super().__init__()
         self.engine = normalize_db_engine(engine, port)
         self.host = host
@@ -843,6 +860,7 @@ class SQLTransactionWorker(QThread):
         self.user = user
         self.password = password
         self.database = database
+        self.schema = schema
         self.queries = queries
         self.connector = None
         self.pending_commit = False
@@ -858,6 +876,7 @@ class SQLTransactionWorker(QThread):
                 self.user,
                 self.password,
                 self.database,
+                self.schema,
             )
             success, msg = self.connector.connect()
 
@@ -1597,7 +1616,7 @@ class SQLEditorDialog(QDialog):
             self.message_text.append(f"✅ 임시 터널: localhost:{port}")
         return host, port, temp_server, None
 
-    def _create_db_connector(self, host, port, user, password, database=None):
+    def _create_db_connector(self, host, port, user, password, database=None, schema=None):
         return create_sql_editor_connector(
             self._db_engine(),
             host,
@@ -1605,6 +1624,20 @@ class SQLEditorDialog(QDialog):
             user,
             password,
             database,
+            schema,
+        )
+
+    def _database_and_schema_for_selection(self, selected: Optional[str] = None) -> Tuple[Optional[str], str]:
+        db_engine = self._db_engine()
+        selected_name = (selected or "").strip()
+        if db_engine == "postgresql":
+            return (
+                self.config.get("default_database") or "postgres",
+                selected_name or self.config.get("default_schema") or "public",
+            )
+        return (
+            selected_name or self.config.get("default_database") or self.config.get("default_schema"),
+            "",
         )
 
     def init_ui(self):
@@ -1627,7 +1660,9 @@ class SQLEditorDialog(QDialog):
 
         conn_bar.addWidget(QLabel(f"🔗 {mode_label}: {host_info}"))
         conn_bar.addWidget(QLabel(f"👤 {db_user or '(미설정)'}"))
-        conn_bar.addWidget(QLabel("📂 DB:"))
+        selector_text = "📂 Schema:" if self._db_engine() == "postgresql" else "📂 DB:"
+        self.db_selector_label = QLabel(selector_text)
+        conn_bar.addWidget(self.db_selector_label)
 
         self.db_combo = QComboBox()
         self.db_combo.setMinimumWidth(200)
@@ -1765,9 +1800,9 @@ class SQLEditorDialog(QDialog):
         result_layout = QVBoxLayout(result_group)
         result_layout.setContentsMargins(4, 8, 4, 4)
 
-        # 메시지 영역 (결과 탭과 분리, 초기 축소)
-        self.btn_toggle_message = QPushButton("▶ 메시지")
-        self.btn_toggle_message.setToolTip("메시지 영역 펼치기")
+        # 메시지 영역 (접힘 상태에서는 한 줄 요약만 노출)
+        self.btn_toggle_message = QPushButton("실행 로그 펼치기")
+        self.btn_toggle_message.setToolTip("실행 로그 상세 보기")
         self.btn_toggle_message.setStyleSheet("""
             QPushButton {
                 text-align: left;
@@ -1784,6 +1819,19 @@ class SQLEditorDialog(QDialog):
         """)
         self.btn_toggle_message.clicked.connect(self._toggle_message_panel)
         result_layout.addWidget(self.btn_toggle_message)
+
+        self.message_summary = QLabel("실행 대기 중")
+        self.message_summary.setStyleSheet("""
+            QLabel {
+                background-color: #f4f7fa;
+                color: #2c3e50;
+                border: 1px solid #d8e0e8;
+                border-radius: 4px;
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+        """)
+        result_layout.addWidget(self.message_summary)
 
         self.message_text = QTextEdit()
         self.message_text.setReadOnly(True)
@@ -2145,14 +2193,16 @@ class SQLEditorDialog(QDialog):
                 self.message_text.append(f"❌ {error}")
                 return
             db_engine = self._db_engine()
+            connect_database, connect_schema = self._database_and_schema_for_selection(
+                self.config.get('default_schema') if db_engine == 'postgresql' else None
+            )
             connector = self._create_db_connector(
                 host,
                 port,
                 db_user,
                 db_password,
-                self.config.get('default_database') or (
-                    self.config.get('default_schema') if db_engine == 'mysql' else None
-                ),
+                connect_database,
+                connect_schema,
             )
             try:
                 success, msg = connector.connect()
@@ -2211,7 +2261,8 @@ class SQLEditorDialog(QDialog):
             if error:
                 return False, error
 
-            database = self.db_combo.currentText().strip() or None
+            selected = self.db_combo.currentText().strip()
+            database, schema = self._database_and_schema_for_selection(selected)
 
             db_engine = self._db_engine()
             connector = self._create_db_connector(
@@ -2220,6 +2271,7 @@ class SQLEditorDialog(QDialog):
                 db_user,
                 db_password,
                 database,
+                schema,
             )
             success, msg = connector.connect()
             if not success:
@@ -2477,7 +2529,8 @@ class SQLEditorDialog(QDialog):
                 self.message_text.append(f"❌ {error}")
                 return
 
-            database = self.db_combo.currentText().strip() or None
+            selected = self.db_combo.currentText().strip()
+            database, schema = self._database_and_schema_for_selection(selected)
 
             self._clear_result_tabs()
 
@@ -2495,6 +2548,7 @@ class SQLEditorDialog(QDialog):
                 database,
                 queries,
                 engine=self._db_engine(),
+                schema=schema,
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.query_result.connect(self._on_query_result)
@@ -2595,19 +2649,25 @@ class SQLEditorDialog(QDialog):
         """메시지 영역 접힘/펼침 상태 적용"""
         self._message_collapsed = collapsed
         if collapsed:
-            self.btn_toggle_message.setText("▶ 메시지")
-            self.btn_toggle_message.setToolTip("메시지 영역 펼치기")
-            self.message_text.setMinimumHeight(44)
-            self.message_text.setMaximumHeight(68)
+            self.btn_toggle_message.setText("실행 로그 펼치기")
+            self.btn_toggle_message.setToolTip("실행 로그 상세 보기")
+            self.message_summary.show()
+            self.message_text.hide()
         else:
-            self.btn_toggle_message.setText("▼ 메시지")
-            self.btn_toggle_message.setToolTip("메시지 영역 접기")
+            self.btn_toggle_message.setText("실행 로그 접기")
+            self.btn_toggle_message.setToolTip("실행 로그 요약 보기")
+            self.message_summary.show()
+            self.message_text.show()
             self.message_text.setMinimumHeight(120)
             self.message_text.setMaximumHeight(220)
 
     def _toggle_message_panel(self):
         """메시지 영역 펼치기/접기"""
         self._set_message_panel_collapsed(not self._message_collapsed)
+
+    def _set_message_summary(self, text: str):
+        """접힌 실행 로그에 표시할 한 줄 상태 요약."""
+        self.message_summary.setText(text or "실행 대기 중")
 
     def _show_result_tab_context_menu(self, position):
         """결과 탭 컨텍스트 메뉴"""
@@ -2770,12 +2830,14 @@ class SQLEditorDialog(QDialog):
     def _on_progress(self, msg):
         """진행 메시지"""
         self.message_text.append(msg)
+        self._set_message_summary(msg)
         self.status_bar.showMessage(msg)
 
     def _on_query_result(self, idx, columns, rows, error, affected, exec_time):
         """쿼리 결과 수신"""
         if error:
             self.message_text.append(f"❌ 쿼리 {idx + 1}: {error}")
+            self._set_message_summary(f"쿼리 {idx + 1} 실패 · {error}")
         elif columns:
             # 편집 가능성 분석 + 설정 (워커에 실행된 원본 쿼리 사용)
             worker_query = ''
@@ -2787,9 +2849,12 @@ class SQLEditorDialog(QDialog):
             self._add_result_table(columns, rows, exec_time, worker_query)
 
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {len(rows)}행 반환 ({exec_time:.3f}초)")
+            self._set_message_summary(f"쿼리 {idx + 1} 완료 · {len(rows)}행 반환 · {exec_time:.3f}초")
+            self._set_message_panel_collapsed(True)
         else:
             # INSERT/UPDATE/DELETE
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {affected}행 영향받음 ({exec_time:.3f}초)")
+            self._set_message_summary(f"쿼리 {idx + 1} 완료 · {affected}행 영향 · {exec_time:.3f}초")
 
         self.progress_bar.setValue(idx + 1)
         self.status_bar.showMessage(f"쿼리 {idx + 1} 완료 ({exec_time:.3f}초)")
@@ -2798,6 +2863,7 @@ class SQLEditorDialog(QDialog):
         """실행 완료"""
         total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
         self.message_text.append(f"\n{msg}")
+        self._set_message_summary(f"{msg} · {total_elapsed:.1f}초")
         self._cleanup()
         self.status_bar.showMessage(f"✅ {msg} ({total_elapsed:.1f}초)")
 
@@ -3550,12 +3616,14 @@ class SQLEditorDialog(QDialog):
                     pass
                 self._metadata_connector = None
 
+            database, connector_schema = self._database_and_schema_for_selection(target_schema)
             connector = self._create_db_connector(
                 host,
                 port,
                 db_user,
                 db_password,
-                target_schema,
+                database,
+                connector_schema,
             )
             success, _ = connector.connect()
             if not success:
@@ -3595,7 +3663,7 @@ class SQLEditorDialog(QDialog):
         self.metadata_provider._metadata = metadata
 
         table_count = len(metadata.tables)
-        version = f"{metadata.db_version[0]}.{metadata.db_version[1]}"
+        version = format_metadata_db_version(metadata.db_version)
         self.validation_label.setText(f"✅ {table_count}개 테이블 로드됨 (MySQL {version})")
 
         # 현재 SQL 재검증

@@ -6,7 +6,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
-from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
+from src.core.sql_validator import SchemaMetadata
+from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog, format_metadata_db_version
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -50,8 +51,9 @@ def test_message_panel_is_separate_from_result_tabs(monkeypatch):
         assert dialog.result_tabs.count() == 0
         assert dialog.result_tabs.indexOf(dialog.message_text) == -1
         assert dialog._message_collapsed is True
-        assert dialog.message_text.maximumHeight() == 68
-        assert dialog.btn_toggle_message.text() == "▶ 메시지"
+        assert dialog.message_text.isHidden()
+        assert not dialog.message_summary.isHidden()
+        assert dialog.btn_toggle_message.text() == "실행 로그 펼치기"
     finally:
         close_dialog(dialog)
 
@@ -61,12 +63,54 @@ def test_message_panel_toggle_changes_height(monkeypatch):
     try:
         dialog._toggle_message_panel()
         assert dialog._message_collapsed is False
+        assert not dialog.message_text.isHidden()
         assert dialog.message_text.maximumHeight() == 220
-        assert dialog.btn_toggle_message.text() == "▼ 메시지"
+        assert dialog.btn_toggle_message.text() == "실행 로그 접기"
 
         dialog._toggle_message_panel()
         assert dialog._message_collapsed is True
-        assert dialog.message_text.maximumHeight() == 68
+        assert dialog.message_text.isHidden()
+    finally:
+        close_dialog(dialog)
+
+
+def test_query_result_collapses_log_and_updates_summary(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        dialog._toggle_message_panel()
+
+        dialog._on_query_result(0, ["id"], [[1], [2]], "", 2, 0.125)
+
+        assert dialog._message_collapsed is True
+        assert dialog.message_text.isHidden()
+        assert "2행 반환" in dialog.message_summary.text()
+        assert "0.125초" in dialog.message_summary.text()
+    finally:
+        close_dialog(dialog)
+
+
+def test_postgresql_header_labels_selector_as_schema(monkeypatch):
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", lambda self: None)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("postgres", "tunnelpass")
+    tunnel_engine = MagicMock()
+
+    dialog = SQLEditorDialog(
+        None,
+        {
+            "id": "pg-test",
+            "name": "PostgreSQL 테스트",
+            "connection_mode": "direct",
+            "remote_host": "127.0.0.1",
+            "remote_port": 35432,
+            "db_engine": "postgresql",
+            "default_database": "tf_target",
+        },
+        config_manager,
+        tunnel_engine,
+    )
+    try:
+        assert dialog.db_selector_label.text() == "📂 Schema:"
     finally:
         close_dialog(dialog)
 
@@ -105,7 +149,7 @@ def test_refresh_databases_uses_configured_engine(monkeypatch):
             return True, "ok"
 
         def get_schemas(self):
-            return ["tf_target"]
+            return ["public"]
 
         def disconnect(self):
             self.disconnected = True
@@ -149,9 +193,72 @@ def test_refresh_databases_uses_configured_engine(monkeypatch):
             "postgres",
             "tunnelpass",
             "tf_target",
+            "public",
         )
-        assert dialog.db_combo.findText("tf_target") >= 0
+        assert dialog.db_combo.findText("public") >= 0
         assert connector.disconnected is True
+    finally:
+        close_dialog(dialog)
+
+
+def test_postgresql_query_connection_uses_database_and_selected_schema(monkeypatch):
+    class FakeCursor:
+        def execute(self, sql):
+            self.sql = sql
+
+    class FakeConnection:
+        open = False
+
+        def __init__(self):
+            self.autocommit_value = None
+            self.cursor_obj = FakeCursor()
+
+        def autocommit(self, value):
+            self.autocommit_value = value
+
+        def cursor(self):
+            return self.cursor_obj
+
+    class FakeConnector:
+        def __init__(self):
+            self.connection = FakeConnection()
+
+        def connect(self):
+            self.connection.open = True
+            return True, "ok"
+
+    dialog = make_dialog(monkeypatch)
+    connector = FakeConnector()
+    created = {}
+    try:
+        dialog.config.update(
+            {
+                "db_engine": "postgresql",
+                "remote_port": 35432,
+                "default_database": "tf_target",
+                "default_schema": None,
+            }
+        )
+        dialog.db_combo.clear()
+        dialog.db_combo.addItem("public")
+        dialog.db_combo.setCurrentText("public")
+        dialog._resolve_db_target = MagicMock(return_value=("127.0.0.1", 35432, None, None))
+        dialog._create_db_connector = MagicMock(
+            side_effect=lambda *args: created.setdefault("args", args) and connector
+        )
+
+        success, error = dialog._ensure_connection()
+
+        assert success is True
+        assert error is None
+        assert created["args"] == (
+            "127.0.0.1",
+            35432,
+            "testuser",
+            "testpass",
+            "tf_target",
+            "public",
+        )
     finally:
         close_dialog(dialog)
 
@@ -205,6 +312,29 @@ def test_refresh_databases_passes_mysql_default_database(monkeypatch):
             "root",
             "tunnelpass",
             "tf_source84",
+            "",
         )
+    finally:
+        close_dialog(dialog)
+
+
+def test_format_metadata_db_version_tolerates_empty_rust_version():
+    assert format_metadata_db_version("") == "unknown"
+    assert format_metadata_db_version("8.4.7") == "8.4"
+    assert format_metadata_db_version((16, 2, 0)) == "16.2"
+
+
+def test_metadata_loaded_does_not_crash_on_empty_version(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        metadata = SchemaMetadata()
+        metadata.tables = {"users"}
+        metadata.db_version = ""
+        dialog._on_validation_requested = MagicMock()
+
+        dialog._on_metadata_loaded(metadata)
+
+        assert "1개 테이블 로드됨" in dialog.validation_label.text()
+        assert "unknown" in dialog.validation_label.text()
     finally:
         close_dialog(dialog)

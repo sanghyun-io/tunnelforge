@@ -1,6 +1,7 @@
 """Client facade for the Rust TunnelForge DB core service."""
 import json
 import os
+import re
 import subprocess
 import threading
 import uuid
@@ -15,7 +16,49 @@ class DbCoreServiceError(RuntimeError):
     """Raised when the Rust DB core service cannot complete a request."""
 
 
+def _format_error_event(payload: Dict[str, Any]) -> str:
+    message = str(payload.get("message") or payload.get("error") or "DB core service error")
+    details: List[str] = []
+    for key, label in (
+        ("code", "code"),
+        ("detail", "detail"),
+        ("hint", "hint"),
+        ("context", "context"),
+        ("table", "table"),
+        ("column", "column"),
+        ("constraint", "constraint"),
+    ):
+        value = payload.get(key)
+        if value not in (None, ""):
+            details.append(f"{label}={value}")
+    if not details:
+        return message
+    return f"{message} ({'; '.join(details)})"
+
+
 SUPPORTED_DB_ENGINES = {"mysql", "postgresql"}
+
+
+def parse_db_version_tuple(version: Any) -> Tuple[int, int, int]:
+    """Return a connector-compatible (major, minor, patch) tuple."""
+    if isinstance(version, tuple):
+        parts = list(version)
+    elif isinstance(version, list):
+        parts = version
+    else:
+        text = str(version or "")
+        match = re.search(r"(\d+)(?:\.(\d+))?(?:\.(\d+))?", text)
+        if not match:
+            return (0, 0, 0)
+        parts = [match.group(1), match.group(2) or 0, match.group(3) or 0]
+
+    parsed = []
+    for index in range(3):
+        try:
+            parsed.append(int(parts[index]))
+        except (IndexError, TypeError, ValueError):
+            parsed.append(0)
+    return tuple(parsed)
 
 
 def normalize_db_engine(engine: Optional[str], port: Optional[int] = None) -> str:
@@ -130,7 +173,7 @@ class DbCoreServiceClient:
                 if event.event == "result":
                     return event.payload
                 if event.event == "error":
-                    raise DbCoreServiceError(event.message)
+                    raise DbCoreServiceError(_format_error_event(event.payload))
 
     def shutdown(self) -> None:
         process = self._process
@@ -397,7 +440,10 @@ class RustDbConnector:
             )
         return self.facade.list_tables(endpoint)
 
-    def get_db_version(self) -> str:
+    def get_db_version(self) -> Tuple[int, int, int]:
+        return parse_db_version_tuple(self.get_db_version_string())
+
+    def get_db_version_string(self) -> str:
         if not self.connection:
             success, _ = self.connect()
             if not success:

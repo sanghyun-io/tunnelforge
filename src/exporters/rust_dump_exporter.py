@@ -17,6 +17,37 @@ from src.core.logger import get_logger
 
 logger = get_logger("rust_dump_exporter")
 
+DEFAULT_DUMP_COMPRESSION = "zstd"
+
+
+def _safe_dump_child_dir(dump_dir: str, table_path: str) -> Optional[Path]:
+    base_path = Path(dump_dir).resolve()
+    table_path_obj = Path(table_path)
+    if (
+        not table_path
+        or table_path_obj.is_absolute()
+        or any(part == ".." for part in table_path_obj.parts)
+    ):
+        return None
+    child_path = (base_path / table_path_obj).resolve()
+    try:
+        if not child_path.is_relative_to(base_path):
+            return None
+    except ValueError:
+        return None
+    return child_path
+
+
+def _safe_dump_child_file(dump_dir: str, path: Path) -> Optional[Path]:
+    base_path = Path(dump_dir).resolve()
+    file_path = path.resolve()
+    try:
+        if not file_path.is_relative_to(base_path):
+            return None
+    except ValueError:
+        return None
+    return file_path if file_path.is_file() else None
+
 
 @dataclass
 class RustDumpConfig:
@@ -346,6 +377,9 @@ class RustDumpExporter:
         schema: str,
         output_dir: str,
         tables: Optional[List[str]],
+        threads: int = 8,
+        chunk_size: int = 50000,
+        compression: str = DEFAULT_DUMP_COMPRESSION,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -356,6 +390,10 @@ class RustDumpExporter:
             "source": self._endpoint(schema).to_payload(),
             "output_dir": output_dir,
             "overwrite": True,
+            "threads": max(1, int(threads)),
+            "chunk_size": max(1000, int(chunk_size)),
+            "data_format": "tsv",
+            "compression": compression if compression in {"none", "zstd"} else DEFAULT_DUMP_COMPRESSION,
         }
         if tables:
             payload["tables"] = tables
@@ -382,8 +420,8 @@ class RustDumpExporter:
         self,
         schema: str,
         output_dir: str,
-        threads: int = 4,
-        compression: str = "none",
+        threads: int = 8,
+        compression: str = DEFAULT_DUMP_COMPRESSION,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -392,14 +430,16 @@ class RustDumpExporter:
     ) -> Tuple[bool, str]:
         try:
             success, message = self._run_rust_dump(
-                schema,
-                output_dir,
-                None,
-                progress_callback,
-                table_progress_callback,
-                detail_callback,
-                table_status_callback,
-                raw_output_callback,
+                schema=schema,
+                output_dir=output_dir,
+                tables=None,
+                threads=threads,
+                compression=compression,
+                progress_callback=progress_callback,
+                table_progress_callback=table_progress_callback,
+                detail_callback=detail_callback,
+                table_status_callback=table_status_callback,
+                raw_output_callback=raw_output_callback,
             )
             if success:
                 self._write_metadata(output_dir, schema, "full", None)
@@ -414,8 +454,8 @@ class RustDumpExporter:
         schema: str,
         tables: List[str],
         output_dir: str,
-        threads: int = 4,
-        compression: str = "none",
+        threads: int = 8,
+        compression: str = DEFAULT_DUMP_COMPRESSION,
         include_fk_parents: bool = True,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -433,14 +473,16 @@ class RustDumpExporter:
                 final_tables, added_tables = resolver.resolve_required_tables(tables, schema)
 
             success, message = self._run_rust_dump(
-                schema,
-                output_dir,
-                final_tables,
-                progress_callback,
-                table_progress_callback,
-                detail_callback,
-                table_status_callback,
-                raw_output_callback,
+                schema=schema,
+                output_dir=output_dir,
+                tables=final_tables,
+                threads=threads,
+                compression=compression,
+                progress_callback=progress_callback,
+                table_progress_callback=table_progress_callback,
+                detail_callback=detail_callback,
+                table_status_callback=table_status_callback,
+                raw_output_callback=raw_output_callback,
             )
             if success:
                 self._write_metadata(output_dir, schema, "partial", final_tables, added_tables)
@@ -500,20 +542,34 @@ class RustDumpImporter:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             chunk_counts = {}
             table_sizes = {}
+            table_rows = {}
             total_bytes = 0
+            total_rows = 0
             for table in manifest.get("tables", []):
                 table_name = str(table.get("name", ""))
                 if not table_name:
                     continue
                 chunk_counts[table_name] = int(table.get("chunks") or 0)
-                table_dir = Path(dump_dir) / str(table.get("path", ""))
-                size = sum(path.stat().st_size for path in table_dir.glob("chunk_*.jsonl"))
+                rows = int(table.get("rows") or 0)
+                table_rows[table_name] = rows
+                total_rows += rows
+                table_dir = _safe_dump_child_dir(dump_dir, str(table.get("path", "")))
+                if table_dir is None:
+                    return None
+                size = 0
+                for path in table_dir.glob("chunk_*.*"):
+                    safe_file = _safe_dump_child_file(dump_dir, path)
+                    if safe_file is None:
+                        return None
+                    size += safe_file.stat().st_size
                 table_sizes[table_name] = size
                 total_bytes += size
             return {
                 "chunk_counts": chunk_counts,
                 "table_sizes": table_sizes,
+                "table_rows": table_rows,
                 "total_bytes": total_bytes,
+                "total_rows": total_rows,
                 "schema": manifest.get("database", ""),
                 "format": manifest.get("format", ""),
                 "format_version": manifest.get("format_version", 0),
@@ -525,7 +581,7 @@ class RustDumpImporter:
         self,
         input_dir: str,
         target_schema: Optional[str] = None,
-        threads: int = 4,
+        threads: int = 8,
         import_mode: str = "replace",
         timezone_sql: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
@@ -571,6 +627,7 @@ class RustDumpImporter:
                 "target": self._endpoint(final_target_schema).to_payload(),
                 "input_dir": input_dir,
                 "mode": import_mode,
+                "threads": max(1, int(threads)),
             }
             if retry_tables:
                 payload["tables"] = retry_tables
@@ -650,14 +707,34 @@ def emit_core_event(
     if raw_output_callback:
         raw_output_callback(json.dumps(event, ensure_ascii=False))
 
-    if event_type == "phase" and progress_callback:
+    if event_type == "dump_plan":
+        if detail_callback:
+            detail_callback({
+                "event": "dump_plan",
+                "tables_total": int(event.get("tables_total") or 0),
+                "rows_total": int(event.get("rows_total") or 0),
+                "tables": event.get("tables") if isinstance(event.get("tables"), list) else [],
+            })
+    elif event_type == "dump_schedule":
+        if detail_callback:
+            detail_callback({
+                "event": "dump_schedule",
+                "threads": int(event.get("threads") or 0),
+                "table_workers": int(event.get("table_workers") or 0),
+                "range_workers_per_table": int(event.get("range_workers_per_table") or 0),
+                "chunk_size": int(event.get("chunk_size") or 0),
+                "data_format": str(event.get("data_format") or ""),
+                "compression": str(event.get("compression") or ""),
+                "scheduled_tables": event.get("scheduled_tables") if isinstance(event.get("scheduled_tables"), list) else [],
+            })
+    elif event_type == "phase" and progress_callback:
         progress_callback(str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중..."))
     elif event_type == "table_progress":
         current = int(event.get("current") or 0)
         total = int(event.get("total") or 0)
         status = str(event.get("status") or "")
         ui_status = "loading" if status in ("dumping", "importing") else "done" if status == "completed" else status
-        if table_progress_callback:
+        if table_progress_callback and status == "completed":
             table_progress_callback(current, total, table)
         if table_status_callback and table:
             table_status_callback(table, ui_status, "")
@@ -666,17 +743,32 @@ def emit_core_event(
     elif event_type == "row_progress":
         rows = int(event.get("rows") or 0)
         total = int(event.get("total") or 0)
+        chunk_rows = int(event.get("chunk_rows") or 0)
+        elapsed_ms = int(event.get("stream_ms") or event.get("read_ms") or event.get("load_ms") or 0)
+        rows_sec = int((chunk_rows * 1000) / elapsed_ms) if chunk_rows and elapsed_ms else 0
         percent = int((rows / total) * 100) if total else 0
         if detail_callback:
             detail_callback({
+                "event": "row_progress",
+                "table": table,
                 "percent": min(percent, 100),
                 "rows_done": rows,
                 "rows_total": total,
-                "rows_sec": 0,
-                "speed": "Rust DB Core",
+                "chunk_rows": chunk_rows,
+                "rows_sec": rows_sec,
+                "speed": f"{rows_sec:,} rows/s" if rows_sec else "Rust DB Core",
+                "chunk_index": event.get("chunk_index"),
+                "chunks_done": event.get("chunks_done"),
+                "chunks_total": event.get("chunks_total"),
+                "strategy": event.get("strategy"),
+                "stream_ms": event.get("stream_ms"),
+                "read_ms": event.get("read_ms"),
+                "write_ms": event.get("write_ms"),
             })
-        if table_chunk_progress_callback and table:
-            table_chunk_progress_callback(table, rows, total)
+        chunks_done = int(event.get("chunks_done") or 0)
+        chunks_total = int(event.get("chunks_total") or 0)
+        if table_chunk_progress_callback and table and chunks_done and chunks_total:
+            table_chunk_progress_callback(table, chunks_done, chunks_total)
 
 
 def check_rust_dump() -> Tuple[bool, str]:
@@ -691,7 +783,7 @@ def export_schema(
     password: str,
     schema: str,
     output_dir: str,
-    threads: int = 4,
+    threads: int = 8,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str]:
     config = RustDumpConfig(host, port, user, password)
@@ -707,7 +799,7 @@ def export_tables(
     schema: str,
     tables: List[str],
     output_dir: str,
-    threads: int = 4,
+    threads: int = 8,
     include_fk_parents: bool = True,
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str, List[str]]:
@@ -730,7 +822,7 @@ def import_dump(
     password: str,
     input_dir: str,
     target_schema: Optional[str] = None,
-    threads: int = 4,
+    threads: int = 8,
     import_mode: str = "replace",
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,

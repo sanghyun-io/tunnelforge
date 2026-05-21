@@ -9,6 +9,7 @@ from src.core.db_core_service import (
     RustDbConnector,
     create_rust_db_connector,
     normalize_db_engine,
+    parse_db_version_tuple,
 )
 
 
@@ -63,6 +64,35 @@ def test_client_reports_missing_core_executable_cleanly():
 
     assert "Rust DB Core 실행 파일을 찾을 수 없습니다" in message
     assert "missing-tunnelforge-core.exe" in message
+
+
+def test_client_error_includes_database_error_details():
+    process = FakeProcess([
+        json.dumps({
+            "event": "error",
+            "request_id": "req-1",
+            "message": "postgresql connection error: db error",
+            "code": "3D000",
+            "detail": "database public does not exist",
+            "context": "connection.open",
+        }),
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+
+    try:
+        client.request("connection.open", request_id="req-1")
+    except DbCoreServiceError as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("DbCoreServiceError was not raised")
+
+    assert "postgresql connection error: db error" in message
+    assert "code=3D000" in message
+    assert "database public does not exist" in message
+    assert "connection.open" in message
 
 
 def test_facade_uses_connection_test_protocol():
@@ -122,6 +152,36 @@ def test_rust_connector_masks_success_message_shape():
     assert success is True
     assert message == "연결 성공"
     assert fake.endpoint.engine == "postgresql"
+
+
+def test_parse_db_version_tuple_handles_rust_core_version_strings():
+    assert parse_db_version_tuple("8.4.7") == (8, 4, 7)
+    assert parse_db_version_tuple("PostgreSQL 16.2 on x86_64") == (16, 2, 0)
+    assert parse_db_version_tuple("") == (0, 0, 0)
+
+
+def test_rust_connector_get_db_version_returns_legacy_tuple():
+    class FakeFacade:
+        def open_connection(self, endpoint):
+            return "conn-1"
+
+        def execute_on_connection(self, connection_id, query, params=None):
+            assert connection_id == "conn-1"
+            assert "VERSION()" in query
+            return [{"version": "8.4.7"}]
+
+    connector = RustDbConnector(
+        "mysql",
+        "127.0.0.1",
+        3306,
+        "root",
+        "pw",
+        "app",
+        facade=FakeFacade(),
+    )
+
+    assert connector.get_db_version() == (8, 4, 7)
+    assert connector.get_db_version_string() == "8.4.7"
 
 
 def test_execute_on_connection_sends_params_to_core_protocol():

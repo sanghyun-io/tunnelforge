@@ -18,12 +18,195 @@ import os
 from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
+from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, RustDumpConfig, check_rust_dump,
-    ForeignKeyResolver, OrphanRecordInfo
+    ForeignKeyResolver, OrphanRecordInfo, DEFAULT_DUMP_COMPRESSION
 )
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
+
+logger = get_logger("db_dialogs")
+
+
+def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tables: int) -> int:
+    """Avoid inflated estimated-row progress while table completion proves export is still running."""
+    bounded = max(0, min(int(percent), 100))
+    if total_tables <= 0 or completed_tables >= total_tables:
+        return bounded
+    table_cap = int(((completed_tables + 1) / total_tables) * 100)
+    return min(bounded, max(1, min(table_cap, 99)))
+
+
+def next_export_percent(
+    last_percent: int,
+    computed_percent: int,
+    completed_tables: int,
+    total_tables: int,
+) -> int:
+    """Advance export progress without letting stale early estimates stick at 99%."""
+    candidate = max(max(0, int(last_percent)), max(0, min(int(computed_percent), 100)))
+    if total_tables > 0 and completed_tables < total_tables:
+        return min(candidate, cap_incomplete_export_percent(100, completed_tables, total_tables))
+    return candidate
+
+
+def export_overall_percent(
+    last_percent: int,
+    overall_done: int,
+    total_rows: int,
+    fallback_percent: int,
+    completed_tables: int,
+    total_tables: int,
+) -> int:
+    """Return monotonic overall export progress from rows when estimates are available."""
+    done = max(0, int(overall_done))
+    total = max(0, int(total_rows))
+    if total > 0:
+        computed = min(int((done / total) * 100), 100)
+        return max(max(0, int(last_percent)), computed)
+
+    computed = cap_incomplete_export_percent(
+        int(fallback_percent),
+        completed_tables,
+        total_tables,
+    )
+    return next_export_percent(last_percent, computed, completed_tables, total_tables)
+
+
+def format_export_row_labels(processed_rows: int, estimated_total_rows: int) -> tuple[str, str]:
+    processed = max(0, int(processed_rows))
+    estimated = max(0, int(estimated_total_rows))
+    processed_label = f"📦 처리 rows: {processed:,} rows"
+    if estimated:
+        estimate_label = f"📐 예상 전체: 약 {estimated:,} rows"
+    else:
+        estimate_label = "📐 예상 전체: 계산 중..."
+    return processed_label, estimate_label
+
+
+def format_export_table_status(table: str, rows_done: int, rows_total: int) -> str:
+    table_name = table or "-"
+    done = max(0, int(rows_done))
+    total = max(0, int(rows_total))
+    if total:
+        percent = min(int((done / total) * 100), 100)
+        return f"🔄 현재: {table_name} {done:,} / {total:,} rows ({percent}%)"
+    return f"🔄 현재: {table_name} {done:,} rows"
+
+
+def format_import_row_labels(info: dict) -> tuple[str, str, str]:
+    """Format import progress as row and chunk metrics instead of byte counters."""
+    table = str(info.get("table") or "-")
+    rows_done = max(0, int(info.get("rows_done") or 0))
+    rows_total = max(0, int(info.get("rows_total") or 0))
+    chunk_rows = max(0, int(info.get("chunk_rows") or 0))
+    chunks_done = int(info.get("chunks_done") or 0)
+    chunks_total = int(info.get("chunks_total") or 0)
+    rows_sec = max(0, int(info.get("rows_sec") or 0))
+    strategy = str(info.get("strategy") or "")
+    strategy_labels = {
+        "insert_fallback": "안전 INSERT fallback",
+        "load_data_local_infile": "LOAD DATA LOCAL",
+        "parallel_load_data_local_infile": "병렬 LOAD DATA LOCAL",
+    }
+    strategy_label = strategy_labels.get(strategy, strategy)
+
+    if rows_total:
+        data_label = f"📦 처리 rows: {rows_done:,} / {rows_total:,} rows"
+    else:
+        data_label = f"📦 처리 rows: {rows_done:,} rows"
+    speed_label = f"⚡ 속도: {rows_sec:,} rows/s" if rows_sec else "⚡ 속도: 계산 중..."
+
+    if chunks_done and chunks_total:
+        status = f"{chunks_done}/{chunks_total} chunks"
+    else:
+        status = "chunk 진행 중"
+    if chunk_rows:
+        status = f"{status}, +{chunk_rows:,} rows"
+    if strategy_label:
+        status = f"{status}, {strategy_label}"
+    return data_label, speed_label, f"🔄 현재: {table} {status}"
+
+
+def import_overall_percent(table_rows_done: dict, table_rows_total: dict) -> int:
+    done = sum(max(0, int(value or 0)) for value in table_rows_done.values())
+    total = sum(max(0, int(value or 0)) for value in table_rows_total.values())
+    if total <= 0:
+        return 0
+    return min(int((done / total) * 100), 100)
+
+
+def format_export_visible_telemetry(event: dict) -> Optional[str]:
+    """Convert Rust dump telemetry into a concise visible log line."""
+    event_type = event.get("event")
+    if event_type == "dump_schedule":
+        scheduler = str(event.get("scheduler") or "")
+        scheduler_part = f", scheduler={scheduler}" if scheduler else ""
+        return (
+            f"스케줄: {event.get('data_format') or '-'}"
+            f"/{event.get('compression') or '-'}{scheduler_part}, "
+            f"threads={int(event.get('threads') or 0)}, "
+            f"table_workers={int(event.get('table_workers') or 0)}, "
+            f"range_workers/table={int(event.get('range_workers_per_table') or 0)}"
+        )
+
+    if event_type == "table_progress":
+        table = str(event.get("table") or "-")
+        status = str(event.get("status") or "")
+        current = int(event.get("current") or 0)
+        total = int(event.get("total") or 0)
+        strategy = str(event.get("strategy") or "")
+        suffix = f", {strategy}" if strategy else ""
+        if status == "dumping":
+            return f"{table}: export 시작 ({current}/{total}){suffix}"
+        if status == "completed":
+            return f"{table}: export 완료 ({current}/{total}){suffix}"
+        return None
+
+    if event_type != "row_progress":
+        return None
+
+    table = str(event.get("table") or "-")
+    rows_done = max(0, int(event.get("rows") or 0))
+    rows_total = max(0, int(event.get("total") or 0))
+    chunk_rows = max(0, int(event.get("chunk_rows") or 0))
+    chunks_done = int(event.get("chunks_done") or 0)
+    chunks_total = int(event.get("chunks_total") or 0)
+    chunk_index = int(event.get("chunk_index") or 0)
+    strategy = str(event.get("strategy") or "")
+    elapsed_ms = int(
+        event.get("stream_ms")
+        or event.get("read_ms")
+        or event.get("write_ms")
+        or event.get("load_ms")
+        or 0
+    )
+
+    if rows_total:
+        percent = min(int((rows_done / rows_total) * 100), 100)
+        row_part = f"{rows_done:,} / {rows_total:,} rows ({percent}%)"
+    else:
+        row_part = f"{rows_done:,} rows"
+
+    if chunks_done and chunks_total:
+        chunk_part = f"{chunks_done}/{chunks_total} chunks"
+    elif chunk_index:
+        chunk_part = f"chunk {chunk_index}"
+    else:
+        chunk_part = f"{chunk_rows:,} rows"
+
+    detail_parts = []
+    if chunk_rows:
+        if elapsed_ms:
+            detail_parts.append(f"{chunk_rows:,} rows in {elapsed_ms / 1000:.1f}s")
+        else:
+            detail_parts.append(f"{chunk_rows:,} rows")
+    if strategy:
+        detail_parts.append(strategy)
+
+    details = f", {', '.join(detail_parts)}" if detail_parts else ""
+    return f"{table}: {chunk_part}, {row_part}{details}"
 
 
 class DBConnectionDialog(QDialog):
@@ -357,6 +540,17 @@ class RustDumpExportDialog(QDialog):
         self.export_success: Optional[bool] = None
         self.export_schema: str = ""
         self.export_tables: List[str] = []
+        self.export_table_totals: dict = {}
+        self.export_table_done: dict = {}
+        self.export_table_status: dict = {}
+        self.export_total_rows: int = 0
+        self.export_completed_tables: int = 0
+        self.export_completed_table_names: set = set()
+        self.export_total_tables: int = 0
+        self.export_last_percent: int = 0
+        self.export_telemetry_events: List[dict] = []
+        self.export_table_started_at: dict = {}
+        self.export_table_finished_at: dict = {}
 
         # rust_dump 설치 확인
         self.rust_dump_installed, self.rust_dump_msg = check_rust_dump()
@@ -497,11 +691,13 @@ class RustDumpExportDialog(QDialog):
 
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 16)
-        self.spin_threads.setValue(4)
+        self.spin_threads.setValue(8)
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
         self.combo_compression = QComboBox()
-        self.combo_compression.addItems(["zstd", "gzip", "none"])
+        self.combo_compression.addItems(["none", "zstd"])
+        self.combo_compression.setCurrentText(DEFAULT_DUMP_COMPRESSION)
+        self.combo_compression.setToolTip("Rust DB Core dump 압축 방식입니다. zstd는 디스크 사용량을 줄이고 import 시 스트리밍 해제됩니다.")
         option_layout.addRow("압축 방식:", self.combo_compression)
 
         container_layout.addWidget(option_group)
@@ -616,11 +812,13 @@ class RustDumpExportDialog(QDialog):
         left_detail = QVBoxLayout()
         self.label_percent = QLabel("📊 진행률: 0%")
         self.label_percent.setStyleSheet("font-weight: bold; font-size: 12pt;")
-        self.label_data = QLabel("📦 데이터: 0 MB / 0 MB")
+        self.label_data = QLabel("📦 처리 rows: 0 rows")
+        self.label_estimated_rows = QLabel("📐 예상 전체: 계산 중...")
         self.label_speed = QLabel("⚡ 속도: 0 MB/s")
         self.label_tables = QLabel("📋 테이블: 0 / 0 완료")
         left_detail.addWidget(self.label_percent)
         left_detail.addWidget(self.label_data)
+        left_detail.addWidget(self.label_estimated_rows)
         left_detail.addWidget(self.label_speed)
         left_detail.addWidget(self.label_tables)
 
@@ -800,31 +998,50 @@ class RustDumpExportDialog(QDialog):
         """
         import os
         from datetime import datetime
+        from pathlib import Path
 
         base_dir = self._get_base_output_dir()
+
+        def safe_component(value: str) -> str:
+            safe = value.replace(':', '_').replace('/', '_').replace('\\', '_')
+            safe = safe.replace('*', '_').replace('?', '_').replace('"', '_')
+            safe = safe.replace('<', '_').replace('>', '_').replace('|', '_')
+            safe = safe.strip().strip(".")
+            return safe if safe not in {".", ".."} else ""
+
+        def safe_join(folder_name: str) -> str:
+            fallback = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            folder_name = safe_component(folder_name) or fallback
+            base_path = Path(base_dir).expanduser().resolve()
+            output_path = (base_path / folder_name).resolve()
+            try:
+                if not output_path.is_relative_to(base_path):
+                    output_path = (base_path / fallback).resolve()
+            except ValueError:
+                output_path = (base_path / fallback).resolve()
+            return str(output_path)
 
         # 수동 모드일 경우
         if hasattr(self, 'radio_manual_naming') and self.radio_manual_naming.isChecked():
             manual_name = self.input_manual_folder.text().strip()
             if manual_name:
-                # 파일명에 사용할 수 없는 문자 제거
-                safe_name = manual_name.replace(':', '_').replace('/', '_').replace('\\', '_')
-                safe_name = safe_name.replace('*', '_').replace('?', '_').replace('"', '_')
-                safe_name = safe_name.replace('<', '_').replace('>', '_').replace('|', '_')
-                return os.path.join(base_dir, safe_name)
-            return os.path.join(base_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                return safe_join(manual_name)
+            return safe_join(f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
         # 자동 모드
         parts = []
 
         # name (연결 정보)
         if hasattr(self, 'chk_name') and self.chk_name.isChecked() and self.connection_info:
-            safe_conn = self.connection_info.replace(':', '_').replace('/', '_').replace('\\', '_')
-            parts.append(safe_conn)
+            safe_conn = safe_component(self.connection_info)
+            if safe_conn:
+                parts.append(safe_conn)
 
         # schema
         if hasattr(self, 'chk_schema') and self.chk_schema.isChecked() and schema:
-            parts.append(schema)
+            safe_schema = safe_component(schema)
+            if safe_schema:
+                parts.append(safe_schema)
 
         # timestamp
         if hasattr(self, 'chk_timestamp') and self.chk_timestamp.isChecked():
@@ -836,7 +1053,7 @@ class RustDumpExportDialog(QDialog):
             parts.append(f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
         folder_name = "_".join(parts)
-        return os.path.join(base_dir, folder_name)
+        return safe_join(folder_name)
 
     def _get_default_output_dir(self) -> str:
         """기본 출력 디렉토리 (초기값)"""
@@ -1025,6 +1242,17 @@ class RustDumpExportDialog(QDialog):
         self.export_success = None
         self.export_schema = schema
         self.export_tables = self.get_selected_tables() if self.radio_partial.isChecked() else []
+        self.export_table_totals = {}
+        self.export_table_done = {}
+        self.export_table_status = {}
+        self.export_total_rows = 0
+        self.export_completed_tables = 0
+        self.export_completed_table_names = set()
+        self.export_total_tables = 0
+        self.export_last_percent = 0
+        self.export_telemetry_events = []
+        self.export_table_started_at = {}
+        self.export_table_finished_at = {}
         self.btn_save_log.setEnabled(False)
 
         # 로그 헤더 추가
@@ -1057,9 +1285,11 @@ class RustDumpExportDialog(QDialog):
         # 프로그레스 바 초기화
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(100)
-        self.label_percent.setText("📊 진행률: 0%")
-        self.label_data.setText("📦 데이터: 0 MB / 0 MB")
-        self.label_speed.setText("⚡ 속도: 0 MB/s")
+        self.label_percent.setText("📊 전체 진행률: 0%")
+        data_label, estimate_label = format_export_row_labels(0, 0)
+        self.label_data.setText(data_label)
+        self.label_estimated_rows.setText(estimate_label)
+        self.label_speed.setText("⚡ 속도: 0 rows/s")
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Export 준비 중...")
 
@@ -1113,14 +1343,19 @@ class RustDumpExportDialog(QDialog):
 
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
-        # 프로그레스 바 최대값 설정 (처음 호출 시)
-        if self.progress_bar.maximum() != total:
-            self.progress_bar.setMaximum(total)
-
-        self.progress_bar.setValue(current)
-        self.label_tables.setText(f"📋 테이블: {current} / {total} 완료")
-        self.label_status.setText(f"✅ {table_name} ({current}/{total})")
-        self._add_log(f"테이블 완료: {table_name} ({current}/{total})")
+        if table_name:
+            self.export_completed_table_names.add(table_name)
+        self.export_completed_tables = max(
+            self.export_completed_tables,
+            len(self.export_completed_table_names),
+        )
+        self.export_total_tables = max(self.export_total_tables, total)
+        self.label_tables.setText(
+            f"📋 테이블: {self.export_completed_tables} / {self.export_total_tables} 완료"
+        )
+        self._add_log(
+            f"테이블 완료: {table_name} ({self.export_completed_tables}/{self.export_total_tables})"
+        )
 
     def on_finished(self, success: bool, message: str):
         # 로그 기록
@@ -1148,8 +1383,13 @@ class RustDumpExportDialog(QDialog):
             # 최종 진행률 100% 표시
             self.progress_bar.setValue(100)
             self.progress_bar.setMaximum(100)  # 퍼센트 기준으로 재설정
-            self.label_percent.setText("📊 진행률: 100%")
-            self.label_data.setText("📦 데이터: Export 완료")
+            self.label_percent.setText("📊 전체 진행률: 100%")
+            data_label, estimate_label = format_export_row_labels(
+                sum(self.export_table_done.values()),
+                self.export_total_rows,
+            )
+            self.label_data.setText(data_label)
+            self.label_estimated_rows.setText(estimate_label)
             self.label_speed.setText("⚡ 속도: -")
             self.label_status.setText("✅ Export 완료")
             # 테이블 완료 수 계산 (done 상태인 테이블 수)
@@ -1165,6 +1405,7 @@ class RustDumpExportDialog(QDialog):
         else:
             self.txt_log.addItem(f"❌ 실패: {message}")
             self.label_data.setText("📦 데이터: Export 실패")
+            self.label_estimated_rows.setText("📐 예상 전체: -")
             self.label_speed.setText("⚡ 속도: -")
             self.label_status.setText("❌ Export 실패")
             # 테이블 완료 수 계산
@@ -1180,24 +1421,82 @@ class RustDumpExportDialog(QDialog):
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
-        percent = info.get('percent', 0)
-        mb_done = info.get('mb_done', 0)
-        mb_total = info.get('mb_total', 0)
-        speed = info.get('speed', '0 B/s')
+        if info.get("event") == "dump_plan":
+            tables = info.get("tables") or []
+            self.export_table_totals = {
+                str(item.get("name")): int(item.get("rows") or 0)
+                for item in tables
+                if item.get("name")
+            }
+            self.export_table_done = {name: 0 for name in self.export_table_totals}
+            self.export_total_rows = int(info.get("rows_total") or sum(self.export_table_totals.values()))
+            self.export_total_tables = int(info.get("tables_total") or len(self.export_table_totals))
+            self.label_tables.setText(f"📋 테이블: 0 / {self.export_total_tables} 완료")
+            data_label, estimate_label = format_export_row_labels(0, self.export_total_rows)
+            self.label_data.setText(data_label)
+            self.label_estimated_rows.setText(estimate_label)
+            self.label_status.setText("Export 계획 수립 완료")
+            return
 
+        table = str(info.get("table") or "")
+        if table:
+            rows_done = int(info.get("rows_done") or 0)
+            table_total = int(info.get("rows_total") or 0)
+            if table_total:
+                previous_total = int(self.export_table_totals.get(table) or 0)
+                self.export_table_totals[table] = table_total
+                if previous_total:
+                    self.export_total_rows = max(
+                        0,
+                        self.export_total_rows - previous_total + table_total,
+                    )
+                else:
+                    self.export_total_rows = max(
+                        self.export_total_rows,
+                        sum(self.export_table_totals.values()),
+                    )
+                rows_done = min(rows_done, table_total)
+            self.export_table_done[table] = max(self.export_table_done.get(table, 0), rows_done)
+
+        overall_done = sum(self.export_table_done.values())
+        percent = export_overall_percent(
+            self.export_last_percent,
+            overall_done,
+            self.export_total_rows,
+            int(info.get("percent") or 0),
+            self.export_completed_tables,
+            self.export_total_tables,
+        )
+        self.export_last_percent = percent
+
+        self.progress_bar.setMaximum(100)
         self.progress_bar.setValue(percent)
-        self.label_percent.setText(f"📊 진행률: {percent}%")
+        self.label_percent.setText(f"📊 전체 진행률: {percent}%")
+        data_label, estimate_label = format_export_row_labels(overall_done, self.export_total_rows)
+        self.label_data.setText(data_label)
+        self.label_estimated_rows.setText(estimate_label)
+        self.label_speed.setText(f"⚡ 속도: {info.get('speed', 'Rust DB Core')}")
 
-        # Export는 데이터 크기를 표시하지 않음 (rows만 표시되므로)
-        if mb_done == 0 and mb_total == 0:
-            self.label_data.setText("📦 데이터: Export 진행 중...")
-        else:
-            self.label_data.setText(f"📦 데이터: {mb_done:.2f} MB / {mb_total:.2f} MB")
-
-        self.label_speed.setText(f"⚡ 속도: {speed}")
+        if table:
+            table_total = self.export_table_totals.get(table) or int(info.get("rows_total") or 0)
+            self.label_status.setText(
+                format_export_table_status(
+                    table,
+                    self.export_table_done.get(table, 0),
+                    table_total,
+                )
+            )
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트"""
+        now = datetime.now()
+        self.export_table_status[table_name] = status
+        if status == "loading":
+            self.export_table_started_at.setdefault(table_name, now)
+            self.label_status.setText(f"🔄 {table_name}")
+        elif status in ("done", "error"):
+            self.export_table_finished_at[table_name] = now
+
         # 상태별 아이콘 및 스타일
         status_icons = {
             'pending': '⏳',
@@ -1231,11 +1530,38 @@ class RustDumpExportDialog(QDialog):
 
     def on_raw_output(self, line: str):
         """rust_dump 실시간 출력 처리 (로그에 추가)"""
-        # 너무 많은 로그 방지 (최대 500줄)
-        if self.txt_log.count() > 500:
-            self.txt_log.takeItem(0)
-        self.txt_log.addItem(line)
-        self.txt_log.scrollToBottom()
+        is_telemetry_event = False
+        visible_summary = None
+        try:
+            event = json.loads(line)
+        except Exception:
+            event = None
+        if isinstance(event, dict) and event.get("event") in {
+            "dump_plan",
+            "dump_schedule",
+            "row_progress",
+            "table_progress",
+        }:
+            is_telemetry_event = True
+            for key in ("password", "credentials"):
+                event.pop(key, None)
+            self.export_telemetry_events.append(event)
+            visible_summary = format_export_visible_telemetry(event)
+
+        if visible_summary:
+            # 너무 많은 로그 방지 (최대 500줄)
+            if self.txt_log.count() > 500:
+                self.txt_log.takeItem(0)
+            self.txt_log.addItem(visible_summary)
+            self.txt_log.scrollToBottom()
+            self._add_log(visible_summary)
+        elif not is_telemetry_event:
+            # 너무 많은 로그 방지 (최대 500줄)
+            if self.txt_log.count() > 500:
+                self.txt_log.takeItem(0)
+            self.txt_log.addItem(line)
+            self.txt_log.scrollToBottom()
+        logger.debug("[rust_dump] %s", line)
 
     def _report_error_to_github(self, error_type: str, error_message: str):
         """GitHub 이슈 자동 보고 (백그라운드)"""
@@ -1261,6 +1587,53 @@ class RustDumpExportDialog(QDialog):
             self._add_log(f"🐙 GitHub: {message}")
         else:
             self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
+
+    def _export_table_duration_seconds(self, table_name: str) -> float:
+        start = self.export_table_started_at.get(table_name)
+        end = self.export_table_finished_at.get(table_name)
+        if not start or not end:
+            return 0.0
+        return max(0.0, (end - start).total_seconds())
+
+    def _export_slow_table_summaries(self) -> List[dict]:
+        summaries = []
+        for table, total_rows in self.export_table_totals.items():
+            summaries.append({
+                "table": table,
+                "rows": total_rows,
+                "done": self.export_table_done.get(table, 0),
+                "duration_sec": self._export_table_duration_seconds(table),
+            })
+        return sorted(summaries, key=lambda item: item["duration_sec"], reverse=True)
+
+    def _export_slow_chunk_summaries(self) -> List[dict]:
+        summaries = []
+        for event in self.export_telemetry_events:
+            if event.get("event") != "row_progress":
+                continue
+            elapsed_ms = int(
+                event.get("stream_ms")
+                or event.get("read_ms")
+                or event.get("write_ms")
+                or event.get("load_ms")
+                or 0
+            )
+            if elapsed_ms <= 0:
+                continue
+            summaries.append({
+                "table": str(event.get("table") or ""),
+                "chunk_index": event.get("chunk_index"),
+                "chunk_rows": int(event.get("chunk_rows") or 0),
+                "elapsed_ms": elapsed_ms,
+                "strategy": str(event.get("strategy") or ""),
+            })
+        return sorted(summaries, key=lambda item: item["elapsed_ms"], reverse=True)
+
+    def _export_schedule_summary(self) -> Optional[dict]:
+        for event in self.export_telemetry_events:
+            if event.get("event") == "dump_schedule":
+                return event
+        return None
 
     def save_log(self):
         """로그를 파일로 저장"""
@@ -1306,6 +1679,43 @@ class RustDumpExportDialog(QDialog):
                 if self.export_start_time and self.export_end_time:
                     elapsed = self.export_end_time - self.export_start_time
                     f.write(f"소요 시간: {elapsed}\n")
+
+                f.write("\n" + "=" * 70 + "\n")
+                f.write("Export Telemetry Summary\n")
+                f.write("=" * 70 + "\n")
+                f.write(f"총 rows: {self.export_total_rows:,}\n")
+                f.write(f"완료 rows: {sum(self.export_table_done.values()):,}\n")
+                f.write(f"수집 이벤트: {len(self.export_telemetry_events):,}\n")
+                schedule = self._export_schedule_summary()
+                if schedule:
+                    f.write("\nAdaptive Schedule\n")
+                    f.write(
+                        f"- format={schedule.get('data_format')}, "
+                        f"compression={schedule.get('compression')}, "
+                        f"threads={schedule.get('threads')}, "
+                        f"table_workers={schedule.get('table_workers')}, "
+                        f"range_workers/table={schedule.get('range_workers_per_table')}, "
+                        f"chunk_size={schedule.get('chunk_size')}\n"
+                    )
+                    for item in (schedule.get("scheduled_tables") or [])[:8]:
+                        f.write(
+                            f"  - {item.get('name')}: {int(item.get('rows') or 0):,} rows, "
+                            f"{int(item.get('estimated_chunks') or 0):,} chunks\n"
+                        )
+                f.write("\n느린 테이블 Top 10\n")
+                for item in self._export_slow_table_summaries()[:10]:
+                    f.write(
+                        f"- {item['table']}: {item['duration_sec']:.1f}s, "
+                        f"{item['done']:,}/{item['rows']:,} rows\n"
+                    )
+                f.write("\n느린 Chunk Top 10\n")
+                for item in self._export_slow_chunk_summaries()[:10]:
+                    chunk = item["chunk_index"] if item["chunk_index"] is not None else "-"
+                    f.write(
+                        f"- {item['table']} chunk {chunk}: "
+                        f"{item['elapsed_ms']}ms, {item['chunk_rows']:,} rows, "
+                        f"{item['strategy'] or 'default'}\n"
+                    )
 
                 f.write("\n" + "=" * 70 + "\n")
                 f.write("상세 로그\n")
@@ -1360,6 +1770,8 @@ class RustDumpImportDialog(QDialog):
 
         # 메타데이터 정보
         self.dump_metadata: Optional[dict] = None
+        self.import_table_rows_done: dict = {}
+        self.import_table_rows_total: dict = {}
 
         # 테이블별 chunk 진행률 추적
         self.table_chunk_progress: dict = {}  # {table_name: (completed, total)}
@@ -1492,7 +1904,7 @@ class RustDumpImportDialog(QDialog):
 
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 16)
-        self.spin_threads.setValue(4)
+        self.spin_threads.setValue(8)
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
         container_layout.addWidget(option_group)
@@ -2158,16 +2570,19 @@ class RustDumpImportDialog(QDialog):
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
-        percent = info.get('percent', 0)
-        mb_done = info.get('mb_done', 0)
-        mb_total = info.get('mb_total', 0)
-        rows_sec = info.get('rows_sec', 0)
-        speed = info.get('speed', '0 B/s')
+        table = str(info.get('table') or "")
+        if table:
+            self.import_table_rows_done[table] = max(0, int(info.get('rows_done') or 0))
+        percent = import_overall_percent(self.import_table_rows_done, self.import_table_rows_total)
+        if percent == 0:
+            percent = info.get('percent', 0)
+        data_label, speed_label, status_label = format_import_row_labels(info)
 
         self.progress_bar.setValue(percent)
-        self.label_percent.setText(f"📊 진행률: {percent}%")
-        self.label_data.setText(f"📦 데이터: {mb_done:.2f} MB / {mb_total:.2f} MB")
-        self.label_speed.setText(f"⚡ 속도: {rows_sec:,} rows/s | {speed}")
+        self.label_percent.setText(f"📊 전체 진행률: {percent}%")
+        self.label_data.setText(data_label)
+        self.label_speed.setText(speed_label)
+        self.label_status.setText(status_label)
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트 (메타데이터 정보 포함)"""
@@ -2314,6 +2729,10 @@ class RustDumpImportDialog(QDialog):
         }
         """
         self.dump_metadata = metadata
+        self.import_table_rows_total = {
+            str(table): int(rows or 0)
+            for table, rows in (metadata.get('table_rows') or {}).items()
+        }
 
         # 대용량 테이블 정보를 테이블 상태 목록에 표시
         if metadata and 'table_sizes' in metadata:

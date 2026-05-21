@@ -1,6 +1,7 @@
 """
 RustDumpExporter 테스트
 """
+import json
 import pytest
 from unittest.mock import patch, MagicMock
 
@@ -193,7 +194,33 @@ class TestRustDumpExporter:
         assert facade.payload["source"]["engine"] == "mysql"
         assert facade.payload["source"]["database"] == "app"
         assert facade.payload["output_dir"].endswith("dump")
+        assert facade.payload["threads"] == 8
+        assert facade.payload["chunk_size"] == 50000
+        assert facade.payload["data_format"] == "tsv"
+        assert facade.payload["compression"] == "zstd"
         assert "2" in msg
+
+    def test_export_full_schema_passes_zstd_compression_to_rust_dump(self, tmp_path):
+        """압축 선택이 Rust dump.run payload로 전달됨"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_dumped": 1}
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        exporter = RustDumpExporter(config, facade=facade)
+
+        success, _ = exporter.export_full_schema(
+            'app',
+            str(tmp_path / 'dump'),
+            compression='zstd',
+        )
+
+        assert success is True
+        assert facade.payload["compression"] == "zstd"
 
     def test_export_tables_passes_selected_tables_to_rust_dump(self, tmp_path):
         """부분 export가 선택 테이블 목록을 Rust core에 전달"""
@@ -218,6 +245,10 @@ class TestRustDumpExporter:
         assert success is True
         assert tables == ['users', 'orders']
         assert facade.payload["tables"] == ['users', 'orders']
+        assert facade.payload["threads"] == 8
+        assert facade.payload["chunk_size"] == 50000
+        assert facade.payload["data_format"] == "tsv"
+        assert facade.payload["compression"] == "zstd"
 
 
 class TestRustDumpImporter:
@@ -261,8 +292,129 @@ class TestRustDumpImporter:
         assert success is True
         assert facade.payload["target"]["database"] == "app"
         assert facade.payload["input_dir"] == str(dump_dir)
+        assert facade.payload["threads"] == 8
         assert results["users"]["status"] == "done"
         assert "1" in msg
+
+    def test_import_row_progress_reports_chunk_counts_to_callback(self):
+        """Import row_progress는 rows/total이 아니라 chunks_done/chunks_total을 chunk callback으로 전달한다."""
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        chunk_events = []
+
+        emit_core_event(
+            {
+                "event": "row_progress",
+                "table": "df_subs",
+                "rows": 100_000,
+                "total": 387_398,
+                "chunk_rows": 50_000,
+                "chunks_done": 2,
+                "chunks_total": 8,
+                "chunk_index": 4,
+                "load_ms": 1250,
+                "strategy": "parallel_load_data_local_infile",
+            },
+            table_chunk_progress_callback=lambda table, done, total: chunk_events.append(
+                (table, done, total)
+            ),
+        )
+
+        assert chunk_events == [("df_subs", 2, 8)]
+
+    def test_import_metadata_reports_table_rows_and_total_rows(self, tmp_path):
+        """Import 대시보드가 전체 row 진행률을 계산할 수 있도록 manifest rows를 전달한다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        users_dir = dump_dir / "0001_users"
+        orders_dir = dump_dir / "0002_orders"
+        users_dir.mkdir(parents=True)
+        orders_dir.mkdir(parents=True)
+        (users_dir / "chunk_000001.tsv").write_text("1\ta\n", encoding="utf-8")
+        (orders_dir / "chunk_000001.tsv").write_text("1\t1\n", encoding="utf-8")
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 2,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "0001_users", "rows": 1, "chunks": 1},
+                        {"name": "orders", "path": "0002_orders", "rows": 2, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+
+        metadata = importer._analyze_dump_metadata(str(dump_dir))
+
+        assert metadata["table_rows"] == {"users": 1, "orders": 2}
+        assert metadata["total_rows"] == 3
+
+    def test_import_metadata_rejects_manifest_path_outside_dump_dir(self, tmp_path):
+        """악의적 manifest path가 dump 폴더 밖 chunk를 참조하면 metadata 분석을 거부한다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        outside_dir = tmp_path / "outside"
+        dump_dir.mkdir()
+        outside_dir.mkdir()
+        (outside_dir / "chunk_000001.tsv").write_text("secret\n", encoding="utf-8")
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 2,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "../outside", "rows": 1, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+
+        assert importer._analyze_dump_metadata(str(dump_dir)) is None
+
+    def test_import_metadata_rejects_chunk_symlink_outside_dump_dir(self, tmp_path):
+        """dump 폴더 내부 chunk symlink가 외부 파일을 가리키면 metadata 분석을 거부한다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        table_dir = dump_dir / "0001_users"
+        outside_dir = tmp_path / "outside"
+        table_dir.mkdir(parents=True)
+        outside_dir.mkdir()
+        outside_file = outside_dir / "chunk_000001.tsv"
+        outside_file.write_text("secret\n", encoding="utf-8")
+        chunk_link = table_dir / "chunk_000001.tsv"
+        try:
+            chunk_link.symlink_to(outside_file)
+        except OSError:
+            return
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 2,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "0001_users", "rows": 1, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+
+        assert importer._analyze_dump_metadata(str(dump_dir)) is None
 
 
 class TestConvenienceFunctions:
@@ -349,3 +501,80 @@ class TestTableProgressTracker:
 
         assert size == 0
         assert chunks == 1  # 기본값
+
+
+class TestCoreEventForwarding:
+    """Rust Core event forwarding contract tests"""
+
+    def test_emit_core_event_forwards_dump_plan_to_detail_callback(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        details = []
+        emit_core_event(
+            {
+                "event": "dump_plan",
+                "tables_total": 2,
+                "rows_total": 150,
+                "tables": [{"name": "a", "rows": 100}, {"name": "b", "rows": 50}],
+            },
+            detail_callback=details.append,
+        )
+
+        assert details == [{
+            "event": "dump_plan",
+            "tables_total": 2,
+            "rows_total": 150,
+            "tables": [{"name": "a", "rows": 100}, {"name": "b", "rows": 50}],
+        }]
+
+    def test_emit_core_event_counts_only_completed_table_progress(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        table_progress = []
+        statuses = []
+
+        emit_core_event(
+            {"event": "table_progress", "table": "users", "status": "dumping", "current": 1, "total": 2},
+            table_progress_callback=lambda current, total, table: table_progress.append((current, total, table)),
+            table_status_callback=lambda table, status, message: statuses.append((table, status, message)),
+        )
+        emit_core_event(
+            {"event": "table_progress", "table": "users", "status": "completed", "current": 1, "total": 2},
+            table_progress_callback=lambda current, total, table: table_progress.append((current, total, table)),
+            table_status_callback=lambda table, status, message: statuses.append((table, status, message)),
+        )
+
+        assert table_progress == [(1, 2, "users")]
+        assert statuses == [("users", "loading", ""), ("users", "done", "")]
+
+    def test_emit_core_event_forwards_dump_schedule_detail(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        details = []
+
+        emit_core_event(
+            {
+                "event": "dump_schedule",
+                "threads": 8,
+                "table_workers": 2,
+                "range_workers_per_table": 4,
+                "chunk_size": 50000,
+                "data_format": "tsv",
+                "compression": "zstd",
+                "scheduled_tables": [{"name": "huge", "rows": 100, "estimated_chunks": 1}],
+            },
+            detail_callback=details.append,
+        )
+
+        assert details == [
+            {
+                "event": "dump_schedule",
+                "threads": 8,
+                "table_workers": 2,
+                "range_workers_per_table": 4,
+                "chunk_size": 50000,
+                "data_format": "tsv",
+                "compression": "zstd",
+                "scheduled_tables": [{"name": "huge", "rows": 100, "estimated_chunks": 1}],
+            }
+        ]
