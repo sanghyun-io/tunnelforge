@@ -51,8 +51,9 @@ def test_message_panel_is_separate_from_result_tabs(monkeypatch):
         assert dialog.result_tabs.count() == 0
         assert dialog.result_tabs.indexOf(dialog.message_text) == -1
         assert dialog._message_collapsed is True
-        assert dialog.message_text.maximumHeight() == 68
-        assert dialog.btn_toggle_message.text() == "▶ 메시지"
+        assert dialog.message_text.isHidden()
+        assert not dialog.message_summary.isHidden()
+        assert dialog.btn_toggle_message.text() == "실행 로그 펼치기"
     finally:
         close_dialog(dialog)
 
@@ -62,12 +63,28 @@ def test_message_panel_toggle_changes_height(monkeypatch):
     try:
         dialog._toggle_message_panel()
         assert dialog._message_collapsed is False
+        assert not dialog.message_text.isHidden()
         assert dialog.message_text.maximumHeight() == 220
-        assert dialog.btn_toggle_message.text() == "▼ 메시지"
+        assert dialog.btn_toggle_message.text() == "실행 로그 접기"
 
         dialog._toggle_message_panel()
         assert dialog._message_collapsed is True
-        assert dialog.message_text.maximumHeight() == 68
+        assert dialog.message_text.isHidden()
+    finally:
+        close_dialog(dialog)
+
+
+def test_query_result_collapses_log_and_updates_summary(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        dialog._toggle_message_panel()
+
+        dialog._on_query_result(0, ["id"], [[1], [2]], "", 2, 0.125)
+
+        assert dialog._message_collapsed is True
+        assert dialog.message_text.isHidden()
+        assert "2행 반환" in dialog.message_summary.text()
+        assert "0.125초" in dialog.message_summary.text()
     finally:
         close_dialog(dialog)
 

@@ -1798,9 +1798,9 @@ class SQLEditorDialog(QDialog):
         result_layout = QVBoxLayout(result_group)
         result_layout.setContentsMargins(4, 8, 4, 4)
 
-        # 메시지 영역 (결과 탭과 분리, 초기 축소)
-        self.btn_toggle_message = QPushButton("▶ 메시지")
-        self.btn_toggle_message.setToolTip("메시지 영역 펼치기")
+        # 메시지 영역 (접힘 상태에서는 한 줄 요약만 노출)
+        self.btn_toggle_message = QPushButton("실행 로그 펼치기")
+        self.btn_toggle_message.setToolTip("실행 로그 상세 보기")
         self.btn_toggle_message.setStyleSheet("""
             QPushButton {
                 text-align: left;
@@ -1817,6 +1817,19 @@ class SQLEditorDialog(QDialog):
         """)
         self.btn_toggle_message.clicked.connect(self._toggle_message_panel)
         result_layout.addWidget(self.btn_toggle_message)
+
+        self.message_summary = QLabel("실행 대기 중")
+        self.message_summary.setStyleSheet("""
+            QLabel {
+                background-color: #f4f7fa;
+                color: #2c3e50;
+                border: 1px solid #d8e0e8;
+                border-radius: 4px;
+                padding: 6px 10px;
+                font-size: 12px;
+            }
+        """)
+        result_layout.addWidget(self.message_summary)
 
         self.message_text = QTextEdit()
         self.message_text.setReadOnly(True)
@@ -2634,19 +2647,25 @@ class SQLEditorDialog(QDialog):
         """메시지 영역 접힘/펼침 상태 적용"""
         self._message_collapsed = collapsed
         if collapsed:
-            self.btn_toggle_message.setText("▶ 메시지")
-            self.btn_toggle_message.setToolTip("메시지 영역 펼치기")
-            self.message_text.setMinimumHeight(44)
-            self.message_text.setMaximumHeight(68)
+            self.btn_toggle_message.setText("실행 로그 펼치기")
+            self.btn_toggle_message.setToolTip("실행 로그 상세 보기")
+            self.message_summary.show()
+            self.message_text.hide()
         else:
-            self.btn_toggle_message.setText("▼ 메시지")
-            self.btn_toggle_message.setToolTip("메시지 영역 접기")
+            self.btn_toggle_message.setText("실행 로그 접기")
+            self.btn_toggle_message.setToolTip("실행 로그 요약 보기")
+            self.message_summary.show()
+            self.message_text.show()
             self.message_text.setMinimumHeight(120)
             self.message_text.setMaximumHeight(220)
 
     def _toggle_message_panel(self):
         """메시지 영역 펼치기/접기"""
         self._set_message_panel_collapsed(not self._message_collapsed)
+
+    def _set_message_summary(self, text: str):
+        """접힌 실행 로그에 표시할 한 줄 상태 요약."""
+        self.message_summary.setText(text or "실행 대기 중")
 
     def _show_result_tab_context_menu(self, position):
         """결과 탭 컨텍스트 메뉴"""
@@ -2809,12 +2828,14 @@ class SQLEditorDialog(QDialog):
     def _on_progress(self, msg):
         """진행 메시지"""
         self.message_text.append(msg)
+        self._set_message_summary(msg)
         self.status_bar.showMessage(msg)
 
     def _on_query_result(self, idx, columns, rows, error, affected, exec_time):
         """쿼리 결과 수신"""
         if error:
             self.message_text.append(f"❌ 쿼리 {idx + 1}: {error}")
+            self._set_message_summary(f"쿼리 {idx + 1} 실패 · {error}")
         elif columns:
             # 편집 가능성 분석 + 설정 (워커에 실행된 원본 쿼리 사용)
             worker_query = ''
@@ -2826,9 +2847,12 @@ class SQLEditorDialog(QDialog):
             self._add_result_table(columns, rows, exec_time, worker_query)
 
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {len(rows)}행 반환 ({exec_time:.3f}초)")
+            self._set_message_summary(f"쿼리 {idx + 1} 완료 · {len(rows)}행 반환 · {exec_time:.3f}초")
+            self._set_message_panel_collapsed(True)
         else:
             # INSERT/UPDATE/DELETE
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {affected}행 영향받음 ({exec_time:.3f}초)")
+            self._set_message_summary(f"쿼리 {idx + 1} 완료 · {affected}행 영향 · {exec_time:.3f}초")
 
         self.progress_bar.setValue(idx + 1)
         self.status_bar.showMessage(f"쿼리 {idx + 1} 완료 ({exec_time:.3f}초)")
@@ -2837,6 +2861,7 @@ class SQLEditorDialog(QDialog):
         """실행 완료"""
         total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
         self.message_text.append(f"\n{msg}")
+        self._set_message_summary(f"{msg} · {total_elapsed:.1f}초")
         self._cleanup()
         self.status_bar.showMessage(f"✅ {msg} ({total_elapsed:.1f}초)")
 
