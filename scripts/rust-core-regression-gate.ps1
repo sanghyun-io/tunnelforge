@@ -93,6 +93,7 @@ try {
     }
 
     Write-Output "Rust Core regression gate passed."
+    exit 0
 } finally {
     Pop-Location
 }
