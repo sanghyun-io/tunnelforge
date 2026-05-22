@@ -7059,7 +7059,7 @@ pub fn select_chunk_text_after_key_sql(
         .collect::<Vec<_>>()
         .join(", ");
     let where_clause = if let Some(values) = last_key_values {
-        let predicates = keyset_predicates(engine, &table.name, key_columns, values);
+        let predicates = keyset_predicates(engine, table, key_columns, values);
         if predicates.is_empty() {
             String::new()
         } else {
@@ -7143,7 +7143,7 @@ pub fn select_chunk_text_range_sql(
 
 fn keyset_predicates(
     engine: &str,
-    table: &str,
+    table: &NormalizedTable,
     key_columns: &[String],
     values: &[String],
 ) -> Vec<String> {
@@ -7154,18 +7154,49 @@ fn keyset_predicates(
         for previous in 0..index {
             parts.push(format!(
                 "{} = {}",
-                quote_column_ref(engine, table, &key_columns[previous]),
-                sql_literal(&Value::String(values[previous].clone()))
+                quote_column_ref(engine, &table.name, &key_columns[previous]),
+                keyset_value_literal(engine, table, &key_columns[previous], &values[previous])
             ));
         }
         parts.push(format!(
             "{} > {}",
-            quote_column_ref(engine, table, &key_columns[index]),
-            sql_literal(&Value::String(values[index].clone()))
+            quote_column_ref(engine, &table.name, &key_columns[index]),
+            keyset_value_literal(engine, table, &key_columns[index], &values[index])
         ));
         predicates.push(format!("({})", parts.join(" AND ")));
     }
     predicates
+}
+
+/// Render a keyset comparison value, accounting for binary columns where the
+/// captured token is the column's HEX text representation. For binary columns
+/// the literal must be decoded back to bytes (UNHEX/decode) or the comparison
+/// degenerates to ASCII string ordering against raw bytes, which never advances
+/// the cursor and causes the keyset loop to fetch the same page forever.
+fn keyset_value_literal(
+    engine: &str,
+    table: &NormalizedTable,
+    column_name: &str,
+    value: &str,
+) -> String {
+    let is_binary = table
+        .columns
+        .iter()
+        .find(|column| column.name == column_name)
+        .map(|column| is_binary_type(&column.type_name))
+        .unwrap_or(false);
+    if is_binary {
+        match engine {
+            "mysql" => format!("UNHEX({})", sql_literal(&Value::String(value.to_string()))),
+            "postgresql" => format!(
+                "decode({}, 'hex')",
+                sql_literal(&Value::String(value.to_string()))
+            ),
+            _ => sql_literal(&Value::String(value.to_string())),
+        }
+    } else {
+        sql_literal(&Value::String(value.to_string()))
+    }
 }
 
 pub fn insert_sql(engine: &str, table: &str, columns: &[String]) -> String {
@@ -10583,5 +10614,100 @@ mod tests {
         };
 
         assert_eq!(next_table_to_copy(&state), Some("orders".to_string()));
+    }
+
+    fn binary_pk_table() -> NormalizedTable {
+        NormalizedTable {
+            name: "dm_row_value_history".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "row_value_history_id".to_string(),
+                type_name: "binary(16)".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    fn int_pk_table() -> NormalizedTable {
+        NormalizedTable {
+            name: "users".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "bigint".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn keyset_predicates_wrap_binary_columns_with_unhex_for_mysql() {
+        let table = binary_pk_table();
+        let key_columns = vec!["row_value_history_id".to_string()];
+        let values = vec!["A1B2C3D4E5F60718293A4B5C6D7E8F90".to_string()];
+        let predicates = keyset_predicates("mysql", &table, &key_columns, &values);
+        assert_eq!(predicates.len(), 1);
+        assert!(
+            predicates[0].contains("UNHEX('A1B2C3D4E5F60718293A4B5C6D7E8F90')"),
+            "binary key value must be wrapped in UNHEX to compare against the raw binary column; got: {}",
+            predicates[0]
+        );
+        assert!(
+            !predicates[0].contains("> 'A1B2C3"),
+            "raw HEX string literal would degenerate to ASCII comparison; got: {}",
+            predicates[0]
+        );
+    }
+
+    #[test]
+    fn keyset_predicates_wrap_binary_columns_with_decode_for_postgresql() {
+        let table = binary_pk_table();
+        let key_columns = vec!["row_value_history_id".to_string()];
+        let values = vec!["A1B2C3D4E5F60718293A4B5C6D7E8F90".to_string()];
+        let predicates = keyset_predicates("postgresql", &table, &key_columns, &values);
+        assert_eq!(predicates.len(), 1);
+        assert!(
+            predicates[0].contains("decode('A1B2C3D4E5F60718293A4B5C6D7E8F90', 'hex')"),
+            "binary key value must be wrapped in decode(..., 'hex'); got: {}",
+            predicates[0]
+        );
+    }
+
+    #[test]
+    fn keyset_predicates_leave_non_binary_columns_as_string_literal() {
+        let table = int_pk_table();
+        let key_columns = vec!["id".to_string()];
+        let values = vec!["42".to_string()];
+        let predicates = keyset_predicates("mysql", &table, &key_columns, &values);
+        assert_eq!(predicates.len(), 1);
+        assert!(predicates[0].contains("> '42'"), "got: {}", predicates[0]);
+        assert!(!predicates[0].contains("UNHEX"), "got: {}", predicates[0]);
+    }
+
+    #[test]
+    fn select_chunk_text_after_key_sql_uses_unhex_for_binary_pk() {
+        let table = binary_pk_table();
+        let key_columns = vec!["row_value_history_id".to_string()];
+        let last = vec!["A1B2C3D4E5F60718293A4B5C6D7E8F90".to_string()];
+        let sql = select_chunk_text_after_key_sql(
+            "mysql",
+            &table,
+            &key_columns,
+            Some(&last),
+            100,
+        );
+        assert!(
+            sql.contains("UNHEX('A1B2C3D4E5F60718293A4B5C6D7E8F90')"),
+            "generated SQL must compare against UNHEX(hex_literal); got: {}",
+            sql
+        );
     }
 }
