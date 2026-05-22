@@ -63,9 +63,12 @@ datas = [
 
 core_suffix = '.exe' if os.name == 'nt' else ''
 tunnelforge_core_exe = os.path.join(project_root, 'migration_core', 'target', 'release', f'tunnelforge-core{core_suffix}')
-binaries = []
-if os.path.exists(tunnelforge_core_exe):
-    binaries.append((tunnelforge_core_exe, '.'))
+if not os.path.exists(tunnelforge_core_exe):
+    raise SystemExit(
+        f"tunnelforge-core{core_suffix} not found at {tunnelforge_core_exe}. "
+        "Run `cargo build --manifest-path migration_core/Cargo.toml --release` first."
+    )
+binaries = [(tunnelforge_core_exe, '.')]
 
 # Analysis: 실행 파일에 포함될 내용 분석
 a = Analysis(
