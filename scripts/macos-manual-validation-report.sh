@@ -148,6 +148,8 @@ check_complete_report() {
   local required_check_items=(
     'Run `bash scripts/validate-macos-release.sh`'
     'Confirm source `python main.py --ui-smoke-check` passed'
+    'Download signed/notarized GitHub Actions macOS artifacts'
+    'Confirm downloaded macOS artifact checksums passed'
     'Confirm built app smoke passed'
     'Confirm mounted DMG smoke passed'
     'Confirm copied DMG install smoke passed'
@@ -225,6 +227,21 @@ check_complete_report() {
 
   if ! grep -qE '^- Architecture:[[:space:]]*(arm64|x86_64)[[:space:]]*$' "$report_path"; then
     echo "Manual validation report must include a supported Mac architecture." >&2
+    failures=1
+  fi
+
+  if ! grep -qE '^- Artifact workflow run:[[:space:]]*[0-9]+[[:space:]]*$' "$report_path"; then
+    echo "Manual validation report must include a GitHub Actions artifact workflow run id." >&2
+    failures=1
+  fi
+
+  if ! grep -qE '^- Artifact directory:[[:space:]]*[^[:space:]].*$' "$report_path"; then
+    echo "Manual validation report must include a downloaded artifact directory." >&2
+    failures=1
+  fi
+
+  if ! grep -qE '^- Artifact checksum verification:[[:space:]]*(pass|passed|PASS|PASSED)[[:space:]]*$' "$report_path"; then
+    echo "Manual validation report must record '- Artifact checksum verification: passed'." >&2
     failures=1
   fi
 
@@ -366,6 +383,9 @@ MACOS_BUILD="$(sw_vers -buildVersion 2>/dev/null || echo unavailable)"
 ARCH="$(uname -m)"
 FINAL_APP_PATH="${MACOS_VALIDATION_APP_PATH:-/Applications/TunnelForge.app}"
 FINAL_APP_EXECUTABLE="${FINAL_APP_PATH}/Contents/MacOS/TunnelForge"
+ARTIFACT_WORKFLOW_RUN="${MACOS_VALIDATION_ARTIFACT_RUN_ID:-}"
+ARTIFACT_DIR="${MACOS_VALIDATION_ARTIFACT_DIR:-build/macos-validation-artifacts}"
+ARTIFACT_CHECKSUM_STATUS="${MACOS_VALIDATION_ARTIFACT_CHECKSUMS:-pending}"
 
 SMOKE_STATUS="not run"
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
@@ -391,6 +411,9 @@ cat > "$REPORT_PATH" <<EOF
 - Git SHA: ${GIT_SHA}
 - macOS: ${MACOS_VERSION} (${MACOS_BUILD})
 - Architecture: ${ARCH}
+- Artifact workflow run: ${ARTIFACT_WORKFLOW_RUN}
+- Artifact directory: ${ARTIFACT_DIR}
+- Artifact checksum verification: ${ARTIFACT_CHECKSUM_STATUS}
 - Python: ${PYTHON_VERSION}
 - Cargo: ${CARGO_VERSION}
 - Release smoke: ${SMOKE_STATUS}
@@ -406,6 +429,8 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Run \`bash scripts/validate-macos-release.sh\`
 - Optional \`/Applications\` install smoke is included when \`MACOS_RELEASE_SMOKE_APPLICATIONS=1\` is set before \`--run-smoke\`.
 - [ ] Confirm source \`python main.py --ui-smoke-check\` passed
+- [ ] Download signed/notarized GitHub Actions macOS artifacts
+- [ ] Confirm downloaded macOS artifact checksums passed
 - [ ] Confirm built app smoke passed
 - [ ] Confirm mounted DMG smoke passed
 - [ ] Confirm copied DMG install smoke passed
