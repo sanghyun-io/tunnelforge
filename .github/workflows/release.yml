@@ -20,8 +20,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
-          token: ""
-          persist-credentials: false
           fetch-depth: 0  # 전체 히스토리 (릴리스 노트 생성용)
 
       - name: Set up Python
@@ -173,8 +171,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
-          token: ""
-          persist-credentials: false
           fetch-depth: 0
 
       - name: Set up Python
@@ -394,8 +390,6 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v5
         with:
-          token: ""
-          persist-credentials: false
           fetch-depth: 0
 
       - name: Extract version from tag

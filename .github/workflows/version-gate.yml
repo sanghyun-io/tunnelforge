@@ -24,10 +24,12 @@ jobs:
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v5
-        with:
-          token: ""
-          persist-credentials: false
+        run: |
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"
+          git checkout --detach FETCH_HEAD
+          git config --global --add safe.directory "$PWD"
 
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -51,10 +53,12 @@ jobs:
 
     steps:
       - name: Checkout PR
-        uses: actions/checkout@v5
-        with:
-          token: ""
-          persist-credentials: false
+        run: |
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"
+          git checkout --detach FETCH_HEAD
+          git config --global --add safe.directory "$PWD"
 
       - name: Set up Python
         uses: actions/setup-python@v6
