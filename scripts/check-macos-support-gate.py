@@ -167,7 +167,9 @@ def check_pr(repo: str, skip_checks: bool) -> bool:
     )
     passed = True
 
-    if pr["mergeStateStatus"] != "CLEAN":
+    if skip_checks:
+        ok("PR merge state skipped by request")
+    elif pr["mergeStateStatus"] != "CLEAN":
         fail(f"PR #{PR_NUMBER} merge state is {pr['mergeStateStatus']}, expected CLEAN")
         passed = False
     else:
@@ -223,7 +225,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--skip-pr-checks",
         action="store_true",
-        help="Skip PR status rollup checks. Useful when running as a PR check itself.",
+        help="Skip PR merge-state and status-rollup checks. Useful when running as a PR check itself.",
     )
     return parser.parse_args()
 

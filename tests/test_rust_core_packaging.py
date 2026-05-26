@@ -229,6 +229,7 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "--report" in script
     assert "--skip-github" in script
     assert "--skip-pr-checks" in script
+    assert "PR merge state skipped by request" in script
     assert "def bash_path" in script
     assert "scripts/macos-manual-validation-report.sh" in script
     assert "statusCheckRollup" in script
