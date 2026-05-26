@@ -65,7 +65,7 @@ These checks require macOS:
 - `bash scripts/build-macos.sh`
 - `bash scripts/package-macos.sh`
 - `bash scripts/validate-macos-release.sh` to run source `python main.py --ui-smoke-check`, build, package, and run `--ui-smoke-check` against the built app, mounted DMG app, copied DMG install app, and extracted ZIP app on a Mac.
-- `bash scripts/macos-manual-validation-report.sh --run-smoke` to create a timestamped Markdown report and smoke log for the remaining manual SSH, DB, migration, LaunchAgent, update, install, signing, notarization, and Gatekeeper checks.
+- `bash scripts/macos-manual-validation-report.sh --run-smoke` to create a timestamped Markdown report and smoke log for the remaining manual SSH, DB, migration, LaunchAgent, update, install, signing, notarization, and Gatekeeper checks. Set `MACOS_RELEASE_SMOKE_APPLICATIONS=1` when running this command to include the `/Applications` install smoke in the automated release smoke log.
 - `bash scripts/macos-manual-validation-report.sh --check-complete <report.md>` to fail the final gate when any checkbox, smoke result, smoke log file, overall result, or validator field is incomplete. Use the exact report path printed by `--run-smoke`.
 - `bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>` to create a `build/macos-manual-validation-evidence-*.zip` bundle containing the completed report, smoke log, and SHA256 manifest for PR or release attachment, plus a sibling `*.zip.sha256` checksum for the bundle itself. Use `--evidence-bundle <zip>` to choose a specific output path.
 - `bash scripts/macos-manual-validation-report.sh --finalize <report.md>` to run the completed-report check, create the evidence zip and checksum, run `scripts/check-macos-support-gate.py --final`, and print the exact report/log/zip/checksum attachment paths. Use `--skip-github` only for offline local rehearsal.
@@ -86,7 +86,7 @@ Final Manual Validation must happen after all implementation milestones are comp
 
 Run on macOS:
 
-1. Run `bash scripts/macos-manual-validation-report.sh --run-smoke` to generate a report and smoke log under `build/` while running the automated release smoke checks.
+1. Run `bash scripts/macos-manual-validation-report.sh --run-smoke` to generate a report and smoke log under `build/` while running the automated release smoke checks. Use `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --run-smoke` when the validator is ready to let the smoke script install and remove `/Applications/TunnelForge.app`.
 2. Build Rust Core and app bundle with `bash scripts/build-macos.sh` if validating the build step separately.
 3. Package with `bash scripts/package-macos.sh` if validating packaging separately.
 4. Launch `dist/TunnelForge.app`.

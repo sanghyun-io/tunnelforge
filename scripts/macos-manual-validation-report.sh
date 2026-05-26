@@ -14,6 +14,7 @@ Usage:
 
 Options:
   --run-smoke                 Run scripts/validate-macos-release.sh while creating the report.
+                              Set MACOS_RELEASE_SMOKE_APPLICATIONS=1 to include /Applications install smoke.
   --check-complete <report>   Verify a completed manual validation report has no open gates.
   --bundle-evidence <report>  Verify the completed report and create an attachable evidence zip.
   --finalize <report>         Verify, bundle, run the final gate, and print attachment paths.
@@ -300,12 +301,14 @@ cat > "$REPORT_PATH" <<EOF
 - Smoke log: ${SMOKE_LOG_PATH}
 - Final app path: ${FINAL_APP_PATH}
 - Final app executable: ${FINAL_APP_EXECUTABLE}
+- Applications install smoke: set \`MACOS_RELEASE_SMOKE_APPLICATIONS=1\` before \`--run-smoke\` to include it in the smoke log
 - Completion check: \`bash scripts/macos-manual-validation-report.sh --check-complete ${REPORT_PATH}\`
 - Evidence bundle: \`bash scripts/macos-manual-validation-report.sh --bundle-evidence ${REPORT_PATH}\`
 
 ## Automated Smoke
 
 - [ ] Run \`bash scripts/validate-macos-release.sh\`
+- Optional \`/Applications\` install smoke is included when \`MACOS_RELEASE_SMOKE_APPLICATIONS=1\` is set before \`--run-smoke\`.
 - [ ] Confirm source \`python main.py --ui-smoke-check\` passed
 - [ ] Confirm built app smoke passed
 - [ ] Confirm mounted DMG smoke passed

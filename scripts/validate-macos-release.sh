@@ -86,7 +86,14 @@ hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet
 trap - EXIT
 smoke_app "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
 
-echo "[8/8] Smoke testing ZIP package"
+if [[ "${MACOS_RELEASE_SMOKE_APPLICATIONS:-}" == "1" ]]; then
+  echo "[8/9] Smoke testing /Applications install"
+  MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM=1 bash scripts/smoke-macos-applications-install.sh "$DMG_PATH"
+else
+  echo "[8/9] Skipping /Applications install smoke; set MACOS_RELEASE_SMOKE_APPLICATIONS=1 to enable"
+fi
+
+echo "[9/9] Smoke testing ZIP package"
 rm -rf build/zip-smoke
 mkdir -p build/zip-smoke
 ditto -x -k "$ZIP_PATH" build/zip-smoke

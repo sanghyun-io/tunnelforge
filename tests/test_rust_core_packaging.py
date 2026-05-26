@@ -120,6 +120,9 @@ def test_macos_release_validation_script_smokes_app_dmg_and_zip():
     assert "Smoke testing copied DMG install" in script
     assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in script
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in script
+    assert "MACOS_RELEASE_SMOKE_APPLICATIONS" in script
+    assert "Smoke testing /Applications install" in script
+    assert 'MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM=1 bash scripts/smoke-macos-applications-install.sh "$DMG_PATH"' in script
     assert "build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in script
     assert "--ui-smoke-check" in script
     assert "window_title" in script
@@ -151,6 +154,7 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "MACOS_VALIDATION_APP_PATH" in script
     assert "macos-release-smoke-${TIMESTAMP}.log" in script
     assert "bash scripts/validate-macos-release.sh" in script
+    assert "MACOS_RELEASE_SMOKE_APPLICATIONS=1" in script
     assert "--check-complete <report>" in script
     assert "--bundle-evidence <report>" in script
     assert "--finalize <report>" in script
