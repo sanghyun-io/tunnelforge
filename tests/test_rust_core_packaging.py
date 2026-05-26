@@ -276,6 +276,10 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "--artifact-output-dir <dir>" in script
     assert "--artifact-arch <arch>" in script
     assert "macos-download-validation-artifacts.sh" in script
+    assert "SMOKE_CHECK_MARK" in script
+    assert "ARTIFACT_CHECK_MARK" in script
+    assert "- [${SMOKE_CHECK_MARK}] Run \\`bash scripts/validate-macos-release.sh\\`" in script
+    assert "- [${ARTIFACT_CHECK_MARK}] Download signed/notarized GitHub Actions macOS artifacts" in script
     assert "MACOS_VALIDATION_EVIDENCE_BUNDLE" in script
     assert "Evidence bundle:" in script
     assert "PYTHON_BIN" in script

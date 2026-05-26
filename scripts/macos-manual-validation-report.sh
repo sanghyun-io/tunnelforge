@@ -452,6 +452,7 @@ if [[ "$DOWNLOAD_ARTIFACTS" -eq 1 ]]; then
 fi
 
 SMOKE_STATUS="not run"
+SMOKE_CHECK_MARK=" "
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
   set +e
   bash scripts/validate-macos-release.sh 2>&1 | tee "$SMOKE_LOG_PATH"
@@ -460,9 +461,15 @@ if [[ "$RUN_SMOKE" -eq 1 ]]; then
 
   if [[ "$smoke_exit" -eq 0 ]]; then
     SMOKE_STATUS="passed"
+    SMOKE_CHECK_MARK="x"
   else
     SMOKE_STATUS="failed (exit ${smoke_exit})"
   fi
+fi
+
+ARTIFACT_CHECK_MARK=" "
+if [[ "$ARTIFACT_CHECKSUM_STATUS" =~ ^(pass|passed|PASS|PASSED)$ ]]; then
+  ARTIFACT_CHECK_MARK="x"
 fi
 
 cat > "$REPORT_PATH" <<EOF
@@ -491,15 +498,15 @@ cat > "$REPORT_PATH" <<EOF
 
 ## Automated Smoke
 
-- [ ] Run \`bash scripts/validate-macos-release.sh\`
+- [${SMOKE_CHECK_MARK}] Run \`bash scripts/validate-macos-release.sh\`
 - Optional \`/Applications\` install smoke is included when \`MACOS_RELEASE_SMOKE_APPLICATIONS=1\` is set before \`--run-smoke\`.
-- [ ] Confirm source \`python main.py --ui-smoke-check\` passed
-- [ ] Download signed/notarized GitHub Actions macOS artifacts
-- [ ] Confirm downloaded macOS artifact checksums passed
-- [ ] Confirm built app smoke passed
-- [ ] Confirm mounted DMG smoke passed
-- [ ] Confirm copied DMG install smoke passed
-- [ ] Confirm ZIP extracted app smoke passed
+- [${SMOKE_CHECK_MARK}] Confirm source \`python main.py --ui-smoke-check\` passed
+- [${ARTIFACT_CHECK_MARK}] Download signed/notarized GitHub Actions macOS artifacts
+- [${ARTIFACT_CHECK_MARK}] Confirm downloaded macOS artifact checksums passed
+- [${SMOKE_CHECK_MARK}] Confirm built app smoke passed
+- [${SMOKE_CHECK_MARK}] Confirm mounted DMG smoke passed
+- [${SMOKE_CHECK_MARK}] Confirm copied DMG install smoke passed
+- [${SMOKE_CHECK_MARK}] Confirm ZIP extracted app smoke passed
 
 ## Interactive App Launch
 

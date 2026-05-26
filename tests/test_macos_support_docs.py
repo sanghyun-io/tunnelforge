@@ -41,6 +41,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "required sections" in doc
     assert "required checklist items" in doc
     assert "successful /Applications install smoke" in doc
+    assert "pre-check" in doc
     assert "Git SHA" in doc
     assert "macOS version" in doc
     assert "Mac architecture" in doc
