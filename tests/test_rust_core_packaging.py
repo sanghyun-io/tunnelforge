@@ -420,6 +420,11 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "scripts/macos-manual-validation-report.sh" in script
     assert "statusCheckRollup" in script
     assert "mergeStateStatus" in script
+    assert "check_manual_macos_validation_workflow" in script
+    assert "workflow_dispatch" in script
+    assert "macOS App Validation" in script
+    assert "Verify signed and notarized artifacts" in script
+    assert "manual macOS signing/notarization workflow passed" in script
 
 
 def test_macos_support_gate_script_accepts_local_final_report(tmp_path):

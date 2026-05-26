@@ -25,6 +25,10 @@ MILESTONE_ISSUES = {
 }
 FINAL_ISSUE = 116
 PR_NUMBER = 117
+MANUAL_MACOS_WORKFLOW = "macOS App Validation"
+MANUAL_MACOS_WORKFLOW_EVENT = "workflow_dispatch"
+MANUAL_MACOS_VERIFY_STEP = "Verify signed and notarized artifacts"
+MANUAL_MACOS_REQUIRED_ARCHES = ("arm64", "x86_64")
 
 
 def run(command: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -323,6 +327,104 @@ def check_pr(repo: str, skip_checks: bool) -> bool:
     return passed
 
 
+def check_manual_macos_validation_workflow(repo: str) -> bool:
+    pr = gh_json(
+        [
+            "pr",
+            "view",
+            str(PR_NUMBER),
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid",
+        ]
+    )
+    head_sha = pr["headRefOid"]
+    runs = gh_json(
+        [
+            "run",
+            "list",
+            "--repo",
+            repo,
+            "--workflow",
+            MANUAL_MACOS_WORKFLOW,
+            "--event",
+            MANUAL_MACOS_WORKFLOW_EVENT,
+            "--limit",
+            "20",
+            "--json",
+            "databaseId,headSha,status,conclusion,url",
+        ]
+    )
+
+    matching_runs = [
+        run
+        for run in runs
+        if run.get("headSha") == head_sha
+        and run.get("status") == "completed"
+        and run.get("conclusion") == "success"
+    ]
+    if not matching_runs:
+        fail(
+            f"no successful manual {MANUAL_MACOS_WORKFLOW} {MANUAL_MACOS_WORKFLOW_EVENT} "
+            f"run found for PR head {head_sha}"
+        )
+        return False
+
+    run_id = matching_runs[0]["databaseId"]
+    run = gh_json(
+        [
+            "run",
+            "view",
+            str(run_id),
+            "--repo",
+            repo,
+            "--json",
+            "jobs,url",
+        ]
+    )
+    jobs = run.get("jobs", [])
+    passed = True
+
+    for arch in MANUAL_MACOS_REQUIRED_ARCHES:
+        job = next((job for job in jobs if arch in job.get("name", "")), None)
+        if job is None:
+            fail(f"manual macOS validation run {run_id} is missing {arch} job")
+            passed = False
+            continue
+
+        if job.get("status") != "completed" or job.get("conclusion") != "success":
+            fail(
+                f"manual macOS validation {arch} job is not green: "
+                f"status={job.get('status')} conclusion={job.get('conclusion')}"
+            )
+            passed = False
+            continue
+
+        verify_step = next(
+            (step for step in job.get("steps", []) if step.get("name") == MANUAL_MACOS_VERIFY_STEP),
+            None,
+        )
+        if verify_step is None:
+            fail(f"manual macOS validation {arch} job is missing {MANUAL_MACOS_VERIFY_STEP!r} step")
+            passed = False
+            continue
+
+        if verify_step.get("status") != "completed" or verify_step.get("conclusion") != "success":
+            fail(
+                f"manual macOS validation {arch} signing/notarization step is not green: "
+                f"status={verify_step.get('status')} conclusion={verify_step.get('conclusion')}"
+            )
+            passed = False
+        else:
+            ok(f"manual macOS signing/notarization workflow passed for {arch}")
+
+    if passed:
+        ok(f"manual macOS signing/notarization workflow passed: {run['url']}")
+
+    return passed
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check the macOS support milestone, PR, and manual validation gate."
@@ -394,6 +496,8 @@ def main() -> int:
                 repo = resolve_repo(args.repo)
                 passed = check_issues(repo, args.final) and passed
                 passed = check_pr(repo, args.skip_pr_checks) and passed
+                if args.final:
+                    passed = check_manual_macos_validation_workflow(repo) and passed
             except RuntimeError as exc:
                 fail(str(exc))
                 passed = False
