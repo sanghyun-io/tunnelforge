@@ -15,6 +15,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "Version Gate" in doc
     assert "macOS App Validation" in doc
     assert "scripts/validate-macos-release.sh" in doc
+    assert "scripts/smoke-macos-launchagent.sh" in doc
     assert "scripts/macos-manual-validation-report.sh" in doc
     assert "scripts/check-macos-support-gate.py" in doc
     assert "--check-complete" in doc
@@ -39,6 +40,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "Export/Import" in doc
     assert "Migration" in doc
     assert "launchagent.{out,err}.log" in doc
+    assert "LaunchAgent plist" in doc
     assert ".sha256" in doc
 
 

@@ -13,6 +13,7 @@ on:
       - "scripts/build-macos.sh"
       - "scripts/package-macos.sh"
       - "scripts/validate-macos-release.sh"
+      - "scripts/smoke-macos-launchagent.sh"
       - "scripts/macos-manual-validation-report.sh"
       - "src/**"
       - "tests/test_app_self_check.py"
@@ -197,6 +198,9 @@ jobs:
           assert data["core_hello"]["service"] == "tunnelforge-core"
           assert data["core_hello"]["success"] is True
           PY
+
+      - name: Smoke LaunchAgent registration
+        run: bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app
 
       - name: Smoke ZIP package
         run: |

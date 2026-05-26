@@ -165,6 +165,24 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "notarization" in script
 
 
+def test_macos_launchagent_smoke_script_validates_packaged_app_plist():
+    script = (PROJECT_ROOT / "scripts" / "smoke-macos-launchagent.sh").read_text(encoding="utf-8")
+
+    assert "This script must run on macOS." in script
+    assert "build/install-smoke/TunnelForge.app" in script
+    assert "StartupRegistrar" in script
+    assert "sys.frozen = True" in script
+    assert "io.sanghyun.tunnelforge" in script
+    assert "ProgramArguments" in script
+    assert "launchagent.out.log" in script
+    assert "launchagent.err.log" in script
+    assert "plutil -lint" in script
+    assert "MACOS_LAUNCHAGENT_BOOTSTRAP" in script
+    assert "launchctl bootstrap" in script
+    assert "launchctl bootout" in script
+    assert "macOS LaunchAgent smoke checks passed." in script
+
+
 def test_macos_manual_validation_report_check_complete_accepts_completed_report(tmp_path):
     if shutil.which("bash") is None:
         pytest.skip("bash is required for shell script validation")
@@ -688,6 +706,8 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "Smoke copied DMG install" in workflow
     assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
+    assert "Smoke LaunchAgent registration" in workflow
+    assert "bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app" in workflow
     assert "Smoke ZIP package" in workflow
     assert "ditto -x -k" in workflow
     assert "build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
@@ -731,6 +751,8 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "bash scripts/package-macos.sh" in workflow
     assert "Smoke DMG package" in workflow
     assert "Smoke copied DMG install" in workflow
+    assert "Smoke LaunchAgent registration" in workflow
+    assert "bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app" in workflow
     assert "Smoke ZIP package" in workflow
     assert "Upload macOS validation artifacts" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow

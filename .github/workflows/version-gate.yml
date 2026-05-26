@@ -226,6 +226,9 @@ jobs:
           assert data["core_hello"]["success"] is True
           PY
 
+      - name: Smoke LaunchAgent registration
+        run: bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app
+
       - name: Smoke ZIP package
         run: |
           ZIP_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
