@@ -221,8 +221,18 @@ def check_evidence_bundle(report: Path, bundle: Path) -> bool:
         fail(f"smoke log referenced by report is missing: {smoke_log}")
         return False
 
+    system_evidence_value = report_path_value(report, "- System evidence log:")
+    if not system_evidence_value:
+        fail("manual validation report does not include a system evidence log path")
+        return False
+
+    system_evidence_log = resolve_report_relative(system_evidence_value)
+    if not system_evidence_log.is_file():
+        fail(f"system evidence log referenced by report is missing: {system_evidence_log}")
+        return False
+
     manifest_name = evidence_manifest_name(report)
-    expected_names = sorted([report.name, smoke_log.name, manifest_name])
+    expected_names = sorted([report.name, smoke_log.name, system_evidence_log.name, manifest_name])
     try:
         with zipfile.ZipFile(bundle) as archive:
             names = sorted(archive.namelist())
@@ -231,15 +241,20 @@ def check_evidence_bundle(report: Path, bundle: Path) -> bool:
                 return False
             report_bytes = report.read_bytes()
             smoke_log_bytes = smoke_log.read_bytes()
+            system_evidence_log_bytes = system_evidence_log.read_bytes()
             if archive.read(report.name) != report_bytes:
                 fail(f"evidence bundle report does not match {report}")
                 return False
             if archive.read(smoke_log.name) != smoke_log_bytes:
                 fail(f"evidence bundle smoke log does not match {smoke_log}")
                 return False
+            if archive.read(system_evidence_log.name) != system_evidence_log_bytes:
+                fail(f"evidence bundle system evidence log does not match {system_evidence_log}")
+                return False
             expected_manifest = (
                 f"{sha256_hex(report_bytes)}  {report.name}\n"
                 f"{sha256_hex(smoke_log_bytes)}  {smoke_log.name}\n"
+                f"{sha256_hex(system_evidence_log_bytes)}  {system_evidence_log.name}\n"
             )
             if archive.read(manifest_name).decode("utf-8") != expected_manifest:
                 fail(f"evidence bundle manifest does not match report/log hashes: {manifest_name}")
@@ -307,7 +322,7 @@ def check_issues(repo: str, final: bool) -> bool:
 
     if final:
         if final_issue["state"] == "OPEN":
-            ok(f"#{FINAL_ISSUE} is still open; close it after attaching the completed report and smoke log")
+            ok(f"#{FINAL_ISSUE} is still open; close it after attaching the completed report, smoke log, and system evidence log")
         elif final_issue["state"] == "CLOSED":
             ok(f"#{FINAL_ISSUE} is closed")
         else:

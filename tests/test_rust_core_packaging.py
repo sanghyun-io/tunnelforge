@@ -17,6 +17,21 @@ SUCCESSFUL_MACOS_SMOKE_LOG = (
     "macOS /Applications install smoke checks passed.\n"
     "macOS release package smoke checks passed.\n"
 )
+SUCCESSFUL_MACOS_SYSTEM_EVIDENCE_LOG = (
+    "== sw_vers ==\n"
+    "ProductVersion: 14.7.1\n"
+    "BuildVersion: 23H222\n"
+    "== uname ==\n"
+    "Darwin validator.local 23.6.0 Darwin Kernel Version\n"
+    "== architecture ==\n"
+    "arm64\n"
+    "== final app ==\n"
+    "/Applications/TunnelForge.app\n"
+    "== codesign verify ==\n"
+    "exit: 0\n"
+    "== spctl assess ==\n"
+    "exit: 0\n"
+)
 
 
 REQUIRED_MANUAL_REPORT_SECTIONS = [
@@ -85,8 +100,9 @@ REQUIRED_MANUAL_REPORT_CHECK_ITEMS = [
 def completed_manual_report_lines(
     smoke_log_arg: str,
     artifact_dir_arg: str = "build/macos-validation-artifacts",
+    system_evidence_arg: str = "",
 ) -> list[str]:
-    return [
+    lines = [
         f"- Git SHA: {current_git_sha()}",
         "- macOS: 14.7.1 (23H222)",
         "- Architecture: arm64",
@@ -97,6 +113,11 @@ def completed_manual_report_lines(
         "- Final app executable: /Applications/TunnelForge.app/Contents/MacOS/TunnelForge",
         "- Release smoke: passed",
         f"- Smoke log: {smoke_log_arg}",
+    ]
+    if system_evidence_arg:
+        lines.append(f"- System evidence log: {system_evidence_arg}")
+    return [
+        *lines,
         *REQUIRED_MANUAL_REPORT_SECTIONS,
         *(f"- [x] {item}" for item in REQUIRED_MANUAL_REPORT_CHECK_ITEMS),
         "- Overall result: passed",
@@ -119,6 +140,34 @@ def evidence_manifest(report: Path, smoke_log: Path) -> str:
     return (
         f"{hashlib.sha256(report.read_bytes()).hexdigest()}  {report.name}\n"
         f"{hashlib.sha256(smoke_log.read_bytes()).hexdigest()}  {smoke_log.name}\n"
+    )
+
+
+def evidence_manifest_with_system_log(report: Path, smoke_log: Path, system_log: Path) -> str:
+    return (
+        f"{hashlib.sha256(report.read_bytes()).hexdigest()}  {report.name}\n"
+        f"{hashlib.sha256(smoke_log.read_bytes()).hexdigest()}  {smoke_log.name}\n"
+        f"{hashlib.sha256(system_log.read_bytes()).hexdigest()}  {system_log.name}\n"
+    )
+
+
+def write_successful_system_evidence_log(report_dir: Path, name: str = "macos-system-evidence.log") -> Path:
+    system_log = report_dir / name
+    system_log.write_text(SUCCESSFUL_MACOS_SYSTEM_EVIDENCE_LOG, encoding="utf-8")
+    return system_log
+
+
+def completed_manual_report_lines_with_system(
+    report_dir: Path,
+    smoke_log_arg: str,
+    artifact_dir_arg: str = "build/macos-validation-artifacts",
+    system_log_name: str = "macos-system-evidence.log",
+) -> list[str]:
+    system_log = write_successful_system_evidence_log(report_dir, system_log_name)
+    return completed_manual_report_lines(
+        smoke_log_arg,
+        artifact_dir_arg=artifact_dir_arg,
+        system_evidence_arg=system_log.relative_to(PROJECT_ROOT).as_posix(),
     )
 
 
@@ -262,6 +311,7 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "This script must run on macOS." in script
     assert "MACOS_VALIDATION_REPORT" in script
     assert "MACOS_VALIDATION_SMOKE_LOG" in script
+    assert "MACOS_VALIDATION_SYSTEM_EVIDENCE_LOG" in script
     assert "MACOS_VALIDATION_APP_PATH" in script
     assert "macos-release-smoke-${TIMESTAMP}.log" in script
     assert "bash scripts/validate-macos-release.sh" in script
@@ -313,6 +363,9 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert 'tee "$SMOKE_LOG_PATH"' in script
     assert "PIPESTATUS" in script
     assert "Smoke log:" in script
+    assert "System evidence log:" in script
+    assert "sw_vers" in script
+    assert "uname -a" in script
     assert "Final app path:" in script
     assert "Completion check:" in script
     assert "SSH tunnel" in script
@@ -471,10 +524,11 @@ def test_macos_manual_validation_report_check_complete_accepts_completed_report(
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+    report.write_text("\n".join(completed_manual_report_lines_with_system(report_dir, smoke_log_arg)), encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -541,6 +595,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
@@ -582,6 +637,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
@@ -625,10 +681,11 @@ def test_macos_manual_validation_report_check_complete_rejects_deleted_export_re
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
-    report_lines = [line for line in completed_manual_report_lines(smoke_log_arg) if missing_item not in line]
+    report_lines = [line for line in completed_manual_report_lines_with_system(report_dir, smoke_log_arg) if missing_item not in line]
     report.write_text("\n".join(report_lines), encoding="utf-8")
 
     result = subprocess.run(
@@ -659,7 +716,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_applicati
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+    report.write_text("\n".join(completed_manual_report_lines_with_system(report_dir, smoke_log_arg)), encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -686,12 +743,13 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_real_maco
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     report_lines = [
         line
-        for line in completed_manual_report_lines(smoke_log_arg)
+        for line in completed_manual_report_lines_with_system(report_dir, smoke_log_arg)
         if not line.startswith("- macOS:") and not line.startswith("- Architecture:")
     ]
     report.write_text("\n".join(report_lines), encoding="utf-8")
@@ -727,7 +785,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_artifact_
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     report_lines = [
         line
-        for line in completed_manual_report_lines(smoke_log_arg)
+        for line in completed_manual_report_lines_with_system(report_dir, smoke_log_arg)
         if not line.startswith("- Artifact workflow run:")
         and not line.startswith("- Artifact directory:")
         and not line.startswith("- Artifact checksum verification:")
@@ -776,7 +834,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_applicati
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     report_lines = [
         line
-        for line in completed_manual_report_lines(smoke_log_arg)
+        for line in completed_manual_report_lines_with_system(report_dir, smoke_log_arg)
         if not line.startswith("- Final app path:") and not line.startswith("- Final app executable:")
     ]
     report.write_text("\n".join(report_lines), encoding="utf-8")
@@ -807,11 +865,12 @@ def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+    report.write_text("\n".join(completed_manual_report_lines_with_system(report_dir, smoke_log_arg)), encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -841,8 +900,56 @@ def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
             manifest_name,
             "macos-manual-validation-report.md",
             "macos-release-smoke.log",
+            "macos-system-evidence.log",
         ]
-        assert archive.read(manifest_name).decode("utf-8") == evidence_manifest(report, smoke_log)
+        assert archive.read(manifest_name).decode("utf-8") == evidence_manifest_with_system_log(
+            report, smoke_log, system_log
+        )
+
+
+def test_macos_manual_validation_report_bundle_evidence_includes_system_evidence_log(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-bundle-system"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
+    report = report_dir / "macos-manual-validation-report.md"
+    bundle = report_dir / "macos-manual-validation-evidence.zip"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report_lines = completed_manual_report_lines_with_system(report_dir, smoke_log_arg)
+    report.write_text("\n".join(report_lines), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--bundle-evidence",
+            report_arg,
+            "--evidence-bundle",
+            bundle.relative_to(PROJECT_ROOT).as_posix(),
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    with zipfile.ZipFile(bundle) as archive:
+        manifest_name = "macos-manual-validation-evidence-macos-manual-validation-report.sha256"
+        assert sorted(archive.namelist()) == [
+            manifest_name,
+            "macos-manual-validation-report.md",
+            "macos-release-smoke.log",
+            "macos-system-evidence.log",
+        ]
+        assert archive.read(manifest_name).decode("utf-8") == evidence_manifest_with_system_log(
+            report, smoke_log, system_log
+        )
 
 
 def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate(tmp_path):
@@ -853,12 +960,13 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+    report.write_text("\n".join(completed_manual_report_lines_with_system(report_dir, smoke_log_arg)), encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -886,6 +994,7 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     assert "Final macOS validation evidence is ready" in result.stdout
     assert f"- Report: {report_arg}" in result.stdout
     assert f"- Smoke log: {smoke_log_arg}" in result.stdout
+    assert f"- System evidence log: {system_log.relative_to(PROJECT_ROOT).as_posix()}" in result.stdout
     assert f"- Evidence bundle: {bundle_arg}" in result.stdout
     assert f"- Evidence bundle checksum: {bundle_arg}.sha256" in result.stdout
 
@@ -947,18 +1056,20 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+    report.write_text("\n".join(completed_manual_report_lines_with_system(report_dir, smoke_log_arg)), encoding="utf-8")
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(report, report.name)
         archive.write(smoke_log, smoke_log.name)
+        archive.write(system_log, system_log.name)
         archive.writestr(
             "macos-manual-validation-evidence-macos-manual-validation-report.sha256",
-            evidence_manifest(report, smoke_log),
+            evidence_manifest_with_system_log(report, smoke_log, system_log),
         )
     write_bundle_checksum(bundle)
 
@@ -993,16 +1104,27 @@ def test_macos_support_gate_script_accepts_globbed_final_report_and_bundle(tmp_p
     def write_completed_evidence(stamp: str, mtime: int) -> tuple[Path, Path]:
         smoke_log = report_dir / f"macos-release-smoke-{stamp}.log"
         smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+        system_log = report_dir / f"macos-system-evidence-{stamp}.log"
         report = report_dir / f"macos-manual-validation-report-{stamp}.md"
         bundle = report_dir / f"macos-manual-validation-evidence-macos-manual-validation-report-{stamp}.zip"
         smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
-        report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+        report.write_text(
+            "\n".join(
+                completed_manual_report_lines_with_system(
+                    report_dir,
+                    smoke_log_arg,
+                    system_log_name=system_log.name,
+                )
+            ),
+            encoding="utf-8",
+        )
         with zipfile.ZipFile(bundle, "w") as archive:
             archive.write(report, report.name)
             archive.write(smoke_log, smoke_log.name)
+            archive.write(system_log, system_log.name)
             archive.writestr(
                 f"macos-manual-validation-evidence-{report.stem}.sha256",
-                evidence_manifest(report, smoke_log),
+                evidence_manifest_with_system_log(report, smoke_log, system_log),
             )
         write_bundle_checksum(bundle)
         os.utime(report, (mtime, mtime))
@@ -1069,12 +1191,13 @@ def test_macos_support_gate_script_rejects_incomplete_evidence_bundle(tmp_path):
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+    report.write_text("\n".join(completed_manual_report_lines_with_system(report_dir, smoke_log_arg)), encoding="utf-8")
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(report, report.name)
     write_bundle_checksum(bundle)
@@ -1108,6 +1231,7 @@ def test_macos_support_gate_script_rejects_report_from_different_git_sha(tmp_pat
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    system_log = report_dir / "macos-system-evidence.log"
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
@@ -1115,15 +1239,16 @@ def test_macos_support_gate_script_rejects_report_from_different_git_sha(tmp_pat
     bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
     report_lines = [
         "- Git SHA: deadbeef",
-        *[line for line in completed_manual_report_lines(smoke_log_arg) if not line.startswith("- Git SHA:")],
+        *[line for line in completed_manual_report_lines_with_system(report_dir, smoke_log_arg) if not line.startswith("- Git SHA:")],
     ]
     report.write_text("\n".join(report_lines), encoding="utf-8")
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(report, report.name)
         archive.write(smoke_log, smoke_log.name)
+        archive.write(system_log, system_log.name)
         archive.writestr(
             "macos-manual-validation-evidence-macos-manual-validation-report.sha256",
-            evidence_manifest(report, smoke_log),
+            evidence_manifest_with_system_log(report, smoke_log, system_log),
         )
     write_bundle_checksum(bundle)
 
@@ -1276,8 +1401,6 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
-
-
 def test_macos_validation_workflow_supports_manual_signed_notarized_run():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "macos-app.yml").read_text(encoding="utf-8")
 

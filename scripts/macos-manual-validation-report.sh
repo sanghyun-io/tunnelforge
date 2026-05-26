@@ -133,9 +133,18 @@ done
 
 extract_smoke_log_path() {
   local report_path="$1"
-  grep -m1 -E '^- Smoke log:' "$report_path" \
+  grep -m1 -E '^- Smoke log:' "$report_path" 2>/dev/null \
     | sed -E 's/^- Smoke log:[[:space:]]*//' \
-    | tr -d '\r'
+    | tr -d '\r' \
+    || true
+}
+
+extract_system_evidence_log_path() {
+  local report_path="$1"
+  grep -m1 -E '^- System evidence log:' "$report_path" 2>/dev/null \
+    | sed -E 's/^- System evidence log:[[:space:]]*//' \
+    | tr -d '\r' \
+    || true
 }
 
 read_artifact_env_value() {
@@ -163,6 +172,7 @@ check_complete_report() {
   local report_path="$1"
   local failures=0
   local smoke_log_path=""
+  local system_evidence_log_path=""
 
   if [[ ! -f "$report_path" ]]; then
     echo "Manual validation report not found: $report_path" >&2
@@ -316,6 +326,34 @@ check_complete_report() {
     failures=1
   fi
 
+  system_evidence_log_path="$(extract_system_evidence_log_path "$report_path")"
+
+  if [[ -z "$system_evidence_log_path" ]]; then
+    echo "Manual validation report must include a system evidence log path." >&2
+    failures=1
+  elif [[ ! -s "$system_evidence_log_path" ]]; then
+    echo "System evidence log is missing or empty: $system_evidence_log_path" >&2
+    failures=1
+  else
+    if ! grep -q "== sw_vers ==" "$system_evidence_log_path" \
+      || ! grep -q "ProductVersion:" "$system_evidence_log_path" \
+      || ! grep -q "== uname ==" "$system_evidence_log_path" \
+      || ! grep -q "Darwin" "$system_evidence_log_path" \
+      || ! grep -q "== architecture ==" "$system_evidence_log_path" \
+      || ! grep -q "== final app ==" "$system_evidence_log_path" \
+      || ! grep -q "/Applications/TunnelForge.app" "$system_evidence_log_path" \
+      || ! grep -q "== codesign verify ==" "$system_evidence_log_path" \
+      || ! grep -q "== spctl assess ==" "$system_evidence_log_path"; then
+      echo "System evidence log must include sw_vers, uname, architecture, final app, codesign, and spctl evidence." >&2
+      failures=1
+    fi
+
+    if [[ "$(grep -cE '^exit: 0[[:space:]]*$' "$system_evidence_log_path")" -lt 2 ]]; then
+      echo "System evidence log must show successful codesign and spctl checks." >&2
+      failures=1
+    fi
+  fi
+
   if [[ "$failures" -ne 0 ]]; then
     exit 1
   fi
@@ -326,14 +364,16 @@ check_complete_report() {
 create_evidence_bundle() {
   local report_path="$1"
   local smoke_log_path=""
+  local system_evidence_log_path=""
   local bundle_path=""
 
   check_complete_report "$report_path"
   smoke_log_path="$(extract_smoke_log_path "$report_path")"
+  system_evidence_log_path="$(extract_system_evidence_log_path "$report_path")"
   bundle_path="$(bundle_path_for_report "$report_path")"
   mkdir -p "$(dirname "$bundle_path")"
 
-  "$PYTHON_BIN" - "$report_path" "$smoke_log_path" "$bundle_path" <<'PY'
+  "$PYTHON_BIN" - "$report_path" "$smoke_log_path" "$system_evidence_log_path" "$bundle_path" <<'PY'
 import hashlib
 import sys
 from pathlib import Path
@@ -341,7 +381,8 @@ from zipfile import ZIP_DEFLATED, ZipFile
 
 report_path = Path(sys.argv[1])
 smoke_log_path = Path(sys.argv[2])
-bundle_path = Path(sys.argv[3])
+system_evidence_log_path = Path(sys.argv[3])
+bundle_path = Path(sys.argv[4])
 manifest_name = f"macos-manual-validation-evidence-{report_path.stem}.sha256"
 
 def digest(path: Path) -> str:
@@ -350,11 +391,13 @@ def digest(path: Path) -> str:
 manifest = (
     f"{digest(report_path)}  {report_path.name}\n"
     f"{digest(smoke_log_path)}  {smoke_log_path.name}\n"
+    f"{digest(system_evidence_log_path)}  {system_evidence_log_path.name}\n"
 )
 
 with ZipFile(bundle_path, "w", ZIP_DEFLATED) as archive:
     archive.write(report_path, report_path.name)
     archive.write(smoke_log_path, smoke_log_path.name)
+    archive.write(system_evidence_log_path, system_evidence_log_path.name)
     archive.writestr(manifest_name, manifest)
 
 bundle_checksum_path = Path(f"{bundle_path}.sha256")
@@ -368,12 +411,14 @@ PY
 finalize_evidence() {
   local report_path="$1"
   local smoke_log_path=""
+  local system_evidence_log_path=""
   local bundle_path=""
   local checksum_path=""
   local gate_args=()
 
   create_evidence_bundle "$report_path"
   smoke_log_path="$(extract_smoke_log_path "$report_path")"
+  system_evidence_log_path="$(extract_system_evidence_log_path "$report_path")"
   bundle_path="$(bundle_path_for_report "$report_path")"
   checksum_path="$(checksum_path_for_bundle "$bundle_path")"
   gate_args=(--final --report "$report_path" --bundle "$bundle_path")
@@ -388,6 +433,7 @@ finalize_evidence() {
   echo "Final macOS validation evidence is ready:"
   echo "- Report: $report_path"
   echo "- Smoke log: $smoke_log_path"
+  echo "- System evidence log: $system_evidence_log_path"
   echo "- Evidence bundle: $bundle_path"
   echo "- Evidence bundle checksum: $checksum_path"
   echo
@@ -418,7 +464,8 @@ mkdir -p build
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_PATH="${MACOS_VALIDATION_REPORT:-build/macos-manual-validation-report-${TIMESTAMP}.md}"
 SMOKE_LOG_PATH="${MACOS_VALIDATION_SMOKE_LOG:-build/macos-release-smoke-${TIMESTAMP}.log}"
-mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$SMOKE_LOG_PATH")"
+SYSTEM_EVIDENCE_LOG_PATH="${MACOS_VALIDATION_SYSTEM_EVIDENCE_LOG:-build/macos-system-evidence-${TIMESTAMP}.log}"
+mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$SMOKE_LOG_PATH")" "$(dirname "$SYSTEM_EVIDENCE_LOG_PATH")"
 VERSION="$("$PYTHON_BIN" -c 'from src.version import __version__; print(__version__)')"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PYTHON_VERSION="$(python --version 2>&1 || echo unavailable)"
@@ -434,6 +481,45 @@ FINAL_APP_EXECUTABLE="${FINAL_APP_PATH}/Contents/MacOS/TunnelForge"
 ARTIFACT_WORKFLOW_RUN="${MACOS_VALIDATION_ARTIFACT_RUN_ID:-}"
 ARTIFACT_DIR="${MACOS_VALIDATION_ARTIFACT_DIR:-build/macos-validation-artifacts}"
 ARTIFACT_CHECKSUM_STATUS="${MACOS_VALIDATION_ARTIFACT_CHECKSUMS:-pending}"
+
+write_system_evidence_log() {
+  {
+    echo "== sw_vers =="
+    sw_vers || true
+    echo
+    echo "== uname =="
+    uname -a || true
+    echo
+    echo "== architecture =="
+    uname -m || true
+    echo
+    echo "== final app =="
+    echo "$FINAL_APP_PATH"
+    if [[ -e "$FINAL_APP_PATH" ]]; then
+      ls -ld "$FINAL_APP_PATH" || true
+    else
+      echo "missing"
+    fi
+    echo
+    echo "== final app executable =="
+    echo "$FINAL_APP_EXECUTABLE"
+    if [[ -e "$FINAL_APP_EXECUTABLE" ]]; then
+      ls -l "$FINAL_APP_EXECUTABLE" || true
+    else
+      echo "missing"
+    fi
+    echo
+    echo "== codesign verify =="
+    set +e
+    codesign --verify --deep --strict --verbose=2 "$FINAL_APP_PATH" 2>&1
+    echo "exit: $?"
+    echo
+    echo "== spctl assess =="
+    spctl --assess --type execute --verbose "$FINAL_APP_PATH" 2>&1
+    echo "exit: $?"
+    set -e
+  } > "$SYSTEM_EVIDENCE_LOG_PATH"
+}
 
 if [[ "$DOWNLOAD_ARTIFACTS" -eq 1 ]]; then
   artifact_download_args=(
@@ -472,6 +558,8 @@ if [[ "$ARTIFACT_CHECKSUM_STATUS" =~ ^(pass|passed|PASS|PASSED)$ ]]; then
   ARTIFACT_CHECK_MARK="x"
 fi
 
+write_system_evidence_log
+
 cat > "$REPORT_PATH" <<EOF
 # TunnelForge macOS Manual Validation Report
 
@@ -489,6 +577,7 @@ cat > "$REPORT_PATH" <<EOF
 - Cargo: ${CARGO_VERSION}
 - Release smoke: ${SMOKE_STATUS}
 - Smoke log: ${SMOKE_LOG_PATH}
+- System evidence log: ${SYSTEM_EVIDENCE_LOG_PATH}
 - Final app path: ${FINAL_APP_PATH}
 - Final app executable: ${FINAL_APP_EXECUTABLE}
 - Applications install smoke: set \`MACOS_RELEASE_SMOKE_APPLICATIONS=1\` before \`--run-smoke\` to include it in the smoke log
