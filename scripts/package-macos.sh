@@ -45,7 +45,7 @@ ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
 
 rm -rf "$DMG_STAGING"
 mkdir -p "$DMG_STAGING"
-cp -R "$APP_PATH" "$DMG_STAGING/"
+ditto "$APP_PATH" "$DMG_STAGING/TunnelForge.app"
 ln -s /Applications "$DMG_STAGING/Applications"
 rm -f "$DMG_PATH"
 hdiutil create -volname "TunnelForge" \
