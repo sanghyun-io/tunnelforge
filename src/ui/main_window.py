@@ -61,11 +61,12 @@ class StartupUpdateCheckerThread(QThread):
 
 
 class TunnelManagerUI(QMainWindow):
-    def __init__(self, config_manager, tunnel_engine):
+    def __init__(self, config_manager, tunnel_engine, start_background=True):
         logger.info("UI 초기화 시작...")
         super().__init__()
         self.config_mgr = config_manager
         self.engine = tunnel_engine
+        self._start_background = start_background
 
         # 설정 로드
         self.config_data = self.config_mgr.load_config()
@@ -82,19 +83,22 @@ class TunnelManagerUI(QMainWindow):
         # BackupScheduler 초기화
         self.scheduler = BackupScheduler(config_manager, tunnel_engine)
         self.scheduler.add_callback(self._on_backup_complete)
-        self.scheduler.start()
+        if self._start_background:
+            self.scheduler.start()
 
         # TunnelMonitor 초기화
         self.tunnel_monitor = TunnelMonitor(tunnel_engine, config_manager)
         self.tunnel_monitor.add_callback(self._on_tunnel_status_changed)
-        self.tunnel_monitor.start_monitoring()
+        if self._start_background:
+            self.tunnel_monitor.start_monitoring()
 
         self.init_ui()
         self.init_tray()
-        self._check_update_on_startup()
-        # 이전 세션 크래시 등으로 남은 로그인 경로 정리 후 자동 연결
-        self._login_path_mgr.cleanup_all_tf_paths()
-        self._auto_connect_tunnels()
+        if self._start_background:
+            self._check_update_on_startup()
+            # 이전 세션 크래시 등으로 남은 로그인 경로 정리 후 자동 연결
+            self._login_path_mgr.cleanup_all_tf_paths()
+            self._auto_connect_tunnels()
         logger.info("UI 초기화 완료")
 
     def _init_theme_manager(self):
@@ -829,14 +833,15 @@ class TunnelManagerUI(QMainWindow):
         self.config_mgr.save_active_tunnels(active_ids)
 
         # 스케줄러 중지
-        if hasattr(self, 'scheduler') and self.scheduler:
+        if self._start_background and hasattr(self, 'scheduler') and self.scheduler:
             self.scheduler.stop()
 
         # 터널 모니터 중지
-        if hasattr(self, 'tunnel_monitor') and self.tunnel_monitor:
+        if self._start_background and hasattr(self, 'tunnel_monitor') and self.tunnel_monitor:
             self.tunnel_monitor.stop_monitoring()
 
-        self._login_path_mgr.cleanup_all_tf_paths()
+        if self._start_background:
+            self._login_path_mgr.cleanup_all_tf_paths()
         self.engine.stop_all()
         self.tray_icon.hide()
         # 모든 창 닫고 종료
@@ -845,6 +850,12 @@ class TunnelManagerUI(QMainWindow):
             app.quit()
         else:
             sys.exit(0)
+
+    def dispose_for_smoke_check(self):
+        """Dispose UI objects created by startup smoke checks without user-state writes."""
+        if hasattr(self, 'tray_icon') and self.tray_icon:
+            self.tray_icon.hide()
+        self.deleteLater()
 
     # =========================================================================
     # 스케줄 백업 관련 메서드

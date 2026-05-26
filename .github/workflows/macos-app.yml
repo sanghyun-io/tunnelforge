@@ -86,7 +86,7 @@ jobs:
         run: |
           APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"
           test -x "$APP_EXECUTABLE"
-          RESPONSE="$("$APP_EXECUTABLE" --self-check)"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
           echo "$RESPONSE"
           RESPONSE="$RESPONSE" python - <<'PY'
           import json
@@ -94,6 +94,8 @@ jobs:
 
           data = json.loads(os.environ["RESPONSE"])
           assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
           assert data["icon_exists"] is True
           assert data["core_exists"] is True
           assert data["core_hello"]["event"] == "result"
@@ -117,7 +119,7 @@ jobs:
           trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
           APP_EXECUTABLE="/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge"
           test -x "$APP_EXECUTABLE"
-          RESPONSE="$("$APP_EXECUTABLE" --self-check)"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
           echo "$RESPONSE"
           RESPONSE="$RESPONSE" python - <<'PY'
           import json
@@ -125,6 +127,8 @@ jobs:
 
           data = json.loads(os.environ["RESPONSE"])
           assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
           assert data["icon_exists"] is True
           assert data["core_exists"] is True
           assert data["core_hello"]["service"] == "tunnelforge-core"
@@ -139,7 +143,7 @@ jobs:
           ditto -x -k "$ZIP_PATH" build/zip-smoke
           APP_EXECUTABLE="build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
           test -x "$APP_EXECUTABLE"
-          RESPONSE="$("$APP_EXECUTABLE" --self-check)"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
           echo "$RESPONSE"
           RESPONSE="$RESPONSE" python - <<'PY'
           import json
@@ -147,6 +151,8 @@ jobs:
 
           data = json.loads(os.environ["RESPONSE"])
           assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
           assert data["icon_exists"] is True
           assert data["core_exists"] is True
           assert data["core_hello"]["service"] == "tunnelforge-core"

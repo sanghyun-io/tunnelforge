@@ -4,6 +4,7 @@ import os
 import traceback
 import json
 import subprocess
+from contextlib import redirect_stdout
 
 # Windows 콘솔 UTF-8 출력 지원 (이모지 출력을 위해)
 # GUI 모드(pythonw.exe 또는 PyInstaller --noconsole)에서는 stdout/stderr가 None일 수 있음
@@ -62,8 +63,42 @@ def db_core_executable() -> str:
     return resolve_db_core_executable()
 
 
+def QApplication():
+    from PyQt6.QtWidgets import QApplication as q_application
+
+    return q_application
+
+
+def QIcon():
+    from PyQt6.QtGui import QIcon as q_icon
+
+    return q_icon
+
+
+def ConfigManager():
+    from src.core import ConfigManager as config_manager
+
+    return config_manager
+
+
+def TunnelEngine():
+    from src.core import TunnelEngine as tunnel_engine
+
+    return tunnel_engine
+
+
+def TunnelManagerUI():
+    from src.ui.main_window import TunnelManagerUI as tunnel_manager_ui
+
+    return tunnel_manager_ui
+
+
 def should_run_self_check(argv=None) -> bool:
     return "--self-check" in (argv if argv is not None else sys.argv)
+
+
+def should_run_ui_smoke_check(argv=None) -> bool:
+    return "--ui-smoke-check" in (argv if argv is not None else sys.argv)
 
 
 def run_self_check() -> dict:
@@ -113,18 +148,46 @@ def run_self_check_cli() -> int:
     return 0 if result["success"] else 1
 
 
+def run_ui_smoke_check() -> dict:
+    """Construct the main PyQt window without background work or event loop."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    self_check = run_self_check()
+
+    app_cls = QApplication()
+    icon_cls = QIcon()
+    config_cls = ConfigManager()
+    engine_cls = TunnelEngine()
+    window_cls = TunnelManagerUI()
+
+    app = app_cls.instance() or app_cls(["TunnelForge", "--ui-smoke-check"])
+    app.setWindowIcon(icon_cls(str(app_icon_path())))
+
+    window = window_cls(config_cls(), engine_cls(), start_background=False)
+    result = {
+        "success": self_check["success"] is True and window.windowTitle() == "TunnelForge",
+        "window_title": window.windowTitle(),
+        "self_check": self_check,
+    }
+    window.dispose_for_smoke_check()
+    return result
+
+
+def run_ui_smoke_check_cli() -> int:
+    with redirect_stdout(sys.stderr):
+        result = run_ui_smoke_check()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result["success"] else 1
+
+
 def main():
     if should_run_self_check():
         return run_self_check_cli()
+    if should_run_ui_smoke_check():
+        return run_ui_smoke_check_cli()
 
-    from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtGui import QIcon
-
-    from src.core import ConfigManager, TunnelEngine
     from src.core.logger import get_logger
     from src.core.platform_integration import set_app_user_model_id
     from src.core.single_instance import SingleInstanceGuard
-    from src.ui.main_window import TunnelManagerUI
 
     # 루트 로거 초기화
     logger = get_logger('main')
@@ -132,8 +195,14 @@ def main():
     # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
     set_app_user_model_id('tunnelforge.1.0')
 
-    app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon(str(app_icon_path())))
+    app_cls = QApplication()
+    icon_cls = QIcon()
+    config_cls = ConfigManager()
+    engine_cls = TunnelEngine()
+    window_cls = TunnelManagerUI()
+
+    app = app_cls(sys.argv)
+    app.setWindowIcon(icon_cls(str(app_icon_path())))
 
     single_instance_guard = SingleInstanceGuard(parent=app)
     if single_instance_guard.is_secondary:
@@ -153,8 +222,8 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     # 1. 매니저 초기화
-    config_mgr = ConfigManager()
-    tunnel_engine = TunnelEngine()
+    config_mgr = config_cls()
+    tunnel_engine = engine_cls()
 
     # 2. 설정 파일 경로 안내 (첫 실행 사용자를 위해)
     config_path = config_mgr.get_config_path()
@@ -162,7 +231,7 @@ def main():
 
     # 3. UI 실행
     start_minimized = '--minimized' in sys.argv
-    window = TunnelManagerUI(config_mgr, tunnel_engine)
+    window = window_cls(config_mgr, tunnel_engine)
     single_instance_guard.activation_requested.connect(window.bring_to_front)
     if not start_minimized:
         window.show()

@@ -81,7 +81,8 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "bash scripts/build-macos.sh" in workflow
     assert "Smoke packaged TunnelForge app" in workflow
     assert 'APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"' in workflow
-    assert "--self-check" in workflow
+    assert "--ui-smoke-check" in workflow
+    assert 'data["window_title"] == "TunnelForge"' in workflow
     assert 'data["core_hello"]["service"] == "tunnelforge-core"' in workflow
     assert "bash scripts/package-macos.sh" in workflow
     assert "Smoke DMG package" in workflow
