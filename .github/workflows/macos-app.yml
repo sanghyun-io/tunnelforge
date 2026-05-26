@@ -19,6 +19,7 @@ on:
       - "tests/test_platform_paths.py"
       - "tests/test_resources.py"
       - "tests/test_rust_core_packaging.py"
+      - "tests/test_settings_update_actions.py"
       - "tests/test_update_downloader.py"
       - "tunnel-manager.spec"
   workflow_dispatch:
@@ -75,6 +76,7 @@ jobs:
             tests/test_resources.py \
             tests/test_update_downloader.py \
             tests/test_rust_core_packaging.py \
+            tests/test_settings_update_actions.py \
             tests/test_app_self_check.py \
             tests/test_macos_support_docs.py
           cargo test --manifest-path migration_core/Cargo.toml

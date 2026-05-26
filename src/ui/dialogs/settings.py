@@ -2,6 +2,8 @@
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
+from typing import Optional
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
@@ -23,6 +25,35 @@ from src.core.platform_integration import (
 )
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
+
+
+@dataclass(frozen=True)
+class UpdatePackageActionText:
+    button: str
+    done_message: str
+    confirm_title: str
+    confirm_question: str
+    confirm_body: str
+
+
+def update_package_action_text(strategy: Optional[str] = None) -> UpdatePackageActionText:
+    launch_strategy = strategy or update_package_launch_strategy()
+    if launch_strategy == "open":
+        return UpdatePackageActionText(
+            button="📂 패키지 열기",
+            done_message="✅ 다운로드 완료! '패키지 열기' 버튼을 클릭하세요.",
+            confirm_title="패키지 열기 확인",
+            confirm_question="다운로드한 TunnelForge 패키지를 여시겠습니까?",
+            confirm_body="다운로드한 패키지를 열면 현재 앱이 종료됩니다.",
+        )
+
+    return UpdatePackageActionText(
+        button="🚀 설치 시작",
+        done_message="✅ 다운로드 완료! '설치 시작' 버튼을 클릭하세요.",
+        confirm_title="설치 확인",
+        confirm_question="TunnelForge 설치를 시작하시겠습니까?",
+        confirm_body="설치를 위해 현재 앱이 종료됩니다.",
+    )
 
 
 class CloseConfirmDialog(QDialog):
@@ -1052,8 +1083,9 @@ class SettingsDialog(QDialog):
 
         if success:
             self._downloaded_installer_path = result
+            action_text = update_package_action_text()
             self.download_progress.setValue(100)
-            self.btn_download.setText("🚀 설치 시작")
+            self.btn_download.setText(action_text.button)
             self.btn_download.setEnabled(True)
             self.btn_download.setStyleSheet("""
                 QPushButton {
@@ -1066,7 +1098,7 @@ class SettingsDialog(QDialog):
             # 버튼 클릭 이벤트 변경
             self.btn_download.clicked.disconnect()
             self.btn_download.clicked.connect(self._launch_installer)
-            self.download_detail_label.setText("✅ 다운로드 완료! '설치 시작' 버튼을 클릭하세요.")
+            self.download_detail_label.setText(action_text.done_message)
         else:
             self.download_progress.hide()
             self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
@@ -1102,10 +1134,8 @@ class SettingsDialog(QDialog):
 
         # 확인 메시지 구성 (활성 터널 경고 포함)
         main_window = self.parent()
-        confirm_msg = (
-            f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
-            "설치를 위해 현재 앱이 종료됩니다."
-        )
+        action_text = update_package_action_text()
+        confirm_msg = f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
 
         if main_window and hasattr(main_window, 'engine'):
             active_count = len(main_window.engine.active_tunnels)
@@ -1116,16 +1146,16 @@ class SettingsDialog(QDialog):
                     tunnel_names.append(config.get('name', tid))
                 tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
                 confirm_msg = (
-                    f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
+                    f"{action_text.confirm_question}\n\n"
                     f"⚠️ 현재 {active_count}개의 활성 터널이 연결 해제됩니다:\n"
                     f"{tunnel_list}\n\n"
-                    "설치를 위해 현재 앱이 종료됩니다."
+                    f"{action_text.confirm_body}"
                 )
 
         # 확인 다이얼로그
         reply = QMessageBox.question(
             self,
-            "설치 확인",
+            action_text.confirm_title,
             confirm_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes

@@ -391,7 +391,7 @@ jobs:
 
       - name: Run tests
         run: |
-          pytest tests/test_platform_paths.py tests/test_platform_integration.py tests/test_rust_core_packaging.py tests/test_update_downloader.py tests/test_app_self_check.py
+          pytest tests/test_platform_paths.py tests/test_platform_integration.py tests/test_rust_core_packaging.py tests/test_update_downloader.py tests/test_settings_update_actions.py tests/test_app_self_check.py
           cargo test --manifest-path migration_core/Cargo.toml
 
       - name: Build macOS app
