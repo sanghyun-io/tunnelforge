@@ -73,6 +73,24 @@ def test_macos_release_validation_script_smokes_app_dmg_and_zip():
     assert "Manual validation still required" in script
 
 
+def test_macos_manual_validation_report_script_records_remaining_gates():
+    script = (PROJECT_ROOT / "scripts" / "macos-manual-validation-report.sh").read_text(encoding="utf-8")
+
+    assert "This script must run on macOS." in script
+    assert "MACOS_VALIDATION_REPORT" in script
+    assert "bash scripts/validate-macos-release.sh" in script
+    assert "SSH tunnel" in script
+    assert "MySQL" in script
+    assert "PostgreSQL" in script
+    assert "Export/Import" in script
+    assert "Migration" in script
+    assert "LaunchAgent" in script
+    assert "Gatekeeper" in script
+    assert "spctl" in script
+    assert "codesign" in script
+    assert "notarization" in script
+
+
 def test_release_workflow_has_macos_app_job_and_assets():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 

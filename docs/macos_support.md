@@ -63,6 +63,7 @@ These checks require macOS:
 - `bash scripts/build-macos.sh`
 - `bash scripts/package-macos.sh`
 - `bash scripts/validate-macos-release.sh` to run source `python main.py --ui-smoke-check`, build, package, and run `--ui-smoke-check` against the built app, mounted DMG app, copied DMG install app, and extracted ZIP app on a Mac.
+- `bash scripts/macos-manual-validation-report.sh --run-smoke` to create a timestamped Markdown report for the remaining manual SSH, DB, migration, LaunchAgent, update, install, signing, notarization, and Gatekeeper checks.
 - Optional signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`.
 
 ## Final Manual Validation
@@ -71,7 +72,7 @@ Final Manual Validation must happen after all implementation milestones are comp
 
 Run on macOS:
 
-1. Run `bash scripts/validate-macos-release.sh` to smoke-check source launch, build, package, mounted DMG, copied DMG install, and ZIP artifacts.
+1. Run `bash scripts/macos-manual-validation-report.sh --run-smoke` to generate a report under `build/` and run the automated release smoke checks.
 2. Build Rust Core and app bundle with `bash scripts/build-macos.sh` if validating the build step separately.
 3. Package with `bash scripts/package-macos.sh` if validating packaging separately.
 4. Launch `dist/TunnelForge.app`.
@@ -85,3 +86,4 @@ Run on macOS:
 12. Open a downloaded DMG through the update UI and confirm it does not try to execute it directly.
 13. Install from DMG into Applications and launch from there.
 14. If distributing outside internal testing, verify codesign, notarization, and Gatekeeper behavior.
+15. Attach the completed `build/macos-manual-validation-report-*.md` report to the PR or release checklist before closing the final macOS gate.
