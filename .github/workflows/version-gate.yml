@@ -33,6 +33,199 @@ jobs:
         shell: pwsh
         run: ./scripts/rust-core-regression-gate.ps1
 
+  macos-app-validation:
+    name: macOS App Validation (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="$(python -c 'from src.version import __version__; print(__version__)')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run focused macOS tests
+        run: |
+          pytest \
+            tests/test_platform_paths.py \
+            tests/test_platform_integration.py \
+            tests/test_resources.py \
+            tests/test_update_downloader.py \
+            tests/test_rust_core_packaging.py \
+            tests/test_settings_update_actions.py \
+            tests/test_app_self_check.py \
+            tests/test_macos_support_docs.py
+          cargo test --manifest-path migration_core/Cargo.toml
+
+      - name: Smoke source-run TunnelForge app
+        run: |
+          cargo build --manifest-path migration_core/Cargo.toml --release
+          RESPONSE="$(python main.py --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          assert data["self_check"]["icon_exists"] is True
+          assert data["self_check"]["core_exists"] is True
+          assert data["self_check"]["core_hello"]["service"] == "tunnelforge-core"
+          assert data["self_check"]["core_hello"]["success"] is True
+          PY
+
+      - name: Build macOS app
+        run: bash scripts/build-macos.sh
+
+      - name: Smoke packaged TunnelForge app
+        run: |
+          APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["event"] == "result"
+          assert data["core_hello"]["request_id"] == "self-check"
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Package macOS app
+        env:
+          MACOS_PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          bash scripts/package-macos.sh "${{ steps.version.outputs.version }}"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256"
+
+      - name: Smoke DMG package
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          DMG_SMOKE_MOUNT="$PWD/build/dmg-smoke-mount"
+          rm -rf "$DMG_SMOKE_MOUNT"
+          mkdir -p "$DMG_SMOKE_MOUNT"
+          hdiutil attach "$DMG_PATH" -mountpoint "$DMG_SMOKE_MOUNT" -quiet
+          trap 'hdiutil detach "$DMG_SMOKE_MOUNT" -quiet || true' EXIT
+          APP_EXECUTABLE="$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Smoke copied DMG install
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          INSTALL_SMOKE_MOUNT="$PWD/build/install-smoke-mount"
+          rm -rf "$INSTALL_SMOKE_MOUNT" build/install-smoke
+          mkdir -p "$INSTALL_SMOKE_MOUNT" build/install-smoke
+          hdiutil attach "$DMG_PATH" -mountpoint "$INSTALL_SMOKE_MOUNT" -quiet
+          trap 'hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet || true' EXIT
+          ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"
+          hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet
+          trap - EXIT
+          APP_EXECUTABLE="build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Smoke ZIP package
+        run: |
+          ZIP_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
+          rm -rf build/zip-smoke
+          mkdir -p build/zip-smoke
+          ditto -x -k "$ZIP_PATH" build/zip-smoke
+          APP_EXECUTABLE="build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Upload macOS validation artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          path: |
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+
   version-gate:
     runs-on: ubuntu-24.04
     timeout-minutes: 10

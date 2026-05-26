@@ -211,3 +211,28 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
+
+
+def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "version-gate.yml").read_text(encoding="utf-8")
+    parsed = yaml.safe_load(workflow)
+    jobs = parsed["jobs"]
+
+    assert "macos-app-validation" in jobs
+    assert jobs["macos-app-validation"]["strategy"]["fail-fast"] is False
+    assert "macos-14" in workflow
+    assert "macos-15-intel" in workflow
+    assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
+    assert "Run focused macOS tests" in workflow
+    assert "Smoke source-run TunnelForge app" in workflow
+    assert "python main.py --ui-smoke-check" in workflow
+    assert "bash scripts/build-macos.sh" in workflow
+    assert "Smoke packaged TunnelForge app" in workflow
+    assert "bash scripts/package-macos.sh" in workflow
+    assert "Smoke DMG package" in workflow
+    assert "Smoke copied DMG install" in workflow
+    assert "Smoke ZIP package" in workflow
+    assert "Upload macOS validation artifacts" in workflow
+    assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
+    assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256" in workflow
+    assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
