@@ -228,6 +228,7 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "--final" in script
     assert "--report" in script
     assert "--skip-github" in script
+    assert "--skip-pr-checks" in script
     assert "def bash_path" in script
     assert "scripts/macos-manual-validation-report.sh" in script
     assert "statusCheckRollup" in script
@@ -416,9 +417,15 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     jobs = parsed["jobs"]
 
     assert "macos-app-validation" in jobs
+    assert "macos-support-tracking-gate" in jobs
     assert "version-bump" in jobs
+    assert "issues: read" in workflow
+    assert "checks: read" in workflow
     assert jobs["macos-app-validation"]["strategy"]["fail-fast"] is False
     assert jobs["version-bump"]["needs"] == "version-gate"
+    assert "Check macOS support GitHub tracking gate" in workflow
+    assert "python scripts/check-macos-support-gate.py" in workflow
+    assert "--skip-pr-checks" in workflow
     version_gate_text = workflow.split("  version-gate:", 1)[1].split("\n  version-bump:", 1)[0]
     assert "actions/create-github-app-token" not in version_gate_text
     assert "git fetch --depth=1 origin" in workflow

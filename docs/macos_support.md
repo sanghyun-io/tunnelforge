@@ -56,6 +56,7 @@ These checks are valid on any development host unless noted:
 - Parse `tunnel-manager.spec` as Python syntax.
 - Parse `.github/workflows/release.yml`, `.github/workflows/macos-app.yml`, and `.github/workflows/version-gate.yml` as YAML.
 - The `Version Gate` workflow includes a macOS validation matrix so an existing default-branch PR workflow can build `arm64` and `x86_64` packages, run `--ui-smoke-check` against source, `.app`, DMG, copied-DMG install, and ZIP paths, and upload DMG/ZIP artifacts plus `.sha256` checksums for inspection.
+- The `Version Gate` workflow also runs `python scripts/check-macos-support-gate.py --skip-pr-checks` so M0-M5 issue closure and #116/M6 tracking are checked on every macOS support PR update without waiting for final real-Mac evidence.
 - The standalone `macOS App Validation` workflow provides the same macOS package validation path for PR/manual runs once GitHub recognizes the workflow from the repository default branch.
 - The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, copied DMG install app, and extracted ZIP app before uploading macOS release assets and `.sha256` checksums.
 

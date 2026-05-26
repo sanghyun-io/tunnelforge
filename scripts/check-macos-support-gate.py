@@ -153,7 +153,7 @@ def check_issues(repo: str, final: bool) -> bool:
     return passed
 
 
-def check_pr(repo: str) -> bool:
+def check_pr(repo: str, skip_checks: bool) -> bool:
     pr = gh_json(
         [
             "pr",
@@ -173,18 +173,21 @@ def check_pr(repo: str) -> bool:
     else:
         ok(f"PR #{PR_NUMBER} merge state is clean")
 
-    for check in pr["statusCheckRollup"]:
-        name = check.get("name", "<unnamed>")
-        status = check.get("status")
-        conclusion = check.get("conclusion")
-        if conclusion == "SKIPPED":
-            ok(f"PR check skipped: {name}")
-            continue
-        if status != "COMPLETED" or conclusion != "SUCCESS":
-            fail(f"PR check not green: {name} status={status} conclusion={conclusion}")
-            passed = False
-        else:
-            ok(f"PR check green: {name}")
+    if skip_checks:
+        ok("PR status checks skipped by request")
+    else:
+        for check in pr["statusCheckRollup"]:
+            name = check.get("name", "<unnamed>")
+            status = check.get("status")
+            conclusion = check.get("conclusion")
+            if conclusion == "SKIPPED":
+                ok(f"PR check skipped: {name}")
+                continue
+            if status != "COMPLETED" or conclusion != "SUCCESS":
+                fail(f"PR check not green: {name} status={status} conclusion={conclusion}")
+                passed = False
+            else:
+                ok(f"PR check green: {name}")
 
     if pr["isDraft"]:
         ok(f"PR #{PR_NUMBER} is still draft while final real-Mac evidence is pending")
@@ -217,6 +220,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Only check local report/log evidence.",
     )
+    parser.add_argument(
+        "--skip-pr-checks",
+        action="store_true",
+        help="Skip PR status rollup checks. Useful when running as a PR check itself.",
+    )
     return parser.parse_args()
 
 
@@ -244,7 +252,7 @@ def main() -> int:
             try:
                 repo = resolve_repo(args.repo)
                 passed = check_issues(repo, args.final) and passed
-                passed = check_pr(repo) and passed
+                passed = check_pr(repo, args.skip_pr_checks) and passed
             except RuntimeError as exc:
                 fail(str(exc))
                 passed = False

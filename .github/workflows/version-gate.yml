@@ -15,9 +15,32 @@ concurrency:
 
 permissions:
   contents: write
+  issues: read
   pull-requests: write
+  checks: read
 
 jobs:
+  macos-support-tracking-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+
+    steps:
+      - name: Checkout PR
+        run: |
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"
+          git checkout --detach FETCH_HEAD
+          git config --global --add safe.directory "$PWD"
+
+      - name: Check macOS support GitHub tracking gate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python scripts/check-macos-support-gate.py \
+            --repo "${{ github.repository }}" \
+            --skip-pr-checks
+
   rust-core-regression-gate:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
