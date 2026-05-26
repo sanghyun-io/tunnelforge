@@ -53,6 +53,41 @@ def newest_report() -> Path | None:
     return reports[0] if reports else None
 
 
+def repo_path(path: Path) -> Path:
+    if path.is_absolute():
+        return path
+    return ROOT / path
+
+
+def resolve_path_arg(values: list[str] | None, label: str) -> tuple[Path | None, bool]:
+    if not values:
+        return None, True
+
+    paths: list[Path] = []
+    for value in values:
+        if glob.has_magic(value):
+            pattern = value if Path(value).is_absolute() else str(ROOT / value)
+            matches = [Path(path) for path in glob.glob(pattern)]
+            if not matches:
+                fail(f"no {label} matched pattern: {value}")
+                return None, False
+            paths.extend(matches)
+        else:
+            paths.append(repo_path(Path(value)))
+
+    if len(paths) == 1:
+        return paths[0], True
+
+    existing = [path for path in paths if path.exists()]
+    if not existing:
+        fail(f"no {label} candidates exist: {', '.join(str(path) for path in paths)}")
+        return None, False
+
+    selected = max(existing, key=lambda path: path.stat().st_mtime)
+    ok(f"selected newest {label}: {selected}")
+    return selected, True
+
+
 def bash_path(path: Path) -> str:
     if sys.platform == "win32" and path.is_absolute():
         resolved = path.resolve()
@@ -265,13 +300,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--report",
-        type=Path,
-        help="Path to build/macos-manual-validation-report-*.md.",
+        nargs="+",
+        help="Path or glob for build/macos-manual-validation-report-*.md. Multiple matches select the newest file.",
     )
     parser.add_argument(
         "--bundle",
-        type=Path,
-        help="Path to build/macos-manual-validation-evidence-*.zip.",
+        nargs="+",
+        help="Path or glob for build/macos-manual-validation-evidence-*.zip. Multiple matches select the newest file.",
     )
     parser.add_argument(
         "--repo",
@@ -293,21 +328,24 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     passed = True
+    report_arg, report_arg_ok = resolve_path_arg(args.report, "manual validation report")
+    bundle_arg, bundle_arg_ok = resolve_path_arg(args.bundle, "evidence bundle")
+    passed = report_arg_ok and bundle_arg_ok and passed
 
     if args.final:
-        report = args.report or newest_report()
+        report = report_arg or newest_report()
         if report is None:
             fail("no macOS manual validation report found under build/")
             passed = False
         else:
             passed = check_manual_report(report) and passed
-            bundle = args.bundle or default_bundle_for_report(report)
+            bundle = bundle_arg or default_bundle_for_report(report)
             passed = check_evidence_bundle(report, bundle) and passed
-    elif args.report:
-        passed = check_manual_report(args.report) and passed
-        if args.bundle:
-            passed = check_evidence_bundle(args.report, args.bundle) and passed
-    elif args.bundle:
+    elif report_arg:
+        passed = check_manual_report(report_arg) and passed
+        if bundle_arg:
+            passed = check_evidence_bundle(report_arg, bundle_arg) and passed
+    elif bundle_arg:
         fail("--bundle requires --report unless --final resolves a report automatically")
         passed = False
     else:

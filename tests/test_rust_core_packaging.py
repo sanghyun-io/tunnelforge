@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -289,6 +290,8 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "--skip-pr-checks" in script
     assert "zipfile" in script
     assert "check_evidence_bundle" in script
+    assert "glob.has_magic" in script
+    assert "selected newest" in script
     assert "PR merge state skipped by request" in script
     assert "def bash_path" in script
     assert "scripts/macos-manual-validation-report.sh" in script
@@ -344,6 +347,67 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     )
 
     assert result.returncode == 0, result.stderr
+    assert "macOS support gate checks passed" in result.stdout
+
+
+def test_macos_support_gate_script_accepts_globbed_final_report_and_bundle(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-gate-glob"
+    report_dir.mkdir(parents=True, exist_ok=True)
+
+    def write_completed_evidence(stamp: str, mtime: int) -> tuple[Path, Path]:
+        smoke_log = report_dir / f"macos-release-smoke-{stamp}.log"
+        smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+        report = report_dir / f"macos-manual-validation-report-{stamp}.md"
+        bundle = report_dir / f"macos-manual-validation-evidence-macos-manual-validation-report-{stamp}.zip"
+        smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+        report.write_text(
+            "\n".join(
+                [
+                    "- Release smoke: passed",
+                    f"- Smoke log: {smoke_log_arg}",
+                    "- [x] Run `bash scripts/validate-macos-release.sh`",
+                    "- Overall result: passed",
+                    "- Validator: Codex",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        with zipfile.ZipFile(bundle, "w") as archive:
+            archive.write(report, report.name)
+            archive.write(smoke_log, smoke_log.name)
+        os.utime(report, (mtime, mtime))
+        os.utime(bundle, (mtime, mtime))
+        return report, bundle
+
+    write_completed_evidence("20260101T000000Z", 100)
+    write_completed_evidence("20260102T000000Z", 200)
+
+    report_pattern = (report_dir / "macos-manual-validation-report-*.md").relative_to(PROJECT_ROOT).as_posix()
+    bundle_pattern = (report_dir / "macos-manual-validation-evidence-*.zip").relative_to(PROJECT_ROOT).as_posix()
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/check-macos-support-gate.py",
+            "--final",
+            "--skip-github",
+            "--report",
+            report_pattern,
+            "--bundle",
+            bundle_pattern,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "selected newest manual validation report" in result.stdout
+    assert "selected newest evidence bundle" in result.stdout
     assert "macOS support gate checks passed" in result.stdout
 
 
