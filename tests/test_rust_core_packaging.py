@@ -67,6 +67,10 @@ def test_macos_release_validation_script_smokes_app_dmg_and_zip():
     assert "python main.py --ui-smoke-check" in script
     assert "bash scripts/build-macos.sh" in script
     assert "bash scripts/package-macos.sh" in script
+    assert 'test -f "$DMG_PATH.sha256"' in script
+    assert 'test -f "$ZIP_PATH.sha256"' in script
+    assert 'shasum -a 256 -c "$DMG_PATH.sha256"' in script
+    assert 'shasum -a 256 -c "$ZIP_PATH.sha256"' in script
     assert "dist/TunnelForge.app/Contents/MacOS/TunnelForge" in script
     assert "build/dmg-smoke-mount" in script
     assert "build/install-smoke-mount" in script
