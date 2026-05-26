@@ -10,12 +10,15 @@ Usage:
   bash scripts/macos-manual-validation-report.sh [--run-smoke]
   bash scripts/macos-manual-validation-report.sh --check-complete <report.md>
   bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>
+  bash scripts/macos-manual-validation-report.sh --finalize <report.md>
 
 Options:
   --run-smoke                 Run scripts/validate-macos-release.sh while creating the report.
   --check-complete <report>   Verify a completed manual validation report has no open gates.
   --bundle-evidence <report>  Verify the completed report and create an attachable evidence zip.
+  --finalize <report>         Verify, bundle, run the final gate, and print attachment paths.
   --evidence-bundle <zip>     Override the evidence zip output path.
+  --skip-github               Pass --skip-github to the final Python gate when finalizing offline.
   --help                      Show this help.
 EOF
 }
@@ -24,6 +27,8 @@ RUN_SMOKE=0
 CHECK_COMPLETE_PATH=""
 BUNDLE_EVIDENCE_PATH=""
 BUNDLE_OUTPUT_PATH=""
+FINALIZE_PATH=""
+SKIP_GITHUB=0
 PYTHON_BIN="${PYTHON:-}"
 
 if [[ -z "$PYTHON_BIN" ]]; then
@@ -56,6 +61,14 @@ while [[ $# -gt 0 ]]; do
       BUNDLE_EVIDENCE_PATH="$2"
       shift 2
       ;;
+    --finalize)
+      if [[ -z "${2:-}" ]]; then
+        echo "--finalize requires a report path." >&2
+        exit 2
+      fi
+      FINALIZE_PATH="$2"
+      shift 2
+      ;;
     --evidence-bundle)
       if [[ -z "${2:-}" ]]; then
         echo "--evidence-bundle requires an output zip path." >&2
@@ -63,6 +76,10 @@ while [[ $# -gt 0 ]]; do
       fi
       BUNDLE_OUTPUT_PATH="$2"
       shift 2
+      ;;
+    --skip-github)
+      SKIP_GITHUB=1
+      shift
       ;;
     --help|-h)
       usage
@@ -81,6 +98,14 @@ extract_smoke_log_path() {
   grep -m1 -E '^- Smoke log:' "$report_path" \
     | sed -E 's/^- Smoke log:[[:space:]]*//' \
     | tr -d '\r'
+}
+
+bundle_path_for_report() {
+  local report_path="$1"
+  local report_name=""
+
+  report_name="$(basename "$report_path" .md)"
+  echo "${BUNDLE_OUTPUT_PATH:-${MACOS_VALIDATION_EVIDENCE_BUNDLE:-build/macos-manual-validation-evidence-${report_name}.zip}}"
 }
 
 check_complete_report() {
@@ -137,13 +162,11 @@ check_complete_report() {
 create_evidence_bundle() {
   local report_path="$1"
   local smoke_log_path=""
-  local report_name=""
   local bundle_path=""
 
   check_complete_report "$report_path"
   smoke_log_path="$(extract_smoke_log_path "$report_path")"
-  report_name="$(basename "$report_path" .md)"
-  bundle_path="${BUNDLE_OUTPUT_PATH:-${MACOS_VALIDATION_EVIDENCE_BUNDLE:-build/macos-manual-validation-evidence-${report_name}.zip}}"
+  bundle_path="$(bundle_path_for_report "$report_path")"
   mkdir -p "$(dirname "$bundle_path")"
 
   "$PYTHON_BIN" - "$report_path" "$smoke_log_path" "$bundle_path" <<'PY'
@@ -163,8 +186,39 @@ PY
   echo "Created $bundle_path"
 }
 
+finalize_evidence() {
+  local report_path="$1"
+  local smoke_log_path=""
+  local bundle_path=""
+  local gate_args=()
+
+  create_evidence_bundle "$report_path"
+  smoke_log_path="$(extract_smoke_log_path "$report_path")"
+  bundle_path="$(bundle_path_for_report "$report_path")"
+  gate_args=(--final --report "$report_path" --bundle "$bundle_path")
+
+  if [[ "$SKIP_GITHUB" -eq 1 ]]; then
+    gate_args+=(--skip-github)
+  fi
+
+  "$PYTHON_BIN" scripts/check-macos-support-gate.py "${gate_args[@]}"
+
+  echo
+  echo "Final macOS validation evidence is ready:"
+  echo "- Report: $report_path"
+  echo "- Smoke log: $smoke_log_path"
+  echo "- Evidence bundle: $bundle_path"
+  echo
+  echo "Attach these files to PR #117 or the release checklist before closing #116."
+}
+
 if [[ -n "$CHECK_COMPLETE_PATH" ]]; then
   check_complete_report "$CHECK_COMPLETE_PATH"
+  exit 0
+fi
+
+if [[ -n "$FINALIZE_PATH" ]]; then
+  finalize_evidence "$FINALIZE_PATH"
   exit 0
 fi
 
@@ -313,3 +367,4 @@ echo
 echo "Fill every checkbox before closing the macOS manual validation gate."
 echo "Then run: bash scripts/macos-manual-validation-report.sh --check-complete $REPORT_PATH"
 echo "Then run: bash scripts/macos-manual-validation-report.sh --bundle-evidence $REPORT_PATH"
+echo "Or run both plus the final GitHub gate: bash scripts/macos-manual-validation-report.sh --finalize $REPORT_PATH"
