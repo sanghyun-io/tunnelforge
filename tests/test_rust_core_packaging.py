@@ -85,6 +85,13 @@ def test_macos_package_script_creates_dmg_and_supports_signing_notarization():
     assert "notarization_env_count" in script
     assert "Apple notarization credentials are incomplete" in script
     assert "APPLE_CODESIGN_IDENTITY is required before notarization" in script
+    assert "submit_for_notarization" in script
+    assert "notarize_stapled_app_for_zip_distribution" in script
+    assert "build/macos-notarization" in script
+    assert 'ditto -c -k --keepParent "$APP_PATH" "$APP_NOTARIZATION_ZIP"' in script
+    assert 'xcrun stapler staple "$APP_PATH"' in script
+    assert 'xcrun stapler validate "$APP_PATH"' in script
+    assert 'xcrun stapler validate "$DMG_PATH"' in script
     assert "create_dmg_with_retry" in script
     assert "hdiutil create failed" in script
     assert "hdiutil info || true" in script

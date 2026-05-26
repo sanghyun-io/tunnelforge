@@ -15,6 +15,7 @@ APP_PATH="dist/TunnelForge.app"
 ZIP_PATH="dist/TunnelForge-macOS-${VERSION}-${ARCH_NAME}.zip"
 DMG_STAGING="build/macos-dmg"
 DMG_PATH="dist/TunnelForge-macOS-${VERSION}-${ARCH_NAME}.dmg"
+APP_NOTARIZATION_ZIP="build/macos-notarization/TunnelForge-app-${VERSION}-${ARCH_NAME}.zip"
 
 create_dmg_with_retry() {
   local attempt
@@ -38,6 +39,27 @@ create_dmg_with_retry() {
 
   echo "Failed to create $DMG_PATH after $max_attempts attempts." >&2
   return 1
+}
+
+submit_for_notarization() {
+  local artifact_path="$1"
+  local label="$2"
+
+  echo "Submitting $artifact_path for $label notarization"
+  xcrun notarytool submit "$artifact_path" \
+    --apple-id "$APPLE_ID" \
+    --team-id "$APPLE_TEAM_ID" \
+    --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+    --wait
+}
+
+notarize_stapled_app_for_zip_distribution() {
+  rm -rf "$(dirname "$APP_NOTARIZATION_ZIP")"
+  mkdir -p "$(dirname "$APP_NOTARIZATION_ZIP")"
+  ditto -c -k --keepParent "$APP_PATH" "$APP_NOTARIZATION_ZIP"
+  submit_for_notarization "$APP_NOTARIZATION_ZIP" "app"
+  xcrun stapler staple "$APP_PATH"
+  xcrun stapler validate "$APP_PATH"
 }
 
 if [[ "$(uname -s)" != "Darwin" ]]; then
@@ -79,6 +101,12 @@ else
   echo "APPLE_CODESIGN_IDENTITY is not set; skipping codesign."
 fi
 
+if [[ "$notarization_env_count" -eq 3 ]]; then
+  notarize_stapled_app_for_zip_distribution
+else
+  echo "Apple notarization credentials are not set; skipping app notarization."
+fi
+
 mkdir -p dist
 ditto -c -k --keepParent "$APP_PATH" "$ZIP_PATH"
 
@@ -96,15 +124,11 @@ if [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
 fi
 
 if [[ -n "${APPLE_ID:-}" && -n "${APPLE_TEAM_ID:-}" && -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
-  echo "Submitting $DMG_PATH for notarization"
-  xcrun notarytool submit "$DMG_PATH" \
-    --apple-id "$APPLE_ID" \
-    --team-id "$APPLE_TEAM_ID" \
-    --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-    --wait
+  submit_for_notarization "$DMG_PATH" "DMG"
   xcrun stapler staple "$DMG_PATH"
+  xcrun stapler validate "$DMG_PATH"
 else
-  echo "Apple notarization credentials are not set; skipping notarization."
+  echo "Apple notarization credentials are not set; skipping DMG notarization."
 fi
 
 shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"

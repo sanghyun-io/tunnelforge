@@ -77,6 +77,7 @@ These checks require macOS:
   - `APPLE_CODESIGN_IDENTITY`: optional explicit Developer ID Application identity name; if omitted, the release workflow discovers the first Developer ID Application identity from the imported certificate.
   - `APPLE_CODESIGN_KEYCHAIN_PASSWORD`: optional temporary keychain password; if omitted, the release workflow generates one.
   - `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`: Apple notarization credentials passed to `notarytool`.
+- When notarization credentials are present, `scripts/package-macos.sh` submits a temporary app ZIP for notarization, staples the returned ticket to the `.app`, validates the stapled `.app`, then creates the final ZIP distribution from that stapled `.app`. It also notarizes, staples, and validates the DMG distribution.
 
 ## Final Manual Validation
 
