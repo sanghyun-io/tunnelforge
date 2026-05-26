@@ -55,6 +55,8 @@ def test_macos_release_validation_script_smokes_app_dmg_and_zip():
     script = (PROJECT_ROOT / "scripts" / "validate-macos-release.sh").read_text(encoding="utf-8")
 
     assert "This script must run on macOS." in script
+    assert "Smoke testing source-run app" in script
+    assert "python main.py --ui-smoke-check" in script
     assert "bash scripts/build-macos.sh" in script
     assert "bash scripts/package-macos.sh" in script
     assert "dist/TunnelForge.app/Contents/MacOS/TunnelForge" in script
