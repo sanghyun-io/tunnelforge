@@ -54,8 +54,9 @@ These checks are valid on any development host unless noted:
 - `pytest tests/test_platform_paths.py tests/test_platform_integration.py tests/test_resources.py tests/test_update_downloader.py tests/test_rust_core_packaging.py tests/test_macos_support_docs.py`
 - `bash -n scripts/build-macos.sh scripts/package-macos.sh`
 - Parse `tunnel-manager.spec` as Python syntax.
-- Parse `.github/workflows/release.yml` and `.github/workflows/macos-app.yml` as YAML.
-- The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, runs `TunnelForge.app/Contents/MacOS/TunnelForge --ui-smoke-check`, validates a copied DMG install path, and uploads DMG/ZIP artifacts plus `.sha256` checksums for inspection.
+- Parse `.github/workflows/release.yml`, `.github/workflows/macos-app.yml`, and `.github/workflows/version-gate.yml` as YAML.
+- The `Version Gate` workflow includes a macOS validation matrix so an existing default-branch PR workflow can build `arm64` and `x86_64` packages, run `--ui-smoke-check` against source, `.app`, DMG, copied-DMG install, and ZIP paths, and upload DMG/ZIP artifacts plus `.sha256` checksums for inspection.
+- The standalone `macOS App Validation` workflow provides the same macOS package validation path for PR/manual runs once GitHub recognizes the workflow from the repository default branch.
 - The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, copied DMG install app, and extracted ZIP app before uploading macOS release assets and `.sha256` checksums.
 
 These checks require macOS:

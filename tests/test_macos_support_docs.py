@@ -12,6 +12,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "Intel" in doc
     assert "Final Manual Validation" in doc
     assert "Windows Regression Gates" in doc
+    assert "Version Gate" in doc
     assert "macOS App Validation" in doc
     assert "scripts/validate-macos-release.sh" in doc
     assert "scripts/macos-manual-validation-report.sh" in doc
