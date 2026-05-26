@@ -469,6 +469,34 @@ jobs:
           assert data["core_hello"]["service"] == "tunnelforge-core"
           PY
 
+      - name: Smoke copied DMG install
+        shell: bash
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg"
+          hdiutil attach "$DMG_PATH" -mountpoint /Volumes/TunnelForge -quiet
+          trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
+          rm -rf build/install-smoke
+          mkdir -p build/install-smoke
+          ditto "/Volumes/TunnelForge/TunnelForge.app" "build/install-smoke/TunnelForge.app"
+          hdiutil detach /Volumes/TunnelForge -quiet
+          trap - EXIT
+          APP_EXECUTABLE="build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          PY
+
       - name: Smoke ZIP package
         shell: bash
         run: |

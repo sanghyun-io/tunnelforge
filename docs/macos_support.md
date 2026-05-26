@@ -55,14 +55,14 @@ These checks are valid on any development host unless noted:
 - `bash -n scripts/build-macos.sh scripts/package-macos.sh`
 - Parse `tunnel-manager.spec` as Python syntax.
 - Parse `.github/workflows/release.yml` and `.github/workflows/macos-app.yml` as YAML.
-- The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, runs `TunnelForge.app/Contents/MacOS/TunnelForge --ui-smoke-check`, and uploads DMG/ZIP artifacts for inspection.
-- The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, and extracted ZIP app before uploading macOS release assets.
+- The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, runs `TunnelForge.app/Contents/MacOS/TunnelForge --ui-smoke-check`, validates a copied DMG install path, and uploads DMG/ZIP artifacts for inspection.
+- The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, copied DMG install app, and extracted ZIP app before uploading macOS release assets.
 
 These checks require macOS:
 
 - `bash scripts/build-macos.sh`
 - `bash scripts/package-macos.sh`
-- `bash scripts/validate-macos-release.sh` to run source `python main.py --ui-smoke-check`, build, package, and run `--ui-smoke-check` against the built app, mounted DMG app, and extracted ZIP app on a Mac.
+- `bash scripts/validate-macos-release.sh` to run source `python main.py --ui-smoke-check`, build, package, and run `--ui-smoke-check` against the built app, mounted DMG app, copied DMG install app, and extracted ZIP app on a Mac.
 - Optional signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`.
 
 ## Final Manual Validation
@@ -71,7 +71,7 @@ Final Manual Validation must happen after all implementation milestones are comp
 
 Run on macOS:
 
-1. Run `bash scripts/validate-macos-release.sh` to smoke-check source launch, build, package, and smoke-check `.app`, DMG, and ZIP artifacts.
+1. Run `bash scripts/validate-macos-release.sh` to smoke-check source launch, build, package, mounted DMG, copied DMG install, and ZIP artifacts.
 2. Build Rust Core and app bundle with `bash scripts/build-macos.sh` if validating the build step separately.
 3. Package with `bash scripts/package-macos.sh` if validating packaging separately.
 4. Launch `dist/TunnelForge.app`.

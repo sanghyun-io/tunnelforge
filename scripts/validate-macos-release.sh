@@ -41,34 +41,44 @@ smoke_app() {
   validate_smoke_response "$response"
 }
 
-echo "[1/7] Building Rust core for source-run smoke"
+echo "[1/8] Building Rust core for source-run smoke"
 cargo build --manifest-path migration_core/Cargo.toml --release
 test -f "migration_core/target/release/tunnelforge-core"
 
-echo "[2/7] Smoke testing source-run app"
+echo "[2/8] Smoke testing source-run app"
 source_response="$(python main.py --ui-smoke-check)"
 echo "$source_response"
 validate_smoke_response "$source_response"
 
-echo "[3/7] Building macOS app"
+echo "[3/8] Building macOS app"
 bash scripts/build-macos.sh
 
-echo "[4/7] Smoke testing built app"
+echo "[4/8] Smoke testing built app"
 smoke_app "$APP_EXECUTABLE"
 
-echo "[5/7] Packaging DMG and ZIP"
+echo "[5/8] Packaging DMG and ZIP"
 bash scripts/package-macos.sh "$VERSION"
 test -f "$DMG_PATH"
 test -f "$ZIP_PATH"
 
-echo "[6/7] Smoke testing DMG package"
+echo "[6/8] Smoke testing DMG package"
 hdiutil attach "$DMG_PATH" -mountpoint /Volumes/TunnelForge -quiet
 trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
 smoke_app "/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge"
 hdiutil detach /Volumes/TunnelForge -quiet
 trap - EXIT
 
-echo "[7/7] Smoke testing ZIP package"
+echo "[7/8] Smoke testing copied DMG install"
+hdiutil attach "$DMG_PATH" -mountpoint /Volumes/TunnelForge -quiet
+trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
+rm -rf build/install-smoke
+mkdir -p build/install-smoke
+ditto "/Volumes/TunnelForge/TunnelForge.app" "build/install-smoke/TunnelForge.app"
+hdiutil detach /Volumes/TunnelForge -quiet
+trap - EXIT
+smoke_app "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
+
+echo "[8/8] Smoke testing ZIP package"
 rm -rf build/zip-smoke
 mkdir -p build/zip-smoke
 ditto -x -k "$ZIP_PATH" build/zip-smoke
