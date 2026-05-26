@@ -13,6 +13,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "Final Manual Validation" in doc
     assert "Windows Regression Gates" in doc
     assert "macOS App Validation" in doc
+    assert "scripts/validate-macos-release.sh" in doc
     assert "--ui-smoke-check" in doc
     assert "SSH tunnel" in doc
     assert "Rust DB Core" in doc

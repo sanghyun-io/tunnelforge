@@ -62,6 +62,7 @@ These checks require macOS:
 
 - `bash scripts/build-macos.sh`
 - `bash scripts/package-macos.sh`
+- `bash scripts/validate-macos-release.sh` to build, package, and run `--ui-smoke-check` against the built app, mounted DMG app, and extracted ZIP app on a Mac.
 - Optional signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`.
 
 ## Final Manual Validation
@@ -70,16 +71,17 @@ Final Manual Validation must happen after all implementation milestones are comp
 
 Run on macOS:
 
-1. Build Rust Core and app bundle with `bash scripts/build-macos.sh`.
-2. Package with `bash scripts/package-macos.sh`.
-3. Launch `dist/TunnelForge.app`.
-4. Confirm `tunnelforge-core` starts from inside the app.
-5. Create and close an SSH tunnel.
-6. Test MySQL and PostgreSQL DB connections.
-7. Run Export/Import on a disposable database.
-8. Run Migration smoke flow: inspect, preflight, plan, migrate, verify, resume.
-9. Enable and disable startup, then inspect the LaunchAgent file.
-10. Check settings, logs, SQL history, migration state, analysis, and rollback files under macOS user directories.
-11. Open a downloaded DMG through the update UI and confirm it does not try to execute it directly.
-12. Install from DMG into Applications and launch from there.
-13. If distributing outside internal testing, verify codesign, notarization, and Gatekeeper behavior.
+1. Run `bash scripts/validate-macos-release.sh` to build, package, and smoke-check `.app`, DMG, and ZIP artifacts.
+2. Build Rust Core and app bundle with `bash scripts/build-macos.sh` if validating the build step separately.
+3. Package with `bash scripts/package-macos.sh` if validating packaging separately.
+4. Launch `dist/TunnelForge.app`.
+5. Confirm `tunnelforge-core` starts from inside the app.
+6. Create and close an SSH tunnel.
+7. Test MySQL and PostgreSQL DB connections.
+8. Run Export/Import on a disposable database.
+9. Run Migration smoke flow: inspect, preflight, plan, migrate, verify, resume.
+10. Enable and disable startup, then inspect the LaunchAgent file.
+11. Check settings, logs, SQL history, migration state, analysis, and rollback files under macOS user directories.
+12. Open a downloaded DMG through the update UI and confirm it does not try to execute it directly.
+13. Install from DMG into Applications and launch from there.
+14. If distributing outside internal testing, verify codesign, notarization, and Gatekeeper behavior.

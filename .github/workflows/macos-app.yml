@@ -12,6 +12,7 @@ on:
       - "pyproject.toml"
       - "scripts/build-macos.sh"
       - "scripts/package-macos.sh"
+      - "scripts/validate-macos-release.sh"
       - "src/**"
       - "tests/test_app_self_check.py"
       - "tests/test_macos_support_docs.py"

@@ -51,6 +51,21 @@ def test_macos_package_script_creates_dmg_and_supports_signing_notarization():
     assert "stapler staple" in script
 
 
+def test_macos_release_validation_script_smokes_app_dmg_and_zip():
+    script = (PROJECT_ROOT / "scripts" / "validate-macos-release.sh").read_text(encoding="utf-8")
+
+    assert "This script must run on macOS." in script
+    assert "bash scripts/build-macos.sh" in script
+    assert "bash scripts/package-macos.sh" in script
+    assert "dist/TunnelForge.app/Contents/MacOS/TunnelForge" in script
+    assert "/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge" in script
+    assert "build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in script
+    assert "--ui-smoke-check" in script
+    assert "window_title" in script
+    assert "tunnelforge-core" in script
+    assert "Manual validation still required" in script
+
+
 def test_release_workflow_has_macos_app_job_and_assets():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
@@ -81,6 +96,7 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true" in workflow
     assert "pull_request:" in workflow
     assert "workflow_dispatch:" in workflow
+    assert '"scripts/validate-macos-release.sh"' in workflow
     assert "tests/test_app_self_check.py" in workflow
     assert "tests/test_settings_update_actions.py" in workflow
     assert "macos-14" in workflow
