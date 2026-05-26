@@ -84,5 +84,11 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "--self-check" in workflow
     assert 'data["core_hello"]["service"] == "tunnelforge-core"' in workflow
     assert "bash scripts/package-macos.sh" in workflow
+    assert "Smoke DMG package" in workflow
+    assert "hdiutil attach" in workflow
+    assert "/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
+    assert "Smoke ZIP package" in workflow
+    assert "ditto -x -k" in workflow
+    assert "build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
     assert "actions/upload-artifact" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow

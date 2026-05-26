@@ -110,6 +110,49 @@ jobs:
           test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
           test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
 
+      - name: Smoke DMG package
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          hdiutil attach "$DMG_PATH" -nobrowse -quiet
+          trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
+          APP_EXECUTABLE="/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --self-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Smoke ZIP package
+        run: |
+          ZIP_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
+          rm -rf build/zip-smoke
+          mkdir -p build/zip-smoke
+          ditto -x -k "$ZIP_PATH" build/zip-smoke
+          APP_EXECUTABLE="build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --self-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
       - name: Upload macOS app artifacts
         uses: actions/upload-artifact@v4
         with:
