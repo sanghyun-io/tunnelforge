@@ -743,6 +743,30 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
 
 
+def test_macos_validation_workflow_supports_manual_signed_notarized_run():
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "macos-app.yml").read_text(encoding="utf-8")
+
+    assert "workflow_dispatch:" in workflow
+    assert "CHECKOUT_REF: ${{ github.event.pull_request.head.sha || github.sha }}" in workflow
+    assert 'git fetch --depth=1 origin "$CHECKOUT_REF"' in workflow
+    assert "Import Apple Developer ID certificate" in workflow
+    assert "github.event_name == 'workflow_dispatch'" in workflow
+    assert "APPLE_CODESIGN_CERTIFICATE_P12_BASE64" in workflow
+    assert "security create-keychain" in workflow
+    assert "security import build/apple-codesign.p12" in workflow
+    assert "security set-key-partition-list" in workflow
+    assert "APPLE_CODESIGN_IDENTITY=$APPLE_CODESIGN_IDENTITY" in workflow
+    assert "APPLE_ID: ${{ secrets.APPLE_ID }}" in workflow
+    assert "APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}" in workflow
+    assert "APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" in workflow
+    assert "Verify signed and notarized artifacts" in workflow
+    assert 'codesign --verify --deep --strict --verbose=2 "$APP_PATH"' in workflow
+    assert 'spctl --assess --type execute --verbose "$APP_PATH"' in workflow
+    assert 'xcrun stapler validate "$APP_PATH"' in workflow
+    assert 'xcrun stapler validate "$DMG_PATH"' in workflow
+    assert "Cleanup Apple signing keychain" in workflow
+
+
 def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "version-gate.yml").read_text(encoding="utf-8")
     parsed = yaml.safe_load(workflow)

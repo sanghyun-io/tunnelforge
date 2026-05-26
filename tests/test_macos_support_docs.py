@@ -48,6 +48,9 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "APPLE_APP_SPECIFIC_PASSWORD" in doc
     assert "stapled `.app`" in doc
     assert "ZIP distribution" in doc
+    assert "workflow_dispatch" in doc
+    assert "signed/notarized macOS validation" in doc
+    assert "spctl --assess" in doc
 
 
 def test_macos_support_plan_references_github_tracking_issues():

@@ -57,7 +57,7 @@ These checks are valid on any development host unless noted:
 - Parse `.github/workflows/release.yml`, `.github/workflows/macos-app.yml`, and `.github/workflows/version-gate.yml` as YAML.
 - The `Version Gate` workflow includes a macOS validation matrix so an existing default-branch PR workflow can build `arm64` and `x86_64` packages, run `--ui-smoke-check` against source, `.app`, DMG, copied-DMG install, and ZIP paths, smoke-test LaunchAgent plist registration for the copied install, and upload DMG/ZIP artifacts plus `.sha256` checksums for inspection.
 - The `Version Gate` workflow also runs `python scripts/check-macos-support-gate.py --skip-pr-checks` so M0-M5 issue closure and #116/M6 tracking are checked on every macOS support PR update without waiting for final real-Mac evidence.
-- The standalone `macOS App Validation` workflow provides the same macOS package validation path for PR/manual runs once GitHub recognizes the workflow from the repository default branch.
+- The standalone `macOS App Validation` workflow provides the same macOS package validation path for PR/manual runs once GitHub recognizes the workflow from the repository default branch. Its `workflow_dispatch` path falls back to `github.sha` when no pull request SHA exists, and can run signed/notarized macOS validation before a tag release when the Apple Developer ID and notarization secrets are configured.
 - The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, copied DMG install app, and extracted ZIP app before uploading macOS release assets and `.sha256` checksums. PR validation also runs `scripts/smoke-macos-launchagent.sh` against the copied DMG install to verify LaunchAgent plist structure and log paths on hosted macOS.
 
 These checks require macOS:
@@ -78,6 +78,7 @@ These checks require macOS:
   - `APPLE_CODESIGN_KEYCHAIN_PASSWORD`: optional temporary keychain password; if omitted, the release workflow generates one.
   - `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`: Apple notarization credentials passed to `notarytool`.
 - When notarization credentials are present, `scripts/package-macos.sh` submits a temporary app ZIP for notarization, staples the returned ticket to the `.app`, validates the stapled `.app`, then creates the final ZIP distribution from that stapled `.app`. It also notarizes, staples, and validates the DMG distribution.
+- For a pre-release hosted check of the Apple secret path, manually run `.github/workflows/macos-app.yml` with `workflow_dispatch` on the release branch. When the signing certificate and notarization credentials are available, the workflow imports the Developer ID certificate into a temporary keychain, packages signed/notarized artifacts, then verifies the `.app` and DMG with `codesign --verify`, `spctl --assess`, and `xcrun stapler validate`.
 
 ## Final Manual Validation
 
