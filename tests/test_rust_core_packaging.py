@@ -127,6 +127,21 @@ def test_macos_release_validation_script_smokes_app_dmg_and_zip():
     assert "Manual validation still required" in script
 
 
+def test_macos_applications_install_smoke_script_validates_real_applications_path():
+    script = (PROJECT_ROOT / "scripts" / "smoke-macos-applications-install.sh").read_text(encoding="utf-8")
+
+    assert "This script must run on macOS." in script
+    assert "MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM=1" in script
+    assert "/Applications/TunnelForge.app" in script
+    assert "hdiutil attach" in script
+    assert "ditto" in script
+    assert "python - <<'PY'" in script
+    assert "--ui-smoke-check" in script
+    assert "tunnelforge-core" in script
+    assert "scripts/smoke-macos-launchagent.sh" in script
+    assert "macOS /Applications install smoke checks passed." in script
+
+
 def test_macos_manual_validation_report_script_records_remaining_gates():
     script = (PROJECT_ROOT / "scripts" / "macos-manual-validation-report.sh").read_text(encoding="utf-8")
 
@@ -659,6 +674,9 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "build/install-smoke-mount" in workflow
     assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
+    assert "Smoke /Applications install" in workflow
+    assert "MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM: \"1\"" in workflow
+    assert "bash scripts/smoke-macos-applications-install.sh" in workflow
     assert "Smoke LaunchAgent registration" in workflow
     assert "bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app" in workflow
     assert "Smoke ZIP package" in workflow
@@ -737,6 +755,9 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "Smoke copied DMG install" in workflow
     assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
+    assert "Smoke /Applications install" in workflow
+    assert "MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM: \"1\"" in workflow
+    assert "bash scripts/smoke-macos-applications-install.sh" in workflow
     assert "Smoke LaunchAgent registration" in workflow
     assert "bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app" in workflow
     assert "Smoke ZIP package" in workflow
@@ -806,6 +827,9 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "bash scripts/package-macos.sh" in workflow
     assert "Smoke DMG package" in workflow
     assert "Smoke copied DMG install" in workflow
+    assert "Smoke /Applications install" in workflow
+    assert "MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM: \"1\"" in workflow
+    assert "bash scripts/smoke-macos-applications-install.sh" in workflow
     assert "Smoke LaunchAgent registration" in workflow
     assert "bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app" in workflow
     assert "Smoke ZIP package" in workflow

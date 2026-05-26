@@ -415,6 +415,14 @@ jobs:
         run: |
           bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app
 
+      - name: Smoke /Applications install
+        shell: bash
+        env:
+          MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM: "1"
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg"
+          bash scripts/smoke-macos-applications-install.sh "$DMG_PATH"
+
       - name: Smoke ZIP package
         shell: bash
         run: |
