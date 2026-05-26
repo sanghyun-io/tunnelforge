@@ -62,6 +62,12 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "scripts/build-macos.sh" in workflow
     assert "scripts/package-macos.sh" in workflow
     assert "tests/test_app_self_check.py" in workflow
+    assert "Smoke packaged TunnelForge app" in workflow
+    assert "Smoke DMG package" in workflow
+    assert "Smoke ZIP package" in workflow
+    assert "--ui-smoke-check" in workflow
+    assert 'data["window_title"] == "TunnelForge"' in workflow
+    assert 'data["core_hello"]["service"] == "tunnelforge-core"' in workflow
     assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
     assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip" in workflow
     assert "macOS 앱 이미지" in workflow
