@@ -146,182 +146,18 @@ jobs:
           echo "installer_path=$($installerFile.FullName)" >> $env:GITHUB_OUTPUT
           echo "installer_name=$($installerFile.Name)" >> $env:GITHUB_OUTPUT
 
-      - name: Generate Release Notes
-        id: release_notes
-        shell: bash
-        run: |
-          VERSION="${{ steps.get_version.outputs.version }}"
-
-          # 이전 태그 찾기
-          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
-          echo "Previous tag: $PREV_TAG"
-          echo "Current tag: v$VERSION"
-
-          # 변경사항 수집 (Conventional Commits 파싱)
-          echo "" > changes_feat.txt
-          echo "" > changes_fix.txt
-          echo "" > changes_docs.txt
-          echo "" > changes_refactor.txt
-          echo "" > changes_perf.txt
-          echo "" > changes_other.txt
-
-          if [ -n "$PREV_TAG" ]; then
-            COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"%s" 2>/dev/null || echo "")
-          else
-            # 첫 릴리스인 경우 최근 50개 커밋
-            COMMITS=$(git log --pretty=format:"%s" -50 2>/dev/null || echo "")
-          fi
-
-          # 커밋 메시지 파싱 (Windows Git Bash 호환)
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-
-            # Conventional Commits 파싱 (간단한 패턴 사용)
-            if [[ "$line" == feat:* ]] || [[ "$line" == feat\(*\):* ]]; then
-              msg="${line#*: }"
-              echo "- $msg" >> changes_feat.txt
-            elif [[ "$line" == fix:* ]] || [[ "$line" == fix\(*\):* ]]; then
-              msg="${line#*: }"
-              echo "- $msg" >> changes_fix.txt
-            elif [[ "$line" == docs:* ]] || [[ "$line" == docs\(*\):* ]]; then
-              msg="${line#*: }"
-              echo "- $msg" >> changes_docs.txt
-            elif [[ "$line" == refactor:* ]] || [[ "$line" == refactor\(*\):* ]]; then
-              msg="${line#*: }"
-              echo "- $msg" >> changes_refactor.txt
-            elif [[ "$line" == perf:* ]] || [[ "$line" == perf\(*\):* ]]; then
-              msg="${line#*: }"
-              echo "- $msg" >> changes_perf.txt
-            elif [[ "$line" != chore:* ]] && [[ "$line" != chore\(*\):* ]] && \
-                 [[ "$line" != ci:* ]] && [[ "$line" != ci\(*\):* ]] && \
-                 [[ "$line" != test:* ]] && [[ "$line" != test\(*\):* ]] && \
-                 [[ "$line" != style:* ]] && [[ "$line" != style\(*\):* ]] && \
-                 [[ "$line" != build:* ]] && [[ "$line" != build\(*\):* ]]; then
-              # chore, ci, test, style, build 제외한 기타 커밋
-              if [[ "$line" != Merge* ]] && [[ "$line" != *"Bump version"* ]]; then
-                echo "- $line" >> changes_other.txt
-              fi
-            fi
-          done <<< "$COMMITS"
-
-          # 릴리스 노트 생성
-          echo "## TunnelForge v$VERSION" > release_notes.md
-          echo "" >> release_notes.md
-
-          # 변경사항 섹션 추가
-          HAS_CHANGES=false
-
-          if [ -s changes_feat.txt ] && [ "$(cat changes_feat.txt | tr -d '[:space:]')" != "" ]; then
-            echo "### ✨ 새로운 기능" >> release_notes.md
-            cat changes_feat.txt >> release_notes.md
-            echo "" >> release_notes.md
-            HAS_CHANGES=true
-          fi
-
-          if [ -s changes_fix.txt ] && [ "$(cat changes_fix.txt | tr -d '[:space:]')" != "" ]; then
-            echo "### 🐛 버그 수정" >> release_notes.md
-            cat changes_fix.txt >> release_notes.md
-            echo "" >> release_notes.md
-            HAS_CHANGES=true
-          fi
-
-          if [ -s changes_perf.txt ] && [ "$(cat changes_perf.txt | tr -d '[:space:]')" != "" ]; then
-            echo "### ⚡ 성능 개선" >> release_notes.md
-            cat changes_perf.txt >> release_notes.md
-            echo "" >> release_notes.md
-            HAS_CHANGES=true
-          fi
-
-          if [ -s changes_refactor.txt ] && [ "$(cat changes_refactor.txt | tr -d '[:space:]')" != "" ]; then
-            echo "### ♻️ 리팩토링" >> release_notes.md
-            cat changes_refactor.txt >> release_notes.md
-            echo "" >> release_notes.md
-            HAS_CHANGES=true
-          fi
-
-          if [ -s changes_docs.txt ] && [ "$(cat changes_docs.txt | tr -d '[:space:]')" != "" ]; then
-            echo "### 📝 문서" >> release_notes.md
-            cat changes_docs.txt >> release_notes.md
-            echo "" >> release_notes.md
-            HAS_CHANGES=true
-          fi
-
-          if [ -s changes_other.txt ] && [ "$(cat changes_other.txt | tr -d '[:space:]')" != "" ]; then
-            echo "### 📦 기타 변경사항" >> release_notes.md
-            cat changes_other.txt >> release_notes.md
-            echo "" >> release_notes.md
-            HAS_CHANGES=true
-          fi
-
-          if [ "$HAS_CHANGES" = false ]; then
-            echo "### 📦 변경사항" >> release_notes.md
-            echo "- 버그 수정 및 안정성 개선" >> release_notes.md
-            echo "" >> release_notes.md
-          fi
-
-          # 다운로드 및 설치 안내
-          echo "---" >> release_notes.md
-          echo "" >> release_notes.md
-          echo "### 📥 다운로드" >> release_notes.md
-          echo "| 파일 | 설명 | 크기 |" >> release_notes.md
-          echo "|------|------|------|" >> release_notes.md
-          echo "| \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |" >> release_notes.md
-          echo "| \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |" >> release_notes.md
-          echo "| \`TunnelForge-macOS-$VERSION-arm64.dmg\` | macOS 앱 이미지 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
-          echo "| \`TunnelForge-macOS-$VERSION-arm64.zip\` | macOS 앱 압축본 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
-          echo "| \`TunnelForge-macOS-$VERSION-arm64.{dmg,zip}.sha256\` | macOS SHA-256 체크섬 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
-          echo "| \`TunnelForge-macOS-$VERSION-x86_64.dmg\` | macOS 앱 이미지 (Intel) | 환경별 산출 |" >> release_notes.md
-          echo "| \`TunnelForge-macOS-$VERSION-x86_64.zip\` | macOS 앱 압축본 (Intel) | 환경별 산출 |" >> release_notes.md
-          echo "| \`TunnelForge-macOS-$VERSION-x86_64.{dmg,zip}.sha256\` | macOS SHA-256 체크섬 (Intel) | 환경별 산출 |" >> release_notes.md
-          echo "" >> release_notes.md
-          echo "### 설치 방법" >> release_notes.md
-          echo "" >> release_notes.md
-          echo "**온라인 설치 (권장):**" >> release_notes.md
-          echo "1. \`TunnelForge-WebSetup.exe\` 다운로드" >> release_notes.md
-          echo "2. 실행하면 자동으로 최신 버전 다운로드 및 설치" >> release_notes.md
-          echo "" >> release_notes.md
-          echo "**오프라인 설치:**" >> release_notes.md
-          echo "1. \`TunnelForge-Setup-$VERSION.exe\` 다운로드" >> release_notes.md
-          echo "2. 설치 마법사를 따라 진행" >> release_notes.md
-          echo "" >> release_notes.md
-          echo "**macOS:**" >> release_notes.md
-          echo "1. Mac 종류에 맞는 \`TunnelForge-macOS-$VERSION-{arm64|x86_64}.dmg\` 다운로드" >> release_notes.md
-          echo "2. DMG를 열고 \`TunnelForge.app\`을 Applications로 이동" >> release_notes.md
-          echo "3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증: \`shasum -a 256 -c <파일명>.sha256\`" >> release_notes.md
-
-          echo ""
-          echo "========== Generated Release Notes =========="
-          cat release_notes.md
-          echo "============================================="
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+      - name: Upload Windows release artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: v${{ steps.get_version.outputs.version }}
-          body_path: release_notes.md
-          files: |
+          name: TunnelForge-Windows-${{ steps.get_version.outputs.version }}
+          path: |
             output/TunnelForge-Setup-${{ steps.get_version.outputs.version }}.exe
             dist/TunnelForge-WebSetup.exe
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Release Summary
-        run: |
-          Write-Host "========================================" -ForegroundColor Cyan
-          Write-Host " ✅ Release Created Successfully!" -ForegroundColor Green
-          Write-Host "========================================" -ForegroundColor Cyan
-          Write-Host ""
-          Write-Host "Release: v${{ steps.get_version.outputs.version }}" -ForegroundColor White
-          Write-Host "Installer: ${{ steps.verify_installer.outputs.installer_name }}" -ForegroundColor White
-          Write-Host "URL: https://github.com/${{ github.repository }}/releases/tag/v${{ steps.get_version.outputs.version }}" -ForegroundColor White
-          Write-Host ""
+          if-no-files-found: error
 
   build-macos-app:
     name: Build macOS App (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    needs: build-windows-installer
     strategy:
       fail-fast: false
       matrix:
@@ -530,13 +366,238 @@ jobs:
           assert data["core_hello"]["service"] == "tunnelforge-core"
           PY
 
-      - name: Upload macOS Release Asset
-        uses: softprops/action-gh-release@v3
+      - name: Upload macOS release artifacts
+        uses: actions/upload-artifact@v4
         with:
-          files: |
+          name: TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}
+          path: |
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg.sha256
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+
+  create-release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs:
+      - build-windows-installer
+      - build-macos-app
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Extract version from tag
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Version: $VERSION"
+
+      - name: Verify version consistency
+        shell: bash
+        run: |
+          PYTHON_VERSION=$(python -c "from src.version import __version__; print(__version__)")
+          TAG_VERSION="${{ steps.get_version.outputs.version }}"
+          if [ "$PYTHON_VERSION" != "$TAG_VERSION" ]; then
+            echo "Version mismatch: src/version.py=$PYTHON_VERSION tag=$TAG_VERSION"
+            exit 1
+          fi
+
+      - name: Download release artifacts
+        uses: actions/download-artifact@v6
+        with:
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Verify release artifacts
+        shell: bash
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+          test -f "release-artifacts/TunnelForge-Setup-$VERSION.exe"
+          test -f "release-artifacts/TunnelForge-WebSetup.exe"
+          for ARCH in arm64 x86_64; do
+            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.dmg"
+            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.zip"
+            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.dmg.sha256"
+            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.zip.sha256"
+          done
+
+      - name: Generate Release Notes
+        id: release_notes
+        shell: bash
+        run: |
+          VERSION="${{ steps.get_version.outputs.version }}"
+
+          # 이전 태그 찾기
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+          echo "Previous tag: $PREV_TAG"
+          echo "Current tag: v$VERSION"
+
+          # 변경사항 수집 (Conventional Commits 파싱)
+          echo "" > changes_feat.txt
+          echo "" > changes_fix.txt
+          echo "" > changes_docs.txt
+          echo "" > changes_refactor.txt
+          echo "" > changes_perf.txt
+          echo "" > changes_other.txt
+
+          if [ -n "$PREV_TAG" ]; then
+            COMMITS=$(git log ${PREV_TAG}..HEAD --pretty=format:"%s" 2>/dev/null || echo "")
+          else
+            # 첫 릴리스인 경우 최근 50개 커밋
+            COMMITS=$(git log --pretty=format:"%s" -50 2>/dev/null || echo "")
+          fi
+
+          # 커밋 메시지 파싱
+          while IFS= read -r line; do
+            [ -z "$line" ] && continue
+
+            # Conventional Commits 파싱 (간단한 패턴 사용)
+            if [[ "$line" == feat:* ]] || [[ "$line" == feat\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_feat.txt
+            elif [[ "$line" == fix:* ]] || [[ "$line" == fix\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_fix.txt
+            elif [[ "$line" == docs:* ]] || [[ "$line" == docs\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_docs.txt
+            elif [[ "$line" == refactor:* ]] || [[ "$line" == refactor\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_refactor.txt
+            elif [[ "$line" == perf:* ]] || [[ "$line" == perf\(*\):* ]]; then
+              msg="${line#*: }"
+              echo "- $msg" >> changes_perf.txt
+            elif [[ "$line" != chore:* ]] && [[ "$line" != chore\(*\):* ]] && \
+                 [[ "$line" != ci:* ]] && [[ "$line" != ci\(*\):* ]] && \
+                 [[ "$line" != test:* ]] && [[ "$line" != test\(*\):* ]] && \
+                 [[ "$line" != style:* ]] && [[ "$line" != style\(*\):* ]] && \
+                 [[ "$line" != build:* ]] && [[ "$line" != build\(*\):* ]]; then
+              # chore, ci, test, style, build 제외한 기타 커밋
+              if [[ "$line" != Merge* ]] && [[ "$line" != *"Bump version"* ]]; then
+                echo "- $line" >> changes_other.txt
+              fi
+            fi
+          done <<< "$COMMITS"
+
+          # 릴리스 노트 생성
+          echo "## TunnelForge v$VERSION" > release_notes.md
+          echo "" >> release_notes.md
+
+          # 변경사항 섹션 추가
+          HAS_CHANGES=false
+
+          if [ -s changes_feat.txt ] && [ "$(cat changes_feat.txt | tr -d '[:space:]')" != "" ]; then
+            echo "### ✨ 새로운 기능" >> release_notes.md
+            cat changes_feat.txt >> release_notes.md
+            echo "" >> release_notes.md
+            HAS_CHANGES=true
+          fi
+
+          if [ -s changes_fix.txt ] && [ "$(cat changes_fix.txt | tr -d '[:space:]')" != "" ]; then
+            echo "### 🐛 버그 수정" >> release_notes.md
+            cat changes_fix.txt >> release_notes.md
+            echo "" >> release_notes.md
+            HAS_CHANGES=true
+          fi
+
+          if [ -s changes_perf.txt ] && [ "$(cat changes_perf.txt | tr -d '[:space:]')" != "" ]; then
+            echo "### ⚡ 성능 개선" >> release_notes.md
+            cat changes_perf.txt >> release_notes.md
+            echo "" >> release_notes.md
+            HAS_CHANGES=true
+          fi
+
+          if [ -s changes_refactor.txt ] && [ "$(cat changes_refactor.txt | tr -d '[:space:]')" != "" ]; then
+            echo "### ♻️ 리팩토링" >> release_notes.md
+            cat changes_refactor.txt >> release_notes.md
+            echo "" >> release_notes.md
+            HAS_CHANGES=true
+          fi
+
+          if [ -s changes_docs.txt ] && [ "$(cat changes_docs.txt | tr -d '[:space:]')" != "" ]; then
+            echo "### 📝 문서" >> release_notes.md
+            cat changes_docs.txt >> release_notes.md
+            echo "" >> release_notes.md
+            HAS_CHANGES=true
+          fi
+
+          if [ -s changes_other.txt ] && [ "$(cat changes_other.txt | tr -d '[:space:]')" != "" ]; then
+            echo "### 📦 기타 변경사항" >> release_notes.md
+            cat changes_other.txt >> release_notes.md
+            echo "" >> release_notes.md
+            HAS_CHANGES=true
+          fi
+
+          if [ "$HAS_CHANGES" = false ]; then
+            echo "### 📦 변경사항" >> release_notes.md
+            echo "- 버그 수정 및 안정성 개선" >> release_notes.md
+            echo "" >> release_notes.md
+          fi
+
+          # 다운로드 및 설치 안내
+          echo "---" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### 📥 다운로드" >> release_notes.md
+          echo "| 파일 | 설명 | 크기 |" >> release_notes.md
+          echo "|------|------|------|" >> release_notes.md
+          echo "| \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |" >> release_notes.md
+          echo "| \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-arm64.dmg\` | macOS 앱 이미지 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-arm64.zip\` | macOS 앱 압축본 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-arm64.{dmg,zip}.sha256\` | macOS SHA-256 체크섬 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-x86_64.dmg\` | macOS 앱 이미지 (Intel) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-x86_64.zip\` | macOS 앱 압축본 (Intel) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-x86_64.{dmg,zip}.sha256\` | macOS SHA-256 체크섬 (Intel) | 환경별 산출 |" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "### 설치 방법" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**온라인 설치 (권장):**" >> release_notes.md
+          echo "1. \`TunnelForge-WebSetup.exe\` 다운로드" >> release_notes.md
+          echo "2. 실행하면 자동으로 최신 버전 다운로드 및 설치" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**오프라인 설치:**" >> release_notes.md
+          echo "1. \`TunnelForge-Setup-$VERSION.exe\` 다운로드" >> release_notes.md
+          echo "2. 설치 마법사를 따라 진행" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**macOS:**" >> release_notes.md
+          echo "1. Mac 종류에 맞는 \`TunnelForge-macOS-$VERSION-{arm64|x86_64}.dmg\` 다운로드" >> release_notes.md
+          echo "2. DMG를 열고 \`TunnelForge.app\`을 Applications로 이동" >> release_notes.md
+          echo "3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증: \`shasum -a 256 -c <파일명>.sha256\`" >> release_notes.md
+
+          echo ""
+          echo "========== Generated Release Notes =========="
+          cat release_notes.md
+          echo "============================================="
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          name: v${{ steps.get_version.outputs.version }}
+          body_path: release_notes.md
+          files: |
+            release-artifacts/TunnelForge-Setup-*.exe
+            release-artifacts/TunnelForge-WebSetup.exe
+            release-artifacts/TunnelForge-macOS-*.dmg
+            release-artifacts/TunnelForge-macOS-*.zip
+            release-artifacts/TunnelForge-macOS-*.dmg.sha256
+            release-artifacts/TunnelForge-macOS-*.zip.sha256
+          draft: false
+          prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Release Summary
+        run: |
+          echo "========================================"
+          echo "✅ Release Created Successfully!"
+          echo "========================================"
+          echo ""
+          echo "Release: v${{ steps.get_version.outputs.version }}"
+          echo "URL: https://github.com/${{ github.repository }}/releases/tag/v${{ steps.get_version.outputs.version }}"
+          echo ""

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import yaml
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -141,6 +143,33 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "macOS SHA-256 체크섬" in workflow
     assert "shasum -a 256 -c" in workflow
     assert r"3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증" in workflow
+
+
+def test_release_workflow_creates_release_after_all_platform_artifacts():
+    workflow_path = PROJECT_ROOT / ".github" / "workflows" / "release.yml"
+    workflow_text = workflow_path.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    jobs = workflow["jobs"]
+
+    windows_job_text = workflow_text.split("  build-windows-installer:", 1)[1].split("\n  build-macos-app:", 1)[0]
+    macos_job_text = workflow_text.split("  build-macos-app:", 1)[1].split("\n  create-release:", 1)[0]
+
+    assert "create-release" in jobs
+    assert jobs["create-release"]["needs"] == ["build-windows-installer", "build-macos-app"]
+    assert "actions/download-artifact" in workflow_text
+    assert "merge-multiple: true" in workflow_text
+    assert "softprops/action-gh-release@v3" in workflow_text
+    assert "Create GitHub Release" in workflow_text
+    assert "release-artifacts/TunnelForge-Setup-*.exe" in workflow_text
+    assert "release-artifacts/TunnelForge-WebSetup.exe" in workflow_text
+    assert "release-artifacts/TunnelForge-macOS-*.dmg" in workflow_text
+    assert "release-artifacts/TunnelForge-macOS-*.zip" in workflow_text
+    assert "release-artifacts/TunnelForge-macOS-*.dmg.sha256" in workflow_text
+    assert "release-artifacts/TunnelForge-macOS-*.zip.sha256" in workflow_text
+    assert "actions/upload-artifact@v4" in windows_job_text
+    assert "actions/upload-artifact@v4" in macos_job_text
+    assert "softprops/action-gh-release@v3" not in windows_job_text
+    assert "softprops/action-gh-release@v3" not in macos_job_text
 
 
 def test_macos_validation_workflow_builds_pr_artifacts():
