@@ -25,6 +25,9 @@ jobs:
     steps:
       - name: Checkout PR
         uses: actions/checkout@v5
+        with:
+          token: ""
+          persist-credentials: false
 
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -49,6 +52,9 @@ jobs:
     steps:
       - name: Checkout PR
         uses: actions/checkout@v5
+        with:
+          token: ""
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -57,7 +63,9 @@ jobs:
           cache: "pip"
 
       - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+        run: |
+          rustc --version
+          cargo --version
 
       - name: Install dependencies
         run: |
@@ -229,6 +237,9 @@ jobs:
   version-gate:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      bump_type: ${{ steps.check.outputs.bump_type }}
+      needs_rebump: ${{ steps.check.outputs.needs_rebump }}
 
     steps:
       - name: Check version labels
@@ -311,8 +322,14 @@ jobs:
 
           echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
 
+  version-bump:
+    runs-on: ubuntu-24.04
+    needs: version-gate
+    if: needs.version-gate.outputs.bump_type != ''
+    timeout-minutes: 10
+
+    steps:
       - name: Generate GitHub App Token
-        if: steps.check.outputs.bump_type != ''
         id: app-token
         uses: actions/create-github-app-token@v3
         with:
@@ -320,7 +337,6 @@ jobs:
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
 
       - name: Checkout PR branch
-        if: steps.check.outputs.bump_type != ''
         uses: actions/checkout@v5
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -328,17 +344,15 @@ jobs:
           fetch-depth: 0
 
       - name: Set up Python
-        if: steps.check.outputs.bump_type != ''
         uses: actions/setup-python@v6
         with:
           python-version: '3.x'
 
       - name: Check if already bumped & bump version (idempotent)
-        if: steps.check.outputs.bump_type != ''
         id: bump
         env:
-          BUMP_TYPE: ${{ steps.check.outputs.bump_type }}
-          NEEDS_REBUMP: ${{ steps.check.outputs.needs_rebump }}
+          BUMP_TYPE: ${{ needs.version-gate.outputs.bump_type }}
+          NEEDS_REBUMP: ${{ needs.version-gate.outputs.needs_rebump }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
         run: |
           set -euo pipefail
@@ -370,15 +384,15 @@ jobs:
           fi
 
       - name: Commit and push bump to PR branch
-        if: steps.check.outputs.bump_type != '' && steps.bump.outputs.skip != 'true'
+        if: steps.bump.outputs.skip != 'true'
         env:
           NEW_VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          python scripts/bump_version.py --bump-type "${{ steps.check.outputs.bump_type }}"
+          python scripts/bump_version.py --bump-type "${{ needs.version-gate.outputs.bump_type }}"
           git add src/version.py pyproject.toml
-          git commit -m "chore: bump version to v${NEW_VERSION} [${{ steps.check.outputs.bump_type }}]"
+          git commit -m "chore: bump version to v${NEW_VERSION} [${{ needs.version-gate.outputs.bump_type }}]"
           git push origin "${{ github.event.pull_request.head.ref }}"
           echo "버전 bump 완료: v${NEW_VERSION}"

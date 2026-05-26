@@ -120,6 +120,9 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
     assert "scripts/build-macos.sh" in workflow
     assert "scripts/package-macos.sh" in workflow
+    assert "rustc --version" in workflow
+    assert "cargo --version" in workflow
+    assert "dtolnay/rust-toolchain" not in workflow
     assert "tests/test_app_self_check.py" in workflow
     assert "tests/test_settings_update_actions.py" in workflow
     assert "Smoke source-run TunnelForge app" in workflow
@@ -190,6 +193,9 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "python main.py --ui-smoke-check" in workflow
     assert 'data["self_check"]["core_hello"]["service"] == "tunnelforge-core"' in workflow
     assert "bash scripts/build-macos.sh" in workflow
+    assert "rustc --version" in workflow
+    assert "cargo --version" in workflow
+    assert "dtolnay/rust-toolchain" not in workflow
     assert "Smoke packaged TunnelForge app" in workflow
     assert 'APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"' in workflow
     assert "--ui-smoke-check" in workflow
@@ -219,7 +225,13 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     jobs = parsed["jobs"]
 
     assert "macos-app-validation" in jobs
+    assert "version-bump" in jobs
     assert jobs["macos-app-validation"]["strategy"]["fail-fast"] is False
+    assert jobs["version-bump"]["needs"] == "version-gate"
+    version_gate_text = workflow.split("  version-gate:", 1)[1].split("\n  version-bump:", 1)[0]
+    assert "actions/create-github-app-token" not in version_gate_text
+    assert "token: \"\"" in workflow
+    assert "persist-credentials: false" in workflow
     assert "macos-14" in workflow
     assert "macos-15-intel" in workflow
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
@@ -227,6 +239,9 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "Smoke source-run TunnelForge app" in workflow
     assert "python main.py --ui-smoke-check" in workflow
     assert "bash scripts/build-macos.sh" in workflow
+    assert "rustc --version" in workflow
+    assert "cargo --version" in workflow
+    assert "dtolnay/rust-toolchain" not in workflow
     assert "Smoke packaged TunnelForge app" in workflow
     assert "bash scripts/package-macos.sh" in workflow
     assert "Smoke DMG package" in workflow
