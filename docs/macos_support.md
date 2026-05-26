@@ -59,6 +59,7 @@ These checks are valid on any development host unless noted:
 - The `Version Gate` workflow also runs `python scripts/check-macos-support-gate.py --skip-pr-checks` so M0-M5 issue closure and #116/M6 tracking are checked on every macOS support PR update without waiting for final real-Mac evidence.
 - The standalone `macOS App Validation` workflow provides the same macOS package validation path for PR/manual runs once GitHub recognizes the workflow from the repository default branch. Its `workflow_dispatch` path falls back to `github.sha` when no pull request SHA exists, and can run signed/notarized macOS validation before a tag release when the Apple Developer ID and notarization secrets are configured.
 - The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, copied DMG install app, `/Applications` installed app, and extracted ZIP app before uploading macOS release assets and `.sha256` checksums. PR validation also runs `scripts/smoke-macos-launchagent.sh` against the copied DMG install and `scripts/smoke-macos-applications-install.sh` against `/Applications/TunnelForge.app` to verify LaunchAgent plist structure and log paths on hosted macOS.
+- `bash scripts/macos-download-validation-artifacts.sh` uses `gh run download` to fetch the latest successful manual `workflow_dispatch` `macOS App Validation` artifacts for the current PR head, or a specific `--run-id`, then verifies downloaded DMG/ZIP files against their `.sha256` files. Use `--arch arm64` or `--arch x86_64` to fetch only one Mac architecture.
 
 These checks require macOS:
 
@@ -79,6 +80,7 @@ These checks require macOS:
   - `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`: Apple notarization credentials passed to `notarytool`.
 - When notarization credentials are present, `scripts/package-macos.sh` submits a temporary app ZIP for notarization, staples the returned ticket to the `.app`, validates the stapled `.app`, then creates the final ZIP distribution from that stapled `.app`. It also notarizes, staples, and validates the DMG distribution.
 - For a pre-release hosted check of the Apple secret path, manually run `.github/workflows/macos-app.yml` with `workflow_dispatch` on the release branch. When the signing certificate and notarization credentials are available, the workflow imports the Developer ID certificate into a temporary keychain, packages signed/notarized artifacts, then verifies the `.app` and DMG with `codesign --verify`, `spctl --assess`, and `xcrun stapler validate`.
+- After that hosted check passes, run `bash scripts/macos-download-validation-artifacts.sh --run-id <workflow-run-id> --arch <arm64|x86_64>` on the validator Mac to download the signed/notarized DMG and ZIP artifacts and verify their checksums before interactive testing.
 
 ## Final Manual Validation
 
@@ -86,21 +88,22 @@ Final Manual Validation must happen after all implementation milestones are comp
 
 Run on macOS:
 
-1. Run `bash scripts/macos-manual-validation-report.sh --run-smoke` to generate a report and smoke log under `build/` while running the automated release smoke checks. Use `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --run-smoke` when the validator is ready to let the smoke script install and remove `/Applications/TunnelForge.app`.
-2. Build Rust Core and app bundle with `bash scripts/build-macos.sh` if validating the build step separately.
-3. Package with `bash scripts/package-macos.sh` if validating packaging separately.
-4. Launch `dist/TunnelForge.app`.
-5. Confirm `tunnelforge-core` starts from inside the app.
-6. Create and close an SSH tunnel.
-7. Test MySQL and PostgreSQL DB connections.
-8. Run Export/Import on a disposable database.
-9. Run Migration smoke flow: inspect, preflight, plan, migrate, verify, resume.
-10. Enable and disable startup, then inspect the LaunchAgent file and `~/Library/Logs/TunnelForge/launchagent.{out,err}.log` paths.
-11. Check settings, logs, SQL history, migration state, analysis, and rollback files under macOS user directories.
-12. Open a downloaded DMG through the update UI and confirm it does not try to execute it directly.
-13. Install from DMG into Applications and launch from there.
-14. If distributing outside internal testing, verify codesign, notarization, and Gatekeeper behavior.
-15. Mark every report checkbox complete, set `Overall result` to `passed`, fill `Validator`, and run `bash scripts/macos-manual-validation-report.sh --finalize <report.md>`.
-16. If finalizing manually instead, run `bash scripts/macos-manual-validation-report.sh --check-complete <report.md>`, then `bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>`, then `python scripts/check-macos-support-gate.py --final --report <report.md> --bundle <evidence.zip>`.
-17. Confirm the finalizer or Python gate reports that the GitHub tracking issues, PR checks, completed report, smoke log, and evidence bundle agree.
-18. Attach the completed `build/macos-manual-validation-report-*.md` report, `build/macos-release-smoke-*.log` smoke log, `build/macos-manual-validation-evidence-*.zip` bundle with its embedded SHA256 manifest, and sibling `*.zip.sha256` checksum to the PR or release checklist before closing the final macOS gate.
+1. Download the signed/notarized GitHub Actions artifacts for the matching Mac architecture with `bash scripts/macos-download-validation-artifacts.sh --run-id <workflow-run-id> --arch <arm64|x86_64>`.
+2. Run `bash scripts/macos-manual-validation-report.sh --run-smoke` to generate a report and smoke log under `build/` while running the automated release smoke checks. Use `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --run-smoke` when the validator is ready to let the smoke script install and remove `/Applications/TunnelForge.app`.
+3. Build Rust Core and app bundle with `bash scripts/build-macos.sh` if validating the build step separately.
+4. Package with `bash scripts/package-macos.sh` if validating packaging separately.
+5. Launch `dist/TunnelForge.app`.
+6. Confirm `tunnelforge-core` starts from inside the app.
+7. Create and close an SSH tunnel.
+8. Test MySQL and PostgreSQL DB connections.
+9. Run Export/Import on a disposable database.
+10. Run Migration smoke flow: inspect, preflight, plan, migrate, verify, resume.
+11. Enable and disable startup, then inspect the LaunchAgent file and `~/Library/Logs/TunnelForge/launchagent.{out,err}.log` paths.
+12. Check settings, logs, SQL history, migration state, analysis, and rollback files under macOS user directories.
+13. Open a downloaded DMG through the update UI and confirm it does not try to execute it directly.
+14. Install from DMG into Applications and launch from there.
+15. If distributing outside internal testing, verify codesign, notarization, and Gatekeeper behavior.
+16. Mark every report checkbox complete, set `Overall result` to `passed`, fill `Validator`, and run `bash scripts/macos-manual-validation-report.sh --finalize <report.md>`.
+17. If finalizing manually instead, run `bash scripts/macos-manual-validation-report.sh --check-complete <report.md>`, then `bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>`, then `python scripts/check-macos-support-gate.py --final --report <report.md> --bundle <evidence.zip>`.
+18. Confirm the finalizer or Python gate reports that the GitHub tracking issues, PR checks, completed report, smoke log, and evidence bundle agree.
+19. Attach the completed `build/macos-manual-validation-report-*.md` report, `build/macos-release-smoke-*.log` smoke log, `build/macos-manual-validation-evidence-*.zip` bundle with its embedded SHA256 manifest, and sibling `*.zip.sha256` checksum to the PR or release checklist before closing the final macOS gate.

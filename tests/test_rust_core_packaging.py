@@ -294,6 +294,52 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "notarization" in script
 
 
+def test_macos_validation_artifact_download_script_fetches_manual_run_artifacts():
+    script = (PROJECT_ROOT / "scripts" / "macos-download-validation-artifacts.sh").read_text(encoding="utf-8")
+
+    assert "macOS App Validation" in script
+    assert "workflow_dispatch" in script
+    assert "macos-app.yml" in script
+    assert "gh run download" in script
+    assert "gh api" in script
+    assert "PR_NUMBER=117" in script
+    assert "TunnelForge-macOS-*-${ARCH_FILTER}" in script
+    assert "verify_downloaded_checksums" in script
+    assert "Checksum verified" in script
+
+
+def test_macos_validation_artifact_download_script_verifies_flat_downloaded_checksums(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    artifact_dir = tmp_path / "TunnelForge-macOS-2.0.5-arm64"
+    artifact_dir.mkdir()
+    dmg = artifact_dir / "TunnelForge-macOS-2.0.5-arm64.dmg"
+    dmg.write_bytes(b"fake-dmg")
+    checksum = hashlib.sha256(dmg.read_bytes()).hexdigest()
+    (artifact_dir / "TunnelForge-macOS-2.0.5-arm64.dmg.sha256").write_text(
+        f"{checksum}  dist/{dmg.name}\n",
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-download-validation-artifacts.sh",
+            "--verify-only",
+            artifact_dir.as_posix(),
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert f"Checksum verified:" in result.stdout
+    assert dmg.name in result.stdout
+
+
 def test_macos_launchagent_smoke_script_validates_packaged_app_plist():
     script = (PROJECT_ROOT / "scripts" / "smoke-macos-launchagent.sh").read_text(encoding="utf-8")
 
