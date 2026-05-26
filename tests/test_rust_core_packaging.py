@@ -1,4 +1,5 @@
 import hashlib
+import importlib.util
 import os
 from pathlib import Path
 import shutil
@@ -124,6 +125,15 @@ def write_bundle_checksum(bundle: Path) -> Path:
     checksum = bundle.with_name(f"{bundle.name}.sha256")
     checksum.write_text(f"{hashlib.sha256(bundle.read_bytes()).hexdigest()}  {bundle.name}\n", encoding="utf-8")
     return checksum
+
+
+def load_macos_support_gate_module():
+    script_path = PROJECT_ROOT / "scripts" / "check-macos-support-gate.py"
+    spec = importlib.util.spec_from_file_location("check_macos_support_gate", script_path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
@@ -831,6 +841,20 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "macOS App Validation" in script
     assert "Verify signed and notarized artifacts" in script
     assert "manual macOS signing/notarization workflow passed" in script
+    assert "check_report_artifact_workflow_run" in script
+    assert "manual validation report Artifact workflow run matches" in script
+
+
+def test_macos_support_gate_script_checks_report_artifact_workflow_run(tmp_path, capsys):
+    gate = load_macos_support_gate_module()
+    report = tmp_path / "macos-manual-validation-report.md"
+    report.write_text("- Artifact workflow run: 26477209665\n", encoding="utf-8")
+
+    assert gate.check_report_artifact_workflow_run(report, "26477209665", "manual macOS workflow run") is True
+    assert "manual validation report Artifact workflow run matches manual macOS workflow run: 26477209665" in capsys.readouterr().out
+
+    assert gate.check_report_artifact_workflow_run(report, "111", "manual macOS workflow run") is False
+    assert "manual validation report Artifact workflow run 26477209665 does not match manual macOS workflow run 111" in capsys.readouterr().err
 
 
 def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
