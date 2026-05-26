@@ -9,6 +9,7 @@ import json
 import shutil
 import subprocess
 import sys
+import zipfile
 from pathlib import Path
 
 
@@ -61,6 +62,20 @@ def bash_path(path: Path) -> str:
     return path.as_posix()
 
 
+def report_path_value(report: Path, prefix: str) -> str:
+    for line in report.read_text(encoding="utf-8").splitlines():
+        if line.startswith(prefix):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+def resolve_report_relative(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return ROOT / path
+
+
 def check_manual_report(report: Path) -> bool:
     if shutil.which("bash") is None:
         fail("bash is required to run scripts/macos-manual-validation-report.sh --check-complete")
@@ -80,6 +95,46 @@ def check_manual_report(report: Path) -> bool:
         return False
 
     ok(f"manual validation report is complete: {report}")
+    return True
+
+
+def default_bundle_for_report(report: Path) -> Path:
+    return ROOT / "build" / f"macos-manual-validation-evidence-{report.stem}.zip"
+
+
+def check_evidence_bundle(report: Path, bundle: Path) -> bool:
+    if not bundle.is_file():
+        fail(f"evidence bundle not found: {bundle}")
+        return False
+
+    smoke_log_value = report_path_value(report, "- Smoke log:")
+    if not smoke_log_value:
+        fail("manual validation report does not include a smoke log path")
+        return False
+
+    smoke_log = resolve_report_relative(smoke_log_value)
+    if not smoke_log.is_file():
+        fail(f"smoke log referenced by report is missing: {smoke_log}")
+        return False
+
+    expected_names = sorted([report.name, smoke_log.name])
+    try:
+        with zipfile.ZipFile(bundle) as archive:
+            names = sorted(archive.namelist())
+            if names != expected_names:
+                fail(f"evidence bundle must contain exactly {expected_names}, found {names}")
+                return False
+            if archive.read(report.name) != report.read_bytes():
+                fail(f"evidence bundle report does not match {report}")
+                return False
+            if archive.read(smoke_log.name) != smoke_log.read_bytes():
+                fail(f"evidence bundle smoke log does not match {smoke_log}")
+                return False
+    except zipfile.BadZipFile:
+        fail(f"evidence bundle is not a valid zip file: {bundle}")
+        return False
+
+    ok(f"evidence bundle is complete: {bundle}")
     return True
 
 
@@ -214,6 +269,11 @@ def parse_args() -> argparse.Namespace:
         help="Path to build/macos-manual-validation-report-*.md.",
     )
     parser.add_argument(
+        "--bundle",
+        type=Path,
+        help="Path to build/macos-manual-validation-evidence-*.zip.",
+    )
+    parser.add_argument(
         "--repo",
         help="GitHub repository in owner/name form. Defaults to gh repo view.",
     )
@@ -241,8 +301,15 @@ def main() -> int:
             passed = False
         else:
             passed = check_manual_report(report) and passed
+            bundle = args.bundle or default_bundle_for_report(report)
+            passed = check_evidence_bundle(report, bundle) and passed
     elif args.report:
         passed = check_manual_report(args.report) and passed
+        if args.bundle:
+            passed = check_evidence_bundle(args.report, args.bundle) and passed
+    elif args.bundle:
+        fail("--bundle requires --report unless --final resolves a report automatically")
+        passed = False
     else:
         ok("manual validation report is optional unless --final is used")
 

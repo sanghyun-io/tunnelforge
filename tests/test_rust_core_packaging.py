@@ -284,8 +284,11 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "macOS Support M6" in script
     assert "--final" in script
     assert "--report" in script
+    assert "--bundle" in script
     assert "--skip-github" in script
     assert "--skip-pr-checks" in script
+    assert "zipfile" in script
+    assert "check_evidence_bundle" in script
     assert "PR merge state skipped by request" in script
     assert "def bash_path" in script
     assert "scripts/macos-manual-validation-report.sh" in script
@@ -302,8 +305,10 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     smoke_log = report_dir / "macos-release-smoke.log"
     smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
+    bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
     report.write_text(
         "\n".join(
             [
@@ -317,6 +322,9 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
         ),
         encoding="utf-8",
     )
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.write(report, report.name)
+        archive.write(smoke_log, smoke_log.name)
 
     result = subprocess.run(
         [
@@ -326,6 +334,8 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
             "--skip-github",
             "--report",
             report_arg,
+            "--bundle",
+            bundle_arg,
         ],
         cwd=PROJECT_ROOT,
         text=True,
@@ -358,6 +368,56 @@ def test_macos_support_gate_script_rejects_missing_final_report():
 
     assert result.returncode == 1
     assert "manual validation report is incomplete" in result.stderr
+
+
+def test_macos_support_gate_script_rejects_incomplete_evidence_bundle(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-gate-bad-bundle"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    bundle = report_dir / "macos-manual-validation-evidence.zip"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text(
+        "\n".join(
+            [
+                "- Release smoke: passed",
+                f"- Smoke log: {smoke_log_arg}",
+                "- [x] Run `bash scripts/validate-macos-release.sh`",
+                "- Overall result: passed",
+                "- Validator: Codex",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.write(report, report.name)
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/check-macos-support-gate.py",
+            "--final",
+            "--skip-github",
+            "--report",
+            report_arg,
+            "--bundle",
+            bundle_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "evidence bundle must contain exactly" in result.stderr
 
 
 def test_release_workflow_has_macos_app_job_and_assets():
