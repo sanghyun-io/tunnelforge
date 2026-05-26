@@ -55,6 +55,21 @@ if [[ "$ARCH_NAME" != "$HOST_ARCH" ]]; then
   exit 1
 fi
 
+notarization_env_count=0
+[[ -n "${APPLE_ID:-}" ]] && notarization_env_count=$((notarization_env_count + 1))
+[[ -n "${APPLE_TEAM_ID:-}" ]] && notarization_env_count=$((notarization_env_count + 1))
+[[ -n "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]] && notarization_env_count=$((notarization_env_count + 1))
+
+if [[ "$notarization_env_count" -gt 0 && "$notarization_env_count" -lt 3 ]]; then
+  echo "Apple notarization credentials are incomplete; set APPLE_ID, APPLE_TEAM_ID, and APPLE_APP_SPECIFIC_PASSWORD together." >&2
+  exit 1
+fi
+
+if [[ "$notarization_env_count" -eq 3 && -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+  echo "APPLE_CODESIGN_IDENTITY is required before notarization." >&2
+  exit 1
+fi
+
 if [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
   echo "Signing $APP_PATH"
   codesign --force --deep --options runtime --timestamp \

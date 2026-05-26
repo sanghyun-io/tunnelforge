@@ -279,9 +279,75 @@ jobs:
           assert data["core_hello"]["request_id"] == "self-check"
           PY
 
+      - name: Import Apple Developer ID certificate
+        shell: bash
+        env:
+          APPLE_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12_BASE64 }}
+          APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_CODESIGN_KEYCHAIN_PASSWORD }}
+        run: |
+          if [[ -z "${APPLE_CODESIGN_CERTIFICATE_P12_BASE64:-}" ]]; then
+            echo "Apple signing certificate secret is not set; unsigned macOS artifacts will be built."
+            exit 0
+          fi
+
+          if [[ -z "${APPLE_CODESIGN_CERTIFICATE_PASSWORD:-}" ]]; then
+            echo "APPLE_CODESIGN_CERTIFICATE_PASSWORD is required when APPLE_CODESIGN_CERTIFICATE_P12_BASE64 is set." >&2
+            exit 1
+          fi
+
+          mkdir -p build
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path("build/apple-codesign.p12").write_bytes(
+              base64.b64decode(os.environ["APPLE_CODESIGN_CERTIFICATE_P12_BASE64"])
+          )
+          PY
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/tunnelforge-signing.keychain-db"
+          KEYCHAIN_PASSWORD="${APPLE_CODESIGN_KEYCHAIN_PASSWORD:-$(uuidgen)}"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import build/apple-codesign.p12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          if [[ -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+            APPLE_CODESIGN_IDENTITY="$(
+              security find-identity -v -p codesigning "$KEYCHAIN_PATH" |
+              awk -F '"' '/Developer ID Application/ { print $2; exit }'
+            )"
+          fi
+
+          if [[ -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+            echo "No Developer ID Application signing identity found in imported certificate." >&2
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+
+          {
+            echo "APPLE_CODESIGN_IDENTITY=$APPLE_CODESIGN_IDENTITY"
+            echo "APPLE_CODESIGN_KEYCHAIN_PATH=$KEYCHAIN_PATH"
+          } >> "$GITHUB_ENV"
+
       - name: Package macOS app
         env:
           MACOS_PACKAGE_ARCH: ${{ matrix.arch }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           bash scripts/package-macos.sh "${{ steps.get_version.outputs.version }}"
           test -f "dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip"
@@ -383,6 +449,15 @@ jobs:
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg.sha256
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip.sha256
           if-no-files-found: error
+
+      - name: Cleanup Apple signing keychain
+        if: always()
+        shell: bash
+        run: |
+          rm -f build/apple-codesign.p12
+          if [[ -n "${APPLE_CODESIGN_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$APPLE_CODESIGN_KEYCHAIN_PATH" || true
+          fi
 
   create-release:
     name: Create GitHub Release

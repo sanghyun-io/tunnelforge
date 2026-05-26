@@ -70,7 +70,13 @@ These checks require macOS:
 - `bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>` to create a `build/macos-manual-validation-evidence-*.zip` bundle containing the completed report, smoke log, and SHA256 manifest for PR or release attachment, plus a sibling `*.zip.sha256` checksum for the bundle itself. Use `--evidence-bundle <zip>` to choose a specific output path.
 - `bash scripts/macos-manual-validation-report.sh --finalize <report.md>` to run the completed-report check, create the evidence zip and checksum, run `scripts/check-macos-support-gate.py --final`, and print the exact report/log/zip/checksum attachment paths. Use `--skip-github` only for offline local rehearsal.
 - `python scripts/check-macos-support-gate.py --final --report build/macos-manual-validation-report-*.md --bundle build/macos-manual-validation-evidence-*.zip` to verify M0-M5 are closed, #116 is assigned to M6, PR #117 checks are green, and the real-Mac report/log/bundle evidence is complete. The Python gate accepts explicit paths or glob patterns and selects the newest match when multiple files exist.
-- Optional signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`.
+- Optional local signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`.
+- Optional GitHub Release signing/notarization secrets:
+  - `APPLE_CODESIGN_CERTIFICATE_P12_BASE64`: base64-encoded Developer ID Application `.p12` certificate.
+  - `APPLE_CODESIGN_CERTIFICATE_PASSWORD`: password for the `.p12` certificate.
+  - `APPLE_CODESIGN_IDENTITY`: optional explicit Developer ID Application identity name; if omitted, the release workflow discovers the first Developer ID Application identity from the imported certificate.
+  - `APPLE_CODESIGN_KEYCHAIN_PASSWORD`: optional temporary keychain password; if omitted, the release workflow generates one.
+  - `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`: Apple notarization credentials passed to `notarytool`.
 
 ## Final Manual Validation
 

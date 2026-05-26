@@ -82,6 +82,9 @@ def test_macos_package_script_creates_dmg_and_supports_signing_notarization():
     assert "APPLE_CODESIGN_IDENTITY" in script
     assert "notarytool submit" in script
     assert "stapler staple" in script
+    assert "notarization_env_count" in script
+    assert "Apple notarization credentials are incomplete" in script
+    assert "APPLE_CODESIGN_IDENTITY is required before notarization" in script
     assert "create_dmg_with_retry" in script
     assert "hdiutil create failed" in script
     assert "hdiutil info || true" in script
@@ -617,6 +620,17 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "macos-15-intel" in workflow
     assert "macos-14" in workflow
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
+    assert "Import Apple Developer ID certificate" in workflow
+    assert "APPLE_CODESIGN_CERTIFICATE_P12_BASE64" in workflow
+    assert "APPLE_CODESIGN_CERTIFICATE_PASSWORD" in workflow
+    assert "APPLE_CODESIGN_IDENTITY" in workflow
+    assert "security create-keychain" in workflow
+    assert "security import build/apple-codesign.p12" in workflow
+    assert "security set-key-partition-list" in workflow
+    assert "APPLE_ID: ${{ secrets.APPLE_ID }}" in workflow
+    assert "APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}" in workflow
+    assert "APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}" in workflow
+    assert "Cleanup Apple signing keychain" in workflow
     assert "scripts/build-macos.sh" in workflow
     assert "scripts/package-macos.sh" in workflow
     assert "rustc --version" in workflow

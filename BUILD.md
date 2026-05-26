@@ -490,6 +490,20 @@ export APPLE_APP_SPECIFIC_PASSWORD="app-specific-password"
 bash scripts/package-macos.sh
 ```
 
+GitHub Release에서 signed/notarized macOS artifact를 만들려면 repository secrets를 설정합니다.
+
+```text
+APPLE_CODESIGN_CERTIFICATE_P12_BASE64  # Developer ID Application .p12 인증서를 base64로 인코딩한 값
+APPLE_CODESIGN_CERTIFICATE_PASSWORD    # .p12 인증서 비밀번호
+APPLE_CODESIGN_IDENTITY                # 선택: Developer ID Application identity 이름
+APPLE_CODESIGN_KEYCHAIN_PASSWORD       # 선택: 임시 keychain 비밀번호
+APPLE_ID                               # Apple ID
+APPLE_TEAM_ID                          # Apple Team ID
+APPLE_APP_SPECIFIC_PASSWORD            # notarization용 app-specific password
+```
+
+`APPLE_CODESIGN_CERTIFICATE_P12_BASE64`가 없으면 release workflow는 unsigned macOS artifact를 빌드합니다. 인증서 secret이 있으면 workflow가 임시 keychain에 인증서를 import하고 `scripts/package-macos.sh`에 signing/notarization 환경 변수를 전달합니다.
+
 ---
 
 **문서 작성일:** 2026-01-27

@@ -42,6 +42,10 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "launchagent.{out,err}.log" in doc
     assert "LaunchAgent plist" in doc
     assert ".sha256" in doc
+    assert "APPLE_CODESIGN_CERTIFICATE_P12_BASE64" in doc
+    assert "APPLE_CODESIGN_CERTIFICATE_PASSWORD" in doc
+    assert "APPLE_CODESIGN_IDENTITY" in doc
+    assert "APPLE_APP_SPECIFIC_PASSWORD" in doc
 
 
 def test_macos_support_plan_references_github_tracking_issues():
