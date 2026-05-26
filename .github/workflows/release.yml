@@ -269,8 +269,10 @@ jobs:
           echo "| \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |" >> release_notes.md
           echo "| \`TunnelForge-macOS-$VERSION-arm64.dmg\` | macOS 앱 이미지 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
           echo "| \`TunnelForge-macOS-$VERSION-arm64.zip\` | macOS 앱 압축본 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-arm64.{dmg,zip}.sha256\` | macOS SHA-256 체크섬 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
           echo "| \`TunnelForge-macOS-$VERSION-x86_64.dmg\` | macOS 앱 이미지 (Intel) | 환경별 산출 |" >> release_notes.md
           echo "| \`TunnelForge-macOS-$VERSION-x86_64.zip\` | macOS 앱 압축본 (Intel) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-x86_64.{dmg,zip}.sha256\` | macOS SHA-256 체크섬 (Intel) | 환경별 산출 |" >> release_notes.md
           echo "" >> release_notes.md
           echo "### 설치 방법" >> release_notes.md
           echo "" >> release_notes.md
@@ -285,6 +287,7 @@ jobs:
           echo "**macOS:**" >> release_notes.md
           echo "1. Mac 종류에 맞는 \`TunnelForge-macOS-$VERSION-{arm64|x86_64}.dmg\` 다운로드" >> release_notes.md
           echo "2. DMG를 열고 \`TunnelForge.app\`을 Applications로 이동" >> release_notes.md
+          echo "3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증: \`shasum -a 256 -c <파일명>.sha256\`" >> release_notes.md
 
           echo ""
           echo "========== Generated Release Notes =========="

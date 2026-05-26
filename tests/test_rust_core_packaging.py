@@ -138,6 +138,9 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg.sha256" in workflow
     assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
     assert "macOS 앱 이미지" in workflow
+    assert "macOS SHA-256 체크섬" in workflow
+    assert "shasum -a 256 -c" in workflow
+    assert r"3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증" in workflow
 
 
 def test_macos_validation_workflow_builds_pr_artifacts():
