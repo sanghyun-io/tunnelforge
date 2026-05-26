@@ -15,6 +15,11 @@ Usage:
 Options:
   --run-smoke                 Run scripts/validate-macos-release.sh while creating the report.
                               Set MACOS_RELEASE_SMOKE_APPLICATIONS=1 to include /Applications install smoke.
+  --download-artifacts        Download and checksum-verify GitHub Actions macOS artifacts before report creation.
+  --artifact-run-id <id>      Download artifacts from a specific macOS App Validation workflow run.
+                              Defaults to the latest successful manual run for PR #117 head.
+  --artifact-output-dir <dir> Destination for downloaded artifacts.
+  --artifact-arch <arch>      Artifact architecture to download: arm64, x86_64, or all. Default: current Mac arch.
   --check-complete <report>   Verify a completed manual validation report has no open gates.
   --bundle-evidence <report>  Verify the completed report and create an attachable evidence zip.
   --finalize <report>         Verify, bundle, run the final gate, and print attachment paths.
@@ -25,6 +30,10 @@ EOF
 }
 
 RUN_SMOKE=0
+DOWNLOAD_ARTIFACTS=0
+ARTIFACT_RUN_ID_ARG=""
+ARTIFACT_OUTPUT_DIR_ARG=""
+ARTIFACT_ARCH_ARG=""
 CHECK_COMPLETE_PATH=""
 BUNDLE_EVIDENCE_PATH=""
 BUNDLE_OUTPUT_PATH=""
@@ -45,6 +54,34 @@ while [[ $# -gt 0 ]]; do
     --run-smoke)
       RUN_SMOKE=1
       shift
+      ;;
+    --download-artifacts)
+      DOWNLOAD_ARTIFACTS=1
+      shift
+      ;;
+    --artifact-run-id)
+      if [[ -z "${2:-}" ]]; then
+        echo "--artifact-run-id requires a run id." >&2
+        exit 2
+      fi
+      ARTIFACT_RUN_ID_ARG="$2"
+      shift 2
+      ;;
+    --artifact-output-dir)
+      if [[ -z "${2:-}" ]]; then
+        echo "--artifact-output-dir requires a directory." >&2
+        exit 2
+      fi
+      ARTIFACT_OUTPUT_DIR_ARG="$2"
+      shift 2
+      ;;
+    --artifact-arch)
+      if [[ -z "${2:-}" ]]; then
+        echo "--artifact-arch requires arm64, x86_64, or all." >&2
+        exit 2
+      fi
+      ARTIFACT_ARCH_ARG="$2"
+      shift 2
       ;;
     --check-complete)
       if [[ -z "${2:-}" ]]; then
@@ -98,6 +135,14 @@ extract_smoke_log_path() {
   local report_path="$1"
   grep -m1 -E '^- Smoke log:' "$report_path" \
     | sed -E 's/^- Smoke log:[[:space:]]*//' \
+    | tr -d '\r'
+}
+
+read_artifact_env_value() {
+  local env_path="$1"
+  local key="$2"
+  grep -m1 -E "^${key}=" "$env_path" \
+    | sed -E "s/^${key}=//" \
     | tr -d '\r'
 }
 
@@ -381,11 +426,30 @@ CARGO_VERSION="$(cargo --version 2>/dev/null || echo unavailable)"
 MACOS_VERSION="$(sw_vers -productVersion 2>/dev/null || echo unavailable)"
 MACOS_BUILD="$(sw_vers -buildVersion 2>/dev/null || echo unavailable)"
 ARCH="$(uname -m)"
+ARTIFACT_ARCH="${ARTIFACT_ARCH_ARG:-${ARCH}}"
+ARTIFACT_ENV_PATH="build/macos-validation-artifacts-${TIMESTAMP}.env"
+ARTIFACT_OUTPUT_DIR="${ARTIFACT_OUTPUT_DIR_ARG:-${MACOS_VALIDATION_ARTIFACT_DIR:-build/macos-validation-artifacts-${GIT_SHA}-${ARTIFACT_ARCH}}}"
 FINAL_APP_PATH="${MACOS_VALIDATION_APP_PATH:-/Applications/TunnelForge.app}"
 FINAL_APP_EXECUTABLE="${FINAL_APP_PATH}/Contents/MacOS/TunnelForge"
 ARTIFACT_WORKFLOW_RUN="${MACOS_VALIDATION_ARTIFACT_RUN_ID:-}"
 ARTIFACT_DIR="${MACOS_VALIDATION_ARTIFACT_DIR:-build/macos-validation-artifacts}"
 ARTIFACT_CHECKSUM_STATUS="${MACOS_VALIDATION_ARTIFACT_CHECKSUMS:-pending}"
+
+if [[ "$DOWNLOAD_ARTIFACTS" -eq 1 ]]; then
+  artifact_download_args=(
+    --arch "$ARTIFACT_ARCH"
+    --output-dir "$ARTIFACT_OUTPUT_DIR"
+    --write-env "$ARTIFACT_ENV_PATH"
+  )
+  if [[ -n "$ARTIFACT_RUN_ID_ARG" ]]; then
+    artifact_download_args+=(--run-id "$ARTIFACT_RUN_ID_ARG")
+  fi
+
+  bash scripts/macos-download-validation-artifacts.sh "${artifact_download_args[@]}"
+  ARTIFACT_WORKFLOW_RUN="$(read_artifact_env_value "$ARTIFACT_ENV_PATH" MACOS_VALIDATION_ARTIFACT_RUN_ID)"
+  ARTIFACT_DIR="$(read_artifact_env_value "$ARTIFACT_ENV_PATH" MACOS_VALIDATION_ARTIFACT_DIR)"
+  ARTIFACT_CHECKSUM_STATUS="$(read_artifact_env_value "$ARTIFACT_ENV_PATH" MACOS_VALIDATION_ARTIFACT_CHECKSUMS)"
+fi
 
 SMOKE_STATUS="not run"
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
@@ -423,6 +487,7 @@ cat > "$REPORT_PATH" <<EOF
 - Applications install smoke: set \`MACOS_RELEASE_SMOKE_APPLICATIONS=1\` before \`--run-smoke\` to include it in the smoke log
 - Completion check: \`bash scripts/macos-manual-validation-report.sh --check-complete ${REPORT_PATH}\`
 - Evidence bundle: \`bash scripts/macos-manual-validation-report.sh --bundle-evidence ${REPORT_PATH}\`
+- Artifact download: \`bash scripts/macos-download-validation-artifacts.sh --run-id ${ARTIFACT_WORKFLOW_RUN:-<workflow-run-id>} --arch ${ARTIFACT_ARCH} --output-dir ${ARTIFACT_DIR}\`
 
 ## Automated Smoke
 

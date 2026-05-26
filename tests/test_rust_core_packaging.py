@@ -3,6 +3,7 @@ import importlib.util
 import os
 from pathlib import Path
 import shutil
+import shlex
 import subprocess
 import tomllib
 import zipfile
@@ -270,6 +271,11 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "--finalize <report>" in script
     assert "--skip-github" in script
     assert "--evidence-bundle <zip>" in script
+    assert "--download-artifacts" in script
+    assert "--artifact-run-id <id>" in script
+    assert "--artifact-output-dir <dir>" in script
+    assert "--artifact-arch <arch>" in script
+    assert "macos-download-validation-artifacts.sh" in script
     assert "MACOS_VALIDATION_EVIDENCE_BUNDLE" in script
     assert "Evidence bundle:" in script
     assert "PYTHON_BIN" in script
@@ -323,12 +329,80 @@ def test_macos_validation_artifact_download_script_fetches_manual_run_artifacts(
     assert "macOS App Validation" in script
     assert "workflow_dispatch" in script
     assert "macos-app.yml" in script
-    assert "gh run download" in script
-    assert "gh api" in script
+    assert '"$GH_BIN" run download' in script
+    assert '"$GH_BIN" api' in script
     assert "PR_NUMBER=117" in script
     assert "TunnelForge-macOS-*-${ARCH_FILTER}" in script
     assert "verify_downloaded_checksums" in script
     assert "Checksum verified" in script
+    assert "--write-env <file>" in script
+    assert "MACOS_VALIDATION_ARTIFACT_RUN_ID" in script
+    assert "MACOS_VALIDATION_ARTIFACT_DIR" in script
+    assert "MACOS_VALIDATION_ARTIFACT_CHECKSUMS" in script
+
+
+def test_macos_validation_artifact_download_script_writes_env_file(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    fake_bin = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-fake-gh-bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "run" && "$2" == "download" ]]; then
+  output_dir=""
+  for ((i = 1; i <= $#; i++)); do
+    if [[ "${!i}" == "--dir" ]]; then
+      next=$((i + 1))
+      output_dir="${!next}"
+    fi
+  done
+  artifact_dir="${output_dir}/TunnelForge-macOS-2.0.5-arm64"
+  mkdir -p "$artifact_dir"
+  printf fake-dmg > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg"
+  shasum -a 256 "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg" > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg.sha256"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 1
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_gh.chmod(0o755)
+
+    output_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-artifacts"
+    env_file = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-macos-validation-artifacts.env"
+    output_dir_arg = output_dir.relative_to(PROJECT_ROOT).as_posix()
+    env_file_arg = env_file.relative_to(PROJECT_ROOT).as_posix()
+    fake_gh_arg = shlex.quote(fake_gh.relative_to(PROJECT_ROOT).as_posix())
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "GH="
+            + fake_gh_arg
+            + " bash scripts/macos-download-validation-artifacts.sh"
+            + " --run-id 26477946208"
+            + " --repo sanghyun-io/tunnelforge"
+            + " --arch arm64"
+            + f" --output-dir {shlex.quote(output_dir_arg)}"
+            + f" --write-env {shlex.quote(env_file_arg)}",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    env_text = env_file.read_text(encoding="utf-8")
+    assert "MACOS_VALIDATION_ARTIFACT_RUN_ID=26477946208" in env_text
+    assert f"MACOS_VALIDATION_ARTIFACT_DIR={output_dir_arg}" in env_text
+    assert "MACOS_VALIDATION_ARTIFACT_CHECKSUMS=passed" in env_text
 
 
 def test_macos_validation_artifact_download_script_verifies_flat_downloaded_checksums(tmp_path):

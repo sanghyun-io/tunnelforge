@@ -8,6 +8,7 @@ PR_NUMBER=117
 WORKFLOW_FILE="macos-app.yml"
 WORKFLOW_NAME="macOS App Validation"
 WORKFLOW_EVENT="workflow_dispatch"
+GH_BIN="${GH:-gh}"
 
 usage() {
   cat <<'EOF'
@@ -23,6 +24,7 @@ Options:
   --output-dir <dir>     Destination directory. Default: build/macos-validation-artifacts.
   --skip-verify          Download without verifying .sha256 files.
   --verify-only <dir>    Only verify already-downloaded artifacts under <dir>.
+  --write-env <file>     Write MACOS_VALIDATION_ARTIFACT_* variables for the report script.
   --help                 Show this help.
 EOF
 }
@@ -33,6 +35,7 @@ ARCH_FILTER="all"
 OUTPUT_DIR="build/macos-validation-artifacts"
 VERIFY_ONLY_DIR=""
 SKIP_VERIFY=0
+WRITE_ENV_PATH=""
 
 normalize_path() {
   local path="$1"
@@ -61,7 +64,7 @@ lowercase() {
 }
 
 require_gh() {
-  if ! command -v gh >/dev/null 2>&1; then
+  if ! command -v "$GH_BIN" >/dev/null 2>&1; then
     echo "gh is required to download macOS validation artifacts." >&2
     exit 1
   fi
@@ -73,7 +76,7 @@ resolve_repo() {
     return
   fi
 
-  gh repo view --json nameWithOwner --jq .nameWithOwner
+  "$GH_BIN" repo view --json nameWithOwner --jq .nameWithOwner
 }
 
 resolve_run_id() {
@@ -86,9 +89,9 @@ resolve_run_id() {
     return
   fi
 
-  pr_head_sha="$(gh pr view "$PR_NUMBER" --repo "$repo" --json headRefOid --jq .headRefOid)"
+  pr_head_sha="$("$GH_BIN" pr view "$PR_NUMBER" --repo "$repo" --json headRefOid --jq .headRefOid)"
   run_id="$(
-    gh api "repos/${repo}/actions/workflows/${WORKFLOW_FILE}/runs?event=${WORKFLOW_EVENT}&status=success&per_page=20" \
+    "$GH_BIN" api "repos/${repo}/actions/workflows/${WORKFLOW_FILE}/runs?event=${WORKFLOW_EVENT}&status=success&per_page=20" \
       --jq ".workflow_runs[] | select(.head_sha == \"${pr_head_sha}\") | .id" \
       | head -n 1
   )"
@@ -161,10 +164,30 @@ verify_downloaded_checksums() {
   fi
 }
 
+write_report_env_file() {
+  local env_path="$1"
+  local run_id="$2"
+  local artifact_dir="$3"
+  local checksum_status="$4"
+
+  if [[ -z "$env_path" ]]; then
+    return
+  fi
+
+  mkdir -p "$(dirname "$env_path")"
+  {
+    printf 'MACOS_VALIDATION_ARTIFACT_RUN_ID=%s\n' "$run_id"
+    printf 'MACOS_VALIDATION_ARTIFACT_DIR=%s\n' "$artifact_dir"
+    printf 'MACOS_VALIDATION_ARTIFACT_CHECKSUMS=%s\n' "$checksum_status"
+  } > "$env_path"
+  echo "Wrote macOS validation artifact environment: $env_path"
+}
+
 download_artifacts() {
   local repo=""
   local run_id=""
   local artifact_pattern=""
+  local checksum_status="skipped"
 
   require_gh
   repo="$(resolve_repo)"
@@ -178,11 +201,14 @@ download_artifacts() {
   fi
 
   echo "Downloading ${WORKFLOW_NAME} artifacts from run ${run_id}: ${artifact_pattern}"
-  gh run download "$run_id" --repo "$repo" --dir "$OUTPUT_DIR" --pattern "$artifact_pattern"
+  "$GH_BIN" run download "$run_id" --repo "$repo" --dir "$OUTPUT_DIR" --pattern "$artifact_pattern"
 
   if [[ "$SKIP_VERIFY" -ne 1 ]]; then
     verify_downloaded_checksums "$OUTPUT_DIR"
+    checksum_status="passed"
   fi
+
+  write_report_env_file "$WRITE_ENV_PATH" "$run_id" "$OUTPUT_DIR" "$checksum_status"
 
   echo
   echo "macOS validation artifacts are ready under $OUTPUT_DIR"
@@ -232,6 +258,14 @@ while [[ $# -gt 0 ]]; do
         exit 2
       fi
       VERIFY_ONLY_DIR="$2"
+      shift 2
+      ;;
+    --write-env)
+      if [[ -z "${2:-}" ]]; then
+        echo "--write-env requires a file path." >&2
+        exit 2
+      fi
+      WRITE_ENV_PATH="$2"
       shift 2
       ;;
     --help|-h)
