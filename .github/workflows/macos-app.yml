@@ -13,6 +13,7 @@ on:
       - "scripts/build-macos.sh"
       - "scripts/package-macos.sh"
       - "src/**"
+      - "tests/test_app_self_check.py"
       - "tests/test_macos_support_docs.py"
       - "tests/test_platform_integration.py"
       - "tests/test_platform_paths.py"
@@ -74,28 +75,31 @@ jobs:
             tests/test_resources.py \
             tests/test_update_downloader.py \
             tests/test_rust_core_packaging.py \
+            tests/test_app_self_check.py \
             tests/test_macos_support_docs.py
           cargo test --manifest-path migration_core/Cargo.toml
 
       - name: Build macOS app
         run: bash scripts/build-macos.sh
 
-      - name: Smoke bundled Rust core
+      - name: Smoke packaged TunnelForge app
         run: |
-          CORE_PATH="$(find "dist/TunnelForge.app" -type f -name "tunnelforge-core" | head -n 1)"
-          test -n "$CORE_PATH"
-          test -x "$CORE_PATH"
-          RESPONSE="$(printf '%s\n' '{"command":"service.hello","request_id":"ci-smoke","payload":{}}' | "$CORE_PATH")"
+          APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --self-check)"
           echo "$RESPONSE"
           RESPONSE="$RESPONSE" python - <<'PY'
           import json
           import os
 
           data = json.loads(os.environ["RESPONSE"])
-          assert data["event"] == "result"
-          assert data["request_id"] == "ci-smoke"
-          assert data["service"] == "tunnelforge-core"
           assert data["success"] is True
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["event"] == "result"
+          assert data["core_hello"]["request_id"] == "self-check"
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
           PY
 
       - name: Package macOS app

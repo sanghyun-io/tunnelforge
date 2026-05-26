@@ -1,16 +1,17 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
-import io
 import traceback
+import json
+import subprocess
 
 # Windows 콘솔 UTF-8 출력 지원 (이모지 출력을 위해)
 # GUI 모드(pythonw.exe 또는 PyInstaller --noconsole)에서는 stdout/stderr가 None일 수 있음
 if sys.platform == 'win32':
-    if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-    if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+    if sys.stderr is not None and hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 
 
 def get_app_dir() -> str:
@@ -49,14 +50,79 @@ def show_error_and_offer_recovery(error_message: str):
             pass
 
 
+def app_icon_path():
+    from src.core.resources import app_icon_path as resolve_app_icon_path
+
+    return resolve_app_icon_path()
+
+
+def db_core_executable() -> str:
+    from src.core.cross_engine_migration import db_core_executable as resolve_db_core_executable
+
+    return resolve_db_core_executable()
+
+
+def should_run_self_check(argv=None) -> bool:
+    return "--self-check" in (argv if argv is not None else sys.argv)
+
+
+def run_self_check() -> dict:
+    """Verify packaged-runtime essentials without starting the GUI event loop."""
+    icon = app_icon_path()
+    core = db_core_executable()
+    result = {
+        "success": False,
+        "icon_path": str(icon),
+        "icon_exists": icon.exists(),
+        "core_path": str(core),
+        "core_exists": os.path.exists(core),
+        "core_hello": None,
+    }
+
+    if not result["icon_exists"] or not result["core_exists"]:
+        return result
+
+    request = {
+        "command": "service.hello",
+        "request_id": "self-check",
+        "payload": {},
+    }
+    completed = subprocess.run(
+        [core],
+        input=json.dumps(request, ensure_ascii=False) + "\n",
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=10,
+    )
+    completed.check_returncode()
+    result["core_hello"] = json.loads(completed.stdout.strip().splitlines()[-1])
+    result["success"] = (
+        result["core_hello"].get("event") == "result"
+        and result["core_hello"].get("request_id") == "self-check"
+        and result["core_hello"].get("service") == "tunnelforge-core"
+        and result["core_hello"].get("success") is True
+    )
+    return result
+
+
+def run_self_check_cli() -> int:
+    result = run_self_check()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result["success"] else 1
+
+
 def main():
+    if should_run_self_check():
+        return run_self_check_cli()
+
     from PyQt6.QtWidgets import QApplication
     from PyQt6.QtGui import QIcon
 
     from src.core import ConfigManager, TunnelEngine
     from src.core.logger import get_logger
     from src.core.platform_integration import set_app_user_model_id
-    from src.core.resources import app_icon_path
     from src.core.single_instance import SingleInstanceGuard
     from src.ui.main_window import TunnelManagerUI
 
@@ -111,7 +177,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except Exception as e:
         # 전역 예외 핸들러: 시작 시 오류 발생하면 복구 프로그램 안내
         error_msg = f"{type(e).__name__}: {str(e)}"

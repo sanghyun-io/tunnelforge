@@ -55,7 +55,7 @@ These checks are valid on any development host unless noted:
 - `bash -n scripts/build-macos.sh scripts/package-macos.sh`
 - Parse `tunnel-manager.spec` as Python syntax.
 - Parse `.github/workflows/release.yml` and `.github/workflows/macos-app.yml` as YAML.
-- The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, and uploads DMG/ZIP artifacts for inspection.
+- The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, runs `TunnelForge.app/Contents/MacOS/TunnelForge --self-check`, and uploads DMG/ZIP artifacts for inspection.
 
 These checks require macOS:
 
