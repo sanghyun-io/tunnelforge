@@ -344,6 +344,11 @@ jobs:
           assert data["core_hello"]["service"] == "tunnelforge-core"
           PY
 
+      - name: Smoke LaunchAgent registration
+        shell: bash
+        run: |
+          bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app
+
       - name: Smoke ZIP package
         shell: bash
         run: |

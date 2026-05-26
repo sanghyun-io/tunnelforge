@@ -630,6 +630,8 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "build/install-smoke-mount" in workflow
     assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
+    assert "Smoke LaunchAgent registration" in workflow
+    assert "bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app" in workflow
     assert "Smoke ZIP package" in workflow
     assert "--ui-smoke-check" in workflow
     assert 'data["window_title"] == "TunnelForge"' in workflow
