@@ -23,6 +23,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "Export/Import" in doc
     assert "Migration" in doc
     assert "launchagent.{out,err}.log" in doc
+    assert ".sha256" in doc
 
 
 def test_macos_support_plan_references_github_tracking_issues():

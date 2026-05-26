@@ -83,7 +83,7 @@
 
 ### 1. Install
 
-Run the downloaded installer and follow the setup wizard. On macOS, download the DMG for your Mac architecture (`arm64` for Apple Silicon, `x86_64` for Intel), open it, and move `TunnelForge.app` to Applications.
+Run the downloaded installer and follow the setup wizard. On macOS, download the DMG for your Mac architecture (`arm64` for Apple Silicon, `x86_64` for Intel), optionally verify it with the matching `.sha256` file, open it, and move `TunnelForge.app` to Applications.
 
 ### 2. Add a Tunnel
 

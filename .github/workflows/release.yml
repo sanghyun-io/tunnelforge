@@ -445,6 +445,8 @@ jobs:
           bash scripts/package-macos.sh "${{ steps.get_version.outputs.version }}"
           test -f "dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip"
           test -f "dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg"
+          test -f "dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip.sha256"
+          test -f "dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg.sha256"
 
       - name: Smoke DMG package
         shell: bash
@@ -531,5 +533,7 @@ jobs:
           files: |
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg
             dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip
+            dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg.sha256
+            dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip.sha256
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

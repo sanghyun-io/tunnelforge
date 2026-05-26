@@ -55,6 +55,8 @@ def test_macos_package_script_creates_dmg_and_supports_signing_notarization():
     assert "stapler staple" in script
     assert 'ditto "$APP_PATH" "$DMG_STAGING/TunnelForge.app"' in script
     assert 'cp -R "$APP_PATH" "$DMG_STAGING/"' not in script
+    assert 'shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"' in script
+    assert 'shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"' in script
 
 
 def test_macos_release_validation_script_smokes_app_dmg_and_zip():
@@ -129,6 +131,8 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert 'data["core_hello"]["service"] == "tunnelforge-core"' in workflow
     assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
     assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip" in workflow
+    assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg.sha256" in workflow
+    assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
     assert "macOS 앱 이미지" in workflow
 
 
@@ -169,3 +173,5 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
     assert "actions/upload-artifact" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
+    assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256" in workflow
+    assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow

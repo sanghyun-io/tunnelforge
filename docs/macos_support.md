@@ -34,7 +34,7 @@ Each release candidate must validate these user-visible behaviors:
 - Migration: cross-engine inspect, preflight, plan, migrate, verify, and resume flows are callable.
 - Settings: config, encryption key, SQL history, migration state, analysis, rollback, and logs use macOS-appropriate user paths.
 - Startup: LaunchAgent registration creates and removes `~/Library/LaunchAgents/io.sanghyun.tunnelforge.plist` and records launch stdout/stderr under `~/Library/Logs/TunnelForge/`.
-- Updates: release asset selection prefers the current Mac architecture's DMG and does not execute DMG/ZIP files as programs.
+- Updates: release asset selection prefers the current Mac architecture's DMG, publishes `.sha256` checksums for DMG/ZIP packages, and does not execute DMG/ZIP files as programs.
 
 ## Windows Regression Gates
 
@@ -55,8 +55,8 @@ These checks are valid on any development host unless noted:
 - `bash -n scripts/build-macos.sh scripts/package-macos.sh`
 - Parse `tunnel-manager.spec` as Python syntax.
 - Parse `.github/workflows/release.yml` and `.github/workflows/macos-app.yml` as YAML.
-- The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, runs `TunnelForge.app/Contents/MacOS/TunnelForge --ui-smoke-check`, validates a copied DMG install path, and uploads DMG/ZIP artifacts for inspection.
-- The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, copied DMG install app, and extracted ZIP app before uploading macOS release assets.
+- The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, runs `TunnelForge.app/Contents/MacOS/TunnelForge --ui-smoke-check`, validates a copied DMG install path, and uploads DMG/ZIP artifacts plus `.sha256` checksums for inspection.
+- The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, copied DMG install app, and extracted ZIP app before uploading macOS release assets and `.sha256` checksums.
 
 These checks require macOS:
 

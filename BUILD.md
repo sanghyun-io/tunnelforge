@@ -476,6 +476,8 @@ bash scripts/package-macos.sh
 ```text
 dist/TunnelForge-macOS-{version}-{arm64|x86_64}.dmg
 dist/TunnelForge-macOS-{version}-{arm64|x86_64}.zip
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.dmg.sha256
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.zip.sha256
 ```
 
 환경 변수가 설정된 경우 코드 서명과 노터라이즈도 수행합니다.

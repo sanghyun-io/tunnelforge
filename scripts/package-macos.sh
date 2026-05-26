@@ -52,6 +52,8 @@ hdiutil create -volname "TunnelForge" \
   -srcfolder "$DMG_STAGING" \
   -ov -format UDZO "$DMG_PATH"
 
+shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"
+
 if [[ -n "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
   echo "Signing $DMG_PATH"
   codesign --force --timestamp --sign "$APPLE_CODESIGN_IDENTITY" "$DMG_PATH"
@@ -69,5 +71,9 @@ else
   echo "Apple notarization credentials are not set; skipping notarization."
 fi
 
+shasum -a 256 "$DMG_PATH" > "$DMG_PATH.sha256"
+
 echo "Created $ZIP_PATH"
+echo "Created $ZIP_PATH.sha256"
 echo "Created $DMG_PATH"
+echo "Created $DMG_PATH.sha256"

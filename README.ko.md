@@ -50,7 +50,7 @@
 
 ### 1. 설치
 
-다운로드한 설치 파일을 실행하고 설치 마법사를 따라 진행하세요. macOS에서는 Mac 아키텍처에 맞는 DMG(`arm64`는 Apple Silicon, `x86_64`는 Intel)를 열고 `TunnelForge.app`을 Applications로 이동하세요.
+다운로드한 설치 파일을 실행하고 설치 마법사를 따라 진행하세요. macOS에서는 Mac 아키텍처에 맞는 DMG(`arm64`는 Apple Silicon, `x86_64`는 Intel)를 받고, 필요하면 함께 제공되는 `.sha256` 파일로 검증한 뒤, DMG를 열어 `TunnelForge.app`을 Applications로 이동하세요.
 
 ### 2. 터널 추가
 
