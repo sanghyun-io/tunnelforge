@@ -17,6 +17,7 @@ def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
     assert "if os.name == 'nt' else app_bundle" in spec
     assert "from src.version import __version__" in spec
     assert "'CFBundleShortVersionString': __version__" in spec
+    assert "'LSMinimumSystemVersion': '13.0'" in spec
 
 
 def test_windows_installer_builds_and_checks_core_service_binaries():
@@ -34,6 +35,9 @@ def test_macos_build_script_builds_core_and_pyinstaller_app():
     assert "cargo build --manifest-path migration_core/Cargo.toml --release" in script
     assert "python -m PyInstaller tunnel-manager.spec --noconfirm" in script
     assert "dist/TunnelForge.app" in script
+    assert "/usr/libexec/PlistBuddy" in script
+    assert ":LSMinimumSystemVersion" in script
+    assert 'Minimum macOS version must be 13.0' in script
     assert "tunnelforge-core" in script
     assert "icon_512x512@2x.png" not in script
 

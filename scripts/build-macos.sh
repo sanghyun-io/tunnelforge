@@ -48,6 +48,12 @@ if [[ ! -d "dist/TunnelForge.app" ]]; then
   exit 1
 fi
 
+MINIMUM_MACOS_VERSION="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "dist/TunnelForge.app/Contents/Info.plist")"
+if [[ "$MINIMUM_MACOS_VERSION" != "13.0" ]]; then
+  echo "Minimum macOS version must be 13.0; found $MINIMUM_MACOS_VERSION" >&2
+  exit 1
+fi
+
 if ! find "dist/TunnelForge.app" -type f -name "tunnelforge-core" | grep -q .; then
   echo "Missing bundled tunnelforge-core in dist/TunnelForge.app" >&2
   exit 1

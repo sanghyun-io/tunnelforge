@@ -149,6 +149,7 @@ if os.name != 'nt':
             'CFBundleDisplayName': 'TunnelForge',
             'CFBundleShortVersionString': __version__,
             'CFBundleVersion': __version__,
+            'LSMinimumSystemVersion': '13.0',
             'NSHighResolutionCapable': True,
         },
     )
