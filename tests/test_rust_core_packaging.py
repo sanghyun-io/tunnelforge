@@ -55,6 +55,7 @@ def test_release_workflow_has_macos_app_job_and_assets():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
     assert "build-macos-app:" in workflow
+    assert "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true" in workflow
     assert "macos-15-intel" in workflow
     assert "macos-14" in workflow
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
@@ -69,6 +70,7 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "macos-app.yml").read_text(encoding="utf-8")
 
     assert "name: macOS App Validation" in workflow
+    assert "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true" in workflow
     assert "pull_request:" in workflow
     assert "workflow_dispatch:" in workflow
     assert "macos-14" in workflow
