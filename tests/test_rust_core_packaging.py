@@ -102,6 +102,9 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "macos-14" in workflow
     assert "macos-15-intel" in workflow
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
+    assert "Smoke source-run TunnelForge app" in workflow
+    assert "python main.py --ui-smoke-check" in workflow
+    assert 'data["self_check"]["core_hello"]["service"] == "tunnelforge-core"' in workflow
     assert "bash scripts/build-macos.sh" in workflow
     assert "Smoke packaged TunnelForge app" in workflow
     assert 'APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"' in workflow
