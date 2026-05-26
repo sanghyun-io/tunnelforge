@@ -1,4 +1,5 @@
 from pathlib import Path
+import tomllib
 
 import yaml
 
@@ -28,6 +29,13 @@ def test_windows_installer_builds_and_checks_core_service_binaries():
     assert "cargo build --manifest-path migration_core\\Cargo.toml --release" in script
     assert "migration_core\\target\\release\\tunnelforge-core.exe" in script
     assert "tunnelforge-core DB service 빌드 완료" in script
+
+
+def test_dev_dependencies_include_yaml_parser_for_workflow_tests():
+    pyproject = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    dev_dependencies = pyproject["project"]["optional-dependencies"]["dev"]
+
+    assert any(dependency.lower().startswith("pyyaml") for dependency in dev_dependencies)
 
 
 def test_macos_build_script_builds_core_and_pyinstaller_app():
