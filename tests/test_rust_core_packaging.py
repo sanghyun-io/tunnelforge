@@ -80,6 +80,8 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "scripts/package-macos.sh" in workflow
     assert "tests/test_app_self_check.py" in workflow
     assert "tests/test_settings_update_actions.py" in workflow
+    assert "Smoke source-run TunnelForge app" in workflow
+    assert "python main.py --ui-smoke-check" in workflow
     assert "Smoke packaged TunnelForge app" in workflow
     assert "Smoke DMG package" in workflow
     assert "Smoke ZIP package" in workflow

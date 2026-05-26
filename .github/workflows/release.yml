@@ -394,6 +394,24 @@ jobs:
           pytest tests/test_platform_paths.py tests/test_platform_integration.py tests/test_rust_core_packaging.py tests/test_update_downloader.py tests/test_settings_update_actions.py tests/test_app_self_check.py
           cargo test --manifest-path migration_core/Cargo.toml
 
+      - name: Smoke source-run TunnelForge app
+        run: |
+          cargo build --manifest-path migration_core/Cargo.toml --release
+          RESPONSE="$(python main.py --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          assert data["self_check"]["icon_exists"] is True
+          assert data["self_check"]["core_exists"] is True
+          assert data["self_check"]["core_hello"]["service"] == "tunnelforge-core"
+          assert data["self_check"]["core_hello"]["success"] is True
+          PY
+
       - name: Build macOS app
         run: |
           bash scripts/build-macos.sh

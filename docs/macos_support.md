@@ -56,7 +56,7 @@ These checks are valid on any development host unless noted:
 - Parse `tunnel-manager.spec` as Python syntax.
 - Parse `.github/workflows/release.yml` and `.github/workflows/macos-app.yml` as YAML.
 - The `macOS App Validation` workflow runs on pull requests and manual dispatch, builds `arm64` and `x86_64` `.app` packages, runs `TunnelForge.app/Contents/MacOS/TunnelForge --ui-smoke-check`, and uploads DMG/ZIP artifacts for inspection.
-- The release workflow repeats the same `--ui-smoke-check` against the built `.app`, the mounted DMG app, and the extracted ZIP app before uploading macOS release assets.
+- The release workflow repeats `--ui-smoke-check` against the source app, built `.app`, mounted DMG app, and extracted ZIP app before uploading macOS release assets.
 
 These checks require macOS:
 
