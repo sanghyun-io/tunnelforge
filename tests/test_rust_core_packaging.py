@@ -28,11 +28,57 @@ REQUIRED_MANUAL_REPORT_SECTIONS = [
 ]
 
 
+REQUIRED_MANUAL_REPORT_CHECK_ITEMS = [
+    "Run `bash scripts/validate-macos-release.sh`",
+    "Confirm source `python main.py --ui-smoke-check` passed",
+    "Confirm built app smoke passed",
+    "Confirm mounted DMG smoke passed",
+    "Confirm copied DMG install smoke passed",
+    "Confirm ZIP extracted app smoke passed",
+    "Launch `python main.py`",
+    "Launch `dist/TunnelForge.app`",
+    "Install from DMG into `/Applications` and launch `/Applications/TunnelForge.app`",
+    "Confirm `tunnelforge-core` starts from inside the app",
+    "Create an SSH tunnel",
+    "Confirm tunnel monitoring updates",
+    "Close the SSH tunnel cleanly",
+    "Test MySQL connection through Rust DB Core",
+    "Test PostgreSQL connection through Rust DB Core",
+    "Run Export/Import on a disposable MySQL database",
+    "Run Export/Import on a disposable PostgreSQL database",
+    "Run inspect",
+    "Run preflight",
+    "Run plan",
+    "Run migrate",
+    "Run verify",
+    "Run resume after an interrupted disposable migration",
+    "Confirm config files use macOS user directories",
+    "Confirm logs use macOS user directories",
+    "Confirm SQL history uses macOS user directories",
+    "Confirm migration state, analysis, and rollback files use macOS user directories",
+    "Enable startup in settings",
+    "Confirm `~/Library/LaunchAgents/io.sanghyun.tunnelforge.plist` exists",
+    "Confirm LaunchAgent points to the expected app path",
+    "Confirm LaunchAgent writes stdout to `~/Library/Logs/TunnelForge/launchagent.out.log`",
+    "Confirm LaunchAgent writes stderr to `~/Library/Logs/TunnelForge/launchagent.err.log`",
+    "Disable startup in settings",
+    "Confirm LaunchAgent is removed",
+    "Confirm macOS update selection prefers the current architecture DMG",
+    "Confirm the update UI opens the downloaded package",
+    "Confirm the update UI does not execute DMG or ZIP as a program",
+    "Run `codesign --verify --deep --strict --verbose=2 /Applications/TunnelForge.app`",
+    "Run `spctl --assess --type execute --verbose /Applications/TunnelForge.app`",
+    "Confirm notarization status if distributing outside internal testing",
+    "Confirm first launch behavior after download/install",
+]
+
+
 def completed_manual_report_lines(smoke_log_arg: str) -> list[str]:
     return [
         "- Release smoke: passed",
         f"- Smoke log: {smoke_log_arg}",
         *REQUIRED_MANUAL_REPORT_SECTIONS,
+        *(f"- [x] {item}" for item in REQUIRED_MANUAL_REPORT_CHECK_ITEMS),
         "- Overall result: passed",
         "- Validator: Codex",
         "",
@@ -195,7 +241,9 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "Evidence bundle checksum:" in script
     assert "check_complete_report" in script
     assert "required_sections" in script
+    assert "required_check_items" in script
     assert "Manual validation report is missing required section" in script
+    assert "Manual validation report is missing required checklist item" in script
     assert "create_evidence_bundle" in script
     assert "finalize_evidence" in script
     assert "scripts/check-macos-support-gate.py" in script
@@ -352,6 +400,48 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
 
     assert result.returncode == 1
     assert "Manual validation report is missing required section" in result.stderr
+
+
+def test_macos_manual_validation_report_check_complete_rejects_missing_required_check_items(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-items"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text(
+        "\n".join(
+            [
+                "- Release smoke: passed",
+                f"- Smoke log: {smoke_log_arg}",
+                *REQUIRED_MANUAL_REPORT_SECTIONS,
+                "- Overall result: passed",
+                "- Validator: Codex",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Manual validation report is missing required checklist item" in result.stderr
 
 
 def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):

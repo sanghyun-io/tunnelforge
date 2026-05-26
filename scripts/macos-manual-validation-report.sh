@@ -145,6 +145,57 @@ check_complete_report() {
     fi
   done
 
+  local required_check_items=(
+    'Run `bash scripts/validate-macos-release.sh`'
+    'Confirm source `python main.py --ui-smoke-check` passed'
+    'Confirm built app smoke passed'
+    'Confirm mounted DMG smoke passed'
+    'Confirm copied DMG install smoke passed'
+    'Confirm ZIP extracted app smoke passed'
+    'Launch `python main.py`'
+    'Launch `dist/TunnelForge.app`'
+    'Install from DMG into `/Applications` and launch'
+    'Confirm `tunnelforge-core` starts from inside the app'
+    'Create an SSH tunnel'
+    'Confirm tunnel monitoring updates'
+    'Close the SSH tunnel cleanly'
+    'Test MySQL connection through Rust DB Core'
+    'Test PostgreSQL connection through Rust DB Core'
+    'Run Export/Import on a disposable MySQL database'
+    'Run Export/Import on a disposable PostgreSQL database'
+    'Run inspect'
+    'Run preflight'
+    'Run plan'
+    'Run migrate'
+    'Run verify'
+    'Run resume after an interrupted disposable migration'
+    'Confirm config files use macOS user directories'
+    'Confirm logs use macOS user directories'
+    'Confirm SQL history uses macOS user directories'
+    'Confirm migration state, analysis, and rollback files use macOS user directories'
+    'Enable startup in settings'
+    'Confirm `~/Library/LaunchAgents/io.sanghyun.tunnelforge.plist` exists'
+    'Confirm LaunchAgent points to the expected app path'
+    'Confirm LaunchAgent writes stdout to `~/Library/Logs/TunnelForge/launchagent.out.log`'
+    'Confirm LaunchAgent writes stderr to `~/Library/Logs/TunnelForge/launchagent.err.log`'
+    'Disable startup in settings'
+    'Confirm LaunchAgent is removed'
+    'Confirm macOS update selection prefers the current architecture DMG'
+    'Confirm the update UI opens the downloaded package'
+    'Confirm the update UI does not execute DMG or ZIP as a program'
+    'Run `codesign --verify --deep --strict --verbose=2'
+    'Run `spctl --assess --type execute --verbose'
+    'Confirm notarization status if distributing outside internal testing'
+    'Confirm first launch behavior after download/install'
+  )
+
+  for required_check_item in "${required_check_items[@]}"; do
+    if ! grep -qF -- "- [x] $required_check_item" "$report_path"; then
+      echo "Manual validation report is missing required checklist item: $required_check_item" >&2
+      failures=1
+    fi
+  done
+
   if grep -qE '^[[:space:]]*- \[ \]' "$report_path"; then
     echo "Manual validation report still has unchecked items:" >&2
     grep -nE '^[[:space:]]*- \[ \]' "$report_path" >&2

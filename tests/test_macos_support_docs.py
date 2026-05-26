@@ -33,6 +33,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "Overall result" in doc
     assert "Validator" in doc
     assert "required sections" in doc
+    assert "required checklist items" in doc
     assert "python main.py --ui-smoke-check" in doc
     assert "copied DMG install" in doc
     assert "/Applications install smoke" in doc
