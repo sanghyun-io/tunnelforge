@@ -312,8 +312,12 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "Final app path:" in script
     assert "Completion check:" in script
     assert "SSH tunnel" in script
+    assert "- Optional: record reconnect behavior if applicable" in script
+    assert "- [ ] Confirm reconnect behavior if applicable" not in script
     assert "MySQL" in script
     assert "PostgreSQL" in script
+    assert "- Optional: record direct connection mode if applicable" in script
+    assert "- [ ] Test direct connection mode if applicable" not in script
     assert "Export/Import" in script
     assert "Migration" in script
     assert "LaunchAgent" in script

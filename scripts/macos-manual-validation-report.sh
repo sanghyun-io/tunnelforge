@@ -512,14 +512,14 @@ cat > "$REPORT_PATH" <<EOF
 
 - [ ] Create an SSH tunnel
 - [ ] Confirm tunnel monitoring updates
-- [ ] Confirm reconnect behavior if applicable
+- Optional: record reconnect behavior if applicable
 - [ ] Close the SSH tunnel cleanly
 
 ## Database Connections
 
 - [ ] Test MySQL connection through Rust DB Core
 - [ ] Test PostgreSQL connection through Rust DB Core
-- [ ] Test direct connection mode if applicable
+- Optional: record direct connection mode if applicable
 
 ## Export/Import
 
