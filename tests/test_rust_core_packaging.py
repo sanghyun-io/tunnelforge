@@ -140,6 +140,7 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "pull_request:" in workflow
     assert "workflow_dispatch:" in workflow
     assert '"scripts/validate-macos-release.sh"' in workflow
+    assert '"scripts/macos-manual-validation-report.sh"' in workflow
     assert "tests/test_app_self_check.py" in workflow
     assert "tests/test_settings_update_actions.py" in workflow
     assert "macos-14" in workflow
