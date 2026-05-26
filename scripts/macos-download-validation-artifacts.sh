@@ -36,8 +36,10 @@ SKIP_VERIFY=0
 
 normalize_path() {
   local path="$1"
+  local drive=""
   if [[ "$path" =~ ^([A-Za-z]):/(.*)$ ]] && [[ -r /proc/version ]] && grep -qi microsoft /proc/version; then
-    echo "/mnt/${BASH_REMATCH[1],,}/${BASH_REMATCH[2]}"
+    drive="$(printf '%s' "${BASH_REMATCH[1]}" | tr '[:upper:]' '[:lower:]')"
+    echo "/mnt/${drive}/${BASH_REMATCH[2]}"
     return
   fi
 
@@ -52,6 +54,10 @@ normalize_path() {
   fi
 
   echo "$path"
+}
+
+lowercase() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
 require_gh() {
@@ -103,6 +109,8 @@ verify_checksum_file() {
   local artifact_name=""
   local artifact_path=""
   local actual=""
+  local actual_lower=""
+  local expected_lower=""
 
   checksum_dir="$(dirname "$checksum_file")"
 
@@ -121,7 +129,9 @@ verify_checksum_file() {
     fi
 
     actual="$(shasum -a 256 "$artifact_path" | awk '{print $1}')"
-    if [[ "${actual,,}" != "${expected,,}" ]]; then
+    actual_lower="$(lowercase "$actual")"
+    expected_lower="$(lowercase "$expected")"
+    if [[ "$actual_lower" != "$expected_lower" ]]; then
       echo "Checksum mismatch for ${artifact_path}: expected ${expected}, got ${actual}" >&2
       return 1
     fi
