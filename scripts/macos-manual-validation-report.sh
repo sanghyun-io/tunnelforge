@@ -170,6 +170,7 @@ create_evidence_bundle() {
   mkdir -p "$(dirname "$bundle_path")"
 
   "$PYTHON_BIN" - "$report_path" "$smoke_log_path" "$bundle_path" <<'PY'
+import hashlib
 import sys
 from pathlib import Path
 from zipfile import ZIP_DEFLATED, ZipFile
@@ -177,10 +178,20 @@ from zipfile import ZIP_DEFLATED, ZipFile
 report_path = Path(sys.argv[1])
 smoke_log_path = Path(sys.argv[2])
 bundle_path = Path(sys.argv[3])
+manifest_name = f"macos-manual-validation-evidence-{report_path.stem}.sha256"
+
+def digest(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+manifest = (
+    f"{digest(report_path)}  {report_path.name}\n"
+    f"{digest(smoke_log_path)}  {smoke_log_path.name}\n"
+)
 
 with ZipFile(bundle_path, "w", ZIP_DEFLATED) as archive:
     archive.write(report_path, report_path.name)
     archive.write(smoke_log_path, smoke_log_path.name)
+    archive.writestr(manifest_name, manifest)
 PY
 
   echo "Created $bundle_path"

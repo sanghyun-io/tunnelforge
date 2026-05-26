@@ -1,3 +1,4 @@
+import hashlib
 import os
 from pathlib import Path
 import shutil
@@ -10,6 +11,13 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def evidence_manifest(report: Path, smoke_log: Path) -> str:
+    return (
+        f"{hashlib.sha256(report.read_bytes()).hexdigest()}  {report.name}\n"
+        f"{hashlib.sha256(smoke_log.read_bytes()).hexdigest()}  {smoke_log.name}\n"
+    )
 
 
 def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
@@ -117,6 +125,8 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "MACOS_VALIDATION_EVIDENCE_BUNDLE" in script
     assert "Evidence bundle:" in script
     assert "PYTHON_BIN" in script
+    assert "hashlib.sha256" in script
+    assert "manifest_name" in script
     assert "check_complete_report" in script
     assert "create_evidence_bundle" in script
     assert "finalize_evidence" in script
@@ -273,10 +283,13 @@ def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
     assert result.returncode == 0, result.stderr
     assert bundle.exists()
     with zipfile.ZipFile(bundle) as archive:
+        manifest_name = "macos-manual-validation-evidence-macos-manual-validation-report.sha256"
         assert sorted(archive.namelist()) == [
+            manifest_name,
             "macos-manual-validation-report.md",
             "macos-release-smoke.log",
         ]
+        assert archive.read(manifest_name).decode("utf-8") == evidence_manifest(report, smoke_log)
 
 
 def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate(tmp_path):
@@ -324,6 +337,8 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
 
     assert result.returncode == 0, result.stderr
     assert bundle.exists()
+    with zipfile.ZipFile(bundle) as archive:
+        assert "macos-manual-validation-evidence-macos-manual-validation-report.sha256" in archive.namelist()
     assert "macOS support gate checks passed" in result.stdout
     assert "Final macOS validation evidence is ready" in result.stdout
     assert f"- Report: {report_arg}" in result.stdout
@@ -346,7 +361,10 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "--skip-github" in script
     assert "--skip-pr-checks" in script
     assert "zipfile" in script
+    assert "hashlib" in script
     assert "check_evidence_bundle" in script
+    assert "evidence_manifest_name" in script
+    assert "evidence bundle is complete with manifest" in script
     assert "glob.has_magic" in script
     assert "selected newest" in script
     assert "PR merge state skipped by request" in script
@@ -385,6 +403,10 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(report, report.name)
         archive.write(smoke_log, smoke_log.name)
+        archive.writestr(
+            "macos-manual-validation-evidence-macos-manual-validation-report.sha256",
+            evidence_manifest(report, smoke_log),
+        )
 
     result = subprocess.run(
         [
@@ -436,6 +458,10 @@ def test_macos_support_gate_script_accepts_globbed_final_report_and_bundle(tmp_p
         with zipfile.ZipFile(bundle, "w") as archive:
             archive.write(report, report.name)
             archive.write(smoke_log, smoke_log.name)
+            archive.writestr(
+                f"macos-manual-validation-evidence-{report.stem}.sha256",
+                evidence_manifest(report, smoke_log),
+            )
         os.utime(report, (mtime, mtime))
         os.utime(bundle, (mtime, mtime))
         return report, bundle

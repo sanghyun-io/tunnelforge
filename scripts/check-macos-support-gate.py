@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import shutil
 import subprocess
@@ -137,6 +138,14 @@ def default_bundle_for_report(report: Path) -> Path:
     return ROOT / "build" / f"macos-manual-validation-evidence-{report.stem}.zip"
 
 
+def evidence_manifest_name(report: Path) -> str:
+    return f"macos-manual-validation-evidence-{report.stem}.sha256"
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
 def check_evidence_bundle(report: Path, bundle: Path) -> bool:
     if not bundle.is_file():
         fail(f"evidence bundle not found: {bundle}")
@@ -152,24 +161,34 @@ def check_evidence_bundle(report: Path, bundle: Path) -> bool:
         fail(f"smoke log referenced by report is missing: {smoke_log}")
         return False
 
-    expected_names = sorted([report.name, smoke_log.name])
+    manifest_name = evidence_manifest_name(report)
+    expected_names = sorted([report.name, smoke_log.name, manifest_name])
     try:
         with zipfile.ZipFile(bundle) as archive:
             names = sorted(archive.namelist())
             if names != expected_names:
                 fail(f"evidence bundle must contain exactly {expected_names}, found {names}")
                 return False
-            if archive.read(report.name) != report.read_bytes():
+            report_bytes = report.read_bytes()
+            smoke_log_bytes = smoke_log.read_bytes()
+            if archive.read(report.name) != report_bytes:
                 fail(f"evidence bundle report does not match {report}")
                 return False
-            if archive.read(smoke_log.name) != smoke_log.read_bytes():
+            if archive.read(smoke_log.name) != smoke_log_bytes:
                 fail(f"evidence bundle smoke log does not match {smoke_log}")
+                return False
+            expected_manifest = (
+                f"{sha256_hex(report_bytes)}  {report.name}\n"
+                f"{sha256_hex(smoke_log_bytes)}  {smoke_log.name}\n"
+            )
+            if archive.read(manifest_name).decode("utf-8") != expected_manifest:
+                fail(f"evidence bundle manifest does not match report/log hashes: {manifest_name}")
                 return False
     except zipfile.BadZipFile:
         fail(f"evidence bundle is not a valid zip file: {bundle}")
         return False
 
-    ok(f"evidence bundle is complete: {bundle}")
+    ok(f"evidence bundle is complete with manifest: {bundle}")
     return True
 
 
