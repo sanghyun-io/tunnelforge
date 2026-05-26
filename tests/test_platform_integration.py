@@ -1,3 +1,4 @@
+import plistlib
 import subprocess
 
 import pytest
@@ -37,6 +38,14 @@ def test_startup_registration_creates_and_removes_macos_launch_agent(tmp_path):
     assert "io.sanghyun.tunnelforge" in content
     assert executable in content
     assert "--minimized" in content
+    launch_agent = plistlib.loads(plist.read_bytes())
+    assert launch_agent["StandardOutPath"] == str(
+        tmp_path / "Library" / "Logs" / "TunnelForge" / "launchagent.out.log"
+    )
+    assert launch_agent["StandardErrorPath"] == str(
+        tmp_path / "Library" / "Logs" / "TunnelForge" / "launchagent.err.log"
+    )
+    assert (tmp_path / "Library" / "Logs" / "TunnelForge").is_dir()
 
     assert registrar.set_registered(False) == (True, "")
     assert registrar.is_registered() is False

@@ -112,6 +112,8 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Enable startup in settings
 - [ ] Confirm \`~/Library/LaunchAgents/io.sanghyun.tunnelforge.plist\` exists
 - [ ] Confirm LaunchAgent points to the expected app path
+- [ ] Confirm LaunchAgent writes stdout to \`~/Library/Logs/TunnelForge/launchagent.out.log\`
+- [ ] Confirm LaunchAgent writes stderr to \`~/Library/Logs/TunnelForge/launchagent.err.log\`
 - [ ] Disable startup in settings
 - [ ] Confirm LaunchAgent is removed
 

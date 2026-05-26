@@ -217,11 +217,15 @@ class StartupRegistrar:
     def _macos_launch_agent_path(self) -> Path:
         return self._home_path() / "Library" / "LaunchAgents" / "io.sanghyun.tunnelforge.plist"
 
+    def _macos_launch_agent_log_dir(self) -> Path:
+        return self._home_path() / "Library" / "Logs" / "TunnelForge"
+
     def _set_macos_launch_agent(self, enable: bool) -> Tuple[bool, str]:
         path = self._macos_launch_agent_path()
         try:
             if enable:
                 path.parent.mkdir(parents=True, exist_ok=True)
+                self._macos_launch_agent_log_dir().mkdir(parents=True, exist_ok=True)
                 path.write_text(self._macos_launch_agent_plist(), encoding="utf-8")
             else:
                 try:
@@ -244,6 +248,9 @@ class StartupRegistrar:
             f"        <string>{escape(str(arg))}</string>"
             for arg in self._macos_startup_arguments()
         )
+        log_dir = self._macos_launch_agent_log_dir()
+        stdout_path = escape(str(log_dir / "launchagent.out.log"))
+        stderr_path = escape(str(log_dir / "launchagent.err.log"))
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -256,6 +263,10 @@ class StartupRegistrar:
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>StandardOutPath</key>
+    <string>{stdout_path}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr_path}</string>
 </dict>
 </plist>
 """
