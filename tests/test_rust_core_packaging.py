@@ -46,6 +46,7 @@ REQUIRED_MANUAL_REPORT_CHECK_ITEMS = [
     "Test PostgreSQL connection through Rust DB Core",
     "Run Export/Import on a disposable MySQL database",
     "Run Export/Import on a disposable PostgreSQL database",
+    "Confirm exported files and imported rows are correct",
     "Run inspect",
     "Run preflight",
     "Run plan",
@@ -442,6 +443,38 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
 
     assert result.returncode == 1
     assert "Manual validation report is missing required checklist item" in result.stderr
+
+
+def test_macos_manual_validation_report_check_complete_rejects_deleted_export_result_check(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    missing_item = "Confirm exported files and imported rows are correct"
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-export-result"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report_lines = [line for line in completed_manual_report_lines(smoke_log_arg) if missing_item not in line]
+    report.write_text("\n".join(report_lines), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert f"Manual validation report is missing required checklist item: {missing_item}" in result.stderr
 
 
 def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):

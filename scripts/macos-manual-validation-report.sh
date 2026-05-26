@@ -163,6 +163,7 @@ check_complete_report() {
     'Test PostgreSQL connection through Rust DB Core'
     'Run Export/Import on a disposable MySQL database'
     'Run Export/Import on a disposable PostgreSQL database'
+    'Confirm exported files and imported rows are correct'
     'Run inspect'
     'Run preflight'
     'Run plan'
