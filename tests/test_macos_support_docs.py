@@ -16,6 +16,9 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "macOS App Validation" in doc
     assert "scripts/validate-macos-release.sh" in doc
     assert "scripts/macos-manual-validation-report.sh" in doc
+    assert "--check-complete" in doc
+    assert "Overall result" in doc
+    assert "Validator" in doc
     assert "python main.py --ui-smoke-check" in doc
     assert "copied DMG install" in doc
     assert "--ui-smoke-check" in doc

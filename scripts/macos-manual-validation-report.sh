@@ -4,14 +4,93 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
+usage() {
+  cat <<'EOF'
+Usage:
+  bash scripts/macos-manual-validation-report.sh [--run-smoke]
+  bash scripts/macos-manual-validation-report.sh --check-complete <report.md>
+
+Options:
+  --run-smoke                 Run scripts/validate-macos-release.sh while creating the report.
+  --check-complete <report>   Verify a completed manual validation report has no open gates.
+  --help                      Show this help.
+EOF
+}
+
+RUN_SMOKE=0
+CHECK_COMPLETE_PATH=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --run-smoke)
+      RUN_SMOKE=1
+      shift
+      ;;
+    --check-complete)
+      if [[ -z "${2:-}" ]]; then
+        echo "--check-complete requires a report path." >&2
+        exit 2
+      fi
+      CHECK_COMPLETE_PATH="$2"
+      shift 2
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+check_complete_report() {
+  local report_path="$1"
+  local failures=0
+
+  if [[ ! -f "$report_path" ]]; then
+    echo "Manual validation report not found: $report_path" >&2
+    exit 1
+  fi
+
+  if grep -qE '^[[:space:]]*- \[ \]' "$report_path"; then
+    echo "Manual validation report still has unchecked items:" >&2
+    grep -nE '^[[:space:]]*- \[ \]' "$report_path" >&2
+    failures=1
+  fi
+
+  if ! grep -qE '^- Release smoke: passed[[:space:]]*$' "$report_path"; then
+    echo "Manual validation report must record '- Release smoke: passed'." >&2
+    failures=1
+  fi
+
+  if ! grep -qE '^- Overall result: (pass|passed|PASS|PASSED)[[:space:]]*$' "$report_path"; then
+    echo "Manual validation report must record '- Overall result: passed'." >&2
+    failures=1
+  fi
+
+  if ! grep -qE '^- Validator:[[:space:]]*[^[:space:]].*$' "$report_path"; then
+    echo "Manual validation report must include a validator name." >&2
+    failures=1
+  fi
+
+  if [[ "$failures" -ne 0 ]]; then
+    exit 1
+  fi
+
+  echo "Manual validation report is complete: $report_path"
+}
+
+if [[ -n "$CHECK_COMPLETE_PATH" ]]; then
+  check_complete_report "$CHECK_COMPLETE_PATH"
+  exit 0
+fi
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This script must run on macOS." >&2
   exit 1
-fi
-
-RUN_SMOKE=0
-if [[ "${1:-}" == "--run-smoke" ]]; then
-  RUN_SMOKE=1
 fi
 
 mkdir -p build
@@ -26,6 +105,8 @@ CARGO_VERSION="$(cargo --version 2>/dev/null || echo unavailable)"
 MACOS_VERSION="$(sw_vers -productVersion 2>/dev/null || echo unavailable)"
 MACOS_BUILD="$(sw_vers -buildVersion 2>/dev/null || echo unavailable)"
 ARCH="$(uname -m)"
+FINAL_APP_PATH="${MACOS_VALIDATION_APP_PATH:-/Applications/TunnelForge.app}"
+FINAL_APP_EXECUTABLE="${FINAL_APP_PATH}/Contents/MacOS/TunnelForge"
 
 SMOKE_STATUS="not run"
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
@@ -55,6 +136,9 @@ cat > "$REPORT_PATH" <<EOF
 - Cargo: ${CARGO_VERSION}
 - Release smoke: ${SMOKE_STATUS}
 - Smoke log: ${SMOKE_LOG_PATH}
+- Final app path: ${FINAL_APP_PATH}
+- Final app executable: ${FINAL_APP_EXECUTABLE}
+- Completion check: \`bash scripts/macos-manual-validation-report.sh --check-complete ${REPORT_PATH}\`
 
 ## Automated Smoke
 
@@ -69,7 +153,7 @@ cat > "$REPORT_PATH" <<EOF
 
 - [ ] Launch \`python main.py\`
 - [ ] Launch \`dist/TunnelForge.app\`
-- [ ] Install from DMG into \`/Applications\` and launch \`/Applications/TunnelForge.app\`
+- [ ] Install from DMG into \`/Applications\` and launch \`${FINAL_APP_PATH}\`
 - [ ] Confirm \`tunnelforge-core\` starts from inside the app
 
 ## SSH Tunnel
@@ -125,8 +209,8 @@ cat > "$REPORT_PATH" <<EOF
 
 ## Signing, Notarization, And Gatekeeper
 
-- [ ] Run \`codesign --verify --deep --strict --verbose=2 /Applications/TunnelForge.app\`
-- [ ] Run \`spctl --assess --type execute --verbose /Applications/TunnelForge.app\`
+- [ ] Run \`codesign --verify --deep --strict --verbose=2 ${FINAL_APP_PATH}\`
+- [ ] Run \`spctl --assess --type execute --verbose ${FINAL_APP_PATH}\`
 - [ ] Confirm notarization status if distributing outside internal testing
 - [ ] Confirm first launch behavior after download/install
 
@@ -141,3 +225,4 @@ EOF
 echo "Created $REPORT_PATH"
 echo
 echo "Fill every checkbox before closing the macOS manual validation gate."
+echo "Then run: bash scripts/macos-manual-validation-report.sh --check-complete $REPORT_PATH"
