@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 from enum import Enum
 from PyQt6.QtCore import QThread, pyqtSignal
+from src.core.platform_integration import no_window_creation_flags
 
 
 class TestType(Enum):
@@ -306,7 +307,7 @@ class SQLExecutionWorker(QThread):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                creationflags=no_window_creation_flags()
             )
 
             stdout, stderr = process.communicate(input=sql_content, timeout=300)
@@ -341,7 +342,7 @@ class SQLExecutionWorker(QThread):
                 ['mysql', '--version'],
                 capture_output=True,
                 text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if os.name == 'nt' else 0
+                creationflags=no_window_creation_flags()
             )
             return result.returncode == 0
         except FileNotFoundError:

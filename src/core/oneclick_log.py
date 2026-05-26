@@ -12,13 +12,12 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
+from src.core.platform_paths import log_dir
+
 
 def _get_migration_log_dir() -> str:
     """마이그레이션 로그 디렉토리 경로"""
-    if os.name == 'nt':
-        return os.path.join(os.environ.get('LOCALAPPDATA', ''), 'TunnelForge', 'logs')
-    else:
-        return os.path.join(os.path.expanduser('~'), '.config', 'tunnelforge', 'logs')
+    return str(log_dir())
 
 
 def create_oneclick_logger(schema: str) -> tuple:

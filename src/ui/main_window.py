@@ -13,17 +13,15 @@ from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
 from src.core.logger import get_logger
+from src.core.platform_integration import restore_window_to_front
+from src.core.resources import app_icon_path, resource_path
 
 logger = get_logger('main_window')
 
 
 def get_resource_path(relative_path):
     """PyInstaller 빌드 환경에서 리소스 경로를 올바르게 반환"""
-    if hasattr(sys, '_MEIPASS'):
-        # PyInstaller로 빌드된 경우
-        return os.path.join(sys._MEIPASS, relative_path)
-    # 개발 환경
-    return os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), relative_path)
+    return str(resource_path(relative_path))
 
 
 from src.ui.dialogs.tunnel_config import TunnelConfigDialog
@@ -119,7 +117,7 @@ class TunnelManagerUI(QMainWindow):
         self.setGeometry(100, 100, 950, 600)
 
         # 창 아이콘 설정
-        icon_path = get_resource_path('assets/icon.ico')
+        icon_path = str(app_icon_path())
         if os.path.exists(icon_path):
             self.setWindowIcon(QIcon(icon_path))
 
@@ -207,7 +205,7 @@ class TunnelManagerUI(QMainWindow):
         """시스템 트레이 아이콘 설정"""
         self.tray_icon = QSystemTrayIcon(self)
         # 커스텀 아이콘 사용 (PyInstaller 빌드 환경 지원)
-        icon_path = get_resource_path('assets/icon.ico')
+        icon_path = str(app_icon_path())
         if os.path.exists(icon_path):
             self.tray_icon.setIcon(QIcon(icon_path))
 
@@ -259,14 +257,8 @@ class TunnelManagerUI(QMainWindow):
         if sys.platform != 'win32':
             return
 
-        try:
-            import ctypes
-
-            hwnd = int(self.winId())
-            ctypes.windll.user32.ShowWindow(hwnd, 9)  # SW_RESTORE
-            ctypes.windll.user32.SetForegroundWindow(hwnd)
-        except Exception as exc:
-            logger.debug(f"창 전면 이동 실패: {exc}")
+        if not restore_window_to_front(int(self.winId())):
+            logger.debug("창 전면 이동 실패")
 
     def _on_tray_activated(self, reason):
         """트레이 아이콘 클릭 시"""

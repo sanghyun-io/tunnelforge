@@ -13,7 +13,7 @@
 [![Build](https://img.shields.io/github/actions/workflow/status/sanghyun-io/tunnelforge/release.yml?style=flat-square&logo=githubactions&logoColor=white&label=Build)](https://github.com/sanghyun-io/tunnelforge/actions)
 [![License](https://img.shields.io/github/license/sanghyun-io/tunnelforge?style=flat-square&label=License)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://github.com/sanghyun-io/tunnelforge/releases)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?style=flat-square)](https://github.com/sanghyun-io/tunnelforge/releases)
 
 </div>
 
@@ -40,7 +40,7 @@
 &nbsp;&nbsp;
 [![오프라인 설치](https://img.shields.io/badge/⬇_오프라인_설치-전체_패키지_(~35MB)-6B7280?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-Setup-latest.exe)
 
-[모든 릴리스 보기 →](https://github.com/sanghyun-io/tunnelforge/releases)
+[macOS DMG/ZIP은 모든 릴리스에서 받기 →](https://github.com/sanghyun-io/tunnelforge/releases)
 
 </div>
 
@@ -50,7 +50,7 @@
 
 ### 1. 설치
 
-다운로드한 설치 파일을 실행하고 설치 마법사를 따라 진행하세요.
+다운로드한 설치 파일을 실행하고 설치 마법사를 따라 진행하세요. macOS에서는 Mac 아키텍처에 맞는 DMG(`arm64`는 Apple Silicon, `x86_64`는 Intel)를 열고 `TunnelForge.app`을 Applications로 이동하세요.
 
 ### 2. 터널 추가
 
@@ -121,12 +121,16 @@ graph LR
 
 | 요구 사항 | 비고 |
 |----------|------|
-| **Windows 10+** | 기본 지원 플랫폼 |
+| **Windows 10+** | 패키징 지원 플랫폼 |
+| **macOS 13+** | 앱 번들 빌드 지원, 릴리스별 실제 기기 검증 필요 |
 | **Rust DB Core 바이너리** | Export/Import 기능용으로 TunnelForge에 빌드/패키징됨 |
+
+macOS 지원 범위와 최종 검증 체크리스트는 [macOS Support Plan](docs/macos_support.md)을 참고하세요.
 
 ## 설정 파일 위치
 
-`%LOCALAPPDATA%\TunnelForge\config.json`
+- Windows: `%LOCALAPPDATA%\TunnelForge\config.json`
+- macOS: `~/Library/Application Support/TunnelForge/config.json`
 
 ---
 

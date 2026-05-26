@@ -13,7 +13,7 @@
 [![Build](https://img.shields.io/github/actions/workflow/status/sanghyun-io/tunnelforge/release.yml?style=flat-square&logo=githubactions&logoColor=white&label=Build)](https://github.com/sanghyun-io/tunnelforge/actions)
 [![License](https://img.shields.io/github/license/sanghyun-io/tunnelforge?style=flat-square&label=License)](LICENSE)
 [![Python](https://img.shields.io/badge/Python-3.9+-3776AB?style=flat-square&logo=python&logoColor=white)](https://www.python.org/)
-[![Platform](https://img.shields.io/badge/Platform-Windows-0078D6?style=flat-square&logo=windows&logoColor=white)](https://github.com/sanghyun-io/tunnelforge/releases)
+[![Platform](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078D6?style=flat-square)](https://github.com/sanghyun-io/tunnelforge/releases)
 
 </div>
 
@@ -73,7 +73,7 @@
 &nbsp;&nbsp;
 [![Offline Installer](https://img.shields.io/badge/⬇_Offline_Installer-Full_Package_(~35MB)-6B7280?style=for-the-badge)](https://github.com/sanghyun-io/tunnelforge/releases/latest/download/TunnelForge-Setup-latest.exe)
 
-[Browse all releases →](https://github.com/sanghyun-io/tunnelforge/releases)
+[Browse all releases for macOS DMG/ZIP →](https://github.com/sanghyun-io/tunnelforge/releases)
 
 </div>
 
@@ -83,7 +83,7 @@
 
 ### 1. Install
 
-Run the downloaded installer and follow the setup wizard.
+Run the downloaded installer and follow the setup wizard. On macOS, download the DMG for your Mac architecture (`arm64` for Apple Silicon, `x86_64` for Intel), open it, and move `TunnelForge.app` to Applications.
 
 ### 2. Add a Tunnel
 
@@ -154,12 +154,18 @@ Create separate tunnel configs for each environment (Dev, Staging, Production) w
 
 | Requirement | Note |
 |-------------|------|
-| **Windows 10+** | Primary supported platform |
+| **Windows 10+** | Supported packaged platform |
+| **macOS 13+** | Supported as a packaged app build; final device validation is required per release |
 | **Rust DB Core binary** | Built and packaged with TunnelForge for Export/Import features |
+
+For the macOS support scope and final validation checklist, see [macOS Support Plan](docs/macos_support.md).
 
 ## Configuration
 
-Settings are stored at: `%LOCALAPPDATA%\TunnelForge\config.json`
+Settings are stored at:
+
+- Windows: `%LOCALAPPDATA%\TunnelForge\config.json`
+- macOS: `~/Library/Application Support/TunnelForge/config.json`
 
 ---
 

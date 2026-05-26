@@ -264,6 +264,10 @@ jobs:
           echo "|------|------|------|" >> release_notes.md
           echo "| \`TunnelForge-WebSetup.exe\` | 온라인 설치 (권장) | ~5MB |" >> release_notes.md
           echo "| \`TunnelForge-Setup-$VERSION.exe\` | 오프라인 설치 | ~35MB |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-arm64.dmg\` | macOS 앱 이미지 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-arm64.zip\` | macOS 앱 압축본 (Apple Silicon) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-x86_64.dmg\` | macOS 앱 이미지 (Intel) | 환경별 산출 |" >> release_notes.md
+          echo "| \`TunnelForge-macOS-$VERSION-x86_64.zip\` | macOS 앱 압축본 (Intel) | 환경별 산출 |" >> release_notes.md
           echo "" >> release_notes.md
           echo "### 설치 방법" >> release_notes.md
           echo "" >> release_notes.md
@@ -274,6 +278,10 @@ jobs:
           echo "**오프라인 설치:**" >> release_notes.md
           echo "1. \`TunnelForge-Setup-$VERSION.exe\` 다운로드" >> release_notes.md
           echo "2. 설치 마법사를 따라 진행" >> release_notes.md
+          echo "" >> release_notes.md
+          echo "**macOS:**" >> release_notes.md
+          echo "1. Mac 종류에 맞는 \`TunnelForge-macOS-$VERSION-{arm64|x86_64}.dmg\` 다운로드" >> release_notes.md
+          echo "2. DMG를 열고 \`TunnelForge.app\`을 Applications로 이동" >> release_notes.md
 
           echo ""
           echo "========== Generated Release Notes =========="
@@ -303,3 +311,103 @@ jobs:
           Write-Host "Installer: ${{ steps.verify_installer.outputs.installer_name }}" -ForegroundColor White
           Write-Host "URL: https://github.com/${{ github.repository }}/releases/tag/v${{ steps.get_version.outputs.version }}" -ForegroundColor White
           Write-Host ""
+
+  build-macos-app:
+    name: Build macOS App (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    needs: build-windows-installer
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract version from tag
+        id: get_version
+        shell: bash
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Verify version consistency
+        shell: bash
+        run: |
+          PYTHON_VERSION=$(python -c "from src.version import __version__; print(__version__)")
+          TAG_VERSION="${{ steps.get_version.outputs.version }}"
+          if [ "$PYTHON_VERSION" != "$TAG_VERSION" ]; then
+            echo "Version mismatch: src/version.py=$PYTHON_VERSION tag=$TAG_VERSION"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Setup GitHub App credentials
+        if: ${{ vars.GH_APP_ID != '' }}
+        shell: bash
+        env:
+          APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
+        run: |
+          echo "GITHUB_APP_ID=${{ vars.GH_APP_ID }}" >> .env
+          echo "GITHUB_APP_INSTALLATION_ID=${{ vars.GH_APP_INSTALLATION_ID }}" >> .env
+          echo "GITHUB_REPO=${{ vars.GH_ISSUE_REPO || github.repository }}" >> .env
+          mkdir -p secrets
+          echo "$APP_PRIVATE_KEY" > secrets/github-app.pem
+          echo "GITHUB_APP_PRIVATE_KEY=secrets/github-app.pem" >> .env
+
+      - name: Embed GitHub App credentials
+        if: ${{ vars.GH_APP_ID != '' }}
+        env:
+          GITHUB_APP_ID: ${{ vars.GH_APP_ID }}
+          GITHUB_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
+          GITHUB_APP_PRIVATE_KEY: secrets/github-app.pem
+          GITHUB_REPO: ${{ vars.GH_ISSUE_REPO || github.repository }}
+        run: |
+          python scripts/embed_github_credentials.py
+
+      - name: Run tests
+        run: |
+          pytest tests/test_platform_paths.py tests/test_platform_integration.py tests/test_rust_core_packaging.py tests/test_update_downloader.py
+          cargo test --manifest-path migration_core/Cargo.toml
+
+      - name: Build macOS app
+        run: |
+          bash scripts/build-macos.sh
+
+      - name: Package macOS app
+        env:
+          MACOS_PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          bash scripts/package-macos.sh "${{ steps.get_version.outputs.version }}"
+          test -f "dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip"
+          test -f "dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg"
+
+      - name: Upload macOS Release Asset
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg
+            dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

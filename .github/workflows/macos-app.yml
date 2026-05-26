@@ -1,0 +1,95 @@
+name: macOS App Validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/macos-app.yml"
+      - ".github/workflows/release.yml"
+      - "assets/**"
+      - "docs/macos_support.md"
+      - "main.py"
+      - "migration_core/**"
+      - "pyproject.toml"
+      - "scripts/build-macos.sh"
+      - "scripts/package-macos.sh"
+      - "src/**"
+      - "tests/test_macos_support_docs.py"
+      - "tests/test_platform_integration.py"
+      - "tests/test_platform_paths.py"
+      - "tests/test_resources.py"
+      - "tests/test_rust_core_packaging.py"
+      - "tests/test_update_downloader.py"
+      - "tunnel-manager.spec"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-macos-app:
+    name: Validate macOS App (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="$(python -c 'from src.version import __version__; print(__version__)')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run focused macOS tests
+        run: |
+          pytest \
+            tests/test_platform_paths.py \
+            tests/test_platform_integration.py \
+            tests/test_resources.py \
+            tests/test_update_downloader.py \
+            tests/test_rust_core_packaging.py \
+            tests/test_macos_support_docs.py
+          cargo test --manifest-path migration_core/Cargo.toml
+
+      - name: Build macOS app
+        run: bash scripts/build-macos.sh
+
+      - name: Package macOS app
+        env:
+          MACOS_PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          bash scripts/package-macos.sh "${{ steps.version.outputs.version }}"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
+
+      - name: Upload macOS app artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          path: |
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip
+          if-no-files-found: error

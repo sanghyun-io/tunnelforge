@@ -15,6 +15,12 @@ from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
 from src.core.logger import get_log_file_path, get_log_dir, read_log_file, filter_log_by_level, clear_log_file
+from src.core.platform_integration import (
+    StartupRegistrar,
+    detached_process_kwargs,
+    no_window_creation_flags,
+    update_package_launch_strategy,
+)
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
 
@@ -376,17 +382,17 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(reconnect_group)
 
-        # Windows 시작 프로그램 설정 그룹
-        startup_group = QGroupBox("Windows 시작 프로그램")
+        # 시작 프로그램 설정 그룹
+        startup_group = QGroupBox("시작 프로그램")
         startup_layout = QVBoxLayout(startup_group)
 
-        self.chk_startup = QCheckBox("Windows 시작 시 자동 실행")
+        self.chk_startup = QCheckBox("시스템 시작 시 자동 실행")
         self.chk_startup.setStyleSheet("font-size: 12px;")
         self.chk_startup.setChecked(self._is_startup_registered())
         startup_layout.addWidget(self.chk_startup)
 
         startup_desc = QLabel(
-            "Windows 부팅 시 시스템 트레이에 최소화된 상태로 자동 시작됩니다."
+            "로그인 시 시스템 트레이에 최소화된 상태로 자동 시작됩니다."
         )
         startup_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
         startup_desc.setWordWrap(True)
@@ -394,8 +400,8 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(startup_group)
 
-        # Windows가 아닌 경우 숨김
-        if sys.platform != 'win32':
+        # 자동 시작이 지원되지 않는 플랫폼에서는 숨김
+        if not StartupRegistrar().is_supported:
             startup_group.setVisible(False)
 
         layout.addStretch()
@@ -938,71 +944,23 @@ class SettingsDialog(QDialog):
         max_reconnect = self.spin_max_reconnect.value()
         self.config_mgr.set_app_setting('max_reconnect_attempts', max_reconnect)
 
-        # Windows 시작 프로그램 설정 저장
-        if sys.platform == 'win32':
+        # 시작 프로그램 설정 저장
+        if StartupRegistrar().is_supported:
             self._set_startup_registry(self.chk_startup.isChecked())
 
         self.accept()
 
     def _is_startup_registered(self) -> bool:
         """레지스트리에 시작 프로그램 등록 여부 확인"""
-        if sys.platform != 'win32':
-            return False
-        try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0, winreg.KEY_READ
-            )
-            try:
-                winreg.QueryValueEx(key, "TunnelForge")
-                return True
-            except FileNotFoundError:
-                return False
-            finally:
-                winreg.CloseKey(key)
-        except Exception:
-            return False
+        return StartupRegistrar().is_registered()
 
     def _set_startup_registry(self, enable: bool):
         """레지스트리에 시작 프로그램 등록/해제"""
-        if sys.platform != 'win32':
-            return
-        try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0, winreg.KEY_SET_VALUE
-            )
-            try:
-                if enable:
-                    if getattr(sys, 'frozen', False):
-                        # PyInstaller 빌드: exe 직접 실행
-                        app_path = f'"{sys.executable}" --minimized'
-                    else:
-                        # 개발 환경: pythonw.exe로 콘솔 없이 실행
-                        python_dir = os.path.dirname(sys.executable)
-                        pythonw = os.path.join(python_dir, 'pythonw.exe')
-                        if not os.path.exists(pythonw):
-                            pythonw = sys.executable
-                        main_py = os.path.abspath(
-                            os.path.join(os.path.dirname(__file__), '..', '..', '..', 'main.py')
-                        )
-                        app_path = f'"{pythonw}" "{main_py}" --minimized'
-                    winreg.SetValueEx(key, "TunnelForge", 0, winreg.REG_SZ, app_path)
-                else:
-                    try:
-                        winreg.DeleteValue(key, "TunnelForge")
-                    except FileNotFoundError:
-                        pass
-            finally:
-                winreg.CloseKey(key)
-        except Exception as e:
+        success, message = StartupRegistrar().set_registered(enable)
+        if not success and message:
             QMessageBox.warning(
                 self, "시작 프로그램 설정 오류",
-                f"레지스트리 설정 중 오류가 발생했습니다:\n{str(e)}"
+                f"시작 프로그램 설정 중 오류가 발생했습니다:\n{message}"
             )
 
     def _check_for_updates(self):
@@ -1234,12 +1192,13 @@ class SettingsDialog(QDialog):
                 subprocess.Popen(
                     ['cmd.exe', '/c', bat_path],
                     creationflags=(
-                        subprocess.CREATE_NO_WINDOW
-                        | subprocess.DETACHED_PROCESS
-                        | subprocess.CREATE_NEW_PROCESS_GROUP
+                        no_window_creation_flags()
+                        | detached_process_kwargs("Windows").get("creationflags", 0)
                     ),
                     close_fds=True,
                 )
+            elif update_package_launch_strategy() == "open":
+                QDesktopServices.openUrl(QUrl.fromLocalFile(self._downloaded_installer_path))
             else:
                 subprocess.Popen(
                     [self._downloaded_installer_path],

@@ -7,13 +7,13 @@ MySQL 8.0 → 8.4 마이그레이션 State Tracker
 - 롤백 SQL 경로 관리
 """
 import json
-import os
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from src.core.logger import get_logger
+from src.core.platform_paths import data_dir
 
 logger = get_logger('migration_state')
 
@@ -69,12 +69,7 @@ class MigrationStateTracker:
 
     def _get_state_dir(self) -> Path:
         """상태 저장 디렉토리 경로 반환"""
-        if os.name == 'nt':  # Windows
-            base = Path(os.environ.get('LOCALAPPDATA', Path.home() / 'AppData' / 'Local'))
-        else:  # Unix/Linux/Mac
-            base = Path.home() / '.local' / 'share'
-
-        state_dir = base / 'TunnelForge' / 'migration_state'
+        state_dir = data_dir() / 'migration_state'
         state_dir.mkdir(parents=True, exist_ok=True)
         return state_dir
 

@@ -438,4 +438,56 @@ Name: "desktopicon"; ...; Flags: unchecked
 
 ---
 
+## macOS App 생성
+
+macOS에서는 PyInstaller `.app` 번들과 DMG/ZIP 배포물을 생성합니다. 실제 실행 검증은 macOS 기기에서 수행해야 합니다.
+지원 범위와 최종 검증 체크리스트는 `docs/macos_support.md`를 기준으로 합니다.
+
+### 사전 요구사항
+
+- macOS 13 이상
+- Python 3.9 이상
+- Rust toolchain (`cargo`)
+- PyInstaller 포함 개발 의존성 (`pip install -e ".[dev]"`)
+
+### 앱 번들 빌드
+
+```bash
+bash scripts/build-macos.sh
+```
+
+이 스크립트는 다음을 수행합니다.
+
+1. Rust DB Core `migration_core/target/release/tunnelforge-core` 빌드
+2. `assets/icon.icns`가 없으면 `assets/icon_512.png`에서 생성
+3. PyInstaller로 `dist/TunnelForge.app` 생성
+4. `.app` 내부에 `tunnelforge-core`가 포함되어 있는지 확인
+
+기본 최소 배포 대상은 `MACOSX_DEPLOYMENT_TARGET=13.0`입니다.
+
+### DMG/ZIP 패키징
+
+```bash
+bash scripts/package-macos.sh
+```
+
+기본 결과물:
+
+```text
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.dmg
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.zip
+```
+
+환경 변수가 설정된 경우 코드 서명과 노터라이즈도 수행합니다.
+
+```bash
+export APPLE_CODESIGN_IDENTITY="Developer ID Application: ..."
+export APPLE_ID="apple-id@example.com"
+export APPLE_TEAM_ID="TEAMID1234"
+export APPLE_APP_SPECIFIC_PASSWORD="app-specific-password"
+bash scripts/package-macos.sh
+```
+
+---
+
 **문서 작성일:** 2026-01-27
