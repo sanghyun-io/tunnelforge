@@ -13,6 +13,32 @@ import yaml
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
+REQUIRED_MANUAL_REPORT_SECTIONS = [
+    "## Automated Smoke",
+    "## Interactive App Launch",
+    "## SSH Tunnel",
+    "## Database Connections",
+    "## Export/Import",
+    "## Migration",
+    "## Settings And User Paths",
+    "## LaunchAgent",
+    "## Updates",
+    "## Signing, Notarization, And Gatekeeper",
+    "## Result",
+]
+
+
+def completed_manual_report_lines(smoke_log_arg: str) -> list[str]:
+    return [
+        "- Release smoke: passed",
+        f"- Smoke log: {smoke_log_arg}",
+        *REQUIRED_MANUAL_REPORT_SECTIONS,
+        "- Overall result: passed",
+        "- Validator: Codex",
+        "",
+    ]
+
+
 def evidence_manifest(report: Path, smoke_log: Path) -> str:
     return (
         f"{hashlib.sha256(report.read_bytes()).hexdigest()}  {report.name}\n"
@@ -168,6 +194,8 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "checksum_path_for_bundle" in script
     assert "Evidence bundle checksum:" in script
     assert "check_complete_report" in script
+    assert "required_sections" in script
+    assert "Manual validation report is missing required section" in script
     assert "create_evidence_bundle" in script
     assert "finalize_evidence" in script
     assert "scripts/check-macos-support-gate.py" in script
@@ -226,19 +254,7 @@ def test_macos_manual_validation_report_check_complete_accepts_completed_report(
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text(
-        "\n".join(
-            [
-                "- Release smoke: passed",
-                f"- Smoke log: {smoke_log_arg}",
-                "- [x] Run `bash scripts/validate-macos-release.sh`",
-                "- Overall result: passed",
-                "- Validator: Codex",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -297,6 +313,47 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_smoke_log
     assert "Smoke log is missing or empty" in result.stderr
 
 
+def test_macos_manual_validation_report_check_complete_rejects_missing_required_sections(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-sections"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text(
+        "\n".join(
+            [
+                "- Release smoke: passed",
+                f"- Smoke log: {smoke_log_arg}",
+                "- Overall result: passed",
+                "- Validator: Codex",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Manual validation report is missing required section" in result.stderr
+
+
 def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
     if shutil.which("bash") is None:
         pytest.skip("bash is required for shell script validation")
@@ -309,19 +366,7 @@ def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text(
-        "\n".join(
-            [
-                "- Release smoke: passed",
-                f"- Smoke log: {smoke_log_arg}",
-                "- [x] Run `bash scripts/validate-macos-release.sh`",
-                "- Overall result: passed",
-                "- Validator: Codex",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -368,19 +413,7 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text(
-        "\n".join(
-            [
-                "- Release smoke: passed",
-                f"- Smoke log: {smoke_log_arg}",
-                "- [x] Run `bash scripts/validate-macos-release.sh`",
-                "- Overall result: passed",
-                "- Validator: Codex",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
 
     result = subprocess.run(
         [
@@ -459,19 +492,7 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text(
-        "\n".join(
-            [
-                "- Release smoke: passed",
-                f"- Smoke log: {smoke_log_arg}",
-                "- [x] Run `bash scripts/validate-macos-release.sh`",
-                "- Overall result: passed",
-                "- Validator: Codex",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(report, report.name)
         archive.write(smoke_log, smoke_log.name)
@@ -515,19 +536,7 @@ def test_macos_support_gate_script_accepts_globbed_final_report_and_bundle(tmp_p
         report = report_dir / f"macos-manual-validation-report-{stamp}.md"
         bundle = report_dir / f"macos-manual-validation-evidence-macos-manual-validation-report-{stamp}.zip"
         smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
-        report.write_text(
-            "\n".join(
-                [
-                    "- Release smoke: passed",
-                    f"- Smoke log: {smoke_log_arg}",
-                    "- [x] Run `bash scripts/validate-macos-release.sh`",
-                    "- Overall result: passed",
-                    "- Validator: Codex",
-                    "",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
         with zipfile.ZipFile(bundle, "w") as archive:
             archive.write(report, report.name)
             archive.write(smoke_log, smoke_log.name)
@@ -605,19 +614,7 @@ def test_macos_support_gate_script_rejects_incomplete_evidence_bundle(tmp_path):
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
     bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
-    report.write_text(
-        "\n".join(
-            [
-                "- Release smoke: passed",
-                f"- Smoke log: {smoke_log_arg}",
-                "- [x] Run `bash scripts/validate-macos-release.sh`",
-                "- Overall result: passed",
-                "- Validator: Codex",
-                "",
-            ]
-        ),
-        encoding="utf-8",
-    )
+    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(report, report.name)
     write_bundle_checksum(bundle)

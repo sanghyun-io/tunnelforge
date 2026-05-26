@@ -124,6 +124,27 @@ check_complete_report() {
     exit 1
   fi
 
+  local required_sections=(
+    "## Automated Smoke"
+    "## Interactive App Launch"
+    "## SSH Tunnel"
+    "## Database Connections"
+    "## Export/Import"
+    "## Migration"
+    "## Settings And User Paths"
+    "## LaunchAgent"
+    "## Updates"
+    "## Signing, Notarization, And Gatekeeper"
+    "## Result"
+  )
+
+  for required_section in "${required_sections[@]}"; do
+    if ! grep -qF "$required_section" "$report_path"; then
+      echo "Manual validation report is missing required section: $required_section" >&2
+      failures=1
+    fi
+  done
+
   if grep -qE '^[[:space:]]*- \[ \]' "$report_path"; then
     echo "Manual validation report still has unchecked items:" >&2
     grep -nE '^[[:space:]]*- \[ \]' "$report_path" >&2
