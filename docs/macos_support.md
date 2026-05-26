@@ -67,6 +67,7 @@ These checks require macOS:
 - `bash scripts/validate-macos-release.sh` to run source `python main.py --ui-smoke-check`, build, package, and run `--ui-smoke-check` against the built app, mounted DMG app, copied DMG install app, and extracted ZIP app on a Mac.
 - `bash scripts/macos-manual-validation-report.sh --run-smoke` to create a timestamped Markdown report and smoke log for the remaining manual SSH, DB, migration, LaunchAgent, update, install, signing, notarization, and Gatekeeper checks.
 - `bash scripts/macos-manual-validation-report.sh --check-complete build/macos-manual-validation-report-*.md` to fail the final gate when any checkbox, smoke result, smoke log file, overall result, or validator field is incomplete.
+- `bash scripts/macos-manual-validation-report.sh --bundle-evidence build/macos-manual-validation-report-*.md` to create a `build/macos-manual-validation-evidence-*.zip` bundle containing the completed report and smoke log for PR or release attachment. Use `--evidence-bundle <zip>` to choose a specific output path.
 - `python scripts/check-macos-support-gate.py --final --report build/macos-manual-validation-report-*.md` to verify M0-M5 are closed, #116 is assigned to M6, PR #117 checks are green, and the real-Mac report/log evidence is complete.
 - Optional signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`.
 
@@ -91,5 +92,6 @@ Run on macOS:
 13. Install from DMG into Applications and launch from there.
 14. If distributing outside internal testing, verify codesign, notarization, and Gatekeeper behavior.
 15. Mark every report checkbox complete, set `Overall result` to `passed`, fill `Validator`, and run `bash scripts/macos-manual-validation-report.sh --check-complete <report.md>`.
-16. Run `python scripts/check-macos-support-gate.py --final --report <report.md>` to confirm the GitHub tracking issues, PR checks, completed report, and smoke log agree.
-17. Attach the completed `build/macos-manual-validation-report-*.md` report and `build/macos-release-smoke-*.log` smoke log to the PR or release checklist before closing the final macOS gate.
+16. Run `bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>` to create `build/macos-manual-validation-evidence-*.zip`.
+17. Run `python scripts/check-macos-support-gate.py --final --report <report.md>` to confirm the GitHub tracking issues, PR checks, completed report, and smoke log agree.
+18. Attach the completed `build/macos-manual-validation-report-*.md` report, `build/macos-release-smoke-*.log` smoke log, and `build/macos-manual-validation-evidence-*.zip` bundle to the PR or release checklist before closing the final macOS gate.

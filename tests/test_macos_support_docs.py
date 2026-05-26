@@ -18,8 +18,11 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "scripts/macos-manual-validation-report.sh" in doc
     assert "scripts/check-macos-support-gate.py" in doc
     assert "--check-complete" in doc
+    assert "--bundle-evidence" in doc
+    assert "--evidence-bundle" in doc
     assert "--skip-pr-checks" in doc
     assert "--final" in doc
+    assert "macos-manual-validation-evidence" in doc
     assert "smoke log file" in doc
     assert "Overall result" in doc
     assert "Validator" in doc

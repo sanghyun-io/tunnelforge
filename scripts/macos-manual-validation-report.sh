@@ -9,16 +9,30 @@ usage() {
 Usage:
   bash scripts/macos-manual-validation-report.sh [--run-smoke]
   bash scripts/macos-manual-validation-report.sh --check-complete <report.md>
+  bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>
 
 Options:
   --run-smoke                 Run scripts/validate-macos-release.sh while creating the report.
   --check-complete <report>   Verify a completed manual validation report has no open gates.
+  --bundle-evidence <report>  Verify the completed report and create an attachable evidence zip.
+  --evidence-bundle <zip>     Override the evidence zip output path.
   --help                      Show this help.
 EOF
 }
 
 RUN_SMOKE=0
 CHECK_COMPLETE_PATH=""
+BUNDLE_EVIDENCE_PATH=""
+BUNDLE_OUTPUT_PATH=""
+PYTHON_BIN="${PYTHON:-}"
+
+if [[ -z "$PYTHON_BIN" ]]; then
+  if command -v python >/dev/null 2>&1; then
+    PYTHON_BIN="python"
+  else
+    PYTHON_BIN="python3"
+  fi
+fi
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -34,6 +48,22 @@ while [[ $# -gt 0 ]]; do
       CHECK_COMPLETE_PATH="$2"
       shift 2
       ;;
+    --bundle-evidence)
+      if [[ -z "${2:-}" ]]; then
+        echo "--bundle-evidence requires a report path." >&2
+        exit 2
+      fi
+      BUNDLE_EVIDENCE_PATH="$2"
+      shift 2
+      ;;
+    --evidence-bundle)
+      if [[ -z "${2:-}" ]]; then
+        echo "--evidence-bundle requires an output zip path." >&2
+        exit 2
+      fi
+      BUNDLE_OUTPUT_PATH="$2"
+      shift 2
+      ;;
     --help|-h)
       usage
       exit 0
@@ -45,6 +75,13 @@ while [[ $# -gt 0 ]]; do
       ;;
   esac
 done
+
+extract_smoke_log_path() {
+  local report_path="$1"
+  grep -m1 -E '^- Smoke log:' "$report_path" \
+    | sed -E 's/^- Smoke log:[[:space:]]*//' \
+    | tr -d '\r'
+}
 
 check_complete_report() {
   local report_path="$1"
@@ -77,11 +114,7 @@ check_complete_report() {
     failures=1
   fi
 
-  smoke_log_path="$(
-    grep -m1 -E '^- Smoke log:' "$report_path" \
-      | sed -E 's/^- Smoke log:[[:space:]]*//' \
-      | tr -d '\r'
-  )"
+  smoke_log_path="$(extract_smoke_log_path "$report_path")"
 
   if [[ -z "$smoke_log_path" ]]; then
     echo "Manual validation report must include a smoke log path." >&2
@@ -101,8 +134,42 @@ check_complete_report() {
   echo "Manual validation report is complete: $report_path"
 }
 
+create_evidence_bundle() {
+  local report_path="$1"
+  local smoke_log_path=""
+  local report_name=""
+  local bundle_path=""
+
+  check_complete_report "$report_path"
+  smoke_log_path="$(extract_smoke_log_path "$report_path")"
+  report_name="$(basename "$report_path" .md)"
+  bundle_path="${BUNDLE_OUTPUT_PATH:-${MACOS_VALIDATION_EVIDENCE_BUNDLE:-build/macos-manual-validation-evidence-${report_name}.zip}}"
+  mkdir -p "$(dirname "$bundle_path")"
+
+  "$PYTHON_BIN" - "$report_path" "$smoke_log_path" "$bundle_path" <<'PY'
+import sys
+from pathlib import Path
+from zipfile import ZIP_DEFLATED, ZipFile
+
+report_path = Path(sys.argv[1])
+smoke_log_path = Path(sys.argv[2])
+bundle_path = Path(sys.argv[3])
+
+with ZipFile(bundle_path, "w", ZIP_DEFLATED) as archive:
+    archive.write(report_path, report_path.name)
+    archive.write(smoke_log_path, smoke_log_path.name)
+PY
+
+  echo "Created $bundle_path"
+}
+
 if [[ -n "$CHECK_COMPLETE_PATH" ]]; then
   check_complete_report "$CHECK_COMPLETE_PATH"
+  exit 0
+fi
+
+if [[ -n "$BUNDLE_EVIDENCE_PATH" ]]; then
+  create_evidence_bundle "$BUNDLE_EVIDENCE_PATH"
   exit 0
 fi
 
@@ -116,7 +183,7 @@ TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_PATH="${MACOS_VALIDATION_REPORT:-build/macos-manual-validation-report-${TIMESTAMP}.md}"
 SMOKE_LOG_PATH="${MACOS_VALIDATION_SMOKE_LOG:-build/macos-release-smoke-${TIMESTAMP}.log}"
 mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$SMOKE_LOG_PATH")"
-VERSION="$(python -c 'from src.version import __version__; print(__version__)')"
+VERSION="$("$PYTHON_BIN" -c 'from src.version import __version__; print(__version__)')"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PYTHON_VERSION="$(python --version 2>&1 || echo unavailable)"
 CARGO_VERSION="$(cargo --version 2>/dev/null || echo unavailable)"
@@ -157,6 +224,7 @@ cat > "$REPORT_PATH" <<EOF
 - Final app path: ${FINAL_APP_PATH}
 - Final app executable: ${FINAL_APP_EXECUTABLE}
 - Completion check: \`bash scripts/macos-manual-validation-report.sh --check-complete ${REPORT_PATH}\`
+- Evidence bundle: \`bash scripts/macos-manual-validation-report.sh --bundle-evidence ${REPORT_PATH}\`
 
 ## Automated Smoke
 
@@ -244,3 +312,4 @@ echo "Created $REPORT_PATH"
 echo
 echo "Fill every checkbox before closing the macOS manual validation gate."
 echo "Then run: bash scripts/macos-manual-validation-report.sh --check-complete $REPORT_PATH"
+echo "Then run: bash scripts/macos-manual-validation-report.sh --bundle-evidence $REPORT_PATH"

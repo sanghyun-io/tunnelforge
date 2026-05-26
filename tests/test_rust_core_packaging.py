@@ -2,6 +2,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import tomllib
+import zipfile
 
 import pytest
 import yaml
@@ -108,7 +109,13 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "macos-release-smoke-${TIMESTAMP}.log" in script
     assert "bash scripts/validate-macos-release.sh" in script
     assert "--check-complete <report>" in script
+    assert "--bundle-evidence <report>" in script
+    assert "--evidence-bundle <zip>" in script
+    assert "MACOS_VALIDATION_EVIDENCE_BUNDLE" in script
+    assert "Evidence bundle:" in script
+    assert "PYTHON_BIN" in script
     assert "check_complete_report" in script
+    assert "create_evidence_bundle" in script
     assert "Manual validation report still has unchecked items" in script
     assert "^[[:space:]]*- \\[ \\]" in script
     assert "^- Release smoke: passed[[:space:]]*$" in script
@@ -214,6 +221,56 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_smoke_log
 
     assert result.returncode == 1
     assert "Smoke log is missing or empty" in result.stderr
+
+
+def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-bundle"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    bundle = report_dir / "macos-manual-validation-evidence.zip"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text(
+        "\n".join(
+            [
+                "- Release smoke: passed",
+                f"- Smoke log: {smoke_log_arg}",
+                "- [x] Run `bash scripts/validate-macos-release.sh`",
+                "- Overall result: passed",
+                "- Validator: Codex",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--bundle-evidence",
+            report_arg,
+            "--evidence-bundle",
+            bundle.relative_to(PROJECT_ROOT).as_posix(),
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert bundle.exists()
+    with zipfile.ZipFile(bundle) as archive:
+        assert sorted(archive.namelist()) == [
+            "macos-manual-validation-report.md",
+            "macos-release-smoke.log",
+        ]
 
 
 def test_macos_support_gate_script_checks_github_tracking_and_final_report():
