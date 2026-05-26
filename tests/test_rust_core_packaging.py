@@ -216,6 +216,91 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_smoke_log
     assert "Smoke log is missing or empty" in result.stderr
 
 
+def test_macos_support_gate_script_checks_github_tracking_and_final_report():
+    script = (PROJECT_ROOT / "scripts" / "check-macos-support-gate.py").read_text(encoding="utf-8")
+
+    assert "MILESTONE_ISSUES" in script
+    assert "110: \"CLOSED\"" in script
+    assert "115: \"CLOSED\"" in script
+    assert "FINAL_ISSUE = 116" in script
+    assert "PR_NUMBER = 117" in script
+    assert "macOS Support M6" in script
+    assert "--final" in script
+    assert "--report" in script
+    assert "--skip-github" in script
+    assert "def bash_path" in script
+    assert "scripts/macos-manual-validation-report.sh" in script
+    assert "statusCheckRollup" in script
+    assert "mergeStateStatus" in script
+
+
+def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-gate-complete"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text(
+        "\n".join(
+            [
+                "- Release smoke: passed",
+                f"- Smoke log: {smoke_log_arg}",
+                "- [x] Run `bash scripts/validate-macos-release.sh`",
+                "- Overall result: passed",
+                "- Validator: Codex",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/check-macos-support-gate.py",
+            "--final",
+            "--skip-github",
+            "--report",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "macOS support gate checks passed" in result.stdout
+
+
+def test_macos_support_gate_script_rejects_missing_final_report():
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/check-macos-support-gate.py",
+            "--final",
+            "--skip-github",
+            "--report",
+            "build/does-not-exist.md",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "manual validation report is incomplete" in result.stderr
+
+
 def test_release_workflow_has_macos_app_job_and_assets():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
 
