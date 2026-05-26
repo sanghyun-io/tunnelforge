@@ -20,6 +20,12 @@ def evidence_manifest(report: Path, smoke_log: Path) -> str:
     )
 
 
+def write_bundle_checksum(bundle: Path) -> Path:
+    checksum = bundle.with_name(f"{bundle.name}.sha256")
+    checksum.write_text(f"{hashlib.sha256(bundle.read_bytes()).hexdigest()}  {bundle.name}\n", encoding="utf-8")
+    return checksum
+
+
 def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
     spec = (PROJECT_ROOT / "tunnel-manager.spec").read_text(encoding="utf-8")
 
@@ -127,6 +133,8 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "PYTHON_BIN" in script
     assert "hashlib.sha256" in script
     assert "manifest_name" in script
+    assert "checksum_path_for_bundle" in script
+    assert "Evidence bundle checksum:" in script
     assert "check_complete_report" in script
     assert "create_evidence_bundle" in script
     assert "finalize_evidence" in script
@@ -282,6 +290,11 @@ def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
 
     assert result.returncode == 0, result.stderr
     assert bundle.exists()
+    checksum = bundle.with_name(f"{bundle.name}.sha256")
+    assert checksum.exists()
+    assert checksum.read_text(encoding="utf-8") == (
+        f"{hashlib.sha256(bundle.read_bytes()).hexdigest()}  {bundle.name}\n"
+    )
     with zipfile.ZipFile(bundle) as archive:
         manifest_name = "macos-manual-validation-evidence-macos-manual-validation-report.sha256"
         assert sorted(archive.namelist()) == [
@@ -337,6 +350,8 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
 
     assert result.returncode == 0, result.stderr
     assert bundle.exists()
+    checksum = bundle.with_name(f"{bundle.name}.sha256")
+    assert checksum.exists()
     with zipfile.ZipFile(bundle) as archive:
         assert "macos-manual-validation-evidence-macos-manual-validation-report.sha256" in archive.namelist()
     assert "macOS support gate checks passed" in result.stdout
@@ -344,6 +359,7 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     assert f"- Report: {report_arg}" in result.stdout
     assert f"- Smoke log: {smoke_log_arg}" in result.stdout
     assert f"- Evidence bundle: {bundle_arg}" in result.stdout
+    assert f"- Evidence bundle checksum: {bundle_arg}.sha256" in result.stdout
 
 
 def test_macos_support_gate_script_checks_github_tracking_and_final_report():
@@ -364,7 +380,8 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "hashlib" in script
     assert "check_evidence_bundle" in script
     assert "evidence_manifest_name" in script
-    assert "evidence bundle is complete with manifest" in script
+    assert "evidence_bundle_checksum_path" in script
+    assert "evidence bundle is complete with manifest and checksum" in script
     assert "glob.has_magic" in script
     assert "selected newest" in script
     assert "PR merge state skipped by request" in script
@@ -407,6 +424,7 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
             "macos-manual-validation-evidence-macos-manual-validation-report.sha256",
             evidence_manifest(report, smoke_log),
         )
+    write_bundle_checksum(bundle)
 
     result = subprocess.run(
         [
@@ -462,8 +480,10 @@ def test_macos_support_gate_script_accepts_globbed_final_report_and_bundle(tmp_p
                 f"macos-manual-validation-evidence-{report.stem}.sha256",
                 evidence_manifest(report, smoke_log),
             )
+        write_bundle_checksum(bundle)
         os.utime(report, (mtime, mtime))
         os.utime(bundle, (mtime, mtime))
+        os.utime(bundle.with_name(f"{bundle.name}.sha256"), (mtime, mtime))
         return report, bundle
 
     write_completed_evidence("20260101T000000Z", 100)
@@ -545,6 +565,7 @@ def test_macos_support_gate_script_rejects_incomplete_evidence_bundle(tmp_path):
     )
     with zipfile.ZipFile(bundle, "w") as archive:
         archive.write(report, report.name)
+    write_bundle_checksum(bundle)
 
     result = subprocess.run(
         [

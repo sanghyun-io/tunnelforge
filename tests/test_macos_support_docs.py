@@ -27,6 +27,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "--final" in doc
     assert "macos-manual-validation-evidence" in doc
     assert "SHA256 manifest" in doc
+    assert "*.zip.sha256" in doc
     assert "smoke log file" in doc
     assert "Overall result" in doc
     assert "Validator" in doc

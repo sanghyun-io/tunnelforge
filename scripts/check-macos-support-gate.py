@@ -142,6 +142,10 @@ def evidence_manifest_name(report: Path) -> str:
     return f"macos-manual-validation-evidence-{report.stem}.sha256"
 
 
+def evidence_bundle_checksum_path(bundle: Path) -> Path:
+    return Path(f"{bundle}.sha256")
+
+
 def sha256_hex(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
@@ -149,6 +153,17 @@ def sha256_hex(data: bytes) -> str:
 def check_evidence_bundle(report: Path, bundle: Path) -> bool:
     if not bundle.is_file():
         fail(f"evidence bundle not found: {bundle}")
+        return False
+
+    checksum_path = evidence_bundle_checksum_path(bundle)
+    if not checksum_path.is_file():
+        fail(f"evidence bundle checksum not found: {checksum_path}")
+        return False
+
+    bundle_bytes = bundle.read_bytes()
+    expected_bundle_checksum = f"{sha256_hex(bundle_bytes)}  {bundle.name}\n"
+    if checksum_path.read_text(encoding="utf-8") != expected_bundle_checksum:
+        fail(f"evidence bundle checksum does not match {bundle}")
         return False
 
     smoke_log_value = report_path_value(report, "- Smoke log:")
@@ -188,7 +203,7 @@ def check_evidence_bundle(report: Path, bundle: Path) -> bool:
         fail(f"evidence bundle is not a valid zip file: {bundle}")
         return False
 
-    ok(f"evidence bundle is complete with manifest: {bundle}")
+    ok(f"evidence bundle is complete with manifest and checksum: {bundle}")
     return True
 
 

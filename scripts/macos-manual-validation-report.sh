@@ -108,6 +108,11 @@ bundle_path_for_report() {
   echo "${BUNDLE_OUTPUT_PATH:-${MACOS_VALIDATION_EVIDENCE_BUNDLE:-build/macos-manual-validation-evidence-${report_name}.zip}}"
 }
 
+checksum_path_for_bundle() {
+  local bundle_path="$1"
+  echo "${bundle_path}.sha256"
+}
+
 check_complete_report() {
   local report_path="$1"
   local failures=0
@@ -192,20 +197,26 @@ with ZipFile(bundle_path, "w", ZIP_DEFLATED) as archive:
     archive.write(report_path, report_path.name)
     archive.write(smoke_log_path, smoke_log_path.name)
     archive.writestr(manifest_name, manifest)
+
+bundle_checksum_path = Path(f"{bundle_path}.sha256")
+bundle_checksum_path.write_text(f"{digest(bundle_path)}  {bundle_path.name}\n", encoding="utf-8")
 PY
 
   echo "Created $bundle_path"
+  echo "Created $(checksum_path_for_bundle "$bundle_path")"
 }
 
 finalize_evidence() {
   local report_path="$1"
   local smoke_log_path=""
   local bundle_path=""
+  local checksum_path=""
   local gate_args=()
 
   create_evidence_bundle "$report_path"
   smoke_log_path="$(extract_smoke_log_path "$report_path")"
   bundle_path="$(bundle_path_for_report "$report_path")"
+  checksum_path="$(checksum_path_for_bundle "$bundle_path")"
   gate_args=(--final --report "$report_path" --bundle "$bundle_path")
 
   if [[ "$SKIP_GITHUB" -eq 1 ]]; then
@@ -219,6 +230,7 @@ finalize_evidence() {
   echo "- Report: $report_path"
   echo "- Smoke log: $smoke_log_path"
   echo "- Evidence bundle: $bundle_path"
+  echo "- Evidence bundle checksum: $checksum_path"
   echo
   echo "Attach these files to PR #117 or the release checklist before closing #116."
 }
