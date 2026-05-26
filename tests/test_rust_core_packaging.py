@@ -60,9 +60,11 @@ def test_macos_release_validation_script_smokes_app_dmg_and_zip():
     assert "bash scripts/build-macos.sh" in script
     assert "bash scripts/package-macos.sh" in script
     assert "dist/TunnelForge.app/Contents/MacOS/TunnelForge" in script
-    assert "/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge" in script
+    assert "build/dmg-smoke-mount" in script
+    assert "build/install-smoke-mount" in script
+    assert '"$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"' in script
     assert "Smoke testing copied DMG install" in script
-    assert 'ditto "/Volumes/TunnelForge/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in script
+    assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in script
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in script
     assert "build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in script
     assert "--ui-smoke-check" in script
@@ -88,7 +90,9 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "Smoke packaged TunnelForge app" in workflow
     assert "Smoke DMG package" in workflow
     assert "Smoke copied DMG install" in workflow
-    assert 'ditto "/Volumes/TunnelForge/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
+    assert "build/dmg-smoke-mount" in workflow
+    assert "build/install-smoke-mount" in workflow
+    assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
     assert "Smoke ZIP package" in workflow
     assert "--ui-smoke-check" in workflow
@@ -124,9 +128,11 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "bash scripts/package-macos.sh" in workflow
     assert "Smoke DMG package" in workflow
     assert "hdiutil attach" in workflow
-    assert "/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
+    assert "build/dmg-smoke-mount" in workflow
+    assert "build/install-smoke-mount" in workflow
+    assert '"$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"' in workflow
     assert "Smoke copied DMG install" in workflow
-    assert 'ditto "/Volumes/TunnelForge/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
+    assert 'ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"' in workflow
     assert "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge" in workflow
     assert "Smoke ZIP package" in workflow
     assert "ditto -x -k" in workflow

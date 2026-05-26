@@ -14,6 +14,8 @@ ARCH_NAME="${MACOS_PACKAGE_ARCH:-$(uname -m)}"
 APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"
 DMG_PATH="dist/TunnelForge-macOS-${VERSION}-${ARCH_NAME}.dmg"
 ZIP_PATH="dist/TunnelForge-macOS-${VERSION}-${ARCH_NAME}.zip"
+DMG_SMOKE_MOUNT="$PWD/build/dmg-smoke-mount"
+INSTALL_SMOKE_MOUNT="$PWD/build/install-smoke-mount"
 
 validate_smoke_response() {
   local response="$1"
@@ -62,19 +64,21 @@ test -f "$DMG_PATH"
 test -f "$ZIP_PATH"
 
 echo "[6/8] Smoke testing DMG package"
-hdiutil attach "$DMG_PATH" -mountpoint /Volumes/TunnelForge -quiet
-trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
-smoke_app "/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge"
-hdiutil detach /Volumes/TunnelForge -quiet
+rm -rf "$DMG_SMOKE_MOUNT"
+mkdir -p "$DMG_SMOKE_MOUNT"
+hdiutil attach "$DMG_PATH" -mountpoint "$DMG_SMOKE_MOUNT" -quiet
+trap 'hdiutil detach "$DMG_SMOKE_MOUNT" -quiet || true' EXIT
+smoke_app "$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"
+hdiutil detach "$DMG_SMOKE_MOUNT" -quiet
 trap - EXIT
 
 echo "[7/8] Smoke testing copied DMG install"
-hdiutil attach "$DMG_PATH" -mountpoint /Volumes/TunnelForge -quiet
-trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
-rm -rf build/install-smoke
-mkdir -p build/install-smoke
-ditto "/Volumes/TunnelForge/TunnelForge.app" "build/install-smoke/TunnelForge.app"
-hdiutil detach /Volumes/TunnelForge -quiet
+rm -rf "$INSTALL_SMOKE_MOUNT" build/install-smoke
+mkdir -p "$INSTALL_SMOKE_MOUNT" build/install-smoke
+hdiutil attach "$DMG_PATH" -mountpoint "$INSTALL_SMOKE_MOUNT" -quiet
+trap 'hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet || true' EXIT
+ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"
+hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet
 trap - EXIT
 smoke_app "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
 

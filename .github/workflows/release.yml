@@ -450,9 +450,12 @@ jobs:
         shell: bash
         run: |
           DMG_PATH="dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg"
-          hdiutil attach "$DMG_PATH" -mountpoint /Volumes/TunnelForge -quiet
-          trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
-          APP_EXECUTABLE="/Volumes/TunnelForge/TunnelForge.app/Contents/MacOS/TunnelForge"
+          DMG_SMOKE_MOUNT="$PWD/build/dmg-smoke-mount"
+          rm -rf "$DMG_SMOKE_MOUNT"
+          mkdir -p "$DMG_SMOKE_MOUNT"
+          hdiutil attach "$DMG_PATH" -mountpoint "$DMG_SMOKE_MOUNT" -quiet
+          trap 'hdiutil detach "$DMG_SMOKE_MOUNT" -quiet || true' EXIT
+          APP_EXECUTABLE="$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"
           test -x "$APP_EXECUTABLE"
           RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
           echo "$RESPONSE"
@@ -473,12 +476,13 @@ jobs:
         shell: bash
         run: |
           DMG_PATH="dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg"
-          hdiutil attach "$DMG_PATH" -mountpoint /Volumes/TunnelForge -quiet
-          trap 'hdiutil detach /Volumes/TunnelForge -quiet || true' EXIT
-          rm -rf build/install-smoke
-          mkdir -p build/install-smoke
-          ditto "/Volumes/TunnelForge/TunnelForge.app" "build/install-smoke/TunnelForge.app"
-          hdiutil detach /Volumes/TunnelForge -quiet
+          INSTALL_SMOKE_MOUNT="$PWD/build/install-smoke-mount"
+          rm -rf "$INSTALL_SMOKE_MOUNT" build/install-smoke
+          mkdir -p "$INSTALL_SMOKE_MOUNT" build/install-smoke
+          hdiutil attach "$DMG_PATH" -mountpoint "$INSTALL_SMOKE_MOUNT" -quiet
+          trap 'hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet || true' EXIT
+          ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"
+          hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet
           trap - EXIT
           APP_EXECUTABLE="build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
           test -x "$APP_EXECUTABLE"
