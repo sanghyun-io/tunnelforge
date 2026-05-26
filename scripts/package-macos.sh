@@ -16,6 +16,30 @@ ZIP_PATH="dist/TunnelForge-macOS-${VERSION}-${ARCH_NAME}.zip"
 DMG_STAGING="build/macos-dmg"
 DMG_PATH="dist/TunnelForge-macOS-${VERSION}-${ARCH_NAME}.dmg"
 
+create_dmg_with_retry() {
+  local attempt
+  local max_attempts=3
+
+  for attempt in $(seq 1 "$max_attempts"); do
+    rm -f "$DMG_PATH"
+    if hdiutil create -volname "TunnelForge" \
+      -srcfolder "$DMG_STAGING" \
+      -ov -format UDZO "$DMG_PATH"; then
+      return 0
+    fi
+
+    echo "hdiutil create failed on attempt ${attempt}/${max_attempts}." >&2
+    rm -f "$DMG_PATH"
+    hdiutil info || true
+    if [[ "$attempt" -lt "$max_attempts" ]]; then
+      sleep $((attempt * 2))
+    fi
+  done
+
+  echo "Failed to create $DMG_PATH after $max_attempts attempts." >&2
+  return 1
+}
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
   echo "This script must run on macOS." >&2
   exit 1
@@ -47,10 +71,7 @@ rm -rf "$DMG_STAGING"
 mkdir -p "$DMG_STAGING"
 ditto "$APP_PATH" "$DMG_STAGING/TunnelForge.app"
 ln -s /Applications "$DMG_STAGING/Applications"
-rm -f "$DMG_PATH"
-hdiutil create -volname "TunnelForge" \
-  -srcfolder "$DMG_STAGING" \
-  -ov -format UDZO "$DMG_PATH"
+create_dmg_with_retry
 
 shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"
 

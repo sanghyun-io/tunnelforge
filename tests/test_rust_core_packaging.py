@@ -82,6 +82,9 @@ def test_macos_package_script_creates_dmg_and_supports_signing_notarization():
     assert "APPLE_CODESIGN_IDENTITY" in script
     assert "notarytool submit" in script
     assert "stapler staple" in script
+    assert "create_dmg_with_retry" in script
+    assert "hdiutil create failed" in script
+    assert "hdiutil info || true" in script
     assert 'ditto "$APP_PATH" "$DMG_STAGING/TunnelForge.app"' in script
     assert 'cp -R "$APP_PATH" "$DMG_STAGING/"' not in script
     assert 'shasum -a 256 "$ZIP_PATH" > "$ZIP_PATH.sha256"' in script
