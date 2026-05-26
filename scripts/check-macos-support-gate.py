@@ -138,6 +138,30 @@ def check_manual_report(report: Path) -> bool:
     return True
 
 
+def local_head_sha() -> str | None:
+    result = run(["git", "rev-parse", "HEAD"])
+    if result.returncode != 0:
+        fail("could not resolve local HEAD SHA")
+        return None
+    return result.stdout.strip()
+
+
+def check_report_git_sha(report: Path, expected_sha: str, expected_label: str) -> bool:
+    report_sha = report_path_value(report, "- Git SHA:")
+    if not report_sha or report_sha == "unknown":
+        fail("manual validation report must include a concrete Git SHA")
+        return False
+
+    report_sha = report_sha.lower()
+    expected_sha = expected_sha.lower()
+    if expected_sha.startswith(report_sha) or report_sha.startswith(expected_sha):
+        ok(f"manual validation report Git SHA matches {expected_label}: {report_sha}")
+        return True
+
+    fail(f"manual validation report Git SHA {report_sha} does not match {expected_label} {expected_sha}")
+    return False
+
+
 def default_bundle_for_report(report: Path) -> Path:
     return ROOT / "build" / f"macos-manual-validation-evidence-{report.stem}.zip"
 
@@ -328,18 +352,7 @@ def check_pr(repo: str, skip_checks: bool) -> bool:
 
 
 def check_manual_macos_validation_workflow(repo: str) -> bool:
-    pr = gh_json(
-        [
-            "pr",
-            "view",
-            str(PR_NUMBER),
-            "--repo",
-            repo,
-            "--json",
-            "headRefOid",
-        ]
-    )
-    head_sha = pr["headRefOid"]
+    head_sha = pr_head_sha(repo)
     runs = gh_json(
         [
             "run",
@@ -425,6 +438,21 @@ def check_manual_macos_validation_workflow(repo: str) -> bool:
     return passed
 
 
+def pr_head_sha(repo: str) -> str:
+    pr = gh_json(
+        [
+            "pr",
+            "view",
+            str(PR_NUMBER),
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid",
+        ]
+    )
+    return pr["headRefOid"]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check the macOS support milestone, PR, and manual validation gate."
@@ -477,6 +505,10 @@ def main() -> int:
             passed = check_manual_report(report) and passed
             bundle = bundle_arg or default_bundle_for_report(report)
             passed = check_evidence_bundle(report, bundle) and passed
+            if args.skip_github:
+                head_sha = local_head_sha()
+                if head_sha:
+                    passed = check_report_git_sha(report, head_sha, "local HEAD") and passed
     elif report_arg:
         passed = check_manual_report(report_arg) and passed
         if bundle_arg:
@@ -497,6 +529,8 @@ def main() -> int:
                 passed = check_issues(repo, args.final) and passed
                 passed = check_pr(repo, args.skip_pr_checks) and passed
                 if args.final:
+                    if report is not None:
+                        passed = check_report_git_sha(report, pr_head_sha(repo), "PR head") and passed
                     passed = check_manual_macos_validation_workflow(repo) and passed
             except RuntimeError as exc:
                 fail(str(exc))

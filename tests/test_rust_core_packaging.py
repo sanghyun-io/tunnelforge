@@ -80,6 +80,7 @@ REQUIRED_MANUAL_REPORT_CHECK_ITEMS = [
 
 def completed_manual_report_lines(smoke_log_arg: str) -> list[str]:
     return [
+        f"- Git SHA: {current_git_sha()}",
         "- Release smoke: passed",
         f"- Smoke log: {smoke_log_arg}",
         *REQUIRED_MANUAL_REPORT_SECTIONS,
@@ -88,6 +89,16 @@ def completed_manual_report_lines(smoke_log_arg: str) -> list[str]:
         "- Validator: Codex",
         "",
     ]
+
+
+def current_git_sha() -> str:
+    return subprocess.run(
+        ["git", "rev-parse", "--short", "HEAD"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
 
 
 def evidence_manifest(report: Path, smoke_log: Path) -> str:
@@ -631,6 +642,7 @@ def test_macos_support_gate_script_checks_github_tracking_and_final_report():
     assert "statusCheckRollup" in script
     assert "mergeStateStatus" in script
     assert "check_manual_macos_validation_workflow" in script
+    assert "check_report_git_sha" in script
     assert "workflow_dispatch" in script
     assert "macOS App Validation" in script
     assert "Verify signed and notarized artifacts" in script
@@ -796,6 +808,54 @@ def test_macos_support_gate_script_rejects_incomplete_evidence_bundle(tmp_path):
 
     assert result.returncode == 1
     assert "evidence bundle must contain exactly" in result.stderr
+
+
+def test_macos_support_gate_script_rejects_report_from_different_git_sha(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-gate-wrong-sha"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    bundle = report_dir / "macos-manual-validation-evidence.zip"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
+    report_lines = [
+        "- Git SHA: deadbeef",
+        *[line for line in completed_manual_report_lines(smoke_log_arg) if not line.startswith("- Git SHA:")],
+    ]
+    report.write_text("\n".join(report_lines), encoding="utf-8")
+    with zipfile.ZipFile(bundle, "w") as archive:
+        archive.write(report, report.name)
+        archive.write(smoke_log, smoke_log.name)
+        archive.writestr(
+            "macos-manual-validation-evidence-macos-manual-validation-report.sha256",
+            evidence_manifest(report, smoke_log),
+        )
+    write_bundle_checksum(bundle)
+
+    result = subprocess.run(
+        [
+            "python",
+            "scripts/check-macos-support-gate.py",
+            "--final",
+            "--skip-github",
+            "--report",
+            report_arg,
+            "--bundle",
+            bundle_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "manual validation report Git SHA deadbeef does not match local HEAD" in result.stderr
 
 
 def test_release_workflow_has_macos_app_job_and_assets():
