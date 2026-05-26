@@ -228,6 +228,16 @@ check_complete_report() {
     failures=1
   fi
 
+  if ! grep -qE '^- Final app path:[[:space:]]*/Applications/TunnelForge\.app[[:space:]]*$' "$report_path"; then
+    echo "Manual validation report must record final app path under /Applications." >&2
+    failures=1
+  fi
+
+  if ! grep -qE '^- Final app executable:[[:space:]]*/Applications/TunnelForge\.app/Contents/MacOS/TunnelForge[[:space:]]*$' "$report_path"; then
+    echo "Manual validation report must record final app executable under /Applications." >&2
+    failures=1
+  fi
+
   smoke_log_path="$(extract_smoke_log_path "$report_path")"
 
   if [[ -z "$smoke_log_path" ]]; then

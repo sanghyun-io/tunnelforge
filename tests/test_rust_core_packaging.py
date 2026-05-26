@@ -83,6 +83,8 @@ def completed_manual_report_lines(smoke_log_arg: str) -> list[str]:
         f"- Git SHA: {current_git_sha()}",
         "- macOS: 14.7.1 (23H222)",
         "- Architecture: arm64",
+        "- Final app path: /Applications/TunnelForge.app",
+        "- Final app executable: /Applications/TunnelForge.app/Contents/MacOS/TunnelForge",
         "- Release smoke: passed",
         f"- Smoke log: {smoke_log_arg}",
         *REQUIRED_MANUAL_REPORT_SECTIONS,
@@ -559,6 +561,42 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_real_maco
     assert result.returncode == 1
     assert "Manual validation report must include a real macOS version." in result.stderr
     assert "Manual validation report must include a supported Mac architecture." in result.stderr
+
+
+def test_macos_manual_validation_report_check_complete_rejects_missing_applications_path_metadata(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-app-path"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report_lines = [
+        line
+        for line in completed_manual_report_lines(smoke_log_arg)
+        if not line.startswith("- Final app path:") and not line.startswith("- Final app executable:")
+    ]
+    report.write_text("\n".join(report_lines), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Manual validation report must record final app path under /Applications." in result.stderr
+    assert "Manual validation report must record final app executable under /Applications." in result.stderr
 
 
 def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
