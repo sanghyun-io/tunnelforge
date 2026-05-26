@@ -11,6 +11,10 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SUCCESSFUL_MACOS_SMOKE_LOG = (
+    "macOS /Applications install smoke checks passed.\n"
+    "macOS release package smoke checks passed.\n"
+)
 
 
 REQUIRED_MANUAL_REPORT_SECTIONS = [
@@ -257,6 +261,7 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "^- Validator:[[:space:]]*[^[:space:]].*$" in script
     assert "Smoke log is missing or empty" in script
     assert "macOS release package smoke checks passed." in script
+    assert "macOS /Applications install smoke checks passed." in script
     assert 'tee "$SMOKE_LOG_PATH"' in script
     assert "PIPESTATUS" in script
     assert "Smoke log:" in script
@@ -299,7 +304,7 @@ def test_macos_manual_validation_report_check_complete_accepts_completed_report(
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-complete"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
@@ -369,7 +374,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-sections"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
@@ -410,7 +415,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-items"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
@@ -453,7 +458,7 @@ def test_macos_manual_validation_report_check_complete_rejects_deleted_export_re
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-export-result"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
     report_arg = report.relative_to(PROJECT_ROOT).as_posix()
@@ -477,6 +482,36 @@ def test_macos_manual_validation_report_check_complete_rejects_deleted_export_re
     assert f"Manual validation report is missing required checklist item: {missing_item}" in result.stderr
 
 
+def test_macos_manual_validation_report_check_complete_rejects_missing_applications_smoke(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-applications-smoke"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text("\n".join(completed_manual_report_lines(smoke_log_arg)), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Smoke log must include the successful /Applications install smoke completion message." in result.stderr
+
+
 def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
     if shutil.which("bash") is None:
         pytest.skip("bash is required for shell script validation")
@@ -484,7 +519,7 @@ def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-bundle"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
@@ -530,7 +565,7 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-finalize"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
@@ -609,7 +644,7 @@ def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-gate-complete"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
@@ -655,7 +690,7 @@ def test_macos_support_gate_script_accepts_globbed_final_report_and_bundle(tmp_p
 
     def write_completed_evidence(stamp: str, mtime: int) -> tuple[Path, Path]:
         smoke_log = report_dir / f"macos-release-smoke-{stamp}.log"
-        smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+        smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
         report = report_dir / f"macos-manual-validation-report-{stamp}.md"
         bundle = report_dir / f"macos-manual-validation-evidence-macos-manual-validation-report-{stamp}.zip"
         smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
@@ -731,7 +766,7 @@ def test_macos_support_gate_script_rejects_incomplete_evidence_bundle(tmp_path):
     report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-gate-bad-bundle"
     report_dir.mkdir(parents=True, exist_ok=True)
     smoke_log = report_dir / "macos-release-smoke.log"
-    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
     report = report_dir / "macos-manual-validation-report.md"
     bundle = report_dir / "macos-manual-validation-evidence.zip"
     smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()

@@ -229,6 +229,9 @@ check_complete_report() {
   elif ! grep -q "macOS release package smoke checks passed." "$smoke_log_path"; then
     echo "Smoke log must include the successful release smoke completion message." >&2
     failures=1
+  elif ! grep -q "macOS /Applications install smoke checks passed." "$smoke_log_path"; then
+    echo "Smoke log must include the successful /Applications install smoke completion message." >&2
+    failures=1
   fi
 
   if [[ "$failures" -ne 0 ]]; then
