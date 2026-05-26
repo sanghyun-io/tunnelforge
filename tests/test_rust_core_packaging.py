@@ -81,6 +81,8 @@ REQUIRED_MANUAL_REPORT_CHECK_ITEMS = [
 def completed_manual_report_lines(smoke_log_arg: str) -> list[str]:
     return [
         f"- Git SHA: {current_git_sha()}",
+        "- macOS: 14.7.1 (23H222)",
+        "- Architecture: arm64",
         "- Release smoke: passed",
         f"- Smoke log: {smoke_log_arg}",
         *REQUIRED_MANUAL_REPORT_SECTIONS,
@@ -521,6 +523,42 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_applicati
 
     assert result.returncode == 1
     assert "Smoke log must include the successful /Applications install smoke completion message." in result.stderr
+
+
+def test_macos_manual_validation_report_check_complete_rejects_missing_real_macos_metadata(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-macos-metadata"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report_lines = [
+        line
+        for line in completed_manual_report_lines(smoke_log_arg)
+        if not line.startswith("- macOS:") and not line.startswith("- Architecture:")
+    ]
+    report.write_text("\n".join(report_lines), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Manual validation report must include a real macOS version." in result.stderr
+    assert "Manual validation report must include a supported Mac architecture." in result.stderr
 
 
 def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
