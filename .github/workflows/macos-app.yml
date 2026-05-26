@@ -80,6 +80,24 @@ jobs:
       - name: Build macOS app
         run: bash scripts/build-macos.sh
 
+      - name: Smoke bundled Rust core
+        run: |
+          CORE_PATH="$(find "dist/TunnelForge.app" -type f -name "tunnelforge-core" | head -n 1)"
+          test -n "$CORE_PATH"
+          test -x "$CORE_PATH"
+          RESPONSE="$(printf '%s\n' '{"command":"service.hello","request_id":"ci-smoke","payload":{}}' | "$CORE_PATH")"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["event"] == "result"
+          assert data["request_id"] == "ci-smoke"
+          assert data["service"] == "tunnelforge-core"
+          assert data["success"] is True
+          PY
+
       - name: Package macOS app
         env:
           MACOS_PACKAGE_ARCH: ${{ matrix.arch }}

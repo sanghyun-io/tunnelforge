@@ -77,6 +77,8 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert "macos-15-intel" in workflow
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
     assert "bash scripts/build-macos.sh" in workflow
+    assert "Smoke bundled Rust core" in workflow
+    assert "service.hello" in workflow
     assert "bash scripts/package-macos.sh" in workflow
     assert "actions/upload-artifact" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
