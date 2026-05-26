@@ -49,6 +49,7 @@ done
 check_complete_report() {
   local report_path="$1"
   local failures=0
+  local smoke_log_path=""
 
   if [[ ! -f "$report_path" ]]; then
     echo "Manual validation report not found: $report_path" >&2
@@ -73,6 +74,23 @@ check_complete_report() {
 
   if ! grep -qE '^- Validator:[[:space:]]*[^[:space:]].*$' "$report_path"; then
     echo "Manual validation report must include a validator name." >&2
+    failures=1
+  fi
+
+  smoke_log_path="$(
+    grep -m1 -E '^- Smoke log:' "$report_path" \
+      | sed -E 's/^- Smoke log:[[:space:]]*//' \
+      | tr -d '\r'
+  )"
+
+  if [[ -z "$smoke_log_path" ]]; then
+    echo "Manual validation report must include a smoke log path." >&2
+    failures=1
+  elif [[ ! -s "$smoke_log_path" ]]; then
+    echo "Smoke log is missing or empty: $smoke_log_path" >&2
+    failures=1
+  elif ! grep -q "macOS release package smoke checks passed." "$smoke_log_path"; then
+    echo "Smoke log must include the successful release smoke completion message." >&2
     failures=1
   fi
 

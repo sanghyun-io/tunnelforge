@@ -1,6 +1,9 @@
 from pathlib import Path
+import shutil
+import subprocess
 import tomllib
 
+import pytest
 import yaml
 
 
@@ -112,6 +115,8 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "^- Overall result: (pass|passed|PASS|PASSED)[[:space:]]*$" in script
     assert "Manual validation report must include a validator name" in script
     assert "^- Validator:[[:space:]]*[^[:space:]].*$" in script
+    assert "Smoke log is missing or empty" in script
+    assert "macOS release package smoke checks passed." in script
     assert 'tee "$SMOKE_LOG_PATH"' in script
     assert "PIPESTATUS" in script
     assert "Smoke log:" in script
@@ -127,6 +132,88 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "spctl" in script
     assert "codesign" in script
     assert "notarization" in script
+
+
+def test_macos_manual_validation_report_check_complete_accepts_completed_report(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-complete"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text("macOS release package smoke checks passed.\n", encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text(
+        "\n".join(
+            [
+                "- Release smoke: passed",
+                f"- Smoke log: {smoke_log_arg}",
+                "- [x] Run `bash scripts/validate-macos-release.sh`",
+                "- Overall result: passed",
+                "- Validator: Codex",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "Manual validation report is complete" in result.stdout
+
+
+def test_macos_manual_validation_report_check_complete_rejects_missing_smoke_log(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-missing"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    report = report_dir / "macos-manual-validation-report.md"
+    missing_log_arg = (report_dir / "missing.log").relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text(
+        "\n".join(
+            [
+                "- Release smoke: passed",
+                f"- Smoke log: {missing_log_arg}",
+                "- [x] Run `bash scripts/validate-macos-release.sh`",
+                "- Overall result: passed",
+                "- Validator: Codex",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Smoke log is missing or empty" in result.stderr
 
 
 def test_release_workflow_has_macos_app_job_and_assets():
