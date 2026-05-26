@@ -17,6 +17,8 @@ fi
 mkdir -p build
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
 REPORT_PATH="${MACOS_VALIDATION_REPORT:-build/macos-manual-validation-report-${TIMESTAMP}.md}"
+SMOKE_LOG_PATH="${MACOS_VALIDATION_SMOKE_LOG:-build/macos-release-smoke-${TIMESTAMP}.log}"
+mkdir -p "$(dirname "$REPORT_PATH")" "$(dirname "$SMOKE_LOG_PATH")"
 VERSION="$(python -c 'from src.version import __version__; print(__version__)')"
 GIT_SHA="$(git rev-parse --short HEAD 2>/dev/null || echo unknown)"
 PYTHON_VERSION="$(python --version 2>&1 || echo unavailable)"
@@ -27,10 +29,15 @@ ARCH="$(uname -m)"
 
 SMOKE_STATUS="not run"
 if [[ "$RUN_SMOKE" -eq 1 ]]; then
-  if bash scripts/validate-macos-release.sh; then
+  set +e
+  bash scripts/validate-macos-release.sh 2>&1 | tee "$SMOKE_LOG_PATH"
+  smoke_exit="${PIPESTATUS[0]}"
+  set -e
+
+  if [[ "$smoke_exit" -eq 0 ]]; then
     SMOKE_STATUS="passed"
   else
-    SMOKE_STATUS="failed"
+    SMOKE_STATUS="failed (exit ${smoke_exit})"
   fi
 fi
 
@@ -47,6 +54,7 @@ cat > "$REPORT_PATH" <<EOF
 - Python: ${PYTHON_VERSION}
 - Cargo: ${CARGO_VERSION}
 - Release smoke: ${SMOKE_STATUS}
+- Smoke log: ${SMOKE_LOG_PATH}
 
 ## Automated Smoke
 

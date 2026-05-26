@@ -78,7 +78,12 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
 
     assert "This script must run on macOS." in script
     assert "MACOS_VALIDATION_REPORT" in script
+    assert "MACOS_VALIDATION_SMOKE_LOG" in script
+    assert "macos-release-smoke-${TIMESTAMP}.log" in script
     assert "bash scripts/validate-macos-release.sh" in script
+    assert 'tee "$SMOKE_LOG_PATH"' in script
+    assert "PIPESTATUS" in script
+    assert "Smoke log:" in script
     assert "SSH tunnel" in script
     assert "MySQL" in script
     assert "PostgreSQL" in script
