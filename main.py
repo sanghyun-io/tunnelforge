@@ -112,6 +112,7 @@ def run_self_check() -> dict:
         "core_path": str(core),
         "core_exists": os.path.exists(core),
         "core_hello": None,
+        "core_error": None,
     }
 
     if not result["icon_exists"] or not result["core_exists"]:
@@ -122,17 +123,22 @@ def run_self_check() -> dict:
         "request_id": "self-check",
         "payload": {},
     }
-    completed = subprocess.run(
-        [core],
-        input=json.dumps(request, ensure_ascii=False) + "\n",
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        timeout=10,
-    )
-    completed.check_returncode()
-    result["core_hello"] = json.loads(completed.stdout.strip().splitlines()[-1])
+    try:
+        completed = subprocess.run(
+            [core],
+            input=json.dumps(request, ensure_ascii=False) + "\n",
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=10,
+        )
+        completed.check_returncode()
+        result["core_hello"] = json.loads(completed.stdout.strip().splitlines()[-1])
+    except Exception as exc:
+        result["core_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
     result["success"] = (
         result["core_hello"].get("event") == "result"
         and result["core_hello"].get("request_id") == "self-check"

@@ -44,6 +44,30 @@ def test_run_self_check_reports_resource_and_core_status(monkeypatch, tmp_path):
     assert result["icon_exists"] is True
     assert result["core_exists"] is True
     assert result["core_hello"]["service"] == "tunnelforge-core"
+    assert result["core_error"] is None
+
+
+def test_run_self_check_reports_core_error_as_json(monkeypatch, tmp_path):
+    icon = tmp_path / "icon.png"
+    icon.write_text("icon", encoding="utf-8")
+    core = tmp_path / "tunnelforge-core"
+    core.write_text("core", encoding="utf-8")
+
+    monkeypatch.setattr(main, "app_icon_path", lambda: icon)
+    monkeypatch.setattr(main, "db_core_executable", lambda: str(core))
+
+    def fake_run(*args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args[0], timeout=10)
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    result = main.run_self_check()
+
+    assert result["success"] is False
+    assert result["icon_exists"] is True
+    assert result["core_exists"] is True
+    assert result["core_hello"] is None
+    assert result["core_error"].startswith("TimeoutExpired:")
 
 
 def test_run_ui_smoke_check_builds_window_without_background(monkeypatch):
