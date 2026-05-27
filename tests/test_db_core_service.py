@@ -138,6 +138,26 @@ def test_facade_uses_dump_protocols():
     assert events[0]["event"] == "phase"
 
 
+def test_facade_uses_oneclick_protocol():
+    process = FakeProcess([
+        '{"event":"phase","phase":"preflight","message":"started"}',
+        '{"event":"result","command":"oneclick.run","success":true,"report":{"schema":"app","success":true}}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    events = []
+
+    result = facade.run_oneclick({"schema": "app"}, on_event=events.append)
+
+    sent = json.loads(process.stdin.getvalue().strip())
+    assert sent["command"] == "oneclick.run"
+    assert result["report"]["schema"] == "app"
+    assert events[0]["phase"] == "preflight"
+
+
 def test_rust_connector_masks_success_message_shape():
     class FakeFacade:
         def open_connection(self, endpoint):

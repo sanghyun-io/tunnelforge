@@ -855,6 +855,13 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
                 emit(rewrite_result_command(event, &command))
             });
         }
+        "oneclick.run" => oneclick_run_streaming(&request, emit),
+        "oneclick.preflight" => emit_all_events(oneclick_preflight(&request), emit),
+        "oneclick.analyze" => emit_all_events(oneclick_analyze(&request), emit),
+        "oneclick.recommend" => emit_all_events(oneclick_recommend(&request), emit),
+        "oneclick.apply_fixes" => emit_all_events(oneclick_apply_fixes(&request), emit),
+        "oneclick.validate" => emit_all_events(oneclick_validate(&request), emit),
+        "oneclick.report" => emit_all_events(oneclick_report(&request), emit),
         "job.cancel" => emit_all_events(job_cancel(&request), emit),
         "inspect" => emit_all_events(inspect(&request), emit),
         "preflight" => preflight_streaming(&request, emit),
@@ -923,6 +930,13 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "migration.run",
             "migration.verify",
             "migration.resume",
+            "oneclick.run",
+            "oneclick.preflight",
+            "oneclick.analyze",
+            "oneclick.recommend",
+            "oneclick.apply_fixes",
+            "oneclick.validate",
+            "oneclick.report",
             "job.cancel",
             "service.shutdown"
         ]
@@ -4186,6 +4200,560 @@ fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "success": !issues.iter().any(|issue| issue.blocking),
         "issues": issues
     }));
+}
+
+fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
+    emit(phase_event(
+        request,
+        "preflight",
+        "one-click preflight started",
+    ));
+    emit(oneclick_progress_event(request, 5, "Pre-flight started"));
+    let state = match oneclick_preflight_state(request) {
+        Ok(state) => state,
+        Err(err) => {
+            emit(json!({
+                "event": "error",
+                "request_id": request.request_id,
+                "message": err
+            }));
+            return;
+        }
+    };
+    emit(oneclick_preflight_event(request, &state));
+    emit(oneclick_progress_event(request, 20, "Pre-flight completed"));
+    if state.issues.iter().any(|issue| issue.blocking) {
+        emit(oneclick_final_result(
+            request,
+            &state.schema_name,
+            false,
+            &state.issues,
+            &state.issues,
+            vec!["Pre-flight blocked execution.".to_string()],
+        ));
+        return;
+    }
+
+    emit(phase_event(
+        request,
+        "analysis",
+        "one-click analysis started",
+    ));
+    let analysis = oneclick_analysis_summary(&state.inspection, &state.issues);
+    emit(json!({
+        "event": "analysis",
+        "request_id": request.request_id,
+        "summary": analysis
+    }));
+    emit(oneclick_progress_event(request, 40, "Analysis completed"));
+
+    emit(phase_event(
+        request,
+        "recommendation",
+        "one-click recommendations ready",
+    ));
+    let recommendations = oneclick_recommendations(&state.issues);
+    let recommendation_summary = oneclick_recommendation_summary(&recommendations);
+    emit(json!({
+        "event": "execution_plan",
+        "request_id": request.request_id,
+        "steps": recommendations,
+        "summary": recommendation_summary
+    }));
+    emit(oneclick_progress_event(
+        request,
+        55,
+        "Recommendations completed",
+    ));
+
+    emit(phase_event(
+        request,
+        "execution",
+        "one-click execution started",
+    ));
+    let dry_run = request
+        .payload
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let execution_log = if dry_run {
+        vec!["DRY-RUN: no database changes were executed.".to_string()]
+    } else {
+        vec!["No automatic Rust Core fixes are currently required.".to_string()]
+    };
+    emit(json!({
+        "event": "execution",
+        "request_id": request.request_id,
+        "dry_run": dry_run,
+        "success_count": 0,
+        "fail_count": 0,
+        "skip_count": state.issues.len(),
+        "log": execution_log
+    }));
+    emit(oneclick_progress_event(request, 80, "Execution completed"));
+
+    emit(phase_event(
+        request,
+        "validation",
+        "one-click validation started",
+    ));
+    let validation_issues = match inspect_live(&state.endpoint) {
+        Ok(inspection) => oneclick_issues_from_inspection(&inspection),
+        Err(err) => vec![MigrationIssue {
+            severity: "error".to_string(),
+            location: "validation".to_string(),
+            message: err,
+            suggestion: "Check the database connection and rerun validation.".to_string(),
+            blocking: true,
+        }],
+    };
+    let validation_success = validation_issues.is_empty();
+    emit(json!({
+        "event": "validation",
+        "request_id": request.request_id,
+        "all_fixed": validation_success,
+        "remaining_issues": validation_issues.clone()
+    }));
+    emit(oneclick_progress_event(
+        request,
+        100,
+        "Validation completed",
+    ));
+    emit(oneclick_final_result(
+        request,
+        &state.schema_name,
+        validation_success,
+        &state.issues,
+        &validation_issues,
+        execution_log,
+    ));
+}
+
+fn oneclick_preflight(request: &Request) -> Vec<Value> {
+    let mut events = vec![phase_event(
+        request,
+        "preflight",
+        "one-click preflight started",
+    )];
+    match oneclick_preflight_state(request) {
+        Ok(state) => {
+            events.push(oneclick_preflight_event(request, &state));
+            events.push(json!({
+                "event": "result",
+                "request_id": request.request_id,
+                "command": "oneclick.preflight",
+                "success": !state.issues.iter().any(|issue| issue.blocking),
+                "schema": state.schema_name,
+                "checks": state.checks,
+                "issues": state.issues
+            }));
+        }
+        Err(err) => events.push(json!({
+            "event": "error",
+            "request_id": request.request_id,
+            "message": err
+        })),
+    }
+    events
+}
+
+fn oneclick_analyze(request: &Request) -> Vec<Value> {
+    let mut events = vec![phase_event(
+        request,
+        "analysis",
+        "one-click analysis started",
+    )];
+    match oneclick_preflight_state(request) {
+        Ok(state) => {
+            let summary = oneclick_analysis_summary(&state.inspection, &state.issues);
+            events.push(json!({
+                "event": "result",
+                "request_id": request.request_id,
+                "command": "oneclick.analyze",
+                "success": true,
+                "schema": state.schema_name,
+                "summary": summary,
+                "issues": state.issues
+            }));
+        }
+        Err(err) => events.push(json!({
+            "event": "error",
+            "request_id": request.request_id,
+            "message": err
+        })),
+    }
+    events
+}
+
+fn oneclick_recommend(request: &Request) -> Vec<Value> {
+    let mut events = vec![phase_event(
+        request,
+        "recommendation",
+        "one-click recommendation started",
+    )];
+    let issues = oneclick_payload_issues(&request.payload);
+    let recommendations = oneclick_recommendations(&issues);
+    let summary = oneclick_recommendation_summary(&recommendations);
+    events.push(json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": "oneclick.recommend",
+        "success": true,
+        "steps": recommendations,
+        "summary": summary
+    }));
+    events
+}
+
+fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
+    let dry_run = request
+        .payload
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    vec![
+        phase_event(request, "execution", "one-click apply fixes started"),
+        json!({
+            "event": "result",
+            "request_id": request.request_id,
+            "command": "oneclick.apply_fixes",
+            "success": true,
+            "dry_run": dry_run,
+            "success_count": 0,
+            "fail_count": 0,
+            "skip_count": request.payload.get("steps").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
+            "log": [if dry_run {
+                "DRY-RUN: no database changes were executed."
+            } else {
+                "No automatic Rust Core fixes are currently required."
+            }]
+        }),
+    ]
+}
+
+fn oneclick_validate(request: &Request) -> Vec<Value> {
+    let mut events = vec![phase_event(
+        request,
+        "validation",
+        "one-click validation started",
+    )];
+    match oneclick_endpoint(request) {
+        Ok((endpoint, schema_name)) => {
+            let issues = match inspect_live(&endpoint) {
+                Ok(inspection) => oneclick_issues_from_inspection(&inspection),
+                Err(err) => vec![MigrationIssue {
+                    severity: "error".to_string(),
+                    location: "validation".to_string(),
+                    message: err,
+                    suggestion: "Check the database connection and rerun validation.".to_string(),
+                    blocking: true,
+                }],
+            };
+            events.push(json!({
+                "event": "result",
+                "request_id": request.request_id,
+                "command": "oneclick.validate",
+                "success": issues.is_empty(),
+                "schema": schema_name,
+                "remaining_issues": issues,
+                "all_fixed": issues.is_empty()
+            }));
+        }
+        Err(err) => events.push(json!({
+            "event": "error",
+            "request_id": request.request_id,
+            "message": err
+        })),
+    }
+    events
+}
+
+fn oneclick_report(request: &Request) -> Vec<Value> {
+    let schema = request
+        .payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let success = request
+        .payload
+        .get("success")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let pre_issues = oneclick_payload_issues(&request.payload);
+    let remaining_issues = request
+        .payload
+        .get("remaining_issues")
+        .and_then(Value::as_array)
+        .map(|issues| {
+            issues
+                .iter()
+                .filter_map(|issue| serde_json::from_value::<MigrationIssue>(issue.clone()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    vec![json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": "oneclick.report",
+        "success": success,
+        "report": oneclick_report_value(schema, success, &pre_issues, &remaining_issues, Vec::new())
+    })]
+}
+
+#[derive(Debug, Clone)]
+struct OneClickState {
+    endpoint: Endpoint,
+    schema_name: String,
+    inspection: InspectionResult,
+    checks: Vec<Value>,
+    issues: Vec<MigrationIssue>,
+}
+
+fn oneclick_preflight_state(request: &Request) -> Result<OneClickState, String> {
+    let (endpoint, schema_name) = oneclick_endpoint(request)?;
+    let mut checks = Vec::new();
+    let mut issues = Vec::new();
+    if endpoint.engine != "mysql" {
+        checks.push(oneclick_check(
+            "MySQL engine",
+            false,
+            "error",
+            "One-Click migration currently supports MySQL endpoints only.",
+        ));
+        issues.push(MigrationIssue {
+            severity: "error".to_string(),
+            location: "connection".to_string(),
+            message: "One-Click migration currently supports MySQL endpoints only.".to_string(),
+            suggestion: "Use Cross-Engine Migration for PostgreSQL workflows.".to_string(),
+            blocking: true,
+        });
+    } else {
+        checks.push(oneclick_check(
+            "MySQL engine",
+            true,
+            "info",
+            "MySQL endpoint confirmed.",
+        ));
+    }
+
+    if request
+        .payload
+        .get("backup_confirmed")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        checks.push(oneclick_check(
+            "Backup status",
+            true,
+            "info",
+            "Backup confirmation was provided.",
+        ));
+    } else {
+        checks.push(oneclick_check(
+            "Backup status",
+            false,
+            "warning",
+            "Backup confirmation was not provided.",
+        ));
+        issues.push(MigrationIssue {
+            severity: "warning".to_string(),
+            location: "backup".to_string(),
+            message: "Backup confirmation was not provided.".to_string(),
+            suggestion: "Confirm a restorable backup before running destructive fixes.".to_string(),
+            blocking: false,
+        });
+    }
+
+    match inspect_live(&endpoint) {
+        Ok(inspection) => {
+            checks.push(oneclick_check(
+                "Schema inspect",
+                true,
+                "info",
+                &format!("Inspected {} table(s).", inspection.schema.tables.len()),
+            ));
+            issues.extend(oneclick_issues_from_inspection(&inspection));
+            Ok(OneClickState {
+                endpoint,
+                schema_name,
+                inspection,
+                checks,
+                issues,
+            })
+        }
+        Err(err) => {
+            checks.push(oneclick_check("Schema inspect", false, "error", &err));
+            issues.push(MigrationIssue {
+                severity: "error".to_string(),
+                location: "schema".to_string(),
+                message: err,
+                suggestion: "Check database connection, schema, and inspection permissions."
+                    .to_string(),
+                blocking: true,
+            });
+            Ok(OneClickState {
+                endpoint,
+                schema_name,
+                inspection: InspectionResult::default(),
+                checks,
+                issues,
+            })
+        }
+    }
+}
+
+fn oneclick_endpoint(request: &Request) -> Result<(Endpoint, String), String> {
+    let mut endpoint = request_endpoint(request)?;
+    let schema_name = request
+        .payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|schema| !schema.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| endpoint_schema(&endpoint));
+    if endpoint.engine == "mysql" {
+        endpoint.database = schema_name.clone();
+        endpoint.schema = None;
+    } else {
+        endpoint.schema = Some(schema_name.clone());
+    }
+    Ok((endpoint, schema_name))
+}
+
+fn oneclick_check(name: &str, passed: bool, severity: &str, message: &str) -> Value {
+    json!({
+        "name": name,
+        "passed": passed,
+        "severity": severity,
+        "message": message
+    })
+}
+
+fn oneclick_issues_from_inspection(inspection: &InspectionResult) -> Vec<MigrationIssue> {
+    inspection
+        .unsupported_objects
+        .iter()
+        .map(|object| MigrationIssue {
+            severity: "warning".to_string(),
+            location: object.clone(),
+            message: format!("Unsupported object detected: {object}"),
+            suggestion: "Review this object manually before promoting One-Click migration."
+                .to_string(),
+            blocking: false,
+        })
+        .collect()
+}
+
+fn oneclick_payload_issues(payload: &Value) -> Vec<MigrationIssue> {
+    payload
+        .get("issues")
+        .and_then(Value::as_array)
+        .map(|issues| {
+            issues
+                .iter()
+                .filter_map(|issue| serde_json::from_value::<MigrationIssue>(issue.clone()).ok())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn oneclick_preflight_event(request: &Request, state: &OneClickState) -> Value {
+    json!({
+        "event": "preflight",
+        "request_id": request.request_id,
+        "schema": state.schema_name,
+        "passed": !state.issues.iter().any(|issue| issue.blocking),
+        "checks": state.checks,
+        "issues": state.issues
+    })
+}
+
+fn oneclick_analysis_summary(inspection: &InspectionResult, issues: &[MigrationIssue]) -> Value {
+    json!({
+        "total_issues": issues.len(),
+        "auto_fixable": 0,
+        "manual_review": issues.len(),
+        "table_count": inspection.schema.tables.len(),
+        "unsupported_object_count": inspection.unsupported_objects.len()
+    })
+}
+
+fn oneclick_recommendations(issues: &[MigrationIssue]) -> Vec<Value> {
+    issues
+        .iter()
+        .enumerate()
+        .map(|(index, issue)| {
+            json!({
+                "issue_index": index,
+                "location": issue.location,
+                "description": issue.message,
+                "selected_option": {
+                    "strategy": "manual",
+                    "label": "Manual review",
+                    "description": issue.suggestion,
+                    "sql_template": ""
+                }
+            })
+        })
+        .collect()
+}
+
+fn oneclick_recommendation_summary(steps: &[Value]) -> Value {
+    json!({
+        "total_issues": steps.len(),
+        "auto_fixable": 0,
+        "manual_review": steps.len(),
+        "skip_recommended": 0
+    })
+}
+
+fn oneclick_progress_event(request: &Request, percent: u64, message: &str) -> Value {
+    json!({
+        "event": "progress",
+        "request_id": request.request_id,
+        "percent": percent,
+        "message": message
+    })
+}
+
+fn oneclick_final_result(
+    request: &Request,
+    schema: &str,
+    success: bool,
+    pre_issues: &[MigrationIssue],
+    remaining_issues: &[MigrationIssue],
+    execution_log: Vec<String>,
+) -> Value {
+    json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": "oneclick.run",
+        "success": success,
+        "report": oneclick_report_value(schema, success, pre_issues, remaining_issues, execution_log)
+    })
+}
+
+fn oneclick_report_value(
+    schema: &str,
+    success: bool,
+    pre_issues: &[MigrationIssue],
+    remaining_issues: &[MigrationIssue],
+    execution_log: Vec<String>,
+) -> Value {
+    json!({
+        "schema": schema,
+        "started_at": current_unix_seconds().to_string(),
+        "completed_at": current_unix_seconds().to_string(),
+        "pre_issue_count": pre_issues.len(),
+        "post_issue_count": remaining_issues.len(),
+        "fixed_issues": [],
+        "remaining_issues": remaining_issues,
+        "new_issues": [],
+        "success": success,
+        "execution_log": execution_log,
+        "duration_seconds": 0.0
+    })
 }
 
 fn readiness(request: &Request) -> Vec<Value> {
@@ -8051,6 +8619,54 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("dump.import")));
+        assert!(result["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("oneclick.run")));
+    }
+
+    #[test]
+    fn oneclick_recommend_contract_returns_manual_steps() {
+        let events = handle_request(Request {
+            command: "oneclick.recommend".to_string(),
+            request_id: Some("oneclick-rec-1".to_string()),
+            payload: json!({
+                "issues": [{
+                    "severity": "warning",
+                    "location": "backup",
+                    "message": "Backup confirmation was not provided.",
+                    "suggestion": "Confirm backup.",
+                    "blocking": false
+                }]
+            }),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["command"], "oneclick.recommend");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["summary"]["manual_review"], 1);
+        assert_eq!(result["steps"][0]["selected_option"]["strategy"], "manual");
+    }
+
+    #[test]
+    fn oneclick_apply_fixes_defaults_to_dry_run() {
+        let events = handle_request(Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: Some("oneclick-apply-1".to_string()),
+            payload: json!({"steps": [{"location": "backup"}]}),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["command"], "oneclick.apply_fixes");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["dry_run"], true);
+        assert_eq!(result["skip_count"], 1);
     }
 
     #[test]

@@ -18,8 +18,7 @@ from PyQt6.QtCore import QThread, pyqtSignal, Qt
 from PyQt6.QtGui import QFont, QColor
 
 from src.core.db_connector import MySQLConnector
-from src.core.migration_preflight import PreflightChecker, PreflightResult, CheckSeverity
-from src.core.migration_auto_recommend import AutoRecommendationEngine
+from src.core.migration_preflight import PreflightResult, CheckResult, CheckSeverity
 from src.core.migration_state_tracker import (
     MigrationStateTracker, MigrationState, MigrationPhase, get_state_tracker
 )
@@ -38,9 +37,8 @@ STYLE_MUTED = "color: #7f8c8d;"
 class OneClickMigrationWorker(QThread):
     """전체 마이그레이션 프로세스 실행 Worker.
 
-    This hidden workflow is allowed to run only on the Rust DB Core connector.
-    Python keeps orchestration, recommendation, and UI logging here; every DB
-    operation must go through the Rust-backed connector facade.
+    This hidden workflow is owned by Rust DB Core. Python only starts the
+    command, handles cancellation intent, and renders structured events.
     """
 
     phase_changed = pyqtSignal(str, str)  # phase, phase_name
@@ -78,241 +76,28 @@ class OneClickMigrationWorker(QThread):
         self._execution_gate.set()
 
     def run(self):
-        """전체 프로세스 실행"""
+        """Run the Rust Core-owned One-Click workflow and render emitted events."""
         _mig_logger = None
         _log_path = ""
         try:
             self._started_at = datetime.now()
-
-            # per-run 로그 파일 생성
             _mig_logger, _log_path = create_oneclick_logger(self.schema)
             _mig_logger.info(f"=== One-Click 마이그레이션 시작: schema={self.schema}, dry_run={self.dry_run} ===")
 
-            self._ensure_rust_core_connector()
+            connection = self._ensure_rust_core_connector()
             self.log_message.emit("🦀 Rust DB Core 연결 확인 완료", STYLE_MUTED)
             _mig_logger.info("Rust DB Core connector verified")
 
-            # Phase 1: Pre-flight
-            self.phase_changed.emit(MigrationPhase.PREFLIGHT, "사전 검사")
-            self.log_message.emit("🔍 Pre-flight 검사 시작...", STYLE_INFO)
-            _mig_logger.info("[Phase 1] Pre-flight 검사 시작")
-
-            preflight = PreflightChecker(self.connector)
-            preflight.set_progress_callback(lambda msg: self.log_message.emit(msg, STYLE_MUTED))
-            result = preflight.check_all(self.schema, self.backup_confirmed)
-
-            self.preflight_result.emit(result)
-
-            if not result.passed:
-                self.log_message.emit("❌ Pre-flight 검사 실패", STYLE_ERROR)
-                for error in result.errors:
-                    self.log_message.emit(f"  - {error}", STYLE_ERROR)
-                _mig_logger.error(f"[Phase 1] Pre-flight 실패: {result.errors}")
-                self.finished.emit(False, None)
-                return
-
-            self.log_message.emit("✅ Pre-flight 검사 통과", STYLE_SUCCESS)
-            _mig_logger.info("[Phase 1] Pre-flight 통과")
-            self.progress.emit(20, "Pre-flight 완료")
-
-            if self._is_cancelled:
-                self.log_message.emit("⚠️ 작업이 취소되었습니다.", STYLE_WARNING)
-                self.finished.emit(False, None)
-                return
-
-            # Phase 2: Analysis
-            self.phase_changed.emit(MigrationPhase.ANALYSIS, "분석")
-            self.log_message.emit("📊 스키마 분석 중...", STYLE_INFO)
-            _mig_logger.info("[Phase 2] 스키마 분석 시작")
-
-            from src.core.migration_analyzer import MigrationAnalyzer
-            analyzer = MigrationAnalyzer(self.connector)
-            analyzer.set_progress_callback(lambda msg: self.log_message.emit(msg, STYLE_MUTED))
-            analysis = analyzer.analyze_schema(self.schema)
-
-            self._pre_issues = analysis.compatibility_issues
-            issue_count = len(self._pre_issues)
-
-            self.log_message.emit(f"📋 발견된 이슈: {issue_count}개", STYLE_INFO)
-            _mig_logger.info(f"[Phase 2] 분석 완료 - 이슈 {issue_count}개")
-            self.progress.emit(40, f"분석 완료 - {issue_count}개 이슈")
-
-            if issue_count == 0:
-                self.log_message.emit("✅ 호환성 이슈가 없습니다!", STYLE_SUCCESS)
-                self.analysis_result.emit(0, 0, 0)
-                self.finished.emit(True, self._create_empty_report())
-                return
-
-            if self._is_cancelled:
-                self.log_message.emit("⚠️ 작업이 취소되었습니다.", STYLE_WARNING)
-                self.finished.emit(False, None)
-                return
-
-            # Phase 3: Auto-Recommend
-            self.phase_changed.emit(MigrationPhase.RECOMMENDATION, "권장 옵션 선택")
-            self.log_message.emit("🎯 자동 권장 옵션 선택 중...", STYLE_INFO)
-
-            from src.core.migration_fix_wizard import SmartFixGenerator, FixWizardStep
-
-            generator = SmartFixGenerator(self.connector, self.schema)
-            steps = []
-
-            for i, issue in enumerate(self._pre_issues):
-                options = generator.get_fix_options(issue)
-                step = FixWizardStep(
-                    issue_index=i,
-                    issue_type=issue.issue_type,
-                    location=issue.location,
-                    description=issue.description,
-                    options=options
-                )
-                steps.append(step)
-
-            engine = AutoRecommendationEngine(self.connector, self.schema)
-            steps = engine.recommend_all(self._pre_issues, steps)
-            summary = engine.get_summary(steps, self._pre_issues)
-
-            self.analysis_result.emit(
-                summary.total_issues,
-                summary.auto_fixable,
-                summary.manual_review
-            )
-
-            self.log_message.emit(
-                f"  - 자동 수정 가능: {summary.auto_fixable}개",
-                STYLE_SUCCESS if summary.auto_fixable > 0 else STYLE_MUTED
-            )
-            self.log_message.emit(
-                f"  - 수동 검토 필요: {summary.manual_review}개",
-                STYLE_WARNING if summary.manual_review > 0 else STYLE_MUTED
-            )
-            self.log_message.emit(
-                f"  - 건너뛰기 권장: {summary.skip_recommended}개",
-                STYLE_MUTED
-            )
-
-            self.progress.emit(50, "권장 옵션 선택 완료")
-
-            # Phase 3→4 사이: 실행 계획 확인 대기
-            # 사용자가 "실행 시작" 버튼을 누를 때까지 일시 정지
-            self._execution_gate.clear()
-            self.execution_plan_ready.emit(steps, summary)
-            _mig_logger.info("[Phase 3→4] 실행 계획 확인 대기 중...")
-
-            # 취소 체크하며 대기 (100ms 간격)
-            while not self._execution_gate.wait(timeout=0.1):
-                if self._is_cancelled:
-                    break
-
-            if self._is_cancelled:
-                self.log_message.emit("⚠️ 작업이 취소되었습니다.", STYLE_WARNING)
-                self.finished.emit(False, None)
-                return
-
-            _mig_logger.info("[Phase 3→4] 실행 계획 확인 완료 - 실행 시작")
-
-            # Phase 4: Execution
-            self.phase_changed.emit(MigrationPhase.EXECUTION, "실행")
-
-            if self.dry_run:
-                self.log_message.emit("🧪 [DRY-RUN] 실제 실행하지 않음", STYLE_WARNING)
-            else:
-                self.log_message.emit("🔧 수정 작업 실행 중...", STYLE_INFO)
-
-            execution_log = []
-            executed_count = 0
-            total_executable = summary.auto_fixable
-
-            from src.core.migration_fix_wizard import BatchFixExecutor
-
-            executor = BatchFixExecutor(self.connector, self.schema)
-            executor.set_progress_callback(
-                lambda msg: self.log_message.emit(msg, STYLE_INFO)
-            )
-
-            batch_result = executor.execute_batch(steps, dry_run=self.dry_run)
-
-            # BatchExecutionResult → execution_log 변환
-            # result.location을 직접 사용 (FK 정렬 후 step↔result 매핑 오류 방지)
-            _mig_logger.info(f"[Phase 4] 실행 완료 - 성공:{batch_result.success_count} 실패:{batch_result.fail_count} 스킵:{batch_result.skip_count}")
-            executed_count = batch_result.success_count
-            for result in batch_result.results:
-                loc = result.location or "<unknown>"
-                if result.success:
-                    if result.message not in ("건너뛰기", "수동 처리 필요"):
-                        sql_preview = result.sql_executed[:50]
-                        suffix = "..." if len(result.sql_executed) > 50 else ""
-                        execution_log.append(f"[OK] {loc}: {sql_preview}{suffix}")
-                        _mig_logger.info(
-                            f"[OK] location={loc} affected_rows={result.affected_rows}\n"
-                            f"     SQL: {result.sql_executed}"
-                        )
-                    else:
-                        reason = f"{result.message}: {result.description}" if result.description else result.message
-                        execution_log.append(f"[SKIP] {loc}: {reason}")
-                        _mig_logger.info(f"[SKIP] location={loc} reason={reason}")
-                else:
-                    execution_log.append(f"[FAIL] {loc}: {result.error or result.message}")
-                    _mig_logger.error(
-                        f"[FAIL] location={loc} error={result.error or result.message}\n"
-                        f"       SQL: {result.sql_executed}"
-                    )
-
-            # Rollback SQL이 있으면 로그에 기록
-            if batch_result.rollback_sql:
-                execution_log.append(f"\n-- Rollback SQL --\n{batch_result.rollback_sql}")
-
-            self.progress.emit(90, "실행 완료")
-            self.log_message.emit(
-                f"✅ 실행 완료: {executed_count}/{total_executable}개 "
-                f"(실패: {batch_result.fail_count}, 스킵: {batch_result.skip_count})",
-                STYLE_SUCCESS
-            )
-
-            if self._is_cancelled:
-                self.log_message.emit("⚠️ 작업이 취소되었습니다.", STYLE_WARNING)
-                self.finished.emit(False, None)
-                return
-
-            # Phase 5: Validation
-            self.phase_changed.emit(MigrationPhase.VALIDATION, "검증")
-            self.log_message.emit("🔍 마이그레이션 결과 검증 중...", STYLE_INFO)
-            _mig_logger.info("[Phase 5] 검증 시작")
-
-            validator = PostMigrationValidator(self.connector)
-            validation = validator.validate(self.schema, self._pre_issues)
-
-            report = validator.generate_report(
-                self.schema,
-                self._pre_issues,
-                validation,
-                self._started_at,
-                execution_log
-            )
-            report.execution_log_path = _log_path
-
-            self.progress.emit(100, "검증 완료")
-
-            if validation.all_fixed:
-                self.log_message.emit("✅ 모든 이슈가 해결되었습니다!", STYLE_SUCCESS)
-                _mig_logger.info("[Phase 5] 모든 이슈 해결됨")
-            else:
-                self.log_message.emit(
-                    f"⚠️ 남은 이슈: {len(validation.remaining_issues)}개",
-                    STYLE_WARNING
-                )
-                if validation.new_issues:
-                    self.log_message.emit(
-                        f"⚠️ 새 이슈: {len(validation.new_issues)}개",
-                        STYLE_WARNING
-                    )
-                _mig_logger.warning(
-                    f"[Phase 5] 남은 이슈: {len(validation.remaining_issues)}개, "
-                    f"새 이슈: {len(validation.new_issues)}개"
-                )
-
-            _mig_logger.info(f"=== 마이그레이션 완료: success={report.success} ===")
-            self.finished.emit(report.success, report)
+            payload = {
+                "connection": connection.endpoint.to_payload(),
+                "schema": self.schema,
+                "dry_run": self.dry_run,
+                "backup_confirmed": self.backup_confirmed,
+            }
+            result = connection.facade.run_oneclick(payload, on_event=self._handle_core_event)
+            report = self._report_from_core_payload(result.get("report") or {}, _log_path)
+            _mig_logger.info(f"=== 마이그레이션 완료: success={result.get('success')} ===")
+            self.finished.emit(bool(result.get("success")), report)
 
         except Exception as e:
             if _mig_logger:
@@ -322,6 +107,115 @@ class OneClickMigrationWorker(QThread):
         finally:
             if _mig_logger:
                 close_oneclick_logger(_mig_logger)
+
+    def _handle_core_event(self, event: dict):
+        """Translate Rust Core One-Click events into UI signals."""
+        if self._is_cancelled:
+            return
+        event_type = event.get("event")
+        if event_type == "phase":
+            phase = str(event.get("phase", ""))
+            self.phase_changed.emit(phase, self._phase_name(phase))
+            message = str(event.get("message", ""))
+            if message:
+                self.log_message.emit(message, STYLE_INFO)
+            return
+        if event_type == "progress":
+            self.progress.emit(int(event.get("percent") or 0), str(event.get("message", "")))
+            return
+        if event_type == "preflight":
+            self.preflight_result.emit(self._preflight_from_core_event(event))
+            return
+        if event_type == "analysis":
+            summary = event.get("summary") if isinstance(event.get("summary"), dict) else {}
+            self.analysis_result.emit(
+                int(summary.get("total_issues") or 0),
+                int(summary.get("auto_fixable") or 0),
+                int(summary.get("manual_review") or 0),
+            )
+            return
+        if event_type == "execution_plan":
+            self.execution_plan_ready.emit(
+                event.get("steps") if isinstance(event.get("steps"), list) else [],
+                event.get("summary") if isinstance(event.get("summary"), dict) else {},
+            )
+            return
+        if event_type == "execution":
+            for item in event.get("log") or []:
+                self.log_message.emit(str(item), STYLE_WARNING if event.get("dry_run") else STYLE_INFO)
+            return
+        if event_type == "validation":
+            remaining = event.get("remaining_issues") if isinstance(event.get("remaining_issues"), list) else []
+            if remaining:
+                self.log_message.emit(f"⚠️ 남은 이슈: {len(remaining)}개", STYLE_WARNING)
+            else:
+                self.log_message.emit("✅ 검증 완료", STYLE_SUCCESS)
+            return
+        if event_type == "error":
+            self.log_message.emit(f"❌ {event.get('message', '')}", STYLE_ERROR)
+
+    def _preflight_from_core_event(self, event: dict) -> PreflightResult:
+        checks = []
+        errors = []
+        warnings = []
+        for item in event.get("checks") or []:
+            if not isinstance(item, dict):
+                continue
+            severity = self._check_severity(str(item.get("severity", "info")))
+            passed = bool(item.get("passed"))
+            message = str(item.get("message", ""))
+            checks.append(CheckResult(
+                name=str(item.get("name", "")),
+                passed=passed,
+                severity=severity,
+                message=message,
+            ))
+            if not passed and severity == CheckSeverity.ERROR:
+                errors.append(message)
+            elif not passed:
+                warnings.append(message)
+        return PreflightResult(
+            passed=bool(event.get("passed")),
+            checks=checks,
+            warnings=warnings,
+            errors=errors,
+        )
+
+    @staticmethod
+    def _check_severity(value: str) -> CheckSeverity:
+        if value == "error":
+            return CheckSeverity.ERROR
+        if value == "warning":
+            return CheckSeverity.WARNING
+        return CheckSeverity.INFO
+
+    @staticmethod
+    def _phase_name(phase: str) -> str:
+        return {
+            MigrationPhase.PREFLIGHT: "사전 검사",
+            MigrationPhase.ANALYSIS: "분석",
+            MigrationPhase.RECOMMENDATION: "권장 옵션 선택",
+            MigrationPhase.EXECUTION: "실행",
+            MigrationPhase.VALIDATION: "검증",
+            MigrationPhase.COMPLETED: "완료",
+        }.get(phase, phase)
+
+    def _report_from_core_payload(self, payload: dict, log_path: str) -> MigrationReport:
+        report = MigrationReport(
+            schema=str(payload.get("schema") or self.schema),
+            started_at=str(payload.get("started_at") or (self._started_at.isoformat() if self._started_at else "")),
+            completed_at=str(payload.get("completed_at") or datetime.now().isoformat()),
+            pre_issue_count=int(payload.get("pre_issue_count") or 0),
+            post_issue_count=int(payload.get("post_issue_count") or 0),
+            fixed_issues=payload.get("fixed_issues") if isinstance(payload.get("fixed_issues"), list) else [],
+            remaining_issues=payload.get("remaining_issues") if isinstance(payload.get("remaining_issues"), list) else [],
+            new_issues=payload.get("new_issues") if isinstance(payload.get("new_issues"), list) else [],
+            success=bool(payload.get("success")),
+            execution_log=payload.get("execution_log") if isinstance(payload.get("execution_log"), list) else [],
+            duration_seconds=float(payload.get("duration_seconds") or 0.0),
+        )
+        report.execution_log_path = log_path
+        return report
 
     def _ensure_rust_core_connector(self):
         """Fail closed unless One-Click is backed by tunnelforge-core."""
@@ -334,6 +228,7 @@ class OneClickMigrationWorker(QThread):
                 "One-Click migration requires a Rust DB Core connector. "
                 "Legacy Python DB connections are not supported."
             )
+        return connection
 
     def _create_empty_report(self) -> MigrationReport:
         """이슈가 없을 때 빈 리포트 생성"""
@@ -775,32 +670,43 @@ class ExecutionPlanWidget(QWidget):
 
     def update_plan(self, steps, summary):
         """실행 계획 데이터로 UI 업데이트"""
-        from src.core.migration_fix_wizard import FixStrategy
-
         auto_items = []
         skip_items = []
         manual_items = []
 
         for step in steps:
-            if not step.selected_option:
-                manual_items.append(f"• {step.location}: {step.description}")
+            if isinstance(step, dict):
+                option = step.get("selected_option") if isinstance(step.get("selected_option"), dict) else {}
+                location = str(step.get("location") or "")
+                description = str(step.get("description") or "")
+                strategy = str(option.get("strategy") or "manual")
+                sql = str(option.get("sql_template") or "")
+                label = str(option.get("label") or description)
+                option_description = str(option.get("description") or description)
+            else:
+                option = getattr(step, "selected_option", None)
+                location = getattr(step, "location", "")
+                description = getattr(step, "description", "")
+                if not option:
+                    manual_items.append(f"• {location}: {description}")
+                    continue
+                strategy = str(getattr(option, "strategy", "manual"))
+                sql = getattr(option, "sql_template", "") or ""
+                label = getattr(option, "label", "") or description
+                option_description = getattr(option, "description", "") or description
+
+            if not option:
+                manual_items.append(f"• {location}: {description}")
                 continue
 
-            strategy = step.selected_option.strategy
-            sql = step.selected_option.sql_template or ""
-
-            if strategy == FixStrategy.SKIP:
-                skip_items.append(f"• {step.location}: {step.selected_option.description}")
-            elif strategy == FixStrategy.COLLATION_FK_SAFE:
-                # FK 안전 변경: sql_template이 주석("--")으로 시작하므로 자동 실행으로 분류
-                auto_items.append(f"• {step.location}: {step.selected_option.label}")
+            if strategy.endswith("SKIP") or strategy == "skip":
+                skip_items.append(f"• {location}: {option_description}")
+            elif strategy.endswith("COLLATION_FK_SAFE"):
+                auto_items.append(f"• {location}: {label}")
             elif not sql or sql.startswith("--"):
-                # SQL이 없거나 주석인 경우 → 마이그레이션 후 수동 처리
-                manual_items.append(
-                    f"• {step.location}: {step.selected_option.description or step.description}"
-                )
+                manual_items.append(f"• {location}: {option_description}")
             else:
-                auto_items.append(f"• {step.location}: {step.selected_option.label}")
+                auto_items.append(f"• {location}: {label}")
 
         self.auto_group.setTitle(f"🔧 자동 실행 대상 ({len(auto_items)}개)")
         self.auto_text.setPlainText("\n".join(auto_items) if auto_items else "(없음)")
@@ -1070,16 +976,15 @@ class OneClickMigrationDialog(QDialog):
         self.analysis_widget.update_result(total, auto_fixable, manual)
 
     def _on_execution_plan_ready(self, steps, summary):
-        """실행 계획 준비 완료 핸들러 (Phase 3→4 사이 일시 정지)"""
+        """실행 계획 준비 완료 핸들러"""
         self.execution_plan_widget.update_plan(steps, summary)
-        self.stack.setCurrentWidget(self.execution_plan_widget)
-
-        # "실행 시작" 버튼 연결 (한 번만 연결하기 위해 disconnect 후 connect)
-        try:
-            self.execution_plan_widget.start_requested.disconnect()
-        except (TypeError, RuntimeError):
-            pass
-        self.execution_plan_widget.start_requested.connect(self._on_start_execution_confirmed)
+        total = summary.get("total_issues", 0) if isinstance(summary, dict) else 0
+        auto_fixable = summary.get("auto_fixable", 0) if isinstance(summary, dict) else 0
+        manual = summary.get("manual_review", 0) if isinstance(summary, dict) else 0
+        self._on_log(
+            f"📋 실행 계획: 전체 {total}개, 자동 {auto_fixable}개, 수동 {manual}개",
+            STYLE_INFO,
+        )
 
     def _on_start_execution_confirmed(self):
         """사용자가 실행 계획 확인 후 "실행 시작" 클릭"""

@@ -313,6 +313,13 @@ class DbCoreFacade:
     ) -> Dict[str, Any]:
         return self.client.request("dump.import", payload, on_event=on_event)
 
+    def run_oneclick(
+        self,
+        payload: Dict[str, Any],
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        return self.client.request("oneclick.run", payload, on_event=on_event)
+
 
 _shared_facade_lock = threading.Lock()
 _shared_facade: Optional[DbCoreFacade] = None
