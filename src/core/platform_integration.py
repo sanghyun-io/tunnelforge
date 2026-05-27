@@ -1,5 +1,6 @@
 """Small platform integration helpers isolated from UI/business logic."""
 import os
+import plistlib
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -152,7 +153,7 @@ class StartupRegistrar:
         if not self.is_supported:
             return False
         if is_macos(self.platform_name):
-            return self._macos_launch_agent_path().exists()
+            return self._macos_launch_agent_matches_current_app()
         try:
             import winreg
 
@@ -219,6 +220,21 @@ class StartupRegistrar:
 
     def _macos_launch_agent_log_dir(self) -> Path:
         return self._home_path() / "Library" / "Logs" / "TunnelForge"
+
+    def _macos_launch_agent_matches_current_app(self) -> bool:
+        path = self._macos_launch_agent_path()
+        if not path.exists():
+            return False
+
+        try:
+            launch_agent = plistlib.loads(path.read_bytes())
+        except Exception:
+            return False
+
+        return (
+            launch_agent.get("ProgramArguments") == list(self._macos_startup_arguments())
+            and launch_agent.get("WorkingDirectory") == self._macos_working_directory()
+        )
 
     def _set_macos_launch_agent(self, enable: bool) -> Tuple[bool, str]:
         path = self._macos_launch_agent_path()
