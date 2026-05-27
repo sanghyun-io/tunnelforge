@@ -995,8 +995,23 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     assert f"- Report: {report_arg}" in result.stdout
     assert f"- Smoke log: {smoke_log_arg}" in result.stdout
     assert f"- System evidence log: {system_log.relative_to(PROJECT_ROOT).as_posix()}" in result.stdout
+    comment_arg = (
+        report_dir / "macos-final-validation-github-comment-macos-manual-validation-report.md"
+    ).relative_to(PROJECT_ROOT).as_posix()
+    assert f"- GitHub evidence comment: {comment_arg}" in result.stdout
     assert f"- Evidence bundle: {bundle_arg}" in result.stdout
     assert f"- Evidence bundle checksum: {bundle_arg}.sha256" in result.stdout
+    comment = PROJECT_ROOT / comment_arg
+    assert comment.exists()
+    comment_text = comment.read_text(encoding="utf-8")
+    assert "Final macOS validation evidence for #116" in comment_text
+    assert report_arg in comment_text
+    assert smoke_log_arg in comment_text
+    assert system_log.relative_to(PROJECT_ROOT).as_posix() in comment_text
+    assert bundle_arg in comment_text
+    assert f"{bundle_arg}.sha256" in comment_text
+    assert "gh issue comment 116 --body-file" in comment_text
+    assert "Keep #116 open until these files are attached" in comment_text
 
 
 def test_macos_support_gate_script_checks_github_tracking_and_final_report():

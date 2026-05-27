@@ -37,6 +37,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "*.zip.sha256" in doc
     assert "smoke log file" in doc
     assert "system evidence log" in doc
+    assert "GitHub evidence comment" in doc
     assert "Overall result" in doc
     assert "Validator" in doc
     assert "required sections" in doc

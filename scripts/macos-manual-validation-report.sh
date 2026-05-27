@@ -168,6 +168,14 @@ checksum_path_for_bundle() {
   echo "${bundle_path}.sha256"
 }
 
+comment_path_for_report() {
+  local report_path="$1"
+  local report_name=""
+
+  report_name="$(basename "$report_path" .md)"
+  echo "$(dirname "$report_path")/macos-final-validation-github-comment-${report_name}.md"
+}
+
 check_complete_report() {
   local report_path="$1"
   local failures=0
@@ -414,6 +422,7 @@ finalize_evidence() {
   local system_evidence_log_path=""
   local bundle_path=""
   local checksum_path=""
+  local comment_path=""
   local gate_args=()
 
   create_evidence_bundle "$report_path"
@@ -421,6 +430,7 @@ finalize_evidence() {
   system_evidence_log_path="$(extract_system_evidence_log_path "$report_path")"
   bundle_path="$(bundle_path_for_report "$report_path")"
   checksum_path="$(checksum_path_for_bundle "$bundle_path")"
+  comment_path="$(comment_path_for_report "$report_path")"
   gate_args=(--final --report "$report_path" --bundle "$bundle_path")
 
   if [[ "$SKIP_GITHUB" -eq 1 ]]; then
@@ -429,11 +439,33 @@ finalize_evidence() {
 
   "$PYTHON_BIN" scripts/check-macos-support-gate.py "${gate_args[@]}"
 
+  cat > "$comment_path" <<EOF
+Final macOS validation evidence for #116
+
+Final gate passed for the attached real-Mac evidence. Attach these files to #116 and PR #117 before checking the final device validation box:
+
+- Report: ${report_path}
+- Smoke log: ${smoke_log_path}
+- System evidence log: ${system_evidence_log_path}
+- Evidence bundle: ${bundle_path}
+- Evidence bundle checksum: ${checksum_path}
+
+Suggested GitHub comment command after attaching the files:
+
+\`\`\`bash
+gh issue comment 116 --body-file ${comment_path}
+gh pr comment 117 --body-file ${comment_path}
+\`\`\`
+
+Keep #116 open until these files are attached and the final device validation checkbox is checked.
+EOF
+
   echo
   echo "Final macOS validation evidence is ready:"
   echo "- Report: $report_path"
   echo "- Smoke log: $smoke_log_path"
   echo "- System evidence log: $system_evidence_log_path"
+  echo "- GitHub evidence comment: $comment_path"
   echo "- Evidence bundle: $bundle_path"
   echo "- Evidence bundle checksum: $checksum_path"
   echo
