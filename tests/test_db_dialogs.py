@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QApplication
 
 from src.ui.dialogs.db_dialogs import (
     RustDumpExportDialog,
+    RustDumpImportDialog,
     RustDumpWizard,
     cap_incomplete_export_percent,
     export_overall_percent,
@@ -182,6 +183,58 @@ def test_rust_dump_export_dialog_rejects_parent_manual_folder(tmp_path):
     generated = Path(dialog._generate_output_dir("dataflare")).resolve()
     assert generated.is_relative_to(tmp_path.resolve())
     assert generated != tmp_path.parent.resolve()
+    dialog.close()
+
+
+def test_rust_dump_import_dialog_prefills_recent_export_dump_dir(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    dump_dir = tmp_path / "recent_dump"
+    dump_dir.mkdir()
+    (dump_dir / "_tunnelforge_dump.json").write_text("{}", encoding="utf-8")
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(dump_dir) if key == "rust_dump_export_dir" else default
+    )
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "ok"))
+
+    dialog = RustDumpImportDialog(config_manager=config_manager)
+
+    assert dialog.input_dir.text() == str(dump_dir)
+    dialog.close()
+
+
+def test_rust_dump_import_browse_uses_recent_dump_dir_and_saves_selection(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    recent_dir = tmp_path / "recent_dump"
+    selected_dir = tmp_path / "selected_dump"
+    recent_dir.mkdir()
+    selected_dir.mkdir()
+    (recent_dir / "_tunnelforge_dump.json").write_text("{}", encoding="utf-8")
+    (selected_dir / "_tunnelforge_dump.json").write_text("{}", encoding="utf-8")
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(recent_dir) if key == "rust_dump_last_dump_dir" else default
+    )
+    captured = {}
+
+    def fake_get_existing_directory(parent, title, start_dir):
+        captured["start_dir"] = start_dir
+        return str(selected_dir)
+
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "ok"))
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.QFileDialog.getExistingDirectory",
+        fake_get_existing_directory,
+    )
+    monkeypatch.setattr(RustDumpImportDialog, "_run_upgrade_check", lambda self, folder: None)
+    dialog = RustDumpImportDialog(config_manager=config_manager)
+
+    dialog.browse_input_dir()
+
+    assert captured["start_dir"] == str(recent_dir)
+    assert dialog.input_dir.text() == str(selected_dir)
+    config_manager.set_app_setting.assert_any_call('rust_dump_import_dir', str(selected_dir))
+    config_manager.set_app_setting.assert_any_call('rust_dump_last_dump_dir', str(selected_dir))
     dialog.close()
 
 

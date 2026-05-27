@@ -3060,6 +3060,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
+        if matches!(mode, "replace" | "recreate") {
+            drop_existing_dump_tables_for_replace(&mut adapter, &tables)?;
+        }
+
         for (index, table_manifest) in tables.iter().enumerate() {
             let table = manifest
                 .schema
@@ -3076,9 +3080,6 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 "total": table_total
             }));
 
-            if matches!(mode, "replace" | "recreate") {
-                adapter.execute_sql(&drop_table_sql(adapter.engine(), &table.name))?;
-            }
             let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
                 .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
             adapter.create_table(table, &ddl)?;
@@ -3303,9 +3304,13 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
         vec![
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION foreign_key_checks=1".to_string(),
+            "SET SESSION sql_mode=COALESCE(@tunnelforge_old_sql_mode, @@SESSION.sql_mode)"
+                .to_string(),
         ]
     } else {
         vec![
+            "SET @tunnelforge_old_sql_mode=@@SESSION.sql_mode".to_string(),
+            "SET SESSION sql_mode=TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','))".to_string(),
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=0".to_string(),
         ]
@@ -3320,6 +3325,24 @@ fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> 
         adapter.execute_sql(&sql)?;
     }
     Ok(())
+}
+
+fn drop_existing_dump_tables_for_replace(
+    adapter: &mut LiveAdapter,
+    tables: &[DumpTableManifest],
+) -> Result<(), String> {
+    for sql in drop_existing_dump_table_sqls(adapter.engine(), tables) {
+        adapter.execute_sql(&sql)?;
+    }
+    Ok(())
+}
+
+fn drop_existing_dump_table_sqls(engine: &str, tables: &[DumpTableManifest]) -> Vec<String> {
+    tables
+        .iter()
+        .rev()
+        .map(|table| drop_table_sql(engine, &table.name))
+        .collect()
 }
 
 fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
@@ -8791,6 +8814,43 @@ mod tests {
     }
 
     #[test]
+    fn dump_import_replace_drops_existing_tables_in_reverse_dependency_order() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+                empty_table("users", Vec::new()),
+            ],
+        };
+        let tables = vec![
+            DumpTableManifest {
+                name: "orders".to_string(),
+                path: "0001_orders".to_string(),
+                rows: 1,
+                chunks: 1,
+                chunk_sha256: BTreeMap::new(),
+            },
+            DumpTableManifest {
+                name: "users".to_string(),
+                path: "0002_users".to_string(),
+                rows: 1,
+                chunks: 1,
+                chunk_sha256: BTreeMap::new(),
+            },
+        ];
+
+        let ordered = dependency_ordered_dump_tables(&schema, tables);
+        let drop_sql = drop_existing_dump_table_sqls("mysql", &ordered);
+
+        assert_eq!(
+            drop_sql,
+            vec![
+                "DROP TABLE IF EXISTS `orders`".to_string(),
+                "DROP TABLE IF EXISTS `users`".to_string(),
+            ]
+        );
+    }
+
+    #[test]
     fn migration_plan_alias_preserves_service_command_name() {
         let result = handle_request(Request {
             command: "migration.plan".to_string(),
@@ -10098,6 +10158,8 @@ mod tests {
         assert_eq!(
             mysql_import_session_tuning_sql(false),
             vec![
+                "SET @tunnelforge_old_sql_mode=@@SESSION.sql_mode".to_string(),
+                "SET SESSION sql_mode=TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','))".to_string(),
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=0".to_string(),
             ]
@@ -10107,6 +10169,8 @@ mod tests {
             vec![
                 "SET SESSION unique_checks=1".to_string(),
                 "SET SESSION foreign_key_checks=1".to_string(),
+                "SET SESSION sql_mode=COALESCE(@tunnelforge_old_sql_mode, @@SESSION.sql_mode)"
+                    .to_string(),
             ]
         );
     }

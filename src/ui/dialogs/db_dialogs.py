@@ -1234,6 +1234,7 @@ class RustDumpExportDialog(QDialog):
         # 설정 저장
         if self.config_manager:
             self.config_manager.set_app_setting('rust_dump_export_dir', output_dir)
+            self.config_manager.set_app_setting('rust_dump_last_dump_dir', output_dir)
 
         # 로그 수집 초기화
         self.log_entries.clear()
@@ -1832,6 +1833,9 @@ class RustDumpImportDialog(QDialog):
 
         self.input_dir = QLineEdit()
         self.input_dir.setPlaceholderText("rust_dump dump 폴더 선택...")
+        initial_input_dir = self._get_initial_input_dir()
+        if initial_input_dir:
+            self.input_dir.setText(initial_input_dir)
 
         btn_browse = QPushButton("선택")
         btn_browse.setStyleSheet("""
@@ -2225,12 +2229,50 @@ class RustDumpImportDialog(QDialog):
         use_original = self.chk_use_original.isChecked()
         self.combo_target_schema.setEnabled(not use_original)
 
+    def _get_saved_existing_dir(self, key: str) -> str:
+        if not self.config_manager:
+            return ""
+        path = self.config_manager.get_app_setting(key, "")
+        return path if path and os.path.isdir(path) else ""
+
+    def _is_dump_dir(self, path: str) -> bool:
+        return bool(
+            path
+            and os.path.isdir(path)
+            and os.path.exists(os.path.join(path, "_tunnelforge_dump.json"))
+        )
+
+    def _get_initial_input_dir(self) -> str:
+        for key in ("rust_dump_last_dump_dir", "rust_dump_export_dir", "rust_dump_import_dir"):
+            path = self._get_saved_existing_dir(key)
+            if self._is_dump_dir(path):
+                return path
+        return ""
+
+    def _get_input_dir_browse_start(self) -> str:
+        current_path = self.input_dir.text().strip()
+        if os.path.isdir(current_path):
+            return current_path
+        for key in (
+            "rust_dump_last_dump_dir",
+            "rust_dump_export_dir",
+            "rust_dump_import_dir",
+            "rust_dump_export_base_dir",
+        ):
+            path = self._get_saved_existing_dir(key)
+            if path:
+                return path
+        return os.path.expanduser("~")
+
     def browse_input_dir(self):
         folder = QFileDialog.getExistingDirectory(
-            self, "Dump 폴더 선택", self.input_dir.text()
+            self, "Dump 폴더 선택", self._get_input_dir_browse_start()
         )
         if folder:
             self.input_dir.setText(folder)
+            if self.config_manager:
+                self.config_manager.set_app_setting('rust_dump_import_dir', folder)
+                self.config_manager.set_app_setting('rust_dump_last_dump_dir', folder)
             # 폴더 선택 시 자동으로 MySQL 8.4 호환성 검사 실행
             self._run_upgrade_check(folder)
 
@@ -2425,6 +2467,9 @@ class RustDumpImportDialog(QDialog):
         # 저장 (재시도용)
         self.last_input_dir = input_dir
         self.last_target_schema = target_schema
+        if self.config_manager:
+            self.config_manager.set_app_setting('rust_dump_import_dir', input_dir)
+            self.config_manager.set_app_setting('rust_dump_last_dump_dir', input_dir)
 
         # UI 상태 변경 - 모든 입력 비활성화
         self.set_ui_enabled(False)
