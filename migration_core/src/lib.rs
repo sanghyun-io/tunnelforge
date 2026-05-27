@@ -250,6 +250,12 @@ enum ImportChunkEvent {
     Error(String),
 }
 
+struct QueryExecutionResult {
+    rows: Vec<Value>,
+    columns: Vec<String>,
+    returns_rows: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 pub struct InspectionResult {
     pub schema: NormalizedSchema,
@@ -1121,12 +1127,16 @@ fn schema_diff(request: &Request) -> Vec<Value> {
 
 fn query_execute(request: &Request) -> Vec<Value> {
     if let Some(rows) = request.payload.get("rows") {
+        let rows = rows.as_array().cloned().unwrap_or_default();
+        let columns = columns_from_json_rows(&rows);
         return vec![json!({
             "event": "result",
             "request_id": request.request_id,
             "command": "query.execute",
             "success": true,
             "rows": rows,
+            "columns": columns,
+            "returns_rows": true,
             "rows_affected": 0
         })];
     }
@@ -1158,7 +1168,7 @@ fn query_execute(request: &Request) -> Vec<Value> {
     let params = query_params(&request.payload);
     let bound_sql = bind_query_params(sql, &params);
     match execute_query_live(&endpoint, &bound_sql) {
-        Ok(rows) => query_result_events(request, rows),
+        Ok(result) => query_result_events(request, result),
         Err(err) => vec![json!({
             "event": "error",
             "request_id": request.request_id,
@@ -1167,7 +1177,14 @@ fn query_execute(request: &Request) -> Vec<Value> {
     }
 }
 
-fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
+fn columns_from_json_rows(rows: &[Value]) -> Vec<String> {
+    rows.first()
+        .and_then(Value::as_object)
+        .map(|row| row.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn query_result_events(request: &Request, result: QueryExecutionResult) -> Vec<Value> {
     let stream_rows = request
         .payload
         .get("stream_rows")
@@ -1179,7 +1196,9 @@ fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
             "request_id": request.request_id,
             "command": "query.execute",
             "success": true,
-            "rows": rows,
+            "rows": result.rows,
+            "columns": result.columns,
+            "returns_rows": result.returns_rows,
             "rows_affected": 0
         })];
     }
@@ -1190,9 +1209,9 @@ fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
         .and_then(Value::as_u64)
         .unwrap_or(500)
         .max(1) as usize;
-    let total = rows.len();
+    let total = result.rows.len();
     let mut events = Vec::new();
-    for (index, chunk) in rows.chunks(batch_size).enumerate() {
+    for (index, chunk) in result.rows.chunks(batch_size).enumerate() {
         events.push(json!({
             "event": "row_batch",
             "request_id": request.request_id,
@@ -1208,6 +1227,8 @@ fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
         "command": "query.execute",
         "success": true,
         "rows": [],
+        "columns": result.columns,
+        "returns_rows": result.returns_rows,
         "rows_streamed": total,
         "rows_affected": 0
     }));
@@ -3681,43 +3702,57 @@ fn redact_endpoint_secret(message: &str, endpoint: &Endpoint) -> String {
     }
 }
 
-fn execute_query_live(endpoint: &Endpoint, sql: &str) -> Result<Vec<Value>, String> {
+fn execute_query_live(endpoint: &Endpoint, sql: &str) -> Result<QueryExecutionResult, String> {
     let mut adapter = LiveAdapter::connect(endpoint)?;
     execute_query_adapter(&mut adapter, sql)
 }
 
-fn execute_query_adapter(adapter: &mut LiveAdapter, sql: &str) -> Result<Vec<Value>, String> {
+fn execute_query_adapter(
+    adapter: &mut LiveAdapter,
+    sql: &str,
+) -> Result<QueryExecutionResult, String> {
     let returns_rows = query_returns_rows(sql);
     match adapter {
         LiveAdapter::MySql(conn) => {
             if !returns_rows {
                 conn.query_drop(sql)
                     .map_err(|err| format!("mysql SQL execution error: {err}"))?;
-                return Ok(Vec::new());
+                return Ok(QueryExecutionResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                    returns_rows: false,
+                });
             }
-            let rows: Vec<mysql::Row> = conn
-                .query(sql)
+            let mut query_result = conn
+                .query_iter(sql)
                 .map_err(|err| format!("mysql query error: {err}"))?;
-            let columns: Vec<String> = rows
-                .first()
-                .map(|row| {
-                    row.columns_ref()
-                        .iter()
-                        .map(|column| column.name_str().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
-            Ok(rows
-                .into_iter()
-                .map(|row| mysql_row_to_json(&columns, row))
-                .collect())
+            let columns: Vec<String> = query_result
+                .columns()
+                .as_ref()
+                .iter()
+                .map(|column| column.name_str().to_string())
+                .collect();
+            let mut rows = Vec::new();
+            for row in query_result.by_ref() {
+                let row = row.map_err(|err| format!("mysql query row error: {err}"))?;
+                rows.push(mysql_row_to_json(&columns, row));
+            }
+            Ok(QueryExecutionResult {
+                rows,
+                columns,
+                returns_rows: true,
+            })
         }
         LiveAdapter::PostgreSql(client) => {
             if !returns_rows {
                 client
                     .batch_execute(sql)
                     .map_err(|err| format!("postgresql SQL execution error: {err}"))?;
-                return Ok(Vec::new());
+                return Ok(QueryExecutionResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                    returns_rows: false,
+                });
             }
             let trimmed = sql.trim().trim_end_matches(';');
             let wrapped = format!("SELECT row_to_json(_tf_row)::text FROM ({trimmed}) AS _tf_row");
@@ -3732,7 +3767,12 @@ fn execute_query_adapter(adapter: &mut LiveAdapter, sql: &str) -> Result<Vec<Val
                     .unwrap_or(Value::Null);
                 values.push(value);
             }
-            Ok(values)
+            let columns = columns_from_json_rows(&values);
+            Ok(QueryExecutionResult {
+                rows: values,
+                columns,
+                returns_rows: true,
+            })
         }
     }
 }
@@ -9205,7 +9245,11 @@ mod tests {
                 request_id: Some("query-1".to_string()),
                 payload: json!({"stream_rows": true, "row_batch_size": 1}),
             },
-            vec![json!({"id": 1}), json!({"id": 2})],
+            QueryExecutionResult {
+                rows: vec![json!({"id": 1}), json!({"id": 2})],
+                columns: vec!["id".to_string()],
+                returns_rows: true,
+            },
         );
 
         assert_eq!(events[0]["event"], "row_batch");

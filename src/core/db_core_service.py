@@ -262,6 +262,24 @@ class DbCoreFacade:
         rows = result.get("rows")
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
+    def execute_on_connection_result(
+        self,
+        connection_id: str,
+        sql: str,
+        params: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
+        result = self.client.request(
+            "query.execute",
+            {"connection_id": connection_id, "sql": sql, "params": list(params or [])},
+        )
+        rows = result.get("rows")
+        columns = result.get("columns")
+        return {
+            "rows": [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
+            "columns": [str(column) for column in columns] if isinstance(columns, list) else [],
+            "returns_rows": bool(result.get("returns_rows")),
+        }
+
     def execute_on_connection_streaming(
         self,
         connection_id: str,
@@ -595,15 +613,26 @@ class RustDbCursor:
         return False
 
     def execute(self, query: str, params: Optional[Sequence[Any]] = None) -> int:
-        self._rows = self.connection.facade.execute_on_connection(
-            self.connection.connection_id,
-            query,
-            params=params,
-        )
-        if self._rows:
-            self.description = [(column,) for column in self._rows[0].keys()]
-        elif query_returns_rows(query):
-            self.description = []
+        if hasattr(self.connection.facade, "execute_on_connection_result"):
+            result = self.connection.facade.execute_on_connection_result(
+                self.connection.connection_id,
+                query,
+                params=params,
+            )
+        else:
+            rows = self.connection.facade.execute_on_connection(
+                self.connection.connection_id,
+                query,
+                params=params,
+            )
+            result = {
+                "rows": rows,
+                "columns": list(rows[0].keys()) if rows else [],
+                "returns_rows": bool(rows) or query_returns_rows(query),
+            }
+        self._rows = result["rows"]
+        if result["returns_rows"]:
+            self.description = [(column,) for column in result["columns"]]
         else:
             self.description = None
         self.rowcount = len(self._rows)

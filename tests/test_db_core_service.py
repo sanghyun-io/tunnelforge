@@ -6,6 +6,7 @@ from src.core.db_core_service import (
     DbCoreServiceError,
     DbCoreServiceClient,
     DbEndpoint,
+    RustDbConnection,
     RustDbConnector,
     create_rust_db_connector,
     normalize_db_engine,
@@ -200,6 +201,38 @@ def test_execute_on_connection_sends_params_to_core_protocol():
     assert rows == [{"id": 1}]
     assert sent["payload"]["connection_id"] == "conn-1"
     assert sent["payload"]["params"] == [1]
+
+
+def test_rust_db_cursor_preserves_empty_select_columns():
+    class FakeFacade:
+        def execute_on_connection_result(self, connection_id, query, params=None):
+            assert connection_id == "conn-1"
+            assert query.startswith("SELECT")
+            return {
+                "rows": [],
+                "columns": ["TABLE_NAME", "TABLE_TYPE", "TABLE_ROWS"],
+                "returns_rows": True,
+            }
+
+    connection = RustDbConnection(
+        DbEndpoint(
+            engine="mysql",
+            host="127.0.0.1",
+            port=3306,
+            user="root",
+            password="pw",
+            database="app",
+        ),
+        FakeFacade(),
+        "conn-1",
+    )
+
+    with connection.cursor() as cursor:
+        cursor.execute("SELECT TABLE_NAME FROM information_schema.TABLES WHERE 1=0")
+
+        assert cursor.description == [("TABLE_NAME",), ("TABLE_TYPE",), ("TABLE_ROWS",)]
+        assert cursor.fetchall() == []
+        assert cursor.rowcount == 0
 
 
 def test_execute_on_connection_streaming_collects_row_batches():

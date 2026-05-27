@@ -795,7 +795,7 @@ class SQLQueryWorker(QThread):
                         cursor.execute(query)
 
                         # SELECT 쿼리인지 확인
-                        if cursor.description:
+                        if cursor.description is not None:
                             # SELECT 결과
                             columns = [desc[0] for desc in cursor.description]
                             rows = cursor.fetchall()
@@ -905,7 +905,7 @@ class SQLTransactionWorker(QThread):
                     with self.connector.connection.cursor() as cursor:
                         cursor.execute(query)
 
-                        if cursor.description:
+                        if cursor.description is not None:
                             # SELECT 결과
                             columns = [desc[0] for desc in cursor.description]
                             rows = cursor.fetchall()
@@ -2458,7 +2458,7 @@ class SQLEditorDialog(QDialog):
                 with self.db_connection.cursor() as db_cursor:
                     self._execute_query_in_thread(db_cursor, query)
 
-                    if db_cursor.description:
+                    if db_cursor.description is not None:
                         # SELECT 결과
                         columns = [desc[0] for desc in db_cursor.description]
                         rows = db_cursor.fetchall()
