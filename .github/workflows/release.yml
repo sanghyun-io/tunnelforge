@@ -57,6 +57,31 @@ jobs:
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            migration_core/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('migration_core/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build tunnelforge-core (Rust)
+        shell: pwsh
+        run: |
+          cargo build --manifest-path migration_core\Cargo.toml --release
+          if (-not (Test-Path "migration_core\target\release\tunnelforge-core.exe")) {
+            Write-Host "::error::tunnelforge-core.exe not produced by cargo build"
+            exit 1
+          }
+          $coreSize = (Get-Item "migration_core\target\release\tunnelforge-core.exe").Length / 1MB
+          Write-Host "tunnelforge-core.exe built: $($coreSize.ToString('0.0')) MB"
+
       - name: Setup GitHub App credentials
         if: ${{ vars.GH_APP_ID != '' }}
         shell: bash

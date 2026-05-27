@@ -2,6 +2,7 @@ import hashlib
 import importlib.util
 import os
 from pathlib import Path
+import re
 import shutil
 import shlex
 import subprocess
@@ -217,6 +218,8 @@ def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
     assert "from src.version import __version__" in spec
     assert "'CFBundleShortVersionString': __version__" in spec
     assert "'LSMinimumSystemVersion': '13.0'" in spec
+    assert "raise SystemExit" in spec
+    assert "Run `cargo build --manifest-path migration_core/Cargo.toml --release` first." in spec
 
 
 def test_windows_installer_builds_and_checks_core_service_binaries():
@@ -1410,6 +1413,7 @@ def test_macos_support_gate_script_rejects_report_from_different_git_sha(tmp_pat
 
 def test_release_workflow_has_macos_app_job_and_assets():
     workflow = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+    macos_job = workflow.split("  build-macos-app:", 1)[1].split("\n  create-release:", 1)[0]
 
     assert "build-macos-app:" in workflow
     assert "FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true" in workflow
@@ -1431,7 +1435,7 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "scripts/package-macos.sh" in workflow
     assert "rustc --version" in workflow
     assert "cargo --version" in workflow
-    assert "dtolnay/rust-toolchain" not in workflow
+    assert "dtolnay/rust-toolchain" not in macos_job
     assert "tests/test_app_self_check.py" in workflow
     assert "tests/test_settings_update_actions.py" in workflow
     assert "Smoke source-run TunnelForge app" in workflow
@@ -1604,3 +1608,28 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256" in workflow
     assert "TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
+
+
+def test_release_workflow_builds_core_before_pyinstaller():
+    workflow = (PROJECT_ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+
+    core_build_index = workflow.index("Build tunnelforge-core (Rust)")
+    pyinstaller_index = workflow.index("Build with PyInstaller")
+
+    assert core_build_index < pyinstaller_index
+    assert "uses: dtolnay/rust-toolchain@stable" in workflow
+    assert "cargo build --manifest-path migration_core\\Cargo.toml --release" in workflow
+    assert "migration_core\\target\\release\\tunnelforge-core.exe" in workflow
+
+
+def test_release_version_files_are_in_sync():
+    version_py = (PROJECT_ROOT / "src" / "version.py").read_text(encoding="utf-8")
+    pyproject = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    installer = (PROJECT_ROOT / "installer" / "TunnelForge.iss").read_text(encoding="utf-8")
+
+    app_version = re.search(r'__version__\s*=\s*"([^"]+)"', version_py).group(1)
+    package_version = re.search(r'^version\s*=\s*"([^"]+)"', pyproject, re.MULTILINE).group(1)
+    installer_version = re.search(r'#define MyAppVersion "([^"]+)"', installer).group(1)
+
+    assert package_version == app_version
+    assert installer_version == app_version

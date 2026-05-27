@@ -1167,15 +1167,14 @@ class SettingsDialog(QDialog):
         try:
             if sys.platform == 'win32':
                 # 배치 스크립트가 업데이트 전체 라이프사이클을 관리:
-                #   ① 기존 프로세스 종료 대기
-                #   ② 설치 프로그램 /SILENT 실행 (skipifsilent로 Inno Setup 자동 실행 방지)
-                #   ③ 설치 프로세스 완료 대기
-                #   ④ 앱 실행
-                # 이렇게 하면 Inno Setup의 [Run] 자동 실행과의 경합(race condition)을 방지하고
-                # PyInstaller _MEI 임시 디렉토리 충돌 문제를 해결
+                #   ① 기존 프로세스 종료 대기 (PyInstaller _MEI 디렉토리 정리 보장)
+                #   ② 인스톨러 정상 모드로 실행 — 마법사 UI 노출
+                # 마법사가 끝나면 Inno Setup [Run] postinstall 옵션이 사용자에게
+                # "TunnelForge 실행" 체크박스를 보여주고 동의 시 자동 재실행.
+                # 따라서 bat에서 별도로 explorer.exe %APP_EXE% 를 띄우지 않는다
+                # (중복 실행 방지).
                 import tempfile
                 current_pid = os.getpid()
-                app_exe_path = sys.executable
                 bat_path = os.path.join(
                     tempfile.gettempdir(),
                     f"tunnelforge_update_{current_pid}.bat"
@@ -1185,7 +1184,6 @@ class SettingsDialog(QDialog):
                     "setlocal\r\n"
                     f"set PID={current_pid}\r\n"
                     f'set INSTALLER="{self._downloaded_installer_path}"\r\n'
-                    f'set APP_EXE="{app_exe_path}"\r\n'
                     "set MAX_WAIT=30\r\n"
                     "set COUNT=0\r\n"
                     "\r\n"
@@ -1198,16 +1196,10 @@ class SettingsDialog(QDialog):
                     "ping -n 2 127.0.0.1 >NUL\r\n"
                     "goto WAIT_EXIT\r\n"
                     "\r\n"
-                    "rem === Phase 2: Run installer silently and wait ===\r\n"
+                    "rem === Phase 2: Run installer with visible wizard ===\r\n"
                     ":RUN_INSTALLER\r\n"
                     "ping -n 2 127.0.0.1 >NUL\r\n"
-                    "%INSTALLER% /SILENT /NORESTART /SUPPRESSMSGBOXES\r\n"
-                    "\r\n"
-                    "rem === Phase 3: Launch updated app via explorer ===\r\n"
-                    "rem explorer.exe launches the app as if user double-clicked it,\r\n"
-                    "rem ensuring correct working directory and environment for PyInstaller\r\n"
-                    "ping -n 4 127.0.0.1 >NUL\r\n"
-                    "explorer.exe %APP_EXE%\r\n"
+                    "start \"\" %INSTALLER%\r\n"
                     "\r\n"
                     "rem === Cleanup ===\r\n"
                     f'del /f /q "{bat_path}"\r\n'
