@@ -347,7 +347,9 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "--artifact-output-dir <dir>" in script
     assert "--artifact-arch <arch>" in script
     assert "macos-download-validation-artifacts.sh" in script
+    assert 'ARTIFACT_ARCH="${ARTIFACT_ARCH_ARG:-${ARCH}}"' in script
     assert "defaults to the latest successful manual run" in script
+    assert "Default: current Mac arch." in script
     assert "--arch ${ARTIFACT_ARCH} --output-dir ${ARTIFACT_DIR}" in script
     assert "Add \\`--run-id ${ARTIFACT_WORKFLOW_RUN:-<workflow-run-id>}\\` only when pinning a specific run." in script
     assert "SMOKE_CHECK_MARK" in script
