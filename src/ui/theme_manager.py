@@ -8,6 +8,7 @@ Windows 시스템 테마 감지 기능 제공
 import sys
 from PyQt6.QtCore import QObject, pyqtSignal
 
+from src.core.i18n import tr
 from src.ui.themes import ThemeType, ThemeColors, get_theme_colors, LIGHT_THEME
 
 
@@ -122,8 +123,8 @@ class ThemeManager(QObject):
     def get_theme_display_name(self, theme_type: ThemeType) -> str:
         """테마 타입의 표시 이름 반환"""
         names = {
-            ThemeType.SYSTEM: "시스템 설정 따르기",
-            ThemeType.LIGHT: "라이트 모드",
-            ThemeType.DARK: "다크 모드"
+            ThemeType.SYSTEM: tr("settings.system_theme"),
+            ThemeType.LIGHT: tr("settings.light_mode"),
+            ThemeType.DARK: tr("settings.dark_mode"),
         }
-        return names.get(theme_type, "알 수 없음")
+        return names.get(theme_type, tr("common.unknown"))

@@ -1790,3 +1790,16 @@ def test_release_version_files_are_in_sync():
 
     assert package_version == app_version
     assert installer_version == app_version
+
+
+def test_windows_installer_captures_selected_app_language():
+    installer = (PROJECT_ROOT / "installer" / "TunnelForge.iss").read_text(encoding="utf-8")
+
+    assert 'Name: "korean"; MessagesFile: "compiler:Languages\\Korean.isl"' in installer
+    assert 'Name: "english"; MessagesFile: "compiler:Default.isl"' in installer
+    assert "installer-language.txt" in installer
+    assert "ActiveLanguage = 'english'" in installer
+    assert "LanguageCode := 'en'" in installer
+    assert "LanguageCode := 'ko'" in installer
+    assert "SaveStringToFile(HintPath, LanguageCode, False)" in installer
+    assert "english.RecoveryShortcut=Recovery and Update" in installer

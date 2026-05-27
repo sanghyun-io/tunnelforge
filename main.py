@@ -164,11 +164,16 @@ def run_ui_smoke_check() -> dict:
     config_cls = ConfigManager()
     engine_cls = TunnelEngine()
     window_cls = TunnelManagerUI()
+    config_mgr = config_cls()
+    from src.core.i18n import configure_language, install_qt_i18n
+
+    configure_language(config_mgr, ["TunnelForge", "--ui-smoke-check"])
+    install_qt_i18n()
 
     app = app_cls.instance() or app_cls(["TunnelForge", "--ui-smoke-check"])
     app.setWindowIcon(icon_cls(str(app_icon_path())))
 
-    window = window_cls(config_cls(), engine_cls(), start_background=False)
+    window = window_cls(config_mgr, engine_cls(), start_background=False)
     result = {
         "success": self_check["success"] is True and window.windowTitle() == "TunnelForge",
         "window_title": window.windowTitle(),
@@ -229,6 +234,10 @@ def main():
 
     # 1. 매니저 초기화
     config_mgr = config_cls()
+    from src.core.i18n import configure_language, install_qt_i18n
+
+    configure_language(config_mgr, sys.argv)
+    install_qt_i18n()
     tunnel_engine = engine_cls()
 
     # 2. 설정 파일 경로 안내 (첫 실행 사용자를 위해)

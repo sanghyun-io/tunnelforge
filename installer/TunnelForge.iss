@@ -60,6 +60,12 @@ RestartApplications=no
 Name: "korean"; MessagesFile: "compiler:Languages\Korean.isl"
 Name: "english"; MessagesFile: "compiler:Default.isl"
 
+[CustomMessages]
+korean.RecoveryShortcut=복구 및 업데이트
+english.RecoveryShortcut=Recovery and Update
+korean.RecoveryShortcutComment=최신 버전으로 재설치
+english.RecoveryShortcutComment=Reinstall the latest version
+
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
@@ -78,7 +84,7 @@ Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 [Icons]
 ; 시작 메뉴 단축키
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"
-Name: "{group}\복구 및 업데이트"; Filename: "{app}\TunnelForge-WebSetup.exe"; Comment: "최신 버전으로 재설치"
+Name: "{group}\{cm:RecoveryShortcut}"; Filename: "{app}\TunnelForge-WebSetup.exe"; Comment: "{cm:RecoveryShortcutComment}"
 Name: "{group}\{cm:UninstallProgram,{#MyAppName}}"; Filename: "{uninstallexe}"
 
 ; 바탕화면 아이콘 (선택 사항)
@@ -137,6 +143,26 @@ begin
 end;
 
 /////////////////////////////////////////////////////////////////////
+procedure WriteInstallerLanguageHint();
+var
+  HintDir: String;
+  HintPath: String;
+  LanguageCode: String;
+begin
+  HintDir := ExpandConstant('{localappdata}\TunnelForge');
+  if not DirExists(HintDir) then
+    CreateDir(HintDir);
+
+  if ActiveLanguage = 'english' then
+    LanguageCode := 'en'
+  else
+    LanguageCode := 'ko';
+
+  HintPath := HintDir + '\installer-language.txt';
+  SaveStringToFile(HintPath, LanguageCode, False);
+end;
+
+/////////////////////////////////////////////////////////////////////
 procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if (CurStep=ssInstall) then
@@ -145,5 +171,9 @@ begin
     begin
       UnInstallOldVersion();
     end;
+  end;
+  if (CurStep=ssPostInstall) then
+  begin
+    WriteInstallerLanguageHint();
   end;
 end;

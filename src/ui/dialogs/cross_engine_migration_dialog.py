@@ -34,6 +34,7 @@ from src.core.cross_engine_migration import (
     schema_from_inspect_result,
     state_key_from_payload,
 )
+from src.core.i18n import translate_text
 from src.ui.workers.cross_engine_migration_worker import CrossEngineMigrationWorker
 
 
@@ -657,12 +658,12 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_verify_status.setText("검증 완료" if bool(payload.get("success")) else "검증 완료: 불일치 확인 필요")
         self.lbl_verify_mismatch.setText(f"Mismatch: {mismatch_count:,}개")
         self._append_verify_log("검증 완료")
-        self.txt_verify_result.setPlainText(self._verification_result_text(payload))
+        self.txt_verify_result.setPlainText(translate_text(self._verification_result_text(payload)))
 
     def _mark_verify_result_stale(self):
         self.verify_activity_bar.hide()
         self.lbl_verify_status.setText("검증 실패")
-        self.txt_verify_result.setPlainText("검증 실패: 새 검증 결과를 받지 못했습니다.")
+        self.txt_verify_result.setPlainText(translate_text("검증 실패: 새 검증 결과를 받지 못했습니다."))
         if isinstance(self.last_result, dict) and self.last_result.get("command") == "verify":
             self.last_result = None
         self.btn_save_report.setEnabled(False)
@@ -671,7 +672,7 @@ class CrossEngineMigrationDialog(QDialog):
         if not hasattr(self, "txt_verify_result"):
             return
         if self.txt_verify_result.toPlainText().strip():
-            self.txt_verify_result.setPlainText("입력 정보가 변경되어 새 검증이 필요합니다.")
+            self.txt_verify_result.setPlainText(translate_text("입력 정보가 변경되어 새 검증이 필요합니다."))
         else:
             self.txt_verify_result.clear()
 

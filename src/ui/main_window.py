@@ -3,7 +3,7 @@ import sys
 import os
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QMessageBox, QSystemTrayIcon,
-                             QMenu, QApplication)
+                             QMenu, QApplication, QDialog)
 from PyQt6.QtCore import QThread, pyqtSignal, pyqtSlot, QTimer, Qt
 from PyQt6.QtGui import QAction, QIcon
 
@@ -15,6 +15,7 @@ from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
 from src.core.logger import get_logger
 from src.core.platform_integration import restore_window_to_front
 from src.core.resources import app_icon_path, resource_path
+from src.core.i18n import tr
 
 logger = get_logger('main_window')
 
@@ -134,53 +135,53 @@ class TunnelManagerUI(QMainWindow):
 
         # --- 상단 헤더 ---
         header_layout = QHBoxLayout()
-        title = QLabel("📡 터널링 연결 목록")
-        title.setStyleSheet(LabelStyles.TITLE)
+        self.title_label = QLabel()
+        self.title_label.setStyleSheet(LabelStyles.TITLE)
 
         # [그룹 추가] 버튼
-        btn_add_group = QPushButton("📁 그룹 추가")
-        btn_add_group.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_add_group.clicked.connect(self.add_group_dialog)
+        self.btn_add_group = QPushButton()
+        self.btn_add_group.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_add_group.clicked.connect(self.add_group_dialog)
 
         # [연결 추가] 버튼 - Primary 스타일 (중앙화)
-        btn_add_tunnel = QPushButton("➕ 연결 추가")
-        btn_add_tunnel.setStyleSheet(ButtonStyles.PRIMARY)
-        btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
+        self.btn_add_tunnel = QPushButton()
+        self.btn_add_tunnel.setStyleSheet(ButtonStyles.PRIMARY)
+        self.btn_add_tunnel.clicked.connect(self.add_tunnel_dialog)
 
         # [스키마 비교] 버튼 - Secondary 스타일
-        btn_schema_diff = QPushButton("🔀 스키마 비교")
-        btn_schema_diff.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_schema_diff.clicked.connect(self._open_schema_diff_dialog)
+        self.btn_schema_diff = QPushButton()
+        self.btn_schema_diff.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_schema_diff.clicked.connect(self._open_schema_diff_dialog)
 
         # [마이그레이션 분석] 버튼 - Secondary 스타일
-        btn_migration = QPushButton("🔄 마이그레이션")
-        btn_migration.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_migration.clicked.connect(self.open_migration_analyzer)
+        self.btn_migration = QPushButton()
+        self.btn_migration.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_migration.clicked.connect(self.open_migration_analyzer)
 
         # [DB 전환] 버튼 - Secondary 스타일
-        btn_db_transition = QPushButton("DB 전환")
-        btn_db_transition.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_db_transition.clicked.connect(self.open_cross_engine_migration)
+        self.btn_db_transition = QPushButton()
+        self.btn_db_transition.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_db_transition.clicked.connect(self.open_cross_engine_migration)
 
         # [스케줄] 버튼 - Secondary 스타일
-        btn_schedule = QPushButton("📅 스케줄")
-        btn_schedule.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_schedule.clicked.connect(self._open_schedule_dialog)
+        self.btn_schedule = QPushButton()
+        self.btn_schedule.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_schedule.clicked.connect(self._open_schedule_dialog)
 
         # [설정] 버튼 - Secondary 스타일 (중앙화)
-        btn_settings = QPushButton("⚙️ 설정")
-        btn_settings.setStyleSheet(ButtonStyles.SECONDARY)
-        btn_settings.clicked.connect(self.open_settings_dialog)
+        self.btn_settings = QPushButton()
+        self.btn_settings.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_settings.clicked.connect(self.open_settings_dialog)
 
-        header_layout.addWidget(title)
+        header_layout.addWidget(self.title_label)
         header_layout.addStretch()
-        header_layout.addWidget(btn_add_group)
-        header_layout.addWidget(btn_add_tunnel)
-        header_layout.addWidget(btn_schema_diff)
-        header_layout.addWidget(btn_migration)
-        header_layout.addWidget(btn_db_transition)
-        header_layout.addWidget(btn_schedule)
-        header_layout.addWidget(btn_settings)
+        header_layout.addWidget(self.btn_add_group)
+        header_layout.addWidget(self.btn_add_tunnel)
+        header_layout.addWidget(self.btn_schema_diff)
+        header_layout.addWidget(self.btn_migration)
+        header_layout.addWidget(self.btn_db_transition)
+        header_layout.addWidget(self.btn_schedule)
+        header_layout.addWidget(self.btn_settings)
         layout.addLayout(header_layout)
 
         # --- 트리 위젯 설정 (터널 그룹핑 지원) ---
@@ -200,10 +201,35 @@ class TunnelManagerUI(QMainWindow):
         # 호환성을 위해 table 변수 유지
         self.table = self.tunnel_tree
 
-        # 하단 상태바
-        self.statusBar().showMessage("준비됨")
+        self._apply_language()
 
         self.refresh_table()
+
+    def _icon_text(self, icon: str, key: str) -> str:
+        return f"{icon} {tr(key)}" if icon else tr(key)
+
+    def _apply_language(self):
+        self.title_label.setText(self._icon_text("📡", "main.title"))
+        self.btn_add_group.setText(self._icon_text("📁", "main.add_group"))
+        self.btn_add_tunnel.setText(self._icon_text("➕", "main.add_tunnel"))
+        self.btn_schema_diff.setText(self._icon_text("🔀", "main.schema_diff"))
+        self.btn_migration.setText(self._icon_text("🔄", "main.migration"))
+        self.btn_db_transition.setText(tr("main.db_transition"))
+        self.btn_schedule.setText(self._icon_text("📅", "main.schedule"))
+        self.btn_settings.setText(self._icon_text("⚙️", "main.settings"))
+        self.statusBar().showMessage(tr("app.ready"))
+        if hasattr(self, "tunnel_tree"):
+            self.tunnel_tree.apply_language()
+        if hasattr(self, "show_action"):
+            self.show_action.setText(tr("main.open"))
+        if hasattr(self, "quit_action"):
+            self.quit_action.setText(tr("main.quit"))
+        if hasattr(self, "schedule_menu"):
+            self.schedule_menu.setTitle(self._icon_text("📅", "main.schedule_backup"))
+        if hasattr(self, "schedule_manage_action"):
+            self.schedule_manage_action.setText(tr("main.schedule_manage"))
+        if hasattr(self, "_schedule_run_menu"):
+            self._schedule_run_menu.setTitle(tr("main.run_now"))
 
     def init_tray(self):
         """시스템 트레이 아이콘 설정"""
@@ -218,24 +244,26 @@ class TunnelManagerUI(QMainWindow):
         show_action.triggered.connect(self.show)
 
         # 스케줄 백업 서브메뉴
-        schedule_menu = tray_menu.addMenu("📅 스케줄 백업")
-        schedule_manage_action = QAction("스케줄 관리...", self)
-        schedule_manage_action.triggered.connect(self._open_schedule_dialog)
-        schedule_menu.addAction(schedule_manage_action)
+        self.schedule_menu = tray_menu.addMenu("")
+        self.schedule_manage_action = QAction(self)
+        self.schedule_manage_action.triggered.connect(self._open_schedule_dialog)
+        self.schedule_menu.addAction(self.schedule_manage_action)
 
-        schedule_menu.addSeparator()
+        self.schedule_menu.addSeparator()
 
         # 스케줄 즉시 실행 서브메뉴
-        self._schedule_run_menu = schedule_menu.addMenu("즉시 실행")
+        self._schedule_run_menu = self.schedule_menu.addMenu("")
         self._update_schedule_run_menu()
 
         tray_menu.addSeparator()
 
-        quit_action = QAction("종료", self)
-        quit_action.triggered.connect(self.close_app)
+        self.show_action = show_action
+        self.quit_action = QAction(self)
+        self.quit_action.triggered.connect(self.close_app)
 
-        tray_menu.addAction(show_action)
-        tray_menu.addAction(quit_action)
+        tray_menu.addAction(self.show_action)
+        tray_menu.addAction(self.quit_action)
+        self._apply_language()
 
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.activated.connect(self._on_tray_activated)
@@ -308,7 +336,7 @@ class TunnelManagerUI(QMainWindow):
             self.tunnel_tree.update_tunnel_status(tid, is_active)
 
             # 전원 버튼 생성
-            btn_power = QPushButton("중지" if is_active else "시작")
+            btn_power = QPushButton(tr("common.stop") if is_active else tr("common.start"))
             if is_active:
                 btn_power.setStyleSheet(ButtonStyles.DANGER)
                 btn_power.clicked.connect(lambda checked, t=tunnel: self.stop_tunnel(t))
@@ -323,12 +351,12 @@ class TunnelManagerUI(QMainWindow):
             h_box.setContentsMargins(2, 2, 2, 2)
             h_box.setSpacing(3)
 
-            btn_edit = QPushButton("수정")
+            btn_edit = QPushButton(tr("common.edit"))
             btn_edit.setStyleSheet(ButtonStyles.EDIT)
             btn_edit.clicked.connect(lambda checked, t=tunnel: self.edit_tunnel_dialog(t))
             h_box.addWidget(btn_edit)
 
-            btn_del = QPushButton("삭제")
+            btn_del = QPushButton(tr("common.delete"))
             btn_del.setStyleSheet(ButtonStyles.DELETE)
             btn_del.clicked.connect(lambda checked, t=tunnel: self.delete_tunnel(t))
             h_box.addWidget(btn_del)
@@ -670,7 +698,9 @@ class TunnelManagerUI(QMainWindow):
     def open_settings_dialog(self):
         """설정 다이얼로그 열기"""
         dialog = SettingsDialog(self, config_manager=self.config_mgr)
-        dialog.exec()
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._apply_language()
+            self.refresh_table()
 
     def open_rust_dump_export(self):
         """Rust DB Core Export 마법사 열기 (병렬 처리)"""

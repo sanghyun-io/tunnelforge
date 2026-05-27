@@ -12,6 +12,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QMimeData
 from PyQt6.QtGui import QColor, QDrag
 
 from src.ui.styles import ButtonStyles
+from src.core.i18n import tr
 
 
 class TunnelTreeWidget(QTreeWidget):
@@ -43,10 +44,7 @@ class TunnelTreeWidget(QTreeWidget):
         super().__init__(parent)
 
         # 컬럼 설정
-        self.setHeaderLabels([
-            "상태", "이름", "로컬 포트", "타겟 호스트",
-            "기본 스키마", "전원", "관리"
-        ])
+        self.apply_language()
 
         # 열 너비 설정
         header = self.header()
@@ -79,6 +77,12 @@ class TunnelTreeWidget(QTreeWidget):
         self._tunnel_items = {}  # tunnel_id -> QTreeWidgetItem
         self._group_items = {}   # group_id -> QTreeWidgetItem
         self._ungrouped_header = None
+
+    def apply_language(self):
+        self.setHeaderLabels([
+            tr("main.status"), tr("main.name"), tr("main.local_port"), tr("main.target_host"),
+            tr("main.default_schema"), tr("main.power"), tr("main.manage")
+        ])
 
     def set_column_ratios(self, ratios: list):
         """컬럼 너비 비율 설정"""
@@ -208,7 +212,7 @@ class TunnelTreeWidget(QTreeWidget):
             'type': self.ITEM_TYPE_UNGROUPED_HEADER
         })
         item.setText(0, "─")
-        item.setText(1, "📋 그룹 없음")
+        item.setText(1, "📋 " + tr("tree.ungrouped"))
         item.setForeground(1, QColor("#7f8c8d"))
 
         # 드래그 불가, 드롭 가능
@@ -315,39 +319,39 @@ class TunnelTreeWidget(QTreeWidget):
             # 그룹 컨텍스트 메뉴
             group_id = item_data.get('id')
 
-            action_connect = menu.addAction("🔗 모두 연결")
+            action_connect = menu.addAction("🔗 " + tr("tree.connect_all"))
             action_connect.triggered.connect(lambda: self.group_connect_all.emit(group_id))
 
-            action_disconnect = menu.addAction("⛔ 모두 해제")
+            action_disconnect = menu.addAction("⛔ " + tr("tree.disconnect_all"))
             action_disconnect.triggered.connect(lambda: self.group_disconnect_all.emit(group_id))
 
             menu.addSeparator()
 
-            action_edit = menu.addAction("✏️ 그룹 수정")
+            action_edit = menu.addAction("✏️ " + tr("tree.edit_group"))
             action_edit.triggered.connect(lambda: self.group_edit_requested.emit(group_id))
 
-            action_delete = menu.addAction("🗑️ 그룹 삭제")
+            action_delete = menu.addAction("🗑️ " + tr("tree.delete_group"))
             action_delete.triggered.connect(lambda: self.group_delete_requested.emit(group_id))
 
         elif item_type == self.ITEM_TYPE_TUNNEL:
             # 터널 컨텍스트 메뉴
             tunnel_data = item_data.get('data', {})
 
-            action_duplicate = menu.addAction("📋 복사하여 새로 만들기")
+            action_duplicate = menu.addAction("📋 " + tr("tree.duplicate"))
             action_duplicate.triggered.connect(lambda: self.tunnel_duplicate.emit(tunnel_data))
 
-            action_edit = menu.addAction("✏️ 수정")
+            action_edit = menu.addAction("✏️ " + tr("common.edit"))
             action_edit.triggered.connect(lambda: self.tunnel_edit_requested.emit(tunnel_data))
 
-            action_test = menu.addAction("🔍 연결 테스트")
+            action_test = menu.addAction("🔍 " + tr("tree.test_connection"))
             action_test.triggered.connect(lambda: self.tunnel_test.emit(tunnel_data))
 
             menu.addSeparator()
 
-            action_db = menu.addAction("🔌 DB 연결")
+            action_db = menu.addAction("🔌 " + tr("tree.db_connect"))
             action_db.triggered.connect(lambda: self.tunnel_db_connect.emit(tunnel_data))
 
-            action_sql = menu.addAction("📝 SQL 에디터")
+            action_sql = menu.addAction("📝 " + tr("tree.sql_editor"))
             action_sql.triggered.connect(lambda: self.tunnel_sql_editor.emit(tunnel_data))
 
             menu.addSeparator()
@@ -360,7 +364,7 @@ class TunnelTreeWidget(QTreeWidget):
 
             menu.addSeparator()
 
-            action_delete = menu.addAction("🗑️ 삭제")
+            action_delete = menu.addAction("🗑️ " + tr("common.delete"))
             action_delete.triggered.connect(lambda: self.tunnel_delete_requested.emit(tunnel_data))
 
         menu.exec(self.mapToGlobal(pos))

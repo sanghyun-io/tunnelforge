@@ -23,6 +23,7 @@ from PyQt6.QtGui import QIcon, QFont, QColor, QTextCharFormat, QSyntaxHighlighte
 
 from src.core.scheduler import ScheduleConfig, CronParser, BackupScheduler, ScheduleTaskType
 from src.core.logger import get_logger
+from src.core.i18n import translate_text
 
 logger = get_logger(__name__)
 
@@ -983,7 +984,7 @@ class ScheduleListDialog(QDialog):
 
         self.log_text.clear()
         if not logs:
-            self.log_text.setPlainText("실행 로그가 없습니다.")
+            self.log_text.setPlainText(translate_text("실행 로그가 없습니다."))
             return
 
         lines = []

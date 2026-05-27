@@ -17,6 +17,7 @@ from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
 from src.core.logger import get_log_file_path, get_log_dir, read_log_file, filter_log_by_level, clear_log_file
+from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
 from src.core.platform_integration import (
     StartupRegistrar,
     detached_process_kwargs,
@@ -146,7 +147,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_mgr = config_manager
-        self.setWindowTitle("설정")
+        self.setWindowTitle(tr("settings.title"))
         self.setMinimumSize(600, 420)
         self._update_checker_thread = None
         self.init_ui()
@@ -155,38 +156,38 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # 탭 위젯 생성
-        tabs = QTabWidget()
-        tabs.addTab(self._create_general_tab(), "일반")
-        tabs.addTab(self._create_pool_tab(), "연결 풀")
-        tabs.addTab(self._create_log_tab(), "로그")
-        tabs.addTab(self._create_about_tab(), "정보")
-        layout.addWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._create_general_tab(), tr("settings.general"))
+        self.tabs.addTab(self._create_pool_tab(), tr("settings.connection_pool"))
+        self.tabs.addTab(self._create_log_tab(), tr("settings.logs"))
+        self.tabs.addTab(self._create_about_tab(), tr("settings.about"))
+        layout.addWidget(self.tabs)
 
         # 버튼
         button_layout = QHBoxLayout()
-        btn_save = QPushButton("저장")
-        btn_save.setStyleSheet("""
+        self.btn_save = QPushButton(tr("common.save"))
+        self.btn_save.setStyleSheet("""
             QPushButton {
                 background-color: #3498db; color: white; font-weight: bold;
                 padding: 6px 16px; border-radius: 4px; border: none;
             }
             QPushButton:hover { background-color: #2980b9; }
         """)
-        btn_save.clicked.connect(self.save_settings)
+        self.btn_save.clicked.connect(self.save_settings)
 
-        btn_cancel = QPushButton("취소")
-        btn_cancel.setStyleSheet("""
+        self.btn_cancel = QPushButton(tr("common.cancel"))
+        self.btn_cancel.setStyleSheet("""
             QPushButton {
                 background-color: #ecf0f1; color: #2c3e50;
                 padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
             }
             QPushButton:hover { background-color: #d5dbdb; }
         """)
-        btn_cancel.clicked.connect(self.reject)
+        self.btn_cancel.clicked.connect(self.reject)
 
         button_layout.addStretch()
-        button_layout.addWidget(btn_save)
-        button_layout.addWidget(btn_cancel)
+        button_layout.addWidget(self.btn_save)
+        button_layout.addWidget(self.btn_cancel)
         layout.addLayout(button_layout)
 
     def _create_general_tab(self) -> QWidget:
@@ -194,21 +195,41 @@ class SettingsDialog(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        language_group = QGroupBox(tr("settings.language"))
+        language_layout = QVBoxLayout(language_group)
+        language_row = QHBoxLayout()
+        self.language_combo = QComboBox()
+        for code, label in SUPPORTED_LANGUAGES.items():
+            self.language_combo.addItem(label, code)
+        selected_language = self.config_mgr.get_app_setting("language", current_language())
+        selected_index = self.language_combo.findData(selected_language)
+        if selected_index >= 0:
+            self.language_combo.setCurrentIndex(selected_index)
+        self.language_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 150px;")
+        language_row.addWidget(self.language_combo)
+        language_row.addStretch()
+        language_layout.addLayout(language_row)
+        restart_note = QLabel(tr("settings.restart_note"))
+        restart_note.setStyleSheet("color: gray; font-size: 11px;")
+        restart_note.setWordWrap(True)
+        language_layout.addWidget(restart_note)
+        layout.addWidget(language_group)
+
         # 종료 동작 설정 그룹
-        group_box = QGroupBox("창 닫기(X) 버튼 동작")
+        group_box = QGroupBox(tr("settings.close_behavior"))
         group_layout = QVBoxLayout(group_box)
 
         self.btn_group = QButtonGroup(self)
 
-        self.radio_ask = QRadioButton("매번 묻기")
+        self.radio_ask = QRadioButton(tr("settings.ask_every_time"))
         self.btn_group.addButton(self.radio_ask)
         group_layout.addWidget(self.radio_ask)
 
-        self.radio_minimize = QRadioButton("항상 시스템 트레이로 최소화")
+        self.radio_minimize = QRadioButton(tr("settings.always_minimize"))
         self.btn_group.addButton(self.radio_minimize)
         group_layout.addWidget(self.radio_minimize)
 
-        self.radio_exit = QRadioButton("항상 프로그램 종료")
+        self.radio_exit = QRadioButton(tr("settings.always_exit"))
         self.btn_group.addButton(self.radio_exit)
         group_layout.addWidget(self.radio_exit)
 
@@ -224,17 +245,17 @@ class SettingsDialog(QDialog):
             self.radio_ask.setChecked(True)
 
         # 테마 설정 그룹
-        theme_group = QGroupBox("테마")
+        theme_group = QGroupBox(tr("settings.theme"))
         theme_layout = QHBoxLayout(theme_group)
 
-        theme_label = QLabel("화면 테마:")
+        theme_label = QLabel(tr("settings.theme_label"))
         theme_label.setStyleSheet("font-size: 12px;")
         theme_layout.addWidget(theme_label)
 
         self.theme_combo = QComboBox()
-        self.theme_combo.addItem("시스템 설정 따르기", ThemeType.SYSTEM.value)
-        self.theme_combo.addItem("라이트 모드", ThemeType.LIGHT.value)
-        self.theme_combo.addItem("다크 모드", ThemeType.DARK.value)
+        self.theme_combo.addItem(tr("settings.system_theme"), ThemeType.SYSTEM.value)
+        self.theme_combo.addItem(tr("settings.light_mode"), ThemeType.LIGHT.value)
+        self.theme_combo.addItem(tr("settings.dark_mode"), ThemeType.DARK.value)
         self.theme_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 150px;")
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         theme_layout.addWidget(self.theme_combo)
@@ -251,7 +272,7 @@ class SettingsDialog(QDialog):
             self.theme_combo.setCurrentIndex(index)
 
         # GitHub 이슈 자동 보고 설정 그룹
-        github_group = QGroupBox("GitHub 이슈 자동 보고")
+        github_group = QGroupBox(tr("settings.github_auto_report"))
         github_layout = QVBoxLayout(github_group)
 
         # GitHub App 설정 확인
@@ -304,7 +325,7 @@ class SettingsDialog(QDialog):
         self._load_github_settings()
 
         # 설정 백업/복원 그룹
-        backup_group = QGroupBox("설정 백업/복원")
+        backup_group = QGroupBox(tr("settings.backup_restore"))
         backup_layout = QVBoxLayout(backup_group)
 
         # 백업 목록 라벨
@@ -379,10 +400,10 @@ class SettingsDialog(QDialog):
         self._refresh_backup_list()
 
         # 자동 재연결 설정 그룹
-        reconnect_group = QGroupBox("터널 자동 재연결")
+        reconnect_group = QGroupBox(tr("settings.reconnect"))
         reconnect_layout = QVBoxLayout(reconnect_group)
 
-        self.chk_auto_reconnect = QCheckBox("연결 끊김 시 자동 재연결")
+        self.chk_auto_reconnect = QCheckBox(tr("settings.auto_reconnect"))
         self.chk_auto_reconnect.setStyleSheet("font-size: 12px;")
         self.chk_auto_reconnect.setChecked(
             self.config_mgr.get_app_setting('auto_reconnect', True)
@@ -390,7 +411,7 @@ class SettingsDialog(QDialog):
         reconnect_layout.addWidget(self.chk_auto_reconnect)
 
         max_attempts_layout = QHBoxLayout()
-        max_attempts_label = QLabel("최대 재연결 시도 횟수:")
+        max_attempts_label = QLabel(tr("settings.max_reconnect_attempts"))
         max_attempts_label.setStyleSheet("font-size: 12px; margin-left: 20px;")
         max_attempts_layout.addWidget(max_attempts_label)
 
@@ -404,9 +425,7 @@ class SettingsDialog(QDialog):
         max_attempts_layout.addStretch()
         reconnect_layout.addLayout(max_attempts_layout)
 
-        reconnect_desc = QLabel(
-            "연결이 끊어지면 점진적 백오프(1초→60초)를 적용하여 자동으로 재연결을 시도합니다."
-        )
+        reconnect_desc = QLabel(tr("settings.reconnect_description"))
         reconnect_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
         reconnect_desc.setWordWrap(True)
         reconnect_layout.addWidget(reconnect_desc)
@@ -414,17 +433,15 @@ class SettingsDialog(QDialog):
         layout.addWidget(reconnect_group)
 
         # 시작 프로그램 설정 그룹
-        startup_group = QGroupBox("시작 프로그램")
+        startup_group = QGroupBox(tr("settings.startup"))
         startup_layout = QVBoxLayout(startup_group)
 
-        self.chk_startup = QCheckBox("시스템 시작 시 자동 실행")
+        self.chk_startup = QCheckBox(tr("settings.startup_auto"))
         self.chk_startup.setStyleSheet("font-size: 12px;")
         self.chk_startup.setChecked(self._is_startup_registered())
         startup_layout.addWidget(self.chk_startup)
 
-        startup_desc = QLabel(
-            "로그인 시 시스템 트레이에 최소화된 상태로 자동 시작됩니다."
-        )
+        startup_desc = QLabel(tr("settings.startup_description"))
         startup_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
         startup_desc.setWordWrap(True)
         startup_layout.addWidget(startup_desc)
@@ -958,6 +975,10 @@ class SettingsDialog(QDialog):
 
         self.config_mgr.set_app_setting('close_action', action)
 
+        language = self.language_combo.currentData() or current_language()
+        set_language(language)
+        self.config_mgr.set_app_setting('language', language)
+
         # 테마 설정은 _on_theme_changed에서 이미 저장됨
 
         # GitHub 자동 보고 설정 저장
@@ -999,7 +1020,7 @@ class SettingsDialog(QDialog):
         self.btn_check_update.setEnabled(False)
         self.btn_check_update.setText("확인 중...")
         self.update_status_label.setHtml(
-            '<div style="color: #3498db; font-size: 12px;">업데이트를 확인하는 중입니다...</div>'
+            translate_text('<div style="color: #3498db; font-size: 12px;">업데이트를 확인하는 중입니다...</div>')
         )
 
         # 백그라운드 스레드에서 확인
@@ -1022,9 +1043,11 @@ class SettingsDialog(QDialog):
         if needs_update:
             self._latest_version = latest_version
             self.update_status_label.setHtml(
-                f'<div style="color: #27ae60; font-size: 12px;">'
-                f'✅ 새로운 버전 {latest_version}이 사용 가능합니다!'
-                f'</div>'
+                translate_text(
+                    f'<div style="color: #27ae60; font-size: 12px;">'
+                    f'✅ 새로운 버전 {latest_version}이 사용 가능합니다!'
+                    f'</div>'
+                )
             )
             # 다운로드 버튼 표시
             self.download_widget.show()
@@ -1035,9 +1058,11 @@ class SettingsDialog(QDialog):
             self.btn_cancel_download.hide()
         else:
             self.update_status_label.setHtml(
-                f'<div style="color: #27ae60; font-size: 12px;">'
-                f'✅ 최신 버전({__version__})을 사용하고 있습니다.'
-                f'</div>'
+                translate_text(
+                    f'<div style="color: #27ae60; font-size: 12px;">'
+                    f'✅ 최신 버전({__version__})을 사용하고 있습니다.'
+                    f'</div>'
+                )
             )
             self.download_widget.hide()
 
