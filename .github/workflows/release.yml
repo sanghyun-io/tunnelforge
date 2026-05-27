@@ -529,17 +529,32 @@ jobs:
           path: release-artifacts
           merge-multiple: true
 
+      - name: Normalize release artifacts
+        shell: bash
+        run: |
+          rm -rf release-upload
+          mkdir -p release-upload
+          find release-artifacts -type f \( \
+            -name "TunnelForge-Setup-*.exe" -o \
+            -name "TunnelForge-WebSetup.exe" -o \
+            -name "TunnelForge-macOS-*.dmg" -o \
+            -name "TunnelForge-macOS-*.zip" -o \
+            -name "TunnelForge-macOS-*.dmg.sha256" -o \
+            -name "TunnelForge-macOS-*.zip.sha256" \
+          \) -exec cp {} release-upload/ \;
+          find release-upload -maxdepth 1 -type f -print | sort
+
       - name: Verify release artifacts
         shell: bash
         run: |
           VERSION="${{ steps.get_version.outputs.version }}"
-          test -f "release-artifacts/TunnelForge-Setup-$VERSION.exe"
-          test -f "release-artifacts/TunnelForge-WebSetup.exe"
+          test -f "release-upload/TunnelForge-Setup-$VERSION.exe"
+          test -f "release-upload/TunnelForge-WebSetup.exe"
           for ARCH in arm64 x86_64; do
-            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.dmg"
-            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.zip"
-            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.dmg.sha256"
-            test -f "release-artifacts/TunnelForge-macOS-$VERSION-$ARCH.zip.sha256"
+            test -f "release-upload/TunnelForge-macOS-$VERSION-$ARCH.dmg"
+            test -f "release-upload/TunnelForge-macOS-$VERSION-$ARCH.zip"
+            test -f "release-upload/TunnelForge-macOS-$VERSION-$ARCH.dmg.sha256"
+            test -f "release-upload/TunnelForge-macOS-$VERSION-$ARCH.zip.sha256"
           done
 
       - name: Generate Release Notes
@@ -701,12 +716,12 @@ jobs:
           name: v${{ steps.get_version.outputs.version }}
           body_path: release_notes.md
           files: |
-            release-artifacts/TunnelForge-Setup-*.exe
-            release-artifacts/TunnelForge-WebSetup.exe
-            release-artifacts/TunnelForge-macOS-*.dmg
-            release-artifacts/TunnelForge-macOS-*.zip
-            release-artifacts/TunnelForge-macOS-*.dmg.sha256
-            release-artifacts/TunnelForge-macOS-*.zip.sha256
+            release-upload/TunnelForge-Setup-*.exe
+            release-upload/TunnelForge-WebSetup.exe
+            release-upload/TunnelForge-macOS-*.dmg
+            release-upload/TunnelForge-macOS-*.zip
+            release-upload/TunnelForge-macOS-*.dmg.sha256
+            release-upload/TunnelForge-macOS-*.zip.sha256
           draft: false
           prerelease: false
         env:

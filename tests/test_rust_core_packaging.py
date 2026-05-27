@@ -1634,14 +1634,16 @@ def test_release_workflow_creates_release_after_all_platform_artifacts():
     assert jobs["create-release"]["needs"] == ["build-windows-installer", "build-macos-app"]
     assert "actions/download-artifact" in workflow_text
     assert "merge-multiple: true" in workflow_text
+    assert "Normalize release artifacts" in workflow_text
+    assert "find release-artifacts -type f" in workflow_text
     assert "softprops/action-gh-release@v3" in workflow_text
     assert "Create GitHub Release" in workflow_text
-    assert "release-artifacts/TunnelForge-Setup-*.exe" in workflow_text
-    assert "release-artifacts/TunnelForge-WebSetup.exe" in workflow_text
-    assert "release-artifacts/TunnelForge-macOS-*.dmg" in workflow_text
-    assert "release-artifacts/TunnelForge-macOS-*.zip" in workflow_text
-    assert "release-artifacts/TunnelForge-macOS-*.dmg.sha256" in workflow_text
-    assert "release-artifacts/TunnelForge-macOS-*.zip.sha256" in workflow_text
+    assert "release-upload/TunnelForge-Setup-*.exe" in workflow_text
+    assert "release-upload/TunnelForge-WebSetup.exe" in workflow_text
+    assert "release-upload/TunnelForge-macOS-*.dmg" in workflow_text
+    assert "release-upload/TunnelForge-macOS-*.zip" in workflow_text
+    assert "release-upload/TunnelForge-macOS-*.dmg.sha256" in workflow_text
+    assert "release-upload/TunnelForge-macOS-*.zip.sha256" in workflow_text
     assert "actions/upload-artifact@v4" in windows_job_text
     assert "actions/upload-artifact@v4" in macos_job_text
     assert "softprops/action-gh-release@v3" not in windows_job_text
