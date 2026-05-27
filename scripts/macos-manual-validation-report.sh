@@ -799,6 +799,7 @@ EOF
 echo "Created $REPORT_PATH"
 echo
 echo "Fill every checkbox before closing the macOS manual validation gate."
+echo "Fill every - Evidence: note with concrete observed behavior or file/log paths."
 echo "Then run: bash scripts/macos-manual-validation-report.sh --check-complete $REPORT_PATH"
 echo "Then run: bash scripts/macos-manual-validation-report.sh --bundle-evidence $REPORT_PATH"
 echo "Or run both plus the final GitHub gate: bash scripts/macos-manual-validation-report.sh --finalize $REPORT_PATH"

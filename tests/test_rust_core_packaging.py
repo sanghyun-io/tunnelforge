@@ -365,6 +365,7 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "section_has_evidence_note" in script
     assert "required_evidence_sections" in script
     assert "Evidence:" in script
+    assert "Fill every - Evidence: note with concrete observed behavior or file/log paths." in script
     assert "required_sections" in script
     assert "required_check_items" in script
     assert "Manual validation report is missing required section" in script
