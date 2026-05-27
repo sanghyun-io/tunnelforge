@@ -30,6 +30,7 @@ from src.core.migration_analyzer import (
 from src.ui.workers.migration_worker import MigrationAnalyzerWorker, CleanupWorker
 from src.ui.dialogs.oneclick_migration_dialog import OneClickMigrationDialog
 from src.core.logger import get_logger
+from src.core.platform_paths import analysis_dir
 
 logger = get_logger('migration_dialogs')
 
@@ -1114,10 +1115,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
 
     def _get_analysis_dir(self) -> str:
         """분석 결과 저장 디렉토리"""
-        if os.name == 'nt':
-            base_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'TunnelForge', 'analysis')
-        else:
-            base_dir = os.path.join(os.path.expanduser('~'), '.config', 'tunnelforge', 'analysis')
+        base_dir = str(analysis_dir())
         os.makedirs(base_dir, exist_ok=True)
         return base_dir
 

@@ -11,12 +11,10 @@ import os
 import sys
 import time
 from logging.handlers import RotatingFileHandler
+from src.core.platform_paths import log_dir
 
 # 로그 디렉토리 경로
-if os.name == 'nt':
-    LOG_DIR = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'TunnelForge', 'logs')
-else:
-    LOG_DIR = os.path.join(os.path.expanduser('~'), '.config', 'tunnelforge', 'logs')
+LOG_DIR = str(log_dir())
 
 # 로그 파일 경로
 LOG_FILE = os.path.join(LOG_DIR, 'tunnelforge.log')

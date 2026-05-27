@@ -8,20 +8,14 @@ from cryptography.fernet import Fernet
 
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_MYSQL_PORT
+from src.core.platform_paths import backups_dir, config_file, encryption_key_file, app_support_dir
 
 logger = get_logger('config_manager')
 
-# 운영체제별 설정 파일 저장 경로 지정
-# Windows: C:\Users\User\AppData\Local\TunnelForge
-# Mac/Linux: ~/.config/tunnelforge
-if os.name == 'nt':
-    APP_DIR = os.path.join(os.environ['LOCALAPPDATA'], 'TunnelForge')
-else:
-    APP_DIR = os.path.join(os.path.expanduser('~'), '.config', 'tunnelforge')
-
-CONFIG_FILE = os.path.join(APP_DIR, 'config.json')
-KEY_FILE = os.path.join(APP_DIR, '.encryption_key')
-BACKUP_DIR = os.path.join(APP_DIR, 'backups')
+APP_DIR = str(app_support_dir())
+CONFIG_FILE = str(config_file())
+KEY_FILE = str(encryption_key_file())
+BACKUP_DIR = str(backups_dir())
 MAX_BACKUPS = 5
 
 

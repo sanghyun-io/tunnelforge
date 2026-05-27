@@ -7790,13 +7790,20 @@ fn drop_table_sql(engine: &str, table: &str) -> String {
 }
 
 pub fn map_type(source: &str, target: &str, type_name: &str) -> String {
-    let ty = type_name.trim().to_ascii_lowercase();
+    let trimmed_type = type_name.trim();
+    let source = source.to_ascii_lowercase();
+    let target = target.to_ascii_lowercase();
+    if source == target {
+        return trimmed_type.to_string();
+    }
+
+    let ty = trimmed_type.to_ascii_lowercase();
     if source == "mysql" && target == "postgresql" {
         map_mysql_to_postgres(&ty)
     } else if source == "postgresql" && target == "mysql" {
         map_postgres_to_mysql(&ty)
     } else {
-        ty
+        trimmed_type.to_string()
     }
 }
 
@@ -8676,6 +8683,35 @@ mod tests {
     }
 
     #[test]
+    fn tsv_dump_rows_preserve_enum_value_case() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-tsv-enum-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let table = NormalizedTable {
+            name: "df_evaluations_norm".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "importance".to_string(),
+                type_name: "enum('HIGH','MEDIUM','LOW')".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        let rows = vec![json!({"importance": "MEDIUM"})];
+        let path = dir.join("chunk_000001.tsv");
+
+        write_dump_rows(&path, &table, &rows, "tsv", "none").unwrap();
+        assert_eq!(read_dump_rows(&path, &table, "tsv", "none").unwrap(), rows);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn zstd_tsv_dump_rows_roundtrip_and_uses_compressed_extension() {
         let dir = std::env::temp_dir().join(format!(
             "tunnelforge-zstd-tsv-test-{}",
@@ -9192,6 +9228,42 @@ mod tests {
         assert_eq!(
             map_type("postgresql", "mysql", "timestamp with time zone"),
             "DATETIME"
+        );
+    }
+
+    #[test]
+    fn preserves_native_type_literals_for_same_engine_imports() {
+        assert_eq!(
+            map_type("mysql", "mysql", " enum('HIGH','MEDIUM','LOW') "),
+            "enum('HIGH','MEDIUM','LOW')"
+        );
+        assert_eq!(
+            map_type("postgresql", "postgresql", "character varying(16)"),
+            "character varying(16)"
+        );
+    }
+
+    #[test]
+    fn mysql_to_mysql_ddl_preserves_enum_literal_case() {
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "df_evaluations_norm".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "importance".to_string(),
+                    type_name: "enum('HIGH','MEDIUM','LOW')".to_string(),
+                    default_value: Some("MEDIUM".to_string()),
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+            }],
+        };
+
+        assert_eq!(
+            generate_schema_ddl(&schema, "mysql", "mysql")[0],
+            "CREATE TABLE `df_evaluations_norm` (\n  `importance` enum('HIGH','MEDIUM','LOW') DEFAULT 'MEDIUM' NOT NULL\n);"
         );
     }
 

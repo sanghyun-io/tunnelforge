@@ -717,17 +717,15 @@ class TestGetStateTracker:
 class TestUncoveredPaths:
     # --- line 75: Unix 경로 분기 ---
     def test_get_state_dir_unix(self, monkeypatch, tmp_path):
-        """os.name != 'nt' 일 때 Unix 경로 사용"""
-        monkeypatch.setattr("src.core.migration_state_tracker.os.name", "posix")
-        fake_home = tmp_path / "home"
-        fake_home.mkdir()
+        """플랫폼 경로 helper의 data dir 아래에 상태 저장"""
+        fake_data_dir = tmp_path / "home" / ".local" / "share" / "tunnelforge"
         monkeypatch.setattr(
-            "src.core.migration_state_tracker.Path.home",
-            staticmethod(lambda: fake_home)
+            "src.core.migration_state_tracker.data_dir",
+            lambda: fake_data_dir,
         )
         t = MigrationStateTracker()
-        # Unix 경로: ~/.local/share/TunnelForge/migration_state
-        assert ".local" in str(t._state_dir) or str(fake_home) in str(t._state_dir)
+
+        assert t._state_dir == fake_data_dir / "migration_state"
 
     # --- line 114-116: save_state 예외 핸들러 ---
     def test_save_state_exception_returns_false(self, tracker, sample_state):

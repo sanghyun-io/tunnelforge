@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tunnelforge"
-version = "2.0.7"
+version = "2.0.9"
 description = "SSH Tunnel and Rust DB Core Manager"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -27,6 +27,7 @@ dev = [
     "pytest>=7.0.0",
     "pytest-mock>=3.0.0",
     "pytest-cov>=4.0.0",
+    "PyYAML>=6.0.0",
 ]
 
 [project.scripts]

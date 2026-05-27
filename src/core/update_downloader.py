@@ -4,9 +4,10 @@ bootstrapper/downloader.py의 로직을 메인 앱용으로 추출한 모듈입�
 """
 
 import os
+import platform
 import tempfile
 import requests
-from typing import Optional, Callable, Tuple
+from typing import Optional, Callable, Tuple, Sequence, Mapping, Any
 
 from src.version import GITHUB_OWNER, GITHUB_REPO
 
@@ -16,12 +17,79 @@ RELEASES_API_URL = f"https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/r
 RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest"
 
 # 다운로드 대상 파일 패턴 (버전별 파일명 사용)
-INSTALLER_FILENAME_PREFIX = "TunnelForge-Setup-"
+WINDOWS_INSTALLER_FILENAME_PREFIX = "TunnelForge-Setup-"
+MACOS_PACKAGE_FILENAME_PREFIX = "TunnelForge-macOS-"
 
 
 class DownloadError(Exception):
     """다운로드 관련 오류"""
     pass
+
+
+def select_release_asset(
+    assets: Sequence[Mapping[str, Any]],
+    platform_name: Optional[str] = None,
+    arch_name: Optional[str] = None,
+) -> Optional[Tuple[str, int]]:
+    """Return the download URL and size for the current platform's release asset."""
+    system = platform_name or platform.system()
+    arch = arch_name or platform.machine()
+    candidates = []
+
+    for asset in assets:
+        asset_name = str(asset.get('name', ''))
+        url = asset.get('browser_download_url')
+        if not url:
+            continue
+
+        if system == "Windows":
+            if (
+                asset_name.startswith(WINDOWS_INSTALLER_FILENAME_PREFIX)
+                and asset_name.endswith('.exe')
+                and 'WebSetup' not in asset_name
+            ):
+                candidates.append((str(url), int(asset.get('size', 0)), 0))
+        elif system == "Darwin":
+            if asset_name.startswith(MACOS_PACKAGE_FILENAME_PREFIX):
+                arch_rank = _macos_arch_rank(asset_name, arch)
+                if arch_rank is None:
+                    continue
+
+                if asset_name.endswith('.dmg'):
+                    candidates.append((str(url), int(asset.get('size', 0)), arch_rank))
+                elif asset_name.endswith('.zip'):
+                    candidates.append((str(url), int(asset.get('size', 0)), arch_rank + 1))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda item: item[2])
+    url, size, _ = candidates[0]
+    return url, size
+
+
+def _macos_arch_rank(asset_name: str, arch_name: str) -> Optional[int]:
+    """Return rank offset for a macOS package architecture, or None if unusable."""
+    normalized_arch = _normalize_macos_arch(arch_name)
+    if not normalized_arch:
+        return 4
+
+    if f"-{normalized_arch}." in asset_name:
+        return 0
+    if "-universal." in asset_name or "-universal2." in asset_name:
+        return 2
+    if "-arm64." in asset_name or "-x86_64." in asset_name:
+        return None
+    return 4
+
+
+def _normalize_macos_arch(arch_name: str) -> str:
+    arch = arch_name.lower()
+    if arch in {"amd64", "x64"}:
+        return "x86_64"
+    if arch == "aarch64":
+        return "arm64"
+    return arch
 
 
 class UpdateDownloader:
@@ -71,21 +139,14 @@ class UpdateDownloader:
             if not self.latest_version:
                 raise DownloadError("버전 정보를 찾을 수 없습니다")
 
-            # assets에서 설치 프로그램 찾기 (TunnelForge-Setup-{version}.exe)
             assets = release_data.get('assets', [])
-            for asset in assets:
-                asset_name = asset.get('name', '')
-                # TunnelForge-Setup-로 시작하고 .exe로 끝나는 파일 (WebSetup 제외)
-                if (asset_name.startswith(INSTALLER_FILENAME_PREFIX) and
-                    asset_name.endswith('.exe') and
-                    'WebSetup' not in asset_name):
-                    self.download_url = asset.get('browser_download_url')
-                    self.file_size = asset.get('size', 0)
-                    break
+            selected = select_release_asset(assets)
+            if selected:
+                self.download_url, self.file_size = selected
 
             if not self.download_url:
                 raise DownloadError(
-                    f"설치 파일을 찾을 수 없습니다.\n"
+                    f"현재 플랫폼용 설치 파일을 찾을 수 없습니다.\n"
                     f"GitHub에서 직접 다운로드: {RELEASES_PAGE_URL}"
                 )
 
@@ -133,7 +194,7 @@ class UpdateDownloader:
 
         # 임시 파일 경로 생성
         temp_dir = tempfile.gettempdir()
-        filename = os.path.basename(self.download_url) or "TunnelForge-Setup.exe"
+        filename = os.path.basename(self.download_url) or "TunnelForge-Update"
         file_path = os.path.join(temp_dir, filename)
 
         try:

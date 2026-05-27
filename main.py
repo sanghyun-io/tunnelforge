@@ -1,18 +1,18 @@
 # -*- coding: utf-8 -*-
 import sys
 import os
-import io
-import ctypes
-import subprocess
 import traceback
+import json
+import subprocess
+from contextlib import redirect_stdout
 
 # Windows 콘솔 UTF-8 출력 지원 (이모지 출력을 위해)
 # GUI 모드(pythonw.exe 또는 PyInstaller --noconsole)에서는 stdout/stderr가 None일 수 있음
 if sys.platform == 'win32':
-    if sys.stdout is not None and hasattr(sys.stdout, 'buffer'):
-        sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-    if sys.stderr is not None and hasattr(sys.stderr, 'buffer'):
-        sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
+    if sys.stdout is not None and hasattr(sys.stdout, 'reconfigure'):
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
+    if sys.stderr is not None and hasattr(sys.stderr, 'reconfigure'):
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 
 
 def get_app_dir() -> str:
@@ -26,78 +26,194 @@ def get_app_dir() -> str:
 
 
 def show_error_and_offer_recovery(error_message: str):
-    """오류 메시지 표시 및 복구 프로그램 실행 제안 (Windows MessageBox 사용)"""
-    # Windows API 상수
-    MB_YESNO = 0x04
-    MB_ICONERROR = 0x10
-    IDYES = 6
+    """오류 메시지 표시 및 복구 프로그램 실행 제안."""
+    try:
+        from src.core.platform_integration import show_crash_recovery_message
 
-    app_dir = get_app_dir()
-    updater_path = os.path.join(app_dir, "TunnelForge-WebSetup.exe")
-    updater_exists = os.path.exists(updater_path)
-
-    if updater_exists:
-        message = (
-            f"프로그램 실행 중 오류가 발생했습니다.\n\n"
-            f"오류 내용:\n{error_message}\n\n"
-            f"복구/업데이트 프로그램을 실행하여 최신 버전으로 재설치하시겠습니까?"
-        )
-
-        result = ctypes.windll.user32.MessageBoxW(
-            None,
-            message,
-            "TunnelForge - 오류",
-            MB_YESNO | MB_ICONERROR
-        )
-
-        if result == IDYES:
+        show_crash_recovery_message(error_message, get_app_dir())
+    except Exception:
+        if sys.platform == 'win32':
             try:
-                subprocess.Popen(
-                    [updater_path],
-                    creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-                )
-            except Exception as e:
+                import ctypes
+
                 ctypes.windll.user32.MessageBoxW(
                     None,
-                    f"복구 프로그램 실행 실패:\n{str(e)}\n\n"
-                    f"수동으로 실행해 주세요:\n{updater_path}",
+                    f"프로그램 실행 중 오류가 발생했습니다.\n\n오류 내용:\n{error_message}",
                     "TunnelForge - 오류",
-                    0x10  # MB_ICONERROR
+                    0x10,
                 )
-    else:
-        # 복구 프로그램이 없는 경우 (개발 환경 등)
-        message = (
-            f"프로그램 실행 중 오류가 발생했습니다.\n\n"
-            f"오류 내용:\n{error_message}\n\n"
-            f"GitHub에서 최신 버전을 다운로드해 주세요:\n"
-            f"https://github.com/sanghyun-io/tunnelforge/releases"
+                return
+            except Exception:
+                pass
+        try:
+            sys.stderr.write(f"TunnelForge startup error\n\n{error_message}\n")
+        except Exception:
+            pass
+
+
+def app_icon_path():
+    from src.core.resources import app_icon_path as resolve_app_icon_path
+
+    return resolve_app_icon_path()
+
+
+def db_core_executable() -> str:
+    from src.core.cross_engine_migration import db_core_executable as resolve_db_core_executable
+
+    return resolve_db_core_executable()
+
+
+def QApplication():
+    from PyQt6.QtWidgets import QApplication as q_application
+
+    return q_application
+
+
+def QIcon():
+    from PyQt6.QtGui import QIcon as q_icon
+
+    return q_icon
+
+
+def ConfigManager():
+    from src.core import ConfigManager as config_manager
+
+    return config_manager
+
+
+def TunnelEngine():
+    from src.core import TunnelEngine as tunnel_engine
+
+    return tunnel_engine
+
+
+def TunnelManagerUI():
+    from src.ui.main_window import TunnelManagerUI as tunnel_manager_ui
+
+    return tunnel_manager_ui
+
+
+def should_run_self_check(argv=None) -> bool:
+    return "--self-check" in (argv if argv is not None else sys.argv)
+
+
+def should_run_ui_smoke_check(argv=None) -> bool:
+    return "--ui-smoke-check" in (argv if argv is not None else sys.argv)
+
+
+def run_self_check() -> dict:
+    """Verify packaged-runtime essentials without starting the GUI event loop."""
+    icon = app_icon_path()
+    core = db_core_executable()
+    result = {
+        "success": False,
+        "icon_path": str(icon),
+        "icon_exists": icon.exists(),
+        "core_path": str(core),
+        "core_exists": os.path.exists(core),
+        "core_hello": None,
+        "core_error": None,
+    }
+
+    if not result["icon_exists"] or not result["core_exists"]:
+        return result
+
+    request = {
+        "command": "service.hello",
+        "request_id": "self-check",
+        "payload": {},
+    }
+    try:
+        completed = subprocess.run(
+            [core],
+            input=json.dumps(request, ensure_ascii=False) + "\n",
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=10,
         )
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            message,
-            "TunnelForge - 오류",
-            0x10  # MB_ICONERROR
-        )
+        completed.check_returncode()
+        result["core_hello"] = json.loads(completed.stdout.strip().splitlines()[-1])
+    except Exception as exc:
+        result["core_error"] = f"{type(exc).__name__}: {exc}"
+        return result
+
+    result["success"] = (
+        result["core_hello"].get("event") == "result"
+        and result["core_hello"].get("request_id") == "self-check"
+        and result["core_hello"].get("service") == "tunnelforge-core"
+        and result["core_hello"].get("success") is True
+    )
+    return result
+
+
+def run_self_check_cli() -> int:
+    result = run_self_check()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result["success"] else 1
+
+
+def run_ui_smoke_check() -> dict:
+    """Construct the main PyQt window without background work or event loop."""
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    self_check = run_self_check()
+
+    app_cls = QApplication()
+    icon_cls = QIcon()
+    config_cls = ConfigManager()
+    engine_cls = TunnelEngine()
+    window_cls = TunnelManagerUI()
+    config_mgr = config_cls()
+    from src.core.i18n import configure_language, install_qt_i18n
+
+    configure_language(config_mgr, ["TunnelForge", "--ui-smoke-check"])
+    install_qt_i18n()
+
+    app = app_cls.instance() or app_cls(["TunnelForge", "--ui-smoke-check"])
+    app.setWindowIcon(icon_cls(str(app_icon_path())))
+
+    window = window_cls(config_mgr, engine_cls(), start_background=False)
+    result = {
+        "success": self_check["success"] is True and window.windowTitle() == "TunnelForge",
+        "window_title": window.windowTitle(),
+        "self_check": self_check,
+    }
+    window.dispose_for_smoke_check()
+    return result
+
+
+def run_ui_smoke_check_cli() -> int:
+    with redirect_stdout(sys.stderr):
+        result = run_ui_smoke_check()
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result["success"] else 1
 
 
 def main():
-    from PyQt6.QtWidgets import QApplication
-    from PyQt6.QtGui import QIcon
+    if should_run_self_check():
+        return run_self_check_cli()
+    if should_run_ui_smoke_check():
+        return run_ui_smoke_check_cli()
 
-    from src.core import ConfigManager, TunnelEngine
     from src.core.logger import get_logger
+    from src.core.platform_integration import set_app_user_model_id
     from src.core.single_instance import SingleInstanceGuard
-    from src.ui.main_window import TunnelManagerUI
 
     # 루트 로거 초기화
     logger = get_logger('main')
 
     # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
-    if sys.platform == 'win32':
-        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID('tunnelforge.1.0')
+    set_app_user_model_id('tunnelforge.1.0')
 
-    app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon('assets/icon.ico'))  # 또는 'assets/icon.png'
+    app_cls = QApplication()
+    icon_cls = QIcon()
+    config_cls = ConfigManager()
+    engine_cls = TunnelEngine()
+    window_cls = TunnelManagerUI()
+
+    app = app_cls(sys.argv)
+    app.setWindowIcon(icon_cls(str(app_icon_path())))
 
     single_instance_guard = SingleInstanceGuard(parent=app)
     if single_instance_guard.is_secondary:
@@ -117,8 +233,12 @@ def main():
     app.setQuitOnLastWindowClosed(False)
 
     # 1. 매니저 초기화
-    config_mgr = ConfigManager()
-    tunnel_engine = TunnelEngine()
+    config_mgr = config_cls()
+    from src.core.i18n import configure_language, install_qt_i18n
+
+    configure_language(config_mgr, sys.argv)
+    install_qt_i18n()
+    tunnel_engine = engine_cls()
 
     # 2. 설정 파일 경로 안내 (첫 실행 사용자를 위해)
     config_path = config_mgr.get_config_path()
@@ -126,7 +246,7 @@ def main():
 
     # 3. UI 실행
     start_minimized = '--minimized' in sys.argv
-    window = TunnelManagerUI(config_mgr, tunnel_engine)
+    window = window_cls(config_mgr, tunnel_engine)
     single_instance_guard.activation_requested.connect(window.bring_to_front)
     if not start_minimized:
         window.show()
@@ -141,7 +261,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except Exception as e:
         # 전역 예외 핸들러: 시작 시 오류 발생하면 복구 프로그램 안내
         error_msg = f"{type(e).__name__}: {str(e)}"

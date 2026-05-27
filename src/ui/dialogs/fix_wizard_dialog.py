@@ -34,6 +34,7 @@ from src.core.migration_fix_wizard import (
     CollationFKGraphBuilder, CharsetFixPlanBuilder, CharsetTableInfo,
     FKSafeCharsetChanger
 )
+from src.core.platform_paths import rollback_dir
 from src.ui.workers.fix_wizard_worker import FixWizardWorker
 
 
@@ -1975,16 +1976,7 @@ class ExecutionPage(QWizardPage):
 
     def _get_rollback_dir(self) -> str:
         """Rollback SQL 저장 디렉토리"""
-        if os.name == 'nt':
-            base_dir = os.path.join(
-                os.environ.get('LOCALAPPDATA', ''),
-                'TunnelForge', 'rollback'
-            )
-        else:
-            base_dir = os.path.join(
-                os.path.expanduser('~'),
-                '.config', 'tunnelforge', 'rollback'
-            )
+        base_dir = str(rollback_dir())
         os.makedirs(base_dir, exist_ok=True)
         return base_dir
 

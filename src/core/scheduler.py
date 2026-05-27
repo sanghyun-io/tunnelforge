@@ -17,6 +17,7 @@ from enum import Enum
 from typing import List, Dict, Any, Optional, Callable, Tuple
 
 from src.core.logger import get_logger
+from src.core.platform_paths import log_dir as platform_log_dir
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 
@@ -559,13 +560,7 @@ class BackupScheduler:
         """백업 로그 저장"""
         try:
             # 로그 디렉토리
-            if os.name == 'nt':
-                log_dir = os.path.join(
-                    os.environ.get('LOCALAPPDATA', ''),
-                    'TunnelForge', 'backup_logs'
-                )
-            else:
-                log_dir = os.path.expanduser('~/.tunnelforge/backup_logs')
+            log_dir = str(platform_log_dir() / 'backup_logs')
 
             os.makedirs(log_dir, exist_ok=True)
 
@@ -592,13 +587,7 @@ class BackupScheduler:
         logs = []
 
         try:
-            if os.name == 'nt':
-                log_dir = os.path.join(
-                    os.environ.get('LOCALAPPDATA', ''),
-                    'TunnelForge', 'backup_logs'
-                )
-            else:
-                log_dir = os.path.expanduser('~/.tunnelforge/backup_logs')
+            log_dir = str(platform_log_dir() / 'backup_logs')
 
             if not os.path.exists(log_dir):
                 return logs

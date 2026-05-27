@@ -41,6 +41,7 @@ Thumbs.db
 *.log
 config.json
 .superpowers/
+.claude/worktrees/
 cross_engine_migration_report*.txt
 migration_core/target/
 *.exe

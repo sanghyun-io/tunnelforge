@@ -2,6 +2,8 @@
 import os
 import subprocess
 import sys
+from dataclasses import dataclass
+from typing import Optional
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
@@ -15,8 +17,44 @@ from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
 from src.core.logger import get_log_file_path, get_log_dir, read_log_file, filter_log_by_level, clear_log_file
+from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
+from src.core.platform_integration import (
+    StartupRegistrar,
+    detached_process_kwargs,
+    no_window_creation_flags,
+    update_package_launch_strategy,
+)
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
+
+
+@dataclass(frozen=True)
+class UpdatePackageActionText:
+    button: str
+    done_message: str
+    confirm_title: str
+    confirm_question: str
+    confirm_body: str
+
+
+def update_package_action_text(strategy: Optional[str] = None) -> UpdatePackageActionText:
+    launch_strategy = strategy or update_package_launch_strategy()
+    if launch_strategy == "open":
+        return UpdatePackageActionText(
+            button="📂 패키지 열기",
+            done_message="✅ 다운로드 완료! '패키지 열기' 버튼을 클릭하세요.",
+            confirm_title="패키지 열기 확인",
+            confirm_question="다운로드한 TunnelForge 패키지를 여시겠습니까?",
+            confirm_body="다운로드한 패키지를 열면 현재 앱이 종료됩니다.",
+        )
+
+    return UpdatePackageActionText(
+        button="🚀 설치 시작",
+        done_message="✅ 다운로드 완료! '설치 시작' 버튼을 클릭하세요.",
+        confirm_title="설치 확인",
+        confirm_question="TunnelForge 설치를 시작하시겠습니까?",
+        confirm_body="설치를 위해 현재 앱이 종료됩니다.",
+    )
 
 
 class CloseConfirmDialog(QDialog):
@@ -109,7 +147,7 @@ class SettingsDialog(QDialog):
     def __init__(self, parent=None, config_manager=None):
         super().__init__(parent)
         self.config_mgr = config_manager
-        self.setWindowTitle("설정")
+        self.setWindowTitle(tr("settings.title"))
         self.setMinimumSize(600, 420)
         self._update_checker_thread = None
         self.init_ui()
@@ -118,38 +156,38 @@ class SettingsDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # 탭 위젯 생성
-        tabs = QTabWidget()
-        tabs.addTab(self._create_general_tab(), "일반")
-        tabs.addTab(self._create_pool_tab(), "연결 풀")
-        tabs.addTab(self._create_log_tab(), "로그")
-        tabs.addTab(self._create_about_tab(), "정보")
-        layout.addWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._create_general_tab(), tr("settings.general"))
+        self.tabs.addTab(self._create_pool_tab(), tr("settings.connection_pool"))
+        self.tabs.addTab(self._create_log_tab(), tr("settings.logs"))
+        self.tabs.addTab(self._create_about_tab(), tr("settings.about"))
+        layout.addWidget(self.tabs)
 
         # 버튼
         button_layout = QHBoxLayout()
-        btn_save = QPushButton("저장")
-        btn_save.setStyleSheet("""
+        self.btn_save = QPushButton(tr("common.save"))
+        self.btn_save.setStyleSheet("""
             QPushButton {
                 background-color: #3498db; color: white; font-weight: bold;
                 padding: 6px 16px; border-radius: 4px; border: none;
             }
             QPushButton:hover { background-color: #2980b9; }
         """)
-        btn_save.clicked.connect(self.save_settings)
+        self.btn_save.clicked.connect(self.save_settings)
 
-        btn_cancel = QPushButton("취소")
-        btn_cancel.setStyleSheet("""
+        self.btn_cancel = QPushButton(tr("common.cancel"))
+        self.btn_cancel.setStyleSheet("""
             QPushButton {
                 background-color: #ecf0f1; color: #2c3e50;
                 padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
             }
             QPushButton:hover { background-color: #d5dbdb; }
         """)
-        btn_cancel.clicked.connect(self.reject)
+        self.btn_cancel.clicked.connect(self.reject)
 
         button_layout.addStretch()
-        button_layout.addWidget(btn_save)
-        button_layout.addWidget(btn_cancel)
+        button_layout.addWidget(self.btn_save)
+        button_layout.addWidget(self.btn_cancel)
         layout.addLayout(button_layout)
 
     def _create_general_tab(self) -> QWidget:
@@ -157,21 +195,41 @@ class SettingsDialog(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        language_group = QGroupBox(tr("settings.language"))
+        language_layout = QVBoxLayout(language_group)
+        language_row = QHBoxLayout()
+        self.language_combo = QComboBox()
+        for code, label in SUPPORTED_LANGUAGES.items():
+            self.language_combo.addItem(label, code)
+        selected_language = self.config_mgr.get_app_setting("language", current_language())
+        selected_index = self.language_combo.findData(selected_language)
+        if selected_index >= 0:
+            self.language_combo.setCurrentIndex(selected_index)
+        self.language_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 150px;")
+        language_row.addWidget(self.language_combo)
+        language_row.addStretch()
+        language_layout.addLayout(language_row)
+        restart_note = QLabel(tr("settings.restart_note"))
+        restart_note.setStyleSheet("color: gray; font-size: 11px;")
+        restart_note.setWordWrap(True)
+        language_layout.addWidget(restart_note)
+        layout.addWidget(language_group)
+
         # 종료 동작 설정 그룹
-        group_box = QGroupBox("창 닫기(X) 버튼 동작")
+        group_box = QGroupBox(tr("settings.close_behavior"))
         group_layout = QVBoxLayout(group_box)
 
         self.btn_group = QButtonGroup(self)
 
-        self.radio_ask = QRadioButton("매번 묻기")
+        self.radio_ask = QRadioButton(tr("settings.ask_every_time"))
         self.btn_group.addButton(self.radio_ask)
         group_layout.addWidget(self.radio_ask)
 
-        self.radio_minimize = QRadioButton("항상 시스템 트레이로 최소화")
+        self.radio_minimize = QRadioButton(tr("settings.always_minimize"))
         self.btn_group.addButton(self.radio_minimize)
         group_layout.addWidget(self.radio_minimize)
 
-        self.radio_exit = QRadioButton("항상 프로그램 종료")
+        self.radio_exit = QRadioButton(tr("settings.always_exit"))
         self.btn_group.addButton(self.radio_exit)
         group_layout.addWidget(self.radio_exit)
 
@@ -187,17 +245,17 @@ class SettingsDialog(QDialog):
             self.radio_ask.setChecked(True)
 
         # 테마 설정 그룹
-        theme_group = QGroupBox("테마")
+        theme_group = QGroupBox(tr("settings.theme"))
         theme_layout = QHBoxLayout(theme_group)
 
-        theme_label = QLabel("화면 테마:")
+        theme_label = QLabel(tr("settings.theme_label"))
         theme_label.setStyleSheet("font-size: 12px;")
         theme_layout.addWidget(theme_label)
 
         self.theme_combo = QComboBox()
-        self.theme_combo.addItem("시스템 설정 따르기", ThemeType.SYSTEM.value)
-        self.theme_combo.addItem("라이트 모드", ThemeType.LIGHT.value)
-        self.theme_combo.addItem("다크 모드", ThemeType.DARK.value)
+        self.theme_combo.addItem(tr("settings.system_theme"), ThemeType.SYSTEM.value)
+        self.theme_combo.addItem(tr("settings.light_mode"), ThemeType.LIGHT.value)
+        self.theme_combo.addItem(tr("settings.dark_mode"), ThemeType.DARK.value)
         self.theme_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 150px;")
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         theme_layout.addWidget(self.theme_combo)
@@ -214,7 +272,7 @@ class SettingsDialog(QDialog):
             self.theme_combo.setCurrentIndex(index)
 
         # GitHub 이슈 자동 보고 설정 그룹
-        github_group = QGroupBox("GitHub 이슈 자동 보고")
+        github_group = QGroupBox(tr("settings.github_auto_report"))
         github_layout = QVBoxLayout(github_group)
 
         # GitHub App 설정 확인
@@ -267,7 +325,7 @@ class SettingsDialog(QDialog):
         self._load_github_settings()
 
         # 설정 백업/복원 그룹
-        backup_group = QGroupBox("설정 백업/복원")
+        backup_group = QGroupBox(tr("settings.backup_restore"))
         backup_layout = QVBoxLayout(backup_group)
 
         # 백업 목록 라벨
@@ -342,10 +400,10 @@ class SettingsDialog(QDialog):
         self._refresh_backup_list()
 
         # 자동 재연결 설정 그룹
-        reconnect_group = QGroupBox("터널 자동 재연결")
+        reconnect_group = QGroupBox(tr("settings.reconnect"))
         reconnect_layout = QVBoxLayout(reconnect_group)
 
-        self.chk_auto_reconnect = QCheckBox("연결 끊김 시 자동 재연결")
+        self.chk_auto_reconnect = QCheckBox(tr("settings.auto_reconnect"))
         self.chk_auto_reconnect.setStyleSheet("font-size: 12px;")
         self.chk_auto_reconnect.setChecked(
             self.config_mgr.get_app_setting('auto_reconnect', True)
@@ -353,7 +411,7 @@ class SettingsDialog(QDialog):
         reconnect_layout.addWidget(self.chk_auto_reconnect)
 
         max_attempts_layout = QHBoxLayout()
-        max_attempts_label = QLabel("최대 재연결 시도 횟수:")
+        max_attempts_label = QLabel(tr("settings.max_reconnect_attempts"))
         max_attempts_label.setStyleSheet("font-size: 12px; margin-left: 20px;")
         max_attempts_layout.addWidget(max_attempts_label)
 
@@ -367,35 +425,31 @@ class SettingsDialog(QDialog):
         max_attempts_layout.addStretch()
         reconnect_layout.addLayout(max_attempts_layout)
 
-        reconnect_desc = QLabel(
-            "연결이 끊어지면 점진적 백오프(1초→60초)를 적용하여 자동으로 재연결을 시도합니다."
-        )
+        reconnect_desc = QLabel(tr("settings.reconnect_description"))
         reconnect_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
         reconnect_desc.setWordWrap(True)
         reconnect_layout.addWidget(reconnect_desc)
 
         layout.addWidget(reconnect_group)
 
-        # Windows 시작 프로그램 설정 그룹
-        startup_group = QGroupBox("Windows 시작 프로그램")
+        # 시작 프로그램 설정 그룹
+        startup_group = QGroupBox(tr("settings.startup"))
         startup_layout = QVBoxLayout(startup_group)
 
-        self.chk_startup = QCheckBox("Windows 시작 시 자동 실행")
+        self.chk_startup = QCheckBox(tr("settings.startup_auto"))
         self.chk_startup.setStyleSheet("font-size: 12px;")
         self.chk_startup.setChecked(self._is_startup_registered())
         startup_layout.addWidget(self.chk_startup)
 
-        startup_desc = QLabel(
-            "Windows 부팅 시 시스템 트레이에 최소화된 상태로 자동 시작됩니다."
-        )
+        startup_desc = QLabel(tr("settings.startup_description"))
         startup_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
         startup_desc.setWordWrap(True)
         startup_layout.addWidget(startup_desc)
 
         layout.addWidget(startup_group)
 
-        # Windows가 아닌 경우 숨김
-        if sys.platform != 'win32':
+        # 자동 시작이 지원되지 않는 플랫폼에서는 숨김
+        if not StartupRegistrar().is_supported:
             startup_group.setVisible(False)
 
         layout.addStretch()
@@ -921,6 +975,10 @@ class SettingsDialog(QDialog):
 
         self.config_mgr.set_app_setting('close_action', action)
 
+        language = self.language_combo.currentData() or current_language()
+        set_language(language)
+        self.config_mgr.set_app_setting('language', language)
+
         # 테마 설정은 _on_theme_changed에서 이미 저장됨
 
         # GitHub 자동 보고 설정 저장
@@ -938,71 +996,23 @@ class SettingsDialog(QDialog):
         max_reconnect = self.spin_max_reconnect.value()
         self.config_mgr.set_app_setting('max_reconnect_attempts', max_reconnect)
 
-        # Windows 시작 프로그램 설정 저장
-        if sys.platform == 'win32':
+        # 시작 프로그램 설정 저장
+        if StartupRegistrar().is_supported:
             self._set_startup_registry(self.chk_startup.isChecked())
 
         self.accept()
 
     def _is_startup_registered(self) -> bool:
         """레지스트리에 시작 프로그램 등록 여부 확인"""
-        if sys.platform != 'win32':
-            return False
-        try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0, winreg.KEY_READ
-            )
-            try:
-                winreg.QueryValueEx(key, "TunnelForge")
-                return True
-            except FileNotFoundError:
-                return False
-            finally:
-                winreg.CloseKey(key)
-        except Exception:
-            return False
+        return StartupRegistrar().is_registered()
 
     def _set_startup_registry(self, enable: bool):
         """레지스트리에 시작 프로그램 등록/해제"""
-        if sys.platform != 'win32':
-            return
-        try:
-            import winreg
-            key = winreg.OpenKey(
-                winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
-                0, winreg.KEY_SET_VALUE
-            )
-            try:
-                if enable:
-                    if getattr(sys, 'frozen', False):
-                        # PyInstaller 빌드: exe 직접 실행
-                        app_path = f'"{sys.executable}" --minimized'
-                    else:
-                        # 개발 환경: pythonw.exe로 콘솔 없이 실행
-                        python_dir = os.path.dirname(sys.executable)
-                        pythonw = os.path.join(python_dir, 'pythonw.exe')
-                        if not os.path.exists(pythonw):
-                            pythonw = sys.executable
-                        main_py = os.path.abspath(
-                            os.path.join(os.path.dirname(__file__), '..', '..', '..', 'main.py')
-                        )
-                        app_path = f'"{pythonw}" "{main_py}" --minimized'
-                    winreg.SetValueEx(key, "TunnelForge", 0, winreg.REG_SZ, app_path)
-                else:
-                    try:
-                        winreg.DeleteValue(key, "TunnelForge")
-                    except FileNotFoundError:
-                        pass
-            finally:
-                winreg.CloseKey(key)
-        except Exception as e:
+        success, message = StartupRegistrar().set_registered(enable)
+        if not success and message:
             QMessageBox.warning(
                 self, "시작 프로그램 설정 오류",
-                f"레지스트리 설정 중 오류가 발생했습니다:\n{str(e)}"
+                f"시작 프로그램 설정 중 오류가 발생했습니다:\n{message}"
             )
 
     def _check_for_updates(self):
@@ -1010,7 +1020,7 @@ class SettingsDialog(QDialog):
         self.btn_check_update.setEnabled(False)
         self.btn_check_update.setText("확인 중...")
         self.update_status_label.setHtml(
-            '<div style="color: #3498db; font-size: 12px;">업데이트를 확인하는 중입니다...</div>'
+            translate_text('<div style="color: #3498db; font-size: 12px;">업데이트를 확인하는 중입니다...</div>')
         )
 
         # 백그라운드 스레드에서 확인
@@ -1033,9 +1043,11 @@ class SettingsDialog(QDialog):
         if needs_update:
             self._latest_version = latest_version
             self.update_status_label.setHtml(
-                f'<div style="color: #27ae60; font-size: 12px;">'
-                f'✅ 새로운 버전 {latest_version}이 사용 가능합니다!'
-                f'</div>'
+                translate_text(
+                    f'<div style="color: #27ae60; font-size: 12px;">'
+                    f'✅ 새로운 버전 {latest_version}이 사용 가능합니다!'
+                    f'</div>'
+                )
             )
             # 다운로드 버튼 표시
             self.download_widget.show()
@@ -1046,9 +1058,11 @@ class SettingsDialog(QDialog):
             self.btn_cancel_download.hide()
         else:
             self.update_status_label.setHtml(
-                f'<div style="color: #27ae60; font-size: 12px;">'
-                f'✅ 최신 버전({__version__})을 사용하고 있습니다.'
-                f'</div>'
+                translate_text(
+                    f'<div style="color: #27ae60; font-size: 12px;">'
+                    f'✅ 최신 버전({__version__})을 사용하고 있습니다.'
+                    f'</div>'
+                )
             )
             self.download_widget.hide()
 
@@ -1094,8 +1108,9 @@ class SettingsDialog(QDialog):
 
         if success:
             self._downloaded_installer_path = result
+            action_text = update_package_action_text()
             self.download_progress.setValue(100)
-            self.btn_download.setText("🚀 설치 시작")
+            self.btn_download.setText(action_text.button)
             self.btn_download.setEnabled(True)
             self.btn_download.setStyleSheet("""
                 QPushButton {
@@ -1108,7 +1123,7 @@ class SettingsDialog(QDialog):
             # 버튼 클릭 이벤트 변경
             self.btn_download.clicked.disconnect()
             self.btn_download.clicked.connect(self._launch_installer)
-            self.download_detail_label.setText("✅ 다운로드 완료! '설치 시작' 버튼을 클릭하세요.")
+            self.download_detail_label.setText(action_text.done_message)
         else:
             self.download_progress.hide()
             self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
@@ -1144,11 +1159,8 @@ class SettingsDialog(QDialog):
 
         # 확인 메시지 구성 (활성 터널 경고 포함)
         main_window = self.parent()
-        confirm_msg = (
-            f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
-            "현재 앱이 종료되고 설치 마법사가 실행됩니다.\n"
-            "설치가 끝나면 마법사에서 TunnelForge를 다시 실행할 수 있습니다."
-        )
+        action_text = update_package_action_text()
+        confirm_msg = f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
 
         if main_window and hasattr(main_window, 'engine'):
             active_count = len(main_window.engine.active_tunnels)
@@ -1159,16 +1171,16 @@ class SettingsDialog(QDialog):
                     tunnel_names.append(config.get('name', tid))
                 tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
                 confirm_msg = (
-                    f"TunnelForge v{self._latest_version} 설치를 시작하시겠습니까?\n\n"
+                    f"{action_text.confirm_question}\n\n"
                     f"⚠️ 현재 {active_count}개의 활성 터널이 연결 해제됩니다:\n"
                     f"{tunnel_list}\n\n"
-                    "현재 앱이 종료되고 설치 마법사가 실행됩니다."
+                    f"{action_text.confirm_body}"
                 )
 
         # 확인 다이얼로그
         reply = QMessageBox.question(
             self,
-            "설치 확인",
+            action_text.confirm_title,
             confirm_msg,
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.Yes
@@ -1183,6 +1195,9 @@ class SettingsDialog(QDialog):
                     [self._downloaded_installer_path],
                     close_fds=True,
                 )
+            elif update_package_launch_strategy() == "open":
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(self._downloaded_installer_path)):
+                    raise RuntimeError("다운로드한 패키지를 열 수 없습니다.")
             else:
                 subprocess.Popen(
                     [self._downloaded_installer_path],

@@ -1,0 +1,347 @@
+name: macOS App Validation
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/macos-app.yml"
+      - ".github/workflows/release.yml"
+      - "assets/**"
+      - "docs/macos_support.md"
+      - "main.py"
+      - "migration_core/**"
+      - "pyproject.toml"
+      - "scripts/build-macos.sh"
+      - "scripts/package-macos.sh"
+      - "scripts/validate-macos-release.sh"
+      - "scripts/smoke-macos-launchagent.sh"
+      - "scripts/smoke-macos-applications-install.sh"
+      - "scripts/macos-manual-validation-report.sh"
+      - "src/**"
+      - "tests/test_app_self_check.py"
+      - "tests/test_macos_support_docs.py"
+      - "tests/test_platform_integration.py"
+      - "tests/test_platform_paths.py"
+      - "tests/test_resources.py"
+      - "tests/test_rust_core_packaging.py"
+      - "tests/test_settings_update_actions.py"
+      - "tests/test_update_downloader.py"
+      - "tunnel-manager.spec"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  validate-macos-app:
+    name: Validate macOS App (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            arch: arm64
+          - runner: macos-15-intel
+            arch: x86_64
+
+    steps:
+      - name: Checkout code
+        env:
+          CHECKOUT_REF: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: |
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "$CHECKOUT_REF"
+          git checkout --detach FETCH_HEAD
+          git config --global --add safe.directory "$PWD"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Set up Rust
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Resolve version
+        id: version
+        run: |
+          VERSION="$(python -c 'from src.version import __version__; print(__version__)')"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Run focused macOS tests
+        run: |
+          pytest \
+            tests/test_platform_paths.py \
+            tests/test_platform_integration.py \
+            tests/test_resources.py \
+            tests/test_update_downloader.py \
+            tests/test_rust_core_packaging.py \
+            tests/test_settings_update_actions.py \
+            tests/test_app_self_check.py \
+            tests/test_macos_support_docs.py
+          cargo test --manifest-path migration_core/Cargo.toml
+
+      - name: Smoke source-run TunnelForge app
+        run: |
+          cargo build --manifest-path migration_core/Cargo.toml --release
+          RESPONSE="$(python main.py --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          assert data["self_check"]["icon_exists"] is True
+          assert data["self_check"]["core_exists"] is True
+          assert data["self_check"]["core_hello"]["service"] == "tunnelforge-core"
+          assert data["self_check"]["core_hello"]["success"] is True
+          PY
+
+      - name: Build macOS app
+        run: bash scripts/build-macos.sh
+
+      - name: Smoke packaged TunnelForge app
+        run: |
+          APP_EXECUTABLE="dist/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["event"] == "result"
+          assert data["core_hello"]["request_id"] == "self-check"
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Import Apple Developer ID certificate
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          APPLE_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12_BASE64 }}
+          APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
+          APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
+          APPLE_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_CODESIGN_KEYCHAIN_PASSWORD }}
+        run: |
+          if [[ -z "${APPLE_CODESIGN_CERTIFICATE_P12_BASE64:-}" ]]; then
+            echo "Apple signing certificate secret is not set; unsigned macOS artifacts will be built."
+            exit 0
+          fi
+
+          if [[ -z "${APPLE_CODESIGN_CERTIFICATE_PASSWORD:-}" ]]; then
+            echo "APPLE_CODESIGN_CERTIFICATE_PASSWORD is required when APPLE_CODESIGN_CERTIFICATE_P12_BASE64 is set." >&2
+            exit 1
+          fi
+
+          mkdir -p build
+          python - <<'PY'
+          import base64
+          import os
+          from pathlib import Path
+
+          Path("build/apple-codesign.p12").write_bytes(
+              base64.b64decode(os.environ["APPLE_CODESIGN_CERTIFICATE_P12_BASE64"])
+          )
+          PY
+
+          KEYCHAIN_PATH="$RUNNER_TEMP/tunnelforge-signing.keychain-db"
+          KEYCHAIN_PASSWORD="${APPLE_CODESIGN_KEYCHAIN_PASSWORD:-$(uuidgen)}"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import build/apple-codesign.p12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CODESIGN_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security default-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          if [[ -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+            APPLE_CODESIGN_IDENTITY="$(
+              security find-identity -v -p codesigning "$KEYCHAIN_PATH" |
+              awk -F '"' '/Developer ID Application/ { print $2; exit }'
+            )"
+          fi
+
+          if [[ -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+            echo "No Developer ID Application signing identity found in imported certificate." >&2
+            security find-identity -v -p codesigning "$KEYCHAIN_PATH" || true
+            exit 1
+          fi
+
+          {
+            echo "APPLE_CODESIGN_IDENTITY=$APPLE_CODESIGN_IDENTITY"
+            echo "APPLE_CODESIGN_KEYCHAIN_PATH=$KEYCHAIN_PATH"
+          } >> "$GITHUB_ENV"
+
+      - name: Package macOS app
+        env:
+          MACOS_PACKAGE_ARCH: ${{ matrix.arch }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          bash scripts/package-macos.sh "${{ steps.version.outputs.version }}"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256"
+          test -f "dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256"
+
+      - name: Verify signed and notarized artifacts
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        run: |
+          if [[ -z "${APPLE_CODESIGN_IDENTITY:-}" ]]; then
+            echo "APPLE_CODESIGN_IDENTITY is not set; skipping signed/notarized artifact verification."
+            exit 0
+          fi
+
+          if [[ -z "${APPLE_ID:-}" || -z "${APPLE_TEAM_ID:-}" || -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+            echo "Apple notarization credentials are not fully set; skipping notarization-specific verification."
+            exit 0
+          fi
+
+          APP_PATH="dist/TunnelForge.app"
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute --verbose "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          xcrun stapler validate "$DMG_PATH"
+
+      - name: Smoke DMG package
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          DMG_SMOKE_MOUNT="$PWD/build/dmg-smoke-mount"
+          rm -rf "$DMG_SMOKE_MOUNT"
+          mkdir -p "$DMG_SMOKE_MOUNT"
+          hdiutil attach "$DMG_PATH" -mountpoint "$DMG_SMOKE_MOUNT" -quiet
+          trap 'hdiutil detach "$DMG_SMOKE_MOUNT" -quiet || true' EXIT
+          APP_EXECUTABLE="$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Smoke copied DMG install
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          INSTALL_SMOKE_MOUNT="$PWD/build/install-smoke-mount"
+          rm -rf "$INSTALL_SMOKE_MOUNT" build/install-smoke
+          mkdir -p "$INSTALL_SMOKE_MOUNT" build/install-smoke
+          hdiutil attach "$DMG_PATH" -mountpoint "$INSTALL_SMOKE_MOUNT" -quiet
+          trap 'hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet || true' EXIT
+          ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"
+          hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet
+          trap - EXIT
+          APP_EXECUTABLE="build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Smoke LaunchAgent registration
+        run: bash scripts/smoke-macos-launchagent.sh build/install-smoke/TunnelForge.app
+
+      - name: Smoke /Applications install
+        env:
+          MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM: "1"
+        run: |
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg"
+          bash scripts/smoke-macos-applications-install.sh "$DMG_PATH"
+
+      - name: Smoke ZIP package
+        run: |
+          ZIP_PATH="dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip"
+          rm -rf build/zip-smoke
+          mkdir -p build/zip-smoke
+          ditto -x -k "$ZIP_PATH" build/zip-smoke
+          APP_EXECUTABLE="build/zip-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
+          test -x "$APP_EXECUTABLE"
+          RESPONSE="$("$APP_EXECUTABLE" --ui-smoke-check)"
+          echo "$RESPONSE"
+          RESPONSE="$RESPONSE" python - <<'PY'
+          import json
+          import os
+
+          data = json.loads(os.environ["RESPONSE"])
+          assert data["success"] is True
+          assert data["window_title"] == "TunnelForge"
+          data = data["self_check"]
+          assert data["icon_exists"] is True
+          assert data["core_exists"] is True
+          assert data["core_hello"]["service"] == "tunnelforge-core"
+          assert data["core_hello"]["success"] is True
+          PY
+
+      - name: Upload macOS app artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}
+          path: |
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.dmg.sha256
+            dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256
+          if-no-files-found: error
+
+      - name: Cleanup Apple signing keychain
+        if: always()
+        run: |
+          rm -f build/apple-codesign.p12
+          if [[ -n "${APPLE_CODESIGN_KEYCHAIN_PATH:-}" ]]; then
+            security delete-keychain "$APPLE_CODESIGN_KEYCHAIN_PATH" || true
+          fi

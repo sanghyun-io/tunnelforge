@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from pathlib import Path
 
 import pytest
 
@@ -8,6 +9,8 @@ from src.core.cross_engine_migration import (
     DatabaseEngine,
     HelperProtocolError,
     MigrationDirection,
+    _db_core_executable_names,
+    _db_core_frozen_candidate_dirs,
     build_helper_request,
     db_core_executable,
     load_resume_state,
@@ -211,3 +214,26 @@ def test_db_core_executable_checks_frozen_app_directory(monkeypatch, tmp_path):
     monkeypatch.delattr(sys, "_MEIPASS", raising=False)
 
     assert db_core_executable() == str(core)
+
+
+def test_db_core_executable_uses_unsuffixed_core_name_on_macos():
+    assert _db_core_executable_names("posix") == ["tunnelforge-core"]
+
+
+def test_db_core_frozen_candidate_dirs_include_macos_app_bundle_locations():
+    executable = Path("/Applications/TunnelForge.app/Contents/MacOS/TunnelForge")
+
+    candidates = _db_core_frozen_candidate_dirs(executable)
+
+    assert executable.parent in candidates
+    assert executable.parent.parent / "Frameworks" in candidates
+    assert executable.parent.parent / "Resources" in candidates
+
+
+def test_db_core_frozen_candidate_dirs_prefer_macos_bundle_before_cwd():
+    executable = Path("/Applications/TunnelForge.app/Contents/MacOS/TunnelForge")
+
+    candidates = _db_core_frozen_candidate_dirs(executable)
+
+    assert candidates.index(executable.parent.parent / "Frameworks") < candidates.index(Path.cwd())
+    assert candidates.index(executable.parent.parent / "Resources") < candidates.index(Path.cwd())

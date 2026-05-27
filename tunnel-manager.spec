@@ -9,6 +9,7 @@ TunnelForge - PyInstaller Spec 파일
 
 import os
 from PyInstaller.utils.hooks import collect_submodules
+from src.version import __version__
 
 # 프로젝트 루트 디렉터리
 project_root = os.path.abspath(SPECPATH)
@@ -70,6 +71,12 @@ if not os.path.exists(tunnelforge_core_exe):
     )
 binaries = [(tunnelforge_core_exe, '.')]
 
+app_icon = (
+    os.path.join(project_root, 'assets', 'icon.ico')
+    if os.name == 'nt'
+    else os.path.join(project_root, 'assets', 'icon.icns')
+)
+
 # Analysis: 실행 파일에 포함될 내용 분석
 a = Analysis(
     [os.path.join(project_root, 'main.py')],  # 메인 스크립트
@@ -87,6 +94,10 @@ a = Analysis(
     noarchive=False,  # False: PYZ 아카이브 사용
 )
 
+exe_binaries = a.binaries if os.name == 'nt' else []
+exe_zipfiles = a.zipfiles if os.name == 'nt' else []
+exe_datas = a.datas if os.name == 'nt' else []
+
 # PYZ: Python 코드 아카이브
 pyz = PYZ(
     a.pure,
@@ -98,9 +109,9 @@ pyz = PYZ(
 exe = EXE(
     pyz,
     a.scripts,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    exe_binaries,
+    exe_zipfiles,
+    exe_datas,
     [],
     name='TunnelForge',  # 실행 파일 이름
     debug=False,  # True: 디버그 정보 포함
@@ -114,8 +125,39 @@ exe = EXE(
     target_arch=None,  # None: 현재 아키텍처, 'x86_64' 또는 'arm64' 지정 가능
     codesign_identity=None,  # 코드 서명 (맥OS)
     entitlements_file=None,  # 권한 파일 (맥OS)
-    icon=os.path.join(project_root, 'assets', 'icon.ico'),  # 실행 파일 아이콘
+    icon=app_icon,  # 실행 파일 아이콘
+    exclude_binaries=os.name != 'nt',
 )
+
+coll = None
+app_bundle = None
+if os.name != 'nt':
+    coll = COLLECT(
+        exe,
+        a.binaries,
+        a.zipfiles,
+        a.datas,
+        strip=False,
+        upx=True,
+        upx_exclude=[],
+        name='TunnelForge',
+    )
+    app_bundle = BUNDLE(
+        coll,
+        name='TunnelForge.app',
+        icon=os.path.join(project_root, 'assets/icon.icns'),
+        bundle_identifier='io.sanghyun.tunnelforge',
+        info_plist={
+            'CFBundleName': 'TunnelForge',
+            'CFBundleDisplayName': 'TunnelForge',
+            'CFBundleShortVersionString': __version__,
+            'CFBundleVersion': __version__,
+            'LSMinimumSystemVersion': '13.0',
+            'NSHighResolutionCapable': True,
+        },
+    )
+
+build_target = exe if os.name == 'nt' else app_bundle
 
 # COLLECT: 디렉터리 모드로 빌드 시 사용
 # 단일 파일 모드(onefile)를 원하면 이 섹션을 주석 처리하세요

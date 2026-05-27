@@ -438,4 +438,72 @@ Name: "desktopicon"; ...; Flags: unchecked
 
 ---
 
+## macOS App 생성
+
+macOS에서는 PyInstaller `.app` 번들과 DMG/ZIP 배포물을 생성합니다. 실제 실행 검증은 macOS 기기에서 수행해야 합니다.
+지원 범위와 최종 검증 체크리스트는 `docs/macos_support.md`를 기준으로 합니다.
+
+### 사전 요구사항
+
+- macOS 13 이상
+- Python 3.9 이상
+- Rust toolchain (`cargo`)
+- PyInstaller 포함 개발 의존성 (`pip install -e ".[dev]"`)
+
+### 앱 번들 빌드
+
+```bash
+bash scripts/build-macos.sh
+```
+
+이 스크립트는 다음을 수행합니다.
+
+1. Rust DB Core `migration_core/target/release/tunnelforge-core` 빌드
+2. `assets/icon.icns`가 없으면 `assets/icon_512.png`에서 생성
+3. PyInstaller로 `dist/TunnelForge.app` 생성
+4. `.app` 내부에 `tunnelforge-core`가 포함되어 있는지 확인
+
+기본 최소 배포 대상은 `MACOSX_DEPLOYMENT_TARGET=13.0`입니다.
+
+### DMG/ZIP 패키징
+
+```bash
+bash scripts/package-macos.sh
+```
+
+기본 결과물:
+
+```text
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.dmg
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.zip
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.dmg.sha256
+dist/TunnelForge-macOS-{version}-{arm64|x86_64}.zip.sha256
+```
+
+환경 변수가 설정된 경우 코드 서명과 노터라이즈도 수행합니다.
+
+```bash
+export APPLE_CODESIGN_IDENTITY="Developer ID Application: ..."
+export APPLE_ID="apple-id@example.com"
+export APPLE_TEAM_ID="TEAMID1234"
+export APPLE_APP_SPECIFIC_PASSWORD="app-specific-password"
+bash scripts/package-macos.sh
+```
+
+GitHub Release에서 signed/notarized macOS artifact를 만들려면 repository secrets를 설정합니다.
+
+```text
+APPLE_CODESIGN_CERTIFICATE_P12_BASE64  # Developer ID Application .p12 인증서를 base64로 인코딩한 값
+APPLE_CODESIGN_CERTIFICATE_PASSWORD    # .p12 인증서 비밀번호
+APPLE_CODESIGN_IDENTITY                # 선택: Developer ID Application identity 이름
+APPLE_CODESIGN_KEYCHAIN_PASSWORD       # 선택: 임시 keychain 비밀번호
+APPLE_ID                               # Apple ID
+APPLE_TEAM_ID                          # Apple Team ID
+APPLE_APP_SPECIFIC_PASSWORD            # notarization용 app-specific password
+```
+
+`APPLE_CODESIGN_CERTIFICATE_P12_BASE64`가 없으면 release workflow는 unsigned macOS artifact를 빌드합니다. 인증서 secret이 있으면 workflow가 임시 keychain에 인증서를 import하고 `scripts/package-macos.sh`에 signing/notarization 환경 변수를 전달합니다.
+
+---
+
 **문서 작성일:** 2026-01-27

@@ -12,6 +12,8 @@ import uuid
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
+from src.core.platform_paths import sql_history_file
+
 
 class SQLHistory:
     """SQL 쿼리 히스토리 관리자 (영구 보관)"""
@@ -23,14 +25,7 @@ class SQLHistory:
 
     def _get_history_file_path(self) -> str:
         """히스토리 파일 경로 반환"""
-        # Windows: %APPDATA%\Local\TunnelForge\sql_history.json
-        if os.name == 'nt':
-            base_dir = os.path.join(os.environ.get('LOCALAPPDATA', ''), 'TunnelForge')
-        else:
-            # Linux/Mac: ~/.tunnelforge
-            base_dir = os.path.expanduser('~/.tunnelforge')
-
-        return os.path.join(base_dir, 'sql_history.json')
+        return str(sql_history_file())
 
     def _ensure_directory(self):
         """히스토리 파일 디렉토리 생성"""

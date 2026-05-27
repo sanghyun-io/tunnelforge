@@ -12,6 +12,8 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.core.platform_paths import data_dir
+
 
 class DatabaseEngine(str, Enum):
     MYSQL = "mysql"
@@ -137,27 +139,37 @@ def project_root() -> Path:
 
 
 def app_data_dir() -> Path:
-    if os.name == "nt":
-        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    else:
-        base = Path.home() / ".local" / "share"
-    return base / "TunnelForge"
+    return data_dir()
+
+
+def _db_core_executable_names(os_name: Optional[str] = None) -> List[str]:
+    return ["tunnelforge-core.exe"] if (os_name or os.name) == "nt" else ["tunnelforge-core"]
+
+
+def _db_core_frozen_candidate_dirs(executable_path: Path) -> List[Path]:
+    executable_dir = executable_path.parent
+    candidate_dirs = [executable_dir]
+
+    contents_dir = executable_dir.parent
+    if executable_dir.name == "MacOS" and contents_dir.name == "Contents":
+        candidate_dirs.extend([
+            contents_dir / "Frameworks",
+            contents_dir / "Resources",
+        ])
+
+    candidate_dirs.append(Path.cwd())
+    return candidate_dirs
 
 
 def db_core_executable() -> str:
     """Return the best available Rust DB core executable path."""
-    exe_names = (
-        ["tunnelforge-core.exe"]
-        if os.name == "nt"
-        else ["tunnelforge-core"]
-    )
+    exe_names = _db_core_executable_names()
     candidate_dirs: List[Path] = []
 
     if hasattr(sys, "_MEIPASS"):
         candidate_dirs.append(Path(sys._MEIPASS))  # type: ignore[attr-defined]
     if getattr(sys, "frozen", False):
-        candidate_dirs.append(Path(sys.executable).resolve().parent)
-        candidate_dirs.append(Path.cwd())
+        candidate_dirs.extend(_db_core_frozen_candidate_dirs(Path(sys.executable)))
 
     root = project_root()
     candidate_dirs.extend([
