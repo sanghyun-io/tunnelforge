@@ -1171,7 +1171,8 @@ class SettingsDialog(QDialog):
                     close_fds=True,
                 )
             elif update_package_launch_strategy() == "open":
-                QDesktopServices.openUrl(QUrl.fromLocalFile(self._downloaded_installer_path))
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(self._downloaded_installer_path)):
+                    raise RuntimeError("다운로드한 패키지를 열 수 없습니다.")
             else:
                 subprocess.Popen(
                     [self._downloaded_installer_path],
