@@ -319,6 +319,7 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "--check-complete <report>" in script
     assert "--bundle-evidence <report>" in script
     assert "--finalize <report>" in script
+    assert "--post-github-comment" in script
     assert "--skip-github" in script
     assert "--evidence-bundle <zip>" in script
     assert "--download-artifacts" in script
@@ -1012,6 +1013,62 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     assert f"{bundle_arg}.sha256" in comment_text
     assert "gh issue comment 116 --body-file" in comment_text
     assert "Keep #116 open until these files are attached" in comment_text
+
+
+def test_macos_manual_validation_report_finalize_can_post_github_comment(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-finalize-post"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    bundle = report_dir / "macos-manual-validation-evidence.zip"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    bundle_arg = bundle.relative_to(PROJECT_ROOT).as_posix()
+    report.write_text("\n".join(completed_manual_report_lines_with_system(report_dir, smoke_log_arg)), encoding="utf-8")
+
+    fake_gh = report_dir / "gh"
+    gh_log = report_dir / "gh.log"
+    fake_gh.write_text(
+        f"""#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\\n' "$*" >> {shlex.quote(gh_log.relative_to(PROJECT_ROOT).as_posix())}
+body_file="${{@:$#}}"
+test -s "$body_file"
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_gh.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            f"GH={shlex.quote(fake_gh.relative_to(PROJECT_ROOT).as_posix())} bash scripts/macos-manual-validation-report.sh"
+            f" --finalize {shlex.quote(report_arg)}"
+            f" --evidence-bundle {shlex.quote(bundle_arg)}"
+            " --skip-github"
+            " --post-github-comment",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    comment_arg = (
+        report_dir / "macos-final-validation-github-comment-macos-manual-validation-report.md"
+    ).relative_to(PROJECT_ROOT).as_posix()
+    assert "Posted GitHub evidence comment to issue #116 and PR #117" in result.stdout
+    assert gh_log.read_text(encoding="utf-8").splitlines() == [
+        f"issue comment 116 --body-file {comment_arg}",
+        f"pr comment 117 --body-file {comment_arg}",
+    ]
 
 
 def test_macos_support_gate_script_checks_github_tracking_and_final_report():

@@ -23,6 +23,7 @@ Options:
   --check-complete <report>   Verify a completed manual validation report has no open gates.
   --bundle-evidence <report>  Verify the completed report and create an attachable evidence zip.
   --finalize <report>         Verify, bundle, run the final gate, and print attachment paths.
+  --post-github-comment       After --finalize, post the generated evidence comment to #116 and PR #117.
   --evidence-bundle <zip>     Override the evidence zip output path.
   --skip-github               Pass --skip-github to the final Python gate when finalizing offline.
   --help                      Show this help.
@@ -39,7 +40,9 @@ BUNDLE_EVIDENCE_PATH=""
 BUNDLE_OUTPUT_PATH=""
 FINALIZE_PATH=""
 SKIP_GITHUB=0
+POST_GITHUB_COMMENT=0
 PYTHON_BIN="${PYTHON:-}"
+GH_BIN="${GH:-gh}"
 
 if [[ -z "$PYTHON_BIN" ]]; then
   if command -v python >/dev/null 2>&1; then
@@ -117,6 +120,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-github)
       SKIP_GITHUB=1
+      shift
+      ;;
+    --post-github-comment)
+      POST_GITHUB_COMMENT=1
       shift
       ;;
     --help|-h)
@@ -459,6 +466,12 @@ gh pr comment 117 --body-file ${comment_path}
 
 Keep #116 open until these files are attached and the final device validation checkbox is checked.
 EOF
+
+  if [[ "$POST_GITHUB_COMMENT" -eq 1 ]]; then
+    "$GH_BIN" issue comment 116 --body-file "$comment_path"
+    "$GH_BIN" pr comment 117 --body-file "$comment_path"
+    echo "Posted GitHub evidence comment to issue #116 and PR #117"
+  fi
 
   echo
   echo "Final macOS validation evidence is ready:"

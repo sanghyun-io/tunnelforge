@@ -22,6 +22,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "--check-complete" in doc
     assert "--bundle-evidence" in doc
     assert "--finalize" in doc
+    assert "--post-github-comment" in doc
     assert "--bundle" in doc
     assert "--evidence-bundle" in doc
     assert "--download-artifacts" in doc
