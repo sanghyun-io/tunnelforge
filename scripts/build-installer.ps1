@@ -24,7 +24,7 @@
     5. Inno Setup으로 Windows Installer(.exe) 생성
 
     출력 파일:
-    - dist\TunnelForge.exe (실행 파일)
+    - dist\TunnelForge\TunnelForge.exe (실행 파일)
     - output\TunnelForge-Setup-{version}.exe (설치 프로그램)
 
 .PARAMETER Clean
@@ -49,7 +49,7 @@
     .\scripts\build-installer.ps1 -SkipPyInstaller
 
     PyInstaller 빌드를 건너뛰고 기존 EXE로 Installer만 생성합니다.
-    EXE가 이미 dist\TunnelForge.exe에 있어야 합니다.
+    EXE가 이미 dist\TunnelForge\TunnelForge.exe에 있어야 합니다.
 
 .EXAMPLE
     .\scripts\build-installer.ps1 -Clean -SkipPyInstaller
@@ -105,7 +105,7 @@ if ($Help) {
     Write-Host "  4. Inno Setup으로 Windows Installer 생성" -ForegroundColor Gray
     Write-Host ""
     Write-Host "출력:" -ForegroundColor Yellow
-    Write-Host "  - dist\TunnelForge.exe                    (실행 파일)" -ForegroundColor Gray
+    Write-Host "  - dist\TunnelForge\TunnelForge.exe                    (실행 파일)" -ForegroundColor Gray
     Write-Host "  - output\TunnelForge-Setup-{version}.exe  (설치 프로그램)" -ForegroundColor Gray
     Write-Host ""
     Write-Host "예제:" -ForegroundColor Yellow
@@ -205,25 +205,25 @@ if (-not $SkipPyInstaller) {
     }
 
     # EXE 파일 존재 확인
-    if (-not (Test-Path "dist\TunnelForge.exe")) {
-        Write-Host "  ❌ dist\TunnelForge.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
+    if (-not (Test-Path "dist\TunnelForge\TunnelForge.exe")) {
+        Write-Host "  ❌ dist\TunnelForge\TunnelForge.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
         exit 1
     }
 
-    $exeSize = (Get-Item "dist\TunnelForge.exe").Length / 1MB
-    Write-Host "  ✅ EXE 빌드 완료: dist\TunnelForge.exe ($($exeSize.ToString('0.0')) MB)" -ForegroundColor Green
+    $exeSize = (Get-Item "dist\TunnelForge\TunnelForge.exe").Length / 1MB
+    Write-Host "  ✅ EXE 빌드 완료: dist\TunnelForge\TunnelForge.exe ($($exeSize.ToString('0.0')) MB)" -ForegroundColor Green
     Write-Host ""
 } else {
     Write-Host "[2/6] Rust helper/PyInstaller 빌드 건너뛰기 (-SkipPyInstaller)" -ForegroundColor Gray
 
     # EXE 파일 존재 확인
-    if (-not (Test-Path "dist\TunnelForge.exe")) {
-        Write-Host "  ❌ dist\TunnelForge.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
+    if (-not (Test-Path "dist\TunnelForge\TunnelForge.exe")) {
+        Write-Host "  ❌ dist\TunnelForge\TunnelForge.exe 파일을 찾을 수 없습니다." -ForegroundColor Red
         Write-Host "  먼저 PyInstaller로 빌드하거나 -SkipPyInstaller 옵션을 제거하세요." -ForegroundColor Yellow
         exit 1
     }
 
-    Write-Host "  기존 EXE 사용: dist\TunnelForge.exe" -ForegroundColor Gray
+    Write-Host "  기존 EXE 사용: dist\TunnelForge\TunnelForge.exe" -ForegroundColor Gray
     Write-Host ""
 }
 
@@ -326,7 +326,7 @@ Write-Host " ✅ 빌드 완료!" -ForegroundColor Green
 Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 Write-Host "출력 파일:" -ForegroundColor Cyan
-Write-Host "  📦 EXE: dist\TunnelForge.exe" -ForegroundColor White
+Write-Host "  📦 EXE: dist\TunnelForge\TunnelForge.exe" -ForegroundColor White
 Write-Host "  📦 Installer: $($installerFile.FullName)" -ForegroundColor White
 Write-Host ""
 Write-Host "설치 프로그램 테스트:" -ForegroundColor Cyan

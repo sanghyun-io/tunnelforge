@@ -8,6 +8,7 @@ from src.ui.dialogs.db_dialogs import (
     RustDumpExportDialog,
     RustDumpWizard,
     cap_incomplete_export_percent,
+    displayed_import_percent,
     export_overall_percent,
     import_overall_percent,
     format_import_row_labels,
@@ -120,6 +121,18 @@ def test_import_overall_percent_uses_all_table_row_totals():
         {"users": 500, "orders": 250},
         {"users": 1_000, "orders": 2_000},
     ) == 25
+
+
+def test_displayed_import_percent_does_not_promote_table_percent_to_overall():
+    assert displayed_import_percent(
+        {"small_table": 390},
+        {"small_table": 390, "large_table": 8_905_087},
+        event_percent=100,
+    ) == 1
+
+
+def test_displayed_import_percent_uses_event_percent_when_overall_total_unknown():
+    assert displayed_import_percent({}, {}, event_percent=42) == 42
 
 
 def test_format_export_visible_telemetry_summarizes_chunk_progress():

@@ -322,6 +322,25 @@ class TestRustDumpImporter:
 
         assert chunk_events == [("df_subs", 2, 8)]
 
+    def test_import_phase_explains_local_infile_fallback_as_non_error(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        messages = []
+
+        emit_core_event(
+            {
+                "event": "phase",
+                "message": "MySQL local_infile is disabled; using safe Rust INSERT fallback",
+                "strategy": "insert_fallback",
+            },
+            progress_callback=messages.append,
+        )
+
+        assert messages == [
+            "MySQL local_infile 비활성화: 안전 INSERT fallback으로 진행합니다. "
+            "에러는 아니지만 LOAD DATA LOCAL보다 느립니다."
+        ]
+
     def test_import_metadata_reports_table_rows_and_total_rows(self, tmp_path):
         """Import 대시보드가 전체 row 진행률을 계산할 수 있도록 manifest rows를 전달한다."""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter

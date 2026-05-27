@@ -94,10 +94,6 @@ a = Analysis(
     noarchive=False,  # False: PYZ 아카이브 사용
 )
 
-exe_binaries = a.binaries if os.name == 'nt' else []
-exe_zipfiles = a.zipfiles if os.name == 'nt' else []
-exe_datas = a.datas if os.name == 'nt' else []
-
 # PYZ: Python 코드 아카이브
 pyz = PYZ(
     a.pure,
@@ -109,15 +105,12 @@ pyz = PYZ(
 exe = EXE(
     pyz,
     a.scripts,
-    exe_binaries,
-    exe_zipfiles,
-    exe_datas,
     [],
     name='TunnelForge',  # 실행 파일 이름
     debug=False,  # True: 디버그 정보 포함
     bootloader_ignore_signals=False,
     strip=False,  # True: 바이너리에서 심볼 제거 (리눅스/맥)
-    upx=True,  # True: UPX로 압축 (UPX 설치 필요)
+    upx=os.name != 'nt',  # Windows installer compression is enough; avoid AV-sensitive packed DLLs.
     upx_exclude=[],  # UPX 압축 제외 파일
     runtime_tmpdir=None,  # 런타임 임시 디렉터리
     console=False,  # False: 콘솔 창 숨김 (GUI 전용), True: 콘솔 표시 (디버깅용)
@@ -126,22 +119,22 @@ exe = EXE(
     codesign_identity=None,  # 코드 서명 (맥OS)
     entitlements_file=None,  # 권한 파일 (맥OS)
     icon=app_icon,  # 실행 파일 아이콘
-    exclude_binaries=os.name != 'nt',
+    exclude_binaries=True,
 )
 
-coll = None
+coll = COLLECT(
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
+    strip=False,
+    upx=os.name != 'nt',
+    upx_exclude=[],
+    name='TunnelForge',
+)
+
 app_bundle = None
 if os.name != 'nt':
-    coll = COLLECT(
-        exe,
-        a.binaries,
-        a.zipfiles,
-        a.datas,
-        strip=False,
-        upx=True,
-        upx_exclude=[],
-        name='TunnelForge',
-    )
     app_bundle = BUNDLE(
         coll,
         name='TunnelForge.app',
@@ -157,10 +150,11 @@ if os.name != 'nt':
         },
     )
 
-build_target = exe if os.name == 'nt' else app_bundle
+build_target = coll if os.name == 'nt' else app_bundle
 
-# COLLECT: 디렉터리 모드로 빌드 시 사용
-# 단일 파일 모드(onefile)를 원하면 이 섹션을 주석 처리하세요
+# Windows는 onedir 설치 패키지로 배포한다. onefile은 %TEMP%\_MEI...에
+# Python 런타임을 풀어 실행하므로 백신/권한/임시폴더 정리와 충돌할 수 있다.
+# 단일 파일 모드(onefile)를 원하면 COLLECT 대신 EXE에 바이너리/데이터를 포함하세요.
 # coll = COLLECT(
 #     exe,
 #     a.binaries,

@@ -137,6 +137,15 @@ def import_overall_percent(table_rows_done: dict, table_rows_total: dict) -> int
     return min(int((done / total) * 100), 100)
 
 
+def displayed_import_percent(table_rows_done: dict, table_rows_total: dict, event_percent: int = 0) -> int:
+    """Return the visible import percent without mistaking table progress for overall progress."""
+    if table_rows_total:
+        percent = import_overall_percent(table_rows_done, table_rows_total)
+        done = sum(max(0, int(value or 0)) for value in table_rows_done.values())
+        return 1 if percent == 0 and done > 0 else percent
+    return min(max(0, int(event_percent or 0)), 100)
+
+
 def format_export_visible_telemetry(event: dict) -> Optional[str]:
     """Convert Rust dump telemetry into a concise visible log line."""
     event_type = event.get("event")
@@ -2573,9 +2582,13 @@ class RustDumpImportDialog(QDialog):
         table = str(info.get('table') or "")
         if table:
             self.import_table_rows_done[table] = max(0, int(info.get('rows_done') or 0))
-        percent = import_overall_percent(self.import_table_rows_done, self.import_table_rows_total)
-        if percent == 0:
-            percent = info.get('percent', 0)
+        if table and table not in self.import_table_rows_total:
+            self.import_table_rows_total[table] = max(0, int(info.get('rows_total') or 0))
+        percent = displayed_import_percent(
+            self.import_table_rows_done,
+            self.import_table_rows_total,
+            int(info.get('percent') or 0),
+        )
         data_label, speed_label, status_label = format_import_row_labels(info)
 
         self.progress_bar.setValue(percent)

@@ -116,11 +116,11 @@ jobs:
 
       - name: Verify EXE build
         run: |
-          if (!(Test-Path "dist\TunnelForge.exe")) {
+          if (!(Test-Path "dist\TunnelForge\TunnelForge.exe")) {
             Write-Host "❌ Error: EXE file not found!"
             exit 1
           }
-          $exeSize = (Get-Item "dist\TunnelForge.exe").Length / 1MB
+          $exeSize = (Get-Item "dist\TunnelForge\TunnelForge.exe").Length / 1MB
           Write-Host "✅ EXE built: $($exeSize.ToString('0.0')) MB"
 
       - name: Build Bootstrapper (for recovery feature)

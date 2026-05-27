@@ -49,6 +49,15 @@ def _safe_dump_child_file(dump_dir: str, path: Path) -> Optional[Path]:
     return file_path if file_path.is_file() else None
 
 
+def _format_import_phase_message(event: dict) -> str:
+    if event.get("strategy") == "insert_fallback":
+        return (
+            "MySQL local_infile 비활성화: 안전 INSERT fallback으로 진행합니다. "
+            "에러는 아니지만 LOAD DATA LOCAL보다 느립니다."
+        )
+    return str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중...")
+
+
 @dataclass
 class RustDumpConfig:
     """Connection settings for Rust DB Core dump operations."""
@@ -728,7 +737,7 @@ def emit_core_event(
                 "scheduled_tables": event.get("scheduled_tables") if isinstance(event.get("scheduled_tables"), list) else [],
             })
     elif event_type == "phase" and progress_callback:
-        progress_callback(str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중..."))
+        progress_callback(_format_import_phase_message(event))
     elif event_type == "table_progress":
         current = int(event.get("current") or 0)
         total = int(event.get("total") or 0)

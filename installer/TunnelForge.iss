@@ -7,7 +7,7 @@
 ;   3. 또는: .\scripts\build-installer.ps1
 
 #define MyAppName "TunnelForge"
-#define MyAppVersion "2.0.10"
+#define MyAppVersion "2.0.11"
 #define MyAppPublisher "sanghyun-io"
 #define MyAppURL "https://github.com/sanghyun-io/tunnelforge"
 #define MyAppExeName "TunnelForge.exe"
@@ -70,8 +70,10 @@ english.RecoveryShortcutComment=Reinstall the latest version
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 
 [Files]
-; 메인 실행 파일 (.iss 파일 기준 상대 경로)
-Source: "..\dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion restartreplace
+; 메인 애플리케이션 폴더 (.iss 파일 기준 상대 경로)
+; Windows는 PyInstaller onedir 배포를 사용한다. onefile의 %TEMP%\_MEI 런타임
+; 추출 경로는 python311.dll 로드 실패를 유발할 수 있다.
+Source: "..\dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
 
 ; 복구/업데이트 프로그램 (부트스트래퍼)
 Source: "..\dist\TunnelForge-WebSetup.exe"; DestDir: "{app}"; Flags: ignoreversion
@@ -92,7 +94,6 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 ; 설치 완료 후 프로그램 실행 옵션
-; PyInstaller one-file 앱은 시작 직후 %TEMP%\_MEI...에 런타임을 풀기 때문에
 ; 설치 프로그램 종료/정리와 겹치지 않도록 짧게 지연한 뒤 설치 경로에서 실행한다.
 Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ""Start-Sleep -Seconds 2; Start-Process -FilePath '{app}\{#MyAppExeName}' -WorkingDirectory '{app}'"""; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: runhidden nowait postinstall skipifsilent
 

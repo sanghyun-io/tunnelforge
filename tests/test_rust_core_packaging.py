@@ -213,7 +213,9 @@ def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
     assert "binaries=binaries" in spec
     assert "app_bundle = BUNDLE(" in spec
     assert "coll = COLLECT(" in spec
-    assert "exclude_binaries=os.name != 'nt'" in spec
+    assert "exclude_binaries=True" in spec
+    assert "build_target = coll if os.name == 'nt' else app_bundle" in spec
+    assert "%TEMP%\\_MEI" in spec
     assert "assets/icon.icns" in spec
     assert "if os.name == 'nt' else app_bundle" in spec
     assert "from src.version import __version__" in spec
@@ -229,6 +231,7 @@ def test_windows_installer_builds_and_checks_core_service_binaries():
     assert "cargo build --manifest-path migration_core\\Cargo.toml --release" in script
     assert "migration_core\\target\\release\\tunnelforge-core.exe" in script
     assert "tunnelforge-core DB service 빌드 완료" in script
+    assert "dist\\TunnelForge\\TunnelForge.exe" in script
 
 
 def test_dev_dependencies_include_yaml_parser_for_workflow_tests():
@@ -1805,11 +1808,16 @@ def test_windows_installer_captures_selected_app_language():
     assert "english.RecoveryShortcut=Recovery and Update" in installer
 
 
-def test_windows_installer_defers_postinstall_launch_for_onefile_runtime():
+def test_windows_installer_installs_onedir_app_and_defers_postinstall_launch():
     installer = (PROJECT_ROOT / "installer" / "TunnelForge.iss").read_text(encoding="utf-8")
 
+    files_section = installer.split("[Files]", 1)[1].split("[Icons]", 1)[0]
     run_section = installer.split("[Run]", 1)[1].split("[Code]", 1)[0]
 
+    assert 'Source: "..\\dist\\{#MyAppName}\\*"; DestDir: "{app}"' in files_section
+    assert "recursesubdirs createallsubdirs" in files_section
+    assert "%TEMP%\\_MEI" in files_section
+    assert 'Source: "..\\dist\\{#MyAppExeName}"' not in files_section
     assert "Start-Sleep -Seconds 2" in run_section
     assert "Start-Process -FilePath '{app}\\{#MyAppExeName}'" in run_section
     assert "-WorkingDirectory '{app}'" in run_section
