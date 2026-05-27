@@ -148,7 +148,7 @@ def _db_core_executable_names(os_name: Optional[str] = None) -> List[str]:
 
 def _db_core_frozen_candidate_dirs(executable_path: Path) -> List[Path]:
     executable_dir = executable_path.parent
-    candidate_dirs = [executable_dir, Path.cwd()]
+    candidate_dirs = [executable_dir]
 
     contents_dir = executable_dir.parent
     if executable_dir.name == "MacOS" and contents_dir.name == "Contents":
@@ -157,6 +157,7 @@ def _db_core_frozen_candidate_dirs(executable_path: Path) -> List[Path]:
             contents_dir / "Resources",
         ])
 
+    candidate_dirs.append(Path.cwd())
     return candidate_dirs
 
 

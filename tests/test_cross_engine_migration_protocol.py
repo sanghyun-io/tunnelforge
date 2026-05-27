@@ -228,3 +228,12 @@ def test_db_core_frozen_candidate_dirs_include_macos_app_bundle_locations():
     assert executable.parent in candidates
     assert executable.parent.parent / "Frameworks" in candidates
     assert executable.parent.parent / "Resources" in candidates
+
+
+def test_db_core_frozen_candidate_dirs_prefer_macos_bundle_before_cwd():
+    executable = Path("/Applications/TunnelForge.app/Contents/MacOS/TunnelForge")
+
+    candidates = _db_core_frozen_candidate_dirs(executable)
+
+    assert candidates.index(executable.parent.parent / "Frameworks") < candidates.index(Path.cwd())
+    assert candidates.index(executable.parent.parent / "Resources") < candidates.index(Path.cwd())
