@@ -47,6 +47,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "system evidence log" in doc
     assert "Evidence:" in doc
     assert "interactive section" in doc
+    assert "placeholder/TODO text" in doc
     assert "GitHub evidence comment" in doc
     assert "Overall result" in doc
     assert "Validator" in doc

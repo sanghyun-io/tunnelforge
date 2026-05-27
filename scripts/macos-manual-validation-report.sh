@@ -173,6 +173,14 @@ from pathlib import Path
 report_path = Path(sys.argv[1])
 section = sys.argv[2]
 in_section = False
+forbidden_fragments = (
+    "placeholder",
+    "todo",
+    "tbd",
+    "gate rehearsal",
+    "<",
+    ">",
+)
 
 for line in report_path.read_text(encoding="utf-8").splitlines():
     if line == section:
@@ -180,8 +188,11 @@ for line in report_path.read_text(encoding="utf-8").splitlines():
         continue
     if in_section and line.startswith("## "):
         in_section = False
-    if in_section and line.startswith("- Evidence:") and line.removeprefix("- Evidence:").strip():
-        sys.exit(0)
+    if in_section and line.startswith("- Evidence:"):
+        note = line.removeprefix("- Evidence:").strip()
+        note_lower = note.lower()
+        if note and not any(fragment in note_lower for fragment in forbidden_fragments):
+            sys.exit(0)
 
 sys.exit(1)
 PY
@@ -327,7 +338,7 @@ check_complete_report() {
 
   for required_evidence_section in "${required_evidence_sections[@]}"; do
     if ! section_has_evidence_note "$report_path" "$required_evidence_section"; then
-      echo "Manual validation report must include evidence note under section: $required_evidence_section" >&2
+      echo "Manual validation report must include evidence note under section: $required_evidence_section (filled with concrete non-placeholder observations)." >&2
       failures=1
     fi
   done
