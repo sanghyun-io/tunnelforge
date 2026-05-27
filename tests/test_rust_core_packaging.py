@@ -433,6 +433,8 @@ def test_macos_validation_artifact_download_script_fetches_manual_run_artifacts(
     assert "TunnelForge-macOS-*-${ARCH_FILTER}" in script
     assert "verify_downloaded_checksums" in script
     assert "Checksum verified" in script
+    assert "clean_existing_artifacts" in script
+    assert 'find "$output_dir" -mindepth 1 -maxdepth 1 -name "$artifact_pattern" -print0' in script
     assert "--write-env <file>" in script
     assert "MACOS_VALIDATION_ARTIFACT_RUN_ID" in script
     assert "MACOS_VALIDATION_ARTIFACT_DIR" in script
@@ -501,6 +503,73 @@ exit 1
     assert "MACOS_VALIDATION_ARTIFACT_RUN_ID=26477946208" in env_text
     assert f"MACOS_VALIDATION_ARTIFACT_DIR={output_dir_arg}" in env_text
     assert "MACOS_VALIDATION_ARTIFACT_CHECKSUMS=passed" in env_text
+
+
+def test_macos_validation_artifact_download_script_cleans_stale_artifact_before_retry(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    fake_bin = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-fake-gh-bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "run" && "$2" == "download" ]]; then
+  output_dir=""
+  for ((i = 1; i <= $#; i++)); do
+    if [[ "${!i}" == "--dir" ]]; then
+      next=$((i + 1))
+      output_dir="${!next}"
+    fi
+  done
+  artifact_dir="${output_dir}/TunnelForge-macOS-2.0.5-arm64"
+  if [[ -e "${artifact_dir}/stale-partial-download" ]]; then
+    echo "stale artifact was not cleaned" >&2
+    exit 9
+  fi
+  mkdir -p "$artifact_dir"
+  printf fake-dmg > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg"
+  shasum -a 256 "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg" > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg.sha256"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 1
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_gh.chmod(0o755)
+
+    output_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-retry-artifacts"
+    shutil.rmtree(output_dir, ignore_errors=True)
+    stale_artifact_dir = output_dir / "TunnelForge-macOS-2.0.5-arm64"
+    stale_artifact_dir.mkdir(parents=True)
+    (stale_artifact_dir / "stale-partial-download").write_text("stale", encoding="utf-8")
+    output_dir_arg = output_dir.relative_to(PROJECT_ROOT).as_posix()
+    fake_gh_arg = shlex.quote(fake_gh.relative_to(PROJECT_ROOT).as_posix())
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "GH="
+            + fake_gh_arg
+            + " bash scripts/macos-download-validation-artifacts.sh"
+            + " --run-id 26477946208"
+            + " --repo sanghyun-io/tunnelforge"
+            + " --arch arm64"
+            + f" --output-dir {shlex.quote(output_dir_arg)}",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert not (stale_artifact_dir / "stale-partial-download").exists()
+    assert (stale_artifact_dir / "TunnelForge-macOS-2.0.5-arm64.dmg").exists()
 
 
 def test_macos_validation_artifact_download_script_verifies_flat_downloaded_checksums(tmp_path):

@@ -183,6 +183,16 @@ write_report_env_file() {
   echo "Wrote macOS validation artifact environment: $env_path"
 }
 
+clean_existing_artifacts() {
+  local output_dir="$1"
+  local artifact_pattern="$2"
+
+  mkdir -p "$output_dir"
+  while IFS= read -r -d '' artifact_path; do
+    rm -rf "$artifact_path"
+  done < <(find "$output_dir" -mindepth 1 -maxdepth 1 -name "$artifact_pattern" -print0)
+}
+
 download_artifacts() {
   local repo=""
   local run_id=""
@@ -193,12 +203,12 @@ download_artifacts() {
   repo="$(resolve_repo)"
   run_id="$(resolve_run_id "$repo")"
 
-  mkdir -p "$OUTPUT_DIR"
   if [[ "$ARCH_FILTER" == "all" ]]; then
     artifact_pattern="TunnelForge-macOS-*"
   else
     artifact_pattern="TunnelForge-macOS-*-${ARCH_FILTER}"
   fi
+  clean_existing_artifacts "$OUTPUT_DIR" "$artifact_pattern"
 
   echo "Downloading ${WORKFLOW_NAME} artifacts from run ${run_id}: ${artifact_pattern}"
   "$GH_BIN" run download "$run_id" --repo "$repo" --dir "$OUTPUT_DIR" --pattern "$artifact_pattern"
