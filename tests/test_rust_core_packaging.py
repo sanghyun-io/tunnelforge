@@ -1615,6 +1615,8 @@ def test_release_workflow_has_macos_app_job_and_assets():
     assert "TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.zip.sha256" in workflow
     assert "macOS 앱 이미지" in workflow
     assert "macOS SHA-256 체크섬" in workflow
+    assert "macOS DMG/ZIP 설치파일은 아직 최종 실제 Mac 운영자 검증 전의 베타 배포물입니다." in workflow
+    assert "운영 환경 사용은 사용자 책임입니다" in workflow
     assert "shasum -a 256 -c" in workflow
     assert r"3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증" in workflow
 

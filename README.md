@@ -75,6 +75,8 @@
 
 [Browse all releases for macOS DMG/ZIP →](https://github.com/sanghyun-io/tunnelforge/releases)
 
+macOS DMG/ZIP packages are beta artifacts pending final real-Mac operator validation. They may have issues in SSH, DB, migration, LaunchAgent, or Gatekeeper flows; use them at your own risk and without warranty until final validation is complete.
+
 </div>
 
 ---

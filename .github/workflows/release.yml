@@ -603,6 +603,9 @@ jobs:
           # 릴리스 노트 생성
           echo "## TunnelForge v$VERSION" > release_notes.md
           echo "" >> release_notes.md
+          echo "### ⚠️ macOS 설치파일 안내" >> release_notes.md
+          echo "macOS DMG/ZIP 설치파일은 아직 최종 실제 Mac 운영자 검증 전의 베타 배포물입니다. SSH/DB/migration/LaunchAgent/Gatekeeper 흐름에서 이슈가 있을 수 있으며, 운영 환경 사용은 사용자 책임입니다. TunnelForge는 최종 검증 전 macOS 설치파일 동작을 보증하지 않습니다." >> release_notes.md
+          echo "" >> release_notes.md
 
           # 변경사항 섹션 추가
           HAS_CHANGES=false
@@ -681,6 +684,8 @@ jobs:
           echo "2. 설치 마법사를 따라 진행" >> release_notes.md
           echo "" >> release_notes.md
           echo "**macOS:**" >> release_notes.md
+          echo "> macOS DMG/ZIP은 베타 배포물이며 최종 실제 Mac 검증 전까지 동작을 보증하지 않습니다. 운영 환경 사용은 사용자 책임입니다." >> release_notes.md
+          echo "" >> release_notes.md
           echo "1. Mac 종류에 맞는 \`TunnelForge-macOS-$VERSION-{arm64|x86_64}.dmg\` 다운로드" >> release_notes.md
           echo "2. DMG를 열고 \`TunnelForge.app\`을 Applications로 이동" >> release_notes.md
           echo "3. 선택적으로 \`.sha256\` 파일로 다운로드를 검증: \`shasum -a 256 -c <파일명>.sha256\`" >> release_notes.md

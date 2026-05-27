@@ -42,6 +42,8 @@
 
 [macOS DMG/ZIP은 모든 릴리스에서 받기 →](https://github.com/sanghyun-io/tunnelforge/releases)
 
+macOS DMG/ZIP 설치파일은 최종 실제 Mac 운영자 검증 전의 베타 배포물입니다. SSH, DB, migration, LaunchAgent, Gatekeeper 흐름에서 이슈가 있을 수 있으며 운영 환경 사용은 사용자 책임이고, 최종 검증 전 동작을 보증하지 않습니다.
+
 </div>
 
 ---
