@@ -168,6 +168,7 @@ section_has_evidence_note() {
   local section="$2"
   "$PYTHON_BIN" - "$report_path" "$section" <<'PY'
 import sys
+import re
 from pathlib import Path
 
 report_path = Path(sys.argv[1])
@@ -178,9 +179,8 @@ forbidden_fragments = (
     "todo",
     "tbd",
     "gate rehearsal",
-    "<",
-    ">",
 )
+placeholder_token = re.compile(r"<[^>\n]+>")
 
 for line in report_path.read_text(encoding="utf-8").splitlines():
     if line == section:
@@ -191,7 +191,11 @@ for line in report_path.read_text(encoding="utf-8").splitlines():
     if in_section and line.startswith("- Evidence:"):
         note = line.removeprefix("- Evidence:").strip()
         note_lower = note.lower()
-        if note and not any(fragment in note_lower for fragment in forbidden_fragments):
+        if (
+            note
+            and not any(fragment in note_lower for fragment in forbidden_fragments)
+            and not placeholder_token.search(note)
+        ):
             sys.exit(0)
 
 sys.exit(1)
