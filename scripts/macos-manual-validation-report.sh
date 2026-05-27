@@ -154,6 +154,26 @@ extract_system_evidence_log_path() {
     || true
 }
 
+extract_report_value() {
+  local report_path="$1"
+  local key="$2"
+  grep -m1 -E "^${key}:" "$report_path" 2>/dev/null \
+    | sed -E "s/^${key}:[[:space:]]*//" \
+    | tr -d '\r' \
+    || true
+}
+
+sha256_file() {
+  local path="$1"
+  "$PYTHON_BIN" - "$path" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+print(hashlib.sha256(Path(sys.argv[1]).read_bytes()).hexdigest())
+PY
+}
+
 read_artifact_env_value() {
   local env_path="$1"
   local key="$2"
@@ -430,6 +450,9 @@ finalize_evidence() {
   local bundle_path=""
   local checksum_path=""
   local comment_path=""
+  local report_git_sha=""
+  local artifact_workflow_run=""
+  local bundle_sha256=""
   local gate_args=()
 
   create_evidence_bundle "$report_path"
@@ -438,6 +461,9 @@ finalize_evidence() {
   bundle_path="$(bundle_path_for_report "$report_path")"
   checksum_path="$(checksum_path_for_bundle "$bundle_path")"
   comment_path="$(comment_path_for_report "$report_path")"
+  report_git_sha="$(extract_report_value "$report_path" "- Git SHA")"
+  artifact_workflow_run="$(extract_report_value "$report_path" "- Artifact workflow run")"
+  bundle_sha256="$(sha256_file "$bundle_path")"
   gate_args=(--final --report "$report_path" --bundle "$bundle_path")
 
   if [[ "$SKIP_GITHUB" -eq 1 ]]; then
@@ -451,6 +477,9 @@ Final macOS validation evidence for #116
 
 Final gate passed for the attached real-Mac evidence. Attach these files to #116 and PR #117 before checking the final device validation box:
 
+- Git SHA: \`${report_git_sha}\`
+- Artifact workflow run: \`${artifact_workflow_run}\`
+- Evidence bundle SHA256: \`${bundle_sha256}\`
 - Report: ${report_path}
 - Smoke log: ${smoke_log_path}
 - System evidence log: ${system_evidence_log_path}

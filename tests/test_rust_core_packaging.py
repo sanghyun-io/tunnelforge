@@ -335,9 +335,12 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "Evidence bundle:" in script
     assert "PYTHON_BIN" in script
     assert "hashlib.sha256" in script
+    assert "extract_report_value" in script
+    assert "sha256_file" in script
     assert "manifest_name" in script
     assert "checksum_path_for_bundle" in script
     assert "Evidence bundle checksum:" in script
+    assert "Evidence bundle SHA256:" in script
     assert "check_complete_report" in script
     assert "required_sections" in script
     assert "required_check_items" in script
@@ -1011,6 +1014,9 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     assert system_log.relative_to(PROJECT_ROOT).as_posix() in comment_text
     assert bundle_arg in comment_text
     assert f"{bundle_arg}.sha256" in comment_text
+    assert f"Git SHA: `{current_git_sha()}`" in comment_text
+    assert "Artifact workflow run: `26476324046`" in comment_text
+    assert f"Evidence bundle SHA256: `{hashlib.sha256(bundle.read_bytes()).hexdigest()}`" in comment_text
     assert "gh issue comment 116 --body-file" in comment_text
     assert "Keep #116 open until these files are attached" in comment_text
 
@@ -1032,6 +1038,7 @@ def test_macos_manual_validation_report_finalize_can_post_github_comment(tmp_pat
 
     fake_gh = report_dir / "gh"
     gh_log = report_dir / "gh.log"
+    gh_log.unlink(missing_ok=True)
     fake_gh.write_text(
         f"""#!/usr/bin/env bash
 set -euo pipefail
