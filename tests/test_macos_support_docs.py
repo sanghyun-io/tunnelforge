@@ -30,6 +30,11 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "--artifact-output-dir" in doc
     assert "--artifact-arch" in doc
     assert "--write-env" in doc
+    assert (
+        "MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh "
+        "--download-artifacts --artifact-arch <arm64|x86_64> --run-smoke"
+    ) in doc
+    assert "Use `--artifact-run-id <workflow-run-id>` only when you need to pin a specific workflow run." in doc
     assert "--skip-github" in doc
     assert "--skip-pr-checks" in doc
     assert "--final" in doc
