@@ -7,7 +7,7 @@
 ;   3. 또는: .\scripts\build-installer.ps1
 
 #define MyAppName "TunnelForge"
-#define MyAppVersion "2.0.6"
+#define MyAppVersion "2.0.7"
 #define MyAppPublisher "sanghyun-io"
 #define MyAppURL "https://github.com/sanghyun-io/tunnelforge"
 #define MyAppExeName "TunnelForge.exe"

@@ -7416,6 +7416,12 @@ pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Va
         if target_engine == "postgresql" {
             return sql_literal(&Value::String(sanitize_postgresql_text(text)));
         }
+        if target_engine == "mysql" {
+            return mysql_sql_literal(value);
+        }
+    }
+    if target_engine == "mysql" {
+        return mysql_sql_literal(value);
     }
     sql_literal(value)
 }
@@ -7470,6 +7476,26 @@ pub fn sql_literal(value: &Value) -> String {
             format!("'{}'", value.to_string().replace('\'', "''"))
         }
     }
+}
+
+fn mysql_sql_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::Bool(value) => {
+            if *value {
+                "TRUE".to_string()
+            } else {
+                "FALSE".to_string()
+            }
+        }
+        Value::Number(value) => value.to_string(),
+        Value::String(value) => mysql_string_literal(value),
+        Value::Array(_) | Value::Object(_) => mysql_string_literal(&value.to_string()),
+    }
+}
+
+fn mysql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 pub fn inspect_tables_sql(engine: &str) -> &'static str {
@@ -10170,6 +10196,35 @@ mod tests {
         assert_eq!(
             sql,
             "INSERT INTO \"users\" (\"id\", \"name\") VALUES (1, 'O''Reilly')"
+        );
+    }
+
+    #[test]
+    fn mysql_json_literal_insert_preserves_json_escape_backslashes() {
+        let table = NormalizedTable {
+            name: "ai_phase1_cache".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "result_json".to_string(),
+                type_name: "json".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
+
+        let sql = insert_rows_literal_sql_for_table(
+            "mysql",
+            &table,
+            &[json!({"result_json": json_text})],
+        );
+
+        assert_eq!(
+            sql,
+            r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES ('{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#
         );
     }
 

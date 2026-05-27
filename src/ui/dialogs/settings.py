@@ -1166,57 +1166,8 @@ class SettingsDialog(QDialog):
 
         try:
             if sys.platform == 'win32':
-                # 배치 스크립트가 업데이트 전체 라이프사이클을 관리:
-                #   ① 기존 프로세스 종료 대기 (PyInstaller _MEI 디렉토리 정리 보장)
-                #   ② 인스톨러 정상 모드로 실행 — 마법사 UI 노출
-                # 마법사가 끝나면 Inno Setup [Run] postinstall 옵션이 사용자에게
-                # "TunnelForge 실행" 체크박스를 보여주고 동의 시 자동 재실행.
-                # 따라서 bat에서 별도로 explorer.exe %APP_EXE% 를 띄우지 않는다
-                # (중복 실행 방지).
-                import tempfile
-                current_pid = os.getpid()
-                bat_path = os.path.join(
-                    tempfile.gettempdir(),
-                    f"tunnelforge_update_{current_pid}.bat"
-                )
-                bat_content = (
-                    "@echo off\r\n"
-                    "setlocal\r\n"
-                    f"set PID={current_pid}\r\n"
-                    f'set INSTALLER="{self._downloaded_installer_path}"\r\n'
-                    "set MAX_WAIT=30\r\n"
-                    "set COUNT=0\r\n"
-                    "\r\n"
-                    "rem === Phase 1: Wait for old process to exit ===\r\n"
-                    ":WAIT_EXIT\r\n"
-                    "tasklist /FI \"PID eq %PID%\" 2>NUL | find /I \"%PID%\" >NUL\r\n"
-                    "if errorlevel 1 goto RUN_INSTALLER\r\n"
-                    "set /A COUNT+=1\r\n"
-                    "if %COUNT% GEQ %MAX_WAIT% goto RUN_INSTALLER\r\n"
-                    "ping -n 2 127.0.0.1 >NUL\r\n"
-                    "goto WAIT_EXIT\r\n"
-                    "\r\n"
-                    "rem === Phase 2: Run installer with visible wizard ===\r\n"
-                    ":RUN_INSTALLER\r\n"
-                    "ping -n 2 127.0.0.1 >NUL\r\n"
-                    "start \"\" %INSTALLER%\r\n"
-                    "\r\n"
-                    "rem === Cleanup ===\r\n"
-                    f'del /f /q "{bat_path}"\r\n'
-                )
-                with open(bat_path, 'w', encoding='ascii') as f:
-                    f.write(bat_content)
-
-                # cmd.exe로 bat 실행:
-                # - CREATE_NO_WINDOW: 콘솔 창 숨김 (UX 개선)
-                # - DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP: 부모(TunnelForge)
-                #   종료 후에도 독립 실행 (main.py 복구 모드와 동일 패턴)
                 subprocess.Popen(
-                    ['cmd.exe', '/c', bat_path],
-                    creationflags=(
-                        no_window_creation_flags()
-                        | detached_process_kwargs("Windows").get("creationflags", 0)
-                    ),
+                    [self._downloaded_installer_path],
                     close_fds=True,
                 )
             elif update_package_launch_strategy() == "open":
@@ -1224,7 +1175,8 @@ class SettingsDialog(QDialog):
             else:
                 subprocess.Popen(
                     [self._downloaded_installer_path],
-                    start_new_session=True
+                    start_new_session=True,
+                    close_fds=True,
                 )
 
             # closeEvent 우회하여 직접 종료 (CloseConfirmDialog 방지)
