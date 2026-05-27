@@ -92,7 +92,9 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 
 [Run]
 ; 설치 완료 후 프로그램 실행 옵션
-Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent
+; PyInstaller one-file 앱은 시작 직후 %TEMP%\_MEI...에 런타임을 풀기 때문에
+; 설치 프로그램 종료/정리와 겹치지 않도록 짧게 지연한 뒤 설치 경로에서 실행한다.
+Filename: "{sys}\WindowsPowerShell\v1.0\powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command ""Start-Sleep -Seconds 2; Start-Process -FilePath '{app}\{#MyAppExeName}' -WorkingDirectory '{app}'"""; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: runhidden nowait postinstall skipifsilent
 
 [Code]
 /////////////////////////////////////////////////////////////////////

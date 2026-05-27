@@ -1803,3 +1803,15 @@ def test_windows_installer_captures_selected_app_language():
     assert "LanguageCode := 'ko'" in installer
     assert "SaveStringToFile(HintPath, LanguageCode, False)" in installer
     assert "english.RecoveryShortcut=Recovery and Update" in installer
+
+
+def test_windows_installer_defers_postinstall_launch_for_onefile_runtime():
+    installer = (PROJECT_ROOT / "installer" / "TunnelForge.iss").read_text(encoding="utf-8")
+
+    run_section = installer.split("[Run]", 1)[1].split("[Code]", 1)[0]
+
+    assert "Start-Sleep -Seconds 2" in run_section
+    assert "Start-Process -FilePath '{app}\\{#MyAppExeName}'" in run_section
+    assert "-WorkingDirectory '{app}'" in run_section
+    assert "runhidden nowait postinstall skipifsilent" in run_section
+    assert 'Filename: "{app}\\{#MyAppExeName}"' not in run_section
