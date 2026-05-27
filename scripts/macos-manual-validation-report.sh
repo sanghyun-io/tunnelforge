@@ -163,6 +163,30 @@ extract_report_value() {
     || true
 }
 
+section_has_evidence_note() {
+  local report_path="$1"
+  local section="$2"
+  "$PYTHON_BIN" - "$report_path" "$section" <<'PY'
+import sys
+from pathlib import Path
+
+report_path = Path(sys.argv[1])
+section = sys.argv[2]
+in_section = False
+
+for line in report_path.read_text(encoding="utf-8").splitlines():
+    if line == section:
+        in_section = True
+        continue
+    if in_section and line.startswith("## "):
+        in_section = False
+    if in_section and line.startswith("- Evidence:") and line.removeprefix("- Evidence:").strip():
+        sys.exit(0)
+
+sys.exit(1)
+PY
+}
+
 sha256_file() {
   local path="$1"
   "$PYTHON_BIN" - "$path" <<'PY'
@@ -285,6 +309,25 @@ check_complete_report() {
   for required_check_item in "${required_check_items[@]}"; do
     if ! grep -qF -- "- [x] $required_check_item" "$report_path"; then
       echo "Manual validation report is missing required checklist item: $required_check_item" >&2
+      failures=1
+    fi
+  done
+
+  local required_evidence_sections=(
+    "## Interactive App Launch"
+    "## SSH Tunnel"
+    "## Database Connections"
+    "## Export/Import"
+    "## Migration"
+    "## Settings And User Paths"
+    "## LaunchAgent"
+    "## Updates"
+    "## Signing, Notarization, And Gatekeeper"
+  )
+
+  for required_evidence_section in "${required_evidence_sections[@]}"; do
+    if ! section_has_evidence_note "$report_path" "$required_evidence_section"; then
+      echo "Manual validation report must include evidence note under section: $required_evidence_section" >&2
       failures=1
     fi
   done
@@ -677,6 +720,7 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Launch \`dist/TunnelForge.app\`
 - [ ] Install from DMG into \`/Applications\` and launch \`${FINAL_APP_PATH}\`
 - [ ] Confirm \`tunnelforge-core\` starts from inside the app
+- Evidence:
 
 ## SSH Tunnel
 
@@ -684,18 +728,21 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Confirm tunnel monitoring updates
 - Optional: record reconnect behavior if applicable
 - [ ] Close the SSH tunnel cleanly
+- Evidence:
 
 ## Database Connections
 
 - [ ] Test MySQL connection through Rust DB Core
 - [ ] Test PostgreSQL connection through Rust DB Core
 - Optional: record direct connection mode if applicable
+- Evidence:
 
 ## Export/Import
 
 - [ ] Run Export/Import on a disposable MySQL database
 - [ ] Run Export/Import on a disposable PostgreSQL database
 - [ ] Confirm exported files and imported rows are correct
+- Evidence:
 
 ## Migration
 
@@ -705,6 +752,7 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Run migrate
 - [ ] Run verify
 - [ ] Run resume after an interrupted disposable migration
+- Evidence:
 
 ## Settings And User Paths
 
@@ -712,6 +760,7 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Confirm logs use macOS user directories
 - [ ] Confirm SQL history uses macOS user directories
 - [ ] Confirm migration state, analysis, and rollback files use macOS user directories
+- Evidence:
 
 ## LaunchAgent
 
@@ -722,12 +771,14 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Confirm LaunchAgent writes stderr to \`~/Library/Logs/TunnelForge/launchagent.err.log\`
 - [ ] Disable startup in settings
 - [ ] Confirm LaunchAgent is removed
+- Evidence:
 
 ## Updates
 
 - [ ] Confirm macOS update selection prefers the current architecture DMG
 - [ ] Confirm the update UI opens the downloaded package
 - [ ] Confirm the update UI does not execute DMG or ZIP as a program
+- Evidence:
 
 ## Signing, Notarization, And Gatekeeper
 
@@ -735,6 +786,7 @@ cat > "$REPORT_PATH" <<EOF
 - [ ] Run \`spctl --assess --type execute --verbose ${FINAL_APP_PATH}\`
 - [ ] Confirm notarization status if distributing outside internal testing
 - [ ] Confirm first launch behavior after download/install
+- Evidence:
 
 ## Result
 

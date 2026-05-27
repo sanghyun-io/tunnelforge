@@ -96,6 +96,18 @@ REQUIRED_MANUAL_REPORT_CHECK_ITEMS = [
     "Confirm first launch behavior after download/install",
 ]
 
+REQUIRED_MANUAL_REPORT_EVIDENCE_SECTIONS = [
+    "## Interactive App Launch",
+    "## SSH Tunnel",
+    "## Database Connections",
+    "## Export/Import",
+    "## Migration",
+    "## Settings And User Paths",
+    "## LaunchAgent",
+    "## Updates",
+    "## Signing, Notarization, And Gatekeeper",
+]
+
 
 def completed_manual_report_lines(
     smoke_log_arg: str,
@@ -116,9 +128,14 @@ def completed_manual_report_lines(
     ]
     if system_evidence_arg:
         lines.append(f"- System evidence log: {system_evidence_arg}")
+    section_lines = []
+    for section in REQUIRED_MANUAL_REPORT_SECTIONS:
+        section_lines.append(section)
+        if section in REQUIRED_MANUAL_REPORT_EVIDENCE_SECTIONS:
+            section_lines.append(f"- Evidence: {section.removeprefix('## ')} validated on operator Mac")
     return [
         *lines,
-        *REQUIRED_MANUAL_REPORT_SECTIONS,
+        *section_lines,
         *(f"- [x] {item}" for item in REQUIRED_MANUAL_REPORT_CHECK_ITEMS),
         "- Overall result: passed",
         "- Validator: Codex",
@@ -342,6 +359,9 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "Evidence bundle checksum:" in script
     assert "Evidence bundle SHA256:" in script
     assert "check_complete_report" in script
+    assert "section_has_evidence_note" in script
+    assert "required_evidence_sections" in script
+    assert "Evidence:" in script
     assert "required_sections" in script
     assert "required_check_items" in script
     assert "Manual validation report is missing required section" in script
@@ -707,6 +727,42 @@ def test_macos_manual_validation_report_check_complete_rejects_deleted_export_re
 
     assert result.returncode == 1
     assert f"Manual validation report is missing required checklist item: {missing_item}" in result.stderr
+
+
+def test_macos_manual_validation_report_check_complete_rejects_missing_interactive_evidence_notes(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    report_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-evidence-notes"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    smoke_log = report_dir / "macos-release-smoke.log"
+    smoke_log.write_text(SUCCESSFUL_MACOS_SMOKE_LOG, encoding="utf-8")
+    report = report_dir / "macos-manual-validation-report.md"
+    smoke_log_arg = smoke_log.relative_to(PROJECT_ROOT).as_posix()
+    report_arg = report.relative_to(PROJECT_ROOT).as_posix()
+    report_lines = [
+        line
+        for line in completed_manual_report_lines_with_system(report_dir, smoke_log_arg)
+        if not line.startswith("- Evidence:")
+    ]
+    report.write_text("\n".join(report_lines), encoding="utf-8")
+
+    result = subprocess.run(
+        [
+            "bash",
+            "scripts/macos-manual-validation-report.sh",
+            "--check-complete",
+            report_arg,
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 1
+    assert "Manual validation report must include evidence note under section: ## Interactive App Launch" in result.stderr
+    assert "Manual validation report must include evidence note under section: ## Migration" in result.stderr
 
 
 def test_macos_manual_validation_report_check_complete_rejects_missing_applications_smoke(tmp_path):
