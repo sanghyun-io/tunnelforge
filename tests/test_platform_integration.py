@@ -20,8 +20,9 @@ def test_detached_process_kwargs_include_flags_on_windows():
     assert kwargs["creationflags"] & getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
 
 
-def test_startup_registration_creates_and_removes_macos_launch_agent(tmp_path):
+def test_startup_registration_creates_and_removes_macos_launch_agent(monkeypatch, tmp_path):
     executable = "/Applications/TunnelForge.app/Contents/MacOS/TunnelForge"
+    monkeypatch.setattr(platform_integration.sys, "frozen", True, raising=False)
     registrar = platform_integration.StartupRegistrar(
         platform_name="Darwin",
         home=tmp_path,
@@ -45,6 +46,7 @@ def test_startup_registration_creates_and_removes_macos_launch_agent(tmp_path):
     assert launch_agent["StandardErrorPath"] == str(
         tmp_path / "Library" / "Logs" / "TunnelForge" / "launchagent.err.log"
     )
+    assert launch_agent["WorkingDirectory"] == "/Applications/TunnelForge.app/Contents/MacOS"
     assert (tmp_path / "Library" / "Logs" / "TunnelForge").is_dir()
 
     assert registrar.set_registered(False) == (True, "")

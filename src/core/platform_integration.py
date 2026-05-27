@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Optional, Tuple
 from xml.sax.saxutils import escape
 
@@ -243,6 +243,12 @@ class StartupRegistrar:
         main_script = os.path.abspath("main.py")
         return (executable, main_script, "--minimized")
 
+    def _macos_working_directory(self) -> str:
+        executable = str(self.executable or sys.executable)
+        if getattr(sys, "frozen", False):
+            return str(PurePosixPath(executable).parent)
+        return str(Path(os.path.abspath("main.py")).parent)
+
     def _macos_launch_agent_plist(self) -> str:
         args = "\n".join(
             f"        <string>{escape(str(arg))}</string>"
@@ -251,6 +257,7 @@ class StartupRegistrar:
         log_dir = self._macos_launch_agent_log_dir()
         stdout_path = escape(str(log_dir / "launchagent.out.log"))
         stderr_path = escape(str(log_dir / "launchagent.err.log"))
+        working_directory = escape(self._macos_working_directory())
         return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -263,6 +270,8 @@ class StartupRegistrar:
     </array>
     <key>RunAtLoad</key>
     <true/>
+    <key>WorkingDirectory</key>
+    <string>{working_directory}</string>
     <key>StandardOutPath</key>
     <string>{stdout_path}</string>
     <key>StandardErrorPath</key>

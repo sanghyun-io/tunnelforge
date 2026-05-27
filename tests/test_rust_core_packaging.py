@@ -84,6 +84,7 @@ REQUIRED_MANUAL_REPORT_CHECK_ITEMS = [
     "Enable startup in settings",
     "Confirm `~/Library/LaunchAgents/io.sanghyun.tunnelforge.plist` exists",
     "Confirm LaunchAgent points to the expected app path",
+    "Confirm LaunchAgent WorkingDirectory points to the app executable directory",
     "Confirm LaunchAgent writes stdout to `~/Library/Logs/TunnelForge/launchagent.out.log`",
     "Confirm LaunchAgent writes stderr to `~/Library/Logs/TunnelForge/launchagent.err.log`",
     "Disable startup in settings",
@@ -543,6 +544,7 @@ def test_macos_launchagent_smoke_script_validates_packaged_app_plist():
     assert "sys.frozen = True" in script
     assert "io.sanghyun.tunnelforge" in script
     assert "ProgramArguments" in script
+    assert "WorkingDirectory" in script
     assert "launchagent.out.log" in script
     assert "launchagent.err.log" in script
     assert "plutil -lint" in script

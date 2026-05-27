@@ -59,6 +59,7 @@ assert launch_agent["StandardOutPath"] == str(
 assert launch_agent["StandardErrorPath"] == str(
     home / "Library" / "Logs" / "TunnelForge" / "launchagent.err.log"
 )
+assert launch_agent["WorkingDirectory"] == str(Path(app_executable).parent)
 assert (home / "Library" / "Logs" / "TunnelForge").is_dir()
 PY
 

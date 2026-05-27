@@ -33,7 +33,7 @@ Each release candidate must validate these user-visible behaviors:
 - Export/Import: Rust dump export and import workflows complete on test databases.
 - Migration: cross-engine inspect, preflight, plan, migrate, verify, and resume flows are callable.
 - Settings: config, encryption key, SQL history, migration state, analysis, rollback, and logs use macOS-appropriate user paths.
-- Startup: LaunchAgent registration creates and removes `~/Library/LaunchAgents/io.sanghyun.tunnelforge.plist` and records launch stdout/stderr under `~/Library/Logs/TunnelForge/`.
+- Startup: LaunchAgent registration creates and removes `~/Library/LaunchAgents/io.sanghyun.tunnelforge.plist`, records launch stdout/stderr under `~/Library/Logs/TunnelForge/`, and sets `WorkingDirectory` to the app executable directory.
 - Updates: release asset selection prefers the current Mac architecture's DMG, publishes `.sha256` checksums for DMG/ZIP packages, and does not execute DMG/ZIP files as programs.
 
 ## Windows Regression Gates
@@ -98,7 +98,7 @@ Run on macOS:
 8. Test MySQL and PostgreSQL DB connections.
 9. Run Export/Import on a disposable database.
 10. Run Migration smoke flow: inspect, preflight, plan, migrate, verify, resume.
-11. Enable and disable startup, then inspect the LaunchAgent file and `~/Library/Logs/TunnelForge/launchagent.{out,err}.log` paths.
+11. Enable and disable startup, then inspect the LaunchAgent file, `WorkingDirectory`, and `~/Library/Logs/TunnelForge/launchagent.{out,err}.log` paths.
 12. Check settings, logs, SQL history, migration state, analysis, and rollback files under macOS user directories.
 13. Open a downloaded DMG through the update UI and confirm it does not try to execute it directly.
 14. Install from DMG into Applications and launch from there.
