@@ -42,17 +42,16 @@
 
 | | Feature | Description |
 |:-:|---------|-------------|
-| 🚀 | **One-Click Migration** | Automated MySQL 5.7/8.0 to 8.4 migration with pre-flight checks. |
-| 🛡️ | **Pre-flight Analysis** | 30+ compatibility rules detect issues before migration starts. |
-| 💡 | **Auto-Recommend** | Smart fix suggestions with one-click apply for detected issues. |
-| 📊 | **Migration Report** | Detailed HTML/JSON reports of all compatibility findings. |
+| 🔄 | **Cross-Engine Migration** | Guided MySQL ↔ PostgreSQL migration powered by Rust DB Core. |
+| 🛡️ | **Migration Analysis** | Compatibility checks help surface MySQL upgrade risks before changes are applied. |
+| 💡 | **Fix Guidance** | Review suggested fixes for detected compatibility issues before applying changes. |
+| 📊 | **Migration Report** | Export detailed HTML/JSON reports of compatibility findings. |
 
 ### Data Tools
 
 | | Feature | Description |
 |:-:|---------|-------------|
 | ⚡ | **Parallel Export/Import** | Blazing-fast data transfers powered by Rust DB Core's parallel processing. |
-| 📅 | **[Scheduled Backup](SCHEDULE.md)** | Cron-style automated backups to keep your data safe. |
 | 📝 | **SQL Editor** | Built-in SQL editor with syntax highlighting and query history. |
 | 🛡️ | **Production Guard** | Safety prompts and confirmations for production database operations. |
 
@@ -61,7 +60,7 @@
 | | Feature | Description |
 |:-:|---------|-------------|
 | 🔄 | **Auto Update** | Checks for new versions on startup so you never miss an update. |
-| 🐛 | **Issue Reporter** | Built-in GitHub issue reporting with automatic diagnostics. |
+| 🐛 | **Optional Issue Reporter** | GitHub App-based error reporting when explicitly configured. |
 
 ---
 

@@ -262,8 +262,16 @@ class SQLExecutionDialog(QDialog):
             self.output_text.append(f"{'='*50}\n")
 
             # Worker 실행
+            db_engine = normalize_db_engine(self.config.get('db_engine'), self.config.get('remote_port'))
             self.worker = SQLExecutionWorker(
-                self.sql_file, host, port, db_user, db_password, database
+                self.sql_file,
+                host,
+                port,
+                db_user,
+                db_password,
+                database,
+                db_engine=db_engine,
+                schema=database if db_engine == 'postgresql' else "",
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.output.connect(self._on_output)

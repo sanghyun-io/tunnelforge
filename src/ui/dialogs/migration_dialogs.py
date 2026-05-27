@@ -28,11 +28,11 @@ from src.core.migration_analyzer import (
     CompatibilityIssue, CleanupAction, ActionType, IssueType
 )
 from src.ui.workers.migration_worker import MigrationAnalyzerWorker, CleanupWorker
-from src.ui.dialogs.oneclick_migration_dialog import OneClickMigrationDialog
 from src.core.logger import get_logger
 from src.core.platform_paths import analysis_dir
 
 logger = get_logger('migration_dialogs')
+ONE_CLICK_MIGRATION_FEATURE_ENABLED = False
 
 
 class MigrationAnalyzerDialog(QDialog):
@@ -200,6 +200,7 @@ class MigrationAnalyzerDialog(QDialog):
             "사전 검사 → 분석 → 자동 수정 → 검증까지 전 과정을 자동화합니다."
         )
         self.btn_oneclick.clicked.connect(self.start_oneclick_migration)
+        self.btn_oneclick.setVisible(ONE_CLICK_MIGRATION_FEATURE_ENABLED)
         btn_layout.addWidget(self.btn_oneclick)
 
         # 저장/불러오기 버튼
@@ -553,10 +554,15 @@ class MigrationAnalyzerDialog(QDialog):
 
     def start_oneclick_migration(self):
         """One-Click 마이그레이션 시작"""
+        if not ONE_CLICK_MIGRATION_FEATURE_ENABLED:
+            return
+
         schema = self.combo_schema.currentText()
         if not schema:
             QMessageBox.warning(self, "경고", "스키마를 선택하세요.")
             return
+
+        from src.ui.dialogs.oneclick_migration_dialog import OneClickMigrationDialog
 
         # One-Click 마이그레이션 다이얼로그 실행
         dialog = OneClickMigrationDialog(self, self.connector, schema)

@@ -2,11 +2,9 @@
 연결 테스트 및 SQL 실행 Worker 클래스
 """
 import os
-import subprocess
-import tempfile
 from enum import Enum
 from PyQt6.QtCore import QThread, pyqtSignal
-from src.core.platform_integration import no_window_creation_flags
+from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 
 
 class TestType(Enum):
@@ -257,13 +255,14 @@ class ConnectionTestWorker(QThread):
 
 
 class SQLExecutionWorker(QThread):
-    """SQL 파일 실행 Worker"""
+    """SQL 파일 실행 Worker backed by Rust DB Core."""
     progress = pyqtSignal(str)          # 진행 메시지
     output = pyqtSignal(str)            # SQL 실행 출력
     finished = pyqtSignal(bool, str)    # (성공여부, 결과메시지)
 
     def __init__(self, sql_file: str, host: str, port: int,
-                 user: str, password: str, database: str = None, parent=None):
+                 user: str, password: str, database: str = None,
+                 db_engine: str = "mysql", schema: str = "", parent=None):
         super().__init__(parent)
         self.sql_file = sql_file
         self.host = host
@@ -271,96 +270,206 @@ class SQLExecutionWorker(QThread):
         self.user = user
         self.password = password
         self.database = database
+        self.db_engine = normalize_db_engine(db_engine, port)
+        self.schema = schema
 
     def run(self):
-        temp_cnf = None
+        connector = None
         try:
-            # mysql CLI 존재 확인
-            self.progress.emit("🔍 mysql CLI 확인 중...")
-            if not self._check_mysql_cli():
-                self.finished.emit(False,
-                    "❌ mysql CLI를 찾을 수 없습니다.\n\n"
-                    "MySQL Client가 설치되어 있고 PATH에 등록되어 있는지 확인해주세요.\n"
-                    "- Windows: MySQL Installer에서 MySQL Server 설치\n"
-                    "- Mac: brew install mysql-client\n"
-                    "- Linux: apt install mysql-client")
+            self.progress.emit("🔌 Rust DB Core 연결 중...")
+            connector = create_rust_db_connector(
+                self.db_engine,
+                self.host,
+                int(self.port),
+                self.user,
+                self.password,
+                self.database,
+                schema=self.schema if self.db_engine == "postgresql" else "",
+            )
+
+            success, message = connector.connect()
+            if not success:
+                self.finished.emit(False, f"❌ DB 연결 실패: {message}")
                 return
 
-            # 임시 설정 파일 생성 (비밀번호 보안)
-            self.progress.emit("🔐 임시 설정 파일 생성 중...")
-            temp_cnf = self._create_temp_cnf()
-
-            # SQL 파일 실행
             self.progress.emit(f"🚀 SQL 실행 중: {os.path.basename(self.sql_file)}")
-
-            cmd = ['mysql', f'--defaults-file={temp_cnf}']
-            if self.database:
-                cmd.append(self.database)
-
-            # SQL 파일을 stdin으로 전달
             with open(self.sql_file, 'r', encoding='utf-8') as f:
                 sql_content = f.read()
 
-            process = subprocess.Popen(
-                cmd,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=no_window_creation_flags()
+            statements = self._parse_sql_statements(sql_content)
+            if not statements:
+                self.finished.emit(False, "❌ 실행할 SQL 문이 없습니다.")
+                return
+
+            total_rows = 0
+            with connector.connection.cursor() as cursor:
+                for index, statement in enumerate(statements, 1):
+                    preview = " ".join(statement.split())
+                    if len(preview) > 120:
+                        preview = preview[:117] + "..."
+                    self.progress.emit(f"  [{index}/{len(statements)}] {preview}")
+
+                    cursor.execute(statement)
+                    rows = cursor.fetchall()
+                    if rows:
+                        total_rows += len(rows)
+                        self.output.emit(self._format_rows(rows))
+
+            self.finished.emit(
+                True,
+                f"✅ SQL 실행 완료: {len(statements)}개 문장"
+                + (f", 결과 {total_rows}행" if total_rows else "")
             )
-
-            stdout, stderr = process.communicate(input=sql_content, timeout=300)
-
-            # 출력 전달
-            if stdout:
-                self.output.emit(stdout)
-            if stderr:
-                self.output.emit(f"[stderr] {stderr}")
-
-            if process.returncode == 0:
-                self.finished.emit(True, "✅ SQL 실행 완료!")
-            else:
-                self.finished.emit(False, f"❌ SQL 실행 실패 (exit code: {process.returncode})\n\n{stderr}")
-
-        except subprocess.TimeoutExpired:
-            self.finished.emit(False, "❌ SQL 실행 시간 초과 (5분)")
         except Exception as e:
             self.finished.emit(False, f"❌ SQL 실행 중 오류: {str(e)}")
         finally:
-            # 임시 파일 정리
-            if temp_cnf and os.path.exists(temp_cnf):
+            if connector:
                 try:
-                    os.remove(temp_cnf)
+                    connector.disconnect()
                 except Exception:
                     pass
 
-    def _check_mysql_cli(self) -> bool:
-        """mysql CLI 존재 여부 확인"""
-        try:
-            result = subprocess.run(
-                ['mysql', '--version'],
-                capture_output=True,
-                text=True,
-                creationflags=no_window_creation_flags()
-            )
-            return result.returncode == 0
-        except FileNotFoundError:
-            return False
-        except Exception:
-            return False
+    @staticmethod
+    def _parse_sql_statements(sql_text: str) -> list:
+        """Split SQL text into statements while preserving semicolons in strings/comments."""
+        if not sql_text or not sql_text.strip():
+            return []
 
-    def _create_temp_cnf(self) -> str:
-        """임시 MySQL 설정 파일 생성 (비밀번호 노출 방지)"""
-        fd, path = tempfile.mkstemp(suffix='.cnf', prefix='mysql_')
-        try:
-            with os.fdopen(fd, 'w', encoding='utf-8') as f:
-                f.write("[client]\n")
-                f.write(f"host={self.host}\n")
-                f.write(f"port={self.port}\n")
-                f.write(f"user={self.user}\n")
-                f.write(f"password={self.password}\n")
-        except Exception:
-            os.close(fd)
-            raise
-        return path
+        statements = []
+        current = []
+        delimiter = ";"
+        quote = None
+        dollar_quote = None
+        line_comment = False
+        block_comment = False
+        escape_next = False
+        i = 0
+
+        while i < len(sql_text):
+            char = sql_text[i]
+            next_char = sql_text[i + 1] if i + 1 < len(sql_text) else ""
+
+            if not any([quote, dollar_quote, line_comment, block_comment]):
+                line_start = i == 0 or sql_text[i - 1] == "\n"
+                if line_start:
+                    line_end = sql_text.find("\n", i)
+                    if line_end == -1:
+                        line_end = len(sql_text)
+                    line = sql_text[i:line_end]
+                    stripped = line.strip()
+                    if stripped.upper().startswith("DELIMITER "):
+                        delimiter = stripped.split(None, 1)[1].strip() or ";"
+                        i = line_end + (1 if line_end < len(sql_text) else 0)
+                        continue
+
+            if line_comment:
+                current.append(char)
+                if char == "\n":
+                    line_comment = False
+                i += 1
+                continue
+
+            if block_comment:
+                current.append(char)
+                if char == "*" and next_char == "/":
+                    current.append(next_char)
+                    block_comment = False
+                    i += 2
+                else:
+                    i += 1
+                continue
+
+            if dollar_quote:
+                if sql_text.startswith(dollar_quote, i):
+                    current.append(dollar_quote)
+                    i += len(dollar_quote)
+                    dollar_quote = None
+                else:
+                    current.append(char)
+                    i += 1
+                continue
+
+            if quote:
+                current.append(char)
+                if escape_next:
+                    escape_next = False
+                elif char == "\\":
+                    escape_next = True
+                elif char == quote:
+                    quote = None
+                i += 1
+                continue
+
+            marker = SQLExecutionWorker._read_dollar_quote(sql_text, i)
+            if marker:
+                dollar_quote = marker
+                current.append(marker)
+                i += len(marker)
+                continue
+
+            if char in ("'", '"', "`"):
+                quote = char
+                current.append(char)
+                i += 1
+                continue
+
+            if char == "-" and next_char == "-":
+                line_comment = True
+                current.extend([char, next_char])
+                i += 2
+                continue
+
+            if char == "#":
+                line_comment = True
+                current.append(char)
+                i += 1
+                continue
+
+            if char == "/" and next_char == "*":
+                block_comment = True
+                current.extend([char, next_char])
+                i += 2
+                continue
+
+            if delimiter and sql_text.startswith(delimiter, i):
+                statement = "".join(current).strip()
+                if statement:
+                    statements.append(statement)
+                current = []
+                i += len(delimiter)
+                continue
+
+            current.append(char)
+            i += 1
+
+        statement = "".join(current).strip()
+        if statement:
+            statements.append(statement)
+        return statements
+
+    @staticmethod
+    def _read_dollar_quote(sql_text: str, start: int) -> str:
+        if sql_text[start] != "$":
+            return ""
+        end = sql_text.find("$", start + 1)
+        if end == -1:
+            return ""
+        tag = sql_text[start + 1:end]
+        if tag:
+            if not (tag[0].isalpha() or tag[0] == "_"):
+                return ""
+            if not all(char.isalnum() or char == "_" for char in tag[1:]):
+                return ""
+        return sql_text[start:end + 1]
+
+    @staticmethod
+    def _format_rows(rows: list) -> str:
+        if not rows:
+            return ""
+        columns = list(rows[0].keys()) if isinstance(rows[0], dict) else []
+        if not columns:
+            return "\n".join(str(row) for row in rows)
+        lines = ["\t".join(columns)]
+        for row in rows:
+            lines.append("\t".join("" if row.get(col) is None else str(row.get(col)) for col in columns))
+        return "\n".join(lines)

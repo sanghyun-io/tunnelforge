@@ -18,6 +18,8 @@ from src.core.resources import app_icon_path, resource_path
 from src.core.i18n import tr
 
 logger = get_logger('main_window')
+SCHEDULE_FEATURE_ENABLED = False
+SQL_FILE_EXECUTION_FEATURE_ENABLED = False
 
 
 def get_resource_path(relative_path):
@@ -30,12 +32,9 @@ from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
 from src.ui.dialogs.db_dialogs import RustDumpWizard
 from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationWizard
 from src.ui.dialogs.migration_dialogs import MigrationWizard
-from src.ui.dialogs.test_dialogs import SQLExecutionDialog
 from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
-from src.ui.dialogs.schedule_dialog import ScheduleListDialog
 from src.ui.dialogs.tunnel_status_dialog import TunnelStatusDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
-from src.core.scheduler import BackupScheduler
 from src.core.tunnel_monitor import TunnelMonitor
 from src.core.mysql_login_path import MysqlLoginPathManager
 
@@ -81,11 +80,15 @@ class TunnelManagerUI(QMainWindow):
         # ThemeManager 초기화
         self._init_theme_manager()
 
-        # BackupScheduler 초기화
-        self.scheduler = BackupScheduler(config_manager, tunnel_engine)
-        self.scheduler.add_callback(self._on_backup_complete)
-        if self._start_background:
-            self.scheduler.start()
+        # Scheduled backup is hidden until the feature is reliable enough to expose.
+        self.scheduler = None
+        if SCHEDULE_FEATURE_ENABLED:
+            from src.core.scheduler import BackupScheduler
+
+            self.scheduler = BackupScheduler(config_manager, tunnel_engine)
+            self.scheduler.add_callback(self._on_backup_complete)
+            if self._start_background:
+                self.scheduler.start()
 
         # TunnelMonitor 초기화
         self.tunnel_monitor = TunnelMonitor(tunnel_engine, config_manager)
@@ -167,6 +170,7 @@ class TunnelManagerUI(QMainWindow):
         self.btn_schedule = QPushButton()
         self.btn_schedule.setStyleSheet(ButtonStyles.SECONDARY)
         self.btn_schedule.clicked.connect(self._open_schedule_dialog)
+        self.btn_schedule.setVisible(SCHEDULE_FEATURE_ENABLED)
 
         # [설정] 버튼 - Secondary 스타일 (중앙화)
         self.btn_settings = QPushButton()
@@ -243,19 +247,20 @@ class TunnelManagerUI(QMainWindow):
         show_action = QAction("열기", self)
         show_action.triggered.connect(self.show)
 
-        # 스케줄 백업 서브메뉴
-        self.schedule_menu = tray_menu.addMenu("")
-        self.schedule_manage_action = QAction(self)
-        self.schedule_manage_action.triggered.connect(self._open_schedule_dialog)
-        self.schedule_menu.addAction(self.schedule_manage_action)
+        if SCHEDULE_FEATURE_ENABLED:
+            # 스케줄 백업 서브메뉴
+            self.schedule_menu = tray_menu.addMenu("")
+            self.schedule_manage_action = QAction(self)
+            self.schedule_manage_action.triggered.connect(self._open_schedule_dialog)
+            self.schedule_menu.addAction(self.schedule_manage_action)
 
-        self.schedule_menu.addSeparator()
+            self.schedule_menu.addSeparator()
 
-        # 스케줄 즉시 실행 서브메뉴
-        self._schedule_run_menu = self.schedule_menu.addMenu("")
-        self._update_schedule_run_menu()
+            # 스케줄 즉시 실행 서브메뉴
+            self._schedule_run_menu = self.schedule_menu.addMenu("")
+            self._update_schedule_run_menu()
 
-        tray_menu.addSeparator()
+            tray_menu.addSeparator()
 
         self.show_action = show_action
         self.quit_action = QAction(self)
@@ -893,8 +898,13 @@ class TunnelManagerUI(QMainWindow):
 
     def _open_schedule_dialog(self):
         """스케줄 관리 다이얼로그 열기"""
+        if not SCHEDULE_FEATURE_ENABLED or not self.scheduler:
+            return
+
         # 터널 목록 준비
         tunnel_list = [(t['id'], t['name']) for t in self.tunnels]
+
+        from src.ui.dialogs.schedule_dialog import ScheduleListDialog
 
         dialog = ScheduleListDialog(self, self.scheduler, tunnel_list)
         dialog.schedule_changed.connect(self._update_schedule_run_menu)
@@ -902,7 +912,7 @@ class TunnelManagerUI(QMainWindow):
 
     def _update_schedule_run_menu(self):
         """즉시 실행 메뉴 업데이트"""
-        if not hasattr(self, '_schedule_run_menu'):
+        if not hasattr(self, '_schedule_run_menu') or not self.scheduler:
             return
 
         self._schedule_run_menu.clear()
@@ -924,6 +934,9 @@ class TunnelManagerUI(QMainWindow):
 
     def _run_schedule_now(self, schedule_id: str):
         """스케줄 즉시 실행"""
+        if not self.scheduler:
+            return
+
         schedule = self.scheduler.get_schedule(schedule_id)
         if not schedule:
             return
@@ -1191,7 +1204,8 @@ class TunnelManagerUI(QMainWindow):
 
         # SQL 에디터 및 실행
         menu.addAction("📝 SQL 에디터 열기...", lambda: self.open_sql_editor(tunnel))
-        menu.addAction("📄 SQL 파일 실행...", lambda: self.run_sql_file(tunnel))
+        if SQL_FILE_EXECUTION_FEATURE_ENABLED:
+            menu.addAction("📄 SQL 파일 실행...", lambda: self.run_sql_file(tunnel))
 
         menu.exec(self.table.mapToGlobal(position))
 
@@ -1228,6 +1242,11 @@ class TunnelManagerUI(QMainWindow):
 
     def run_sql_file(self, tunnel):
         """SQL 파일 실행 다이얼로그"""
+        if not SQL_FILE_EXECUTION_FEATURE_ENABLED:
+            return
+
+        from src.ui.dialogs.test_dialogs import SQLExecutionDialog
+
         # 자격 증명 확인
         user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
         if not user:

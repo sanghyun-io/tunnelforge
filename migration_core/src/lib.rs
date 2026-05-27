@@ -3146,6 +3146,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
     import_result?;
     restore_result?;
+    let target_engine = adapter.engine().to_string();
+    apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
 
     Ok(json!({
         "event": "result",
@@ -5269,35 +5271,18 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
     }
 
     state.current_phase = "completed".to_string();
-    for sql in generate_sequence_reset_ddl(&ordered_schema, target_engine) {
-        if let Err(err) = target.execute_sql(&sql) {
-            let table = ordered_schema
-                .tables
-                .first()
-                .cloned()
-                .unwrap_or(NormalizedTable {
-                    name: "sequence_reset".to_string(),
-                    columns: Vec::new(),
-                    indexes: Vec::new(),
-                    foreign_keys: Vec::new(),
-                });
-            return migration_error_result(state, rows_copied, chunks_copied, &table, err);
-        }
-    }
-    for sql in generate_post_data_ddl(&ordered_schema, target_engine) {
-        if let Err(err) = target.execute_sql(&sql) {
-            let table = ordered_schema
-                .tables
-                .first()
-                .cloned()
-                .unwrap_or(NormalizedTable {
-                    name: "post_data_ddl".to_string(),
-                    columns: Vec::new(),
-                    indexes: Vec::new(),
-                    foreign_keys: Vec::new(),
-                });
-            return migration_error_result(state, rows_copied, chunks_copied, &table, err);
-        }
+    if let Err(err) = apply_post_load_ddl(target, &ordered_schema, target_engine) {
+        let table = ordered_schema
+            .tables
+            .first()
+            .cloned()
+            .unwrap_or(NormalizedTable {
+                name: "post_data_ddl".to_string(),
+                columns: Vec::new(),
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+            });
+        return migration_error_result(state, rows_copied, chunks_copied, &table, err);
     }
     MigrationResult {
         success: true,
@@ -6906,6 +6891,20 @@ pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> V
     ddl
 }
 
+fn apply_post_load_ddl<A: MigrationAdapter>(
+    target: &mut A,
+    schema: &NormalizedSchema,
+    target_engine: &str,
+) -> Result<(), String> {
+    for sql in generate_sequence_reset_ddl(schema, target_engine) {
+        target.execute_sql(&sql)?;
+    }
+    for sql in generate_post_data_ddl(schema, target_engine) {
+        target.execute_sql(&sql)?;
+    }
+    Ok(())
+}
+
 pub fn count_sql(engine: &str, table: &str) -> String {
     format!(
         "SELECT COUNT(*) AS row_count FROM {}",
@@ -7986,6 +7985,43 @@ mod tests {
             columns: vec!["parent_id".to_string()],
             referenced_table: referenced_table.to_string(),
             referenced_columns: vec!["id".to_string()],
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingAdapter {
+        executed_sql: Vec<String>,
+    }
+
+    impl MigrationAdapter for RecordingAdapter {
+        fn row_count(&mut self, _table: &str) -> Result<usize, String> {
+            Ok(0)
+        }
+
+        fn create_table(&mut self, _table: &NormalizedTable, _ddl: &str) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn read_rows(
+            &mut self,
+            _table: &NormalizedTable,
+            _offset: usize,
+            _limit: usize,
+        ) -> Result<Vec<Value>, String> {
+            Ok(Vec::new())
+        }
+
+        fn insert_rows(
+            &mut self,
+            _table: &NormalizedTable,
+            _rows: Vec<Value>,
+        ) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn execute_sql(&mut self, sql: &str) -> Result<(), String> {
+            self.executed_sql.push(sql.to_string());
+            Ok(())
         }
     }
 
@@ -9337,6 +9373,37 @@ mod tests {
         assert_eq!(
             ddl[1],
             "ALTER TABLE \"orders\" ADD CONSTRAINT \"fk_orders_users\" FOREIGN KEY (\"user_id\") REFERENCES \"users\" (\"id\");"
+        );
+    }
+
+    #[test]
+    fn post_load_ddl_applies_secondary_indexes_after_import_data() {
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "orders".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "user_id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: vec![NormalizedIndex {
+                    name: "idx_orders_user_id".to_string(),
+                    columns: vec!["user_id".to_string()],
+                    unique: false,
+                }],
+                foreign_keys: Vec::new(),
+            }],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap();
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec!["CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);"]
         );
     }
 

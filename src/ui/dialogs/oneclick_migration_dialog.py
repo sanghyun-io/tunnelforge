@@ -36,7 +36,12 @@ STYLE_MUTED = "color: #7f8c8d;"
 
 
 class OneClickMigrationWorker(QThread):
-    """전체 마이그레이션 프로세스 실행 Worker"""
+    """전체 마이그레이션 프로세스 실행 Worker.
+
+    This hidden workflow is allowed to run only on the Rust DB Core connector.
+    Python keeps orchestration, recommendation, and UI logging here; every DB
+    operation must go through the Rust-backed connector facade.
+    """
 
     phase_changed = pyqtSignal(str, str)  # phase, phase_name
     progress = pyqtSignal(int, str)  # percent, message
@@ -82,6 +87,10 @@ class OneClickMigrationWorker(QThread):
             # per-run 로그 파일 생성
             _mig_logger, _log_path = create_oneclick_logger(self.schema)
             _mig_logger.info(f"=== One-Click 마이그레이션 시작: schema={self.schema}, dry_run={self.dry_run} ===")
+
+            self._ensure_rust_core_connector()
+            self.log_message.emit("🦀 Rust DB Core 연결 확인 완료", STYLE_MUTED)
+            _mig_logger.info("Rust DB Core connector verified")
 
             # Phase 1: Pre-flight
             self.phase_changed.emit(MigrationPhase.PREFLIGHT, "사전 검사")
@@ -313,6 +322,18 @@ class OneClickMigrationWorker(QThread):
         finally:
             if _mig_logger:
                 close_oneclick_logger(_mig_logger)
+
+    def _ensure_rust_core_connector(self):
+        """Fail closed unless One-Click is backed by tunnelforge-core."""
+        connection = getattr(self.connector, "connection", None)
+        facade = getattr(connection, "facade", None)
+        connection_id = getattr(connection, "connection_id", None)
+        endpoint = getattr(connection, "endpoint", None)
+        if not all([connection, facade, connection_id, endpoint]):
+            raise RuntimeError(
+                "One-Click migration requires a Rust DB Core connector. "
+                "Legacy Python DB connections are not supported."
+            )
 
     def _create_empty_report(self) -> MigrationReport:
         """이슈가 없을 때 빈 리포트 생성"""
@@ -840,6 +861,7 @@ class OneClickMigrationDialog(QDialog):
 
         self.chk_dry_run = QCheckBox("Dry-run (실제 실행하지 않음)")
         self.chk_dry_run.setToolTip("체크하면 실제 SQL을 실행하지 않고 시뮬레이션만 합니다.")
+        self.chk_dry_run.setChecked(True)
         options_layout.addWidget(self.chk_dry_run)
 
         self.chk_backup = QCheckBox("백업 완료 확인")
