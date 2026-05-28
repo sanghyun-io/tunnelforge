@@ -3476,7 +3476,7 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
         ]
     } else {
         vec![
-            "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), ',,', ','), ',,', ','))".to_string(),
+            "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=0".to_string(),
         ]
@@ -3513,7 +3513,13 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
             compression,
         )?;
         let started = Instant::now();
-        let rows = insert_mysql_tsv_chunk_with_batches(conn, table, &chunk_path, compression)?;
+        let rows = insert_mysql_tsv_chunk_with_batches(conn, table, &chunk_path, compression)
+            .map_err(|err| {
+                format!(
+                    "mysql insert fallback error for table {} chunk {}: {err}",
+                    table.name, chunk_index
+                )
+            })?;
         rows_imported += rows;
         chunks_imported += 1;
         emit(json!({
@@ -3544,7 +3550,7 @@ fn insert_mysql_tsv_chunk_with_batches(
         MYSQL_INSERT_FALLBACK_BATCH_BYTES,
         |rows| {
             conn.query_drop(insert_rows_literal_sql_for_table("mysql", table, rows))
-                .map_err(|err| format!("mysql insert fallback error: {err}"))
+                .map_err(|err| err.to_string())
         },
     )
 }
@@ -11036,7 +11042,7 @@ mod tests {
         assert_eq!(
             mysql_import_session_tuning_sql(false),
             vec![
-                "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), ',,', ','), ',,', ','))".to_string(),
+                "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=0".to_string(),
             ]

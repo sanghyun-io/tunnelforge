@@ -192,6 +192,16 @@ def test_format_import_visible_telemetry_summarizes_row_progress():
     )
 
 
+def test_format_import_visible_telemetry_hides_local_infile_phase_noise():
+    line = format_import_visible_telemetry({
+        "event": "phase",
+        "message": "MySQL local_infile is disabled; using safe Rust INSERT fallback",
+        "strategy": "insert_fallback",
+    })
+
+    assert line is None
+
+
 def test_import_raw_output_shows_visible_telemetry_summary():
     class FakeLogList:
         def __init__(self):

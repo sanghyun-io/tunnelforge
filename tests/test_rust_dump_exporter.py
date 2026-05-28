@@ -323,7 +323,7 @@ class TestRustDumpImporter:
 
         assert chunk_events == [("df_subs", 2, 8)]
 
-    def test_import_phase_explains_local_infile_fallback_as_non_error(self):
+    def test_import_phase_hides_local_infile_fallback_noise(self):
         from src.exporters.rust_dump_exporter import emit_core_event
 
         messages = []
@@ -337,12 +337,9 @@ class TestRustDumpImporter:
             progress_callback=messages.append,
         )
 
-        assert messages == [
-            "MySQL local_infile 비활성화: 안전 INSERT fallback으로 진행합니다. "
-            "에러는 아니지만 LOAD DATA LOCAL보다 느립니다."
-        ]
+        assert messages == []
 
-    def test_import_phase_explains_temporary_local_infile_attempt(self):
+    def test_import_phase_hides_temporary_local_infile_noise(self):
         from src.exporters.rust_dump_exporter import emit_core_event
 
         messages = []
@@ -365,10 +362,7 @@ class TestRustDumpImporter:
             progress_callback=messages.append,
         )
 
-        assert messages == [
-            "MySQL local_infile이 꺼져 있어 고속 Import용 임시 활성화를 시도합니다.",
-            "MySQL local_infile 활성화됨: LOAD DATA LOCAL 고속 Import로 진행합니다.",
-        ]
+        assert messages == []
 
     def test_import_metadata_reports_table_rows_and_total_rows(self, tmp_path):
         """Import 대시보드가 전체 row 진행률을 계산할 수 있도록 manifest rows를 전달한다."""

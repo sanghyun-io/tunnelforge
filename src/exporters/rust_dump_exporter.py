@@ -49,18 +49,17 @@ def _safe_dump_child_file(dump_dir: str, path: Path) -> Optional[Path]:
     return file_path if file_path.is_file() else None
 
 
-def _format_import_phase_message(event: dict) -> str:
-    if event.get("strategy") == "temporary_local_infile":
-        return "MySQL local_infile이 꺼져 있어 고속 Import용 임시 활성화를 시도합니다."
-    if event.get("strategy") == "temporary_local_infile_restore":
-        return str(event.get("message") or "MySQL local_infile 값을 원래대로 복구했습니다.")
-    if event.get("performance") == "fast_path":
-        return "MySQL local_infile 활성화됨: LOAD DATA LOCAL 고속 Import로 진행합니다."
-    if event.get("strategy") == "insert_fallback":
-        return (
-            "MySQL local_infile 비활성화: 안전 INSERT fallback으로 진행합니다. "
-            "에러는 아니지만 LOAD DATA LOCAL보다 느립니다."
-        )
+def _format_import_phase_message(event: dict) -> Optional[str]:
+    strategy = str(event.get("strategy") or "")
+    performance = str(event.get("performance") or "")
+    message = str(event.get("message") or "")
+    if (
+        strategy in {"temporary_local_infile", "temporary_local_infile_restore", "insert_fallback"}
+        or performance == "fast_path"
+        or "local_infile" in message
+        or "LOAD DATA LOCAL" in message
+    ):
+        return None
     return str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중...")
 
 
@@ -743,7 +742,9 @@ def emit_core_event(
                 "scheduled_tables": event.get("scheduled_tables") if isinstance(event.get("scheduled_tables"), list) else [],
             })
     elif event_type == "phase" and progress_callback:
-        progress_callback(_format_import_phase_message(event))
+        message = _format_import_phase_message(event)
+        if message:
+            progress_callback(message)
     elif event_type == "table_progress":
         current = int(event.get("current") or 0)
         total = int(event.get("total") or 0)

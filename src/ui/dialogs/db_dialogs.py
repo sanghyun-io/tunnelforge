@@ -223,7 +223,10 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
     event_type = event.get("event")
     table = str(event.get("table") or "")
     if event_type == "phase":
-        return str(event.get("message") or "")
+        message = str(event.get("message") or "")
+        if "local_infile" in message or "LOAD DATA LOCAL" in message:
+            return None
+        return message
     if event_type == "table_progress" and table:
         status = str(event.get("status") or "")
         current = int(event.get("current") or 0)
