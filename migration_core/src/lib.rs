@@ -3470,11 +3470,13 @@ fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
 fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
     if restore {
         vec![
+            "SET SESSION sql_mode=DEFAULT".to_string(),
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION foreign_key_checks=1".to_string(),
         ]
     } else {
         vec![
+            "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), ',,', ','), ',,', ','))".to_string(),
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=0".to_string(),
         ]
@@ -11034,6 +11036,7 @@ mod tests {
         assert_eq!(
             mysql_import_session_tuning_sql(false),
             vec![
+                "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), ',,', ','), ',,', ','))".to_string(),
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=0".to_string(),
             ]
@@ -11041,6 +11044,7 @@ mod tests {
         assert_eq!(
             mysql_import_session_tuning_sql(true),
             vec![
+                "SET SESSION sql_mode=DEFAULT".to_string(),
                 "SET SESSION unique_checks=1".to_string(),
                 "SET SESSION foreign_key_checks=1".to_string(),
             ]

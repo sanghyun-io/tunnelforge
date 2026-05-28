@@ -10,6 +10,7 @@ from src.ui.dialogs.db_dialogs import (
     RustDumpWizard,
     cap_incomplete_export_percent,
     displayed_import_percent,
+    format_import_visible_telemetry,
     export_overall_percent,
     import_overall_percent,
     format_import_row_labels,
@@ -172,6 +173,63 @@ def test_format_export_visible_telemetry_summarizes_schedule():
         "스케줄: tsv/zstd, scheduler=global_chunk, "
         "threads=8, table_workers=2, range_workers/table=4"
     )
+
+
+def test_format_import_visible_telemetry_summarizes_row_progress():
+    line = format_import_visible_telemetry({
+        "event": "row_progress",
+        "table": "ai_phase1_cache",
+        "rows": 390,
+        "total": 390,
+        "chunk_rows": 390,
+        "load_ms": 167,
+        "strategy": "load_data_local_infile",
+    })
+
+    assert line == (
+        "ai_phase1_cache: +390 rows, 390/390 rows (100%), "
+        "2,335 rows/s, load_data_local_infile"
+    )
+
+
+def test_import_raw_output_shows_visible_telemetry_summary():
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = lambda message: dialog.log_entries.append(f"[00:00:00] {message}")
+
+    RustDumpImportDialog.on_raw_output(dialog, json.dumps({
+        "event": "row_progress",
+        "table": "ai_phase1_cache",
+        "rows": 390,
+        "total": 390,
+        "chunk_rows": 390,
+        "load_ms": 167,
+        "strategy": "load_data_local_infile",
+    }))
+
+    assert dialog.txt_log.items == [
+        "ai_phase1_cache: +390 rows, 390/390 rows (100%), "
+        "2,335 rows/s, load_data_local_infile"
+    ]
+    assert dialog.log_entries[0].endswith("load_data_local_infile")
+    assert "[rust_dump]" in dialog.log_entries[1]
 
 
 def test_rust_dump_export_dialog_defaults_to_zstd():

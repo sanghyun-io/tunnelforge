@@ -218,6 +218,49 @@ def format_export_visible_telemetry(event: dict) -> Optional[str]:
     return f"{table}: {chunk_part}, {row_part}{details}"
 
 
+def format_import_visible_telemetry(event: dict) -> Optional[str]:
+    """Convert Rust import telemetry into a concise visible log line."""
+    event_type = event.get("event")
+    table = str(event.get("table") or "")
+    if event_type == "phase":
+        return str(event.get("message") or "")
+    if event_type == "table_progress" and table:
+        status = str(event.get("status") or "")
+        current = int(event.get("current") or 0)
+        total = int(event.get("total") or 0)
+        suffix = f" ({current}/{total})" if current and total else ""
+        if status == "importing":
+            return f"테이블 Import 시작: {table}{suffix}"
+        if status == "completed":
+            return f"테이블 Import 완료: {table}{suffix}"
+        if status == "error":
+            message = str(event.get("message") or "")
+            return f"테이블 Import 오류: {table} - {message}" if message else f"테이블 Import 오류: {table}"
+    if event_type == "row_progress" and table:
+        rows = int(event.get("rows") or 0)
+        total = int(event.get("total") or 0)
+        chunk_rows = int(event.get("chunk_rows") or 0)
+        strategy = str(event.get("strategy") or "")
+        elapsed_ms = int(event.get("stream_ms") or event.get("read_ms") or event.get("load_ms") or 0)
+        rows_sec = int((chunk_rows * 1000) / elapsed_ms) if chunk_rows and elapsed_ms else 0
+        parts = []
+        if chunk_rows:
+            parts.append(f"+{chunk_rows:,} rows")
+        if rows and total:
+            percent = min(100, int((rows / total) * 100))
+            parts.append(f"{rows:,}/{total:,} rows ({percent}%)")
+        elif rows:
+            parts.append(f"{rows:,} rows")
+        if rows_sec:
+            parts.append(f"{rows_sec:,} rows/s")
+        if strategy:
+            parts.append(strategy)
+        return f"{table}: {', '.join(parts)}" if parts else f"{table}: row progress"
+    if event_type == "error":
+        return f"Import 오류: {event.get('message') or event}"
+    return None
+
+
 class DBConnectionDialog(QDialog):
     """DB 연결 다이얼로그"""
 
@@ -2796,13 +2839,24 @@ class RustDumpImportDialog(QDialog):
             item.setText(display_text)
 
     def on_raw_output(self, line: str):
-        """rust_dump 실시간 출력 처리 (로그에 추가)"""
+        """Rust Core 실시간 출력 처리."""
         # 너무 많은 로그 방지 (최대 500줄)
         if self.txt_log.count() > 500:
             self.txt_log.takeItem(0)
-        self.txt_log.addItem(line)
-        self.txt_log.scrollToBottom()
-        # raw output도 로그에 기록
+
+        visible_summary = None
+        try:
+            event = json.loads(line)
+            if isinstance(event, dict):
+                visible_summary = format_import_visible_telemetry(event)
+        except json.JSONDecodeError:
+            visible_summary = line
+
+        if visible_summary:
+            self.txt_log.addItem(visible_summary)
+            self.txt_log.scrollToBottom()
+            self._add_log(visible_summary)
+
         self._add_log(f"[rust_dump] {line}")
 
     def on_metadata_analyzed(self, metadata: dict):
