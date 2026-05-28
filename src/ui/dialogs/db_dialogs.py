@@ -1243,6 +1243,7 @@ class RustDumpExportDialog(QDialog):
         # 설정 저장
         if self.config_manager:
             self.config_manager.set_app_setting('rust_dump_export_dir', output_dir)
+            self.config_manager.set_app_setting('rust_dump_last_dump_dir', output_dir)
 
         # 로그 수집 초기화
         self.log_entries.clear()
@@ -1786,6 +1787,7 @@ class RustDumpImportDialog(QDialog):
         self.table_chunk_progress: dict = {}  # {table_name: (completed, total)}
 
         self.init_ui()
+        self._load_default_input_dir()
         self.load_schemas()
 
     def init_ui(self):
@@ -2243,13 +2245,70 @@ class RustDumpImportDialog(QDialog):
         self.combo_target_schema.setEnabled(not use_original)
 
     def browse_input_dir(self):
+        start_dir = self._get_input_browse_start_dir()
         folder = QFileDialog.getExistingDirectory(
-            self, "Dump 폴더 선택", self.input_dir.text()
+            self, "Dump 폴더 선택", start_dir
         )
         if folder:
             self.input_dir.setText(folder)
+            if self.config_manager:
+                self.config_manager.set_app_setting('rust_dump_import_dir', folder)
+                self.config_manager.set_app_setting('rust_dump_last_dump_dir', folder)
             # 폴더 선택 시 자동으로 MySQL 8.4 호환성 검사 실행
             self._run_upgrade_check(folder)
+
+    def _is_valid_dump_dir(self, path: str) -> bool:
+        if not path:
+            return False
+        return (
+            os.path.isdir(path)
+            and os.path.exists(os.path.join(path, "_tunnelforge_dump.json"))
+        )
+
+    def _existing_dir(self, path: str) -> str:
+        if path and os.path.isdir(path):
+            return path
+        return ""
+
+    def _configured_dump_dirs(self) -> List[str]:
+        if not self.config_manager:
+            return []
+        keys = (
+            'rust_dump_last_dump_dir',
+            'rust_dump_export_dir',
+            'rust_dump_import_dir',
+        )
+        return [
+            str(self.config_manager.get_app_setting(key, "") or "")
+            for key in keys
+        ]
+
+    def _load_default_input_dir(self):
+        """마지막 Export/Import dump 폴더를 Import 기본값으로 사용."""
+        for path in self._configured_dump_dirs():
+            if self._is_valid_dump_dir(path):
+                self.input_dir.setText(path)
+                return
+
+    def _get_input_browse_start_dir(self) -> str:
+        """Dump 선택창 시작 위치. 빈 값이면 Windows가 설치 폴더를 잡으므로 항상 명시한다."""
+        current = self._existing_dir(self.input_dir.text().strip())
+        if current:
+            return current
+
+        for path in self._configured_dump_dirs():
+            existing = self._existing_dir(path)
+            if existing:
+                return existing
+
+        if self.config_manager:
+            base_dir = self.config_manager.get_app_setting('rust_dump_export_base_dir', "")
+            existing = self._existing_dir(str(base_dir or ""))
+            if existing:
+                return existing
+
+        desktop = os.path.join(os.path.expanduser("~"), "Desktop")
+        return desktop if os.path.isdir(desktop) else os.path.expanduser("~")
 
     def _run_upgrade_check(self, dump_path: str):
         """Import 전 MySQL 8.4 호환성 검사"""
@@ -2443,6 +2502,9 @@ class RustDumpImportDialog(QDialog):
         # 저장 (재시도용)
         self.last_input_dir = input_dir
         self.last_target_schema = target_schema
+        if self.config_manager:
+            self.config_manager.set_app_setting('rust_dump_import_dir', input_dir)
+            self.config_manager.set_app_setting('rust_dump_last_dump_dir', input_dir)
 
         # UI 상태 변경 - 모든 입력 비활성화
         self.set_ui_enabled(False)

@@ -6,6 +6,7 @@ from PyQt6.QtWidgets import QApplication
 
 from src.ui.dialogs.db_dialogs import (
     RustDumpExportDialog,
+    RustDumpImportDialog,
     RustDumpWizard,
     cap_incomplete_export_percent,
     displayed_import_percent,
@@ -195,6 +196,46 @@ def test_rust_dump_export_dialog_rejects_parent_manual_folder(tmp_path):
     generated = Path(dialog._generate_output_dir("dataflare")).resolve()
     assert generated.is_relative_to(tmp_path.resolve())
     assert generated != tmp_path.parent.resolve()
+    dialog.close()
+
+
+def test_rust_dump_import_dialog_defaults_to_last_export_dump_dir(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    dump_dir = tmp_path / "dataflare_20260528_090000"
+    dump_dir.mkdir()
+    (dump_dir / "_tunnelforge_dump.json").write_text(
+        json.dumps({"format": "tunnelforge-dump", "tables": []}),
+        encoding="utf-8",
+    )
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(dump_dir) if key == "rust_dump_export_dir" else default
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+
+    dialog = RustDumpImportDialog(config_manager=config_manager)
+
+    assert dialog.input_dir.text() == str(dump_dir)
+    dialog.close()
+
+
+def test_rust_dump_import_browse_starts_from_export_base_when_no_dump(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(tmp_path) if key == "rust_dump_export_base_dir" else default
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog(config_manager=config_manager)
+
+    assert dialog.input_dir.text() == ""
+    assert dialog._get_input_browse_start_dir() == str(tmp_path)
     dialog.close()
 
 

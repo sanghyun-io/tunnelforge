@@ -1,4 +1,4 @@
--- TunnelForge v2.0.12 import verification queries.
+-- TunnelForge v2.0.13 import verification queries.
 -- Run this after selecting the imported MySQL database:
 --
 --   USE dataflare;
