@@ -7,7 +7,7 @@
 ;   3. 또는: .\scripts\build-installer.ps1
 
 #define MyAppName "TunnelForge"
-#define MyAppVersion "2.0.11"
+#define MyAppVersion "2.0.12"
 #define MyAppPublisher "sanghyun-io"
 #define MyAppURL "https://github.com/sanghyun-io/tunnelforge"
 #define MyAppExeName "TunnelForge.exe"
@@ -73,7 +73,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; 메인 애플리케이션 폴더 (.iss 파일 기준 상대 경로)
 ; Windows는 PyInstaller onedir 배포를 사용한다. onefile의 %TEMP%\_MEI 런타임
 ; 추출 경로는 python311.dll 로드 실패를 유발할 수 있다.
-Source: "..\dist\{#MyAppName}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
+Source: "..\dist\{#MyAppName}\*"; DestDir: "{app}"; Excludes: "crash.log"; Flags: ignoreversion recursesubdirs createallsubdirs restartreplace
 
 ; 복구/업데이트 프로그램 (부트스트래퍼)
 Source: "..\dist\TunnelForge-WebSetup.exe"; DestDir: "{app}"; Flags: ignoreversion

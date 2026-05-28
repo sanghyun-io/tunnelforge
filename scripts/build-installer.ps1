@@ -300,6 +300,12 @@ Write-Host ""
 # Inno Setup으로 Installer 컴파일
 Write-Host "[6/6] Windows Installer 생성 중..." -ForegroundColor Yellow
 
+$crashLog = "dist\TunnelForge\crash.log"
+if (Test-Path $crashLog) {
+    Remove-Item -LiteralPath $crashLog -Force
+    Write-Host "  ✅ 이전 crash.log 제거 완료" -ForegroundColor Green
+}
+
 & $ISCC "installer\TunnelForge.iss"
 
 if ($LASTEXITCODE -ne 0) {
@@ -308,11 +314,11 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Installer 파일 확인
-$installerPattern = "output\TunnelForge-Setup-*.exe"
-$installerFile = Get-Item $installerPattern -ErrorAction SilentlyContinue | Select-Object -First 1
+$installerPath = "output\TunnelForge-Setup-$version.exe"
+$installerFile = Get-Item $installerPath -ErrorAction SilentlyContinue
 
 if (-not $installerFile) {
-    Write-Host "  ❌ Installer 파일을 찾을 수 없습니다: $installerPattern" -ForegroundColor Red
+    Write-Host "  ❌ Installer 파일을 찾을 수 없습니다: $installerPath" -ForegroundColor Red
     exit 1
 }
 
@@ -330,5 +336,5 @@ Write-Host "  📦 EXE: dist\TunnelForge\TunnelForge.exe" -ForegroundColor White
 Write-Host "  📦 Installer: $($installerFile.FullName)" -ForegroundColor White
 Write-Host ""
 Write-Host "설치 프로그램 테스트:" -ForegroundColor Cyan
-Write-Host "  .\$($installerFile.FullName)" -ForegroundColor Gray
+Write-Host "  $($installerFile.FullName)" -ForegroundColor Gray
 Write-Host ""

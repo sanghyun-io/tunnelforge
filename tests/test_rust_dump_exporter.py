@@ -293,8 +293,40 @@ class TestRustDumpImporter:
         assert facade.payload["target"]["database"] == "app"
         assert facade.payload["input_dir"] == str(dump_dir)
         assert facade.payload["threads"] == 8
+        assert facade.payload["mysql_local_infile_policy"] == "fallback"
         assert results["users"]["status"] == "done"
         assert "1" in msg
+
+    def test_import_dump_can_request_temporary_local_infile_policy(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        table_dir = dump_dir / '0001_users'
+        table_dir.mkdir(parents=True)
+        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":1,"database":"app","tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_imported": 1}
+
+        facade = FakeFacade()
+        importer = RustDumpImporter(
+            RustDumpConfig('localhost', 3306, 'root', 'password'),
+            facade=facade,
+        )
+
+        success, _, _ = importer.import_dump(
+            str(dump_dir),
+            mysql_local_infile_policy="temporary_global",
+        )
+
+        assert success is True
+        assert facade.payload["mysql_local_infile_policy"] == "temporary_global"
 
     def test_import_row_progress_reports_chunk_counts_to_callback(self):
         """Import row_progress는 rows/total이 아니라 chunks_done/chunks_total을 chunk callback으로 전달한다."""
@@ -339,6 +371,34 @@ class TestRustDumpImporter:
         assert messages == [
             "MySQL local_infile 비활성화: 안전 INSERT fallback으로 진행합니다. "
             "에러는 아니지만 LOAD DATA LOCAL보다 느립니다."
+        ]
+
+    def test_import_phase_explains_temporary_local_infile_attempt(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        messages = []
+
+        emit_core_event(
+            {
+                "event": "phase",
+                "message": "MySQL local_infile is disabled; trying temporary SET GLOBAL local_infile=ON",
+                "strategy": "temporary_local_infile",
+            },
+            progress_callback=messages.append,
+        )
+        emit_core_event(
+            {
+                "event": "phase",
+                "message": "MySQL local_infile temporarily enabled; using fast LOAD DATA LOCAL import",
+                "strategy": "load_data_local_infile",
+                "performance": "fast_path",
+            },
+            progress_callback=messages.append,
+        )
+
+        assert messages == [
+            "MySQL local_infile이 꺼져 있어 고속 Import용 임시 활성화를 시도합니다.",
+            "MySQL local_infile 활성화됨: LOAD DATA LOCAL 고속 Import로 진행합니다.",
         ]
 
     def test_import_metadata_reports_table_rows_and_total_rows(self, tmp_path):

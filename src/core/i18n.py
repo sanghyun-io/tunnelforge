@@ -261,6 +261,7 @@ _EN_TEXT_TRANSLATIONS = {
     "가져오기 실패": "Import Failed",
     "가져오기 완료": "Import Complete",
     "경고": "Warning",
+    "고속 Import:": "Fast Import:",
     "고급 설정 열기": "Open Advanced Settings",
     "고아 레코드 검사": "Check Orphan Records",
     "그룹 삭제": "Delete Group",
@@ -357,7 +358,9 @@ _EN_TEXT_TRANSLATIONS = {
     "터널 테스트": "Tunnel Test",
     "파일 없음": "File Not Found",
     "필수 항목 누락": "Required Field Missing",
+    "필요 시 MySQL local_infile 임시 활성화 후 복구": "Temporarily enable MySQL local_infile when needed, then restore it",
     "현재 상태": "Current Status",
+    "고속 LOAD DATA LOCAL Import를 위해 대상 MySQL의 GLOBAL local_infile을 임시로 켭니다. 권한이 없거나 관리형 DB에서 막히면 안전 INSERT fallback으로 계속 진행합니다.": "Temporarily enables the target MySQL GLOBAL local_infile for fast LOAD DATA LOCAL import. If permissions or managed DB policy block it, TunnelForge continues with the safe INSERT fallback.",
     "ℹ️ <b>FK 안전 변경 방식</b>으로 모든 테이블이 일괄 처리됩니다.<br>체크 해제 시 해당 테이블을 건너뜁니다.<br>FK 관계로 인해 연쇄적으로 건너뛰어야 하는 테이블이 있을 수 있습니다.": "ℹ️ All tables are processed in batch using the <b>FK-safe change method</b>.<br>Uncheck a table to skip it.<br>Some tables may need to be skipped together because of FK relationships.",
 }
 

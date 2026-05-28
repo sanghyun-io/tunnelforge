@@ -15,6 +15,39 @@ if sys.platform == 'win32':
         sys.stderr.reconfigure(encoding='utf-8', errors='replace', line_buffering=True)
 
 
+def _stream_is_usable(stream) -> bool:
+    if stream is None:
+        return False
+    try:
+        stream.write("")
+        stream.flush()
+        return True
+    except (AttributeError, OSError, ValueError):
+        return False
+
+
+def write_cli_json(result: dict) -> None:
+    """Write CLI JSON without crashing noconsole PyInstaller builds."""
+    payload = json.dumps(result, ensure_ascii=False, sort_keys=True)
+    for stream in (sys.stdout, getattr(sys, "__stdout__", None)):
+        if not _stream_is_usable(stream):
+            continue
+        try:
+            stream.write(payload + "\n")
+            stream.flush()
+            return
+        except (AttributeError, OSError, ValueError):
+            continue
+
+    output_path = os.environ.get("TUNNELFORGE_CLI_OUTPUT")
+    if output_path:
+        try:
+            with open(output_path, "w", encoding="utf-8") as output_file:
+                output_file.write(payload + "\n")
+        except OSError:
+            pass
+
+
 def get_app_dir() -> str:
     """애플리케이션 설치 경로 반환"""
     if getattr(sys, 'frozen', False):
@@ -150,7 +183,7 @@ def run_self_check() -> dict:
 
 def run_self_check_cli() -> int:
     result = run_self_check()
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    write_cli_json(result)
     return 0 if result["success"] else 1
 
 
@@ -184,9 +217,18 @@ def run_ui_smoke_check() -> dict:
 
 
 def run_ui_smoke_check_cli() -> int:
-    with redirect_stdout(sys.stderr):
-        result = run_ui_smoke_check()
-    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    redirect_target = sys.stderr
+    close_redirect_target = False
+    if not _stream_is_usable(redirect_target):
+        redirect_target = open(os.devnull, "w", encoding="utf-8")
+        close_redirect_target = True
+    try:
+        with redirect_stdout(redirect_target):
+            result = run_ui_smoke_check()
+    finally:
+        if close_redirect_target:
+            redirect_target.close()
+    write_cli_json(result)
     return 0 if result["success"] else 1
 
 

@@ -3055,6 +3055,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .map(|value| value as usize)
         .unwrap_or(8)
         .max(1);
+    let mysql_local_infile_policy = mysql_local_infile_policy_from_payload(&request.payload)?;
     let tables: Vec<DumpTableManifest> = manifest
         .tables
         .iter()
@@ -3068,6 +3069,13 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
+    let local_infile_restore = prepare_mysql_local_infile_policy(
+        &mut adapter,
+        &endpoint,
+        mysql_local_infile_policy,
+        request.request_id.clone(),
+        &mut emit,
+    )?;
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
@@ -3158,8 +3166,15 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         Ok(())
     })();
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
+    let local_infile_restore_result = restore_mysql_local_infile_policy(
+        &mut adapter,
+        local_infile_restore,
+        request.request_id.clone(),
+        &mut emit,
+    );
     import_result?;
     restore_result?;
+    local_infile_restore_result?;
     let target_engine = adapter.engine().to_string();
     apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
 
@@ -3294,16 +3309,154 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
 }
 
 fn mysql_local_infile_enabled(conn: &mut mysql::PooledConn) -> bool {
+    mysql_local_infile_value(conn)
+        .map(|value| mysql_bool_value_enabled(&value))
+        .unwrap_or(true)
+}
+
+fn mysql_local_infile_value(conn: &mut mysql::PooledConn) -> Option<String> {
     conn.query_first::<(String, String), _>("SHOW VARIABLES LIKE 'local_infile'")
         .ok()
         .flatten()
-        .map(|(_, value)| {
-            matches!(
-                value.to_ascii_lowercase().as_str(),
-                "on" | "1" | "true" | "yes"
-            )
-        })
-        .unwrap_or(true)
+        .map(|(_, value)| value)
+}
+
+fn mysql_bool_value_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "on" | "1" | "true" | "yes"
+    )
+}
+
+fn mysql_set_global_local_infile_sql(enabled: bool) -> &'static str {
+    if enabled {
+        "SET GLOBAL local_infile = 1"
+    } else {
+        "SET GLOBAL local_infile = 0"
+    }
+}
+
+fn mysql_local_infile_policy_from_payload(payload: &Value) -> Result<&str, String> {
+    let policy = payload
+        .get("mysql_local_infile_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("fallback");
+    if matches!(policy, "fallback" | "temporary_global") {
+        Ok(policy)
+    } else {
+        Err(format!("unsupported mysql_local_infile_policy: {policy}"))
+    }
+}
+
+fn prepare_mysql_local_infile_policy<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    endpoint: &Endpoint,
+    policy: &str,
+    request_id: Option<String>,
+    emit: &mut F,
+) -> Result<Option<String>, String> {
+    if policy != "temporary_global" {
+        return Ok(None);
+    }
+    let previous = {
+        let LiveAdapter::MySql(conn) = adapter else {
+            return Ok(None);
+        };
+        let previous = mysql_local_infile_value(conn).unwrap_or_else(|| "ON".to_string());
+        if mysql_bool_value_enabled(&previous) {
+            emit(json!({
+                "event": "phase",
+                "request_id": request_id,
+                "phase": "dump_import",
+                "message": "MySQL local_infile is already enabled; using fast LOAD DATA LOCAL import",
+                "strategy": "load_data_local_infile",
+                "performance": "fast_path"
+            }));
+            return Ok(None);
+        }
+
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": "MySQL local_infile is disabled; trying temporary SET GLOBAL local_infile=ON",
+            "strategy": "temporary_local_infile",
+            "performance": "fast_path_attempt"
+        }));
+
+        if let Err(err) = conn.query_drop(mysql_set_global_local_infile_sql(true)) {
+            emit(json!({
+                "event": "phase",
+                "request_id": request_id,
+                "phase": "dump_import",
+                "message": format!("MySQL local_infile temporary enable failed: {err}; using safe Rust INSERT fallback"),
+                "strategy": "insert_fallback",
+                "performance": "safe_fallback"
+            }));
+            return Ok(None);
+        }
+        previous
+    };
+
+    if let Err(err) = LiveAdapter::connect(endpoint).map(|new_adapter| *adapter = new_adapter) {
+        if let LiveAdapter::MySql(conn) = adapter {
+            let _ = conn.query_drop(mysql_set_global_local_infile_sql(mysql_bool_value_enabled(
+                &previous,
+            )));
+        }
+        return Err(err);
+    }
+    let enabled = match adapter {
+        LiveAdapter::MySql(conn) => mysql_local_infile_enabled(conn),
+        LiveAdapter::PostgreSql(_) => false,
+    };
+    if enabled {
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": "MySQL local_infile temporarily enabled; using fast LOAD DATA LOCAL import",
+            "strategy": "load_data_local_infile",
+            "performance": "fast_path"
+        }));
+    } else {
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": "MySQL local_infile temporary enable did not take effect; using safe Rust INSERT fallback",
+            "strategy": "insert_fallback",
+            "performance": "safe_fallback"
+        }));
+    }
+    Ok(Some(previous))
+}
+
+fn restore_mysql_local_infile_policy<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    previous: Option<String>,
+    request_id: Option<String>,
+    emit: &mut F,
+) -> Result<(), String> {
+    let Some(previous) = previous else {
+        return Ok(());
+    };
+    let enabled = mysql_bool_value_enabled(&previous);
+    let LiveAdapter::MySql(conn) = adapter else {
+        return Ok(());
+    };
+    conn.query_drop(mysql_set_global_local_infile_sql(enabled))
+        .map_err(|err| {
+            format!("mysql local_infile restore failed; previous value was {previous}: {err}")
+        })?;
+    emit(json!({
+        "event": "phase",
+        "request_id": request_id,
+        "phase": "dump_import",
+        "message": format!("MySQL local_infile restored to {previous}"),
+        "strategy": "temporary_local_infile_restore"
+    }));
+    Ok(())
 }
 
 fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
@@ -8891,11 +9044,22 @@ mod tests {
     }
 
     #[test]
-    fn mysql_dump_import_does_not_build_global_local_infile_statement() {
-        let source = include_str!("lib.rs");
-        let forbidden = ["SET", "GLOBAL", "local_infile"].join(" ");
-
-        assert!(!source.contains(&forbidden));
+    fn mysql_dump_import_defaults_to_safe_local_infile_policy() {
+        assert_eq!(
+            mysql_local_infile_policy_from_payload(&json!({})).unwrap(),
+            "fallback"
+        );
+        assert_eq!(
+            mysql_local_infile_policy_from_payload(&json!({
+                "mysql_local_infile_policy": "temporary_global"
+            }))
+            .unwrap(),
+            "temporary_global"
+        );
+        assert!(mysql_local_infile_policy_from_payload(&json!({
+            "mysql_local_infile_policy": "always"
+        }))
+        .is_err());
     }
 
     #[test]
@@ -9253,6 +9417,23 @@ mod tests {
         assert!(!is_mysql_local_infile_disabled_error(
             "mysql LOAD DATA error: duplicate key"
         ));
+    }
+
+    #[test]
+    fn mysql_local_infile_boolean_values_and_set_sql_are_stable() {
+        assert!(mysql_bool_value_enabled("ON"));
+        assert!(mysql_bool_value_enabled("1"));
+        assert!(mysql_bool_value_enabled(" yes "));
+        assert!(!mysql_bool_value_enabled("OFF"));
+        assert!(!mysql_bool_value_enabled("0"));
+        assert_eq!(
+            mysql_set_global_local_infile_sql(true),
+            "SET GLOBAL local_infile = 1"
+        );
+        assert_eq!(
+            mysql_set_global_local_infile_sql(false),
+            "SET GLOBAL local_infile = 0"
+        );
     }
 
     #[test]

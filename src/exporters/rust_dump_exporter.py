@@ -50,6 +50,12 @@ def _safe_dump_child_file(dump_dir: str, path: Path) -> Optional[Path]:
 
 
 def _format_import_phase_message(event: dict) -> str:
+    if event.get("strategy") == "temporary_local_infile":
+        return "MySQL local_infile이 꺼져 있어 고속 Import용 임시 활성화를 시도합니다."
+    if event.get("strategy") == "temporary_local_infile_restore":
+        return str(event.get("message") or "MySQL local_infile 값을 원래대로 복구했습니다.")
+    if event.get("performance") == "fast_path":
+        return "MySQL local_infile 활성화됨: LOAD DATA LOCAL 고속 Import로 진행합니다."
     if event.get("strategy") == "insert_fallback":
         return (
             "MySQL local_infile 비활성화: 안전 INSERT fallback으로 진행합니다. "
@@ -601,6 +607,7 @@ class RustDumpImporter:
         retry_tables: Optional[List[str]] = None,
         metadata_callback: Optional[Callable[[dict], None]] = None,
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        mysql_local_infile_policy: str = "fallback",
     ) -> Tuple[bool, str, dict]:
         import_results: dict = {}
         try:
@@ -637,6 +644,7 @@ class RustDumpImporter:
                 "input_dir": input_dir,
                 "mode": import_mode,
                 "threads": max(1, int(threads)),
+                "mysql_local_infile_policy": mysql_local_infile_policy,
             }
             if retry_tables:
                 payload["tables"] = retry_tables
@@ -835,6 +843,7 @@ def import_dump(
     import_mode: str = "replace",
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    mysql_local_infile_policy: str = "fallback",
 ) -> Tuple[bool, str, dict]:
     config = RustDumpConfig(host, port, user, password)
     importer = RustDumpImporter(config)
@@ -845,4 +854,5 @@ def import_dump(
         import_mode=import_mode,
         progress_callback=progress_callback,
         table_chunk_progress_callback=table_chunk_progress_callback,
+        mysql_local_infile_policy=mysql_local_infile_policy,
     )

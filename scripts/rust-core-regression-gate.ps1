@@ -75,7 +75,6 @@ try {
     }
 
     $securityForbidden = @(
-        "SET GLOBAL local_infile",
         "mysql_local_infile_sql",
         "ensure_mysql_local_infile_for_import",
         "restore_mysql_local_infile_after_import",

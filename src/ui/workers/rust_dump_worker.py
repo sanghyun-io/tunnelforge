@@ -120,7 +120,8 @@ class RustDumpWorker(QThread):
                     raw_output_callback,
                     self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
                     metadata_callback,
-                    table_chunk_progress_callback
+                    table_chunk_progress_callback,
+                    self.kwargs.get('mysql_local_infile_policy', 'fallback'),
                 )
                 self.import_finished.emit(success, msg, results)
                 self.finished.emit(success, msg)
