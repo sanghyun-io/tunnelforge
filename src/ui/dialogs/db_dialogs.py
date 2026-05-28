@@ -1961,14 +1961,6 @@ class RustDumpImportDialog(QDialog):
         self.spin_threads.setValue(8)
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
-        self.chk_temp_local_infile = QCheckBox("필요 시 MySQL local_infile 임시 활성화 후 복구")
-        self.chk_temp_local_infile.setChecked(False)
-        self.chk_temp_local_infile.setToolTip(
-            "고속 LOAD DATA LOCAL Import를 위해 대상 MySQL의 GLOBAL local_infile을 임시로 켭니다. "
-            "권한이 없거나 관리형 DB에서 막히면 안전 INSERT fallback으로 계속 진행합니다."
-        )
-        option_layout.addRow("고속 Import:", self.chk_temp_local_infile)
-
         container_layout.addWidget(option_group)
 
         # --- 타임존 설정 ---
@@ -2449,7 +2441,6 @@ class RustDumpImportDialog(QDialog):
         self.chk_use_original.setEnabled(enabled)
         self.combo_target_schema.setEnabled(enabled and not self.chk_use_original.isChecked())
         self.spin_threads.setEnabled(enabled)
-        self.chk_temp_local_infile.setEnabled(enabled)
         self.radio_merge.setEnabled(enabled)
         self.radio_replace.setEnabled(enabled)
         self.radio_recreate.setEnabled(enabled)
@@ -2590,8 +2581,6 @@ class RustDumpImportDialog(QDialog):
             self._add_log(f"대상 스키마: {target_schema if target_schema else '원본 스키마명 사용'}")
             self._add_log(f"Import 모드: {import_mode_str}")
             self._add_log(f"병렬 스레드: {self.spin_threads.value()}")
-            if self.chk_temp_local_infile.isChecked():
-                self._add_log("MySQL local_infile 임시 활성화 시도: 사용")
             self._add_log(f"{'='*60}")
 
         # 프로그레스 바 초기화
@@ -2655,9 +2644,6 @@ class RustDumpImportDialog(QDialog):
             threads=self.spin_threads.value(),
             import_mode=import_mode,
             timezone_sql=timezone_sql,
-            mysql_local_infile_policy=(
-                "temporary_global" if self.chk_temp_local_infile.isChecked() else "fallback"
-            ),
             retry_tables=retry_tables
         )
 

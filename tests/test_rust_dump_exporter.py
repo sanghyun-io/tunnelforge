@@ -293,40 +293,9 @@ class TestRustDumpImporter:
         assert facade.payload["target"]["database"] == "app"
         assert facade.payload["input_dir"] == str(dump_dir)
         assert facade.payload["threads"] == 8
-        assert facade.payload["mysql_local_infile_policy"] == "fallback"
+        assert "mysql_local_infile_policy" not in facade.payload
         assert results["users"]["status"] == "done"
         assert "1" in msg
-
-    def test_import_dump_can_request_temporary_local_infile_policy(self, tmp_path):
-        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
-
-        dump_dir = tmp_path / 'dump'
-        table_dir = dump_dir / '0001_users'
-        table_dir.mkdir(parents=True)
-        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
-        (dump_dir / '_tunnelforge_dump.json').write_text(
-            '{"format":"tunnelforge-dump","format_version":1,"database":"app","tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
-            encoding='utf-8',
-        )
-
-        class FakeFacade:
-            def import_dump(self, payload, on_event=None):
-                self.payload = payload
-                return {"success": True, "tables": 1, "rows_imported": 1}
-
-        facade = FakeFacade()
-        importer = RustDumpImporter(
-            RustDumpConfig('localhost', 3306, 'root', 'password'),
-            facade=facade,
-        )
-
-        success, _, _ = importer.import_dump(
-            str(dump_dir),
-            mysql_local_infile_policy="temporary_global",
-        )
-
-        assert success is True
-        assert facade.payload["mysql_local_infile_policy"] == "temporary_global"
 
     def test_import_row_progress_reports_chunk_counts_to_callback(self):
         """Import row_progress는 rows/total이 아니라 chunks_done/chunks_total을 chunk callback으로 전달한다."""

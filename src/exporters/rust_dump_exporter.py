@@ -607,7 +607,6 @@ class RustDumpImporter:
         retry_tables: Optional[List[str]] = None,
         metadata_callback: Optional[Callable[[dict], None]] = None,
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
-        mysql_local_infile_policy: str = "fallback",
     ) -> Tuple[bool, str, dict]:
         import_results: dict = {}
         try:
@@ -644,7 +643,6 @@ class RustDumpImporter:
                 "input_dir": input_dir,
                 "mode": import_mode,
                 "threads": max(1, int(threads)),
-                "mysql_local_infile_policy": mysql_local_infile_policy,
             }
             if retry_tables:
                 payload["tables"] = retry_tables
@@ -843,7 +841,6 @@ def import_dump(
     import_mode: str = "replace",
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
-    mysql_local_infile_policy: str = "fallback",
 ) -> Tuple[bool, str, dict]:
     config = RustDumpConfig(host, port, user, password)
     importer = RustDumpImporter(config)
@@ -854,5 +851,4 @@ def import_dump(
         import_mode=import_mode,
         progress_callback=progress_callback,
         table_chunk_progress_callback=table_chunk_progress_callback,
-        mysql_local_infile_policy=mysql_local_infile_policy,
     )
