@@ -428,7 +428,11 @@ class RustDumpExporter:
         )
         rows = int(result.get("rows_dumped") or 0)
         table_count = int(result.get("tables") or 0)
-        return True, f"Rust DB Core export 완료: {table_count}개 테이블, {rows:,} rows"
+        view_count = int(result.get("views") or 0)
+        message = f"Rust DB Core export 완료: {table_count}개 테이블, {rows:,} rows"
+        if view_count:
+            message += f", View {view_count}개"
+        return True, message
 
     def export_full_schema(
         self,
@@ -663,7 +667,20 @@ class RustDumpImporter:
             for table in tables_to_import:
                 import_results[table] = {"status": "done", "message": ""}
             rows = int(result.get("rows_imported") or 0)
-            return True, f"Rust DB Core import 완료: {len(tables_to_import)}개 테이블, {rows:,} rows", import_results
+            views_imported = result.get("views_imported") or []
+            views_failed = result.get("views_failed") or []
+            views_skipped = result.get("views_skipped_cross_engine") or []
+            message = f"Rust DB Core import 완료: {len(tables_to_import)}개 테이블, {rows:,} rows"
+            if views_imported:
+                message += f", View {len(views_imported)}개"
+            if views_failed:
+                failed_names = ", ".join(
+                    str(item.get("name", "")) for item in views_failed if isinstance(item, dict)
+                )
+                message += f" (View {len(views_failed)}개 생성 실패: {failed_names})"
+            if views_skipped:
+                message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
+            return True, message, import_results
         except DbCoreServiceError as exc:
             return False, f"Rust DB Core import 오류: {exc}", import_results
         except Exception as exc:

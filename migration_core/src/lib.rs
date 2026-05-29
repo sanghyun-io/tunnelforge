@@ -149,6 +149,14 @@ pub struct DumpManifest {
     pub chunk_size: usize,
     pub created_unix_seconds: u64,
     pub tables: Vec<DumpTableManifest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<NormalizedView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedView {
+    pub name: String,
+    pub definition: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1526,6 +1534,8 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     let output_path = Path::new(output_dir);
     prepare_dump_output_dir(output_path, overwrite)?;
 
+    // 부분 export(tables 지정) 시에는 View가 참조하는 base table이 빠질 수 있으므로 View를 수집하지 않는다.
+    let full_export = selected_tables.is_empty();
     let inspection = inspect_live(&endpoint)?;
     let mut schema = inspection.schema;
     if !selected_tables.is_empty() {
@@ -1654,6 +1664,25 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             )?
         };
 
+    // View 정의 수집 (전체 export 시에만). 실패해도 테이블 덤프는 유효하므로 fatal로 보지 않는다.
+    let views = if full_export {
+        match collect_views(&endpoint) {
+            Ok(views) => views,
+            Err(err) => {
+                emit(json!({
+                    "event": "phase",
+                    "request_id": request.request_id,
+                    "phase": "dump",
+                    "message": format!("View 정의 수집 실패 (테이블 덤프는 정상): {err}"),
+                }));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let views_count = views.len();
+
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
         format_version: if data_format == "jsonl" { 1 } else { 2 },
@@ -1665,6 +1694,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         chunk_size,
         created_unix_seconds: current_unix_seconds(),
         tables: table_manifests,
+        views,
     };
     write_dump_manifest(output_path, &manifest)?;
 
@@ -1678,6 +1708,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         "format_version": manifest.format_version,
         "compression": manifest.compression,
         "tables": manifest.tables.len(),
+        "views": views_count,
         "rows_dumped": total_rows,
         "chunks_dumped": total_chunks,
         "manifest": "_tunnelforge_dump.json"
@@ -3178,6 +3209,21 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let target_engine = adapter.engine().to_string();
     apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
 
+    // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
+    // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
+    let view_outcome = if selected.is_empty() && !manifest.views.is_empty() {
+        import_views(
+            &mut adapter,
+            &manifest,
+            &target_engine,
+            mode,
+            request.request_id.clone(),
+            &mut emit,
+        )
+    } else {
+        ViewImportOutcome::default()
+    };
+
     Ok(json!({
         "event": "result",
         "request_id": request.request_id,
@@ -3187,8 +3233,122 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "mode": mode,
         "tables": table_total,
         "rows_imported": rows_imported,
-        "chunks_imported": chunks_imported
+        "chunks_imported": chunks_imported,
+        "views_imported": view_outcome.imported,
+        "views_failed": view_outcome.failed,
+        "views_skipped_cross_engine": view_outcome.skipped_cross_engine
     }))
+}
+
+#[derive(Debug, Default)]
+struct ViewImportOutcome {
+    imported: Vec<String>,
+    failed: Vec<Value>,
+    skipped_cross_engine: Vec<String>,
+}
+
+/// manifest의 View들을 대상 DB에 생성한다.
+/// - source/target 엔진이 다르면 정의 SQL이 호환되지 않으므로 전부 skip.
+/// - View 간 의존성 순서 문제를 fixpoint 재시도 루프로 해결한다.
+/// - 각 View 실패는 non-fatal: 결과에 모아 보고만 한다.
+fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
+    adapter: &mut A,
+    manifest: &DumpManifest,
+    target_engine: &str,
+    mode: &str,
+    request_id: Option<String>,
+    mut emit: F,
+) -> ViewImportOutcome {
+    let mut outcome = ViewImportOutcome::default();
+
+    if manifest.source_engine != target_engine {
+        outcome.skipped_cross_engine = manifest.views.iter().map(|v| v.name.clone()).collect();
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": format!(
+                "크로스 엔진 import: View {}개는 정의 비호환으로 건너뜁니다 ({} -> {})",
+                outcome.skipped_cross_engine.len(),
+                manifest.source_engine,
+                target_engine
+            ),
+        }));
+        return outcome;
+    }
+
+    // replace/recreate 모드면 기존 View를 먼저 정리한다 (테이블이 아닌 View 전용 DROP).
+    if matches!(mode, "replace" | "recreate") {
+        for view in &manifest.views {
+            let _ = adapter.execute_sql(&drop_view_sql(target_engine, &view.name));
+        }
+    }
+
+    // 정화된 정의를 미리 만들어 둔다.
+    let mut pending: Vec<(String, String)> = manifest
+        .views
+        .iter()
+        .map(|view| {
+            (
+                view.name.clone(),
+                sanitize_view_definition(&view.definition, &manifest.database, target_engine),
+            )
+        })
+        .collect();
+
+    // fixpoint 루프: 한 바퀴에 하나도 성공하지 못하면 중단한다.
+    let mut last_errors: BTreeMap<String, String> = BTreeMap::new();
+    loop {
+        let mut progressed = false;
+        let mut still_pending: Vec<(String, String)> = Vec::new();
+        for (name, sql) in pending.drain(..) {
+            match adapter.execute_sql(&sql) {
+                Ok(()) => {
+                    progressed = true;
+                    last_errors.remove(&name);
+                    outcome.imported.push(name.clone());
+                    emit(json!({
+                        "event": "table_progress",
+                        "request_id": request_id,
+                        "table": name,
+                        "status": "completed",
+                        "kind": "view"
+                    }));
+                }
+                Err(err) => {
+                    last_errors.insert(name.clone(), err);
+                    still_pending.push((name, sql));
+                }
+            }
+        }
+        pending = still_pending;
+        if pending.is_empty() || !progressed {
+            break;
+        }
+    }
+
+    for (name, _sql) in pending {
+        let error = last_errors
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| "unknown error".to_string());
+        outcome.failed.push(json!({ "name": name, "error": error }));
+    }
+
+    if !outcome.failed.is_empty() {
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": format!(
+                "View {}개 생성 성공, {}개 실패 (데이터 import는 정상 완료)",
+                outcome.imported.len(),
+                outcome.failed.len()
+            ),
+        }));
+    }
+
+    outcome
 }
 
 fn import_mysql_tsv_table<F: FnMut(Value)>(
@@ -4323,6 +4483,124 @@ fn inspect_postgresql_unsupported_objects(
     );
 
     Ok(objects)
+}
+
+/// 원본 DB의 View 정의를 수집한다. 전체 export 시에만 호출된다.
+/// MySQL은 `SHOW CREATE VIEW`, PostgreSQL은 `pg_get_viewdef`를 사용한다.
+fn collect_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, String> {
+    match endpoint.engine.as_str() {
+        "mysql" => collect_mysql_views(endpoint),
+        "postgresql" => collect_postgresql_views(endpoint),
+        other => Err(format!("unsupported endpoint engine: {other}")),
+    }
+}
+
+fn collect_mysql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, String> {
+    let schema_name = endpoint_schema(endpoint);
+    let opts = mysql_opts(endpoint);
+    let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
+    let mut conn = pool
+        .get_conn()
+        .map_err(|err| format!("mysql connection error: {err}"))?;
+    let view_names: Vec<String> = conn
+        .exec_map(
+            "SELECT TABLE_NAME FROM information_schema.views WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (&schema_name,),
+            |name: String| name,
+        )
+        .map_err(|err| format!("mysql view list error: {err}"))?;
+
+    let mut views = Vec::with_capacity(view_names.len());
+    for name in view_names {
+        // SHOW CREATE VIEW `name` → (View, Create View, character_set_client, collation_connection)
+        let create_sql = format!("SHOW CREATE VIEW {}", quote_ident("mysql", &name));
+        let row: Option<mysql::Row> = conn
+            .query_first(create_sql)
+            .map_err(|err| format!("mysql SHOW CREATE VIEW error for {name}: {err}"))?;
+        let definition = row
+            .as_ref()
+            .and_then(|row| row.get::<String, _>(1))
+            .ok_or_else(|| format!("mysql SHOW CREATE VIEW returned no definition for {name}"))?;
+        views.push(NormalizedView { name, definition });
+    }
+    Ok(views)
+}
+
+fn collect_postgresql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, String> {
+    let schema_name = endpoint_schema(endpoint);
+    let mut client = postgres_config(endpoint)
+        .connect(NoTls)
+        .map_err(|err| format!("postgresql connection error: {err}"))?;
+    let rows = client
+        .query(
+            "SELECT table_name, pg_get_viewdef(format('%I.%I', table_schema, table_name)::regclass, true) \
+             FROM information_schema.views WHERE table_schema = $1 ORDER BY table_name",
+            &[&schema_name],
+        )
+        .map_err(|err| format!("postgresql view list error: {err}"))?;
+    let mut views = Vec::with_capacity(rows.len());
+    for row in rows {
+        let name: String = row.get(0);
+        let body: String = row.get(1);
+        // pg_get_viewdef는 본문(SELECT ...)만 반환하므로 CREATE 문으로 감싼다.
+        let definition = format!(
+            "CREATE OR REPLACE VIEW {} AS\n{}",
+            quote_ident("postgresql", &name),
+            body
+        );
+        views.push(NormalizedView { name, definition });
+    }
+    Ok(views)
+}
+
+/// import 시점에 View 정의 SQL을 정화한다.
+/// - MySQL `DEFINER=...` 절 제거 (대상 서버에 해당 유저가 없으면 view가 깨짐)
+/// - `SQL SECURITY DEFINER` → `SQL SECURITY INVOKER`
+/// - 원본 schema 한정자(`source_db`.) 제거 (대상 schema가 다를 수 있음)
+fn sanitize_view_definition(definition: &str, source_schema: &str, engine: &str) -> String {
+    let mut sql = definition.to_string();
+    if engine == "mysql" {
+        sql = strip_mysql_definer(&sql);
+        sql = sql.replace("SQL SECURITY DEFINER", "SQL SECURITY INVOKER");
+    }
+    if !source_schema.trim().is_empty() {
+        // `source_db`.`obj` → `obj`  (quote_ident 기준 인용 문자 사용)
+        let quoted_db = quote_ident(engine, source_schema);
+        sql = sql.replace(&format!("{quoted_db}."), "");
+    }
+    sql
+}
+
+/// `CREATE ALGORITHM=... DEFINER=\`u\`@\`h\` SQL SECURITY ... VIEW` 에서 DEFINER 절만 제거한다.
+fn strip_mysql_definer(sql: &str) -> String {
+    let Some(start) = sql.find("DEFINER=") else {
+        return sql.to_string();
+    };
+    // DEFINER= 다음부터 공백을 만나기 전까지가 한 토큰 (`user`@`host` 또는 CURRENT_USER 등).
+    // 백틱 안에 공백이 들어갈 수 있으므로 백틱 균형을 추적한다.
+    let bytes = sql.as_bytes();
+    let mut idx = start + "DEFINER=".len();
+    let mut in_backtick = false;
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        if ch == b'`' {
+            in_backtick = !in_backtick;
+        } else if ch == b' ' && !in_backtick {
+            break;
+        }
+        idx += 1;
+    }
+    // start 직전의 공백 하나도 함께 제거하여 "CREATE  SQL SECURITY" 처럼 이중 공백이 남지 않게 한다.
+    let prefix_end = sql[..start].trim_end().len();
+    // idx 위치의 공백은 남겨 토큰 구분을 유지한다.
+    let mut result = String::with_capacity(sql.len());
+    result.push_str(&sql[..prefix_end]);
+    result.push_str(&sql[idx..]);
+    result
+}
+
+fn drop_view_sql(engine: &str, view: &str) -> String {
+    format!("DROP VIEW IF EXISTS {}", quote_ident(engine, view))
 }
 
 fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
@@ -8846,6 +9124,7 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -8885,6 +9164,7 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "../outside".to_string(),
@@ -8934,6 +9214,7 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -8967,6 +9248,7 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9003,6 +9285,7 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9123,6 +9406,7 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            views: Vec::new(),
             tables: Vec::new(),
         };
 
@@ -9149,6 +9433,7 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            views: Vec::new(),
             tables: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
@@ -11584,5 +11869,116 @@ mod tests {
         };
 
         assert_eq!(next_table_to_copy(&state), Some("orders".to_string()));
+    }
+
+    #[test]
+    fn strip_mysql_definer_removes_definer_clause() {
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v` AS select 1";
+        let stripped = strip_mysql_definer(sql);
+        assert!(!stripped.contains("DEFINER="));
+        assert!(stripped.contains("CREATE ALGORITHM=UNDEFINED"));
+        assert!(stripped.contains("SQL SECURITY DEFINER VIEW `v` AS select 1"));
+    }
+
+    #[test]
+    fn strip_mysql_definer_handles_current_user_form() {
+        let sql = "CREATE DEFINER=CURRENT_USER VIEW `v` AS select 1";
+        let stripped = strip_mysql_definer(sql);
+        assert_eq!(stripped, "CREATE VIEW `v` AS select 1");
+    }
+
+    #[test]
+    fn strip_mysql_definer_noop_without_definer() {
+        let sql = "CREATE VIEW `v` AS select 1";
+        assert_eq!(strip_mysql_definer(sql), sql);
+    }
+
+    #[test]
+    fn sanitize_view_definition_strips_definer_security_and_source_schema() {
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER \
+                   VIEW `ref_vendor_codes_view` AS select * from `dataflare`.`vendor_codes`";
+        let out = sanitize_view_definition(sql, "dataflare", "mysql");
+        assert!(!out.contains("DEFINER="));
+        assert!(out.contains("SQL SECURITY INVOKER"));
+        assert!(!out.contains("`dataflare`."));
+        assert!(out.contains("from `vendor_codes`"));
+    }
+
+    #[test]
+    fn sanitize_view_definition_postgresql_strips_source_schema_only() {
+        let sql = "CREATE OR REPLACE VIEW \"v\" AS SELECT * FROM \"app\".\"users\"";
+        let out = sanitize_view_definition(sql, "app", "postgresql");
+        // PG는 DEFINER/SQL SECURITY 처리를 하지 않는다.
+        assert!(out.contains("SELECT * FROM \"users\""));
+        assert!(!out.contains("\"app\"."));
+    }
+
+    #[test]
+    fn drop_view_sql_uses_drop_view() {
+        assert_eq!(drop_view_sql("mysql", "v"), "DROP VIEW IF EXISTS `v`");
+        assert_eq!(drop_view_sql("postgresql", "v"), "DROP VIEW IF EXISTS \"v\"");
+    }
+
+    #[test]
+    fn dump_manifest_without_views_field_deserializes_to_empty() {
+        // 기존(v1/v2) dump에는 views 필드가 없다 — serde(default)로 빈 Vec이 되어야 한다.
+        let json = r#"{
+            "format": "tunnelforge-dump",
+            "format_version": 2,
+            "data_format": "tsv",
+            "compression": "zstd",
+            "source_engine": "mysql",
+            "database": "app",
+            "schema": {"tables": []},
+            "chunk_size": 50000,
+            "created_unix_seconds": 1,
+            "tables": []
+        }"#;
+        let manifest: DumpManifest = serde_json::from_str(json).expect("parse legacy manifest");
+        assert!(manifest.views.is_empty());
+    }
+
+    #[test]
+    fn dump_manifest_with_views_round_trips() {
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: NormalizedSchema::default(),
+            chunk_size: 50000,
+            created_unix_seconds: 1,
+            tables: Vec::new(),
+            views: vec![NormalizedView {
+                name: "ref_vendor_codes_view".to_string(),
+                definition: "CREATE VIEW `ref_vendor_codes_view` AS select 1".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        assert!(json.contains("ref_vendor_codes_view"));
+        let parsed: DumpManifest = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.views, manifest.views);
+    }
+
+    #[test]
+    fn empty_views_are_skipped_in_serialization() {
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: NormalizedSchema::default(),
+            chunk_size: 50000,
+            created_unix_seconds: 1,
+            tables: Vec::new(),
+            views: Vec::new(),
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        // skip_serializing_if 로 빈 views는 직렬화되지 않아 기존 dump와 바이트 호환.
+        assert!(!json.contains("\"views\""));
     }
 }
