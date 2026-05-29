@@ -3277,24 +3277,39 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
         return outcome;
     }
 
-    // replace/recreate 모드면 기존 View를 먼저 정리한다 (테이블이 아닌 View 전용 DROP).
-    if matches!(mode, "replace" | "recreate") {
-        for view in &manifest.views {
-            let _ = adapter.execute_sql(&drop_view_sql(target_engine, &view.name));
+    // 정화 + 단일 CREATE VIEW 문 검증. 검증 실패한 정의는 실행하지 않고 즉시 failed로 보고한다.
+    // (변조된 manifest가 multi-statement SQL 체인을 심는 것을 차단 — 특히 PostgreSQL batch_execute 경로)
+    let mut pending: Vec<(String, String)> = Vec::with_capacity(manifest.views.len());
+    let mut validated_names: Vec<&str> = Vec::with_capacity(manifest.views.len());
+    for view in &manifest.views {
+        let sanitized =
+            sanitize_view_definition(&view.definition, &manifest.database, target_engine);
+        match validate_single_view_statement(&sanitized) {
+            Ok(()) => {
+                validated_names.push(&view.name);
+                pending.push((view.name.clone(), sanitized));
+            }
+            Err(reason) => {
+                outcome
+                    .failed
+                    .push(json!({ "name": view.name, "error": format!("rejected: {reason}") }));
+                emit(json!({
+                    "event": "phase",
+                    "request_id": request_id,
+                    "phase": "dump_import",
+                    "message": format!("View '{}' 거부됨 (안전하지 않은 정의): {reason}", view.name),
+                }));
+            }
         }
     }
 
-    // 정화된 정의를 미리 만들어 둔다.
-    let mut pending: Vec<(String, String)> = manifest
-        .views
-        .iter()
-        .map(|view| {
-            (
-                view.name.clone(),
-                sanitize_view_definition(&view.definition, &manifest.database, target_engine),
-            )
-        })
-        .collect();
+    // replace/recreate 모드면 기존 View를 먼저 정리한다 (테이블이 아닌 View 전용 DROP).
+    // 검증을 통과한 View만 DROP 대상으로 삼는다.
+    if matches!(mode, "replace" | "recreate") {
+        for name in &validated_names {
+            let _ = adapter.execute_sql(&drop_view_sql(target_engine, name));
+        }
+    }
 
     // fixpoint 루프: 한 바퀴에 하나도 성공하지 못하면 중단한다.
     let mut last_errors: BTreeMap<String, String> = BTreeMap::new();
@@ -4555,13 +4570,15 @@ fn collect_postgresql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, 
 
 /// import 시점에 View 정의 SQL을 정화한다.
 /// - MySQL `DEFINER=...` 절 제거 (대상 서버에 해당 유저가 없으면 view가 깨짐)
-/// - `SQL SECURITY DEFINER` → `SQL SECURITY INVOKER`
+/// - `SQL SECURITY DEFINER` → `SQL SECURITY INVOKER` (case-insensitive)
 /// - 원본 schema 한정자(`source_db`.) 제거 (대상 schema가 다를 수 있음)
+///
+/// SQL 키워드는 대소문자를 구분하지 않으므로 DEFINER/SQL SECURITY 처리는 case-insensitive로 수행한다.
 fn sanitize_view_definition(definition: &str, source_schema: &str, engine: &str) -> String {
     let mut sql = definition.to_string();
     if engine == "mysql" {
         sql = strip_mysql_definer(&sql);
-        sql = sql.replace("SQL SECURITY DEFINER", "SQL SECURITY INVOKER");
+        sql = replace_ignore_ascii_case(&sql, "SQL SECURITY DEFINER", "SQL SECURITY INVOKER");
     }
     if !source_schema.trim().is_empty() {
         // `source_db`.`obj` → `obj`  (quote_ident 기준 인용 문자 사용)
@@ -4571,9 +4588,31 @@ fn sanitize_view_definition(definition: &str, source_schema: &str, engine: &str)
     sql
 }
 
+/// `needle`(ASCII 대소문자 무시)을 모두 `replacement`로 치환한다.
+/// `needle` 안의 내부 공백은 정확히 한 칸으로 가정한다 (SQL 키워드 정규형).
+fn replace_ignore_ascii_case(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let lower_haystack = haystack.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut result = String::with_capacity(haystack.len());
+    let mut cursor = 0;
+    while let Some(rel) = lower_haystack[cursor..].find(&lower_needle) {
+        let start = cursor + rel;
+        result.push_str(&haystack[cursor..start]);
+        result.push_str(replacement);
+        cursor = start + needle.len();
+    }
+    result.push_str(&haystack[cursor..]);
+    result
+}
+
 /// `CREATE ALGORITHM=... DEFINER=\`u\`@\`h\` SQL SECURITY ... VIEW` 에서 DEFINER 절만 제거한다.
+/// `DEFINER=` 키워드 매칭은 case-insensitive로 수행한다.
 fn strip_mysql_definer(sql: &str) -> String {
-    let Some(start) = sql.find("DEFINER=") else {
+    let lower = sql.to_ascii_lowercase();
+    let Some(start) = lower.find("definer=") else {
         return sql.to_string();
     };
     // DEFINER= 다음부터 공백을 만나기 전까지가 한 토큰 (`user`@`host` 또는 CURRENT_USER 등).
@@ -4601,6 +4640,102 @@ fn strip_mysql_definer(sql: &str) -> String {
 
 fn drop_view_sql(engine: &str, view: &str) -> String {
     format!("DROP VIEW IF EXISTS {}", quote_ident(engine, view))
+}
+
+/// View 정의가 단일 `CREATE [OR REPLACE] VIEW ...` 문인지 가볍게 검증한다.
+///
+/// 주목적은 PostgreSQL `batch_execute` 경로다 — 이 드라이버는 세미콜론으로 구분된
+/// multi-statement를 모두 실행하므로, 변조된 manifest가 `CREATE VIEW x AS ...; DROP TABLE y; GRANT ...`
+/// 같은 SQL 체인을 심으면 그대로 실행된다. MySQL `query_drop`은 기본적으로 multi-statement를
+/// 거부하지만, 일관성과 방어를 위해 양쪽 엔진 모두에 동일한 shape 검증을 적용한다.
+///
+/// 허용: 문자열 리터럴/식별자/주석 바깥의 세미콜론이 끝에만(또는 없음) 존재하고,
+/// 첫 유효 토큰이 `CREATE`인 경우. 그 외(추가 statement, CREATE 아닌 시작)는 거부한다.
+fn validate_single_view_statement(sql: &str) -> Result<(), String> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err("empty view definition".to_string());
+    }
+
+    // 문자열 리터럴('...'), 식별자 인용(`...` / "..."), 주석(-- , /* */) 바깥의 세미콜론을 찾는다.
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let len = bytes.len();
+    while i < len {
+        let ch = bytes[i];
+        match ch {
+            b'\'' => {
+                // 작은따옴표 문자열 — '' escape 처리
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'"' {
+                        if i + 1 < len && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'`' => {
+                i += 1;
+                while i < len && bytes[i] != b'`' {
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                // 라인 주석
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // 블록 주석
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b';' => {
+                // 끝에 오는 세미콜론(뒤에 공백만 남음)은 허용, 그 외는 추가 statement로 간주.
+                let rest = trimmed[i + 1..].trim();
+                if rest.is_empty() {
+                    break;
+                }
+                return Err("view definition contains multiple statements".to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // 첫 유효 토큰이 CREATE 인지 확인 (case-insensitive).
+    let first_token = trimmed
+        .split(|c: char| c.is_whitespace())
+        .find(|t| !t.is_empty())
+        .unwrap_or("");
+    if !first_token.eq_ignore_ascii_case("create") {
+        return Err(format!(
+            "view definition must start with CREATE, got: {first_token}"
+        ));
+    }
+    Ok(())
 }
 
 fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
@@ -11980,5 +12115,62 @@ mod tests {
         let json = serde_json::to_string(&manifest).expect("serialize");
         // skip_serializing_if 로 빈 views는 직렬화되지 않아 기존 dump와 바이트 호환.
         assert!(!json.contains("\"views\""));
+    }
+
+    #[test]
+    fn strip_mysql_definer_is_case_insensitive() {
+        let sql = "create definer=`root`@`localhost` sql security definer view `v` as select 1";
+        let stripped = strip_mysql_definer(sql);
+        assert!(!stripped.to_ascii_lowercase().contains("definer="));
+        assert!(stripped.contains("sql security definer view `v` as select 1"));
+    }
+
+    #[test]
+    fn sanitize_view_definition_lowercase_security_clause_becomes_invoker() {
+        // 변조/비정규 정의: 소문자 sql security definer 도 INVOKER 로 바뀌어야 한다.
+        let sql = "CREATE sql security definer VIEW `leak` AS SELECT 1";
+        let out = sanitize_view_definition(sql, "", "mysql");
+        assert!(out.contains("SQL SECURITY INVOKER"));
+        assert!(!out.to_ascii_lowercase().contains("security definer"));
+    }
+
+    #[test]
+    fn replace_ignore_ascii_case_replaces_all_case_variants() {
+        let out = replace_ignore_ascii_case("a FOO b foo c FoO", "foo", "X");
+        assert_eq!(out, "a X b X c X");
+    }
+
+    #[test]
+    fn validate_single_view_statement_accepts_plain_create_view() {
+        assert!(validate_single_view_statement("CREATE VIEW `v` AS SELECT 1").is_ok());
+        assert!(
+            validate_single_view_statement("create or replace view \"v\" as select 1;").is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_single_view_statement_rejects_multi_statement() {
+        let sql = "CREATE VIEW \"v\" AS SELECT 1; DROP TABLE customers";
+        let err = validate_single_view_statement(sql).unwrap_err();
+        assert!(err.contains("multiple statements"));
+    }
+
+    #[test]
+    fn validate_single_view_statement_rejects_non_create_start() {
+        let err = validate_single_view_statement("DROP TABLE customers").unwrap_err();
+        assert!(err.contains("must start with CREATE"));
+    }
+
+    #[test]
+    fn validate_single_view_statement_allows_semicolon_inside_string_literal() {
+        // SELECT 본문의 문자열 리터럴 안 세미콜론은 statement 구분자가 아니다.
+        let sql = "CREATE VIEW `v` AS SELECT 'a;b' AS s";
+        assert!(validate_single_view_statement(sql).is_ok());
+    }
+
+    #[test]
+    fn validate_single_view_statement_ignores_semicolon_in_comment() {
+        let sql = "CREATE VIEW `v` AS SELECT 1 -- drop; me\n";
+        assert!(validate_single_view_statement(sql).is_ok());
     }
 }
