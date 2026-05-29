@@ -3284,7 +3284,15 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
     for view in &manifest.views {
         let sanitized =
             sanitize_view_definition(&view.definition, &manifest.database, target_engine);
-        match validate_single_view_statement(&sanitized) {
+        // shape 검증(단일 CREATE ... VIEW 문) + MySQL DEFINER/SQL SECURITY 잔존 fail-closed.
+        let validation = validate_single_view_statement(&sanitized).and_then(|()| {
+            if target_engine == "mysql" && mysql_definition_has_residual_definer(&sanitized) {
+                Err("residual DEFINER/SQL SECURITY DEFINER clause after sanitization".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        match validation {
             Ok(()) => {
                 validated_names.push(&view.name);
                 pending.push((view.name.clone(), sanitized));
@@ -4642,6 +4650,44 @@ fn drop_view_sql(engine: &str, view: &str) -> String {
     format!("DROP VIEW IF EXISTS {}", quote_ident(engine, view))
 }
 
+/// sanitize 후에도 MySQL 정의에 `DEFINER=` 또는 `SQL SECURITY DEFINER`가 남아있는지 검사한다.
+/// 정상 경로(`SHOW CREATE VIEW`의 대문자/단일공백 정규화 출력)는 sanitize가 모두 처리하므로
+/// 여기서 잔존이 감지된다는 것은 탭/주석을 끼운 비정규(변조 의심) 정의라는 뜻 → fail-closed로 거부한다.
+fn mysql_definition_has_residual_definer(sql: &str) -> bool {
+    // 주석(-- 라인, /* */ 블록)을 공백으로 치환하고, 모든 공백류를 단일 공백으로 정규화한 검사용 사본.
+    let mut cleaned = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            cleaned.push(' ');
+        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            cleaned.push(' ');
+        } else {
+            cleaned.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    let normalized = cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    // "definer =" (공백 포함) 및 "definer=" 모두 잡기 위해 공백 제거 사본도 확인.
+    let no_space = normalized.replace(' ', "");
+    no_space.contains("definer=") || normalized.contains("sql security definer")
+}
+
 /// View 정의가 단일 `CREATE [OR REPLACE] VIEW ...` 문인지 가볍게 검증한다.
 ///
 /// 주목적은 PostgreSQL `batch_execute` 경로다 — 이 드라이버는 세미콜론으로 구분된
@@ -4725,15 +4771,53 @@ fn validate_single_view_statement(sql: &str) -> Result<(), String> {
         i += 1;
     }
 
-    // 첫 유효 토큰이 CREATE 인지 확인 (case-insensitive).
-    let first_token = trimmed
+    // CREATE [OR REPLACE] [TEMP|TEMPORARY] [ALGORITHM=..] [DEFINER=..] [SQL SECURITY ..] VIEW 형태인지 확인.
+    // 단순히 첫 토큰이 CREATE 인 것만으로는 부족하다 — CREATE USER / CREATE TABLE AS SELECT 같은
+    // 단일 statement도 통과해버리므로, 반드시 view-modifier 뒤에 VIEW 키워드가 와야 한다.
+    let tokens: Vec<&str> = trimmed
         .split(|c: char| c.is_whitespace())
-        .find(|t| !t.is_empty())
-        .unwrap_or("");
-    if !first_token.eq_ignore_ascii_case("create") {
-        return Err(format!(
-            "view definition must start with CREATE, got: {first_token}"
-        ));
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut iter = tokens.iter();
+    match iter.next() {
+        Some(tok) if tok.eq_ignore_ascii_case("create") => {}
+        Some(tok) => {
+            return Err(format!("view definition must start with CREATE, got: {tok}"))
+        }
+        None => return Err("empty view definition".to_string()),
+    }
+    // CREATE 와 VIEW 사이에 올 수 있는 view-modifier 토큰만 허용한다.
+    // (sanitize 후 DEFINER 절은 제거되지만, 다른 형태를 대비해 보수적으로 허용 목록을 둔다)
+    let mut saw_view = false;
+    while let Some(tok) = iter.next() {
+        if tok.eq_ignore_ascii_case("view") {
+            saw_view = true;
+            break;
+        }
+        let lower = tok.to_ascii_lowercase();
+        let allowed = lower == "or"
+            || lower == "replace"
+            || lower == "temp"
+            || lower == "temporary"
+            || lower == "recursive"
+            || lower == "security"
+            || lower == "invoker"
+            || lower == "definer"
+            || lower == "undefined"
+            || lower == "merge"
+            || lower == "temptable"
+            || lower == "sql"
+            || lower.starts_with("algorithm=")
+            || lower.starts_with("definer=")
+            || lower == "=";
+        if !allowed {
+            return Err(format!(
+                "view definition must be CREATE ... VIEW, unexpected token before VIEW: {tok}"
+            ));
+        }
+    }
+    if !saw_view {
+        return Err("view definition must contain the VIEW keyword".to_string());
     }
     Ok(())
 }
@@ -12159,6 +12243,53 @@ mod tests {
     fn validate_single_view_statement_rejects_non_create_start() {
         let err = validate_single_view_statement("DROP TABLE customers").unwrap_err();
         assert!(err.contains("must start with CREATE"));
+    }
+
+    #[test]
+    fn validate_single_view_statement_rejects_create_non_view() {
+        // CREATE 로 시작하지만 VIEW가 아닌 단일 statement는 거부해야 한다.
+        assert!(validate_single_view_statement("CREATE USER attacker IDENTIFIED BY 'p'").is_err());
+        assert!(
+            validate_single_view_statement("CREATE TABLE stolen AS SELECT * FROM secrets")
+                .is_err()
+        );
+        let err = validate_single_view_statement("CREATE DATABASE evil").unwrap_err();
+        assert!(err.contains("VIEW"));
+    }
+
+    #[test]
+    fn validate_single_view_statement_accepts_view_with_modifiers() {
+        // MySQL SHOW CREATE VIEW 정규 출력(정화 후) 형태
+        assert!(validate_single_view_statement(
+            "CREATE ALGORITHM=UNDEFINED SQL SECURITY INVOKER VIEW `v` AS select 1"
+        )
+        .is_ok());
+        assert!(
+            validate_single_view_statement("CREATE OR REPLACE VIEW \"v\" AS SELECT 1").is_ok()
+        );
+    }
+
+    #[test]
+    fn mysql_residual_definer_detects_tab_and_comment_variants() {
+        // sanitize가 놓칠 수 있는 비정규 변형들 — fail-closed로 거부되어야 한다.
+        assert!(mysql_definition_has_residual_definer(
+            "CREATE SQL\tSECURITY\tDEFINER VIEW `v` AS SELECT 1"
+        ));
+        assert!(mysql_definition_has_residual_definer(
+            "CREATE SQL/**/SECURITY/**/DEFINER VIEW `v` AS SELECT 1"
+        ));
+        assert!(mysql_definition_has_residual_definer(
+            "CREATE DEFINER = `root`@`localhost` VIEW `v` AS SELECT 1"
+        ));
+    }
+
+    #[test]
+    fn mysql_residual_definer_clean_after_sanitize_is_false() {
+        // 정상 정의를 sanitize 하면 잔존 DEFINER가 없어야 한다.
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER \
+                   VIEW `v` AS SELECT 1";
+        let sanitized = sanitize_view_definition(sql, "", "mysql");
+        assert!(!mysql_definition_has_residual_definer(&sanitized));
     }
 
     #[test]
