@@ -411,7 +411,7 @@ jobs:
           else
             if [ "$NEEDS_REBUMP" = "true" ]; then
               echo "라벨 변경으로 인한 재bump. base 버전으로 복원 후 재bump."
-              git checkout "origin/${BASE_REF}" -- src/version.py pyproject.toml
+              git checkout "origin/${BASE_REF}" -- src/version.py pyproject.toml installer/TunnelForge.iss
             fi
             python scripts/bump_version.py --bump-type "$BUMP_TYPE" --dry-run > /tmp/bump_dry.txt
             EXPECTED=$(grep 'new_version=' /tmp/bump_dry.txt | cut -d= -f2)
@@ -429,7 +429,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
           python scripts/bump_version.py --bump-type "${{ needs.version-gate.outputs.bump_type }}"
-          git add src/version.py pyproject.toml
+          git add src/version.py pyproject.toml installer/TunnelForge.iss
           git commit -m "chore: bump version to v${NEW_VERSION} [${{ needs.version-gate.outputs.bump_type }}]"
           git push origin "${{ github.event.pull_request.head.ref }}"
           echo "버전 bump 완료: v${NEW_VERSION}"

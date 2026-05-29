@@ -62,6 +62,11 @@ def main() -> int:
         default='pyproject.toml',
         help='pyproject.toml 경로 (기본값: pyproject.toml)'
     )
+    parser.add_argument(
+        '--installer-file',
+        default='installer/TunnelForge.iss',
+        help='Inno Setup 스크립트 경로 (기본값: installer/TunnelForge.iss)'
+    )
 
     args = parser.parse_args()
 
@@ -71,11 +76,18 @@ def main() -> int:
 
     version_file = project_root / args.version_file
     pyproject_file = project_root / args.pyproject_file
+    installer_file = project_root / args.installer_file
 
     # versioning 모듈 임포트 (scripts/ 디렉토리를 sys.path에 추가)
     sys.path.insert(0, str(script_dir))
     try:
-        from versioning import read_version, write_version, sync_pyproject, bump_version
+        from versioning import (
+            read_version,
+            write_version,
+            sync_pyproject,
+            sync_installer,
+            bump_version,
+        )
     except ImportError as e:
         print(f"ERROR: versioning.py 임포트 실패: {e}", file=sys.stderr)
         return 1
@@ -123,6 +135,17 @@ def main() -> int:
                 return 1
         else:
             print(f"[SKIP] {pyproject_file} 없음, 건너뜁니다.", file=sys.stderr)
+
+        # Inno Setup 인스톨러 버전 동기화 (test_release_version_files_are_in_sync 요구사항)
+        if installer_file.exists():
+            try:
+                sync_installer(installer_file, new_version)
+                print(f"[OK] {installer_file} 업데이트 완료", file=sys.stderr)
+            except (ValueError, OSError) as e:
+                print(f"ERROR: installer .iss 쓰기 실패: {e}", file=sys.stderr)
+                return 1
+        else:
+            print(f"[SKIP] {installer_file} 없음, 건너뜁니다.", file=sys.stderr)
 
     # $GITHUB_OUTPUT 호환 형식으로 stdout 출력
     print(f"new_version={new_version}")

@@ -91,6 +91,34 @@ def sync_pyproject(pyproject_file: Path, new_version: str) -> None:
     pyproject_file.write_text(''.join(new_lines), encoding='utf-8')
 
 
+def sync_installer(installer_file: Path, new_version: str) -> None:
+    """installer/TunnelForge.iss의 #define MyAppVersion 값을 업데이트한다.
+
+    Inno Setup 스크립트의 버전 정의만 교체하며 다른 설정은 보존된다.
+    이 동기화가 없으면 test_release_version_files_are_in_sync가 실패한다
+    (version.py / pyproject.toml / .iss 세 파일의 버전이 일치해야 함).
+
+    Args:
+        installer_file: installer/TunnelForge.iss 경로
+        new_version: 새 버전 문자열 (예: "1.11.1")
+
+    Raises:
+        FileNotFoundError: 파일이 존재하지 않을 때
+        ValueError: #define MyAppVersion 라인을 찾을 수 없을 때
+    """
+    content = installer_file.read_text(encoding='utf-8')
+    new_content, count = re.subn(
+        r'(#define\s+MyAppVersion\s+")[^"]*(")',
+        rf'\g<1>{new_version}\g<2>',
+        content,
+    )
+    if count == 0:
+        raise ValueError(
+            f"#define MyAppVersion 라인을 찾을 수 없습니다: {installer_file}"
+        )
+    installer_file.write_text(new_content, encoding='utf-8')
+
+
 def bump_version(version: str, bump_type: str) -> str:
     """시맨틱 버전을 bump_type에 따라 증가시킨다.
 
