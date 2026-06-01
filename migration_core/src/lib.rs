@@ -230,7 +230,24 @@ pub struct DumpManifest {
     pub restorability: RestorabilityGrade,
     #[serde(default)]
     pub blockers: Vec<String>,
+    #[serde(default)]
+    pub objects: DumpObjectManifest,
     pub tables: Vec<DumpTableManifest>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DumpObjectManifest {
+    #[serde(default)]
+    pub objects: Vec<DumpObjectEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DumpObjectEntry {
+    pub object_type: String,
+    pub schema: String,
+    pub name: String,
+    pub path: String,
+    pub restore_order: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1896,6 +1913,20 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             )?
         };
 
+    let dump_objects = if endpoint.engine == "mysql" {
+        if let Some(LiveAdapter::MySql(conn)) = mysql_snapshot_adapter.as_mut() {
+            capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
+        } else {
+            let mut adapter = LiveAdapter::connect(&endpoint)?;
+            let LiveAdapter::MySql(conn) = &mut adapter else {
+                return Err("failed to open mysql dump adapter".to_string());
+            };
+            capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
+        }
+    } else {
+        DumpObjectManifest::default()
+    };
+
     let result = finish_dump_run_artifact(DumpRunFinishInput {
         request_id: request.request_id.clone(),
         output_dir,
@@ -1909,6 +1940,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         table_manifests,
         total_rows,
         total_chunks,
+        dump_objects,
         snapshot_policy: snapshot_evidence.policy.clone(),
         snapshot_warnings: snapshot_evidence.warnings.clone(),
     })?;
@@ -1934,6 +1966,7 @@ struct DumpRunFinishInput<'a> {
     table_manifests: Vec<DumpTableManifest>,
     total_rows: u64,
     total_chunks: u64,
+    dump_objects: DumpObjectManifest,
     snapshot_policy: String,
     snapshot_warnings: Vec<String>,
 }
@@ -1965,12 +1998,28 @@ fn finish_dump_run_artifact(input: DumpRunFinishInput<'_>) -> Result<Value, Stri
         features: DumpFeatureSet {
             snapshot: snapshot_enabled,
             chunking: true,
+            routines: input
+                .dump_objects
+                .objects
+                .iter()
+                .any(|object| object.object_type == "routine"),
+            events: input
+                .dump_objects
+                .objects
+                .iter()
+                .any(|object| object.object_type == "event"),
+            triggers: input
+                .dump_objects
+                .objects
+                .iter()
+                .any(|object| object.object_type == "trigger"),
             checksum: true,
             timezone: false,
             ..DumpFeatureSet::default()
         },
         restorability: RestorabilityGrade::LimitedRestorable,
         blockers: Vec::new(),
+        objects: input.dump_objects,
         tables: input.table_manifests,
     };
     finalize_dump_manifest_grade(&mut manifest);
@@ -2008,6 +2057,219 @@ fn dump_run_result_payload(
         "blockers": &manifest.blockers,
         "manifest": "_tunnelforge_dump.json"
     })
+}
+
+fn capture_mysql_dump_objects(
+    conn: &mut mysql::PooledConn,
+    output_path: &Path,
+    schema: &str,
+) -> Result<DumpObjectManifest, String> {
+    for directory in [
+        "objects/views",
+        "objects/triggers",
+        "objects/routines",
+        "objects/events",
+    ] {
+        fs::create_dir_all(output_path.join(directory))
+            .map_err(|err| format!("failed to prepare dump object directory {directory}: {err}"))?;
+    }
+
+    let mut objects = Vec::new();
+    let views: Vec<String> = conn
+        .exec_map(
+            "SELECT TABLE_NAME FROM information_schema.views WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
+            (schema,),
+            |name: String| name,
+        )
+        .map_err(|err| format!("mysql view inspect error: {err}"))?;
+    for name in views {
+        let ddl = mysql_show_create_object_ddl(
+            conn,
+            &format!(
+                "SHOW CREATE VIEW {}",
+                quote_qualified_ident("mysql", schema, &name)
+            ),
+            "view",
+            &name,
+        )?;
+        let path = write_dump_object_sql(
+            output_path,
+            "objects/views",
+            &safe_dump_object_file_stem(&name),
+            &ddl,
+        )?;
+        objects.push(DumpObjectEntry {
+            object_type: "view".to_string(),
+            schema: schema.to_string(),
+            name,
+            path,
+            restore_order: 10,
+        });
+    }
+
+    let events: Vec<String> = conn
+        .exec_map(
+            "SELECT EVENT_NAME FROM information_schema.events WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME",
+            (schema,),
+            |name: String| name,
+        )
+        .map_err(|err| format!("mysql event inspect error: {err}"))?;
+    for name in events {
+        let ddl = mysql_show_create_object_ddl(
+            conn,
+            &format!(
+                "SHOW CREATE EVENT {}",
+                quote_qualified_ident("mysql", schema, &name)
+            ),
+            "event",
+            &name,
+        )?;
+        let path = write_dump_object_sql(
+            output_path,
+            "objects/events",
+            &safe_dump_object_file_stem(&name),
+            &ddl,
+        )?;
+        objects.push(DumpObjectEntry {
+            object_type: "event".to_string(),
+            schema: schema.to_string(),
+            name,
+            path,
+            restore_order: 20,
+        });
+    }
+
+    let routines: Vec<(String, String)> = conn
+        .exec_map(
+            "SELECT ROUTINE_TYPE, ROUTINE_NAME FROM information_schema.routines WHERE ROUTINE_SCHEMA = ? ORDER BY ROUTINE_TYPE, ROUTINE_NAME",
+            (schema,),
+            |(routine_type, name): (String, String)| (routine_type, name),
+        )
+        .map_err(|err| format!("mysql routine inspect error: {err}"))?;
+    for (routine_type, name) in routines {
+        let routine_type_upper = routine_type.to_ascii_uppercase();
+        if !matches!(routine_type_upper.as_str(), "PROCEDURE" | "FUNCTION") {
+            return Err(format!(
+                "mysql routine inspect returned unsupported routine type {routine_type} for {name}"
+            ));
+        }
+        let ddl = mysql_show_create_object_ddl(
+            conn,
+            &format!(
+                "SHOW CREATE {} {}",
+                routine_type_upper,
+                quote_qualified_ident("mysql", schema, &name)
+            ),
+            "routine",
+            &format!("{routine_type_upper}:{name}"),
+        )?;
+        let path = write_dump_object_sql(
+            output_path,
+            "objects/routines",
+            &safe_dump_object_file_stem(&format!(
+                "{}_{}",
+                routine_type_upper.to_ascii_lowercase(),
+                name
+            )),
+            &ddl,
+        )?;
+        objects.push(DumpObjectEntry {
+            object_type: "routine".to_string(),
+            schema: schema.to_string(),
+            name,
+            path,
+            restore_order: 30,
+        });
+    }
+
+    let triggers: Vec<String> = conn
+        .exec_map(
+            "SELECT TRIGGER_NAME FROM information_schema.triggers WHERE TRIGGER_SCHEMA = ? ORDER BY TRIGGER_NAME",
+            (schema,),
+            |name: String| name,
+        )
+        .map_err(|err| format!("mysql trigger inspect error: {err}"))?;
+    for name in triggers {
+        let ddl = mysql_show_create_object_ddl(
+            conn,
+            &format!(
+                "SHOW CREATE TRIGGER {}",
+                quote_qualified_ident("mysql", schema, &name)
+            ),
+            "trigger",
+            &name,
+        )?;
+        let path = write_dump_object_sql(
+            output_path,
+            "objects/triggers",
+            &safe_dump_object_file_stem(&name),
+            &ddl,
+        )?;
+        objects.push(DumpObjectEntry {
+            object_type: "trigger".to_string(),
+            schema: schema.to_string(),
+            name,
+            path,
+            restore_order: 40,
+        });
+    }
+
+    Ok(DumpObjectManifest { objects })
+}
+
+fn mysql_show_create_object_ddl(
+    conn: &mut mysql::PooledConn,
+    sql: &str,
+    object_type: &str,
+    object_name: &str,
+) -> Result<String, String> {
+    let row = conn
+        .query_first::<mysql::Row, _>(sql)
+        .map_err(|err| format!("mysql {object_type} show create error for {object_name}: {err}"))?
+        .ok_or_else(|| format!("mysql {object_type} show create returned no row for {object_name}"))?;
+    mysql_show_create_statement_from_row(row).ok_or_else(|| {
+        format!(
+            "mysql {object_type} show create did not return DDL text for {object_name}"
+        )
+    })
+}
+
+fn mysql_show_create_statement_from_row(row: mysql::Row) -> Option<String> {
+    row.unwrap().into_iter().find_map(|value| match value {
+        mysql::Value::Bytes(bytes) => {
+            let text = String::from_utf8_lossy(&bytes).trim().to_string();
+            if text.to_ascii_uppercase().starts_with("CREATE ") {
+                Some(text)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    })
+}
+
+fn safe_dump_object_file_stem(name: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    let hash = hex::encode(&hasher.finalize()[..6]);
+    format!("{}_{}", safe_dump_component(name), hash)
+}
+
+fn write_dump_object_sql(
+    output_path: &Path,
+    directory: &str,
+    file_stem: &str,
+    ddl: &str,
+) -> Result<String, String> {
+    let relative_path = format!("{directory}/{file_stem}.sql");
+    let output_file = output_path.join(&relative_path);
+    fs::write(&output_file, ddl.as_bytes()).map_err(|err| {
+        format!(
+            "failed to write dump object definition {}: {err}",
+            output_file.display()
+        )
+    })?;
+    Ok(relative_path)
 }
 
 fn prepare_dump_output_dir(output_path: &Path, overwrite: bool) -> Result<(), String> {
@@ -3422,6 +3684,11 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         adapter.execute_sql(sql)?;
     }
     let target_engine = adapter.engine().to_string();
+    if target_engine != "mysql" && !manifest.objects.objects.is_empty() {
+        return Err(format!(
+            "dump.import object restore is only supported for mysql targets; target engine is {target_engine}"
+        ));
+    }
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
         &endpoint,
@@ -3592,6 +3859,16 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     );
     import_result?;
     verify_imported_row_counts(&tables, &imported_rows_by_table)?;
+    if !manifest.objects.objects.is_empty() {
+        emit(json!({
+            "event": "phase",
+            "request_id": request.request_id,
+            "phase": "dump_import_objects",
+            "message": "restoring mysql views, events, routines, and triggers"
+        }));
+    }
+    let objects_restored =
+        restore_dump_objects(&mut adapter, input_path, &manifest.objects, &target_engine)?;
     restore_result?;
     local_infile_restore_result?;
     let import_report_path = dump_import_report_path(input_path)?;
@@ -3601,6 +3878,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "tables": table_total,
         "rows_imported": rows_imported,
         "chunks_imported": chunks_imported,
+        "objects_restored": objects_restored,
         "verification": {
             "row_counts": "passed",
             "strict_manifest": strict_manifest,
@@ -3619,6 +3897,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "tables": table_total,
         "rows_imported": rows_imported,
         "chunks_imported": chunks_imported,
+        "objects_restored": objects_restored,
         "import_report": import_report_path.display().to_string(),
         "verification": {
             "row_counts": "passed",
@@ -7969,6 +8248,9 @@ fn read_dump_manifest(input_path: &Path) -> Result<DumpManifest, String> {
     for table in &manifest.tables {
         validate_dump_table_path(&table.path)?;
     }
+    for object in &manifest.objects.objects {
+        validate_dump_object_path(&object.path)?;
+    }
     Ok(manifest)
 }
 
@@ -8033,6 +8315,20 @@ fn validate_dump_table_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_dump_object_path(path: &str) -> Result<(), String> {
+    let object_path = Path::new(path);
+    if path.trim().is_empty() || object_path.is_absolute() {
+        return Err(format!("unsafe dump object path: {path}"));
+    }
+    for component in object_path.components() {
+        match component {
+            Component::Normal(_) | Component::CurDir => {}
+            _ => return Err(format!("unsafe dump object path: {path}")),
+        }
+    }
+    Ok(())
+}
+
 fn dump_manifest_chunk_path(
     input_path: &Path,
     table_path: &str,
@@ -8062,6 +8358,28 @@ fn dump_manifest_chunk_path(
         ));
     }
     Ok(chunk_path)
+}
+
+fn dump_manifest_object_path(input_path: &Path, object_path: &str) -> Result<PathBuf, String> {
+    validate_dump_object_path(object_path)?;
+    let base_path = fs::canonicalize(input_path)
+        .map_err(|err| format!("failed to validate dump input_dir: {err}"))?;
+    let raw_path = input_path.join(object_path);
+    let resolved_path = fs::canonicalize(&raw_path)
+        .map_err(|err| format!("failed to validate dump object file: {err}"))?;
+    if !resolved_path.starts_with(&base_path) {
+        return Err(format!(
+            "dump object path is outside dump directory: {}",
+            raw_path.display()
+        ));
+    }
+    if !resolved_path.is_file() {
+        return Err(format!(
+            "dump object path is not a file: {}",
+            raw_path.display()
+        ));
+    }
+    Ok(resolved_path)
 }
 
 fn validate_dump_manifest_chunks(
@@ -8167,6 +8485,55 @@ fn verify_imported_row_counts(
         }
     }
     Ok(())
+}
+
+fn restore_dump_objects(
+    adapter: &mut dyn MigrationAdapter,
+    input_path: &Path,
+    objects: &DumpObjectManifest,
+    target_engine: &str,
+) -> Result<u64, String> {
+    if objects.objects.is_empty() {
+        return Ok(0);
+    }
+    if target_engine != "mysql" {
+        return Err(format!(
+            "dump.import object restore is only supported for mysql targets; target engine is {target_engine}"
+        ));
+    }
+    let mut entries = objects.objects.clone();
+    entries.sort_by(|left, right| {
+        left.restore_order
+            .cmp(&right.restore_order)
+            .then_with(|| left.object_type.cmp(&right.object_type))
+            .then_with(|| left.schema.cmp(&right.schema))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    let mut restored = 0_u64;
+    for entry in entries {
+        let ddl_path = dump_manifest_object_path(input_path, &entry.path)?;
+        let ddl = fs::read_to_string(&ddl_path).map_err(|err| {
+            format!(
+                "failed to read dump object definition {}: {err}",
+                ddl_path.display()
+            )
+        })?;
+        let sql = ddl.trim();
+        if sql.is_empty() {
+            return Err(format!("dump object definition is empty: {}", ddl_path.display()));
+        }
+        adapter.execute_sql(sql).map_err(|err| {
+            format!(
+                "failed to restore {} {}.{} from {}: {err}",
+                entry.object_type,
+                entry.schema,
+                entry.name,
+                ddl_path.display()
+            )
+        })?;
+        restored = restored.saturating_add(1);
+    }
+    Ok(restored)
 }
 
 fn dump_import_report_path(input_path: &Path) -> Result<PathBuf, String> {
@@ -9937,6 +10304,7 @@ mod tests {
             },
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: Vec::new(),
         }
     }
@@ -10186,6 +10554,7 @@ mod tests {
             },
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -10329,6 +10698,7 @@ mod tests {
             table_manifests,
             total_rows: 9,
             total_chunks: 1,
+            dump_objects: DumpObjectManifest::default(),
             snapshot_policy: "not_enforced".to_string(),
             snapshot_warnings: vec!["snapshot consistency is not proven".to_string()],
         })
@@ -10388,6 +10758,7 @@ mod tests {
             }],
             total_rows: 1,
             total_chunks: 1,
+            dump_objects: DumpObjectManifest::default(),
             snapshot_policy: "transaction_snapshot".to_string(),
             snapshot_warnings: Vec::new(),
         })
@@ -10543,6 +10914,7 @@ mod tests {
             features: DumpFeatureSet::default(),
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -10586,6 +10958,33 @@ mod tests {
         assert_eq!(manifest.restorability, RestorabilityGrade::LimitedRestorable);
         assert!(manifest.blockers.is_empty());
         assert!(manifest.features.unsupported.is_empty());
+        assert!(manifest.objects.objects.is_empty());
+    }
+
+    #[test]
+    fn dump_object_manifest_serializes_view_and_trigger_entries() {
+        let objects = DumpObjectManifest {
+            objects: vec![
+                DumpObjectEntry {
+                    object_type: "view".to_string(),
+                    schema: "app".to_string(),
+                    name: "v_orders".to_string(),
+                    path: "objects/views/v_orders.sql".to_string(),
+                    restore_order: 10,
+                },
+                DumpObjectEntry {
+                    object_type: "trigger".to_string(),
+                    schema: "app".to_string(),
+                    name: "trg_orders_ai".to_string(),
+                    path: "objects/triggers/trg_orders_ai.sql".to_string(),
+                    restore_order: 40,
+                },
+            ],
+        };
+
+        let json = serde_json::to_string(&objects).unwrap();
+        assert!(json.contains("\"object_type\":\"view\""));
+        assert!(json.contains("\"restore_order\":40"));
     }
 
     #[test]
@@ -10614,6 +11013,7 @@ mod tests {
             features: DumpFeatureSet::default(),
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "../outside".to_string(),
@@ -10671,6 +11071,7 @@ mod tests {
             features: DumpFeatureSet::default(),
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -10683,6 +11084,41 @@ mod tests {
         let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none").unwrap_err();
 
         assert!(err.contains("outside dump directory"));
+        fs::remove_dir_all(&dir).ok();
+        fs::remove_dir_all(&outside).ok();
+    }
+
+    #[test]
+    fn dump_manifest_object_path_rejects_traversal_and_symlink_escape() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-object-path-test-{}",
+            current_unix_seconds()
+        ));
+        let outside = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-object-path-outside-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(dir.join("objects")).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("v_users.sql"), b"CREATE VIEW `v_users` AS SELECT 1").unwrap();
+
+        let traversal_err = dump_manifest_object_path(&dir, "../outside.sql").unwrap_err();
+        assert!(traversal_err.contains("unsafe dump object path"));
+
+        let link_dir = dir.join("objects").join("views");
+        #[cfg(windows)]
+        let link_result = std::os::windows::fs::symlink_dir(&outside, &link_dir);
+        #[cfg(unix)]
+        let link_result = std::os::unix::fs::symlink(&outside, &link_dir);
+        if link_result.is_err() {
+            fs::remove_dir_all(&dir).ok();
+            fs::remove_dir_all(&outside).ok();
+            return;
+        }
+
+        let err = dump_manifest_object_path(&dir, "objects/views/v_users.sql").unwrap_err();
+        assert!(err.contains("outside dump directory"));
+
         fs::remove_dir_all(&dir).ok();
         fs::remove_dir_all(&outside).ok();
     }
@@ -10712,6 +11148,7 @@ mod tests {
             features: DumpFeatureSet::default(),
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -10756,6 +11193,7 @@ mod tests {
             features: DumpFeatureSet::default(),
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -10884,6 +11322,7 @@ mod tests {
             features: DumpFeatureSet::default(),
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: Vec::new(),
         };
 
@@ -10918,6 +11357,7 @@ mod tests {
             features: DumpFeatureSet::default(),
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
             tables: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
@@ -12328,6 +12768,71 @@ mod tests {
             adapter.executed_sql,
             vec!["CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);"]
         );
+    }
+
+    #[test]
+    fn dump_import_restore_objects_executes_in_restore_order() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-restore-objects-order-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(dir.join("objects/views")).unwrap();
+        fs::create_dir_all(dir.join("objects/routines")).unwrap();
+        fs::create_dir_all(dir.join("objects/triggers")).unwrap();
+        fs::write(
+            dir.join("objects/views/v_orders.sql"),
+            "CREATE VIEW `v_orders` AS SELECT 1",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("objects/routines/proc_sync.sql"),
+            "CREATE PROCEDURE `proc_sync`() SELECT 1",
+        )
+        .unwrap();
+        fs::write(
+            dir.join("objects/triggers/trg_orders_ai.sql"),
+            "CREATE TRIGGER `trg_orders_ai` BEFORE INSERT ON `orders` FOR EACH ROW SET NEW.id = NEW.id",
+        )
+        .unwrap();
+        let manifest = DumpObjectManifest {
+            objects: vec![
+                DumpObjectEntry {
+                    object_type: "trigger".to_string(),
+                    schema: "app".to_string(),
+                    name: "trg_orders_ai".to_string(),
+                    path: "objects/triggers/trg_orders_ai.sql".to_string(),
+                    restore_order: 40,
+                },
+                DumpObjectEntry {
+                    object_type: "view".to_string(),
+                    schema: "app".to_string(),
+                    name: "v_orders".to_string(),
+                    path: "objects/views/v_orders.sql".to_string(),
+                    restore_order: 10,
+                },
+                DumpObjectEntry {
+                    object_type: "routine".to_string(),
+                    schema: "app".to_string(),
+                    name: "proc_sync".to_string(),
+                    path: "objects/routines/proc_sync.sql".to_string(),
+                    restore_order: 30,
+                },
+            ],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        let restored = restore_dump_objects(&mut adapter, &dir, &manifest, "mysql").unwrap();
+
+        assert_eq!(restored, 3);
+        assert_eq!(
+            adapter.executed_sql,
+            vec![
+                "CREATE VIEW `v_orders` AS SELECT 1",
+                "CREATE PROCEDURE `proc_sync`() SELECT 1",
+                "CREATE TRIGGER `trg_orders_ai` BEFORE INSERT ON `orders` FOR EACH ROW SET NEW.id = NEW.id",
+            ]
+        );
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
