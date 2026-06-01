@@ -430,6 +430,34 @@ class TestRustDumpImporter:
         assert metadata["table_rows"] == {"users": 1, "orders": 2}
         assert metadata["total_rows"] == 3
 
+    def test_import_metadata_exposes_restorability(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 3,
+                    "source_engine": "mysql",
+                    "database": "app",
+                    "restorability": "limited_restorable",
+                    "manifest_warnings": ["snapshot consistency is not proven"],
+                    "blockers": [],
+                    "tables": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+        metadata = importer._analyze_dump_metadata(str(dump_dir))
+
+        assert metadata["restorability"] == "limited_restorable"
+        assert metadata["warnings"] == ["snapshot consistency is not proven"]
+        assert metadata["blockers"] == []
+
     def test_import_metadata_rejects_manifest_path_outside_dump_dir(self, tmp_path):
         """악의적 manifest path가 dump 폴더 밖 chunk를 참조하면 metadata 분석을 거부한다."""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter

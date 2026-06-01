@@ -84,6 +84,8 @@ _TRANSLATIONS = {
         "settings.theme": "테마",
         "settings.theme_label": "화면 테마:",
         "settings.title": "설정",
+        "Strict restorable dump": "엄격 복원 가능 Dump",
+        "Dump compatibility is not checked": "Dump 호환성을 아직 확인하지 않았습니다",
     },
     "en": {
         "app.ready": "Ready",
@@ -150,6 +152,8 @@ _TRANSLATIONS = {
         "settings.theme": "Theme",
         "settings.theme_label": "Display theme:",
         "settings.title": "Settings",
+        "Strict restorable dump": "Strict restorable dump",
+        "Dump compatibility is not checked": "Dump compatibility is not checked",
     },
 }
 

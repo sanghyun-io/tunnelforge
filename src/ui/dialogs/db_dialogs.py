@@ -1877,6 +1877,7 @@ class RustDumpImportDialog(QDialog):
         self.dump_metadata: Optional[dict] = None
         self.import_table_rows_done: dict = {}
         self.import_table_rows_total: dict = {}
+        self._compatibility_allows_recommended_import = True
 
         # 테이블별 chunk 진행률 추적
         self.table_chunk_progress: dict = {}  # {table_name: (completed, total)}
@@ -1978,6 +1979,10 @@ class RustDumpImportDialog(QDialog):
         status_line.addWidget(self.btn_view_issues)
 
         upgrade_check_layout.addLayout(status_line)
+        self.lbl_dump_compatibility = QLabel(self.tr("Dump compatibility is not checked"))
+        self.lbl_dump_compatibility.setWordWrap(True)
+        self.lbl_dump_compatibility.setStyleSheet("color: #7f8c8d;")
+        upgrade_check_layout.addWidget(self.lbl_dump_compatibility)
 
         # 호환성 검사 결과 저장
         self._upgrade_issues: List[CompatibilityIssue] = []
@@ -2378,6 +2383,7 @@ class RustDumpImportDialog(QDialog):
         for path in self._configured_dump_dirs():
             if self._is_valid_dump_dir(path):
                 self.input_dir.setText(path)
+                self._run_upgrade_check(path)
                 return
 
     def _get_input_browse_start_dir(self) -> str:
@@ -2402,6 +2408,21 @@ class RustDumpImportDialog(QDialog):
 
     def _run_upgrade_check(self, dump_path: str):
         """Import 전 MySQL 8.4 호환성 검사"""
+        manifest_path = os.path.join(dump_path, "_tunnelforge_dump.json")
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as file:
+                manifest = json.load(file)
+            self._set_dump_compatibility(
+                {
+                    "restorability": str(manifest.get("restorability") or "limited_restorable"),
+                    "warnings": list(manifest.get("manifest_warnings") or manifest.get("warnings") or []),
+                    "blockers": list(manifest.get("blockers") or []),
+                }
+            )
+        except Exception:
+            self.lbl_dump_compatibility.setText(self.tr("Dump compatibility is not checked"))
+            self.lbl_dump_compatibility.setStyleSheet("color: #7f8c8d;")
+
         self.lbl_upgrade_status.setText("🔍 호환성 검사 중...")
         self.lbl_upgrade_status.setStyleSheet("color: #3498db;")
         self.btn_view_issues.setVisible(False)
@@ -2504,7 +2525,40 @@ class RustDumpImportDialog(QDialog):
         self.radio_tz_kst.setEnabled(enabled)
         self.radio_tz_utc.setEnabled(enabled)
         self.radio_tz_none.setEnabled(enabled)
-        self.btn_import.setEnabled(enabled)
+        self.btn_import.setEnabled(
+            enabled and self.rust_dump_installed and self._compatibility_allows_recommended_import
+        )
+
+    def _set_dump_compatibility(self, metadata: dict) -> None:
+        grade = str(metadata.get("restorability") or "limited_restorable")
+        warnings = list(metadata.get("warnings") or [])
+        blockers = list(metadata.get("blockers") or [])
+
+        if grade == "strict_restorable":
+            text = self.tr("Strict restorable dump")
+            enable_recommended = True
+            color = "#27ae60"
+        elif grade == "not_restorable":
+            text = self.tr("복원 불가 Dump")
+            enable_recommended = False
+            color = "#e74c3c"
+        else:
+            text = self.tr("제한적 복원 Dump")
+            enable_recommended = False
+            color = "#f39c12"
+
+        details = blockers or warnings
+        if details:
+            text = f"{text}: {'; '.join(str(item) for item in details)}"
+
+        self._compatibility_allows_recommended_import = enable_recommended
+        self.lbl_dump_compatibility.setText(text)
+        self.lbl_dump_compatibility.setStyleSheet(f"color: {color};")
+        self.btn_import.setEnabled(
+            self.input_dir.isEnabled()
+            and self.rust_dump_installed
+            and self._compatibility_allows_recommended_import
+        )
 
     def check_timezone_support(self) -> bool:
         """
@@ -2931,6 +2985,7 @@ class RustDumpImportDialog(QDialog):
             str(table): int(rows or 0)
             for table, rows in (metadata.get('table_rows') or {}).items()
         }
+        self._set_dump_compatibility(metadata)
 
         # 대용량 테이블 정보를 테이블 상태 목록에 표시
         if metadata and 'table_sizes' in metadata:

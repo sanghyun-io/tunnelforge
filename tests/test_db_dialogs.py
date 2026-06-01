@@ -346,6 +346,23 @@ def test_import_dialog_does_not_claim_all_objects_are_recreated(monkeypatch):
     dialog.close()
 
 
+def test_import_dialog_disables_recommended_import_for_limited_dump(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+    dialog = RustDumpImportDialog(connector=None)
+    dialog._set_dump_compatibility(
+        {
+            "restorability": "limited_restorable",
+            "warnings": ["snapshot consistency is not proven"],
+            "blockers": [],
+        }
+    )
+
+    assert not dialog.btn_import.isEnabled()
+    assert "제한적 복원" in dialog.lbl_dump_compatibility.text()
+    dialog.close()
+
+
 def test_export_raw_output_shows_visible_telemetry_summary():
     class FakeLogList:
         def __init__(self):

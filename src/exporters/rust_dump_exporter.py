@@ -587,6 +587,11 @@ class RustDumpImporter:
                 "schema": manifest.get("database", ""),
                 "format": manifest.get("format", ""),
                 "format_version": manifest.get("format_version", 0),
+                "restorability": str(manifest.get("restorability") or "limited_restorable"),
+                "warnings": list(manifest.get("manifest_warnings") or manifest.get("warnings") or []),
+                "blockers": list(manifest.get("blockers") or []),
+                "snapshot_policy": str(manifest.get("snapshot_policy") or "unknown"),
+                "features": dict(manifest.get("features") or {}),
             }
         except Exception:
             return None
