@@ -3732,7 +3732,15 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .map_err(|err| {
             format!("{err}; existing import progress state requires resume or reset")
         })?;
-        return Err("existing import progress state requires resume or reset".to_string());
+        if !import_progress_state_is_terminal_complete(&existing_state) {
+            return Err("existing import progress state requires resume or reset".to_string());
+        }
+        emit(json!({
+            "event": "warning",
+            "request_id": request.request_id,
+            "phase": "dump_import_preflight",
+            "message": "existing completed import progress state found; replacing it for a new import attempt"
+        }));
     }
     write_import_progress_state(&progress_path, &progress_state)?;
     if let Some(sql) = timezone_sql.as_deref() {
@@ -8754,6 +8762,15 @@ fn validate_import_resume_state(
     Ok(())
 }
 
+fn import_progress_state_is_terminal_complete(state: &ImportProgressState) -> bool {
+    if !state.verification_complete || !state.cleanup_complete {
+        return false;
+    }
+    let has_data = state.completed_steps.iter().any(|step| step == "load_data");
+    let has_objects = state.completed_steps.iter().any(|step| step == "load_objects");
+    has_data && has_objects
+}
+
 fn dump_manifest_hash(input_path: &Path) -> Result<String, String> {
     let manifest_path = input_path.join("_tunnelforge_dump.json");
     let mut file = File::open(&manifest_path).map_err(|err| {
@@ -11292,6 +11309,33 @@ mod tests {
             validate_import_resume_state(&state, "new", "mysql://localhost/app", "replace")
                 .unwrap_err();
         assert!(err.contains("progress file belongs to a different dump manifest"));
+    }
+
+    #[test]
+    fn import_progress_state_terminal_complete_requires_verification_cleanup_and_steps() {
+        let mut state = ImportProgressState {
+            manifest_hash: "abc123".to_string(),
+            target_identity: "mysql://localhost/app".to_string(),
+            import_mode: "replace".to_string(),
+            completed_steps: vec!["load_data".to_string(), "load_objects".to_string()],
+            failed_steps: Vec::new(),
+            completed_chunks: BTreeSet::new(),
+            verification_complete: true,
+            switched: false,
+            cleanup_complete: true,
+        };
+        assert!(import_progress_state_is_terminal_complete(&state));
+
+        state.verification_complete = false;
+        assert!(!import_progress_state_is_terminal_complete(&state));
+
+        state.verification_complete = true;
+        state.cleanup_complete = false;
+        assert!(!import_progress_state_is_terminal_complete(&state));
+
+        state.cleanup_complete = true;
+        state.completed_steps = vec!["load_data".to_string()];
+        assert!(!import_progress_state_is_terminal_complete(&state));
     }
 
     #[test]
