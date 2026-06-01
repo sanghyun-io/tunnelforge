@@ -2028,7 +2028,7 @@ fn finish_dump_run_artifact(input: DumpRunFinishInput<'_>) -> Result<Value, Stri
     }
     let mut manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
-        format_version: if input.data_format == "jsonl" { 1 } else { 2 },
+        format_version: if input.data_format == "jsonl" { 1 } else { 3 },
         data_format: input.data_format,
         compression: input.compression,
         source_engine: input.endpoint.engine.clone(),
@@ -3678,7 +3678,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
-    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2) {
+    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3) {
         return Err("unsupported dump manifest format".to_string());
     }
     let data_format = manifest.data_format.to_ascii_lowercase();
@@ -11315,7 +11315,7 @@ mod tests {
 
         let mut manifest = DumpManifest {
             format: "tunnelforge-dump".to_string(),
-            format_version: 2,
+            format_version: 3,
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
@@ -11370,6 +11370,7 @@ mod tests {
         let err = dump_import(&request, |event| events.push(event)).unwrap_err();
 
         assert!(err.contains("dump artifact is not restorable"));
+        assert!(!err.contains("unsupported dump manifest format"));
         assert!(err.contains("unsupported feature mysql.unsupported"));
         assert!(!err.contains("mysql connection error"));
         assert!(!err.contains("mysql pool error"));
@@ -11490,6 +11491,7 @@ mod tests {
 
         let persisted = read_dump_manifest(&dir).unwrap();
 
+        assert_eq!(persisted.format_version, 3);
         assert_eq!(persisted.source_version, Some("8.0.36".to_string()));
         assert_eq!(result["event"], "result");
         assert_eq!(result["request_id"], "dump-run-2");
