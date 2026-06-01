@@ -148,6 +148,12 @@ pub struct DumpManifest {
     pub schema: NormalizedSchema,
     pub chunk_size: usize,
     pub created_unix_seconds: u64,
+    #[serde(default = "default_snapshot_policy")]
+    pub snapshot_policy: String,
+    #[serde(default)]
+    pub strict_export: bool,
+    #[serde(default)]
+    pub manifest_warnings: Vec<String>,
     pub tables: Vec<DumpTableManifest>,
 }
 
@@ -666,6 +672,10 @@ fn default_dump_data_format() -> String {
 
 fn default_dump_compression() -> String {
     "none".to_string()
+}
+
+fn default_snapshot_policy() -> String {
+    "unknown".to_string()
 }
 
 pub struct CoreService {
@@ -1654,6 +1664,12 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             )?
         };
 
+    let snapshot_policy = "not_enforced".to_string();
+    let strict_export = false;
+    let manifest_warnings = vec![
+        "dump snapshot consistency is not currently enforced across schema, counts, and chunks"
+            .to_string(),
+    ];
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
         format_version: if data_format == "jsonl" { 1 } else { 2 },
@@ -1664,6 +1680,9 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         schema,
         chunk_size,
         created_unix_seconds: current_unix_seconds(),
+        snapshot_policy,
+        strict_export,
+        manifest_warnings,
         tables: table_manifests,
     };
     write_dump_manifest(output_path, &manifest)?;
@@ -8086,6 +8105,9 @@ fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Resul
                         Some(&table.name),
                     )
                 })?;
+            if table.columns.is_empty() || referenced_table.columns.is_empty() {
+                continue;
+            }
             for (column_name, referenced_column_name) in
                 fk.columns.iter().zip(fk.referenced_columns.iter())
             {
@@ -9471,6 +9493,9 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9493,6 +9518,26 @@ mod tests {
     }
 
     #[test]
+    fn dump_manifest_snapshot_fields_default_for_legacy_json() {
+        let json = r#"{
+            "format": "tunnelforge-dump",
+            "format_version": 2,
+            "source_engine": "mysql",
+            "database": "dataflare",
+            "schema": {"tables": []},
+            "chunk_size": 1000,
+            "created_unix_seconds": 1,
+            "tables": []
+        }"#;
+
+        let manifest: DumpManifest = serde_json::from_str(json).unwrap();
+
+        assert_eq!(manifest.snapshot_policy, "unknown");
+        assert!(!manifest.strict_export);
+        assert!(manifest.manifest_warnings.is_empty());
+    }
+
+    #[test]
     fn dump_manifest_rejects_table_paths_outside_dump_dir() {
         let dir = std::env::temp_dir().join(format!(
             "tunnelforge-dump-traversal-test-{}",
@@ -9510,6 +9555,9 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "../outside".to_string(),
@@ -9559,6 +9607,9 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9592,6 +9643,9 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9628,6 +9682,9 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9748,6 +9805,9 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
             tables: Vec::new(),
         };
 
@@ -9774,6 +9834,9 @@ mod tests {
             schema: schema(),
             chunk_size: 1000,
             created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
             tables: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
