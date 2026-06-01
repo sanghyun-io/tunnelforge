@@ -3067,8 +3067,16 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     }
 
     let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
+    let import_schema = dump_import_schema_for_tables(&manifest.schema, &tables);
+    let strict_manifest = request
+        .payload
+        .get("strict_manifest")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let manifest_warnings = validate_dump_import_manifest_strictness(&tables, strict_manifest)?;
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
+    let target_engine = adapter.engine().to_string();
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
         &endpoint,
@@ -3076,93 +3084,137 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         request.request_id.clone(),
         &mut emit,
     )?;
+    for warning in &manifest_warnings {
+        emit(json!({
+            "event": "warning",
+            "request_id": request.request_id,
+            "phase": "dump_import_manifest",
+            "classification": "legacy_dump",
+            "message": warning
+        }));
+    }
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
-        for (index, table_manifest) in tables.iter().enumerate() {
-            let table = manifest
-                .schema
-                .tables
-                .iter()
-                .find(|table| table.name == table_manifest.name)
-                .ok_or_else(|| format!("manifest schema missing table {}", table_manifest.name))?;
+        if mode == "recreate" && selected.is_empty() && target_engine == "mysql" {
+            let shadow_database = mysql_shadow_schema_name(
+                &endpoint.database,
+                request.request_id.as_deref(),
+                current_unix_seconds(),
+            );
             emit(json!({
-                "event": "table_progress",
+                "event": "phase",
                 "request_id": request.request_id,
-                "table": table.name,
-                "status": "importing",
-                "current": index + 1,
-                "total": table_total
+                "phase": "dump_import_cleanup",
+                "message": "restoring into temporary schema before final switch",
+                "shadow_schema": shadow_database
             }));
-
-            if matches!(mode, "replace" | "recreate") {
-                adapter.execute_sql(&drop_table_sql(adapter.engine(), &table.name))?;
-            }
-            let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
-                .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
-            adapter.create_table(table, &ddl)?;
-
-            if data_format == "tsv" && !has_binary_columns(table) {
-                if let LiveAdapter::MySql(conn) = &mut adapter {
-                    let (rows, chunks) = import_mysql_tsv_table(
-                        &endpoint,
-                        conn,
-                        input_path,
-                        table,
-                        table_manifest,
-                        &compression,
-                        threads,
-                        request.request_id.clone(),
-                        |event| emit(event),
-                    )?;
-                    rows_imported += rows;
-                    chunks_imported += chunks;
-                    emit(json!({
-                        "event": "table_progress",
-                        "request_id": request.request_id,
-                        "table": table.name,
-                        "status": "completed",
-                        "current": index + 1,
-                        "total": table_total
-                    }));
-                    continue;
-                }
-            }
-
-            for chunk_index in 1..=table_manifest.chunks {
-                let chunk_path = dump_manifest_chunk_path(
-                    input_path,
-                    &table_manifest.path,
-                    chunk_index,
-                    &data_format,
-                    &compression,
-                )?;
-                let rows = read_dump_rows(&chunk_path, table, &data_format, &compression)?;
-                let row_count = rows.len();
-                adapter.insert_rows(table, rows)?;
-                rows_imported += row_count as u64;
-                chunks_imported += 1;
-                emit(json!({
-                    "event": "row_progress",
-                    "request_id": request.request_id,
-                    "table": table.name,
-                    "rows": rows_imported,
-                    "total": table_manifest.rows
-                }));
-            }
+            drop_mysql_database(&mut adapter, &shadow_database)?;
+            create_mysql_database(&mut adapter, &shadow_database)?;
+            use_mysql_database(&mut adapter, &shadow_database)?;
 
             emit(json!({
-                "event": "table_progress",
+                "event": "phase",
                 "request_id": request.request_id,
-                "table": table.name,
-                "status": "completed",
-                "current": index + 1,
-                "total": table_total
+                "phase": "dump_import_schema",
+                "message": "creating target tables in temporary schema",
+                "shadow_schema": shadow_database
             }));
+            create_dump_import_tables(
+                &mut adapter,
+                &import_schema,
+                &manifest.source_engine,
+                &target_engine,
+            )?;
+
+            import_dump_table_data(
+                &mut adapter,
+                &endpoint,
+                input_path,
+                &tables,
+                &import_schema,
+                &data_format,
+                &compression,
+                threads,
+                request.request_id.clone(),
+                table_total,
+                &mut rows_imported,
+                &mut chunks_imported,
+                &mut emit,
+            )?;
+
+            emit(json!({
+                "event": "phase",
+                "request_id": request.request_id,
+                "phase": "dump_import_post_load",
+                "message": "creating indexes and foreign keys in temporary schema",
+                "shadow_schema": shadow_database
+            }));
+            apply_post_load_ddl(&mut adapter, &import_schema, &target_engine)?;
+
+            emit(json!({
+                "event": "phase",
+                "request_id": request.request_id,
+                "phase": "dump_import_switch",
+                "message": "switching temporary schema into target database",
+                "shadow_schema": shadow_database,
+                "target_schema": endpoint.database
+            }));
+            switch_mysql_shadow_database(
+                &mut adapter,
+                &endpoint.database,
+                &shadow_database,
+                &import_schema,
+            )?;
+            return Ok(());
+        } else if matches!(mode, "replace" | "recreate") {
+            emit(json!({
+                "event": "phase",
+                "request_id": request.request_id,
+                "phase": "dump_import_cleanup",
+                "message": "preparing target tables"
+            }));
+            drop_dump_import_tables(&mut adapter, &import_schema, &target_engine)?;
+
+            emit(json!({
+                "event": "phase",
+                "request_id": request.request_id,
+                "phase": "dump_import_schema",
+                "message": "creating target tables"
+            }));
+            create_dump_import_tables(
+                &mut adapter,
+                &import_schema,
+                &manifest.source_engine,
+                &target_engine,
+            )?;
         }
+
+        import_dump_table_data(
+            &mut adapter,
+            &endpoint,
+            input_path,
+            &tables,
+            &import_schema,
+            &data_format,
+            &compression,
+            threads,
+            request.request_id.clone(),
+            table_total,
+            &mut rows_imported,
+            &mut chunks_imported,
+            &mut emit,
+        )?;
+        emit(json!({
+            "event": "phase",
+            "request_id": request.request_id,
+            "phase": "dump_import_post_load",
+            "message": "creating indexes and foreign keys"
+        }));
+        apply_post_load_ddl(&mut adapter, &import_schema, &target_engine)?;
         Ok(())
     })();
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
@@ -3175,8 +3227,6 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     import_result?;
     restore_result?;
     local_infile_restore_result?;
-    let target_engine = adapter.engine().to_string();
-    apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
 
     Ok(json!({
         "event": "result",
@@ -3306,6 +3356,98 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         }));
     }
     Ok((rows_imported, chunks_imported))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn import_dump_table_data<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    endpoint: &Endpoint,
+    input_path: &Path,
+    tables: &[DumpTableManifest],
+    import_schema: &NormalizedSchema,
+    data_format: &str,
+    compression: &str,
+    threads: usize,
+    request_id: Option<String>,
+    table_total: usize,
+    rows_imported: &mut u64,
+    chunks_imported: &mut u64,
+    emit: &mut F,
+) -> Result<(), String> {
+    for (index, table_manifest) in tables.iter().enumerate() {
+        let table = import_schema
+            .tables
+            .iter()
+            .find(|table| table.name == table_manifest.name)
+            .ok_or_else(|| format!("manifest schema missing table {}", table_manifest.name))?;
+        emit(json!({
+            "event": "table_progress",
+            "request_id": request_id,
+            "table": table.name,
+            "status": "importing",
+            "current": index + 1,
+            "total": table_total
+        }));
+
+        if data_format == "tsv" && !has_binary_columns(table) {
+            if let LiveAdapter::MySql(conn) = adapter {
+                let (rows, chunks) = import_mysql_tsv_table(
+                    endpoint,
+                    conn,
+                    input_path,
+                    table,
+                    table_manifest,
+                    compression,
+                    threads,
+                    request_id.clone(),
+                    |event| emit(event),
+                )?;
+                *rows_imported += rows;
+                *chunks_imported += chunks;
+                emit(json!({
+                    "event": "table_progress",
+                    "request_id": request_id,
+                    "table": table.name,
+                    "status": "completed",
+                    "current": index + 1,
+                    "total": table_total
+                }));
+                continue;
+            }
+        }
+
+        for chunk_index in 1..=table_manifest.chunks {
+            let chunk_path = dump_manifest_chunk_path(
+                input_path,
+                &table_manifest.path,
+                chunk_index,
+                data_format,
+                compression,
+            )?;
+            let rows = read_dump_rows(&chunk_path, table, data_format, compression)?;
+            let row_count = rows.len();
+            adapter.insert_rows(table, rows)?;
+            *rows_imported += row_count as u64;
+            *chunks_imported += 1;
+            emit(json!({
+                "event": "row_progress",
+                "request_id": request_id,
+                "table": table.name,
+                "rows": *rows_imported,
+                "total": table_manifest.rows
+            }));
+        }
+
+        emit(json!({
+            "event": "table_progress",
+            "request_id": request_id,
+            "table": table.name,
+            "status": "completed",
+            "current": index + 1,
+            "total": table_total
+        }));
+    }
+    Ok(())
 }
 
 fn mysql_local_infile_enabled(conn: &mut mysql::PooledConn) -> bool {
@@ -4071,28 +4213,46 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let mut tables = Vec::new();
 
     for table_name in table_names {
-        let columns: Vec<NormalizedColumn> = conn
-            .exec_map(
-                inspect_columns_sql("mysql"),
-                (&schema_name, &table_name),
-                |(name, type_name, is_nullable, default_value, extra): (
-                    String,
-                    String,
-                    String,
-                    Option<String>,
-                    String,
-                )| {
-                    NormalizedColumn {
+        let columns: Vec<NormalizedColumn> =
+            conn
+                .exec_map(
+                    inspect_columns_sql("mysql"),
+                    (&schema_name, &table_name),
+                    |(
                         name,
-                        type_name: with_auto_increment_marker(&type_name, &extra),
+                        type_name,
+                        character_set,
+                        collation,
+                        is_nullable,
                         default_value,
-                        nullable: is_nullable.eq_ignore_ascii_case("YES"),
-                        primary_key: false,
-                        unique: false,
-                    }
-                },
-            )
-            .map_err(|err| format!("mysql column inspect error: {err}"))?;
+                        extra,
+                    ): (
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        String,
+                        Option<String>,
+                        String,
+                    )| {
+                        NormalizedColumn {
+                            name,
+                            type_name: with_auto_increment_marker(
+                                &mysql_column_type_with_charset(
+                                    &type_name,
+                                    character_set.as_deref(),
+                                    collation.as_deref(),
+                                ),
+                                &extra,
+                            ),
+                            default_value,
+                            nullable: is_nullable.eq_ignore_ascii_case("YES"),
+                            primary_key: false,
+                            unique: false,
+                        }
+                    },
+                )
+                .map_err(|err| format!("mysql column inspect error: {err}"))?;
         let keys: Vec<(String, String)> = conn
             .exec_map(
                 inspect_keys_sql("mysql"),
@@ -6870,6 +7030,169 @@ fn dependency_ordered_dump_tables(
     ordered
 }
 
+fn dump_import_schema_for_tables(
+    schema: &NormalizedSchema,
+    tables: &[DumpTableManifest],
+) -> NormalizedSchema {
+    let selected = tables
+        .iter()
+        .map(|table| table.name.clone())
+        .collect::<BTreeSet<_>>();
+    let filtered = NormalizedSchema {
+        tables: schema
+            .tables
+            .iter()
+            .filter(|table| selected.contains(&table.name))
+            .cloned()
+            .map(|mut table| {
+                table
+                    .foreign_keys
+                    .retain(|fk| selected.contains(&fk.referenced_table));
+                table
+            })
+            .collect(),
+    };
+    dependency_ordered_schema(&filtered)
+}
+
+fn drop_dump_import_tables<A: MigrationAdapter>(
+    target: &mut A,
+    schema: &NormalizedSchema,
+    target_engine: &str,
+) -> Result<(), String> {
+    for table in schema.tables.iter().rev() {
+        let sql = drop_table_sql(target_engine, &table.name);
+        target
+            .execute_sql(&sql)
+            .map_err(|err| format!("target cleanup failed for table {}: {err}", table.name))?;
+    }
+    Ok(())
+}
+
+fn create_dump_import_tables<A: MigrationAdapter>(
+    target: &mut A,
+    schema: &NormalizedSchema,
+    source_engine: &str,
+    target_engine: &str,
+) -> Result<(), String> {
+    for table in &schema.tables {
+        let ddl = generate_table_ddl(table, source_engine, target_engine)
+            .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
+        target
+            .create_table(table, &ddl)
+            .map_err(|err| format!("target table create failed for table {}: {err}", table.name))?;
+    }
+    Ok(())
+}
+
+fn create_mysql_database<A: MigrationAdapter>(
+    target: &mut A,
+    database: &str,
+) -> Result<(), String> {
+    let database = database.trim();
+    if database.is_empty() {
+        return Err("mysql import requires a target database".to_string());
+    }
+    let quoted = quote_ident("mysql", database);
+    let sql = format!("CREATE DATABASE {quoted} CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+    target
+        .execute_sql(&sql)
+        .map_err(|err| format!("mysql database create failed: {sql}: {err}"))
+}
+
+fn drop_mysql_database<A: MigrationAdapter>(target: &mut A, database: &str) -> Result<(), String> {
+    let database = database.trim();
+    if database.is_empty() {
+        return Err("mysql import requires a target database".to_string());
+    }
+    let sql = format!("DROP DATABASE IF EXISTS {}", quote_ident("mysql", database));
+    target
+        .execute_sql(&sql)
+        .map_err(|err| format!("mysql database drop failed: {sql}: {err}"))
+}
+
+fn use_mysql_database<A: MigrationAdapter>(target: &mut A, database: &str) -> Result<(), String> {
+    let database = database.trim();
+    if database.is_empty() {
+        return Err("mysql import requires a target database".to_string());
+    }
+    let sql = format!("USE {}", quote_ident("mysql", database));
+    target
+        .execute_sql(&sql)
+        .map_err(|err| format!("mysql database selection failed: {sql}: {err}"))
+}
+
+fn mysql_shadow_schema_name(database: &str, request_id: Option<&str>, fallback: u64) -> String {
+    let mut database = mysql_identifier_fragment(database);
+    if database.is_empty() {
+        database = "db".to_string();
+    }
+    let suffix_source = request_id
+        .map(ToString::to_string)
+        .unwrap_or_else(|| fallback.to_string());
+    let mut suffix = mysql_identifier_fragment(&suffix_source);
+    if suffix.is_empty() {
+        suffix = fallback.to_string();
+    }
+    let suffix = suffix.chars().take(18).collect::<String>();
+    let prefix = "_tf_restore_";
+    let max_database_len = 64_usize
+        .saturating_sub(prefix.len())
+        .saturating_sub(1)
+        .saturating_sub(suffix.len());
+    let database = database
+        .chars()
+        .take(max_database_len.max(1))
+        .collect::<String>();
+    format!("{prefix}{database}_{suffix}")
+}
+
+fn mysql_identifier_fragment(value: &str) -> String {
+    let mut output = String::new();
+    let mut last_was_underscore = false;
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            output.push(ch);
+            last_was_underscore = false;
+        } else if !last_was_underscore {
+            output.push('_');
+            last_was_underscore = true;
+        }
+    }
+    output.trim_matches('_').to_string()
+}
+
+fn switch_mysql_shadow_database<A: MigrationAdapter>(
+    target: &mut A,
+    database: &str,
+    shadow_database: &str,
+    schema: &NormalizedSchema,
+) -> Result<(), String> {
+    drop_mysql_database(target, database)?;
+    create_mysql_database(target, database)?;
+    if !schema.tables.is_empty() {
+        let renames = schema
+            .tables
+            .iter()
+            .map(|table| {
+                format!(
+                    "{} TO {}",
+                    quote_qualified_ident("mysql", shadow_database, &table.name),
+                    quote_qualified_ident("mysql", database, &table.name)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let sql = format!("RENAME TABLE {renames}");
+        target
+            .execute_sql(&sql)
+            .map_err(|err| format!("mysql shadow schema switch failed: {sql}: {err}"))?;
+    }
+    drop_mysql_database(target, shadow_database)?;
+    use_mysql_database(target, database)?;
+    Ok(())
+}
+
 fn table_dependency_order_indices(schema: &NormalizedSchema) -> (Vec<usize>, Vec<String>) {
     let table_count = schema.tables.len();
     if table_count <= 1 {
@@ -7226,6 +7549,37 @@ fn validate_dump_manifest_chunks(
     Ok(())
 }
 
+fn classified_import_error(code: &str, message: &str, scope: Option<&str>) -> String {
+    match scope.filter(|value| !value.trim().is_empty()) {
+        Some(scope) => format!("{code}: {scope}: {message}"),
+        None => format!("{code}: {message}"),
+    }
+}
+
+fn validate_dump_import_manifest_strictness(
+    tables: &[DumpTableManifest],
+    strict: bool,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    for table in tables {
+        if table.chunks > 0 && table.chunk_sha256.is_empty() {
+            let message = format!(
+                "table {} has chunks but no chunk_sha256 metadata",
+                table.name
+            );
+            if strict {
+                return Err(classified_import_error(
+                    "export_invalid",
+                    &format!("missing chunk_sha256; {message}"),
+                    Some(&table.name),
+                ));
+            }
+            warnings.push(format!("legacy dump: {message}"));
+        }
+    }
+    Ok(warnings)
+}
+
 fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
     let extension = if data_format == "tsv" { "tsv" } else { "jsonl" };
     if compression == "zstd" {
@@ -7546,6 +7900,12 @@ pub fn generate_schema_ddl(schema: &NormalizedSchema, source: &str, target: &str
 }
 
 pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+    let mut ddl = generate_post_data_index_ddl(schema, target);
+    ddl.extend(generate_post_data_foreign_key_ddl(schema, target));
+    ddl
+}
+
+pub fn generate_post_data_index_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
     if target.is_empty() {
         return Vec::new();
     }
@@ -7570,6 +7930,16 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
                 columns
             ));
         }
+    }
+    ddl
+}
+
+pub fn generate_post_data_foreign_key_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+    if target.is_empty() {
+        return Vec::new();
+    }
+    let mut ddl = Vec::new();
+    for table in &schema.tables {
         for fk in &table.foreign_keys {
             if fk.columns.is_empty() || fk.referenced_columns.is_empty() {
                 continue;
@@ -7626,10 +7996,19 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
     target_engine: &str,
 ) -> Result<(), String> {
     for sql in generate_sequence_reset_ddl(schema, target_engine) {
-        target.execute_sql(&sql)?;
+        target
+            .execute_sql(&sql)
+            .map_err(|err| format!("post-load sequence reset failed: {sql}: {err}"))?;
     }
-    for sql in generate_post_data_ddl(schema, target_engine) {
-        target.execute_sql(&sql)?;
+    for sql in generate_post_data_index_ddl(schema, target_engine) {
+        target
+            .execute_sql(&sql)
+            .map_err(|err| format!("post-load index DDL failed: {sql}: {err}"))?;
+    }
+    for sql in generate_post_data_foreign_key_ddl(schema, target_engine) {
+        target
+            .execute_sql(&sql)
+            .map_err(|err| format!("post-load foreign key DDL failed: {sql}: {err}"))?;
     }
     Ok(())
 }
@@ -8238,7 +8617,7 @@ pub fn inspect_columns_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
         "SELECT column_name, data_type, is_nullable, character_maximum_length, numeric_precision, numeric_scale, column_default, is_identity FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position"
     } else {
-        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
+        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
     }
 }
 
@@ -8376,11 +8755,21 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
         lines.push(format!("  PRIMARY KEY ({})", primary_keys.join(", ")));
     }
 
+    let table_options = create_table_options(target);
     Some(format!(
-        "CREATE TABLE {} (\n{}\n);",
+        "CREATE TABLE {} (\n{}\n){};",
         quote_ident(target, &table.name),
-        lines.join(",\n")
+        lines.join(",\n"),
+        table_options
     ))
+}
+
+fn create_table_options(target: &str) -> &'static str {
+    if target == "mysql" {
+        " ENGINE=InnoDB"
+    } else {
+        ""
+    }
 }
 
 fn default_clause(target: &str, default_value: Option<&str>, source_type: &str) -> String {
@@ -8505,6 +8894,14 @@ fn quote_ident(engine: &str, ident: &str) -> String {
     }
 }
 
+fn quote_qualified_ident(engine: &str, schema: &str, ident: &str) -> String {
+    format!(
+        "{}.{}",
+        quote_ident(engine, schema),
+        quote_ident(engine, ident)
+    )
+}
+
 fn quote_column_ref(engine: &str, table: &str, column: &str) -> String {
     format!(
         "{}.{}",
@@ -8525,7 +8922,11 @@ pub fn map_type(source: &str, target: &str, type_name: &str) -> String {
         return trimmed_type.to_string();
     }
 
-    let ty = trimmed_type.to_ascii_lowercase();
+    let ty = if source == "mysql" && target != "mysql" {
+        strip_mysql_charset_attributes(trimmed_type).to_ascii_lowercase()
+    } else {
+        trimmed_type.to_ascii_lowercase()
+    };
     if source == "mysql" && target == "postgresql" {
         map_mysql_to_postgres(&ty)
     } else if source == "postgresql" && target == "mysql" {
@@ -8533,6 +8934,86 @@ pub fn map_type(source: &str, target: &str, type_name: &str) -> String {
     } else {
         trimmed_type.to_string()
     }
+}
+
+fn mysql_column_type_with_charset(
+    type_name: &str,
+    character_set: Option<&str>,
+    collation: Option<&str>,
+) -> String {
+    let mut rendered = type_name.trim().to_string();
+    if !mysql_type_supports_charset(&rendered) {
+        return rendered;
+    }
+    let lower = rendered.to_ascii_lowercase();
+    if lower.contains(" character set ") || lower.contains(" collate ") {
+        return rendered;
+    }
+    if let Some(character_set) = mysql_identifier_token(character_set) {
+        rendered.push_str(" CHARACTER SET ");
+        rendered.push_str(&character_set);
+    }
+    if let Some(collation) = mysql_identifier_token(collation) {
+        rendered.push_str(" COLLATE ");
+        rendered.push_str(&collation);
+    }
+    rendered
+}
+
+fn mysql_type_supports_charset(type_name: &str) -> bool {
+    let ty = type_name.trim().to_ascii_lowercase();
+    ty.starts_with("char")
+        || ty.starts_with("varchar")
+        || ty.starts_with("tinytext")
+        || ty.starts_with("text")
+        || ty.starts_with("mediumtext")
+        || ty.starts_with("longtext")
+        || ty.starts_with("enum(")
+        || ty.starts_with("set(")
+}
+
+fn mysql_identifier_token(value: Option<&str>) -> Option<String> {
+    let value = value?.trim();
+    if value.is_empty() {
+        return None;
+    }
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        Some(value.to_string())
+    } else {
+        None
+    }
+}
+
+fn strip_mysql_charset_attributes(type_name: &str) -> String {
+    let Some(index) = find_mysql_column_attr_start(type_name) else {
+        return type_name.trim().to_string();
+    };
+    type_name[..index].trim_end().to_string()
+}
+
+fn find_mysql_column_attr_start(type_name: &str) -> Option<usize> {
+    let lower = type_name.to_ascii_lowercase();
+    let bytes = lower.as_bytes();
+    let mut in_string = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'\'' {
+            in_string = !in_string;
+            index += 1;
+            continue;
+        }
+        if !in_string
+            && (lower[index..].starts_with(" character set ")
+                || lower[index..].starts_with(" collate "))
+        {
+            return Some(index);
+        }
+        index += 1;
+    }
+    None
 }
 
 fn map_mysql_to_postgres(ty: &str) -> String {
@@ -10059,6 +10540,14 @@ mod tests {
         assert_eq!(map_type("mysql", "postgresql", "tinyint(1)"), "BOOLEAN");
         assert_eq!(map_type("mysql", "postgresql", "json"), "JSONB");
         assert_eq!(map_type("mysql", "postgresql", "datetime"), "TIMESTAMP");
+        assert_eq!(
+            map_type(
+                "mysql",
+                "postgresql",
+                "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+            ),
+            "VARCHAR(45)"
+        );
     }
 
     #[test]
@@ -10104,7 +10593,7 @@ mod tests {
 
         assert_eq!(
             generate_schema_ddl(&schema, "mysql", "mysql")[0],
-            "CREATE TABLE `df_evaluations_norm` (\n  `importance` enum('HIGH','MEDIUM','LOW') DEFAULT 'MEDIUM' NOT NULL\n);"
+            "CREATE TABLE `df_evaluations_norm` (\n  `importance` enum('HIGH','MEDIUM','LOW') DEFAULT 'MEDIUM' NOT NULL\n) ENGINE=InnoDB;"
         );
     }
 
@@ -10182,6 +10671,195 @@ mod tests {
     }
 
     #[test]
+    fn generates_all_post_data_indexes_before_foreign_keys() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "orders".to_string(),
+                    columns: Vec::new(),
+                    indexes: vec![NormalizedIndex {
+                        name: "idx_orders_user_id".to_string(),
+                        columns: vec!["user_id".to_string()],
+                        unique: false,
+                    }],
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "fk_orders_users".to_string(),
+                        columns: vec!["user_id".to_string()],
+                        referenced_table: "users".to_string(),
+                        referenced_columns: vec!["id".to_string()],
+                    }],
+                },
+                NormalizedTable {
+                    name: "users".to_string(),
+                    columns: Vec::new(),
+                    indexes: vec![NormalizedIndex {
+                        name: "uq_users_email".to_string(),
+                        columns: vec!["email".to_string()],
+                        unique: true,
+                    }],
+                    foreign_keys: Vec::new(),
+                },
+            ],
+        };
+
+        let ddl = generate_post_data_ddl(&schema, "mysql");
+
+        assert_eq!(
+            ddl,
+            vec![
+                "CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);",
+                "CREATE UNIQUE INDEX `uq_users_email` ON `users` (`email`);",
+                "ALTER TABLE `orders` ADD CONSTRAINT `fk_orders_users` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`);",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_table_ddl_preserves_column_charset_and_collation() {
+        let table = NormalizedTable {
+            name: "audit_category".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "code".to_string(),
+                type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                    .to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        let ddl = generate_table_ddl(&table, "mysql", "mysql").unwrap();
+
+        assert!(ddl.contains("`code` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"));
+    }
+
+    #[test]
+    fn mysql_column_inspection_appends_charset_only_for_textual_types() {
+        assert_eq!(
+            mysql_column_type_with_charset(
+                "varchar(45)",
+                Some("utf8mb4"),
+                Some("utf8mb4_0900_ai_ci")
+            ),
+            "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+        );
+        assert_eq!(
+            mysql_column_type_with_charset("int", Some("utf8mb4"), Some("utf8mb4_0900_ai_ci")),
+            "int"
+        );
+    }
+
+    #[test]
+    fn dump_import_schema_filters_unselected_foreign_keys() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("users", Vec::new()),
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+            ],
+        };
+        let selected_tables = vec![DumpTableManifest {
+            name: "orders".to_string(),
+            path: "0001_orders".to_string(),
+            rows: 0,
+            chunks: 0,
+            chunk_sha256: BTreeMap::new(),
+        }];
+
+        let import_schema = dump_import_schema_for_tables(&schema, &selected_tables);
+
+        assert_eq!(import_schema.tables.len(), 1);
+        assert_eq!(import_schema.tables[0].name, "orders");
+        assert!(import_schema.tables[0].foreign_keys.is_empty());
+    }
+
+    #[test]
+    fn dump_import_cleanup_drops_children_before_parents() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("users", Vec::new()),
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+            ],
+        };
+        let import_schema = dependency_ordered_schema(&schema);
+        let mut adapter = RecordingAdapter::default();
+
+        drop_dump_import_tables(&mut adapter, &import_schema, "mysql").unwrap();
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec![
+                "DROP TABLE IF EXISTS `orders`",
+                "DROP TABLE IF EXISTS `users`",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_shadow_schema_name_is_safe_and_bounded() {
+        let name = mysql_shadow_schema_name(
+            "data`flare-prod",
+            Some("py-8025831119204db98a-unsafe"),
+            1779950000,
+        );
+
+        assert!(name.starts_with("_tf_restore_data_flare_prod_"));
+        assert!(name.len() <= 64);
+        assert!(name
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
+    }
+
+    #[test]
+    fn mysql_safe_recreate_creates_shadow_database_before_schema_load() {
+        let mut adapter = RecordingAdapter::default();
+
+        create_mysql_database(&mut adapter, "data`flare").unwrap();
+        use_mysql_database(&mut adapter, "data`flare").unwrap();
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec![
+                "CREATE DATABASE `data``flare` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+                "USE `data``flare`",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_safe_recreate_switch_moves_shadow_tables_to_target() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("users", Vec::new()),
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+            ],
+        };
+        let import_schema = dependency_ordered_schema(&schema);
+        let mut adapter = RecordingAdapter::default();
+
+        switch_mysql_shadow_database(
+            &mut adapter,
+            "dataflare",
+            "_tf_restore_dataflare_1",
+            &import_schema,
+        )
+        .unwrap();
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec![
+                "DROP DATABASE IF EXISTS `dataflare`",
+                "CREATE DATABASE `dataflare` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci",
+                "RENAME TABLE `_tf_restore_dataflare_1`.`users` TO `dataflare`.`users`, `_tf_restore_dataflare_1`.`orders` TO `dataflare`.`orders`",
+                "DROP DATABASE IF EXISTS `_tf_restore_dataflare_1`",
+                "USE `dataflare`",
+            ]
+        );
+    }
+
+    #[test]
     fn post_load_ddl_applies_secondary_indexes_after_import_data() {
         let schema = NormalizedSchema {
             tables: vec![NormalizedTable {
@@ -10251,7 +10929,7 @@ mod tests {
         );
         assert_eq!(
             generate_schema_ddl(&postgresql_schema, "postgresql", "mysql")[0],
-            "CREATE TABLE `users` (\n  `id` INT AUTO_INCREMENT NOT NULL,\n  PRIMARY KEY (`id`)\n);"
+            "CREATE TABLE `users` (\n  `id` INT AUTO_INCREMENT NOT NULL,\n  PRIMARY KEY (`id`)\n) ENGINE=InnoDB;"
         );
         assert_eq!(
             generate_sequence_reset_ddl(&mysql_schema, "postgresql")[0],
@@ -10308,7 +10986,7 @@ mod tests {
         );
         assert_eq!(
             generate_schema_ddl(&postgresql_schema, "postgresql", "mysql")[0],
-            "CREATE TABLE `users` (\n  `enabled` TINYINT(1) DEFAULT 1 NOT NULL\n);"
+            "CREATE TABLE `users` (\n  `enabled` TINYINT(1) DEFAULT 1 NOT NULL\n) ENGINE=InnoDB;"
         );
     }
 
@@ -11065,6 +11743,55 @@ mod tests {
     }
 
     #[test]
+    fn strict_manifest_validation_rejects_missing_chunk_checksums() {
+        let table = DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 10,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        };
+
+        let err = validate_dump_import_manifest_strictness(&[table], true).unwrap_err();
+
+        assert!(err.contains("export_invalid"));
+        assert!(err.contains("users"));
+        assert!(err.contains("missing chunk_sha256"));
+    }
+
+    #[test]
+    fn legacy_manifest_validation_allows_missing_checksums_when_not_strict() {
+        let table = DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 10,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        };
+
+        let warnings = validate_dump_import_manifest_strictness(&[table], false).unwrap();
+
+        assert_eq!(
+            warnings,
+            vec!["legacy dump: table users has chunks but no chunk_sha256 metadata".to_string()]
+        );
+    }
+
+    #[test]
+    fn classified_import_error_formats_code_scope_and_message() {
+        let err = classified_import_error(
+            "import_plan_invalid",
+            "full replacement worker target is unresolved",
+            Some("users"),
+        );
+
+        assert_eq!(
+            err,
+            "import_plan_invalid: users: full replacement worker target is unresolved"
+        );
+    }
+
+    #[test]
     fn binary_columns_are_selected_as_hex_and_inserted_as_binary_literals() {
         let table = NormalizedTable {
             name: "files".to_string(),
@@ -11226,6 +11953,8 @@ mod tests {
         assert!(inspect_tables_sql("mysql").contains("information_schema.tables"));
         assert!(inspect_columns_sql("postgresql").contains("information_schema.columns"));
         assert!(inspect_columns_sql("postgresql").contains("character_maximum_length"));
+        assert!(inspect_columns_sql("mysql").contains("CHARACTER_SET_NAME"));
+        assert!(inspect_columns_sql("mysql").contains("COLLATION_NAME"));
         assert!(inspect_keys_sql("mysql").contains("KEY_COLUMN_USAGE"));
         assert!(inspect_foreign_keys_sql("postgresql").contains("FOREIGN KEY"));
         assert!(inspect_indexes_sql("postgresql").contains("pg_index"));
