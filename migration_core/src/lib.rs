@@ -1356,6 +1356,65 @@ struct DumpTablePerfProfile {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlTableEngine {
+    table: String,
+    engine: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MysqlSnapshotEvidence {
+    policy: String,
+    strict_candidate: bool,
+    warnings: Vec<String>,
+}
+
+fn classify_mysql_snapshot_strategy(
+    tables: &[MysqlTableEngine],
+    transaction_snapshot_available: bool,
+    lock_based_snapshot_available: bool,
+    dump_threads: usize,
+) -> MysqlSnapshotEvidence {
+    let has_non_transactional_table = tables
+        .iter()
+        .any(|table| !table.engine.eq_ignore_ascii_case("innodb"));
+    if has_non_transactional_table && !lock_based_snapshot_available {
+        return MysqlSnapshotEvidence {
+            policy: "not_enforced".to_string(),
+            strict_candidate: false,
+            warnings: vec!["non-transactional tables require lock-based export".to_string()],
+        };
+    }
+    if lock_based_snapshot_available {
+        return MysqlSnapshotEvidence {
+            policy: "lock_based".to_string(),
+            strict_candidate: true,
+            warnings: Vec::new(),
+        };
+    }
+    if dump_threads > 1 {
+        return MysqlSnapshotEvidence {
+            policy: "not_enforced".to_string(),
+            strict_candidate: false,
+            warnings: vec![
+                "parallel dump connections cannot share a transaction snapshot".to_string(),
+            ],
+        };
+    }
+    if transaction_snapshot_available {
+        return MysqlSnapshotEvidence {
+            policy: "transaction_snapshot".to_string(),
+            strict_candidate: true,
+            warnings: Vec::new(),
+        };
+    }
+    MysqlSnapshotEvidence {
+        policy: "not_enforced".to_string(),
+        strict_candidate: false,
+        warnings: vec!["snapshot consistency is not proven".to_string()],
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct DumpWorkPlanItem {
     table: String,
     chunk_index: Option<u64>,
@@ -1447,6 +1506,21 @@ fn dump_table_stats(
         );
     }
     counts
+}
+
+fn inspect_mysql_table_engines(
+    conn: &mut mysql::PooledConn,
+    database: &str,
+) -> Result<Vec<MysqlTableEngine>, String> {
+    conn.exec_map(
+        "SELECT TABLE_NAME, COALESCE(ENGINE, '') \
+         FROM information_schema.TABLES \
+         WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' \
+         ORDER BY TABLE_NAME",
+        (database,),
+        |(table, engine): (String, String)| MysqlTableEngine { table, engine },
+    )
+    .map_err(|err| format!("mysql table engine inspect error: {err}"))
 }
 
 fn dump_perf_profile_path() -> Option<PathBuf> {
@@ -1632,14 +1706,47 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     ));
 
     let table_total = schema.tables.len();
+    let mut snapshot_evidence = MysqlSnapshotEvidence {
+        policy: "not_enforced".to_string(),
+        strict_candidate: false,
+        warnings: vec!["snapshot consistency is not proven".to_string()],
+    };
+    let mut mysql_snapshot_adapter: Option<LiveAdapter> = None;
+    let mut effective_threads = threads;
+    if endpoint.engine == "mysql" {
+        let mut adapter = LiveAdapter::connect(&endpoint)?;
+        let LiveAdapter::MySql(conn) = &mut adapter else {
+            return Err("failed to open mysql dump adapter".to_string());
+        };
+        let all_tables = inspect_mysql_table_engines(conn, &endpoint.database)?;
+        let selected_table_names = schema
+            .tables
+            .iter()
+            .map(|table| table.name.as_str())
+            .collect::<BTreeSet<_>>();
+        let exported_tables = all_tables
+            .into_iter()
+            .filter(|table| selected_table_names.contains(table.table.as_str()))
+            .collect::<Vec<_>>();
+        snapshot_evidence =
+            classify_mysql_snapshot_strategy(&exported_tables, true, false, threads);
+        if snapshot_evidence.policy == "transaction_snapshot" {
+            effective_threads = 1;
+            conn.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+                .map_err(|err| format!("mysql snapshot setup error: {err}"))?;
+            conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
+                .map_err(|err| format!("mysql snapshot start error: {err}"))?;
+            mysql_snapshot_adapter = Some(adapter);
+        }
+    }
     let parallel_limits = adaptive_dump_parallel_limits_with_avg(
-        threads,
+        effective_threads,
         table_total,
         chunk_size,
         &row_counts,
         &avg_row_lengths,
     );
-    let export_tables = if threads > 1 && table_total > 1 {
+    let export_tables = if effective_threads > 1 && table_total > 1 {
         dump_schedule_order(&schema.tables, &row_counts)
     } else {
         schema.tables.clone()
@@ -1649,18 +1756,32 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         &export_tables,
         &row_counts,
         parallel_limits,
-        threads,
+        effective_threads,
         chunk_size,
         &data_format,
         &compression,
-        if endpoint.engine == "mysql" && threads > 1 && table_total > 1 {
+        if endpoint.engine == "mysql" && effective_threads > 1 && table_total > 1 {
             "global_chunk"
         } else {
             "table_parallel"
         },
     ));
     let (table_manifests, total_rows, total_chunks) =
-        if endpoint.engine == "mysql" && threads > 1 && table_total == 1 {
+        if endpoint.engine == "mysql" && snapshot_evidence.policy == "transaction_snapshot" {
+            let adapter = mysql_snapshot_adapter
+                .as_mut()
+                .ok_or_else(|| "mysql snapshot adapter was not initialized".to_string())?;
+            dump_tables_sequential(
+                adapter,
+                output_path,
+                &export_tables,
+                chunk_size,
+                &data_format,
+                &compression,
+                request.request_id.clone(),
+                |event| emit(event),
+            )?
+        } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total == 1 {
             match dump_single_mysql_table_parallel(
                 &endpoint,
                 output_path,
@@ -1687,7 +1808,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                     )?
                 }
             }
-        } else if endpoint.engine == "mysql" && threads > 1 && table_total > 1 {
+        } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total > 1 {
             dump_tables_global_mysql(
                 &endpoint,
                 output_path,
@@ -1695,11 +1816,11 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 chunk_size,
                 &data_format,
                 &compression,
-                threads,
+                effective_threads,
                 request.request_id.clone(),
                 |event| emit(event),
             )?
-        } else if threads > 1 && table_total > 1 {
+        } else if effective_threads > 1 && table_total > 1 {
             dump_tables_parallel(
                 &endpoint,
                 output_path,
@@ -1726,7 +1847,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             )?
         };
 
-    finish_dump_run_artifact(DumpRunFinishInput {
+    let result = finish_dump_run_artifact(DumpRunFinishInput {
         request_id: request.request_id.clone(),
         output_dir,
         output_path,
@@ -1739,7 +1860,16 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         table_manifests,
         total_rows,
         total_chunks,
-    })
+        snapshot_policy: snapshot_evidence.policy.clone(),
+        snapshot_warnings: snapshot_evidence.warnings.clone(),
+    })?;
+
+    if let Some(LiveAdapter::MySql(conn)) = mysql_snapshot_adapter.as_mut() {
+        conn.query_drop("COMMIT")
+            .map_err(|err| format!("mysql snapshot commit error: {err}"))?;
+    }
+
+    Ok(result)
 }
 
 struct DumpRunFinishInput<'a> {
@@ -1755,15 +1885,19 @@ struct DumpRunFinishInput<'a> {
     table_manifests: Vec<DumpTableManifest>,
     total_rows: u64,
     total_chunks: u64,
+    snapshot_policy: String,
+    snapshot_warnings: Vec<String>,
 }
 
 fn finish_dump_run_artifact(input: DumpRunFinishInput<'_>) -> Result<Value, String> {
-    let snapshot_policy = "not_enforced".to_string();
-    let snapshot_enabled = snapshot_policy != "not_enforced";
-    let manifest_warnings = vec![
-        "dump snapshot consistency is not currently enforced across schema, counts, and chunks"
-            .to_string(),
-    ];
+    let snapshot_enabled = input.snapshot_policy != "not_enforced" && input.snapshot_policy != "unknown";
+    let mut manifest_warnings = input.snapshot_warnings;
+    if input.snapshot_policy == "transaction_snapshot" {
+        manifest_warnings.push(
+            "schema and row count inspection are not covered by the export transaction snapshot"
+                .to_string(),
+        );
+    }
     let mut manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
         format_version: if input.data_format == "jsonl" { 1 } else { 2 },
@@ -1775,7 +1909,7 @@ fn finish_dump_run_artifact(input: DumpRunFinishInput<'_>) -> Result<Value, Stri
         schema: input.schema,
         chunk_size: input.chunk_size,
         created_unix_seconds: current_unix_seconds(),
-        snapshot_policy,
+        snapshot_policy: input.snapshot_policy,
         strict_export: false,
         manifest_warnings,
         dump_scope: "schema".to_string(),
@@ -9684,6 +9818,42 @@ mod tests {
     }
 
     #[test]
+    fn mysql_snapshot_evidence_marks_transaction_snapshot_strict_for_innodb_only() {
+        let tables = vec![MysqlTableEngine {
+            table: "orders".to_string(),
+            engine: "InnoDB".to_string(),
+        }];
+
+        let evidence = classify_mysql_snapshot_strategy(&tables, true, false, 1);
+
+        assert_eq!(evidence.policy, "transaction_snapshot");
+        assert!(evidence.strict_candidate);
+        assert!(evidence.warnings.is_empty());
+    }
+
+    #[test]
+    fn mysql_snapshot_evidence_marks_mixed_engines_limited_without_locks() {
+        let tables = vec![
+            MysqlTableEngine {
+                table: "orders".to_string(),
+                engine: "InnoDB".to_string(),
+            },
+            MysqlTableEngine {
+                table: "audit_log".to_string(),
+                engine: "MyISAM".to_string(),
+            },
+        ];
+
+        let evidence = classify_mysql_snapshot_strategy(&tables, true, false, 8);
+
+        assert_eq!(evidence.policy, "not_enforced");
+        assert!(!evidence.strict_candidate);
+        assert!(evidence
+            .warnings
+            .contains(&"non-transactional tables require lock-based export".to_string()));
+    }
+
+    #[test]
     fn artifact_grading_requires_snapshot_for_strict_restore() {
         let manifest = mysql_grade_manifest("not_enforced", true, Vec::new());
 
@@ -9967,6 +10137,8 @@ mod tests {
             table_manifests,
             total_rows: 9,
             total_chunks: 1,
+            snapshot_policy: "not_enforced".to_string(),
+            snapshot_warnings: vec!["snapshot consistency is not proven".to_string()],
         })
         .unwrap();
 
@@ -9982,6 +10154,62 @@ mod tests {
         assert_eq!(result["restorability"], json!(persisted.restorability));
         assert_eq!(result["warnings"], json!(persisted.manifest_warnings));
         assert_eq!(result["blockers"], json!(persisted.blockers));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dump_run_finish_artifact_keeps_transaction_snapshot_limited_until_full_scope_covered() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-run-finish-snapshot-warning-{}",
+            current_unix_seconds()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        prepare_dump_output_dir(&dir, false).unwrap();
+
+        let endpoint = Endpoint {
+            engine: "mysql".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            password: String::new(),
+            database: "app".to_string(),
+            schema: Some("app".to_string()),
+        };
+
+        let result = finish_dump_run_artifact(DumpRunFinishInput {
+            request_id: Some("dump-run-transaction-snapshot".to_string()),
+            output_dir: dir.to_str().unwrap(),
+            output_path: &dir,
+            endpoint: &endpoint,
+            schema: schema(),
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            chunk_size: 1000,
+            source_version: Some("8.0.36".to_string()),
+            table_manifests: vec![DumpTableManifest {
+                name: "users".to_string(),
+                path: "users".to_string(),
+                rows: 1,
+                chunks: 1,
+                chunk_sha256: BTreeMap::new(),
+            }],
+            total_rows: 1,
+            total_chunks: 1,
+            snapshot_policy: "transaction_snapshot".to_string(),
+            snapshot_warnings: Vec::new(),
+        })
+        .unwrap();
+
+        let persisted = read_dump_manifest(&dir).unwrap();
+        assert_eq!(persisted.snapshot_policy, "transaction_snapshot");
+        assert_eq!(persisted.restorability, RestorabilityGrade::LimitedRestorable);
+        assert!(!persisted.strict_export);
+        assert!(persisted.manifest_warnings.contains(
+            &"schema and row count inspection are not covered by the export transaction snapshot"
+                .to_string()
+        ));
+        assert_eq!(result["restorability"], "limited_restorable");
 
         let _ = fs::remove_dir_all(&dir);
     }
