@@ -1607,6 +1607,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
     }
+    let source_version = detect_dump_source_version(&endpoint);
 
     let table_stats = dump_table_stats(&endpoint, &schema.tables);
     let row_counts = table_stats
@@ -1726,31 +1727,38 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         };
 
     let snapshot_policy = "not_enforced".to_string();
-    let strict_export = false;
+    let snapshot_enabled = snapshot_policy != "not_enforced";
     let manifest_warnings = vec![
         "dump snapshot consistency is not currently enforced across schema, counts, and chunks"
             .to_string(),
     ];
-    let manifest = DumpManifest {
+    let mut manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
         format_version: if data_format == "jsonl" { 1 } else { 2 },
         data_format,
         compression,
         source_engine: endpoint.engine.clone(),
-        source_version: None,
+        source_version,
         database: endpoint.database.clone(),
         schema,
         chunk_size,
         created_unix_seconds: current_unix_seconds(),
         snapshot_policy,
-        strict_export,
+        strict_export: false,
         manifest_warnings,
-        dump_scope: default_dump_scope(),
-        features: DumpFeatureSet::default(),
-        restorability: default_restorability_grade(),
+        dump_scope: "schema".to_string(),
+        features: DumpFeatureSet {
+            snapshot: snapshot_enabled,
+            chunking: true,
+            checksum: true,
+            timezone: false,
+            ..DumpFeatureSet::default()
+        },
+        restorability: RestorabilityGrade::LimitedRestorable,
         blockers: Vec::new(),
         tables: table_manifests,
     };
+    finalize_dump_manifest_grade(&mut manifest);
     write_dump_manifest(output_path, &manifest)?;
 
     Ok(json!({
@@ -1765,6 +1773,9 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         "tables": manifest.tables.len(),
         "rows_dumped": total_rows,
         "chunks_dumped": total_chunks,
+        "restorability": manifest.restorability,
+        "warnings": manifest.manifest_warnings,
+        "blockers": manifest.blockers,
         "manifest": "_tunnelforge_dump.json"
     }))
 }
@@ -7553,6 +7564,23 @@ fn mysql_table_avg_row_length(
     conn.query_first::<u64, _>(sql).ok().flatten().unwrap_or(0)
 }
 
+fn detect_server_version(conn: &mut mysql::PooledConn) -> Result<String, String> {
+    conn.query_first::<String, _>("SELECT VERSION()")
+        .map_err(|err| format!("failed to inspect MySQL version: {err}"))?
+        .ok_or_else(|| "MySQL version query returned no rows".to_string())
+}
+
+fn detect_dump_source_version(endpoint: &Endpoint) -> Option<String> {
+    if endpoint.engine != "mysql" {
+        return None;
+    }
+    let mut adapter = LiveAdapter::connect(endpoint).ok()?;
+    match &mut adapter {
+        LiveAdapter::MySql(conn) => detect_server_version(conn).ok(),
+        LiveAdapter::PostgreSql(_) => None,
+    }
+}
+
 fn mysql_numeric_min_max(
     conn: &mut mysql::PooledConn,
     table: &str,
@@ -7640,6 +7668,14 @@ fn read_dump_manifest(input_path: &Path) -> Result<DumpManifest, String> {
         validate_dump_table_path(&table.path)?;
     }
     Ok(manifest)
+}
+
+fn finalize_dump_manifest_grade(manifest: &mut DumpManifest) {
+    let grade = grade_dump_artifact(manifest);
+    manifest.restorability = grade.restorability;
+    manifest.manifest_warnings = grade.warnings;
+    manifest.blockers = grade.blockers;
+    manifest.strict_export = manifest.restorability == RestorabilityGrade::StrictRestorable;
 }
 
 fn grade_dump_artifact(manifest: &DumpManifest) -> ArtifactGrade {
@@ -9616,6 +9652,30 @@ mod tests {
             .warnings
             .contains(&"checksum coverage is incomplete".to_string()));
         assert!(grade.blockers.is_empty());
+    }
+
+    #[test]
+    fn dump_manifest_finalizer_records_limited_grade_when_snapshot_is_missing() {
+        let mut manifest = mysql_grade_manifest("not_enforced", true, Vec::new());
+
+        finalize_dump_manifest_grade(&mut manifest);
+
+        assert_eq!(manifest.restorability, RestorabilityGrade::LimitedRestorable);
+        assert!(!manifest.strict_export);
+        assert!(manifest
+            .manifest_warnings
+            .contains(&"snapshot consistency is not proven".to_string()));
+    }
+
+    #[test]
+    fn dump_manifest_finalizer_records_strict_grade_when_evidence_is_complete() {
+        let mut manifest = mysql_grade_manifest("transaction_snapshot", true, Vec::new());
+
+        finalize_dump_manifest_grade(&mut manifest);
+
+        assert_eq!(manifest.restorability, RestorabilityGrade::StrictRestorable);
+        assert!(manifest.strict_export);
+        assert!(manifest.blockers.is_empty());
     }
 
     #[derive(Default)]
