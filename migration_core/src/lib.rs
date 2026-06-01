@@ -1761,23 +1761,39 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     finalize_dump_manifest_grade(&mut manifest);
     write_dump_manifest(output_path, &manifest)?;
 
-    Ok(json!({
+    Ok(dump_run_result_payload(
+        request.request_id.clone(),
+        output_dir,
+        &manifest,
+        total_rows,
+        total_chunks,
+    ))
+}
+
+fn dump_run_result_payload(
+    request_id: Option<String>,
+    output_dir: &str,
+    manifest: &DumpManifest,
+    total_rows: u64,
+    total_chunks: u64,
+) -> Value {
+    json!({
         "event": "result",
-        "request_id": request.request_id,
+        "request_id": request_id,
         "command": "dump.run",
         "success": true,
         "output_dir": output_dir,
-        "format": manifest.format,
+        "format": &manifest.format,
         "format_version": manifest.format_version,
-        "compression": manifest.compression,
+        "compression": &manifest.compression,
         "tables": manifest.tables.len(),
         "rows_dumped": total_rows,
         "chunks_dumped": total_chunks,
-        "restorability": manifest.restorability,
-        "warnings": manifest.manifest_warnings,
-        "blockers": manifest.blockers,
+        "restorability": &manifest.restorability,
+        "warnings": &manifest.manifest_warnings,
+        "blockers": &manifest.blockers,
         "manifest": "_tunnelforge_dump.json"
-    }))
+    })
 }
 
 fn prepare_dump_output_dir(output_path: &Path, overwrite: bool) -> Result<(), String> {
@@ -9676,6 +9692,69 @@ mod tests {
         assert_eq!(manifest.restorability, RestorabilityGrade::StrictRestorable);
         assert!(manifest.strict_export);
         assert!(manifest.blockers.is_empty());
+    }
+
+    #[test]
+    fn dump_run_result_payload_includes_finalized_grading_fields() {
+        let mut manifest = mysql_grade_manifest(
+            "not_enforced",
+            true,
+            vec!["mysql.unknown_feature".to_string()],
+        );
+        manifest.tables.push(DumpTableManifest {
+            name: "users".to_string(),
+            path: "users".to_string(),
+            rows: 20,
+            chunks: 2,
+            chunk_sha256: BTreeMap::new(),
+        });
+
+        finalize_dump_manifest_grade(&mut manifest);
+
+        let payload = dump_run_result_payload(
+            Some("dump-run-1".to_string()),
+            "tmp/export",
+            &manifest,
+            99,
+            7,
+        );
+
+        assert_eq!(payload["event"], "result");
+        assert_eq!(payload["request_id"], "dump-run-1");
+        assert_eq!(payload["command"], "dump.run");
+        assert_eq!(payload["success"], true);
+        assert_eq!(payload["output_dir"], "tmp/export");
+        assert_eq!(payload["format"], "tunnelforge-dump");
+        assert_eq!(payload["compression"], "zstd");
+        assert_eq!(payload["tables"], 1);
+        assert_eq!(payload["rows_dumped"], 99);
+        assert_eq!(payload["chunks_dumped"], 7);
+        assert_eq!(payload["restorability"], "not_restorable");
+        assert!(payload["warnings"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("snapshot consistency is not proven")));
+        assert!(payload["blockers"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("unsupported feature mysql.unknown_feature")));
+    }
+
+    #[test]
+    fn dump_run_detect_source_version_returns_none_for_non_mysql_engine() {
+        let endpoint = Endpoint {
+            engine: "postgresql".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 5432,
+            user: "postgres".to_string(),
+            password: "secret".to_string(),
+            database: "app".to_string(),
+            schema: Some("public".to_string()),
+        };
+
+        let source_version = detect_dump_source_version(&endpoint);
+
+        assert_eq!(source_version, None);
     }
 
     #[derive(Default)]
