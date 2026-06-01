@@ -3096,6 +3096,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
+    let mut recreated_target = false;
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
@@ -3129,6 +3130,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &manifest.source_engine,
                 &target_engine,
             )?;
+            recreated_target = true;
 
             let worker_endpoint = mysql_import_worker_endpoint(&endpoint, Some(&shadow_database));
             import_dump_table_data(
@@ -3192,6 +3194,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &manifest.source_engine,
                 &target_engine,
             )?;
+            recreated_target = true;
         }
 
         let worker_endpoint = mysql_import_worker_endpoint(&endpoint, None);
@@ -3210,13 +3213,23 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             &mut chunks_imported,
             &mut emit,
         )?;
-        emit(json!({
-            "event": "phase",
-            "request_id": request.request_id,
-            "phase": "dump_import_post_load",
-            "message": "creating indexes and foreign keys"
-        }));
-        apply_post_load_ddl(&mut adapter, &import_schema, &target_engine)?;
+        if should_apply_post_load_ddl(mode, recreated_target) {
+            emit(json!({
+                "event": "phase",
+                "request_id": request.request_id,
+                "phase": "dump_import_post_load",
+                "message": "creating indexes and foreign keys"
+            }));
+            apply_post_load_ddl(&mut adapter, &import_schema, &target_engine)?;
+        } else {
+            emit(json!({
+                "event": "phase",
+                "request_id": request.request_id,
+                "phase": "dump_import_post_load",
+                "message": post_load_ddl_skip_message(mode),
+                "strategy": "existing_schema"
+            }));
+        }
         Ok(())
     })();
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
@@ -8024,6 +8037,14 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
     Ok(())
 }
 
+fn should_apply_post_load_ddl(mode: &str, recreated_target: bool) -> bool {
+    recreated_target && matches!(mode, "replace" | "recreate")
+}
+
+fn post_load_ddl_skip_message(mode: &str) -> String {
+    format!("skipping post-load DDL for {mode} import; existing objects must already match")
+}
+
 pub fn count_sql(engine: &str, table: &str) -> String {
     format!(
         "SELECT COUNT(*) AS row_count FROM {}",
@@ -10934,6 +10955,22 @@ mod tests {
         assert_eq!(
             adapter.executed_sql,
             vec!["CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);"]
+        );
+    }
+
+    #[test]
+    fn post_load_ddl_policy_applies_for_recreated_targets_only() {
+        assert!(should_apply_post_load_ddl("recreate", true));
+        assert!(should_apply_post_load_ddl("replace", true));
+        assert!(!should_apply_post_load_ddl("merge", false));
+        assert!(!should_apply_post_load_ddl("merge", true));
+    }
+
+    #[test]
+    fn merge_import_does_not_claim_post_load_ddl_phase() {
+        assert_eq!(
+            post_load_ddl_skip_message("merge"),
+            "skipping post-load DDL for merge import; existing objects must already match"
         );
     }
 
