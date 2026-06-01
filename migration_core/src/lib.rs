@@ -8050,6 +8050,7 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
     schema: &NormalizedSchema,
     target_engine: &str,
 ) -> Result<(), String> {
+    validate_foreign_key_column_compatibility(schema)?;
     for sql in generate_sequence_reset_ddl(schema, target_engine) {
         target
             .execute_sql(&sql)
@@ -8066,6 +8067,86 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
             .map_err(|err| format!("post-load foreign key DDL failed: {sql}: {err}"))?;
     }
     Ok(())
+}
+
+fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Result<(), String> {
+    for table in &schema.tables {
+        for fk in &table.foreign_keys {
+            let referenced_table = schema
+                .tables
+                .iter()
+                .find(|candidate| candidate.name == fk.referenced_table)
+                .ok_or_else(|| {
+                    classified_import_error(
+                        "post_load_validation_failed",
+                        &format!(
+                            "foreign key {} references missing table {}",
+                            fk.name, fk.referenced_table
+                        ),
+                        Some(&table.name),
+                    )
+                })?;
+            for (column_name, referenced_column_name) in
+                fk.columns.iter().zip(fk.referenced_columns.iter())
+            {
+                let column = table
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.name == *column_name)
+                    .ok_or_else(|| {
+                        classified_import_error(
+                            "post_load_validation_failed",
+                            &format!(
+                                "foreign key {} references missing column {}",
+                                fk.name, column_name
+                            ),
+                            Some(&table.name),
+                        )
+                    })?;
+                let referenced_column = referenced_table
+                    .columns
+                    .iter()
+                    .find(|candidate| candidate.name == *referenced_column_name)
+                    .ok_or_else(|| {
+                        classified_import_error(
+                            "post_load_validation_failed",
+                            &format!(
+                                "foreign key {} references missing column {}.{}",
+                                fk.name, referenced_table.name, referenced_column_name
+                            ),
+                            Some(&table.name),
+                        )
+                    })?;
+                if normalize_fk_type_signature(&column.type_name)
+                    != normalize_fk_type_signature(&referenced_column.type_name)
+                {
+                    return Err(classified_import_error(
+                        "post_load_validation_failed",
+                        &format!(
+                            "foreign key {} incompatible columns {}.{} ({}) and {}.{} ({})",
+                            fk.name,
+                            table.name,
+                            column.name,
+                            column.type_name,
+                            referenced_table.name,
+                            referenced_column.name,
+                            referenced_column.type_name
+                        ),
+                        Some(&table.name),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn normalize_fk_type_signature(type_name: &str) -> String {
+    type_name
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
 }
 
 fn should_apply_post_load_ddl(mode: &str, recreated_target: bool) -> bool {
@@ -11037,6 +11118,98 @@ mod tests {
         imported.insert("users".to_string(), 3_u64);
 
         verify_imported_row_counts(&tables, &imported).unwrap();
+    }
+
+    #[test]
+    fn fk_schema_fidelity_rejects_incompatible_text_collations() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "audit_category".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+                NormalizedTable {
+                    name: "df_evaluation_results".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "audit_category_code".to_string(),
+                        type_name:
+                            "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                                .to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "df_evaluation_results_ibfk_3".to_string(),
+                        columns: vec!["audit_category_code".to_string()],
+                        referenced_table: "audit_category".to_string(),
+                        referenced_columns: vec!["code".to_string()],
+                    }],
+                },
+            ],
+        };
+
+        let err = validate_foreign_key_column_compatibility(&schema).unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("df_evaluation_results_ibfk_3"));
+        assert!(err.contains("audit_category_code"));
+        assert!(err.contains("code"));
+    }
+
+    #[test]
+    fn fk_schema_fidelity_accepts_matching_text_collations() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "audit_category".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+                NormalizedTable {
+                    name: "df_evaluation_results".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "audit_category_code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "df_evaluation_results_ibfk_3".to_string(),
+                        columns: vec!["audit_category_code".to_string()],
+                        referenced_table: "audit_category".to_string(),
+                        referenced_columns: vec!["code".to_string()],
+                    }],
+                },
+            ],
+        };
+
+        validate_foreign_key_column_compatibility(&schema).unwrap();
     }
 
     #[test]
