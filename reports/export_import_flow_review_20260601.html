@@ -1,0 +1,399 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>TunnelForge Export/Import Flow Review - 2026-06-01</title>
+  <style>
+    :root {
+      --fg: #1f2933;
+      --muted: #5f6b7a;
+      --line: #d9e2ec;
+      --bg: #f7f9fb;
+      --card: #ffffff;
+      --critical: #b42318;
+      --high: #c2410c;
+      --medium: #a16207;
+      --low: #2563eb;
+      --ok: #166534;
+    }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "Malgun Gothic", Arial, sans-serif;
+      color: var(--fg);
+      background: var(--bg);
+      line-height: 1.55;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 36px 28px 64px;
+    }
+    h1, h2, h3 {
+      margin: 0 0 12px;
+      line-height: 1.25;
+    }
+    h1 { font-size: 30px; }
+    h2 {
+      margin-top: 30px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--line);
+      font-size: 22px;
+    }
+    h3 { font-size: 17px; }
+    p { margin: 8px 0; }
+    .meta, .summary, .finding, .flow, .evidence {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px 18px;
+      margin: 14px 0;
+    }
+    .summary strong { color: var(--critical); }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+      gap: 12px;
+    }
+    .metric {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .metric b {
+      display: block;
+      font-size: 24px;
+      margin-bottom: 2px;
+    }
+    .sev {
+      display: inline-block;
+      min-width: 82px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      color: white;
+      font-size: 12px;
+      font-weight: 700;
+      text-align: center;
+      letter-spacing: 0;
+    }
+    .critical { background: var(--critical); }
+    .high { background: var(--high); }
+    .medium { background: var(--medium); }
+    .low { background: var(--low); }
+    .ok { color: var(--ok); font-weight: 700; }
+    code {
+      font-family: Consolas, "Cascadia Mono", monospace;
+      background: #eef2f7;
+      padding: 1px 4px;
+      border-radius: 4px;
+    }
+    pre {
+      overflow-x: auto;
+      background: #111827;
+      color: #e5e7eb;
+      padding: 12px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      background: var(--card);
+      border: 1px solid var(--line);
+      margin: 12px 0;
+    }
+    th, td {
+      border: 1px solid var(--line);
+      padding: 9px 10px;
+      vertical-align: top;
+      text-align: left;
+    }
+    th { background: #eef2f7; }
+    ul, ol { margin-top: 8px; }
+    li { margin: 5px 0; }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+<main>
+  <h1>TunnelForge Export/Import Flow Review</h1>
+  <div class="meta">
+    <p><b>작성일:</b> 2026-06-01</p>
+    <p><b>검토 범위:</b> Rust DB Core <code>dump.run</code>/<code>dump.import</code>, Python wrapper <code>src/exporters/rust_dump_exporter.py</code>, Import UI 흐름</p>
+    <p><b>검토 목적:</b> 최근 FK collation 오류처럼 과거의 땜빵식 개선 또는 흐름상 근본 결함이 남아 있는지 확인</p>
+    <p><b>중요 전제:</b> 이 리포트는 코드 리뷰 결과이며, 코드 수정은 포함하지 않는다.</p>
+  </div>
+
+  <div class="summary">
+    <h2>Executive Summary</h2>
+    <p><strong>현재 Export/Import 흐름은 그대로 운영 신뢰하기 어렵다.</strong> 특히 “안전 재생성 Import”는 다중 chunk 테이블에서 병렬 LOAD DATA 워커가 임시 스키마가 아니라 원래 대상 DB로 접속하는 구조라, 안전 재생성이라는 이름과 다르게 원본 대상 DB에 쓰기 작업이 들어갈 수 있다.</p>
+    <p>또한 Export는 일관 스냅샷 없이 여러 커넥션/여러 시점에서 데이터를 읽고, Import는 strict SQL mode를 완화한 뒤 성공 시 row count/digest 검증 없이 성공을 반환한다. UI에서 제공하는 timezone 설정은 Python wrapper payload에 반영되지 않는다.</p>
+  </div>
+
+  <div class="grid">
+    <div class="metric"><b>2</b>Critical findings</div>
+    <div class="metric"><b>4</b>High findings</div>
+    <div class="metric"><b>4</b>Medium findings</div>
+    <div class="metric"><b>3</b>Verified positive controls</div>
+  </div>
+
+  <h2>Flow Map</h2>
+  <div class="flow">
+    <h3>Export</h3>
+    <ol>
+      <li>Python <code>RustDumpExporter._run_rust_dump</code> builds payload with <code>data_format=tsv</code>, <code>compression=zstd</code>, <code>overwrite=true</code>.</li>
+      <li>Rust <code>dump_run</code> validates output dir, inspects schema, orders tables, estimates row counts, chooses sequential/table-parallel/global MySQL dump path.</li>
+      <li>Chunks are written as TSV/JSONL, checksums are recorded, then <code>_tunnelforge_dump.json</code> and marker are written at the end.</li>
+    </ol>
+    <h3>Import</h3>
+    <ol>
+      <li>Python <code>RustDumpImporter.import_dump</code> reads manifest for UI metadata, builds <code>dump.import</code> payload, and optionally passes selected retry tables.</li>
+      <li>Rust <code>dump_import</code> reads manifest, validates paths/checksums when present, orders tables, and applies mode behavior.</li>
+      <li><code>replace</code>: drop selected/import tables, create tables, import data, create secondary indexes/FKs.</li>
+      <li><code>merge</code>: skip create/drop, import data into existing tables, then still attempts post-load DDL.</li>
+      <li><code>recreate</code> full MySQL: create shadow schema, create tables there, import data, apply post-load DDL, drop/recreate target DB, rename shadow tables into target DB.</li>
+    </ol>
+  </div>
+
+  <h2>Findings</h2>
+
+  <div class="finding">
+    <h3><span class="sev critical">CRITICAL</span> Safe recreate 병렬 import가 원본 target DB로 접속한다</h3>
+    <p><b>근거:</b> safe recreate에서는 메인 adapter만 <code>USE shadow_database</code> 한다. 하지만 다중 chunk TSV import는 <code>import_mysql_tsv_table_parallel(endpoint, ...)</code>로 분기하고, 각 worker가 <code>LiveAdapter::connect(&endpoint)</code>로 새 접속을 만든다. 이 endpoint는 원래 target database를 가리킨다.</p>
+    <p><b>증거 위치:</b> <code>migration_core/src/lib.rs:3087-3121</code>, <code>migration_core/src/lib.rs:3260-3268</code>, <code>migration_core/src/lib.rs:3706-3714</code>, <code>migration_core/src/lib.rs:3819-3834</code></p>
+    <p><b>영향:</b> “안전 재생성 Import”가 임시 스키마에만 쓰지 않는다. 다중 chunk 테이블은 기존 target DB에 LOAD DATA가 들어가거나, target에 테이블이 없으면 실패한다. 실패 후 switch 로직에 진입하지 않더라도 이미 target DB에 쓰기 부작용이 발생할 수 있다.</p>
+    <p><b>권장 조치:</b> safe recreate 상태에서는 worker endpoint database를 shadow database로 복제해 넘기거나, parallel worker에 schema override를 명시 전달한다. 이 버그가 고쳐지고 회귀 테스트가 생길 때까지 safe recreate는 <code>threads=1</code>로 강제하거나 UI에서 비활성화해야 한다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev critical">CRITICAL</span> Export에 consistent snapshot/transaction 경계가 없다</h3>
+    <p><b>근거:</b> <code>dump_run</code>은 schema inspect, row count, chunk dump를 별도 단계와 여러 커넥션에서 수행한다. 코드 검색에서 <code>START TRANSACTION</code>, <code>WITH CONSISTENT SNAPSHOT</code>, <code>LOCK TABLES</code>, <code>SET TRANSACTION</code> 경로가 확인되지 않았다.</p>
+    <p><b>증거 위치:</b> <code>migration_core/src/lib.rs:1529-1655</code>, <code>migration_core/src/lib.rs:1916-1985</code>, <code>migration_core/src/lib.rs:2757-2998</code></p>
+    <p><b>영향:</b> 운영 DB가 export 중 변경되면 table 간 FK 일관성, row count, chunk 내용이 서로 다른 시점의 데이터가 될 수 있다. Export 완료는 “덤프 파일이 만들어졌다”만 의미하고 “복원 가능한 일관 스냅샷”을 의미하지 않는다.</p>
+    <p><b>권장 조치:</b> MySQL은 InnoDB 기준 <code>START TRANSACTION WITH CONSISTENT SNAPSHOT READ ONLY</code> 전략을 검토해야 한다. 다중 커넥션 병렬 dump를 유지하려면 snapshot token/backup lock/전역 read lock 등 설계가 필요하다. 최소한 UI와 manifest에 “consistent=false”를 명시하고 운영 Export 전 변경 중지를 요구해야 한다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev high">HIGH</span> Merge/Retry import가 데이터 적재 후 기존 index/FK를 다시 생성한다</h3>
+    <p><b>근거:</b> <code>merge</code> 모드는 create/drop 단계를 건너뛰지만, 데이터 import 후 <code>apply_post_load_ddl</code>을 무조건 호출한다.</p>
+    <p><b>증거 위치:</b> <code>migration_core/src/lib.rs:3158-3202</code>, UI retry는 <code>src/ui/dialogs/db_dialogs.py:2701-2703</code>에서 <code>merge</code>로 강제된다.</p>
+    <p><b>영향:</b> retry/merge 대상 테이블에 이미 index/FK가 있으면 duplicate key/index/constraint 오류가 발생할 수 있다. 오류가 데이터 적재 뒤에 발생하면 일부 데이터만 들어간 뒤 실패하는 상태가 된다.</p>
+    <p><b>권장 조치:</b> <code>merge</code>에서는 post-load DDL을 기본적으로 생략하거나, 대상에 없는 index/FK만 diff 기반으로 생성해야 한다. retry는 “실패 테이블 cleanup 후 replace”인지 “기존 테이블 append”인지 의미를 분리해야 한다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev high">HIGH</span> UI timezone 설정이 Rust import payload로 전달되지 않는다</h3>
+    <p><b>근거:</b> UI는 <code>timezone_sql</code>을 계산해 worker로 전달하지만, Python wrapper의 payload에는 <code>target</code>, <code>input_dir</code>, <code>mode</code>, <code>threads</code>만 포함된다.</p>
+    <p><b>증거 위치:</b> <code>src/ui/dialogs/db_dialogs.py:2670-2712</code>, <code>src/exporters/rust_dump_exporter.py:594-647</code></p>
+    <p><b>영향:</b> TIMESTAMP/DATETIME 계열 데이터에서 사용자가 선택한 KST/UTC 보정이 실제 import session에 적용되지 않는다. UI상 제어가 있는 것처럼 보이지만 core는 받지 않는다.</p>
+    <p><b>권장 조치:</b> Rust core payload에 <code>session_sql</code> 또는 제한된 <code>time_zone</code> 필드를 추가하고, 모든 main/parallel import connection에 동일하게 적용해야 한다. 임의 SQL 주입 형태는 피해야 한다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev high">HIGH</span> Import 성공 기준에 row count/digest 검증이 없다</h3>
+    <p><b>근거:</b> Import는 <code>rows_imported</code>, <code>chunks_imported</code>만 반환한다. manifest의 <code>table.rows</code>와 대상 table count 비교, digest 비교, FK 검증 결과를 success gate로 삼지 않는다.</p>
+    <p><b>증거 위치:</b> <code>migration_core/src/lib.rs:3190-3226</code></p>
+    <p><b>영향:</b> SQL mode 완화, LOAD DATA coercion, 잘못된 기존 데이터, retry 중복, 부분 적재가 있어도 core가 “성공”으로 종료할 여지가 있다.</p>
+    <p><b>권장 조치:</b> 최소 table별 target count == manifest rows 검증을 success gate로 추가한다. 중요 테이블은 canonical row digest 또는 checksum 기반 검증을 옵션으로 추가해야 한다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev high">HIGH</span> UI는 “모든 객체 재생성”이라고 안내하지만 dump/import는 tables만 처리한다</h3>
+    <p><b>근거:</b> UI 문구는 “테이블/뷰/프로시저/이벤트” 재생성을 안내한다. Rust dump manifest는 <code>NormalizedSchema.tables</code>와 table chunks만 저장한다. unsupported objects는 inspect에서 수집되지만 dump_run에서 차단하거나 manifest에 보존하지 않는다.</p>
+    <p><b>증거 위치:</b> <code>src/ui/dialogs/db_dialogs.py:2065-2070</code>, <code>migration_core/src/lib.rs:1529-1668</code>, <code>migration_core/src/lib.rs:4275-4279</code></p>
+    <p><b>영향:</b> Export/Import 성공 후에도 views/procedures/triggers/events가 복원되지 않을 수 있다. 운영 복구 도구로 쓰는 사용자에게 실제 DB 상태와 UI 설명이 다르다.</p>
+    <p><b>권장 조치:</b> 당장 UI 문구를 “테이블 데이터/인덱스/FK 중심”으로 정정하고, unsupported objects 존재 시 Export 완료 전 경고/리포트로 남긴다. 장기적으로 객체별 DDL 캡처/복원 설계가 필요하다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev medium">MEDIUM</span> Checksum 검증이 optional이라 manifest에서 누락되면 무결성 검사가 통과한다</h3>
+    <p><b>근거:</b> <code>validate_dump_manifest_chunks</code>는 chunk 파일 존재를 확인하지만, <code>chunk_sha256.get(...)</code>이 <code>None</code>이면 checksum 비교 없이 넘어간다.</p>
+    <p><b>증거 위치:</b> <code>migration_core/src/lib.rs:7505-7535</code></p>
+    <p><b>영향:</b> 새 format v2 dump에서 checksum이 누락되거나 손상되어도 import가 진행될 수 있다. 오래된 v1 호환 때문이라면 version별 정책이 분리되어야 한다.</p>
+    <p><b>권장 조치:</b> format_version 2 이상은 모든 chunk checksum을 필수화한다. v1 호환은 명시적 legacy path로 분기하고 UI에 “무결성 검증 불가”를 표시한다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev medium">MEDIUM</span> SQL mode 완화가 데이터 변형을 숨길 수 있다</h3>
+    <p><b>근거:</b> import 시작 시 strict/zero-date 관련 mode를 제거하고 <code>foreign_key_checks=0</code>, <code>unique_checks=0</code>를 설정한다.</p>
+    <p><b>증거 위치:</b> <code>migration_core/src/lib.rs:3597-3609</code></p>
+    <p><b>영향:</b> Import를 성공시키기 위해 coercion이 발생해도 후속 검증이 없으면 원본과 다른 값이 들어갈 수 있다.</p>
+    <p><b>권장 조치:</b> 완화 모드는 사용자가 선택한 호환 모드에서만 켠다. 기본은 strict 유지, 실패 시 어떤 컬럼/값 때문에 실패했는지 리포트하는 방향이 맞다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev medium">MEDIUM</span> Table-level charset/collation/engine 보존은 아직 불완전하다</h3>
+    <p><b>근거:</b> 최근 수정으로 문자열 컬럼 charset/collation은 보존되지만, table default charset/collation과 engine option은 schema model에 별도 필드로 보존되지 않는다. MySQL DDL은 현재 <code>ENGINE=InnoDB</code>만 붙인다.</p>
+    <p><b>증거 위치:</b> <code>migration_core/src/lib.rs:4200-4240</code>, <code>migration_core/src/lib.rs:8709-8727</code></p>
+    <p><b>영향:</b> FK 문자열 호환 문제는 새 export에서 개선되지만, 전체 schema fidelity는 아직 원본과 다를 수 있다. MyISAM, table default collation, row format 등은 손실된다.</p>
+    <p><b>권장 조치:</b> <code>NormalizedTable</code>에 engine/default charset/default collation/options를 구조화해서 저장하고, DDL 생성에 반영한다. type string에 정보를 덧붙이는 방식은 임시 호환층으로만 사용한다.</p>
+  </div>
+
+  <div class="finding">
+    <h3><span class="sev medium">MEDIUM</span> 기존 dump에는 charset/collation이 없으며 자동 복구할 수 없다</h3>
+    <p><b>근거:</b> 사용자가 제공한 기존 dump manifest의 <code>audit_category.code</code>, <code>df_evaluation_results.audit_category_code</code>는 둘 다 <code>varchar(45)</code>만 보유했다. 원본 collation 정보가 dump에 없다.</p>
+    <p><b>영향:</b> 기존 dump는 어떤 collation이 원본이었는지 알 수 없으므로, 새 코드만으로 원본 스키마를 정확히 복원할 수 없다.</p>
+    <p><b>권장 조치:</b> 기존 dump import 전 preflight에서 “charset/collation metadata missing”을 탐지해 warning 또는 block한다. 원본 DB 접근이 가능하면 재-export를 요구하는 것이 정직한 동작이다.</p>
+  </div>
+
+  <h2>Verified Positive Controls</h2>
+  <div class="evidence">
+    <ul>
+      <li><span class="ok">OK</span> Dump table path와 chunk path는 canonicalize 후 dump directory 하위인지 검사한다. 관련 코드: <code>migration_core/src/lib.rs:7463-7503</code>.</li>
+      <li><span class="ok">OK</span> Post-load DDL은 index를 먼저 만들고 FK를 나중에 만든다. 관련 코드: <code>migration_core/src/lib.rs:7856-7965</code>.</li>
+      <li><span class="ok">OK</span> Python metadata 분석도 manifest path traversal과 chunk symlink 외부 참조를 거부하는 테스트가 있다. 관련 테스트: <code>tests/test_rust_dump_exporter.py:400-459</code>.</li>
+    </ul>
+  </div>
+
+  <h2>Remediation Summary</h2>
+  <div class="evidence">
+    <ul>
+      <li><span class="ok">FIXED</span> MySQL column inspection now preserves textual column charset/collation in the normalized type string, preventing the reported FK mismatch class from being silently recreated as incompatible DDL.</li>
+      <li><span class="ok">FIXED</span> Full replacement safe import now resolves a worker endpoint for the shadow database before parallel TSV load, so loader workers cannot reconnect to the original target database during shadow restore.</li>
+      <li><span class="ok">FIXED</span> Strict dump import now rejects manifests with chunked tables that lack <code>chunk_sha256</code> before target mutation. Legacy mode can still emit explicit warnings.</li>
+      <li><span class="ok">FIXED</span> Merge import no longer blindly claims or applies recreate-style post-load DDL. Recreated targets still apply index/FK DDL; merge reports an existing-schema strategy.</li>
+      <li><span class="ok">FIXED</span> Import success is gated by manifest row counts and writes <code>_tunnelforge_import_report.json</code> with verification details.</li>
+      <li><span class="ok">FIXED</span> Python now forwards <code>timezone_sql</code> and <code>strict_manifest</code> to Rust. Rust accepts only <code>SET SESSION time_zone</code> for this field.</li>
+      <li><span class="ok">FIXED</span> UI wording no longer promises automatic restoration of views, procedures, triggers, or events.</li>
+    </ul>
+  </div>
+
+  <h2>Provided PROD Dump Classification</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>항목</th>
+        <th>값</th>
+        <th>판정</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>Dump path</td>
+        <td><code>C:\Users\QESG\Desktop\PROD_root_dataflare_20260601_120617</code></td>
+        <td>Manifest readable</td>
+      </tr>
+      <tr>
+        <td>format / version</td>
+        <td><code>tunnelforge-dump</code> / <code>2</code></td>
+        <td>Supported container version</td>
+      </tr>
+      <tr>
+        <td>data format / compression</td>
+        <td><code>tsv</code> / <code>zstd</code></td>
+        <td>Supported data encoding</td>
+      </tr>
+      <tr>
+        <td>snapshot_policy / strict_export</td>
+        <td>empty / empty</td>
+        <td><span class="sev medium">LEGACY</span> snapshot consistency was not recorded</td>
+      </tr>
+      <tr>
+        <td>chunk checksums</td>
+        <td>43 of 209 tables missing checksum metadata</td>
+        <td><span class="sev high">STRICT BLOCK</span> strict import must reject before target mutation</td>
+      </tr>
+      <tr>
+        <td>Reported FK columns</td>
+        <td><code>audit_category.code</code> and <code>df_evaluation_results.audit_category_code</code> are both only <code>varchar(45)</code></td>
+        <td><span class="sev medium">INCOMPLETE</span> original charset/collation cannot be recovered from this dump</td>
+      </tr>
+    </tbody>
+  </table>
+  <p>정직한 운영 복구 경로는 수정된 core로 원본 DB를 다시 Export한 뒤 새 dump를 Import하는 것이다. 기존 dump는 제한 복원 대상으로만 취급해야 하며, strict 완전 복원 산출물로 표시하면 안 된다.</p>
+
+  <h2>Remaining Limits</h2>
+  <div class="finding">
+    <p><b>Export snapshot:</b> 이번 수습은 새 dump가 snapshot consistency를 증명하지 못하면 manifest에 <code>snapshot_policy: not_enforced</code>와 warning을 남기도록 했다. MySQL consistent snapshot을 실제로 공유하는 export path는 별도 후속 작업이다.</p>
+    <p><b>Table-level metadata:</b> column charset/collation은 보존하지만 table engine/default collation/row format은 아직 구조화된 schema field가 아니다. 따라서 새 경로는 FK mismatch class를 줄이고 검증하지만, 모든 MySQL physical option을 완전 복제한다고 말하지 않는다.</p>
+  </div>
+
+  <h2>Verification Evidence</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Command</th>
+        <th>Result</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td>
+        <td><span class="ok">PASS</span></td>
+        <td>136 lib tests, CLI helper test, and 6 live-gated tests passed.</td>
+      </tr>
+      <tr>
+        <td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td>
+        <td><span class="ok">PASS</span></td>
+        <td>Release binary built at <code>migration_core\target\release\tunnelforge-core.exe</code>.</td>
+      </tr>
+      <tr>
+        <td><code>pytest</code></td>
+        <td><span class="ok">PASS</span></td>
+        <td>1698 Python tests passed, 5 existing warnings.</td>
+      </tr>
+      <tr>
+        <td><code>service.hello</code> against release binary</td>
+        <td><span class="ok">PASS</span></td>
+        <td>Output advertises <code>dump.run</code> and <code>dump.import</code>.</td>
+      </tr>
+      <tr>
+        <td><code>git diff --check</code></td>
+        <td><span class="ok">PASS</span></td>
+        <td>No whitespace errors.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Recommended Immediate Gate</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>순서</th>
+        <th>조치</th>
+        <th>이유</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>1</td>
+        <td>Safe recreate 병렬 import를 막거나 shadow DB endpoint로 고친다.</td>
+        <td>현재 가장 직접적인 데이터 손상/오염 위험이다.</td>
+      </tr>
+      <tr>
+        <td>2</td>
+        <td>Import success gate에 table row count 검증을 추가한다.</td>
+        <td>성공 메시지와 실제 적재 상태를 일치시켜야 한다.</td>
+      </tr>
+      <tr>
+        <td>3</td>
+        <td>Merge/retry에서 post-load DDL을 생략하거나 diff 기반으로 바꾼다.</td>
+        <td>데이터 적재 후 duplicate DDL 실패를 막는다.</td>
+      </tr>
+      <tr>
+        <td>4</td>
+        <td>Export snapshot 정책을 결정한다.</td>
+        <td>운영 DB dump가 복원 가능한 일관 상태인지 정의해야 한다.</td>
+      </tr>
+      <tr>
+        <td>5</td>
+        <td>UI 문구를 실제 기능에 맞게 낮춘다.</td>
+        <td>현재는 tables 외 객체 복원을 약속하는 문구가 있다.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Verification Commands Run For This Report</h2>
+  <pre>rg -n "dump.run|dump.import|safe recreate|recreate|replace|merge|foreign_key_checks|local_infile|LOAD DATA|CREATE DATABASE|DROP DATABASE|RENAME TABLE|apply_post_load_ddl|generate_post_data" migration_core\src\lib.rs
+rg -n "timezone_sql|time_zone|Asia/Seoul|\+09:00" src\exporters\rust_dump_exporter.py src\ui\dialogs\db_dialogs.py migration_core\src\lib.rs
+rg -n "START TRANSACTION|REPEATABLE|CONSISTENT|LOCK TABLE|FLUSH TABLE|snapshot|transaction|BEGIN|SET TRANSACTION|read only|read_only" migration_core\src\lib.rs src\exporters\rust_dump_exporter.py
+git diff --check</pre>
+
+  <h2>Bottom Line</h2>
+  <div class="summary">
+    <p>이번 수습으로 Import의 가장 위험한 경로는 검증 가능한 규칙으로 고정됐다. 다만 사용자가 제공한 기존 PROD dump는 strict 완전 복원 산출물이 아니다. 새 core로 재-export한 산출물을 표준 복구 경로로 사용해야 한다.</p>
+  </div>
+</main>
+</body>
+</html>
