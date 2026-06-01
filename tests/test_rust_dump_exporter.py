@@ -2,8 +2,21 @@
 RustDumpExporter 테스트
 """
 import json
+from pathlib import Path
 import pytest
 from unittest.mock import patch, MagicMock
+
+
+def test_mysqlsh_grade_manifest_fixtures_are_classified():
+    fixtures = Path("tests/fixtures/mysqlsh_grade")
+    strict = json.loads((fixtures / "strict_manifest.json").read_text(encoding="utf-8"))
+    limited = json.loads((fixtures / "limited_legacy_manifest.json").read_text(encoding="utf-8"))
+    blocked = json.loads((fixtures / "not_restorable_manifest.json").read_text(encoding="utf-8"))
+
+    assert strict["restorability"] == "strict_restorable"
+    assert limited["restorability"] == "limited_restorable"
+    assert blocked["restorability"] == "not_restorable"
+    assert blocked["blockers"] == ["unsupported feature mysql.unknown_feature"]
 
 
 class TestRustDumpChecker:

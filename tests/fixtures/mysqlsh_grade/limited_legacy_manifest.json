@@ -1,0 +1,20 @@
+{
+  "format": "tunnelforge-dump",
+  "format_version": 2,
+  "data_format": "tsv",
+  "compression": "zstd",
+  "source_engine": "mysql",
+  "database": "dataflare",
+  "schema": { "tables": [] },
+  "chunk_size": 1000,
+  "created_unix_seconds": 1780000000,
+  "snapshot_policy": "not_enforced",
+  "strict_export": false,
+  "manifest_warnings": ["snapshot consistency is not proven"],
+  "dump_scope": "schema",
+  "features": { "snapshot": false, "chunking": true, "checksum": false, "timezone": false },
+  "restorability": "limited_restorable",
+  "blockers": [],
+  "objects": { "objects": [] },
+  "tables": []
+}

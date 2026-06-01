@@ -1,0 +1,20 @@
+{
+  "format": "tunnelforge-dump",
+  "format_version": 3,
+  "data_format": "tsv",
+  "compression": "none",
+  "source_engine": "mysql",
+  "database": "app",
+  "schema": { "tables": [] },
+  "chunk_size": 1000,
+  "created_unix_seconds": 1790000001,
+  "snapshot_policy": "transaction_snapshot",
+  "strict_export": false,
+  "manifest_warnings": [],
+  "dump_scope": "schema",
+  "features": { "snapshot": true, "chunking": true, "checksum": true, "unsupported": ["mysql.unknown_feature"] },
+  "restorability": "not_restorable",
+  "blockers": ["unsupported feature mysql.unknown_feature"],
+  "objects": { "objects": [] },
+  "tables": []
+}

@@ -11211,6 +11211,22 @@ mod tests {
     }
 
     #[test]
+    fn mysqlsh_grade_fixtures_parse_as_dump_manifests() {
+        let fixture_dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/fixtures/mysqlsh_grade");
+        for file_name in [
+            "strict_manifest.json",
+            "limited_legacy_manifest.json",
+            "not_restorable_manifest.json",
+        ] {
+            let json = fs::read_to_string(fixture_dir.join(file_name)).unwrap();
+            let manifest: DumpManifest = serde_json::from_str(&json).unwrap();
+            let grade = grade_dump_artifact(&manifest);
+            assert_eq!(manifest.restorability, grade.restorability);
+        }
+    }
+
+    #[test]
     fn artifact_grading_allows_strict_when_required_evidence_exists() {
         let manifest = mysql_grade_manifest("transaction_snapshot", true, Vec::new());
 
