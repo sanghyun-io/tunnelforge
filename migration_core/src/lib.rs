@@ -3721,6 +3721,19 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         switched: false,
         cleanup_complete: false,
     };
+    if progress_path.exists() {
+        let existing_state = read_import_progress_state(&progress_path)?;
+        validate_import_resume_state(
+            &existing_state,
+            &progress_state.manifest_hash,
+            &progress_state.target_identity,
+            &progress_state.import_mode,
+        )
+        .map_err(|err| {
+            format!("{err}; existing import progress state requires resume or reset")
+        })?;
+        return Err("existing import progress state requires resume or reset".to_string());
+    }
     write_import_progress_state(&progress_path, &progress_state)?;
     if let Some(sql) = timezone_sql.as_deref() {
         adapter.execute_sql(sql)?;
@@ -3827,6 +3840,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &shadow_database,
                 &import_schema,
             )?;
+            progress_state.switched = true;
+            write_import_progress_state(&progress_path, &progress_state)?;
             return Ok(());
         } else if matches!(mode, "replace" | "recreate") {
             emit(json!({
@@ -3850,8 +3865,6 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &target_engine,
             )?;
             recreated_target = true;
-            mark_import_step_completed(&progress_path, &mut progress_state, "load_schema")?;
-        } else if mode == "merge" {
             mark_import_step_completed(&progress_path, &mut progress_state, "load_schema")?;
         }
 
@@ -3901,6 +3914,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     );
     import_result?;
     verify_imported_row_counts(&tables, &imported_rows_by_table)?;
+    progress_state.verification_complete = true;
+    write_import_progress_state(&progress_path, &progress_state)?;
     if !manifest.objects.objects.is_empty() {
         emit(json!({
             "event": "phase",
@@ -3910,9 +3925,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         }));
     }
     let objects_restored = restore_dump_objects(&mut adapter, input_path, &manifest.objects)?;
-    mark_import_step_completed(&progress_path, &mut progress_state, "load_objects")?;
     restore_result?;
     local_infile_restore_result?;
+    progress_state.cleanup_complete = true;
+    mark_import_step_completed(&progress_path, &mut progress_state, "load_objects")?;
     let import_report_path = dump_import_report_path(input_path)?;
     let import_report = json!({
         "success": true,
@@ -8695,7 +8711,8 @@ fn write_import_progress_state(path: &Path, state: &ImportProgressState) -> Resu
             "failed to replace import progress file {}: {err}",
             path.display()
         )
-    })
+    })?;
+    sync_parent_directory(path)
 }
 
 fn read_import_progress_state(path: &Path) -> Result<ImportProgressState, String> {
@@ -8778,6 +8795,34 @@ fn mark_import_step_completed(
         state.completed_steps.push(step.to_string());
     }
     write_import_progress_state(progress_path, state)
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), String> {
+    let Some(parent) = path.parent() else {
+        return Ok(());
+    };
+    let parent_file = match File::open(parent) {
+        Ok(file) => file,
+        Err(err) => {
+            if cfg!(windows) {
+                return Ok(());
+            }
+            return Err(format!(
+                "failed to open import progress parent directory {} for sync: {err}",
+                parent.display()
+            ));
+        }
+    };
+    if let Err(err) = parent_file.sync_all() {
+        if cfg!(windows) {
+            return Ok(());
+        }
+        return Err(format!(
+            "failed to sync import progress parent directory {}: {err}",
+            parent.display()
+        ));
+    }
+    Ok(())
 }
 
 fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
