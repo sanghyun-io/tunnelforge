@@ -3130,9 +3130,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &target_engine,
             )?;
 
+            let worker_endpoint = mysql_import_worker_endpoint(&endpoint, Some(&shadow_database));
             import_dump_table_data(
                 &mut adapter,
-                &endpoint,
+                &worker_endpoint,
                 input_path,
                 &tables,
                 &import_schema,
@@ -3193,9 +3194,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             )?;
         }
 
+        let worker_endpoint = mysql_import_worker_endpoint(&endpoint, None);
         import_dump_table_data(
             &mut adapter,
-            &endpoint,
+            &worker_endpoint,
             input_path,
             &tables,
             &import_schema,
@@ -7147,6 +7149,15 @@ fn mysql_shadow_schema_name(database: &str, request_id: Option<&str>, fallback: 
     format!("{prefix}{database}_{suffix}")
 }
 
+fn mysql_import_worker_endpoint(endpoint: &Endpoint, database: Option<&str>) -> Endpoint {
+    let mut worker_endpoint = endpoint.clone();
+    if let Some(database) = database.filter(|value| !value.trim().is_empty()) {
+        worker_endpoint.database = database.to_string();
+        worker_endpoint.schema = Some(database.to_string());
+    }
+    worker_endpoint
+}
+
 fn mysql_identifier_fragment(value: &str) -> String {
     let mut output = String::new();
     let mut last_was_underscore = false;
@@ -10810,6 +10821,42 @@ mod tests {
         assert!(name
             .chars()
             .all(|ch| ch.is_ascii_alphanumeric() || ch == '_'));
+    }
+
+    #[test]
+    fn mysql_shadow_import_endpoint_targets_shadow_database() {
+        let endpoint = Endpoint {
+            engine: "mysql".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            database: "dataflare".to_string(),
+            schema: None,
+        };
+
+        let shadow = mysql_import_worker_endpoint(&endpoint, Some("_tf_restore_dataflare_1"));
+
+        assert_eq!(shadow.database, "_tf_restore_dataflare_1");
+        assert_eq!(shadow.host, endpoint.host);
+        assert_eq!(shadow.user, endpoint.user);
+    }
+
+    #[test]
+    fn direct_import_worker_endpoint_keeps_target_database() {
+        let endpoint = Endpoint {
+            engine: "mysql".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            password: "secret".to_string(),
+            database: "dataflare".to_string(),
+            schema: None,
+        };
+
+        let direct = mysql_import_worker_endpoint(&endpoint, None);
+
+        assert_eq!(direct.database, "dataflare");
     }
 
     #[test]
