@@ -86,6 +86,8 @@ _TRANSLATIONS = {
         "settings.title": "설정",
         "Strict restorable dump": "엄격 복원 가능 Dump",
         "Dump compatibility is not checked": "Dump 호환성을 아직 확인하지 않았습니다",
+        "복원 불가 Dump": "복원 불가 Dump",
+        "제한적 복원 Dump": "제한적 복원 Dump",
     },
     "en": {
         "app.ready": "Ready",
@@ -154,6 +156,8 @@ _TRANSLATIONS = {
         "settings.title": "Settings",
         "Strict restorable dump": "Strict restorable dump",
         "Dump compatibility is not checked": "Dump compatibility is not checked",
+        "복원 불가 Dump": "Not restorable dump",
+        "제한적 복원 Dump": "Limited restorable dump",
     },
 }
 

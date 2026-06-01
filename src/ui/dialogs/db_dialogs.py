@@ -2547,9 +2547,15 @@ class RustDumpImportDialog(QDialog):
             enable_recommended = False
             color = "#f39c12"
 
-        details = blockers or warnings
+        details = []
+        seen_details = set()
+        for item in blockers + warnings:
+            detail = str(item)
+            if detail and detail not in seen_details:
+                seen_details.add(detail)
+                details.append(detail)
         if details:
-            text = f"{text}: {'; '.join(str(item) for item in details)}"
+            text = f"{text}: {'; '.join(details)}"
 
         self._compatibility_allows_recommended_import = enable_recommended
         self.lbl_dump_compatibility.setText(text)

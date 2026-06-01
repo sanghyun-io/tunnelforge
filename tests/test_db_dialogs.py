@@ -363,6 +363,27 @@ def test_import_dialog_disables_recommended_import_for_limited_dump(monkeypatch)
     dialog.close()
 
 
+def test_import_dialog_compatibility_text_includes_blockers_and_warnings(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+    dialog = RustDumpImportDialog(connector=None)
+    dialog._set_dump_compatibility(
+        {
+            "restorability": "not_restorable",
+            "warnings": ["w1", "shared"],
+            "blockers": ["b1", "shared"],
+        }
+    )
+
+    text = dialog.lbl_dump_compatibility.text()
+    assert "복원 불가 Dump" in text
+    assert "b1" in text
+    assert "w1" in text
+    assert text.index("b1") < text.index("w1")
+    assert text.count("shared") == 1
+    dialog.close()
+
+
 def test_export_raw_output_shows_visible_telemetry_summary():
     class FakeLogList:
         def __init__(self):
