@@ -20,6 +20,19 @@ logger = get_logger("rust_dump_exporter")
 DEFAULT_DUMP_COMPRESSION = "zstd"
 
 
+def _manifest_string_list(value: object) -> List[str]:
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        values: List[str] = []
+        for item in value:
+            text = str(item)
+            if text:
+                values.append(text)
+        return values
+    return []
+
+
 def _safe_dump_child_dir(dump_dir: str, table_path: str) -> Optional[Path]:
     base_path = Path(dump_dir).resolve()
     table_path_obj = Path(table_path)
@@ -588,8 +601,11 @@ class RustDumpImporter:
                 "format": manifest.get("format", ""),
                 "format_version": manifest.get("format_version", 0),
                 "restorability": str(manifest.get("restorability") or "limited_restorable"),
-                "warnings": list(manifest.get("manifest_warnings") or manifest.get("warnings") or []),
-                "blockers": list(manifest.get("blockers") or []),
+                "warnings": (
+                    _manifest_string_list(manifest.get("manifest_warnings"))
+                    or _manifest_string_list(manifest.get("warnings"))
+                ),
+                "blockers": _manifest_string_list(manifest.get("blockers")),
                 "snapshot_policy": str(manifest.get("snapshot_policy") or "unknown"),
                 "features": dict(manifest.get("features") or {}),
             }

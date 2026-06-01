@@ -458,6 +458,32 @@ class TestRustDumpImporter:
         assert metadata["warnings"] == ["snapshot consistency is not proven"]
         assert metadata["blockers"] == []
 
+    def test_import_metadata_normalizes_string_warning_field(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir()
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 3,
+                    "database": "app",
+                    "restorability": "limited_restorable",
+                    "manifest_warnings": "snapshot consistency is not proven",
+                    "blockers": "binlog not available",
+                    "tables": [],
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
+        metadata = importer._analyze_dump_metadata(str(dump_dir))
+
+        assert metadata["warnings"] == ["snapshot consistency is not proven"]
+        assert metadata["blockers"] == ["binlog not available"]
+
     def test_import_metadata_rejects_manifest_path_outside_dump_dir(self, tmp_path):
         """악의적 manifest path가 dump 폴더 밖 chunk를 참조하면 metadata 분석을 거부한다."""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter

@@ -19,6 +19,7 @@ import shutil
 from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
+from src.core.i18n import tr as i18n_tr
 from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, RustDumpConfig, check_rust_dump,
@@ -28,6 +29,19 @@ from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
 logger = get_logger("db_dialogs")
+
+
+def _manifest_string_list(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value] if value else []
+    if isinstance(value, (list, tuple)):
+        values: list[str] = []
+        for item in value:
+            text = str(item)
+            if text:
+                values.append(text)
+        return values
+    return []
 
 
 def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tables: int) -> int:
@@ -1877,7 +1891,7 @@ class RustDumpImportDialog(QDialog):
         self.dump_metadata: Optional[dict] = None
         self.import_table_rows_done: dict = {}
         self.import_table_rows_total: dict = {}
-        self._compatibility_allows_recommended_import = True
+        self._compatibility_allows_recommended_import = False
 
         # 테이블별 chunk 진행률 추적
         self.table_chunk_progress: dict = {}  # {table_name: (completed, total)}
@@ -1979,7 +1993,7 @@ class RustDumpImportDialog(QDialog):
         status_line.addWidget(self.btn_view_issues)
 
         upgrade_check_layout.addLayout(status_line)
-        self.lbl_dump_compatibility = QLabel(self.tr("Dump compatibility is not checked"))
+        self.lbl_dump_compatibility = QLabel(i18n_tr("Dump compatibility is not checked"))
         self.lbl_dump_compatibility.setWordWrap(True)
         self.lbl_dump_compatibility.setStyleSheet("color: #7f8c8d;")
         upgrade_check_layout.addWidget(self.lbl_dump_compatibility)
@@ -2264,7 +2278,7 @@ class RustDumpImportDialog(QDialog):
             QPushButton:hover { background-color: #d35400; }
         """)
         self.btn_import.clicked.connect(self.do_import)
-        self.btn_import.setEnabled(self.rust_dump_installed)
+        self.btn_import.setEnabled(False)
 
         self.btn_save_log = QPushButton("📄 로그 저장")
         self.btn_save_log.setStyleSheet("""
@@ -2294,6 +2308,7 @@ class RustDumpImportDialog(QDialog):
         button_layout.addWidget(self.btn_import)
         button_layout.addWidget(btn_cancel)
         layout.addLayout(button_layout)
+        self._set_import_button_enabled_for_current_gate()
 
     def toggle_config_section(self):
         """설정 섹션 접기/펼치기"""
@@ -2415,13 +2430,18 @@ class RustDumpImportDialog(QDialog):
             self._set_dump_compatibility(
                 {
                     "restorability": str(manifest.get("restorability") or "limited_restorable"),
-                    "warnings": list(manifest.get("manifest_warnings") or manifest.get("warnings") or []),
-                    "blockers": list(manifest.get("blockers") or []),
+                    "warnings": (
+                        _manifest_string_list(manifest.get("manifest_warnings"))
+                        or _manifest_string_list(manifest.get("warnings"))
+                    ),
+                    "blockers": _manifest_string_list(manifest.get("blockers")),
                 }
             )
         except Exception:
-            self.lbl_dump_compatibility.setText(self.tr("Dump compatibility is not checked"))
+            self._compatibility_allows_recommended_import = False
+            self.lbl_dump_compatibility.setText(i18n_tr("Dump compatibility is not checked"))
             self.lbl_dump_compatibility.setStyleSheet("color: #7f8c8d;")
+            self._set_import_button_enabled_for_current_gate()
 
         self.lbl_upgrade_status.setText("🔍 호환성 검사 중...")
         self.lbl_upgrade_status.setStyleSheet("color: #3498db;")
@@ -2454,9 +2474,18 @@ class RustDumpImportDialog(QDialog):
                 self.btn_view_issues.setVisible(False)
 
         except Exception as e:
+            self._compatibility_allows_recommended_import = False
+            self._set_import_button_enabled_for_current_gate()
             self.lbl_upgrade_status.setText(f"❌ 검사 실패: {str(e)}")
             self.lbl_upgrade_status.setStyleSheet("color: #e74c3c;")
             self._upgrade_issues = []
+
+    def _set_import_button_enabled_for_current_gate(self) -> None:
+        self.btn_import.setEnabled(
+            self.input_dir.isEnabled()
+            and self.rust_dump_installed
+            and self._compatibility_allows_recommended_import
+        )
 
     def _show_upgrade_issues_dialog(self):
         """호환성 이슈 상세 다이얼로그 표시"""
@@ -2525,25 +2554,23 @@ class RustDumpImportDialog(QDialog):
         self.radio_tz_kst.setEnabled(enabled)
         self.radio_tz_utc.setEnabled(enabled)
         self.radio_tz_none.setEnabled(enabled)
-        self.btn_import.setEnabled(
-            enabled and self.rust_dump_installed and self._compatibility_allows_recommended_import
-        )
+        self._set_import_button_enabled_for_current_gate()
 
     def _set_dump_compatibility(self, metadata: dict) -> None:
         grade = str(metadata.get("restorability") or "limited_restorable")
-        warnings = list(metadata.get("warnings") or [])
-        blockers = list(metadata.get("blockers") or [])
+        warnings = _manifest_string_list(metadata.get("warnings"))
+        blockers = _manifest_string_list(metadata.get("blockers"))
 
         if grade == "strict_restorable":
-            text = self.tr("Strict restorable dump")
+            text = i18n_tr("Strict restorable dump")
             enable_recommended = True
             color = "#27ae60"
         elif grade == "not_restorable":
-            text = self.tr("복원 불가 Dump")
+            text = i18n_tr("복원 불가 Dump")
             enable_recommended = False
             color = "#e74c3c"
         else:
-            text = self.tr("제한적 복원 Dump")
+            text = i18n_tr("제한적 복원 Dump")
             enable_recommended = False
             color = "#f39c12"
 
@@ -2560,11 +2587,7 @@ class RustDumpImportDialog(QDialog):
         self._compatibility_allows_recommended_import = enable_recommended
         self.lbl_dump_compatibility.setText(text)
         self.lbl_dump_compatibility.setStyleSheet(f"color: {color};")
-        self.btn_import.setEnabled(
-            self.input_dir.isEnabled()
-            and self.rust_dump_installed
-            and self._compatibility_allows_recommended_import
-        )
+        self._set_import_button_enabled_for_current_gate()
 
     def check_timezone_support(self) -> bool:
         """
@@ -2621,6 +2644,16 @@ class RustDumpImportDialog(QDialog):
 
         if not os.path.exists(input_dir):
             QMessageBox.warning(self, "오류", "폴더가 존재하지 않습니다.")
+            return
+
+        self._run_upgrade_check(input_dir)
+        if not self._compatibility_allows_recommended_import:
+            QMessageBox.warning(
+                self,
+                "오류",
+                "이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n"
+                f"{self.lbl_dump_compatibility.text()}",
+            )
             return
 
         target_schema = None

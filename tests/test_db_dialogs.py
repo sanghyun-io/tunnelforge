@@ -363,6 +363,32 @@ def test_import_dialog_disables_recommended_import_for_limited_dump(monkeypatch)
     dialog.close()
 
 
+def test_import_dialog_initial_import_button_disabled_until_compatibility_checked(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+    dialog = RustDumpImportDialog(connector=None)
+
+    assert not dialog.btn_import.isEnabled()
+    dialog.close()
+
+
+def test_import_dialog_enables_recommended_import_for_strict_dump(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+    dialog = RustDumpImportDialog(connector=None)
+    dialog._set_dump_compatibility(
+        {
+            "restorability": "strict_restorable",
+            "warnings": [],
+            "blockers": [],
+        }
+    )
+
+    assert dialog.btn_import.isEnabled()
+    assert "엄격 복원 가능 Dump" in dialog.lbl_dump_compatibility.text()
+    dialog.close()
+
+
 def test_import_dialog_compatibility_text_includes_blockers_and_warnings(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
@@ -381,6 +407,48 @@ def test_import_dialog_compatibility_text_includes_blockers_and_warnings(monkeyp
     assert "w1" in text
     assert text.index("b1") < text.index("w1")
     assert text.count("shared") == 1
+    dialog.close()
+
+
+def test_import_dialog_blocks_manual_typed_limited_dump_before_worker_start(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+    (dump_dir / "_tunnelforge_dump.json").write_text(
+        json.dumps(
+            {
+                "format": "tunnelforge-dump",
+                "format_version": 3,
+                "database": "app",
+                "restorability": "limited_restorable",
+                "manifest_warnings": ["snapshot consistency is not proven"],
+                "blockers": [],
+                "tables": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    warning_calls = []
+    worker_started = {"value": False}
+
+    class FakeWorker:
+        def __init__(self, *args, **kwargs):
+            worker_started["value"] = True
+
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.QMessageBox.warning", lambda *args, **kwargs: warning_calls.append((args, kwargs)))
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
+
+    dialog = RustDumpImportDialog(connector=None)
+    dialog.input_dir.setText(str(dump_dir))
+
+    dialog.do_import()
+
+    assert warning_calls
+    assert "권장 Import 경로" in warning_calls[0][0][2]
+    assert worker_started["value"] is False
     dialog.close()
 
 
