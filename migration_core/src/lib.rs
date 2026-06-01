@@ -3158,7 +3158,6 @@ fn dump_import_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
 }
 
 fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
-    let endpoint = request_endpoint(request)?;
     let input_dir = request
         .payload
         .get("input_dir")
@@ -3228,6 +3227,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     validate_dump_import_compatibility(&manifest, strict_manifest)?;
     let manifest_warnings = validate_dump_import_manifest_strictness(&tables, strict_manifest)?;
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
+    let endpoint = request_endpoint(request)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     let timezone_sql = validated_timezone_sql(
         request
@@ -7870,9 +7870,14 @@ fn validate_dump_import_compatibility(
         ));
     }
     if strict_import && grade.restorability != RestorabilityGrade::StrictRestorable {
+        let reason = if grade.warnings.is_empty() {
+            "dump artifact is not strict restorable".to_string()
+        } else {
+            grade.warnings.join("; ")
+        };
         return Err(format!(
             "strict import requires a strict restorable dump: {}",
-            grade.warnings.join("; ")
+            reason
         ));
     }
     Ok(())
@@ -9782,6 +9787,81 @@ mod tests {
         finalize_dump_manifest_grade(&mut manifest);
 
         validate_dump_import_compatibility(&manifest, false).unwrap();
+    }
+
+    #[test]
+    fn import_preflight_blocks_before_target_connect_for_not_restorable_manifest() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-import-preflight-gate-test-{}-{}",
+            current_unix_seconds(),
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        let mut manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "none".to_string(),
+            source_engine: "mysql".to_string(),
+            source_version: Some("8.0.36".to_string()),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            snapshot_policy: "transaction_snapshot".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet {
+                snapshot: true,
+                chunking: true,
+                checksum: true,
+                timezone: true,
+                unsupported: vec!["mysql.unsupported".to_string()],
+                ..DumpFeatureSet::default()
+            },
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
+            tables: vec![DumpTableManifest {
+                name: "users".to_string(),
+                path: "0001_users".to_string(),
+                rows: 0,
+                chunks: 0,
+                chunk_sha256: BTreeMap::new(),
+            }],
+        };
+        finalize_dump_manifest_grade(&mut manifest);
+        write_dump_manifest(&dir, &manifest).unwrap();
+
+        let request = Request {
+            command: "dump.import".to_string(),
+            request_id: Some("import-preflight-gate".to_string()),
+            payload: json!({
+                "input_dir": dir.display().to_string(),
+                "strict_manifest": true,
+                "target": {
+                    "engine": "unsupported_engine",
+                    "host": "127.0.0.1",
+                    "port": 1234,
+                    "user": "u",
+                    "password": "p",
+                    "database": "db"
+                }
+            }),
+        };
+        let mut events = Vec::new();
+        let err = dump_import(&request, |event| events.push(event)).unwrap_err();
+
+        assert!(err.contains("dump artifact is not restorable"));
+        assert!(err.contains("unsupported feature mysql.unsupported"));
+        assert!(!err.contains("unsupported endpoint engine"));
+        assert!(events
+            .iter()
+            .any(|event| event.get("phase") == Some(&json!("dump_import_preflight"))));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
