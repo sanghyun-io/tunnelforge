@@ -90,7 +90,8 @@ pub struct ImportVerificationEvidence {
     pub sql_mode_before: Option<String>,
     #[serde(default)]
     pub sql_mode_after: Option<String>,
-    pub local_infile_enabled: bool,
+    #[serde(default)]
+    pub local_infile_enabled: Option<bool>,
     #[serde(default)]
     pub session_timezone: Option<String>,
 }
@@ -4005,14 +4006,27 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         request.request_id.clone(),
         &mut emit,
     );
-    import_result?;
-    restore_sql_mode_result?;
-    let sql_mode_after = sql_mode_after_result?;
-    restore_result?;
-    local_infile_restore_result?;
+    let mut sql_mode_after = None;
+    let sql_mode_after_read_result = match sql_mode_after_result {
+        Ok(value) => {
+            sql_mode_after = value;
+            Ok(())
+        }
+        Err(err) => Err(err),
+    };
+    let import_cleanup_result = combine_import_and_cleanup_errors(
+        import_result,
+        &[
+            ("mysql session sql_mode restore", restore_sql_mode_result),
+            ("mysql session sql_mode post-restore read", sql_mode_after_read_result),
+            ("mysql import session tuning restore", restore_result),
+            ("mysql local_infile restore", local_infile_restore_result),
+        ],
+    );
+    import_cleanup_result?;
     let local_infile_enabled = match &mut adapter {
-        LiveAdapter::MySql(conn) => mysql_local_infile_status(conn).unwrap_or(false),
-        LiveAdapter::PostgreSql(_) => false,
+        LiveAdapter::MySql(conn) => mysql_local_infile_status(conn),
+        LiveAdapter::PostgreSql(_) => None,
     };
     let target_rows_by_table = collect_target_row_counts(&mut adapter, &tables)?;
     verify_target_row_counts(&tables, &target_rows_by_table)?;
@@ -4048,6 +4062,9 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         session_timezone,
     };
     let verdict = classify_import_verdict(&verification_evidence);
+    if verdict == "failed" {
+        return Err("dump import verification verdict failed on success path".to_string());
+    }
     let import_report_path = dump_import_report_path(input_path)?;
     let import_report = json!({
         "success": true,
@@ -4374,11 +4391,15 @@ fn mysql_local_infile_value(conn: &mut mysql::PooledConn) -> Option<String> {
         .map(|(_, value)| value)
 }
 
-fn mysql_session_warning_count(conn: &mut mysql::PooledConn) -> u64 {
-    conn.query_first::<u64, _>("SELECT @@warning_count")
-        .ok()
-        .flatten()
-        .unwrap_or(0)
+fn mysql_session_warning_count(conn: &mut mysql::PooledConn) -> Result<u64, String> {
+    mysql_warning_count_from_query_result(
+        conn.query_first::<u64, _>("SELECT @@warning_count")
+            .map_err(|err| format!("failed to read mysql session warning_count: {err}")),
+    )
+}
+
+fn mysql_warning_count_from_query_result(result: Result<Option<u64>, String>) -> Result<u64, String> {
+    result.map(|value| value.unwrap_or(0))
 }
 
 fn mysql_session_sql_mode(adapter: &mut LiveAdapter) -> Result<Option<String>, String> {
@@ -4419,6 +4440,30 @@ fn import_session_timezone_evidence(payload: &Value, timezone_sql: Option<&str>)
                 .filter(|value| !value.is_empty())
                 .map(ToString::to_string)
         })
+}
+
+fn combine_import_and_cleanup_errors(
+    import_result: Result<(), String>,
+    cleanup_results: &[(&str, Result<(), String>)],
+) -> Result<(), String> {
+    let mut cleanup_errors = Vec::new();
+    for (label, result) in cleanup_results {
+        if let Err(err) = result {
+            cleanup_errors.push(format!("{label} failed: {err}"));
+        }
+    }
+    match (import_result, cleanup_errors.is_empty()) {
+        (Ok(()), true) => Ok(()),
+        (Err(import_err), true) => Err(import_err),
+        (Ok(()), false) => Err(format!(
+            "dump import cleanup failed: {}",
+            cleanup_errors.join("; ")
+        )),
+        (Err(import_err), false) => Err(format!(
+            "dump import failed: {import_err}; cleanup errors: {}",
+            cleanup_errors.join("; ")
+        )),
+    }
 }
 
 fn mysql_bool_value_enabled(value: &str) -> bool {
@@ -4935,7 +4980,7 @@ fn load_mysql_tsv_chunk(
         .map_err(|err| format!("mysql LOAD DATA error: {err}"));
     let warning_count = mysql_session_warning_count(conn);
     conn.set_local_infile_handler(None);
-    result.map(|rows| (rows, warning_count))
+    result.and_then(|rows| warning_count.map(|warnings| (rows, warnings)))
 }
 
 pub fn load_data_local_infile_sql(
@@ -14782,7 +14827,7 @@ mod tests {
             load_data_warnings: 0,
             sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
             sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
-            local_infile_enabled: true,
+            local_infile_enabled: Some(true),
             session_timezone: Some("+00:00".to_string()),
         };
         let verdict = classify_import_verdict(&evidence);
@@ -14802,11 +14847,54 @@ mod tests {
             load_data_warnings: 0,
             sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
             sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
-            local_infile_enabled: true,
+            local_infile_enabled: Some(true),
             session_timezone: Some("+00:00".to_string()),
         };
         let verdict = classify_import_verdict(&evidence);
         assert_eq!(verdict, "success");
+    }
+
+    #[test]
+    fn import_verdict_is_limited_success_when_warnings_exist() {
+        let evidence = ImportVerificationEvidence {
+            tables: vec![TableVerificationEvidence {
+                table: "orders".to_string(),
+                expected_rows: 10,
+                actual_rows: 10,
+                checksum_match: Some(true),
+                digest_match: Some(true),
+            }],
+            load_data_warnings: 2,
+            sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
+            sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
+            local_infile_enabled: Some(true),
+            session_timezone: Some("+00:00".to_string()),
+        };
+        let verdict = classify_import_verdict(&evidence);
+        assert_eq!(verdict, "limited_success");
+    }
+
+    #[test]
+    fn dump_import_combines_import_and_cleanup_errors_when_both_fail() {
+        let result = combine_import_and_cleanup_errors(
+            Err("import failed".to_string()),
+            &[
+                ("sql_mode restore", Err("permission denied".to_string())),
+                ("local_infile restore", Err("global var readonly".to_string())),
+            ],
+        );
+        let err = result.unwrap_err();
+        assert!(err.contains("dump import failed: import failed"));
+        assert!(err.contains("sql_mode restore failed: permission denied"));
+        assert!(err.contains("local_infile restore failed: global var readonly"));
+    }
+
+    #[test]
+    fn dump_import_warning_count_result_helper_propagates_error() {
+        let result =
+            mysql_warning_count_from_query_result(Err("warning_count unavailable".to_string()));
+        let err = result.unwrap_err();
+        assert!(err.contains("warning_count unavailable"));
     }
 
     #[test]
