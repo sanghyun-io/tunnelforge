@@ -57,15 +57,34 @@ pub struct NormalizedSchema {
     pub tables: Vec<NormalizedTable>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedTable {
     pub name: String,
+    #[serde(default)]
+    pub engine: Option<String>,
+    #[serde(default)]
+    pub default_charset: Option<String>,
+    #[serde(default)]
+    pub default_collation: Option<String>,
+    #[serde(default)]
+    pub row_format: Option<String>,
+    #[serde(default)]
+    pub partitions: Vec<NormalizedPartition>,
     #[serde(default)]
     pub columns: Vec<NormalizedColumn>,
     #[serde(default)]
     pub indexes: Vec<NormalizedIndex>,
     #[serde(default)]
     pub foreign_keys: Vec<NormalizedForeignKey>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedPartition {
+    pub name: String,
+    #[serde(default)]
+    pub method: Option<String>,
+    #[serde(default)]
+    pub expression: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4596,16 +4615,33 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let mut conn = pool
         .get_conn()
         .map_err(|err| format!("mysql connection error: {err}"))?;
-    let table_names: Vec<String> = conn
+    let table_rows: Vec<(String, Option<String>, Option<String>, Option<String>)> = conn
         .exec_map(
-            inspect_tables_sql("mysql"),
+            r#"
+            SELECT
+                TABLE_NAME,
+                ENGINE,
+                TABLE_COLLATION,
+                ROW_FORMAT
+            FROM information_schema.TABLES
+            WHERE TABLE_SCHEMA = ?
+              AND TABLE_TYPE = 'BASE TABLE'
+            ORDER BY TABLE_NAME
+            "#,
             (&schema_name,),
-            |table_name: String| table_name,
+            |(table_name, engine, table_collation, row_format): (
+                String,
+                Option<String>,
+                Option<String>,
+                Option<String>,
+            )| (table_name, engine, table_collation, row_format),
         )
-        .map_err(|err| format!("mysql table inspect error: {err}"))?;
+        .map_err(|err| format!("mysql table metadata inspect error: {err}"))?;
     let mut tables = Vec::new();
 
-    for table_name in table_names {
+    for (table_name, engine, table_collation, row_format) in table_rows {
+        let partitions = inspect_mysql_partitions(&mut conn, &schema_name, &table_name)?;
+        let default_charset = mysql_charset_from_collation(&table_collation);
         let columns: Vec<NormalizedColumn> =
             conn
                 .exec_map(
@@ -4674,6 +4710,11 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
             .map_err(|err| format!("mysql index inspect error: {err}"))?;
         tables.push(NormalizedTable {
             name: table_name,
+            engine,
+            default_charset,
+            default_collation: table_collation,
+            row_format,
+            partitions,
             columns: apply_key_flags(columns, &keys),
             indexes: group_indexes(index_rows),
             foreign_keys: group_foreign_keys(foreign_key_rows),
@@ -4718,6 +4759,43 @@ fn inspect_mysql_unsupported_objects(
         .map_err(|err| format!("mysql routine inspect error: {err}"))?;
     objects.extend(routines);
     Ok(objects)
+}
+
+fn mysql_charset_from_collation(collation: &Option<String>) -> Option<String> {
+    collation
+        .as_ref()
+        .and_then(|value| value.split('_').next())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn inspect_mysql_partitions(
+    conn: &mut mysql::PooledConn,
+    database: &str,
+    table: &str,
+) -> Result<Vec<NormalizedPartition>, String> {
+    conn.exec_map(
+        r#"
+        SELECT
+            PARTITION_NAME,
+            PARTITION_METHOD,
+            PARTITION_EXPRESSION
+        FROM information_schema.PARTITIONS
+        WHERE TABLE_SCHEMA = ?
+          AND TABLE_NAME = ?
+          AND PARTITION_NAME IS NOT NULL
+        ORDER BY PARTITION_ORDINAL_POSITION
+        "#,
+        (database, table),
+        |(name, method, expression): (String, Option<String>, Option<String>)| {
+            NormalizedPartition {
+                name,
+                method,
+                expression,
+            }
+        },
+    )
+    .map_err(|err| format!("failed to inspect MySQL partitions for {table}: {err}"))
 }
 
 fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
@@ -4823,6 +4901,7 @@ fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
             columns: apply_key_flags(columns, &keys),
             indexes,
             foreign_keys,
+            ..Default::default()
         });
     }
 
@@ -6563,6 +6642,7 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             });
         return migration_error_result(state, rows_copied, chunks_copied, &table, err);
     }
@@ -9370,7 +9450,7 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
         lines.push(format!("  PRIMARY KEY ({})", primary_keys.join(", ")));
     }
 
-    let table_options = create_table_options(target);
+    let table_options = create_table_options(table, target);
     Some(format!(
         "CREATE TABLE {} (\n{}\n){};",
         quote_ident(target, &table.name),
@@ -9379,12 +9459,23 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
     ))
 }
 
-fn create_table_options(target: &str) -> &'static str {
-    if target == "mysql" {
-        " ENGINE=InnoDB"
-    } else {
-        ""
+fn create_table_options(table: &NormalizedTable, target: &str) -> String {
+    if target != "mysql" {
+        return String::new();
     }
+    let mut sql = String::new();
+    let engine = mysql_identifier_token(table.engine.as_deref()).unwrap_or_else(|| "InnoDB".to_string());
+    sql.push_str(&format!(" ENGINE={engine}"));
+    if let Some(charset) = mysql_identifier_token(table.default_charset.as_deref()) {
+        sql.push_str(&format!(" DEFAULT CHARSET={charset}"));
+    }
+    if let Some(collation) = mysql_identifier_token(table.default_collation.as_deref()) {
+        sql.push_str(&format!(" COLLATE={collation}"));
+    }
+    if let Some(row_format) = mysql_identifier_token(table.row_format.as_deref()) {
+        sql.push_str(&format!(" ROW_FORMAT={row_format}"));
+    }
+    sql
 }
 
 fn default_clause(target: &str, default_value: Option<&str>, source_type: &str) -> String {
@@ -9791,6 +9882,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         }
     }
@@ -9801,6 +9893,7 @@ mod tests {
             columns: Vec::new(),
             indexes: Vec::new(),
             foreign_keys,
+            ..Default::default()
         }
     }
 
@@ -11014,18 +11107,21 @@ mod tests {
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             },
             NormalizedTable {
                 name: "huge".to_string(),
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             },
             NormalizedTable {
                 name: "medium".to_string(),
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             },
         ];
         let mut counts = BTreeMap::new();
@@ -11188,6 +11284,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
         let rows = vec![json!({"id": "1", "body": "a\tb\nc\\d", "empty": null})];
         let path = dir.join("chunk_000001.tsv");
@@ -11217,6 +11314,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
         let rows = vec![json!({"importance": "MEDIUM"})];
         let path = dir.join("chunk_000001.tsv");
@@ -11256,6 +11354,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
         let rows = vec![
             json!({"id": "1", "notes": "hello\tworld"}),
@@ -11462,6 +11561,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(single_numeric_primary_key(&table), Some("id"));
@@ -11491,6 +11591,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(single_numeric_primary_key(&table), None);
@@ -11510,6 +11611,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
 
         assert!(should_use_pk_range_dump(&table, 200_000, 50_000));
@@ -11529,6 +11631,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
 
         assert!(!should_use_pk_range_dump(&table, 10_000, 50_000));
@@ -11782,6 +11885,7 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
 
@@ -11816,6 +11920,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    ..Default::default()
                 },
                 NormalizedTable {
                     name: "orders".to_string(),
@@ -11848,6 +11953,7 @@ mod tests {
                         referenced_table: "users".to_string(),
                         referenced_columns: vec!["id".to_string()],
                     }],
+                    ..Default::default()
                 },
             ],
         };
@@ -11882,6 +11988,7 @@ mod tests {
                         referenced_table: "users".to_string(),
                         referenced_columns: vec!["id".to_string()],
                     }],
+                    ..Default::default()
                 },
                 NormalizedTable {
                     name: "users".to_string(),
@@ -11892,6 +11999,7 @@ mod tests {
                         unique: true,
                     }],
                     foreign_keys: Vec::new(),
+                    ..Default::default()
                 },
             ],
         };
@@ -11923,11 +12031,36 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
 
         let ddl = generate_table_ddl(&table, "mysql", "mysql").unwrap();
 
         assert!(ddl.contains("`code` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"));
+    }
+
+    #[test]
+    fn normalized_table_preserves_mysql_table_options() {
+        let table = NormalizedTable {
+            name: "orders".to_string(),
+            engine: Some("InnoDB".to_string()),
+            default_charset: Some("utf8mb4".to_string()),
+            default_collation: Some("utf8mb4_0900_ai_ci".to_string()),
+            row_format: Some("Dynamic".to_string()),
+            partitions: vec![NormalizedPartition {
+                name: "p2026".to_string(),
+                method: Some("RANGE".to_string()),
+                expression: Some("YEAR(created_at)".to_string()),
+            }],
+            columns: Vec::new(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        let json = serde_json::to_string(&table).unwrap();
+        assert!(json.contains("\"engine\":\"InnoDB\""));
+        assert!(json.contains("\"default_charset\":\"utf8mb4\""));
+        assert!(json.contains("\"partitions\""));
     }
 
     #[test]
@@ -12108,6 +12241,7 @@ mod tests {
                     unique: false,
                 }],
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let mut adapter = RecordingAdapter::default();
@@ -12202,6 +12336,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    ..Default::default()
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -12222,6 +12357,7 @@ mod tests {
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
                     }],
+                    ..Default::default()
                 },
             ],
         };
@@ -12251,6 +12387,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    ..Default::default()
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -12270,6 +12407,7 @@ mod tests {
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
                     }],
+                    ..Default::default()
                 },
             ],
         };
@@ -12292,6 +12430,7 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let postgresql_schema = NormalizedSchema {
@@ -12307,6 +12446,7 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
 
@@ -12349,6 +12489,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let postgresql_schema = NormalizedSchema {
@@ -12364,6 +12505,7 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
 
@@ -12800,6 +12942,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let source = MemoryAdapter::from_value(Some(&json!({
@@ -12873,6 +13016,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -12928,6 +13072,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -12977,6 +13122,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -13028,6 +13174,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                ..Default::default()
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -13211,6 +13358,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(
@@ -13282,6 +13430,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
         let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
 
@@ -13311,6 +13460,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
         let mysql_schema = NormalizedTable {
             name: "flags".to_string(),
@@ -13324,6 +13474,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            ..Default::default()
         };
 
         assert_eq!(
