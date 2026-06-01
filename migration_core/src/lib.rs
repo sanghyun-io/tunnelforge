@@ -1414,6 +1414,29 @@ fn classify_mysql_snapshot_strategy(
     }
 }
 
+fn mysql_snapshot_evidence_from_engine_inspection(
+    engine_inspection: Result<Vec<MysqlTableEngine>, String>,
+    transaction_snapshot_available: bool,
+    lock_based_snapshot_available: bool,
+    dump_threads: usize,
+) -> MysqlSnapshotEvidence {
+    match engine_inspection {
+        Ok(tables) => classify_mysql_snapshot_strategy(
+            &tables,
+            transaction_snapshot_available,
+            lock_based_snapshot_available,
+            dump_threads,
+        ),
+        Err(err) => MysqlSnapshotEvidence {
+            policy: "not_enforced".to_string(),
+            strict_candidate: false,
+            warnings: vec![format!(
+                "mysql table engine inspection failed; snapshot consistency is not proven: {err}"
+            )],
+        },
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DumpWorkPlanItem {
     table: String,
@@ -1718,18 +1741,25 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         let LiveAdapter::MySql(conn) = &mut adapter else {
             return Err("failed to open mysql dump adapter".to_string());
         };
-        let all_tables = inspect_mysql_table_engines(conn, &endpoint.database)?;
         let selected_table_names = schema
             .tables
             .iter()
             .map(|table| table.name.as_str())
             .collect::<BTreeSet<_>>();
-        let exported_tables = all_tables
-            .into_iter()
-            .filter(|table| selected_table_names.contains(table.table.as_str()))
-            .collect::<Vec<_>>();
-        snapshot_evidence =
-            classify_mysql_snapshot_strategy(&exported_tables, true, false, threads);
+        let exported_table_engines = inspect_mysql_table_engines(conn, &endpoint.database).map(
+            |all_tables| {
+                all_tables
+                    .into_iter()
+                    .filter(|table| selected_table_names.contains(table.table.as_str()))
+                    .collect::<Vec<_>>()
+            },
+        );
+        snapshot_evidence = mysql_snapshot_evidence_from_engine_inspection(
+            exported_table_engines,
+            true,
+            false,
+            threads,
+        );
         if snapshot_evidence.policy == "transaction_snapshot" {
             effective_threads = 1;
             conn.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
@@ -9903,6 +9933,22 @@ mod tests {
         assert!(evidence
             .warnings
             .contains(&"snapshot consistency is not proven".to_string()));
+    }
+
+    #[test]
+    fn mysql_snapshot_evidence_from_engine_inspection_error_downgrades_to_not_enforced() {
+        let evidence = mysql_snapshot_evidence_from_engine_inspection(
+            Err("denied".to_string()),
+            true,
+            false,
+            1,
+        );
+
+        assert_eq!(evidence.policy, "not_enforced");
+        assert!(!evidence.strict_candidate);
+        assert!(evidence.warnings.iter().any(|warning| warning.contains(
+            "mysql table engine inspection failed; snapshot consistency is not proven: denied"
+        )));
     }
 
     #[test]
