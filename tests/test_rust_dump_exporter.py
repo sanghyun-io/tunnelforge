@@ -426,6 +426,7 @@ class TestRustDumpImporter:
         importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
 
         metadata = importer._analyze_dump_metadata(str(dump_dir))
+        assert metadata is not None
 
         assert metadata["table_rows"] == {"users": 1, "orders": 2}
         assert metadata["total_rows"] == 3
@@ -453,6 +454,7 @@ class TestRustDumpImporter:
 
         importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
         metadata = importer._analyze_dump_metadata(str(dump_dir))
+        assert metadata is not None
 
         assert metadata["restorability"] == "limited_restorable"
         assert metadata["warnings"] == ["snapshot consistency is not proven"]
@@ -480,6 +482,7 @@ class TestRustDumpImporter:
 
         importer = RustDumpImporter(RustDumpConfig("localhost", 3306, "root", "password"))
         metadata = importer._analyze_dump_metadata(str(dump_dir))
+        assert metadata is not None
 
         assert metadata["warnings"] == ["snapshot consistency is not proven"]
         assert metadata["blockers"] == ["binlog not available"]

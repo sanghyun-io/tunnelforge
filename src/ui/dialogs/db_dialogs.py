@@ -640,7 +640,7 @@ class DBConnectionDialog(QDialog):
 class RustDumpExportDialog(QDialog):
     """Rust DB Core Export 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None,
+    def __init__(self, parent=None, connector: Optional[MySQLConnector] = None,
                  config_manager=None, connection_info: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Rust DB Core Export (병렬 처리)")
@@ -1862,8 +1862,8 @@ class RustDumpExportDialog(QDialog):
 class RustDumpImportDialog(QDialog):
     """Rust DB Core Import 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None,
-                 tunnel_config: dict = None):
+    def __init__(self, parent=None, connector: Optional[MySQLConnector] = None, config_manager=None,
+                 tunnel_config: Optional[dict] = None):
         super().__init__(parent)
         self.setWindowTitle("Rust DB Core Import (병렬 처리)")
         self.resize(600, 700)
@@ -3490,7 +3490,7 @@ class RustDumpWizard:
 class OrphanRecordDialog(QDialog):
     """고아 레코드 분석 다이얼로그"""
 
-    def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None):
+    def __init__(self, parent=None, connector: Optional[MySQLConnector] = None, config_manager=None):
         super().__init__(parent)
         self.connector = connector
         self.config_manager = config_manager
