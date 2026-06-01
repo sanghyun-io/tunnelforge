@@ -627,6 +627,7 @@ class RustDumpImporter:
         retry_tables: Optional[List[str]] = None,
         metadata_callback: Optional[Callable[[dict], None]] = None,
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        progress_policy: str = "fresh",
     ) -> Tuple[bool, str, dict]:
         import_results: dict = {}
         try:
@@ -662,6 +663,7 @@ class RustDumpImporter:
                 "target": self._endpoint(final_target_schema).to_payload(),
                 "input_dir": input_dir,
                 "mode": import_mode,
+                "progress_policy": progress_policy,
                 "threads": max(1, int(threads)),
                 "strict_manifest": True,
             }
@@ -866,6 +868,7 @@ def import_dump(
     import_mode: str = "replace",
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    progress_policy: str = "fresh",
 ) -> Tuple[bool, str, dict]:
     config = RustDumpConfig(host, port, user, password)
     importer = RustDumpImporter(config)
@@ -874,6 +877,7 @@ def import_dump(
         target_schema,
         threads,
         import_mode=import_mode,
+        progress_policy=progress_policy,
         progress_callback=progress_callback,
         table_chunk_progress_callback=table_chunk_progress_callback,
     )

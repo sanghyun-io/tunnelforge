@@ -3639,6 +3639,16 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     if !matches!(mode, "replace" | "merge" | "recreate") {
         return Err(format!("unsupported dump import mode: {mode}"));
     }
+    let progress_policy = request
+        .payload
+        .get("progress_policy")
+        .and_then(Value::as_str)
+        .unwrap_or("fresh");
+    if !matches!(progress_policy, "fresh" | "resume" | "reset") {
+        return Err(format!(
+            "unsupported import progress_policy {progress_policy}"
+        ));
+    }
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
@@ -3722,25 +3732,51 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         cleanup_complete: false,
     };
     if progress_path.exists() {
-        let existing_state = read_import_progress_state(&progress_path)?;
-        validate_import_resume_state(
-            &existing_state,
-            &progress_state.manifest_hash,
-            &progress_state.target_identity,
-            &progress_state.import_mode,
-        )
-        .map_err(|err| {
-            format!("{err}; existing import progress state requires resume or reset")
-        })?;
-        if !import_progress_state_is_terminal_complete(&existing_state) {
-            return Err("existing import progress state requires resume or reset".to_string());
+        match progress_policy {
+            "resume" => {
+                let existing_state = read_import_progress_state(&progress_path)?;
+                validate_import_resume_state(
+                    &existing_state,
+                    &progress_state.manifest_hash,
+                    &progress_state.target_identity,
+                    &progress_state.import_mode,
+                )
+                .map_err(|err| {
+                    format!("{err}; existing import progress state requires resume or reset")
+                })?;
+                progress_state = existing_state;
+            }
+            "reset" => {
+                fs::remove_file(&progress_path).map_err(|err| {
+                    format!(
+                        "failed to remove import progress file {}: {err}",
+                        progress_path.display()
+                    )
+                })?;
+            }
+            "fresh" => {
+                let existing_state = read_import_progress_state(&progress_path)?;
+                validate_import_resume_state(
+                    &existing_state,
+                    &progress_state.manifest_hash,
+                    &progress_state.target_identity,
+                    &progress_state.import_mode,
+                )
+                .map_err(|err| {
+                    format!("{err}; existing import progress state requires resume or reset")
+                })?;
+                if !import_progress_state_is_terminal_complete(&existing_state) {
+                    return Err("existing import progress state requires resume or reset".to_string());
+                }
+                emit(json!({
+                    "event": "warning",
+                    "request_id": request.request_id,
+                    "phase": "dump_import_preflight",
+                    "message": "existing completed import progress state found; replacing it for a new import attempt"
+                }));
+            }
+            _ => {}
         }
-        emit(json!({
-            "event": "warning",
-            "request_id": request.request_id,
-            "phase": "dump_import_preflight",
-            "message": "existing completed import progress state found; replacing it for a new import attempt"
-        }));
     }
     write_import_progress_state(&progress_path, &progress_state)?;
     if let Some(sql) = timezone_sql.as_deref() {
@@ -3821,6 +3857,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &mut rows_imported,
                 &mut chunks_imported,
                 &mut imported_rows_by_table,
+                &progress_path,
+                &mut progress_state,
                 &mut emit,
             )?;
             mark_import_step_completed(&progress_path, &mut progress_state, "load_data")?;
@@ -3891,6 +3929,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             &mut rows_imported,
             &mut chunks_imported,
             &mut imported_rows_by_table,
+            &progress_path,
+            &mut progress_state,
             &mut emit,
         )?;
         mark_import_step_completed(&progress_path, &mut progress_state, "load_data")?;
@@ -3981,9 +4021,11 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     table_manifest: &DumpTableManifest,
     compression: &str,
     threads: usize,
+    progress_path: &Path,
+    progress_state: &mut ImportProgressState,
     request_id: Option<String>,
     mut emit: F,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64, u64), String> {
     if !mysql_local_infile_enabled(conn) {
         emit(json!({
             "event": "phase",
@@ -3999,6 +4041,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             table,
             table_manifest,
             compression,
+            progress_path,
+            progress_state,
             request_id,
             emit,
         );
@@ -4012,6 +4056,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             table_manifest,
             compression,
             threads,
+            progress_path,
+            progress_state,
             request_id.clone(),
             |event| emit(event),
         );
@@ -4032,6 +4078,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     table,
                     table_manifest,
                     compression,
+                    progress_path,
+                    progress_state,
                     request_id,
                     emit,
                 )
@@ -4042,7 +4090,19 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
 
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
+    let mut verified_rows = 0_u64;
     for chunk_index in 1..=table_manifest.chunks {
+        if import_chunk_already_completed(progress_state, &table.name, chunk_index) {
+            verified_rows += count_dump_chunk_rows(
+                input_path,
+                table_manifest,
+                table,
+                chunk_index,
+                "tsv",
+                compression,
+            )?;
+            continue;
+        }
         let chunk_path = dump_manifest_chunk_path(
             input_path,
             &table_manifest.path,
@@ -4068,13 +4128,17 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     table,
                     table_manifest,
                     compression,
+                    progress_path,
+                    progress_state,
                     request_id,
                     emit,
                 );
             }
             Err(err) => return Err(err),
         };
+        mark_import_chunk_completed(progress_path, progress_state, &table.name, chunk_index)?;
         rows_imported += rows;
+        verified_rows += rows;
         chunks_imported += 1;
         emit(json!({
             "event": "row_progress",
@@ -4087,7 +4151,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             "strategy": "load_data_local_infile"
         }));
     }
-    Ok((rows_imported, chunks_imported))
+    Ok((rows_imported, chunks_imported, verified_rows))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4105,6 +4169,8 @@ fn import_dump_table_data<F: FnMut(Value)>(
     rows_imported: &mut u64,
     chunks_imported: &mut u64,
     imported_rows_by_table: &mut BTreeMap<String, u64>,
+    progress_path: &Path,
+    progress_state: &mut ImportProgressState,
     emit: &mut F,
 ) -> Result<(), String> {
     for (index, table_manifest) in tables.iter().enumerate() {
@@ -4124,7 +4190,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
 
         if data_format == "tsv" && !has_binary_columns(table) {
             if let LiveAdapter::MySql(conn) = adapter {
-                let (rows, chunks) = import_mysql_tsv_table(
+                let (rows, chunks, verified_rows) = import_mysql_tsv_table(
                     endpoint,
                     conn,
                     input_path,
@@ -4132,12 +4198,14 @@ fn import_dump_table_data<F: FnMut(Value)>(
                     table_manifest,
                     compression,
                     threads,
+                    progress_path,
+                    progress_state,
                     request_id.clone(),
                     |event| emit(event),
                 )?;
                 *rows_imported += rows;
                 *chunks_imported += chunks;
-                imported_rows_by_table.insert(table.name.clone(), rows);
+                imported_rows_by_table.insert(table.name.clone(), verified_rows);
                 emit(json!({
                     "event": "table_progress",
                     "request_id": request_id,
@@ -4152,6 +4220,19 @@ fn import_dump_table_data<F: FnMut(Value)>(
 
         let mut table_rows_imported = 0_u64;
         for chunk_index in 1..=table_manifest.chunks {
+            if import_chunk_already_completed(progress_state, &table.name, chunk_index) {
+                let skipped_chunk_path = dump_manifest_chunk_path(
+                    input_path,
+                    &table_manifest.path,
+                    chunk_index,
+                    data_format,
+                    compression,
+                )?;
+                let skipped_rows =
+                    read_dump_rows(&skipped_chunk_path, table, data_format, compression)?;
+                table_rows_imported += skipped_rows.len() as u64;
+                continue;
+            }
             let chunk_path = dump_manifest_chunk_path(
                 input_path,
                 &table_manifest.path,
@@ -4162,6 +4243,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
             let rows = read_dump_rows(&chunk_path, table, data_format, compression)?;
             let row_count = rows.len();
             adapter.insert_rows(table, rows)?;
+            mark_import_chunk_completed(progress_path, progress_state, &table.name, chunk_index)?;
             *rows_imported += row_count as u64;
             table_rows_imported += row_count as u64;
             *chunks_imported += 1;
@@ -4392,18 +4474,51 @@ fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> 
     Ok(())
 }
 
+fn count_dump_chunk_rows(
+    input_path: &Path,
+    table_manifest: &DumpTableManifest,
+    table: &NormalizedTable,
+    chunk_index: u64,
+    data_format: &str,
+    compression: &str,
+) -> Result<u64, String> {
+    let chunk_path = dump_manifest_chunk_path(
+        input_path,
+        &table_manifest.path,
+        chunk_index,
+        data_format,
+        compression,
+    )?;
+    let rows = read_dump_rows(&chunk_path, table, data_format, compression)?;
+    Ok(rows.len() as u64)
+}
+
 fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
     conn: &mut mysql::PooledConn,
     input_path: &Path,
     table: &NormalizedTable,
     table_manifest: &DumpTableManifest,
     compression: &str,
+    progress_path: &Path,
+    progress_state: &mut ImportProgressState,
     request_id: Option<String>,
     mut emit: F,
-) -> Result<(u64, u64), String> {
+) -> Result<(u64, u64, u64), String> {
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
+    let mut verified_rows = 0_u64;
     for chunk_index in 1..=table_manifest.chunks {
+        if import_chunk_already_completed(progress_state, &table.name, chunk_index) {
+            verified_rows += count_dump_chunk_rows(
+                input_path,
+                table_manifest,
+                table,
+                chunk_index,
+                "tsv",
+                compression,
+            )?;
+            continue;
+        }
         let chunk_path = dump_manifest_chunk_path(
             input_path,
             &table_manifest.path,
@@ -4419,7 +4534,9 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
                     table.name, chunk_index
                 )
             })?;
+        mark_import_chunk_completed(progress_path, progress_state, &table.name, chunk_index)?;
         rows_imported += rows;
+        verified_rows += rows;
         chunks_imported += 1;
         emit(json!({
             "event": "row_progress",
@@ -4432,7 +4549,7 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
             "strategy": "insert_fallback"
         }));
     }
-    Ok((rows_imported, chunks_imported))
+    Ok((rows_imported, chunks_imported, verified_rows))
 }
 
 fn insert_mysql_tsv_chunk_with_batches(
@@ -4461,17 +4578,38 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     table_manifest: &DumpTableManifest,
     compression: &str,
     threads: usize,
+    progress_path: &Path,
+    progress_state: &mut ImportProgressState,
     request_id: Option<String>,
     mut emit: F,
-) -> Result<(u64, u64), String> {
-    let max_threads = threads.max(1).min(table_manifest.chunks as usize);
-    let mut pending = adaptive_import_chunk_order(input_path, table_manifest, "tsv", compression);
+) -> Result<(u64, u64, u64), String> {
+    let mut verified_rows = 0_u64;
+    let mut pending = VecDeque::new();
+    for chunk_index in adaptive_import_chunk_order(input_path, table_manifest, "tsv", compression) {
+        if import_chunk_already_completed(progress_state, &table.name, chunk_index) {
+            verified_rows += count_dump_chunk_rows(
+                input_path,
+                table_manifest,
+                table,
+                chunk_index,
+                "tsv",
+                compression,
+            )?;
+        } else {
+            pending.push_back(chunk_index);
+        }
+    }
+    let max_threads = threads.max(1).min(pending.len().max(1));
     let mut active = 0_usize;
     let mut completed = 0_u64;
     let mut rows_imported = 0_u64;
     let mut first_error: Option<String> = None;
     let mut handles = Vec::new();
     let (sender, receiver) = mpsc::channel::<ImportChunkEvent>();
+
+    if pending.is_empty() {
+        return Ok((0, 0, verified_rows));
+    }
 
     while active < max_threads {
         if let Some(chunk_index) = pending.pop_front() {
@@ -4490,13 +4628,20 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
         }
     }
 
-    while completed < table_manifest.chunks && active > 0 {
+    let pending_total = (active + pending.len()) as u64;
+    while completed < pending_total && active > 0 {
         match receiver.recv() {
             Ok(ImportChunkEvent::Done {
                 chunk_index,
                 rows,
                 load_ms,
             }) => {
+                mark_import_chunk_completed(
+                    progress_path,
+                    progress_state,
+                    &table.name,
+                    chunk_index,
+                )?;
                 rows_imported += rows;
                 completed += 1;
                 active = active.saturating_sub(1);
@@ -4508,7 +4653,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                     "total": table_manifest.rows,
                     "chunk_rows": rows,
                     "chunks_done": completed,
-                    "chunks_total": table_manifest.chunks,
+                    "chunks_total": pending_total,
                     "chunk_index": chunk_index,
                     "load_ms": load_ms,
                     "strategy": "parallel_load_data_local_infile"
@@ -4541,7 +4686,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     if let Some(err) = first_error {
         return Err(err);
     }
-    Ok((rows_imported, completed))
+    Ok((rows_imported, completed, verified_rows + rows_imported))
 }
 
 fn adaptive_import_chunk_order(
@@ -8812,6 +8957,33 @@ fn mark_import_step_completed(
         state.completed_steps.push(step.to_string());
     }
     write_import_progress_state(progress_path, state)
+}
+
+fn import_chunk_progress_key(table_name: &str, chunk_index: u64) -> String {
+    format!("{table_name}:{chunk_index}")
+}
+
+fn import_chunk_already_completed(
+    state: &ImportProgressState,
+    table_name: &str,
+    chunk_index: u64,
+) -> bool {
+    state
+        .completed_chunks
+        .contains(&import_chunk_progress_key(table_name, chunk_index))
+}
+
+fn mark_import_chunk_completed(
+    progress_path: &Path,
+    state: &mut ImportProgressState,
+    table_name: &str,
+    chunk_index: u64,
+) -> Result<(), String> {
+    let key = import_chunk_progress_key(table_name, chunk_index);
+    if state.completed_chunks.insert(key) {
+        write_import_progress_state(progress_path, state)?;
+    }
+    Ok(())
 }
 
 fn sync_parent_directory(path: &Path) -> Result<(), String> {
