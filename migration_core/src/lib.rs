@@ -3216,6 +3216,16 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .get("strict_manifest")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    let grade = grade_dump_artifact(&manifest);
+    emit(json!({
+        "event": "progress",
+        "phase": "dump_import_preflight",
+        "message": "dump compatibility preflight completed",
+        "restorability": grade.restorability,
+        "warnings": grade.warnings,
+        "blockers": grade.blockers
+    }));
+    validate_dump_import_compatibility(&manifest, strict_manifest)?;
     let manifest_warnings = validate_dump_import_manifest_strictness(&tables, strict_manifest)?;
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
@@ -7848,6 +7858,26 @@ fn classified_import_error(code: &str, message: &str, scope: Option<&str>) -> St
     }
 }
 
+fn validate_dump_import_compatibility(
+    manifest: &DumpManifest,
+    strict_import: bool,
+) -> Result<(), String> {
+    let grade = grade_dump_artifact(manifest);
+    if grade.restorability == RestorabilityGrade::NotRestorable {
+        return Err(format!(
+            "dump artifact is not restorable: {}",
+            grade.blockers.join("; ")
+        ));
+    }
+    if strict_import && grade.restorability != RestorabilityGrade::StrictRestorable {
+        return Err(format!(
+            "strict import requires a strict restorable dump: {}",
+            grade.warnings.join("; ")
+        ));
+    }
+    Ok(())
+}
+
 fn validate_dump_import_manifest_strictness(
     tables: &[DumpTableManifest],
     strict: bool,
@@ -9723,6 +9753,35 @@ mod tests {
         assert_eq!(manifest.restorability, RestorabilityGrade::StrictRestorable);
         assert!(manifest.strict_export);
         assert!(manifest.blockers.is_empty());
+    }
+
+    #[test]
+    fn import_preflight_blocks_not_restorable_manifest() {
+        let mut manifest = mysql_grade_manifest("transaction_snapshot", true, vec!["x".to_string()]);
+        finalize_dump_manifest_grade(&mut manifest);
+
+        let err = validate_dump_import_compatibility(&manifest, true).unwrap_err();
+
+        assert!(err.contains("dump artifact is not restorable"));
+        assert!(err.contains("unsupported feature x"));
+    }
+
+    #[test]
+    fn import_preflight_blocks_strict_import_for_limited_manifest() {
+        let mut manifest = mysql_grade_manifest("not_enforced", true, Vec::new());
+        finalize_dump_manifest_grade(&mut manifest);
+
+        let err = validate_dump_import_compatibility(&manifest, true).unwrap_err();
+
+        assert!(err.contains("strict import requires a strict restorable dump"));
+    }
+
+    #[test]
+    fn import_preflight_allows_limited_manifest_when_strict_is_false() {
+        let mut manifest = mysql_grade_manifest("not_enforced", true, Vec::new());
+        finalize_dump_manifest_grade(&mut manifest);
+
+        validate_dump_import_compatibility(&manifest, false).unwrap();
     }
 
     #[test]
