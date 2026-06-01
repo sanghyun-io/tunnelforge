@@ -3096,6 +3096,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
+    let mut imported_rows_by_table: BTreeMap<String, u64> = BTreeMap::new();
     let mut recreated_target = false;
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
@@ -3146,6 +3147,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 table_total,
                 &mut rows_imported,
                 &mut chunks_imported,
+                &mut imported_rows_by_table,
                 &mut emit,
             )?;
 
@@ -3211,6 +3213,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             table_total,
             &mut rows_imported,
             &mut chunks_imported,
+            &mut imported_rows_by_table,
             &mut emit,
         )?;
         if should_apply_post_load_ddl(mode, recreated_target) {
@@ -3240,6 +3243,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         &mut emit,
     );
     import_result?;
+    verify_imported_row_counts(&tables, &imported_rows_by_table)?;
     restore_result?;
     local_infile_restore_result?;
 
@@ -3252,7 +3256,12 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "mode": mode,
         "tables": table_total,
         "rows_imported": rows_imported,
-        "chunks_imported": chunks_imported
+        "chunks_imported": chunks_imported,
+        "verification": {
+            "row_counts": "passed",
+            "strict_manifest": strict_manifest,
+            "warnings": manifest_warnings
+        }
     }))
 }
 
@@ -3387,6 +3396,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
     table_total: usize,
     rows_imported: &mut u64,
     chunks_imported: &mut u64,
+    imported_rows_by_table: &mut BTreeMap<String, u64>,
     emit: &mut F,
 ) -> Result<(), String> {
     for (index, table_manifest) in tables.iter().enumerate() {
@@ -3419,6 +3429,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
                 )?;
                 *rows_imported += rows;
                 *chunks_imported += chunks;
+                imported_rows_by_table.insert(table.name.clone(), rows);
                 emit(json!({
                     "event": "table_progress",
                     "request_id": request_id,
@@ -3431,6 +3442,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
             }
         }
 
+        let mut table_rows_imported = 0_u64;
         for chunk_index in 1..=table_manifest.chunks {
             let chunk_path = dump_manifest_chunk_path(
                 input_path,
@@ -3443,6 +3455,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
             let row_count = rows.len();
             adapter.insert_rows(table, rows)?;
             *rows_imported += row_count as u64;
+            table_rows_imported += row_count as u64;
             *chunks_imported += 1;
             emit(json!({
                 "event": "row_progress",
@@ -3452,6 +3465,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
                 "total": table_manifest.rows
             }));
         }
+        imported_rows_by_table.insert(table.name.clone(), table_rows_imported);
 
         emit(json!({
             "event": "table_progress",
@@ -7604,6 +7618,23 @@ fn validate_dump_import_manifest_strictness(
     Ok(warnings)
 }
 
+fn verify_imported_row_counts(
+    tables: &[DumpTableManifest],
+    imported_rows_by_table: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    for table in tables {
+        let imported = imported_rows_by_table.get(&table.name).copied().unwrap_or(0);
+        if imported != table.rows {
+            return Err(classified_import_error(
+                "post_load_validation_failed",
+                &format!("expected {} rows, imported {}", table.rows, imported),
+                Some(&table.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
     let extension = if data_format == "tsv" { "tsv" } else { "jsonl" };
     if compression == "zstd" {
@@ -10972,6 +11003,40 @@ mod tests {
             post_load_ddl_skip_message("merge"),
             "skipping post-load DDL for merge import; existing objects must already match"
         );
+    }
+
+    #[test]
+    fn import_row_count_verification_rejects_missing_rows() {
+        let tables = vec![DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 3,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut imported = BTreeMap::new();
+        imported.insert("users".to_string(), 2_u64);
+
+        let err = verify_imported_row_counts(&tables, &imported).unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("users"));
+        assert!(err.contains("expected 3 rows, imported 2"));
+    }
+
+    #[test]
+    fn import_row_count_verification_accepts_matching_counts() {
+        let tables = vec![DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 3,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut imported = BTreeMap::new();
+        imported.insert("users".to_string(), 3_u64);
+
+        verify_imported_row_counts(&tables, &imported).unwrap();
     }
 
     #[test]
