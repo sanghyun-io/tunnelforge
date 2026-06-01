@@ -9605,6 +9605,19 @@ mod tests {
         assert!(grade.blockers.is_empty());
     }
 
+    #[test]
+    fn artifact_grading_warns_when_checksum_is_missing() {
+        let manifest = mysql_grade_manifest("transaction_snapshot", false, Vec::new());
+
+        let grade = grade_dump_artifact(&manifest);
+
+        assert_eq!(grade.restorability, RestorabilityGrade::LimitedRestorable);
+        assert!(grade
+            .warnings
+            .contains(&"checksum coverage is incomplete".to_string()));
+        assert!(grade.blockers.is_empty());
+    }
+
     #[derive(Default)]
     struct RecordingAdapter {
         executed_sql: Vec<String>,
