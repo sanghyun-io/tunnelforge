@@ -9854,6 +9854,58 @@ mod tests {
     }
 
     #[test]
+    fn mysql_snapshot_evidence_marks_lock_based_strict_when_locks_are_available() {
+        let tables = vec![
+            MysqlTableEngine {
+                table: "orders".to_string(),
+                engine: "InnoDB".to_string(),
+            },
+            MysqlTableEngine {
+                table: "audit_log".to_string(),
+                engine: "MyISAM".to_string(),
+            },
+        ];
+
+        let evidence = classify_mysql_snapshot_strategy(&tables, true, true, 8);
+
+        assert_eq!(evidence.policy, "lock_based");
+        assert!(evidence.strict_candidate);
+        assert!(evidence.warnings.is_empty());
+    }
+
+    #[test]
+    fn mysql_snapshot_evidence_marks_parallel_threads_as_not_enforced_without_locks() {
+        let tables = vec![MysqlTableEngine {
+            table: "orders".to_string(),
+            engine: "InnoDB".to_string(),
+        }];
+
+        let evidence = classify_mysql_snapshot_strategy(&tables, true, false, 8);
+
+        assert_eq!(evidence.policy, "not_enforced");
+        assert!(!evidence.strict_candidate);
+        assert!(evidence.warnings.contains(
+            &"parallel dump connections cannot share a transaction snapshot".to_string()
+        ));
+    }
+
+    #[test]
+    fn mysql_snapshot_evidence_marks_not_enforced_when_snapshot_is_unavailable() {
+        let tables = vec![MysqlTableEngine {
+            table: "orders".to_string(),
+            engine: "InnoDB".to_string(),
+        }];
+
+        let evidence = classify_mysql_snapshot_strategy(&tables, false, false, 1);
+
+        assert_eq!(evidence.policy, "not_enforced");
+        assert!(!evidence.strict_candidate);
+        assert!(evidence
+            .warnings
+            .contains(&"snapshot consistency is not proven".to_string()));
+    }
+
+    #[test]
     fn artifact_grading_requires_snapshot_for_strict_restore() {
         let manifest = mysql_grade_manifest("not_enforced", true, Vec::new());
 
