@@ -1726,6 +1726,38 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             )?
         };
 
+    finish_dump_run_artifact(DumpRunFinishInput {
+        request_id: request.request_id.clone(),
+        output_dir,
+        output_path,
+        endpoint: &endpoint,
+        schema,
+        data_format,
+        compression,
+        chunk_size,
+        source_version,
+        table_manifests,
+        total_rows,
+        total_chunks,
+    })
+}
+
+struct DumpRunFinishInput<'a> {
+    request_id: Option<String>,
+    output_dir: &'a str,
+    output_path: &'a Path,
+    endpoint: &'a Endpoint,
+    schema: NormalizedSchema,
+    data_format: String,
+    compression: String,
+    chunk_size: usize,
+    source_version: Option<String>,
+    table_manifests: Vec<DumpTableManifest>,
+    total_rows: u64,
+    total_chunks: u64,
+}
+
+fn finish_dump_run_artifact(input: DumpRunFinishInput<'_>) -> Result<Value, String> {
     let snapshot_policy = "not_enforced".to_string();
     let snapshot_enabled = snapshot_policy != "not_enforced";
     let manifest_warnings = vec![
@@ -1734,14 +1766,14 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     ];
     let mut manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
-        format_version: if data_format == "jsonl" { 1 } else { 2 },
-        data_format,
-        compression,
-        source_engine: endpoint.engine.clone(),
-        source_version,
-        database: endpoint.database.clone(),
-        schema,
-        chunk_size,
+        format_version: if input.data_format == "jsonl" { 1 } else { 2 },
+        data_format: input.data_format,
+        compression: input.compression,
+        source_engine: input.endpoint.engine.clone(),
+        source_version: input.source_version,
+        database: input.endpoint.database.clone(),
+        schema: input.schema,
+        chunk_size: input.chunk_size,
         created_unix_seconds: current_unix_seconds(),
         snapshot_policy,
         strict_export: false,
@@ -1756,17 +1788,16 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         },
         restorability: RestorabilityGrade::LimitedRestorable,
         blockers: Vec::new(),
-        tables: table_manifests,
+        tables: input.table_manifests,
     };
     finalize_dump_manifest_grade(&mut manifest);
-    write_dump_manifest(output_path, &manifest)?;
-
+    write_dump_manifest(input.output_path, &manifest)?;
     Ok(dump_run_result_payload(
-        request.request_id.clone(),
-        output_dir,
+        input.request_id,
+        input.output_dir,
         &manifest,
-        total_rows,
-        total_chunks,
+        input.total_rows,
+        input.total_chunks,
     ))
 }
 
@@ -9755,6 +9786,64 @@ mod tests {
         let source_version = detect_dump_source_version(&endpoint);
 
         assert_eq!(source_version, None);
+    }
+
+    #[test]
+    fn dump_run_finish_artifact_writes_finalized_manifest_and_result() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-dump-run-finish-{}",
+            current_unix_seconds()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        prepare_dump_output_dir(&dir, false).unwrap();
+
+        let endpoint = Endpoint {
+            engine: "mysql".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "root".to_string(),
+            password: String::new(),
+            database: "app".to_string(),
+            schema: Some("app".to_string()),
+        };
+        let table_manifests = vec![DumpTableManifest {
+            name: "users".to_string(),
+            path: "users".to_string(),
+            rows: 9,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+
+        let result = finish_dump_run_artifact(DumpRunFinishInput {
+            request_id: Some("dump-run-2".to_string()),
+            output_dir: dir.to_str().unwrap(),
+            output_path: &dir,
+            endpoint: &endpoint,
+            schema: schema(),
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            chunk_size: 1000,
+            source_version: Some("8.0.36".to_string()),
+            table_manifests,
+            total_rows: 9,
+            total_chunks: 1,
+        })
+        .unwrap();
+
+        let persisted = read_dump_manifest(&dir).unwrap();
+
+        assert_eq!(persisted.source_version, Some("8.0.36".to_string()));
+        assert_eq!(result["event"], "result");
+        assert_eq!(result["request_id"], "dump-run-2");
+        assert_eq!(result["command"], "dump.run");
+        assert_eq!(result["tables"], 1);
+        assert_eq!(result["rows_dumped"], 9);
+        assert_eq!(result["chunks_dumped"], 1);
+        assert_eq!(result["restorability"], json!(persisted.restorability));
+        assert_eq!(result["warnings"], json!(persisted.manifest_warnings));
+        assert_eq!(result["blockers"], json!(persisted.blockers));
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[derive(Default)]
