@@ -3158,6 +3158,7 @@ fn dump_import_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
 }
 
 fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
+    let endpoint = request_endpoint(request)?;
     let input_dir = request
         .payload
         .get("input_dir")
@@ -3227,7 +3228,6 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     validate_dump_import_compatibility(&manifest, strict_manifest)?;
     let manifest_warnings = validate_dump_import_manifest_strictness(&tables, strict_manifest)?;
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
-    let endpoint = request_endpoint(request)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     let timezone_sql = validated_timezone_sql(
         request
@@ -9842,9 +9842,9 @@ mod tests {
                 "input_dir": dir.display().to_string(),
                 "strict_manifest": true,
                 "target": {
-                    "engine": "unsupported_engine",
+                    "engine": "mysql",
                     "host": "127.0.0.1",
-                    "port": 1234,
+                    "port": 1,
                     "user": "u",
                     "password": "p",
                     "database": "db"
@@ -9856,7 +9856,8 @@ mod tests {
 
         assert!(err.contains("dump artifact is not restorable"));
         assert!(err.contains("unsupported feature mysql.unsupported"));
-        assert!(!err.contains("unsupported endpoint engine"));
+        assert!(!err.contains("mysql connection error"));
+        assert!(!err.contains("mysql pool error"));
         assert!(events
             .iter()
             .any(|event| event.get("phase") == Some(&json!("dump_import_preflight"))));
