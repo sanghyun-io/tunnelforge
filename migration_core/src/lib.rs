@@ -3684,11 +3684,13 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         adapter.execute_sql(sql)?;
     }
     let target_engine = adapter.engine().to_string();
-    if target_engine != "mysql" && !manifest.objects.objects.is_empty() {
-        return Err(format!(
-            "dump.import object restore is only supported for mysql targets; target engine is {target_engine}"
-        ));
-    }
+    validate_dump_objects_for_restore(
+        &manifest.objects,
+        &target_engine,
+        &endpoint.database,
+        selected.is_empty(),
+        mode,
+    )?;
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
         &endpoint,
@@ -3867,8 +3869,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             "message": "restoring mysql views, events, routines, and triggers"
         }));
     }
-    let objects_restored =
-        restore_dump_objects(&mut adapter, input_path, &manifest.objects, &target_engine)?;
+    let objects_restored = restore_dump_objects(&mut adapter, input_path, &manifest.objects)?;
     restore_result?;
     local_infile_restore_result?;
     let import_report_path = dump_import_report_path(input_path)?;
@@ -8487,19 +8488,77 @@ fn verify_imported_row_counts(
     Ok(())
 }
 
-fn restore_dump_objects(
-    adapter: &mut dyn MigrationAdapter,
-    input_path: &Path,
+fn expected_dump_object_layout(object_type: &str) -> Option<(&'static str, u32)> {
+    match object_type {
+        "view" => Some(("objects/views/", 10)),
+        "event" => Some(("objects/events/", 20)),
+        "routine" => Some(("objects/routines/", 30)),
+        "trigger" => Some(("objects/triggers/", 40)),
+        _ => None,
+    }
+}
+
+fn validate_dump_objects_for_restore(
     objects: &DumpObjectManifest,
     target_engine: &str,
-) -> Result<u64, String> {
+    target_schema: &str,
+    selected_is_empty: bool,
+    mode: &str,
+) -> Result<(), String> {
     if objects.objects.is_empty() {
-        return Ok(0);
+        return Ok(());
     }
     if target_engine != "mysql" {
         return Err(format!(
             "dump.import object restore is only supported for mysql targets; target engine is {target_engine}"
         ));
+    }
+    if !selected_is_empty {
+        return Err("dump.import object restore requires full-schema import".to_string());
+    }
+    if mode == "recreate" {
+        return Err(
+            "dump.import object restore is not supported for recreate mode; use replace or merge"
+                .to_string(),
+        );
+    }
+    for entry in &objects.objects {
+        let (expected_prefix, expected_order) =
+            expected_dump_object_layout(&entry.object_type).ok_or_else(|| {
+                format!(
+                    "dump.import object restore found unsupported object_type: {}",
+                    entry.object_type
+                )
+            })?;
+        if entry.restore_order != expected_order {
+            return Err(format!(
+                "dump.import object restore order mismatch for {} {}: expected {}, got {}",
+                entry.object_type, entry.name, expected_order, entry.restore_order
+            ));
+        }
+        if !entry.path.starts_with(expected_prefix) {
+            return Err(format!(
+                "dump.import object path prefix mismatch for {} {}: expected prefix {}, got {}",
+                entry.object_type, entry.name, expected_prefix, entry.path
+            ));
+        }
+        if entry.schema != target_schema {
+            return Err(format!(
+                "object DDL schema {} does not match target schema {} for {} {}",
+                entry.schema, target_schema, entry.object_type, entry.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn restore_dump_objects(
+    adapter: &mut dyn MigrationAdapter,
+    input_path: &Path,
+    objects: &DumpObjectManifest,
+) -> Result<u64, String> {
+    if objects.objects.is_empty() {
+        return Ok(0);
     }
     let mut entries = objects.objects.clone();
     entries.sort_by(|left, right| {
@@ -12821,7 +12880,7 @@ mod tests {
         };
         let mut adapter = RecordingAdapter::default();
 
-        let restored = restore_dump_objects(&mut adapter, &dir, &manifest, "mysql").unwrap();
+        let restored = restore_dump_objects(&mut adapter, &dir, &manifest).unwrap();
 
         assert_eq!(restored, 3);
         assert_eq!(
@@ -12833,6 +12892,102 @@ mod tests {
             ]
         );
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dump_import_object_validation_rejects_schema_mismatch() {
+        let objects = DumpObjectManifest {
+            objects: vec![DumpObjectEntry {
+                object_type: "view".to_string(),
+                schema: "source_db".to_string(),
+                name: "v_orders".to_string(),
+                path: "objects/views/v_orders.sql".to_string(),
+                restore_order: 10,
+            }],
+        };
+
+        let err = validate_dump_objects_for_restore(&objects, "mysql", "target_db", true, "replace")
+            .unwrap_err();
+
+        assert!(err.contains("does not match target schema"));
+    }
+
+    #[test]
+    fn dump_import_object_validation_rejects_partial_selected_import() {
+        let objects = DumpObjectManifest {
+            objects: vec![DumpObjectEntry {
+                object_type: "trigger".to_string(),
+                schema: "app".to_string(),
+                name: "trg_orders_ai".to_string(),
+                path: "objects/triggers/trg_orders_ai.sql".to_string(),
+                restore_order: 40,
+            }],
+        };
+
+        let err =
+            validate_dump_objects_for_restore(&objects, "mysql", "app", false, "replace").unwrap_err();
+
+        assert!(err.contains("requires full-schema import"));
+    }
+
+    #[test]
+    fn dump_import_object_validation_rejects_recreate_mode() {
+        let objects = DumpObjectManifest {
+            objects: vec![DumpObjectEntry {
+                object_type: "view".to_string(),
+                schema: "app".to_string(),
+                name: "v_orders".to_string(),
+                path: "objects/views/v_orders.sql".to_string(),
+                restore_order: 10,
+            }],
+        };
+
+        let err =
+            validate_dump_objects_for_restore(&objects, "mysql", "app", true, "recreate").unwrap_err();
+
+        assert!(err.contains("not supported for recreate mode"));
+    }
+
+    #[test]
+    fn dump_import_object_validation_rejects_invalid_type_order_and_path_prefix() {
+        let invalid_type = DumpObjectManifest {
+            objects: vec![DumpObjectEntry {
+                object_type: "materialized_view".to_string(),
+                schema: "app".to_string(),
+                name: "mv_orders".to_string(),
+                path: "objects/views/mv_orders.sql".to_string(),
+                restore_order: 10,
+            }],
+        };
+        let err = validate_dump_objects_for_restore(&invalid_type, "mysql", "app", true, "replace")
+            .unwrap_err();
+        assert!(err.contains("unsupported object_type"));
+
+        let invalid_order = DumpObjectManifest {
+            objects: vec![DumpObjectEntry {
+                object_type: "event".to_string(),
+                schema: "app".to_string(),
+                name: "ev_orders".to_string(),
+                path: "objects/events/ev_orders.sql".to_string(),
+                restore_order: 30,
+            }],
+        };
+        let err = validate_dump_objects_for_restore(&invalid_order, "mysql", "app", true, "replace")
+            .unwrap_err();
+        assert!(err.contains("restore order mismatch"));
+
+        let invalid_path = DumpObjectManifest {
+            objects: vec![DumpObjectEntry {
+                object_type: "routine".to_string(),
+                schema: "app".to_string(),
+                name: "proc_sync".to_string(),
+                path: "objects/views/proc_sync.sql".to_string(),
+                restore_order: 30,
+            }],
+        };
+        let err = validate_dump_objects_for_restore(&invalid_path, "mysql", "app", true, "replace")
+            .unwrap_err();
+        assert!(err.contains("path prefix mismatch"));
     }
 
     #[test]
