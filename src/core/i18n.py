@@ -630,6 +630,7 @@ _EN_PHRASE_TRANSLATIONS = {
     "중복 객체가 있으면 오류 발생": "Duplicate objects cause errors",
     "모든 객체": "All objects",
     "재생성": "recreate",
+    "테이블 구조와 데이터를 Rust DB Core로 복원\n   ⚠️ 뷰/프로시저/트리거/이벤트는 자동 복원 대상 아님": "Restore table structure and data with Rust DB Core\n   ⚠️ Views/procedures/triggers/events are not automatically restored",
     "임시 스키마에 먼저 복원 후 성공 시 전환": "Restore to a temporary schema first, then switch after success",
     "전환 시 대상 DB 교체, 추가 여유 공간 필요": "Target DB is replaced during switch; extra free space is required",
     "대상 MySQL 저장소가 다른 드라이브나 서버에 있으면 실제 필요 공간은 달라질 수 있습니다.": "If the target MySQL storage is on another drive or server, the actual required space may differ.",
