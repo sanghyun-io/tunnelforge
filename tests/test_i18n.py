@@ -92,6 +92,9 @@ def test_translate_text_handles_common_hardcoded_ui_phrases():
     assert i18n.translate_text("Mismatch: {}개") == "Mismatch: {}"
     assert i18n.translate_text("Rust Core 검사 완료: {}개 테이블") == "Rust Core inspection complete: {} tables"
     assert i18n.translate_text("✅ {}개 테이블 로드됨 (MySQL {})") == "✅ {} tables loaded (MySQL {})"
+    assert i18n.translate_text("이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n{}") == (
+        "This dump cannot proceed through the recommended import path.\n\n{}"
+    )
 
 
 def test_qt_i18n_hooks_translate_hardcoded_widget_text(monkeypatch):

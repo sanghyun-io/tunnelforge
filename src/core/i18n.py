@@ -323,6 +323,7 @@ _EN_TEXT_TRANSLATIONS = {
     "실행 전": "Before Run",
     "실행 실패": "Run Failed",
     "실행할 SQL이 없습니다.": "There is no SQL to run.",
+    "이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n{}": "This dump cannot proceed through the recommended import path.\n\n{}",
     "알 수 없음": "Unknown",
     "알림": "Notice",
     "업데이트": "Update",
