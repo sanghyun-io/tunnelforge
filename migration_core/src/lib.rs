@@ -17,6 +17,7 @@ const MYSQL_INSERT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const MYSQL_DUMP_TARGET_BYTES_PER_CHUNK: u64 = 64_000_000;
 const MYSQL_DUMP_ZSTD_LEVEL: i32 = 1;
 const DUMP_DIR_MARKER: &str = ".tunnelforge_dump_dir";
+const IMPORT_PROGRESS_FILE: &str = "_tunnelforge_import_progress.json";
 
 #[derive(Debug, Deserialize)]
 pub struct Request {
@@ -49,6 +50,25 @@ pub struct ResumeState {
     pub direction: String,
     pub current_phase: String,
     pub tables: Vec<ResumeTableState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportProgressState {
+    pub manifest_hash: String,
+    pub target_identity: String,
+    pub import_mode: String,
+    #[serde(default)]
+    pub completed_steps: Vec<String>,
+    #[serde(default)]
+    pub failed_steps: Vec<String>,
+    #[serde(default)]
+    pub completed_chunks: BTreeSet<String>,
+    #[serde(default)]
+    pub verification_complete: bool,
+    #[serde(default)]
+    pub switched: bool,
+    #[serde(default)]
+    pub cleanup_complete: bool,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -3673,6 +3693,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     validate_dump_import_compatibility(&manifest, strict_manifest)?;
     let manifest_warnings = validate_dump_import_manifest_strictness(&tables, strict_manifest)?;
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
+    let manifest_hash = dump_manifest_hash(input_path)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     let timezone_sql = validated_timezone_sql(
         request
@@ -3680,9 +3701,6 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             .get("timezone_sql")
             .and_then(Value::as_str),
     )?;
-    if let Some(sql) = timezone_sql.as_deref() {
-        adapter.execute_sql(sql)?;
-    }
     let target_engine = adapter.engine().to_string();
     validate_dump_objects_for_restore(
         &manifest.objects,
@@ -3691,6 +3709,22 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         selected.is_empty(),
         mode,
     )?;
+    let progress_path = dump_import_progress_path(input_path)?;
+    let mut progress_state = ImportProgressState {
+        manifest_hash,
+        target_identity: import_target_identity(&endpoint, &target_engine),
+        import_mode: mode.to_string(),
+        completed_steps: Vec::new(),
+        failed_steps: Vec::new(),
+        completed_chunks: BTreeSet::new(),
+        verification_complete: false,
+        switched: false,
+        cleanup_complete: false,
+    };
+    write_import_progress_state(&progress_path, &progress_state)?;
+    if let Some(sql) = timezone_sql.as_deref() {
+        adapter.execute_sql(sql)?;
+    }
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
         &endpoint,
@@ -3749,6 +3783,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &target_engine,
             )?;
             recreated_target = true;
+            mark_import_step_completed(&progress_path, &mut progress_state, "load_schema")?;
 
             let worker_endpoint = mysql_import_worker_endpoint(&endpoint, Some(&shadow_database));
             import_dump_table_data(
@@ -3767,6 +3802,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &mut imported_rows_by_table,
                 &mut emit,
             )?;
+            mark_import_step_completed(&progress_path, &mut progress_state, "load_data")?;
 
             emit(json!({
                 "event": "phase",
@@ -3814,6 +3850,9 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 &target_engine,
             )?;
             recreated_target = true;
+            mark_import_step_completed(&progress_path, &mut progress_state, "load_schema")?;
+        } else if mode == "merge" {
+            mark_import_step_completed(&progress_path, &mut progress_state, "load_schema")?;
         }
 
         let worker_endpoint = mysql_import_worker_endpoint(&endpoint, None);
@@ -3833,6 +3872,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             &mut imported_rows_by_table,
             &mut emit,
         )?;
+        mark_import_step_completed(&progress_path, &mut progress_state, "load_data")?;
         if should_apply_post_load_ddl(mode, recreated_target) {
             emit(json!({
                 "event": "phase",
@@ -3870,6 +3910,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         }));
     }
     let objects_restored = restore_dump_objects(&mut adapter, input_path, &manifest.objects)?;
+    mark_import_step_completed(&progress_path, &mut progress_state, "load_objects")?;
     restore_result?;
     local_infile_restore_result?;
     let import_report_path = dump_import_report_path(input_path)?;
@@ -8610,6 +8651,135 @@ fn write_dump_import_report(input_path: &Path, report: &Value) -> Result<(), Str
         .map_err(|err| format!("cannot write import report {}: {err}", report_path.display()))
 }
 
+fn dump_import_progress_path(input_path: &Path) -> Result<PathBuf, String> {
+    let canonical = input_path
+        .canonicalize()
+        .map_err(|err| format!("cannot resolve import progress directory: {err}"))?;
+    Ok(canonical.join(IMPORT_PROGRESS_FILE))
+}
+
+fn write_import_progress_state(path: &Path, state: &ImportProgressState) -> Result<(), String> {
+    let bytes = serde_json::to_vec_pretty(state)
+        .map_err(|err| format!("failed to serialize import progress state: {err}"))?;
+    let nonce = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("import_progress.json");
+    let temp_path =
+        path.with_file_name(format!("{file_name}.tmp-{}-{nonce}", std::process::id()));
+    let mut file = File::create(&temp_path).map_err(|err| {
+        format!(
+            "failed to create import progress temp file {}: {err}",
+            temp_path.display()
+        )
+    })?;
+    file.write_all(&bytes).map_err(|err| {
+        format!(
+            "failed to write import progress temp file {}: {err}",
+            temp_path.display()
+        )
+    })?;
+    file.sync_all().map_err(|err| {
+        format!(
+            "failed to flush import progress temp file {}: {err}",
+            temp_path.display()
+        )
+    })?;
+    fs::rename(&temp_path, path).map_err(|err| {
+        let _ = fs::remove_file(&temp_path);
+        format!(
+            "failed to replace import progress file {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn read_import_progress_state(path: &Path) -> Result<ImportProgressState, String> {
+    let file = File::open(path).map_err(|err| {
+        format!(
+            "failed to open import progress file {}: {err}",
+            path.display()
+        )
+    })?;
+    serde_json::from_reader(file).map_err(|err| {
+        format!(
+            "failed to parse import progress file {}: {err}",
+            path.display()
+        )
+    })
+}
+
+fn validate_import_resume_state(
+    state: &ImportProgressState,
+    manifest_hash: &str,
+    target_identity: &str,
+    import_mode: &str,
+) -> Result<(), String> {
+    if state.manifest_hash != manifest_hash {
+        return Err("progress file belongs to a different dump manifest".to_string());
+    }
+    if state.target_identity != target_identity {
+        return Err(format!(
+            "progress file belongs to a different target identity: expected {target_identity}, got {}",
+            state.target_identity
+        ));
+    }
+    if state.import_mode != import_mode {
+        return Err(format!(
+            "progress file belongs to a different import mode: expected {import_mode}, got {}",
+            state.import_mode
+        ));
+    }
+    Ok(())
+}
+
+fn dump_manifest_hash(input_path: &Path) -> Result<String, String> {
+    let manifest_path = input_path.join("_tunnelforge_dump.json");
+    let mut file = File::open(&manifest_path).map_err(|err| {
+        format!(
+            "failed to open dump manifest for hashing {}: {err}",
+            manifest_path.display()
+        )
+    })?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer).map_err(|err| {
+            format!(
+                "failed to read dump manifest for hashing {}: {err}",
+                manifest_path.display()
+            )
+        })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn import_target_identity(endpoint: &Endpoint, target_engine: &str) -> String {
+    format!(
+        "{}://{}:{}/{}",
+        target_engine, endpoint.host, endpoint.port, endpoint.database
+    )
+}
+
+fn mark_import_step_completed(
+    progress_path: &Path,
+    state: &mut ImportProgressState,
+    step: &str,
+) -> Result<(), String> {
+    if !state.completed_steps.iter().any(|value| value == step) {
+        state.completed_steps.push(step.to_string());
+    }
+    write_import_progress_state(progress_path, state)
+}
+
 fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
     let extension = if data_format == "tsv" { "tsv" } else { "jsonl" };
     if compression == "zstd" {
@@ -10285,6 +10455,51 @@ pub fn next_table_to_copy(state: &ResumeState) -> Option<String> {
 mod tests {
     use super::*;
 
+    mod tempfile {
+        use std::fs;
+        use std::path::{Path, PathBuf};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        pub struct TempDir {
+            path: PathBuf,
+        }
+
+        impl TempDir {
+            pub fn path(&self) -> &Path {
+                &self.path
+            }
+        }
+
+        impl Drop for TempDir {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.path);
+            }
+        }
+
+        pub fn tempdir() -> std::io::Result<TempDir> {
+            let base = std::env::temp_dir();
+            for attempt in 0..1024_u32 {
+                let nonce = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|duration| duration.as_nanos())
+                    .unwrap_or(0);
+                let candidate = base.join(format!(
+                    "tunnelforge-test-tempdir-{}-{nonce}-{attempt}",
+                    std::process::id()
+                ));
+                match fs::create_dir(&candidate) {
+                    Ok(()) => return Ok(TempDir { path: candidate }),
+                    Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                    Err(err) => return Err(err),
+                }
+            }
+            Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "failed to allocate unique tempdir",
+            ))
+        }
+    }
+
     fn schema() -> NormalizedSchema {
         NormalizedSchema {
             tables: vec![NormalizedTable {
@@ -10993,6 +11208,45 @@ mod tests {
         assert_eq!(read_jsonl_rows(&chunk_path, "none").unwrap(), rows);
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_progress_state_roundtrips_with_manifest_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("_tunnelforge_import_progress.json");
+        let state = ImportProgressState {
+            manifest_hash: "abc123".to_string(),
+            target_identity: "mysql://localhost/app".to_string(),
+            import_mode: "replace".to_string(),
+            completed_steps: vec!["load_schema".to_string()],
+            failed_steps: Vec::new(),
+            completed_chunks: BTreeSet::from(["orders:1".to_string()]),
+            verification_complete: false,
+            switched: false,
+            cleanup_complete: false,
+        };
+        write_import_progress_state(&path, &state).unwrap();
+        let loaded = read_import_progress_state(&path).unwrap();
+        assert_eq!(loaded, state);
+    }
+
+    #[test]
+    fn import_resume_rejects_mismatched_manifest_hash() {
+        let state = ImportProgressState {
+            manifest_hash: "old".to_string(),
+            target_identity: "mysql://localhost/app".to_string(),
+            import_mode: "replace".to_string(),
+            completed_steps: Vec::new(),
+            failed_steps: Vec::new(),
+            completed_chunks: BTreeSet::new(),
+            verification_complete: false,
+            switched: false,
+            cleanup_complete: false,
+        };
+        let err =
+            validate_import_resume_state(&state, "new", "mysql://localhost/app", "replace")
+                .unwrap_err();
+        assert!(err.contains("progress file belongs to a different dump manifest"));
     }
 
     #[test]
