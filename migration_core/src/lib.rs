@@ -136,6 +136,53 @@ pub struct MigrationResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestorabilityGrade {
+    StrictRestorable,
+    LimitedRestorable,
+    NotRestorable,
+}
+
+fn default_restorability_grade() -> RestorabilityGrade {
+    RestorabilityGrade::LimitedRestorable
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct DumpFeatureSet {
+    #[serde(default)]
+    pub snapshot: bool,
+    #[serde(default)]
+    pub chunking: bool,
+    #[serde(default)]
+    pub partitioning: bool,
+    #[serde(default)]
+    pub routines: bool,
+    #[serde(default)]
+    pub events: bool,
+    #[serde(default)]
+    pub triggers: bool,
+    #[serde(default)]
+    pub users: bool,
+    #[serde(default)]
+    pub grants: bool,
+    #[serde(default)]
+    pub checksum: bool,
+    #[serde(default)]
+    pub row_digest: bool,
+    #[serde(default)]
+    pub timezone: bool,
+    #[serde(default)]
+    pub unsupported: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ArtifactGrade {
+    pub restorability: RestorabilityGrade,
+    pub warnings: Vec<String>,
+    pub blockers: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DumpManifest {
     pub format: String,
     pub format_version: u32,
@@ -144,6 +191,8 @@ pub struct DumpManifest {
     #[serde(default = "default_dump_compression")]
     pub compression: String,
     pub source_engine: String,
+    #[serde(default)]
+    pub source_version: Option<String>,
     pub database: String,
     pub schema: NormalizedSchema,
     pub chunk_size: usize,
@@ -154,6 +203,14 @@ pub struct DumpManifest {
     pub strict_export: bool,
     #[serde(default)]
     pub manifest_warnings: Vec<String>,
+    #[serde(default = "default_dump_scope")]
+    pub dump_scope: String,
+    #[serde(default)]
+    pub features: DumpFeatureSet,
+    #[serde(default = "default_restorability_grade")]
+    pub restorability: RestorabilityGrade,
+    #[serde(default)]
+    pub blockers: Vec<String>,
     pub tables: Vec<DumpTableManifest>,
 }
 
@@ -676,6 +733,10 @@ fn default_dump_compression() -> String {
 
 fn default_snapshot_policy() -> String {
     "unknown".to_string()
+}
+
+fn default_dump_scope() -> String {
+    "schema".to_string()
 }
 
 pub struct CoreService {
@@ -1676,6 +1737,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         data_format,
         compression,
         source_engine: endpoint.engine.clone(),
+        source_version: None,
         database: endpoint.database.clone(),
         schema,
         chunk_size,
@@ -1683,6 +1745,10 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         snapshot_policy,
         strict_export,
         manifest_warnings,
+        dump_scope: default_dump_scope(),
+        features: DumpFeatureSet::default(),
+        restorability: default_restorability_grade(),
+        blockers: Vec::new(),
         tables: table_manifests,
     };
     write_dump_manifest(output_path, &manifest)?;
@@ -7576,6 +7642,45 @@ fn read_dump_manifest(input_path: &Path) -> Result<DumpManifest, String> {
     Ok(manifest)
 }
 
+fn grade_dump_artifact(manifest: &DumpManifest) -> ArtifactGrade {
+    let mut warnings = manifest.manifest_warnings.clone();
+    let mut blockers = manifest.blockers.clone();
+
+    for feature in &manifest.features.unsupported {
+        blockers.push(format!("unsupported feature {feature}"));
+    }
+    if manifest.snapshot_policy == "not_enforced" || manifest.snapshot_policy == "unknown" {
+        warnings.push("snapshot consistency is not proven".to_string());
+    }
+    if !manifest.features.checksum {
+        warnings.push("checksum coverage is incomplete".to_string());
+    }
+
+    warnings.sort();
+    warnings.dedup();
+    blockers.sort();
+    blockers.dedup();
+
+    let restorability = if !blockers.is_empty() {
+        RestorabilityGrade::NotRestorable
+    } else if warnings.is_empty()
+        && manifest.features.snapshot
+        && manifest.features.checksum
+        && manifest.snapshot_policy != "not_enforced"
+        && manifest.snapshot_policy != "unknown"
+    {
+        RestorabilityGrade::StrictRestorable
+    } else {
+        RestorabilityGrade::LimitedRestorable
+    };
+
+    ArtifactGrade {
+        restorability,
+        warnings,
+        blockers,
+    }
+}
+
 fn validate_dump_table_path(path: &str) -> Result<(), String> {
     let table_path = Path::new(path);
     if path.trim().is_empty() || table_path.is_absolute() {
@@ -9426,6 +9531,80 @@ mod tests {
         }
     }
 
+    fn mysql_grade_manifest(
+        snapshot_policy: &str,
+        checksum: bool,
+        unsupported: Vec<String>,
+    ) -> DumpManifest {
+        DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 3,
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            source_engine: "mysql".to_string(),
+            source_version: Some("8.0.36".to_string()),
+            database: "app".to_string(),
+            schema: NormalizedSchema::default(),
+            chunk_size: 1000,
+            created_unix_seconds: 1,
+            snapshot_policy: snapshot_policy.to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet {
+                snapshot: snapshot_policy != "not_enforced",
+                chunking: true,
+                checksum,
+                timezone: true,
+                unsupported,
+                ..DumpFeatureSet::default()
+            },
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
+            tables: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn artifact_grading_requires_snapshot_for_strict_restore() {
+        let manifest = mysql_grade_manifest("not_enforced", true, Vec::new());
+
+        let grade = grade_dump_artifact(&manifest);
+
+        assert_eq!(grade.restorability, RestorabilityGrade::LimitedRestorable);
+        assert!(grade
+            .warnings
+            .contains(&"snapshot consistency is not proven".to_string()));
+        assert!(grade.blockers.is_empty());
+    }
+
+    #[test]
+    fn artifact_grading_blocks_unsupported_features() {
+        let manifest = mysql_grade_manifest(
+            "transaction_snapshot",
+            true,
+            vec!["mysql.unknown_feature".to_string()],
+        );
+
+        let grade = grade_dump_artifact(&manifest);
+
+        assert_eq!(grade.restorability, RestorabilityGrade::NotRestorable);
+        assert!(grade
+            .blockers
+            .contains(&"unsupported feature mysql.unknown_feature".to_string()));
+    }
+
+    #[test]
+    fn artifact_grading_allows_strict_when_required_evidence_exists() {
+        let manifest = mysql_grade_manifest("transaction_snapshot", true, Vec::new());
+
+        let grade = grade_dump_artifact(&manifest);
+
+        assert_eq!(grade.restorability, RestorabilityGrade::StrictRestorable);
+        assert!(grade.warnings.is_empty());
+        assert!(grade.blockers.is_empty());
+    }
+
     #[derive(Default)]
     struct RecordingAdapter {
         executed_sql: Vec<String>,
@@ -9551,6 +9730,7 @@ mod tests {
             data_format: "jsonl".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_version: None,
             database: "app".to_string(),
             schema: schema(),
             chunk_size: 1000,
@@ -9558,6 +9738,10 @@ mod tests {
             snapshot_policy: "unknown".to_string(),
             strict_export: false,
             manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9597,6 +9781,10 @@ mod tests {
         assert_eq!(manifest.snapshot_policy, "unknown");
         assert!(!manifest.strict_export);
         assert!(manifest.manifest_warnings.is_empty());
+        assert_eq!(manifest.dump_scope, "schema");
+        assert_eq!(manifest.restorability, RestorabilityGrade::LimitedRestorable);
+        assert!(manifest.blockers.is_empty());
+        assert!(manifest.features.unsupported.is_empty());
     }
 
     #[test]
@@ -9613,6 +9801,7 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "zstd".to_string(),
             source_engine: "mysql".to_string(),
+            source_version: None,
             database: "app".to_string(),
             schema: schema(),
             chunk_size: 1000,
@@ -9620,6 +9809,10 @@ mod tests {
             snapshot_policy: "unknown".to_string(),
             strict_export: false,
             manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "../outside".to_string(),
@@ -9665,6 +9858,7 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_version: None,
             database: "app".to_string(),
             schema: schema(),
             chunk_size: 1000,
@@ -9672,6 +9866,10 @@ mod tests {
             snapshot_policy: "unknown".to_string(),
             strict_export: false,
             manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9701,6 +9899,7 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_version: None,
             database: "app".to_string(),
             schema: schema(),
             chunk_size: 1000,
@@ -9708,6 +9907,10 @@ mod tests {
             snapshot_policy: "unknown".to_string(),
             strict_export: false,
             manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9740,6 +9943,7 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_version: None,
             database: "app".to_string(),
             schema: schema(),
             chunk_size: 1000,
@@ -9747,6 +9951,10 @@ mod tests {
             snapshot_policy: "unknown".to_string(),
             strict_export: false,
             manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -9863,6 +10071,7 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_version: None,
             database: "app".to_string(),
             schema: schema(),
             chunk_size: 1000,
@@ -9870,6 +10079,10 @@ mod tests {
             snapshot_policy: "unknown".to_string(),
             strict_export: false,
             manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
             tables: Vec::new(),
         };
 
@@ -9892,6 +10105,7 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_version: None,
             database: "app".to_string(),
             schema: schema(),
             chunk_size: 1000,
@@ -9899,6 +10113,10 @@ mod tests {
             snapshot_policy: "unknown".to_string(),
             strict_export: false,
             manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
             tables: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
