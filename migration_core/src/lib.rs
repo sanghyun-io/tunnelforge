@@ -3807,6 +3807,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
         if mode == "recreate" && selected.is_empty() && target_engine == "mysql" {
+            reset_import_progress_for_destructive_schema_prep(
+                &progress_path,
+                &mut progress_state,
+            )?;
             let shadow_database = mysql_shadow_schema_name(
                 &endpoint.database,
                 request.request_id.as_deref(),
@@ -3890,6 +3894,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             write_import_progress_state(&progress_path, &progress_state)?;
             return Ok(());
         } else if matches!(mode, "replace" | "recreate") {
+            reset_import_progress_for_destructive_schema_prep(
+                &progress_path,
+                &mut progress_state,
+            )?;
             emit(json!({
                 "event": "phase",
                 "request_id": request.request_id,
@@ -3961,7 +3969,9 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         &mut emit,
     );
     import_result?;
-    verify_imported_row_counts(&tables, &imported_rows_by_table)?;
+    let target_rows_by_table = collect_target_row_counts(&mut adapter, &tables)?;
+    verify_target_row_counts(&tables, &target_rows_by_table)?;
+    let rows_verified_total: u64 = target_rows_by_table.values().copied().sum();
     progress_state.verification_complete = true;
     write_import_progress_state(&progress_path, &progress_state)?;
     if !manifest.objects.objects.is_empty() {
@@ -3983,6 +3993,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "mode": mode,
         "tables": table_total,
         "rows_imported": rows_imported,
+        "rows_loaded_this_run": rows_imported,
+        "rows_verified_total": rows_verified_total,
         "chunks_imported": chunks_imported,
         "objects_restored": objects_restored,
         "verification": {
@@ -4002,6 +4014,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "mode": mode,
         "tables": table_total,
         "rows_imported": rows_imported,
+        "rows_loaded_this_run": rows_imported,
+        "rows_verified_total": rows_verified_total,
         "chunks_imported": chunks_imported,
         "objects_restored": objects_restored,
         "import_report": import_report_path.display().to_string(),
@@ -8681,21 +8695,35 @@ fn validate_dump_import_manifest_strictness(
     Ok(warnings)
 }
 
-fn verify_imported_row_counts(
+fn verify_target_row_counts(
     tables: &[DumpTableManifest],
-    imported_rows_by_table: &BTreeMap<String, u64>,
+    target_rows_by_table: &BTreeMap<String, u64>,
 ) -> Result<(), String> {
     for table in tables {
-        let imported = imported_rows_by_table.get(&table.name).copied().unwrap_or(0);
-        if imported != table.rows {
+        let target_rows = target_rows_by_table.get(&table.name).copied().unwrap_or(0);
+        if target_rows != table.rows {
             return Err(classified_import_error(
                 "post_load_validation_failed",
-                &format!("expected {} rows, imported {}", table.rows, imported),
+                &format!("expected {} rows, target has {}", table.rows, target_rows),
                 Some(&table.name),
             ));
         }
     }
     Ok(())
+}
+
+fn collect_target_row_counts(
+    adapter: &mut dyn MigrationAdapter,
+    tables: &[DumpTableManifest],
+) -> Result<BTreeMap<String, u64>, String> {
+    let mut counts = BTreeMap::new();
+    for table in tables {
+        let count = adapter
+            .row_count(&table.name)
+            .map_err(|err| format!("failed to count target rows for {}: {err}", table.name))?;
+        counts.insert(table.name.clone(), count as u64);
+    }
+    Ok(counts)
 }
 
 fn expected_dump_object_layout(object_type: &str) -> Option<(&'static str, u32)> {
@@ -8981,6 +9009,44 @@ fn mark_import_chunk_completed(
 ) -> Result<(), String> {
     let key = import_chunk_progress_key(table_name, chunk_index);
     if state.completed_chunks.insert(key) {
+        write_import_progress_state(progress_path, state)?;
+    }
+    Ok(())
+}
+
+fn reset_import_progress_for_destructive_schema_prep(
+    progress_path: &Path,
+    state: &mut ImportProgressState,
+) -> Result<(), String> {
+    let mut changed = false;
+    if !state.completed_chunks.is_empty() {
+        state.completed_chunks.clear();
+        changed = true;
+    }
+    let completed_len = state.completed_steps.len();
+    state.completed_steps.retain(|step| {
+        !matches!(step.as_str(), "load_schema" | "load_data" | "load_objects")
+    });
+    if state.completed_steps.len() != completed_len {
+        changed = true;
+    }
+    if !state.failed_steps.is_empty() {
+        state.failed_steps.clear();
+        changed = true;
+    }
+    if state.verification_complete {
+        state.verification_complete = false;
+        changed = true;
+    }
+    if state.cleanup_complete {
+        state.cleanup_complete = false;
+        changed = true;
+    }
+    if state.switched {
+        state.switched = false;
+        changed = true;
+    }
+    if changed {
         write_import_progress_state(progress_path, state)?;
     }
     Ok(())
@@ -11511,6 +11577,41 @@ mod tests {
     }
 
     #[test]
+    fn import_progress_state_destructive_schema_reset_clears_completed_chunks_and_stale_flags() {
+        let dir = tempfile::tempdir().unwrap();
+        let progress_path = dir.path().join("_tunnelforge_import_progress.json");
+        let mut state = ImportProgressState {
+            manifest_hash: "abc123".to_string(),
+            target_identity: "mysql://localhost/app".to_string(),
+            import_mode: "replace".to_string(),
+            completed_steps: vec![
+                "load_schema".to_string(),
+                "load_data".to_string(),
+                "load_objects".to_string(),
+                "preflight".to_string(),
+            ],
+            failed_steps: vec!["load_data".to_string()],
+            completed_chunks: BTreeSet::from(["users:1".to_string(), "users:2".to_string()]),
+            verification_complete: true,
+            switched: true,
+            cleanup_complete: true,
+        };
+        write_import_progress_state(&progress_path, &state).unwrap();
+
+        reset_import_progress_for_destructive_schema_prep(&progress_path, &mut state).unwrap();
+
+        assert!(state.completed_chunks.is_empty());
+        assert_eq!(state.completed_steps, vec!["preflight".to_string()]);
+        assert!(state.failed_steps.is_empty());
+        assert!(!state.verification_complete);
+        assert!(!state.cleanup_complete);
+        assert!(!state.switched);
+
+        let persisted = read_import_progress_state(&progress_path).unwrap();
+        assert_eq!(persisted, state);
+    }
+
+    #[test]
     fn dump_manifest_snapshot_fields_default_for_legacy_json() {
         let json = r#"{
             "format": "tunnelforge-dump",
@@ -13522,7 +13623,7 @@ mod tests {
     }
 
     #[test]
-    fn import_row_count_verification_rejects_missing_rows() {
+    fn target_row_count_verification_rejects_missing_rows() {
         let tables = vec![DumpTableManifest {
             name: "users".to_string(),
             path: "0001_users".to_string(),
@@ -13530,18 +13631,18 @@ mod tests {
             chunks: 1,
             chunk_sha256: BTreeMap::new(),
         }];
-        let mut imported = BTreeMap::new();
-        imported.insert("users".to_string(), 2_u64);
+        let mut target_rows = BTreeMap::new();
+        target_rows.insert("users".to_string(), 2_u64);
 
-        let err = verify_imported_row_counts(&tables, &imported).unwrap_err();
+        let err = verify_target_row_counts(&tables, &target_rows).unwrap_err();
 
         assert!(err.contains("post_load_validation_failed"));
         assert!(err.contains("users"));
-        assert!(err.contains("expected 3 rows, imported 2"));
+        assert!(err.contains("expected 3 rows, target has 2"));
     }
 
     #[test]
-    fn import_row_count_verification_accepts_matching_counts() {
+    fn target_row_count_verification_accepts_matching_counts() {
         let tables = vec![DumpTableManifest {
             name: "users".to_string(),
             path: "0001_users".to_string(),
@@ -13549,10 +13650,10 @@ mod tests {
             chunks: 1,
             chunk_sha256: BTreeMap::new(),
         }];
-        let mut imported = BTreeMap::new();
-        imported.insert("users".to_string(), 3_u64);
+        let mut target_rows = BTreeMap::new();
+        target_rows.insert("users".to_string(), 3_u64);
 
-        verify_imported_row_counts(&tables, &imported).unwrap();
+        verify_target_row_counts(&tables, &target_rows).unwrap();
     }
 
     #[test]
