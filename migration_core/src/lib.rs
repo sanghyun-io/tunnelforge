@@ -71,6 +71,30 @@ pub struct ImportProgressState {
     pub cleanup_complete: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableVerificationEvidence {
+    pub table: String,
+    pub expected_rows: u64,
+    pub actual_rows: u64,
+    #[serde(default)]
+    pub checksum_match: Option<bool>,
+    #[serde(default)]
+    pub digest_match: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImportVerificationEvidence {
+    pub tables: Vec<TableVerificationEvidence>,
+    pub load_data_warnings: u64,
+    #[serde(default)]
+    pub sql_mode_before: Option<String>,
+    #[serde(default)]
+    pub sql_mode_after: Option<String>,
+    pub local_infile_enabled: bool,
+    #[serde(default)]
+    pub session_timezone: Option<String>,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NormalizedSchema {
     #[serde(default)]
@@ -365,6 +389,7 @@ enum ImportChunkEvent {
         chunk_index: u64,
         rows: u64,
         load_ms: u64,
+        warnings: u64,
     },
     Error(String),
 }
@@ -3711,6 +3736,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             .get("timezone_sql")
             .and_then(Value::as_str),
     )?;
+    let session_timezone = import_session_timezone_evidence(&request.payload, timezone_sql.as_deref());
     let target_engine = adapter.engine().to_string();
     validate_dump_objects_for_restore(
         &manifest.objects,
@@ -3801,8 +3827,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
+    let mut load_data_warnings = 0_u64;
     let mut imported_rows_by_table: BTreeMap<String, u64> = BTreeMap::new();
     let mut recreated_target = false;
+    let sql_mode_before = mysql_session_sql_mode(&mut adapter)?;
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
@@ -3860,6 +3888,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 table_total,
                 &mut rows_imported,
                 &mut chunks_imported,
+                &mut load_data_warnings,
                 &mut imported_rows_by_table,
                 &progress_path,
                 &mut progress_state,
@@ -3936,6 +3965,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             table_total,
             &mut rows_imported,
             &mut chunks_imported,
+            &mut load_data_warnings,
             &mut imported_rows_by_table,
             &progress_path,
             &mut progress_state,
@@ -3961,6 +3991,13 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         }
         Ok(())
     })();
+    let restore_sql_mode_result =
+        restore_mysql_session_sql_mode(&mut adapter, sql_mode_before.as_deref());
+    let sql_mode_after_result = if restore_sql_mode_result.is_ok() {
+        mysql_session_sql_mode(&mut adapter)
+    } else {
+        Ok(None)
+    };
     let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
     let local_infile_restore_result = restore_mysql_local_infile_policy(
         &mut adapter,
@@ -3969,6 +4006,14 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         &mut emit,
     );
     import_result?;
+    restore_sql_mode_result?;
+    let sql_mode_after = sql_mode_after_result?;
+    restore_result?;
+    local_infile_restore_result?;
+    let local_infile_enabled = match &mut adapter {
+        LiveAdapter::MySql(conn) => mysql_local_infile_status(conn).unwrap_or(false),
+        LiveAdapter::PostgreSql(_) => false,
+    };
     let target_rows_by_table = collect_target_row_counts(&mut adapter, &tables)?;
     verify_target_row_counts(&tables, &target_rows_by_table)?;
     let rows_verified_total: u64 = target_rows_by_table.values().copied().sum();
@@ -3983,13 +4028,30 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         }));
     }
     let objects_restored = restore_dump_objects(&mut adapter, input_path, &manifest.objects)?;
-    restore_result?;
-    local_infile_restore_result?;
     progress_state.cleanup_complete = true;
     mark_import_step_completed(&progress_path, &mut progress_state, "load_objects")?;
+    let verification_evidence = ImportVerificationEvidence {
+        tables: tables
+            .iter()
+            .map(|table| TableVerificationEvidence {
+                table: table.name.clone(),
+                expected_rows: table.rows,
+                actual_rows: target_rows_by_table.get(&table.name).copied().unwrap_or(0),
+                checksum_match: None,
+                digest_match: None,
+            })
+            .collect(),
+        load_data_warnings,
+        sql_mode_before,
+        sql_mode_after,
+        local_infile_enabled,
+        session_timezone,
+    };
+    let verdict = classify_import_verdict(&verification_evidence);
     let import_report_path = dump_import_report_path(input_path)?;
     let import_report = json!({
         "success": true,
+        "verdict": verdict,
         "mode": mode,
         "tables": table_total,
         "rows_imported": rows_imported,
@@ -3998,6 +4060,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "chunks_imported": chunks_imported,
         "objects_restored": objects_restored,
         "verification": {
+            "verdict": verdict,
+            "evidence": verification_evidence,
             "row_counts": "passed",
             "strict_manifest": strict_manifest,
             "warnings": manifest_warnings
@@ -4011,6 +4075,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "command": "dump.import",
         "success": true,
         "input_dir": input_dir,
+        "verdict": verdict,
         "mode": mode,
         "tables": table_total,
         "rows_imported": rows_imported,
@@ -4020,6 +4085,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "objects_restored": objects_restored,
         "import_report": import_report_path.display().to_string(),
         "verification": {
+            "verdict": verdict,
+            "evidence": verification_evidence,
             "row_counts": "passed",
             "strict_manifest": strict_manifest,
             "warnings": manifest_warnings
@@ -4039,7 +4106,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     progress_state: &mut ImportProgressState,
     request_id: Option<String>,
     mut emit: F,
-) -> Result<(u64, u64, u64), String> {
+) -> Result<(u64, u64, u64, u64), String> {
     if !mysql_local_infile_enabled(conn) {
         emit(json!({
             "event": "phase",
@@ -4059,7 +4126,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             progress_state,
             request_id,
             emit,
-        );
+        )
+        .map(|(rows, chunks, verified_rows)| (rows, chunks, verified_rows, 0));
     }
 
     if threads > 1 && table_manifest.chunks > 1 {
@@ -4097,6 +4165,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     request_id,
                     emit,
                 )
+                .map(|(rows, chunks, verified_rows)| (rows, chunks, verified_rows, 0))
             }
             Err(err) => Err(err),
         };
@@ -4105,6 +4174,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
     let mut verified_rows = 0_u64;
+    let mut load_data_warnings = 0_u64;
     for chunk_index in 1..=table_manifest.chunks {
         if import_chunk_already_completed(progress_state, &table.name, chunk_index) {
             verified_rows += count_dump_chunk_rows(
@@ -4125,8 +4195,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             compression,
         )?;
         let started = Instant::now();
-        let rows = match load_mysql_tsv_chunk(conn, table, &chunk_path, compression) {
-            Ok(rows) => rows,
+        let (rows, warnings) = match load_mysql_tsv_chunk(conn, table, &chunk_path, compression) {
+            Ok(result) => result,
             Err(err) if is_mysql_local_infile_disabled_error(&err) => {
                 emit(json!({
                     "event": "phase",
@@ -4146,13 +4216,15 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     progress_state,
                     request_id,
                     emit,
-                );
+                )
+                .map(|(rows, chunks, verified_rows)| (rows, chunks, verified_rows, 0));
             }
             Err(err) => return Err(err),
         };
         mark_import_chunk_completed(progress_path, progress_state, &table.name, chunk_index)?;
         rows_imported += rows;
         verified_rows += rows;
+        load_data_warnings += warnings;
         chunks_imported += 1;
         emit(json!({
             "event": "row_progress",
@@ -4165,7 +4237,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             "strategy": "load_data_local_infile"
         }));
     }
-    Ok((rows_imported, chunks_imported, verified_rows))
+    Ok((rows_imported, chunks_imported, verified_rows, load_data_warnings))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4182,6 +4254,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
     table_total: usize,
     rows_imported: &mut u64,
     chunks_imported: &mut u64,
+    load_data_warnings: &mut u64,
     imported_rows_by_table: &mut BTreeMap<String, u64>,
     progress_path: &Path,
     progress_state: &mut ImportProgressState,
@@ -4204,7 +4277,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
 
         if data_format == "tsv" && !has_binary_columns(table) {
             if let LiveAdapter::MySql(conn) = adapter {
-                let (rows, chunks, verified_rows) = import_mysql_tsv_table(
+                let (rows, chunks, verified_rows, warnings) = import_mysql_tsv_table(
                     endpoint,
                     conn,
                     input_path,
@@ -4219,6 +4292,7 @@ fn import_dump_table_data<F: FnMut(Value)>(
                 )?;
                 *rows_imported += rows;
                 *chunks_imported += chunks;
+                *load_data_warnings += warnings;
                 imported_rows_by_table.insert(table.name.clone(), verified_rows);
                 emit(json!({
                     "event": "table_progress",
@@ -4289,11 +4363,62 @@ fn mysql_local_infile_enabled(conn: &mut mysql::PooledConn) -> bool {
         .unwrap_or(true)
 }
 
+fn mysql_local_infile_status(conn: &mut mysql::PooledConn) -> Option<bool> {
+    mysql_local_infile_value(conn).map(|value| mysql_bool_value_enabled(&value))
+}
+
 fn mysql_local_infile_value(conn: &mut mysql::PooledConn) -> Option<String> {
     conn.query_first::<(String, String), _>("SHOW VARIABLES LIKE 'local_infile'")
         .ok()
         .flatten()
         .map(|(_, value)| value)
+}
+
+fn mysql_session_warning_count(conn: &mut mysql::PooledConn) -> u64 {
+    conn.query_first::<u64, _>("SELECT @@warning_count")
+        .ok()
+        .flatten()
+        .unwrap_or(0)
+}
+
+fn mysql_session_sql_mode(adapter: &mut LiveAdapter) -> Result<Option<String>, String> {
+    let LiveAdapter::MySql(conn) = adapter else {
+        return Ok(None);
+    };
+    conn.query_first::<String, _>("SELECT @@SESSION.sql_mode")
+        .map_err(|err| format!("failed to read mysql session sql_mode: {err}"))
+}
+
+fn restore_mysql_session_sql_mode(
+    adapter: &mut LiveAdapter,
+    sql_mode_before: Option<&str>,
+) -> Result<(), String> {
+    let Some(sql_mode_before) = sql_mode_before else {
+        return Ok(());
+    };
+    if !matches!(adapter, LiveAdapter::MySql(_)) {
+        return Ok(());
+    }
+    let sql = format!(
+        "SET SESSION sql_mode={}",
+        sql_literal(&Value::String(sql_mode_before.to_string()))
+    );
+    adapter.execute_sql(&sql)
+}
+
+fn import_session_timezone_evidence(payload: &Value, timezone_sql: Option<&str>) -> Option<String> {
+    payload
+        .get("timezone")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            timezone_sql
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string)
+        })
 }
 
 fn mysql_bool_value_enabled(value: &str) -> bool {
@@ -4465,7 +4590,6 @@ fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
 fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
     if restore {
         vec![
-            "SET SESSION sql_mode=DEFAULT".to_string(),
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION foreign_key_checks=1".to_string(),
         ]
@@ -4596,8 +4720,9 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     progress_state: &mut ImportProgressState,
     request_id: Option<String>,
     mut emit: F,
-) -> Result<(u64, u64, u64), String> {
+) -> Result<(u64, u64, u64, u64), String> {
     let mut verified_rows = 0_u64;
+    let mut load_data_warnings = 0_u64;
     let mut pending = VecDeque::new();
     for chunk_index in adaptive_import_chunk_order(input_path, table_manifest, "tsv", compression) {
         if import_chunk_already_completed(progress_state, &table.name, chunk_index) {
@@ -4622,7 +4747,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     let (sender, receiver) = mpsc::channel::<ImportChunkEvent>();
 
     if pending.is_empty() {
-        return Ok((0, 0, verified_rows));
+        return Ok((0, 0, verified_rows, 0));
     }
 
     while active < max_threads {
@@ -4649,6 +4774,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                 chunk_index,
                 rows,
                 load_ms,
+                warnings,
             }) => {
                 mark_import_chunk_completed(
                     progress_path,
@@ -4657,6 +4783,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                     chunk_index,
                 )?;
                 rows_imported += rows;
+                load_data_warnings += warnings;
                 completed += 1;
                 active = active.saturating_sub(1);
                 emit(json!({
@@ -4700,7 +4827,12 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     if let Some(err) = first_error {
         return Err(err);
     }
-    Ok((rows_imported, completed, verified_rows + rows_imported))
+    Ok((
+        rows_imported,
+        completed,
+        verified_rows + rows_imported,
+        load_data_warnings,
+    ))
 }
 
 fn adaptive_import_chunk_order(
@@ -4762,15 +4894,17 @@ fn spawn_mysql_import_chunk_worker(
                 &compression,
             )?;
             let started = Instant::now();
-            let rows = load_mysql_tsv_chunk(&mut conn, &table, &chunk_path, &compression)?;
-            Ok((rows, started.elapsed().as_millis() as u64))
+            let (rows, warnings) =
+                load_mysql_tsv_chunk(&mut conn, &table, &chunk_path, &compression)?;
+            Ok((rows, started.elapsed().as_millis() as u64, warnings))
         })();
         match result {
-            Ok((rows, load_ms)) => {
+            Ok((rows, load_ms, warnings)) => {
                 let _ = sender.send(ImportChunkEvent::Done {
                     chunk_index,
                     rows,
                     load_ms,
+                    warnings,
                 });
             }
             Err(err) => {
@@ -4785,7 +4919,7 @@ fn load_mysql_tsv_chunk(
     table: &NormalizedTable,
     chunk_path: &Path,
     compression: &str,
-) -> Result<u64, String> {
+) -> Result<(u64, u64), String> {
     let path = chunk_path.to_path_buf();
     let compression = compression.to_string();
     conn.set_local_infile_handler(Some(LocalInfileHandler::new(move |_, stream| {
@@ -4799,8 +4933,9 @@ fn load_mysql_tsv_chunk(
         .query_drop(sql)
         .map(|_| conn.affected_rows())
         .map_err(|err| format!("mysql LOAD DATA error: {err}"));
+    let warning_count = mysql_session_warning_count(conn);
     conn.set_local_infile_handler(None);
-    result
+    result.map(|rows| (rows, warning_count))
 }
 
 pub fn load_data_local_infile_sql(
@@ -8710,6 +8845,20 @@ fn verify_target_row_counts(
         }
     }
     Ok(())
+}
+
+fn classify_import_verdict(evidence: &ImportVerificationEvidence) -> &'static str {
+    if evidence.tables.iter().any(|table| {
+        table.expected_rows != table.actual_rows
+            || table.checksum_match == Some(false)
+            || table.digest_match == Some(false)
+    }) {
+        return "failed";
+    }
+    if evidence.load_data_warnings > 0 {
+        return "limited_success";
+    }
+    "success"
 }
 
 fn collect_target_row_counts(
@@ -14614,11 +14763,50 @@ mod tests {
         assert_eq!(
             mysql_import_session_tuning_sql(true),
             vec![
-                "SET SESSION sql_mode=DEFAULT".to_string(),
                 "SET SESSION unique_checks=1".to_string(),
                 "SET SESSION foreign_key_checks=1".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn import_verdict_fails_on_row_count_mismatch() {
+        let evidence = ImportVerificationEvidence {
+            tables: vec![TableVerificationEvidence {
+                table: "orders".to_string(),
+                expected_rows: 10,
+                actual_rows: 9,
+                checksum_match: Some(true),
+                digest_match: None,
+            }],
+            load_data_warnings: 0,
+            sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
+            sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
+            local_infile_enabled: true,
+            session_timezone: Some("+00:00".to_string()),
+        };
+        let verdict = classify_import_verdict(&evidence);
+        assert_eq!(verdict, "failed");
+    }
+
+    #[test]
+    fn import_verdict_is_success_when_rows_and_checksums_match() {
+        let evidence = ImportVerificationEvidence {
+            tables: vec![TableVerificationEvidence {
+                table: "orders".to_string(),
+                expected_rows: 10,
+                actual_rows: 10,
+                checksum_match: Some(true),
+                digest_match: Some(true),
+            }],
+            load_data_warnings: 0,
+            sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
+            sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
+            local_infile_enabled: true,
+            session_timezone: Some("+00:00".to_string()),
+        };
+        let verdict = classify_import_verdict(&evidence);
+        assert_eq!(verdict, "success");
     }
 
     #[test]
