@@ -4640,7 +4640,8 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let mut tables = Vec::new();
 
     for (table_name, engine, table_collation, row_format) in table_rows {
-        let partitions = inspect_mysql_partitions(&mut conn, &schema_name, &table_name)?;
+        let partitions =
+            inspect_mysql_partitions(&mut conn, &schema_name, &table_name).unwrap_or_default();
         let default_charset = mysql_charset_from_collation(&table_collation);
         let columns: Vec<NormalizedColumn> =
             conn
@@ -12037,6 +12038,81 @@ mod tests {
         let ddl = generate_table_ddl(&table, "mysql", "mysql").unwrap();
 
         assert!(ddl.contains("`code` varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"));
+    }
+
+    #[test]
+    fn mysql_create_table_options_render_valid_metadata() {
+        let table = NormalizedTable {
+            name: "orders".to_string(),
+            engine: Some("MyISAM".to_string()),
+            default_charset: Some("utf8mb4".to_string()),
+            default_collation: Some("utf8mb4_0900_ai_ci".to_string()),
+            row_format: Some("Dynamic".to_string()),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "int".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            ..Default::default()
+        };
+
+        let ddl = generate_table_ddl(&table, "mysql", "mysql").unwrap();
+
+        assert!(ddl.contains(" ENGINE=MyISAM"));
+        assert!(ddl.contains(" DEFAULT CHARSET=utf8mb4"));
+        assert!(ddl.contains(" COLLATE=utf8mb4_0900_ai_ci"));
+        assert!(ddl.contains(" ROW_FORMAT=Dynamic"));
+    }
+
+    #[test]
+    fn mysql_create_table_options_sanitize_invalid_tokens_and_fallback_engine() {
+        let invalid_engine = NormalizedTable {
+            name: "orders".to_string(),
+            engine: Some("InnoDB;DROP".to_string()),
+            default_charset: Some("utf8mb4;DROP".to_string()),
+            default_collation: Some("utf8mb4 0900 ai ci".to_string()),
+            row_format: Some("Dynamic;DROP".to_string()),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "int".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            ..Default::default()
+        };
+
+        let ddl = generate_table_ddl(&invalid_engine, "mysql", "mysql").unwrap();
+        assert!(ddl.contains(" ENGINE=InnoDB"));
+        assert!(!ddl.contains("DEFAULT CHARSET="));
+        assert!(!ddl.contains(" COLLATE="));
+        assert!(!ddl.contains(" ROW_FORMAT="));
+        assert!(!ddl.contains("DROP"));
+
+        let missing_engine = NormalizedTable {
+            name: "users".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "int".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            ..Default::default()
+        };
+        let ddl = generate_table_ddl(&missing_engine, "mysql", "mysql").unwrap();
+        assert!(ddl.contains(" ENGINE=InnoDB"));
     }
 
     #[test]
