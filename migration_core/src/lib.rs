@@ -3277,6 +3277,20 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     verify_imported_row_counts(&tables, &imported_rows_by_table)?;
     restore_result?;
     local_infile_restore_result?;
+    let import_report_path = dump_import_report_path(input_path)?;
+    let import_report = json!({
+        "success": true,
+        "mode": mode,
+        "tables": table_total,
+        "rows_imported": rows_imported,
+        "chunks_imported": chunks_imported,
+        "verification": {
+            "row_counts": "passed",
+            "strict_manifest": strict_manifest,
+            "warnings": manifest_warnings
+        }
+    });
+    write_dump_import_report(input_path, &import_report)?;
 
     Ok(json!({
         "event": "result",
@@ -3288,6 +3302,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "tables": table_total,
         "rows_imported": rows_imported,
         "chunks_imported": chunks_imported,
+        "import_report": import_report_path.display().to_string(),
         "verification": {
             "row_counts": "passed",
             "strict_manifest": strict_manifest,
@@ -7686,6 +7701,21 @@ fn verify_imported_row_counts(
     Ok(())
 }
 
+fn dump_import_report_path(input_path: &Path) -> Result<PathBuf, String> {
+    let canonical = input_path
+        .canonicalize()
+        .map_err(|err| format!("cannot resolve import report directory: {err}"))?;
+    Ok(canonical.join("_tunnelforge_import_report.json"))
+}
+
+fn write_dump_import_report(input_path: &Path, report: &Value) -> Result<(), String> {
+    let report_path = dump_import_report_path(input_path)?;
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|err| format!("cannot serialize import report: {err}"))?;
+    fs::write(&report_path, bytes)
+        .map_err(|err| format!("cannot write import report {}: {err}", report_path.display()))
+}
+
 fn dump_chunk_name(index: u64, data_format: &str, compression: &str) -> String {
     let extension = if data_format == "tsv" { "tsv" } else { "jsonl" };
     if compression == "zstd" {
@@ -11213,6 +11243,21 @@ mod tests {
         imported.insert("users".to_string(), 3_u64);
 
         verify_imported_row_counts(&tables, &imported).unwrap();
+    }
+
+    #[test]
+    fn import_report_path_lives_inside_dump_directory() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-import-report-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+
+        let path = dump_import_report_path(&dir).unwrap();
+
+        assert_eq!(path.file_name().unwrap(), "_tunnelforge_import_report.json");
+        assert!(path.starts_with(fs::canonicalize(&dir).unwrap()));
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
