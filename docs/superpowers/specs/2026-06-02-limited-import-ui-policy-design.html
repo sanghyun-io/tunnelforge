@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Limited Import UI Policy Design</title>
+  <style>
+    :root {
+      --fg: #1f2937;
+      --muted: #6b7280;
+      --border: #d1d5db;
+      --bg: #f8fafc;
+      --panel: #ffffff;
+      --ok: #15803d;
+      --warn: #b45309;
+      --bad: #b91c1c;
+    }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--fg);
+      font-family: "Segoe UI", Arial, sans-serif;
+      line-height: 1.55;
+    }
+    main {
+      max-width: 980px;
+      margin: 0 auto;
+      padding: 32px 24px 56px;
+    }
+    h1, h2, h3 { line-height: 1.25; }
+    h1 { margin-bottom: 8px; }
+    h2 {
+      margin-top: 32px;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 6px;
+    }
+    code {
+      background: #eef2f7;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .meta, .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 16px 18px;
+      margin: 16px 0;
+    }
+    .muted { color: var(--muted); }
+    .strict { color: var(--ok); font-weight: 700; }
+    .limited { color: var(--warn); font-weight: 700; }
+    .blocked { color: var(--bad); font-weight: 700; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      background: var(--panel);
+      margin: 12px 0 18px;
+    }
+    th, td {
+      border: 1px solid var(--border);
+      padding: 10px 12px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th { background: #eef2f7; }
+    ul { margin-top: 6px; }
+    li { margin: 5px 0; }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Limited Import UI Policy Design</h1>
+  <p class="muted">작성일: 2026-06-02</p>
+
+  <div class="meta">
+    <p><b>목적:</b> Export가 성공했는데 <code>limited_restorable</code>이라는 이유만으로 사용자가 아무 Import도 할 수 없는 흐름을 고친다.</p>
+    <p><b>핵심 원칙:</b> strict가 아닌 Dump를 권장 Import로 포장하지 않는다. 대신 사용자가 위험을 쉬운말로 이해하고 명시적으로 선택하면 제한적 Import를 허용한다.</p>
+  </div>
+
+  <h2>사용자에게 보여줄 3단계 상태</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>상태</th>
+        <th>쉬운 설명</th>
+        <th>UI 동작</th>
+        <th>Rust Import 설정</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td class="strict">strict_restorable</td>
+        <td>검증 증거가 충분한 Dump입니다. 권장 복원 경로로 진행할 수 있습니다.</td>
+        <td>Import 버튼 활성화. 권장 Import로 표시.</td>
+        <td><code>strict_manifest=true</code></td>
+      </tr>
+      <tr>
+        <td class="limited">limited_restorable</td>
+        <td>Dump 파일은 사용할 수 있지만, 모든 데이터가 같은 순간의 스냅샷이라는 증거가 부족합니다.</td>
+        <td>Import 버튼 활성화. 시작 전 제한적 복원 확인창 표시.</td>
+        <td><code>strict_manifest=false</code></td>
+      </tr>
+      <tr>
+        <td class="blocked">not_restorable</td>
+        <td>현재 버전의 TunnelForge가 안전하게 복원할 수 없는 Dump입니다.</td>
+        <td>Import 버튼 비활성화. 차단 이유와 상세 설명 표시.</td>
+        <td>Import 호출 안 함</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>not_restorable 기준</h2>
+  <div class="card">
+    <p><b>쉬운 설명:</b> 이 Dump는 그대로 Import하면 대상 DB가 잘못 만들어질 가능성이 커서 프로그램이 막는 상태입니다.</p>
+    <p>대표 기준:</p>
+    <ul>
+      <li>Dump manifest가 없거나 깨졌거나 지원하지 않는 형식입니다.</li>
+      <li>필수 chunk 파일이 없습니다.</li>
+      <li>checksum이 맞지 않아 파일이 손상됐을 수 있습니다.</li>
+      <li>프로그램이 모르는 기능이 manifest에 선언되어 있습니다.</li>
+      <li>object/schema 정보가 대상 DB와 맞지 않습니다.</li>
+      <li>Import하면 데이터가 틀어질 가능성이 큰 구조적 문제가 있습니다.</li>
+    </ul>
+  </div>
+
+  <h2>limited_restorable 선택 제공</h2>
+  <div class="card">
+    <p><b>쉬운 설명:</b> Import 자체는 가능하지만, 완전 검증 Dump라고 말할 수는 없습니다.</p>
+    <p>예를 들어 <code>threads=8</code>로 Export하면 여러 DB 연결이 동시에 데이터를 읽습니다. 이 경우 모든 테이블이 정확히 같은 순간의 데이터인지 증명할 수 없습니다.</p>
+    <p>그래도 파일과 checksum은 정상일 수 있으므로, 테스트 복원이나 사용자가 위험을 받아들이는 제한적 복원은 가능하게 합니다.</p>
+  </div>
+
+  <h2>제한적 Import 확인창 문구</h2>
+  <div class="card">
+    <p><b>제목:</b> 제한적 복원으로 진행</p>
+    <p>이 Dump는 Import할 수 있지만 완전 검증 Dump는 아닙니다.</p>
+    <p>Export 중 원본 DB 데이터가 변경되었다면, 일부 테이블이 서로 다른 시점의 데이터일 수 있습니다.</p>
+    <p>완전 검증 복원이 필요하면 Export를 다시 실행해서 strict Dump를 만들어야 합니다.</p>
+    <p>테스트 복원, 제한적 이관, 또는 이 한계를 이해하고 받아들이는 경우에만 계속 진행하세요.</p>
+  </div>
+
+  <h2>구현 범위</h2>
+  <ul>
+    <li>UI 호환성 영역에 쉬운말 상태 설명과 상세 이유를 함께 표시한다.</li>
+    <li><code>limited_restorable</code>은 버튼을 활성화하되 제한적 복원 확인창을 거친다.</li>
+    <li><code>not_restorable</code>은 버튼을 비활성화하고 우회 버튼을 제공하지 않는다.</li>
+    <li>Python wrapper에 <code>strict_manifest</code> 인자를 추가한다.</li>
+    <li>strict Dump는 <code>strict_manifest=true</code>, limited Dump는 확인 후 <code>false</code>로 호출한다.</li>
+  </ul>
+
+  <h2>테스트 기준</h2>
+  <ul>
+    <li>limited Dump에서 버튼이 활성화되는지 확인한다.</li>
+    <li>limited Dump 진행 시 확인창이 뜨고 <code>strict_manifest=false</code>가 전달되는지 확인한다.</li>
+    <li>not restorable Dump에서 버튼이 비활성화되는지 확인한다.</li>
+    <li>not restorable 기준 설명이 쉬운말로 노출되는지 확인한다.</li>
+    <li>Python wrapper가 <code>strict_manifest=False</code>를 Rust payload로 전달하는지 확인한다.</li>
+  </ul>
+
+  <h2>범위 밖</h2>
+  <ul>
+    <li>병렬 Export에서 여러 연결이 하나의 MySQL transaction snapshot을 공유하게 만드는 기능.</li>
+    <li>Export thread 기본값 변경.</li>
+    <li><code>not_restorable</code> 우회 Import.</li>
+  </ul>
+</main>
+</body>
+</html>
