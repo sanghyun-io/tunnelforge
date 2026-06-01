@@ -121,7 +121,7 @@
     <p><b>작성일:</b> 2026-06-01</p>
     <p><b>검토 범위:</b> Rust DB Core <code>dump.run</code>/<code>dump.import</code>, Python wrapper <code>src/exporters/rust_dump_exporter.py</code>, Import UI 흐름</p>
     <p><b>검토 목적:</b> 최근 FK collation 오류처럼 과거의 땜빵식 개선 또는 흐름상 근본 결함이 남아 있는지 확인</p>
-    <p><b>중요 전제:</b> 이 리포트는 코드 리뷰 결과이며, 코드 수정은 포함하지 않는다.</p>
+    <p><b>중요 전제:</b> 이 리포트는 최초 결함 검토와 2026-06-01 수습 구현 이후의 최종 검증 상태를 함께 기록한다.</p>
   </div>
 
   <div class="summary">
@@ -258,6 +258,27 @@
     </ul>
   </div>
 
+  <h2>MySQL Shell Grade Implementation Verdict</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>Dimension</th>
+        <th>Target</th>
+        <th>TunnelForge Status</th>
+        <th>Evidence</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr><td>Metadata and feature contract</td><td>Manifest declares supported features</td><td>Implemented</td><td>format_version 3, features, restorability, blockers</td></tr>
+      <tr><td>Consistent snapshot</td><td>Strict dumps prove snapshot strategy</td><td>Implemented with explicit limits</td><td>snapshot_policy and manifest warnings</td></tr>
+      <tr><td>DDL and data separation</td><td>Schema/data/object files are separated</td><td>Implemented</td><td>tables plus objects manifest</td></tr>
+      <tr><td>Object support</td><td>Views, triggers, routines, and events are visible</td><td>Implemented for captured object classes</td><td>objects manifest and object restore count</td></tr>
+      <tr><td>Progress and resume</td><td>Interrupted imports can resume or reset</td><td>Implemented</td><td>_tunnelforge_import_progress.json</td></tr>
+      <tr><td>Verification</td><td>Final result is evidence-backed</td><td>Implemented</td><td>_tunnelforge_import_report.json verdict and verification</td></tr>
+      <tr><td>Legacy dump honesty</td><td>Legacy artifacts are not presented as strict success</td><td>Implemented</td><td>limited_restorable and UI disabled recommended import</td></tr>
+    </tbody>
+  </table>
+
   <h2>Provided PROD Dump Classification</h2>
   <table>
     <thead>
@@ -321,7 +342,7 @@
       <tr>
         <td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td>
         <td><span class="ok">PASS</span></td>
-        <td>136 lib tests, CLI helper test, and 6 live-gated tests passed.</td>
+        <td>176 lib tests, CLI helper test, and 6 live-gated tests passed.</td>
       </tr>
       <tr>
         <td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td>
@@ -331,12 +352,12 @@
       <tr>
         <td><code>pytest</code></td>
         <td><span class="ok">PASS</span></td>
-        <td>1698 Python tests passed, 5 existing warnings.</td>
+        <td>1708 Python tests passed, 5 existing warnings.</td>
       </tr>
       <tr>
         <td><code>service.hello</code> against release binary</td>
         <td><span class="ok">PASS</span></td>
-        <td>Output advertises <code>dump.run</code> and <code>dump.import</code>.</td>
+        <td>Output contains <code>"event":"result"</code>, <code>"service":"tunnelforge-core"</code>, <code>dump.run</code>, and <code>dump.import</code>.</td>
       </tr>
       <tr>
         <td><code>git diff --check</code></td>
@@ -385,9 +406,10 @@
   </table>
 
   <h2>Verification Commands Run For This Report</h2>
-  <pre>rg -n "dump.run|dump.import|safe recreate|recreate|replace|merge|foreign_key_checks|local_infile|LOAD DATA|CREATE DATABASE|DROP DATABASE|RENAME TABLE|apply_post_load_ddl|generate_post_data" migration_core\src\lib.rs
-rg -n "timezone_sql|time_zone|Asia/Seoul|\+09:00" src\exporters\rust_dump_exporter.py src\ui\dialogs\db_dialogs.py migration_core\src\lib.rs
-rg -n "START TRANSACTION|REPEATABLE|CONSISTENT|LOCK TABLE|FLUSH TABLE|snapshot|transaction|BEGIN|SET TRANSACTION|read only|read_only" migration_core\src\lib.rs src\exporters\rust_dump_exporter.py
+  <pre>cargo test --manifest-path migration_core\Cargo.toml
+cargo build --manifest-path migration_core\Cargo.toml --release
+pytest
+python - << service.hello smoke script against migration_core\target\release\tunnelforge-core.exe
 git diff --check</pre>
 
   <h2>Bottom Line</h2>
