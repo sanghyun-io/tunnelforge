@@ -1953,6 +1953,7 @@ class RustDumpImportDialog(QDialog):
 
         self.input_dir = QLineEdit()
         self.input_dir.setPlaceholderText("rust_dump dump 폴더 선택...")
+        self.input_dir.editingFinished.connect(self._on_input_dir_editing_finished)
 
         btn_browse = QPushButton("선택")
         btn_browse.setStyleSheet("""
@@ -2400,6 +2401,16 @@ class RustDumpImportDialog(QDialog):
                 self.input_dir.setText(path)
                 self._run_upgrade_check(path)
                 return
+
+    def _on_input_dir_editing_finished(self):
+        path = self.input_dir.text().strip()
+        if self._is_valid_dump_dir(path):
+            self._run_upgrade_check(path)
+            return
+        self._compatibility_allows_recommended_import = False
+        self.lbl_dump_compatibility.setText(i18n_tr("Dump compatibility is not checked"))
+        self.lbl_dump_compatibility.setStyleSheet("color: #7f8c8d;")
+        self._set_import_button_enabled_for_current_gate()
 
     def _get_input_browse_start_dir(self) -> str:
         """Dump 선택창 시작 위치. 빈 값이면 Windows가 설치 폴더를 잡으므로 항상 명시한다."""

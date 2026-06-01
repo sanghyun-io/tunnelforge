@@ -452,6 +452,45 @@ def test_import_dialog_blocks_manual_typed_limited_dump_before_worker_start(tmp_
     dialog.close()
 
 
+def test_import_dialog_manual_strict_dump_path_enables_import(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+
+    class FakeAnalysisResult:
+        compatibility_issues = []
+
+    class FakeDumpFileAnalyzer:
+        def analyze_dump_folder(self, dump_path):
+            return FakeAnalysisResult()
+
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.DumpFileAnalyzer", FakeDumpFileAnalyzer)
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+    (dump_dir / "_tunnelforge_dump.json").write_text(
+        json.dumps(
+            {
+                "format": "tunnelforge-dump",
+                "format_version": 3,
+                "database": "app",
+                "restorability": "strict_restorable",
+                "manifest_warnings": [],
+                "blockers": [],
+                "tables": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    dialog = RustDumpImportDialog(connector=None)
+    dialog.input_dir.setText(str(dump_dir))
+    dialog._on_input_dir_editing_finished()
+
+    assert dialog.btn_import.isEnabled()
+    assert "엄격 복원 가능 Dump" in dialog.lbl_dump_compatibility.text()
+    dialog.close()
+
+
 def test_export_raw_output_shows_visible_telemetry_summary():
     class FakeLogList:
         def __init__(self):
