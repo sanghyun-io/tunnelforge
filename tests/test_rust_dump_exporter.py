@@ -297,6 +297,39 @@ class TestRustDumpImporter:
         assert results["users"]["status"] == "done"
         assert "1" in msg
 
+    def test_import_dump_forwards_timezone_and_strict_manifest(self, tmp_path):
+        """UI에서 정한 timezone/import 의도가 Rust payload에서 누락되지 않는다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        dump_dir.mkdir()
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":2,"database":"dataflare","tables":[]}',
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 0, "rows_imported": 0}
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        importer = RustDumpImporter(config, facade=facade)
+
+        success, msg, _ = importer.import_dump(
+            str(dump_dir),
+            target_schema='dataflare',
+            timezone_sql="SET SESSION time_zone = '+09:00'",
+            import_mode='recreate',
+        )
+
+        assert success is True
+        assert "완료" in msg
+        assert facade.payload["timezone_sql"] == "SET SESSION time_zone = '+09:00'"
+        assert facade.payload["strict_manifest"] is True
+        assert facade.payload["mode"] == "recreate"
+
     def test_import_row_progress_reports_chunk_counts_to_callback(self):
         """Import row_progress는 rows/total이 아니라 chunks_done/chunks_total을 chunk callback으로 전달한다."""
         from src.exporters.rust_dump_exporter import emit_core_event

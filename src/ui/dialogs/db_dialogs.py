@@ -14,6 +14,7 @@ from typing import List, Optional
 from datetime import datetime
 import json
 import os
+import shutil
 
 from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
@@ -262,6 +263,54 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
     if event_type == "error":
         return f"Import 오류: {event.get('message') or event}"
     return None
+
+
+def format_storage_size(size_bytes: int) -> str:
+    """Format a byte count for import capacity guidance."""
+    size = max(0, float(size_bytes))
+    units = ["B", "KB", "MB", "GB", "TB"]
+    for unit in units:
+        if size < 1024 or unit == units[-1]:
+            return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
+def folder_size_bytes(folder: str) -> int:
+    """Return the visible size of a dump folder without following symlinks."""
+    total = 0
+    for root, _, files in os.walk(folder, followlinks=False):
+        for filename in files:
+            path = os.path.join(root, filename)
+            try:
+                if not os.path.islink(path):
+                    total += os.path.getsize(path)
+            except OSError:
+                continue
+    return total
+
+
+def build_safe_recreate_capacity_notice(input_dir: str) -> str:
+    """Build a best-effort capacity notice before safe recreate import."""
+    dump_bytes = folder_size_bytes(input_dir)
+    recommended_bytes = dump_bytes * 3 if dump_bytes else 0
+    lines = [
+        "안전 재생성 Import는 임시 스키마에 먼저 복원한 뒤 성공 시 대상 DB로 전환합니다.",
+        "전환 전까지 기존 대상 DB를 최대한 건드리지 않지만, 임시 복원 공간이 추가로 필요합니다.",
+    ]
+    if dump_bytes:
+        lines.append(f"덤프 폴더 크기: {format_storage_size(dump_bytes)}")
+        lines.append(f"권장 여유 공간(대략): {format_storage_size(recommended_bytes)} 이상")
+    try:
+        usage = shutil.disk_usage(os.path.abspath(input_dir))
+        free_bytes = getattr(usage, "free", usage[2])
+        lines.append(f"현재 덤프 드라이브 여유 공간: {format_storage_size(free_bytes)}")
+        if recommended_bytes and free_bytes < recommended_bytes:
+            lines.append("주의: 현재 확인 가능한 여유 공간이 권장치보다 작습니다.")
+    except OSError:
+        lines.append("현재 드라이브 여유 공간은 확인할 수 없습니다.")
+    lines.append("대상 MySQL 저장소가 다른 드라이브나 서버에 있으면 실제 필요 공간은 달라질 수 있습니다.")
+    return "\n".join(lines)
 
 
 class DBConnectionDialog(QDialog):
@@ -2017,16 +2066,19 @@ class RustDumpImportDialog(QDialog):
         mode_replace_layout = QVBoxLayout()
         self.radio_replace = QRadioButton("전체 교체 Import (권장) ⭐")
         self.radio_replace.setChecked(True)  # 기본값
-        mode_replace_desc = QLabel("   모든 객체(테이블/뷰/프로시저/이벤트) 재생성\n   ✅ Export → Import 시 권장")
+        mode_replace_desc = QLabel(
+            "   테이블 구조와 데이터를 Rust DB Core로 복원\n"
+            "   ⚠️ 뷰/프로시저/트리거/이벤트는 자동 복원 대상 아님"
+        )
         mode_replace_desc.setStyleSheet("color: #27ae60; font-size: 10pt; font-weight: bold; margin-left: 20px;")
         mode_replace_layout.addWidget(self.radio_replace)
         mode_replace_layout.addWidget(mode_replace_desc)
         mode_layout.addLayout(mode_replace_layout)
 
-        # 3. 완전 재생성 Import
+        # 3. 안전 재생성 Import
         mode_recreate_layout = QVBoxLayout()
-        self.radio_recreate = QRadioButton("완전 재생성 Import")
-        mode_recreate_desc = QLabel("   데이터베이스 삭제 후 처음부터 재생성\n   ⚠️ 모든 데이터 손실")
+        self.radio_recreate = QRadioButton("안전 재생성 Import")
+        mode_recreate_desc = QLabel("   임시 스키마에 먼저 복원 후 성공 시 전환\n   ⚠️ 전환 시 대상 DB 교체, 추가 여유 공간 필요")
         mode_recreate_desc.setStyleSheet("color: #e74c3c; font-size: 10pt; margin-left: 20px;")
         mode_recreate_layout.addWidget(self.radio_recreate)
         mode_recreate_layout.addWidget(mode_recreate_desc)
@@ -2496,7 +2548,7 @@ class RustDumpImportDialog(QDialog):
         if self.radio_replace.isChecked():
             return "전체 교체 Import"
         elif self.radio_recreate.isChecked():
-            return "완전 재생성 Import"
+            return "안전 재생성 Import"
         return "증분 Import (병합)"
 
     def do_import(self, retry_tables: list = None):
@@ -2518,6 +2570,18 @@ class RustDumpImportDialog(QDialog):
                 QMessageBox.warning(self, "오류", "대상 스키마를 선택하세요.")
                 return
 
+        if self.radio_recreate.isChecked() and not retry_tables:
+            notice = build_safe_recreate_capacity_notice(input_dir)
+            reply = QMessageBox.question(
+                self,
+                "안전 재생성 Import 확인",
+                f"{notice}\n\n계속 진행할까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         # Production 환경 확인
         if self.tunnel_config:
             from src.core.production_guard import ProductionGuard
@@ -2530,6 +2594,8 @@ class RustDumpImportDialog(QDialog):
                 schema_name = self._get_dump_schema_name(input_dir) or "(원본 스키마)"
             details = (f"Dump 폴더: {input_dir}<br>"
                       f"Import 모드: {self._get_import_mode_text()}")
+            if self.radio_recreate.isChecked() and not retry_tables:
+                details += "<br><br>" + build_safe_recreate_capacity_notice(input_dir).replace("\n", "<br>")
 
             if not guard.confirm_dangerous_operation(
                 self.tunnel_config, "데이터 Import", schema_name, details
@@ -2574,7 +2640,7 @@ class RustDumpImportDialog(QDialog):
             if self.radio_replace.isChecked():
                 import_mode_str = "전체 교체 Import"
             elif self.radio_recreate.isChecked():
-                import_mode_str = "완전 재생성 Import"
+                import_mode_str = "안전 재생성 Import"
 
             # 로그 헤더 추가
             self._add_log(f"{'='*60}")
@@ -3019,7 +3085,7 @@ class RustDumpImportDialog(QDialog):
         elif self.radio_replace.isChecked():
             return "replace (기존 테이블 삭제)"
         else:
-            return "recreate (스키마 재생성)"
+            return "recreate (안전 재생성)"
 
     def select_failed_tables(self):
         """실패한 테이블 모두 선택"""

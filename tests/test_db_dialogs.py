@@ -2,15 +2,18 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from src.ui.dialogs.db_dialogs import (
     RustDumpExportDialog,
     RustDumpImportDialog,
     RustDumpWizard,
+    build_safe_recreate_capacity_notice,
     cap_incomplete_export_percent,
     displayed_import_percent,
+    folder_size_bytes,
     format_import_visible_telemetry,
+    format_storage_size,
     export_overall_percent,
     import_overall_percent,
     format_import_row_labels,
@@ -202,6 +205,27 @@ def test_format_import_visible_telemetry_hides_local_infile_phase_noise():
     assert line is None
 
 
+def test_safe_recreate_capacity_notice_reports_dump_size(tmp_path, monkeypatch):
+    dump_dir = tmp_path / "dump"
+    table_dir = dump_dir / "0001_users"
+    table_dir.mkdir(parents=True)
+    (table_dir / "chunk_000001.tsv").write_bytes(b"x" * 2048)
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.shutil.disk_usage",
+        lambda path: (100_000, 10_000, 90_000),
+    )
+
+    assert folder_size_bytes(str(dump_dir)) == 2048
+    assert format_storage_size(2048) == "2.0 KB"
+
+    notice = build_safe_recreate_capacity_notice(str(dump_dir))
+
+    assert "안전 재생성 Import는 임시 스키마에 먼저 복원" in notice
+    assert "덤프 폴더 크기: 2.0 KB" in notice
+    assert "권장 여유 공간(대략): 6.0 KB 이상" in notice
+    assert "현재 덤프 드라이브 여유 공간: 87.9 KB" in notice
+
+
 def test_import_raw_output_shows_visible_telemetry_summary():
     class FakeLogList:
         def __init__(self):
@@ -304,6 +328,21 @@ def test_rust_dump_import_browse_starts_from_export_base_when_no_dump(tmp_path, 
 
     assert dialog.input_dir.text() == ""
     assert dialog._get_input_browse_start_dir() == str(tmp_path)
+    dialog.close()
+
+
+def test_import_dialog_does_not_claim_all_objects_are_recreated(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+
+    dialog = RustDumpImportDialog()
+    combined = "\n".join(label.text() for label in dialog.findChildren(QLabel))
+
+    assert "모든 객체" not in combined
+    assert "테이블" in combined
     dialog.close()
 
 

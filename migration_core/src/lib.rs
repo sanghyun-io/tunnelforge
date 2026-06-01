@@ -3095,6 +3095,15 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let manifest_warnings = validate_dump_import_manifest_strictness(&tables, strict_manifest)?;
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
+    let timezone_sql = validated_timezone_sql(
+        request
+            .payload
+            .get("timezone_sql")
+            .and_then(Value::as_str),
+    )?;
+    if let Some(sql) = timezone_sql.as_deref() {
+        adapter.execute_sql(sql)?;
+    }
     let target_engine = adapter.engine().to_string();
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
@@ -3136,6 +3145,9 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             drop_mysql_database(&mut adapter, &shadow_database)?;
             create_mysql_database(&mut adapter, &shadow_database)?;
             use_mysql_database(&mut adapter, &shadow_database)?;
+            if let Some(sql) = timezone_sql.as_deref() {
+                adapter.execute_sql(sql)?;
+            }
 
             emit(json!({
                 "event": "phase",
@@ -3535,6 +3547,26 @@ fn mysql_local_infile_policy_from_payload(payload: &Value) -> Result<&str, Strin
         Ok(policy)
     } else {
         Err(format!("unsupported mysql_local_infile_policy: {policy}"))
+    }
+}
+
+fn validated_timezone_sql(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(sql) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = sql.to_ascii_lowercase();
+    if normalized.starts_with("set session time_zone")
+        && !normalized.contains(';')
+        && !normalized.contains("--")
+        && !normalized.contains("/*")
+    {
+        Ok(Some(sql.to_string()))
+    } else {
+        Err(classified_import_error(
+            "import_plan_invalid",
+            "unsupported timezone_sql; only SET SESSION time_zone is allowed",
+            None,
+        ))
     }
 }
 
@@ -12125,6 +12157,15 @@ mod tests {
         assert!(is_mysql_local_infile_disabled_error(
             "ERROR 3948 (42000): Loading local data is disabled"
         ));
+    }
+
+    #[test]
+    fn import_timezone_sql_accepts_session_time_zone_only() {
+        assert_eq!(
+            validated_timezone_sql(Some("SET SESSION time_zone = '+09:00'")).unwrap(),
+            Some("SET SESSION time_zone = '+09:00'".to_string())
+        );
+        assert!(validated_timezone_sql(Some("DROP DATABASE prod")).is_err());
     }
 
     #[test]
