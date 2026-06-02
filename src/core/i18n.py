@@ -326,6 +326,13 @@ _EN_TEXT_TRANSLATIONS = {
     "이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n{}": "This dump cannot proceed through the recommended import path.\n\n{}",
     "이 Dump는 Import할 수 없습니다.\n\n{}": "This dump cannot be imported.\n\n{}",
     "제한적 복원 Import 확인": "Limited Restore Import Confirmation",
+    "일관성 모드:": "Consistency mode:",
+    "자동 (권장): 엄격 시도, 권한 부족 시 제한적 Export": "Auto (recommended): try strict, fall back to limited if privileges are missing",
+    "엄격: 같은 시점이 증명되지 않으면 중단": "Strict: stop unless the same point in time is proven",
+    "제한적: 빠른 병렬 Export, 같은 시점 보장 없음": "Limited: fast parallel Export, same point in time is not guaranteed",
+    "자동은 mysqlsh처럼 안전한 병렬 snapshot을 먼저 시도합니다. 권한이 부족하면 Export를 실패시키지 않고 제한적 복원 Dump로 저장합니다.": (
+        "Auto first tries a safe parallel snapshot like mysqlsh. If privileges are missing, it saves a limited restore dump instead of failing Export."
+    ),
     "이 Dump는 제한적 복원 Dump입니다.\n\nImport는 할 수 있지만, Export 중 원본 DB가 변경되었다면 일부 테이블이나 같은 테이블의 일부 조각이 서로 다른 시점일 수 있습니다.\n\n운영 복구용으로 완전히 검증된 Dump가 필요하면 strict 조건으로 다시 Export하세요.\n\n이 한계를 이해하고 제한적 복원으로 Import를 진행할까요?": (
         "This is a limited restore dump.\n\n"
         "It can be imported, but if the source DB changed during Export, some tables or parts of the same table may come from different moments.\n\n"

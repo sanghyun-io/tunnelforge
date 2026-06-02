@@ -274,6 +274,15 @@ def test_rust_dump_export_dialog_defaults_to_zstd():
     dialog.close()
 
 
+def test_rust_dump_export_dialog_defaults_to_best_effort_consistency():
+    app = QApplication.instance() or QApplication([])
+    dialog = RustDumpExportDialog()
+
+    assert dialog.combo_consistency_mode.currentData() == "best_effort"
+    assert "자동" in dialog.combo_consistency_mode.currentText()
+    dialog.close()
+
+
 def test_rust_dump_export_dialog_rejects_parent_manual_folder(tmp_path):
     app = QApplication.instance() or QApplication([])
     config_manager = MagicMock()

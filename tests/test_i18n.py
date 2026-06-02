@@ -101,6 +101,7 @@ def test_translate_text_handles_common_hardcoded_ui_phrases():
     assert i18n.translate_text("제한적 복원 Import 확인") == (
         "Limited Restore Import Confirmation"
     )
+    assert i18n.translate_text("일관성 모드:") == "Consistency mode:"
 
 
 def test_qt_i18n_hooks_translate_hardcoded_widget_text(monkeypatch):

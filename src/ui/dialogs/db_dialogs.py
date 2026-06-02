@@ -818,6 +818,16 @@ class RustDumpExportDialog(QDialog):
         self.combo_compression.setToolTip("Rust DB Core dump 압축 방식입니다. zstd는 디스크 사용량을 줄이고 import 시 스트리밍 해제됩니다.")
         option_layout.addRow("압축 방식:", self.combo_compression)
 
+        self.combo_consistency_mode = QComboBox()
+        self.combo_consistency_mode.addItem("자동 (권장): 엄격 시도, 권한 부족 시 제한적 Export", "best_effort")
+        self.combo_consistency_mode.addItem("엄격: 같은 시점이 증명되지 않으면 중단", "strict")
+        self.combo_consistency_mode.addItem("제한적: 빠른 병렬 Export, 같은 시점 보장 없음", "limited")
+        self.combo_consistency_mode.setToolTip(
+            "자동은 mysqlsh처럼 안전한 병렬 snapshot을 먼저 시도합니다. "
+            "권한이 부족하면 Export를 실패시키지 않고 제한적 복원 Dump로 저장합니다."
+        )
+        option_layout.addRow("일관성 모드:", self.combo_consistency_mode)
+
         container_layout.addWidget(option_group)
 
         # --- 출력 폴더 설정 ---
@@ -1311,6 +1321,7 @@ class RustDumpExportDialog(QDialog):
         self.table_group.setEnabled(enabled)
         self.spin_threads.setEnabled(enabled)
         self.combo_compression.setEnabled(enabled)
+        self.combo_consistency_mode.setEnabled(enabled)
         self.btn_export.setEnabled(enabled)
 
         # 폴더 설정 UI
@@ -1385,6 +1396,7 @@ class RustDumpExportDialog(QDialog):
         self._add_log(f"출력 폴더: {output_dir}")
         self._add_log(f"병렬 스레드: {self.spin_threads.value()}")
         self._add_log(f"압축 방식: {self.combo_compression.currentText()}")
+        self._add_log(f"일관성 모드: {self.combo_consistency_mode.currentText()}")
         self._add_log(f"{'='*60}")
 
         # UI 상태 변경 - 모든 입력 비활성화
@@ -1427,7 +1439,8 @@ class RustDumpExportDialog(QDialog):
                 schema=schema,
                 output_dir=output_dir,
                 threads=self.spin_threads.value(),
-                compression=self.combo_compression.currentText()
+                compression=self.combo_compression.currentText(),
+                consistency_mode=self.combo_consistency_mode.currentData()
             )
         else:
             self.worker = RustDumpWorker(
@@ -1437,7 +1450,8 @@ class RustDumpExportDialog(QDialog):
                 output_dir=output_dir,
                 threads=self.spin_threads.value(),
                 compression=self.combo_compression.currentText(),
-                include_fk_parents=self.chk_include_fk.isChecked()
+                include_fk_parents=self.chk_include_fk.isChecked(),
+                consistency_mode=self.combo_consistency_mode.currentData()
             )
 
         # 시그널 연결

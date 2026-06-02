@@ -209,9 +209,31 @@ class TestRustDumpExporter:
         assert facade.payload["output_dir"].endswith("dump")
         assert facade.payload["threads"] == 8
         assert facade.payload["chunk_size"] == 50000
+        assert facade.payload["consistency_mode"] == "best_effort"
         assert facade.payload["data_format"] == "tsv"
         assert facade.payload["compression"] == "zstd"
         assert "2" in msg
+
+    def test_export_full_schema_forwards_limited_consistency_mode(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_dumped": 10}
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        exporter = RustDumpExporter(config, facade=facade)
+
+        success, _ = exporter.export_full_schema(
+            'app',
+            str(tmp_path / 'dump'),
+            consistency_mode='limited',
+        )
+
+        assert success is True
+        assert facade.payload["consistency_mode"] == "limited"
 
     def test_export_full_schema_passes_zstd_compression_to_rust_dump(self, tmp_path):
         """압축 선택이 Rust dump.run payload로 전달됨"""

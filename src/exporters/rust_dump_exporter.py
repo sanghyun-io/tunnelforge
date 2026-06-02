@@ -407,6 +407,7 @@ class RustDumpExporter:
         threads: int = 8,
         chunk_size: int = 50000,
         compression: str = DEFAULT_DUMP_COMPRESSION,
+        consistency_mode: str = "best_effort",
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -421,6 +422,7 @@ class RustDumpExporter:
             "chunk_size": max(1000, int(chunk_size)),
             "data_format": "tsv",
             "compression": compression if compression in {"none", "zstd"} else DEFAULT_DUMP_COMPRESSION,
+            "consistency_mode": consistency_mode if consistency_mode in {"best_effort", "strict", "limited"} else "best_effort",
         }
         if tables:
             payload["tables"] = tables
@@ -449,6 +451,7 @@ class RustDumpExporter:
         output_dir: str,
         threads: int = 8,
         compression: str = DEFAULT_DUMP_COMPRESSION,
+        consistency_mode: str = "best_effort",
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -462,6 +465,7 @@ class RustDumpExporter:
                 tables=None,
                 threads=threads,
                 compression=compression,
+                consistency_mode=consistency_mode,
                 progress_callback=progress_callback,
                 table_progress_callback=table_progress_callback,
                 detail_callback=detail_callback,
@@ -484,6 +488,7 @@ class RustDumpExporter:
         threads: int = 8,
         compression: str = DEFAULT_DUMP_COMPRESSION,
         include_fk_parents: bool = True,
+        consistency_mode: str = "best_effort",
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
         detail_callback: Optional[Callable[[dict], None]] = None,
@@ -505,6 +510,7 @@ class RustDumpExporter:
                 tables=final_tables,
                 threads=threads,
                 compression=compression,
+                consistency_mode=consistency_mode,
                 progress_callback=progress_callback,
                 table_progress_callback=table_progress_callback,
                 detail_callback=detail_callback,
@@ -827,11 +833,18 @@ def export_schema(
     schema: str,
     output_dir: str,
     threads: int = 8,
+    consistency_mode: str = "best_effort",
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str]:
     config = RustDumpConfig(host, port, user, password)
     exporter = RustDumpExporter(config)
-    return exporter.export_full_schema(schema, output_dir, threads, progress_callback=progress_callback)
+    return exporter.export_full_schema(
+        schema,
+        output_dir,
+        threads,
+        consistency_mode=consistency_mode,
+        progress_callback=progress_callback,
+    )
 
 
 def export_tables(
@@ -844,6 +857,7 @@ def export_tables(
     output_dir: str,
     threads: int = 8,
     include_fk_parents: bool = True,
+    consistency_mode: str = "best_effort",
     progress_callback: Optional[Callable[[str], None]] = None,
 ) -> Tuple[bool, str, List[str]]:
     config = RustDumpConfig(host, port, user, password)
@@ -854,6 +868,7 @@ def export_tables(
         output_dir,
         threads,
         include_fk_parents=include_fk_parents,
+        consistency_mode=consistency_mode,
         progress_callback=progress_callback,
     )
 

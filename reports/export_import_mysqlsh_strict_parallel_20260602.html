@@ -38,6 +38,9 @@
         <code>FLUSH TABLES WITH READ LOCK</code> 중 worker connection을 미리 열고
         <code>START TRANSACTION WITH CONSISTENT SNAPSHOT</code>을 시작한 뒤
         <code>LOCK INSTANCE FOR BACKUP</code>을 잡고 병렬 dump를 수행하는 strict 경로를 추가했다.
+        2026-06-02 추가 수정으로 <code>FLUSH TABLES WITH READ LOCK</code> 권한이 없으면
+        <code>LOCK TABLES ... READ</code> 대체 경로를 시도하고, 자동 모드에서는 strict 권한 경로가 불가능할 때
+        Export를 실패시키지 않고 <code>limited_restorable</code>로 명확히 강등한다.
       </td>
     </tr>
     <tr>
@@ -56,6 +59,14 @@
       </td>
     </tr>
     <tr>
+      <td>Export UI</td>
+      <td>
+        Export 옵션에 일관성 모드를 추가했다.
+        기본값은 <code>자동</code>이며, strict 병렬 snapshot을 먼저 시도하고 권한이 부족하면 제한적 Export로 진행한다.
+        사용자는 <code>엄격</code> 또는 <code>제한적</code>을 직접 선택할 수 있다.
+      </td>
+    </tr>
+    <tr>
       <td>Python Wrapper</td>
       <td>
         limited Import 시 Rust Core에 <code>strict_manifest=false</code>를 전달할 수 있도록
@@ -69,6 +80,7 @@
     <li>선택된 MySQL 테이블 엔진을 검사한다.</li>
     <li>모든 대상 테이블이 InnoDB이고 병렬 Export이면 strict parallel 경로를 시도한다.</li>
     <li><code>FLUSH TABLES WITH READ LOCK</code>을 짧게 획득한다.</li>
+    <li><code>FLUSH TABLES WITH READ LOCK</code>이 권한 부족이면 <code>LOCK TABLES ... READ</code>를 시도한다.</li>
     <li>row count, range 계획을 lock 안에서 계산한다.</li>
     <li>worker connection을 미리 만들고 각 connection에서 consistent snapshot transaction을 시작한다.</li>
     <li><code>LOCK INSTANCE FOR BACKUP</code>을 획득한다.</li>
@@ -79,17 +91,18 @@
 
   <h2>운영 전제</h2>
   <p>
-    strict 병렬 Export는 MySQL 권한이 필요하다. 계정에 <code>FLUSH TABLES WITH READ LOCK</code> 및
-    <code>LOCK INSTANCE FOR BACKUP</code> 수행 권한이 없으면 Export는 strict로 포장되지 않고 명확한 에러를 낸다.
-    이는 제한적 Dump를 strict처럼 보이게 만드는 땜빵을 피하기 위한 의도적인 동작이다.
+    strict 병렬 Export는 MySQL 권한이 필요하다. 자동 모드에서는 <code>FLUSH TABLES WITH READ LOCK</code>,
+    <code>LOCK TABLES ... READ</code>, <code>LOCK INSTANCE FOR BACKUP</code> 순서로 가능한 strict 경로를 시도한다.
+    권한이 부족하면 Export 자체를 실패시키지 않고 제한적 복원 Dump로 저장하며, manifest warning에 이유를 남긴다.
+    엄격 모드에서는 같은 상황을 에러로 처리한다.
   </p>
 
   <h2>검증 결과</h2>
   <table>
     <tr><th>검증</th><th>결과</th></tr>
-    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="ok">통과: 178 lib tests + helper/live-gated tests</td></tr>
+    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="ok">통과: 180 lib tests + helper/live-gated tests</td></tr>
     <tr><td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td><td class="ok">통과</td></tr>
-    <tr><td><code>pytest</code></td><td class="ok">통과: 1709 passed, 5 warnings</td></tr>
+    <tr><td><code>pytest</code></td><td class="ok">통과: 1711 passed, 5 warnings</td></tr>
     <tr><td><code>.\scripts\build-bootstrapper.ps1</code></td><td class="ok">통과: <code>dist\TunnelForge-WebSetup.exe</code> 생성</td></tr>
     <tr><td><code>.\scripts\build-installer.ps1 -SkipPyInstaller</code></td><td class="ok">통과: <code>output\TunnelForge-Setup-2.0.16.exe</code> 생성</td></tr>
     <tr><td><code>git diff --check</code></td><td class="ok">통과</td></tr>

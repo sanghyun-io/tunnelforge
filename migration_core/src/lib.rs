@@ -1450,6 +1450,20 @@ struct MysqlSnapshotEvidence {
     warnings: Vec<String>,
 }
 
+fn dump_consistency_mode(payload: &Value) -> String {
+    match payload
+        .get("consistency_mode")
+        .and_then(Value::as_str)
+        .unwrap_or("best_effort")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "strict" => "strict".to_string(),
+        "limited" => "limited".to_string(),
+        _ => "best_effort".to_string(),
+    }
+}
+
 fn classify_mysql_snapshot_strategy(
     tables: &[MysqlTableEngine],
     transaction_snapshot_available: bool,
@@ -1755,6 +1769,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         .map(|value| value as usize)
         .unwrap_or(8)
         .max(1);
+    let consistency_mode = dump_consistency_mode(&request.payload);
     let overwrite = request
         .payload
         .get("overwrite")
@@ -1847,8 +1862,10 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             .as_ref()
             .map(|tables| tables.iter().all(|table| table.engine.eq_ignore_ascii_case("innodb")))
             .unwrap_or(false);
-        let use_mysql_strict_parallel_snapshot =
-            threads > 1 && table_total > 1 && all_selected_tables_innodb;
+        let use_mysql_strict_parallel_snapshot = consistency_mode != "limited"
+            && threads > 1
+            && table_total > 1
+            && all_selected_tables_innodb;
         snapshot_evidence = mysql_snapshot_evidence_from_engine_inspection(
             exported_table_engines,
             true,
@@ -1915,7 +1932,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         } else if endpoint.engine == "mysql"
             && snapshot_evidence.policy == "lock_synchronized_transaction_snapshot"
         {
-            dump_tables_global_mysql_strict_parallel(
+            match dump_tables_global_mysql_strict_parallel(
                 &endpoint,
                 output_path,
                 &export_tables,
@@ -1925,7 +1942,30 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 effective_threads,
                 request.request_id.clone(),
                 |event| emit(event),
-            )?
+            ) {
+                Ok(result) => result,
+                Err(err) if consistency_mode == "best_effort" => {
+                    snapshot_evidence = MysqlSnapshotEvidence {
+                        policy: "not_enforced".to_string(),
+                        strict_candidate: false,
+                        warnings: vec![format!(
+                            "strict parallel snapshot unavailable; exported as limited restore dump: {err}"
+                        )],
+                    };
+                    dump_tables_global_mysql_limited_with_objects(
+                        &endpoint,
+                        output_path,
+                        &export_tables,
+                        chunk_size,
+                        &data_format,
+                        &compression,
+                        effective_threads,
+                        request.request_id.clone(),
+                        |event| emit(event),
+                    )?
+                }
+                Err(err) => return Err(err),
+            }
         } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total == 1 {
             let (table_manifests, total_rows, total_chunks) = match dump_single_mysql_table_parallel(
                 &endpoint,
@@ -1962,7 +2002,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             };
             (table_manifests, total_rows, total_chunks, dump_objects)
         } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total > 1 {
-            let (table_manifests, total_rows, total_chunks) = dump_tables_global_mysql(
+            dump_tables_global_mysql_limited_with_objects(
                 &endpoint,
                 output_path,
                 &export_tables,
@@ -1972,15 +2012,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 effective_threads,
                 request.request_id.clone(),
                 |event| emit(event),
-            )?;
-            let dump_objects = {
-                let mut adapter = LiveAdapter::connect(&endpoint)?;
-                let LiveAdapter::MySql(conn) = &mut adapter else {
-                    return Err("failed to open mysql dump adapter".to_string());
-                };
-                capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
-            };
-            (table_manifests, total_rows, total_chunks, dump_objects)
+            )?
         } else if effective_threads > 1 && table_total > 1 {
             let (table_manifests, total_rows, total_chunks) = dump_tables_parallel(
                 &endpoint,
@@ -2981,11 +3013,50 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
     Ok((manifests, total_rows, total_chunks))
 }
 
+fn dump_tables_global_mysql_limited_with_objects<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    output_path: &Path,
+    tables: &[NormalizedTable],
+    chunk_size: usize,
+    data_format: &str,
+    compression: &str,
+    threads: usize,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(Vec<DumpTableManifest>, u64, u64, DumpObjectManifest), String> {
+    let (table_manifests, total_rows, total_chunks) = dump_tables_global_mysql(
+        endpoint,
+        output_path,
+        tables,
+        chunk_size,
+        data_format,
+        compression,
+        threads,
+        request_id,
+        |event| emit(event),
+    )?;
+    let mut adapter = LiveAdapter::connect(endpoint)?;
+    let LiveAdapter::MySql(conn) = &mut adapter else {
+        return Err("failed to open mysql dump adapter".to_string());
+    };
+    let dump_objects = capture_mysql_dump_objects(conn, output_path, &endpoint.database)?;
+    Ok((table_manifests, total_rows, total_chunks, dump_objects))
+}
+
 fn mysql_start_consistent_snapshot(conn: &mut mysql::PooledConn) -> Result<(), String> {
     conn.query_drop("SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ")
         .map_err(|err| format!("mysql snapshot setup error: {err}"))?;
     conn.query_drop("START TRANSACTION WITH CONSISTENT SNAPSHOT")
         .map_err(|err| format!("mysql snapshot start error: {err}"))
+}
+
+fn mysql_lock_tables_read_sql(tables: &[NormalizedTable]) -> String {
+    let table_locks = tables
+        .iter()
+        .map(|table| format!("{} READ", quote_ident("mysql", &table.name)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("LOCK TABLES {table_locks}")
 }
 
 fn dump_tables_global_mysql_strict_parallel<F: FnMut(Value)>(
@@ -3008,13 +3079,14 @@ fn dump_tables_global_mysql_strict_parallel<F: FnMut(Value)>(
     };
     let mut worker_conns = Vec::<mysql::PooledConn>::new();
 
-    lock_conn
-        .query_drop("FLUSH TABLES WITH READ LOCK")
-        .map_err(|err| {
+    if let Err(flush_err) = lock_conn.query_drop("FLUSH TABLES WITH READ LOCK") {
+        let lock_tables_sql = mysql_lock_tables_read_sql(tables);
+        lock_conn.query_drop(lock_tables_sql).map_err(|lock_err| {
             format!(
-                "mysql strict parallel snapshot requires FLUSH TABLES WITH READ LOCK privilege: {err}"
+                "mysql strict parallel snapshot requires FLUSH TABLES WITH READ LOCK or LOCK TABLES privilege: FLUSH TABLES WITH READ LOCK failed: {flush_err}; LOCK TABLES failed: {lock_err}"
             )
         })?;
+    }
 
     let profiles = load_dump_perf_profiles();
     let mut ranges_by_table = BTreeMap::<String, Vec<DumpRange>>::new();
@@ -11618,6 +11690,36 @@ mod tests {
         assert_eq!(evidence.policy, "transaction_snapshot");
         assert!(evidence.strict_candidate);
         assert!(evidence.warnings.is_empty());
+    }
+
+    #[test]
+    fn dump_consistency_mode_defaults_to_best_effort_and_accepts_explicit_modes() {
+        assert_eq!(dump_consistency_mode(&json!({})), "best_effort");
+        assert_eq!(
+            dump_consistency_mode(&json!({"consistency_mode": "strict"})),
+            "strict"
+        );
+        assert_eq!(
+            dump_consistency_mode(&json!({"consistency_mode": "limited"})),
+            "limited"
+        );
+        assert_eq!(
+            dump_consistency_mode(&json!({"consistency_mode": "unknown"})),
+            "best_effort"
+        );
+    }
+
+    #[test]
+    fn mysql_lock_tables_read_sql_quotes_every_table() {
+        let tables = vec![
+            empty_table("orders", Vec::new()),
+            empty_table("weird`name", Vec::new()),
+        ];
+
+        assert_eq!(
+            mysql_lock_tables_read_sql(&tables),
+            "LOCK TABLES `orders` READ, `weird``name` READ"
+        );
     }
 
     #[test]
