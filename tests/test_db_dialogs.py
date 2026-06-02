@@ -12,6 +12,9 @@ from src.ui.dialogs.db_dialogs import (
     cap_incomplete_export_percent,
     displayed_import_percent,
     folder_size_bytes,
+    import_phase_label,
+    import_stage_percent,
+    plain_import_progress_message,
     format_import_visible_telemetry,
     format_storage_size,
     export_overall_percent,
@@ -121,6 +124,19 @@ def test_format_import_row_labels_explains_safe_insert_fallback():
     assert labels[2] == "🔄 현재: df_subs 1/2 chunks, +50,000 rows, 안전 INSERT fallback"
 
 
+def test_format_import_row_labels_prefers_overall_rows_when_provided():
+    labels = format_import_row_labels({
+        "table": "df_subs",
+        "rows_done": 50_000,
+        "rows_total": 100_000,
+        "overall_rows_done": 750_000,
+        "overall_rows_total": 3_000_000,
+        "chunk_rows": 50_000,
+    })
+
+    assert labels[0] == "📦 전체 rows: 750,000 / 3,000,000 rows"
+
+
 def test_import_overall_percent_uses_all_table_row_totals():
     assert import_overall_percent(
         {"users": 500, "orders": 250},
@@ -138,6 +154,21 @@ def test_displayed_import_percent_does_not_promote_table_percent_to_overall():
 
 def test_displayed_import_percent_uses_event_percent_when_overall_total_unknown():
     assert displayed_import_percent({}, {}, event_percent=42) == 42
+
+
+def test_import_stage_percent_keeps_data_load_below_final_completion():
+    assert import_stage_percent(100, "dump_import") == 85
+    assert import_stage_percent(100, "dump_import_post_load") == 88
+    assert import_stage_percent(100, "dump_import_objects") == 96
+
+
+def test_import_phase_label_uses_plain_stage_names():
+    assert import_phase_label("dump_import_post_load") == "인덱스/FK 생성"
+    assert import_phase_label("dump_import_objects") == "View/이벤트/루틴/트리거 복원"
+
+
+def test_plain_import_progress_message_translates_post_load():
+    assert plain_import_progress_message("creating indexes and foreign keys") == "🔄 인덱스/FK 생성 중..."
 
 
 def test_format_export_visible_telemetry_summarizes_chunk_progress():
@@ -205,6 +236,16 @@ def test_format_import_visible_telemetry_hides_local_infile_phase_noise():
     assert line is None
 
 
+def test_format_import_visible_telemetry_translates_phase_message():
+    line = format_import_visible_telemetry({
+        "event": "phase",
+        "phase": "dump_import_post_load",
+        "message": "creating indexes and foreign keys",
+    })
+
+    assert line == "인덱스/FK 생성: 🔄 인덱스/FK 생성 중..."
+
+
 def test_safe_recreate_capacity_notice_reports_dump_size(tmp_path, monkeypatch):
     dump_dir = tmp_path / "dump"
     table_dir = dump_dir / "0001_users"
@@ -264,6 +305,45 @@ def test_import_raw_output_shows_visible_telemetry_summary():
     ]
     assert dialog.log_entries[0].endswith("load_data_local_infile")
     assert "[rust_dump]" in dialog.log_entries[1]
+
+
+def test_import_dialog_phase_progress_includes_post_load_stage(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+    dialog = RustDumpImportDialog(connector=None)
+    dialog.import_data_percent = 100
+    dialog.import_display_percent = 85
+    dialog.progress_bar.setValue(85)
+
+    dialog.on_raw_output(json.dumps({
+        "event": "phase",
+        "phase": "dump_import_post_load",
+        "message": "creating indexes and foreign keys",
+    }))
+
+    assert dialog.progress_bar.value() == 88
+    assert "인덱스/FK 생성" in dialog.label_percent.text()
+    assert "FK/인덱스: 생성 중" in dialog.label_fk_status.text()
+    dialog.close()
+
+
+def test_import_dialog_failure_preserves_stage_progress(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.QMessageBox.warning", lambda *args, **kwargs: None)
+    dialog = RustDumpImportDialog(connector=None)
+    dialog.import_results = {"users": {"status": "done", "message": ""}}
+    dialog.import_data_percent = 100
+    dialog.import_display_percent = 88
+    dialog.import_current_phase_label = "인덱스/FK 생성"
+    dialog.progress_bar.setValue(88)
+
+    dialog.on_finished(False, "creating indexes and foreign keys failed")
+
+    assert dialog.progress_bar.value() == 88
+    assert "실패 지점: 인덱스/FK 생성" in dialog.label_percent.text()
+    assert "Import 실패: 인덱스/FK 생성 단계" in dialog.label_status.text()
+    dialog.close()
 
 
 def test_rust_dump_export_dialog_defaults_to_zstd():

@@ -144,6 +144,8 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
     table = str(info.get("table") or "-")
     rows_done = max(0, int(info.get("rows_done") or 0))
     rows_total = max(0, int(info.get("rows_total") or 0))
+    overall_rows_done = max(0, int(info.get("overall_rows_done") or 0))
+    overall_rows_total = max(0, int(info.get("overall_rows_total") or 0))
     chunk_rows = max(0, int(info.get("chunk_rows") or 0))
     chunks_done = int(info.get("chunks_done") or 0)
     chunks_total = int(info.get("chunks_total") or 0)
@@ -156,7 +158,11 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
     }
     strategy_label = strategy_labels.get(strategy, strategy)
 
-    if rows_total:
+    if overall_rows_total:
+        data_label = f"📦 전체 rows: {overall_rows_done:,} / {overall_rows_total:,} rows"
+    elif overall_rows_done:
+        data_label = f"📦 전체 rows: {overall_rows_done:,} rows"
+    elif rows_total:
         data_label = f"📦 처리 rows: {rows_done:,} / {rows_total:,} rows"
     else:
         data_label = f"📦 처리 rows: {rows_done:,} rows"
@@ -171,6 +177,72 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
     if strategy_label:
         status = f"{status}, {strategy_label}"
     return data_label, speed_label, f"🔄 현재: {table} {status}"
+
+
+IMPORT_DATA_PROGRESS_CAP = 85
+IMPORT_PHASE_PROGRESS_FLOORS = {
+    "dump_import_preflight": 2,
+    "dump_import_manifest": 4,
+    "dump_import_cleanup": 6,
+    "dump_import_schema": 10,
+    "dump_import": 10,
+    "dump_import_post_load": 88,
+    "dump_import_switch": 93,
+    "dump_import_objects": 96,
+}
+IMPORT_PHASE_LABELS = {
+    "dump_import_preflight": "사전 검사",
+    "dump_import_manifest": "Dump 확인",
+    "dump_import_cleanup": "기존 대상 정리",
+    "dump_import_schema": "테이블 생성",
+    "dump_import": "데이터 적재",
+    "dump_import_post_load": "인덱스/FK 생성",
+    "dump_import_switch": "임시 스키마 전환",
+    "dump_import_objects": "View/이벤트/루틴/트리거 복원",
+}
+
+
+def import_phase_label(phase: str, message: str = "") -> str:
+    """Return a user-facing import phase label."""
+    phase_key = str(phase or "")
+    if phase_key in IMPORT_PHASE_LABELS:
+        return IMPORT_PHASE_LABELS[phase_key]
+    message_text = str(message or "").strip()
+    return message_text or "Import 진행 중"
+
+
+def plain_import_progress_message(message: str) -> str:
+    """Translate Rust Core import progress messages into plain UI text."""
+    text = str(message or "").strip()
+    lowered = text.lower()
+    if "creating indexes and foreign keys" in lowered:
+        return "🔄 인덱스/FK 생성 중..."
+    if "restoring mysql views" in lowered:
+        return "🔄 View/이벤트/루틴/트리거 복원 중..."
+    if "switching temporary schema" in lowered:
+        return "🔄 임시 스키마를 대상 DB로 전환 중..."
+    if "creating target tables" in lowered:
+        return "🔄 테이블 생성 중..."
+    if "preparing target tables" in lowered:
+        return "🔄 기존 대상 정리 중..."
+    if "restoring into temporary schema" in lowered:
+        return "🔄 임시 스키마 준비 중..."
+    if "dump import started" in lowered:
+        return "🔄 Import 시작"
+    if "dump compatibility preflight completed" in lowered:
+        return "🔄 사전 검사 완료"
+    return text
+
+
+def import_stage_percent(data_percent: int, phase: str = "") -> int:
+    """Map data-load progress onto the full import lifecycle."""
+    bounded_data = max(0, min(int(data_percent or 0), 100))
+    if bounded_data:
+        data_stage_percent = 10 + int((bounded_data / 100) * (IMPORT_DATA_PROGRESS_CAP - 10))
+    else:
+        data_stage_percent = 0
+    phase_floor = IMPORT_PHASE_PROGRESS_FLOORS.get(str(phase or ""), 0)
+    return min(max(data_stage_percent, phase_floor), 99)
 
 
 def import_overall_percent(table_rows_done: dict, table_rows_total: dict) -> int:
@@ -270,7 +342,10 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
         message = str(event.get("message") or "")
         if "local_infile" in message or "LOAD DATA LOCAL" in message:
             return None
-        return message
+        phase = str(event.get("phase") or "")
+        if phase in IMPORT_PHASE_LABELS:
+            return f"{import_phase_label(phase)}: {plain_import_progress_message(message)}"
+        return plain_import_progress_message(message)
     if event_type == "table_progress" and table:
         status = str(event.get("status") or "")
         current = int(event.get("current") or 0)
@@ -1934,6 +2009,10 @@ class RustDumpImportDialog(QDialog):
         self.dump_metadata: Optional[dict] = None
         self.import_table_rows_done: dict = {}
         self.import_table_rows_total: dict = {}
+        self.import_data_percent = 0
+        self.import_display_percent = 0
+        self.import_current_phase = ""
+        self.import_current_phase_label = "대기 중"
         self._compatibility_allows_recommended_import = False
         self._dump_restorability_grade = ""
         self._dump_requires_limited_confirmation = False
@@ -2828,10 +2907,14 @@ class RustDumpImportDialog(QDialog):
             self._add_log(f"{'='*60}")
 
         # 프로그레스 바 초기화
+        self.import_data_percent = 0
+        self.import_display_percent = 0
+        self.import_current_phase = "dump_import_preflight"
+        self.import_current_phase_label = import_phase_label(self.import_current_phase)
         self.progress_bar.setValue(0)
         self.progress_bar.setMaximum(100)
         self.label_percent.setText("📊 진행률: 0%")
-        self.label_data.setText("📦 데이터: 0 MB / 0 MB")
+        self.label_data.setText("📦 전체 rows: 0 rows")
         self.label_speed.setText("⚡ 속도: 0 rows/s")
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Import 준비 중...")
@@ -2909,18 +2992,19 @@ class RustDumpImportDialog(QDialog):
 
     def on_progress(self, msg: str):
         """일반 진행 메시지 처리"""
-        self.txt_log.addItem(msg)
+        display_msg = plain_import_progress_message(msg)
+        self.txt_log.addItem(display_msg)
         self.txt_log.scrollToBottom()
-        self.label_status.setText(msg)
-        self._add_log(msg)
+        self.label_status.setText(display_msg)
+        self._add_log(display_msg)
 
         # FK 관련 메시지 감지 시 FK 상태 라벨 업데이트
-        if "FK 제약조건" in msg or "FK 재연결" in msg:
-            self.label_fk_status.setText(msg)
-            if "백업 중" in msg or "재연결 중" in msg:
+        if "FK 제약조건" in display_msg or "FK 재연결" in display_msg or "인덱스/FK" in display_msg:
+            self.label_fk_status.setText(display_msg)
+            if "백업 중" in display_msg or "재연결 중" in display_msg or "생성 중" in display_msg:
                 self.label_fk_status.setStyleSheet("color: #3498db; font-weight: bold;")
-            elif "완료" in msg:
-                if "실패 0" in msg or ("성공" in msg and "실패" not in msg):
+            elif "완료" in display_msg:
+                if "실패 0" in display_msg or ("성공" in display_msg and "실패" not in display_msg):
                     self.label_fk_status.setStyleSheet("color: #27ae60; font-weight: bold;")
                 else:
                     self.label_fk_status.setStyleSheet("color: #e67e22; font-weight: bold;")
@@ -2937,18 +3021,48 @@ class RustDumpImportDialog(QDialog):
             self.import_table_rows_done[table] = max(0, int(info.get('rows_done') or 0))
         if table and table not in self.import_table_rows_total:
             self.import_table_rows_total[table] = max(0, int(info.get('rows_total') or 0))
-        percent = displayed_import_percent(
+        self.import_current_phase = "dump_import"
+        self.import_current_phase_label = import_phase_label(self.import_current_phase)
+        data_percent = displayed_import_percent(
             self.import_table_rows_done,
             self.import_table_rows_total,
             int(info.get('percent') or 0),
         )
-        data_label, speed_label, status_label = format_import_row_labels(info)
+        self.import_data_percent = data_percent
+        percent = import_stage_percent(data_percent, self.import_current_phase)
+        self.import_display_percent = percent
+        progress_info = dict(info)
+        progress_info["overall_rows_done"] = sum(
+            max(0, int(value or 0)) for value in self.import_table_rows_done.values()
+        )
+        progress_info["overall_rows_total"] = sum(
+            max(0, int(value or 0)) for value in self.import_table_rows_total.values()
+        )
+        data_label, speed_label, status_label = format_import_row_labels(progress_info)
 
         self.progress_bar.setValue(percent)
-        self.label_percent.setText(f"📊 전체 진행률: {percent}%")
+        self.label_percent.setText(f"📊 전체 진행률: {percent}% (데이터 적재 {data_percent}%)")
         self.label_data.setText(data_label)
         self.label_speed.setText(speed_label)
         self.label_status.setText(status_label)
+
+    def _set_import_phase(self, phase: str, message: str = ""):
+        """Update stage-aware import progress from Rust Core phase events."""
+        self.import_current_phase = str(phase or "")
+        self.import_current_phase_label = import_phase_label(phase, message)
+        percent = import_stage_percent(self.import_data_percent, self.import_current_phase)
+        if percent > self.import_display_percent:
+            self.import_display_percent = percent
+            self.progress_bar.setValue(percent)
+        if self.import_current_phase:
+            self.label_percent.setText(
+                f"📊 전체 진행률: {self.import_display_percent}% "
+                f"({self.import_current_phase_label})"
+            )
+            self.label_status.setText(f"🔄 {self.import_current_phase_label}")
+        if self.import_current_phase == "dump_import_post_load":
+            self.label_fk_status.setText("🔗 FK/인덱스: 생성 중")
+            self.label_fk_status.setStyleSheet("color: #3498db; font-weight: bold;")
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트 (메타데이터 정보 포함)"""
@@ -3082,6 +3196,10 @@ class RustDumpImportDialog(QDialog):
         try:
             event = json.loads(line)
             if isinstance(event, dict):
+                event_type = str(event.get("event") or "")
+                phase = str(event.get("phase") or "")
+                if event_type in {"phase", "progress"} and phase and hasattr(self, "progress_bar"):
+                    self._set_import_phase(phase, str(event.get("message") or ""))
                 visible_summary = format_import_visible_telemetry(event)
         except json.JSONDecodeError:
             visible_summary = line
@@ -3202,10 +3320,17 @@ class RustDumpImportDialog(QDialog):
         if success:
             self.label_status.setText(f"✅ Import 완료: {done_count}/{total_count} 테이블 성공")
             self.progress_bar.setValue(100)
+            self.import_display_percent = 100
+            self.label_percent.setText("📊 전체 진행률: 100% (완료)")
             self.txt_log.addItem(f"✅ 완료: {message}")
             QMessageBox.information(self, "Import 완료", f"✅ Import가 완료되었습니다.\n\n성공: {done_count}개 테이블")
         else:
-            self.label_status.setText(f"❌ Import 실패: {error_count}/{total_count} 테이블 오류")
+            failed_phase = self.import_current_phase_label or "Import 진행 중"
+            self.label_status.setText(f"❌ Import 실패: {failed_phase} 단계")
+            self.label_percent.setText(
+                f"📊 전체 진행률: {self.import_display_percent}% "
+                f"(실패 지점: {failed_phase}, 데이터 적재 {self.import_data_percent}%)"
+            )
             self.txt_log.addItem(f"❌ 실패: {message}")
 
             if error_count > 0:
