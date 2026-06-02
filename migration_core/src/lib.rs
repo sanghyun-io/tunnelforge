@@ -10385,11 +10385,30 @@ fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Resul
 }
 
 fn normalize_fk_type_signature(type_name: &str) -> String {
-    strip_generation_marker(type_name)
+    let normalized = strip_generation_marker(type_name)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-        .to_ascii_lowercase()
+        .to_ascii_lowercase();
+    normalize_fk_string_type_length(&normalized)
+}
+
+fn normalize_fk_string_type_length(type_signature: &str) -> String {
+    for base_type in ["varchar", "char", "varbinary", "binary"] {
+        let prefix = format!("{base_type}(");
+        if !type_signature.starts_with(&prefix) {
+            continue;
+        }
+        if let Some(close_index) = type_signature.find(')') {
+            let suffix = type_signature[close_index + 1..].trim_start();
+            return if suffix.is_empty() {
+                base_type.to_string()
+            } else {
+                format!("{base_type} {suffix}")
+            };
+        }
+    }
+    type_signature.to_string()
 }
 
 fn should_apply_post_load_ddl(mode: &str, recreated_target: bool) -> bool {
@@ -14633,6 +14652,51 @@ mod tests {
                         columns: vec!["audit_category_code".to_string()],
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        validate_foreign_key_column_compatibility(&schema).unwrap();
+    }
+
+    #[test]
+    fn fk_schema_fidelity_accepts_different_varchar_lengths_with_matching_collation() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "df_subs_init".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "sub_code".to_string(),
+                        type_name: "varchar(50) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: false,
+                        unique: true,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                },
+                NormalizedTable {
+                    name: "df_pipelines".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "pipeline_sub_code".to_string(),
+                        type_name: "varchar(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "fk_pipeline_sub_code".to_string(),
+                        columns: vec!["pipeline_sub_code".to_string()],
+                        referenced_table: "df_subs_init".to_string(),
+                        referenced_columns: vec!["sub_code".to_string()],
                     }],
                     ..Default::default()
                 },
