@@ -44,6 +44,35 @@ def _manifest_string_list(value: object) -> list[str]:
     return []
 
 
+def _plain_dump_warning(warning: str) -> Optional[str]:
+    text = str(warning or "")
+    lowered = text.lower()
+    if "backup_admin" in lowered or "lock instance for backup" in lowered:
+        return i18n_tr("운영 복구용 완전 일관 Export에 필요한 BACKUP_ADMIN 권한이 없어 제한적 복원 Dump로 저장되었습니다.")
+    if "snapshot consistency is not proven" in lowered:
+        return i18n_tr("Export 중 원본 DB가 변경되었다면 일부 데이터가 서로 다른 시점일 수 있습니다.")
+    if "parallel dump connections cannot share a transaction snapshot" in lowered:
+        return i18n_tr("병렬 Export 작업들이 모두 같은 순간을 기준으로 읽었다고 증명되지 않았습니다.")
+    if "strict parallel snapshot unavailable" in lowered:
+        return i18n_tr("완전히 같은 시점이 보장되는 병렬 Export 조건을 만들 수 없어 제한적 복원 Dump로 저장되었습니다.")
+    if "non-transactional tables" in lowered:
+        return i18n_tr("일부 테이블은 DB 트랜잭션 보호를 받지 않아 완전 일관 Dump로 볼 수 없습니다.")
+    if text:
+        return text
+    return None
+
+
+def _plain_dump_details(items: list[str]) -> list[str]:
+    details: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        detail = _plain_dump_warning(item)
+        if detail and detail not in seen:
+            seen.add(detail)
+            details.append(detail)
+    return details
+
+
 def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tables: int) -> int:
     """Avoid inflated estimated-row progress while table completion proves export is still running."""
     bounded = max(0, min(int(percent), 100))
@@ -823,7 +852,7 @@ class RustDumpExportDialog(QDialog):
         self.combo_consistency_mode.addItem("엄격: 같은 시점이 증명되지 않으면 중단", "strict")
         self.combo_consistency_mode.addItem("제한적: 빠른 병렬 Export, 같은 시점 보장 없음", "limited")
         self.combo_consistency_mode.setToolTip(
-            "자동은 mysqlsh처럼 안전한 병렬 snapshot을 먼저 시도합니다. "
+            "자동은 mysqlsh처럼 모든 테이블을 같은 순간 기준으로 읽는 방식을 먼저 시도합니다. "
             "권한이 부족하면 Export를 실패시키지 않고 제한적 복원 Dump로 저장합니다."
         )
         option_layout.addRow("일관성 모드:", self.combo_consistency_mode)
@@ -2605,20 +2634,18 @@ class RustDumpImportDialog(QDialog):
             requires_limited_confirmation = False
             color = "#e74c3c"
         else:
-            text = i18n_tr("제한적 복원 Dump")
+            text = (
+                f"{i18n_tr('제한적 복원 Dump - Import 가능, 주의 필요')}\n"
+                f"{i18n_tr('Import는 가능하지만, 운영 DB의 완전히 같은 한 시점 백업이라고는 증명되지 않았습니다.')}\n"
+                f"{i18n_tr('Staging 검증은 진행할 수 있고, 운영 복구용 완전 일관 Dump가 필요하면 권한을 보완한 뒤 다시 Export하세요.')}"
+            )
             enable_recommended = True
             requires_limited_confirmation = True
             color = "#f39c12"
 
-        details = []
-        seen_details = set()
-        for item in blockers + warnings:
-            detail = str(item)
-            if detail and detail not in seen_details:
-                seen_details.add(detail)
-                details.append(detail)
+        details = _plain_dump_details(blockers + warnings)
         if details:
-            text = f"{text}: {'; '.join(details)}"
+            text = f"{text}\n{i18n_tr('상세 원인:')} {'; '.join(details)}"
 
         self._compatibility_allows_recommended_import = enable_recommended
         self._dump_restorability_grade = grade
@@ -2701,7 +2728,8 @@ class RustDumpImportDialog(QDialog):
                 "이 Dump는 제한적 복원 Dump입니다.\n\n"
                 "Import는 할 수 있지만, Export 중 원본 DB가 변경되었다면 "
                 "일부 테이블이나 같은 테이블의 일부 조각이 서로 다른 시점일 수 있습니다.\n\n"
-                "운영 복구용으로 완전히 검증된 Dump가 필요하면 strict 조건으로 다시 Export하세요.\n\n"
+                "운영 복구용으로 '모든 데이터를 같은 순간 기준으로 읽었다'는 보장이 필요하면 "
+                "필요 권한을 보완한 뒤 다시 Export하세요.\n\n"
                 "이 한계를 이해하고 제한적 복원으로 Import를 진행할까요?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,

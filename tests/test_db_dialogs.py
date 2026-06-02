@@ -372,6 +372,36 @@ def test_import_dialog_enables_limited_import_with_warning_state(monkeypatch):
     dialog.close()
 
 
+def test_import_dialog_limited_compatibility_uses_plain_language_for_backup_admin(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
+    dialog = RustDumpImportDialog(connector=None)
+    dialog._set_dump_compatibility(
+        {
+            "restorability": "limited_restorable",
+            "warnings": [
+                "snapshot consistency is not proven",
+                "strict parallel snapshot unavailable; exported as limited restore dump: "
+                "mysql strict parallel snapshot requires LOCK INSTANCE FOR BACKUP privilege: "
+                "MySqlError { ERROR 1227 (42000): Access denied; you need (at least one of) "
+                "the BACKUP_ADMIN privilege(s) for this operation }",
+            ],
+            "blockers": [],
+        }
+    )
+
+    text = dialog.lbl_dump_compatibility.text()
+    assert "Import는 가능" in text
+    assert "같은 한 시점" in text
+    assert "서로 다른 시점" in text
+    assert "BACKUP_ADMIN 권한" in text
+    assert "snapshot" not in text
+    assert "strict" not in text
+    assert "MySqlError" not in text
+    assert "ERROR 1227" not in text
+    dialog.close()
+
+
 def test_import_dialog_initial_import_button_disabled_until_compatibility_checked(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))

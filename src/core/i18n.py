@@ -326,17 +326,40 @@ _EN_TEXT_TRANSLATIONS = {
     "이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n{}": "This dump cannot proceed through the recommended import path.\n\n{}",
     "이 Dump는 Import할 수 없습니다.\n\n{}": "This dump cannot be imported.\n\n{}",
     "제한적 복원 Import 확인": "Limited Restore Import Confirmation",
+    "Import는 가능하지만, 운영 DB의 완전히 같은 한 시점 백업이라고는 증명되지 않았습니다.": (
+        "Import is possible, but this is not proven to be a fully same-point-in-time backup of the production DB."
+    ),
+    "제한적 복원 Dump - Import 가능, 주의 필요": "Limited restore dump - import possible, caution required",
+    "Staging 검증은 진행할 수 있고, 운영 복구용 완전 일관 Dump가 필요하면 권한을 보완한 뒤 다시 Export하세요.": (
+        "You can continue with Staging validation. If you need a fully consistent dump for production recovery, add the required privileges and export again."
+    ),
+    "상세 원인:": "Details:",
+    "운영 복구용 완전 일관 Export에 필요한 BACKUP_ADMIN 권한이 없어 제한적 복원 Dump로 저장되었습니다.": (
+        "The BACKUP_ADMIN privilege required for a fully consistent production-recovery export is missing, so this was saved as a limited restore dump."
+    ),
+    "Export 중 원본 DB가 변경되었다면 일부 데이터가 서로 다른 시점일 수 있습니다.": (
+        "If the source DB changed during Export, some data may come from different moments."
+    ),
+    "병렬 Export 작업들이 모두 같은 순간을 기준으로 읽었다고 증명되지 않았습니다.": (
+        "It is not proven that all parallel Export tasks read from the same moment."
+    ),
+    "완전히 같은 시점이 보장되는 병렬 Export 조건을 만들 수 없어 제한적 복원 Dump로 저장되었습니다.": (
+        "The conditions for a parallel Export guaranteed to read from one same moment could not be created, so this was saved as a limited restore dump."
+    ),
+    "일부 테이블은 DB 트랜잭션 보호를 받지 않아 완전 일관 Dump로 볼 수 없습니다.": (
+        "Some tables are not protected by DB transactions, so this cannot be treated as a fully consistent dump."
+    ),
     "일관성 모드:": "Consistency mode:",
     "자동 (권장): 엄격 시도, 권한 부족 시 제한적 Export": "Auto (recommended): try strict, fall back to limited if privileges are missing",
     "엄격: 같은 시점이 증명되지 않으면 중단": "Strict: stop unless the same point in time is proven",
     "제한적: 빠른 병렬 Export, 같은 시점 보장 없음": "Limited: fast parallel Export, same point in time is not guaranteed",
-    "자동은 mysqlsh처럼 안전한 병렬 snapshot을 먼저 시도합니다. 권한이 부족하면 Export를 실패시키지 않고 제한적 복원 Dump로 저장합니다.": (
-        "Auto first tries a safe parallel snapshot like mysqlsh. If privileges are missing, it saves a limited restore dump instead of failing Export."
+    "자동은 mysqlsh처럼 모든 테이블을 같은 순간 기준으로 읽는 방식을 먼저 시도합니다. 권한이 부족하면 Export를 실패시키지 않고 제한적 복원 Dump로 저장합니다.": (
+        "Auto first tries a mysqlsh-like method that reads every table from the same moment. If privileges are missing, it saves a limited restore dump instead of failing Export."
     ),
-    "이 Dump는 제한적 복원 Dump입니다.\n\nImport는 할 수 있지만, Export 중 원본 DB가 변경되었다면 일부 테이블이나 같은 테이블의 일부 조각이 서로 다른 시점일 수 있습니다.\n\n운영 복구용으로 완전히 검증된 Dump가 필요하면 strict 조건으로 다시 Export하세요.\n\n이 한계를 이해하고 제한적 복원으로 Import를 진행할까요?": (
+    "이 Dump는 제한적 복원 Dump입니다.\n\nImport는 할 수 있지만, Export 중 원본 DB가 변경되었다면 일부 테이블이나 같은 테이블의 일부 조각이 서로 다른 시점일 수 있습니다.\n\n운영 복구용으로 '모든 데이터를 같은 순간 기준으로 읽었다'는 보장이 필요하면 필요 권한을 보완한 뒤 다시 Export하세요.\n\n이 한계를 이해하고 제한적 복원으로 Import를 진행할까요?": (
         "This is a limited restore dump.\n\n"
         "It can be imported, but if the source DB changed during Export, some tables or parts of the same table may come from different moments.\n\n"
-        "For production recovery that requires a fully proven dump, export again with strict conditions.\n\n"
+        "If production recovery requires proof that all data was read from the same moment, add the required privileges and export again.\n\n"
         "Do you understand this limit and want to continue with limited restore import?"
     ),
     "알 수 없음": "Unknown",
