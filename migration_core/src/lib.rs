@@ -1850,17 +1850,20 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             .iter()
             .map(|table| table.name.as_str())
             .collect::<BTreeSet<_>>();
-        let exported_table_engines = inspect_mysql_table_engines(conn, &endpoint.database).map(
-            |all_tables| {
+        let exported_table_engines =
+            inspect_mysql_table_engines(conn, &endpoint.database).map(|all_tables| {
                 all_tables
                     .into_iter()
                     .filter(|table| selected_table_names.contains(table.table.as_str()))
                     .collect::<Vec<_>>()
-            },
-        );
+            });
         let all_selected_tables_innodb = exported_table_engines
             .as_ref()
-            .map(|tables| tables.iter().all(|table| table.engine.eq_ignore_ascii_case("innodb")))
+            .map(|tables| {
+                tables
+                    .iter()
+                    .all(|table| table.engine.eq_ignore_ascii_case("innodb"))
+            })
             .unwrap_or(false);
         let use_mysql_strict_parallel_snapshot = consistency_mode != "limited"
             && threads > 1
@@ -1908,144 +1911,150 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             "table_parallel"
         },
     ));
-    let (table_manifests, total_rows, total_chunks, dump_objects) =
-        if endpoint.engine == "mysql" && snapshot_evidence.policy == "transaction_snapshot" {
-            let adapter = mysql_snapshot_adapter
-                .as_mut()
-                .ok_or_else(|| "mysql snapshot adapter was not initialized".to_string())?;
-            let (table_manifests, total_rows, total_chunks) = dump_tables_sequential(
-                adapter,
-                output_path,
-                &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
-                request.request_id.clone(),
-                |event| emit(event),
-            )?;
-            let dump_objects = if let LiveAdapter::MySql(conn) = adapter {
-                capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
-            } else {
-                DumpObjectManifest::default()
-            };
-            (table_manifests, total_rows, total_chunks, dump_objects)
-        } else if endpoint.engine == "mysql"
-            && snapshot_evidence.policy == "lock_synchronized_transaction_snapshot"
-        {
-            match dump_tables_global_mysql_strict_parallel(
-                &endpoint,
-                output_path,
-                &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
-                effective_threads,
-                request.request_id.clone(),
-                |event| emit(event),
-            ) {
-                Ok(result) => result,
-                Err(err) if consistency_mode == "best_effort" => {
-                    snapshot_evidence = MysqlSnapshotEvidence {
+    let (table_manifests, total_rows, total_chunks, dump_objects) = if endpoint.engine == "mysql"
+        && snapshot_evidence.policy == "transaction_snapshot"
+    {
+        let adapter = mysql_snapshot_adapter
+            .as_mut()
+            .ok_or_else(|| "mysql snapshot adapter was not initialized".to_string())?;
+        let (table_manifests, total_rows, total_chunks) = dump_tables_sequential(
+            adapter,
+            output_path,
+            &export_tables,
+            chunk_size,
+            &data_format,
+            &compression,
+            request.request_id.clone(),
+            |event| emit(event),
+        )?;
+        let dump_objects = if let LiveAdapter::MySql(conn) = adapter {
+            capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
+        } else {
+            DumpObjectManifest::default()
+        };
+        (table_manifests, total_rows, total_chunks, dump_objects)
+    } else if endpoint.engine == "mysql"
+        && snapshot_evidence.policy == "lock_synchronized_transaction_snapshot"
+    {
+        match dump_tables_global_mysql_strict_parallel(
+            &endpoint,
+            output_path,
+            &export_tables,
+            chunk_size,
+            &data_format,
+            &compression,
+            effective_threads,
+            request.request_id.clone(),
+            |event| emit(event),
+        ) {
+            Ok(result) => result,
+            Err(err) if consistency_mode == "best_effort" => {
+                snapshot_evidence = MysqlSnapshotEvidence {
                         policy: "not_enforced".to_string(),
                         strict_candidate: false,
                         warnings: vec![format!(
                             "strict parallel snapshot unavailable; exported as limited restore dump: {err}"
                         )],
                     };
-                    dump_tables_global_mysql_limited_with_objects(
-                        &endpoint,
-                        output_path,
-                        &export_tables,
-                        chunk_size,
-                        &data_format,
-                        &compression,
-                        effective_threads,
-                        request.request_id.clone(),
-                        |event| emit(event),
-                    )?
-                }
-                Err(err) => return Err(err),
+                dump_tables_global_mysql_limited_with_objects(
+                    &endpoint,
+                    output_path,
+                    &export_tables,
+                    chunk_size,
+                    &data_format,
+                    &compression,
+                    effective_threads,
+                    request.request_id.clone(),
+                    |event| emit(event),
+                )?
             }
-        } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total == 1 {
-            let (table_manifests, total_rows, total_chunks) = match dump_single_mysql_table_parallel(
-                &endpoint,
-                output_path,
-                &export_tables[0],
-                chunk_size,
-                &data_format,
-                &compression,
-                parallel_limits.range_workers_per_table,
-                request.request_id.clone(),
-                |event| emit(event),
-            )? {
-                Some(result) => result,
-                None => {
-                    let mut adapter = LiveAdapter::connect(&endpoint)?;
-                    dump_tables_sequential(
-                        &mut adapter,
-                        output_path,
-                        &export_tables,
-                        chunk_size,
-                        &data_format,
-                        &compression,
-                        request.request_id.clone(),
-                        |event| emit(event),
-                    )?
-                }
-            };
-            let dump_objects = {
+            Err(err) => return Err(err),
+        }
+    } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total == 1 {
+        let (table_manifests, total_rows, total_chunks) = match dump_single_mysql_table_parallel(
+            &endpoint,
+            output_path,
+            &export_tables[0],
+            chunk_size,
+            &data_format,
+            &compression,
+            parallel_limits.range_workers_per_table,
+            request.request_id.clone(),
+            |event| emit(event),
+        )? {
+            Some(result) => result,
+            None => {
                 let mut adapter = LiveAdapter::connect(&endpoint)?;
-                let LiveAdapter::MySql(conn) = &mut adapter else {
-                    return Err("failed to open mysql dump adapter".to_string());
-                };
-                capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
-            };
-            (table_manifests, total_rows, total_chunks, dump_objects)
-        } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total > 1 {
-            dump_tables_global_mysql_limited_with_objects(
-                &endpoint,
-                output_path,
-                &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
-                effective_threads,
-                request.request_id.clone(),
-                |event| emit(event),
-            )?
-        } else if effective_threads > 1 && table_total > 1 {
-            let (table_manifests, total_rows, total_chunks) = dump_tables_parallel(
-                &endpoint,
-                output_path,
-                &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
-                parallel_limits.table_workers,
-                parallel_limits.range_workers_per_table,
-                request.request_id.clone(),
-                |event| emit(event),
-            )?;
-            (table_manifests, total_rows, total_chunks, DumpObjectManifest::default())
-        } else {
-            let mut adapter = LiveAdapter::connect(&endpoint)?;
-            let (table_manifests, total_rows, total_chunks) = dump_tables_sequential(
-                &mut adapter,
-                output_path,
-                &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
-                request.request_id.clone(),
-                |event| emit(event),
-            )?;
-            let dump_objects = if let LiveAdapter::MySql(conn) = &mut adapter {
-                capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
-            } else {
-                DumpObjectManifest::default()
-            };
-            (table_manifests, total_rows, total_chunks, dump_objects)
+                dump_tables_sequential(
+                    &mut adapter,
+                    output_path,
+                    &export_tables,
+                    chunk_size,
+                    &data_format,
+                    &compression,
+                    request.request_id.clone(),
+                    |event| emit(event),
+                )?
+            }
         };
+        let dump_objects = {
+            let mut adapter = LiveAdapter::connect(&endpoint)?;
+            let LiveAdapter::MySql(conn) = &mut adapter else {
+                return Err("failed to open mysql dump adapter".to_string());
+            };
+            capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
+        };
+        (table_manifests, total_rows, total_chunks, dump_objects)
+    } else if endpoint.engine == "mysql" && effective_threads > 1 && table_total > 1 {
+        dump_tables_global_mysql_limited_with_objects(
+            &endpoint,
+            output_path,
+            &export_tables,
+            chunk_size,
+            &data_format,
+            &compression,
+            effective_threads,
+            request.request_id.clone(),
+            |event| emit(event),
+        )?
+    } else if effective_threads > 1 && table_total > 1 {
+        let (table_manifests, total_rows, total_chunks) = dump_tables_parallel(
+            &endpoint,
+            output_path,
+            &export_tables,
+            chunk_size,
+            &data_format,
+            &compression,
+            parallel_limits.table_workers,
+            parallel_limits.range_workers_per_table,
+            request.request_id.clone(),
+            |event| emit(event),
+        )?;
+        (
+            table_manifests,
+            total_rows,
+            total_chunks,
+            DumpObjectManifest::default(),
+        )
+    } else {
+        let mut adapter = LiveAdapter::connect(&endpoint)?;
+        let (table_manifests, total_rows, total_chunks) = dump_tables_sequential(
+            &mut adapter,
+            output_path,
+            &export_tables,
+            chunk_size,
+            &data_format,
+            &compression,
+            request.request_id.clone(),
+            |event| emit(event),
+        )?;
+        let dump_objects = if let LiveAdapter::MySql(conn) = &mut adapter {
+            capture_mysql_dump_objects(conn, output_path, &endpoint.database)?
+        } else {
+            DumpObjectManifest::default()
+        };
+        (table_manifests, total_rows, total_chunks, dump_objects)
+    };
 
     let result = finish_dump_run_artifact(DumpRunFinishInput {
         request_id: request.request_id.clone(),
@@ -2092,7 +2101,8 @@ struct DumpRunFinishInput<'a> {
 }
 
 fn finish_dump_run_artifact(input: DumpRunFinishInput<'_>) -> Result<Value, String> {
-    let snapshot_enabled = input.snapshot_policy != "not_enforced" && input.snapshot_policy != "unknown";
+    let snapshot_enabled =
+        input.snapshot_policy != "not_enforced" && input.snapshot_policy != "unknown";
     let mut manifest_warnings = input.snapshot_warnings;
     if input.snapshot_policy == "transaction_snapshot" {
         manifest_warnings.push(
@@ -2346,11 +2356,11 @@ fn mysql_show_create_object_ddl(
     let row = conn
         .query_first::<mysql::Row, _>(sql)
         .map_err(|err| format!("mysql {object_type} show create error for {object_name}: {err}"))?
-        .ok_or_else(|| format!("mysql {object_type} show create returned no row for {object_name}"))?;
+        .ok_or_else(|| {
+            format!("mysql {object_type} show create returned no row for {object_name}")
+        })?;
     mysql_show_create_statement_from_row(row).ok_or_else(|| {
-        format!(
-            "mysql {object_type} show create did not return DDL text for {object_name}"
-        )
+        format!("mysql {object_type} show create did not return DDL text for {object_name}")
     })
 }
 
@@ -3223,19 +3233,22 @@ fn dump_tables_global_mysql_strict_parallel<F: FnMut(Value)>(
             let _ = conn.query_drop("ROLLBACK");
         }
         let _ = lock_conn.query_drop("UNLOCK INSTANCE");
-        return Err(format!("mysql strict parallel snapshot unlock error: {err}"));
+        return Err(format!(
+            "mysql strict parallel snapshot unlock error: {err}"
+        ));
     }
 
-    let dump_objects = match capture_mysql_dump_objects(&mut lock_conn, output_path, &endpoint.database) {
-        Ok(objects) => objects,
-        Err(err) => {
-            for conn in worker_conns.iter_mut() {
-                let _ = conn.query_drop("ROLLBACK");
+    let dump_objects =
+        match capture_mysql_dump_objects(&mut lock_conn, output_path, &endpoint.database) {
+            Ok(objects) => objects,
+            Err(err) => {
+                for conn in worker_conns.iter_mut() {
+                    let _ = conn.query_drop("ROLLBACK");
+                }
+                let _ = lock_conn.query_drop("UNLOCK INSTANCE");
+                return Err(err);
             }
-            let _ = lock_conn.query_drop("UNLOCK INSTANCE");
-            return Err(err);
-        }
-    };
+        };
 
     let result = dump_tables_global_mysql_with_snapshot_connections(
         endpoint,
@@ -4332,13 +4345,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     let manifest_hash = dump_manifest_hash(input_path)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
-    let timezone_sql = validated_timezone_sql(
-        request
-            .payload
-            .get("timezone_sql")
-            .and_then(Value::as_str),
-    )?;
-    let session_timezone = import_session_timezone_evidence(&request.payload, timezone_sql.as_deref());
+    let timezone_sql =
+        validated_timezone_sql(request.payload.get("timezone_sql").and_then(Value::as_str))?;
+    let session_timezone =
+        import_session_timezone_evidence(&request.payload, timezone_sql.as_deref());
     let target_engine = adapter.engine().to_string();
     validate_dump_objects_for_restore(
         &manifest.objects,
@@ -4394,7 +4404,9 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                     format!("{err}; existing import progress state requires resume or reset")
                 })?;
                 if !import_progress_state_is_terminal_complete(&existing_state) {
-                    return Err("existing import progress state requires resume or reset".to_string());
+                    return Err(
+                        "existing import progress state requires resume or reset".to_string()
+                    );
                 }
                 emit(json!({
                     "event": "warning",
@@ -4437,10 +4449,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
         if mode == "recreate" && selected.is_empty() && target_engine == "mysql" {
-            reset_import_progress_for_destructive_schema_prep(
-                &progress_path,
-                &mut progress_state,
-            )?;
+            reset_import_progress_for_destructive_schema_prep(&progress_path, &mut progress_state)?;
             let shadow_database = mysql_shadow_schema_name(
                 &endpoint.database,
                 request.request_id.as_deref(),
@@ -4525,10 +4534,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             write_import_progress_state(&progress_path, &progress_state)?;
             return Ok(());
         } else if matches!(mode, "replace" | "recreate") {
-            reset_import_progress_for_destructive_schema_prep(
-                &progress_path,
-                &mut progress_state,
-            )?;
+            reset_import_progress_for_destructive_schema_prep(&progress_path, &mut progress_state)?;
             emit(json!({
                 "event": "phase",
                 "request_id": request.request_id,
@@ -4619,7 +4625,10 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         import_result,
         &[
             ("mysql session sql_mode restore", restore_sql_mode_result),
-            ("mysql session sql_mode post-restore read", sql_mode_after_read_result),
+            (
+                "mysql session sql_mode post-restore read",
+                sql_mode_after_read_result,
+            ),
             ("mysql import session tuning restore", restore_result),
             ("mysql local_infile restore", local_infile_restore_result),
         ],
@@ -4642,7 +4651,12 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             "message": "restoring mysql views, events, routines, and triggers"
         }));
     }
-    let objects_restored = restore_dump_objects(&mut adapter, input_path, &manifest.objects)?;
+    let objects_restored = restore_dump_objects(
+        &mut adapter,
+        input_path,
+        &manifest.objects,
+        mode == "replace",
+    )?;
     progress_state.cleanup_complete = true;
     mark_import_step_completed(&progress_path, &mut progress_state, "load_objects")?;
     let verification_evidence = ImportVerificationEvidence {
@@ -4855,7 +4869,12 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             "strategy": "load_data_local_infile"
         }));
     }
-    Ok((rows_imported, chunks_imported, verified_rows, load_data_warnings))
+    Ok((
+        rows_imported,
+        chunks_imported,
+        verified_rows,
+        load_data_warnings,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4999,7 +5018,9 @@ fn mysql_session_warning_count(conn: &mut mysql::PooledConn) -> Result<u64, Stri
     )
 }
 
-fn mysql_warning_count_from_query_result(result: Result<Option<u64>, String>) -> Result<u64, String> {
+fn mysql_warning_count_from_query_result(
+    result: Result<Option<u64>, String>,
+) -> Result<u64, String> {
     result.map(|value| value.unwrap_or(0))
 }
 
@@ -9556,8 +9577,8 @@ fn validate_dump_objects_for_restore(
         );
     }
     for entry in &objects.objects {
-        let (expected_prefix, expected_order) =
-            expected_dump_object_layout(&entry.object_type).ok_or_else(|| {
+        let (expected_prefix, expected_order) = expected_dump_object_layout(&entry.object_type)
+            .ok_or_else(|| {
                 format!(
                     "dump.import object restore found unsupported object_type: {}",
                     entry.object_type
@@ -9589,6 +9610,7 @@ fn restore_dump_objects(
     adapter: &mut dyn MigrationAdapter,
     input_path: &Path,
     objects: &DumpObjectManifest,
+    replace_existing: bool,
 ) -> Result<u64, String> {
     if objects.objects.is_empty() {
         return Ok(0);
@@ -9612,7 +9634,20 @@ fn restore_dump_objects(
         })?;
         let sql = ddl.trim();
         if sql.is_empty() {
-            return Err(format!("dump object definition is empty: {}", ddl_path.display()));
+            return Err(format!(
+                "dump object definition is empty: {}",
+                ddl_path.display()
+            ));
+        }
+        if replace_existing {
+            if let Some(drop_sql) = dump_object_drop_sql(&entry, sql)? {
+                adapter.execute_sql(&drop_sql).map_err(|err| {
+                    format!(
+                        "failed to drop existing {} {}.{} before restore: {err}",
+                        entry.object_type, entry.schema, entry.name
+                    )
+                })?;
+            }
         }
         adapter.execute_sql(sql).map_err(|err| {
             format!(
@@ -9628,6 +9663,37 @@ fn restore_dump_objects(
     Ok(restored)
 }
 
+fn dump_object_drop_sql(entry: &DumpObjectEntry, ddl: &str) -> Result<Option<String>, String> {
+    let qualified_name = quote_qualified_ident("mysql", &entry.schema, &entry.name);
+    match entry.object_type.as_str() {
+        "view" => Ok(Some(format!("DROP VIEW IF EXISTS {qualified_name}"))),
+        "event" => Ok(Some(format!("DROP EVENT IF EXISTS {qualified_name}"))),
+        "trigger" => Ok(Some(format!("DROP TRIGGER IF EXISTS {qualified_name}"))),
+        "routine" => {
+            let normalized_ddl = ddl
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_ascii_uppercase();
+            if normalized_ddl.contains(" PROCEDURE ")
+                || normalized_ddl.starts_with("CREATE PROCEDURE ")
+            {
+                Ok(Some(format!("DROP PROCEDURE IF EXISTS {qualified_name}")))
+            } else if normalized_ddl.contains(" FUNCTION ")
+                || normalized_ddl.starts_with("CREATE FUNCTION ")
+            {
+                Ok(Some(format!("DROP FUNCTION IF EXISTS {qualified_name}")))
+            } else {
+                Err(format!(
+                    "cannot infer routine type for {} from dump object DDL",
+                    entry.name
+                ))
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 fn dump_import_report_path(input_path: &Path) -> Result<PathBuf, String> {
     let canonical = input_path
         .canonicalize()
@@ -9639,8 +9705,12 @@ fn write_dump_import_report(input_path: &Path, report: &Value) -> Result<(), Str
     let report_path = dump_import_report_path(input_path)?;
     let bytes = serde_json::to_vec_pretty(report)
         .map_err(|err| format!("cannot serialize import report: {err}"))?;
-    fs::write(&report_path, bytes)
-        .map_err(|err| format!("cannot write import report {}: {err}", report_path.display()))
+    fs::write(&report_path, bytes).map_err(|err| {
+        format!(
+            "cannot write import report {}: {err}",
+            report_path.display()
+        )
+    })
 }
 
 fn dump_import_progress_path(input_path: &Path) -> Result<PathBuf, String> {
@@ -9661,8 +9731,7 @@ fn write_import_progress_state(path: &Path, state: &ImportProgressState) -> Resu
         .file_name()
         .and_then(|value| value.to_str())
         .unwrap_or("import_progress.json");
-    let temp_path =
-        path.with_file_name(format!("{file_name}.tmp-{}-{nonce}", std::process::id()));
+    let temp_path = path.with_file_name(format!("{file_name}.tmp-{}-{nonce}", std::process::id()));
     let mut file = File::create(&temp_path).map_err(|err| {
         format!(
             "failed to create import progress temp file {}: {err}",
@@ -9735,7 +9804,10 @@ fn import_progress_state_is_terminal_complete(state: &ImportProgressState) -> bo
         return false;
     }
     let has_data = state.completed_steps.iter().any(|step| step == "load_data");
-    let has_objects = state.completed_steps.iter().any(|step| step == "load_objects");
+    let has_objects = state
+        .completed_steps
+        .iter()
+        .any(|step| step == "load_objects");
     has_data && has_objects
 }
 
@@ -9819,9 +9891,9 @@ fn reset_import_progress_for_destructive_schema_prep(
         changed = true;
     }
     let completed_len = state.completed_steps.len();
-    state.completed_steps.retain(|step| {
-        !matches!(step.as_str(), "load_schema" | "load_data" | "load_objects")
-    });
+    state
+        .completed_steps
+        .retain(|step| !matches!(step.as_str(), "load_schema" | "load_data" | "load_objects"));
     if state.completed_steps.len() != completed_len {
         changed = true;
     }
@@ -11175,7 +11247,8 @@ fn create_table_options(table: &NormalizedTable, target: &str) -> String {
         return String::new();
     }
     let mut sql = String::new();
-    let engine = mysql_identifier_token(table.engine.as_deref()).unwrap_or_else(|| "InnoDB".to_string());
+    let engine =
+        mysql_identifier_token(table.engine.as_deref()).unwrap_or_else(|| "InnoDB".to_string());
     sql.push_str(&format!(" ENGINE={engine}"));
     if let Some(charset) = mysql_identifier_token(table.default_charset.as_deref()) {
         sql.push_str(&format!(" DEFAULT CHARSET={charset}"));
@@ -11792,10 +11865,7 @@ mod tests {
 
         let evidence = classify_mysql_snapshot_strategy(&tables, true, true, 8);
 
-        assert_eq!(
-            evidence.policy,
-            "lock_synchronized_transaction_snapshot"
-        );
+        assert_eq!(evidence.policy, "lock_synchronized_transaction_snapshot");
         assert!(evidence.strict_candidate);
         assert!(evidence.warnings.is_empty());
     }
@@ -11863,11 +11933,8 @@ mod tests {
 
     #[test]
     fn artifact_grading_accepts_lock_synchronized_transaction_snapshot_as_strict() {
-        let manifest = mysql_grade_manifest(
-            "lock_synchronized_transaction_snapshot",
-            true,
-            Vec::new(),
-        );
+        let manifest =
+            mysql_grade_manifest("lock_synchronized_transaction_snapshot", true, Vec::new());
 
         let grade = grade_dump_artifact(&manifest);
 
@@ -11938,7 +12005,10 @@ mod tests {
 
         finalize_dump_manifest_grade(&mut manifest);
 
-        assert_eq!(manifest.restorability, RestorabilityGrade::LimitedRestorable);
+        assert_eq!(
+            manifest.restorability,
+            RestorabilityGrade::LimitedRestorable
+        );
         assert!(!manifest.strict_export);
         assert!(manifest
             .manifest_warnings
@@ -11958,7 +12028,8 @@ mod tests {
 
     #[test]
     fn import_preflight_blocks_not_restorable_manifest() {
-        let mut manifest = mysql_grade_manifest("transaction_snapshot", true, vec!["x".to_string()]);
+        let mut manifest =
+            mysql_grade_manifest("transaction_snapshot", true, vec!["x".to_string()]);
         finalize_dump_manifest_grade(&mut manifest);
 
         let err = validate_dump_import_compatibility(&manifest, true).unwrap_err();
@@ -12234,7 +12305,10 @@ mod tests {
 
         let persisted = read_dump_manifest(&dir).unwrap();
         assert_eq!(persisted.snapshot_policy, "transaction_snapshot");
-        assert_eq!(persisted.restorability, RestorabilityGrade::LimitedRestorable);
+        assert_eq!(
+            persisted.restorability,
+            RestorabilityGrade::LimitedRestorable
+        );
         assert!(!persisted.strict_export);
         assert!(persisted.manifest_warnings.contains(
             &"schema and row count inspection are not covered by the export transaction snapshot"
@@ -12437,9 +12511,8 @@ mod tests {
             switched: false,
             cleanup_complete: false,
         };
-        let err =
-            validate_import_resume_state(&state, "new", "mysql://localhost/app", "replace")
-                .unwrap_err();
+        let err = validate_import_resume_state(&state, "new", "mysql://localhost/app", "replace")
+            .unwrap_err();
         assert!(err.contains("progress file belongs to a different dump manifest"));
     }
 
@@ -12524,7 +12597,10 @@ mod tests {
         assert!(!manifest.strict_export);
         assert!(manifest.manifest_warnings.is_empty());
         assert_eq!(manifest.dump_scope, "schema");
-        assert_eq!(manifest.restorability, RestorabilityGrade::LimitedRestorable);
+        assert_eq!(
+            manifest.restorability,
+            RestorabilityGrade::LimitedRestorable
+        );
         assert!(manifest.blockers.is_empty());
         assert!(manifest.features.unsupported.is_empty());
         assert!(manifest.objects.objects.is_empty());
@@ -12669,7 +12745,11 @@ mod tests {
         ));
         fs::create_dir_all(dir.join("objects")).unwrap();
         fs::create_dir_all(&outside).unwrap();
-        fs::write(outside.join("v_users.sql"), b"CREATE VIEW `v_users` AS SELECT 1").unwrap();
+        fs::write(
+            outside.join("v_users.sql"),
+            b"CREATE VIEW `v_users` AS SELECT 1",
+        )
+        .unwrap();
 
         let traversal_err = dump_manifest_object_path(&dir, "../outside.sql").unwrap_err();
         assert!(traversal_err.contains("unsafe dump object path"));
@@ -14390,16 +14470,52 @@ mod tests {
         };
         let mut adapter = RecordingAdapter::default();
 
-        let restored = restore_dump_objects(&mut adapter, &dir, &manifest).unwrap();
+        let restored = restore_dump_objects(&mut adapter, &dir, &manifest, true).unwrap();
 
         assert_eq!(restored, 3);
         assert_eq!(
             adapter.executed_sql,
             vec![
+                "DROP VIEW IF EXISTS `app`.`v_orders`",
                 "CREATE VIEW `v_orders` AS SELECT 1",
+                "DROP PROCEDURE IF EXISTS `app`.`proc_sync`",
                 "CREATE PROCEDURE `proc_sync`() SELECT 1",
+                "DROP TRIGGER IF EXISTS `app`.`trg_orders_ai`",
                 "CREATE TRIGGER `trg_orders_ai` BEFORE INSERT ON `orders` FOR EACH ROW SET NEW.id = NEW.id",
             ]
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn dump_import_restore_objects_keeps_merge_duplicate_behavior() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-restore-objects-merge-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(dir.join("objects/views")).unwrap();
+        fs::write(
+            dir.join("objects/views/v_orders.sql"),
+            "CREATE VIEW `v_orders` AS SELECT 1",
+        )
+        .unwrap();
+        let manifest = DumpObjectManifest {
+            objects: vec![DumpObjectEntry {
+                object_type: "view".to_string(),
+                schema: "app".to_string(),
+                name: "v_orders".to_string(),
+                path: "objects/views/v_orders.sql".to_string(),
+                restore_order: 10,
+            }],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        let restored = restore_dump_objects(&mut adapter, &dir, &manifest, false).unwrap();
+
+        assert_eq!(restored, 1);
+        assert_eq!(
+            adapter.executed_sql,
+            vec!["CREATE VIEW `v_orders` AS SELECT 1"]
         );
         fs::remove_dir_all(&dir).ok();
     }
@@ -14416,8 +14532,9 @@ mod tests {
             }],
         };
 
-        let err = validate_dump_objects_for_restore(&objects, "mysql", "target_db", true, "replace")
-            .unwrap_err();
+        let err =
+            validate_dump_objects_for_restore(&objects, "mysql", "target_db", true, "replace")
+                .unwrap_err();
 
         assert!(err.contains("does not match target schema"));
     }
@@ -14434,8 +14551,8 @@ mod tests {
             }],
         };
 
-        let err =
-            validate_dump_objects_for_restore(&objects, "mysql", "app", false, "replace").unwrap_err();
+        let err = validate_dump_objects_for_restore(&objects, "mysql", "app", false, "replace")
+            .unwrap_err();
 
         assert!(err.contains("requires full-schema import"));
     }
@@ -14452,8 +14569,8 @@ mod tests {
             }],
         };
 
-        let err =
-            validate_dump_objects_for_restore(&objects, "mysql", "app", true, "recreate").unwrap_err();
+        let err = validate_dump_objects_for_restore(&objects, "mysql", "app", true, "recreate")
+            .unwrap_err();
 
         assert!(err.contains("not supported for recreate mode"));
     }
@@ -14482,8 +14599,9 @@ mod tests {
                 restore_order: 30,
             }],
         };
-        let err = validate_dump_objects_for_restore(&invalid_order, "mysql", "app", true, "replace")
-            .unwrap_err();
+        let err =
+            validate_dump_objects_for_restore(&invalid_order, "mysql", "app", true, "replace")
+                .unwrap_err();
         assert!(err.contains("restore order mismatch"));
 
         let invalid_path = DumpObjectManifest {
@@ -14588,9 +14706,8 @@ mod tests {
                     name: "df_evaluation_results".to_string(),
                     columns: vec![NormalizedColumn {
                         name: "audit_category_code".to_string(),
-                        type_name:
-                            "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
-                                .to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                            .to_string(),
                         default_value: None,
                         nullable: true,
                         primary_key: false,
@@ -15714,7 +15831,10 @@ mod tests {
             Err("import failed".to_string()),
             &[
                 ("sql_mode restore", Err("permission denied".to_string())),
-                ("local_infile restore", Err("global var readonly".to_string())),
+                (
+                    "local_infile restore",
+                    Err("global var readonly".to_string()),
+                ),
             ],
         );
         let err = result.unwrap_err();
