@@ -2874,11 +2874,13 @@ class RustDumpImportDialog(QDialog):
             import_mode = "replace"
         elif self.radio_recreate.isChecked():
             import_mode = "recreate"
+        progress_policy = "reset" if import_mode in {"replace", "recreate"} else "fresh"
 
         # 재시도 시 모드 표시
         if retry_tables:
             self.txt_log.addItem(f"🔄 재시도 모드: {len(retry_tables)}개 테이블")
             import_mode = "merge"  # 재시도 시에는 병합 모드 사용
+            progress_policy = "resume"
 
         # 작업 스레드 시작
         self.worker = RustDumpWorker(
@@ -2887,6 +2889,7 @@ class RustDumpImportDialog(QDialog):
             target_schema=target_schema,
             threads=self.spin_threads.value(),
             import_mode=import_mode,
+            progress_policy=progress_policy,
             timezone_sql=timezone_sql,
             retry_tables=retry_tables,
             strict_manifest=strict_manifest,

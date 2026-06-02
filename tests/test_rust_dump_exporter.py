@@ -627,6 +627,35 @@ def test_import_dump_forwards_progress_policy(tmp_path):
     assert facade.payload["progress_policy"] == "resume"
 
 
+def test_rust_dump_worker_forwards_import_progress_policy(monkeypatch):
+    from src.exporters.rust_dump_exporter import RustDumpConfig
+    from src.ui.workers.rust_dump_worker import RustDumpWorker
+
+    captured = {}
+
+    class FakeImporter:
+        def __init__(self, config):
+            self.config = config
+
+        def import_dump(self, *args, **kwargs):
+            captured["progress_policy"] = kwargs.get("progress_policy")
+            return True, "ok", {}
+
+    monkeypatch.setattr("src.ui.workers.rust_dump_worker.RustDumpImporter", FakeImporter)
+
+    worker = RustDumpWorker(
+        "import",
+        RustDumpConfig("localhost", 3306, "root", "password"),
+        input_dir="dump",
+        target_schema="app",
+        import_mode="replace",
+        progress_policy="reset",
+    )
+    worker.run()
+
+    assert captured["progress_policy"] == "reset"
+
+
 def test_import_dump_forwards_non_strict_manifest_for_limited_import(tmp_path):
     from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
 

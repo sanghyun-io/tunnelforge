@@ -123,6 +123,7 @@ class RustDumpWorker(QThread):
                     self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
                     metadata_callback,
                     table_chunk_progress_callback,
+                    progress_policy=self.kwargs.get('progress_policy', 'fresh'),
                     strict_manifest=self.kwargs.get('strict_manifest', True),
                 )
                 self.import_finished.emit(success, msg, results)

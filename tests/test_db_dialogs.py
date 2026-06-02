@@ -508,6 +508,8 @@ def test_import_dialog_limited_dump_starts_after_confirmation_with_non_strict_ma
     assert question_calls
     assert "제한적 복원" in question_calls[0][0][2]
     assert worker_started["value"] is True
+    assert worker_kwargs["import_mode"] == "replace"
+    assert worker_kwargs["progress_policy"] == "reset"
     assert worker_kwargs["strict_manifest"] is False
     dialog.close()
 
