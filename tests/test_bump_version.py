@@ -24,6 +24,7 @@ from versioning import (
     bump_version,
     compare_versions,
     read_version,
+    sync_installer,
     sync_pyproject,
     write_version,
 )
@@ -50,6 +51,21 @@ def pyproject_file(tmp_path):
     f = tmp_path / "pyproject.toml"
     f.write_text(
         '[build-system]\nrequires = ["setuptools"]\n\n[project]\nname = "tunnelforge"\nversion = "1.11.0"\ndescription = "Test"\n',
+        encoding='utf-8'
+    )
+    return f
+
+
+@pytest.fixture
+def installer_file(tmp_path):
+    """정상적인 Inno Setup(.iss) 형태의 임시 파일."""
+    f = tmp_path / "TunnelForge.iss"
+    f.write_text(
+        '#define MyAppName "TunnelForge"\n'
+        '#define MyAppVersion "1.11.0"\n'
+        '#define MyAppPublisher "sanghyun-io"\n\n'
+        '[Setup]\nAppVersion={#MyAppVersion}\n'
+        'OutputBaseFilename=TunnelForge-Setup-{#MyAppVersion}\n',
         encoding='utf-8'
     )
     return f
@@ -202,6 +218,46 @@ class TestSyncPyproject:
 
 
 # ─────────────────────────────────────────────
+# sync_installer 테스트
+# ─────────────────────────────────────────────
+
+class TestSyncInstaller:
+    def test_updates_version(self, installer_file):
+        sync_installer(installer_file, "1.11.1")
+        content = installer_file.read_text(encoding='utf-8')
+        assert '#define MyAppVersion "1.11.1"' in content
+
+    def test_preserves_other_defines(self, installer_file):
+        sync_installer(installer_file, "1.11.1")
+        content = installer_file.read_text(encoding='utf-8')
+        assert '#define MyAppName "TunnelForge"' in content
+        assert '#define MyAppPublisher "sanghyun-io"' in content
+        # {#MyAppVersion} 참조는 그대로 보존되어야 한다 (값만 바뀜)
+        assert 'AppVersion={#MyAppVersion}' in content
+        assert 'OutputBaseFilename=TunnelForge-Setup-{#MyAppVersion}' in content
+
+    def test_does_not_duplicate(self, installer_file):
+        sync_installer(installer_file, "1.11.1")
+        content = installer_file.read_text(encoding='utf-8')
+        assert content.count('#define MyAppVersion "1.11.1"') == 1
+
+    def test_minor_bump_version(self, installer_file):
+        sync_installer(installer_file, "2.1.0")
+        content = installer_file.read_text(encoding='utf-8')
+        assert '#define MyAppVersion "2.1.0"' in content
+
+    def test_missing_define_raises(self, tmp_path):
+        f = tmp_path / "bad.iss"
+        f.write_text('#define MyAppName "X"\n', encoding='utf-8')
+        with pytest.raises(ValueError):
+            sync_installer(f, "1.0.0")
+
+    def test_file_not_found_raises(self, tmp_path):
+        with pytest.raises(FileNotFoundError):
+            sync_installer(tmp_path / "nonexistent.iss", "1.0.0")
+
+
+# ─────────────────────────────────────────────
 # compare_versions 테스트
 # ─────────────────────────────────────────────
 
@@ -279,6 +335,30 @@ class TestBumpVersionCLI:
     def test_invalid_bump_type_exit_nonzero(self):
         code, _, _ = self.run_cli("--bump-type", "invalid")
         assert code != 0
+
+    def test_real_bump_syncs_all_three_files(self, tmp_path):
+        """실제 bump 시 version.py / pyproject.toml / .iss 세 파일이 모두 동기화되어야 한다.
+
+        워크트리 실제 파일을 건드리지 않도록 임시 경로를 인자로 전달한다.
+        """
+        vf = tmp_path / "version.py"
+        vf.write_text('__version__ = "2.1.0"\n', encoding='utf-8')
+        pf = tmp_path / "pyproject.toml"
+        pf.write_text('[project]\nname = "x"\nversion = "2.1.0"\n', encoding='utf-8')
+        isf = tmp_path / "TunnelForge.iss"
+        isf.write_text('#define MyAppVersion "2.1.0"\n', encoding='utf-8')
+
+        code, stdout, stderr = self.run_cli(
+            "--bump-type", "patch",
+            "--version-file", str(vf),
+            "--pyproject-file", str(pf),
+            "--installer-file", str(isf),
+        )
+        assert code == 0, stderr
+        assert "new_version=2.1.1" in stdout
+        assert '__version__ = "2.1.1"' in vf.read_text(encoding='utf-8')
+        assert 'version = "2.1.1"' in pf.read_text(encoding='utf-8')
+        assert '#define MyAppVersion "2.1.1"' in isf.read_text(encoding='utf-8')
 
     def test_help_exit_zero(self):
         code, _, _ = self.run_cli("--help")

@@ -278,6 +278,14 @@ pub struct DumpManifest {
     #[serde(default)]
     pub objects: DumpObjectManifest,
     pub tables: Vec<DumpTableManifest>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub views: Vec<NormalizedView>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedView {
+    pub name: String,
+    pub definition: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -2151,6 +2159,7 @@ fn finish_dump_run_artifact(input: DumpRunFinishInput<'_>) -> Result<Value, Stri
         blockers: Vec::new(),
         objects: input.dump_objects,
         tables: input.table_manifests,
+        views: Vec::new(),
     };
     finalize_dump_manifest_grade(&mut manifest);
     write_dump_manifest(input.output_path, &manifest)?;
@@ -2180,6 +2189,7 @@ fn dump_run_result_payload(
         "format_version": manifest.format_version,
         "compression": &manifest.compression,
         "tables": manifest.tables.len(),
+        "views": manifest.objects.objects.iter().filter(|object| object.object_type == "view").count() + manifest.views.len(),
         "rows_dumped": total_rows,
         "chunks_dumped": total_chunks,
         "restorability": &manifest.restorability,
@@ -4701,6 +4711,21 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     });
     write_dump_import_report(input_path, &import_report)?;
 
+    // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
+    // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
+    let view_outcome = if selected.is_empty() && !manifest.views.is_empty() {
+        import_views(
+            &mut adapter,
+            &manifest,
+            &target_engine,
+            mode,
+            request.request_id.clone(),
+            &mut emit,
+        )
+    } else {
+        ViewImportOutcome::default()
+    };
+
     Ok(json!({
         "event": "result",
         "request_id": request.request_id,
@@ -4722,8 +4747,145 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             "row_counts": "passed",
             "strict_manifest": strict_manifest,
             "warnings": manifest_warnings
-        }
+        },
+        "views_imported": view_outcome.imported,
+        "views_failed": view_outcome.failed,
+        "views_skipped_cross_engine": view_outcome.skipped_cross_engine
     }))
+}
+
+#[derive(Debug, Default)]
+struct ViewImportOutcome {
+    imported: Vec<String>,
+    failed: Vec<Value>,
+    skipped_cross_engine: Vec<String>,
+}
+
+/// manifest의 View들을 대상 DB에 생성한다.
+/// - source/target 엔진이 다르면 정의 SQL이 호환되지 않으므로 전부 skip.
+/// - View 간 의존성 순서 문제를 fixpoint 재시도 루프로 해결한다.
+/// - 각 View 실패는 non-fatal: 결과에 모아 보고만 한다.
+fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
+    adapter: &mut A,
+    manifest: &DumpManifest,
+    target_engine: &str,
+    mode: &str,
+    request_id: Option<String>,
+    mut emit: F,
+) -> ViewImportOutcome {
+    let mut outcome = ViewImportOutcome::default();
+
+    if manifest.source_engine != target_engine {
+        outcome.skipped_cross_engine = manifest.views.iter().map(|v| v.name.clone()).collect();
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": format!(
+                "크로스 엔진 import: View {}개는 정의 비호환으로 건너뜁니다 ({} -> {})",
+                outcome.skipped_cross_engine.len(),
+                manifest.source_engine,
+                target_engine
+            ),
+        }));
+        return outcome;
+    }
+
+    // 정화 + 단일 CREATE VIEW 문 검증. 검증 실패한 정의는 실행하지 않고 즉시 failed로 보고한다.
+    // (변조된 manifest가 multi-statement SQL 체인을 심는 것을 차단 — 특히 PostgreSQL batch_execute 경로)
+    let mut pending: Vec<(String, String)> = Vec::with_capacity(manifest.views.len());
+    let mut validated_names: Vec<&str> = Vec::with_capacity(manifest.views.len());
+    for view in &manifest.views {
+        let sanitized =
+            sanitize_view_definition(&view.definition, &manifest.database, target_engine);
+        // shape 검증(단일 CREATE ... VIEW 문) + MySQL DEFINER/SQL SECURITY 잔존 fail-closed.
+        let validation = validate_single_view_statement(&sanitized).and_then(|()| {
+            if target_engine == "mysql" && mysql_definition_has_residual_definer(&sanitized) {
+                Err("residual DEFINER/SQL SECURITY DEFINER clause after sanitization".to_string())
+            } else {
+                Ok(())
+            }
+        });
+        match validation {
+            Ok(()) => {
+                validated_names.push(&view.name);
+                pending.push((view.name.clone(), sanitized));
+            }
+            Err(reason) => {
+                outcome
+                    .failed
+                    .push(json!({ "name": view.name, "error": format!("rejected: {reason}") }));
+                emit(json!({
+                    "event": "phase",
+                    "request_id": request_id,
+                    "phase": "dump_import",
+                    "message": format!("View '{}' 거부됨 (안전하지 않은 정의): {reason}", view.name),
+                }));
+            }
+        }
+    }
+
+    // replace/recreate 모드면 기존 View를 먼저 정리한다 (테이블이 아닌 View 전용 DROP).
+    // 검증을 통과한 View만 DROP 대상으로 삼는다.
+    if matches!(mode, "replace" | "recreate") {
+        for name in &validated_names {
+            let _ = adapter.execute_sql(&drop_view_sql(target_engine, name));
+        }
+    }
+
+    // fixpoint 루프: 한 바퀴에 하나도 성공하지 못하면 중단한다.
+    let mut last_errors: BTreeMap<String, String> = BTreeMap::new();
+    loop {
+        let mut progressed = false;
+        let mut still_pending: Vec<(String, String)> = Vec::new();
+        for (name, sql) in pending.drain(..) {
+            match adapter.execute_sql(&sql) {
+                Ok(()) => {
+                    progressed = true;
+                    last_errors.remove(&name);
+                    outcome.imported.push(name.clone());
+                    emit(json!({
+                        "event": "table_progress",
+                        "request_id": request_id,
+                        "table": name,
+                        "status": "completed",
+                        "kind": "view"
+                    }));
+                }
+                Err(err) => {
+                    last_errors.insert(name.clone(), err);
+                    still_pending.push((name, sql));
+                }
+            }
+        }
+        pending = still_pending;
+        if pending.is_empty() || !progressed {
+            break;
+        }
+    }
+
+    for (name, _sql) in pending {
+        let error = last_errors
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| "unknown error".to_string());
+        outcome.failed.push(json!({ "name": name, "error": error }));
+    }
+
+    if !outcome.failed.is_empty() {
+        emit(json!({
+            "event": "phase",
+            "request_id": request_id,
+            "phase": "dump_import",
+            "message": format!(
+                "View {}개 생성 성공, {}개 실패 (데이터 import는 정상 완료)",
+                outcome.imported.len(),
+                outcome.failed.len()
+            ),
+        }));
+    }
+
+    outcome
 }
 
 fn import_mysql_tsv_table<F: FnMut(Value)>(
@@ -6262,6 +6424,254 @@ fn inspect_postgresql_unsupported_objects(
     );
 
     Ok(objects)
+}
+
+/// import 시점에 View 정의 SQL을 정화한다.
+/// - MySQL `DEFINER=...` 절 제거 (대상 서버에 해당 유저가 없으면 view가 깨짐)
+/// - `SQL SECURITY DEFINER` → `SQL SECURITY INVOKER` (case-insensitive)
+/// - 원본 schema 한정자(`source_db`.) 제거 (대상 schema가 다를 수 있음)
+///
+/// SQL 키워드는 대소문자를 구분하지 않으므로 DEFINER/SQL SECURITY 처리는 case-insensitive로 수행한다.
+fn sanitize_view_definition(definition: &str, source_schema: &str, engine: &str) -> String {
+    let mut sql = definition.to_string();
+    if engine == "mysql" {
+        sql = strip_mysql_definer(&sql);
+        sql = replace_ignore_ascii_case(&sql, "SQL SECURITY DEFINER", "SQL SECURITY INVOKER");
+    }
+    if !source_schema.trim().is_empty() {
+        // `source_db`.`obj` → `obj`  (quote_ident 기준 인용 문자 사용)
+        let quoted_db = quote_ident(engine, source_schema);
+        sql = sql.replace(&format!("{quoted_db}."), "");
+    }
+    sql
+}
+
+/// `needle`(ASCII 대소문자 무시)을 모두 `replacement`로 치환한다.
+/// `needle` 안의 내부 공백은 정확히 한 칸으로 가정한다 (SQL 키워드 정규형).
+fn replace_ignore_ascii_case(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let lower_haystack = haystack.to_ascii_lowercase();
+    let lower_needle = needle.to_ascii_lowercase();
+    let mut result = String::with_capacity(haystack.len());
+    let mut cursor = 0;
+    while let Some(rel) = lower_haystack[cursor..].find(&lower_needle) {
+        let start = cursor + rel;
+        result.push_str(&haystack[cursor..start]);
+        result.push_str(replacement);
+        cursor = start + needle.len();
+    }
+    result.push_str(&haystack[cursor..]);
+    result
+}
+
+/// `CREATE ALGORITHM=... DEFINER=\`u\`@\`h\` SQL SECURITY ... VIEW` 에서 DEFINER 절만 제거한다.
+/// `DEFINER=` 키워드 매칭은 case-insensitive로 수행한다.
+fn strip_mysql_definer(sql: &str) -> String {
+    let lower = sql.to_ascii_lowercase();
+    let Some(start) = lower.find("definer=") else {
+        return sql.to_string();
+    };
+    // DEFINER= 다음부터 공백을 만나기 전까지가 한 토큰 (`user`@`host` 또는 CURRENT_USER 등).
+    // 백틱 안에 공백이 들어갈 수 있으므로 백틱 균형을 추적한다.
+    let bytes = sql.as_bytes();
+    let mut idx = start + "DEFINER=".len();
+    let mut in_backtick = false;
+    while idx < bytes.len() {
+        let ch = bytes[idx];
+        if ch == b'`' {
+            in_backtick = !in_backtick;
+        } else if ch == b' ' && !in_backtick {
+            break;
+        }
+        idx += 1;
+    }
+    // start 직전의 공백 하나도 함께 제거하여 "CREATE  SQL SECURITY" 처럼 이중 공백이 남지 않게 한다.
+    let prefix_end = sql[..start].trim_end().len();
+    // idx 위치의 공백은 남겨 토큰 구분을 유지한다.
+    let mut result = String::with_capacity(sql.len());
+    result.push_str(&sql[..prefix_end]);
+    result.push_str(&sql[idx..]);
+    result
+}
+
+fn drop_view_sql(engine: &str, view: &str) -> String {
+    format!("DROP VIEW IF EXISTS {}", quote_ident(engine, view))
+}
+
+/// sanitize 후에도 MySQL 정의에 `DEFINER=` 또는 `SQL SECURITY DEFINER`가 남아있는지 검사한다.
+/// 정상 경로(`SHOW CREATE VIEW`의 대문자/단일공백 정규화 출력)는 sanitize가 모두 처리하므로
+/// 여기서 잔존이 감지된다는 것은 탭/주석을 끼운 비정규(변조 의심) 정의라는 뜻 → fail-closed로 거부한다.
+fn mysql_definition_has_residual_definer(sql: &str) -> bool {
+    // 주석(-- 라인, /* */ 블록)을 공백으로 치환하고, 모든 공백류를 단일 공백으로 정규화한 검사용 사본.
+    let mut cleaned = String::with_capacity(sql.len());
+    let bytes = sql.as_bytes();
+    let len = bytes.len();
+    let mut i = 0;
+    while i < len {
+        if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+            i += 2;
+            while i < len && bytes[i] != b'\n' {
+                i += 1;
+            }
+            cleaned.push(' ');
+        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+            i += 2;
+            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                i += 1;
+            }
+            i += 2;
+            cleaned.push(' ');
+        } else {
+            cleaned.push(bytes[i] as char);
+            i += 1;
+        }
+    }
+    let normalized = cleaned
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase();
+    // "definer =" (공백 포함) 및 "definer=" 모두 잡기 위해 공백 제거 사본도 확인.
+    let no_space = normalized.replace(' ', "");
+    no_space.contains("definer=") || normalized.contains("sql security definer")
+}
+
+/// View 정의가 단일 `CREATE [OR REPLACE] VIEW ...` 문인지 가볍게 검증한다.
+///
+/// 주목적은 PostgreSQL `batch_execute` 경로다 — 이 드라이버는 세미콜론으로 구분된
+/// multi-statement를 모두 실행하므로, 변조된 manifest가 `CREATE VIEW x AS ...; DROP TABLE y; GRANT ...`
+/// 같은 SQL 체인을 심으면 그대로 실행된다. MySQL `query_drop`은 기본적으로 multi-statement를
+/// 거부하지만, 일관성과 방어를 위해 양쪽 엔진 모두에 동일한 shape 검증을 적용한다.
+///
+/// 허용: 문자열 리터럴/식별자/주석 바깥의 세미콜론이 끝에만(또는 없음) 존재하고,
+/// 첫 유효 토큰이 `CREATE`인 경우. 그 외(추가 statement, CREATE 아닌 시작)는 거부한다.
+fn validate_single_view_statement(sql: &str) -> Result<(), String> {
+    let trimmed = sql.trim();
+    if trimmed.is_empty() {
+        return Err("empty view definition".to_string());
+    }
+
+    // 문자열 리터럴('...'), 식별자 인용(`...` / "..."), 주석(-- , /* */) 바깥의 세미콜론을 찾는다.
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    let len = bytes.len();
+    while i < len {
+        let ch = bytes[i];
+        match ch {
+            b'\'' => {
+                // 작은따옴표 문자열 — '' escape 처리
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'\'' {
+                        if i + 1 < len && bytes[i + 1] == b'\'' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < len {
+                    if bytes[i] == b'"' {
+                        if i + 1 < len && bytes[i + 1] == b'"' {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'`' => {
+                i += 1;
+                while i < len && bytes[i] != b'`' {
+                    i += 1;
+                }
+            }
+            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
+                // 라인 주석
+                i += 2;
+                while i < len && bytes[i] != b'\n' {
+                    i += 1;
+                }
+            }
+            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
+                // 블록 주석
+                i += 2;
+                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
+                    i += 1;
+                }
+                i += 2;
+            }
+            b';' => {
+                // 끝에 오는 세미콜론(뒤에 공백만 남음)은 허용, 그 외는 추가 statement로 간주.
+                let rest = trimmed[i + 1..].trim();
+                if rest.is_empty() {
+                    break;
+                }
+                return Err("view definition contains multiple statements".to_string());
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    // CREATE [OR REPLACE] [TEMP|TEMPORARY] [ALGORITHM=..] [DEFINER=..] [SQL SECURITY ..] VIEW 형태인지 확인.
+    // 단순히 첫 토큰이 CREATE 인 것만으로는 부족하다 — CREATE USER / CREATE TABLE AS SELECT 같은
+    // 단일 statement도 통과해버리므로, 반드시 view-modifier 뒤에 VIEW 키워드가 와야 한다.
+    let tokens: Vec<&str> = trimmed
+        .split(|c: char| c.is_whitespace())
+        .filter(|t| !t.is_empty())
+        .collect();
+    let mut iter = tokens.iter();
+    match iter.next() {
+        Some(tok) if tok.eq_ignore_ascii_case("create") => {}
+        Some(tok) => {
+            return Err(format!(
+                "view definition must start with CREATE, got: {tok}"
+            ))
+        }
+        None => return Err("empty view definition".to_string()),
+    }
+    // CREATE 와 VIEW 사이에 올 수 있는 view-modifier 토큰만 허용한다.
+    // (sanitize 후 DEFINER 절은 제거되지만, 다른 형태를 대비해 보수적으로 허용 목록을 둔다)
+    let mut saw_view = false;
+    while let Some(tok) = iter.next() {
+        if tok.eq_ignore_ascii_case("view") {
+            saw_view = true;
+            break;
+        }
+        let lower = tok.to_ascii_lowercase();
+        let allowed = lower == "or"
+            || lower == "replace"
+            || lower == "temp"
+            || lower == "temporary"
+            || lower == "recursive"
+            || lower == "security"
+            || lower == "invoker"
+            || lower == "definer"
+            || lower == "undefined"
+            || lower == "merge"
+            || lower == "temptable"
+            || lower == "sql"
+            || lower.starts_with("algorithm=")
+            || lower.starts_with("definer=")
+            || lower == "=";
+        if !allowed {
+            return Err(format!(
+                "view definition must be CREATE ... VIEW, unexpected token before VIEW: {tok}"
+            ));
+        }
+    }
+    if !saw_view {
+        return Err("view definition must contain the VIEW keyword".to_string());
+    }
+    Ok(())
 }
 
 fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
@@ -11767,6 +12177,7 @@ mod tests {
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
             tables: Vec::new(),
+            views: Vec::new(),
         }
     }
 
@@ -12099,6 +12510,7 @@ mod tests {
                 chunks: 0,
                 chunk_sha256: BTreeMap::new(),
             }],
+            views: Vec::new(),
         };
         finalize_dump_manifest_grade(&mut manifest);
         write_dump_manifest(&dir, &manifest).unwrap();
@@ -12457,6 +12869,7 @@ mod tests {
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -12659,6 +13072,7 @@ mod tests {
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "../outside".to_string(),
@@ -12717,6 +13131,7 @@ mod tests {
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -12798,6 +13213,7 @@ mod tests {
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -12843,6 +13259,7 @@ mod tests {
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
+            views: Vec::new(),
             tables: vec![DumpTableManifest {
                 name: "users".to_string(),
                 path: "0001_users".to_string(),
@@ -12972,6 +13389,7 @@ mod tests {
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
+            views: Vec::new(),
             tables: Vec::new(),
         };
 
@@ -13007,6 +13425,7 @@ mod tests {
             restorability: RestorabilityGrade::LimitedRestorable,
             blockers: Vec::new(),
             objects: DumpObjectManifest::default(),
+            views: Vec::new(),
             tables: Vec::new(),
         };
         write_dump_manifest(&dir, &manifest).unwrap();
@@ -16442,5 +16861,238 @@ mod tests {
         };
 
         assert_eq!(next_table_to_copy(&state), Some("orders".to_string()));
+    }
+
+    #[test]
+    fn strip_mysql_definer_removes_definer_clause() {
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `v` AS select 1";
+        let stripped = strip_mysql_definer(sql);
+        assert!(!stripped.contains("DEFINER="));
+        assert!(stripped.contains("CREATE ALGORITHM=UNDEFINED"));
+        assert!(stripped.contains("SQL SECURITY DEFINER VIEW `v` AS select 1"));
+    }
+
+    #[test]
+    fn strip_mysql_definer_handles_current_user_form() {
+        let sql = "CREATE DEFINER=CURRENT_USER VIEW `v` AS select 1";
+        let stripped = strip_mysql_definer(sql);
+        assert_eq!(stripped, "CREATE VIEW `v` AS select 1");
+    }
+
+    #[test]
+    fn strip_mysql_definer_noop_without_definer() {
+        let sql = "CREATE VIEW `v` AS select 1";
+        assert_eq!(strip_mysql_definer(sql), sql);
+    }
+
+    #[test]
+    fn sanitize_view_definition_strips_definer_security_and_source_schema() {
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER \
+                   VIEW `ref_vendor_codes_view` AS select * from `dataflare`.`vendor_codes`";
+        let out = sanitize_view_definition(sql, "dataflare", "mysql");
+        assert!(!out.contains("DEFINER="));
+        assert!(out.contains("SQL SECURITY INVOKER"));
+        assert!(!out.contains("`dataflare`."));
+        assert!(out.contains("from `vendor_codes`"));
+    }
+
+    #[test]
+    fn sanitize_view_definition_postgresql_strips_source_schema_only() {
+        let sql = "CREATE OR REPLACE VIEW \"v\" AS SELECT * FROM \"app\".\"users\"";
+        let out = sanitize_view_definition(sql, "app", "postgresql");
+        // PG는 DEFINER/SQL SECURITY 처리를 하지 않는다.
+        assert!(out.contains("SELECT * FROM \"users\""));
+        assert!(!out.contains("\"app\"."));
+    }
+
+    #[test]
+    fn drop_view_sql_uses_drop_view() {
+        assert_eq!(drop_view_sql("mysql", "v"), "DROP VIEW IF EXISTS `v`");
+        assert_eq!(
+            drop_view_sql("postgresql", "v"),
+            "DROP VIEW IF EXISTS \"v\""
+        );
+    }
+
+    #[test]
+    fn dump_manifest_without_views_field_deserializes_to_empty() {
+        // 기존(v1/v2) dump에는 views 필드가 없다 — serde(default)로 빈 Vec이 되어야 한다.
+        let json = r#"{
+            "format": "tunnelforge-dump",
+            "format_version": 2,
+            "data_format": "tsv",
+            "compression": "zstd",
+            "source_engine": "mysql",
+            "database": "app",
+            "schema": {"tables": []},
+            "chunk_size": 50000,
+            "created_unix_seconds": 1,
+            "tables": []
+        }"#;
+        let manifest: DumpManifest = serde_json::from_str(json).expect("parse legacy manifest");
+        assert!(manifest.views.is_empty());
+    }
+
+    #[test]
+    fn dump_manifest_with_views_round_trips() {
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            source_engine: "mysql".to_string(),
+            source_version: None,
+            database: "app".to_string(),
+            schema: NormalizedSchema::default(),
+            chunk_size: 50000,
+            created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
+            tables: Vec::new(),
+            views: vec![NormalizedView {
+                name: "ref_vendor_codes_view".to_string(),
+                definition: "CREATE VIEW `ref_vendor_codes_view` AS select 1".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        assert!(json.contains("ref_vendor_codes_view"));
+        let parsed: DumpManifest = serde_json::from_str(&json).expect("parse");
+        assert_eq!(parsed.views, manifest.views);
+    }
+
+    #[test]
+    fn empty_views_are_skipped_in_serialization() {
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "zstd".to_string(),
+            source_engine: "mysql".to_string(),
+            source_version: None,
+            database: "app".to_string(),
+            schema: NormalizedSchema::default(),
+            chunk_size: 50000,
+            created_unix_seconds: 1,
+            snapshot_policy: "unknown".to_string(),
+            strict_export: false,
+            manifest_warnings: Vec::new(),
+            dump_scope: "schema".to_string(),
+            features: DumpFeatureSet::default(),
+            restorability: RestorabilityGrade::LimitedRestorable,
+            blockers: Vec::new(),
+            objects: DumpObjectManifest::default(),
+            tables: Vec::new(),
+            views: Vec::new(),
+        };
+        let json = serde_json::to_string(&manifest).expect("serialize");
+        // skip_serializing_if 로 빈 views는 직렬화되지 않아 기존 dump와 바이트 호환.
+        assert!(!json.contains("\"views\""));
+    }
+
+    #[test]
+    fn strip_mysql_definer_is_case_insensitive() {
+        let sql = "create definer=`root`@`localhost` sql security definer view `v` as select 1";
+        let stripped = strip_mysql_definer(sql);
+        assert!(!stripped.to_ascii_lowercase().contains("definer="));
+        assert!(stripped.contains("sql security definer view `v` as select 1"));
+    }
+
+    #[test]
+    fn sanitize_view_definition_lowercase_security_clause_becomes_invoker() {
+        // 변조/비정규 정의: 소문자 sql security definer 도 INVOKER 로 바뀌어야 한다.
+        let sql = "CREATE sql security definer VIEW `leak` AS SELECT 1";
+        let out = sanitize_view_definition(sql, "", "mysql");
+        assert!(out.contains("SQL SECURITY INVOKER"));
+        assert!(!out.to_ascii_lowercase().contains("security definer"));
+    }
+
+    #[test]
+    fn replace_ignore_ascii_case_replaces_all_case_variants() {
+        let out = replace_ignore_ascii_case("a FOO b foo c FoO", "foo", "X");
+        assert_eq!(out, "a X b X c X");
+    }
+
+    #[test]
+    fn validate_single_view_statement_accepts_plain_create_view() {
+        assert!(validate_single_view_statement("CREATE VIEW `v` AS SELECT 1").is_ok());
+        assert!(
+            validate_single_view_statement("create or replace view \"v\" as select 1;").is_ok()
+        );
+    }
+
+    #[test]
+    fn validate_single_view_statement_rejects_multi_statement() {
+        let sql = "CREATE VIEW \"v\" AS SELECT 1; DROP TABLE customers";
+        let err = validate_single_view_statement(sql).unwrap_err();
+        assert!(err.contains("multiple statements"));
+    }
+
+    #[test]
+    fn validate_single_view_statement_rejects_non_create_start() {
+        let err = validate_single_view_statement("DROP TABLE customers").unwrap_err();
+        assert!(err.contains("must start with CREATE"));
+    }
+
+    #[test]
+    fn validate_single_view_statement_rejects_create_non_view() {
+        // CREATE 로 시작하지만 VIEW가 아닌 단일 statement는 거부해야 한다.
+        assert!(validate_single_view_statement("CREATE USER attacker IDENTIFIED BY 'p'").is_err());
+        assert!(
+            validate_single_view_statement("CREATE TABLE stolen AS SELECT * FROM secrets").is_err()
+        );
+        let err = validate_single_view_statement("CREATE DATABASE evil").unwrap_err();
+        assert!(err.contains("VIEW"));
+    }
+
+    #[test]
+    fn validate_single_view_statement_accepts_view_with_modifiers() {
+        // MySQL SHOW CREATE VIEW 정규 출력(정화 후) 형태
+        assert!(validate_single_view_statement(
+            "CREATE ALGORITHM=UNDEFINED SQL SECURITY INVOKER VIEW `v` AS select 1"
+        )
+        .is_ok());
+        assert!(validate_single_view_statement("CREATE OR REPLACE VIEW \"v\" AS SELECT 1").is_ok());
+    }
+
+    #[test]
+    fn mysql_residual_definer_detects_tab_and_comment_variants() {
+        // sanitize가 놓칠 수 있는 비정규 변형들 — fail-closed로 거부되어야 한다.
+        assert!(mysql_definition_has_residual_definer(
+            "CREATE SQL\tSECURITY\tDEFINER VIEW `v` AS SELECT 1"
+        ));
+        assert!(mysql_definition_has_residual_definer(
+            "CREATE SQL/**/SECURITY/**/DEFINER VIEW `v` AS SELECT 1"
+        ));
+        assert!(mysql_definition_has_residual_definer(
+            "CREATE DEFINER = `root`@`localhost` VIEW `v` AS SELECT 1"
+        ));
+    }
+
+    #[test]
+    fn mysql_residual_definer_clean_after_sanitize_is_false() {
+        // 정상 정의를 sanitize 하면 잔존 DEFINER가 없어야 한다.
+        let sql = "CREATE ALGORITHM=UNDEFINED DEFINER=`root`@`localhost` SQL SECURITY DEFINER \
+                   VIEW `v` AS SELECT 1";
+        let sanitized = sanitize_view_definition(sql, "", "mysql");
+        assert!(!mysql_definition_has_residual_definer(&sanitized));
+    }
+
+    #[test]
+    fn validate_single_view_statement_allows_semicolon_inside_string_literal() {
+        // SELECT 본문의 문자열 리터럴 안 세미콜론은 statement 구분자가 아니다.
+        let sql = "CREATE VIEW `v` AS SELECT 'a;b' AS s";
+        assert!(validate_single_view_statement(sql).is_ok());
+    }
+
+    #[test]
+    fn validate_single_view_statement_ignores_semicolon_in_comment() {
+        let sql = "CREATE VIEW `v` AS SELECT 1 -- drop; me\n";
+        assert!(validate_single_view_statement(sql).is_ok());
     }
 }
