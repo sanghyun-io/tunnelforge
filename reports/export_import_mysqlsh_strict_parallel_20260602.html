@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <title>Export/Import Strict Parallel 개선 보고서 - 2026-06-02</title>
+  <style>
+    body { font-family: "Segoe UI", "Malgun Gothic", sans-serif; margin: 32px; color: #1f2937; line-height: 1.55; }
+    h1 { font-size: 24px; margin-bottom: 8px; }
+    h2 { font-size: 18px; margin-top: 28px; border-bottom: 1px solid #d1d5db; padding-bottom: 6px; }
+    code { background: #f3f4f6; padding: 1px 4px; border-radius: 4px; }
+    table { border-collapse: collapse; width: 100%; margin: 12px 0; }
+    th, td { border: 1px solid #d1d5db; padding: 8px; text-align: left; vertical-align: top; }
+    th { background: #f9fafb; }
+    .ok { color: #047857; font-weight: 600; }
+    .warn { color: #b45309; font-weight: 600; }
+    .bad { color: #b91c1c; font-weight: 600; }
+  </style>
+</head>
+<body>
+  <h1>Export/Import Strict Parallel 개선 보고서</h1>
+  <p>작성일: 2026-06-02</p>
+
+  <h2>핵심 결론</h2>
+  <p>
+    기존 문제는 Import 버튼만의 문제가 아니었다. <code>threads &gt; 1</code> Export에서 각 worker가
+    독립적으로 connection을 열어 SELECT를 시작했기 때문에, 여러 worker가 같은 기준 시점의 snapshot을
+    바라본다고 증명할 수 없었다. 그래서 manifest가 <code>limited_restorable</code>로 내려가는 판단은 맞았고,
+    빠진 것은 MySQL Shell 방식의 snapshot 동기화 경로였다.
+  </p>
+
+  <h2>적용한 변경</h2>
+  <table>
+    <tr><th>영역</th><th>변경 내용</th></tr>
+    <tr>
+      <td>Rust Core Export</td>
+      <td>
+        MySQL 병렬 Export에서 InnoDB 테이블만 대상이고 <code>threads &gt; 1</code>인 경우,
+        <code>FLUSH TABLES WITH READ LOCK</code> 중 worker connection을 미리 열고
+        <code>START TRANSACTION WITH CONSISTENT SNAPSHOT</code>을 시작한 뒤
+        <code>LOCK INSTANCE FOR BACKUP</code>을 잡고 병렬 dump를 수행하는 strict 경로를 추가했다.
+      </td>
+    </tr>
+    <tr>
+      <td>Rust Core Manifest</td>
+      <td>
+        새 정책 <code>lock_synchronized_transaction_snapshot</code>을 추가했다. 이 정책은 snapshot과 checksum
+        증거가 완성되고 경고/blocker가 없을 때 <code>strict_restorable</code>로 판정된다.
+      </td>
+    </tr>
+    <tr>
+      <td>Import UI</td>
+      <td>
+        <code>strict_restorable</code>은 기존처럼 권장 Import로 진행한다.
+        <code>limited_restorable</code>은 쉬운 한국어 설명과 사용자 확인 후 Import를 허용한다.
+        <code>not_restorable</code>은 계속 차단한다.
+      </td>
+    </tr>
+    <tr>
+      <td>Python Wrapper</td>
+      <td>
+        limited Import 시 Rust Core에 <code>strict_manifest=false</code>를 전달할 수 있도록
+        <code>RustDumpImporter.import_dump()</code>, worker, convenience API를 보강했다.
+      </td>
+    </tr>
+  </table>
+
+  <h2>Strict Parallel Export 동작 순서</h2>
+  <ol>
+    <li>선택된 MySQL 테이블 엔진을 검사한다.</li>
+    <li>모든 대상 테이블이 InnoDB이고 병렬 Export이면 strict parallel 경로를 시도한다.</li>
+    <li><code>FLUSH TABLES WITH READ LOCK</code>을 짧게 획득한다.</li>
+    <li>row count, range 계획을 lock 안에서 계산한다.</li>
+    <li>worker connection을 미리 만들고 각 connection에서 consistent snapshot transaction을 시작한다.</li>
+    <li><code>LOCK INSTANCE FOR BACKUP</code>을 획득한다.</li>
+    <li>초기 global read lock을 해제한다.</li>
+    <li>미리 snapshot을 잡은 worker connection으로만 병렬 SELECT를 수행한다.</li>
+    <li>완료 후 worker transaction과 backup lock을 정리한다.</li>
+  </ol>
+
+  <h2>운영 전제</h2>
+  <p>
+    strict 병렬 Export는 MySQL 권한이 필요하다. 계정에 <code>FLUSH TABLES WITH READ LOCK</code> 및
+    <code>LOCK INSTANCE FOR BACKUP</code> 수행 권한이 없으면 Export는 strict로 포장되지 않고 명확한 에러를 낸다.
+    이는 제한적 Dump를 strict처럼 보이게 만드는 땜빵을 피하기 위한 의도적인 동작이다.
+  </p>
+
+  <h2>검증 결과</h2>
+  <table>
+    <tr><th>검증</th><th>결과</th></tr>
+    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="ok">통과: 178 lib tests + helper/live-gated tests</td></tr>
+    <tr><td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td><td class="ok">통과</td></tr>
+    <tr><td><code>pytest</code></td><td class="ok">통과: 1709 passed, 5 warnings</td></tr>
+    <tr><td><code>.\scripts\build-bootstrapper.ps1</code></td><td class="ok">통과: <code>dist\TunnelForge-WebSetup.exe</code> 생성</td></tr>
+    <tr><td><code>.\scripts\build-installer.ps1 -SkipPyInstaller</code></td><td class="ok">통과: <code>output\TunnelForge-Setup-2.0.16.exe</code> 생성</td></tr>
+    <tr><td><code>git diff --check</code></td><td class="ok">통과</td></tr>
+  </table>
+
+  <h2>남은 확인</h2>
+  <p>
+    다음 실제 검증은 로컬 Staging Export다. 같은 조건에서 다시 Export했을 때 manifest의
+    <code>snapshot_policy</code>가 <code>lock_synchronized_transaction_snapshot</code>이고
+    <code>restorability</code>가 <code>strict_restorable</code>인지 확인하면 된다.
+  </p>
+</body>
+</html>

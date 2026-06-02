@@ -95,6 +95,12 @@ def test_translate_text_handles_common_hardcoded_ui_phrases():
     assert i18n.translate_text("이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n{}") == (
         "This dump cannot proceed through the recommended import path.\n\n{}"
     )
+    assert i18n.translate_text("이 Dump는 Import할 수 없습니다.\n\n{}") == (
+        "This dump cannot be imported.\n\n{}"
+    )
+    assert i18n.translate_text("제한적 복원 Import 확인") == (
+        "Limited Restore Import Confirmation"
+    )
 
 
 def test_qt_i18n_hooks_translate_hardcoded_widget_text(monkeypatch):

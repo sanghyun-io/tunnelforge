@@ -605,6 +605,49 @@ def test_import_dump_forwards_progress_policy(tmp_path):
     assert facade.payload["progress_policy"] == "resume"
 
 
+def test_import_dump_forwards_non_strict_manifest_for_limited_import(tmp_path):
+    from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+    (dump_dir / "_tunnelforge_dump.json").write_text(
+        json.dumps(
+            {
+                "format": "tunnelforge-dump",
+                "format_version": 3,
+                "data_format": "tsv",
+                "compression": "none",
+                "source_engine": "mysql",
+                "database": "app",
+                "restorability": "limited_restorable",
+                "features": {"checksum": True, "snapshot": False},
+                "tables": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class RecordingDumpCoreService:
+        def import_dump(self, payload, on_event=None):
+            self.payload = payload
+            return {"success": True, "tables": 0, "rows_imported": 0}
+
+    facade = RecordingDumpCoreService()
+    importer = RustDumpImporter(
+        RustDumpConfig("localhost", 3306, "root", "password"),
+        facade=facade,
+    )
+
+    success, _, _ = importer.import_dump(
+        str(dump_dir),
+        "app",
+        strict_manifest=False,
+    )
+
+    assert success is True
+    assert facade.payload["strict_manifest"] is False
+
+
 class TestConvenienceFunctions:
     """편의 함수 테스트"""
 

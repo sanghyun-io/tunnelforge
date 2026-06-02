@@ -324,6 +324,14 @@ _EN_TEXT_TRANSLATIONS = {
     "실행 실패": "Run Failed",
     "실행할 SQL이 없습니다.": "There is no SQL to run.",
     "이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n{}": "This dump cannot proceed through the recommended import path.\n\n{}",
+    "이 Dump는 Import할 수 없습니다.\n\n{}": "This dump cannot be imported.\n\n{}",
+    "제한적 복원 Import 확인": "Limited Restore Import Confirmation",
+    "이 Dump는 제한적 복원 Dump입니다.\n\nImport는 할 수 있지만, Export 중 원본 DB가 변경되었다면 일부 테이블이나 같은 테이블의 일부 조각이 서로 다른 시점일 수 있습니다.\n\n운영 복구용으로 완전히 검증된 Dump가 필요하면 strict 조건으로 다시 Export하세요.\n\n이 한계를 이해하고 제한적 복원으로 Import를 진행할까요?": (
+        "This is a limited restore dump.\n\n"
+        "It can be imported, but if the source DB changed during Export, some tables or parts of the same table may come from different moments.\n\n"
+        "For production recovery that requires a fully proven dump, export again with strict conditions.\n\n"
+        "Do you understand this limit and want to continue with limited restore import?"
+    ),
     "알 수 없음": "Unknown",
     "알림": "Notice",
     "업데이트": "Update",

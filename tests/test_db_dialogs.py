@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from PyQt6.QtWidgets import QApplication, QLabel
+from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from src.ui.dialogs.db_dialogs import (
     RustDumpExportDialog,
@@ -346,7 +346,7 @@ def test_import_dialog_does_not_claim_all_objects_are_recreated(monkeypatch):
     dialog.close()
 
 
-def test_import_dialog_disables_recommended_import_for_limited_dump(monkeypatch):
+def test_import_dialog_enables_limited_import_with_warning_state(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
     dialog = RustDumpImportDialog(connector=None)
@@ -358,7 +358,7 @@ def test_import_dialog_disables_recommended_import_for_limited_dump(monkeypatch)
         }
     )
 
-    assert not dialog.btn_import.isEnabled()
+    assert dialog.btn_import.isEnabled()
     assert "제한적 복원" in dialog.lbl_dump_compatibility.text()
     dialog.close()
 
@@ -410,7 +410,7 @@ def test_import_dialog_compatibility_text_includes_blockers_and_warnings(monkeyp
     dialog.close()
 
 
-def test_import_dialog_blocks_manual_typed_limited_dump_before_worker_start(tmp_path, monkeypatch):
+def test_import_dialog_limited_dump_starts_after_confirmation_with_non_strict_manifest(tmp_path, monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr("src.ui.dialogs.db_dialogs.check_rust_dump", lambda: (True, "installed"))
 
@@ -431,14 +431,34 @@ def test_import_dialog_blocks_manual_typed_limited_dump_before_worker_start(tmp_
         encoding="utf-8",
     )
 
-    warning_calls = []
+    question_calls = []
+    worker_kwargs = {}
     worker_started = {"value": False}
+
+    class FakeSignal:
+        def connect(self, callback):
+            self.callback = callback
 
     class FakeWorker:
         def __init__(self, *args, **kwargs):
+            worker_kwargs.update(kwargs)
+            self.progress = FakeSignal()
+            self.table_progress = FakeSignal()
+            self.detail_progress = FakeSignal()
+            self.table_status = FakeSignal()
+            self.raw_output = FakeSignal()
+            self.import_finished = FakeSignal()
+            self.finished = FakeSignal()
+            self.metadata_analyzed = FakeSignal()
+            self.table_chunk_progress = FakeSignal()
+
+        def start(self):
             worker_started["value"] = True
 
-    monkeypatch.setattr("src.ui.dialogs.db_dialogs.QMessageBox.warning", lambda *args, **kwargs: warning_calls.append((args, kwargs)))
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.QMessageBox.question",
+        lambda *args, **kwargs: question_calls.append((args, kwargs)) or QMessageBox.StandardButton.Yes,
+    )
     monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
 
     dialog = RustDumpImportDialog(connector=None)
@@ -446,9 +466,10 @@ def test_import_dialog_blocks_manual_typed_limited_dump_before_worker_start(tmp_
 
     dialog.do_import()
 
-    assert warning_calls
-    assert "권장 Import 경로" in warning_calls[0][0][2]
-    assert worker_started["value"] is False
+    assert question_calls
+    assert "제한적 복원" in question_calls[0][0][2]
+    assert worker_started["value"] is True
+    assert worker_kwargs["strict_manifest"] is False
     dialog.close()
 
 

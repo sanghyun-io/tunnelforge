@@ -628,6 +628,7 @@ class RustDumpImporter:
         metadata_callback: Optional[Callable[[dict], None]] = None,
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
         progress_policy: str = "fresh",
+        strict_manifest: bool = True,
     ) -> Tuple[bool, str, dict]:
         import_results: dict = {}
         try:
@@ -665,7 +666,7 @@ class RustDumpImporter:
                 "mode": import_mode,
                 "progress_policy": progress_policy,
                 "threads": max(1, int(threads)),
-                "strict_manifest": True,
+                "strict_manifest": bool(strict_manifest),
             }
             if timezone_sql:
                 payload["timezone_sql"] = timezone_sql
@@ -869,6 +870,7 @@ def import_dump(
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
     progress_policy: str = "fresh",
+    strict_manifest: bool = True,
 ) -> Tuple[bool, str, dict]:
     config = RustDumpConfig(host, port, user, password)
     importer = RustDumpImporter(config)
@@ -878,6 +880,7 @@ def import_dump(
         threads,
         import_mode=import_mode,
         progress_policy=progress_policy,
+        strict_manifest=strict_manifest,
         progress_callback=progress_callback,
         table_chunk_progress_callback=table_chunk_progress_callback,
     )

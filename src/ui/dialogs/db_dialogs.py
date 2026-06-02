@@ -1892,6 +1892,8 @@ class RustDumpImportDialog(QDialog):
         self.import_table_rows_done: dict = {}
         self.import_table_rows_total: dict = {}
         self._compatibility_allows_recommended_import = False
+        self._dump_restorability_grade = ""
+        self._dump_requires_limited_confirmation = False
 
         # 테이블별 chunk 진행률 추적
         self.table_chunk_progress: dict = {}  # {table_name: (completed, total)}
@@ -2408,6 +2410,8 @@ class RustDumpImportDialog(QDialog):
             self._run_upgrade_check(path)
             return
         self._compatibility_allows_recommended_import = False
+        self._dump_restorability_grade = ""
+        self._dump_requires_limited_confirmation = False
         self.lbl_dump_compatibility.setText(i18n_tr("Dump compatibility is not checked"))
         self.lbl_dump_compatibility.setStyleSheet("color: #7f8c8d;")
         self._set_import_button_enabled_for_current_gate()
@@ -2450,6 +2454,8 @@ class RustDumpImportDialog(QDialog):
             )
         except Exception:
             self._compatibility_allows_recommended_import = False
+            self._dump_restorability_grade = ""
+            self._dump_requires_limited_confirmation = False
             self.lbl_dump_compatibility.setText(i18n_tr("Dump compatibility is not checked"))
             self.lbl_dump_compatibility.setStyleSheet("color: #7f8c8d;")
             self._set_import_button_enabled_for_current_gate()
@@ -2486,6 +2492,8 @@ class RustDumpImportDialog(QDialog):
 
         except Exception as e:
             self._compatibility_allows_recommended_import = False
+            self._dump_restorability_grade = ""
+            self._dump_requires_limited_confirmation = False
             self._set_import_button_enabled_for_current_gate()
             self.lbl_upgrade_status.setText(f"❌ 검사 실패: {str(e)}")
             self.lbl_upgrade_status.setStyleSheet("color: #e74c3c;")
@@ -2575,14 +2583,17 @@ class RustDumpImportDialog(QDialog):
         if grade == "strict_restorable":
             text = i18n_tr("Strict restorable dump")
             enable_recommended = True
+            requires_limited_confirmation = False
             color = "#27ae60"
         elif grade == "not_restorable":
             text = i18n_tr("복원 불가 Dump")
             enable_recommended = False
+            requires_limited_confirmation = False
             color = "#e74c3c"
         else:
             text = i18n_tr("제한적 복원 Dump")
-            enable_recommended = False
+            enable_recommended = True
+            requires_limited_confirmation = True
             color = "#f39c12"
 
         details = []
@@ -2596,6 +2607,8 @@ class RustDumpImportDialog(QDialog):
             text = f"{text}: {'; '.join(details)}"
 
         self._compatibility_allows_recommended_import = enable_recommended
+        self._dump_restorability_grade = grade
+        self._dump_requires_limited_confirmation = requires_limited_confirmation
         self.lbl_dump_compatibility.setText(text)
         self.lbl_dump_compatibility.setStyleSheet(f"color: {color};")
         self._set_import_button_enabled_for_current_gate()
@@ -2662,10 +2675,26 @@ class RustDumpImportDialog(QDialog):
             QMessageBox.warning(
                 self,
                 "오류",
-                "이 Dump는 권장 Import 경로로 진행할 수 없습니다.\n\n"
+                "이 Dump는 Import할 수 없습니다.\n\n"
                 f"{self.lbl_dump_compatibility.text()}",
             )
             return
+        strict_manifest = True
+        if self._dump_requires_limited_confirmation:
+            reply = QMessageBox.question(
+                self,
+                "제한적 복원 Import 확인",
+                "이 Dump는 제한적 복원 Dump입니다.\n\n"
+                "Import는 할 수 있지만, Export 중 원본 DB가 변경되었다면 "
+                "일부 테이블이나 같은 테이블의 일부 조각이 서로 다른 시점일 수 있습니다.\n\n"
+                "운영 복구용으로 완전히 검증된 Dump가 필요하면 strict 조건으로 다시 Export하세요.\n\n"
+                "이 한계를 이해하고 제한적 복원으로 Import를 진행할까요?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+            strict_manifest = False
 
         target_schema = None
         if not self.chk_use_original.isChecked():
@@ -2817,7 +2846,8 @@ class RustDumpImportDialog(QDialog):
             threads=self.spin_threads.value(),
             import_mode=import_mode,
             timezone_sql=timezone_sql,
-            retry_tables=retry_tables
+            retry_tables=retry_tables,
+            strict_manifest=strict_manifest,
         )
 
         # 시그널 연결
