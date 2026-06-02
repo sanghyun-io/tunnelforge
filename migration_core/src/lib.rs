@@ -10385,7 +10385,7 @@ fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Resul
 }
 
 fn normalize_fk_type_signature(type_name: &str) -> String {
-    type_name
+    strip_generation_marker(type_name)
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
@@ -14640,6 +14640,95 @@ mod tests {
         };
 
         validate_foreign_key_column_compatibility(&schema).unwrap();
+    }
+
+    #[test]
+    fn fk_schema_fidelity_accepts_auto_increment_referenced_integer() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "df_authenticated_callers".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "int auto_increment".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                },
+                NormalizedTable {
+                    name: "df_call_logs".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "caller_id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "df_call_logs_ibfk_1".to_string(),
+                        columns: vec!["caller_id".to_string()],
+                        referenced_table: "df_authenticated_callers".to_string(),
+                        referenced_columns: vec!["id".to_string()],
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        validate_foreign_key_column_compatibility(&schema).unwrap();
+    }
+
+    #[test]
+    fn fk_schema_fidelity_still_rejects_unsigned_mismatch_with_auto_increment() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "parents".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "int unsigned auto_increment".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                },
+                NormalizedTable {
+                    name: "children".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "parent_id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "children_ibfk_1".to_string(),
+                        columns: vec!["parent_id".to_string()],
+                        referenced_table: "parents".to_string(),
+                        referenced_columns: vec!["id".to_string()],
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let err = validate_foreign_key_column_compatibility(&schema).unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("children_ibfk_1"));
     }
 
     #[test]
