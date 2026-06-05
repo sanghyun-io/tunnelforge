@@ -250,6 +250,23 @@ class TestRustDumpExporter:
         assert facade.payload["data_format"] == "tsv"
         assert facade.payload["compression"] == "zstd"
 
+    def test_export_full_schema_reports_view_count(self, tmp_path):
+        """전체 export 결과에 View 개수가 메시지로 포함됨"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                return {"success": True, "tables": 3, "rows_dumped": 10, "views": 2}
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        exporter = RustDumpExporter(config, facade=facade)
+
+        success, msg = exporter.export_full_schema('app', str(tmp_path / 'dump'))
+
+        assert success is True
+        assert "View 2개" in msg
+
 
 class TestRustDumpImporter:
     """RustDumpImporter 클래스 테스트"""
@@ -296,6 +313,74 @@ class TestRustDumpImporter:
         assert "mysql_local_infile_policy" not in facade.payload
         assert results["users"]["status"] == "done"
         assert "1" in msg
+
+    def test_import_dump_reports_view_results_in_message(self, tmp_path):
+        """import 결과의 views_imported/failed/skipped 가 메시지에 반영됨"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        table_dir = dump_dir / '0001_users'
+        table_dir.mkdir(parents=True)
+        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":1,"database":"app",'
+            '"tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                return {
+                    "success": True,
+                    "tables": 1,
+                    "rows_imported": 1,
+                    "views_imported": ["ref_vendor_codes_view", "another_view"],
+                    "views_failed": [{"name": "broken_view", "error": "missing base table"}],
+                    "views_skipped_cross_engine": [],
+                }
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        importer = RustDumpImporter(config, facade=facade)
+
+        success, msg, _results = importer.import_dump(str(dump_dir), import_mode='replace')
+
+        assert success is True
+        assert "View 2개" in msg
+        assert "broken_view" in msg
+        assert "생성 실패" in msg
+
+    def test_import_dump_reports_cross_engine_skipped_views(self, tmp_path):
+        """크로스 엔진 import 시 건너뛴 View 개수가 메시지에 표시됨"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        table_dir = dump_dir / '0001_users'
+        table_dir.mkdir(parents=True)
+        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":1,"database":"app",'
+            '"tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                return {
+                    "success": True,
+                    "tables": 1,
+                    "rows_imported": 1,
+                    "views_skipped_cross_engine": ["v1", "v2", "v3"],
+                }
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        importer = RustDumpImporter(config, facade=facade)
+
+        success, msg, _results = importer.import_dump(str(dump_dir), import_mode='replace')
+
+        assert success is True
+        assert "크로스 엔진 View 3개" in msg
 
     def test_import_row_progress_reports_chunk_counts_to_callback(self):
         """Import row_progress는 rows/total이 아니라 chunks_done/chunks_total을 chunk callback으로 전달한다."""
