@@ -76,6 +76,24 @@ def _format_import_phase_message(event: dict) -> Optional[str]:
     return str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중...")
 
 
+def _format_import_ddl_progress_message(event: dict) -> str:
+    kind = str(event.get("kind") or "")
+    table = str(event.get("table") or "")
+    name = str(event.get("name") or "")
+    status = str(event.get("status") or "")
+    current = int(event.get("current") or 0)
+    total = int(event.get("total") or 0)
+    kind_label = {
+        "index": "인덱스",
+        "foreign_key": "FK",
+        "sequence": "시퀀스",
+    }.get(kind, "DDL")
+    status_label = "생성 완료" if status == "completed" else "생성 중"
+    object_name = f"{table}.{name}" if table and name else name or table or "-"
+    suffix = f" ({current}/{total})" if current and total else ""
+    return f"{kind_label} {status_label}: {object_name}{suffix}"
+
+
 @dataclass
 class RustDumpConfig:
     """Connection settings for Rust DB Core dump operations."""
@@ -795,6 +813,8 @@ def emit_core_event(
         message = _format_import_phase_message(event)
         if message:
             progress_callback(message)
+    elif event_type == "ddl_progress" and progress_callback:
+        progress_callback(_format_import_ddl_progress_message(event))
     elif event_type == "table_progress":
         current = int(event.get("current") or 0)
         total = int(event.get("total") or 0)

@@ -234,6 +234,21 @@ def plain_import_progress_message(message: str) -> str:
     return text
 
 
+def is_import_ddl_detail_message(message: str) -> bool:
+    """Return true for post-load DDL detail messages already logged from raw events."""
+    text = str(message or "").strip()
+    return text.startswith((
+        "인덱스 생성 중:",
+        "인덱스 생성 완료:",
+        "FK 생성 중:",
+        "FK 생성 완료:",
+        "시퀀스 생성 중:",
+        "시퀀스 생성 완료:",
+        "DDL 생성 중:",
+        "DDL 생성 완료:",
+    ))
+
+
 def import_stage_percent(data_percent: int, phase: str = "") -> int:
     """Map data-load progress onto the full import lifecycle."""
     bounded_data = max(0, min(int(data_percent or 0), 100))
@@ -338,6 +353,21 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
     """Convert Rust import telemetry into a concise visible log line."""
     event_type = event.get("event")
     table = str(event.get("table") or "")
+    if event_type == "ddl_progress":
+        kind = str(event.get("kind") or "")
+        name = str(event.get("name") or "")
+        status = str(event.get("status") or "")
+        current = int(event.get("current") or 0)
+        total = int(event.get("total") or 0)
+        kind_label = {
+            "index": "인덱스",
+            "foreign_key": "FK",
+            "sequence": "시퀀스",
+        }.get(kind, "DDL")
+        status_label = "생성 완료" if status == "completed" else "생성 중"
+        object_name = f"{table}.{name}" if table and name else name or table or "-"
+        suffix = f" ({current}/{total})" if current and total else ""
+        return f"{kind_label} {status_label}: {object_name}{suffix}"
     if event_type == "phase":
         message = str(event.get("message") or "")
         if "local_infile" in message or "LOAD DATA LOCAL" in message:
@@ -2993,6 +3023,11 @@ class RustDumpImportDialog(QDialog):
     def on_progress(self, msg: str):
         """일반 진행 메시지 처리"""
         display_msg = plain_import_progress_message(msg)
+        if is_import_ddl_detail_message(display_msg):
+            self.label_status.setText(display_msg)
+            self.label_fk_status.setText(display_msg)
+            self.label_fk_status.setStyleSheet("color: #3498db; font-weight: bold;")
+            return
         self.txt_log.addItem(display_msg)
         self.txt_log.scrollToBottom()
         self.label_status.setText(display_msg)
@@ -3193,21 +3228,28 @@ class RustDumpImportDialog(QDialog):
             self.txt_log.takeItem(0)
 
         visible_summary = None
+        is_ddl_progress = False
         try:
             event = json.loads(line)
             if isinstance(event, dict):
                 event_type = str(event.get("event") or "")
+                is_ddl_progress = event_type == "ddl_progress"
                 phase = str(event.get("phase") or "")
                 if event_type in {"phase", "progress"} and phase and hasattr(self, "progress_bar"):
                     self._set_import_phase(phase, str(event.get("message") or ""))
                 visible_summary = format_import_visible_telemetry(event)
+                if is_ddl_progress and visible_summary:
+                    self.label_status.setText(visible_summary)
+                    self.label_fk_status.setText(visible_summary)
+                    self.label_fk_status.setStyleSheet("color: #3498db; font-weight: bold;")
         except json.JSONDecodeError:
             visible_summary = line
 
         if visible_summary:
             self.txt_log.addItem(visible_summary)
             self.txt_log.scrollToBottom()
-            self._add_log(visible_summary)
+            if not is_ddl_progress:
+                self._add_log(visible_summary)
 
         self._add_log(f"[rust_dump] {line}")
 

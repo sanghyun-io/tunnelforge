@@ -87,6 +87,8 @@ pub struct ImportVerificationEvidence {
     pub tables: Vec<TableVerificationEvidence>,
     pub load_data_warnings: u64,
     #[serde(default)]
+    pub row_count_warnings: u64,
+    #[serde(default)]
     pub sql_mode_before: Option<String>,
     #[serde(default)]
     pub sql_mode_after: Option<String>,
@@ -4524,7 +4526,13 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 "message": "creating indexes and foreign keys in temporary schema",
                 "shadow_schema": shadow_database
             }));
-            apply_post_load_ddl(&mut adapter, &import_schema, &target_engine)?;
+            apply_post_load_ddl_with_events(
+                &mut adapter,
+                &import_schema,
+                &target_engine,
+                request.request_id.clone(),
+                &mut emit,
+            )?;
 
             emit(json!({
                 "event": "phase",
@@ -4597,7 +4605,13 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 "phase": "dump_import_post_load",
                 "message": "creating indexes and foreign keys"
             }));
-            apply_post_load_ddl(&mut adapter, &import_schema, &target_engine)?;
+            apply_post_load_ddl_with_events(
+                &mut adapter,
+                &import_schema,
+                &target_engine,
+                request.request_id.clone(),
+                &mut emit,
+            )?;
         } else {
             emit(json!({
                 "event": "phase",
@@ -4649,8 +4663,30 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         LiveAdapter::PostgreSql(_) => None,
     };
     let target_rows_by_table = collect_target_row_counts(&mut adapter, &tables)?;
-    verify_target_row_counts(&tables, &target_rows_by_table)?;
-    let rows_verified_total: u64 = target_rows_by_table.values().copied().sum();
+    let row_count_warnings = verify_import_row_counts(
+        mode,
+        &tables,
+        &target_rows_by_table,
+        &imported_rows_by_table,
+    )?;
+    for warning in &row_count_warnings {
+        emit(json!({
+            "event": "warning",
+            "request_id": request.request_id,
+            "phase": "dump_import_validation",
+            "classification": "target_extra_rows",
+            "message": warning
+        }));
+    }
+    let mut verification_warnings = manifest_warnings.clone();
+    verification_warnings.extend(row_count_warnings.iter().cloned());
+    let verified_rows_by_table = import_row_counts_for_verification(
+        mode,
+        &tables,
+        &target_rows_by_table,
+        &imported_rows_by_table,
+    );
+    let rows_verified_total: u64 = verified_rows_by_table.values().copied().sum();
     progress_state.verification_complete = true;
     write_import_progress_state(&progress_path, &progress_state)?;
     if !manifest.objects.objects.is_empty() {
@@ -4675,12 +4711,16 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             .map(|table| TableVerificationEvidence {
                 table: table.name.clone(),
                 expected_rows: table.rows,
-                actual_rows: target_rows_by_table.get(&table.name).copied().unwrap_or(0),
+                actual_rows: verified_rows_by_table
+                    .get(&table.name)
+                    .copied()
+                    .unwrap_or(0),
                 checksum_match: None,
                 digest_match: None,
             })
             .collect(),
         load_data_warnings,
+        row_count_warnings: row_count_warnings.len() as u64,
         sql_mode_before,
         sql_mode_after,
         local_infile_enabled,
@@ -4706,7 +4746,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             "evidence": verification_evidence,
             "row_counts": "passed",
             "strict_manifest": strict_manifest,
-            "warnings": manifest_warnings
+            "warnings": verification_warnings
         }
     });
     write_dump_import_report(input_path, &import_report)?;
@@ -4746,7 +4786,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             "evidence": verification_evidence,
             "row_counts": "passed",
             "strict_manifest": strict_manifest,
-            "warnings": manifest_warnings
+            "warnings": verification_warnings
         },
         "views_imported": view_outcome.imported,
         "views_failed": view_outcome.failed,
@@ -9907,21 +9947,93 @@ fn validate_dump_import_manifest_strictness(
     Ok(warnings)
 }
 
-fn verify_target_row_counts(
+fn import_row_counts_for_verification(
+    mode: &str,
     tables: &[DumpTableManifest],
     target_rows_by_table: &BTreeMap<String, u64>,
-) -> Result<(), String> {
+    imported_rows_by_table: &BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    let mut rows_by_table = BTreeMap::new();
     for table in tables {
         let target_rows = target_rows_by_table.get(&table.name).copied().unwrap_or(0);
-        if target_rows != table.rows {
+        let imported_rows = imported_rows_by_table
+            .get(&table.name)
+            .copied()
+            .unwrap_or(0);
+        let rows = if mode == "merge" {
+            imported_rows
+        } else if imported_rows == table.rows && target_rows > table.rows {
+            table.rows
+        } else {
+            target_rows
+        };
+        rows_by_table.insert(table.name.clone(), rows);
+    }
+    rows_by_table
+}
+
+fn verified_load_extra_target_rows_warning(
+    mode: &str,
+    table: &DumpTableManifest,
+    target_rows: u64,
+    imported_rows: u64,
+) -> Option<String> {
+    if mode == "merge" || imported_rows != table.rows || target_rows <= table.rows {
+        return None;
+    }
+
+    Some(format!(
+        "post-load row count warning for {}: loaded expected {} rows, target has {} rows (+{}); treating extra rows as concurrent target writes",
+        table.name,
+        table.rows,
+        target_rows,
+        target_rows - table.rows
+    ))
+}
+
+fn verify_import_row_counts(
+    mode: &str,
+    tables: &[DumpTableManifest],
+    target_rows_by_table: &BTreeMap<String, u64>,
+    imported_rows_by_table: &BTreeMap<String, u64>,
+) -> Result<Vec<String>, String> {
+    let rows_by_table = import_row_counts_for_verification(
+        mode,
+        tables,
+        target_rows_by_table,
+        imported_rows_by_table,
+    );
+    let mut warnings = Vec::new();
+    for table in tables {
+        let target_rows = target_rows_by_table.get(&table.name).copied().unwrap_or(0);
+        let imported_rows = imported_rows_by_table
+            .get(&table.name)
+            .copied()
+            .unwrap_or(0);
+        if let Some(warning) =
+            verified_load_extra_target_rows_warning(mode, table, target_rows, imported_rows)
+        {
+            warnings.push(warning);
+            continue;
+        }
+        let actual_rows = rows_by_table.get(&table.name).copied().unwrap_or(0);
+        if actual_rows != table.rows {
+            let message = if mode == "merge" {
+                format!(
+                    "expected {} rows, imported {}; target has {}",
+                    table.rows, actual_rows, target_rows
+                )
+            } else {
+                format!("expected {} rows, target has {}", table.rows, actual_rows)
+            };
             return Err(classified_import_error(
                 "post_load_validation_failed",
-                &format!("expected {} rows, target has {}", table.rows, target_rows),
+                &message,
                 Some(&table.name),
             ));
         }
     }
-    Ok(())
+    Ok(warnings)
 }
 
 fn classify_import_verdict(evidence: &ImportVerificationEvidence) -> &'static str {
@@ -9932,7 +10044,7 @@ fn classify_import_verdict(evidence: &ImportVerificationEvidence) -> &'static st
     }) {
         return "failed";
     }
-    if evidence.load_data_warnings > 0 {
+    if evidence.load_data_warnings > 0 || evidence.row_count_warnings > 0 {
         return "limited_success";
     }
     "success"
@@ -10682,7 +10794,18 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
     ddl
 }
 
-pub fn generate_post_data_index_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PostLoadDdlItem {
+    kind: &'static str,
+    table: String,
+    name: String,
+    sql: String,
+}
+
+fn generate_post_data_index_ddl_items(
+    schema: &NormalizedSchema,
+    target: &str,
+) -> Vec<PostLoadDdlItem> {
     if target.is_empty() {
         return Vec::new();
     }
@@ -10699,19 +10822,80 @@ pub fn generate_post_data_index_ddl(schema: &NormalizedSchema, target: &str) -> 
                 .map(|column| quote_ident(target, column))
                 .collect::<Vec<_>>()
                 .join(", ");
-            ddl.push(format!(
-                "CREATE {}INDEX {} ON {} ({});",
-                unique,
-                quote_ident(target, &index.name),
-                quote_ident(target, &table.name),
-                columns
-            ));
+            ddl.push(PostLoadDdlItem {
+                kind: "index",
+                table: table.name.clone(),
+                name: index.name.clone(),
+                sql: format!(
+                    "CREATE {}INDEX {} ON {} ({});",
+                    unique,
+                    quote_ident(target, &index.name),
+                    quote_ident(target, &table.name),
+                    columns
+                ),
+            });
         }
     }
     ddl
 }
 
-pub fn generate_post_data_foreign_key_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+fn generate_post_data_index_ddl_items_for_load(
+    schema: &NormalizedSchema,
+    target: &str,
+) -> Vec<PostLoadDdlItem> {
+    if target != "mysql" {
+        return generate_post_data_index_ddl_items(schema, target);
+    }
+    let mut ddl = Vec::new();
+    for table in &schema.tables {
+        let mut clauses = Vec::new();
+        let mut names = Vec::new();
+        for index in &table.indexes {
+            if index.columns.is_empty() {
+                continue;
+            }
+            let unique = if index.unique { "UNIQUE " } else { "" };
+            let columns = index
+                .columns
+                .iter()
+                .map(|column| quote_ident(target, column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!(
+                "ADD {}INDEX {} ({})",
+                unique,
+                quote_ident(target, &index.name),
+                columns
+            ));
+            names.push(index.name.clone());
+        }
+        if !clauses.is_empty() {
+            ddl.push(PostLoadDdlItem {
+                kind: "index",
+                table: table.name.clone(),
+                name: names.join(", "),
+                sql: format!(
+                    "ALTER TABLE {} {};",
+                    quote_ident(target, &table.name),
+                    clauses.join(", ")
+                ),
+            });
+        }
+    }
+    ddl
+}
+
+pub fn generate_post_data_index_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+    generate_post_data_index_ddl_items(schema, target)
+        .into_iter()
+        .map(|item| item.sql)
+        .collect()
+}
+
+fn generate_post_data_foreign_key_ddl_items(
+    schema: &NormalizedSchema,
+    target: &str,
+) -> Vec<PostLoadDdlItem> {
     if target.is_empty() {
         return Vec::new();
     }
@@ -10733,20 +10917,87 @@ pub fn generate_post_data_foreign_key_ddl(schema: &NormalizedSchema, target: &st
                 .map(|column| quote_ident(target, column))
                 .collect::<Vec<_>>()
                 .join(", ");
-            ddl.push(format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({});",
-                quote_ident(target, &table.name),
-                quote_ident(target, &fk.name),
-                columns,
-                quote_ident(target, &fk.referenced_table),
-                referenced_columns
-            ));
+            ddl.push(PostLoadDdlItem {
+                kind: "foreign_key",
+                table: table.name.clone(),
+                name: fk.name.clone(),
+                sql: format!(
+                    "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({});",
+                    quote_ident(target, &table.name),
+                    quote_ident(target, &fk.name),
+                    columns,
+                    quote_ident(target, &fk.referenced_table),
+                    referenced_columns
+                ),
+            });
         }
     }
     ddl
 }
 
-pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+fn generate_post_data_foreign_key_ddl_items_for_load(
+    schema: &NormalizedSchema,
+    target: &str,
+) -> Vec<PostLoadDdlItem> {
+    if !matches!(target, "mysql" | "postgresql") {
+        return generate_post_data_foreign_key_ddl_items(schema, target);
+    }
+    let mut ddl = Vec::new();
+    for table in &schema.tables {
+        let mut clauses = Vec::new();
+        let mut names = Vec::new();
+        for fk in &table.foreign_keys {
+            if fk.columns.is_empty() || fk.referenced_columns.is_empty() {
+                continue;
+            }
+            let columns = fk
+                .columns
+                .iter()
+                .map(|column| quote_ident(target, column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let referenced_columns = fk
+                .referenced_columns
+                .iter()
+                .map(|column| quote_ident(target, column))
+                .collect::<Vec<_>>()
+                .join(", ");
+            clauses.push(format!(
+                "ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({})",
+                quote_ident(target, &fk.name),
+                columns,
+                quote_ident(target, &fk.referenced_table),
+                referenced_columns
+            ));
+            names.push(fk.name.clone());
+        }
+        if !clauses.is_empty() {
+            ddl.push(PostLoadDdlItem {
+                kind: "foreign_key",
+                table: table.name.clone(),
+                name: names.join(", "),
+                sql: format!(
+                    "ALTER TABLE {} {};",
+                    quote_ident(target, &table.name),
+                    clauses.join(", ")
+                ),
+            });
+        }
+    }
+    ddl
+}
+
+pub fn generate_post_data_foreign_key_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+    generate_post_data_foreign_key_ddl_items(schema, target)
+        .into_iter()
+        .map(|item| item.sql)
+        .collect()
+}
+
+fn generate_sequence_reset_ddl_items(
+    schema: &NormalizedSchema,
+    target: &str,
+) -> Vec<PostLoadDdlItem> {
     if target != "postgresql" {
         return Vec::new();
     }
@@ -10754,17 +11005,79 @@ pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> V
     for table in &schema.tables {
         for column in &table.columns {
             if is_auto_increment_type(&column.type_name) {
-                ddl.push(format!(
-                    "SELECT setval(pg_get_serial_sequence('{}', '{}'), COALESCE((SELECT MAX({}) FROM {}), 0) + 1, false);",
-                    table.name.replace('\'', "''"),
-                    column.name.replace('\'', "''"),
-                    quote_ident(target, &column.name),
-                    quote_ident(target, &table.name)
-                ));
+                ddl.push(PostLoadDdlItem {
+                    kind: "sequence",
+                    table: table.name.clone(),
+                    name: column.name.clone(),
+                    sql: format!(
+                        "SELECT setval(pg_get_serial_sequence('{}', '{}'), COALESCE((SELECT MAX({}) FROM {}), 0) + 1, false);",
+                        table.name.replace('\'', "''"),
+                        column.name.replace('\'', "''"),
+                        quote_ident(target, &column.name),
+                        quote_ident(target, &table.name)
+                    ),
+                });
             }
         }
     }
     ddl
+}
+
+pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> Vec<String> {
+    generate_sequence_reset_ddl_items(schema, target)
+        .into_iter()
+        .map(|item| item.sql)
+        .collect()
+}
+
+fn generate_post_load_ddl_items(schema: &NormalizedSchema, target: &str) -> Vec<PostLoadDdlItem> {
+    let mut ddl = generate_sequence_reset_ddl_items(schema, target);
+    ddl.extend(generate_post_data_index_ddl_items_for_load(schema, target));
+    ddl.extend(generate_post_data_foreign_key_ddl_items_for_load(
+        schema, target,
+    ));
+    ddl
+}
+
+fn apply_post_load_ddl_with_events<A: MigrationAdapter, F: FnMut(Value)>(
+    target: &mut A,
+    schema: &NormalizedSchema,
+    target_engine: &str,
+    request_id: Option<String>,
+    emit: &mut F,
+) -> Result<(), String> {
+    validate_foreign_key_column_compatibility(schema)?;
+    let ddl_items = generate_post_load_ddl_items(schema, target_engine);
+    let total = ddl_items.len();
+    for (index, item) in ddl_items.into_iter().enumerate() {
+        let current = index + 1;
+        emit(json!({
+            "event": "ddl_progress",
+            "request_id": request_id.clone(),
+            "phase": "dump_import_post_load",
+            "kind": item.kind,
+            "table": item.table.clone(),
+            "name": item.name.clone(),
+            "status": "running",
+            "current": current,
+            "total": total
+        }));
+        target
+            .execute_sql(&item.sql)
+            .map_err(|err| format!("post-load {} DDL failed: {}: {err}", item.kind, item.sql))?;
+        emit(json!({
+            "event": "ddl_progress",
+            "request_id": request_id.clone(),
+            "phase": "dump_import_post_load",
+            "kind": item.kind,
+            "table": item.table,
+            "name": item.name,
+            "status": "completed",
+            "current": current,
+            "total": total
+        }));
+    }
+    Ok(())
 }
 
 fn apply_post_load_ddl<A: MigrationAdapter>(
@@ -10772,23 +11085,7 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
     schema: &NormalizedSchema,
     target_engine: &str,
 ) -> Result<(), String> {
-    validate_foreign_key_column_compatibility(schema)?;
-    for sql in generate_sequence_reset_ddl(schema, target_engine) {
-        target
-            .execute_sql(&sql)
-            .map_err(|err| format!("post-load sequence reset failed: {sql}: {err}"))?;
-    }
-    for sql in generate_post_data_index_ddl(schema, target_engine) {
-        target
-            .execute_sql(&sql)
-            .map_err(|err| format!("post-load index DDL failed: {sql}: {err}"))?;
-    }
-    for sql in generate_post_data_foreign_key_ddl(schema, target_engine) {
-        target
-            .execute_sql(&sql)
-            .map_err(|err| format!("post-load foreign key DDL failed: {sql}: {err}"))?;
-    }
-    Ok(())
+    apply_post_load_ddl_with_events(target, schema, target_engine, None, &mut |_| {})
 }
 
 fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Result<(), String> {
@@ -14834,7 +15131,301 @@ mod tests {
 
         assert_eq!(
             adapter.executed_sql,
-            vec!["CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);"]
+            vec!["ALTER TABLE `orders` ADD INDEX `idx_orders_user_id` (`user_id`);"]
+        );
+    }
+
+    #[test]
+    fn post_load_ddl_emits_index_and_foreign_key_progress() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "users".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: true,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                },
+                NormalizedTable {
+                    name: "orders".to_string(),
+                    columns: vec![
+                        NormalizedColumn {
+                            name: "id".to_string(),
+                            type_name: "int".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: true,
+                            unique: true,
+                        },
+                        NormalizedColumn {
+                            name: "user_id".to_string(),
+                            type_name: "int".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: false,
+                            unique: false,
+                        },
+                    ],
+                    indexes: vec![NormalizedIndex {
+                        name: "idx_orders_user_id".to_string(),
+                        columns: vec!["user_id".to_string()],
+                        unique: false,
+                    }],
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "fk_orders_users".to_string(),
+                        columns: vec!["user_id".to_string()],
+                        referenced_table: "users".to_string(),
+                        referenced_columns: vec!["id".to_string()],
+                    }],
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut adapter = RecordingAdapter::default();
+        let mut events = Vec::new();
+
+        apply_post_load_ddl_with_events(
+            &mut adapter,
+            &schema,
+            "mysql",
+            Some("import-1".to_string()),
+            &mut |event| events.push(event),
+        )
+        .unwrap();
+
+        let progress_events = events
+            .iter()
+            .filter(|event| event.get("event") == Some(&json!("ddl_progress")))
+            .collect::<Vec<_>>();
+        assert_eq!(progress_events.len(), 4);
+        assert_eq!(progress_events[0]["request_id"], "import-1");
+        assert_eq!(progress_events[0]["phase"], "dump_import_post_load");
+        assert_eq!(progress_events[0]["kind"], "index");
+        assert_eq!(progress_events[0]["table"], "orders");
+        assert_eq!(progress_events[0]["name"], "idx_orders_user_id");
+        assert_eq!(progress_events[0]["status"], "running");
+        assert_eq!(progress_events[0]["current"], 1);
+        assert_eq!(progress_events[0]["total"], 2);
+        assert_eq!(progress_events[1]["status"], "completed");
+        assert_eq!(progress_events[2]["kind"], "foreign_key");
+        assert_eq!(progress_events[2]["name"], "fk_orders_users");
+        assert_eq!(progress_events[2]["current"], 2);
+        assert_eq!(progress_events[2]["total"], 2);
+        assert_eq!(progress_events[3]["status"], "completed");
+    }
+
+    #[test]
+    fn mysql_post_load_ddl_batches_indexes_and_foreign_keys_by_table() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "users".to_string(),
+                    columns: vec![
+                        NormalizedColumn {
+                            name: "id".to_string(),
+                            type_name: "int".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: true,
+                            unique: true,
+                        },
+                        NormalizedColumn {
+                            name: "email".to_string(),
+                            type_name: "varchar(255)".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: false,
+                            unique: false,
+                        },
+                    ],
+                    indexes: vec![NormalizedIndex {
+                        name: "uq_users_email".to_string(),
+                        columns: vec!["email".to_string()],
+                        unique: true,
+                    }],
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                },
+                NormalizedTable {
+                    name: "campaigns".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: true,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                },
+                NormalizedTable {
+                    name: "df_subs".to_string(),
+                    columns: vec![
+                        NormalizedColumn {
+                            name: "id".to_string(),
+                            type_name: "int".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: true,
+                            unique: true,
+                        },
+                        NormalizedColumn {
+                            name: "user_id".to_string(),
+                            type_name: "int".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: false,
+                            unique: false,
+                        },
+                        NormalizedColumn {
+                            name: "campaign_id".to_string(),
+                            type_name: "int".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: false,
+                            unique: false,
+                        },
+                    ],
+                    indexes: vec![
+                        NormalizedIndex {
+                            name: "idx_df_subs_user_id".to_string(),
+                            columns: vec!["user_id".to_string()],
+                            unique: false,
+                        },
+                        NormalizedIndex {
+                            name: "idx_df_subs_campaign_id".to_string(),
+                            columns: vec!["campaign_id".to_string()],
+                            unique: false,
+                        },
+                    ],
+                    foreign_keys: vec![
+                        NormalizedForeignKey {
+                            name: "fk_df_subs_users".to_string(),
+                            columns: vec!["user_id".to_string()],
+                            referenced_table: "users".to_string(),
+                            referenced_columns: vec!["id".to_string()],
+                        },
+                        NormalizedForeignKey {
+                            name: "fk_df_subs_campaigns".to_string(),
+                            columns: vec!["campaign_id".to_string()],
+                            referenced_table: "campaigns".to_string(),
+                            referenced_columns: vec!["id".to_string()],
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap();
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec![
+                "ALTER TABLE `users` ADD UNIQUE INDEX `uq_users_email` (`email`);",
+                "ALTER TABLE `df_subs` ADD INDEX `idx_df_subs_user_id` (`user_id`), ADD INDEX `idx_df_subs_campaign_id` (`campaign_id`);",
+                "ALTER TABLE `df_subs` ADD CONSTRAINT `fk_df_subs_users` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`), ADD CONSTRAINT `fk_df_subs_campaigns` FOREIGN KEY (`campaign_id`) REFERENCES `campaigns` (`id`);",
+            ]
+        );
+    }
+
+    #[test]
+    fn postgresql_post_load_ddl_batches_foreign_keys_but_keeps_indexes_individual() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "users".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "integer".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: true,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                    ..Default::default()
+                },
+                NormalizedTable {
+                    name: "df_subs".to_string(),
+                    columns: vec![
+                        NormalizedColumn {
+                            name: "id".to_string(),
+                            type_name: "integer".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: true,
+                            unique: true,
+                        },
+                        NormalizedColumn {
+                            name: "user_id".to_string(),
+                            type_name: "integer".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: false,
+                            unique: false,
+                        },
+                        NormalizedColumn {
+                            name: "created_at".to_string(),
+                            type_name: "timestamp".to_string(),
+                            default_value: None,
+                            nullable: false,
+                            primary_key: false,
+                            unique: false,
+                        },
+                    ],
+                    indexes: vec![
+                        NormalizedIndex {
+                            name: "idx_df_subs_user_id".to_string(),
+                            columns: vec!["user_id".to_string()],
+                            unique: false,
+                        },
+                        NormalizedIndex {
+                            name: "idx_df_subs_created_at".to_string(),
+                            columns: vec!["created_at".to_string()],
+                            unique: false,
+                        },
+                    ],
+                    foreign_keys: vec![
+                        NormalizedForeignKey {
+                            name: "fk_df_subs_users_1".to_string(),
+                            columns: vec!["user_id".to_string()],
+                            referenced_table: "users".to_string(),
+                            referenced_columns: vec!["id".to_string()],
+                        },
+                        NormalizedForeignKey {
+                            name: "fk_df_subs_users_2".to_string(),
+                            columns: vec!["user_id".to_string()],
+                            referenced_table: "users".to_string(),
+                            referenced_columns: vec!["id".to_string()],
+                        },
+                    ],
+                    ..Default::default()
+                },
+            ],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        apply_post_load_ddl(&mut adapter, &schema, "postgresql").unwrap();
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec![
+                "CREATE INDEX \"idx_df_subs_user_id\" ON \"df_subs\" (\"user_id\");",
+                "CREATE INDEX \"idx_df_subs_created_at\" ON \"df_subs\" (\"created_at\");",
+                "ALTER TABLE \"df_subs\" ADD CONSTRAINT \"fk_df_subs_users_1\" FOREIGN KEY (\"user_id\") REFERENCES \"users\" (\"id\"), ADD CONSTRAINT \"fk_df_subs_users_2\" FOREIGN KEY (\"user_id\") REFERENCES \"users\" (\"id\");",
+            ]
         );
     }
 
@@ -15064,8 +15655,10 @@ mod tests {
         }];
         let mut target_rows = BTreeMap::new();
         target_rows.insert("users".to_string(), 2_u64);
+        let imported_rows = BTreeMap::new();
 
-        let err = verify_target_row_counts(&tables, &target_rows).unwrap_err();
+        let err =
+            verify_import_row_counts("replace", &tables, &target_rows, &imported_rows).unwrap_err();
 
         assert!(err.contains("post_load_validation_failed"));
         assert!(err.contains("users"));
@@ -15083,8 +15676,85 @@ mod tests {
         }];
         let mut target_rows = BTreeMap::new();
         target_rows.insert("users".to_string(), 3_u64);
+        let imported_rows = BTreeMap::new();
 
-        verify_target_row_counts(&tables, &target_rows).unwrap();
+        assert!(
+            verify_import_row_counts("replace", &tables, &target_rows, &imported_rows)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn merge_row_count_verification_accepts_existing_target_rows() {
+        let tables = vec![DumpTableManifest {
+            name: "login_attempts".to_string(),
+            path: "0001_login_attempts".to_string(),
+            rows: 77_198,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut target_rows = BTreeMap::new();
+        target_rows.insert("login_attempts".to_string(), 77_210_u64);
+        let mut imported_rows = BTreeMap::new();
+        imported_rows.insert("login_attempts".to_string(), 77_198_u64);
+
+        assert!(
+            verify_import_row_counts("merge", &tables, &target_rows, &imported_rows)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn replace_row_count_verification_allows_extra_target_rows_after_verified_load() {
+        let tables = vec![DumpTableManifest {
+            name: "login_attempts".to_string(),
+            path: "0001_login_attempts".to_string(),
+            rows: 77_198,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut target_rows = BTreeMap::new();
+        target_rows.insert("login_attempts".to_string(), 77_210_u64);
+        let mut imported_rows = BTreeMap::new();
+        imported_rows.insert("login_attempts".to_string(), 77_198_u64);
+
+        let warnings =
+            verify_import_row_counts("replace", &tables, &target_rows, &imported_rows).unwrap();
+        let verified_rows = import_row_counts_for_verification(
+            "replace",
+            &tables,
+            &target_rows,
+            &imported_rows,
+        );
+
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("login_attempts"));
+        assert!(warnings[0].contains("target has 77210 rows (+12)"));
+        assert_eq!(verified_rows.get("login_attempts").copied(), Some(77_198));
+    }
+
+    #[test]
+    fn replace_row_count_verification_rejects_extra_target_rows_when_load_count_is_unverified() {
+        let tables = vec![DumpTableManifest {
+            name: "login_attempts".to_string(),
+            path: "0001_login_attempts".to_string(),
+            rows: 77_198,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut target_rows = BTreeMap::new();
+        target_rows.insert("login_attempts".to_string(), 77_210_u64);
+        let mut imported_rows = BTreeMap::new();
+        imported_rows.insert("login_attempts".to_string(), 77_190_u64);
+
+        let err =
+            verify_import_row_counts("replace", &tables, &target_rows, &imported_rows).unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("login_attempts"));
+        assert!(err.contains("expected 77198 rows, target has 77210"));
     }
 
     #[test]
@@ -16195,6 +16865,7 @@ mod tests {
                 digest_match: None,
             }],
             load_data_warnings: 0,
+            row_count_warnings: 0,
             sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
             sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
             local_infile_enabled: Some(true),
@@ -16215,6 +16886,7 @@ mod tests {
                 digest_match: Some(true),
             }],
             load_data_warnings: 0,
+            row_count_warnings: 0,
             sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
             sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
             local_infile_enabled: Some(true),
@@ -16235,6 +16907,28 @@ mod tests {
                 digest_match: Some(true),
             }],
             load_data_warnings: 2,
+            row_count_warnings: 0,
+            sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
+            sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
+            local_infile_enabled: Some(true),
+            session_timezone: Some("+00:00".to_string()),
+        };
+        let verdict = classify_import_verdict(&evidence);
+        assert_eq!(verdict, "limited_success");
+    }
+
+    #[test]
+    fn import_verdict_is_limited_success_when_row_count_warnings_exist() {
+        let evidence = ImportVerificationEvidence {
+            tables: vec![TableVerificationEvidence {
+                table: "login_attempts".to_string(),
+                expected_rows: 77_198,
+                actual_rows: 77_198,
+                checksum_match: Some(true),
+                digest_match: Some(true),
+            }],
+            load_data_warnings: 0,
+            row_count_warnings: 1,
             sql_mode_before: Some("STRICT_TRANS_TABLES".to_string()),
             sql_mode_after: Some("STRICT_TRANS_TABLES".to_string()),
             local_infile_enabled: Some(true),

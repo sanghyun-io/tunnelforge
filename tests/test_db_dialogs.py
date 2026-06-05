@@ -12,6 +12,7 @@ from src.ui.dialogs.db_dialogs import (
     cap_incomplete_export_percent,
     displayed_import_percent,
     folder_size_bytes,
+    is_import_ddl_detail_message,
     import_phase_label,
     import_stage_percent,
     plain_import_progress_message,
@@ -246,6 +247,27 @@ def test_format_import_visible_telemetry_translates_phase_message():
     assert line == "인덱스/FK 생성: 🔄 인덱스/FK 생성 중..."
 
 
+def test_format_import_visible_telemetry_shows_post_load_ddl_detail():
+    line = format_import_visible_telemetry({
+        "event": "ddl_progress",
+        "phase": "dump_import_post_load",
+        "kind": "foreign_key",
+        "table": "orders",
+        "name": "fk_orders_users",
+        "current": 2,
+        "total": 8,
+        "status": "running",
+    })
+
+    assert line == "FK 생성 중: orders.fk_orders_users (2/8)"
+
+
+def test_import_ddl_detail_message_is_identified_for_deduplication():
+    assert is_import_ddl_detail_message("인덱스 생성 중: df_subs.idx_name (195/658)")
+    assert is_import_ddl_detail_message("FK 생성 완료: orders.fk_orders_users (8/8)")
+    assert not is_import_ddl_detail_message("인덱스/FK 생성: 🔄 인덱스/FK 생성 중...")
+
+
 def test_safe_recreate_capacity_notice_reports_dump_size(tmp_path, monkeypatch):
     dump_dir = tmp_path / "dump"
     table_dir = dump_dir / "0001_users"
@@ -305,6 +327,49 @@ def test_import_raw_output_shows_visible_telemetry_summary():
     ]
     assert dialog.log_entries[0].endswith("load_data_local_infile")
     assert "[rust_dump]" in dialog.log_entries[1]
+
+
+def test_import_raw_output_does_not_save_duplicate_ddl_summary():
+    app = QApplication.instance() or QApplication([])
+
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog.label_status = QLabel()
+    dialog.label_fk_status = QLabel()
+    dialog._add_log = lambda message: dialog.log_entries.append(f"[00:00:00] {message}")
+
+    RustDumpImportDialog.on_raw_output(dialog, json.dumps({
+        "event": "ddl_progress",
+        "phase": "dump_import_post_load",
+        "kind": "foreign_key",
+        "table": "orders",
+        "name": "fk_orders_users",
+        "current": 2,
+        "total": 8,
+        "status": "running",
+    }))
+
+    assert dialog.txt_log.items == ["FK 생성 중: orders.fk_orders_users (2/8)"]
+    assert len(dialog.log_entries) == 1
+    assert "[rust_dump]" in dialog.log_entries[0]
+    assert "ddl_progress" in dialog.log_entries[0]
 
 
 def test_import_dialog_phase_progress_includes_post_load_stage(monkeypatch):
