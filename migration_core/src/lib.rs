@@ -15,6 +15,7 @@ use postgres::{error::SqlState, NoTls};
 const MYSQL_INSERT_FALLBACK_BATCH_ROWS: usize = 500;
 const MYSQL_INSERT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const MYSQL_DUMP_TARGET_BYTES_PER_CHUNK: u64 = 64_000_000;
+const MYSQL_PK_RANGE_MAX_SPAN_TO_ROW_RATIO: u128 = 8;
 const MYSQL_DUMP_ZSTD_LEVEL: i32 = 1;
 const DUMP_DIR_MARKER: &str = ".tunnelforge_dump_dir";
 
@@ -2082,27 +2083,31 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 avg_row_bytes,
                 profiles.get(&profile_key),
             );
-            if should_use_pk_range_dump(table, table_row_count, range_chunk_size) {
-                if let Some((min_key, max_key)) =
-                    mysql_numeric_min_max(&mut conn, &table.name, pk_column)?
-                {
-                    if min_key <= max_key {
-                        let ranges = pk_ranges(min_key, max_key, table_row_count, range_chunk_size);
-                        chunks_total = ranges.len() as u64;
-                        ranges_by_table.insert(table.name.clone(), ranges);
-                        emit(json!({
-                            "event": "table_progress",
-                            "request_id": request_id,
-                            "table": table.name,
-                            "status": "dumping",
-                            "current": index + 1,
-                            "total": table_total,
-                            "strategy": "global_pk_range_parallel",
-                            "range_chunk_size": range_chunk_size,
-                            "target_bytes_per_chunk": MYSQL_DUMP_TARGET_BYTES_PER_CHUNK,
-                            "avg_row_bytes": avg_row_bytes
-                        }));
-                    }
+            if let Some((min_key, max_key)) =
+                mysql_numeric_min_max(&mut conn, &table.name, pk_column)?
+            {
+                if should_use_pk_range_dump_for_span(
+                    table,
+                    table_row_count,
+                    range_chunk_size,
+                    min_key,
+                    max_key,
+                ) {
+                    let ranges = pk_ranges(min_key, max_key, table_row_count, range_chunk_size);
+                    chunks_total = ranges.len() as u64;
+                    ranges_by_table.insert(table.name.clone(), ranges);
+                    emit(json!({
+                        "event": "table_progress",
+                        "request_id": request_id,
+                        "table": table.name,
+                        "status": "dumping",
+                        "current": index + 1,
+                        "total": table_total,
+                        "strategy": "global_pk_range_parallel",
+                        "range_chunk_size": range_chunk_size,
+                        "target_bytes_per_chunk": MYSQL_DUMP_TARGET_BYTES_PER_CHUNK,
+                        "avg_row_bytes": avg_row_bytes
+                    }));
                 }
             }
         }
@@ -2396,7 +2401,13 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
     let Some((min_key, max_key)) = mysql_numeric_min_max(&mut conn, &table.name, pk_column)? else {
         return Ok(None);
     };
-    if min_key > max_key {
+    if !should_use_pk_range_dump_for_span(
+        table,
+        table_row_count,
+        range_chunk_size,
+        min_key,
+        max_key,
+    ) {
         return Ok(None);
     }
 
@@ -7514,6 +7525,22 @@ fn should_use_pk_range_dump(table: &NormalizedTable, row_count: u64, chunk_size:
     row_count >= threshold && single_numeric_primary_key(table).is_some()
 }
 
+fn should_use_pk_range_dump_for_span(
+    table: &NormalizedTable,
+    row_count: u64,
+    chunk_size: usize,
+    min_key: i128,
+    max_key: i128,
+) -> bool {
+    if !should_use_pk_range_dump(table, row_count, chunk_size) || min_key > max_key {
+        return false;
+    }
+
+    let span = max_key.saturating_sub(min_key).saturating_add(1) as u128;
+    let row_capacity = (row_count as u128).saturating_mul(MYSQL_PK_RANGE_MAX_SPAN_TO_ROW_RATIO);
+    span <= row_capacity
+}
+
 fn mysql_range_chunk_size_for_avg_row(fallback_chunk_size: usize, avg_row_bytes: u64) -> usize {
     let fallback_chunk_size = fallback_chunk_size.max(1);
     if avg_row_bytes == 0 {
@@ -10342,6 +10369,52 @@ mod tests {
         };
 
         assert!(should_use_pk_range_dump(&table, 200_000, 50_000));
+    }
+
+    #[test]
+    fn sparse_numeric_pk_span_falls_back_to_keyset_dump() {
+        let table = NormalizedTable {
+            name: "sparse_events".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "bigint".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        assert!(!should_use_pk_range_dump_for_span(
+            &table,
+            200_000,
+            50_000,
+            1,
+            10_000_000_000,
+        ));
+    }
+
+    #[test]
+    fn dense_numeric_pk_span_uses_range_dump() {
+        let table = NormalizedTable {
+            name: "dense_events".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "bigint".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+
+        assert!(should_use_pk_range_dump_for_span(
+            &table, 200_000, 50_000, 1, 220_000,
+        ));
     }
 
     #[test]
