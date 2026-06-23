@@ -18,6 +18,7 @@ import os
 from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
+from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
     RustDumpChecker, RustDumpConfig, check_rust_dump,
@@ -1391,6 +1392,8 @@ class RustDumpExportDialog(QDialog):
         timestamp = datetime.now().strftime('%H:%M:%S')
         log_entry = f"[{timestamp}] {msg}"
         self.log_entries.append(log_entry)
+        if hasattr(self, "btn_save_log"):
+            self.btn_save_log.setEnabled(True)
 
     def on_progress(self, msg: str):
         self.txt_log.addItem(msg)
@@ -1699,7 +1702,10 @@ class RustDumpExportDialog(QDialog):
 
         # 기본 파일명 생성
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        status = "success" if self.export_success else "failed"
+        if self.export_success is None:
+            status = "running"
+        else:
+            status = "success" if self.export_success else "failed"
         default_filename = f"export_log_{self.export_schema}_{status}_{timestamp}.txt"
 
         # 파일 저장 대화상자
@@ -1726,7 +1732,11 @@ class RustDumpExportDialog(QDialog):
                     f.write(f"선택 테이블: {', '.join(self.export_tables)}\n")
                 f.write(f"출력 폴더: {self.input_output_dir.text()}\n")
                 f.write(f"연결 정보: {self.connection_info}\n")
-                f.write(f"결과: {'성공 ✅' if self.export_success else '실패 ❌'}\n")
+                if self.export_success is None:
+                    result_label = "진행 중"
+                else:
+                    result_label = "성공 ✅" if self.export_success else "실패 ❌"
+                f.write(f"결과: {result_label}\n")
 
                 if self.export_start_time:
                     f.write(f"시작 시간: {self.export_start_time.strftime('%Y-%m-%d %H:%M:%S')}\n")
@@ -1791,6 +1801,18 @@ class RustDumpExportDialog(QDialog):
             )
 
     def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self._add_log("닫기 차단: Export가 실행 중입니다. 로그 저장은 계속 사용할 수 있습니다.")
+            self.btn_save_log.setEnabled(True)
+            QMessageBox.warning(
+                self,
+                translate_text("Export 실행 중"),
+                translate_text(
+                    "Export가 실행 중입니다.\n로그 저장은 가능하지만, 진행 중에는 창을 닫을 수 없습니다."
+                )
+            )
+            event.ignore()
+            return
         if self.connector:
             self.connector.disconnect()
         event.accept()

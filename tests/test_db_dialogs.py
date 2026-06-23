@@ -351,6 +351,75 @@ def test_export_raw_output_shows_visible_telemetry_summary():
     assert dialog.log_entries[0].endswith("pk_range_parallel")
 
 
+def test_export_add_log_enables_save_log_before_finish(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpExportDialog()
+
+    assert not dialog.btn_save_log.isEnabled()
+
+    dialog._add_log("export started")
+
+    assert dialog.btn_save_log.isEnabled()
+    dialog.close()
+
+
+def test_export_close_while_running_keeps_dialog_open_and_log_available(monkeypatch):
+    class FakeWorker:
+        def isRunning(self):
+            return True
+
+    class FakeConnector:
+        def __init__(self):
+            self.disconnected = False
+
+        def disconnect(self):
+            self.disconnected = True
+
+    class FakeButton:
+        def __init__(self):
+            self.enabled = False
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+    class FakeEvent:
+        def __init__(self):
+            self.accepted = False
+            self.ignored = False
+
+        def accept(self):
+            self.accepted = True
+
+        def ignore(self):
+            self.ignored = True
+
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.QMessageBox.warning",
+        lambda *args: warnings.append(args),
+    )
+    dialog = type("DummyDialog", (), {})()
+    dialog.worker = FakeWorker()
+    dialog.connector = FakeConnector()
+    dialog.btn_save_log = FakeButton()
+    dialog.log_entries = []
+    dialog._add_log = lambda message: dialog.log_entries.append(message)
+    event = FakeEvent()
+
+    RustDumpExportDialog.closeEvent(dialog, event)
+
+    assert event.ignored
+    assert not event.accepted
+    assert not dialog.connector.disconnected
+    assert dialog.btn_save_log.enabled
+    assert any("닫기 차단" in entry for entry in dialog.log_entries)
+    assert warnings
+
+
 def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
     captured = {}
 
