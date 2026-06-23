@@ -1816,6 +1816,17 @@ fn dump_tables_sequential<F: FnMut(Value)>(
     Ok((manifests, total_rows, total_chunks))
 }
 
+fn bounded_dump_chunk_limit(total_rows: u64, rows_dumped: u64, chunk_size: usize) -> Option<usize> {
+    if total_rows > 0 && rows_dumped >= total_rows {
+        return None;
+    }
+    let limit = chunk_size.max(1);
+    if total_rows == 0 {
+        return Some(limit);
+    }
+    Some(limit.min((total_rows - rows_dumped) as usize))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DumpParallelLimits {
     table_workers: usize,
@@ -2835,11 +2846,15 @@ fn dump_one_table<F: FnMut(Value)>(
     let mut chunk_sha256 = BTreeMap::new();
 
     loop {
+        let Some(read_limit) = bounded_dump_chunk_limit(table_row_count, rows_dumped, chunk_size)
+        else {
+            break;
+        };
         let read_started = Instant::now();
         let rows = if use_keyset {
-            adapter.read_rows_after_key(table, &key_columns, last_key.as_deref(), chunk_size)?
+            adapter.read_rows_after_key(table, &key_columns, last_key.as_deref(), read_limit)?
         } else {
-            adapter.read_rows(table, offset, chunk_size)?
+            adapter.read_rows(table, offset, read_limit)?
         };
         let read_ms = read_started.elapsed().as_millis() as u64;
         if rows.is_empty() {
@@ -2939,6 +2954,10 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
     let mut chunk_sha256 = BTreeMap::new();
 
     loop {
+        let Some(read_limit) = bounded_dump_chunk_limit(table_row_count, rows_dumped, chunk_size)
+        else {
+            break;
+        };
         chunks_dumped += 1;
         let chunk_name = dump_chunk_name(chunks_dumped, data_format, compression);
         let chunk_path = table_dir.join(&chunk_name);
@@ -2951,7 +2970,7 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
                 table,
                 &key_columns,
                 last_values.as_deref(),
-                chunk_size,
+                read_limit,
             )
         } else {
             select_chunk_text_sql("mysql", table, &key_columns)
@@ -2959,7 +2978,7 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
         let sql = if use_keyset {
             sql
         } else {
-            sql.replacen('?', &(chunk_size as u64).to_string(), 1)
+            sql.replacen('?', &(read_limit as u64).to_string(), 1)
                 .replacen('?', &(offset as u64).to_string(), 1)
         };
         let result = if use_keyset {
@@ -4793,7 +4812,9 @@ fn validate_single_view_statement(sql: &str) -> Result<(), String> {
     match iter.next() {
         Some(tok) if tok.eq_ignore_ascii_case("create") => {}
         Some(tok) => {
-            return Err(format!("view definition must start with CREATE, got: {tok}"))
+            return Err(format!(
+                "view definition must start with CREATE, got: {tok}"
+            ))
         }
         None => return Err("empty view definition".to_string()),
     }
@@ -10128,6 +10149,20 @@ mod tests {
     }
 
     #[test]
+    fn dump_chunk_limit_stops_at_initial_row_count_when_source_grows() {
+        assert_eq!(bounded_dump_chunk_limit(2, 0, 50_000), Some(2));
+        assert_eq!(bounded_dump_chunk_limit(2, 2, 50_000), None);
+        assert_eq!(
+            bounded_dump_chunk_limit(120_000, 50_000, 50_000),
+            Some(50_000)
+        );
+        assert_eq!(
+            bounded_dump_chunk_limit(120_000, 100_000, 50_000),
+            Some(20_000)
+        );
+    }
+
+    #[test]
     fn adaptive_import_chunk_order_prefers_larger_chunk_files() {
         let dir = std::env::temp_dir().join(format!(
             "tunnelforge-import-order-test-{}",
@@ -12208,7 +12243,10 @@ mod tests {
     #[test]
     fn drop_view_sql_uses_drop_view() {
         assert_eq!(drop_view_sql("mysql", "v"), "DROP VIEW IF EXISTS `v`");
-        assert_eq!(drop_view_sql("postgresql", "v"), "DROP VIEW IF EXISTS \"v\"");
+        assert_eq!(
+            drop_view_sql("postgresql", "v"),
+            "DROP VIEW IF EXISTS \"v\""
+        );
     }
 
     #[test]
@@ -12323,8 +12361,7 @@ mod tests {
         // CREATE 로 시작하지만 VIEW가 아닌 단일 statement는 거부해야 한다.
         assert!(validate_single_view_statement("CREATE USER attacker IDENTIFIED BY 'p'").is_err());
         assert!(
-            validate_single_view_statement("CREATE TABLE stolen AS SELECT * FROM secrets")
-                .is_err()
+            validate_single_view_statement("CREATE TABLE stolen AS SELECT * FROM secrets").is_err()
         );
         let err = validate_single_view_statement("CREATE DATABASE evil").unwrap_err();
         assert!(err.contains("VIEW"));
@@ -12337,9 +12374,7 @@ mod tests {
             "CREATE ALGORITHM=UNDEFINED SQL SECURITY INVOKER VIEW `v` AS select 1"
         )
         .is_ok());
-        assert!(
-            validate_single_view_statement("CREATE OR REPLACE VIEW \"v\" AS SELECT 1").is_ok()
-        );
+        assert!(validate_single_view_statement("CREATE OR REPLACE VIEW \"v\" AS SELECT 1").is_ok());
     }
 
     #[test]
