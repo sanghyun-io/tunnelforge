@@ -47,3 +47,32 @@ Before exposing the UI as preview, beta, or fully enabled:
    becomes fully enabled.
 5. Update the feature flags, user-facing docs, and `docs\current_status.md` in
    the same change if the decision changes.
+
+## 2026-06-26 Analysis
+
+The current evidence supports keeping the workflow hidden or, at most, exposing
+a dry-run-only preview after UI copy and tests are tightened. It does not
+support full enablement.
+
+Reasons:
+
+- Rust Core `oneclick.run` emits a complete phase/progress/report stream, but
+  `oneclick_analysis_summary` reports `auto_fixable = 0` and
+  `manual_review = issues.len()`.
+- `oneclick_recommendations` currently returns manual review steps only.
+- `oneclick_apply_fixes` and the execution phase do not apply SQL fixes; a
+  non-dry-run request logs that no automatic Rust Core fixes are currently
+  required.
+- The migration analyzer button copy and tooltip still say automatic migration
+  and automatic fixes, which overstates the current backend behavior.
+- The dialog backup checkbox defaults unchecked. If preview is exposed, dry-run
+  UX should avoid making a backup warning look like a solved migration issue.
+
+Recommended next repo-side change:
+
+1. Keep `ONECLICK_REAL_EXECUTION_ENABLED = False`.
+2. Add a separate preview decision flag or keep
+   `ONE_CLICK_MIGRATION_FEATURE_ENABLED = False` until copy is updated.
+3. If preview is chosen, expose it as "One-Click dry-run preview" only, update
+   tooltip/result wording, and add tests for button visibility plus dry-run-only
+   behavior.
