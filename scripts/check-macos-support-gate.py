@@ -7,6 +7,7 @@ import argparse
 import glob
 import hashlib
 import json
+import re
 import shutil
 import subprocess
 import sys
@@ -301,6 +302,22 @@ def resolve_repo(explicit_repo: str | None) -> str:
     return data["nameWithOwner"]
 
 
+def check_final_issue_handoff(body: str) -> bool:
+    if re.search(r"^- Current repository-side gate head:\s*`[0-9a-fA-F]{7,40}`\.", body, re.MULTILINE):
+        fail(
+            f"#{FINAL_ISSUE} Current Evidence must not hard-code a current gate head SHA; "
+            "use latest pushed main wording so documentation-only commits do not stale the handoff"
+        )
+        return False
+
+    if "latest pushed `main`" not in body and "latest pushed main" not in body:
+        fail(f"#{FINAL_ISSUE} Current Evidence must tell operators to use the latest pushed main")
+        return False
+
+    ok("final issue handoff uses non-volatile latest-main wording")
+    return True
+
+
 def check_issues(repo: str, final: bool) -> bool:
     passed = True
     for issue_number, expected_state in MILESTONE_ISSUES.items():
@@ -329,9 +346,10 @@ def check_issues(repo: str, final: bool) -> bool:
             "--repo",
             repo,
             "--json",
-            "state,milestone,title",
+            "state,milestone,title,body",
         ]
     )
+    passed = check_final_issue_handoff(final_issue.get("body") or "") and passed
     milestone_title = (final_issue.get("milestone") or {}).get("title", "")
     if "macOS Support M6" not in milestone_title:
         fail(f"#{FINAL_ISSUE} is not assigned to the M6 milestone")

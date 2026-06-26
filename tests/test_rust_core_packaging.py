@@ -1368,6 +1368,16 @@ def test_macos_support_gate_checks_report_artifact_head_sha(tmp_path, capsys):
     assert "manual validation report Artifact head SHA 0123456789abcdef does not match manual macOS workflow run deadbeef" in capsys.readouterr().err
 
 
+def test_macos_support_gate_rejects_hard_coded_current_issue_head(capsys):
+    gate = load_macos_support_gate_module()
+
+    assert gate.check_final_issue_handoff("- Current repository-side gate source: latest pushed `main`\n") is True
+    assert "final issue handoff uses non-volatile latest-main wording" in capsys.readouterr().out
+
+    assert gate.check_final_issue_handoff("- Current repository-side gate head: `3360cd9`.\n") is False
+    assert "must not hard-code a current gate head SHA" in capsys.readouterr().err
+
+
 def test_macos_support_gate_accepts_merged_pr_with_unknown_merge_state(monkeypatch, capsys):
     gate = load_macos_support_gate_module()
 
