@@ -100,6 +100,12 @@ class CleanupWorker(QThread):
         dry_run: bool = True
     ):
         super().__init__()
+        if not dry_run:
+            raise RuntimeError(
+                "Legacy Python cleanup worker actual execution is disabled. "
+                "DB mutations must be owned by Rust Core."
+            )
+
         self.connector = connector
         self.schema = schema
         self.actions = actions
