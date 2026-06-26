@@ -61,13 +61,14 @@
     <li>Parallel exports are marked <code>non_consistent_parallel</code> and non-strict instead of implying an unproven shared snapshot.</li>
     <li>MySQL column inspection now preserves <code>CHARACTER_SET_NAME</code> and <code>COLLATION_NAME</code> in dump schema type metadata, and post-load FK DDL is blocked when text-column charset/collation is incompatible.</li>
     <li>Shadow full replacement has been retired as a current guarantee; full replacement is documented as direct replacement against the selected target database.</li>
+    <li>Direct replace/recreate DDL failures now include a classified error, affected table, and operation such as <code>drop_table</code> or <code>create_table</code>.</li>
     <li>Import UI wording no longer promises that every object type is restored automatically.</li>
   </ul>
 
   <h2>Verification Evidence</h2>
   <table>
     <tr><th>Command</th><th>Result</th><th>Notes</th></tr>
-    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="status-pass">PASS</td><td>157 Rust lib tests, JSONL CLI test, live-roundtrip gated tests, doctests.</td></tr>
+    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="status-pass">PASS</td><td>158 Rust lib tests, JSONL CLI test, live-roundtrip gated tests, doctests.</td></tr>
     <tr><td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td><td class="status-pass">PASS</td><td>Release Rust core binary builds.</td></tr>
     <tr><td><code>.venv\Scripts\python -m pytest -q</code></td><td class="status-pass">PASS</td><td>1710 Python tests passed, 3 collection warnings from existing test helper classes.</td></tr>
     <tr><td><code>.venv\Scripts\python -m compileall -q main.py src tests</code></td><td class="status-pass">PASS</td><td>Python syntax check passed.</td></tr>
@@ -86,6 +87,7 @@
     <tr><td>Export manifest lacks consistency metadata</td><td><code>dump_manifest_strictness_fields_default_for_legacy_json</code>, <code>dump_manifest_consistency_metadata_marks_parallel_as_non_strict</code></td></tr>
     <tr><td>Merge import reapplies recreated-target DDL</td><td><code>post_load_ddl_policy_applies_for_recreated_targets_only</code>, <code>merge_import_does_not_claim_post_load_ddl_phase</code></td></tr>
     <tr><td>MySQL FK charset/collation mismatch reaches database as <code>ERROR 3780</code></td><td><code>fk_schema_fidelity_rejects_incompatible_text_collations</code>, <code>fk_schema_fidelity_accepts_matching_text_collations</code>, <code>mysql_column_inspection_captures_character_metadata</code></td></tr>
+    <tr><td>Direct replacement DDL failure loses table/operation context</td><td><code>dump_import_ddl_error_includes_classification_table_and_operation</code></td></tr>
     <tr><td>Import UI overpromises all-object restoration</td><td><code>test_import_dialog_does_not_claim_all_objects_are_recreated</code></td></tr>
   </table>
 

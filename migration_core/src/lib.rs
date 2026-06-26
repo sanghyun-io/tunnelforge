@@ -3212,11 +3212,15 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             let table_rows_before = rows_imported;
 
             if matches!(mode, "replace" | "recreate") {
-                adapter.execute_sql(&drop_table_sql(adapter.engine(), &table.name))?;
+                adapter
+                    .execute_sql(&drop_table_sql(adapter.engine(), &table.name))
+                    .map_err(|err| dump_import_ddl_error("drop_table", &table.name, &err))?;
             }
             let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
                 .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
-            adapter.create_table(table, &ddl)?;
+            adapter
+                .create_table(table, &ddl)
+                .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
 
             if data_format == "tsv" && !has_binary_columns(table) {
                 if let LiveAdapter::MySql(conn) = &mut adapter {
@@ -7909,6 +7913,14 @@ fn classified_import_error(code: &str, message: &str, scope: Option<&str>) -> St
     }
 }
 
+fn dump_import_ddl_error(operation: &str, table: &str, err: &str) -> String {
+    classified_import_error(
+        "load_failed",
+        &format!("{operation} failed: {err}"),
+        Some(table),
+    )
+}
+
 fn validate_dump_import_manifest_strictness(
     tables: &[DumpTableManifest],
     strict: bool,
@@ -10111,6 +10123,16 @@ mod tests {
         assert_eq!(
             err,
             "import_plan_invalid: users: full replacement worker target is unresolved"
+        );
+    }
+
+    #[test]
+    fn dump_import_ddl_error_includes_classification_table_and_operation() {
+        let err = dump_import_ddl_error("create_table", "users", "mysql create table error");
+
+        assert_eq!(
+            err,
+            "load_failed: users: create_table failed: mysql create table error"
         );
     }
 
