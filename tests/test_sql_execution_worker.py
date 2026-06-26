@@ -1,3 +1,4 @@
+from src.core.sql_statement_parser import read_dollar_quote
 from src.ui.workers.test_worker import SQLExecutionWorker
 
 
@@ -141,3 +142,14 @@ def test_sql_statement_parser_supports_postgresql_dollar_quotes():
         "CREATE FUNCTION f() RETURNS void AS $body$\n    BEGIN\n        RAISE NOTICE 'a;b';\n    END\n    $body$ LANGUAGE plpgsql",
         "SELECT 1",
     ]
+
+
+def test_dollar_quote_reader_fails_closed_for_out_of_range_starts():
+    sql = "$body$"
+
+    assert read_dollar_quote("", 0) == ""
+    assert read_dollar_quote(sql, -1) == ""
+    assert read_dollar_quote(sql, len(sql)) == ""
+    assert SQLExecutionWorker._read_dollar_quote("", 0) == ""
+    assert SQLExecutionWorker._read_dollar_quote(sql, -1) == ""
+    assert SQLExecutionWorker._read_dollar_quote(sql, len(sql)) == ""

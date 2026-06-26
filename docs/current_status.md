@@ -187,7 +187,7 @@ repo-side implementation issue.
 
 GitHub #152 is fixed as the post-#151 full-suite evidence refresh: after adding
 post-#151 current-status coverage, `pytest -q` reported `1839 passed, 5
-warnings`; that count is now superseded by TF-STATUS-056 full-suite evidence.
+warnings`; that count is now superseded by TF-STATUS-057 full-suite evidence.
 
 GitHub #153 is fixed as a Rust Core DML affected-row reporting follow-up:
 Rust Core `query.execute` now returns `rows_affected` for non-row-returning
@@ -208,6 +208,13 @@ file execution, SQL Editor execute-all/current-query, and hidden scheduled SQL.
 `find_sql_statement_at_position` uses parser ranges so SQL Editor current-query
 execution returns a whole statement when the cursor is inside comments,
 PostgreSQL dollar quote bodies, quoted identifiers, or MySQL DELIMITER scripts.
+
+GitHub #156 is fixed as a SQL dollar quote helper guard follow-up:
+`read_dollar_quote` now returns an empty marker for empty SQL text and
+out-of-range start offsets instead of raising `IndexError` or inspecting a
+negative Python index. The compatibility wrapper
+`SQLExecutionWorker._read_dollar_quote` now inherits the same fail-closed
+behavior.
 
 The current full Python suite count was refreshed again on 2026-06-27 after
 the current-status re-audit regression coverage was added.
@@ -257,7 +264,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before this document |
-| `pytest -q` | PASS, 1843 passed, 5 warnings |
+| `pytest -q` | PASS, 1845 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -281,7 +288,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1843 passed, 5 warnings |
+| `pytest -q` | PASS, 1845 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -329,11 +336,14 @@ Commands run locally:
 | `pytest tests\test_sql_editor_dialog.py::test_split_queries_preserves_comments_dollar_quotes_and_delimiters tests\test_sql_editor_dialog.py::test_get_query_at_cursor_uses_statement_parser_ranges -q` | RED then PASS |
 | `pytest tests\test_scheduler.py::TestBackupScheduler::test_parse_sql_queries_preserves_comments_dollar_quotes_and_delimiters -q` | RED then PASS |
 | `pytest tests\test_sql_editor_dialog.py tests\test_scheduler.py tests\test_sql_execution_worker.py -q` | PASS, 71 passed, 2 warnings |
+| `pytest tests\test_sql_execution_worker.py::test_dollar_quote_reader_fails_closed_for_out_of_range_starts -q` | RED then PASS |
+| `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q` | PASS, 72 passed, 2 warnings |
 
 ## Verification Log
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | SQL dollar quote helper guard | RED/GREEN: `pytest tests\test_sql_execution_worker.py::test_dollar_quote_reader_fails_closed_for_out_of_range_starts -q`; `gh issue create` created #156; `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q`; `python -m compileall -q src\core\sql_statement_parser.py tests\test_sql_execution_worker.py`; `git diff --check` | PASS | GitHub #156 is fixed: `read_dollar_quote` and `SQLExecutionWorker._read_dollar_quote` return `""` for empty SQL text or out-of-range start offsets |
 | 2026-06-27 | SQL statement parser mismatch fix | RED/GREEN: `pytest tests\test_sql_editor_dialog.py::test_split_queries_preserves_comments_dollar_quotes_and_delimiters tests\test_sql_editor_dialog.py::test_get_query_at_cursor_uses_statement_parser_ranges -q`; RED/GREEN: `pytest tests\test_scheduler.py::TestBackupScheduler::test_parse_sql_queries_preserves_comments_dollar_quotes_and_delimiters -q`; `pytest tests\test_sql_editor_dialog.py tests\test_scheduler.py tests\test_sql_execution_worker.py -q`; `pytest -q` | PASS | GitHub #155 is fixed: SQL file execution, SQL Editor execute-all/current-query, and scheduled SQL now share `src/core/sql_statement_parser.py`; SQL Editor current-query lookup uses parser ranges via `find_sql_statement_at_position` |
 | 2026-06-27 | SQL statement parser mismatch analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_sql_statement_parser_mismatch_issue -q`; `git fetch --all --prune`; `git status --short --branch`; `gh issue list --state open --limit 30`; `gh issue view 116 --json ...`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; direct parser comparison; `gh issue create` created #155 | EXPECTED FAIL for `--final` only | `main` is aligned with `origin/main`; #116 remains external real-Mac evidence work; GitHub #155 now tracks the confirmed repo-side mismatch where SQL Editor/Scheduler quote-only splitting diverges from the robust SQL file execution parser |
 | 2026-06-27 | Call-local Rust cursor affected-row metadata | RED/GREEN: `pytest tests\test_db_core_service.py::test_rust_db_cursor_rowcount_uses_call_local_rows_affected -q`; `gh issue create` created #154; focused DB core/current-status pytest; `pytest -q` | PASS | GitHub #154 is fixed: `RustDbCursor.rowcount` uses call-local `execute_on_connection_result` metadata instead of shared facade state; the then-current 1839-test suite evidence is superseded by TF-STATUS-056 |
@@ -2003,12 +2013,13 @@ Next action:
 | TF-STATUS-054 | Medium | closed | Rust Core query execution / SQL reporting | Rust Core DML affected row counts | Preserve Rust Core affected-row metadata in Python cursor shims |
 | TF-STATUS-055 | Medium | closed | Rust Core Python shim / SQL reporting | Call-local affected-row metadata | Do not store per-query rowcount metadata on shared facade state |
 | TF-STATUS-056 | High | closed | SQL execution / SQL Editor / Scheduler | SQL statement parser mismatch | Share one robust parser for SQL file execution, SQL Editor execute-all/current-query, and scheduled SQL |
+| TF-STATUS-057 | Low | closed | SQL parser helper | SQL dollar quote helper guard | Keep dollar quote marker detection fail-closed for invalid start offsets |
 
 ## Recommended Execution Order
 
-1. No repo-side implementation issue is currently open after TF-STATUS-056 /
-   GitHub #155 fixed SQL statement parser sharing across SQL file execution,
-   SQL Editor execute-all/current-query, and scheduled SQL.
+1. No repo-side implementation issue is currently open after TF-STATUS-057 /
+   GitHub #156 hardened SQL dollar quote helper bounds handling after
+   TF-STATUS-056 / GitHub #155 fixed SQL statement parser sharing.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence; #116 remains external.
 3. Track additional One-Click automatic fix classes as separate GitHub issues
@@ -2018,6 +2029,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-06-27 | Fixed TF-STATUS-057 / GitHub #156 by making the SQL dollar quote helper fail closed for empty SQL text and out-of-range starts. | `src/core/sql_statement_parser.py`, `tests/test_sql_execution_worker.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #156 | RED/GREEN: dollar quote helper bounds pytest; parser suite, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-056 / GitHub #155 by extracting the robust SQL statement parser to `src/core/sql_statement_parser.py` and routing SQL file execution, SQL Editor split/current-query, and scheduled SQL through it. | `src/core/sql_statement_parser.py`, `src/ui/workers/test_worker.py`, `src/ui/dialogs/sql_editor_dialog.py`, `src/core/scheduler.py`, `tests/test_sql_editor_dialog.py`, `tests/test_scheduler.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #155 | RED/GREEN: SQL Editor/Scheduler parser tests; final: SQL Editor/Scheduler/worker pytest and full `pytest -q` |
 | 2026-06-27 | Created TF-STATUS-056 / GitHub #155 after confirming that SQL Editor and hidden scheduler statement splitters can over-split comments, PostgreSQL dollar quote bodies, and MySQL `DELIMITER` scripts while SQL file execution already handles those cases. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #155 | RED/GREEN: SQL parser mismatch current-status pytest; #116 gate pass, expected-failing final gate |
 | 2026-06-27 | Created and fixed TF-STATUS-055 / GitHub #154 after finding that the #153 Python cursor shim used shared facade state for affected-row metadata. | `src/core/db_core_service.py`, `tests/test_db_core_service.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #154 | RED/GREEN: call-local rowcount metadata pytest |
