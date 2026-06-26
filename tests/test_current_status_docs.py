@@ -101,6 +101,20 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "Current main full Python suite" in doc
 
 
+def test_current_status_does_not_describe_stale_full_pytest_count_as_current():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+
+    stale_current_phrases = [
+        "current full Python suite is now `1830 passed, 5 warnings`",
+        "current `1830 passed, 5 warnings` evidence",
+        "now reports `1830 passed, 5 warnings`",
+    ]
+
+    for phrase in stale_current_phrases:
+        assert phrase not in normalized_doc
+
+
 def test_current_status_current_baseline_section_is_not_stale_dated():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     headings = [line for line in doc.splitlines() if line.startswith("## ")]
