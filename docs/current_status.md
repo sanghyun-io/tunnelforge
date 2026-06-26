@@ -96,6 +96,7 @@ Version references are aligned at `2.1.6` across:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-26 | Direct DB Export/Import Rust Core endpoint host | RED/GREEN: `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump -q`; RED/GREEN: `pytest tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q`; `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q` | PASS | `RustDumpExportDialog` and `RustDumpImportDialog` now preserve direct connector `host` when creating `RustDumpConfig`; tunnel connections still use their connector host, normally `127.0.0.1` |
 | 2026-06-26 | Export table selection audit | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_export_table_selection_audit -q`; `git status --short --branch`; `gh issue list --state open --limit 30 --json number,title,state,labels,updatedAt,url`; `rg -n "class RustDumpExportDialog|export_tables|dump.run|selected_tables|table selection" src tests docs README.md README.ko.md migration_core\src migration_core\tests`; code inspection of `RustDumpExportDialog`, `RustDumpExporter.export_tables`, `RustDumpWorker`, and Rust `dump.run` table filtering | PASS | Export individual table selection is currently implemented: PyQt exposes `선택 테이블 Export`, checkbox table list, select-all/deselect-all, and FK parent auto-include; Python forwards selected tables through `RustDumpExporter.export_tables`; Rust Core `dump.run` filters schema tables from the `tables` payload |
 | 2026-06-26 | GitHub #116 final evidence attachment wording | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate tests\test_rust_core_packaging.py::test_macos_manual_validation_report_finalize_can_post_github_comment -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py -q`; `python scripts\check-macos-support-gate.py`; `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py`; `git diff --check` | PASS | Finalizer stdout, generated GitHub comment, and macOS support docs now tell operators to attach final real-Mac evidence to #116 first; PR #117 is only a traceability mirror |
 | 2026-06-26 | GitHub #116 Actions lookup command accuracy | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_support_gate_rejects_hard_coded_current_issue_head -q`; RED/GREEN: `python scripts\check-macos-support-gate.py`; `gh run list --workflow "macOS App Validation" --branch main --limit 5`; `gh run list --workflow "macOS App Validation" --event pull_request --limit 3`; `gh run list --workflow "Version Gate" --event pull_request --limit 3`; `gh issue edit 116 --body-file <temp>` | PASS | #116 no longer tells operators to use `--branch main` for PR workflow run lookup; event-filtered commands return relevant PR/manual runs |
@@ -992,6 +993,37 @@ Next action:
 2. Keep #140 derivation evidence refreshed if PyQt payload construction,
    Rust Core derivation, or One-Click event payloads change.
 
+### TF-STATUS-024: Direct DB Export/Import Uses Connector Host
+
+Status: closed
+Severity: High
+Area: Export/Import UI
+
+Evidence:
+
+- 2026-06-26 audit found `RustDumpExportDialog.do_export()` and
+  `RustDumpImportDialog.do_import()` created `RustDumpConfig` with
+  `host="127.0.0.1"` even when the active connector represented a direct
+  remote DB connection.
+- Tunnel flows normally expose `connector.host == "127.0.0.1"` because they
+  connect through a local forwarded port, but direct flows must preserve the
+  connector host.
+- RED/GREEN tests now cover both dialogs with a direct connector at
+  `db.example.com:3307`.
+
+Resolution:
+
+- Export and Import dialogs now set `RustDumpConfig.host` from
+  `connector.host`, falling back to `127.0.0.1` only when the connector lacks a
+  host attribute.
+- Focused tests verify host, port, user, and password are forwarded to the Rust
+  DB Core worker config.
+
+Next action:
+
+1. Keep direct-connection endpoint coverage aligned if Export/Import worker
+   construction moves or if PostgreSQL dump support is added later.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1019,6 +1051,7 @@ Next action:
 | TF-STATUS-021 | High | closed | One-Click migration UI / Rust Core automatic fixes | Charset/collation automatic fix coverage | Keep validator/live evidence aligned if the charset contract changes |
 | TF-STATUS-022 | High | closed | One-Click migration UI / Rust Core automatic fixes | Derive charset contracts for PyQt execution | Keep derivation evidence aligned if PyQt payload construction or Rust Core derivation changes |
 | TF-STATUS-023 | Medium | closed | One-Click migration UI / Rust Core automatic fixes | Align `int_display_width` skip semantics | Keep display-only skip policy aligned if Rust Core begins emitting this class |
+| TF-STATUS-024 | High | closed | Export/Import UI | Direct DB Rust Core endpoint host | Keep direct connector host coverage when worker construction changes |
 
 ## Recommended Execution Order
 
@@ -1112,3 +1145,4 @@ Next action:
 | 2026-06-26 | Replaced misleading #116 `gh run list --workflow ... --branch main` operator guidance with event-filtered commands that were verified to return relevant workflow runs; gate now rejects the bad pattern. | `scripts/check-macos-support-gate.py`, `tests/test_rust_core_packaging.py`, `docs/current_status.md`, GitHub #116 body | RED/GREEN: focused pytest and `python scripts\check-macos-support-gate.py` |
 | 2026-06-26 | Tightened #116 final evidence attachment wording so the finalizer and docs direct operators to attach the real-Mac bundle to #116 before closing it, while PR #117 remains only a mirrored traceability target. | `scripts/macos-manual-validation-report.sh`, `docs/macos_support.md`, `tests/test_rust_core_packaging.py`, `docs/current_status.md` | RED/GREEN: focused finalizer pytest; final: focused macOS/docs pytest, full #116 gate, compileall, `git diff --check` |
 | 2026-06-26 | Audited the original Export table-selection question and recorded the current contract: the app can export individually selected tables today through `RustDumpExportDialog` -> `RustDumpExporter.export_tables` -> Rust Core `dump.run` `tables` filtering. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_export_table_selection_audit -q`; source/doc/GitHub issue scan |
+| 2026-06-26 | Fixed TF-STATUS-024 after finding that direct DB Export/Import dialogs hard-coded the Rust DB Core endpoint host to `127.0.0.1`; both dialogs now preserve `connector.host` while tunnel flows still use their local connector host. | `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `docs/current_status.md` | RED/GREEN: focused Export and Import direct-host pytest |

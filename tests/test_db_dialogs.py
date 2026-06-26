@@ -538,3 +538,135 @@ def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
         "password": "tunnelpass",
         "database": "tf_source84",
     }
+
+
+def test_export_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    captured = {}
+
+    class FakeWorker:
+        progress = FakeSignal()
+        table_progress = FakeSignal()
+        detail_progress = FakeSignal()
+        table_status = FakeSignal()
+        raw_output = FakeSignal()
+        finished = FakeSignal()
+
+        def __init__(self, task_type, config, **kwargs):
+            captured["task_type"] = task_type
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+
+        def start(self):
+            captured["started"] = True
+
+        def isRunning(self):
+            return False
+
+    class FakeConnector:
+        host = "db.example.com"
+        port = 3307
+        user = "exporter"
+        password = "secret"
+
+        def get_schemas(self):
+            return ["app"]
+
+        def get_tables(self, _schema):
+            return ["users"]
+
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(tmp_path) if key == "rust_dump_export_base_dir" else default
+    )
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
+
+    dialog = RustDumpExportDialog(
+        connector=FakeConnector(),
+        config_manager=config_manager,
+        connection_info="db-example_3307",
+    )
+
+    dialog.do_export()
+
+    assert captured["task_type"] == "export_schema"
+    assert captured["config"].host == "db.example.com"
+    assert captured["config"].port == 3307
+    assert captured["config"].user == "exporter"
+    assert captured["config"].password == "secret"
+    assert captured["started"] is True
+    dialog.deleteLater()
+
+
+def test_import_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    captured = {}
+
+    class FakeWorker:
+        progress = FakeSignal()
+        table_progress = FakeSignal()
+        detail_progress = FakeSignal()
+        table_status = FakeSignal()
+        raw_output = FakeSignal()
+        import_finished = FakeSignal()
+        finished = FakeSignal()
+        metadata_analyzed = FakeSignal()
+        table_chunk_progress = FakeSignal()
+
+        def __init__(self, task_type, config, **kwargs):
+            captured["task_type"] = task_type
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+
+        def start(self):
+            captured["started"] = True
+
+        def isRunning(self):
+            return False
+
+    class FakeConnector:
+        host = "db.example.com"
+        port = 3307
+        user = "importer"
+        password = "secret"
+
+        def get_schemas(self):
+            return ["app"]
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog.input_dir.setText(str(dump_dir))
+    dialog.radio_tz_none.setChecked(True)
+
+    dialog.do_import()
+
+    assert captured["task_type"] == "import"
+    assert captured["config"].host == "db.example.com"
+    assert captured["config"].port == 3307
+    assert captured["config"].user == "importer"
+    assert captured["config"].password == "secret"
+    assert captured["started"] is True
+    dialog.deleteLater()

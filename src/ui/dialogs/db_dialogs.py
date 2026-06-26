@@ -1404,7 +1404,7 @@ class RustDumpExportDialog(QDialog):
 
         # Rust DB Core 설정
         config = RustDumpConfig(
-            host="127.0.0.1",  # 터널 통해 로컬 접속
+            host=getattr(self.connector, 'host', "127.0.0.1"),
             port=self.connector.port if hasattr(self.connector, 'port') else 3306,
             user=self.connector.user if hasattr(self.connector, 'user') else "root",
             password=self.connector.password if hasattr(self.connector, 'password') else ""
@@ -2674,7 +2674,7 @@ class RustDumpImportDialog(QDialog):
 
         # Rust DB Core 설정
         config = RustDumpConfig(
-            host="127.0.0.1",
+            host=getattr(self.connector, 'host', "127.0.0.1"),
             port=self.connector.port if hasattr(self.connector, 'port') else 3306,
             user=self.connector.user if hasattr(self.connector, 'user') else "root",
             password=self.connector.password if hasattr(self.connector, 'password') else ""
