@@ -62,15 +62,16 @@
     <li>MySQL column inspection now preserves <code>CHARACTER_SET_NAME</code> and <code>COLLATION_NAME</code> in dump schema type metadata, and post-load FK DDL is blocked when text-column charset/collation is incompatible.</li>
     <li>Shadow full replacement has been retired as a current guarantee; full replacement is documented as direct replacement against the selected target database.</li>
     <li>Direct replace/recreate DDL failures now include a classified error, affected table, and operation such as <code>drop_table</code> or <code>create_table</code>.</li>
+    <li>Import telemetry now separates manifest-wide cumulative rows, average speed, current chunk speed, row-based ETA, and post-load DDL phase status.</li>
     <li>Import UI wording no longer promises that every object type is restored automatically.</li>
   </ul>
 
   <h2>Verification Evidence</h2>
   <table>
     <tr><th>Command</th><th>Result</th><th>Notes</th></tr>
-    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="status-pass">PASS</td><td>162 Rust lib tests, JSONL CLI test, live-roundtrip gated tests, doctests.</td></tr>
+    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="status-pass">PASS</td><td>163 Rust lib tests, JSONL CLI test, live-roundtrip gated tests, doctests.</td></tr>
     <tr><td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td><td class="status-pass">PASS</td><td>Release Rust core binary builds.</td></tr>
-    <tr><td><code>.venv\Scripts\python -m pytest -q</code></td><td class="status-pass">PASS</td><td>1710 Python tests passed, 3 collection warnings from existing test helper classes.</td></tr>
+    <tr><td><code>pytest -q</code></td><td class="status-pass">PASS</td><td>1714 Python tests passed, 5 existing warnings from Paramiko deprecations and test helper collection.</td></tr>
     <tr><td><code>.venv\Scripts\python -m compileall -q main.py src tests</code></td><td class="status-pass">PASS</td><td>Python syntax check passed.</td></tr>
     <tr><td><code>cargo fmt --manifest-path migration_core\Cargo.toml --check</code></td><td class="status-pass">PASS</td><td>Rust formatting check passed.</td></tr>
     <tr><td><code>git diff --check</code></td><td class="status-pass">PASS</td><td>No whitespace errors at the latest check before report creation.</td></tr>
@@ -91,6 +92,7 @@
     <tr><td>MySQL FK charset/collation mismatch reaches database as <code>ERROR 3780</code></td><td><code>fk_schema_fidelity_rejects_incompatible_text_collations</code>, <code>fk_schema_fidelity_accepts_matching_text_collations</code>, <code>mysql_column_inspection_captures_character_metadata</code></td></tr>
     <tr><td>Direct replacement DDL failure loses table/operation context</td><td><code>dump_import_ddl_error_includes_classification_table_and_operation</code></td></tr>
     <tr><td>Post-load DDL failure hides the failing SQL statement</td><td><code>post_load_ddl_errors_include_classification_and_sql_context</code></td></tr>
+    <tr><td>Import UI treats recent chunk speed as end-to-end throughput or row ETA during post-load work</td><td><code>test_format_import_row_labels_reports_cumulative_average_current_and_eta</code>, <code>test_import_row_progress_forwards_cumulative_totals_to_detail_callback</code>, <code>dump_import_row_progress_event_reports_table_and_overall_rows</code></td></tr>
     <tr><td>Import UI overpromises all-object restoration</td><td><code>test_import_dialog_does_not_claim_all_objects_are_recreated</code></td></tr>
   </table>
 

@@ -431,6 +431,40 @@ Next action:
 2. Track broader table-option fidelity separately if table engine/table
    collation preservation becomes a release requirement beyond FK validation.
 
+### TF-STATUS-012: Import Cumulative Telemetry
+
+Status: `closed`
+Severity: Medium
+Area: Import UI / Rust Core dump.import events
+
+Evidence:
+
+- GitHub issue #128 identified that Import speed and ETA could be mistaken for
+  end-to-end throughput because the UI showed recent chunk speed without a
+  separate cumulative baseline.
+- Rust Core `dump.import` row progress events now include table-local rows and
+  manifest-wide cumulative rows through `table_rows_done`,
+  `table_rows_total`, `overall_rows_done`, and `overall_rows_total`.
+- The Python bridge forwards the cumulative fields and calculates visible
+  progress from the manifest-wide denominator when available.
+- The Import dialog now displays cumulative processed rows, average speed since
+  Import start, current chunk speed, and row-based ETA only while data load is
+  still in progress.
+- Post-load DDL emits an explicit phase event so the UI can stop implying a
+  row-based ETA after data reaches 100%.
+- GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/128
+
+Impact:
+
+- Import progress is now anchored to the dump manifest row total instead of the
+  current table/chunk alone, while recent chunk throughput remains separately
+  labeled as current speed.
+
+Next action:
+
+1. Re-check wording with real long-running imports if additional post-load
+   phases are split out later.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -446,6 +480,7 @@ Next action:
 | TF-STATUS-009 | High | closed | Rust Core import | Merge import post-load DDL policy | Keep merge/recreate policy tests |
 | TF-STATUS-010 | High | closed | Rust Core import | Shadow replacement retired; direct replacement documented | Keep UI/docs aligned |
 | TF-STATUS-011 | High | closed | Rust Core schema fidelity | MySQL FK charset/collation fidelity | Keep FK fidelity regression coverage |
+| TF-STATUS-012 | Medium | closed | Import UI telemetry | Cumulative Import rows/s and ETA | Re-check wording with real long-running imports |
 
 ## Recommended Execution Order
 
@@ -471,3 +506,4 @@ Next action:
 | 2026-06-26 | Fixed post-load DDL ordering so all secondary/unique indexes are applied before any foreign keys, addressing GitHub #127. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml post_data_ddl_applies_all_indexes_before_any_foreign_keys --lib`; `cargo test --manifest-path migration_core\Cargo.toml` |
 | 2026-06-26 | Added final target row-count verification for direct replace/recreate imports, addressing GitHub #131 while preserving merge semantics. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml import_target_row_verification --lib`; `cargo test --manifest-path migration_core\Cargo.toml` |
 | 2026-06-26 | Classified post-load DDL execution failures with the failing SQL statement for diagnosis of errors such as GitHub #126. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl_errors_include_classification_and_sql_context --lib`; `cargo test --manifest-path migration_core\Cargo.toml` |
+| 2026-06-26 | Added cumulative Import telemetry for GitHub #128: Rust row events now carry table-local and manifest-wide row counts, Python forwards them, and the UI separates average speed, current speed, ETA, and post-load phase text. | `migration_core/src/lib.rs`, `src/exporters/rust_dump_exporter.py`, `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `tests/test_rust_dump_exporter.py`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `pytest tests/test_db_dialogs.py::test_format_import_row_labels_reports_cumulative_average_current_and_eta tests/test_db_dialogs.py::test_format_import_row_labels_stops_row_eta_during_post_load_phase tests/test_rust_dump_exporter.py::TestRustDumpImporter::test_import_row_progress_forwards_cumulative_totals_to_detail_callback`; `cargo test --manifest-path migration_core\Cargo.toml dump_import_row_progress_event_reports_table_and_overall_rows`; final: `pytest tests/test_db_dialogs.py tests/test_rust_dump_exporter.py`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `pytest -q`; `python -m compileall -q main.py src tests`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |

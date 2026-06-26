@@ -101,23 +101,49 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
     table = str(info.get("table") or "-")
     rows_done = max(0, int(info.get("rows_done") or 0))
     rows_total = max(0, int(info.get("rows_total") or 0))
+    overall_rows_done = max(0, int(info.get("overall_rows_done") or 0))
+    overall_rows_total = max(0, int(info.get("overall_rows_total") or 0))
     chunk_rows = max(0, int(info.get("chunk_rows") or 0))
     chunks_done = int(info.get("chunks_done") or 0)
     chunks_total = int(info.get("chunks_total") or 0)
     rows_sec = max(0, int(info.get("rows_sec") or 0))
+    avg_rows_sec = max(0, int(info.get("avg_rows_sec") or 0))
+    eta_seconds = max(0, int(info.get("eta_seconds") or 0))
+    current_phase = str(info.get("current_phase") or "")
     strategy = str(info.get("strategy") or "")
     strategy_labels = {
         "insert_fallback": "안전 INSERT fallback",
         "load_data_local_infile": "LOAD DATA LOCAL",
         "parallel_load_data_local_infile": "병렬 LOAD DATA LOCAL",
+        "insert_rows": "Rust INSERT",
     }
     strategy_label = strategy_labels.get(strategy, strategy)
 
-    if rows_total:
-        data_label = f"📦 처리 rows: {rows_done:,} / {rows_total:,} rows"
+    display_rows_done = overall_rows_done or rows_done
+    display_rows_total = overall_rows_total or rows_total
+    if display_rows_total:
+        data_label = f"📦 처리 rows: {display_rows_done:,} / {display_rows_total:,} rows"
     else:
-        data_label = f"📦 처리 rows: {rows_done:,} rows"
-    speed_label = f"⚡ 속도: {rows_sec:,} rows/s" if rows_sec else "⚡ 속도: 계산 중..."
+        data_label = f"📦 처리 rows: {display_rows_done:,} rows"
+
+    if avg_rows_sec:
+        current_speed = f"{rows_sec:,} rows/s" if rows_sec else "-"
+        speed_label = f"⚡ 평균: {avg_rows_sec:,} rows/s · 현재: {current_speed}"
+    else:
+        speed_label = f"⚡ 속도: {rows_sec:,} rows/s" if rows_sec else "⚡ 속도: 계산 중..."
+
+    if current_phase in {"post_load_ddl", "dump_import_post_load"}:
+        return (
+            data_label,
+            speed_label,
+            "🔄 현재 단계: 인덱스/FK 생성 중 · 데이터 Import 완료, 후처리 진행 중",
+        )
+    if current_phase in {"dump_import_switch", "safe_recreate_switch"}:
+        return (
+            data_label,
+            speed_label,
+            "🔄 현재 단계: 최종 스키마 전환 중 · 데이터 Import 완료, 후처리 진행 중",
+        )
 
     if chunks_done and chunks_total:
         status = f"{chunks_done}/{chunks_total} chunks"
@@ -127,7 +153,20 @@ def format_import_row_labels(info: dict) -> tuple[str, str, str]:
         status = f"{status}, +{chunk_rows:,} rows"
     if strategy_label:
         status = f"{status}, {strategy_label}"
+    if eta_seconds and display_rows_total and display_rows_done < display_rows_total:
+        status = f"{status} · ETA {_format_compact_duration(eta_seconds)}"
     return data_label, speed_label, f"🔄 현재: {table} {status}"
+
+
+def _format_compact_duration(seconds: int) -> str:
+    remaining = max(0, int(seconds))
+    hours, remainder = divmod(remaining, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
 
 
 def import_overall_percent(table_rows_done: dict, table_rows_total: dict) -> int:
@@ -243,20 +282,33 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
     if event_type == "row_progress" and table:
         rows = int(event.get("rows") or 0)
         total = int(event.get("total") or 0)
+        overall_rows = int(event.get("overall_rows_done") or 0)
+        overall_total = int(event.get("overall_rows_total") or 0)
         chunk_rows = int(event.get("chunk_rows") or 0)
+        chunks_done = int(event.get("chunks_done") or 0)
+        chunks_total = int(event.get("chunks_total") or 0)
         strategy = str(event.get("strategy") or "")
         elapsed_ms = int(event.get("stream_ms") or event.get("read_ms") or event.get("load_ms") or 0)
         rows_sec = int((chunk_rows * 1000) / elapsed_ms) if chunk_rows and elapsed_ms else 0
         parts = []
-        if chunk_rows:
+        if chunks_done and chunks_total:
+            parts.append(f"{chunks_done}/{chunks_total} chunks")
+        elif chunk_rows:
             parts.append(f"+{chunk_rows:,} rows")
-        if rows and total:
+        if overall_rows and overall_total:
+            if rows and total:
+                table_percent = min(100, int((rows / total) * 100))
+                parts.append(f"table {rows:,}/{total:,} rows ({table_percent}%)")
+            overall_percent = min(100, int((overall_rows / overall_total) * 100))
+            parts.append(f"전체 {overall_rows:,}/{overall_total:,} rows ({overall_percent}%)")
+        elif rows and total:
             percent = min(100, int((rows / total) * 100))
             parts.append(f"{rows:,}/{total:,} rows ({percent}%)")
         elif rows:
             parts.append(f"{rows:,} rows")
         if rows_sec:
-            parts.append(f"{rows_sec:,} rows/s")
+            speed_prefix = "현재 " if overall_rows and overall_total else ""
+            parts.append(f"{speed_prefix}{rows_sec:,} rows/s")
         if strategy:
             parts.append(strategy)
         return f"{table}: {', '.join(parts)}" if parts else f"{table}: row progress"
@@ -2712,16 +2764,34 @@ class RustDumpImportDialog(QDialog):
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
+        info = dict(info)
         table = str(info.get('table') or "")
         if table:
             self.import_table_rows_done[table] = max(0, int(info.get('rows_done') or 0))
         if table and table not in self.import_table_rows_total:
             self.import_table_rows_total[table] = max(0, int(info.get('rows_total') or 0))
-        percent = displayed_import_percent(
-            self.import_table_rows_done,
-            self.import_table_rows_total,
-            int(info.get('percent') or 0),
-        )
+        overall_done = max(0, int(info.get('overall_rows_done') or 0))
+        overall_total = max(0, int(info.get('overall_rows_total') or 0))
+        if not overall_total and self.import_table_rows_total:
+            overall_done = sum(max(0, int(value or 0)) for value in self.import_table_rows_done.values())
+            overall_total = sum(max(0, int(value or 0)) for value in self.import_table_rows_total.values())
+            info["overall_rows_done"] = overall_done
+            info["overall_rows_total"] = overall_total
+        if self.import_start_time and overall_done:
+            elapsed_seconds = max((datetime.now() - self.import_start_time).total_seconds(), 0.001)
+            avg_rows_sec = int(overall_done / elapsed_seconds)
+            if avg_rows_sec:
+                info["avg_rows_sec"] = avg_rows_sec
+                if overall_total and overall_done < overall_total:
+                    info["eta_seconds"] = int((overall_total - overall_done) / avg_rows_sec)
+        if overall_total:
+            percent = min(int((overall_done / overall_total) * 100), 100)
+        else:
+            percent = displayed_import_percent(
+                self.import_table_rows_done,
+                self.import_table_rows_total,
+                int(info.get('percent') or 0),
+            )
         data_label, speed_label, status_label = format_import_row_labels(info)
 
         self.progress_bar.setValue(percent)

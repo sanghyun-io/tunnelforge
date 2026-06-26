@@ -777,12 +777,17 @@ def emit_core_event(
         if import_results is not None and table:
             import_results[table] = {"status": ui_status or "loading", "message": ""}
     elif event_type == "row_progress":
-        rows = int(event.get("rows") or 0)
-        total = int(event.get("total") or 0)
+        rows = int(event.get("table_rows_done") or event.get("rows") or 0)
+        total = int(event.get("table_rows_total") or event.get("total") or 0)
+        overall_rows = int(event.get("overall_rows_done") or 0)
+        overall_total = int(event.get("overall_rows_total") or 0)
         chunk_rows = int(event.get("chunk_rows") or 0)
         elapsed_ms = int(event.get("stream_ms") or event.get("read_ms") or event.get("load_ms") or 0)
         rows_sec = int((chunk_rows * 1000) / elapsed_ms) if chunk_rows and elapsed_ms else 0
-        percent = int((rows / total) * 100) if total else 0
+        if overall_total:
+            percent = int((overall_rows / overall_total) * 100)
+        else:
+            percent = int((rows / total) * 100) if total else 0
         if detail_callback:
             detail_callback({
                 "event": "row_progress",
@@ -790,6 +795,8 @@ def emit_core_event(
                 "percent": min(percent, 100),
                 "rows_done": rows,
                 "rows_total": total,
+                "overall_rows_done": overall_rows,
+                "overall_rows_total": overall_total,
                 "chunk_rows": chunk_rows,
                 "rows_sec": rows_sec,
                 "speed": f"{rows_sec:,} rows/s" if rows_sec else "Rust DB Core",
@@ -800,6 +807,7 @@ def emit_core_event(
                 "stream_ms": event.get("stream_ms"),
                 "read_ms": event.get("read_ms"),
                 "write_ms": event.get("write_ms"),
+                "load_ms": event.get("load_ms"),
             })
         chunks_done = int(event.get("chunks_done") or 0)
         chunks_total = int(event.get("chunks_total") or 0)

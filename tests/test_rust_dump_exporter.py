@@ -476,6 +476,49 @@ class TestRustDumpImporter:
 
         assert chunk_events == [("df_subs", 2, 8)]
 
+    def test_import_row_progress_forwards_cumulative_totals_to_detail_callback(self):
+        from src.exporters.rust_dump_exporter import emit_core_event
+
+        details = []
+
+        emit_core_event(
+            {
+                "event": "row_progress",
+                "table": "orders",
+                "rows": 25,
+                "total": 100,
+                "table_rows_done": 25,
+                "table_rows_total": 100,
+                "overall_rows_done": 1_025,
+                "overall_rows_total": 2_000,
+                "chunk_rows": 25,
+                "load_ms": 500,
+                "strategy": "load_data_local_infile",
+            },
+            detail_callback=details.append,
+        )
+
+        assert details == [{
+            "event": "row_progress",
+            "table": "orders",
+            "percent": 51,
+            "rows_done": 25,
+            "rows_total": 100,
+            "overall_rows_done": 1_025,
+            "overall_rows_total": 2_000,
+            "chunk_rows": 25,
+            "rows_sec": 50,
+            "speed": "50 rows/s",
+            "chunk_index": None,
+            "chunks_done": None,
+            "chunks_total": None,
+            "strategy": "load_data_local_infile",
+            "stream_ms": None,
+            "read_ms": None,
+            "write_ms": None,
+            "load_ms": 500,
+        }]
+
     def test_import_phase_hides_local_infile_fallback_noise(self):
         from src.exporters.rust_dump_exporter import emit_core_event
 

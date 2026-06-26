@@ -104,6 +104,44 @@ def test_format_import_row_labels_separates_rows_chunks_and_strategy():
     )
 
 
+def test_format_import_row_labels_reports_cumulative_average_current_and_eta():
+    labels = format_import_row_labels({
+        "table": "df_subs",
+        "rows_done": 100_000,
+        "rows_total": 387_398,
+        "overall_rows_done": 300_000,
+        "overall_rows_total": 1_000_000,
+        "chunk_rows": 50_000,
+        "chunks_done": 2,
+        "chunks_total": 8,
+        "rows_sec": 40_000,
+        "avg_rows_sec": 10_000,
+        "eta_seconds": 70,
+        "strategy": "parallel_load_data_local_infile",
+    })
+
+    assert labels == (
+        "📦 처리 rows: 300,000 / 1,000,000 rows",
+        "⚡ 평균: 10,000 rows/s · 현재: 40,000 rows/s",
+        "🔄 현재: df_subs 2/8 chunks, +50,000 rows, 병렬 LOAD DATA LOCAL · ETA 1m 10s",
+    )
+
+
+def test_format_import_row_labels_stops_row_eta_during_post_load_phase():
+    labels = format_import_row_labels({
+        "overall_rows_done": 1_000,
+        "overall_rows_total": 1_000,
+        "avg_rows_sec": 100,
+        "current_phase": "post_load_ddl",
+    })
+
+    assert labels == (
+        "📦 처리 rows: 1,000 / 1,000 rows",
+        "⚡ 평균: 100 rows/s · 현재: -",
+        "🔄 현재 단계: 인덱스/FK 생성 중 · 데이터 Import 완료, 후처리 진행 중",
+    )
+
+
 def test_format_import_row_labels_explains_safe_insert_fallback():
     labels = format_import_row_labels({
         "table": "df_subs",
@@ -189,6 +227,28 @@ def test_format_import_visible_telemetry_summarizes_row_progress():
     assert line == (
         "ai_phase1_cache: +390 rows, 390/390 rows (100%), "
         "2,335 rows/s, load_data_local_infile"
+    )
+
+
+def test_format_import_visible_telemetry_labels_overall_and_current_speed():
+    line = format_import_visible_telemetry({
+        "event": "row_progress",
+        "table": "df_subs",
+        "rows": 100_000,
+        "total": 387_398,
+        "overall_rows_done": 300_000,
+        "overall_rows_total": 1_000_000,
+        "chunk_rows": 50_000,
+        "chunks_done": 2,
+        "chunks_total": 8,
+        "load_ms": 1_250,
+        "strategy": "parallel_load_data_local_infile",
+    })
+
+    assert line == (
+        "df_subs: 2/8 chunks, table 100,000/387,398 rows (25%), "
+        "전체 300,000/1,000,000 rows (30%), 현재 40,000 rows/s, "
+        "parallel_load_data_local_infile"
     )
 
 

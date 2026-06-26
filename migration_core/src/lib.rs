@@ -1507,6 +1507,58 @@ fn dump_schedule_event(
     })
 }
 
+fn dump_import_row_progress_event(
+    request_id: Option<String>,
+    table: &str,
+    table_rows_done: u64,
+    table_rows_total: u64,
+    overall_rows_before: u64,
+    overall_rows_total: u64,
+    chunk_rows: u64,
+    chunks_done: Option<u64>,
+    chunks_total: Option<u64>,
+    chunk_index: Option<u64>,
+    load_ms: Option<u64>,
+    strategy: &str,
+) -> Value {
+    let raw_overall_rows_done = overall_rows_before.saturating_add(table_rows_done);
+    let overall_rows_done = if overall_rows_total > 0 {
+        raw_overall_rows_done.min(overall_rows_total)
+    } else {
+        raw_overall_rows_done
+    };
+    let mut event = json!({
+        "event": "row_progress",
+        "request_id": request_id,
+        "table": table,
+        "rows": table_rows_done,
+        "total": table_rows_total,
+        "table_rows_done": table_rows_done,
+        "table_rows_total": table_rows_total,
+        "overall_rows_done": overall_rows_done,
+        "overall_rows_total": overall_rows_total,
+        "chunk_rows": chunk_rows,
+        "strategy": strategy
+    });
+
+    if let Value::Object(fields) = &mut event {
+        if let Some(value) = chunks_done {
+            fields.insert("chunks_done".to_string(), json!(value));
+        }
+        if let Some(value) = chunks_total {
+            fields.insert("chunks_total".to_string(), json!(value));
+        }
+        if let Some(value) = chunk_index {
+            fields.insert("chunk_index".to_string(), json!(value));
+        }
+        if let Some(value) = load_ms {
+            fields.insert("load_ms".to_string(), json!(value));
+        }
+    }
+
+    event
+}
+
 fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
     let endpoint = request_endpoint(request)?;
     let output_dir = request
@@ -3188,6 +3240,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         &mut emit,
     )?;
     let table_total = tables.len();
+    let overall_rows_total = tables.iter().map(|table| table.rows).sum::<u64>();
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
     let mut imported_rows_by_table: BTreeMap<String, u64> = BTreeMap::new();
@@ -3233,6 +3286,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                         &compression,
                         threads,
                         request.request_id.clone(),
+                        rows_imported,
+                        overall_rows_total,
                         |event| emit(event),
                     )?;
                     rows_imported += rows;
@@ -3263,13 +3318,21 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 adapter.insert_rows(table, rows)?;
                 rows_imported += row_count as u64;
                 chunks_imported += 1;
-                emit(json!({
-                    "event": "row_progress",
-                    "request_id": request.request_id,
-                    "table": table.name,
-                    "rows": rows_imported,
-                    "total": table_manifest.rows
-                }));
+                let table_rows_done = rows_imported.saturating_sub(table_rows_before);
+                emit(dump_import_row_progress_event(
+                    request.request_id.clone(),
+                    &table.name,
+                    table_rows_done,
+                    table_manifest.rows,
+                    table_rows_before,
+                    overall_rows_total,
+                    row_count as u64,
+                    Some(chunk_index),
+                    Some(table_manifest.chunks),
+                    Some(chunk_index),
+                    None,
+                    "insert_rows",
+                ));
             }
 
             let table_rows_imported = rows_imported.saturating_sub(table_rows_before);
@@ -3297,6 +3360,13 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     local_infile_restore_result?;
     let target_engine = adapter.engine().to_string();
     if should_apply_post_load_ddl(mode) {
+        emit(json!({
+            "event": "phase",
+            "request_id": request.request_id,
+            "phase": "dump_import_post_load",
+            "message": "현재 단계: 인덱스/FK 생성 중 - 데이터 Import는 완료, 후처리 진행 중",
+            "strategy": "post_load_ddl"
+        }));
         apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
     } else {
         emit(json!({
@@ -3504,6 +3574,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
     compression: &str,
     threads: usize,
     request_id: Option<String>,
+    overall_rows_before: u64,
+    overall_rows_total: u64,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
     if !mysql_local_infile_enabled(conn) {
@@ -3522,6 +3594,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             table_manifest,
             compression,
             request_id,
+            overall_rows_before,
+            overall_rows_total,
             emit,
         );
     }
@@ -3535,6 +3609,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             compression,
             threads,
             request_id.clone(),
+            overall_rows_before,
+            overall_rows_total,
             |event| emit(event),
         );
         return match result {
@@ -3555,6 +3631,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     table_manifest,
                     compression,
                     request_id,
+                    overall_rows_before,
+                    overall_rows_total,
                     emit,
                 )
             }
@@ -3591,6 +3669,8 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     table_manifest,
                     compression,
                     request_id,
+                    overall_rows_before,
+                    overall_rows_total,
                     emit,
                 );
             }
@@ -3598,16 +3678,20 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         };
         rows_imported += rows;
         chunks_imported += 1;
-        emit(json!({
-            "event": "row_progress",
-            "request_id": request_id,
-            "table": table.name,
-            "rows": rows_imported,
-            "total": table_manifest.rows,
-            "chunk_rows": rows,
-            "load_ms": started.elapsed().as_millis() as u64,
-            "strategy": "load_data_local_infile"
-        }));
+        emit(dump_import_row_progress_event(
+            request_id.clone(),
+            &table.name,
+            rows_imported,
+            table_manifest.rows,
+            overall_rows_before,
+            overall_rows_total,
+            rows,
+            Some(chunks_imported),
+            Some(table_manifest.chunks),
+            Some(chunk_index),
+            Some(started.elapsed().as_millis() as u64),
+            "load_data_local_infile",
+        ));
     }
     Ok((rows_imported, chunks_imported))
 }
@@ -3868,6 +3952,8 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
     table_manifest: &DumpTableManifest,
     compression: &str,
     request_id: Option<String>,
+    overall_rows_before: u64,
+    overall_rows_total: u64,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
     let mut rows_imported = 0_u64;
@@ -3890,16 +3976,20 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
             })?;
         rows_imported += rows;
         chunks_imported += 1;
-        emit(json!({
-            "event": "row_progress",
-            "request_id": request_id,
-            "table": table.name,
-            "rows": rows_imported,
-            "total": table_manifest.rows,
-            "chunk_rows": rows,
-            "load_ms": started.elapsed().as_millis() as u64,
-            "strategy": "insert_fallback"
-        }));
+        emit(dump_import_row_progress_event(
+            request_id.clone(),
+            &table.name,
+            rows_imported,
+            table_manifest.rows,
+            overall_rows_before,
+            overall_rows_total,
+            rows,
+            Some(chunks_imported),
+            Some(table_manifest.chunks),
+            Some(chunk_index),
+            Some(started.elapsed().as_millis() as u64),
+            "insert_fallback",
+        ));
     }
     Ok((rows_imported, chunks_imported))
 }
@@ -3931,6 +4021,8 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     compression: &str,
     threads: usize,
     request_id: Option<String>,
+    overall_rows_before: u64,
+    overall_rows_total: u64,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
     let max_threads = threads.max(1).min(table_manifest.chunks as usize);
@@ -3969,19 +4061,20 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                 rows_imported += rows;
                 completed += 1;
                 active = active.saturating_sub(1);
-                emit(json!({
-                    "event": "row_progress",
-                    "request_id": request_id,
-                    "table": table.name,
-                    "rows": rows_imported,
-                    "total": table_manifest.rows,
-                    "chunk_rows": rows,
-                    "chunks_done": completed,
-                    "chunks_total": table_manifest.chunks,
-                    "chunk_index": chunk_index,
-                    "load_ms": load_ms,
-                    "strategy": "parallel_load_data_local_infile"
-                }));
+                emit(dump_import_row_progress_event(
+                    request_id.clone(),
+                    &table.name,
+                    rows_imported,
+                    table_manifest.rows,
+                    overall_rows_before,
+                    overall_rows_total,
+                    rows,
+                    Some(completed),
+                    Some(table_manifest.chunks),
+                    Some(chunk_index),
+                    Some(load_ms),
+                    "parallel_load_data_local_infile",
+                ));
                 if let Some(next_chunk) = pending.pop_front() {
                     handles.push(spawn_mysql_import_chunk_worker(
                         endpoint.clone(),
@@ -10594,6 +10687,40 @@ mod tests {
         assert_eq!(event["rows_total"], 42);
         assert_eq!(event["tables"][0]["name"], "users");
         assert_eq!(event["tables"][0]["rows"], 42);
+    }
+
+    #[test]
+    fn dump_import_row_progress_event_reports_table_and_overall_rows() {
+        let event = dump_import_row_progress_event(
+            Some("import-1".to_string()),
+            "orders",
+            25,
+            100,
+            1_000,
+            2_000,
+            25,
+            Some(2),
+            Some(8),
+            Some(4),
+            Some(500),
+            "load_data_local_infile",
+        );
+
+        assert_eq!(event["event"], "row_progress");
+        assert_eq!(event["request_id"], "import-1");
+        assert_eq!(event["table"], "orders");
+        assert_eq!(event["rows"], 25);
+        assert_eq!(event["total"], 100);
+        assert_eq!(event["table_rows_done"], 25);
+        assert_eq!(event["table_rows_total"], 100);
+        assert_eq!(event["overall_rows_done"], 1_025);
+        assert_eq!(event["overall_rows_total"], 2_000);
+        assert_eq!(event["chunk_rows"], 25);
+        assert_eq!(event["chunks_done"], 2);
+        assert_eq!(event["chunks_total"], 8);
+        assert_eq!(event["chunk_index"], 4);
+        assert_eq!(event["load_ms"], 500);
+        assert_eq!(event["strategy"], "load_data_local_infile");
     }
 
     #[test]
