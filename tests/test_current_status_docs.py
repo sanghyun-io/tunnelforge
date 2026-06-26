@@ -47,3 +47,10 @@ def test_current_status_does_not_describe_old_gate_head_as_current():
 
     for phrase in stale_phrases:
         assert phrase not in doc
+
+
+def test_current_status_does_not_keep_stale_macos_focused_test_count():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+
+    assert "PASS, 47 passed" not in doc
+    assert "Current main macOS focused tests" in doc
