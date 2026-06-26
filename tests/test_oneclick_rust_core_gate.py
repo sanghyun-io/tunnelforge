@@ -7,6 +7,7 @@ from src.ui.dialogs.oneclick_migration_dialog import (
     OneClickMigrationDialog,
     OneClickMigrationWorker,
 )
+from src.ui.dialogs import migration_dialogs
 
 
 class FakeEndpoint:
@@ -22,6 +23,11 @@ class FakeEndpoint:
             "database": "app",
             "schema": "",
         }
+
+
+class FakeSchemaConnector:
+    def get_schemas(self):
+        return ["app"]
 
 
 def test_oneclick_worker_rejects_non_rust_core_connector():
@@ -81,6 +87,25 @@ def test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens():
     assert dialog.chk_dry_run.isChecked()
     assert not dialog.chk_dry_run.isEnabled()
     assert "GitHub #137" in dialog.chk_dry_run.toolTip()
+    dialog.close()
+
+
+def test_migration_analyzer_exposes_oneclick_as_dry_run_preview_only():
+    app = QApplication.instance() or QApplication([])
+
+    dialog = migration_dialogs.MigrationAnalyzerDialog(
+        None,
+        connector=FakeSchemaConnector(),
+    )
+
+    assert migration_dialogs.ONE_CLICK_MIGRATION_FEATURE_ENABLED is True
+    assert not dialog.btn_oneclick.isHidden()
+    assert "Dry-run Preview" in dialog.btn_oneclick.text()
+    tooltip = dialog.btn_oneclick.toolTip()
+    assert "dry-run" in tooltip.lower()
+    assert "실제 변경" in tooltip
+    assert "자동 수행" not in tooltip
+    assert "자동 수정 → 검증" not in tooltip
     dialog.close()
 
 

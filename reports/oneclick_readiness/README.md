@@ -7,9 +7,9 @@ This directory stores machine-checkable evidence for GitHub #137.
 - `oneclick-dry-run-evidence.json` was captured from a local MySQL container
   using Rust Core `oneclick.run` with `dry_run=true`.
 - The report proves that Rust Core advertises the `oneclick.*` command surface,
-  the hidden PyQt gate remains disabled, real One-Click execution remains
-  disabled, and the dry-run workflow emitted preflight, analysis,
-  recommendation, execution, validation, and final result events.
+  the PyQt entry point is exposed only as a dry-run preview, real One-Click
+  execution remains disabled, and the dry-run workflow emitted preflight,
+  analysis, recommendation, execution, validation, and final result events.
 
 Validate it with:
 

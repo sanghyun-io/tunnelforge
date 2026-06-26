@@ -1,9 +1,9 @@
 {
   "issue": 137,
-  "git_sha": "b5ad7da2afba21e60154815a83ccb3082eeb0378",
+  "git_sha": "190d2ab776665be11ea63a4a6fd161a8061692ba",
   "source_type": "local_mysql_container",
   "feature_flags": {
-    "oneclick_ui_enabled": false,
+    "oneclick_ui_enabled": true,
     "oneclick_real_execution_enabled": false
   },
   "service_hello": {

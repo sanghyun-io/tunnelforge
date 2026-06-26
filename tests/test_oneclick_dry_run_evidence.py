@@ -37,7 +37,7 @@ def _valid_evidence():
         "git_sha": "abcdef123456",
         "source_type": "local_mysql_container",
         "feature_flags": {
-            "oneclick_ui_enabled": False,
+            "oneclick_ui_enabled": True,
             "oneclick_real_execution_enabled": False,
         },
         "service_hello": {
@@ -97,6 +97,17 @@ def test_oneclick_dry_run_evidence_rejects_real_execution(tmp_path):
     report.write_text(json.dumps(evidence), encoding="utf-8")
 
     with pytest.raises(validator.EvidenceError, match="dry_run must be true"):
+        validator.validate_report(report)
+
+
+def test_oneclick_dry_run_evidence_requires_preview_ui_enabled(tmp_path):
+    validator = _load_validator()
+    evidence = _valid_evidence()
+    evidence["feature_flags"]["oneclick_ui_enabled"] = False
+    report = tmp_path / "oneclick-evidence.json"
+    report.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(validator.EvidenceError, match="oneclick_ui_enabled"):
         validator.validate_report(report)
 
 

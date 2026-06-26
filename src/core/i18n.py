@@ -323,6 +323,11 @@ _EN_TEXT_TRANSLATIONS = {
     "업데이트 확인": "Check for Updates",
     "업데이트를 확인하는 중입니다...": "Checking for updates...",
     "최신 버전": "latest version",
+    "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 dry-run으로 실행합니다.\n실제 변경은 수행하지 않으며 자동 SQL 수정은 아직 활성화되지 않았습니다.": (
+        "Run the Rust Core-backed One-Click preflight, analysis, recommendation, "
+        "and validation flow as a dry-run.\nNo real changes are performed and "
+        "automatic SQL fixes are not enabled yet."
+    ),
     "업데이트 사용 가능": "Update Available",
     "연결 복사 - 새 연결 만들기": "Copy Connection - Create New Connection",
     "연결 오류": "Connection Error",

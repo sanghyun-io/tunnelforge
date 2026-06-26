@@ -32,7 +32,7 @@ from src.core.logger import get_logger
 from src.core.platform_paths import analysis_dir
 
 logger = get_logger('migration_dialogs')
-ONE_CLICK_MIGRATION_FEATURE_ENABLED = False
+ONE_CLICK_MIGRATION_FEATURE_ENABLED = True
 
 
 class MigrationAnalyzerDialog(QDialog):
@@ -184,8 +184,8 @@ class MigrationAnalyzerDialog(QDialog):
         self.btn_analyze.clicked.connect(self.start_analysis)
         btn_layout.addWidget(self.btn_analyze)
 
-        # One-Click 마이그레이션 버튼
-        self.btn_oneclick = QPushButton("🚀 One-Click 마이그레이션")
+        # One-Click dry-run preview button
+        self.btn_oneclick = QPushButton("🚀 One-Click Dry-run Preview")
         self.btn_oneclick.setStyleSheet("""
             QPushButton {
                 background-color: #27ae60; color: white; font-weight: bold;
@@ -196,8 +196,8 @@ class MigrationAnalyzerDialog(QDialog):
             QPushButton:disabled { background-color: #bdc3c7; }
         """)
         self.btn_oneclick.setToolTip(
-            "한 번의 클릭으로 MySQL 8.0 → 8.4 마이그레이션을 자동 수행합니다.\n"
-            "사전 검사 → 분석 → 자동 수정 → 검증까지 전 과정을 자동화합니다."
+            "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 dry-run으로 실행합니다.\n"
+            "실제 변경은 수행하지 않으며 자동 SQL 수정은 아직 활성화되지 않았습니다."
         )
         self.btn_oneclick.clicked.connect(self.start_oneclick_migration)
         self.btn_oneclick.setVisible(ONE_CLICK_MIGRATION_FEATURE_ENABLED)

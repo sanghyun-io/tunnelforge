@@ -78,7 +78,7 @@ def validate_report(report_path: Path | str) -> Dict[str, Any]:
     _require_non_empty_text(report.get("source_type"), "source_type")
 
     flags = _require_mapping(report.get("feature_flags"), "feature_flags")
-    _require_false(flags.get("oneclick_ui_enabled"), "feature_flags.oneclick_ui_enabled")
+    _require_bool(flags.get("oneclick_ui_enabled"), "feature_flags.oneclick_ui_enabled")
     _require_false(
         flags.get("oneclick_real_execution_enabled"),
         "feature_flags.oneclick_real_execution_enabled",
