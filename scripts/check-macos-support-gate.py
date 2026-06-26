@@ -346,13 +346,16 @@ def check_pr(repo: str, skip_checks: bool) -> bool:
             "--repo",
             repo,
             "--json",
-            "headRefOid,isDraft,mergeStateStatus,statusCheckRollup",
+            "headRefOid,isDraft,mergeStateStatus,state,statusCheckRollup",
         ]
     )
     passed = True
+    pr_state = pr.get("state")
 
     if skip_checks:
         ok("PR merge state skipped by request")
+    elif pr_state == "MERGED":
+        ok(f"PR #{PR_NUMBER} is merged; merge-state cleanliness is no longer required")
     elif pr["mergeStateStatus"] != "CLEAN":
         fail(f"PR #{PR_NUMBER} merge state is {pr['mergeStateStatus']}, expected CLEAN")
         passed = False
@@ -375,7 +378,9 @@ def check_pr(repo: str, skip_checks: bool) -> bool:
             else:
                 ok(f"PR check green: {name}")
 
-    if pr["isDraft"]:
+    if pr_state == "MERGED":
+        ok(f"PR #{PR_NUMBER} is merged")
+    elif pr["isDraft"]:
         ok(f"PR #{PR_NUMBER} is still draft while final real-Mac evidence is pending")
     else:
         ok(f"PR #{PR_NUMBER} is ready for review")

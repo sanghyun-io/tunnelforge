@@ -1342,6 +1342,29 @@ def test_macos_support_gate_script_checks_report_artifact_workflow_run(tmp_path,
     assert "manual validation report Artifact workflow run 26477209665 does not match manual macOS workflow run 111" in capsys.readouterr().err
 
 
+def test_macos_support_gate_accepts_merged_pr_with_unknown_merge_state(monkeypatch, capsys):
+    gate = load_macos_support_gate_module()
+
+    def fake_gh_json(command):
+        assert command[:3] == ["pr", "view", "117"]
+        return {
+            "state": "MERGED",
+            "headRefOid": "abc123",
+            "isDraft": False,
+            "mergeStateStatus": "UNKNOWN",
+            "statusCheckRollup": [
+                {"name": "version-gate", "status": "COMPLETED", "conclusion": "SUCCESS"}
+            ],
+        }
+
+    monkeypatch.setattr(gate, "gh_json", fake_gh_json)
+
+    assert gate.check_pr("sanghyun-io/tunnelforge", skip_checks=False) is True
+    output = capsys.readouterr().out
+    assert "PR #117 is merged; merge-state cleanliness is no longer required" in output
+    assert "PR #117 is merged" in output
+
+
 def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     if shutil.which("bash") is None:
         pytest.skip("bash is required for shell script validation")
