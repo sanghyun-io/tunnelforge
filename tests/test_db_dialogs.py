@@ -728,3 +728,132 @@ def test_import_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp
     assert captured["config"].engine == "postgresql"
     assert captured["started"] is True
     dialog.deleteLater()
+
+
+def test_postgresql_import_auto_timezone_skips_mysql_detection(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    captured = {}
+
+    class FakeWorker:
+        progress = FakeSignal()
+        table_progress = FakeSignal()
+        detail_progress = FakeSignal()
+        table_status = FakeSignal()
+        raw_output = FakeSignal()
+        import_finished = FakeSignal()
+        finished = FakeSignal()
+        metadata_analyzed = FakeSignal()
+        table_chunk_progress = FakeSignal()
+
+        def __init__(self, task_type, config, **kwargs):
+            captured["task_type"] = task_type
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+
+        def start(self):
+            captured["started"] = True
+
+        def isRunning(self):
+            return False
+
+    class FakeConnector:
+        host = "pg.example.com"
+        port = 5432
+        user = "importer"
+        password = "secret"
+        engine = "postgresql"
+
+        def get_schemas(self):
+            return ["app"]
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog.input_dir.setText(str(dump_dir))
+    dialog.check_timezone_support = MagicMock(
+        side_effect=AssertionError("PostgreSQL import must not query MySQL timezone tables")
+    )
+
+    dialog.do_import()
+
+    assert captured["task_type"] == "import"
+    assert captured["config"].engine == "postgresql"
+    assert captured["kwargs"]["timezone_sql"] is None
+    dialog.check_timezone_support.assert_not_called()
+    assert captured["started"] is True
+    dialog.deleteLater()
+
+
+def test_postgresql_import_forced_kst_uses_postgresql_timezone_sql(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    captured = {}
+
+    class FakeWorker:
+        progress = FakeSignal()
+        table_progress = FakeSignal()
+        detail_progress = FakeSignal()
+        table_status = FakeSignal()
+        raw_output = FakeSignal()
+        import_finished = FakeSignal()
+        finished = FakeSignal()
+        metadata_analyzed = FakeSignal()
+        table_chunk_progress = FakeSignal()
+
+        def __init__(self, task_type, config, **kwargs):
+            captured["task_type"] = task_type
+            captured["config"] = config
+            captured["kwargs"] = kwargs
+
+        def start(self):
+            captured["started"] = True
+
+        def isRunning(self):
+            return False
+
+    class FakeConnector:
+        host = "pg.example.com"
+        port = 5432
+        user = "importer"
+        password = "secret"
+        engine = "postgresql"
+
+        def get_schemas(self):
+            return ["app"]
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog.input_dir.setText(str(dump_dir))
+    dialog.radio_tz_kst.setChecked(True)
+
+    dialog.do_import()
+
+    assert captured["task_type"] == "import"
+    assert captured["config"].engine == "postgresql"
+    assert captured["kwargs"]["timezone_sql"] == "SET TIME ZONE '+09:00'"
+    assert captured["started"] is True
+    dialog.deleteLater()

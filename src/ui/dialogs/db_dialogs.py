@@ -2684,26 +2684,38 @@ class RustDumpImportDialog(QDialog):
 
         # 타임존 설정 결정
         timezone_sql = None
+        db_engine = config.engine
 
         if self.radio_tz_auto.isChecked():
-            self.txt_log.addItem("🔍 타임존 지원 여부 확인 중...")
-            QApplication.processEvents()
+            if db_engine == "mysql":
+                self.txt_log.addItem("🔍 타임존 지원 여부 확인 중...")
+                QApplication.processEvents()
 
-            supports_named_tz = self.check_timezone_support()
+                supports_named_tz = self.check_timezone_support()
 
-            if supports_named_tz:
-                self.txt_log.addItem("✅ 서버가 지역명 타임존을 지원합니다.")
+                if supports_named_tz:
+                    self.txt_log.addItem("✅ 서버가 지역명 타임존을 지원합니다.")
+                else:
+                    timezone_sql = "SET SESSION time_zone = '+09:00'"
+                    self.txt_log.addItem("⚠️ 서버가 지역명 타임존을 지원하지 않습니다.")
+                    self.txt_log.addItem("ℹ️ 'Asia/Seoul' 에러 방지를 위해 타임존을 '+09:00'으로 자동 보정합니다.")
             else:
-                timezone_sql = "SET SESSION time_zone = '+09:00'"
-                self.txt_log.addItem("⚠️ 서버가 지역명 타임존을 지원하지 않습니다.")
-                self.txt_log.addItem("ℹ️ 'Asia/Seoul' 에러 방지를 위해 타임존을 '+09:00'으로 자동 보정합니다.")
+                self.txt_log.addItem("ℹ️ PostgreSQL Import는 MySQL 타임존 자동 보정을 건너뜁니다.")
 
         elif self.radio_tz_kst.isChecked():
-            timezone_sql = "SET SESSION time_zone = '+09:00'"
+            timezone_sql = (
+                "SET TIME ZONE '+09:00'"
+                if db_engine == "postgresql"
+                else "SET SESSION time_zone = '+09:00'"
+            )
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+09:00' (KST)로 설정합니다.")
 
         elif self.radio_tz_utc.isChecked():
-            timezone_sql = "SET SESSION time_zone = '+00:00'"
+            timezone_sql = (
+                "SET TIME ZONE '+00:00'"
+                if db_engine == "postgresql"
+                else "SET SESSION time_zone = '+00:00'"
+            )
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+00:00' (UTC)로 설정합니다.")
 
         # Import 모드 결정

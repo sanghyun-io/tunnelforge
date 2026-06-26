@@ -690,6 +690,7 @@ _EN_PHRASE_TRANSLATIONS = {
     "서버가 지역명 타임존을 지원합니다.": "The server supports named time zones.",
     "서버가 지역명 타임존을 지원하지 않습니다.": "The server does not support named time zones.",
     "'Asia/Seoul' 에러 방지를 위해 타임존을 '+09:00'으로 자동 보정합니다.": "Timezone is adjusted to '+09:00' to avoid 'Asia/Seoul' errors.",
+    "PostgreSQL Import는 MySQL 타임존 자동 보정을 건너뜁니다.": "PostgreSQL import skips MySQL timezone auto-correction.",
     "타임존을 강제로 '+09:00' (KST)로 설정합니다.": "Force timezone to '+09:00' (KST).",
     "타임존을 강제로 '+00:00' (UTC)로 설정합니다.": "Force timezone to '+00:00' (UTC).",
     "타임존 지원 여부 확인 중": "Checking timezone support",
