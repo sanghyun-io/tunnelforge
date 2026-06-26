@@ -57,9 +57,11 @@ TunnelForge is in a strong build/test state. The active architecture baseline
 is Rust Core ownership of DB operations through `tunnelforge-core`, with
 Python/PyQt responsible for UI, orchestration, signals, and dialogs.
 
-The only open GitHub issue found in the current pass is #116, and its remaining
-unchecked criterion is external real operator Mac validation evidence. No new
-repository-side code or documentation gap was found while re-auditing the issue.
+Open GitHub issue #116 remains external: its remaining unchecked criterion is
+real operator Mac validation evidence. The current pass also found that the
+One-Click migration Rust Core command surface is implemented, but the PyQt entry
+point remains intentionally hidden behind a feature flag without a separate
+open production-readiness tracker; GitHub issue #137 now tracks that gate.
 
 ## Verified On 2026-06-26
 
@@ -79,6 +81,7 @@ Commands run locally:
 | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 47 passed |
+| `tunnelforge-core service.hello` | PASS, advertises `oneclick.*` commands while the PyQt One-Click entry point remains hidden |
 
 Version references are aligned at `2.1.6` across:
 
@@ -100,6 +103,7 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Current main macOS support gate | `python scripts\check-macos-support-gate.py --skip-github` | PASS | Repository-side macOS support tracking checks pass without final real-Mac evidence |
 | 2026-06-26 | Current main macOS focused tests | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | 47 passed |
 | 2026-06-26 | Current main diff hygiene | `git diff --check` | PASS | No whitespace errors |
+| 2026-06-26 | One-Click production-readiness audit | `tunnelforge-core service.hello`; `rg -n "oneclick\.|ONE_CLICK_MIGRATION_FEATURE_ENABLED" migration_core\src\lib.rs src tests docs README.md README.ko.md`; `gh issue view 124` | PASS | Rust Core advertises `oneclick.*` commands and Python worker uses Rust Core, but the PyQt entry point is still hidden; created GitHub #137 |
 | 2026-06-26 | Full Python suite | `pytest -q` | PASS | 1707 passed, 3 warnings |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | Unit, CLI, and gated live tests pass or skip according to env |
 | 2026-06-26 | Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Produced `migration_core\target\release\tunnelforge-core.exe` |
@@ -371,12 +375,12 @@ Evidence:
   `python -m compileall -q scripts tests` still pass on main. #116 remains open
   only for the real operator Mac report/log/system-evidence/evidence-zip
   attachment.
-- 2026-06-26 current-main re-audit: full Python suite, full Rust core tests,
-  Rust release build, compileall, final live UI evidence validator, Rust
-  performance evidence validator, optional evidence regression gate with both
-  required evidence flags, macOS support gate, focused macOS tests, and diff
-  hygiene all pass. GitHub issue #116 is still the only open issue and still
-  has only the final real operator Mac validation checkbox unchecked.
+- 2026-06-26 current-main re-audit before #137 creation: full Python suite,
+  full Rust core tests, Rust release build, compileall, final live UI evidence
+  validator, Rust performance evidence validator, optional evidence regression
+  gate with both required evidence flags, macOS support gate, focused macOS
+  tests, and diff hygiene all pass. GitHub issue #116 still has only the final
+  real operator Mac validation checkbox unchecked.
 
 Next action:
 
@@ -731,6 +735,46 @@ Next action:
    migration worker, Rust Core streaming, heartbeat sampling, or stress/RSS
    semantics change.
 
+### TF-STATUS-019: One-Click Migration UI Production-Readiness Gate
+
+Status: `open`
+Severity: Medium
+Area: One-Click migration UI / Rust Core integration
+
+Evidence:
+
+- GitHub issue #124 is closed because One-Click migration orchestration moved
+  into Rust Core, but its acceptance criteria intentionally kept the hidden UI
+  gate disabled until the workflow is production-ready.
+- `tunnelforge-core service.hello` advertises `oneclick.run`,
+  `oneclick.preflight`, `oneclick.analyze`, `oneclick.recommend`,
+  `oneclick.apply_fixes`, `oneclick.validate`, and `oneclick.report`.
+- `src\ui\dialogs\oneclick_migration_dialog.py` uses
+  `DbCoreFacade.run_oneclick(...)` and fails closed unless the connector has
+  the Rust Core facade shape.
+- `src\ui\dialogs\migration_dialogs.py` still sets
+  `ONE_CLICK_MIGRATION_FEATURE_ENABLED = False`, so the user-facing One-Click
+  entry point remains hidden.
+- 2026-06-26 update: created GitHub issue #137 to track the production-readiness
+  decision and evidence required before changing the feature flag.
+
+Follow-up GitHub issue:
+
+- https://github.com/sanghyun-io/tunnelforge/issues/137
+
+Impact:
+
+- The Rust Core command surface exists, but users cannot access the One-Click
+  UI from the migration analyzer while the gate stays disabled.
+- Without a separate tracker, the disabled state can be mistaken for completed
+  user-facing functionality because #124 is closed.
+
+Next action:
+
+1. Define the supported One-Click release scope, collect at least one realistic
+   Rust Core-backed dry-run evidence flow, and then decide whether to keep the
+   UI hidden, expose it as preview/beta, or fully enable it.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -753,10 +797,13 @@ Next action:
 | TF-STATUS-016 | Medium | closed | Rust Core dump.import diagnostics | MySQL ERROR 1114 table-full guidance | Collect target storage/tmpdir evidence if it recurs |
 | TF-STATUS-017 | High | closed | Rust Core migration performance evidence | 1M/10M evidence archived and validated | Refresh if migration/verify streaming semantics change |
 | TF-STATUS-018 | High | closed | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence captured | Refresh final validator evidence if migration/RSS semantics change |
+| TF-STATUS-019 | Medium | open | One-Click migration UI | Production-readiness gate for hidden One-Click entry point | Work GitHub #137; decide hidden/preview/enabled with evidence |
 
 ## Recommended Execution Order
 
-1. Keep macOS real-device validation tracked separately.
+1. Work TF-STATUS-019 / GitHub #137 because it is actionable in-repo.
+2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
+   operator Mac validation evidence.
 
 ## Session Log
 
@@ -795,4 +842,5 @@ Next action:
 | 2026-06-26 | Re-audited the last open issue #116 after #99/#136 closure; local macOS support gates still pass, but the issue remains open for external real operator Mac evidence. | `docs/current_status.md` | `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q scripts tests` |
 | 2026-06-26 | Cleaned up stale wording after closing #99/#136 so the evidence READMEs and status heading describe completed evidence instead of pending closure gates. | `docs/current_status.md`, `reports/live_ui_migration/README.md`, `reports/rust_core_performance/README.md` | `rg -n "remaining #99|GitHub issue #136 now tracks|Live UI Performance Evidence Pending|should remain open until the live|#99 remains open|#136 still remains open" docs reports scripts tests README.md README.ko.md`; `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json`; `python scripts\validate-rust-core-performance-evidence.py`; `git diff --check` |
 | 2026-06-26 | Wired final live UI evidence into the optional Rust Core regression gate so clean checkouts can require both archived Rust performance evidence and live UI evidence. | `scripts/rust-core-regression-gate.ps1`, `tests/test_live_ui_migration_evidence.py`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_evidence.py::test_regression_gate_can_require_live_ui_evidence -q`; `RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
-| 2026-06-26 | Reconfirmed current `main` is aligned with `origin/main`, ran a broader current-main verification sweep, and re-analyzed GitHub #116 as the only remaining open issue. | `docs/current_status.md` | `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `python -m compileall -q main.py src tests scripts`; `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json`; `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `git diff --check` |
+| 2026-06-26 | Reconfirmed current `main` was aligned with `origin/main`, ran a broader current-main verification sweep, and re-analyzed GitHub #116 as the then-only remaining open issue before the later One-Click tracker was created. | `docs/current_status.md` | `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `python -m compileall -q main.py src tests scripts`; `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json`; `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `git diff --check` |
+| 2026-06-26 | Audited stale plan/TODO candidates after #116 was confirmed external; found the One-Click Rust Core command surface exists while the PyQt entry point remains hidden, created GitHub #137, and added TF-STATUS-019 so the production-readiness gate is tracked separately from closed #124. | `docs/current_status.md` | `rg -n "oneclick\.|ONE_CLICK_MIGRATION_FEATURE_ENABLED" migration_core\src\lib.rs src tests docs README.md README.ko.md`; `tunnelforge-core service.hello`; `gh issue view 124`; `gh issue create` created #137 |
