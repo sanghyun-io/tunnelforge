@@ -172,6 +172,23 @@ def test_current_status_tracks_call_local_rowcount_metadata_issue():
     assert "shared facade state" in normalized_doc
 
 
+def test_current_status_tracks_sql_statement_parser_mismatch_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-056" in doc
+    assert "GitHub #155" in doc
+    assert "SQL statement parser mismatch" in doc
+    assert "SQL Editor" in doc
+    assert "SQLExecutionWorker._parse_sql_statements" in doc
+    assert "PostgreSQL dollar quote" in normalized_doc
+    assert "MySQL DELIMITER" in normalized_doc
+    assert "GitHub #155 is open" in summary
+    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
+
+
 def test_current_status_records_post_151_next_issue_analysis():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     normalized_doc = " ".join(doc.split())
@@ -187,7 +204,7 @@ def test_current_status_records_post_151_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a repo-side implementation issue" in normalized_doc
-    assert "TF-STATUS-052 reconfirmed no new repo-side issue after #151 closure" in order
+    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
 
 
 def test_current_status_current_baseline_section_is_not_stale_dated():
@@ -287,7 +304,7 @@ def test_current_status_tracks_legacy_python_auto_fix_wizard_issue():
     assert "FixWizardWorker" in doc
     assert "GitHub #142 is fixed" in summary
     assert "Legacy Auto-Fix Wizard is dry-run/manual SQL only" in doc
-    assert "No repo-side implementation issue is currently open" in order
+    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
 
 
 def test_current_status_records_post_142_next_issue_analysis():
@@ -367,7 +384,7 @@ def test_current_status_records_post_146_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a new repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-040" in order
+    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
 
 
 def test_current_status_tracks_post_release_version_drift_issue():
