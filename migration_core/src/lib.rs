@@ -5221,7 +5221,9 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "recommendation",
         "one-click recommendations ready",
     ));
-    let recommendations = oneclick_recommendations(&state.issues, &state.schema_name);
+    let charset_contracts = BTreeMap::new();
+    let recommendations =
+        oneclick_recommendations(&state.issues, &state.schema_name, &charset_contracts);
     let recommendation_summary = oneclick_recommendation_summary(&recommendations);
     emit(json!({
         "event": "execution_plan",
@@ -5446,7 +5448,8 @@ fn oneclick_recommend(request: &Request) -> Vec<Value> {
         .and_then(Value::as_str)
         .unwrap_or("");
     let issues = oneclick_payload_issues(&request.payload);
-    let recommendations = oneclick_recommendations(&issues, schema);
+    let charset_contracts = oneclick_charset_contracts_by_issue_index(&request.payload);
+    let recommendations = oneclick_recommendations(&issues, schema, &charset_contracts);
     let summary = oneclick_recommendation_summary(&recommendations);
     events.push(json!({
         "event": "result",
@@ -5465,13 +5468,13 @@ fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let plan = oneclick_apply_actions(&request.payload);
     let mut events = vec![phase_event(
         request,
         "execution",
         "one-click apply fixes started",
     )];
     if dry_run {
+        let preview = oneclick_dry_run_preview_fixes(&request.payload);
         events.push(json!({
             "event": "result",
             "request_id": request.request_id,
@@ -5480,14 +5483,16 @@ fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
             "dry_run": true,
             "success_count": 0,
             "fail_count": 0,
-            "skip_count": plan.actions.len() + plan.skipped,
-            "disallowed_fix_attempts": plan.disallowed,
+            "skip_count": preview.skipped,
+            "disallowed_fix_attempts": preview.disallowed,
             "applied_fixes": [],
+            "planned_fixes": preview.planned_fixes,
             "log": ["DRY-RUN: no database changes were executed."]
         }));
         return events;
     }
 
+    let plan = oneclick_apply_actions(&request.payload);
     if !plan.disallowed.is_empty() {
         events.push(json!({
             "event": "result",
@@ -5854,13 +5859,18 @@ fn oneclick_analysis_summary(inspection: &InspectionResult, issues: &[MigrationI
     })
 }
 
-fn oneclick_recommendations(issues: &[MigrationIssue], schema: &str) -> Vec<Value> {
+fn oneclick_recommendations(
+    issues: &[MigrationIssue],
+    schema: &str,
+    charset_contracts: &BTreeMap<usize, Value>,
+) -> Vec<Value> {
     issues
         .iter()
         .enumerate()
         .map(|(index, issue)| {
-            let selected_option = oneclick_auto_fix_option(issue, schema)
-                .unwrap_or_else(|| oneclick_manual_option(issue));
+            let selected_option =
+                oneclick_auto_fix_option(issue, schema, charset_contracts.get(&index))
+                    .unwrap_or_else(|| oneclick_manual_option(issue));
             json!({
                 "issue_index": index,
                 "issue_type": issue.issue_type.clone().unwrap_or_else(|| "unknown".to_string()),
@@ -5902,24 +5912,46 @@ fn oneclick_manual_option(issue: &MigrationIssue) -> Value {
     })
 }
 
-fn oneclick_auto_fix_option(issue: &MigrationIssue, schema: &str) -> Option<Value> {
-    if issue.issue_type.as_deref() != Some("deprecated_engine") {
-        return None;
+fn oneclick_auto_fix_option(
+    issue: &MigrationIssue,
+    schema: &str,
+    charset_contract: Option<&Value>,
+) -> Option<Value> {
+    match issue.issue_type.as_deref() {
+        Some("deprecated_engine") => {
+            let table = issue.table_name.as_deref()?.trim();
+            if table.is_empty() || schema.trim().is_empty() {
+                return None;
+            }
+            Some(json!({
+                "strategy": "engine_innodb",
+                "label": "Convert table to InnoDB",
+                "description": "Convert this deprecated storage engine table to InnoDB.",
+                "sql_template": format!(
+                    "ALTER TABLE {}.{} ENGINE=InnoDB;",
+                    quote_ident("mysql", schema.trim()),
+                    quote_ident("mysql", table),
+                )
+            }))
+        }
+        Some("charset_issue") => charset_contract.and_then(|contract| {
+            oneclick_charset_fk_safe_option_from_payload(contract, schema).ok()
+        }),
+        _ => None,
     }
-    let table = issue.table_name.as_deref()?.trim();
-    if table.is_empty() || schema.trim().is_empty() {
-        return None;
-    }
-    Some(json!({
-        "strategy": "engine_innodb",
-        "label": "Convert table to InnoDB",
-        "description": "Convert this deprecated storage engine table to InnoDB.",
-        "sql_template": format!(
-            "ALTER TABLE {}.{} ENGINE=InnoDB;",
-            quote_ident("mysql", schema.trim()),
-            quote_ident("mysql", table),
-        )
-    }))
+}
+
+fn oneclick_charset_contracts_by_issue_index(payload: &Value) -> BTreeMap<usize, Value> {
+    payload
+        .get("charset_contracts")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|contract| {
+            let index = contract.get("issue_index").and_then(Value::as_u64)? as usize;
+            Some((index, contract.clone()))
+        })
+        .collect()
 }
 
 fn oneclick_charset_fk_safe_option_from_payload(
@@ -6052,6 +6084,13 @@ struct OneClickApplyOutcome {
     applied_fixes: Vec<Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneClickDryRunPreview {
+    planned_fixes: Vec<Value>,
+    skipped: usize,
+    disallowed: Vec<String>,
+}
+
 fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
     let schema = payload
         .get("schema")
@@ -6117,6 +6156,81 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
 
     OneClickApplyPlan {
         actions,
+        skipped,
+        disallowed,
+    }
+}
+
+fn oneclick_dry_run_preview_fixes(payload: &Value) -> OneClickDryRunPreview {
+    let schema = payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut planned_fixes = Vec::new();
+    let mut skipped = 0usize;
+    let mut disallowed = Vec::new();
+
+    for step in payload
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let issue_type = step
+            .get("issue_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let selected = step.get("selected_option").unwrap_or(&Value::Null);
+        let strategy = selected
+            .get("strategy")
+            .and_then(Value::as_str)
+            .unwrap_or("manual");
+
+        if strategy == "manual" || strategy == "skip" {
+            skipped += 1;
+            continue;
+        }
+        if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
+            match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
+                Ok(mut plan) => {
+                    if let Some(object) = plan.as_object_mut() {
+                        object.insert("issue_type".to_string(), json!("charset_issue"));
+                        object.insert("schema".to_string(), json!(schema));
+                        object.insert("dry_run".to_string(), json!(true));
+                        object.insert("success".to_string(), json!(false));
+                    }
+                    planned_fixes.push(plan);
+                }
+                Err(_) => disallowed.push(format!("{issue_type}:{strategy}")),
+            }
+            continue;
+        }
+        if issue_type == "deprecated_engine" && strategy == "engine_innodb" {
+            let Some(table) = oneclick_apply_step_table(step, schema) else {
+                skipped += 1;
+                continue;
+            };
+            planned_fixes.push(json!({
+                "issue_type": "deprecated_engine",
+                "strategy": "engine_innodb",
+                "schema": schema,
+                "table": table,
+                "sql": format!(
+                    "ALTER TABLE {}.{} ENGINE=InnoDB;",
+                    quote_ident("mysql", schema),
+                    quote_ident("mysql", &table),
+                ),
+                "dry_run": true,
+                "success": false
+            }));
+            continue;
+        }
+        disallowed.push(format!("{issue_type}:{strategy}"));
+    }
+
+    OneClickDryRunPreview {
+        planned_fixes,
         skipped,
         disallowed,
     }
@@ -10589,6 +10703,83 @@ mod tests {
     }
 
     #[test]
+    fn oneclick_recommend_gates_charset_auto_fix_on_complete_contract() {
+        let events = handle_request(Request {
+            command: "oneclick.recommend".to_string(),
+            request_id: Some("oneclick-rec-charset-1".to_string()),
+            payload: json!({
+                "schema": "tf_oneclick_charset",
+                "issues": [{
+                    "issue_type": "charset_issue",
+                    "severity": "warning",
+                    "location": "tf_oneclick_charset.tf_oneclick_parent",
+                    "table_name": "tf_oneclick_parent",
+                    "message": "Table uses a legacy charset.",
+                    "suggestion": "Convert table charset/collation after FK-safe review.",
+                    "blocking": false
+                }],
+                "charset_contracts": [{
+                    "issue_index": 0,
+                    "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+                    "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+                    "target_charset": "utf8mb4",
+                    "target_collation": "utf8mb4_0900_ai_ci",
+                    "rollback_sql": [
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                    ]
+                }]
+            }),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["summary"]["auto_fixable"], 1);
+        assert_eq!(result["summary"]["manual_review"], 0);
+        assert_eq!(
+            result["steps"][0]["selected_option"]["strategy"],
+            "charset_collation_fk_safe"
+        );
+        assert_eq!(
+            result["steps"][0]["selected_option"]["sql"],
+            json!([
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+            ])
+        );
+    }
+
+    #[test]
+    fn oneclick_recommend_keeps_charset_manual_without_complete_contract() {
+        let events = handle_request(Request {
+            command: "oneclick.recommend".to_string(),
+            request_id: Some("oneclick-rec-charset-manual-1".to_string()),
+            payload: json!({
+                "schema": "tf_oneclick_charset",
+                "issues": [{
+                    "issue_type": "charset_issue",
+                    "severity": "warning",
+                    "location": "tf_oneclick_charset.tf_oneclick_parent",
+                    "table_name": "tf_oneclick_parent",
+                    "message": "Table uses a legacy charset.",
+                    "suggestion": "Convert table charset/collation after FK-safe review.",
+                    "blocking": false
+                }]
+            }),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["summary"]["auto_fixable"], 0);
+        assert_eq!(result["summary"]["manual_review"], 1);
+        assert_eq!(result["steps"][0]["selected_option"]["strategy"], "manual");
+    }
+
+    #[test]
     fn oneclick_issues_classify_deprecated_engine_marker_as_auto_fixable() {
         let inspection = InspectionResult {
             schema: NormalizedSchema {
@@ -10603,7 +10794,8 @@ mod tests {
         };
 
         let issues = oneclick_issues_from_inspection(&inspection);
-        let recommendations = oneclick_recommendations(&issues, "app");
+        let charset_contracts = BTreeMap::new();
+        let recommendations = oneclick_recommendations(&issues, "app", &charset_contracts);
         let summary = oneclick_recommendation_summary(&recommendations);
 
         assert_eq!(issues.len(), 1);
@@ -10740,6 +10932,96 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["dry_run"], true);
         assert_eq!(result["skip_count"], 1);
+    }
+
+    #[test]
+    fn oneclick_apply_fixes_dry_run_previews_charset_plan_without_execution_allowlist() {
+        let events = handle_request(Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: Some("oneclick-apply-charset-dry-1".to_string()),
+            payload: json!({
+                "schema": "tf_oneclick_charset",
+                "dry_run": true,
+                "steps": [{
+                    "issue_type": "charset_issue",
+                    "location": "tf_oneclick_charset.tf_oneclick_parent",
+                    "table_name": "tf_oneclick_parent",
+                    "selected_option": {
+                        "strategy": "charset_collation_fk_safe",
+                        "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+                        "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+                        "target_charset": "utf8mb4",
+                        "target_collation": "utf8mb4_0900_ai_ci",
+                        "sql": [
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+                        ],
+                        "rollback_sql": [
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                        ]
+                    }
+                }]
+            }),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["success"], true);
+        assert_eq!(result["dry_run"], true);
+        assert_eq!(result["disallowed_fix_attempts"], json!([]));
+        assert_eq!(
+            result["planned_fixes"][0]["strategy"],
+            "charset_collation_fk_safe"
+        );
+        assert_eq!(result["planned_fixes"][0]["success"], false);
+        assert_eq!(result["planned_fixes"][0]["dry_run"], true);
+        assert_eq!(result["applied_fixes"], json!([]));
+    }
+
+    #[test]
+    fn oneclick_apply_fixes_real_charset_still_disallowed_until_execution_evidence() {
+        let events = handle_request(Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: Some("oneclick-apply-charset-real-1".to_string()),
+            payload: json!({
+                "schema": "tf_oneclick_charset",
+                "dry_run": false,
+                "steps": [{
+                    "issue_type": "charset_issue",
+                    "location": "tf_oneclick_charset.tf_oneclick_parent",
+                    "table_name": "tf_oneclick_parent",
+                    "selected_option": {
+                        "strategy": "charset_collation_fk_safe",
+                        "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+                        "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+                        "target_charset": "utf8mb4",
+                        "target_collation": "utf8mb4_0900_ai_ci",
+                        "sql": [
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+                        ],
+                        "rollback_sql": [
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                        ]
+                    }
+                }]
+            }),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["success"], false);
+        assert_eq!(
+            result["disallowed_fix_attempts"],
+            json!(["charset_issue:charset_collation_fk_safe"])
+        );
+        assert_eq!(result["applied_fixes"], json!([]));
     }
 
     #[test]

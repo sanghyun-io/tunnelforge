@@ -64,7 +64,7 @@ Current Rust Core recommendation coverage:
 | Issue type | Status | Strategy | Notes |
 | --- | --- | --- | --- |
 | `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. `oneclick.apply_fixes` and UI-facing `oneclick.run dry_run=false` execute only this strategy through Rust Core. PyQt requires backup confirmation before sending a non-dry-run payload. |
-| `charset_issue` | manual | `manual` | FK-safe ordering, rollback, and collation/charset target selection must be proven before automatic execution. |
+| `charset_issue` | gated preview only | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify a charset issue as an automatic dry-run candidate only when the request includes complete safe `charset_contracts` data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. Real execution remains disallowed. |
 | `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
 | `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
 | `float_precision` | manual | `manual` | Requires precision/scale policy review. |
@@ -120,12 +120,14 @@ Implementation gate:
 - `scripts\capture-oneclick-charset-evidence.py` must remain fail-closed for
   live capture until the Rust Core allowlist path exists. The scaffold is only
   a report-shape and safe-scope helper at this stage.
-- Rust Core now has an internal, un-wired contract helper for the future
-  `charset_collation_fk_safe` option. It validates safe `tf_oneclick_`
-  evidence identifiers, explicit target charset/collation, FK order coverage,
-  rollback SQL, and generated table-level conversion SQL, but it is not yet
-  connected to `oneclick.recommend`, `oneclick.apply_fixes`, or
-  `oneclick.run dry_run=false`.
+- Rust Core now uses the `charset_collation_fk_safe` contract helper for
+  `oneclick.recommend` when `charset_contracts[]` includes a complete contract
+  for the issue index. Missing or incomplete contract data keeps the issue
+  manual.
+- `oneclick.apply_fixes dry_run=true` can return charset `planned_fixes` for a
+  complete contract without executing SQL. `oneclick.apply_fixes dry_run=false`
+  still rejects `charset_issue:charset_collation_fk_safe` as disallowed until
+  live execution and validator-backed evidence are implemented.
 
 ## Real-Execution Gate Outcome
 
