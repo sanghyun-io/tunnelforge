@@ -250,13 +250,14 @@ Reasons:
 - The dialog backup checkbox defaults unchecked. If preview is exposed, dry-run
   UX should avoid making a backup warning look like a solved migration issue.
 
-Recommended next repo-side change:
+Standing One-Click follow-up policy:
 
 1. Keep the current limited-scope real-execution gate narrow.
 2. Create separate issues for each additional automatic fix class before
    enabling it.
 3. Refresh evidence if event payloads, Rust Core sequencing, or UI safety gates
    change.
+4. No repo-side One-Click follow-up issue is currently open.
 
 Completed tracking:
 

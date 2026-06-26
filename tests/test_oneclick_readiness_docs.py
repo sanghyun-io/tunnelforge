@@ -22,10 +22,14 @@ def test_oneclick_readiness_does_not_present_closed_issues_as_current_tracking()
         "GitHub #138 tracks real execution",
         "Real execution and automatic fix coverage: GitHub #138.",
         "Charset/collation automatic fix coverage: GitHub #139.",
+        "Recommended next repo-side change:",
     ]
 
     for phrase in stale_phrases:
         assert phrase not in doc
+
+    assert "Standing One-Click follow-up policy:" in doc
+    assert "No repo-side One-Click follow-up issue is currently open" in doc
 
 
 def test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support():
