@@ -42,20 +42,21 @@ The current supported scope is intentionally narrow:
   sequences the same validated apply path.
 - Charset/collation evidence contract:
   `scripts\validate-oneclick-charset-evidence.py` and
-  `reports\oneclick_readiness\oneclick-charset-evidence.template.json`.
-  This is a contract/template only; no completed charset/collation evidence has
-  been captured yet.
-- Charset/collation capture scaffold:
-  `scripts\capture-oneclick-charset-evidence.py` can build a validator-backed
-  #139 report from captured inputs and rejects unsafe non-`tf_oneclick_`
-  evidence scopes. Its live capture entry point intentionally fails closed until
-  Rust Core implements the allowlisted charset/collation execution path.
+  `reports\oneclick_readiness\oneclick-charset-evidence.json`.
+  Completed evidence proves Rust Core `oneclick.apply_fixes` can convert the
+  controlled local FK-connected test tables
+  `tf_oneclick_charset.tf_oneclick_parent` and
+  `tf_oneclick_charset.tf_oneclick_child` from `utf8mb3` /
+  `utf8mb3_general_ci` to `utf8mb4` / `utf8mb4_0900_ai_ci`, while preserving
+  FK evidence and rollback metadata.
+- Charset/collation capture helper:
+  `scripts\capture-oneclick-charset-evidence.py` seeds and captures only safe
+  local `tf_oneclick_` scopes through Rust DB Core APIs.
 
 ## Not Yet Supported
 
 - Production database usage.
-- UI-facing `oneclick.run dry_run=false` charset/collation execution and
-  completed charset/collation evidence.
+- UI-facing `oneclick.run dry_run=false` charset/collation execution.
 
 ## Automatic Fix Coverage
 
@@ -73,10 +74,11 @@ Current Rust Core recommendation coverage:
 
 ## Charset/Collation Automation Policy (#139)
 
-Charset/collation command-level execution is now allowlisted only for complete
-`charset_collation_fk_safe` contracts. UI-facing `oneclick.run dry_run=false`
-charset execution and completed local MySQL evidence are still pending. The
-following policy defines the only eligible scope.
+Charset/collation command-level execution is allowlisted only for complete
+`charset_collation_fk_safe` contracts. Local MySQL evidence for the command
+path is captured and validator-backed. UI-facing `oneclick.run dry_run=false`
+charset execution is still pending. The following policy defines the only
+eligible scope.
 
 Eligible automatic subset:
 
@@ -119,8 +121,8 @@ Implementation gate:
   `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` must pass against
   `reports\oneclick_readiness\oneclick-charset-evidence.json` before
   `charset_issue` is added to the real-execution allowlist.
-- `scripts\capture-oneclick-charset-evidence.py` still needs a live capture
-  implementation and must only use local `tf_oneclick_` evidence scopes.
+- `scripts\capture-oneclick-charset-evidence.py` captures live evidence only
+  from local `tf_oneclick_` evidence scopes.
 - Rust Core now uses the `charset_collation_fk_safe` contract helper for
   `oneclick.recommend` when `charset_contracts[]` includes a complete contract
   for the issue index. Missing or incomplete contract data keeps the issue
@@ -129,7 +131,7 @@ Implementation gate:
   complete contract without executing SQL. `oneclick.apply_fixes dry_run=false`
   can execute the contract SQL through the Rust adapter path and includes
   rollback metadata in the applied-fix payload; validator-backed live MySQL
-  evidence is still required before #139 can close.
+  evidence for this command path is captured.
 
 ## Real-Execution Gate Outcome
 

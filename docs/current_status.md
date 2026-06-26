@@ -917,11 +917,11 @@ Evidence:
   execution through Python DB drivers. The reusable idea is the contract shape;
   execution ownership must stay in `tunnelforge-core`.
 - `scripts\capture-oneclick-charset-evidence.py` and
-  `tests\test_oneclick_charset_capture.py` now scaffold the #139 capture/report
-  layer. The report builder can create validator-compatible charset evidence
-  from captured inputs, and the live capture entry point rejects unsafe scopes
-  before failing closed because Rust Core charset execution is not implemented
-  yet.
+  `tests\test_oneclick_charset_capture.py` now implement the #139 local MySQL
+  capture/report layer through Rust DB Core APIs. The helper seeds only safe
+  `tf_oneclick_` scopes, captures before/after charset state, captures FK
+  evidence, executes `oneclick.apply_fixes dry_run=false`, and writes a
+  validator-compatible report.
 - `migration_core\src\lib.rs` has a `charset_collation_fk_safe` contract helper
   covered by Rust tests. It validates safe `tf_oneclick_` evidence identifiers,
   explicit charset/collation target, FK order table coverage, rollback SQL, and
@@ -934,9 +934,12 @@ Evidence:
 - Rust Core command-level `oneclick.apply_fixes dry_run=false` can now execute
   complete `charset_collation_fk_safe` contract SQL through the adapter path and
   returns rollback metadata, target charset/collation, FK order, SQL list, and
-  success/error state in `applied_fixes`. UI-facing `oneclick.run dry_run=false`
-  charset orchestration, live capture tooling, and completed local MySQL
-  evidence are still pending.
+  success/error state in `applied_fixes`.
+- `reports\oneclick_readiness\oneclick-charset-evidence.json` now provides
+  validator-backed local MySQL evidence for the command-level charset path.
+  `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` passes. UI-facing
+  `oneclick.run dry_run=false` charset orchestration and PyQt rendering/count
+  tests are still pending.
 
 GitHub issue:
 
@@ -951,14 +954,12 @@ Impact:
 
 Next action:
 
-1. Implement live charset evidence capture against local MySQL, including
-   before/after table charset state and FK validity proof.
-2. Connect UI-facing `oneclick.run` to the proven charset contract only after
-   local capture passes, or keep it manual if live evidence exposes FK DDL gaps.
-3. Add PyQt rendering/count/copy tests for automatic vs manual charset payloads.
-4. Capture completed local MySQL evidence and enable
-   `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` in the final verification
-   pass before documenting or closing #139.
+1. Connect UI-facing `oneclick.run` to the proven charset contract only for the
+   same validated local-safe contract shape, or keep it manual if automatic
+   contract derivation is not ready.
+2. Add PyQt rendering/count/copy tests for automatic vs manual charset payloads.
+3. Run final gates including `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1`
+   before documenting or closing #139.
 
 ## Issue Tracker
 
@@ -1054,3 +1055,4 @@ Next action:
 | 2026-06-26 | Added an internal Rust Core #139 contract helper for future `charset_issue -> charset_collation_fk_safe` options without wiring it into recommendation or execution paths. The helper validates safe evidence identifiers, explicit target charset/collation, FK-order coverage, rollback SQL, and generated table-level conversion SQL. | `migration_core/src/lib.rs`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED: `cargo test --manifest-path migration_core\Cargo.toml oneclick_charset_contract --lib` failed because `oneclick_charset_fk_safe_option_from_payload` did not exist; GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `pytest tests\test_oneclick_charset_capture.py tests\test_oneclick_charset_evidence.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Connected the #139 Rust Core charset contract to recommendation and dry-run preview only. Complete `charset_contracts[]` data can produce a `charset_collation_fk_safe` recommendation and `oneclick.apply_fixes dry_run=true` `planned_fixes`; missing contract data remains manual. | `migration_core/src/lib.rs`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED: `cargo test --manifest-path migration_core\Cargo.toml oneclick_recommend_gates_charset_auto_fix_on_complete_contract --lib` failed with `auto_fixable` 0; RED: `cargo test --manifest-path migration_core\Cargo.toml oneclick_apply_fixes_dry_run_previews_charset_plan_without_execution_allowlist --lib` failed with disallowed charset dry-run; GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `pytest tests\test_oneclick_charset_capture.py tests\test_oneclick_charset_evidence.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Added command-level Rust Core charset execution planning for complete `charset_collation_fk_safe` contracts. The adapter path executes generated charset SQL in FK order, preserves rollback SQL/target/fk_order metadata in applied fixes, and reports SQL failure with rollback metadata. | `migration_core/src/lib.rs`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED: `cargo test --manifest-path migration_core\Cargo.toml oneclick_apply_plan_executes_charset_sql_in_fk_order_with_rollback_metadata --lib` failed because no charset SQL executed; GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `pytest tests\test_oneclick_charset_capture.py tests\test_oneclick_charset_evidence.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `git diff --check` |
+| 2026-06-26 | Implemented and captured #139 local MySQL charset/collation evidence through Rust DB Core. The completed report proves `oneclick.apply_fixes dry_run=false` changed the local FK-connected `tf_oneclick_charset` tables from `utf8mb3`/`utf8mb3_general_ci` to `utf8mb4`/`utf8mb4_0900_ai_ci`, preserved FK evidence, and includes rollback metadata. | `scripts/capture-oneclick-charset-evidence.py`, `tests/test_oneclick_charset_capture.py`, `reports/oneclick_readiness/oneclick-charset-evidence.json`, `reports/oneclick_readiness/README.md`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED: `pytest tests\test_oneclick_charset_capture.py::test_oneclick_charset_capture_orchestrates_validator_backed_live_report -q` failed because `capture_oneclick_charset` did not accept a facade; GREEN: `pytest tests\test_oneclick_charset_capture.py tests\test_oneclick_charset_evidence.py -q`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `python scripts\capture-oneclick-charset-evidence.py --seed-local-container --mysql-container tf-live-mysql --mysql-host 127.0.0.1 --mysql-port 3406 --mysql-user root --mysql-password test --schema tf_oneclick_charset --output reports\oneclick_readiness\oneclick-charset-evidence.json`; `python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.json`; `$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |

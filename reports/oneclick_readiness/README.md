@@ -25,10 +25,14 @@ This directory stores machine-checkable One-Click readiness evidence.
 - `oneclick-charset-evidence.template.json` documents the GitHub #139 evidence
   shape for future controlled local `charset_issue -> charset_collation_fk_safe`
   runs. It is a template only, not completed evidence.
-- `scripts\capture-oneclick-charset-evidence.py` now provides the #139
-  validator-backed report builder and safe `tf_oneclick_` scope checks. Its
-  live capture path intentionally fails closed until Rust Core implements the
-  charset/collation allowlisted execution path.
+- `oneclick-charset-evidence.json` is captured from a local MySQL container
+  using Rust Core `oneclick.apply_fixes` with `dry_run=false` against
+  `tf_oneclick_charset.tf_oneclick_parent` and
+  `tf_oneclick_charset.tf_oneclick_child`.
+- The charset/collation evidence proves the command-level
+  `charset_issue -> charset_collation_fk_safe` path changed those local test
+  tables from `utf8mb3` / `utf8mb3_general_ci` to `utf8mb4` /
+  `utf8mb4_0900_ai_ci`, preserved FK evidence, and captured rollback metadata.
 
 Validate it with:
 
@@ -63,8 +67,7 @@ $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'
 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
 ```
 
-The charset/collation evidence gate can be required after completed evidence is
-captured:
+The charset/collation evidence gate can be required with:
 
 ```powershell
 $env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE='1'
@@ -89,14 +92,12 @@ python scripts\capture-oneclick-real-execution-evidence.py --seed-local-containe
 python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json
 ```
 
-The charset/collation capture helper is scaffolded, but it cannot produce
-completed evidence yet:
+Refresh the charset/collation evidence with:
 
 ```powershell
-python scripts\capture-oneclick-charset-evidence.py --output reports\oneclick_readiness\oneclick-charset-evidence.json
+cargo build --manifest-path migration_core\Cargo.toml --release
+python scripts\capture-oneclick-charset-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-charset-evidence.json
+python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.json
 ```
-
-That command is expected to fail closed until Rust Core exposes the #139
-`charset_issue -> charset_collation_fk_safe` real-execution path.
 
 Do not use production databases for this evidence.
