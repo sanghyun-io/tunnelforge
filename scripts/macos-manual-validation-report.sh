@@ -541,7 +541,7 @@ finalize_evidence() {
   cat > "$comment_path" <<EOF
 Final macOS validation evidence for #116
 
-Final gate passed for the attached real-Mac evidence. Attach these files to #116 and PR #117 before checking the final device validation box:
+Final gate passed for the attached real-Mac evidence. Attach these files to #116 before checking the final device validation box. The generated comment is also safe to mirror to PR #117 for traceability:
 
 - Git SHA: \`${report_git_sha}\`
 - Artifact workflow run: \`${artifact_workflow_run}\`
@@ -566,7 +566,7 @@ EOF
   if [[ "$POST_GITHUB_COMMENT" -eq 1 ]]; then
     "$GH_BIN" issue comment 116 --body-file "$comment_path"
     "$GH_BIN" pr comment 117 --body-file "$comment_path"
-    echo "Posted GitHub evidence comment to issue #116 and PR #117"
+    echo "Posted GitHub evidence comment to issue #116 and mirrored it to PR #117"
   fi
 
   echo
@@ -578,7 +578,7 @@ EOF
   echo "- Evidence bundle: $bundle_path"
   echo "- Evidence bundle checksum: $checksum_path"
   echo
-  echo "Attach these files to PR #117 or the release checklist before closing #116."
+  echo "Attach these files to #116 before closing #116."
 }
 
 if [[ -n "$CHECK_COMPLETE_PATH" ]]; then
