@@ -47,7 +47,7 @@ Current Rust Core recommendation coverage:
 
 | Issue type | Status | Strategy | Notes |
 | --- | --- | --- | --- |
-| `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. This is recommendation metadata only while real execution remains disabled. |
+| `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. `oneclick.apply_fixes` can execute this strategy through Rust Core when called with `dry_run=false` and a MySQL endpoint, but app-level real execution remains disabled until validator-backed evidence is captured. |
 | `charset_issue` | manual | `manual` | FK-safe ordering, rollback, and collation/charset target selection must be proven before automatic execution. |
 | `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
 | `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
@@ -98,9 +98,13 @@ Reasons:
   live-inspection issues still do not carry typed automatic-fix metadata.
 - `oneclick_recommendations` currently marks only `deprecated_engine` payload
   issues with `table_name` as automatic candidates.
-- `oneclick_apply_fixes` and the execution phase do not apply SQL fixes; a
-  non-dry-run request logs that no automatic Rust Core fixes are currently
-  required.
+- `oneclick_apply_fixes` now plans and executes only the allowed
+  `deprecated_engine -> engine_innodb` action through Rust Core
+  `MigrationAdapter::execute_sql`; manual/skip steps remain skipped, disallowed
+  strategies are blocked, and missing endpoints fail closed.
+- The full `oneclick.run` execution phase still does not perform automatic SQL
+  fixes, and no local before/after real-execution evidence has been captured
+  yet.
 - `scripts\validate-oneclick-real-execution-evidence.py` defines the
   machine-checkable proof required before `engine_innodb` real execution can be
   considered ready, but the matching real evidence file is still absent.

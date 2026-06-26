@@ -5376,24 +5376,108 @@ fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    vec![
-        phase_event(request, "execution", "one-click apply fixes started"),
-        json!({
+    let plan = oneclick_apply_actions(&request.payload);
+    let mut events = vec![phase_event(
+        request,
+        "execution",
+        "one-click apply fixes started",
+    )];
+    if dry_run {
+        events.push(json!({
             "event": "result",
             "request_id": request.request_id,
             "command": "oneclick.apply_fixes",
             "success": true,
-            "dry_run": dry_run,
+            "dry_run": true,
             "success_count": 0,
             "fail_count": 0,
-            "skip_count": request.payload.get("steps").and_then(Value::as_array).map(Vec::len).unwrap_or(0),
-            "log": [if dry_run {
-                "DRY-RUN: no database changes were executed."
-            } else {
-                "No automatic Rust Core fixes are currently required."
-            }]
-        }),
-    ]
+            "skip_count": plan.actions.len() + plan.skipped,
+            "disallowed_fix_attempts": plan.disallowed,
+            "applied_fixes": [],
+            "log": ["DRY-RUN: no database changes were executed."]
+        }));
+        return events;
+    }
+
+    if !plan.disallowed.is_empty() {
+        events.push(json!({
+            "event": "result",
+            "request_id": request.request_id,
+            "command": "oneclick.apply_fixes",
+            "success": false,
+            "dry_run": false,
+            "success_count": 0,
+            "fail_count": plan.disallowed.len(),
+            "skip_count": plan.skipped,
+            "disallowed_fix_attempts": plan.disallowed,
+            "applied_fixes": [],
+            "log": ["Disallowed One-Click automatic fix attempt blocked."]
+        }));
+        return events;
+    }
+
+    if plan.actions.is_empty() {
+        events.push(json!({
+            "event": "result",
+            "request_id": request.request_id,
+            "command": "oneclick.apply_fixes",
+            "success": true,
+            "dry_run": false,
+            "success_count": 0,
+            "fail_count": 0,
+            "skip_count": plan.skipped,
+            "disallowed_fix_attempts": [],
+            "applied_fixes": [],
+            "log": ["No automatic Rust Core fixes are currently required."]
+        }));
+        return events;
+    }
+
+    let (endpoint, _) = match oneclick_endpoint(request) {
+        Ok(endpoint) => endpoint,
+        Err(err) => {
+            events.push(json!({
+                "event": "error",
+                "request_id": request.request_id,
+                "message": err
+            }));
+            return events;
+        }
+    };
+    if endpoint.engine != "mysql" {
+        events.push(json!({
+            "event": "error",
+            "request_id": request.request_id,
+            "message": "oneclick.apply_fixes currently supports MySQL engine fixes only"
+        }));
+        return events;
+    }
+    let mut adapter = match LiveAdapter::connect(&endpoint) {
+        Ok(adapter) => adapter,
+        Err(err) => {
+            events.push(json!({
+                "event": "error",
+                "request_id": request.request_id,
+                "message": err
+            }));
+            return events;
+        }
+    };
+    let outcome = oneclick_execute_apply_plan(&plan, &mut adapter);
+    events.push(json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": "oneclick.apply_fixes",
+        "success": outcome.fail_count == 0,
+        "dry_run": false,
+        "success_count": outcome.success_count,
+        "fail_count": outcome.fail_count,
+        "skip_count": plan.skipped,
+        "disallowed_fix_attempts": [],
+        "applied_fixes": outcome.applied_fixes,
+        "log": outcome.log
+    }));
+    events
 }
 
 fn oneclick_validate(request: &Request) -> Vec<Value> {
@@ -5723,6 +5807,173 @@ fn oneclick_auto_fix_option(issue: &MigrationIssue, schema: &str) -> Option<Valu
             quote_ident("mysql", table),
         )
     }))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneClickApplyAction {
+    issue_type: String,
+    strategy: String,
+    schema: String,
+    table: String,
+    sql: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneClickApplyPlan {
+    actions: Vec<OneClickApplyAction>,
+    skipped: usize,
+    disallowed: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneClickApplyOutcome {
+    success_count: usize,
+    fail_count: usize,
+    log: Vec<String>,
+    applied_fixes: Vec<Value>,
+}
+
+fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
+    let schema = payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    let mut actions = Vec::new();
+    let mut skipped = 0usize;
+    let mut disallowed = Vec::new();
+
+    for step in payload
+        .get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let issue_type = step
+            .get("issue_type")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let selected = step.get("selected_option").unwrap_or(&Value::Null);
+        let strategy = selected
+            .get("strategy")
+            .and_then(Value::as_str)
+            .unwrap_or("manual");
+
+        if strategy == "manual" || strategy == "skip" {
+            skipped += 1;
+            continue;
+        }
+        if issue_type != "deprecated_engine" || strategy != "engine_innodb" {
+            disallowed.push(format!("{issue_type}:{strategy}"));
+            continue;
+        }
+
+        let Some(table) = oneclick_apply_step_table(step, schema) else {
+            skipped += 1;
+            continue;
+        };
+        let sql = format!(
+            "ALTER TABLE {}.{} ENGINE=InnoDB;",
+            quote_ident("mysql", schema),
+            quote_ident("mysql", &table),
+        );
+        if selected
+            .get("sql_template")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|template| !template.is_empty() && *template != sql)
+            .is_some()
+        {
+            disallowed.push(format!("{issue_type}:{strategy}:sql_mismatch"));
+            continue;
+        }
+        actions.push(OneClickApplyAction {
+            issue_type: issue_type.to_string(),
+            strategy: strategy.to_string(),
+            schema: schema.to_string(),
+            table,
+            sql,
+        });
+    }
+
+    OneClickApplyPlan {
+        actions,
+        skipped,
+        disallowed,
+    }
+}
+
+fn oneclick_execute_apply_plan<A: MigrationAdapter>(
+    plan: &OneClickApplyPlan,
+    adapter: &mut A,
+) -> OneClickApplyOutcome {
+    let mut success_count = 0usize;
+    let mut fail_count = 0usize;
+    let mut log = Vec::new();
+    let mut applied_fixes = Vec::new();
+
+    for action in &plan.actions {
+        match adapter.execute_sql(&action.sql) {
+            Ok(()) => {
+                success_count += 1;
+                log.push(format!("APPLIED: {}", action.sql));
+                applied_fixes.push(json!({
+                    "issue_type": action.issue_type,
+                    "strategy": action.strategy,
+                    "schema": action.schema,
+                    "table": action.table,
+                    "sql": action.sql,
+                    "success": true,
+                    "rows_affected": 0
+                }));
+            }
+            Err(err) => {
+                fail_count += 1;
+                log.push(format!("FAILED: {}: {err}", action.sql));
+                applied_fixes.push(json!({
+                    "issue_type": action.issue_type,
+                    "strategy": action.strategy,
+                    "schema": action.schema,
+                    "table": action.table,
+                    "sql": action.sql,
+                    "success": false,
+                    "error": err
+                }));
+            }
+        }
+    }
+
+    OneClickApplyOutcome {
+        success_count,
+        fail_count,
+        log,
+        applied_fixes,
+    }
+}
+
+fn oneclick_apply_step_table(step: &Value, schema: &str) -> Option<String> {
+    if schema.trim().is_empty() {
+        return None;
+    }
+    if let Some(table) = step
+        .get("table_name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|table| !table.is_empty())
+    {
+        return Some(table.to_string());
+    }
+
+    let location = step.get("location").and_then(Value::as_str)?.trim();
+    let mut parts = location.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(location_schema), Some(table), None)
+            if location_schema == schema && !table.is_empty() =>
+        {
+            Some(table.to_string())
+        }
+        _ => None,
+    }
 }
 
 fn oneclick_progress_event(request: &Request, percent: u64, message: &str) -> Value {
@@ -10133,6 +10384,98 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["dry_run"], true);
         assert_eq!(result["skip_count"], 1);
+    }
+
+    #[test]
+    fn oneclick_apply_actions_accepts_only_engine_innodb_steps() {
+        let plan = oneclick_apply_actions(&json!({
+            "schema": "app",
+            "steps": [{
+                "issue_type": "deprecated_engine",
+                "location": "app.legacy_table",
+                "selected_option": {
+                    "strategy": "engine_innodb",
+                    "sql_template": "ALTER TABLE `app`.`legacy_table` ENGINE=InnoDB;"
+                }
+            }, {
+                "issue_type": "charset_issue",
+                "location": "app.users.name",
+                "selected_option": {
+                    "strategy": "manual",
+                    "sql_template": ""
+                }
+            }]
+        }));
+
+        assert_eq!(plan.actions.len(), 1);
+        assert_eq!(plan.skipped, 1);
+        assert_eq!(plan.disallowed.len(), 0);
+        assert_eq!(plan.actions[0].issue_type, "deprecated_engine");
+        assert_eq!(plan.actions[0].strategy, "engine_innodb");
+        assert_eq!(plan.actions[0].schema, "app");
+        assert_eq!(plan.actions[0].table, "legacy_table");
+        assert_eq!(
+            plan.actions[0].sql,
+            "ALTER TABLE `app`.`legacy_table` ENGINE=InnoDB;"
+        );
+    }
+
+    #[test]
+    fn oneclick_apply_plan_executes_engine_innodb_sql() {
+        let plan = oneclick_apply_actions(&json!({
+            "schema": "app",
+            "steps": [{
+                "issue_type": "deprecated_engine",
+                "location": "app.legacy_table",
+                "selected_option": {
+                    "strategy": "engine_innodb",
+                    "sql_template": "ALTER TABLE `app`.`legacy_table` ENGINE=InnoDB;"
+                }
+            }]
+        }));
+        let mut adapter = RecordingAdapter::default();
+
+        let outcome = oneclick_execute_apply_plan(&plan, &mut adapter);
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec!["ALTER TABLE `app`.`legacy_table` ENGINE=InnoDB;"]
+        );
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(outcome.fail_count, 0);
+        assert_eq!(outcome.applied_fixes.len(), 1);
+        assert_eq!(outcome.applied_fixes[0]["strategy"], "engine_innodb");
+        assert_eq!(outcome.applied_fixes[0]["success"], true);
+    }
+
+    #[test]
+    fn oneclick_apply_fixes_real_engine_innodb_requires_endpoint() {
+        let events = handle_request(Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: Some("oneclick-apply-real-1".to_string()),
+            payload: json!({
+                "schema": "app",
+                "dry_run": false,
+                "steps": [{
+                    "issue_type": "deprecated_engine",
+                    "location": "app.legacy_table",
+                    "selected_option": {
+                        "strategy": "engine_innodb",
+                        "sql_template": "ALTER TABLE `app`.`legacy_table` ENGINE=InnoDB;"
+                    }
+                }]
+            }),
+        });
+        let error = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("error")))
+            .unwrap();
+
+        assert_eq!(error["request_id"], "oneclick-apply-real-1");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid endpoint"));
     }
 
     #[test]
