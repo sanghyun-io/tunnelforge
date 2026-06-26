@@ -153,3 +153,8 @@ def test_dollar_quote_reader_fails_closed_for_out_of_range_starts():
     assert SQLExecutionWorker._read_dollar_quote("", 0) == ""
     assert SQLExecutionWorker._read_dollar_quote(sql, -1) == ""
     assert SQLExecutionWorker._read_dollar_quote(sql, len(sql)) == ""
+
+
+def test_dollar_quote_reader_fails_closed_for_none_sql_text():
+    assert read_dollar_quote(None, 0) == ""
+    assert SQLExecutionWorker._read_dollar_quote(None, 0) == ""

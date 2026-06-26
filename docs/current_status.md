@@ -222,6 +222,12 @@ as `Recommended next repo-side change`. The section is now standing policy
 for future One-Click automatic-fix expansion and explicitly states that no
 repo-side One-Click follow-up issue is currently open.
 
+GitHub #158 is fixed as a SQL dollar quote helper None input follow-up:
+`read_dollar_quote(None, 0)` and
+`SQLExecutionWorker._read_dollar_quote(None, 0)` now return an empty marker
+instead of raising `TypeError`, matching the parser's existing fail-closed
+empty-input behavior.
+
 Post-#156 main merge and next issue analysis on 2026-06-27 reconfirmed that
 `main` was already aligned with `origin/main`, #116 is still the only open
 GitHub issue, and the normal repository-side #116 gate passes. The final gate
@@ -278,7 +284,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before post-#156 re-analysis |
-| `pytest -q` | PASS, 1847 passed, 5 warnings |
+| `pytest -q` | PASS, 1849 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -302,7 +308,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1847 passed, 5 warnings |
+| `pytest -q` | PASS, 1849 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -351,18 +357,21 @@ Commands run locally:
 | `pytest tests\test_scheduler.py::TestBackupScheduler::test_parse_sql_queries_preserves_comments_dollar_quotes_and_delimiters -q` | RED then PASS |
 | `pytest tests\test_sql_editor_dialog.py tests\test_scheduler.py tests\test_sql_execution_worker.py -q` | PASS, 71 passed, 2 warnings |
 | `pytest tests\test_sql_execution_worker.py::test_dollar_quote_reader_fails_closed_for_out_of_range_starts -q` | RED then PASS |
-| `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q` | PASS, 72 passed, 2 warnings |
 | `pytest tests\test_current_status_docs.py::test_current_status_records_post_156_next_issue_analysis -q` | RED then PASS |
 | `gh issue list --state open --limit 30 --json number,title,labels,url,updatedAt` | PASS, only #116 open |
 | `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_does_not_present_closed_issues_as_current_tracking -q` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_oneclick_next_action_wording_issue -q` | RED then PASS |
+| `pytest tests\test_sql_execution_worker.py::test_dollar_quote_reader_fails_closed_for_none_sql_text -q` | RED then PASS |
+| `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q` | PASS, 73 passed, 2 warnings |
+| `pytest tests\test_current_status_docs.py::test_current_status_tracks_dollar_quote_none_input_issue -q` | RED then PASS |
 
 ## Verification Log
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | One-Click readiness next-action wording cleanup | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_does_not_present_closed_issues_as_current_tracking -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_oneclick_next_action_wording_issue -q`; `gh issue create` created #157; `pytest -q` | PASS | GitHub #157 is fixed: `docs/oneclick_readiness.md` now frames additional One-Click automatic-fix work as standing policy/watch guidance instead of a current `Recommended next repo-side change`; current full Python suite is `1847 passed, 5 warnings` |
-| 2026-06-27 | Post-#156 main merge and next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_156_next_issue_analysis -q`; `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30 --json number,title,labels,url,updatedAt`; `gh issue view 116 --json number,title,state,labels,body,comments,url,updatedAt`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; `pytest -q` | EXPECTED FAIL for `--final` only | `main` was already aligned with `origin/main`; #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for current merged main HEAD, so no new repo-side implementation issue was created. Full-suite count is superseded by TF-STATUS-059 |
+| 2026-06-27 | SQL dollar quote helper None input guard | RED/GREEN: `pytest tests\test_sql_execution_worker.py::test_dollar_quote_reader_fails_closed_for_none_sql_text -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_dollar_quote_none_input_issue -q`; `gh issue create` created #158; `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q`; `pytest -q` | PASS | GitHub #158 is fixed: `read_dollar_quote(None, 0)` and `SQLExecutionWorker._read_dollar_quote(None, 0)` now fail closed with `""` instead of raising `TypeError`; current full Python suite is `1849 passed, 5 warnings` |
+| 2026-06-27 | One-Click readiness next-action wording cleanup | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_does_not_present_closed_issues_as_current_tracking -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_oneclick_next_action_wording_issue -q`; `gh issue create` created #157; `pytest -q` | PASS | GitHub #157 is fixed: `docs/oneclick_readiness.md` now frames additional One-Click automatic-fix work as standing policy/watch guidance instead of a current `Recommended next repo-side change`; full-suite count is superseded by TF-STATUS-060 |
+| 2026-06-27 | Post-#156 main merge and next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_156_next_issue_analysis -q`; `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30 --json number,title,labels,url,updatedAt`; `gh issue view 116 --json number,title,state,labels,body,comments,url,updatedAt`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; `pytest -q` | EXPECTED FAIL for `--final` only | `main` was already aligned with `origin/main`; #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for current merged main HEAD, so no new repo-side implementation issue was created. Full-suite count is superseded by TF-STATUS-060 |
 | 2026-06-27 | SQL dollar quote helper guard | RED/GREEN: `pytest tests\test_sql_execution_worker.py::test_dollar_quote_reader_fails_closed_for_out_of_range_starts -q`; `gh issue create` created #156; `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q`; `python -m compileall -q src\core\sql_statement_parser.py tests\test_sql_execution_worker.py`; `git diff --check` | PASS | GitHub #156 is fixed: `read_dollar_quote` and `SQLExecutionWorker._read_dollar_quote` return `""` for empty SQL text or out-of-range start offsets |
 | 2026-06-27 | SQL statement parser mismatch fix | RED/GREEN: `pytest tests\test_sql_editor_dialog.py::test_split_queries_preserves_comments_dollar_quotes_and_delimiters tests\test_sql_editor_dialog.py::test_get_query_at_cursor_uses_statement_parser_ranges -q`; RED/GREEN: `pytest tests\test_scheduler.py::TestBackupScheduler::test_parse_sql_queries_preserves_comments_dollar_quotes_and_delimiters -q`; `pytest tests\test_sql_editor_dialog.py tests\test_scheduler.py tests\test_sql_execution_worker.py -q`; `pytest -q` | PASS | GitHub #155 is fixed: SQL file execution, SQL Editor execute-all/current-query, and scheduled SQL now share `src/core/sql_statement_parser.py`; SQL Editor current-query lookup uses parser ranges via `find_sql_statement_at_position` |
 | 2026-06-27 | SQL statement parser mismatch analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_sql_statement_parser_mismatch_issue -q`; `git fetch --all --prune`; `git status --short --branch`; `gh issue list --state open --limit 30`; `gh issue view 116 --json ...`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; direct parser comparison; `gh issue create` created #155 | EXPECTED FAIL for `--final` only | `main` is aligned with `origin/main`; #116 remains external real-Mac evidence work; GitHub #155 now tracks the confirmed repo-side mismatch where SQL Editor/Scheduler quote-only splitting diverges from the robust SQL file execution parser |
@@ -2036,11 +2045,12 @@ Next action:
 | TF-STATUS-057 | Low | closed | SQL parser helper | SQL dollar quote helper guard | Keep dollar quote marker detection fail-closed for invalid start offsets |
 | TF-STATUS-058 | Low | closed | Status documentation / macOS release validation | Post-#156 main merge and next issue analysis | Keep #116 external until real operator Mac validation evidence is attached |
 | TF-STATUS-059 | Low | closed | One-Click readiness docs | One-Click readiness next-action wording | Keep completed One-Click readiness guidance framed as standing policy, not current next repo-side work |
+| TF-STATUS-060 | Low | closed | SQL parser helper | SQL dollar quote helper None input | Keep dollar quote marker detection fail-closed for invalid and missing SQL text |
 
 ## Recommended Execution Order
 
-1. No repo-side implementation issue is currently open after TF-STATUS-059 /
-   GitHub #157 clarified One-Click readiness next-action wording. `main` is
+1. No repo-side implementation issue is currently open after TF-STATUS-060 /
+   GitHub #158 hardened SQL dollar quote helper None input handling. `main` is
    aligned with `origin/main`, and #116 remains the only open GitHub issue.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence; #116 remains external.
@@ -2051,8 +2061,9 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
-| 2026-06-27 | Fixed TF-STATUS-059 / GitHub #157 by changing One-Click readiness follow-up wording from a current next repo-side change to standing policy/watch guidance. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #157 | RED/GREEN: One-Click readiness docs pytest and current-status pytest; final: full `pytest -q` at 1847 passed |
-| 2026-06-27 | Re-analyzed the next issue after #156 and confirmed `main` was already aligned with `origin/main`. #116 is the only open GitHub issue; the normal repository-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#156 current-status pytest; final: #116 gate pass, expected-failing final gate; full-suite count superseded by TF-STATUS-059 |
+| 2026-06-27 | Fixed TF-STATUS-060 / GitHub #158 by making the SQL dollar quote helper fail closed for `None` SQL text. | `src/core/sql_statement_parser.py`, `tests/test_sql_execution_worker.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #158 | RED/GREEN: dollar quote None-input pytest and current-status pytest; parser suite; final: full `pytest -q` at 1849 passed |
+| 2026-06-27 | Fixed TF-STATUS-059 / GitHub #157 by changing One-Click readiness follow-up wording from a current next repo-side change to standing policy/watch guidance. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #157 | RED/GREEN: One-Click readiness docs pytest and current-status pytest; full-suite count superseded by TF-STATUS-060 |
+| 2026-06-27 | Re-analyzed the next issue after #156 and confirmed `main` was already aligned with `origin/main`. #116 is the only open GitHub issue; the normal repository-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#156 current-status pytest; final: #116 gate pass, expected-failing final gate; full-suite count superseded by TF-STATUS-060 |
 | 2026-06-27 | Fixed TF-STATUS-057 / GitHub #156 by making the SQL dollar quote helper fail closed for empty SQL text and out-of-range starts. | `src/core/sql_statement_parser.py`, `tests/test_sql_execution_worker.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #156 | RED/GREEN: dollar quote helper bounds pytest; parser suite, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-056 / GitHub #155 by extracting the robust SQL statement parser to `src/core/sql_statement_parser.py` and routing SQL file execution, SQL Editor split/current-query, and scheduled SQL through it. | `src/core/sql_statement_parser.py`, `src/ui/workers/test_worker.py`, `src/ui/dialogs/sql_editor_dialog.py`, `src/core/scheduler.py`, `tests/test_sql_editor_dialog.py`, `tests/test_scheduler.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #155 | RED/GREEN: SQL Editor/Scheduler parser tests; final: SQL Editor/Scheduler/worker pytest and full `pytest -q` |
 | 2026-06-27 | Created TF-STATUS-056 / GitHub #155 after confirming that SQL Editor and hidden scheduler statement splitters can over-split comments, PostgreSQL dollar quote bodies, and MySQL `DELIMITER` scripts while SQL file execution already handles those cases. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #155 | RED/GREEN: SQL parser mismatch current-status pytest; #116 gate pass, expected-failing final gate |

@@ -103,7 +103,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1837 passed, 5 warnings" not in doc
     assert "PASS, 1845 passed, 5 warnings" not in doc
     assert "PASS, 1846 passed, 5 warnings" not in doc
-    assert "PASS, 1847 passed, 5 warnings" in doc
+    assert "PASS, 1847 passed, 5 warnings" not in doc
+    assert "PASS, 1849 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -139,6 +140,9 @@ def test_current_status_does_not_describe_stale_full_pytest_count_as_current():
         "current full Python suite is now `1846 passed, 5 warnings`",
         "current `1846 passed, 5 warnings` evidence",
         "now reports `1846 passed, 5 warnings`",
+        "current full Python suite is now `1847 passed, 5 warnings`",
+        "current `1847 passed, 5 warnings` evidence",
+        "now reports `1847 passed, 5 warnings`",
     ]
 
     for phrase in stale_current_phrases:
@@ -202,7 +206,7 @@ def test_current_status_tracks_sql_statement_parser_mismatch_issue():
     assert "GitHub #155 is fixed" in summary
     assert "src/core/sql_statement_parser.py" in doc
     assert "find_sql_statement_at_position" in doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-059" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
 
 
 def test_current_status_tracks_dollar_quote_helper_guard_issue():
@@ -217,7 +221,7 @@ def test_current_status_tracks_dollar_quote_helper_guard_issue():
     assert "read_dollar_quote" in doc
     assert "out-of-range" in normalized_doc
     assert "GitHub #156 is fixed" in summary
-    assert "No repo-side implementation issue is currently open after TF-STATUS-059" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
 
 
 def test_current_status_records_post_156_next_issue_analysis():
@@ -234,7 +238,7 @@ def test_current_status_records_post_156_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-059" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
 
 
 def test_current_status_tracks_oneclick_next_action_wording_issue():
@@ -248,7 +252,23 @@ def test_current_status_tracks_oneclick_next_action_wording_issue():
     assert "One-Click readiness next-action wording" in doc
     assert "Recommended next repo-side change" in normalized_doc
     assert "GitHub #157 is fixed" in summary
-    assert "No repo-side implementation issue is currently open after TF-STATUS-059" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
+
+
+def test_current_status_tracks_dollar_quote_none_input_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-060" in doc
+    assert "GitHub #158" in doc
+    assert "SQL dollar quote helper None input" in doc
+    assert "read_dollar_quote(None, 0)" in doc
+    assert "SQLExecutionWorker._read_dollar_quote(None, 0)" in doc
+    assert "GitHub #158 is fixed" in summary
+    assert "fail-closed" in normalized_doc
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
 
 
 def test_current_status_records_post_151_next_issue_analysis():
@@ -266,7 +286,7 @@ def test_current_status_records_post_151_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-059" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
 
 
 def test_current_status_current_baseline_section_is_not_stale_dated():
@@ -366,7 +386,7 @@ def test_current_status_tracks_legacy_python_auto_fix_wizard_issue():
     assert "FixWizardWorker" in doc
     assert "GitHub #142 is fixed" in summary
     assert "Legacy Auto-Fix Wizard is dry-run/manual SQL only" in doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-059" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
 
 
 def test_current_status_records_post_142_next_issue_analysis():
@@ -446,7 +466,7 @@ def test_current_status_records_post_146_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a new repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-059" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-060" in order
 
 
 def test_current_status_tracks_post_release_version_drift_issue():

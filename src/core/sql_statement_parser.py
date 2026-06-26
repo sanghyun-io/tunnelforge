@@ -165,6 +165,7 @@ def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
 
 
 def read_dollar_quote(sql_text: str, start: int) -> str:
+    sql_text = sql_text or ""
     if start < 0 or start >= len(sql_text):
         return ""
     if sql_text[start] != "$":
