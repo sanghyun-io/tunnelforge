@@ -94,7 +94,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1822 passed, 5 warnings" not in doc
     assert "PASS, 1823 passed, 5 warnings" not in doc
     assert "PASS, 1825 passed, 5 warnings" not in doc
-    assert "PASS, 1826 passed, 5 warnings" in doc
+    assert "PASS, 1826 passed, 5 warnings" not in doc
+    assert "PASS, 1827 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -276,6 +277,20 @@ def test_current_status_records_post_146_next_issue_analysis():
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a new repo-side implementation issue" in normalized_doc
     assert "No repo-side implementation issue is currently open after TF-STATUS-040" in order
+
+
+def test_current_status_tracks_post_release_version_drift_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-046" in doc
+    assert "GitHub #147" in doc
+    assert "post-release version drift" in normalized_doc
+    assert "v2.1.6" in doc
+    assert "2.1.7" in doc
+    assert "GitHub #147 is fixed" in summary
+    assert "Version references are aligned at `2.1.7`" in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
