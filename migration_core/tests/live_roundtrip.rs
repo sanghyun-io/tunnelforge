@@ -104,6 +104,14 @@ fn mysql_index_exists(
         > 0
 }
 
+fn mysql_table_engine(conn: &mut mysql::PooledConn, database: &str, table: &str) -> Option<String> {
+    conn.exec_first::<String, _, _>(
+        "SELECT ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ?",
+        (database, table),
+    )
+    .unwrap()
+}
+
 fn unsupported_objects_from_inspect(endpoint: &Endpoint) -> Vec<String> {
     let inspect = result_payload(handle_request(Request {
         command: "inspect".to_string(),
@@ -286,6 +294,50 @@ fn live_readiness_reports_each_direction_when_env_is_configured() {
         .unwrap();
     postgres
         .batch_execute(&format!("DROP TABLE IF EXISTS \"{pg_table}\""))
+        .unwrap();
+}
+
+#[test]
+fn oneclick_run_live_engine_innodb_when_env_is_configured() {
+    let Some(mysql_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
+        eprintln!("skipping oneclick live apply: TF_MYSQL_* is not configured");
+        return;
+    };
+
+    let table = unique_table("tf_oneclick_engine");
+    let mut mysql = mysql_conn(&mysql_endpoint);
+    mysql
+        .query_drop(format!("DROP TABLE IF EXISTS `{table}`"))
+        .unwrap();
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE `{table}` (`id` INT PRIMARY KEY, `name` VARCHAR(32) NOT NULL) ENGINE=MyISAM"
+        ))
+        .unwrap();
+    assert_eq!(
+        mysql_table_engine(&mut mysql, &mysql_endpoint.database, &table).as_deref(),
+        Some("MyISAM")
+    );
+
+    let result = result_payload(handle_request(Request {
+        command: "oneclick.run".to_string(),
+        request_id: None,
+        payload: json!({
+            "connection": endpoint_json(&mysql_endpoint),
+            "schema": mysql_endpoint.database,
+            "dry_run": false,
+            "backup_confirmed": true
+        }),
+    }));
+
+    assert_eq!(result["success"], true);
+    assert_eq!(
+        mysql_table_engine(&mut mysql, &mysql_endpoint.database, &table).as_deref(),
+        Some("InnoDB")
+    );
+
+    mysql
+        .query_drop(format!("DROP TABLE IF EXISTS `{table}`"))
         .unwrap();
 }
 

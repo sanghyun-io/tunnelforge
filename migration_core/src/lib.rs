@@ -5245,21 +5245,94 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    let execution_log = if dry_run {
-        vec!["DRY-RUN: no database changes were executed.".to_string()]
+    let plan_payload = json!({
+        "schema": state.schema_name,
+        "steps": recommendations
+    });
+    let apply_plan = oneclick_apply_actions(&plan_payload);
+    let (
+        success_count,
+        fail_count,
+        skip_count,
+        disallowed_fix_attempts,
+        applied_fixes,
+        execution_log,
+    ) = if dry_run {
+        (
+            0usize,
+            0usize,
+            apply_plan.actions.len() + apply_plan.skipped,
+            apply_plan.disallowed,
+            Vec::new(),
+            vec!["DRY-RUN: no database changes were executed.".to_string()],
+        )
+    } else if !apply_plan.disallowed.is_empty() {
+        (
+            0,
+            apply_plan.disallowed.len(),
+            apply_plan.skipped,
+            apply_plan.disallowed,
+            Vec::new(),
+            vec!["Disallowed One-Click automatic fix attempt blocked.".to_string()],
+        )
+    } else if apply_plan.actions.is_empty() {
+        (
+            0,
+            0,
+            apply_plan.skipped,
+            Vec::new(),
+            Vec::new(),
+            vec!["No automatic Rust Core fixes are currently required.".to_string()],
+        )
     } else {
-        vec!["No automatic Rust Core fixes are currently required.".to_string()]
+        match LiveAdapter::connect(&state.endpoint) {
+            Ok(mut adapter) => {
+                let outcome = oneclick_execute_apply_plan(&apply_plan, &mut adapter);
+                (
+                    outcome.success_count,
+                    outcome.fail_count,
+                    apply_plan.skipped,
+                    Vec::new(),
+                    outcome.applied_fixes,
+                    outcome.log,
+                )
+            }
+            Err(err) => (
+                0,
+                apply_plan.actions.len(),
+                apply_plan.skipped,
+                Vec::new(),
+                Vec::new(),
+                vec![format!(
+                    "FAILED: unable to connect for One-Click fixes: {err}"
+                )],
+            ),
+        }
+    };
+    let execution_success = fail_count == 0 && disallowed_fix_attempts.is_empty();
+    let report_execution_log = execution_log.clone();
+    let report_fail_count = fail_count;
+    let report_disallowed_count = disallowed_fix_attempts.len();
+    let report_applied_count = applied_fixes.len();
+    let execution_message = if dry_run {
+        "Execution completed"
+    } else if execution_success {
+        "Execution completed"
+    } else {
+        "Execution completed with errors"
     };
     emit(json!({
         "event": "execution",
         "request_id": request.request_id,
         "dry_run": dry_run,
-        "success_count": 0,
-        "fail_count": 0,
-        "skip_count": state.issues.len(),
+        "success_count": success_count,
+        "fail_count": fail_count,
+        "skip_count": skip_count,
+        "disallowed_fix_attempts": disallowed_fix_attempts,
+        "applied_fixes": applied_fixes,
         "log": execution_log
     }));
-    emit(oneclick_progress_event(request, 80, "Execution completed"));
+    emit(oneclick_progress_event(request, 80, execution_message));
 
     emit(phase_event(
         request,
@@ -5279,12 +5352,16 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
             column_name: None,
         }],
     };
-    let validation_success = validation_issues.is_empty();
+    let validation_success = validation_issues.is_empty()
+        && execution_success
+        && report_fail_count == 0
+        && report_disallowed_count == 0;
     emit(json!({
         "event": "validation",
         "request_id": request.request_id,
         "all_fixed": validation_success,
-        "remaining_issues": validation_issues.clone()
+        "remaining_issues": validation_issues.clone(),
+        "applied_fix_count": report_applied_count
     }));
     emit(oneclick_progress_event(
         request,
@@ -5297,7 +5374,7 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         validation_success,
         &state.issues,
         &validation_issues,
-        execution_log,
+        report_execution_log,
     ));
 }
 
@@ -5788,6 +5865,8 @@ fn oneclick_recommendations(issues: &[MigrationIssue], schema: &str) -> Vec<Valu
                 "issue_index": index,
                 "issue_type": issue.issue_type.clone().unwrap_or_else(|| "unknown".to_string()),
                 "location": issue.location,
+                "table_name": issue.table_name,
+                "column_name": issue.column_name,
                 "description": issue.message,
                 "selected_option": selected_option
             })
@@ -10391,6 +10470,7 @@ mod tests {
         assert_eq!(result["summary"]["auto_fixable"], 1);
         assert_eq!(result["summary"]["manual_review"], 1);
         assert_eq!(result["steps"][0]["issue_type"], "deprecated_engine");
+        assert_eq!(result["steps"][0]["table_name"], "legacy_table");
         assert_eq!(
             result["steps"][0]["selected_option"]["strategy"],
             "engine_innodb"

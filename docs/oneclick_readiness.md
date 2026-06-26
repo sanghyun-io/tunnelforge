@@ -73,7 +73,8 @@ Before removing the dry-run lock or enabling real execution:
    archived local evidence.
 5. Decide and document how `oneclick.run` should invoke/sequence automatic
    fixes, because the UI currently calls `oneclick.run`, not
-   `oneclick.apply_fixes` directly.
+   `oneclick.apply_fixes` directly. Done for the validated
+   `deprecated_engine -> engine_innodb` path.
 6. Decide and document whether the UI remains dry-run preview/beta or becomes
    real-execution capable.
 7. Update the feature flags, user-facing docs, and `docs\current_status.md` in
@@ -115,9 +116,11 @@ Reasons:
 - `reports\oneclick_readiness\oneclick-real-execution-evidence.json` now proves
   `oneclick.apply_fixes` changed the controlled local MySQL table from
   `MyISAM` to `InnoDB`.
-- The full `oneclick.run` execution phase still does not perform automatic SQL
-  fixes, so app-level real execution remains disabled until the UI-facing run
-  orchestration is connected and tested.
+- The full `oneclick.run` execution phase now sequences the same
+  `engine_innodb` apply plan when `dry_run=false`, and a live MySQL regression
+  test proves it converts a MyISAM table to InnoDB.
+- App-level real execution remains disabled until the PyQt dry-run lock,
+  user-facing copy, and final safety gate are updated in the same change.
 - `scripts\validate-oneclick-real-execution-evidence.py` defines the
   machine-checkable proof required before `engine_innodb` real execution can be
   considered ready; the current archived evidence passes that validator for
