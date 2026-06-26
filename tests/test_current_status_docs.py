@@ -293,6 +293,23 @@ def test_current_status_tracks_post_release_version_drift_issue():
     assert "Version references are aligned at `2.1.7`" in doc
 
 
+def test_current_status_tracks_v217_release_publication_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-047" in doc
+    assert "GitHub #148" in doc
+    assert "v2.1.7 release publication" in normalized_doc
+    assert "28255274238" in doc
+    assert "TunnelForge-Setup-2.1.7.exe" in doc
+    assert "TunnelForge-macOS-2.1.7-arm64.dmg" in doc
+    assert "TunnelForge-macOS-2.1.7-x86_64.dmg" in doc
+    assert "GitHub #148 is fixed" in summary
+    assert "#116 remains external" in order
+
+
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     focused = _section(doc, "Focused Verification On 2026-06-27")

@@ -144,6 +144,15 @@ drift after `v2.1.6` is resolved by bumping the next unreleased source version
 to `2.1.7` across `src/version.py`, `pyproject.toml`, and
 `installer/TunnelForge.iss`.
 
+GitHub #148 is fixed as the release-publication follow-up: tag `v2.1.7` was
+created from current `main` commit `fa22306`, Build and Release workflow run
+`28255274238` completed successfully, and GitHub release `v2.1.7` was
+published with `TunnelForge-Setup-2.1.7.exe`, `TunnelForge-WebSetup.exe`,
+`TunnelForge-macOS-2.1.7-arm64.dmg`,
+`TunnelForge-macOS-2.1.7-arm64.zip`,
+`TunnelForge-macOS-2.1.7-x86_64.dmg`,
+`TunnelForge-macOS-2.1.7-x86_64.zip`, and checksum assets.
+
 The current full Python suite count was refreshed again on 2026-06-27 after
 the current-status re-audit regression coverage was added.
 
@@ -242,6 +251,9 @@ Commands run locally:
 | `pytest tests\test_current_status_docs.py::test_current_status_records_post_146_next_issue_analysis -q` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_release_version_drift_issue -q` | RED then PASS |
 | `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS |
+| `pytest tests\test_current_status_docs.py::test_current_status_tracks_v217_release_publication_issue -q` | RED then PASS |
+| `gh run view 28255274238 --json status,conclusion,url` | PASS, Build and Release workflow completed successfully |
+| `gh release view v2.1.7 --json tagName,name,url,assets,publishedAt,targetCommitish,isDraft,isPrerelease` | PASS, release `v2.1.7` published with Windows and macOS assets |
 | `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL, missing real-Mac report and current-HEAD manual workflow_dispatch evidence |
 | `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
 | `pytest tests\test_current_status_docs.py -q` | PASS |
@@ -252,6 +264,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | v2.1.7 release publication | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_v217_release_publication_issue -q`; `git status --short --branch`; `gh issue list --state open --limit 20`; `git tag -a v2.1.7 -m "Release v2.1.7"`; `git push origin v2.1.7`; `gh run view 28255274238 --json status,conclusion,url`; `gh release view v2.1.7 --json tagName,name,url,assets,publishedAt,targetCommitish,isDraft,isPrerelease` | PASS | GitHub #148 is fixed: release `v2.1.7` was published from current `main` with `TunnelForge-Setup-2.1.7.exe`, `TunnelForge-WebSetup.exe`, `TunnelForge-macOS-2.1.7-arm64.dmg`, `TunnelForge-macOS-2.1.7-arm64.zip`, `TunnelForge-macOS-2.1.7-x86_64.dmg`, `TunnelForge-macOS-2.1.7-x86_64.zip`, and checksum assets |
 | 2026-06-27 | Post-release version drift fix | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_release_version_drift_issue -q`; `gh issue create` created #147; `python scripts\bump_version.py --bump-type patch`; `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q`; `git log --oneline v2.1.6..HEAD`; `gh release list --limit 10` | PASS | GitHub #147 is fixed: current source/package/installer version is `2.1.7` after `v2.1.6` was already released and main accumulated post-release commits |
 | 2026-06-27 | Post-#146 next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_146_next_issue_analysis -q`; `git status --short --branch`; `gh issue list --state open --limit 30`; `gh issue view 116 --json number,title,state,labels,body,comments,url`; direct DB mutation/helper scan; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL for `--final` only | Current `main` is aligned with `origin/main`; #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for the current merged main HEAD, so no new repo-side implementation issue was created |
 | 2026-06-27 | Legacy MySQLConnector execute_many mutation helper fail-closed | RED/GREEN: `pytest tests\test_db_connector.py::TestMySQLConnector::test_execute_many_rejects_legacy_python_mutation_helper -q`; `gh issue create` created #146; `pytest tests\test_current_status_docs.py::test_current_status_tracks_legacy_execute_many_issue -q`; final: `pytest tests\test_db_connector.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\core\db_connector.py tests\test_db_connector.py tests\test_current_status_docs.py`; `python scripts\check-macos-support-gate.py`; `pytest -q`; `git diff --check` | PASS | GitHub #146 is fixed: `MySQLConnector.execute_many` now rejects the unused Python batch mutation helper before cursor/commit work, while read/query helper behavior is unchanged |
@@ -1900,6 +1913,7 @@ Next action:
 | TF-STATUS-044 | Medium | closed | Rust Core baseline / DB connector helper API | Legacy MySQLConnector execute_many mutation helper | Keep generic Python batch mutation helper disabled unless Rust Core owns the workflow |
 | TF-STATUS-045 | Low | closed | Status documentation / macOS release validation | Post-#146 next issue analysis | Keep #116 external until real operator Mac validation evidence is attached |
 | TF-STATUS-046 | Medium | closed | Release versioning | Post-release version drift | Keep source/package/installer versions ahead of the latest released tag before release tagging |
+| TF-STATUS-047 | Medium | closed | Release publication | v2.1.7 release publication | Keep release tags/assets aligned when version bumps land directly on main |
 
 ## Recommended Execution Order
 
@@ -1907,9 +1921,10 @@ Next action:
    GitHub #142, TF-STATUS-041 / GitHub #143, TF-STATUS-042 / GitHub #144,
    TF-STATUS-043 / GitHub #145, and TF-STATUS-044 / GitHub #146 were fixed
    and verified; TF-STATUS-045 found no new repo-side implementation issue,
-   and TF-STATUS-046 / GitHub #147 fixed the post-release version drift.
+   TF-STATUS-046 / GitHub #147 fixed the post-release version drift, and
+   TF-STATUS-047 / GitHub #148 published release `v2.1.7`.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
-   operator Mac validation evidence.
+   operator Mac validation evidence; #116 remains external.
 3. Track additional One-Click automatic fix classes as separate GitHub issues
    before implementation.
 
@@ -1917,6 +1932,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-06-27 | Created and fixed TF-STATUS-047 / GitHub #148 after direct `main` version bumping left release publication behind; pushed tag `v2.1.7`, verified Build and Release workflow run `28255274238`, and confirmed the GitHub release assets. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #148, release `v2.1.7` | RED/GREEN: v2.1.7 release-publication current-status pytest; final: release workflow success and `gh release view v2.1.7` |
 | 2026-06-27 | Created and fixed TF-STATUS-046 / GitHub #147 after finding that `main` still declared `2.1.6` even though release/tag `v2.1.6` already exists and post-release commits have accumulated. | `src/version.py`, `pyproject.toml`, `installer/TunnelForge.iss`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #147 | RED/GREEN: post-release version drift current-status pytest; version sync pytest; final: full pytest, #116 gate, compileall, `git diff --check` |
 | 2026-06-27 | Re-analyzed the next issue after #146. #116 is still the only open GitHub issue; the normal repo-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#146 current-status pytest; final: #116 gate pass, expected-failing final gate, current-status pytest |
 | 2026-06-27 | Created and fixed TF-STATUS-044 / GitHub #146 after finding the unused `MySQLConnector.execute_many` public helper still exposed a Python-owned batch mutation/commit API. | `src/core/db_connector.py`, `tests/test_db_connector.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #146 | RED/GREEN: connector helper pytest and current-status pytest; final: full pytest, #116 gate, compileall, `git diff --check` |
