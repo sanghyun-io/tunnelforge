@@ -383,6 +383,7 @@ Evidence:
   a shadow-schema switch flow.
 - The final remediation report records this as a residual limit instead of a
   completed fix.
+- GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/133
 
 Impact:
 
@@ -412,6 +413,7 @@ Evidence:
   represented in the manifest.
 - No focused test currently proves that FK column charset/collation mismatches
   are rejected before post-load DDL.
+- GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/134
 
 Impact:
 
@@ -438,8 +440,8 @@ Next action:
 | TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
 | TF-STATUS-008 | Low | watch | macOS | Final real-Mac validation pending | Require evidence bundle before production-ready claim |
 | TF-STATUS-009 | High | closed | Rust Core import | Merge import post-load DDL policy | Keep merge/recreate policy tests |
-| TF-STATUS-010 | High | open | Rust Core import | Shadow full replacement not implemented | Decide direct replacement support vs shadow architecture implementation |
-| TF-STATUS-011 | High | open | Rust Core schema fidelity | MySQL FK charset/collation fidelity incomplete | Add FK schema fidelity tests and pre-DDL validation |
+| TF-STATUS-010 | High | open | Rust Core import | Shadow full replacement not implemented | GitHub #133 |
+| TF-STATUS-011 | High | open | Rust Core schema fidelity | MySQL FK charset/collation fidelity incomplete | GitHub #134 |
 
 ## Recommended Execution Order
 
@@ -461,3 +463,4 @@ Next action:
 | 2026-06-26 | Added merge import post-load DDL skip policy, fixed English translation for import UI wording, and created the final remediation report. | `migration_core/src/lib.rs`, `src/core/i18n.py`, `reports/export_import_flow_review_20260601.html`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `.venv\Scripts\python -m pytest -q`; `compileall`; `git diff --check` |
 | 2026-06-26 | Marked scheduled backup documentation as disabled/internal while the main UI feature flag remains off. | `SCHEDULE.md`, `docs/current_status.md` | `rg -n "SCHEDULE_FEATURE_ENABLED|SQL_FILE_EXECUTION_FEATURE_ENABLED|스케줄" src docs SCHEDULE.md` |
 | 2026-06-26 | Re-audited recovery design residuals after user challenge; added explicit open tracking for shadow replacement and MySQL schema fidelity gaps. | `docs/current_status.md` | `rg -n "shadow|ERROR 3780|charset|collation" docs/superpowers/specs/2026-06-01-export-import-recovery-design.md docs/superpowers/plans/2026-06-01-export-import-recovery.md reports/export_import_flow_review_20260601.html migration_core/src/lib.rs` |
+| 2026-06-26 | Created GitHub issues for remaining recovery gaps. | `docs/current_status.md` | `gh issue create` created #133 and #134 |
