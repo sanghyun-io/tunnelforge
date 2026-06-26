@@ -368,35 +368,35 @@ Next action:
 
 1. Keep the policy tests for merge/recreate behavior.
 
-### TF-STATUS-010: Shadow Full Replacement Architecture Is Not Implemented
+### TF-STATUS-010: Shadow Full Replacement Architecture Retired
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: Rust Core dump.import
 
 Evidence:
 
-- The recovery design requires full replacement to load into a shadow
+- The original recovery design required full replacement to load into a shadow
   schema/database, verify, then switch after verification.
-- The current `dump_import()` implementation performs direct
-  replace/recreate/merge work against the target adapter and does not implement
-  a shadow-schema switch flow.
-- The final remediation report records this as a residual limit instead of a
-  completed fix.
+- 2026-06-26 decision: current TunnelForge support is direct
+  `replace`/`recreate`/`merge` import against the selected target database, not
+  atomic shadow-schema replacement.
+- The recovery design, recovery plan, and final remediation report now state
+  this explicitly so future sessions do not implement a partial shadow helper
+  without a new product decision.
 - GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/133
 
 Impact:
 
-- Full replacement is safer than before because strict manifest validation and
-  row verification now exist, but it is not an atomic shadow replacement
-  architecture.
+- Full replacement remains non-atomic direct replacement. Strict manifest
+  validation, row verification, post-load validation, classified errors, and
+  import reports are the supported safety boundary.
 
 Next action:
 
-1. Decide whether to implement the full shadow replacement architecture or
-   revise the design to state that direct replacement is the supported mode.
-2. If implementing, add worker endpoint resolution tests and switch/cleanup
-   verification before changing production code.
+1. Do not reintroduce shadow replacement unless a new product decision includes
+   DB-specific switch, rollback, cleanup, and worker endpoint semantics.
+2. Keep UI wording aligned with direct replacement behavior.
 
 ### TF-STATUS-011: MySQL FK Charset/Collation Fidelity
 
@@ -444,14 +444,12 @@ Next action:
 | TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
 | TF-STATUS-008 | Low | watch | macOS | Final real-Mac validation pending | Require evidence bundle before production-ready claim |
 | TF-STATUS-009 | High | closed | Rust Core import | Merge import post-load DDL policy | Keep merge/recreate policy tests |
-| TF-STATUS-010 | High | open | Rust Core import | Shadow full replacement not implemented | GitHub #133 |
+| TF-STATUS-010 | High | closed | Rust Core import | Shadow replacement retired; direct replacement documented | Keep UI/docs aligned |
 | TF-STATUS-011 | High | closed | Rust Core schema fidelity | MySQL FK charset/collation fidelity | Keep FK fidelity regression coverage |
 
 ## Recommended Execution Order
 
-1. Decide and implement or explicitly retire shadow full replacement
-   architecture.
-2. Keep macOS real-device validation tracked separately.
+1. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -468,3 +466,4 @@ Next action:
 | 2026-06-26 | Re-audited recovery design residuals after user challenge; added explicit open tracking for shadow replacement and MySQL schema fidelity gaps. | `docs/current_status.md` | `rg -n "shadow|ERROR 3780|charset|collation" docs/superpowers/specs/2026-06-01-export-import-recovery-design.md docs/superpowers/plans/2026-06-01-export-import-recovery.md reports/export_import_flow_review_20260601.html migration_core/src/lib.rs` |
 | 2026-06-26 | Created GitHub issues for remaining recovery gaps. | `docs/current_status.md` | `gh issue create` created #133 and #134 |
 | 2026-06-26 | Added MySQL FK charset/collation fidelity capture and post-load validation for GitHub #134. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py -q -k "classified_core_error"`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
+| 2026-06-26 | Explicitly retired shadow full replacement as a current guarantee and documented direct replacement as the supported import architecture for GitHub #133. | `docs/superpowers/specs/2026-06-01-export-import-recovery-design.md`, `docs/superpowers/plans/2026-06-01-export-import-recovery.md`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | `rg -n "shadow|direct replacement|atomic" docs/superpowers/specs/2026-06-01-export-import-recovery-design.md docs/superpowers/plans/2026-06-01-export-import-recovery.md docs/current_status.md reports/export_import_flow_review_20260601.html`; `git diff --check` |

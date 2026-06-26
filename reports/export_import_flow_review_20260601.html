@@ -60,6 +60,7 @@
     <li>Export manifests now record <code>snapshot_policy</code>, <code>strict_export</code>, and <code>manifest_warnings</code>.</li>
     <li>Parallel exports are marked <code>non_consistent_parallel</code> and non-strict instead of implying an unproven shared snapshot.</li>
     <li>MySQL column inspection now preserves <code>CHARACTER_SET_NAME</code> and <code>COLLATION_NAME</code> in dump schema type metadata, and post-load FK DDL is blocked when text-column charset/collation is incompatible.</li>
+    <li>Shadow full replacement has been retired as a current guarantee; full replacement is documented as direct replacement against the selected target database.</li>
     <li>Import UI wording no longer promises that every object type is restored automatically.</li>
   </ul>
 
@@ -90,7 +91,7 @@
 
   <h2>Residual Limits</h2>
   <ul>
-    <li class="status-watch">The current Rust <code>dump_import()</code> path performs direct replace/recreate/merge work; the shadow-schema switch architecture described in the original design is not present in the current implementation.</li>
+    <li class="status-watch">Full replacement is direct replacement, not an atomic shadow-schema switch. Operators should treat replacement imports as target-mutating operations and rely on external backups for rollback.</li>
     <li class="status-watch">View import remains best-effort. Procedures, triggers, and events still require separate review instead of automatic restoration.</li>
     <li class="status-watch">Parallel exports are now honestly classified as non-strict, but they do not yet provide a shared consistent snapshot guarantee.</li>
     <li class="status-watch">macOS production readiness still requires the separate real-Mac validation bundle tracked outside this report.</li>

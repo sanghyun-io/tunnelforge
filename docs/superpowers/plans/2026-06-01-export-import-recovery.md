@@ -6,6 +6,13 @@
 
 **Architecture:** Rust `tunnelforge-core` owns dump/import semantics, import plans, validation, and success classification. Python/PyQt forwards user intent, displays classified events, and keeps UI text aligned with actual Rust behavior.
 
+**2026-06-26 architecture update:** shadow full replacement is retired as a
+current guarantee. Historical steps below that mention shadow schemas, shadow
+workers, or schema switching are superseded unless a new product decision
+reintroduces atomic shadow replacement with DB-specific switch, rollback,
+cleanup, and worker endpoint semantics. The supported current architecture is
+direct `replace`/`recreate`/`merge` import against the selected target database.
+
 **Tech Stack:** Rust core in `migration_core/src/lib.rs`, Python wrapper in `src/exporters/rust_dump_exporter.py`, PyQt dialog code in `src/ui/dialogs/db_dialogs.py`, pytest tests under `tests/`, Rust tests through Cargo.
 
 ---
@@ -207,10 +214,16 @@ git commit -m "fix: classify strict dump import manifests"
 
 ---
 
-### Task 2: Make Import Target Context Explicit For Shadow Workers
+### Task 2: Retired Draft - Shadow Worker Target Context
 
 **Files:**
 - Modify: `migration_core/src/lib.rs`
+
+Decision update, 2026-06-26: this task is superseded. The current supported
+architecture is direct `replace`/`recreate`/`merge` import against the selected
+target database. Do not implement the shadow worker helper below unless a new
+product decision reintroduces atomic shadow replacement with DB-specific
+switch/cleanup semantics.
 
 - [ ] **Step 1: Write failing Rust tests for shadow endpoint resolution**
 
@@ -1458,7 +1471,7 @@ Edit the HTML report to include:
 ```html
 <h2>Remediation Summary</h2>
 <ul>
-  <li>Shadow full replacement workers now resolve the effective shadow database before parallel load.</li>
+  <li>Full replacement is documented as direct replacement, not an atomic shadow switch.</li>
   <li>Strict import rejects incomplete dump manifests before target mutation.</li>
   <li>Merge import no longer blindly reapplies post-load DDL.</li>
   <li>Import success is gated by verification and emits an import report.</li>
@@ -1519,7 +1532,7 @@ git diff --check
 Completion can be claimed only if:
 
 - `ERROR 3780` class mismatch is covered by schema fidelity or import-plan validation tests.
-- Shadow full replacement workers cannot target the original database.
+- Shadow full replacement is not claimed by docs or UI; direct replacement is the documented supported mode.
 - Import success is emitted after verification.
 - Strict import rejects incomplete manifests or routes them to a limited legacy path.
 - UI wording matches actual object support.

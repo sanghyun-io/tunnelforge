@@ -18,8 +18,9 @@ wording, tests, and final reporting.
 The review report at `reports/export_import_flow_review_20260601.html`
 identified several flow-level risks:
 
-- Safe recreate import can create/load a shadow schema on the main connection
-  while parallel TSV workers reconnect through the original endpoint database.
+- Earlier drafts described a shadow-schema recreate path, but the current
+  supported implementation uses direct `replace`, `recreate`, and `merge`
+  import modes against the selected target database.
 - Export currently lacks a clearly enforced consistent snapshot boundary across
   schema, counts, and chunk data.
 - Merge/retry paths can load data and then apply post-load DDL as if the target
@@ -84,19 +85,20 @@ silently dropped while the UI says every object will be recreated.
 1. Manifest validation checks version, source/target engine compatibility,
    required schema metadata, required checksums, selected tables, and legacy
    status before any target mutation.
-2. Plan generation resolves the effective target context for every operation.
-   Shadow import, direct replace, merge, and retry must be distinct plans.
-3. Full replacement uses a shadow schema/database when available. Every loader
-   worker receives the resolved shadow target context, not the original endpoint
-   database.
+2. Plan generation resolves the requested direct import mode. `replace`,
+   `recreate`, `merge`, and retry must remain distinct plans with different
+   mutation and post-load DDL policies.
+3. Full replacement is direct replacement in the selected target database.
+   TunnelForge does not currently promise atomic shadow-schema switch semantics.
 4. Table creation and data loading are separated from post-load DDL. Indexes are
    applied before foreign keys.
 5. Merge and retry modes do not blindly reapply post-load DDL. Existing objects
    are accepted only when their definitions match the manifest.
 6. Verification checks row counts, chunk checksums, schema compatibility, and
    post-load constraints before emitting success.
-7. Full replacement switches to the restored schema only after verification.
-   Cleanup failures are reported separately from import success.
+7. Direct replacement reports success only after verification. Because the
+   target is mutated directly, failed direct replacement must be surfaced as a
+   classified import failure with enough report detail for operator recovery.
 
 ## Failure Policy
 
@@ -108,11 +110,11 @@ Failures are classified before they reach the UI.
 - `import_plan_invalid`: The requested mode, target, selected tables, and
   manifest cannot produce a safe plan. No target mutation should occur.
 - `load_failed`: Chunk load, row count, checksum, or data conversion failed.
-  Full replacement must not switch to the restored schema.
+  Direct replacement must not report success.
 - `post_load_validation_failed`: Index, FK, schema, or constraint validation
   failed after data load. This remains an import failure.
-- `cleanup_failed`: Primary import succeeded, but cleanup failed. This is a
-  warning with explicit cleanup instructions, not a data success failure.
+- `cleanup_failed`: A cleanup operation failed. This is reported with explicit
+  cleanup instructions and must not be hidden behind a generic success message.
 
 Retry is stateful. It reads an import report or state file and resumes only from
 states that are provably safe. Merge retry is blocked unless the existing target
@@ -125,7 +127,8 @@ offered as limited restoration only, with reduced guarantees clearly displayed.
 
 UI labels must match Rust behavior:
 
-- "Full replacement" is recommended only when the strict safe plan can run.
+- "Full replacement" means direct replacement of selected target tables, not an
+  atomic shadow-schema switch.
 - "All objects recreated" is forbidden unless views, procedures, triggers, and
   events are actually restored by the dump pipeline.
 - Legacy/incomplete dumps are shown as limited restoration.
@@ -141,16 +144,16 @@ Rust unit tests must cover:
 - MySQL charset/collation and table option preservation.
 - Manifest validation for required checksums and schema metadata.
 - Legacy dump classification.
-- Full replacement worker target resolution to the shadow schema.
+- Direct replacement, recreate, and merge mode policy separation.
 - Merge/retry post-load DDL policy.
 - Index-before-FK ordering and error classification.
 
 Rust integration-style tests using fake adapters must cover:
 
-- `plan -> create shadow -> load -> apply DDL -> verify -> switch -> cleanup`.
-- Load failure prevents switching.
+- `plan -> direct target mutation -> load -> apply DDL -> verify -> report`.
+- Load failure prevents success events.
 - Validation failure prevents success events.
-- Cleanup failure is reported without changing the primary verdict.
+- Cleanup failure is classified and reported when cleanup commands are used.
 
 Python tests must cover:
 
@@ -173,7 +176,8 @@ Manual verification must run:
 
 1. Fix import safety first:
    - Make import target context explicit.
-   - Ensure shadow full replacement workers connect to the shadow database.
+   - Retire the shadow full replacement requirement from current guarantees and
+     document direct replacement as the supported mode.
    - Split merge/retry post-load DDL behavior from recreate behavior.
 2. Add manifest and schema fidelity gates:
    - Require checksums for strict imports.
@@ -199,7 +203,8 @@ The recovery is complete only when current evidence proves all of the following:
 
 - The `ERROR 3780` class of mismatch is prevented by schema fidelity capture or
   caught before unsafe import mutation.
-- Shadow full replacement cannot load data into the original target database.
+- The documentation and UI do not promise shadow or atomic replacement behavior
+  that Rust Core does not implement.
 - Import success events occur only after verification.
 - Strict import rejects incomplete manifests or explicitly routes them through a
   limited legacy path.
@@ -208,4 +213,3 @@ The recovery is complete only when current evidence proves all of the following:
   explained with concrete reasons.
 - The final HTML report is updated and available through a `file:///...html`
   path.
-
