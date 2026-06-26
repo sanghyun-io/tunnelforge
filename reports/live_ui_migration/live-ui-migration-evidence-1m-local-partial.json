@@ -1,0 +1,43 @@
+{
+  "issue": 136,
+  "git_sha": "ff78e2ce5fa94223bbd30e074b5a5c7e4cef3599",
+  "source_type": "local_containers",
+  "directions": {
+    "mysql_to_postgresql": {
+      "rows_migrated": 1000000,
+      "migration_success": true,
+      "verify_success": true,
+      "mismatches": 0,
+      "worker_progress_events": 201,
+      "ui_heartbeat": {
+        "samples": 72,
+        "max_gap_ms": 125,
+        "max_allowed_gap_ms": 1000
+      },
+      "notes": "mysql_to_postgresql captured through CrossEngineMigrationWorker"
+    },
+    "postgresql_to_mysql": {
+      "rows_migrated": 1000000,
+      "migration_success": true,
+      "verify_success": true,
+      "mismatches": 0,
+      "worker_progress_events": 201,
+      "ui_heartbeat": {
+        "samples": 103,
+        "max_gap_ms": 125,
+        "max_allowed_gap_ms": 1000
+      },
+      "notes": "postgresql_to_mysql captured through CrossEngineMigrationWorker"
+    }
+  },
+  "stress_10m": {
+    "source_type": "synthetic_adapter",
+    "rows": 10000000,
+    "resume_success": true,
+    "verify_success": true,
+    "mismatches": 0,
+    "peak_rss_mb": 0,
+    "rss_limit_mb": 0,
+    "notes": "placeholder; RSS not measured in this run, do not use as final #136 evidence"
+  }
+}

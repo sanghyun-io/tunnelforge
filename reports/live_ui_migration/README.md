@@ -46,3 +46,13 @@ synthetic evidence.
 
 Do not commit smoke reports with fewer than 1,000,000 rows. They are useful only
 for checking the capture script path and must fail the final validator.
+
+## Partial Evidence
+
+- `live-ui-migration-evidence-1m-local-partial.json` preserves a local
+  Docker-backed 1M bidirectional PyQt worker capture from 2026-06-26. It proves
+  both 1M directions and heartbeat sampling, but it intentionally sets
+  `stress_10m.peak_rss_mb` and `stress_10m.rss_limit_mb` to `0` because 10M RSS
+  was not measured in that run. The final validator must reject this partial
+  file, and it must not be copied to `live-ui-migration-evidence.json` until the
+  10M RSS fields are backed by real measurement evidence.

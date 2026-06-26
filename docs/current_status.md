@@ -98,6 +98,8 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Live UI evidence capture tests | `pytest tests\test_live_ui_migration_capture.py tests\test_live_ui_migration_evidence.py -q` | PASS | Capture helper report shape and final validator behavior covered |
 | 2026-06-26 | Live UI capture smoke | `python scripts\capture-live-ui-migration-evidence.py --rows 1000 --chunk-size 250 --seed-local-containers --output reports\live_ui_migration\live-ui-migration-evidence-smoke.json --stress-source-type synthetic_adapter --stress-peak-rss-mb 512 --stress-rss-limit-mb 2048 --stress-notes "smoke only; not #136 closure evidence"` | PASS | Smoke produced bidirectional 1,000-row worker evidence; smoke artifact removed and not used for #136 closure |
 | 2026-06-26 | Live UI evidence negative check | `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-smoke.json` | FAIL expected | Validator rejected the smoke report because rows were below 1,000,000 |
+| 2026-06-26 | Live UI 1M partial capture | `python scripts\capture-live-ui-migration-evidence.py --rows 1000000 --chunk-size 10000 --seed-local-containers --output reports\live_ui_migration\live-ui-migration-evidence-1m-local.json --stress-source-type synthetic_adapter --stress-peak-rss-mb 0 --stress-rss-limit-mb 0 --stress-notes "placeholder; RSS not measured in this run, do not use as final #136 evidence"` | PASS | Both 1M directions migrated+verified through `CrossEngineMigrationWorker`; max heartbeat gap 125ms; renamed to `live-ui-migration-evidence-1m-local-partial.json` |
+| 2026-06-26 | Live UI partial evidence negative check | `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-1m-local-partial.json` | FAIL expected | Validator rejects the partial because 10M RSS fields are intentionally 0 |
 | 2026-06-26 | Import wrapper/dialog focused tests | `python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 62 passed after payload/UI wording fixes |
 | 2026-06-26 | Rust timezone validation TDD | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_session_time_zone_only --lib` | FAIL then PASS | Initial RED failed because `validated_timezone_sql` did not exist; GREEN passed after helper implementation |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 139 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
@@ -668,6 +670,12 @@ Evidence:
 - 2026-06-26 update: a 1,000-row smoke run of the capture helper succeeded for
   both directions and was intentionally rejected by the final validator because
   it was below the required 1,000,000 rows.
+- 2026-06-26 update: `live-ui-migration-evidence-1m-local-partial.json`
+  preserves a local Docker 1M bidirectional PyQt worker run. MySQL ->
+  PostgreSQL and PostgreSQL -> MySQL each migrated and verified 1,000,000 rows,
+  emitted 201 worker progress events, and recorded a 125ms max Qt heartbeat gap
+  against a 1000ms threshold. The file remains partial because the 10M RSS
+  fields are intentionally 0 and therefore fail the final validator.
 - GitHub issue #136 now tracks this remaining #99 closure evidence.
 - Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
 - Follow-up GitHub issue:
@@ -687,10 +695,10 @@ Next action:
    evidence with UI responsiveness proof, save it as
    `reports\live_ui_migration\live-ui-migration-evidence.json`, and run the
    live UI evidence validator.
-2. Run `scripts\capture-live-ui-migration-evidence.py` with `--rows 1000000`
-   and real 10M RSS bounds, then commit the completed
-   `reports\live_ui_migration\live-ui-migration-evidence.json` only if the
-   validator passes.
+2. Measure or regenerate the 10M stress/resume/verify run with a real peak RSS
+   value and accepted RSS limit, then either update the partial 1M artifact into
+   the final `reports\live_ui_migration\live-ui-migration-evidence.json` or run
+   the full capture again. Commit the final file only if the validator passes.
 
 ## Issue Tracker
 
@@ -753,3 +761,4 @@ Next action:
 | 2026-06-26 | Added a machine-checkable #136 live UI migration evidence validator and JSON template so future real 1M bidirectional runs can be accepted or rejected consistently. | `scripts/validate-live-ui-migration-evidence.py`, `tests/test_live_ui_migration_evidence.py`, `reports/live_ui_migration`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_evidence.py -q`; final: `python -m compileall -q scripts tests`; `git diff --check` |
 | 2026-06-26 | Analyzed GitHub #136 after merging prior work to main; confirmed local MySQL/PostgreSQL live endpoint wiring passes small Rust Core roundtrip tests, but #136 still requires durable 1M bidirectional PyQt heartbeat evidence. | `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` |
 | 2026-06-26 | Added the #136 live UI evidence capture helper with deterministic local-container seeding, CrossEngineMigrationWorker execution, Qt heartbeat sampling, and validator-compatible report generation; verified the path with a 1,000-row smoke that must not be used as final evidence. | `scripts/capture-live-ui-migration-evidence.py`, `tests/test_live_ui_migration_capture.py`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_capture.py -q`; smoke: `python scripts\capture-live-ui-migration-evidence.py --rows 1000 ...`; expected reject: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-smoke.json` |
+| 2026-06-26 | Captured and preserved partial #136 evidence for the live 1M bidirectional PyQt worker path; both directions passed migrate+verify with heartbeat max gap 125ms, leaving only real 10M RSS evidence before final validator closure. | `reports/live_ui_migration/live-ui-migration-evidence-1m-local-partial.json`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | `python scripts\capture-live-ui-migration-evidence.py --rows 1000000 ...`; expected reject: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-1m-local-partial.json` |
