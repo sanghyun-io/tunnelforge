@@ -3928,7 +3928,7 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
         ]
     } else {
         vec![
-            "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
+            "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=0".to_string(),
         ]
@@ -9176,14 +9176,25 @@ pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Va
         if target_engine == "postgresql" {
             return sql_literal(&Value::String(sanitize_postgresql_text(text)));
         }
+        if target_engine == "mysql" && is_json_type(&source_type) {
+            return mysql_json_literal(value);
+        }
         if target_engine == "mysql" {
             return mysql_sql_literal(value);
         }
+    }
+    if target_engine == "mysql" && is_json_type(source_type) {
+        return mysql_json_literal(value);
     }
     if target_engine == "mysql" {
         return mysql_sql_literal(value);
     }
     sql_literal(value)
+}
+
+fn is_json_type(type_name: &str) -> bool {
+    let type_name = type_name.trim().to_ascii_lowercase();
+    type_name == "json" || type_name.starts_with("json ")
 }
 
 pub fn is_binary_type(type_name: &str) -> bool {
@@ -9252,6 +9263,19 @@ fn mysql_sql_literal(value: &Value) -> String {
         Value::String(value) => mysql_string_literal(value),
         Value::Array(_) | Value::Object(_) => mysql_string_literal(&value.to_string()),
     }
+}
+
+fn mysql_json_literal(value: &Value) -> String {
+    match value {
+        Value::Null => "NULL".to_string(),
+        Value::String(value) => mysql_utf8mb4_string_literal(value),
+        Value::Array(_) | Value::Object(_) => mysql_utf8mb4_string_literal(&value.to_string()),
+        Value::Bool(_) | Value::Number(_) => mysql_utf8mb4_string_literal(&value.to_string()),
+    }
+}
+
+fn mysql_utf8mb4_string_literal(value: &str) -> String {
+    format!("_utf8mb4{}", mysql_string_literal(value))
 }
 
 fn mysql_string_literal(value: &str) -> String {
@@ -12785,7 +12809,7 @@ mod tests {
         assert_eq!(
             mysql_import_session_tuning_sql(false),
             vec![
-                "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
+                "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=0".to_string(),
             ]
@@ -12913,7 +12937,36 @@ mod tests {
 
         assert_eq!(
             sql,
-            r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES ('{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#
+            r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES (_utf8mb4'{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#
+        );
+    }
+
+    #[test]
+    fn mysql_json_literal_uses_utf8mb4_introducer_for_unicode_json_text() {
+        let table = NormalizedTable {
+            name: "ai_phase1_cache".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "result_json".to_string(),
+                type_name: "json".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+        };
+        let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
+
+        let sql = insert_rows_literal_sql_for_table(
+            "mysql",
+            &table,
+            &[json!({"result_json": json_text})],
+        );
+
+        assert_eq!(
+            sql,
+            r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES (_utf8mb4'{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#
         );
     }
 
