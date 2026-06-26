@@ -13,7 +13,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Optional
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +22,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from src.ui.dialogs.migration_dialogs import ONE_CLICK_MIGRATION_FEATURE_ENABLED  # noqa: E402
 from src.ui.dialogs.oneclick_migration_dialog import ONECLICK_REAL_EXECUTION_ENABLED  # noqa: E402
+from src.core.db_core_service import DbCoreFacade, DbEndpoint  # noqa: E402
 
 
 DEFAULT_SCHEMA = "tf_oneclick_charset"
@@ -32,8 +33,8 @@ DEFAULT_TARGET_COLLATION = "utf8mb4_0900_ai_ci"
 SAFE_ONECLICK_IDENTIFIER_RE = re.compile(r"^tf_oneclick_[A-Za-z0-9_]+$")
 
 
-class CaptureNotImplementedError(RuntimeError):
-    """Raised until Rust Core exposes the #139 charset execution path."""
+class CaptureError(RuntimeError):
+    """Raised when One-Click charset evidence capture cannot complete safely."""
 
 
 def current_git_sha() -> str:
@@ -60,6 +61,52 @@ def _require_safe_scope(schema: str, tables: Iterable[str]) -> List[str]:
     for table in safe_tables:
         _require_safe_oneclick_identifier(table, "table")
     return safe_tables
+
+
+def _run_checked(args: List[str]) -> None:
+    subprocess.run(args, check=True, text=True)
+
+
+def seed_local_mysql_container(
+    *,
+    container: str,
+    user: str,
+    password: str,
+    schema: str,
+    parent_table: str,
+    child_table: str,
+) -> None:
+    _require_safe_scope(schema, [parent_table, child_table])
+
+    sql = f"""
+DROP DATABASE IF EXISTS `{schema}`;
+CREATE DATABASE `{schema}` CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;
+USE `{schema}`;
+CREATE TABLE `{parent_table}` (
+  `id` INT NOT NULL PRIMARY KEY,
+  `name` VARCHAR(64) NOT NULL
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci;
+CREATE TABLE `{child_table}` (
+  `id` INT NOT NULL PRIMARY KEY,
+  `parent_id` INT NOT NULL,
+  `name` VARCHAR(64) NOT NULL,
+  CONSTRAINT `fk_child_parent` FOREIGN KEY (`parent_id`) REFERENCES `{parent_table}` (`id`)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci;
+INSERT INTO `{parent_table}` (`id`, `name`) VALUES (1, 'parent-row-1'), (2, 'parent-row-2');
+INSERT INTO `{child_table}` (`id`, `parent_id`, `name`) VALUES
+  (1, 1, 'child-row-1'),
+  (2, 2, 'child-row-2');
+"""
+    _run_checked([
+        "docker",
+        "exec",
+        container,
+        "mysql",
+        f"-u{user}",
+        f"-p{password}",
+        "-e",
+        sql,
+    ])
 
 
 def build_evidence_report(
@@ -154,13 +201,156 @@ def capture_oneclick_charset(
     tables: List[str],
     target_charset: str = DEFAULT_TARGET_CHARSET,
     target_collation: str = DEFAULT_TARGET_COLLATION,
+    facade: Optional[Any] = None,
+    git_sha: Optional[str] = None,
 ) -> Dict[str, Any]:
-    _ = (host, port, user, password, target_charset, target_collation)
-    _require_safe_scope(schema, tables)
-    raise CaptureNotImplementedError(
-        "Rust Core charset/collation real execution is not implemented yet; "
-        "add the #139 Rust Core allowlist path before capturing completed evidence."
+    safe_tables = _require_safe_scope(schema, tables)
+    _require_safe_charset_token(target_charset, "target_charset")
+    _require_safe_charset_token(target_collation, "target_collation")
+
+    facade = facade or DbCoreFacade()
+    endpoint = DbEndpoint(
+        engine="mysql",
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=schema,
     )
+    try:
+        service_hello = facade.hello()
+        before_tables = _table_charset_rows(facade, endpoint, schema, safe_tables)
+        foreign_keys = _foreign_key_rows(facade, endpoint, schema, safe_tables)
+        apply_result = facade.apply_oneclick_fixes(
+            {
+                "connection": endpoint.to_payload(),
+                "schema": schema,
+                "dry_run": False,
+                "backup_confirmed": True,
+                "steps": [{
+                    "issue_type": "charset_issue",
+                    "location": f"{schema}.{safe_tables[0]}",
+                    "table_name": safe_tables[0],
+                    "selected_option": _charset_selected_option(
+                        schema=schema,
+                        tables=safe_tables,
+                        before_tables=before_tables,
+                        target_charset=target_charset,
+                        target_collation=target_collation,
+                    ),
+                }],
+            }
+        )
+        after_tables = _table_charset_rows(facade, endpoint, schema, safe_tables)
+    finally:
+        client = getattr(facade, "client", None)
+        shutdown = getattr(client, "shutdown", None)
+        if callable(shutdown):
+            shutdown()
+
+    return build_evidence_report(
+        git_sha=git_sha or current_git_sha(),
+        service_hello=service_hello,
+        schema=schema,
+        target_charset=target_charset,
+        target_collation=target_collation,
+        apply_result=apply_result,
+        before_tables=before_tables,
+        after_tables=after_tables,
+        rollback_tables=before_tables,
+        foreign_keys=foreign_keys,
+    )
+
+
+def _require_safe_charset_token(value: str, label: str) -> None:
+    if not re.fullmatch(r"^[A-Za-z0-9_]+$", value or ""):
+        raise ValueError(f"refusing unsafe One-Click {label}: {value!r}")
+
+
+def _table_charset_rows(
+    facade: Any,
+    endpoint: DbEndpoint,
+    schema: str,
+    tables: List[str],
+) -> List[Dict[str, Any]]:
+    placeholders = ", ".join(["%s"] * len(tables))
+    rows = facade.execute_query(
+        endpoint,
+        (
+            "SELECT t.TABLE_SCHEMA AS `schema`, t.TABLE_NAME AS `table`, "
+            "ccsa.CHARACTER_SET_NAME AS charset, t.TABLE_COLLATION AS collation "
+            "FROM information_schema.TABLES t "
+            "JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY ccsa "
+            "ON t.TABLE_COLLATION = ccsa.COLLATION_NAME "
+            f"WHERE t.TABLE_SCHEMA = %s AND t.TABLE_NAME IN ({placeholders}) "
+            "ORDER BY FIELD(t.TABLE_NAME, "
+            + ", ".join(["%s"] * len(tables))
+            + ")"
+        ),
+        [schema, *tables, *tables],
+    )
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _foreign_key_rows(
+    facade: Any,
+    endpoint: DbEndpoint,
+    schema: str,
+    tables: List[str],
+) -> List[Dict[str, Any]]:
+    placeholders = ", ".join(["%s"] * len(tables))
+    rows = facade.execute_query(
+        endpoint,
+        (
+            "SELECT kcu.TABLE_SCHEMA AS `schema`, kcu.TABLE_NAME AS `table`, "
+            "kcu.REFERENCED_TABLE_NAME AS referenced_table, "
+            "kcu.CONSTRAINT_NAME AS `constraint` "
+            "FROM information_schema.KEY_COLUMN_USAGE kcu "
+            f"WHERE kcu.TABLE_SCHEMA = %s AND kcu.TABLE_NAME IN ({placeholders}) "
+            "AND kcu.REFERENCED_TABLE_NAME IS NOT NULL "
+            "ORDER BY kcu.TABLE_NAME, kcu.CONSTRAINT_NAME"
+        ),
+        [schema, *tables],
+    )
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def _charset_selected_option(
+    *,
+    schema: str,
+    tables: List[str],
+    before_tables: List[Dict[str, Any]],
+    target_charset: str,
+    target_collation: str,
+) -> Dict[str, Any]:
+    before_by_table = {str(row.get("table")): row for row in before_tables}
+    sql = [
+        (
+            f"ALTER TABLE `{schema}`.`{table}` CONVERT TO CHARACTER SET "
+            f"{target_charset} COLLATE {target_collation};"
+        )
+        for table in tables
+    ]
+    rollback_sql = []
+    for table in reversed(tables):
+        before = before_by_table.get(table) or {}
+        charset = str(before.get("charset") or "").strip()
+        collation = str(before.get("collation") or "").strip()
+        if not charset or not collation:
+            raise CaptureError(f"missing rollback charset/collation metadata for {schema}.{table}")
+        rollback_sql.append(
+            f"ALTER TABLE `{schema}`.`{table}` CONVERT TO CHARACTER SET {charset} COLLATE {collation};"
+        )
+
+    return {
+        "strategy": "charset_collation_fk_safe",
+        "tables": tables,
+        "fk_order": tables,
+        "target_charset": target_charset,
+        "target_collation": target_collation,
+        "sql": sql,
+        "rollback_sql": rollback_sql,
+    }
 
 
 def main() -> int:
@@ -173,6 +363,8 @@ def main() -> int:
     parser.add_argument("--mysql-port", type=int, default=3406)
     parser.add_argument("--mysql-user", default="root")
     parser.add_argument("--mysql-password", default="test")
+    parser.add_argument("--seed-local-container", action="store_true")
+    parser.add_argument("--mysql-container", default="tf-live-mysql")
     parser.add_argument("--schema", default=DEFAULT_SCHEMA)
     parser.add_argument("--table", action="append", dest="tables")
     parser.add_argument("--target-charset", default=DEFAULT_TARGET_CHARSET)
@@ -180,6 +372,18 @@ def main() -> int:
     args = parser.parse_args()
 
     tables = args.tables or [DEFAULT_PARENT_TABLE, DEFAULT_CHILD_TABLE]
+    if len(tables) < 2:
+        print("One-Click charset evidence capture failed: at least two tf_oneclick_ tables are required", file=sys.stderr)
+        return 1
+    if args.seed_local_container:
+        seed_local_mysql_container(
+            container=args.mysql_container,
+            user=args.mysql_user,
+            password=args.mysql_password,
+            schema=args.schema,
+            parent_table=tables[0],
+            child_table=tables[1],
+        )
     try:
         report = capture_oneclick_charset(
             host=args.mysql_host,
@@ -191,9 +395,9 @@ def main() -> int:
             target_charset=args.target_charset,
             target_collation=args.target_collation,
         )
-    except CaptureNotImplementedError as exc:
-        print(f"One-Click charset evidence capture failed closed: {exc}", file=sys.stderr)
-        return 2
+    except Exception as exc:
+        print(f"One-Click charset evidence capture failed: {exc}", file=sys.stderr)
+        return 1
 
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
