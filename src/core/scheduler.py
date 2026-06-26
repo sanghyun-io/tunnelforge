@@ -459,17 +459,55 @@ class BackupScheduler:
             output_subdir = os.path.join(schedule.output_dir, f"{schedule.name}_{timestamp}")
             os.makedirs(output_subdir, exist_ok=True)
 
+            credential_result = None
+            get_credentials = getattr(self.config_manager, 'get_tunnel_credentials', None)
+            if callable(get_credentials):
+                credential_result = get_credentials(schedule.tunnel_id)
+
+            credential_user = ''
+            credential_password = ''
+            if isinstance(credential_result, (tuple, list)) and len(credential_result) >= 2:
+                credential_user = credential_result[0] or ''
+                credential_password = credential_result[1] or ''
+
+            if isinstance(conn_info, dict):
+                host = conn_info.get('host', DEFAULT_LOCAL_HOST)
+                local_port = int(conn_info.get('local_port') or conn_info.get('port') or DEFAULT_MYSQL_PORT)
+                user = (
+                    conn_info.get('db_user')
+                    or conn_info.get('db_username')
+                    or credential_user
+                    or tunnel_config.get('db_user')
+                    or tunnel_config.get('db_username')
+                    or 'root'
+                )
+                password = (
+                    conn_info.get('db_password')
+                    or credential_password
+                    or tunnel_config.get('db_password')
+                    or ''
+                )
+            else:
+                host, local_port = conn_info
+                local_port = int(local_port or DEFAULT_MYSQL_PORT)
+                user = (
+                    credential_user
+                    or tunnel_config.get('db_user')
+                    or tunnel_config.get('db_username')
+                    or 'root'
+                )
+                password = credential_password or tunnel_config.get('db_password') or ''
+
             # RustDump Export 실행
-            local_port = conn_info.get('local_port', DEFAULT_MYSQL_PORT)
             engine = normalize_db_engine(
                 tunnel_config.get('db_engine'),
                 tunnel_config.get('remote_port') or local_port,
             )
             config = RustDumpConfig(
-                host=conn_info.get('host', DEFAULT_LOCAL_HOST),
+                host=host or DEFAULT_LOCAL_HOST,
                 port=local_port,
-                user=conn_info.get('db_user', 'root'),
-                password=conn_info.get('db_password', ''),
+                user=user,
+                password=password,
                 schema=schedule.schema,
                 engine=engine,
             )

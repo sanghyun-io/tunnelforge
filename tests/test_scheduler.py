@@ -450,6 +450,51 @@ class TestBackupScheduler:
         assert captured["schema"] == "analytics"
         assert captured["threads"] == 4
 
+    def test_backup_task_accepts_tuple_connection_info_for_rust_dump(self, monkeypatch, tmp_path):
+        """예약 백업은 실제 TunnelEngine의 (host, port) 연결 정보를 처리"""
+        captured = {}
+
+        class FakeExporter:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def export_full_schema(self, schema, output_dir, threads):
+                captured["schema"] = schema
+                captured["output_dir"] = output_dir
+                captured["threads"] = threads
+                return True, "ok"
+
+        self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 15432)
+        self.mock_engine.tunnel_configs = {
+            "tunnel-001": {
+                "db_engine": "postgresql",
+                "remote_port": 5432,
+            }
+        }
+        self.mock_config_manager.get_tunnel_credentials.return_value = ("pg_user", "pg_pw")
+        monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", FakeExporter)
+
+        schedule = self.ScheduleConfig(
+            id="backup-002",
+            name="Tuple Backup",
+            tunnel_id="tunnel-001",
+            schema="analytics",
+            output_dir=str(tmp_path),
+        )
+
+        success, message = self.scheduler._execute_backup(schedule)
+
+        assert success is True
+        assert "백업 완료" in message
+        assert captured["config"].engine == "postgresql"
+        assert captured["config"].host == "127.0.0.1"
+        assert captured["config"].port == 15432
+        assert captured["config"].user == "pg_user"
+        assert captured["config"].password == "pg_pw"
+        assert captured["config"].schema == "analytics"
+        assert captured["schema"] == "analytics"
+        assert captured["threads"] == 4
+
     def test_run_now_schedule_not_found(self):
         """존재하지 않는 스케줄 즉시 실행 시 실패"""
         success, msg = self.scheduler.run_now('nonexistent')
