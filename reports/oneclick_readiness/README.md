@@ -1,6 +1,6 @@
 # One-Click Readiness Evidence
 
-This directory stores machine-checkable evidence for GitHub #137.
+This directory stores machine-checkable One-Click readiness evidence.
 
 ## Current Evidence
 
@@ -10,6 +10,10 @@ This directory stores machine-checkable evidence for GitHub #137.
   the PyQt entry point is exposed only as a dry-run preview, real One-Click
   execution remains disabled, and the dry-run workflow emitted preflight,
   analysis, recommendation, execution, validation, and final result events.
+- `oneclick-real-execution-evidence.template.json` documents the required
+  GitHub #138 evidence shape for a future controlled local non-dry-run
+  `deprecated_engine -> engine_innodb` run. It is a template only, not completed
+  evidence.
 
 Validate it with:
 
@@ -17,11 +21,26 @@ Validate it with:
 python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json
 ```
 
+After real-execution evidence is captured from a controlled local MySQL schema,
+validate it with:
+
+```powershell
+python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json
+```
+
 A clean checkout can also require this evidence through the Rust Core regression
 gate:
 
 ```powershell
 $env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'
+powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
+```
+
+The real-execution evidence gate is intentionally optional until completed
+evidence exists:
+
+```powershell
+$env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'
 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
 ```
 

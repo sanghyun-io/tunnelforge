@@ -107,6 +107,7 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | One-Click dry-run evidence | `pytest tests\test_oneclick_dry_run_evidence.py -q`; `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS | Local MySQL Rust Core `oneclick.run` dry-run evidence captured and wired to optional regression gate |
 | 2026-06-26 | One-Click dry-run preview gate | `pytest tests\test_oneclick_rust_core_gate.py::test_migration_analyzer_exposes_oneclick_as_dry_run_preview_only -q`; `pytest tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_accepts_complete_report tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_requires_preview_ui_enabled -q`; `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json` | PASS | PyQt entry point is visible as dry-run preview; evidence requires preview UI enabled and real execution disabled |
 | 2026-06-26 | One-Click issue split | `gh issue create` created #138; `gh issue view 137`; `gh issue view 138`; `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens -q`; `rg -n "TF-STATUS-019|TF-STATUS-020|#138|ONECLICK_REAL_EXECUTION_ENABLED" docs src tests migration_core` | PASS | #137 dry-run preview gate is separated from #138 real-execution/automatic-fix coverage; real-execution lock copy points to #138 |
+| 2026-06-26 | One-Click real-execution evidence contract | `pytest tests\test_oneclick_real_execution_evidence.py -q` RED, then GREEN; `pytest tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_rust_core_gate.py -q`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.template.json` expected reject; `python -m compileall -q scripts tests`; `git diff --check` | PASS | #138 real-execution validator and optional gate hook added; template is rejected until real git SHA/evidence is captured |
 | 2026-06-26 | Full Python suite | `pytest -q` | PASS | 1707 passed, 3 warnings |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | Unit, CLI, and gated live tests pass or skip according to env |
 | 2026-06-26 | Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Produced `migration_core\target\release\tunnelforge-core.exe` |
@@ -811,6 +812,15 @@ Evidence:
   issues with `table_name` as automatic candidates using `engine_innodb`
   recommendation metadata. Other issue classes remain manual, and non-dry-run
   execution does not apply SQL fixes.
+- `scripts\validate-oneclick-real-execution-evidence.py` now defines the
+  machine-checkable #138 evidence contract for a controlled local
+  `deprecated_engine -> engine_innodb` non-dry-run proof. It requires a safe
+  `tf_oneclick_` schema, app real execution still disabled, all `oneclick.*`
+  service capabilities, no disallowed fix attempts, and before/after table
+  engine evidence proving only the allowed fix was applied.
+- `reports\oneclick_readiness\oneclick-real-execution-evidence.template.json`
+  documents the required evidence shape, but completed real-execution evidence
+  has not been captured yet.
 - `src\ui\dialogs\oneclick_migration_dialog.py` keeps
   `ONECLICK_REAL_EXECUTION_ENABLED = False`, so non-dry-run payloads fail
   closed.
@@ -828,10 +838,12 @@ Impact:
 
 Next action:
 
-1. Work GitHub #138: define automatic fix classes, add Rust/Python contract
-   coverage beyond the initial `deprecated_engine` recommendation, add a
-   real-execution evidence validator, and keep
-   `ONECLICK_REAL_EXECUTION_ENABLED = False` until that validator passes.
+1. Work GitHub #138: implement the controlled local real-execution capture
+   path for `engine_innodb`, make Rust Core apply only the allowed
+   `deprecated_engine` fix, produce
+   `reports\oneclick_readiness\oneclick-real-execution-evidence.json`, and
+   keep `ONECLICK_REAL_EXECUTION_ENABLED = False` until the validator passes
+   on real evidence.
 
 ## Issue Tracker
 
@@ -856,7 +868,7 @@ Next action:
 | TF-STATUS-017 | High | closed | Rust Core migration performance evidence | 1M/10M evidence archived and validated | Refresh if migration/verify streaming semantics change |
 | TF-STATUS-018 | High | closed | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence captured | Refresh final validator evidence if migration/RSS semantics change |
 | TF-STATUS-019 | Medium | closed | One-Click migration UI | Dry-run preview One-Click entry point | Keep preview evidence aligned if event payloads change |
-| TF-STATUS-020 | High | open | One-Click migration UI / Rust Core automatic fixes | Real execution and automatic fix coverage | Work GitHub #138; keep real execution disabled until automatic fix coverage is defined and proven |
+| TF-STATUS-020 | High | open | One-Click migration UI / Rust Core automatic fixes | Real execution and automatic fix coverage | Work GitHub #138; capture validator-backed local `engine_innodb` real-execution evidence before enabling app execution |
 
 ## Recommended Execution Order
 
@@ -909,3 +921,4 @@ Next action:
 | 2026-06-26 | Exposed #137 as a dry-run-only preview: the migration analyzer shows `One-Click Dry-run Preview`, real execution remains blocked, and refreshed evidence now requires preview UI enabled plus real execution disabled. | `src/ui/dialogs/migration_dialogs.py`, `src/core/i18n.py`, `scripts/validate-oneclick-dry-run-evidence.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_oneclick_dry_run_evidence.py`, `reports/oneclick_readiness`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_migration_analyzer_exposes_oneclick_as_dry_run_preview_only -q`; RED/GREEN: `pytest tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_accepts_complete_report tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_requires_preview_ui_enabled -q`; i18n: `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; capture: `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; validator: `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json` |
 | 2026-06-26 | Split the remaining One-Click real-execution work into GitHub #138, marked TF-STATUS-019 as the closed dry-run preview gate, opened TF-STATUS-020 for automatic fix coverage, and updated the real-execution lock copy to point at #138. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `docs/current_status.md`, `docs/oneclick_readiness.md` | `gh issue create` created #138; `gh issue view 137`; `gh issue view 138`; RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens -q`; `rg -n "TF-STATUS-019|TF-STATUS-020|#138|ONECLICK_REAL_EXECUTION_ENABLED" docs src tests migration_core` |
 | 2026-06-26 | Started GitHub #138 automatic-fix coverage by adding typed Rust Core recommendation metadata: `deprecated_engine` with `table_name` becomes an `engine_innodb` automatic candidate while real execution remains disabled. | `migration_core/src/lib.rs`, `tests/test_oneclick_rust_core_gate.py`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick_recommend_classifies_deprecated_engine_as_auto_fixable --lib` |
+| 2026-06-26 | Added the #138 real-execution evidence validator and optional regression-gate hook without enabling real execution. The validator requires controlled local MySQL evidence for `deprecated_engine -> engine_innodb`, safe `tf_oneclick_` schema scope, app real execution still disabled, no disallowed fix attempts, and before/after `InnoDB` proof. | `scripts/validate-oneclick-real-execution-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_oneclick_real_execution_evidence.py`, `reports/oneclick_readiness/oneclick-real-execution-evidence.template.json`, `reports/oneclick_readiness/README.md`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_real_execution_evidence.py -q`; final: `pytest tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_rust_core_gate.py -q`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; template expected reject: `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.template.json`; `python -m compileall -q scripts tests`; `git diff --check` |

@@ -1,0 +1,79 @@
+{
+  "_template_note": "Template only. Do not treat this file as completed evidence. Capture a real local MySQL run into oneclick-real-execution-evidence.json before validating #138.",
+  "issue": 138,
+  "git_sha": "",
+  "source_type": "local_mysql_container",
+  "feature_flags": {
+    "oneclick_ui_enabled": true,
+    "oneclick_real_execution_enabled": false
+  },
+  "service_hello": {
+    "capabilities": [
+      "oneclick.run",
+      "oneclick.preflight",
+      "oneclick.analyze",
+      "oneclick.recommend",
+      "oneclick.apply_fixes",
+      "oneclick.validate",
+      "oneclick.report"
+    ]
+  },
+  "scope": {
+    "schema": "tf_oneclick_real_execution",
+    "allowed_fix_types": [
+      "deprecated_engine"
+    ],
+    "allowed_strategies": [
+      "engine_innodb"
+    ]
+  },
+  "run": {
+    "command": "oneclick.apply_fixes",
+    "dry_run": false,
+    "backup_confirmed": true,
+    "success": true,
+    "schema": "tf_oneclick_real_execution",
+    "attempted_fix_types": [
+      "deprecated_engine"
+    ],
+    "attempted_strategies": [
+      "engine_innodb"
+    ],
+    "disallowed_fix_attempts": [],
+    "applied_fixes": [
+      {
+        "issue_type": "deprecated_engine",
+        "strategy": "engine_innodb",
+        "schema": "tf_oneclick_real_execution",
+        "table": "legacy_engine_table",
+        "sql": "ALTER TABLE `tf_oneclick_real_execution`.`legacy_engine_table` ENGINE=InnoDB;",
+        "success": true,
+        "rows_affected": 0
+      }
+    ]
+  },
+  "before": {
+    "tables": [
+      {
+        "schema": "tf_oneclick_real_execution",
+        "table": "legacy_engine_table",
+        "engine": "MyISAM"
+      }
+    ]
+  },
+  "after": {
+    "tables": [
+      {
+        "schema": "tf_oneclick_real_execution",
+        "table": "legacy_engine_table",
+        "engine": "InnoDB"
+      }
+    ],
+    "unrelated_tables_unchanged": true
+  },
+  "validation": {
+    "all_fixed": true,
+    "remaining_issues": 0,
+    "post_engine": "InnoDB"
+  }
+}
