@@ -178,12 +178,13 @@ superseded by the current `1832 passed, 5 warnings` evidence from
 TF-STATUS-050 / TF-STATUS-051.
 
 Post-#151 main merge and next issue analysis on 2026-06-27 reconfirmed that
-main is aligned with origin/main at `effe01c`, #116 is still the only open
-GitHub issue, and the normal repository-side #116 gate passes. The final gate
-still fails only because no macOS manual validation report is present under
-`build/` and no successful manual macOS App Validation workflow_dispatch run
-found for current merged main HEAD. This remains external real-Mac validation
-work, not a repo-side implementation issue.
+main was aligned with origin/main before this status update, this status update
+was pushed to origin/main, #116 is still the only open GitHub issue, and the
+normal repository-side #116 gate passes. The final gate still fails only
+because no macOS manual validation report is present under `build/` and no
+successful manual macOS App Validation workflow_dispatch run found for current
+merged main HEAD. This remains external real-Mac validation work, not a
+repo-side implementation issue.
 
 The current full Python suite count was refreshed again on 2026-06-27 after
 the current-status re-audit regression coverage was added.
@@ -305,7 +306,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | Post-#151 main merge and next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_151_next_issue_analysis -q`; `git fetch --all --prune`; `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 20`; `gh issue view 116 --json number,title,state,labels,milestone,updatedAt,url,body`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL for `--final` only | Current `main` is aligned with `origin/main` at `effe01c`; #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for current merged main HEAD `effe01c4b25f1fb8e238f60b8ef9419dbc3871a0`, so no new repo-side implementation issue was created |
+| 2026-06-27 | Post-#151 main merge and next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_151_next_issue_analysis -q`; `git fetch --all --prune`; `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 20`; `gh issue view 116 --json number,title,state,labels,milestone,updatedAt,url,body`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL for `--final` only | `main` was aligned with `origin/main` before this status update, and this status update was pushed to `origin/main`; #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for current merged main HEAD, so no new repo-side implementation issue was created |
 | 2026-06-27 | Stale current pytest count wording cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_describe_stale_full_pytest_count_as_current -q`; `gh issue create` created #151; `rg -n "1830 passed|1832 passed" docs\current_status.md tests\test_current_status_docs.py` | PASS | GitHub #151 is fixed: older TF-STATUS-049 wording no longer describes `1830 passed, 5 warnings` as current evidence; current full-suite evidence remains `1832 passed, 5 warnings` |
 | 2026-06-27 | RustDbCursor executemany batch helper fail-closed | RED/GREEN: `pytest tests\test_db_core_service.py::test_rust_db_cursor_executemany_rejects_python_batch_helper -q`; `gh issue create` created #150; `pytest tests\test_current_status_docs.py::test_current_status_tracks_rust_db_cursor_executemany_issue -q`; `rg -n "executemany\(|execute_many\(" src tests migration_core\src migration_core\tests`; `pytest -q` | PASS | GitHub #150 is fixed: `RustDbCursor.executemany` now rejects the unused Python-side batch helper before any query/facade call; single-query Rust Core paths remain unchanged; current full Python suite is now `1832 passed, 5 warnings` |
 | 2026-06-27 | Post-v2.1.7 version drift fix | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_v217_version_drift_issue -q`; `gh issue create` created #149; `git rev-list --count v2.1.7..HEAD`; `gh release list --limit 5`; `python scripts\bump_version.py --bump-type patch`; `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q`; `pytest -q` | PASS | GitHub #149 is fixed: current source/package/installer version is `2.1.8`, ahead of already published release `v2.1.7` after main accumulated release-tracking commits; its full-suite count is superseded by the `1832 passed, 5 warnings` evidence above |
@@ -1989,7 +1990,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
-| 2026-06-27 | Re-analyzed the next issue after #151 and confirmed current `main` is already aligned with `origin/main` at `effe01c`. #116 is the only open GitHub issue; the normal repository-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#151 current-status pytest; final: #116 gate pass, expected-failing final gate |
+| 2026-06-27 | Re-analyzed the next issue after #151 and confirmed `main` was aligned with `origin/main` before this status update, then pushed this status update to `origin/main`. #116 is the only open GitHub issue; the normal repository-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#151 current-status pytest; final: #116 gate pass, expected-failing final gate |
 | 2026-06-27 | Created and fixed TF-STATUS-051 / GitHub #151 after finding stale current-tense `1830 passed` wording left behind after the #150 full-suite run. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #151 | RED/GREEN: stale current-count current-status pytest |
 | 2026-06-27 | Created and fixed TF-STATUS-050 / GitHub #150 after finding the unused `RustDbCursor.executemany` Python-side batch helper. | `src/core/db_core_service.py`, `tests/test_db_core_service.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #150 | RED/GREEN: RustDbCursor executemany pytest and current-status pytest; full pytest `1832 passed, 5 warnings` |
 | 2026-06-27 | Created and fixed TF-STATUS-049 / GitHub #149 after finding that `main` had post-`v2.1.7` commits while source/package/installer references still declared `2.1.7`. | `src/version.py`, `pyproject.toml`, `installer/TunnelForge.iss`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #149 | RED/GREEN: post-v2.1.7 version drift current-status pytest; version sync pytest; full pytest count superseded by TF-STATUS-050/051 |

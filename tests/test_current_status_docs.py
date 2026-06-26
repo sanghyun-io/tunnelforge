@@ -123,7 +123,8 @@ def test_current_status_records_post_151_next_issue_analysis():
 
     assert "TF-STATUS-052" in doc
     assert "Post-#151 main merge and next issue analysis" in doc
-    assert "main is aligned with origin/main at `effe01c`" in normalized_doc
+    assert "main was aligned with origin/main before this status update" in normalized_doc
+    assert "this status update was pushed to origin/main" in normalized_doc
     assert "#116 is still the only open GitHub issue" in summary
     assert "normal repository-side #116 gate passes" in normalized_doc
     assert "no macOS manual validation report found under build/" in doc
