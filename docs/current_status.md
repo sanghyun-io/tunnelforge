@@ -632,6 +632,36 @@ Next action:
 1. Refresh the archived evidence if Rust Core migration/verify streaming
    semantics change.
 
+### TF-STATUS-018: Rust Core Live UI Performance Evidence Pending
+
+Status: `open`
+Severity: High
+Area: Rust Core live migration / PyQt responsiveness evidence
+
+Evidence:
+
+- GitHub issue #99 requires MySQL -> PostgreSQL and PostgreSQL -> MySQL 1M row
+  migration+verify to complete without UI freeze.
+- TF-STATUS-017 preserves Rust Core 1M/10M JSONL evidence, but those archived
+  files alone do not prove bidirectional live database coverage or PyQt
+  responsiveness during a live 1M migration run.
+- Cross-engine worker/dialog tests cover progress, checkpoint, resume, and
+  worker signal plumbing, but they do not run a live 1M row UI workflow.
+- GitHub issue #136 now tracks this remaining #99 closure evidence.
+- Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
+- Follow-up GitHub issue:
+  https://github.com/sanghyun-io/tunnelforge/issues/136
+
+Impact:
+
+- #99 should remain open until the live bidirectional 1M/UI responsiveness
+  evidence is captured or explicitly scoped out.
+
+Next action:
+
+1. Capture durable live MySQL/PostgreSQL bidirectional 1M migration+verify
+   evidence with UI responsiveness proof.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -653,10 +683,13 @@ Next action:
 | TF-STATUS-015 | Medium | closed | SQL editor UI | Schema/table tree panel | Consider richer query composition later |
 | TF-STATUS-016 | Medium | closed | Rust Core dump.import diagnostics | MySQL ERROR 1114 table-full guidance | Collect target storage/tmpdir evidence if it recurs |
 | TF-STATUS-017 | High | closed | Rust Core migration performance evidence | 1M/10M evidence archived and validated | Refresh if migration/verify streaming semantics change |
+| TF-STATUS-018 | High | open | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence pending | Capture durable MySQL/PostgreSQL 1M UI responsiveness evidence for #99/#136 |
 
 ## Recommended Execution Order
 
-1. Keep macOS real-device validation tracked separately.
+1. Capture live bidirectional 1M Rust Core UI responsiveness evidence for
+   #99/#136.
+2. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -686,3 +719,4 @@ Next action:
 | 2026-06-26 | Re-audited GitHub #116 after #126 closure: PR #117 is merged and local codebase gates pass, but #116 remains open only for final real operator Mac evidence. | `docs/current_status.md` | `gh pr view 117 --repo sanghyun-io/tunnelforge`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` |
 | 2026-06-26 | Analyzed GitHub #99 and created #135 for the remaining Rust Core 1M/10M performance evidence durability gap. | `docs/current_status.md` | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `git status --ignored --short migration_core\target\perf_*.jsonl`; `gh issue create` |
 | 2026-06-26 | Archived Rust Core 1M/10M performance evidence under `reports\rust_core_performance`, added a validator, and wired the optional performance regression gate to the archived evidence for GitHub #135/#99. | `reports/rust_core_performance`, `scripts/validate-rust-core-performance-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_rust_core_performance_evidence.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_performance_evidence.py -q`; final: `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
+| 2026-06-26 | Audited GitHub #99 closure criteria after #135 and created #136 for the remaining live bidirectional 1M UI responsiveness evidence. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; focused Python Rust Core/UI plumbing tests; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `rg` direct DB driver scan |
