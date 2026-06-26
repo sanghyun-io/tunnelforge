@@ -3160,6 +3160,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let table_total = tables.len();
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
+    let mut imported_rows_by_table: BTreeMap<String, u64> = BTreeMap::new();
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
     let import_result = (|| -> Result<(), String> {
@@ -3178,6 +3179,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 "current": index + 1,
                 "total": table_total
             }));
+            let table_rows_before = rows_imported;
 
             if matches!(mode, "replace" | "recreate") {
                 adapter.execute_sql(&drop_table_sql(adapter.engine(), &table.name))?;
@@ -3201,6 +3203,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                     )?;
                     rows_imported += rows;
                     chunks_imported += chunks;
+                    imported_rows_by_table.insert(table.name.clone(), rows);
                     emit(json!({
                         "event": "table_progress",
                         "request_id": request.request_id,
@@ -3235,6 +3238,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 }));
             }
 
+            let table_rows_imported = rows_imported.saturating_sub(table_rows_before);
+            imported_rows_by_table.insert(table.name.clone(), table_rows_imported);
             emit(json!({
                 "event": "table_progress",
                 "request_id": request.request_id,
@@ -3258,6 +3263,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     local_infile_restore_result?;
     let target_engine = adapter.engine().to_string();
     apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
+    verify_imported_row_counts(&tables, &imported_rows_by_table)?;
 
     // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
@@ -3273,6 +3279,24 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     } else {
         ViewImportOutcome::default()
     };
+    let import_report = json!({
+        "success": true,
+        "mode": mode,
+        "tables": table_total,
+        "rows_imported": rows_imported,
+        "chunks_imported": chunks_imported,
+        "imported_rows_by_table": imported_rows_by_table,
+        "verification": {
+            "row_counts": "passed",
+            "strict_manifest": strict_manifest,
+            "warnings": manifest_warnings
+        },
+        "views_imported": view_outcome.imported,
+        "views_failed": view_outcome.failed,
+        "views_skipped_cross_engine": view_outcome.skipped_cross_engine
+    });
+    write_dump_import_report(input_path, &import_report)?;
+    let import_report_path = dump_import_report_path(input_path)?;
 
     Ok(json!({
         "event": "result",
@@ -3284,9 +3308,11 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         "tables": table_total,
         "rows_imported": rows_imported,
         "chunks_imported": chunks_imported,
-        "views_imported": view_outcome.imported,
-        "views_failed": view_outcome.failed,
-        "views_skipped_cross_engine": view_outcome.skipped_cross_engine
+        "verification": import_report["verification"].clone(),
+        "import_report": import_report_path.display().to_string(),
+        "views_imported": import_report["views_imported"].clone(),
+        "views_failed": import_report["views_failed"].clone(),
+        "views_skipped_cross_engine": import_report["views_skipped_cross_engine"].clone()
     }))
 }
 
@@ -7863,6 +7889,45 @@ fn validate_dump_import_manifest_strictness(
     Ok(warnings)
 }
 
+fn verify_imported_row_counts(
+    tables: &[DumpTableManifest],
+    imported_rows_by_table: &BTreeMap<String, u64>,
+) -> Result<(), String> {
+    for table in tables {
+        let imported = imported_rows_by_table
+            .get(&table.name)
+            .copied()
+            .unwrap_or(0);
+        if imported != table.rows {
+            return Err(classified_import_error(
+                "post_load_validation_failed",
+                &format!("expected {} rows, imported {}", table.rows, imported),
+                Some(&table.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn dump_import_report_path(input_path: &Path) -> Result<PathBuf, String> {
+    if input_path.as_os_str().is_empty() {
+        return Err("cannot write import report without input_dir".to_string());
+    }
+    Ok(input_path.join("_tunnelforge_import_report.json"))
+}
+
+fn write_dump_import_report(input_path: &Path, report: &Value) -> Result<(), String> {
+    let report_path = dump_import_report_path(input_path)?;
+    let bytes = serde_json::to_vec_pretty(report)
+        .map_err(|err| format!("cannot serialize import report: {err}"))?;
+    fs::write(&report_path, bytes).map_err(|err| {
+        format!(
+            "cannot write import report {}: {err}",
+            report_path.display()
+        )
+    })
+}
+
 fn validate_dump_manifest_chunks(
     input_path: &Path,
     tables: &[DumpTableManifest],
@@ -9865,6 +9930,74 @@ mod tests {
             .unwrap();
         assert!(message.contains("export_invalid"));
         assert!(message.contains("missing chunk_sha256"));
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn import_row_count_verification_rejects_missing_rows() {
+        let tables = vec![DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 3,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut imported = BTreeMap::new();
+        imported.insert("users".to_string(), 2_u64);
+
+        let err = verify_imported_row_counts(&tables, &imported).unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("users"));
+        assert!(err.contains("expected 3 rows, imported 2"));
+    }
+
+    #[test]
+    fn import_row_count_verification_accepts_matching_counts() {
+        let tables = vec![DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 3,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut imported = BTreeMap::new();
+        imported.insert("users".to_string(), 3_u64);
+
+        verify_imported_row_counts(&tables, &imported).unwrap();
+    }
+
+    #[test]
+    fn import_report_path_lives_inside_dump_directory() {
+        let dir = Path::new("C:/tmp/dump");
+        let path = dump_import_report_path(dir).unwrap();
+
+        assert!(path.ends_with("_tunnelforge_import_report.json"));
+        assert!(path.starts_with(dir));
+    }
+
+    #[test]
+    fn write_dump_import_report_creates_json_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-import-report-test-{}",
+            current_unix_seconds()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        write_dump_import_report(
+            &dir,
+            &json!({
+                "success": true,
+                "verification": {"row_counts": "passed"}
+            }),
+        )
+        .unwrap();
+
+        let report_path = dir.join("_tunnelforge_import_report.json");
+        let report_text = fs::read_to_string(&report_path).unwrap();
+        assert!(report_text.contains("\"row_counts\": \"passed\""));
 
         fs::remove_dir_all(&dir).unwrap();
     }

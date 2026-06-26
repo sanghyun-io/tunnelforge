@@ -102,6 +102,11 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 143 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
 | 2026-06-26 | Import wrapper/dialog focused tests | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 63 passed after classified error regression |
 | 2026-06-26 | Rust format and diff hygiene | `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` | PASS | No formatting or whitespace issues |
+| 2026-06-26 | Import row-count verification TDD | `cargo test --manifest-path migration_core\Cargo.toml import_row_count_verification --lib` | FAIL then PASS | Initial RED failed because `verify_imported_row_counts` and report path helper did not exist; GREEN covered matching and mismatched table row counts |
+| 2026-06-26 | Import report path | `cargo test --manifest-path migration_core\Cargo.toml import_report_path_lives_inside_dump_directory --lib` | PASS | Confirms report path resolves under dump directory |
+| 2026-06-26 | Import report artifact | `cargo test --manifest-path migration_core\Cargo.toml write_dump_import_report_creates_json_file --lib` | PASS | Confirms `_tunnelforge_import_report.json` is written with verification JSON |
+| 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 147 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
+| 2026-06-26 | Import wrapper/dialog focused tests | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 63 passed after import verification/report change |
 
 ## Existing Status And Planning Documents
 
@@ -169,32 +174,32 @@ Next action:
 1. Continue import success gating in `TF-STATUS-002`.
 2. Add export consistency manifest metadata in `TF-STATUS-004`.
 
-### TF-STATUS-002: Import Success Is Not Gated By Complete Verification
+### TF-STATUS-002: Import Success Is Gated By Row Verification
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: Rust Core dump.import
 
 Evidence:
 
-- `dump_import()` validates existing chunks only when checksums are present.
-- `dump_import()` applies post-load DDL and then returns a `success: true`
-  result without a row-count verification report.
-- `DumpManifest` does not contain `snapshot_policy`, `strict_export`, or
-  `manifest_warnings`.
+- 2026-06-26 update: `dump_import()` now tracks imported rows per table and
+  calls `verify_imported_row_counts()` before returning success.
+- 2026-06-26 update: mismatched imported row counts fail with
+  `post_load_validation_failed` and table scope.
+- 2026-06-26 update: successful imports write
+  `_tunnelforge_import_report.json` beside the dump and include the report path
+  plus verification summary in the result payload.
 
 Impact:
 
-- A data-load completion can be reported as import success without proving all
-  planned recovery invariants.
-- Legacy or incomplete dumps are not clearly classified before target mutation.
+- Import success now has an explicit row-count verification gate and persisted
+  report artifact.
+- Export consistency metadata remains separate and is tracked by
+  `TF-STATUS-004`.
 
 Next action:
 
-1. Add strict manifest validation helpers and tests.
-2. Track imported rows per table.
-3. Gate success on row-count verification.
-4. Write `_tunnelforge_import_report.json` beside the dump.
+1. Add export consistency manifest metadata in `TF-STATUS-004`.
 
 ### TF-STATUS-003: Import UI Overpromises Object Restoration
 
@@ -330,7 +335,7 @@ Next action:
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
 | TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Continue remaining recovery work in TF-STATUS-002 and TF-STATUS-004 |
-| TF-STATUS-002 | High | open | Rust Core import | Import success not fully verified | Add row-count verification and import report artifact |
+| TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Continue export consistency metadata in TF-STATUS-004 |
 | TF-STATUS-003 | High | fixed_pending_full_verify | Import UI | Object restoration wording | Keep focused regression; add unsupported-object UI surfacing |
 | TF-STATUS-004 | High | open | Rust Core export | Export consistency not explicit | Add snapshot/strictness manifest metadata |
 | TF-STATUS-005 | Medium | open | Docs/UI flags | Docs mention disabled features | Decide support status for schedule and SQL file execution |
@@ -340,15 +345,11 @@ Next action:
 
 ## Recommended Execution Order
 
-1. Add Rust import verification:
-   - per-table imported row counts
-   - success only after verification
-   - import report artifact
-2. Add export strictness metadata:
+1. Add export strictness metadata:
    - snapshot policy
    - strict export marker
    - manifest warnings
-3. Update or create final remediation report after the recovery work is
+2. Update or create final remediation report after the recovery work is
    verified.
 
 ## Session Log
@@ -359,3 +360,4 @@ Next action:
 | 2026-06-26 | Added Python import payload forwarding for `timezone_sql` and `strict_manifest`; removed import UI `모든 객체` overpromise; added focused regression tests. | `src/exporters/rust_dump_exporter.py`, `src/ui/dialogs/db_dialogs.py`, `tests/test_rust_dump_exporter.py`, `tests/test_db_dialogs.py`, `docs/current_status.md` | `python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `git diff --check` |
 | 2026-06-26 | Added Rust validation/application for dump import `timezone_sql`; arbitrary SQL and multi-statement payloads are rejected before DB connection. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_session_time_zone_only --lib`; `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` |
 | 2026-06-26 | Added strict manifest classification before dump import target mutation and preserved classified core errors through Python import messages. | `migration_core/src/lib.rs`, `tests/test_rust_dump_exporter.py`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
+| 2026-06-26 | Added dump import row-count success gate and `_tunnelforge_import_report.json` success artifact. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo test --manifest-path migration_core\Cargo.toml write_dump_import_report_creates_json_file --lib` |
