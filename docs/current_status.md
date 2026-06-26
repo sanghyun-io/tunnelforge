@@ -339,6 +339,10 @@ Evidence:
 
 - `docs/macos_support.md` explicitly states final real-Mac validation is
   separate from repository verification.
+- 2026-06-26 update: PR #117 is merged, `python
+  scripts\check-macos-support-gate.py --skip-github` passes, and focused macOS
+  support tests pass locally, but GitHub issue #116 remains open because the
+  final real operator Mac interactive evidence bundle is not attached.
 
 Next action:
 
@@ -588,6 +592,38 @@ Next action:
    MySQL storage, `tmpdir`, and InnoDB temporary tablespace evidence rather than
    changing import semantics first.
 
+### TF-STATUS-017: Rust Core Performance Evidence Is Local-Only
+
+Status: `open`
+Severity: High
+Area: Rust Core migration performance evidence
+
+Evidence:
+
+- GitHub issue #99 requires MySQL/PostgreSQL 1M row migration+verify and 10M row
+  streaming/resume/verify evidence before the Rust DB Core Service epic can be
+  closed.
+- `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File
+  scripts\rust-core-regression-gate.ps1` passes on this machine because the
+  expected performance JSONL files exist under `migration_core\target`.
+- `migration_core\target` is ignored by git, so those JSONL files are local
+  machine state rather than durable repo, CI, release, or handoff evidence.
+- GitHub issue #135 now tracks preserving or regenerating this evidence in a
+  way a clean checkout/future session can audit.
+- Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
+- Follow-up GitHub issue:
+  https://github.com/sanghyun-io/tunnelforge/issues/135
+
+Impact:
+
+- #99 should not be closed based solely on ignored local target artifacts, even
+  though the current machine has passing performance evidence.
+
+Next action:
+
+1. Add a repeatable performance evidence generator/workflow or durable artifact
+   handoff, then update #99 with auditable 1M/10M evidence.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -608,10 +644,13 @@ Next action:
 | TF-STATUS-014 | Medium | closed | SQL editor UI | Large SQL rendering guard | Revisit virtual rendering if measured bottleneck remains |
 | TF-STATUS-015 | Medium | closed | SQL editor UI | Schema/table tree panel | Consider richer query composition later |
 | TF-STATUS-016 | Medium | closed | Rust Core dump.import diagnostics | MySQL ERROR 1114 table-full guidance | Collect target storage/tmpdir evidence if it recurs |
+| TF-STATUS-017 | High | open | Rust Core migration performance evidence | 1M/10M evidence is local-only | Preserve or regenerate durable performance evidence for #99/#135 |
 
 ## Recommended Execution Order
 
-1. Keep macOS real-device validation tracked separately.
+1. Preserve or regenerate durable Rust Core 1M/10M performance evidence for
+   #99/#135.
+2. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -638,3 +677,5 @@ Next action:
 | 2026-06-26 | Added a large-document guard for GitHub #86 so SQL files at or above 512KB open with syntax highlighting and real-time validation disabled, then restore normal editor features for smaller content. | `src/ui/dialogs/sql_editor_dialog.py`, `src/core/i18n.py`, `tests/test_sql_editor_dialog.py`, `docs/current_status.md` | RED/GREEN: `pytest tests/test_sql_editor_dialog.py::test_large_sql_file_disables_expensive_editor_features tests/test_sql_editor_dialog.py::test_small_content_reenables_editor_features_after_large_file`; final: `pytest tests/test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests/test_sql_editor_dialog.py`; `pytest -q`; `python -m compileall -q main.py src tests`; `git diff --check` |
 | 2026-06-26 | Added the SQL editor schema/table tree panel for GitHub #92 with schema roots, loaded table/column children, and table-click insertion into the current editor. | `src/ui/dialogs/sql_editor_dialog.py`, `tests/test_sql_editor_dialog.py`, `docs/current_status.md` | RED/GREEN: `pytest tests/test_sql_editor_dialog.py::test_metadata_loaded_populates_schema_tree tests/test_sql_editor_dialog.py::test_schema_tree_table_click_inserts_quoted_table_name`; final: `pytest tests/test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests/test_sql_editor_dialog.py`; `pytest -q`; `python -m compileall -q main.py src tests`; `git diff --check` |
 | 2026-06-26 | Analyzed GitHub #126 and added MySQL `ERROR 1114` storage/tmpdir guidance to post-load DDL import failures. | `migration_core/src/lib.rs`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl_mysql_table_full_error_includes_storage_guidance --lib`; focused regression: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl --lib`; final: `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
+| 2026-06-26 | Re-audited GitHub #116 after #126 closure: PR #117 is merged and local codebase gates pass, but #116 remains open only for final real operator Mac evidence. | `docs/current_status.md` | `gh pr view 117 --repo sanghyun-io/tunnelforge`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` |
+| 2026-06-26 | Analyzed GitHub #99 and created #135 for the remaining Rust Core 1M/10M performance evidence durability gap. | `docs/current_status.md` | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `git status --ignored --short migration_core\target\perf_*.jsonl`; `gh issue create` |
