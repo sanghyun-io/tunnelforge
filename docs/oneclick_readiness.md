@@ -82,7 +82,7 @@ Current Rust Core recommendation coverage:
 | `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
 | `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
 | `float_precision` | manual | `manual` | Requires precision/scale policy review. |
-| `int_display_width` | manual or skip | `manual` | MySQL 8.4 ignores display width semantics; no automatic DDL is currently applied. |
+| `int_display_width` | display-only skip | `skip` | MySQL 8.4 ignores display width semantics. Rust Core live One-Click does not synthesize `int_display_width` issues today; PyQt can render externally supplied skip payloads as no DB action required, and `skip` does not execute SQL. |
 | `enum_empty_value` | manual | `manual` | Requires data cleanup policy. |
 
 ## Charset/Collation Automation Policy (#139)
@@ -124,6 +124,13 @@ Manual or fail-closed subset:
 - Any charset/collation strategy other than `charset_collation_fk_safe`.
 - Any bundled remediation with invalid dates, ZEROFILL, float precision,
   integer display width, enum cleanup, or other issue types.
+
+Display-only skip subset:
+
+- `int_display_width` may be shown as `skip` when an external analysis payload
+  supplies that selected option. It is not a Rust Core live One-Click mutation
+  class, Rust Core live One-Click does not synthesize `int_display_width`
+  issues, and `skip` does not execute SQL.
 
 Implementation gate:
 

@@ -11289,6 +11289,32 @@ mod tests {
     }
 
     #[test]
+    fn oneclick_live_inspection_does_not_synthesize_int_display_width_skip() {
+        let inspection = InspectionResult {
+            schema: NormalizedSchema {
+                tables: vec![NormalizedTable {
+                    name: "orders".to_string(),
+                    columns: Vec::new(),
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                }],
+            },
+            unsupported_objects: vec!["int_display_width:orders.id".to_string()],
+        };
+
+        let issues = oneclick_issues_from_inspection(&inspection);
+        let charset_contracts = BTreeMap::new();
+        let recommendations = oneclick_recommendations(&issues, "app", &charset_contracts);
+        let summary = oneclick_recommendation_summary(&recommendations);
+
+        assert_eq!(issues.len(), 1);
+        assert_ne!(issues[0].issue_type.as_deref(), Some("int_display_width"));
+        assert_eq!(summary["auto_fixable"], 0);
+        assert_eq!(summary["skip_recommended"], 0);
+        assert_eq!(recommendations[0]["selected_option"]["strategy"], "manual");
+    }
+
+    #[test]
     fn oneclick_charset_contract_builds_fk_safe_option() {
         let option = oneclick_charset_fk_safe_option_from_payload(
             &json!({
