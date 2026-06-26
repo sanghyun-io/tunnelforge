@@ -134,7 +134,6 @@ Commands run locally:
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 52 passed |
 | `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
 | `pytest tests\test_current_status_docs.py -q` | PASS |
-| `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py` | PASS |
 | `git diff --check` | PASS |
 
@@ -142,6 +141,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Focused verification duplicate row cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_focused_verification_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Focused Verification On 2026-06-27` no longer repeats the same `python scripts\check-macos-support-gate.py --skip-github` check row |
 | 2026-06-27 | Current baseline count refresh after re-audit coverage | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_macos_focused_test_count tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top current baseline now reflects the latest current-status test addition and the freshly rerun macOS focused suite: `pytest -q` is 1795 passed, 5 warnings, and macOS focused tests are 52 passed |
 | 2026-06-27 | Current main next-issue re-audit | `git status --short --branch`; `git log --oneline --decorate -5`; `gh issue list --state open --limit 20`; `gh issue view 116 --comments`; `rg -n "pymysql|psycopg|mysql\.connector|mysqldump|pg_dump|mysqlpump|mysqlimport|\bpsql\b" src scripts`; `rg -n "execute\(|cursor\(|commit\(|rollback\(" src\core src\ui src\exporters`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | Main is aligned with origin/main, #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core baseline scan found no new repo-side violation; legacy-shaped DB connector paths route through Rust Core shims |
 | 2026-06-27 | Current baseline verification heading | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top status no longer labels the mixed current baseline as `Verified On 2026-06-26`; the section now distinguishes the refreshed 2026-06-27 full-suite count from preserved 2026-06-26 broader baseline evidence |
@@ -1294,6 +1294,29 @@ Next action:
 1. Refresh these counts whenever tests are added and the matching verification
    commands are rerun.
 
+### TF-STATUS-032: Focused Verification Table Has No Duplicate Check Rows
+
+Status: closed
+Severity: Low
+Area: Status documentation
+
+Evidence:
+
+- The `Focused Verification On 2026-06-27` table listed
+  `python scripts\check-macos-support-gate.py --skip-github` twice.
+- RED/GREEN coverage now extracts focused verification command rows and rejects
+  duplicate command entries.
+
+Resolution:
+
+- Removed the duplicate focused verification row while preserving the full
+  #116 gate and skip-GitHub gate evidence.
+
+Next action:
+
+1. Keep focused verification tables deduplicated when adding future evidence
+   rows.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1329,6 +1352,7 @@ Next action:
 | TF-STATUS-029 | Low | closed | Status documentation | Baseline verification heading | Replace preservation note after a full broad baseline sweep is rerun |
 | TF-STATUS-030 | Low | closed | Status documentation / Rust Core boundary audit | Current main next-issue re-audit | Keep #116 as the only open issue unless new repo-side evidence appears |
 | TF-STATUS-031 | Low | closed | Status documentation | Baseline count refresh after re-audit coverage | Refresh counts when new tests are added and rerun |
+| TF-STATUS-032 | Low | closed | Status documentation | Focused verification duplicate rows | Keep focused verification command rows unique |
 
 ## Recommended Execution Order
 
@@ -1430,3 +1454,4 @@ Next action:
 | 2026-06-27 | Fixed TF-STATUS-029 after noticing the top verification table still said `Verified On 2026-06-26` while containing a 2026-06-27 full pytest count. The section now describes a current baseline with preserved broader rows. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Re-audited current main and the next remaining issue. #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core boundary scan found no new repo-side baseline violation; legacy-shaped DB connector names currently route through Rust Core shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_current_main_next_issue_reaudit -q`; final: #116 gates, macOS/docs focused pytest, current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Refreshed the top baseline counts after adding current-status re-audit coverage. The current full Python suite is now `1795 passed, 5 warnings`, and the current macOS focused suite is `52 passed`. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: stale-count current-status pytest; final: `pytest -q`, current-status pytest, macOS/docs focused pytest, compileall, `git diff --check` |
+| 2026-06-27 | Removed a duplicate `--skip-github` row from the focused verification table and added a current-status regression so future focused verification command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |

@@ -96,3 +96,16 @@ def test_current_status_records_current_main_next_issue_reaudit():
     assert "Current main next-issue re-audit" in doc
     assert "GitHub #116 is the only open issue" in summary
     assert "no new repo-side Rust Core baseline violation" in summary
+
+
+def test_current_status_focused_verification_has_no_duplicate_check_rows():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    focused = _section(doc, "Focused Verification On 2026-06-27")
+    check_rows = [
+        line
+        for line in focused.splitlines()
+        if line.startswith("| `") and "` |" in line
+    ]
+    commands = [line.split("`", maxsplit=2)[1] for line in check_rows]
+
+    assert len(commands) == len(set(commands))
