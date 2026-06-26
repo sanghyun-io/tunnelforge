@@ -58,13 +58,16 @@ is Rust Core ownership of DB operations through `tunnelforge-core`, with
 Python/PyQt responsible for UI, orchestration, signals, and dialogs.
 
 Open GitHub issue #116 remains external: its remaining unchecked criterion is
-real operator Mac validation evidence. GitHub issues #137 through #141 closed
-the current One-Click readiness sequence: dry-run preview, limited
-`deprecated_engine -> engine_innodb` real execution, charset/collation supplied
-contract execution, PyQt-triggered charset contract derivation, and
-display-only `int_display_width` skip policy. No repo-side One-Click follow-up
-issue is currently open; track each additional automatic-fix class as a
-separate issue before implementation.
+real operator Mac validation evidence. GitHub #142 is the next repo-side issue:
+legacy Python Auto-Fix Wizard mutations still have a Python-owned execution
+path that should be disabled, made manual/dry-run only, or rerouted through
+Rust Core. GitHub issues #137 through #141 closed the current One-Click
+readiness sequence: dry-run preview, limited `deprecated_engine ->
+engine_innodb` real execution, charset/collation supplied contract execution,
+PyQt-triggered charset contract derivation, and display-only
+`int_display_width` skip policy. No repo-side One-Click follow-up issue is
+currently open; track each additional automatic-fix class as a separate issue
+before implementation.
 
 On 2026-06-27, the remaining repo-side #116 handoff drift found in the next
 issue analysis was closed: macOS artifact download defaults now use the PR head
@@ -83,12 +86,14 @@ real-execution gate: the app supports only backup-confirmed
 production automatic remediation and production charset/collation execution
 remain unsupported.
 
-Current main next-issue re-audit on 2026-06-27 confirms GitHub #116 is the
-only open issue. The full #116 repository-side gate passes, the macOS focused
-suite passes at 53 tests, and a Rust Core baseline scan found no new repo-side
-Rust Core baseline violation: legacy-shaped `MySQLConnector`/`PostgresConnector`
-paths currently route through `DbCoreFacade`/`RustDbConnection`, and hidden
-schedule SQL execution also uses the Rust connector shim when enabled.
+Current main next-issue re-audit on 2026-06-27 initially confirmed only #116
+was open and found no Rust Core baseline violation in legacy connector names:
+`MySQLConnector`/`PostgresConnector` route through
+`DbCoreFacade`/`RustDbConnection`, hidden schedule SQL execution uses the Rust
+connector shim when enabled, and SQL editor query execution also routes through
+the Rust connector shim. A later focused audit found a different repo-side
+baseline gap: the legacy Auto-Fix Wizard mutation policy is still owned by
+Python, now tracked as GitHub #142 / TF-STATUS-040.
 
 The current full Python suite count was refreshed again on 2026-06-27 after
 the current-status re-audit regression coverage was added.
@@ -116,10 +121,10 @@ the same head policy as the final report and artifact download path: PR head
 before merge, current merged main HEAD after merge.
 
 A post-merge next-issue external re-audit on 2026-06-27 reconfirmed that
-`main` is aligned with `origin/main`, #116 is still the only open GitHub issue,
-the full #116 repository-side gate passes, and no new repo-side Rust Core
-baseline violation was found. SQL editor query execution also routes through
-the Rust connector shim.
+`main` is aligned with `origin/main`, #116 remained external, the full #116
+repository-side gate passed, and SQL editor query execution also routes through
+the Rust connector shim. The follow-up baseline scan created GitHub #142 after
+confirming the separate legacy Python Auto-Fix Wizard mutation path.
 
 ## Current Baseline Verification
 
@@ -130,7 +135,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before this document |
-| `pytest -q` | PASS, 1808 passed, 5 warnings |
+| `pytest -q` | PASS, 1809 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 166 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -154,7 +159,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1808 passed, 5 warnings |
+| `pytest -q` | PASS, 1809 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -165,6 +170,7 @@ Commands run locally:
 | `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q` | RED then PASS |
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 53 passed |
 | `pytest tests\test_current_status_docs.py::test_current_status_records_post_merge_next_issue_external_reaudit -q` | RED then PASS |
+| `pytest tests\test_current_status_docs.py::test_current_status_tracks_legacy_python_auto_fix_wizard_issue -q` | RED then PASS |
 | `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
 | `pytest tests\test_current_status_docs.py -q` | PASS |
 | `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py` | PASS |
@@ -174,15 +180,16 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | Post-merge next-issue external re-audit | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_merge_next_issue_external_reaudit -q`; `git status --short --branch`; `gh issue list --state open --limit 30 --json number,title,state,labels,updatedAt,url,assignees`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest -q`; direct DB/feature-flag/stale-doc scans | PASS | #116 is still the only open issue, the #116 repo-side gates pass, SQL editor query execution also routes through the Rust connector shim, the current full Python suite is 1808 passed, and no new GitHub issue was created from this pass because no confirmed repo-side issue was found |
+| 2026-06-27 | Legacy Python Auto-Fix Wizard mutation issue split | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_legacy_python_auto_fix_wizard_issue -q`; `gh issue create` created #142; `pytest -q`; `rg -n "MigrationFixWizard|FixWizard|fix_wizard|btn_auto_fix|auto_fix|MigrationAnalyzerDialog|migration_dialogs|oneclick|One-Click" src tests docs README.md README.ko.md`; inspection of `src/ui/dialogs/migration_dialogs.py`, `src/ui/dialogs/fix_wizard_dialog.py`, `src/ui/workers/fix_wizard_worker.py`, and `src/core/migration_fix_wizard.py` | PASS | GitHub #142 now tracks the repo-side Rust Core baseline gap where the legacy Auto-Fix Wizard can execute DB mutations through Python-owned fix logic; current full Python suite is 1809 passed |
+| 2026-06-27 | Post-merge next-issue external re-audit | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_merge_next_issue_external_reaudit -q`; `git status --short --branch`; `gh issue list --state open --limit 30 --json number,title,state,labels,updatedAt,url,assignees`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest -q`; direct DB/feature-flag/stale-doc scans | PASS | At that pass #116 was the only open issue, the #116 repo-side gates passed, SQL editor query execution also routed through the Rust connector shim, and no new GitHub issue was created because no confirmed repo-side issue was found yet |
 | 2026-06-27 | macOS manual workflow head policy | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_support_gate_uses_local_head_for_manual_workflow_after_pr_merge -q`; RED/GREEN: `pytest tests\test_macos_support_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python scripts\check-macos-support-gate.py`; `gh issue view 116 --json body` | PASS | `scripts/check-macos-support-gate.py --final` now resolves the successful manual `workflow_dispatch` macOS artifact run against the same head policy as report SHA/artifact download: PR head before merge, current merged main HEAD after PR #117 has merged; GitHub #116 body now says the same, and current macOS focused suite is 53 passed |
-| 2026-06-27 | BUILD installer version examples | RED/GREEN: `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q`; final: `pytest -q`; `pytest tests\test_build_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_build_docs.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | `BUILD.md` no longer shows stale 1.0.0 installer filename/AppVersion examples; installer examples use `{version}` and `AppVersion={#MyAppVersion}`; the current full Python suite count is superseded above by the 1808-test run |
-| 2026-06-27 | One-Click module scope docstring | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope tests\test_current_status_docs.py::test_current_status_records_oneclick_module_scope_docstring_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Module-level One-Click wording no longer says the whole migration process is automatically executed; it now describes Rust DB Core dry-run default and limited real execution; the current full Python suite count is superseded above by the 1808-test run |
-| 2026-06-27 | One-Click fallback dry-run tooltip | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138 tests\test_current_status_docs.py::test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | The disabled-real-execution fallback tooltip now says real execution is `disabled in this build` and no longer points at the already closed GitHub #138 gate; the current full Python suite count is superseded above by the 1808-test run |
-| 2026-06-27 | Rust Core Export/Import menu wording | RED/GREEN: `pytest tests\test_main_window_export_import_labels.py -q`; `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count tests\test_current_status_docs.py::test_current_status_records_rust_core_export_import_menu_wording -q`; final: `pytest -q`; `pytest tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\main_window.py tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Tunnel context menu actions now display `Rust DB Core Export` / `Rust DB Core Import`, handlers use `_context_rust_core_export` / `_context_rust_core_import`; the current full Python suite count is superseded above by the 1808-test run |
+| 2026-06-27 | BUILD installer version examples | RED/GREEN: `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q`; final: `pytest -q`; `pytest tests\test_build_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_build_docs.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | `BUILD.md` no longer shows stale 1.0.0 installer filename/AppVersion examples; installer examples use `{version}` and `AppVersion={#MyAppVersion}`; the current full Python suite count is superseded above by the 1809-test run |
+| 2026-06-27 | One-Click module scope docstring | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope tests\test_current_status_docs.py::test_current_status_records_oneclick_module_scope_docstring_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Module-level One-Click wording no longer says the whole migration process is automatically executed; it now describes Rust DB Core dry-run default and limited real execution; the current full Python suite count is superseded above by the 1809-test run |
+| 2026-06-27 | One-Click fallback dry-run tooltip | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138 tests\test_current_status_docs.py::test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | The disabled-real-execution fallback tooltip now says real execution is `disabled in this build` and no longer points at the already closed GitHub #138 gate; the current full Python suite count is superseded above by the 1809-test run |
+| 2026-06-27 | Rust Core Export/Import menu wording | RED/GREEN: `pytest tests\test_main_window_export_import_labels.py -q`; `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count tests\test_current_status_docs.py::test_current_status_records_rust_core_export_import_menu_wording -q`; final: `pytest -q`; `pytest tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\main_window.py tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Tunnel context menu actions now display `Rust DB Core Export` / `Rust DB Core Import`, handlers use `_context_rust_core_export` / `_context_rust_core_import`; the current full Python suite count is superseded above by the 1809-test run |
 | 2026-06-27 | Current baseline duplicate service.hello cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Current Baseline Verification` now keeps one `tunnelforge-core service.hello` row that covers dump/import, migration, and One-Click capability evidence |
 | 2026-06-27 | Focused verification duplicate row cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_focused_verification_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Focused Verification On 2026-06-27` no longer repeats the same `python scripts\check-macos-support-gate.py --skip-github` check row |
-| 2026-06-27 | Current baseline count refresh after re-audit coverage | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_macos_focused_test_count tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top current baseline reflects the refreshed current-status coverage and macOS focused suite evidence; the current `pytest -q` row is superseded above by the 1808-test run, and macOS focused tests are now superseded by the 53-test run |
+| 2026-06-27 | Current baseline count refresh after re-audit coverage | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_macos_focused_test_count tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top current baseline reflects the refreshed current-status coverage and macOS focused suite evidence; the current `pytest -q` row is superseded above by the 1809-test run, and macOS focused tests are now superseded by the 53-test run |
 | 2026-06-27 | Current main next-issue re-audit | `git status --short --branch`; `git log --oneline --decorate -5`; `gh issue list --state open --limit 20`; `gh issue view 116 --comments`; `rg -n "pymysql|psycopg|mysql\.connector|mysqldump|pg_dump|mysqlpump|mysqlimport|\bpsql\b" src scripts`; `rg -n "execute\(|cursor\(|commit\(|rollback\(" src\core src\ui src\exporters`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | Main is aligned with origin/main, #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests now pass at 53 tests, and the Rust Core baseline scan found no new repo-side violation; legacy-shaped DB connector paths route through Rust Core shims |
 | 2026-06-27 | Current baseline verification heading | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top status no longer labels the mixed current baseline as `Verified On 2026-06-26`; the section now distinguishes the refreshed 2026-06-27 full-suite count from preserved 2026-06-26 broader baseline evidence |
 | 2026-06-27 | Current full Python suite count refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py`; `git diff --check` | PASS | Updated top current-status full Python suite count from stale `1786 passed` to current `1793 passed, 5 warnings` after recent documentation regression tests |
@@ -1529,7 +1536,7 @@ Area: Status documentation / Rust Core boundary audit
 Evidence:
 
 - `git status --short --branch` shows `main` aligned with `origin/main`.
-- `gh issue list --state open --limit 30` still returns only GitHub #116.
+- `gh issue list --state open --limit 30` then returned only GitHub #116.
 - `python scripts\check-macos-support-gate.py --skip-github` and
   `python scripts\check-macos-support-gate.py` both pass.
 - Focused scans checked stale handoff wording, feature flags, direct DB driver
@@ -1539,9 +1546,9 @@ Evidence:
 
 Resolution:
 
-- No repo-side follow-up issue was confirmed. Therefore, no new GitHub issue was
-  created from this pass; #116 remains the only open issue and is still blocked
-  on external real-Mac operator validation evidence.
+- No repo-side follow-up issue was confirmed during that pass. Therefore, no
+  new GitHub issue was created from that pass; #116 remained blocked on
+  external real-Mac operator validation evidence.
 - This entry records the latest post-merge re-audit so future sessions do not
   re-open the SQL editor or legacy connector names as false positives without
   new evidence.
@@ -1550,8 +1557,48 @@ Next action:
 
 1. Keep #116 open until the real-Mac evidence bundle is attached and the final
    device validation checkbox is checked.
-2. Create a separate GitHub issue only when a future scan finds confirmed
-   repo-side evidence, not merely because #116 is externally blocked.
+2. A later scan did find confirmed repo-side evidence and created GitHub #142 /
+   TF-STATUS-040.
+
+### TF-STATUS-040: Legacy Python Auto-Fix Wizard Mutations
+
+Status: open
+Severity: High
+Area: Rust Core baseline / Migration Auto-Fix Wizard
+
+Evidence:
+
+- GitHub #142 tracks this issue separately from external macOS #116.
+- `src/ui/dialogs/migration_dialogs.py` exposes `btn_auto_fix` and opens
+  `FixWizardDialog` for auto-fixable migration issues.
+- `src/ui/dialogs/fix_wizard_dialog.py` wires the final execution button to
+  `FixWizardWorker(..., dry_run=False)`.
+- `src/ui/workers/fix_wizard_worker.py` calls
+  `FKSafeCharsetChanger.execute_safe_charset_change(..., dry_run=False)` and
+  `BatchFixExecutor.execute_batch(..., dry_run=False)`.
+- `src/core/migration_fix_wizard.py` directly generates and executes DDL/DML
+  through `connector.connection.cursor().execute(...)`, `commit()`, and
+  `rollback()`.
+- This differs from the current baseline where `tunnelforge-core` should own
+  DB mutation operations and Python/PyQt should orchestrate UI/signals/dialogs.
+
+Impact:
+
+- The connector may currently be a Rust connector shim, but the mutation
+  policy, SQL generation, rollback behavior, and execution sequencing still
+  live in Python.
+- This is separate from One-Click `oneclick.*`, whose current limited
+  real-execution path is already Rust Core-owned and evidence-backed.
+
+Next action:
+
+1. Decide whether the legacy Auto-Fix Wizard should be hidden/disabled,
+   converted to dry-run/manual SQL only, or rerouted through Rust Core commands.
+2. If execution remains supported, move mutation ownership and fail-closed
+   validation into `tunnelforge-core` with focused Python payload tests and
+   Rust command tests.
+3. Keep One-Click behavior and evidence separate while changing this legacy
+   wizard path.
 
 ## Issue Tracker
 
@@ -1596,12 +1643,16 @@ Next action:
 | TF-STATUS-037 | Low | closed | Build documentation | BUILD installer version examples | Keep build examples version-neutral or synced |
 | TF-STATUS-038 | High | closed | macOS release validation | macOS manual workflow head policy | Keep final report/artifact/manual workflow SHA policies aligned |
 | TF-STATUS-039 | Low | closed | Status documentation / Rust Core boundary audit | Post-merge next-issue external re-audit | Keep #116 external unless confirmed repo-side evidence appears |
+| TF-STATUS-040 | High | open | Rust Core baseline / Migration Auto-Fix Wizard | Legacy Python Auto-Fix Wizard mutations | Resolve GitHub #142 by disabling, manualizing, or rerouting mutation execution through Rust Core |
 
 ## Recommended Execution Order
 
-1. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
+1. Resolve TF-STATUS-040 / GitHub #142 as the next repo-side issue: the legacy
+   Python Auto-Fix Wizard mutation path must be disabled/manualized or rerouted
+   through Rust Core.
+2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence.
-2. Track additional One-Click automatic fix classes as separate GitHub issues
+3. Track additional One-Click automatic fix classes as separate GitHub issues
    before implementation.
 
 ## Session Log
@@ -1696,7 +1747,7 @@ Next action:
 | 2026-06-27 | Refreshed TF-STATUS-028 after rerunning the full Python suite. The current suite is now `1793 passed, 5 warnings`, replacing the stale `1786 passed` handoff count. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; final: `pytest -q`, docs pytest, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-029 after noticing the top verification table still said `Verified On 2026-06-26` while containing a 2026-06-27 full pytest count. The section now describes a current baseline with preserved broader rows. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Re-audited current main and the next remaining issue. #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests now pass at 53 tests, and the Rust Core boundary scan found no new repo-side baseline violation; legacy-shaped DB connector names currently route through Rust Core shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_current_main_next_issue_reaudit -q`; final: #116 gates, macOS/docs focused pytest, current-status pytest, compileall, `git diff --check` |
-| 2026-06-27 | Refreshed the top baseline counts after adding current-status re-audit coverage. The current full Python suite is now superseded by the 1808-test run, and the current macOS focused suite is now superseded by the 53-test run. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: stale-count current-status pytest; final: `pytest -q`, current-status pytest, macOS/docs focused pytest, compileall, `git diff --check` |
+| 2026-06-27 | Refreshed the top baseline counts after adding current-status re-audit coverage. The current full Python suite is now superseded by the 1809-test run, and the current macOS focused suite is now superseded by the 53-test run. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: stale-count current-status pytest; final: `pytest -q`, current-status pytest, macOS/docs focused pytest, compileall, `git diff --check` |
 | 2026-06-27 | Removed a duplicate `--skip-github` row from the focused verification table and added a current-status regression so future focused verification command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Merged duplicate `tunnelforge-core service.hello` rows in the current baseline table and added a regression so current baseline command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: baseline duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-034 after finding legacy-branded Export/Import context-menu wording on the Rust Core path; handlers and labels now use Rust DB Core naming, with a focused source-level regression and refreshed full-suite count. | `src/ui/main_window.py`, `tests/test_main_window_export_import_labels.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: Export/Import label pytest and current-status pytest; final: `pytest -q`, focused docs/UI pytest, compileall, `git diff --check`, #116 gate checks |
@@ -1705,3 +1756,4 @@ Next action:
 | 2026-06-27 | Fixed TF-STATUS-037 after finding stale Windows installer version examples in `BUILD.md`; output/test paths now use `{version}` and the Inno snippet uses `{#MyAppVersion}`. | `BUILD.md`, `tests/test_build_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: build-doc/current-status pytest; final: `pytest -q`, focused build-doc/current-status pytest, compileall, `git diff --check`, #116 gates |
 | 2026-06-27 | Fixed TF-STATUS-038 after finding that #116 final gate manual workflow lookup still targeted PR #117 head after merge while artifact download/report SHA policy had moved to current merged main HEAD. | `scripts/check-macos-support-gate.py`, `docs/macos_support.md`, GitHub #116 body, `tests/test_rust_core_packaging.py`, `tests/test_macos_support_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: manual workflow head-policy pytest, macOS support docs pytest, current-status pytest; #116 body updated and full gate rechecked |
 | 2026-06-27 | Recorded TF-STATUS-039 after a post-merge next-issue re-audit found no new repo-side issue: #116 is still the only open GitHub issue, full #116 gates pass, and SQL editor execution also routes through Rust Core connector shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: post-merge current-status pytest; final: current-status pytest, #116 gates, compileall, `git diff --check` |
+| 2026-06-27 | Created GitHub #142 and TF-STATUS-040 after finding a separate repo-side Rust Core baseline gap: the legacy Auto-Fix Wizard can still execute DB mutations through Python-owned fix logic. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #142 | RED/GREEN: legacy Auto-Fix current-status pytest; final: current-status pytest, issue scan, compileall, `git diff --check` |
