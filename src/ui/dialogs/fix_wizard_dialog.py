@@ -6,7 +6,7 @@
 2. CharsetFixPage: 문자셋 이슈 테이블 선택 (FK 안전 변경)
 3. FixOptionPage: 기타 이슈별 수정 옵션 선택
 4. PreviewPage: SQL 미리보기 및 Dry-run
-5. ExecutionPage: 실제 실행 및 결과 표시
+5. ExecutionPage: Dry-run 재확인 및 수동 SQL 안내
 """
 
 import os
@@ -46,7 +46,7 @@ class FixWizardDialog(QWizard):
     2. CharsetFixPage: 문자셋 이슈 테이블 선택 (FK 안전 변경)
     3. FixOptionPage: 이슈별 수정 옵션 선택 (문자셋 제외)
     4. PreviewPage: SQL 미리보기 및 Dry-run
-    5. ExecutionPage: 실제 실행 및 결과 표시
+    5. ExecutionPage: Dry-run 재확인 및 수동 SQL 안내
     """
 
     def __init__(
@@ -1733,7 +1733,7 @@ class PreviewPage(QWizardPage):
 
 
 class ExecutionPage(QWizardPage):
-    """5단계: 실제 실행 및 결과"""
+    """5단계: Dry-run 재확인 및 수동 SQL 안내"""
 
     def __init__(self, wizard: FixWizardDialog):
         super().__init__(wizard)
@@ -1742,10 +1742,10 @@ class ExecutionPage(QWizardPage):
         self.executed = False
         self.rollback_sql_path: Optional[str] = None  # 저장된 Rollback SQL 경로
 
-        self.setTitle("실행")
-        self.setSubTitle("수정 작업을 실행합니다. 문제 발생 시 Rollback SQL을 제공합니다.")
+        self.setTitle("SQL 확인")
+        self.setSubTitle("Legacy 자동 수정 위저드는 DB 변경을 직접 실행하지 않고 Dry-run 결과와 SQL만 제공합니다.")
 
-        self.setCommitPage(True)  # Commit 버튼 사용
+        self.setCommitPage(False)
 
         self.init_ui()
 
@@ -1754,8 +1754,8 @@ class ExecutionPage(QWizardPage):
 
         # 경고
         warning_label = QLabel(
-            "⚠️ <b>주의:</b> 실행 버튼을 클릭하면 데이터베이스가 수정됩니다. "
-            "이 작업은 되돌릴 수 없으니 신중하게 진행하세요."
+            "⚠️ <b>Rust Core 전환:</b> 이 Legacy 자동 수정 위저드는 DB 변경을 직접 실행하지 않습니다. "
+            "아래 버튼은 Dry-run으로 SQL과 예상 영향만 확인합니다. 실제 변경은 Rust Core 소유 경로로만 진행해야 합니다."
         )
         warning_label.setWordWrap(True)
         warning_label.setStyleSheet("""
@@ -1785,7 +1785,7 @@ class ExecutionPage(QWizardPage):
         layout.addWidget(self.txt_log)
 
         # 결과 요약
-        self.grp_result = QGroupBox("실행 결과")
+        self.grp_result = QGroupBox("Dry-run 결과")
         self.grp_result.setVisible(False)
         result_layout = QFormLayout(self.grp_result)
 
@@ -1837,10 +1837,10 @@ class ExecutionPage(QWizardPage):
         rollback_layout.addLayout(rollback_btn_layout)
         layout.addWidget(self.grp_rollback)
 
-        # 실행 버튼
+        # Dry-run 버튼
         btn_layout = QHBoxLayout()
 
-        self.btn_execute = QPushButton("⚡ 실행")
+        self.btn_execute = QPushButton("🔍 Dry-run 확인")
         self.btn_execute.setStyleSheet("""
             QPushButton {
                 background-color: #e74c3c; color: white; font-weight: bold;
@@ -1871,7 +1871,7 @@ class ExecutionPage(QWizardPage):
         other_execute_count = sum(1 for s in steps
                                   if s.selected_option and s.selected_option.strategy != FixStrategy.SKIP)
 
-        self.txt_log.append(f"📋 실행 대기 중...")
+        self.txt_log.append(f"📋 Dry-run 확인 대기 중...")
         if charset_count > 0:
             self.txt_log.append(f"  - 문자셋 변경: {charset_count}개 테이블 (FK 안전 변경)")
         if steps:
@@ -1880,33 +1880,21 @@ class ExecutionPage(QWizardPage):
             if skip_count > 0:
                 self.txt_log.append(f"  - 건너뛰기: {skip_count}개")
         self.txt_log.append("")
-        self.txt_log.append("'실행' 버튼을 클릭하여 수정을 적용하세요.")
+        self.txt_log.append("'Dry-run 확인' 버튼을 클릭하여 SQL과 예상 영향만 확인하세요.")
 
     def execute(self):
-        """실행"""
-        reply = QMessageBox.warning(
-            self,
-            "실행 확인",
-            "선택한 수정 작업을 실행합니다.\n\n"
-            "이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No
-        )
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
+        """Dry-run 확인"""
         self.btn_execute.setEnabled(False)
         self.progress_bar.setRange(0, 0)
         self.txt_log.clear()
-        self.txt_log.append("🔧 실행 시작...")
+        self.txt_log.append("🔍 Dry-run 확인 시작...")
 
-        # 워커 실행
+        # Legacy Auto-Fix Wizard must not own DB mutations; keep this path dry-run only.
         self.worker = FixWizardWorker(
             connector=self.wizard_dialog.connector,
             schema=self.wizard_dialog.schema,
             steps=self.wizard_dialog.wizard_steps,
-            dry_run=False,
+            dry_run=True,
             charset_tables_to_fix=self.wizard_dialog.charset_tables_to_fix
         )
 
@@ -1928,7 +1916,7 @@ class ExecutionPage(QWizardPage):
         if success and result:
             self.txt_log.append("")
             self.txt_log.append("=" * 50)
-            self.txt_log.append("✅ 실행 완료!")
+            self.txt_log.append("✅ Dry-run 확인 완료!")
 
             # 결과 요약 표시
             self.grp_result.setVisible(True)

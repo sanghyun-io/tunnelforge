@@ -323,6 +323,16 @@ _EN_TEXT_TRANSLATIONS = {
     "업데이트 확인": "Check for Updates",
     "업데이트를 확인하는 중입니다...": "Checking for updates...",
     "최신 버전": "latest version",
+    "Legacy 자동 수정 위저드는 DB 변경을 직접 실행하지 않고 Dry-run 결과와 SQL만 제공합니다.": (
+        "The legacy auto-fix wizard does not run DB changes directly; it only provides Dry-run results and SQL."
+    ),
+    "⚠️ <b>Rust Core 전환:</b> 이 Legacy 자동 수정 위저드는 DB 변경을 직접 실행하지 않습니다. 아래 버튼은 Dry-run으로 SQL과 예상 영향만 확인합니다. 실제 변경은 Rust Core 소유 경로로만 진행해야 합니다.": (
+        "⚠️ <b>Rust Core transition:</b> This legacy auto-fix wizard does not run DB changes directly. "
+        "The button below only checks SQL and estimated impact as a Dry-run. Real changes must use a Rust Core-owned path."
+    ),
+    "'Dry-run 확인' 버튼을 클릭하여 SQL과 예상 영향만 확인하세요.": (
+        "Click the 'Dry-run Check' button to review only SQL and estimated impact."
+    ),
     "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 기본 dry-run으로 실행합니다.\n백업 확인 후 검증된 MyISAM/deprecated engine 테이블만 InnoDB로 자동 변경할 수 있습니다.": (
         "Run the Rust Core-backed One-Click preflight, analysis, recommendation, "
         "and validation flow as dry-run by default.\nAfter backup confirmation, "

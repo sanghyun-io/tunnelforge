@@ -80,6 +80,11 @@ class FixWizardWorker(QThread):
         charset_tables_to_fix: Optional[Set[str]] = None
     ):
         super().__init__()
+        if not dry_run:
+            raise RuntimeError(
+                "Legacy Python Auto-Fix Wizard mutation execution is disabled. "
+                "DB mutations must be owned by Rust Core."
+            )
         self.connector = connector
         self.schema = schema
         self.steps = steps

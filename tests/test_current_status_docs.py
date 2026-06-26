@@ -85,7 +85,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1805 passed, 5 warnings" not in doc
     assert "PASS, 1807 passed, 5 warnings" not in doc
     assert "PASS, 1808 passed, 5 warnings" not in doc
-    assert "PASS, 1809 passed, 5 warnings" in doc
+    assert "PASS, 1809 passed, 5 warnings" not in doc
+    assert "PASS, 1811 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -113,9 +114,8 @@ def test_current_status_records_current_main_next_issue_reaudit():
 
     assert "TF-STATUS-030" in doc
     assert "Current main next-issue re-audit" in doc
-    assert "GitHub #142 is the next repo-side issue" in summary
     assert "legacy connector names" in summary
-    assert "Python Auto-Fix Wizard mutation path" in summary
+    assert "Legacy Auto-Fix Wizard mutation path" in summary
 
 
 def test_current_status_records_rust_core_export_import_menu_wording():
@@ -185,8 +185,9 @@ def test_current_status_tracks_legacy_python_auto_fix_wizard_issue():
     assert "legacy Python Auto-Fix Wizard mutations" in doc
     assert "migration_fix_wizard.py" in doc
     assert "FixWizardWorker" in doc
-    assert "GitHub #142 is the next repo-side issue" in summary
-    assert "TF-STATUS-040 / GitHub #142" in order
+    assert "GitHub #142 is fixed" in summary
+    assert "Legacy Auto-Fix Wizard is dry-run/manual SQL only" in doc
+    assert "No repo-side implementation issue is currently open" in order
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
