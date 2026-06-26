@@ -293,6 +293,26 @@ def test_execute_on_connection_streaming_collects_row_batches():
     assert result["rows_streamed"] == 2
 
 
+def test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml():
+    process = FakeProcess([
+        '{"event":"result","command":"query.execute","success":true,"rows":[],"rows_affected":7}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
+    connection = RustDbConnection(endpoint, facade, "conn-1")
+
+    with connection.cursor() as cursor:
+        rowcount = cursor.execute("UPDATE users SET active = 0")
+
+    assert rowcount == 7
+    assert cursor.rowcount == 7
+    assert cursor.fetchall() == []
+
+
 def test_rust_db_cursor_executemany_rejects_python_batch_helper():
     class FakeFacade:
         def __init__(self):

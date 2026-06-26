@@ -809,7 +809,7 @@ impl CoreService {
             let params = query_params(&request.payload);
             let bound_sql = bind_query_params(sql, &params);
             return match execute_query_adapter(adapter, &bound_sql) {
-                Ok(rows) => query_result_events(request, rows),
+                Ok(result) => query_result_events(request, result),
                 Err(err) => vec![json!({
                     "event": "error",
                     "request_id": request.request_id,
@@ -1213,7 +1213,7 @@ fn query_execute(request: &Request) -> Vec<Value> {
     let params = query_params(&request.payload);
     let bound_sql = bind_query_params(sql, &params);
     match execute_query_live(&endpoint, &bound_sql) {
-        Ok(rows) => query_result_events(request, rows),
+        Ok(result) => query_result_events(request, result),
         Err(err) => vec![json!({
             "event": "error",
             "request_id": request.request_id,
@@ -1222,7 +1222,12 @@ fn query_execute(request: &Request) -> Vec<Value> {
     }
 }
 
-fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
+struct QueryExecutionResult {
+    rows: Vec<Value>,
+    rows_affected: u64,
+}
+
+fn query_result_events(request: &Request, result: QueryExecutionResult) -> Vec<Value> {
     let stream_rows = request
         .payload
         .get("stream_rows")
@@ -1234,8 +1239,8 @@ fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
             "request_id": request.request_id,
             "command": "query.execute",
             "success": true,
-            "rows": rows,
-            "rows_affected": 0
+            "rows": result.rows,
+            "rows_affected": result.rows_affected
         })];
     }
 
@@ -1245,9 +1250,9 @@ fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
         .and_then(Value::as_u64)
         .unwrap_or(500)
         .max(1) as usize;
-    let total = rows.len();
+    let total = result.rows.len();
     let mut events = Vec::new();
-    for (index, chunk) in rows.chunks(batch_size).enumerate() {
+    for (index, chunk) in result.rows.chunks(batch_size).enumerate() {
         events.push(json!({
             "event": "row_batch",
             "request_id": request.request_id,
@@ -1264,7 +1269,7 @@ fn query_result_events(request: &Request, rows: Vec<Value>) -> Vec<Value> {
         "success": true,
         "rows": [],
         "rows_streamed": total,
-        "rows_affected": 0
+        "rows_affected": result.rows_affected
     }));
     events
 }
@@ -4306,19 +4311,25 @@ fn redact_endpoint_secret(message: &str, endpoint: &Endpoint) -> String {
     }
 }
 
-fn execute_query_live(endpoint: &Endpoint, sql: &str) -> Result<Vec<Value>, String> {
+fn execute_query_live(endpoint: &Endpoint, sql: &str) -> Result<QueryExecutionResult, String> {
     let mut adapter = LiveAdapter::connect(endpoint)?;
     execute_query_adapter(&mut adapter, sql)
 }
 
-fn execute_query_adapter(adapter: &mut LiveAdapter, sql: &str) -> Result<Vec<Value>, String> {
+fn execute_query_adapter(
+    adapter: &mut LiveAdapter,
+    sql: &str,
+) -> Result<QueryExecutionResult, String> {
     let returns_rows = query_returns_rows(sql);
     match adapter {
         LiveAdapter::MySql(conn) => {
             if !returns_rows {
                 conn.query_drop(sql)
                     .map_err(|err| format!("mysql SQL execution error: {err}"))?;
-                return Ok(Vec::new());
+                return Ok(QueryExecutionResult {
+                    rows: Vec::new(),
+                    rows_affected: conn.affected_rows(),
+                });
             }
             let rows: Vec<mysql::Row> = conn
                 .query(sql)
@@ -4332,17 +4343,23 @@ fn execute_query_adapter(adapter: &mut LiveAdapter, sql: &str) -> Result<Vec<Val
                         .collect()
                 })
                 .unwrap_or_default();
-            Ok(rows
-                .into_iter()
-                .map(|row| mysql_row_to_json(&columns, row))
-                .collect())
+            Ok(QueryExecutionResult {
+                rows: rows
+                    .into_iter()
+                    .map(|row| mysql_row_to_json(&columns, row))
+                    .collect(),
+                rows_affected: 0,
+            })
         }
         LiveAdapter::PostgreSql(client) => {
             if !returns_rows {
-                client
-                    .batch_execute(sql)
+                let rows_affected = client
+                    .execute(sql, &[])
                     .map_err(|err| format!("postgresql SQL execution error: {err}"))?;
-                return Ok(Vec::new());
+                return Ok(QueryExecutionResult {
+                    rows: Vec::new(),
+                    rows_affected,
+                });
             }
             let trimmed = sql.trim().trim_end_matches(';');
             let wrapped = format!("SELECT row_to_json(_tf_row)::text FROM ({trimmed}) AS _tf_row");
@@ -4357,7 +4374,10 @@ fn execute_query_adapter(adapter: &mut LiveAdapter, sql: &str) -> Result<Vec<Val
                     .unwrap_or(Value::Null);
                 values.push(value);
             }
-            Ok(values)
+            Ok(QueryExecutionResult {
+                rows: values,
+                rows_affected: 0,
+            })
         }
     }
 }
@@ -13564,7 +13584,10 @@ mod tests {
                 request_id: Some("query-1".to_string()),
                 payload: json!({"stream_rows": true, "row_batch_size": 1}),
             },
-            vec![json!({"id": 1}), json!({"id": 2})],
+            QueryExecutionResult {
+                rows: vec![json!({"id": 1}), json!({"id": 2})],
+                rows_affected: 0,
+            },
         );
 
         assert_eq!(events[0]["event"], "row_batch");
@@ -13572,6 +13595,25 @@ mod tests {
         assert_eq!(events[1]["event"], "row_batch");
         assert_eq!(events[2]["event"], "result");
         assert_eq!(events[2]["rows_streamed"], 2);
+    }
+
+    #[test]
+    fn query_result_includes_non_row_rows_affected() {
+        let events = query_result_events(
+            &Request {
+                command: "query.execute".to_string(),
+                request_id: Some("query-1".to_string()),
+                payload: json!({}),
+            },
+            QueryExecutionResult {
+                rows: Vec::new(),
+                rows_affected: 7,
+            },
+        );
+
+        assert_eq!(events[0]["event"], "result");
+        assert_eq!(events[0]["rows_affected"], 7);
+        assert_eq!(events[0]["rows"], json!([]));
     }
 
     #[test]

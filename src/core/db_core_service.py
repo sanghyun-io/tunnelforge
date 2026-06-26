@@ -201,6 +201,7 @@ class DbCoreFacade:
 
     def __init__(self, client: Optional[DbCoreServiceClient] = None):
         self.client = client or DbCoreServiceClient()
+        self.last_rows_affected = 0
 
     def hello(self) -> Dict[str, Any]:
         return self.client.request("service.hello")
@@ -246,6 +247,7 @@ class DbCoreFacade:
             "query.execute",
             {"connection": endpoint.to_payload(), "sql": sql, "params": list(params or [])},
         )
+        self.last_rows_affected = int(result.get("rows_affected") or 0)
         rows = result.get("rows")
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
@@ -259,6 +261,7 @@ class DbCoreFacade:
             "query.execute",
             {"connection_id": connection_id, "sql": sql, "params": list(params or [])},
         )
+        self.last_rows_affected = int(result.get("rows_affected") or 0)
         rows = result.get("rows")
         return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
@@ -627,7 +630,10 @@ class RustDbCursor:
             self.description = []
         else:
             self.description = None
-        self.rowcount = len(self._rows)
+        if query_returns_rows(query):
+            self.rowcount = len(self._rows)
+        else:
+            self.rowcount = int(getattr(self.connection.facade, "last_rows_affected", len(self._rows)))
         return self.rowcount
 
     def executemany(self, query: str, data: Sequence[Sequence[Any]]) -> int:

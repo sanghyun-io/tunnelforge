@@ -99,7 +99,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1830 passed, 5 warnings" not in doc
     assert "PASS, 1832 passed, 5 warnings" not in doc
     assert "PASS, 1834 passed, 5 warnings" not in doc
-    assert "PASS, 1835 passed, 5 warnings" in doc
+    assert "PASS, 1835 passed, 5 warnings" not in doc
+    assert "PASS, 1837 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -117,6 +118,9 @@ def test_current_status_does_not_describe_stale_full_pytest_count_as_current():
         "current full Python suite is now `1834 passed, 5 warnings`",
         "current `1834 passed, 5 warnings` evidence",
         "now reports `1834 passed, 5 warnings`",
+        "current full Python suite is now `1835 passed, 5 warnings`",
+        "current `1835 passed, 5 warnings` evidence",
+        "now reports `1835 passed, 5 warnings`",
     ]
 
     for phrase in stale_current_phrases:
@@ -131,9 +135,23 @@ def test_current_status_tracks_post_151_full_pytest_refresh_issue():
     assert "TF-STATUS-053" in doc
     assert "GitHub #152" in doc
     assert "post-#151 full-suite evidence refresh" in normalized_doc
-    assert "1835 passed, 5 warnings" in doc
+    assert "1837 passed, 5 warnings" in doc
     assert "GitHub #152 is fixed" in summary
     assert "stale 1832-count wording cannot return as current evidence" in normalized_doc
+
+
+def test_current_status_tracks_rust_core_dml_rowcount_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-054" in doc
+    assert "GitHub #153" in doc
+    assert "Rust Core DML affected row counts" in doc
+    assert "rows_affected" in doc
+    assert "RustDbCursor.rowcount" in doc
+    assert "GitHub #153 is fixed" in summary
+    assert "scheduled SQL and SQL editor DML reporting" in normalized_doc
 
 
 def test_current_status_records_post_151_next_issue_analysis():
