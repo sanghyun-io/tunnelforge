@@ -26,3 +26,21 @@ def test_oneclick_readiness_does_not_present_closed_issues_as_current_tracking()
 
     for phrase in stale_phrases:
         assert phrase not in doc
+
+
+def test_oneclick_evidence_readme_does_not_describe_completed_evidence_as_future():
+    readme = (
+        PROJECT_ROOT / "reports" / "oneclick_readiness" / "README.md"
+    ).read_text(encoding="utf-8")
+
+    stale_phrases = [
+        "for a future controlled local non-dry-run",
+        "shape for future controlled local",
+        "Validate future charset/collation evidence",
+    ]
+
+    for phrase in stale_phrases:
+        assert phrase not in readme
+
+    assert "`oneclick-real-execution-evidence.json` was captured" in readme
+    assert "`oneclick-charset-evidence.json` is captured" in readme

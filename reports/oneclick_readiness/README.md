@@ -19,12 +19,13 @@ This directory stores machine-checkable One-Click readiness evidence.
   evidence and the UI-facing `oneclick.run dry_run=false` sequencing were
   proven.
 - `oneclick-real-execution-evidence.template.json` documents the required
-  GitHub #138 evidence shape for a future controlled local non-dry-run
-  `deprecated_engine -> engine_innodb` run. It is a template only, not
-  completed evidence.
+  GitHub #138 evidence shape for refreshing the controlled local non-dry-run
+  `deprecated_engine -> engine_innodb` proof. It is a template only, not the
+  completed evidence artifact.
 - `oneclick-charset-evidence.template.json` documents the GitHub #139 evidence
-  shape for future controlled local `charset_issue -> charset_collation_fk_safe`
-  runs. It is a template only, not completed evidence.
+  shape for refreshing controlled local
+  `charset_issue -> charset_collation_fk_safe` proof. It is a template only,
+  not the completed evidence artifact.
 - `oneclick-charset-evidence.json` is captured from a local MySQL container
   using Rust Core `oneclick.apply_fixes` with `dry_run=false` against
   `tf_oneclick_charset.tf_oneclick_parent` and
@@ -52,7 +53,7 @@ Validate the real-execution evidence with:
 python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json
 ```
 
-Validate future charset/collation evidence with:
+Validate the charset/collation evidence with:
 
 ```powershell
 python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.json
