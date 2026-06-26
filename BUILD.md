@@ -344,7 +344,7 @@ PyInstaller로 빌드한 EXE 파일을 Inno Setup으로 패키징하여 Windows 
 **이 스크립트가 자동으로 하는 일:**
 1. ✅ Rust DB Core `tunnelforge-core.exe` 빌드
 2. ✅ PyInstaller로 `TunnelForge.exe` 빌드
-3. ✅ Inno Setup으로 `TunnelForge-Setup-1.0.0.exe` 생성
+3. ✅ Inno Setup으로 `TunnelForge-Setup-{version}.exe` 생성
 4. ✅ 빌드 과정 상태를 실시간으로 표시
 5. ✅ 에러 발생 시 명확한 해결 방법 안내
 
@@ -376,7 +376,7 @@ pyinstaller tunnel-manager.spec
 
 # 3단계: Inno Setup 컴파일러로 .iss 파일을 읽어서 Installer 생성
 "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\TunnelForge.iss
-# → 결과: output/TunnelForge-Setup-1.0.0.exe
+# → 결과: output/TunnelForge-Setup-{version}.exe
 ```
 
 **참고:** `TunnelForge.iss`는 직접 실행하는 게 아니라 Inno Setup 컴파일러(ISCC.exe)가 읽는 설정 파일입니다.
@@ -400,14 +400,14 @@ tunnel-manager/
 ├── dist/
 │   └── TunnelForge.exe          # PyInstaller 빌드 결과
 └── output/
-    └── TunnelForge-Setup-1.0.0.exe  # Windows Installer
+    └── TunnelForge-Setup-{version}.exe  # Windows Installer
 ```
 
 ### Installer 테스트
 
 ```powershell
 # Installer 실행
-.\output\TunnelForge-Setup-1.0.0.exe
+.\output\TunnelForge-Setup-{version}.exe
 
 # 설치 후 확인사항:
 # 1. 시작 메뉴에서 "TunnelForge" 검색
@@ -422,7 +422,7 @@ tunnel-manager/
 
 ```iss
 [Setup]
-AppVersion=1.0.0                      ; 버전 번호
+AppVersion={#MyAppVersion}            ; src/version.py에서 동기화된 버전 번호
 DefaultDirName={autopf}\...          ; 기본 설치 경로
 Compression=lzma2/ultra64            ; 압축 설정
 

@@ -106,6 +106,10 @@ One-Click module scope wording now matches the current implementation: Rust DB
 Core owns the workflow, dry-run is the default, and real execution is limited
 to backup-confirmed validated scopes.
 
+Windows installer examples in `BUILD.md` now avoid the stale `1.0.0` sample
+version and use `{version}` / `{#MyAppVersion}` placeholders aligned with the
+release version sync path.
+
 ## Current Baseline Verification
 
 Commands run locally. Full-suite count refreshed on 2026-06-27; some broader
@@ -115,7 +119,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before this document |
-| `pytest -q` | PASS, 1803 passed, 5 warnings |
+| `pytest -q` | PASS, 1805 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 166 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -139,9 +143,10 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1803 passed, 5 warnings |
+| `pytest -q` | PASS, 1805 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
+| `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
 | `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope tests\test_current_status_docs.py::test_current_status_records_oneclick_module_scope_docstring_cleanup -q` | RED then PASS |
 | `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138 tests\test_current_status_docs.py::test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup -q` | RED then PASS |
 | `pytest tests\test_main_window_export_import_labels.py -q` | PASS |
@@ -156,12 +161,13 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | One-Click module scope docstring | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope tests\test_current_status_docs.py::test_current_status_records_oneclick_module_scope_docstring_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Module-level One-Click wording no longer says the whole migration process is automatically executed; it now describes Rust DB Core dry-run default and limited real execution, and the full Python suite count is refreshed to 1803 passed, 5 warnings |
-| 2026-06-27 | One-Click fallback dry-run tooltip | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138 tests\test_current_status_docs.py::test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | The disabled-real-execution fallback tooltip now says real execution is `disabled in this build` and no longer points at the already closed GitHub #138 gate; the current full Python suite count is superseded above by the 1803-test run |
-| 2026-06-27 | Rust Core Export/Import menu wording | RED/GREEN: `pytest tests\test_main_window_export_import_labels.py -q`; `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count tests\test_current_status_docs.py::test_current_status_records_rust_core_export_import_menu_wording -q`; final: `pytest -q`; `pytest tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\main_window.py tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Tunnel context menu actions now display `Rust DB Core Export` / `Rust DB Core Import`, handlers use `_context_rust_core_export` / `_context_rust_core_import`; the current full Python suite count is superseded above by the 1803-test run |
+| 2026-06-27 | BUILD installer version examples | RED/GREEN: `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q`; final: `pytest -q`; `pytest tests\test_build_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_build_docs.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | `BUILD.md` no longer shows stale 1.0.0 installer filename/AppVersion examples; installer examples use `{version}` and `AppVersion={#MyAppVersion}`, and the full Python suite count is refreshed to 1805 passed, 5 warnings |
+| 2026-06-27 | One-Click module scope docstring | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope tests\test_current_status_docs.py::test_current_status_records_oneclick_module_scope_docstring_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Module-level One-Click wording no longer says the whole migration process is automatically executed; it now describes Rust DB Core dry-run default and limited real execution; the current full Python suite count is superseded above by the 1805-test run |
+| 2026-06-27 | One-Click fallback dry-run tooltip | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138 tests\test_current_status_docs.py::test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | The disabled-real-execution fallback tooltip now says real execution is `disabled in this build` and no longer points at the already closed GitHub #138 gate; the current full Python suite count is superseded above by the 1805-test run |
+| 2026-06-27 | Rust Core Export/Import menu wording | RED/GREEN: `pytest tests\test_main_window_export_import_labels.py -q`; `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count tests\test_current_status_docs.py::test_current_status_records_rust_core_export_import_menu_wording -q`; final: `pytest -q`; `pytest tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\main_window.py tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Tunnel context menu actions now display `Rust DB Core Export` / `Rust DB Core Import`, handlers use `_context_rust_core_export` / `_context_rust_core_import`; the current full Python suite count is superseded above by the 1805-test run |
 | 2026-06-27 | Current baseline duplicate service.hello cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Current Baseline Verification` now keeps one `tunnelforge-core service.hello` row that covers dump/import, migration, and One-Click capability evidence |
 | 2026-06-27 | Focused verification duplicate row cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_focused_verification_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Focused Verification On 2026-06-27` no longer repeats the same `python scripts\check-macos-support-gate.py --skip-github` check row |
-| 2026-06-27 | Current baseline count refresh after re-audit coverage | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_macos_focused_test_count tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top current baseline reflects the refreshed current-status coverage and macOS focused suite evidence; the current `pytest -q` row is superseded above by the 1803-test run, and macOS focused tests are 52 passed |
+| 2026-06-27 | Current baseline count refresh after re-audit coverage | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_macos_focused_test_count tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top current baseline reflects the refreshed current-status coverage and macOS focused suite evidence; the current `pytest -q` row is superseded above by the 1805-test run, and macOS focused tests are 52 passed |
 | 2026-06-27 | Current main next-issue re-audit | `git status --short --branch`; `git log --oneline --decorate -5`; `gh issue list --state open --limit 20`; `gh issue view 116 --comments`; `rg -n "pymysql|psycopg|mysql\.connector|mysqldump|pg_dump|mysqlpump|mysqlimport|\bpsql\b" src scripts`; `rg -n "execute\(|cursor\(|commit\(|rollback\(" src\core src\ui src\exporters`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | Main is aligned with origin/main, #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core baseline scan found no new repo-side violation; legacy-shaped DB connector paths route through Rust Core shims |
 | 2026-06-27 | Current baseline verification heading | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top status no longer labels the mixed current baseline as `Verified On 2026-06-26`; the section now distinguishes the refreshed 2026-06-27 full-suite count from preserved 2026-06-26 broader baseline evidence |
 | 2026-06-27 | Current full Python suite count refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py`; `git diff --check` | PASS | Updated top current-status full Python suite count from stale `1786 passed` to current `1793 passed, 5 warnings` after recent documentation regression tests |
@@ -1304,7 +1310,7 @@ Evidence:
 
 Resolution:
 
-- The top `pytest -q` verification row now reports `1803 passed, 5 warnings`.
+- The top `pytest -q` verification row now reports `1805 passed, 5 warnings`.
 - The top macOS focused verification row now reports `52 passed`.
 - The focused verification table records the refreshed full-suite command.
 
@@ -1441,6 +1447,33 @@ Next action:
 1. Keep One-Click source-level comments aligned with the supported execution
    matrix when the workflow expands.
 
+### TF-STATUS-037: BUILD Installer Version Examples
+
+Status: closed
+Severity: Low
+Area: Build documentation
+
+Evidence:
+
+- `BUILD.md` still showed stale 1.0.0 installer filename/AppVersion examples
+  even though release version sources are aligned at `2.1.6` and the installer
+  uses `MyAppVersion`.
+- RED/GREEN coverage now rejects the stale installer example version and
+  requires `{version}` / `{#MyAppVersion}` placeholders.
+
+Resolution:
+
+- Replaced stale Windows installer output/test examples with
+  `TunnelForge-Setup-{version}.exe`.
+- Updated the Inno Setup snippet to use `AppVersion={#MyAppVersion}` and note
+  that it is synced from `src/version.py`.
+- The regression is recorded in `tests/test_build_docs.py`.
+
+Next action:
+
+1. Keep build documentation examples version-neutral unless they intentionally
+   document the current release version.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1481,6 +1514,7 @@ Next action:
 | TF-STATUS-034 | Low | closed | Export/Import UI | Rust Core Export/Import menu wording | Keep Export/Import labels aligned with Rust Core ownership |
 | TF-STATUS-035 | Low | closed | One-Click migration UI | One-Click fallback dry-run tooltip | Keep feature-flag fallback copy aligned with current support matrix |
 | TF-STATUS-036 | Low | closed | One-Click migration UI | One-Click module scope docstring | Keep source comments aligned with the One-Click support matrix |
+| TF-STATUS-037 | Low | closed | Build documentation | BUILD installer version examples | Keep build examples version-neutral or synced |
 
 ## Recommended Execution Order
 
@@ -1581,9 +1615,10 @@ Next action:
 | 2026-06-27 | Refreshed TF-STATUS-028 after rerunning the full Python suite. The current suite is now `1793 passed, 5 warnings`, replacing the stale `1786 passed` handoff count. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; final: `pytest -q`, docs pytest, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-029 after noticing the top verification table still said `Verified On 2026-06-26` while containing a 2026-06-27 full pytest count. The section now describes a current baseline with preserved broader rows. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Re-audited current main and the next remaining issue. #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core boundary scan found no new repo-side baseline violation; legacy-shaped DB connector names currently route through Rust Core shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_current_main_next_issue_reaudit -q`; final: #116 gates, macOS/docs focused pytest, current-status pytest, compileall, `git diff --check` |
-| 2026-06-27 | Refreshed the top baseline counts after adding current-status re-audit coverage. The current full Python suite is now `1803 passed, 5 warnings`, and the current macOS focused suite is `52 passed`. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: stale-count current-status pytest; final: `pytest -q`, current-status pytest, macOS/docs focused pytest, compileall, `git diff --check` |
+| 2026-06-27 | Refreshed the top baseline counts after adding current-status re-audit coverage. The current full Python suite is now `1805 passed, 5 warnings`, and the current macOS focused suite is `52 passed`. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: stale-count current-status pytest; final: `pytest -q`, current-status pytest, macOS/docs focused pytest, compileall, `git diff --check` |
 | 2026-06-27 | Removed a duplicate `--skip-github` row from the focused verification table and added a current-status regression so future focused verification command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Merged duplicate `tunnelforge-core service.hello` rows in the current baseline table and added a regression so current baseline command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: baseline duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-034 after finding legacy-branded Export/Import context-menu wording on the Rust Core path; handlers and labels now use Rust DB Core naming, with a focused source-level regression and refreshed full-suite count. | `src/ui/main_window.py`, `tests/test_main_window_export_import_labels.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: Export/Import label pytest and current-status pytest; final: `pytest -q`, focused docs/UI pytest, compileall, `git diff --check`, #116 gate checks |
 | 2026-06-27 | Fixed TF-STATUS-035 after finding One-Click disabled-real-execution fallback copy still pointed at closed #138; the fallback now describes real execution as disabled in this build and keeps dry-run preview wording current. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: One-Click tooltip/current-status pytest; final: `pytest -q`, focused One-Click/current-status pytest, compileall, `git diff --check`, #116 gates |
 | 2026-06-27 | Fixed TF-STATUS-036 after finding the One-Click module docstring still overpromised full automatic migration; it now describes Rust DB Core dry-run default and limited backup-confirmed real execution. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: One-Click docstring/current-status pytest; final: `pytest -q`, focused One-Click/current-status pytest, compileall, `git diff --check`, #116 gates |
+| 2026-06-27 | Fixed TF-STATUS-037 after finding stale Windows installer version examples in `BUILD.md`; output/test paths now use `{version}` and the Inno snippet uses `{#MyAppVersion}`. | `BUILD.md`, `tests/test_build_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: build-doc/current-status pytest; final: `pytest -q`, focused build-doc/current-status pytest, compileall, `git diff --check`, #116 gates |

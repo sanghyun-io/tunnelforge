@@ -80,7 +80,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1799 passed, 5 warnings" not in doc
     assert "PASS, 1801 passed, 5 warnings" not in doc
     assert "1801 passed, 5 warnings" not in doc
-    assert "PASS, 1803 passed, 5 warnings" in doc
+    assert "PASS, 1803 passed, 5 warnings" not in doc
+    assert "PASS, 1805 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -139,6 +140,15 @@ def test_current_status_records_oneclick_module_scope_docstring_cleanup():
     assert "One-Click module scope docstring" in doc
     assert "Rust DB Core dry-run default and limited real execution" in doc
     assert "전체 마이그레이션 프로세스를 자동으로 실행합니다" not in doc
+
+
+def test_current_status_records_build_doc_installer_version_cleanup():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+
+    assert "TF-STATUS-037" in doc
+    assert "BUILD installer version examples" in doc
+    assert "TunnelForge-Setup-{version}.exe" in doc
+    assert "TunnelForge-Setup-1.0.0.exe" not in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
