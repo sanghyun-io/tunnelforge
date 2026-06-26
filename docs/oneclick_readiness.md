@@ -66,6 +66,53 @@ Current Rust Core recommendation coverage:
 | `int_display_width` | manual or skip | `manual` | MySQL 8.4 ignores display width semantics; no automatic DDL is currently applied. |
 | `enum_empty_value` | manual | `manual` | Requires data cleanup policy. |
 
+## Charset/Collation Automation Policy (#139)
+
+No charset/collation One-Click real execution is enabled yet. The following
+policy defines the only scope that can become eligible in a future change.
+
+Eligible automatic subset:
+
+- Issue type must be exactly `charset_issue`.
+- Strategy must be exactly `charset_collation_fk_safe`.
+- Execution must be table-level only:
+  `ALTER TABLE <schema>.<table> CONVERT TO CHARACTER SET <target> COLLATE <target>;`.
+- The target must be explicit in the request/evidence. The current planned
+  target is `utf8mb4` with `utf8mb4_0900_ai_ci`.
+- Every table name must use the safe local evidence prefix `tf_oneclick_` while
+  the feature is being proven.
+- Every table in the FK-connected conversion set must be present in the
+  evidence `tables` list and in `fk_order`.
+- Before evidence must prove each converted table was not already at the target
+  charset/collation.
+- After evidence must prove every converted table reached the target
+  charset/collation and that FK constraints remain valid.
+- Rollback metadata and rollback SQL must be captured before the real
+  conversion is considered valid evidence.
+
+Manual or fail-closed subset:
+
+- Column-level charset/collation changes.
+- Mixed or ambiguous target charset/collation.
+- Missing FK dependency ordering or FK closure information.
+- Missing rollback metadata.
+- Any table outside the controlled local `tf_oneclick_` evidence namespace.
+- Any production database evidence or production execution claim.
+- Any charset/collation strategy other than `charset_collation_fk_safe`.
+- Any bundled remediation with invalid dates, ZEROFILL, float precision,
+  integer display width, enum cleanup, or other issue types.
+
+Implementation gate:
+
+- Rust Core recommendation changes must not mark `charset_issue` as
+  `auto_fixable` until `oneclick.apply_fixes` and UI-facing
+  `oneclick.run dry_run=false` can execute or fail closed for the exact
+  allowlisted strategy.
+- The optional regression gate
+  `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` must pass against
+  `reports\oneclick_readiness\oneclick-charset-evidence.json` before
+  `charset_issue` is added to the real-execution allowlist.
+
 ## Real-Execution Gate Outcome
 
 The dry-run lock was removed only for the first validated automatic-fix scope.

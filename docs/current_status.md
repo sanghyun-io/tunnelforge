@@ -904,6 +904,10 @@ Evidence:
 - `scripts\rust-core-regression-gate.ps1` can require completed charset
   evidence with `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1`; it fails
   until `reports\oneclick_readiness\oneclick-charset-evidence.json` exists.
+- `docs\oneclick_readiness.md` now defines the #139 policy boundary: only
+  table-level `charset_issue -> charset_collation_fk_safe` with explicit
+  target charset/collation, FK closure/order evidence, rollback metadata, and
+  local `tf_oneclick_` evidence can become automatic in a future change.
 
 GitHub issue:
 
@@ -950,7 +954,7 @@ Next action:
 | TF-STATUS-018 | High | closed | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence captured | Refresh final validator evidence if migration/RSS semantics change |
 | TF-STATUS-019 | Medium | closed | One-Click migration UI | Dry-run preview One-Click entry point | Keep preview evidence aligned if event payloads change |
 | TF-STATUS-020 | High | closed | One-Click migration UI / Rust Core automatic fixes | Real execution and automatic fix coverage | Track any additional automatic fix class as a separate issue |
-| TF-STATUS-021 | High | open | One-Click migration UI / Rust Core automatic fixes | Charset/collation automatic fix coverage | Work GitHub #139; keep charset_issue manual until FK-safe evidence exists |
+| TF-STATUS-021 | High | open | One-Click migration UI / Rust Core automatic fixes | Charset/collation automatic fix coverage | Implement #139 behind the documented policy and validator; keep charset_issue manual until FK-safe evidence exists |
 
 ## Recommended Execution Order
 
@@ -1014,3 +1018,4 @@ Next action:
 | 2026-06-26 | Closed GitHub #138, scanned remaining open issues, and re-audited #116 as the only remaining open issue. The macOS support gate and focused tests still pass; #116 remains blocked only on real operator Mac evidence. | `docs/current_status.md` | `gh issue list --repo sanghyun-io/tunnelforge --state open --limit 20 --json number,title,labels,url`; `gh issue view 116 --repo sanghyun-io/tunnelforge --json number,title,state,body,comments,url,labels`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` |
 | 2026-06-26 | Created GitHub #139 and TF-STATUS-021 for the next actionable One-Click automatic-fix class: charset/collation coverage. | `docs/current_status.md`, `docs/oneclick_readiness.md` | `rg -n "charset_issue|invalid_date|zerofill_usage|float_precision|enum_empty_value|deprecated_engine|engine_innodb|manual|oneclick_recommend|oneclick_apply" migration_core\src\lib.rs tests docs\oneclick_readiness.md`; `gh issue create` created #139 |
 | 2026-06-26 | Added the #139 charset/collation evidence validator, JSON template, and optional regression-gate hook without enabling charset real execution. | `scripts/validate-oneclick-charset-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_oneclick_charset_evidence.py`, `reports/oneclick_readiness/oneclick-charset-evidence.template.json`, `reports/oneclick_readiness/README.md`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_charset_evidence.py -q`; expected reject: `python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.template.json`; expected reject until evidence capture: `$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
+| 2026-06-26 | Documented the #139 charset/collation automation policy boundary before enabling any Rust Core recommendation or execution path. | `docs/oneclick_readiness.md`, `docs/current_status.md` | Policy-only change; no charset real execution enabled |
