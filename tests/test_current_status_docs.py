@@ -93,7 +93,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1820 passed, 5 warnings" not in doc
     assert "PASS, 1822 passed, 5 warnings" not in doc
     assert "PASS, 1823 passed, 5 warnings" not in doc
-    assert "PASS, 1825 passed, 5 warnings" in doc
+    assert "PASS, 1825 passed, 5 warnings" not in doc
+    assert "PASS, 1826 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -259,6 +260,22 @@ def test_current_status_tracks_legacy_execute_many_issue():
     assert "MySQLConnector.execute_many" in doc
     assert "GitHub #146 is fixed" in summary
     assert "read/query helper behavior is unchanged" in doc
+
+
+def test_current_status_records_post_146_next_issue_analysis():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-045" in doc
+    assert "Post-#146 next issue analysis" in doc
+    assert "#116 is still the only open GitHub issue" in summary
+    assert "normal repository-side #116 gate passes" in normalized_doc
+    assert "no macOS manual validation report found under build/" in doc
+    assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
+    assert "not a new repo-side implementation issue" in normalized_doc
+    assert "No repo-side implementation issue is currently open after TF-STATUS-040" in order
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
