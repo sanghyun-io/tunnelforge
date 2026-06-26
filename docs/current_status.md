@@ -908,6 +908,14 @@ Evidence:
   table-level `charset_issue -> charset_collation_fk_safe` with explicit
   target charset/collation, FK closure/order evidence, rollback metadata, and
   local `tf_oneclick_` evidence can become automatic in a future change.
+- 2026-06-26 next-issue analysis confirmed #139 is the next in-repo issue
+  after the latest `main` merge. GitHub #116 remains external real-Mac
+  evidence work, while #139 has concrete Rust Core, PyQt, and local MySQL
+  evidence tasks that can proceed in this repository.
+- Existing Python Fix Wizard charset code already generates FK DROP, table
+  conversion, FK ADD, and recovery SQL, but #139 must not route One-Click real
+  execution through Python DB drivers. The reusable idea is the contract shape;
+  execution ownership must stay in `tunnelforge-core`.
 
 GitHub issue:
 
@@ -922,13 +930,19 @@ Impact:
 
 Next action:
 
-1. Work GitHub #139: implement the eligible charset/collation subset in Rust
-   Core behind the evidence contract, including target policy, FK-safe ordering,
-   rollback metadata, Rust Core contract tests, PyQt rendering tests, and local
-   MySQL before/after evidence.
-2. Keep `charset_issue` out of the One-Click real-execution allowlist until
-   validator-backed evidence passes and docs/status are updated in the same
-   change.
+1. Add #139 capture/report scaffolding first so local MySQL before/after
+   evidence can be produced in the validator's required shape without opening
+   the charset execution allowlist early.
+2. Add Rust Core contract tests for `charset_issue -> charset_collation_fk_safe`
+   recommendation payloads, target policy, disallowed strategies, FK closure,
+   rollback metadata, and generated SQL.
+3. Implement the Rust Core allowlisted charset path only after those failing
+   tests exist; keep `oneclick.apply_fixes` and `oneclick.run dry_run=false`
+   fail-closed for every other charset strategy.
+4. Add PyQt rendering/count/copy tests for automatic vs manual charset payloads.
+5. Capture completed local MySQL evidence and enable
+   `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` in the final verification
+   pass before documenting or closing #139.
 
 ## Issue Tracker
 
@@ -1019,3 +1033,4 @@ Next action:
 | 2026-06-26 | Created GitHub #139 and TF-STATUS-021 for the next actionable One-Click automatic-fix class: charset/collation coverage. | `docs/current_status.md`, `docs/oneclick_readiness.md` | `rg -n "charset_issue|invalid_date|zerofill_usage|float_precision|enum_empty_value|deprecated_engine|engine_innodb|manual|oneclick_recommend|oneclick_apply" migration_core\src\lib.rs tests docs\oneclick_readiness.md`; `gh issue create` created #139 |
 | 2026-06-26 | Added the #139 charset/collation evidence validator, JSON template, and optional regression-gate hook without enabling charset real execution. | `scripts/validate-oneclick-charset-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_oneclick_charset_evidence.py`, `reports/oneclick_readiness/oneclick-charset-evidence.template.json`, `reports/oneclick_readiness/README.md`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_charset_evidence.py -q`; expected reject: `python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.template.json`; expected reject until evidence capture: `$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
 | 2026-06-26 | Documented the #139 charset/collation automation policy boundary before enabling any Rust Core recommendation or execution path. | `docs/oneclick_readiness.md`, `docs/current_status.md` | Policy-only change; no charset real execution enabled |
+| 2026-06-26 | Reconfirmed the latest changes are already on `main`/`origin/main` and analyzed the next open issue. #139 is the next in-repo issue; #116 remains external real-Mac evidence. The next safe #139 step is evidence capture/report scaffolding before any Rust Core charset allowlist expansion. | `docs/current_status.md` | `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30 --json number,title,labels,updatedAt,createdAt,url,assignees`; `gh issue view 139 --comments --json ...`; `gh issue view 116 --json ...`; `rg -n "charset_issue|charset|collation|oneclick_auto_fix_option|oneclick_apply_actions|engine_innodb|deprecated_engine" migration_core\src\lib.rs tests docs\oneclick_readiness.md src` |
