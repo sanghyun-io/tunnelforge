@@ -54,8 +54,8 @@ The current supported scope is intentionally narrow:
 ## Not Yet Supported
 
 - Production database usage.
-- Automatic remediation coverage beyond
-  `deprecated_engine -> engine_innodb`.
+- UI-facing `oneclick.run dry_run=false` charset/collation execution and
+  completed charset/collation evidence.
 
 ## Automatic Fix Coverage
 
@@ -64,7 +64,7 @@ Current Rust Core recommendation coverage:
 | Issue type | Status | Strategy | Notes |
 | --- | --- | --- | --- |
 | `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. `oneclick.apply_fixes` and UI-facing `oneclick.run dry_run=false` execute only this strategy through Rust Core. PyQt requires backup confirmation before sending a non-dry-run payload. |
-| `charset_issue` | gated preview only | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify a charset issue as an automatic dry-run candidate only when the request includes complete safe `charset_contracts` data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. Real execution remains disallowed. |
+| `charset_issue` | command-level allowlisted, evidence pending | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify and execute a command-level charset fix only when the request includes complete safe contract data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. UI-facing `oneclick.run dry_run=false`, capture tooling, and completed local MySQL evidence remain pending. |
 | `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
 | `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
 | `float_precision` | manual | `manual` | Requires precision/scale policy review. |
@@ -73,8 +73,10 @@ Current Rust Core recommendation coverage:
 
 ## Charset/Collation Automation Policy (#139)
 
-No charset/collation One-Click real execution is enabled yet. The following
-policy defines the only scope that can become eligible in a future change.
+Charset/collation command-level execution is now allowlisted only for complete
+`charset_collation_fk_safe` contracts. UI-facing `oneclick.run dry_run=false`
+charset execution and completed local MySQL evidence are still pending. The
+following policy defines the only eligible scope.
 
 Eligible automatic subset:
 
@@ -117,17 +119,17 @@ Implementation gate:
   `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` must pass against
   `reports\oneclick_readiness\oneclick-charset-evidence.json` before
   `charset_issue` is added to the real-execution allowlist.
-- `scripts\capture-oneclick-charset-evidence.py` must remain fail-closed for
-  live capture until the Rust Core allowlist path exists. The scaffold is only
-  a report-shape and safe-scope helper at this stage.
+- `scripts\capture-oneclick-charset-evidence.py` still needs a live capture
+  implementation and must only use local `tf_oneclick_` evidence scopes.
 - Rust Core now uses the `charset_collation_fk_safe` contract helper for
   `oneclick.recommend` when `charset_contracts[]` includes a complete contract
   for the issue index. Missing or incomplete contract data keeps the issue
   manual.
 - `oneclick.apply_fixes dry_run=true` can return charset `planned_fixes` for a
   complete contract without executing SQL. `oneclick.apply_fixes dry_run=false`
-  still rejects `charset_issue:charset_collation_fk_safe` as disallowed until
-  live execution and validator-backed evidence are implemented.
+  can execute the contract SQL through the Rust adapter path and includes
+  rollback metadata in the applied-fix payload; validator-backed live MySQL
+  evidence is still required before #139 can close.
 
 ## Real-Execution Gate Outcome
 

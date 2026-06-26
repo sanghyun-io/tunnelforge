@@ -6067,6 +6067,12 @@ struct OneClickApplyAction {
     schema: String,
     table: String,
     sql: String,
+    tables: Vec<String>,
+    fk_order: Vec<String>,
+    sql_statements: Vec<String>,
+    rollback_sql: Vec<String>,
+    target_charset: Option<String>,
+    target_collation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6121,6 +6127,43 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
             skipped += 1;
             continue;
         }
+        if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
+            match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
+                Ok(option) => {
+                    let tables = oneclick_required_string_list(option.get("tables"), "tables")
+                        .unwrap_or_default();
+                    let fk_order =
+                        oneclick_required_string_list(option.get("fk_order"), "fk_order")
+                            .unwrap_or_default();
+                    let sql_statements =
+                        oneclick_required_string_list(option.get("sql"), "sql").unwrap_or_default();
+                    let rollback_sql =
+                        oneclick_required_string_list(option.get("rollback_sql"), "rollback_sql")
+                            .unwrap_or_default();
+                    actions.push(OneClickApplyAction {
+                        issue_type: issue_type.to_string(),
+                        strategy: strategy.to_string(),
+                        schema: schema.to_string(),
+                        table: tables.first().cloned().unwrap_or_default(),
+                        sql: sql_statements.first().cloned().unwrap_or_default(),
+                        tables,
+                        fk_order,
+                        sql_statements,
+                        rollback_sql,
+                        target_charset: option
+                            .get("target_charset")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                        target_collation: option
+                            .get("target_collation")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    });
+                }
+                Err(_) => disallowed.push(format!("{issue_type}:{strategy}")),
+            }
+            continue;
+        }
         if issue_type != "deprecated_engine" || strategy != "engine_innodb" {
             disallowed.push(format!("{issue_type}:{strategy}"));
             continue;
@@ -6149,8 +6192,14 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
             issue_type: issue_type.to_string(),
             strategy: strategy.to_string(),
             schema: schema.to_string(),
-            table,
-            sql,
+            table: table.clone(),
+            sql: sql.clone(),
+            tables: vec![table],
+            fk_order: Vec::new(),
+            sql_statements: vec![sql],
+            rollback_sql: Vec::new(),
+            target_charset: None,
+            target_collation: None,
         });
     }
 
@@ -6246,33 +6295,26 @@ fn oneclick_execute_apply_plan<A: MigrationAdapter>(
     let mut applied_fixes = Vec::new();
 
     for action in &plan.actions {
-        match adapter.execute_sql(&action.sql) {
-            Ok(()) => {
-                success_count += 1;
-                log.push(format!("APPLIED: {}", action.sql));
-                applied_fixes.push(json!({
-                    "issue_type": action.issue_type,
-                    "strategy": action.strategy,
-                    "schema": action.schema,
-                    "table": action.table,
-                    "sql": action.sql,
-                    "success": true,
-                    "rows_affected": 0
-                }));
+        let mut action_error = None;
+        for sql in &action.sql_statements {
+            match adapter.execute_sql(sql) {
+                Ok(()) => {
+                    log.push(format!("APPLIED: {sql}"));
+                }
+                Err(err) => {
+                    log.push(format!("FAILED: {sql}: {err}"));
+                    action_error = Some(err);
+                    break;
+                }
             }
-            Err(err) => {
-                fail_count += 1;
-                log.push(format!("FAILED: {}: {err}", action.sql));
-                applied_fixes.push(json!({
-                    "issue_type": action.issue_type,
-                    "strategy": action.strategy,
-                    "schema": action.schema,
-                    "table": action.table,
-                    "sql": action.sql,
-                    "success": false,
-                    "error": err
-                }));
-            }
+        }
+
+        if let Some(err) = action_error {
+            fail_count += 1;
+            applied_fixes.push(oneclick_applied_fix_payload(action, false, Some(&err)));
+        } else {
+            success_count += 1;
+            applied_fixes.push(oneclick_applied_fix_payload(action, true, None));
         }
     }
 
@@ -6282,6 +6324,45 @@ fn oneclick_execute_apply_plan<A: MigrationAdapter>(
         log,
         applied_fixes,
     }
+}
+
+fn oneclick_applied_fix_payload(
+    action: &OneClickApplyAction,
+    success: bool,
+    error: Option<&str>,
+) -> Value {
+    if action.issue_type == "charset_issue" && action.strategy == "charset_collation_fk_safe" {
+        let mut payload = json!({
+            "issue_type": action.issue_type,
+            "strategy": action.strategy,
+            "schema": action.schema,
+            "tables": action.tables,
+            "target_charset": action.target_charset,
+            "target_collation": action.target_collation,
+            "sql": action.sql_statements,
+            "rollback_sql": action.rollback_sql,
+            "fk_order": action.fk_order,
+            "success": success
+        });
+        if let Some(error) = error {
+            payload["error"] = json!(error);
+        }
+        return payload;
+    }
+
+    let mut payload = json!({
+        "issue_type": action.issue_type,
+        "strategy": action.strategy,
+        "schema": action.schema,
+        "table": action.table,
+        "sql": action.sql,
+        "success": success,
+        "rows_affected": 0
+    });
+    if let Some(error) = error {
+        payload["error"] = json!(error);
+    }
+    payload
 }
 
 fn oneclick_apply_step_table(step: &Value, schema: &str) -> Option<String> {
@@ -10935,7 +11016,7 @@ mod tests {
     }
 
     #[test]
-    fn oneclick_apply_fixes_dry_run_previews_charset_plan_without_execution_allowlist() {
+    fn oneclick_apply_fixes_dry_run_previews_charset_plan_without_executing_sql() {
         let events = handle_request(Request {
             command: "oneclick.apply_fixes".to_string(),
             request_id: Some("oneclick-apply-charset-dry-1".to_string()),
@@ -10982,7 +11063,7 @@ mod tests {
     }
 
     #[test]
-    fn oneclick_apply_fixes_real_charset_still_disallowed_until_execution_evidence() {
+    fn oneclick_apply_fixes_real_charset_requires_endpoint() {
         let events = handle_request(Request {
             command: "oneclick.apply_fixes".to_string(),
             request_id: Some("oneclick-apply-charset-real-1".to_string()),
@@ -11011,17 +11092,16 @@ mod tests {
                 }]
             }),
         });
-        let result = events
+        let error = events
             .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
+            .find(|event| event.get("event") == Some(&json!("error")))
             .unwrap();
 
-        assert_eq!(result["success"], false);
-        assert_eq!(
-            result["disallowed_fix_attempts"],
-            json!(["charset_issue:charset_collation_fk_safe"])
-        );
-        assert_eq!(result["applied_fixes"], json!([]));
+        assert_eq!(error["request_id"], "oneclick-apply-charset-real-1");
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid endpoint"));
     }
 
     #[test]
@@ -11084,6 +11164,128 @@ mod tests {
         assert_eq!(outcome.applied_fixes.len(), 1);
         assert_eq!(outcome.applied_fixes[0]["strategy"], "engine_innodb");
         assert_eq!(outcome.applied_fixes[0]["success"], true);
+    }
+
+    #[test]
+    fn oneclick_apply_plan_executes_charset_sql_in_fk_order_with_rollback_metadata() {
+        let plan = oneclick_apply_actions(&json!({
+            "schema": "tf_oneclick_charset",
+            "steps": [{
+                "issue_type": "charset_issue",
+                "location": "tf_oneclick_charset.tf_oneclick_parent",
+                "table_name": "tf_oneclick_parent",
+                "selected_option": {
+                    "strategy": "charset_collation_fk_safe",
+                    "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+                    "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+                    "target_charset": "utf8mb4",
+                    "target_collation": "utf8mb4_0900_ai_ci",
+                    "sql": [
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+                    ],
+                    "rollback_sql": [
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                    ]
+                }
+            }]
+        }));
+        let mut adapter = RecordingAdapter::default();
+
+        let outcome = oneclick_execute_apply_plan(&plan, &mut adapter);
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec![
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+            ]
+        );
+        assert_eq!(outcome.success_count, 1);
+        assert_eq!(outcome.fail_count, 0);
+        assert_eq!(outcome.applied_fixes[0]["issue_type"], "charset_issue");
+        assert_eq!(
+            outcome.applied_fixes[0]["strategy"],
+            "charset_collation_fk_safe"
+        );
+        assert_eq!(
+            outcome.applied_fixes[0]["tables"],
+            json!(["tf_oneclick_parent", "tf_oneclick_child"])
+        );
+        assert_eq!(
+            outcome.applied_fixes[0]["fk_order"],
+            json!(["tf_oneclick_parent", "tf_oneclick_child"])
+        );
+        assert_eq!(outcome.applied_fixes[0]["target_charset"], "utf8mb4");
+        assert_eq!(
+            outcome.applied_fixes[0]["target_collation"],
+            "utf8mb4_0900_ai_ci"
+        );
+        assert_eq!(
+            outcome.applied_fixes[0]["rollback_sql"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(outcome.applied_fixes[0]["success"], true);
+    }
+
+    #[test]
+    fn oneclick_apply_plan_reports_charset_failure_with_rollback_metadata() {
+        let plan = oneclick_apply_actions(&json!({
+            "schema": "tf_oneclick_charset",
+            "steps": [{
+                "issue_type": "charset_issue",
+                "location": "tf_oneclick_charset.tf_oneclick_parent",
+                "table_name": "tf_oneclick_parent",
+                "selected_option": {
+                    "strategy": "charset_collation_fk_safe",
+                    "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+                    "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+                    "target_charset": "utf8mb4",
+                    "target_collation": "utf8mb4_0900_ai_ci",
+                    "sql": [
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+                    ],
+                    "rollback_sql": [
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                        "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                    ]
+                }
+            }]
+        }));
+        let mut adapter = RecordingAdapter {
+            fail_sql_contains: Some("tf_oneclick_child".to_string()),
+            ..RecordingAdapter::default()
+        };
+
+        let outcome = oneclick_execute_apply_plan(&plan, &mut adapter);
+
+        assert_eq!(
+            adapter.executed_sql,
+            vec!["ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"]
+        );
+        assert_eq!(outcome.success_count, 0);
+        assert_eq!(outcome.fail_count, 1);
+        assert!(outcome
+            .log
+            .iter()
+            .any(|line| line.contains("tf_oneclick_child") && line.contains("FAILED")));
+        assert_eq!(outcome.applied_fixes[0]["success"], false);
+        assert!(outcome.applied_fixes[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("SQL execution error"));
+        assert_eq!(
+            outcome.applied_fixes[0]["rollback_sql"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[test]
