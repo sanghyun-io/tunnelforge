@@ -115,6 +115,23 @@ def test_current_status_does_not_describe_stale_full_pytest_count_as_current():
         assert phrase not in normalized_doc
 
 
+def test_current_status_records_post_151_next_issue_analysis():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-052" in doc
+    assert "Post-#151 main merge and next issue analysis" in doc
+    assert "main is aligned with origin/main at `effe01c`" in normalized_doc
+    assert "#116 is still the only open GitHub issue" in summary
+    assert "normal repository-side #116 gate passes" in normalized_doc
+    assert "no macOS manual validation report found under build/" in doc
+    assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
+    assert "not a repo-side implementation issue" in normalized_doc
+    assert "TF-STATUS-052 reconfirmed no new repo-side issue after #151 closure" in order
+
+
 def test_current_status_current_baseline_section_is_not_stale_dated():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     headings = [line for line in doc.splitlines() if line.startswith("## ")]
