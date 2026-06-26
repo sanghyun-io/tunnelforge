@@ -75,6 +75,7 @@ Commands run locally:
 | `python -m compileall -q main.py src tests` | PASS |
 | `git diff --check` | PASS |
 | `tunnelforge-core service.hello` | PASS, reports `dump.run`, `dump.import`, migration commands |
+| `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` | PASS, 6 live container MySQL/PostgreSQL smoke tests |
 
 Version references are aligned at `2.1.6` across:
 
@@ -92,6 +93,7 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Python syntax | `python -m compileall -q main.py src tests` | PASS | No compile errors |
 | 2026-06-26 | Diff hygiene | `git diff --check` | PASS | No whitespace errors |
 | 2026-06-26 | Core smoke | `tunnelforge-core service.hello` | PASS | Advertises dump/import and migration commands |
+| 2026-06-26 | Live MySQL/PostgreSQL smoke | `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` | PASS | 6 live container tests passed against MySQL 8.4 on port 3406 and PostgreSQL 16 on port 55432 |
 | 2026-06-26 | Import wrapper/dialog focused tests | `python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 62 passed after payload/UI wording fixes |
 | 2026-06-26 | Rust timezone validation TDD | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_session_time_zone_only --lib` | FAIL then PASS | Initial RED failed because `validated_timezone_sql` did not exist; GREEN passed after helper implementation |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 139 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
@@ -650,6 +652,10 @@ Evidence:
 - 2026-06-26 update: `scripts\validate-live-ui-migration-evidence.py` and
   `reports\live_ui_migration\live-ui-migration-evidence.template.json` now
   define the machine-checkable final evidence shape for #136.
+- 2026-06-26 update: local Docker-backed MySQL 8.4 and PostgreSQL 16 endpoints
+  passed the existing `live_roundtrip` Rust integration tests, covering inspect,
+  readiness, guide, preflight, MySQL -> PostgreSQL migrate+verify, and
+  PostgreSQL -> MySQL migrate+verify on small fixtures.
 - GitHub issue #136 now tracks this remaining #99 closure evidence.
 - Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
 - Follow-up GitHub issue:
@@ -659,6 +665,9 @@ Impact:
 
 - #99 should remain open until the live bidirectional 1M/UI responsiveness
   evidence is captured or explicitly scoped out.
+- The small live roundtrip smoke proves endpoint wiring, but it is not enough to
+  satisfy #136 because it does not run 1M rows or measure the PyQt worker/dialog
+  event-loop heartbeat during a long migration.
 
 Next action:
 
@@ -666,6 +675,9 @@ Next action:
    evidence with UI responsiveness proof, save it as
    `reports\live_ui_migration\live-ui-migration-evidence.json`, and run the
    live UI evidence validator.
+2. If this must be repeated by future sessions, add an evidence-capture helper
+   that seeds the local containers, runs the PyQt worker path with heartbeat
+   sampling, and writes the validator-compatible JSON report.
 
 ## Issue Tracker
 
@@ -726,3 +738,4 @@ Next action:
 | 2026-06-26 | Archived Rust Core 1M/10M performance evidence under `reports\rust_core_performance`, added a validator, and wired the optional performance regression gate to the archived evidence for GitHub #135/#99. | `reports/rust_core_performance`, `scripts/validate-rust-core-performance-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_rust_core_performance_evidence.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_performance_evidence.py -q`; final: `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
 | 2026-06-26 | Audited GitHub #99 closure criteria after #135 and created #136 for the remaining live bidirectional 1M UI responsiveness evidence. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; focused Python Rust Core/UI plumbing tests; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `rg` direct DB driver scan |
 | 2026-06-26 | Added a machine-checkable #136 live UI migration evidence validator and JSON template so future real 1M bidirectional runs can be accepted or rejected consistently. | `scripts/validate-live-ui-migration-evidence.py`, `tests/test_live_ui_migration_evidence.py`, `reports/live_ui_migration`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_evidence.py -q`; final: `python -m compileall -q scripts tests`; `git diff --check` |
+| 2026-06-26 | Analyzed GitHub #136 after merging prior work to main; confirmed local MySQL/PostgreSQL live endpoint wiring passes small Rust Core roundtrip tests, but #136 still requires durable 1M bidirectional PyQt heartbeat evidence. | `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` |
