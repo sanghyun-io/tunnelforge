@@ -361,6 +361,46 @@ class TestGenerateCleanupSql:
         assert "수동 처리" in action.sql
 
 
+class TestExecuteCleanup:
+    def test_dry_run_cleanup_still_counts_affected_rows(self, fake_connector):
+        fake_connector.query_results = {
+            "SELECT COUNT(*)": [{"cnt": 7}],
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        action = CleanupAction(
+            action_type=ActionType.DELETE,
+            table="orders",
+            description="delete orphan orders",
+            sql="DELETE FROM `test_db`.`orders` WHERE `user_id` IS NULL",
+            affected_rows=3,
+        )
+
+        success, message, affected = analyzer.execute_cleanup(action, dry_run=True)
+
+        assert success is True
+        assert affected == 7
+        assert "[DRY-RUN]" in message
+        assert len(fake_connector.executed_queries) == 1
+
+    def test_actual_cleanup_rejects_legacy_python_mutation_mode(self, fake_connector):
+        analyzer = MigrationAnalyzer(fake_connector)
+        action = CleanupAction(
+            action_type=ActionType.DELETE,
+            table="orders",
+            description="delete orphan orders",
+            sql="DELETE FROM `test_db`.`orders` WHERE `user_id` IS NULL",
+            affected_rows=3,
+        )
+
+        with pytest.raises(RuntimeError, match="Rust Core"):
+            analyzer.execute_cleanup(action, dry_run=False)
+
+        fake_connector.connection.cursor.assert_not_called()
+        fake_connector.connection.commit.assert_not_called()
+        fake_connector.connection.rollback.assert_not_called()
+        assert fake_connector.executed_queries == []
+
+
 # ============================================================
 # AnalysisResult 직렬화 테스트
 # ============================================================

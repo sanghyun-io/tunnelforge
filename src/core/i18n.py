@@ -940,6 +940,7 @@ _EN_PHRASE_TRANSLATIONS = {
     "마이그레이션 전 필수 요건을 검사합니다.": "Checks required conditions before migration.",
     "검사 항목": "Check Items",
     "실행 중": "Running",
+    "실행 비활성화": "Execution Disabled",
     "요약": "Summary",
     "HTML 리포트 다운로드": "Download HTML Report",
     "JSON 리포트 다운로드": "Download JSON Report",

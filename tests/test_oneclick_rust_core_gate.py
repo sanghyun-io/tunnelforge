@@ -9,6 +9,7 @@ from src.ui.dialogs.oneclick_migration_dialog import (
     OneClickMigrationWorker,
 )
 from src.ui.dialogs import migration_dialogs, oneclick_migration_dialog
+from src.core.migration_analyzer import AnalysisResult, OrphanRecord
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -234,6 +235,37 @@ def test_migration_analyzer_exposes_oneclick_with_limited_real_execution_copy():
     assert "dry-run" in tooltip.lower()
     assert "InnoDB" in tooltip
     assert "백업" in tooltip
+    dialog.close()
+
+
+def test_migration_analyzer_cleanup_keeps_legacy_actual_execution_disabled():
+    app = QApplication.instance() or QApplication([])
+
+    dialog = migration_dialogs.MigrationAnalyzerDialog(
+        None,
+        connector=FakeSchemaConnector(),
+    )
+    dialog.analysis_result = AnalysisResult(
+        schema="app",
+        analyzed_at="2026-06-27T00:00:00",
+        total_tables=1,
+        total_fk_relations=1,
+        orphan_records=[
+            OrphanRecord(
+                child_table="orders",
+                child_column="user_id",
+                parent_table="users",
+                parent_column="id",
+                orphan_count=2,
+            )
+        ],
+    )
+
+    dialog.update_orphans_table(dialog.analysis_result.orphan_records)
+
+    assert dialog.btn_dry_run.isEnabled()
+    assert not dialog.btn_execute.isEnabled()
+    assert "Rust Core" in dialog.btn_execute.toolTip()
     dialog.close()
 
 

@@ -603,6 +603,12 @@ AND `{orphan.child_column}` IS NOT NULL"""
         Returns:
             (성공여부, 메시지, 영향받은 행 수)
         """
+        if not dry_run:
+            raise RuntimeError(
+                "Legacy Python cleanup mutation execution is disabled. "
+                "DB mutations must be owned by Rust Core."
+            )
+
         if dry_run:
             # dry-run: 실제 실행하지 않고 영향받는 행 수 확인
             self._log(f"🔍 [DRY-RUN] 영향 분석: {action.table}")
@@ -631,22 +637,6 @@ AND `{orphan.child_column}` IS NOT NULL"""
                 return True, f"[DRY-RUN] {affected}개 행이 영향받음", affected
 
             return True, "[DRY-RUN] 영향 분석 완료", action.affected_rows
-
-        else:
-            # 실제 실행
-            self._log(f"🔧 실행 중: {action.table}")
-
-            try:
-                with self.connector.connection.cursor() as cursor:
-                    cursor.execute(action.sql)
-                    affected = cursor.rowcount
-                    self.connector.connection.commit()
-
-                return True, f"✅ {affected}개 행 처리됨", affected
-
-            except Exception as e:
-                self.connector.connection.rollback()
-                return False, f"❌ 오류: {str(e)}", 0
 
     def analyze_schema(
         self,

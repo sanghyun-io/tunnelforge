@@ -89,7 +89,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1811 passed, 5 warnings" not in doc
     assert "PASS, 1812 passed, 5 warnings" not in doc
     assert "PASS, 1815 passed, 5 warnings" not in doc
-    assert "PASS, 1816 passed, 5 warnings" in doc
+    assert "PASS, 1816 passed, 5 warnings" not in doc
+    assert "PASS, 1820 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -215,6 +216,20 @@ def test_current_status_tracks_legacy_auto_fix_core_mutation_api_issue():
     assert "FKSafeCharsetChanger.execute_safe_charset_change" in doc
     assert "GitHub #143 is fixed" in summary
     assert "dry-run/SQL generation remains available" in doc
+
+
+def test_current_status_tracks_legacy_migration_analyzer_cleanup_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-042" in doc
+    assert "GitHub #144" in doc
+    assert "legacy MigrationAnalyzer cleanup mutations" in normalized_doc
+    assert "MigrationAnalyzer.execute_cleanup" in doc
+    assert "CleanupWorker" in doc
+    assert "GitHub #144 is fixed" in summary
+    assert "Dry-Run and SQL preview remain available" in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():

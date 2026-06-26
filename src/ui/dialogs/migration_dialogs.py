@@ -2,7 +2,7 @@
 마이그레이션 분석 다이얼로그
 - 스키마 분석 (고아 레코드, 호환성 이슈)
 - FK 관계 시각화
-- dry-run 및 실제 정리 작업
+- dry-run 정리 영향 분석
 """
 import os
 import json
@@ -33,6 +33,10 @@ from src.core.platform_paths import analysis_dir
 
 logger = get_logger('migration_dialogs')
 ONE_CLICK_MIGRATION_FEATURE_ENABLED = True
+LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP = (
+    "실제 정리 실행은 Rust Core 구현 전까지 비활성화되어 있습니다. "
+    "현재는 Dry-Run과 SQL 미리보기만 사용할 수 있습니다."
+)
 
 
 class MigrationAnalyzerDialog(QDialog):
@@ -364,6 +368,7 @@ class MigrationAnalyzerDialog(QDialog):
         self.btn_dry_run.setEnabled(False)
 
         self.btn_execute = QPushButton("⚡ 실행")
+        self.btn_execute.setToolTip(LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP)
         self.btn_execute.setStyleSheet("""
             QPushButton {
                 background-color: #e74c3c; color: white; font-weight: bold;
@@ -699,7 +704,7 @@ class MigrationAnalyzerDialog(QDialog):
             self.table_orphans.setItem(i, 5, QTableWidgetItem(samples))
 
         self.btn_dry_run.setEnabled(len(orphans) > 0)
-        self.btn_execute.setEnabled(len(orphans) > 0)
+        self.btn_execute.setEnabled(False)
         self.btn_export_orphan_query.setEnabled(len(orphans) > 0)
 
     def update_compatibility_table(self, issues: List[CompatibilityIssue]):
@@ -932,6 +937,14 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
         if not self.analysis_result:
             return
 
+        if not dry_run:
+            QMessageBox.warning(
+                self,
+                "실행 비활성화",
+                LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP
+            )
+            return
+
         selected_rows = self.table_orphans.selectionModel().selectedRows()
         if not selected_rows:
             QMessageBox.warning(self, "선택 필요", "정리할 고아 레코드를 선택하세요.")
@@ -993,7 +1006,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
     def on_cleanup_finished(self, success: bool, message: str, results: dict):
         """정리 작업 완료 시"""
         self.btn_dry_run.setEnabled(True)
-        self.btn_execute.setEnabled(True)
+        self.btn_execute.setEnabled(False)
         self.progress_bar.setVisible(False)
 
         self.add_log(message)
