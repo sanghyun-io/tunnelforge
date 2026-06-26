@@ -13,6 +13,15 @@ def _section(text: str, heading: str) -> str:
     return text[start:next_heading]
 
 
+def _check_row_commands(section: str) -> list[str]:
+    check_rows = [
+        line
+        for line in section.splitlines()
+        if line.startswith("| `") and "` |" in line
+    ]
+    return [line.split("`", maxsplit=2)[1] for line in check_rows]
+
+
 def test_current_status_summary_does_not_point_to_closed_oneclick_issue_as_next_work():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     summary = " ".join(_section(doc, "Summary").split())
@@ -101,11 +110,14 @@ def test_current_status_records_current_main_next_issue_reaudit():
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     focused = _section(doc, "Focused Verification On 2026-06-27")
-    check_rows = [
-        line
-        for line in focused.splitlines()
-        if line.startswith("| `") and "` |" in line
-    ]
-    commands = [line.split("`", maxsplit=2)[1] for line in check_rows]
+    commands = _check_row_commands(focused)
+
+    assert len(commands) == len(set(commands))
+
+
+def test_current_status_current_baseline_has_no_duplicate_check_rows():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    baseline = _section(doc, "Current Baseline Verification")
+    commands = _check_row_commands(baseline)
 
     assert len(commands) == len(set(commands))

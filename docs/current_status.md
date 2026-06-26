@@ -107,13 +107,12 @@ those commands are rerun.
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
 | `git diff --check` | PASS |
-| `tunnelforge-core service.hello` | PASS, reports `dump.run`, `dump.import`, migration commands |
+| `tunnelforge-core service.hello` | PASS, reports `dump.run`, `dump.import`, migration commands, and `oneclick.*` commands |
 | `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` | PASS, 6 live container MySQL/PostgreSQL smoke tests |
 | `pytest tests\test_live_ui_migration_capture.py tests\test_live_ui_migration_evidence.py -q` | PASS, capture and validator tests |
 | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 52 passed |
-| `tunnelforge-core service.hello` | PASS, advertises `oneclick.*` commands; PyQt exposes One-Click with Dry-run default and limited backup-gated `engine_innodb` real execution |
 
 Version references are aligned at `2.1.6` across:
 
@@ -141,6 +140,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Current baseline duplicate service.hello cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Current Baseline Verification` now keeps one `tunnelforge-core service.hello` row that covers dump/import, migration, and One-Click capability evidence |
 | 2026-06-27 | Focused verification duplicate row cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_focused_verification_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Focused Verification On 2026-06-27` no longer repeats the same `python scripts\check-macos-support-gate.py --skip-github` check row |
 | 2026-06-27 | Current baseline count refresh after re-audit coverage | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_macos_focused_test_count tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top current baseline now reflects the latest current-status test addition and the freshly rerun macOS focused suite: `pytest -q` is 1795 passed, 5 warnings, and macOS focused tests are 52 passed |
 | 2026-06-27 | Current main next-issue re-audit | `git status --short --branch`; `git log --oneline --decorate -5`; `gh issue list --state open --limit 20`; `gh issue view 116 --comments`; `rg -n "pymysql|psycopg|mysql\.connector|mysqldump|pg_dump|mysqlpump|mysqlimport|\bpsql\b" src scripts`; `rg -n "execute\(|cursor\(|commit\(|rollback\(" src\core src\ui src\exporters`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | Main is aligned with origin/main, #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core baseline scan found no new repo-side violation; legacy-shaped DB connector paths route through Rust Core shims |
@@ -1317,6 +1317,30 @@ Next action:
 1. Keep focused verification tables deduplicated when adding future evidence
    rows.
 
+### TF-STATUS-033: Current Baseline Table Has No Duplicate Check Rows
+
+Status: closed
+Severity: Low
+Area: Status documentation
+
+Evidence:
+
+- The `Current Baseline Verification` table listed `tunnelforge-core
+  service.hello` twice: once for dump/import/migration capability evidence and
+  once for One-Click capability evidence.
+- RED/GREEN coverage now extracts current baseline check rows and rejects
+  duplicate command entries.
+
+Resolution:
+
+- Merged the duplicate `service.hello` rows into one row covering dump/import,
+  migration, and One-Click command advertisement.
+
+Next action:
+
+1. Keep current baseline command rows unique; add detail to the result cell
+   rather than duplicating a command row.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1353,6 +1377,7 @@ Next action:
 | TF-STATUS-030 | Low | closed | Status documentation / Rust Core boundary audit | Current main next-issue re-audit | Keep #116 as the only open issue unless new repo-side evidence appears |
 | TF-STATUS-031 | Low | closed | Status documentation | Baseline count refresh after re-audit coverage | Refresh counts when new tests are added and rerun |
 | TF-STATUS-032 | Low | closed | Status documentation | Focused verification duplicate rows | Keep focused verification command rows unique |
+| TF-STATUS-033 | Low | closed | Status documentation | Current baseline duplicate rows | Keep current baseline command rows unique |
 
 ## Recommended Execution Order
 
@@ -1455,3 +1480,4 @@ Next action:
 | 2026-06-27 | Re-audited current main and the next remaining issue. #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core boundary scan found no new repo-side baseline violation; legacy-shaped DB connector names currently route through Rust Core shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_current_main_next_issue_reaudit -q`; final: #116 gates, macOS/docs focused pytest, current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Refreshed the top baseline counts after adding current-status re-audit coverage. The current full Python suite is now `1795 passed, 5 warnings`, and the current macOS focused suite is `52 passed`. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: stale-count current-status pytest; final: `pytest -q`, current-status pytest, macOS/docs focused pytest, compileall, `git diff --check` |
 | 2026-06-27 | Removed a duplicate `--skip-github` row from the focused verification table and added a current-status regression so future focused verification command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |
+| 2026-06-27 | Merged duplicate `tunnelforge-core service.hello` rows in the current baseline table and added a regression so current baseline command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: baseline duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |
