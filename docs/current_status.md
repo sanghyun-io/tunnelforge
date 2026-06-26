@@ -353,6 +353,12 @@ Evidence:
   scripts\check-macos-support-gate.py --skip-github` passes, and focused macOS
   support tests pass locally, but GitHub issue #116 remains open because the
   final real operator Mac interactive evidence bundle is not attached.
+- 2026-06-26 update: after #99/#136 closure, `python
+  scripts\check-macos-support-gate.py --skip-github`, `pytest
+  tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`, and
+  `python -m compileall -q scripts tests` still pass on main. #116 remains open
+  only for the real operator Mac report/log/system-evidence/evidence-zip
+  attachment.
 
 Next action:
 
@@ -766,3 +772,4 @@ Next action:
 | 2026-06-26 | Added the #136 live UI evidence capture helper with deterministic local-container seeding, CrossEngineMigrationWorker execution, Qt heartbeat sampling, and validator-compatible report generation; verified the path with a 1,000-row smoke that must not be used as final evidence. | `scripts/capture-live-ui-migration-evidence.py`, `tests/test_live_ui_migration_capture.py`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_capture.py -q`; smoke: `python scripts\capture-live-ui-migration-evidence.py --rows 1000 ...`; expected reject: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-smoke.json` |
 | 2026-06-26 | Captured and preserved partial #136 evidence for the live 1M bidirectional PyQt worker path; both directions passed migrate+verify with heartbeat max gap 125ms, leaving only real 10M RSS evidence before final validator closure. | `reports/live_ui_migration/live-ui-migration-evidence-1m-local-partial.json`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | `python scripts\capture-live-ui-migration-evidence.py --rows 1000000 ...`; expected reject: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-1m-local-partial.json` |
 | 2026-06-26 | Added and ran the Rust Core 10M synthetic stress RSS harness, generated the final #136 evidence file, and closed TF-STATUS-018 after the final validator passed. | `migration_core/tests/stress_rss.rs`, `reports/live_ui_migration/stress-10m-rss.json`, `reports/live_ui_migration/live-ui-migration-evidence.json`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml --test stress_rss synthetic_stress_run_reports_resume_verify_and_rss_bound -- --nocapture`; ignored 10M: `cargo test --manifest-path migration_core\Cargo.toml --test stress_rss synthetic_10m_stress_resume_verify_reports_rss_bound -- --ignored --nocapture`; final: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json` |
+| 2026-06-26 | Re-audited the last open issue #116 after #99/#136 closure; local macOS support gates still pass, but the issue remains open for external real operator Mac evidence. | `docs/current_status.md` | `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q scripts tests` |
