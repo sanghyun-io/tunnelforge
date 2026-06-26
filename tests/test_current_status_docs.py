@@ -81,3 +81,13 @@ def test_current_status_records_export_table_selection_audit():
     assert "RustDumpExportDialog" in doc
     assert "RustDumpExporter.export_tables" in doc
     assert "dump.run" in doc
+
+
+def test_current_status_records_current_main_next_issue_reaudit():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-030" in doc
+    assert "Current main next-issue re-audit" in doc
+    assert "GitHub #116 is the only open issue" in summary
+    assert "no new repo-side Rust Core baseline violation" in summary

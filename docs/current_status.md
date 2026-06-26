@@ -83,6 +83,13 @@ real-execution gate: the app supports only backup-confirmed
 production automatic remediation and production charset/collation execution
 remain unsupported.
 
+Current main next-issue re-audit on 2026-06-27 confirms GitHub #116 is the
+only open issue. The full #116 repository-side gate passes, the macOS focused
+suite passes at 52 tests, and a Rust Core baseline scan found no new repo-side
+Rust Core baseline violation: legacy-shaped `MySQLConnector`/`PostgresConnector`
+paths currently route through `DbCoreFacade`/`RustDbConnection`, and hidden
+schedule SQL execution also uses the Rust connector shim when enabled.
+
 The current full Python suite count was refreshed on 2026-06-27 after the
 schedule and One-Click documentation regression tests were added.
 
@@ -120,6 +127,8 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
+| `python scripts\check-macos-support-gate.py --skip-github` | PASS |
+| `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q` | RED then PASS |
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 52 passed |
 | `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
@@ -132,6 +141,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Current main next-issue re-audit | `git status --short --branch`; `git log --oneline --decorate -5`; `gh issue list --state open --limit 20`; `gh issue view 116 --comments`; `rg -n "pymysql|psycopg|mysql\.connector|mysqldump|pg_dump|mysqlpump|mysqlimport|\bpsql\b" src scripts`; `rg -n "execute\(|cursor\(|commit\(|rollback\(" src\core src\ui src\exporters`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | Main is aligned with origin/main, #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core baseline scan found no new repo-side violation; legacy-shaped DB connector paths route through Rust Core shims |
 | 2026-06-27 | Current baseline verification heading | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top status no longer labels the mixed current baseline as `Verified On 2026-06-26`; the section now distinguishes the refreshed 2026-06-27 full-suite count from preserved 2026-06-26 broader baseline evidence |
 | 2026-06-27 | Current full Python suite count refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py`; `git diff --check` | PASS | Updated top current-status full Python suite count from stale `1786 passed` to current `1793 passed, 5 warnings` after recent documentation regression tests |
 | 2026-06-27 | One-Click limited production scope wording | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; `pytest tests\test_oneclick_readiness_docs.py -q`; `pytest tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | Readiness docs no longer say all production database usage is unsupported; they distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution |
@@ -1215,6 +1225,46 @@ Next action:
 1. If a full broad baseline sweep is rerun, replace the preservation note with
    that sweep's concrete date and command evidence.
 
+### TF-STATUS-030: Current Main Next-Issue Re-Audit
+
+Status: closed
+Severity: Low
+Area: Status documentation / Rust Core boundary audit
+
+Evidence:
+
+- 2026-06-27 main alignment check found `main` aligned with `origin/main`;
+  latest pushed commits already include the recent schedule, One-Click, and
+  status documentation fixes.
+- GitHub issue scan found #116 as the only open issue.
+- `python scripts\check-macos-support-gate.py --skip-github` passed.
+- `python scripts\check-macos-support-gate.py` passed against GitHub state,
+  confirming #110-#115 closure, #116/M6 tracking, merged PR #117 state, and
+  green repository-side checks.
+- `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`
+  passed with 52 tests.
+- Rust Core boundary scan checked DB driver/tool names, subprocess callers,
+  SQL cursor/commit/rollback usage, and disabled feature flags. The scan found
+  no new repo-side Rust Core baseline violation: legacy-shaped
+  `MySQLConnector` and `PostgresConnector` now open `DbCoreFacade`
+  connections and expose `RustDbConnection`/`RustDbCursor` shims, while hidden
+  scheduler SQL execution uses `create_rust_db_connector`.
+
+Resolution:
+
+- No new GitHub issue was created from this pass because the only remaining
+  actionable item is already tracked as #116 / TF-STATUS-008 and requires
+  external real-Mac operator evidence.
+- The re-audit is recorded here so later sessions do not repeat the same
+  connector-name false positive without new evidence.
+
+Next action:
+
+1. Keep #116 open until a real Mac operator attaches the completed evidence
+   bundle and final handoff comment.
+2. If a future scan finds an actual non-Rust DB operation owner path, create a
+   separate GitHub issue before implementation.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1248,6 +1298,7 @@ Next action:
 | TF-STATUS-027 | Medium | closed | One-Click migration docs | Limited production scope wording | Keep docs aligned if the real-execution allowlist expands |
 | TF-STATUS-028 | Low | closed | Status documentation | Full Python suite count refresh | Refresh count when new tests are added and full pytest is rerun |
 | TF-STATUS-029 | Low | closed | Status documentation | Baseline verification heading | Replace preservation note after a full broad baseline sweep is rerun |
+| TF-STATUS-030 | Low | closed | Status documentation / Rust Core boundary audit | Current main next-issue re-audit | Keep #116 as the only open issue unless new repo-side evidence appears |
 
 ## Recommended Execution Order
 
@@ -1347,3 +1398,4 @@ Next action:
 | 2026-06-27 | Re-scanned One-Click readiness wording and fixed TF-STATUS-027: docs now distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; final: One-Click/current-status docs pytest, compileall, `git diff --check` |
 | 2026-06-27 | Refreshed TF-STATUS-028 after rerunning the full Python suite. The current suite is now `1793 passed, 5 warnings`, replacing the stale `1786 passed` handoff count. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; final: `pytest -q`, docs pytest, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-029 after noticing the top verification table still said `Verified On 2026-06-26` while containing a 2026-06-27 full pytest count. The section now describes a current baseline with preserved broader rows. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; final: current-status pytest, compileall, `git diff --check` |
+| 2026-06-27 | Re-audited current main and the next remaining issue. #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests pass at 52 tests, and the Rust Core boundary scan found no new repo-side baseline violation; legacy-shaped DB connector names currently route through Rust Core shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_current_main_next_issue_reaudit -q`; final: #116 gates, macOS/docs focused pytest, current-status pytest, compileall, `git diff --check` |
