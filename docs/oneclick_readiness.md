@@ -40,6 +40,11 @@ The current supported scope is intentionally narrow:
   `tf_oneclick_real_execution.tf_oneclick_legacy_engine_table` from `MyISAM` to
   `InnoDB`. A live Rust Core regression also proves `oneclick.run dry_run=false`
   sequences the same validated apply path.
+- Charset/collation evidence contract:
+  `scripts\validate-oneclick-charset-evidence.py` and
+  `reports\oneclick_readiness\oneclick-charset-evidence.template.json`.
+  This is a contract/template only; no completed charset/collation evidence has
+  been captured yet.
 
 ## Not Yet Supported
 
@@ -131,6 +136,12 @@ Reasons:
   machine-checkable proof required before `engine_innodb` real execution can be
   considered ready; the current archived evidence passes that validator for
   `oneclick.apply_fixes`.
+- `scripts\validate-oneclick-charset-evidence.py` now defines the
+  machine-checkable proof required before any
+  `charset_issue -> charset_collation_fk_safe` real execution can be enabled.
+  It requires a safe `tf_oneclick_` schema, local MySQL source, explicit target
+  charset/collation, FK-valid after-state, rollback metadata, no disallowed
+  attempts, and before/after table charset/collation proof.
 - The migration analyzer button copy and tooltip now label the entry point as
   One-Click Migration, say dry-run is the default, and limit automatic changes
   to verified MyISAM/deprecated engine tables becoming InnoDB after backup

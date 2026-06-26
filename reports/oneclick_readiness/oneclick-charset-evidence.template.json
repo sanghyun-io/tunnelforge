@@ -1,0 +1,126 @@
+{
+  "_template_note": "Template only. Do not treat this file as completed evidence. Capture a real local MySQL charset/collation run into oneclick-charset-evidence.json before validating #139.",
+  "issue": 139,
+  "git_sha": "<real git sha>",
+  "source_type": "local_mysql_container",
+  "feature_flags": {
+    "oneclick_ui_enabled": true,
+    "oneclick_real_execution_enabled": true
+  },
+  "service_hello": {
+    "capabilities": [
+      "oneclick.run",
+      "oneclick.preflight",
+      "oneclick.analyze",
+      "oneclick.recommend",
+      "oneclick.apply_fixes",
+      "oneclick.validate",
+      "oneclick.report"
+    ]
+  },
+  "scope": {
+    "schema": "tf_oneclick_charset",
+    "allowed_fix_types": ["charset_issue"],
+    "allowed_strategies": ["charset_collation_fk_safe"],
+    "target_charset": "utf8mb4",
+    "target_collation": "utf8mb4_0900_ai_ci",
+    "requires_fk_safe_ordering": true,
+    "requires_rollback_metadata": true
+  },
+  "run": {
+    "command": "oneclick.apply_fixes",
+    "dry_run": false,
+    "backup_confirmed": true,
+    "success": true,
+    "schema": "tf_oneclick_charset",
+    "attempted_fix_types": ["charset_issue"],
+    "attempted_strategies": ["charset_collation_fk_safe"],
+    "disallowed_fix_attempts": [],
+    "applied_fixes": [
+      {
+        "issue_type": "charset_issue",
+        "strategy": "charset_collation_fk_safe",
+        "schema": "tf_oneclick_charset",
+        "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+        "target_charset": "utf8mb4",
+        "target_collation": "utf8mb4_0900_ai_ci",
+        "sql": [
+          "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+          "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+        ],
+        "rollback_sql": [
+          "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+          "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+        ],
+        "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+        "success": true
+      }
+    ]
+  },
+  "before": {
+    "tables": [
+      {
+        "schema": "tf_oneclick_charset",
+        "table": "tf_oneclick_parent",
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci"
+      },
+      {
+        "schema": "tf_oneclick_charset",
+        "table": "tf_oneclick_child",
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci"
+      }
+    ],
+    "foreign_keys": [
+      {
+        "schema": "tf_oneclick_charset",
+        "table": "tf_oneclick_child",
+        "referenced_table": "tf_oneclick_parent",
+        "constraint": "fk_child_parent"
+      }
+    ]
+  },
+  "after": {
+    "tables": [
+      {
+        "schema": "tf_oneclick_charset",
+        "table": "tf_oneclick_parent",
+        "charset": "utf8mb4",
+        "collation": "utf8mb4_0900_ai_ci"
+      },
+      {
+        "schema": "tf_oneclick_charset",
+        "table": "tf_oneclick_child",
+        "charset": "utf8mb4",
+        "collation": "utf8mb4_0900_ai_ci"
+      }
+    ],
+    "foreign_keys_valid": true,
+    "unrelated_tables_unchanged": true
+  },
+  "rollback": {
+    "metadata_captured": true,
+    "tables": [
+      {
+        "schema": "tf_oneclick_charset",
+        "table": "tf_oneclick_parent",
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci"
+      },
+      {
+        "schema": "tf_oneclick_charset",
+        "table": "tf_oneclick_child",
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci"
+      }
+    ]
+  },
+  "validation": {
+    "all_fixed": true,
+    "remaining_issues": 0,
+    "fk_constraints_valid": true,
+    "post_charset": "utf8mb4",
+    "post_collation": "utf8mb4_0900_ai_ci"
+  }
+}

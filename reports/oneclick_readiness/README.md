@@ -22,6 +22,9 @@ This directory stores machine-checkable One-Click readiness evidence.
   GitHub #138 evidence shape for a future controlled local non-dry-run
   `deprecated_engine -> engine_innodb` run. It is a template only, not
   completed evidence.
+- `oneclick-charset-evidence.template.json` documents the GitHub #139 evidence
+  shape for future controlled local `charset_issue -> charset_collation_fk_safe`
+  runs. It is a template only, not completed evidence.
 
 Validate it with:
 
@@ -33,6 +36,12 @@ Validate the real-execution evidence with:
 
 ```powershell
 python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json
+```
+
+Validate future charset/collation evidence with:
+
+```powershell
+python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.json
 ```
 
 A clean checkout can also require this evidence through the Rust Core regression
@@ -47,6 +56,14 @@ The real-execution evidence gate can be required with:
 
 ```powershell
 $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'
+powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
+```
+
+The charset/collation evidence gate can be required after completed evidence is
+captured:
+
+```powershell
+$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE='1'
 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
 ```
 
