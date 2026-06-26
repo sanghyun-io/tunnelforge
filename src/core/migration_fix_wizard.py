@@ -914,6 +914,12 @@ class FKSafeCharsetChanger:
         - 각 SQL 실행 직후 해당 롤백 SQL을 스택에 push (LIFO)
         - 에러 발생 시 스택을 역순으로 pop하여 롤백 SQL 제공
         """
+        if not dry_run:
+            raise RuntimeError(
+                "Legacy Python Auto-Fix Wizard mutation execution is disabled. "
+                "DB mutations must be owned by Rust Core."
+            )
+
         def log(msg: str):
             if progress_callback:
                 progress_callback(msg)
@@ -925,133 +931,6 @@ class FKSafeCharsetChanger:
             log(f"   - 영향받는 FK: {sql_parts['fk_count']}개")
             log(f"   - 변경할 테이블: {sql_parts['table_count']}개")
             return True, "DRY-RUN 완료", sql_parts
-
-        # 실제 실행
-        log("🔧 FK 안전 Charset 변경 시작...")
-
-        executed_drop = []
-        executed_alter = []
-        executed_add = []
-
-        # 롤백 SQL 스택 (LIFO - 실행 역순으로 복원)
-        rollback_stack: List[str] = []
-
-        # FK 정보 맵 (DROP SQL -> FK 정의) - 롤백 시 FK 재생성용
-        fk_map: Dict[str, FKDefinition] = {}
-        for fk in self.get_related_fks(tables):
-            fk_map[fk.get_drop_sql(self.schema)] = fk
-
-        try:
-            with self.connector.connection.cursor() as cursor:
-                # Phase 1: FK DROP
-                log("  📦 Phase 1: FK 임시 DROP...")
-                for sql in sql_parts['drop_fks']:
-                    log(f"    🔸 {sql[:60]}...")
-                    cursor.execute(sql)
-                    executed_drop.append(sql)
-
-                    # 롤백 스택에 FK ADD SQL 추가 (LIFO)
-                    if sql in fk_map:
-                        rollback_sql = fk_map[sql].get_add_sql(self.schema)
-                        rollback_stack.append(rollback_sql)
-
-                self.connector.connection.commit()
-
-                # Phase 2: Charset 변경
-                log("  🔄 Phase 2: Charset 변경...")
-                skipped_tables = []
-                for sql in sql_parts['alter_tables']:
-                    log(f"    🔸 {sql[:60]}...")
-                    try:
-                        cursor.execute(sql)
-                        executed_alter.append(sql)
-                    except Exception as alter_error:
-                        error_code = getattr(alter_error, 'args', [None])[0]
-                        error_msg_inner = str(alter_error)
-                        # Error 1347: 'xxx' is not BASE TABLE (VIEW인 경우)
-                        if error_code == 1347 or 'is not BASE TABLE' in error_msg_inner:
-                            log(f"    ⏭️ VIEW 건너뛰기: {error_msg_inner}")
-                            skipped_tables.append(sql)
-                            continue
-                        else:
-                            # 다른 오류는 그대로 raise
-                            raise
-                self.connector.connection.commit()
-
-                # Phase 3: FK 재생성
-                log("  🔗 Phase 3: FK 재생성...")
-                for sql in sql_parts['add_fks']:
-                    log(f"    🔸 {sql[:60]}...")
-                    cursor.execute(sql)
-                    executed_add.append(sql)
-
-                    # FK 재생성 완료 시 롤백 스택에서 해당 항목 제거
-                    if sql in rollback_stack:
-                        rollback_stack.remove(sql)
-
-                self.connector.connection.commit()
-
-            if skipped_tables:
-                log(f"✅ FK 안전 Charset 변경 완료 (VIEW {len(skipped_tables)}개 건너뜀)")
-            else:
-                log("✅ FK 안전 Charset 변경 완료")
-            return True, "변경 완료", {
-                'executed_drop': executed_drop,
-                'executed_alter': executed_alter,
-                'executed_add': executed_add,
-                'skipped_tables': skipped_tables
-            }
-
-        except Exception as e:
-            self.connector.connection.rollback()
-            error_msg = str(e)
-            log(f"❌ 오류 발생: {error_msg}")
-
-            # 자동 복구 시도: DROP된 FK 재생성
-            auto_recovered = False
-            auto_recovery_errors = []
-            if rollback_stack:
-                log("  🔄 자동 복구 시도: DROP된 FK 재생성 중...")
-                try:
-                    with self.connector.connection.cursor() as recovery_cursor:
-                        for recovery_fk_sql in reversed(rollback_stack):
-                            try:
-                                log(f"    🔸 {recovery_fk_sql[:60]}...")
-                                recovery_cursor.execute(recovery_fk_sql)
-                            except Exception as fk_err:
-                                auto_recovery_errors.append(f"{recovery_fk_sql[:40]}: {str(fk_err)[:60]}")
-                                log(f"    ❌ FK 복구 실패: {str(fk_err)[:80]}")
-                        self.connector.connection.commit()
-
-                    if not auto_recovery_errors:
-                        auto_recovered = True
-                        log("  ✅ 자동 복구 완료: 모든 FK 재생성 성공")
-                    else:
-                        log(f"  ⚠️ 부분 복구: {len(auto_recovery_errors)}개 FK 복구 실패")
-                except Exception as recovery_err:
-                    log(f"  ❌ 자동 복구 중 오류: {str(recovery_err)[:80]}")
-                    auto_recovery_errors.append(f"전체 복구 실패: {str(recovery_err)[:60]}")
-
-            # 롤백 SQL 생성 (수동 복구용)
-            recovery_sql = self._build_recovery_sql(
-                rollback_stack, executed_drop, executed_alter, executed_add, error_msg
-            )
-
-            if auto_recovered:
-                log(f"  ✅ 자동 복구 완료 - 수동 롤백 SQL 불필요")
-            else:
-                log(f"  📋 수동 롤백 SQL {len(rollback_stack)}개 생성됨")
-
-            return False, f"오류: {error_msg}", {
-                'error': error_msg,
-                'executed_drop': executed_drop,
-                'executed_alter': executed_alter,
-                'executed_add': executed_add,
-                'recovery_sql': recovery_sql,
-                'rollback_stack': rollback_stack,
-                'auto_recovered': auto_recovered,
-                'auto_recovery_errors': auto_recovery_errors
-            }
 
     def _build_recovery_sql(
         self,
@@ -1219,20 +1098,7 @@ class BatchFixExecutor:
         FK_SAFE 배치, COLLATION_SINGLE 병합, 메인 for 루프를 포함하여
         단일 진입점에서 세션 정리를 보장한다.
         """
-        try:
-            yield
-        finally:
-            if not dry_run:
-                if original_sql_mode is not None:  # 빈 문자열('')도 복원 보장
-                    self.connector.set_session_sql_mode(original_sql_mode)
-            if has_charset and not dry_run:
-                self._log("  🔒 FOREIGN_KEY_CHECKS 복원")
-                try:
-                    with self.connector.connection.cursor() as cursor:
-                        cursor.execute("SET FOREIGN_KEY_CHECKS = 1")
-                    self.connector.connection.commit()
-                except Exception as e:
-                    self._log(f"  ⚠️ FK_CHECKS 복원 실패: {e}")
+        yield
 
     def execute_batch(
         self,
@@ -1253,6 +1119,12 @@ class BatchFixExecutor:
         - FK 관계에 따른 실행 순서 최적화
         - 실행 전 상태 캡처 및 Rollback SQL 생성
         """
+        if not dry_run:
+            raise RuntimeError(
+                "Legacy Python Auto-Fix Wizard mutation execution is disabled. "
+                "DB mutations must be owned by Rust Core."
+            )
+
         results: List[FixExecutionResult] = []
         success_count = 0
         fail_count = 0
@@ -1265,25 +1137,10 @@ class BatchFixExecutor:
 
         # === 실행 전 상태 캡처 (Rollback SQL 생성용) ===
         pre_states: Dict[str, Dict[str, Any]] = {}
-        if not dry_run:
-            self._log("  📸 변경 전 상태 캡처 중...")
-            rollback_generator = RollbackSQLGenerator(self.connector, self.schema)
-            pre_states = self._capture_pre_states(steps, rollback_generator)
 
         # 문자셋 이슈 확인 및 FK_CHECKS 비활성화
         has_charset = self._has_charset_issues(steps)
         original_sql_mode = self.connector.get_session_sql_mode()
-        if not dry_run:
-            # 0000-00-00 날짜값 비교/CONVERT 시 strict mode 1292/1525 오류 방지
-            self.connector.set_session_sql_mode('')
-        if has_charset and not dry_run:
-            self._log("  🔓 FOREIGN_KEY_CHECKS 비활성화 (문자셋 변경용)")
-            try:
-                with self.connector.connection.cursor() as cursor:
-                    cursor.execute("SET FOREIGN_KEY_CHECKS = 0")
-                self.connector.connection.commit()
-            except Exception as e:
-                self._log(f"  ⚠️ FK_CHECKS 비활성화 실패: {e}")
 
         # FK 관계에 따른 실행 순서 정렬
         if has_charset:
@@ -1640,54 +1497,10 @@ class BatchFixExecutor:
 
     def _execute_single(self, sql: str) -> FixExecutionResult:
         """단일 SQL 실행"""
-        try:
-            # 여러 문장이 있을 수 있음 (FK_CHECKS 설정 등)
-            statements = [s.strip() for s in sql.split(';') if s.strip()]
-
-            total_affected = 0
-            skipped_views = []
-            with self.connector.connection.cursor() as cursor:
-                for stmt in statements:
-                    if not stmt or stmt.startswith('--'):
-                        continue
-                    try:
-                        cursor.execute(stmt)
-                        total_affected += cursor.rowcount if cursor.rowcount > 0 else 0
-                    except Exception as stmt_error:
-                        error_code = getattr(stmt_error, 'args', [None])[0]
-                        error_msg = str(stmt_error)
-                        # Error 1347: 'xxx' is not BASE TABLE (VIEW인 경우)
-                        if error_code == 1347 or 'is not BASE TABLE' in error_msg:
-                            skipped_views.append(stmt)
-                            continue
-                        else:
-                            raise
-
-                self.connector.connection.commit()
-
-            if skipped_views:
-                return FixExecutionResult(
-                    success=True,
-                    message=f"실행 완료 (VIEW {len(skipped_views)}개 건너뜀)",
-                    sql_executed=sql,
-                    affected_rows=total_affected
-                )
-
-            return FixExecutionResult(
-                success=True,
-                message="실행 완료",
-                sql_executed=sql,
-                affected_rows=total_affected
-            )
-
-        except Exception as e:
-            self.connector.connection.rollback()
-            return FixExecutionResult(
-                success=False,
-                message=f"실행 오류: {str(e)}",
-                sql_executed=sql,
-                error=str(e)
-            )
+        raise RuntimeError(
+            "Legacy Python Auto-Fix Wizard mutation execution is disabled. "
+            "DB mutations must be owned by Rust Core."
+        )
 
     def _execute_fk_safe_charset_change(self, step: FixWizardStep) -> FixExecutionResult:
         """FK 안전 Charset 변경 실행

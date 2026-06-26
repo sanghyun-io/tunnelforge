@@ -101,6 +101,18 @@ That Legacy Auto-Fix Wizard mutation path was fixed later on 2026-06-27:
 `dry_run=True`, the worker rejects `dry_run=False`, and the UI text presents
 the page as SQL/Dry-run confirmation instead of DB execution.
 
+GitHub #143 is fixed as the deeper follow-up: the legacy Auto-Fix core
+mutation APIs now fail-close when `dry_run=False` is requested, and the
+legacy Auto-Fix core mutation APIs are no longer executable in Python mutation
+mode.
+`BatchFixExecutor.execute_batch` and
+`FKSafeCharsetChanger.execute_safe_charset_change` reject Python-owned DB
+mutation mode before session state or execution hooks are touched, and
+`BatchFixExecutor._execute_single` is also fail-closed if called directly,
+while dry-run/SQL generation remains available. Direct
+`cursor.execute`/`commit`/`rollback` mutation calls were removed from
+`src/core/migration_fix_wizard.py`.
+
 The current full Python suite count was refreshed again on 2026-06-27 after
 the current-status re-audit regression coverage was added.
 
@@ -149,7 +161,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before this document |
-| `pytest -q` | PASS, 1812 passed, 5 warnings |
+| `pytest -q` | PASS, 1816 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 166 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -173,7 +185,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1812 passed, 5 warnings |
+| `pytest -q` | PASS, 1816 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -186,6 +198,7 @@ Commands run locally:
 | `pytest tests\test_current_status_docs.py::test_current_status_records_post_merge_next_issue_external_reaudit -q` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_legacy_python_auto_fix_wizard_issue -q` | RED then PASS |
 | `pytest tests\test_fix_wizard_dialog.py -q` | RED then PASS, 2 passed |
+| `pytest tests\test_migration_fix_wizard.py -q` | RED then PASS, 88 passed |
 | `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests\test_fix_wizard_dialog.py tests\test_current_status_docs.py -q` | PASS, 20 passed |
 | `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL, missing real-Mac report and current-HEAD manual workflow_dispatch evidence |
 | `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
@@ -197,6 +210,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Legacy Auto-Fix core mutation APIs fail-closed | RED/GREEN: `pytest tests\test_migration_fix_wizard.py::TestSessionGuardFaultInjection::test_batch_executor_rejects_legacy_python_mutation_mode tests\test_migration_fix_wizard.py::TestSessionGuardFaultInjection::test_fk_safe_charset_changer_rejects_legacy_python_mutation_mode -q`; RED/GREEN: `pytest tests\test_migration_fix_wizard.py::TestSessionGuardFaultInjection::test_private_single_execution_hook_is_fail_closed -q`; `pytest tests\test_migration_fix_wizard.py -q`; `gh issue create` created #143; `pytest tests\test_current_status_docs.py::test_current_status_tracks_legacy_auto_fix_core_mutation_api_issue -q`; final: `pytest tests\test_migration_fix_wizard.py tests\test_fix_wizard_dialog.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\core\migration_fix_wizard.py tests\test_migration_fix_wizard.py tests\test_current_status_docs.py`; `python scripts\check-macos-support-gate.py`; `pytest -q`; `git diff --check` | PASS | GitHub #143 is fixed: `BatchFixExecutor.execute_batch`, `FKSafeCharsetChanger.execute_safe_charset_change`, and `BatchFixExecutor._execute_single` now reject Python-owned DB mutation/session execution; dry-run/SQL preview remains available; current full Python suite is 1816 passed |
 | 2026-06-27 | Post-#142 next issue analysis | `gh issue list --state open --limit 30 --json number,title,state,labels,updatedAt,url,assignees`; `gh issue view 116 --comments --json number,title,state,body,labels,comments,updatedAt,url`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; `rg -n "#116|TF-STATUS-008|real-Mac|real Mac|Mac validation|macOS Support M6|manual validation|final" docs\current_status.md docs\macos_support.md scripts tests README.md README.ko.md` | EXPECTED FAIL for `--final` only | #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate currently reports `no macOS manual validation report found under build/` and `no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD`, so the blocker remains external real-Mac evidence/current-head manual validation, not a repo-side implementation issue |
 | 2026-06-27 | Legacy Auto-Fix Wizard dry-run only | RED/GREEN: `pytest tests\test_fix_wizard_dialog.py::test_legacy_fix_wizard_execution_page_runs_dry_run_only -q`; RED/GREEN: `pytest tests\test_fix_wizard_dialog.py::test_fix_wizard_worker_rejects_legacy_python_mutation_mode -q`; `pytest tests\test_fix_wizard_dialog.py -q`; `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests\test_fix_wizard_dialog.py tests\test_current_status_docs.py -q`; `pytest tests\test_fix_wizard_dialog.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\core\i18n.py src\ui\dialogs\fix_wizard_dialog.py src\ui\workers\fix_wizard_worker.py tests\test_fix_wizard_dialog.py tests\test_current_status_docs.py`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest -q`; `git diff --check` | PASS | GitHub #142 is fixed: `ExecutionPage` now starts `FixWizardWorker` with `dry_run=True`, `FixWizardWorker` rejects `dry_run=False`, and the legacy Auto-Fix UI presents Dry-run/SQL/manual execution rather than direct DB mutation; English runtime translations cover the new UI copy; current full Python suite is superseded above by the 1812-test run |
 | 2026-06-27 | Legacy Python Auto-Fix Wizard mutation issue split | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_legacy_python_auto_fix_wizard_issue -q`; `gh issue create` created #142; `pytest -q`; `rg -n "MigrationFixWizard|FixWizard|fix_wizard|btn_auto_fix|auto_fix|MigrationAnalyzerDialog|migration_dialogs|oneclick|One-Click" src tests docs README.md README.ko.md`; inspection of `src/ui/dialogs/migration_dialogs.py`, `src/ui/dialogs/fix_wizard_dialog.py`, `src/ui/workers/fix_wizard_worker.py`, and `src/core/migration_fix_wizard.py` | PASS | GitHub #142 tracked the repo-side Rust Core baseline gap where the legacy Auto-Fix Wizard could execute DB mutations through Python-owned fix logic; this count is superseded above by the 1812-test run |
@@ -1635,6 +1649,55 @@ Next action:
 3. Track any future real execution path as a separate issue with Rust command
    tests before enabling it in PyQt.
 
+### TF-STATUS-041: Legacy Auto-Fix Core Mutation APIs
+
+Status: closed
+Severity: High
+Area: Rust Core baseline / Migration Auto-Fix Wizard
+
+Evidence:
+
+- GitHub #143 tracked the deeper follow-up after #142: the UI/worker path was
+  dry-run/manual SQL only, but the underlying legacy Python core APIs still
+  accepted `dry_run=False`.
+- `BatchFixExecutor.execute_batch(..., dry_run=False)` could enter session
+  state changes, SQL mode changes, FK check toggles, rollback capture, and
+  `_execute_single(...)`.
+- `FKSafeCharsetChanger.execute_safe_charset_change(..., dry_run=False)` could
+  generate and execute FK DROP, ALTER, FK ADD, commit, rollback, and recovery
+  SQL from Python-owned logic.
+- RED/GREEN coverage in `tests/test_migration_fix_wizard.py` now proves both
+  core APIs reject `dry_run=False` with a Rust Core ownership error, that
+  `BatchFixExecutor` rejects mutation mode before session state or execution
+  hooks are touched, and that `BatchFixExecutor._execute_single` is also
+  fail-closed if called directly.
+- Direct `cursor.execute`/`commit`/`rollback` mutation calls no longer appear in
+  `src/core/migration_fix_wizard.py`.
+
+Resolution:
+
+- `BatchFixExecutor.execute_batch` raises `RuntimeError` immediately when
+  `dry_run=False`.
+- `FKSafeCharsetChanger.execute_safe_charset_change` raises `RuntimeError`
+  immediately when `dry_run=False`.
+- `BatchFixExecutor._execute_single` raises `RuntimeError` immediately if a
+  direct caller tries to use the old private SQL execution hook.
+- Dead legacy direct `cursor.execute`/`commit`/`rollback` bodies were removed
+  from `src/core/migration_fix_wizard.py`.
+- Dry-run/SQL generation remains available for preview and manual execution
+  guidance.
+- The older Python mutation-specific session/fallback tests were rewritten to
+  assert fail-closed behavior rather than preserving an execution path that
+  violates the Rust Core baseline.
+
+Next action:
+
+1. Keep these core APIs dry-run/SQL-generation only unless a future issue adds
+   a Rust Core-owned command for the exact automatic-fix workflow.
+2. If real automatic fix execution is needed later, implement it in
+   `tunnelforge-core` first and add Rust command tests before exposing it in
+   PyQt.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1679,11 +1742,12 @@ Next action:
 | TF-STATUS-038 | High | closed | macOS release validation | macOS manual workflow head policy | Keep final report/artifact/manual workflow SHA policies aligned |
 | TF-STATUS-039 | Low | closed | Status documentation / Rust Core boundary audit | Post-merge next-issue external re-audit | Keep #116 external unless confirmed repo-side evidence appears |
 | TF-STATUS-040 | High | closed | Rust Core baseline / Migration Auto-Fix Wizard | Legacy Python Auto-Fix Wizard mutations | Keep the legacy wizard dry-run/manual SQL only unless a future Rust Core-owned command is added |
+| TF-STATUS-041 | High | closed | Rust Core baseline / Migration Auto-Fix Wizard | Legacy Auto-Fix core mutation APIs | Keep core legacy Auto-Fix APIs fail-closed for `dry_run=False` unless Rust Core owns the workflow |
 
 ## Recommended Execution Order
 
 1. No repo-side implementation issue is currently open after TF-STATUS-040 /
-   GitHub #142 was fixed and verified.
+   GitHub #142 and TF-STATUS-041 / GitHub #143 were fixed and verified.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence.
 3. Track additional One-Click automatic fix classes as separate GitHub issues
@@ -1793,3 +1857,4 @@ Next action:
 | 2026-06-27 | Created GitHub #142 and TF-STATUS-040 after finding a separate repo-side Rust Core baseline gap: the legacy Auto-Fix Wizard can still execute DB mutations through Python-owned fix logic. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #142 | RED/GREEN: legacy Auto-Fix current-status pytest; final: current-status pytest, issue scan, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-040 / GitHub #142 by making the legacy Auto-Fix Wizard dry-run/manual SQL only and fail-closing `FixWizardWorker` when `dry_run=False` is requested. | `src/ui/dialogs/fix_wizard_dialog.py`, `src/ui/workers/fix_wizard_worker.py`, `src/core/i18n.py`, `tests/test_fix_wizard_dialog.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #142 | RED/GREEN: legacy Auto-Fix dialog/worker pytest and current-status pytest; final: full pytest, #116 gates, compileall, `git diff --check` |
 | 2026-06-27 | Analyzed the next open issue after #142 closure. #116 is still the only open GitHub issue; normal repo-side gate passes, while `--final` fails because the real-Mac report and current-main manual workflow_dispatch evidence are not present. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#142 current-status pytest; final: #116 gate, expected-failing final gate, current-status pytest, full pytest, compileall, `git diff --check` |
+| 2026-06-27 | Created and fixed TF-STATUS-041 / GitHub #143 after finding that the underlying legacy Auto-Fix core APIs still accepted `dry_run=False` after #142 closed the user-visible worker path. | `src/core/migration_fix_wizard.py`, `tests/test_migration_fix_wizard.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #143 | RED/GREEN: legacy core mutation API pytest and current-status pytest; final: full pytest, #116 gate, compileall, `git diff --check` |

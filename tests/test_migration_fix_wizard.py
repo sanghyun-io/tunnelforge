@@ -1076,8 +1076,31 @@ def _make_executor_with_session_mocks():
 class TestSessionGuardFaultInjection:
     """_session_guard try/finally 및 2-phase bookkeeping 오류 주입 테스트"""
 
-    def test_session_restored_on_exception_in_main_loop(self):
-        """메인 루프 도중 예외가 발생해도 sql_mode가 복원된다"""
+    def test_batch_executor_rejects_legacy_python_mutation_mode(self):
+        """Rust Core baseline: legacy core executor must not run DB mutations."""
+        executor = _make_executor_with_session_mocks()
+        step = _make_step(
+            0, IssueType.INVALID_DATE,
+            location="test_db.orders.created_at",
+            selected_option=_make_option(
+                FixStrategy.DATE_TO_NULL,
+                sql_template="UPDATE `test_db`.`orders` SET `created_at` = NULL;",
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="Rust Core"):
+            executor.execute_batch([step], dry_run=False)
+
+    def test_fk_safe_charset_changer_rejects_legacy_python_mutation_mode(self):
+        """Rust Core baseline: FK-safe charset changer remains SQL/dry-run only."""
+        conn = FakeMySQLConnector()
+        changer = FKSafeCharsetChanger(conn, "test_db")
+
+        with pytest.raises(RuntimeError, match="Rust Core"):
+            changer.execute_safe_charset_change({"users"}, dry_run=False)
+
+    def test_mutation_mode_is_rejected_before_session_state_changes(self):
+        """dry_run=False는 sql_mode 변경 같은 세션 mutation 전에 차단된다."""
         executor = _make_executor_with_session_mocks()
         step = _make_step(
             0, IssueType.CHARSET_ISSUE,
@@ -1088,20 +1111,16 @@ class TestSessionGuardFaultInjection:
             )
         )
 
-        with patch.object(executor, '_execute_single', side_effect=RuntimeError("injected")):
-            with pytest.raises(RuntimeError):
+        with patch.object(executor, '_execute_single') as execute_single:
+            with pytest.raises(RuntimeError, match="Rust Core"):
                 executor.execute_batch([step], dry_run=False)
 
-        # set_session_sql_mode 호출 시퀀스: [call('')(설정), call('STRICT...')(복원)]
-        # 마지막 호출이 원래 sql_mode로 복원이어야 함
-        calls = executor.connector.set_session_sql_mode.call_args_list
-        assert len(calls) >= 1
-        assert calls[-1].args[0] == 'STRICT_TRANS_TABLES', (
-            f"마지막 복원 호출이 원래 sql_mode여야 함: {calls}"
-        )
+        execute_single.assert_not_called()
+        executor.connector.get_session_sql_mode.assert_not_called()
+        executor.connector.set_session_sql_mode.assert_not_called()
 
-    def test_session_restored_with_empty_original_sql_mode(self):
-        """original sql_mode='' 일 때도 복원 호출된다 (빈 문자열 falsy 버그 방지)"""
+    def test_mutation_mode_with_empty_original_sql_mode_is_rejected_before_session_state_changes(self):
+        """original sql_mode='' 케이스도 fail-closed guard 전에 세션을 만지지 않는다."""
         executor = _make_executor_with_session_mocks()
         executor.connector.get_session_sql_mode = MagicMock(return_value='')
         step = _make_step(
@@ -1113,16 +1132,13 @@ class TestSessionGuardFaultInjection:
             )
         )
 
-        with patch.object(executor, '_execute_single', side_effect=RuntimeError("injected")):
-            with pytest.raises(RuntimeError):
+        with patch.object(executor, '_execute_single') as execute_single:
+            with pytest.raises(RuntimeError, match="Rust Core"):
                 executor.execute_batch([step], dry_run=False)
 
-        # '' is not None → 빈 문자열로도 복원 호출되어야 함
-        calls = executor.connector.set_session_sql_mode.call_args_list
-        assert len(calls) >= 1, "set_session_sql_mode가 한 번도 호출되지 않음"
-        assert calls[-1].args[0] == '', (
-            f"마지막 복원 호출이 빈 문자열이어야 함: {calls}"
-        )
+        execute_single.assert_not_called()
+        executor.connector.get_session_sql_mode.assert_not_called()
+        executor.connector.set_session_sql_mode.assert_not_called()
 
     def test_collation_single_merge_all_steps_in_results(self):
         """같은 테이블 3개 column이 병합될 때 모든 step이 results에 정확히 1번 포함된다"""
@@ -1138,53 +1154,37 @@ class TestSessionGuardFaultInjection:
         assert len(result.results) == 3
         assert result.success_count + result.fail_count + result.skip_count == 3
 
-    def test_merge_fallback_all_steps_in_results(self):
-        """병합 ALTER 실패 시 fallback 개별 실행으로 모든 step이 results에 포함된다"""
+    def test_mutation_mode_rejected_before_merge_execution_fallback(self):
+        """병합 ALTER fallback도 Python mutation mode에서는 진입하지 않는다."""
         executor = _make_executor_with_session_mocks()
 
         steps = [_make_charset_step(i, f"col{i}") for i in range(2)]
 
-        def _execute_side_effect(sql):
-            # 두 컬럼을 한꺼번에 포함하는 merged SQL은 실패
-            if '`col0`' in sql and '`col1`' in sql:
-                return FixExecutionResult(
-                    success=False, message="merge failed", sql_executed=sql
-                )
-            return FixExecutionResult(
-                success=True, message="실행 완료", sql_executed=sql, affected_rows=1
-            )
+        with patch.object(executor, '_execute_single') as execute_single:
+            with pytest.raises(RuntimeError, match="Rust Core"):
+                executor.execute_batch(steps, dry_run=False)
 
-        with patch.object(executor, '_execute_single', side_effect=_execute_side_effect):
-            result = executor.execute_batch(steps, dry_run=False)
+        execute_single.assert_not_called()
 
-        assert result.total_steps == 2
-        assert len(result.results) == 2
-        assert result.success_count == 2
-        assert result.fail_count == 0
+    def test_private_single_execution_hook_is_fail_closed(self):
+        """내부 단일 SQL 실행 훅도 직접 호출 시 DB mutation을 거부한다."""
+        executor = _make_executor_with_session_mocks()
 
-    def test_no_duplicate_step_processing_after_merge(self):
-        """병합 처리된 step은 메인 루프에서 중복 처리되지 않는다"""
+        with pytest.raises(RuntimeError, match="Rust Core"):
+            executor._execute_single("UPDATE `test_db`.`orders` SET `created_at` = NULL;")
+
+    def test_dry_run_merge_preview_does_not_execute_steps(self):
+        """병합 preview는 dry-run accounting만 만들고 실제 실행 훅을 호출하지 않는다."""
         conn = FakeMySQLConnector()
         conn.query_results = {'KEY_COLUMN_USAGE': []}
         executor = BatchFixExecutor(conn, "test_db")
 
         steps = [_make_charset_step(i, f"col{i}") for i in range(2)]
 
-        executed_sqls = []
+        with patch.object(executor, '_execute_single') as execute_single:
+            result = executor.execute_batch(steps, dry_run=True)
 
-        def _execute_side_effect(sql):
-            executed_sqls.append(sql)
-            return FixExecutionResult(
-                success=True, message="실행 완료", sql_executed=sql, affected_rows=1
-            )
-
-        with patch.object(executor, '_execute_single', side_effect=_execute_side_effect):
-            result = executor.execute_batch(steps, dry_run=False)
-
-        # 병합되면 1번만 _execute_single 호출 (2번이 아님)
-        assert len(executed_sqls) == 1, (
-            f"병합된 step이 중복 실행됨: {len(executed_sqls)}번 호출"
-        )
+        execute_single.assert_not_called()
         assert result.total_steps == 2
         assert len(result.results) == 2
 

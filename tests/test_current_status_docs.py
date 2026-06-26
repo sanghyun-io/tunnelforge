@@ -87,7 +87,9 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1808 passed, 5 warnings" not in doc
     assert "PASS, 1809 passed, 5 warnings" not in doc
     assert "PASS, 1811 passed, 5 warnings" not in doc
-    assert "PASS, 1812 passed, 5 warnings" in doc
+    assert "PASS, 1812 passed, 5 warnings" not in doc
+    assert "PASS, 1815 passed, 5 warnings" not in doc
+    assert "PASS, 1816 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -200,6 +202,19 @@ def test_current_status_records_post_142_next_issue_analysis():
     assert "python scripts\\check-macos-support-gate.py --final" in doc
     assert "no macOS manual validation report found under build" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
+
+
+def test_current_status_tracks_legacy_auto_fix_core_mutation_api_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-041" in doc
+    assert "GitHub #143" in doc
+    assert "legacy Auto-Fix core mutation APIs" in doc
+    assert "BatchFixExecutor.execute_batch" in doc
+    assert "FKSafeCharsetChanger.execute_safe_charset_change" in doc
+    assert "GitHub #143 is fixed" in summary
+    assert "dry-run/SQL generation remains available" in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
