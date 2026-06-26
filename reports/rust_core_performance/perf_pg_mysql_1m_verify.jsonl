@@ -1,0 +1,2 @@
+{"event":"phase","message":"verification started","phase":"verify","request_id":"perf-pg-mysql-1m-verify"}
+{"command":"migration.verify","event":"result","mismatches":[],"request_id":"perf-pg-mysql-1m-verify","success":true}

@@ -57,20 +57,9 @@ try {
     }
 
     if ($env:RUST_CORE_REQUIRE_PERF_EVIDENCE -eq "1") {
-        $perfFiles = @(
-            "migration_core/target/perf_pg_mysql_1m_migrate.jsonl",
-            "migration_core/target/perf_pg_mysql_1m_verify.jsonl",
-            "migration_core/target/perf_stress_10m_resume.jsonl",
-            "migration_core/target/perf_stress_10m_verify.jsonl"
-        )
-        foreach ($file in $perfFiles) {
-            if (-not (Test-Path $file)) {
-                Write-Error "Rust Core performance gate failed: missing evidence file $file"
-            }
-            $result = Get-Content $file | Where-Object { $_ -match '"event"\s*:\s*"result"' } | Select-Object -Last 1 | ConvertFrom-Json
-            if (-not $result.success) {
-                Write-Error "Rust Core performance gate failed: $file did not finish successfully"
-            }
+        python scripts/validate-rust-core-performance-evidence.py reports/rust_core_performance
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
         }
     }
 

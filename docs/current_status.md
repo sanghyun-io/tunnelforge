@@ -592,9 +592,9 @@ Next action:
    MySQL storage, `tmpdir`, and InnoDB temporary tablespace evidence rather than
    changing import semantics first.
 
-### TF-STATUS-017: Rust Core Performance Evidence Is Local-Only
+### TF-STATUS-017: Rust Core Performance Evidence Is Durable
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: Rust Core migration performance evidence
 
@@ -608,21 +608,29 @@ Evidence:
   expected performance JSONL files exist under `migration_core\target`.
 - `migration_core\target` is ignored by git, so those JSONL files are local
   machine state rather than durable repo, CI, release, or handoff evidence.
-- GitHub issue #135 now tracks preserving or regenerating this evidence in a
-  way a clean checkout/future session can audit.
+- 2026-06-26 update: the four required JSONL files are archived under
+  `reports\rust_core_performance`, with `README.md` documenting refresh and
+  validation.
+- `scripts\validate-rust-core-performance-evidence.py` validates that all four
+  files exist, contain successful Rust Core `result` events, prove the required
+  1M/10M row counts, and do not report verification mismatches.
+- `scripts\rust-core-regression-gate.ps1` now uses the archived evidence
+  validator when `RUST_CORE_REQUIRE_PERF_EVIDENCE=1`, so a clean checkout audits
+  committed evidence instead of ignored `target` artifacts.
 - Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
 - Follow-up GitHub issue:
   https://github.com/sanghyun-io/tunnelforge/issues/135
 
 Impact:
 
-- #99 should not be closed based solely on ignored local target artifacts, even
-  though the current machine has passing performance evidence.
+- #99 can now point at repo-preserved 1M/10M performance evidence and a
+  repeatable validator instead of relying on one developer's ignored local
+  `target` directory.
 
 Next action:
 
-1. Add a repeatable performance evidence generator/workflow or durable artifact
-   handoff, then update #99 with auditable 1M/10M evidence.
+1. Refresh the archived evidence if Rust Core migration/verify streaming
+   semantics change.
 
 ## Issue Tracker
 
@@ -644,13 +652,11 @@ Next action:
 | TF-STATUS-014 | Medium | closed | SQL editor UI | Large SQL rendering guard | Revisit virtual rendering if measured bottleneck remains |
 | TF-STATUS-015 | Medium | closed | SQL editor UI | Schema/table tree panel | Consider richer query composition later |
 | TF-STATUS-016 | Medium | closed | Rust Core dump.import diagnostics | MySQL ERROR 1114 table-full guidance | Collect target storage/tmpdir evidence if it recurs |
-| TF-STATUS-017 | High | open | Rust Core migration performance evidence | 1M/10M evidence is local-only | Preserve or regenerate durable performance evidence for #99/#135 |
+| TF-STATUS-017 | High | closed | Rust Core migration performance evidence | 1M/10M evidence archived and validated | Refresh if migration/verify streaming semantics change |
 
 ## Recommended Execution Order
 
-1. Preserve or regenerate durable Rust Core 1M/10M performance evidence for
-   #99/#135.
-2. Keep macOS real-device validation tracked separately.
+1. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -679,3 +685,4 @@ Next action:
 | 2026-06-26 | Analyzed GitHub #126 and added MySQL `ERROR 1114` storage/tmpdir guidance to post-load DDL import failures. | `migration_core/src/lib.rs`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl_mysql_table_full_error_includes_storage_guidance --lib`; focused regression: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl --lib`; final: `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Re-audited GitHub #116 after #126 closure: PR #117 is merged and local codebase gates pass, but #116 remains open only for final real operator Mac evidence. | `docs/current_status.md` | `gh pr view 117 --repo sanghyun-io/tunnelforge`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` |
 | 2026-06-26 | Analyzed GitHub #99 and created #135 for the remaining Rust Core 1M/10M performance evidence durability gap. | `docs/current_status.md` | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `git status --ignored --short migration_core\target\perf_*.jsonl`; `gh issue create` |
+| 2026-06-26 | Archived Rust Core 1M/10M performance evidence under `reports\rust_core_performance`, added a validator, and wired the optional performance regression gate to the archived evidence for GitHub #135/#99. | `reports/rust_core_performance`, `scripts/validate-rust-core-performance-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_rust_core_performance_evidence.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_performance_evidence.py -q`; final: `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
