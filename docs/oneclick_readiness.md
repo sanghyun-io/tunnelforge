@@ -1,8 +1,10 @@
 # One-Click Migration Readiness
 
 This document tracks the release scope for the One-Click migration UI gate.
-GitHub #137 covered dry-run preview exposure; GitHub #138 tracks real execution
-and automatic fix coverage.
+GitHub #137 covered dry-run preview exposure, #138 covered the first limited
+real-execution path, #139 covered charset/collation execution, #140 covered
+PyQt-triggered derivation, and #141 covered display-only skip policy. No
+repo-side One-Click follow-up issue is currently open.
 
 ## Current Decision
 
@@ -254,8 +256,10 @@ Recommended next repo-side change:
 3. Refresh evidence if event payloads, Rust Core sequencing, or UI safety gates
    change.
 
-Follow-up tracking:
+Completed tracking:
 
-- Dry-run preview gate: GitHub #137.
-- Real execution and automatic fix coverage: GitHub #138.
-- Charset/collation automatic fix coverage: GitHub #139.
+- Completed dry-run preview gate: GitHub #137.
+- Completed first real-execution and automatic-fix gate: GitHub #138.
+- Completed charset/collation automatic-fix gate: GitHub #139.
+- Completed PyQt-triggered charset/collation derivation gate: GitHub #140.
+- Completed display-only `int_display_width` skip policy gate: GitHub #141.
