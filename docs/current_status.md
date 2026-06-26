@@ -53,14 +53,13 @@ session. If only focused tests passed, use `fixed_pending_full_verify`.
 
 ## Summary
 
-TunnelForge is in a strong build/test state, but not all documented recovery
-work is complete. The active architecture baseline is Rust Core ownership of DB
-operations through `tunnelforge-core`, with Python/PyQt responsible for UI,
-orchestration, signals, and dialogs.
+TunnelForge is in a strong build/test state. The active architecture baseline
+is Rust Core ownership of DB operations through `tunnelforge-core`, with
+Python/PyQt responsible for UI, orchestration, signals, and dialogs.
 
-The highest-risk gap is Export/Import Recovery. The design and implementation
-plan exist, but the code still lacks several planned guarantees around strict
-manifest handling, import verification, and export consistency metadata.
+The only open GitHub issue found in the current pass is #116, and its remaining
+unchecked criterion is external real operator Mac validation evidence. No new
+repository-side code or documentation gap was found while re-auditing the issue.
 
 ## Verified On 2026-06-26
 
@@ -69,14 +68,17 @@ Commands run locally:
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before this document |
-| `pytest -q` | PASS, 1707 passed, 3 warnings |
-| `cargo test --manifest-path migration_core\Cargo.toml` | PASS |
+| `pytest -q` | PASS, 1729 passed, 5 warnings |
+| `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 166 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
-| `python -m compileall -q main.py src tests` | PASS |
+| `python -m compileall -q main.py src tests scripts` | PASS |
 | `git diff --check` | PASS |
 | `tunnelforge-core service.hello` | PASS, reports `dump.run`, `dump.import`, migration commands |
 | `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` | PASS, 6 live container MySQL/PostgreSQL smoke tests |
 | `pytest tests\test_live_ui_migration_capture.py tests\test_live_ui_migration_evidence.py -q` | PASS, capture and validator tests |
+| `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
+| `python scripts\check-macos-support-gate.py --skip-github` | PASS |
+| `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 47 passed |
 
 Version references are aligned at `2.1.6` across:
 
@@ -88,6 +90,16 @@ Version references are aligned at `2.1.6` across:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-26 | Current main full Python suite | `pytest -q` | PASS | 1729 passed, 5 warnings |
+| 2026-06-26 | Current main Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 166 lib tests, JSONL CLI test, 6 live-roundtrip tests, 2 non-ignored stress tests, doctests |
+| 2026-06-26 | Current main Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Produced release Rust core binary |
+| 2026-06-26 | Current main Python syntax | `python -m compileall -q main.py src tests scripts` | PASS | No compile errors |
+| 2026-06-26 | Current main live UI evidence validator | `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json` | PASS | 2 directions and 12,000,000 rows checked |
+| 2026-06-26 | Current main Rust performance evidence validator | `python scripts\validate-rust-core-performance-evidence.py` | PASS | 4 files and 11,000,000 rows proven |
+| 2026-06-26 | Current main optional evidence regression gate | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS | Requires both archived Rust performance evidence and live UI migration evidence |
+| 2026-06-26 | Current main macOS support gate | `python scripts\check-macos-support-gate.py --skip-github` | PASS | Repository-side macOS support tracking checks pass without final real-Mac evidence |
+| 2026-06-26 | Current main macOS focused tests | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | 47 passed |
+| 2026-06-26 | Current main diff hygiene | `git diff --check` | PASS | No whitespace errors |
 | 2026-06-26 | Full Python suite | `pytest -q` | PASS | 1707 passed, 3 warnings |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | Unit, CLI, and gated live tests pass or skip according to env |
 | 2026-06-26 | Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Produced `migration_core\target\release\tunnelforge-core.exe` |
@@ -359,6 +371,12 @@ Evidence:
   `python -m compileall -q scripts tests` still pass on main. #116 remains open
   only for the real operator Mac report/log/system-evidence/evidence-zip
   attachment.
+- 2026-06-26 current-main re-audit: full Python suite, full Rust core tests,
+  Rust release build, compileall, final live UI evidence validator, Rust
+  performance evidence validator, optional evidence regression gate with both
+  required evidence flags, macOS support gate, focused macOS tests, and diff
+  hygiene all pass. GitHub issue #116 is still the only open issue and still
+  has only the final real operator Mac validation checkbox unchecked.
 
 Next action:
 
@@ -777,3 +795,4 @@ Next action:
 | 2026-06-26 | Re-audited the last open issue #116 after #99/#136 closure; local macOS support gates still pass, but the issue remains open for external real operator Mac evidence. | `docs/current_status.md` | `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q scripts tests` |
 | 2026-06-26 | Cleaned up stale wording after closing #99/#136 so the evidence READMEs and status heading describe completed evidence instead of pending closure gates. | `docs/current_status.md`, `reports/live_ui_migration/README.md`, `reports/rust_core_performance/README.md` | `rg -n "remaining #99|GitHub issue #136 now tracks|Live UI Performance Evidence Pending|should remain open until the live|#99 remains open|#136 still remains open" docs reports scripts tests README.md README.ko.md`; `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json`; `python scripts\validate-rust-core-performance-evidence.py`; `git diff --check` |
 | 2026-06-26 | Wired final live UI evidence into the optional Rust Core regression gate so clean checkouts can require both archived Rust performance evidence and live UI evidence. | `scripts/rust-core-regression-gate.ps1`, `tests/test_live_ui_migration_evidence.py`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_evidence.py::test_regression_gate_can_require_live_ui_evidence -q`; `RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
+| 2026-06-26 | Reconfirmed current `main` is aligned with `origin/main`, ran a broader current-main verification sweep, and re-analyzed GitHub #116 as the only remaining open issue. | `docs/current_status.md` | `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `python -m compileall -q main.py src tests scripts`; `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json`; `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `git diff --check` |
