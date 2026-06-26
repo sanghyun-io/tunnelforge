@@ -319,7 +319,8 @@ def test_current_status_records_post_148_next_issue_analysis():
     assert "Post-#148 next issue analysis" in doc
     assert "#116 is the only open GitHub issue" in summary
     assert "normal repository-side #116 gate passes" in normalized_doc
-    assert "current merged main HEAD `8edcb88" in doc
+    assert "current merged main HEAD" in doc
+    assert "no successful manual `macOS App Validation` `workflow_dispatch` run" in doc
     assert "not a repo-side implementation issue" in normalized_doc
 
 
