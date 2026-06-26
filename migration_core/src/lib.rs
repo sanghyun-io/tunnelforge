@@ -147,6 +147,12 @@ pub struct DumpManifest {
     pub source_engine: String,
     pub database: String,
     pub schema: NormalizedSchema,
+    #[serde(default = "default_snapshot_policy")]
+    pub snapshot_policy: String,
+    #[serde(default)]
+    pub strict_export: bool,
+    #[serde(default)]
+    pub manifest_warnings: Vec<String>,
     pub chunk_size: usize,
     pub created_unix_seconds: u64,
     pub tables: Vec<DumpTableManifest>,
@@ -675,6 +681,22 @@ fn default_dump_data_format() -> String {
 
 fn default_dump_compression() -> String {
     "none".to_string()
+}
+
+fn default_snapshot_policy() -> String {
+    "unknown".to_string()
+}
+
+fn dump_manifest_consistency_metadata(threads: usize) -> (String, bool, Vec<String>) {
+    if threads > 1 {
+        (
+            "non_consistent_parallel".to_string(),
+            false,
+            vec!["parallel export did not prove a shared consistent snapshot".to_string()],
+        )
+    } else {
+        ("connection_consistent".to_string(), true, Vec::new())
+    }
 }
 
 pub struct CoreService {
@@ -1683,6 +1705,8 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         Vec::new()
     };
     let views_count = views.len();
+    let (snapshot_policy, strict_export, manifest_warnings) =
+        dump_manifest_consistency_metadata(threads);
 
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
@@ -1692,6 +1716,9 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         source_engine: endpoint.engine.clone(),
         database: endpoint.database.clone(),
         schema,
+        snapshot_policy,
+        strict_export,
+        manifest_warnings,
         chunk_size,
         created_unix_seconds: current_unix_seconds(),
         tables: table_manifests,
@@ -1708,6 +1735,9 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         "format": manifest.format,
         "format_version": manifest.format_version,
         "compression": manifest.compression,
+        "snapshot_policy": manifest.snapshot_policy,
+        "strict_export": manifest.strict_export,
+        "manifest_warnings": manifest.manifest_warnings,
         "tables": manifest.tables.len(),
         "views": views_count,
         "rows_dumped": total_rows,
@@ -9578,6 +9608,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 1000,
             created_unix_seconds: 1,
             views: Vec::new(),
@@ -9618,6 +9651,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 1000,
             created_unix_seconds: 1,
             views: Vec::new(),
@@ -9668,6 +9704,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 1000,
             created_unix_seconds: 1,
             views: Vec::new(),
@@ -9702,6 +9741,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 1000,
             created_unix_seconds: 1,
             views: Vec::new(),
@@ -9739,6 +9781,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 1000,
             created_unix_seconds: 1,
             views: Vec::new(),
@@ -9893,6 +9938,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 50_000,
             created_unix_seconds: 1,
             tables: vec![DumpTableManifest {
@@ -10053,6 +10101,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 1000,
             created_unix_seconds: 1,
             views: Vec::new(),
@@ -10080,6 +10131,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: schema(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 1000,
             created_unix_seconds: 1,
             views: Vec::new(),
@@ -12651,6 +12705,49 @@ mod tests {
     }
 
     #[test]
+    fn dump_manifest_strictness_fields_default_for_legacy_json() {
+        let json = r#"{
+            "format": "tunnelforge-dump",
+            "format_version": 2,
+            "data_format": "tsv",
+            "compression": "zstd",
+            "source_engine": "mysql",
+            "database": "app",
+            "schema": {"tables": []},
+            "chunk_size": 50000,
+            "created_unix_seconds": 1,
+            "tables": []
+        }"#;
+
+        let manifest: DumpManifest = serde_json::from_str(json).expect("parse legacy manifest");
+
+        assert_eq!(manifest.snapshot_policy, "unknown");
+        assert!(!manifest.strict_export);
+        assert!(manifest.manifest_warnings.is_empty());
+    }
+
+    #[test]
+    fn dump_manifest_consistency_metadata_marks_parallel_as_non_strict() {
+        let (snapshot_policy, strict_export, warnings) = dump_manifest_consistency_metadata(8);
+
+        assert_eq!(snapshot_policy, "non_consistent_parallel");
+        assert!(!strict_export);
+        assert_eq!(
+            warnings,
+            vec!["parallel export did not prove a shared consistent snapshot".to_string()]
+        );
+    }
+
+    #[test]
+    fn dump_manifest_consistency_metadata_marks_single_thread_as_strict() {
+        let (snapshot_policy, strict_export, warnings) = dump_manifest_consistency_metadata(1);
+
+        assert_eq!(snapshot_policy, "connection_consistent");
+        assert!(strict_export);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
     fn dump_manifest_with_views_round_trips() {
         let manifest = DumpManifest {
             format: "tunnelforge-dump".to_string(),
@@ -12660,6 +12757,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: NormalizedSchema::default(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 50000,
             created_unix_seconds: 1,
             tables: Vec::new(),
@@ -12684,6 +12784,9 @@ mod tests {
             source_engine: "mysql".to_string(),
             database: "app".to_string(),
             schema: NormalizedSchema::default(),
+            snapshot_policy: "connection_consistent".to_string(),
+            strict_export: true,
+            manifest_warnings: Vec::new(),
             chunk_size: 50000,
             created_unix_seconds: 1,
             tables: Vec::new(),

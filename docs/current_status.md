@@ -107,6 +107,10 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Import report artifact | `cargo test --manifest-path migration_core\Cargo.toml write_dump_import_report_creates_json_file --lib` | PASS | Confirms `_tunnelforge_import_report.json` is written with verification JSON |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 147 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
 | 2026-06-26 | Import wrapper/dialog focused tests | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 63 passed after import verification/report change |
+| 2026-06-26 | Export manifest metadata TDD | `cargo test --manifest-path migration_core\Cargo.toml dump_manifest_strictness_fields_default_for_legacy_json --lib` | FAIL then PASS | Initial RED failed because `snapshot_policy`, `strict_export`, and `manifest_warnings` did not exist |
+| 2026-06-26 | Export consistency policy | `cargo test --manifest-path migration_core\Cargo.toml dump_manifest_consistency_metadata --lib` | PASS | Parallel exports are marked non-strict; single-thread exports are marked connection-consistent |
+| 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 150 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
+| 2026-06-26 | Import wrapper/dialog focused tests | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 63 passed after export metadata change |
 
 ## Existing Status And Planning Documents
 
@@ -224,29 +228,30 @@ Next action:
 1. Keep the regression test that rejects `모든 객체`.
 2. Continue surfacing unsupported object warnings from Rust in the import UI.
 
-### TF-STATUS-004: Export Consistency Is Not Explicit In The Manifest
+### TF-STATUS-004: Export Consistency Is Explicit In The Manifest
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: Rust Core dump.run manifest
 
 Evidence:
 
-- The recovery design requires strict export metadata such as snapshot policy.
-- Current `DumpManifest` lacks fields to distinguish strict consistent exports
-  from non-consistent parallel exports.
+- 2026-06-26 update: `DumpManifest` now includes `snapshot_policy`,
+  `strict_export`, and `manifest_warnings`.
+- 2026-06-26 update: legacy manifests default to
+  `snapshot_policy = "unknown"`, `strict_export = false`, and no warnings.
+- 2026-06-26 update: new single-thread exports are marked
+  `connection_consistent` and strict; parallel exports are marked
+  `non_consistent_parallel`, non-strict, with a warning.
 
 Impact:
 
-- A dump artifact cannot communicate whether it can prove a shared consistency
-  boundary across schema, counts, chunks, and checksums.
+- Dump artifacts now communicate the export consistency policy instead of
+  implying a shared snapshot that was not proven.
 
 Next action:
 
-1. Add manifest fields for `snapshot_policy`, `strict_export`, and
-   `manifest_warnings`.
-2. Default legacy manifests to `snapshot_policy = "unknown"`.
-3. Mark new exports according to the actual export path.
+1. Update or create the final remediation report tracked by `TF-STATUS-007`.
 
 ## Medium Priority Issues
 
@@ -337,7 +342,7 @@ Next action:
 | TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Continue remaining recovery work in TF-STATUS-002 and TF-STATUS-004 |
 | TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Continue export consistency metadata in TF-STATUS-004 |
 | TF-STATUS-003 | High | fixed_pending_full_verify | Import UI | Object restoration wording | Keep focused regression; add unsupported-object UI surfacing |
-| TF-STATUS-004 | High | open | Rust Core export | Export consistency not explicit | Add snapshot/strictness manifest metadata |
+| TF-STATUS-004 | High | closed | Rust Core export | Export consistency explicit | Update final remediation report in TF-STATUS-007 |
 | TF-STATUS-005 | Medium | open | Docs/UI flags | Docs mention disabled features | Decide support status for schedule and SQL file execution |
 | TF-STATUS-006 | Medium | watch | Maintainability | Very large files | Keep fixes narrow; split later if behavior stabilizes |
 | TF-STATUS-007 | Low | open | Reporting | Referenced HTML report missing | Create/update final remediation report |
@@ -345,11 +350,7 @@ Next action:
 
 ## Recommended Execution Order
 
-1. Add export strictness metadata:
-   - snapshot policy
-   - strict export marker
-   - manifest warnings
-2. Update or create final remediation report after the recovery work is
+1. Update or create final remediation report after the recovery work is
    verified.
 
 ## Session Log
@@ -361,3 +362,4 @@ Next action:
 | 2026-06-26 | Added Rust validation/application for dump import `timezone_sql`; arbitrary SQL and multi-statement payloads are rejected before DB connection. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_session_time_zone_only --lib`; `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` |
 | 2026-06-26 | Added strict manifest classification before dump import target mutation and preserved classified core errors through Python import messages. | `migration_core/src/lib.rs`, `tests/test_rust_dump_exporter.py`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Added dump import row-count success gate and `_tunnelforge_import_report.json` success artifact. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo test --manifest-path migration_core\Cargo.toml write_dump_import_report_creates_json_file --lib` |
+| 2026-06-26 | Added dump manifest consistency metadata for strict and non-strict export paths. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
