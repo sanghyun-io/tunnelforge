@@ -21,3 +21,17 @@ def test_current_status_summary_does_not_point_to_closed_oneclick_issue_as_next_
     assert "GitHub issues #137 through #141 closed" in summary
     assert "No repo-side One-Click follow-up issue is currently open" in summary
     assert "GitHub issue #139 now tracks the next" not in summary
+
+
+def test_current_status_top_handoff_does_not_present_closed_issues_as_current_work():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    top_handoff = " ".join(doc.split("## Issue Tracker", maxsplit=1)[0].split())
+
+    stale_current_work_phrases = [
+        "#140 remains the next actionable in-repo issue",
+        "#139 is the next in-repo issue",
+        "GitHub issue #139 now tracks the next",
+    ]
+
+    for phrase in stale_current_work_phrases:
+        assert phrase not in top_handoff
