@@ -1,0 +1,88 @@
+{
+  "issue": 137,
+  "git_sha": "b5ad7da2afba21e60154815a83ccb3082eeb0378",
+  "source_type": "local_mysql_container",
+  "feature_flags": {
+    "oneclick_ui_enabled": false,
+    "oneclick_real_execution_enabled": false
+  },
+  "service_hello": {
+    "capabilities": [
+      "connection.open",
+      "connection.close",
+      "connection.test",
+      "schema.list",
+      "schema.inspect",
+      "schema.diff",
+      "query.execute",
+      "query.cancel",
+      "dump.run",
+      "dump.import",
+      "migration.plan",
+      "migration.run",
+      "migration.verify",
+      "migration.resume",
+      "oneclick.run",
+      "oneclick.preflight",
+      "oneclick.analyze",
+      "oneclick.recommend",
+      "oneclick.apply_fixes",
+      "oneclick.validate",
+      "oneclick.report",
+      "job.cancel",
+      "service.shutdown"
+    ]
+  },
+  "run": {
+    "command": "oneclick.run",
+    "dry_run": true,
+    "backup_confirmed": true,
+    "success": true,
+    "schema": "tf_oneclick_readiness",
+    "phase_events": [
+      "preflight",
+      "analysis",
+      "recommendation",
+      "execution",
+      "validation"
+    ],
+    "progress_percents": [
+      5,
+      20,
+      40,
+      55,
+      80,
+      100
+    ],
+    "preflight": {
+      "passed": true,
+      "checks": 3,
+      "issues": 0
+    },
+    "analysis": {
+      "table_count": 1,
+      "total_issues": 0
+    },
+    "execution": {
+      "dry_run": true,
+      "success_count": 0,
+      "fail_count": 0,
+      "skip_count": 0,
+      "log": [
+        "DRY-RUN: no database changes were executed."
+      ]
+    },
+    "validation": {
+      "all_fixed": true,
+      "remaining_issues": 0
+    },
+    "report": {
+      "success": true,
+      "pre_issue_count": 0,
+      "post_issue_count": 0,
+      "execution_log": [
+        "DRY-RUN: no database changes were executed."
+      ]
+    }
+  }
+}

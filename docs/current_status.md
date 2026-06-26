@@ -105,6 +105,7 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Current main diff hygiene | `git diff --check` | PASS | No whitespace errors |
 | 2026-06-26 | One-Click production-readiness audit | `tunnelforge-core service.hello`; `rg -n "oneclick\.|ONE_CLICK_MIGRATION_FEATURE_ENABLED" migration_core\src\lib.rs src tests docs README.md README.ko.md`; `gh issue view 124` | PASS | Rust Core advertises `oneclick.*` commands and Python worker uses Rust Core, but the PyQt entry point is still hidden; created GitHub #137 |
 | 2026-06-26 | One-Click dry-run safety gate | `pytest tests\test_oneclick_rust_core_gate.py tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_db_core_service.py -q`; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py`; `git diff --check` | PASS | Worker rejects real execution until #137; hidden dialog locks Dry-run checked/disabled |
+| 2026-06-26 | One-Click dry-run evidence | `pytest tests\test_oneclick_dry_run_evidence.py -q`; `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS | Local MySQL Rust Core `oneclick.run` dry-run evidence captured and wired to optional regression gate |
 | 2026-06-26 | Full Python suite | `pytest -q` | PASS | 1707 passed, 3 warnings |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | Unit, CLI, and gated live tests pass or skip according to env |
 | 2026-06-26 | Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Produced `migration_core\target\release\tunnelforge-core.exe` |
@@ -761,6 +762,15 @@ Evidence:
 - 2026-06-26 update: `OneClickMigrationWorker` now rejects non-dry-run payloads
   while `ONECLICK_REAL_EXECUTION_ENABLED = False`, and the hidden dialog locks
   the Dry-run checkbox checked/disabled until the #137 gate is complete.
+- 2026-06-26 update: `docs\oneclick_readiness.md` defines the current hidden
+  dry-run-only support scope; `reports\oneclick_readiness` now contains
+  validator-backed local MySQL Rust Core `oneclick.run` dry-run evidence.
+- `scripts\validate-oneclick-dry-run-evidence.py` verifies that the evidence
+  includes all `oneclick.*` service capabilities, disabled UI/real-execution
+  flags, `dry_run=true`, every expected phase, a 100% progress event, zero
+  validation remnants, and the explicit dry-run execution log.
+- `scripts\rust-core-regression-gate.ps1` can require the evidence when
+  `RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE=1`.
 
 Follow-up GitHub issue:
 
@@ -775,9 +785,9 @@ Impact:
 
 Next action:
 
-1. Define the supported One-Click release scope, collect at least one realistic
-   Rust Core-backed dry-run evidence flow, and then decide whether to keep the
-   UI hidden, expose it as preview/beta, or fully enable it.
+1. Decide whether to keep the UI hidden, expose it as preview/beta, or fully
+   enable it; if that decision changes, update the feature flags, user-facing
+   docs, and status tracker in the same change.
 
 ## Issue Tracker
 
@@ -849,3 +859,4 @@ Next action:
 | 2026-06-26 | Reconfirmed current `main` was aligned with `origin/main`, ran a broader current-main verification sweep, and re-analyzed GitHub #116 as the then-only remaining open issue before the later One-Click tracker was created. | `docs/current_status.md` | `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `python -m compileall -q main.py src tests scripts`; `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json`; `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `git diff --check` |
 | 2026-06-26 | Audited stale plan/TODO candidates after #116 was confirmed external; found the One-Click Rust Core command surface exists while the PyQt entry point remains hidden, created GitHub #137, and added TF-STATUS-019 so the production-readiness gate is tracked separately from closed #124. | `docs/current_status.md` | `rg -n "oneclick\.|ONE_CLICK_MIGRATION_FEATURE_ENABLED" migration_core\src\lib.rs src tests docs README.md README.ko.md`; `tunnelforge-core service.hello`; `gh issue view 124`; `gh issue create` created #137 |
 | 2026-06-26 | Hardened the hidden One-Click path for #137 so real execution is blocked until the readiness gate opens and the hidden dialog cannot uncheck Dry-run. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens -q`; RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens -q`; final: `pytest tests\test_oneclick_rust_core_gate.py tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_db_core_service.py -q`; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py`; `git diff --check` |
+| 2026-06-26 | Added One-Click dry-run evidence capture/validation tooling, archived local MySQL Rust Core `oneclick.run` dry-run evidence, documented the current hidden dry-run-only scope, and wired the optional regression gate to that evidence. | `scripts/validate-oneclick-dry-run-evidence.py`, `scripts/capture-oneclick-dry-run-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_oneclick_dry_run_evidence.py`, `reports/oneclick_readiness`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_dry_run_evidence.py -q`; capture: `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; final: `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
