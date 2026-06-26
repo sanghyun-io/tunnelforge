@@ -1,8 +1,9 @@
 """
 One-Click MySQL 8.0 → 8.4 마이그레이션 다이얼로그
 
-한 번의 클릭으로 Pre-flight → Analysis → Execution → Validation까지
-전체 마이그레이션 프로세스를 자동으로 실행합니다.
+Rust DB Core로 Pre-flight → Analysis → Execution Plan → Validation 흐름을
+실행합니다. 기본값은 dry-run이며, 실제 변경은 백업 확인 후 검증된 제한
+범위에서만 실행됩니다.
 """
 import threading
 from datetime import datetime

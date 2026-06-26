@@ -78,7 +78,9 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1795 passed, 5 warnings" not in doc
     assert "PASS, 1796 passed, 5 warnings" not in doc
     assert "PASS, 1799 passed, 5 warnings" not in doc
-    assert "PASS, 1801 passed, 5 warnings" in doc
+    assert "PASS, 1801 passed, 5 warnings" not in doc
+    assert "1801 passed, 5 warnings" not in doc
+    assert "PASS, 1803 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -128,6 +130,15 @@ def test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup():
     assert "One-Click fallback dry-run tooltip" in doc
     assert "disabled in this build" in doc
     assert "One-Click allows Dry-run only until the GitHub #138" not in doc
+
+
+def test_current_status_records_oneclick_module_scope_docstring_cleanup():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+
+    assert "TF-STATUS-036" in doc
+    assert "One-Click module scope docstring" in doc
+    assert "Rust DB Core dry-run default and limited real execution" in doc
+    assert "전체 마이그레이션 프로세스를 자동으로 실행합니다" not in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():

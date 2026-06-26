@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from PyQt6.QtWidgets import QApplication
@@ -8,6 +9,9 @@ from src.ui.dialogs.oneclick_migration_dialog import (
     OneClickMigrationWorker,
 )
 from src.ui.dialogs import migration_dialogs, oneclick_migration_dialog
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 class FakeEndpoint:
@@ -66,6 +70,17 @@ def test_oneclick_worker_accepts_rust_core_connector_shape():
     )
 
     worker._ensure_rust_core_connector()
+
+
+def test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope():
+    source = (
+        PROJECT_ROOT / "src" / "ui" / "dialogs" / "oneclick_migration_dialog.py"
+    ).read_text(encoding="utf-8")
+
+    assert "전체 마이그레이션 프로세스를 자동으로 실행합니다" not in source
+    assert "Rust DB Core" in source
+    assert "dry-run" in source
+    assert "백업 확인" in source
 
 
 def test_oneclick_worker_rejects_real_execution_without_backup_confirmation():
