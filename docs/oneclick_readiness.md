@@ -120,6 +120,12 @@ Implementation gate:
 - `scripts\capture-oneclick-charset-evidence.py` must remain fail-closed for
   live capture until the Rust Core allowlist path exists. The scaffold is only
   a report-shape and safe-scope helper at this stage.
+- Rust Core now has an internal, un-wired contract helper for the future
+  `charset_collation_fk_safe` option. It validates safe `tf_oneclick_`
+  evidence identifiers, explicit target charset/collation, FK order coverage,
+  rollback SQL, and generated table-level conversion SQL, but it is not yet
+  connected to `oneclick.recommend`, `oneclick.apply_fixes`, or
+  `oneclick.run dry_run=false`.
 
 ## Real-Execution Gate Outcome
 

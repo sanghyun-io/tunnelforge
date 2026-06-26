@@ -5922,6 +5922,112 @@ fn oneclick_auto_fix_option(issue: &MigrationIssue, schema: &str) -> Option<Valu
     }))
 }
 
+fn oneclick_charset_fk_safe_option_from_payload(
+    payload: &Value,
+    schema: &str,
+) -> Result<Value, String> {
+    let schema = oneclick_safe_charset_identifier(schema, "schema")?;
+    let tables = oneclick_required_string_list(payload.get("tables"), "tables")?;
+    let fk_order = oneclick_required_string_list(payload.get("fk_order"), "fk_order")?;
+    let target_charset = oneclick_safe_charset_token(
+        payload.get("target_charset").and_then(Value::as_str),
+        "target_charset",
+    )?;
+    let target_collation = oneclick_safe_charset_token(
+        payload.get("target_collation").and_then(Value::as_str),
+        "target_collation",
+    )?;
+    let rollback_sql = oneclick_required_string_list(payload.get("rollback_sql"), "rollback_sql")?;
+
+    if tables.is_empty() {
+        return Err("tables must not be empty".to_string());
+    }
+    if rollback_sql.is_empty() {
+        return Err("rollback_sql must not be empty".to_string());
+    }
+    for table in &tables {
+        oneclick_safe_charset_identifier(table, "table")?;
+    }
+    for table in &fk_order {
+        oneclick_safe_charset_identifier(table, "fk_order")?;
+    }
+    let table_set: BTreeSet<_> = tables.iter().cloned().collect();
+    let fk_order_set: BTreeSet<_> = fk_order.iter().cloned().collect();
+    if table_set != fk_order_set {
+        return Err("fk_order must cover the same tables as tables".to_string());
+    }
+
+    let sql = fk_order
+        .iter()
+        .map(|table| {
+            format!(
+                "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
+                quote_ident("mysql", &schema),
+                quote_ident("mysql", table),
+                target_charset,
+                target_collation
+            )
+        })
+        .collect::<Vec<_>>();
+
+    Ok(json!({
+        "strategy": "charset_collation_fk_safe",
+        "label": "Convert table charset/collation with FK-safe ordering",
+        "description": "Convert the FK-connected table set to the explicit target charset/collation.",
+        "tables": tables,
+        "fk_order": fk_order,
+        "target_charset": target_charset,
+        "target_collation": target_collation,
+        "sql": sql,
+        "rollback_sql": rollback_sql
+    }))
+}
+
+fn oneclick_required_string_list(
+    value: Option<&Value>,
+    label: &str,
+) -> Result<Vec<String>, String> {
+    let Some(values) = value.and_then(Value::as_array) else {
+        return Err(format!("{label} must be an array"));
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(ToString::to_string)
+                .ok_or_else(|| format!("{label} must contain non-empty strings"))
+        })
+        .collect()
+}
+
+fn oneclick_safe_charset_identifier(value: &str, label: &str) -> Result<String, String> {
+    let value = value.trim();
+    if !value.starts_with("tf_oneclick_")
+        || !value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(format!("{label} must use a safe tf_oneclick_ identifier"));
+    }
+    Ok(value.to_string())
+}
+
+fn oneclick_safe_charset_token(value: Option<&str>, label: &str) -> Result<String, String> {
+    let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Err(format!("{label} is required"));
+    };
+    if !value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+    {
+        return Err(format!("{label} must be a safe token"));
+    }
+    Ok(value.to_string())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OneClickApplyAction {
     issue_type: String,
@@ -10508,6 +10614,114 @@ mod tests {
             recommendations[0]["selected_option"]["strategy"],
             "engine_innodb"
         );
+    }
+
+    #[test]
+    fn oneclick_charset_contract_builds_fk_safe_option() {
+        let option = oneclick_charset_fk_safe_option_from_payload(
+            &json!({
+                "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+                "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+                "target_charset": "utf8mb4",
+                "target_collation": "utf8mb4_0900_ai_ci",
+                "rollback_sql": [
+                    "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                    "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                ]
+            }),
+            "tf_oneclick_charset",
+        )
+        .unwrap();
+
+        assert_eq!(option["strategy"], "charset_collation_fk_safe");
+        assert_eq!(option["target_charset"], "utf8mb4");
+        assert_eq!(option["target_collation"], "utf8mb4_0900_ai_ci");
+        assert_eq!(
+            option["tables"],
+            json!(["tf_oneclick_parent", "tf_oneclick_child"])
+        );
+        assert_eq!(
+            option["fk_order"],
+            json!(["tf_oneclick_parent", "tf_oneclick_child"])
+        );
+        assert_eq!(
+            option["sql"],
+            json!([
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+            ])
+        );
+        assert_eq!(option["rollback_sql"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn oneclick_charset_contract_rejects_missing_target() {
+        let err = oneclick_charset_fk_safe_option_from_payload(
+            &json!({
+                "tables": ["tf_oneclick_parent"],
+                "fk_order": ["tf_oneclick_parent"],
+                "target_charset": "utf8mb4",
+                "rollback_sql": [
+                    "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                ]
+            }),
+            "tf_oneclick_charset",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("target_collation"));
+    }
+
+    #[test]
+    fn oneclick_charset_contract_rejects_incomplete_fk_order() {
+        let err = oneclick_charset_fk_safe_option_from_payload(
+            &json!({
+                "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+                "fk_order": ["tf_oneclick_parent"],
+                "target_charset": "utf8mb4",
+                "target_collation": "utf8mb4_0900_ai_ci",
+                "rollback_sql": [
+                    "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                ]
+            }),
+            "tf_oneclick_charset",
+        )
+        .unwrap_err();
+
+        assert!(err.contains("fk_order"));
+    }
+
+    #[test]
+    fn oneclick_charset_contract_rejects_unsafe_schema_or_table() {
+        let unsafe_schema = oneclick_charset_fk_safe_option_from_payload(
+            &json!({
+                "tables": ["tf_oneclick_parent"],
+                "fk_order": ["tf_oneclick_parent"],
+                "target_charset": "utf8mb4",
+                "target_collation": "utf8mb4_0900_ai_ci",
+                "rollback_sql": [
+                    "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                ]
+            }),
+            "prod",
+        )
+        .unwrap_err();
+        assert!(unsafe_schema.contains("schema"));
+
+        let unsafe_table = oneclick_charset_fk_safe_option_from_payload(
+            &json!({
+                "tables": ["users"],
+                "fk_order": ["users"],
+                "target_charset": "utf8mb4",
+                "target_collation": "utf8mb4_0900_ai_ci",
+                "rollback_sql": [
+                    "ALTER TABLE `tf_oneclick_charset`.`users` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+                ]
+            }),
+            "tf_oneclick_charset",
+        )
+        .unwrap_err();
+        assert!(unsafe_table.contains("table"));
     }
 
     #[test]
