@@ -8553,12 +8553,24 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
 ) -> Result<(), String> {
     validate_foreign_key_column_compatibility(schema)?;
     for sql in generate_sequence_reset_ddl(schema, target_engine) {
-        target.execute_sql(&sql)?;
+        target
+            .execute_sql(&sql)
+            .map_err(|err| post_load_ddl_error(&sql, &err))?;
     }
     for sql in generate_post_data_ddl(schema, target_engine) {
-        target.execute_sql(&sql)?;
+        target
+            .execute_sql(&sql)
+            .map_err(|err| post_load_ddl_error(&sql, &err))?;
     }
     Ok(())
+}
+
+fn post_load_ddl_error(sql: &str, err: &str) -> String {
+    classified_import_error(
+        "post_load_validation_failed",
+        &format!("post-load DDL failed while executing {sql}: {err}"),
+        None,
+    )
 }
 
 pub fn count_sql(engine: &str, table: &str) -> String {
@@ -9719,6 +9731,7 @@ mod tests {
     struct RecordingAdapter {
         executed_sql: Vec<String>,
         row_counts: BTreeMap<String, usize>,
+        fail_sql_contains: Option<String>,
     }
 
     impl MigrationAdapter for RecordingAdapter {
@@ -9748,6 +9761,13 @@ mod tests {
         }
 
         fn execute_sql(&mut self, sql: &str) -> Result<(), String> {
+            if self
+                .fail_sql_contains
+                .as_ref()
+                .is_some_and(|needle| sql.contains(needle))
+            {
+                return Err("mysql SQL execution error: ERROR 1114 (HY000): The table '#sql-1cbc_17b' is full".to_string());
+            }
             self.executed_sql.push(sql.to_string());
             Ok(())
         }
@@ -11773,6 +11793,39 @@ mod tests {
 
         assert!(err.contains("post_load_validation_failed"));
         assert!(adapter.executed_sql.is_empty());
+    }
+
+    #[test]
+    fn post_load_ddl_errors_include_classification_and_sql_context() {
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "login_attempts".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "user_id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: vec![NormalizedIndex {
+                    name: "idx_login_attempts_user_id".to_string(),
+                    columns: vec!["user_id".to_string()],
+                    unique: false,
+                }],
+                foreign_keys: Vec::new(),
+            }],
+        };
+        let mut adapter = RecordingAdapter {
+            fail_sql_contains: Some("idx_login_attempts_user_id".to_string()),
+            ..RecordingAdapter::default()
+        };
+
+        let err = apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("CREATE INDEX `idx_login_attempts_user_id`"));
+        assert!(err.contains("ERROR 1114"));
     }
 
     #[test]
