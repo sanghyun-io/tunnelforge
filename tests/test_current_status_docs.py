@@ -51,8 +51,11 @@ def test_current_status_does_not_describe_old_gate_head_as_current():
 
 def test_current_status_does_not_keep_stale_macos_focused_test_count():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    baseline = _section(doc, "Current Baseline Verification")
 
     assert "PASS, 47 passed" not in doc
+    assert "PASS, 51 passed" not in baseline
+    assert "PASS, 52 passed" in baseline
     assert "Current main macOS focused tests" in doc
 
 
@@ -61,7 +64,9 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
 
     assert "PASS, 1729 passed" not in doc
     assert "PASS, 1786 passed" not in doc
-    assert "PASS, 1793 passed, 5 warnings" in doc
+    assert "PASS, 1793 passed, 5 warnings" not in doc
+    assert "PASS, 1794 passed, 5 warnings" not in doc
+    assert "PASS, 1795 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
