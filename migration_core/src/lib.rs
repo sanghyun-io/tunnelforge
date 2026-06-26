@@ -8458,6 +8458,8 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
                 columns
             ));
         }
+    }
+    for table in &schema.tables {
         for fk in &table.foreign_keys {
             if fk.columns.is_empty() || fk.referenced_columns.is_empty() {
                 continue;
@@ -11567,6 +11569,61 @@ mod tests {
             ddl[1],
             "ALTER TABLE \"orders\" ADD CONSTRAINT \"fk_orders_users\" FOREIGN KEY (\"user_id\") REFERENCES \"users\" (\"id\");"
         );
+    }
+
+    #[test]
+    fn post_data_ddl_applies_all_indexes_before_any_foreign_keys() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "cr_industry_map".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "brief_slug".to_string(),
+                        type_name: "varchar(64)".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "cr_industry_map_ibfk_1".to_string(),
+                        columns: vec!["brief_slug".to_string()],
+                        referenced_table: "cr_industry_briefs".to_string(),
+                        referenced_columns: vec!["slug".to_string()],
+                    }],
+                },
+                NormalizedTable {
+                    name: "cr_industry_briefs".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "slug".to_string(),
+                        type_name: "varchar(64)".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: false,
+                        unique: true,
+                    }],
+                    indexes: vec![NormalizedIndex {
+                        name: "ux_cr_industry_briefs_slug".to_string(),
+                        columns: vec!["slug".to_string()],
+                        unique: true,
+                    }],
+                    foreign_keys: Vec::new(),
+                },
+            ],
+        };
+
+        let ddl = generate_post_data_ddl(&schema, "mysql");
+        let parent_unique_index = ddl
+            .iter()
+            .position(|sql| sql.contains("ux_cr_industry_briefs_slug"))
+            .unwrap();
+        let child_foreign_key = ddl
+            .iter()
+            .position(|sql| sql.contains("cr_industry_map_ibfk_1"))
+            .unwrap();
+
+        assert!(parent_unique_index < child_foreign_key);
     }
 
     #[test]
