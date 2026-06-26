@@ -61,7 +61,8 @@ Open GitHub issue #116 remains external: its remaining unchecked criterion is
 real operator Mac validation evidence. GitHub issue #137 covered the One-Click
 dry-run preview gate; GitHub issue #138 is closed for the now-validated limited
 real-execution and automatic-fix gate for
-`deprecated_engine -> engine_innodb`.
+`deprecated_engine -> engine_innodb`. GitHub issue #139 now tracks the next
+actionable One-Click automatic-fix class: charset/collation coverage.
 
 ## Verified On 2026-06-26
 
@@ -116,6 +117,7 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | One-Click limited real-execution PyQt gate | `pytest tests\test_oneclick_rust_core_gate.py -q` RED then GREEN; `pytest tests\test_oneclick_rust_core_gate.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_real_execution_capture.py tests\test_db_core_service.py -q`; `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json` | PASS | PyQt keeps Dry-run default, allows limited backup-confirmed real execution, and rejects non-dry-run without backup confirmation |
 | 2026-06-26 | One-Click #138 closure gate | `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `TF_MYSQL_HOST=127.0.0.1; TF_MYSQL_PORT=3406; TF_MYSQL_USER=root; TF_MYSQL_PASSWORD=test; TF_MYSQL_DATABASE=tf_oneclick_real_execution; cargo test --manifest-path migration_core\Cargo.toml oneclick_run_live_engine_innodb_when_env_is_configured --test live_roundtrip -- --nocapture`; `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py src\ui\dialogs\migration_dialogs.py src\core\i18n.py scripts\validate-oneclick-dry-run-evidence.py scripts\validate-oneclick-real-execution-evidence.py tests\test_oneclick_rust_core_gate.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_real_execution_evidence.py`; `git diff --check` | PASS | #138 acceptance is satisfied for the exact `deprecated_engine -> engine_innodb` automatic scope |
 | 2026-06-26 | Post-#138 open issue scan and #116 re-audit | `gh issue list --repo sanghyun-io/tunnelforge --state open --limit 20 --json number,title,labels,url`; `gh issue view 116 --repo sanghyun-io/tunnelforge --json number,title,state,body,comments,url,labels`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | #116 is the only remaining open issue; no repository-side macOS gap found, final real operator Mac evidence is still external |
+| 2026-06-26 | One-Click follow-up issue split | `rg -n "charset_issue|invalid_date|zerofill_usage|float_precision|enum_empty_value|deprecated_engine|engine_innodb|manual|oneclick_recommend|oneclick_apply" migration_core\src\lib.rs tests docs\oneclick_readiness.md`; `gh issue create` created #139 | PASS | Charset/collation One-Click automatic fix coverage is now tracked separately from closed #138 |
 | 2026-06-26 | Full Python suite | `pytest -q` | PASS | 1707 passed, 3 warnings |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | Unit, CLI, and gated live tests pass or skip according to env |
 | 2026-06-26 | Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Produced `migration_core\target\release\tunnelforge-core.exe` |
@@ -876,6 +878,43 @@ Next action:
 2. Keep production database usage out of One-Click real execution until there
    is explicit production-readiness evidence.
 
+### TF-STATUS-021: One-Click Charset/Collation Automatic Fix Coverage
+
+Status: `open`
+Severity: High
+Area: One-Click migration UI / Rust Core automatic fixes
+
+Evidence:
+
+- GitHub #139 tracks charset/collation automatic fix coverage as a separate
+  follow-up after #138.
+- `docs\oneclick_readiness.md` currently keeps `charset_issue` manual because
+  FK-safe ordering, rollback metadata, and target charset/collation selection
+  are not proven for One-Click real execution.
+- Current Rust Core One-Click apply logic only allowlists
+  `deprecated_engine -> engine_innodb`; charset/collation strategies remain
+  manual or blocked as disallowed.
+
+GitHub issue:
+
+- https://github.com/sanghyun-io/tunnelforge/issues/139
+
+Impact:
+
+- Users can still run One-Click dry-run and the validated engine fix, but
+  charset/collation remediation remains manual.
+- Enabling charset/collation real execution without FK ordering, rollback, and
+  target policy evidence would risk unsafe schema changes.
+
+Next action:
+
+1. Work GitHub #139: define the eligible charset/collation subset, target
+   policy, FK-safe ordering, rollback metadata, Rust Core contract tests, PyQt
+   rendering tests, and local MySQL before/after evidence.
+2. Keep `charset_issue` out of the One-Click real-execution allowlist until
+   validator-backed evidence passes and docs/status are updated in the same
+   change.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -900,12 +939,14 @@ Next action:
 | TF-STATUS-018 | High | closed | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence captured | Refresh final validator evidence if migration/RSS semantics change |
 | TF-STATUS-019 | Medium | closed | One-Click migration UI | Dry-run preview One-Click entry point | Keep preview evidence aligned if event payloads change |
 | TF-STATUS-020 | High | closed | One-Click migration UI / Rust Core automatic fixes | Real execution and automatic fix coverage | Track any additional automatic fix class as a separate issue |
+| TF-STATUS-021 | High | open | One-Click migration UI / Rust Core automatic fixes | Charset/collation automatic fix coverage | Work GitHub #139; keep charset_issue manual until FK-safe evidence exists |
 
 ## Recommended Execution Order
 
-1. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
+1. Work TF-STATUS-021 / GitHub #139 because it is actionable in-repo.
+2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence.
-2. Track additional One-Click automatic fix classes as separate GitHub issues
+3. Track additional One-Click automatic fix classes as separate GitHub issues
    before implementation.
 
 ## Session Log
@@ -960,3 +1001,4 @@ Next action:
 | 2026-06-26 | Connected `oneclick.run dry_run=false` to the validated `engine_innodb` apply path. The live MySQL regression creates a MyISAM table, runs the UI-facing Rust command, and verifies the table becomes InnoDB. | `migration_core/src/lib.rs`, `migration_core/tests/live_roundtrip.rs`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `TF_MYSQL_HOST=127.0.0.1; TF_MYSQL_PORT=3406; TF_MYSQL_USER=root; TF_MYSQL_PASSWORD=test; TF_MYSQL_DATABASE=tf_oneclick_real_execution; cargo test --manifest-path migration_core\Cargo.toml oneclick_run_live_engine_innodb_when_env_is_configured --test live_roundtrip -- --nocapture` |
 | 2026-06-26 | Opened the PyQt One-Click real-execution gate only for the validated `deprecated_engine -> engine_innodb` scope, kept Dry-run as the default, required backup confirmation for non-dry-run payloads, updated evidence validators/docs/status, and prepared GitHub #138 for closure. | `src/ui/dialogs/oneclick_migration_dialog.py`, `src/ui/dialogs/migration_dialogs.py`, `src/core/i18n.py`, `scripts/validate-oneclick-dry-run-evidence.py`, `scripts/validate-oneclick-real-execution-evidence.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_oneclick_dry_run_evidence.py`, `tests/test_oneclick_real_execution_evidence.py`, `docs/oneclick_readiness.md`, `docs/current_status.md`, `reports/oneclick_readiness/README.md` | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py -q`; final: `pytest tests\test_oneclick_rust_core_gate.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_real_execution_capture.py tests\test_db_core_service.py -q`; `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; live: `cargo test --manifest-path migration_core\Cargo.toml oneclick_run_live_engine_innodb_when_env_is_configured --test live_roundtrip -- --nocapture`; evidence gate: `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python -m compileall -q ...`; `git diff --check` |
 | 2026-06-26 | Closed GitHub #138, scanned remaining open issues, and re-audited #116 as the only remaining open issue. The macOS support gate and focused tests still pass; #116 remains blocked only on real operator Mac evidence. | `docs/current_status.md` | `gh issue list --repo sanghyun-io/tunnelforge --state open --limit 20 --json number,title,labels,url`; `gh issue view 116 --repo sanghyun-io/tunnelforge --json number,title,state,body,comments,url,labels`; `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` |
+| 2026-06-26 | Created GitHub #139 and TF-STATUS-021 for the next actionable One-Click automatic-fix class: charset/collation coverage. | `docs/current_status.md`, `docs/oneclick_readiness.md` | `rg -n "charset_issue|invalid_date|zerofill_usage|float_precision|enum_empty_value|deprecated_engine|engine_innodb|manual|oneclick_recommend|oneclick_apply" migration_core\src\lib.rs tests docs\oneclick_readiness.md`; `gh issue create` created #139 |

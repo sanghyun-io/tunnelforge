@@ -150,3 +150,4 @@ Follow-up tracking:
 
 - Dry-run preview gate: GitHub #137.
 - Real execution and automatic fix coverage: GitHub #138.
+- Charset/collation automatic fix coverage: GitHub #139.
