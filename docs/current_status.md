@@ -398,9 +398,9 @@ Next action:
 2. If implementing, add worker endpoint resolution tests and switch/cleanup
    verification before changing production code.
 
-### TF-STATUS-011: Schema Fidelity Metadata Is Still Incomplete
+### TF-STATUS-011: MySQL FK Charset/Collation Fidelity
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: Rust Core dump.run manifest / dump.import plan
 
@@ -408,24 +408,28 @@ Evidence:
 
 - The recovery design calls out MySQL charset/collation/table-option fidelity
   and treats `ERROR 3780` as a schema fidelity/import-plan validation problem.
-- `DumpManifest` now records export consistency metadata, but table/column
-  charset, collation, engine, and related schema fidelity metadata are not fully
-  represented in the manifest.
-- No focused test currently proves that FK column charset/collation mismatches
-  are rejected before post-load DDL.
+- MySQL column inspection now captures `CHARACTER_SET_NAME` and
+  `COLLATION_NAME` and preserves them in the native column type literal stored
+  in the dump manifest schema.
+- `dump.import` and migration post-load DDL now validate FK column
+  charset/collation compatibility before applying FK DDL.
+- Focused tests cover incompatible FK text collations, matching collations,
+  metadata capture in MySQL inspect SQL, and MySQL-to-PostgreSQL type mapping
+  with MySQL character options stripped.
 - GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/134
 
 Impact:
 
-- The import pipeline can classify missing checksums and row-count mismatches,
-  but it still cannot fully prove schema fidelity for MySQL FK compatibility
-  before applying post-load DDL.
+- The import pipeline now classifies the `ERROR 3780` class of FK
+  charset/collation mismatch as `post_load_validation_failed` before sending
+  incompatible FK DDL to the target database.
 
 Next action:
 
-1. Add failing tests for FK charset/collation mismatch classification.
-2. Extend schema capture/manifest metadata or add an import-plan validator that
-   rejects incompatible FK column definitions before target mutation.
+1. Keep FK fidelity regression coverage aligned with future schema metadata
+   changes.
+2. Track broader table-option fidelity separately if table engine/table
+   collation preservation becomes a release requirement beyond FK validation.
 
 ## Issue Tracker
 
@@ -441,14 +445,13 @@ Next action:
 | TF-STATUS-008 | Low | watch | macOS | Final real-Mac validation pending | Require evidence bundle before production-ready claim |
 | TF-STATUS-009 | High | closed | Rust Core import | Merge import post-load DDL policy | Keep merge/recreate policy tests |
 | TF-STATUS-010 | High | open | Rust Core import | Shadow full replacement not implemented | GitHub #133 |
-| TF-STATUS-011 | High | open | Rust Core schema fidelity | MySQL FK charset/collation fidelity incomplete | GitHub #134 |
+| TF-STATUS-011 | High | closed | Rust Core schema fidelity | MySQL FK charset/collation fidelity | Keep FK fidelity regression coverage |
 
 ## Recommended Execution Order
 
-1. Resolve schema fidelity metadata and `ERROR 3780` class validation.
-2. Decide and implement or explicitly retire shadow full replacement
+1. Decide and implement or explicitly retire shadow full replacement
    architecture.
-3. Keep macOS real-device validation tracked separately.
+2. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -464,3 +467,4 @@ Next action:
 | 2026-06-26 | Marked scheduled backup documentation as disabled/internal while the main UI feature flag remains off. | `SCHEDULE.md`, `docs/current_status.md` | `rg -n "SCHEDULE_FEATURE_ENABLED|SQL_FILE_EXECUTION_FEATURE_ENABLED|스케줄" src docs SCHEDULE.md` |
 | 2026-06-26 | Re-audited recovery design residuals after user challenge; added explicit open tracking for shadow replacement and MySQL schema fidelity gaps. | `docs/current_status.md` | `rg -n "shadow|ERROR 3780|charset|collation" docs/superpowers/specs/2026-06-01-export-import-recovery-design.md docs/superpowers/plans/2026-06-01-export-import-recovery.md reports/export_import_flow_review_20260601.html migration_core/src/lib.rs` |
 | 2026-06-26 | Created GitHub issues for remaining recovery gaps. | `docs/current_status.md` | `gh issue create` created #133 and #134 |
+| 2026-06-26 | Added MySQL FK charset/collation fidelity capture and post-load validation for GitHub #134. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py -q -k "classified_core_error"`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |

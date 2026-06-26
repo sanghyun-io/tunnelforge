@@ -4434,28 +4434,41 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let mut tables = Vec::new();
 
     for table_name in table_names {
-        let columns: Vec<NormalizedColumn> = conn
-            .exec_map(
-                inspect_columns_sql("mysql"),
-                (&schema_name, &table_name),
-                |(name, type_name, is_nullable, default_value, extra): (
-                    String,
-                    String,
-                    String,
-                    Option<String>,
-                    String,
-                )| {
-                    NormalizedColumn {
+        let columns: Vec<NormalizedColumn> =
+            conn
+                .exec_map(
+                    inspect_columns_sql("mysql"),
+                    (&schema_name, &table_name),
+                    |(
                         name,
-                        type_name: with_auto_increment_marker(&type_name, &extra),
+                        type_name,
+                        character_set,
+                        collation,
+                        is_nullable,
                         default_value,
-                        nullable: is_nullable.eq_ignore_ascii_case("YES"),
-                        primary_key: false,
-                        unique: false,
-                    }
-                },
-            )
-            .map_err(|err| format!("mysql column inspect error: {err}"))?;
+                        extra,
+                    ): (
+                        String,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        String,
+                        Option<String>,
+                        String,
+                    )| {
+                        let type_name =
+                            mysql_type_with_character_options(&type_name, character_set, collation);
+                        NormalizedColumn {
+                            name,
+                            type_name: with_auto_increment_marker(&type_name, &extra),
+                            default_value,
+                            nullable: is_nullable.eq_ignore_ascii_case("YES"),
+                            primary_key: false,
+                            unique: false,
+                        }
+                    },
+                )
+                .map_err(|err| format!("mysql column inspect error: {err}"))?;
         let keys: Vec<(String, String)> = conn
             .exec_map(
                 inspect_keys_sql("mysql"),
@@ -7949,6 +7962,95 @@ fn verify_imported_row_counts(
     Ok(())
 }
 
+fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Result<(), String> {
+    for table in &schema.tables {
+        for fk in &table.foreign_keys {
+            for (column_name, referenced_column_name) in
+                fk.columns.iter().zip(fk.referenced_columns.iter())
+            {
+                let Some(column) = find_schema_column(schema, &table.name, column_name) else {
+                    continue;
+                };
+                let Some(referenced_column) =
+                    find_schema_column(schema, &fk.referenced_table, referenced_column_name)
+                else {
+                    continue;
+                };
+
+                let column_fidelity = mysql_character_fidelity(&column.type_name);
+                let referenced_fidelity = mysql_character_fidelity(&referenced_column.type_name);
+
+                if let (Some(charset), Some(referenced_charset)) = (
+                    column_fidelity.character_set.as_deref(),
+                    referenced_fidelity.character_set.as_deref(),
+                ) {
+                    if !charset.eq_ignore_ascii_case(referenced_charset) {
+                        return Err(foreign_key_fidelity_error(
+                            fk,
+                            column_name,
+                            referenced_column_name,
+                            "character set",
+                            charset,
+                            referenced_charset,
+                        ));
+                    }
+                }
+
+                if let (Some(collation), Some(referenced_collation)) = (
+                    column_fidelity.collation.as_deref(),
+                    referenced_fidelity.collation.as_deref(),
+                ) {
+                    if !collation.eq_ignore_ascii_case(referenced_collation) {
+                        return Err(foreign_key_fidelity_error(
+                            fk,
+                            column_name,
+                            referenced_column_name,
+                            "collation",
+                            collation,
+                            referenced_collation,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn find_schema_column<'a>(
+    schema: &'a NormalizedSchema,
+    table_name: &str,
+    column_name: &str,
+) -> Option<&'a NormalizedColumn> {
+    schema
+        .tables
+        .iter()
+        .find(|table| table.name == table_name)
+        .and_then(|table| {
+            table
+                .columns
+                .iter()
+                .find(|column| column.name == column_name)
+        })
+}
+
+fn foreign_key_fidelity_error(
+    fk: &NormalizedForeignKey,
+    column_name: &str,
+    referenced_column_name: &str,
+    property: &str,
+    value: &str,
+    referenced_value: &str,
+) -> String {
+    classified_import_error(
+        "post_load_validation_failed",
+        &format!(
+            "foreign key column {column_name} {property} {value} is incompatible with referenced column {referenced_column_name} {property} {referenced_value}"
+        ),
+        Some(&fk.name),
+    )
+}
+
 fn dump_import_report_path(input_path: &Path) -> Result<PathBuf, String> {
     if input_path.as_os_str().is_empty() {
         return Err("cannot write import report without input_dir".to_string());
@@ -8407,6 +8509,7 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
     schema: &NormalizedSchema,
     target_engine: &str,
 ) -> Result<(), String> {
+    validate_foreign_key_column_compatibility(schema)?;
     for sql in generate_sequence_reset_ddl(schema, target_engine) {
         target.execute_sql(&sql)?;
     }
@@ -9020,7 +9123,7 @@ pub fn inspect_columns_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
         "SELECT column_name, data_type, is_nullable, character_maximum_length, numeric_precision, numeric_scale, column_default, is_identity FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position"
     } else {
-        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
+        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
     }
 }
 
@@ -9237,6 +9340,53 @@ fn with_auto_increment_marker(type_name: &str, extra: &str) -> String {
     }
 }
 
+fn mysql_type_with_character_options(
+    type_name: &str,
+    character_set: Option<String>,
+    collation: Option<String>,
+) -> String {
+    let mut enriched = type_name.trim().to_string();
+    let lower = enriched.to_ascii_lowercase();
+    if let Some(character_set) = character_set.filter(|value| !value.trim().is_empty()) {
+        if !lower.contains(" character set ") && !lower.contains(" charset ") {
+            enriched.push_str(" CHARACTER SET ");
+            enriched.push_str(character_set.trim());
+        }
+    }
+    let lower = enriched.to_ascii_lowercase();
+    if let Some(collation) = collation.filter(|value| !value.trim().is_empty()) {
+        if !lower.contains(" collate ") {
+            enriched.push_str(" COLLATE ");
+            enriched.push_str(collation.trim());
+        }
+    }
+    enriched
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct MysqlCharacterFidelity {
+    character_set: Option<String>,
+    collation: Option<String>,
+}
+
+fn mysql_character_fidelity(type_name: &str) -> MysqlCharacterFidelity {
+    MysqlCharacterFidelity {
+        character_set: mysql_type_option_value(type_name, "character set")
+            .or_else(|| mysql_type_option_value(type_name, "charset")),
+        collation: mysql_type_option_value(type_name, "collate"),
+    }
+}
+
+fn mysql_type_option_value(type_name: &str, option: &str) -> Option<String> {
+    let lower = type_name.to_ascii_lowercase();
+    let start = lower.find(option)? + option.len();
+    let value = type_name[start..].trim_start();
+    let value = value
+        .split(|character: char| character.is_whitespace() || character == ',' || character == ')')
+        .find(|part| !part.is_empty())?;
+    Some(value.trim_matches('`').to_string())
+}
+
 fn with_postgresql_identity_marker(
     type_name: &str,
     column_default: Option<&str>,
@@ -9318,6 +9468,8 @@ pub fn map_type(source: &str, target: &str, type_name: &str) -> String {
 }
 
 fn map_mysql_to_postgres(ty: &str) -> String {
+    let stripped = strip_mysql_character_options(ty);
+    let ty = stripped.trim();
     if ty.starts_with("bigint") {
         "BIGINT".to_string()
     } else if ty.starts_with("int") || ty.starts_with("integer") {
@@ -9343,6 +9495,28 @@ fn map_mysql_to_postgres(ty: &str) -> String {
     } else {
         "TEXT".to_string()
     }
+}
+
+fn strip_mysql_character_options(type_name: &str) -> String {
+    let mut kept = Vec::new();
+    let mut tokens = type_name.split_whitespace().peekable();
+    while let Some(token) = tokens.next() {
+        if token.eq_ignore_ascii_case("character")
+            && tokens
+                .peek()
+                .is_some_and(|next| next.eq_ignore_ascii_case("set"))
+        {
+            tokens.next();
+            tokens.next();
+            continue;
+        }
+        if token.eq_ignore_ascii_case("charset") || token.eq_ignore_ascii_case("collate") {
+            tokens.next();
+            continue;
+        }
+        kept.push(token);
+    }
+    kept.join(" ")
 }
 
 fn map_postgres_to_mysql(ty: &str) -> String {
@@ -10032,6 +10206,97 @@ mod tests {
         imported.insert("users".to_string(), 3_u64);
 
         verify_imported_row_counts(&tables, &imported).unwrap();
+    }
+
+    #[test]
+    fn fk_schema_fidelity_rejects_incompatible_text_collations() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "audit_category".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+                NormalizedTable {
+                    name: "df_evaluation_results".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "audit_category_code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "df_evaluation_results_ibfk_3".to_string(),
+                        columns: vec!["audit_category_code".to_string()],
+                        referenced_table: "audit_category".to_string(),
+                        referenced_columns: vec!["code".to_string()],
+                    }],
+                },
+            ],
+        };
+
+        let err = validate_foreign_key_column_compatibility(&schema).unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("df_evaluation_results_ibfk_3"));
+        assert!(err.contains("audit_category_code"));
+        assert!(err.contains("code"));
+    }
+
+    #[test]
+    fn fk_schema_fidelity_accepts_matching_text_collations() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "audit_category".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+                NormalizedTable {
+                    name: "df_evaluation_results".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "audit_category_code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "df_evaluation_results_ibfk_3".to_string(),
+                        columns: vec!["audit_category_code".to_string()],
+                        referenced_table: "audit_category".to_string(),
+                        referenced_columns: vec!["code".to_string()],
+                    }],
+                },
+            ],
+        };
+
+        validate_foreign_key_column_compatibility(&schema).unwrap();
     }
 
     #[test]
@@ -11166,6 +11431,26 @@ mod tests {
     }
 
     #[test]
+    fn mysql_to_postgres_type_mapping_strips_mysql_character_options() {
+        assert_eq!(
+            map_type(
+                "mysql",
+                "postgresql",
+                "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci",
+            ),
+            "VARCHAR(45)"
+        );
+    }
+
+    #[test]
+    fn mysql_column_inspection_captures_character_metadata() {
+        let sql = inspect_columns_sql("mysql");
+
+        assert!(sql.contains("CHARACTER_SET_NAME"));
+        assert!(sql.contains("COLLATION_NAME"));
+    }
+
+    #[test]
     fn mysql_to_mysql_ddl_preserves_enum_literal_case() {
         let schema = NormalizedSchema {
             tables: vec![NormalizedTable {
@@ -11291,6 +11576,57 @@ mod tests {
             adapter.executed_sql,
             vec!["CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);"]
         );
+    }
+
+    #[test]
+    fn post_load_ddl_rejects_incompatible_fk_collation_before_sql_execution() {
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "audit_category".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+                NormalizedTable {
+                    name: "df_evaluation_results".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "audit_category_code".to_string(),
+                        type_name: "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci"
+                            .to_string(),
+                        default_value: None,
+                        nullable: true,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: vec![NormalizedIndex {
+                        name: "idx_df_evaluation_results_audit_category_code".to_string(),
+                        columns: vec!["audit_category_code".to_string()],
+                        unique: false,
+                    }],
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "df_evaluation_results_ibfk_3".to_string(),
+                        columns: vec!["audit_category_code".to_string()],
+                        referenced_table: "audit_category".to_string(),
+                        referenced_columns: vec!["code".to_string()],
+                    }],
+                },
+            ],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        let err = apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(adapter.executed_sql.is_empty());
     }
 
     #[test]
