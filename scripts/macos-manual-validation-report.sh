@@ -384,6 +384,11 @@ check_complete_report() {
     failures=1
   fi
 
+  if ! grep -qE '^- Artifact head SHA:[[:space:]]*[0-9a-fA-F]{7,40}[[:space:]]*$' "$report_path"; then
+    echo "Manual validation report must include a GitHub Actions artifact head SHA." >&2
+    failures=1
+  fi
+
   if ! grep -qE '^- Artifact directory:[[:space:]]*[^[:space:]].*$' "$report_path"; then
     echo "Manual validation report must include a downloaded artifact directory." >&2
     failures=1
@@ -511,6 +516,7 @@ finalize_evidence() {
   local comment_path=""
   local report_git_sha=""
   local artifact_workflow_run=""
+  local artifact_head_sha=""
   local bundle_sha256=""
   local gate_args=()
 
@@ -522,6 +528,7 @@ finalize_evidence() {
   comment_path="$(comment_path_for_report "$report_path")"
   report_git_sha="$(extract_report_value "$report_path" "- Git SHA")"
   artifact_workflow_run="$(extract_report_value "$report_path" "- Artifact workflow run")"
+  artifact_head_sha="$(extract_report_value "$report_path" "- Artifact head SHA")"
   bundle_sha256="$(sha256_file "$bundle_path")"
   gate_args=(--final --report "$report_path" --bundle "$bundle_path")
 
@@ -538,6 +545,7 @@ Final gate passed for the attached real-Mac evidence. Attach these files to #116
 
 - Git SHA: \`${report_git_sha}\`
 - Artifact workflow run: \`${artifact_workflow_run}\`
+- Artifact head SHA: \`${artifact_head_sha}\`
 - Evidence bundle SHA256: \`${bundle_sha256}\`
 - Report: ${report_path}
 - Smoke log: ${smoke_log_path}
@@ -612,6 +620,7 @@ ARTIFACT_OUTPUT_DIR="${ARTIFACT_OUTPUT_DIR_ARG:-${MACOS_VALIDATION_ARTIFACT_DIR:
 FINAL_APP_PATH="${MACOS_VALIDATION_APP_PATH:-/Applications/TunnelForge.app}"
 FINAL_APP_EXECUTABLE="${FINAL_APP_PATH}/Contents/MacOS/TunnelForge"
 ARTIFACT_WORKFLOW_RUN="${MACOS_VALIDATION_ARTIFACT_RUN_ID:-}"
+ARTIFACT_HEAD_SHA="${MACOS_VALIDATION_ARTIFACT_HEAD_SHA:-}"
 ARTIFACT_DIR="${MACOS_VALIDATION_ARTIFACT_DIR:-build/macos-validation-artifacts}"
 ARTIFACT_CHECKSUM_STATUS="${MACOS_VALIDATION_ARTIFACT_CHECKSUMS:-pending}"
 
@@ -666,6 +675,7 @@ if [[ "$DOWNLOAD_ARTIFACTS" -eq 1 ]]; then
 
   bash scripts/macos-download-validation-artifacts.sh "${artifact_download_args[@]}"
   ARTIFACT_WORKFLOW_RUN="$(read_artifact_env_value "$ARTIFACT_ENV_PATH" MACOS_VALIDATION_ARTIFACT_RUN_ID)"
+  ARTIFACT_HEAD_SHA="$(read_artifact_env_value "$ARTIFACT_ENV_PATH" MACOS_VALIDATION_ARTIFACT_HEAD_SHA)"
   ARTIFACT_DIR="$(read_artifact_env_value "$ARTIFACT_ENV_PATH" MACOS_VALIDATION_ARTIFACT_DIR)"
   ARTIFACT_CHECKSUM_STATUS="$(read_artifact_env_value "$ARTIFACT_ENV_PATH" MACOS_VALIDATION_ARTIFACT_CHECKSUMS)"
 fi
@@ -704,6 +714,7 @@ cat > "$REPORT_PATH" <<EOF
 - macOS: ${MACOS_VERSION} (${MACOS_BUILD})
 - Architecture: ${ARCH}
 - Artifact workflow run: ${ARTIFACT_WORKFLOW_RUN}
+- Artifact head SHA: ${ARTIFACT_HEAD_SHA}
 - Artifact directory: ${ARTIFACT_DIR}
 - Artifact checksum verification: ${ARTIFACT_CHECKSUM_STATUS}
 - Python: ${PYTHON_VERSION}

@@ -60,6 +60,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "macOS version" in doc
     assert "Mac architecture" in doc
     assert "Artifact workflow run" in doc
+    assert "Artifact head SHA" in doc
     assert "Artifact checksum verification" in doc
     assert "Final app path" in doc
     assert "python main.py --ui-smoke-check" in doc

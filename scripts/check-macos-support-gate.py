@@ -179,6 +179,25 @@ def check_report_artifact_workflow_run(report: Path, expected_run_id: str, expec
     return False
 
 
+def check_report_artifact_head_sha(report: Path, expected_sha: str, expected_label: str) -> bool:
+    report_sha = report_path_value(report, "- Artifact head SHA:")
+    if not report_sha:
+        fail("manual validation report must include an Artifact head SHA")
+        return False
+
+    report_sha = report_sha.lower()
+    expected_sha = expected_sha.lower()
+    if expected_sha.startswith(report_sha) or report_sha.startswith(expected_sha):
+        ok(f"manual validation report Artifact head SHA matches {expected_label}: {report_sha}")
+        return True
+
+    fail(
+        f"manual validation report Artifact head SHA {report_sha} "
+        f"does not match {expected_label} {expected_sha}"
+    )
+    return False
+
+
 def default_bundle_for_report(report: Path) -> Path:
     return ROOT / "build" / f"macos-manual-validation-evidence-{report.stem}.zip"
 
@@ -388,7 +407,7 @@ def check_pr(repo: str, skip_checks: bool) -> bool:
     return passed
 
 
-def check_manual_macos_validation_workflow(repo: str) -> tuple[bool, str | None]:
+def check_manual_macos_validation_workflow(repo: str) -> tuple[bool, str | None, str | None]:
     head_sha = pr_head_sha(repo)
     runs = gh_json(
         [
@@ -419,9 +438,10 @@ def check_manual_macos_validation_workflow(repo: str) -> tuple[bool, str | None]
             f"no successful manual {MANUAL_MACOS_WORKFLOW} {MANUAL_MACOS_WORKFLOW_EVENT} "
             f"run found for PR head {head_sha}"
         )
-        return False, None
+        return False, None, None
 
     run_id = str(matching_runs[0]["databaseId"])
+    run_head_sha = str(matching_runs[0]["headSha"])
     run = gh_json(
         [
             "run",
@@ -472,7 +492,7 @@ def check_manual_macos_validation_workflow(repo: str) -> tuple[bool, str | None]
     if passed:
         ok(f"manual macOS signing/notarization workflow passed: {run['url']}")
 
-    return passed, run_id
+    return passed, run_id, run_head_sha
 
 
 def pr_head_sha(repo: str) -> str:
@@ -594,13 +614,24 @@ def main() -> int:
                             passed = check_report_git_sha(report, expected_sha, expected_label) and passed
                         else:
                             passed = False
-                    manual_workflow_passed, manual_run_id = check_manual_macos_validation_workflow(repo)
+                    manual_workflow_passed, manual_run_id, manual_run_head_sha = (
+                        check_manual_macos_validation_workflow(repo)
+                    )
                     passed = manual_workflow_passed and passed
                     if report is not None and manual_run_id is not None:
                         passed = (
                             check_report_artifact_workflow_run(
                                 report,
                                 manual_run_id,
+                                "manual macOS workflow run",
+                            )
+                            and passed
+                        )
+                    if report is not None and manual_run_head_sha is not None:
+                        passed = (
+                            check_report_artifact_head_sha(
+                                report,
+                                manual_run_head_sha,
                                 "manual macOS workflow run",
                             )
                             and passed

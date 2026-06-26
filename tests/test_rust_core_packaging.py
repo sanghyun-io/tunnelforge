@@ -121,6 +121,7 @@ def completed_manual_report_lines(
         "- macOS: 14.7.1 (23H222)",
         "- Architecture: arm64",
         "- Artifact workflow run: 26476324046",
+        "- Artifact head SHA: 0123456789abcdef0123456789abcdef01234567",
         f"- Artifact directory: {artifact_dir_arg}",
         "- Artifact checksum verification: passed",
         "- Final app path: /Applications/TunnelForge.app",
@@ -440,6 +441,7 @@ def test_macos_validation_artifact_download_script_fetches_manual_run_artifacts(
     assert 'find "$output_dir" -mindepth 1 -maxdepth 1 -name "$artifact_pattern" -print0' in script
     assert "--write-env <file>" in script
     assert "MACOS_VALIDATION_ARTIFACT_RUN_ID" in script
+    assert "MACOS_VALIDATION_ARTIFACT_HEAD_SHA" in script
     assert "MACOS_VALIDATION_ARTIFACT_DIR" in script
     assert "MACOS_VALIDATION_ARTIFACT_CHECKSUMS" in script
 
@@ -466,6 +468,10 @@ if [[ "$1" == "run" && "$2" == "download" ]]; then
   mkdir -p "$artifact_dir"
   printf fake-dmg > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg"
   shasum -a 256 "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg" > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg.sha256"
+  exit 0
+fi
+if [[ "$1" == "run" && "$2" == "view" ]]; then
+  printf '0123456789abcdef0123456789abcdef01234567\\n'
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
@@ -504,6 +510,7 @@ exit 1
     assert result.returncode == 0, result.stderr
     env_text = env_file.read_text(encoding="utf-8")
     assert "MACOS_VALIDATION_ARTIFACT_RUN_ID=26477946208" in env_text
+    assert "MACOS_VALIDATION_ARTIFACT_HEAD_SHA=0123456789abcdef0123456789abcdef01234567" in env_text
     assert f"MACOS_VALIDATION_ARTIFACT_DIR={output_dir_arg}" in env_text
     assert "MACOS_VALIDATION_ARTIFACT_CHECKSUMS=passed" in env_text
 
@@ -534,6 +541,10 @@ if [[ "$1" == "run" && "$2" == "download" ]]; then
   mkdir -p "$artifact_dir"
   printf fake-dmg > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg"
   shasum -a 256 "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg" > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg.sha256"
+  exit 0
+fi
+if [[ "$1" == "run" && "$2" == "view" ]]; then
+  printf '0123456789abcdef0123456789abcdef01234567\\n'
   exit 0
 fi
 echo "unexpected gh invocation: $*" >&2
@@ -1006,6 +1017,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_artifact_
         line
         for line in completed_manual_report_lines_with_system(report_dir, smoke_log_arg)
         if not line.startswith("- Artifact workflow run:")
+        and not line.startswith("- Artifact head SHA:")
         and not line.startswith("- Artifact directory:")
         and not line.startswith("- Artifact checksum verification:")
         and "Download signed/notarized GitHub Actions macOS artifacts" not in line
@@ -1028,6 +1040,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_artifact_
 
     assert result.returncode == 1
     assert "Manual validation report must include a GitHub Actions artifact workflow run id." in result.stderr
+    assert "Manual validation report must include a GitHub Actions artifact head SHA." in result.stderr
     assert "Manual validation report must include a downloaded artifact directory." in result.stderr
     assert "Manual validation report must record '- Artifact checksum verification: passed'." in result.stderr
     assert (
@@ -1231,6 +1244,7 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
     assert f"{bundle_arg}.sha256" in comment_text
     assert f"Git SHA: `{current_git_sha()}`" in comment_text
     assert "Artifact workflow run: `26476324046`" in comment_text
+    assert "Artifact head SHA: `0123456789abcdef0123456789abcdef01234567`" in comment_text
     assert f"Evidence bundle SHA256: `{hashlib.sha256(bundle.read_bytes()).hexdigest()}`" in comment_text
     assert "gh issue comment 116 --body-file" in comment_text
     assert "Keep #116 open until these files are attached" in comment_text
@@ -1340,6 +1354,18 @@ def test_macos_support_gate_script_checks_report_artifact_workflow_run(tmp_path,
 
     assert gate.check_report_artifact_workflow_run(report, "111", "manual macOS workflow run") is False
     assert "manual validation report Artifact workflow run 26477209665 does not match manual macOS workflow run 111" in capsys.readouterr().err
+
+
+def test_macos_support_gate_checks_report_artifact_head_sha(tmp_path, capsys):
+    gate = load_macos_support_gate_module()
+    report = tmp_path / "macos-manual-validation-report.md"
+    report.write_text("- Artifact head SHA: 0123456789abcdef\n", encoding="utf-8")
+
+    assert gate.check_report_artifact_head_sha(report, "0123456789abcdef", "manual macOS workflow run") is True
+    assert "manual validation report Artifact head SHA matches manual macOS workflow run" in capsys.readouterr().out
+
+    assert gate.check_report_artifact_head_sha(report, "deadbeef", "manual macOS workflow run") is False
+    assert "manual validation report Artifact head SHA 0123456789abcdef does not match manual macOS workflow run deadbeef" in capsys.readouterr().err
 
 
 def test_macos_support_gate_accepts_merged_pr_with_unknown_merge_state(monkeypatch, capsys):

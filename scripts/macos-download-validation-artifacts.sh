@@ -167,8 +167,9 @@ verify_downloaded_checksums() {
 write_report_env_file() {
   local env_path="$1"
   local run_id="$2"
-  local artifact_dir="$3"
-  local checksum_status="$4"
+  local head_sha="$3"
+  local artifact_dir="$4"
+  local checksum_status="$5"
 
   if [[ -z "$env_path" ]]; then
     return
@@ -177,10 +178,18 @@ write_report_env_file() {
   mkdir -p "$(dirname "$env_path")"
   {
     printf 'MACOS_VALIDATION_ARTIFACT_RUN_ID=%s\n' "$run_id"
+    printf 'MACOS_VALIDATION_ARTIFACT_HEAD_SHA=%s\n' "$head_sha"
     printf 'MACOS_VALIDATION_ARTIFACT_DIR=%s\n' "$artifact_dir"
     printf 'MACOS_VALIDATION_ARTIFACT_CHECKSUMS=%s\n' "$checksum_status"
   } > "$env_path"
   echo "Wrote macOS validation artifact environment: $env_path"
+}
+
+resolve_run_head_sha() {
+  local repo="$1"
+  local run_id="$2"
+
+  "$GH_BIN" run view "$run_id" --repo "$repo" --json headSha --jq .headSha
 }
 
 clean_existing_artifacts() {
@@ -196,12 +205,14 @@ clean_existing_artifacts() {
 download_artifacts() {
   local repo=""
   local run_id=""
+  local head_sha=""
   local artifact_pattern=""
   local checksum_status="skipped"
 
   require_gh
   repo="$(resolve_repo)"
   run_id="$(resolve_run_id "$repo")"
+  head_sha="$(resolve_run_head_sha "$repo" "$run_id")"
 
   if [[ "$ARCH_FILTER" == "all" ]]; then
     artifact_pattern="TunnelForge-macOS-*"
@@ -218,7 +229,7 @@ download_artifacts() {
     checksum_status="passed"
   fi
 
-  write_report_env_file "$WRITE_ENV_PATH" "$run_id" "$OUTPUT_DIR" "$checksum_status"
+  write_report_env_file "$WRITE_ENV_PATH" "$run_id" "$head_sha" "$OUTPUT_DIR" "$checksum_status"
 
   echo
   echo "macOS validation artifacts are ready under $OUTPUT_DIR"
