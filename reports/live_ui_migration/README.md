@@ -59,6 +59,13 @@ final validator.
 python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json
 ```
 
+- Optional regression gate:
+
+```powershell
+$env:RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE='1'
+powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
+```
+
 ## Partial Evidence
 
 - `live-ui-migration-evidence-1m-local-partial.json` preserves a local

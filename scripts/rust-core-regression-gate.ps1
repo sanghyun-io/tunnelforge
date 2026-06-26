@@ -63,6 +63,13 @@ try {
         }
     }
 
+    if ($env:RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE -eq "1") {
+        python scripts/validate-live-ui-migration-evidence.py reports/live_ui_migration/live-ui-migration-evidence.json
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+    }
+
     $securityForbidden = @(
         "mysql_local_infile_sql",
         "ensure_mysql_local_infile_for_import",

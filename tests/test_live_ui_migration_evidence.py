@@ -78,3 +78,12 @@ def test_live_ui_migration_evidence_rejects_missing_direction(tmp_path):
 
     with pytest.raises(validator.EvidenceError, match="missing direction"):
         validator.validate_report(report)
+
+
+def test_regression_gate_can_require_live_ui_evidence():
+    gate = Path(__file__).resolve().parents[1] / "scripts" / "rust-core-regression-gate.ps1"
+    text = gate.read_text(encoding="utf-8")
+
+    assert "RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE" in text
+    assert "validate-live-ui-migration-evidence.py" in text
+    assert "reports/live_ui_migration/live-ui-migration-evidence.json" in text
