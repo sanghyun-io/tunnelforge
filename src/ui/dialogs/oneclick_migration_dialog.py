@@ -795,8 +795,8 @@ class OneClickMigrationDialog(QDialog):
         if not ONECLICK_REAL_EXECUTION_ENABLED:
             self.chk_dry_run.setEnabled(False)
             self.chk_dry_run.setToolTip(
-                "One-Click allows Dry-run only until the GitHub #138 "
-                "automatic-fix coverage gate is complete."
+                "One-Click real execution is disabled in this build. "
+                "Dry-run remains available for previewing Rust Core recommendations."
             )
         options_layout.addWidget(self.chk_dry_run)
 

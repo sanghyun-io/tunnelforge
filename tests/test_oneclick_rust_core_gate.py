@@ -7,7 +7,7 @@ from src.ui.dialogs.oneclick_migration_dialog import (
     OneClickMigrationDialog,
     OneClickMigrationWorker,
 )
-from src.ui.dialogs import migration_dialogs
+from src.ui.dialogs import migration_dialogs, oneclick_migration_dialog
 
 
 class FakeEndpoint:
@@ -182,6 +182,25 @@ def test_oneclick_dialog_keeps_dry_run_default_but_allows_limited_real_execution
     assert dialog.chk_dry_run.isChecked()
     assert dialog.chk_dry_run.isEnabled()
     assert "InnoDB" in dialog.chk_dry_run.toolTip()
+    dialog.close()
+
+
+def test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(oneclick_migration_dialog, "ONECLICK_REAL_EXECUTION_ENABLED", False)
+
+    dialog = OneClickMigrationDialog(
+        None,
+        connector=SimpleNamespace(),
+        schema="app",
+    )
+
+    tooltip = dialog.chk_dry_run.toolTip()
+    assert dialog.chk_dry_run.isChecked()
+    assert not dialog.chk_dry_run.isEnabled()
+    assert "#138" not in tooltip
+    assert "until" not in tooltip.lower()
+    assert "disabled in this build" in tooltip
     dialog.close()
 
 

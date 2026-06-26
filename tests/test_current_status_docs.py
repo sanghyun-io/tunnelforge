@@ -77,7 +77,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1794 passed, 5 warnings" not in doc
     assert "PASS, 1795 passed, 5 warnings" not in doc
     assert "PASS, 1796 passed, 5 warnings" not in doc
-    assert "PASS, 1799 passed, 5 warnings" in doc
+    assert "PASS, 1799 passed, 5 warnings" not in doc
+    assert "PASS, 1801 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -118,6 +119,15 @@ def test_current_status_records_rust_core_export_import_menu_wording():
     assert "Rust DB Core Import" in doc
     assert "Shell Export" not in doc
     assert "Shell Import" not in doc
+
+
+def test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+
+    assert "TF-STATUS-035" in doc
+    assert "One-Click fallback dry-run tooltip" in doc
+    assert "disabled in this build" in doc
+    assert "One-Click allows Dry-run only until the GitHub #138" not in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
