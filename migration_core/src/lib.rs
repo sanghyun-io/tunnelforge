@@ -5478,11 +5478,12 @@ fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value> {
         "recommendation",
         "one-click charset contract derivation started",
     )];
-    let schema = request
+    let mut schema_name = request
         .payload
         .get("schema")
         .and_then(Value::as_str)
-        .unwrap_or("");
+        .unwrap_or("")
+        .to_string();
     let target_charset = request
         .payload
         .get("target_charset")
@@ -5493,12 +5494,41 @@ fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value> {
         .get("target_collation")
         .and_then(Value::as_str)
         .unwrap_or("utf8mb4_0900_ai_ci");
-    let issues = oneclick_payload_issues(&request.payload);
-    let table_facts = oneclick_charset_table_facts_from_payload(&request.payload);
-    let fk_facts = oneclick_charset_fk_facts_from_payload(&request.payload);
+    let mut issues = oneclick_payload_issues(&request.payload);
+    let mut table_facts = oneclick_charset_table_facts_from_payload(&request.payload);
+    let mut fk_facts = oneclick_charset_fk_facts_from_payload(&request.payload);
+    if table_facts.is_empty() && oneclick_has_endpoint_payload(&request.payload) {
+        match oneclick_endpoint(request).and_then(|(endpoint, endpoint_schema)| {
+            let facts = oneclick_live_charset_facts(&endpoint, &endpoint_schema)?;
+            Ok((endpoint_schema, facts))
+        }) {
+            Ok((endpoint_schema, (live_table_facts, live_fk_facts))) => {
+                schema_name = endpoint_schema;
+                table_facts = live_table_facts;
+                fk_facts = live_fk_facts;
+                if issues.is_empty() {
+                    issues = oneclick_synthetic_charset_issues_from_facts(
+                        &schema_name,
+                        &table_facts,
+                        &fk_facts,
+                        target_charset,
+                        target_collation,
+                    );
+                }
+            }
+            Err(err) => {
+                events.push(json!({
+                    "event": "error",
+                    "request_id": request.request_id,
+                    "message": err
+                }));
+                return events;
+            }
+        }
+    }
     let contracts = oneclick_derive_charset_contracts_from_facts(
         &issues,
-        schema,
+        &schema_name,
         &table_facts,
         &fk_facts,
         target_charset,
@@ -5509,7 +5539,8 @@ fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value> {
         "request_id": request.request_id,
         "command": "oneclick.derive_charset_contracts",
         "success": true,
-        "schema": schema,
+        "schema": schema_name,
+        "issues": issues,
         "contracts": contracts,
         "summary": {
             "total_issues": issues.len(),
@@ -6040,6 +6071,119 @@ fn oneclick_charset_fk_facts_from_payload(payload: &Value) -> Vec<OneClickCharse
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn oneclick_has_endpoint_payload(payload: &Value) -> bool {
+    ["connection", "endpoint", "source", "target"]
+        .iter()
+        .any(|key| payload.get(*key).is_some())
+}
+
+fn oneclick_live_charset_facts(
+    endpoint: &Endpoint,
+    schema: &str,
+) -> Result<(Vec<OneClickCharsetTableFact>, Vec<OneClickCharsetFkFact>), String> {
+    if endpoint.engine != "mysql" {
+        return Err("oneclick.derive_charset_contracts currently supports MySQL only".to_string());
+    }
+    let opts = mysql_opts(endpoint);
+    let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
+    let mut conn = pool
+        .get_conn()
+        .map_err(|err| format!("mysql connection error: {err}"))?;
+    let table_facts = conn
+        .exec_map(
+            "SELECT t.TABLE_NAME, ccsa.CHARACTER_SET_NAME, t.TABLE_COLLATION \
+             FROM information_schema.TABLES t \
+             JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY ccsa \
+             ON t.TABLE_COLLATION = ccsa.COLLATION_NAME \
+             WHERE t.TABLE_SCHEMA = ? AND t.TABLE_TYPE = 'BASE TABLE' \
+             ORDER BY t.TABLE_NAME",
+            (schema,),
+            |(table, charset, collation): (String, String, String)| OneClickCharsetTableFact {
+                table,
+                charset,
+                collation,
+            },
+        )
+        .map_err(|err| format!("mysql charset fact inspect error: {err}"))?;
+    let fk_facts = conn
+        .exec_map(
+            "SELECT TABLE_NAME, REFERENCED_TABLE_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+             GROUP BY TABLE_NAME, REFERENCED_TABLE_NAME \
+             ORDER BY TABLE_NAME, REFERENCED_TABLE_NAME",
+            (schema,),
+            |(table, referenced_table): (String, String)| OneClickCharsetFkFact {
+                table,
+                referenced_table,
+            },
+        )
+        .map_err(|err| format!("mysql charset FK fact inspect error: {err}"))?;
+    Ok((table_facts, fk_facts))
+}
+
+fn oneclick_synthetic_charset_issues_from_facts(
+    schema: &str,
+    table_facts: &[OneClickCharsetTableFact],
+    fk_facts: &[OneClickCharsetFkFact],
+    target_charset: &str,
+    target_collation: &str,
+) -> Vec<MigrationIssue> {
+    let mut seen_groups = BTreeSet::new();
+    let mut issues = Vec::new();
+    for fact in table_facts {
+        let candidate = MigrationIssue {
+            issue_type: Some("charset_issue".to_string()),
+            severity: "warning".to_string(),
+            location: format!("{schema}.{}", fact.table),
+            message: "Table uses a legacy charset/collation.".to_string(),
+            suggestion: "Convert table charset/collation after FK-safe review.".to_string(),
+            blocking: false,
+            table_name: Some(fact.table.clone()),
+            column_name: None,
+        };
+        let contracts = oneclick_derive_charset_contracts_from_facts(
+            std::slice::from_ref(&candidate),
+            schema,
+            table_facts,
+            fk_facts,
+            target_charset,
+            target_collation,
+        );
+        let Some(contract) = contracts.first() else {
+            continue;
+        };
+        let tables = contract
+            .get("tables")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect::<Vec<_>>();
+        if tables.is_empty() {
+            continue;
+        }
+        let group_key = tables.join("\0");
+        if !seen_groups.insert(group_key) {
+            continue;
+        }
+        let table_name = contract
+            .get("fk_order")
+            .and_then(Value::as_array)
+            .and_then(|values| values.first())
+            .and_then(Value::as_str)
+            .unwrap_or(&fact.table)
+            .to_string();
+        issues.push(MigrationIssue {
+            location: format!("{schema}.{table_name}"),
+            table_name: Some(table_name),
+            ..candidate
+        });
+    }
+    issues
 }
 
 fn oneclick_derive_charset_contracts_from_facts(

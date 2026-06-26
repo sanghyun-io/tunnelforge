@@ -30,6 +30,16 @@ class FakeSchemaConnector:
         return ["app"]
 
 
+class FakeDerivationFacade:
+    def __init__(self, result):
+        self.result = result
+        self.payload = None
+
+    def derive_oneclick_charset_contracts(self, payload):
+        self.payload = payload
+        return self.result
+
+
 def test_oneclick_worker_rejects_non_rust_core_connector():
     worker = OneClickMigrationWorker(
         connector=SimpleNamespace(connection=object()),
@@ -93,6 +103,71 @@ def test_oneclick_worker_allows_limited_real_execution_with_backup_confirmation(
 
     assert payload["dry_run"] is False
     assert payload["backup_confirmed"] is True
+
+
+def test_oneclick_worker_includes_derived_charset_contracts_when_gate_passes():
+    facade = FakeDerivationFacade({
+        "success": True,
+        "issues": [{
+            "issue_type": "charset_issue",
+            "severity": "warning",
+            "location": "tf_oneclick_app.tf_oneclick_parent",
+            "table_name": "tf_oneclick_parent",
+            "message": "Table uses a legacy charset.",
+            "suggestion": "Convert table charset/collation after FK-safe review.",
+            "blocking": False,
+        }],
+        "contracts": [{
+            "issue_index": 0,
+            "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
+            "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
+            "target_charset": "utf8mb4",
+            "target_collation": "utf8mb4_0900_ai_ci",
+            "rollback_sql": [
+                "ALTER TABLE `tf_oneclick_app`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                "ALTER TABLE `tf_oneclick_app`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+            ],
+        }],
+    })
+    connection = SimpleNamespace(
+        facade=facade,
+        connection_id="conn-1",
+        endpoint=FakeEndpoint(),
+    )
+    worker = OneClickMigrationWorker(
+        connector=SimpleNamespace(connection=connection),
+        schema="tf_oneclick_app",
+        dry_run=False,
+        backup_confirmed=True,
+    )
+
+    payload = worker._core_payload(connection)
+
+    assert facade.payload["schema"] == "tf_oneclick_app"
+    assert facade.payload["connection"] == FakeEndpoint().to_payload()
+    assert payload["issues"][0]["issue_type"] == "charset_issue"
+    assert payload["charset_contracts"][0]["issue_index"] == 0
+    assert payload["charset_contracts"][0]["target_collation"] == "utf8mb4_0900_ai_ci"
+
+
+def test_oneclick_worker_omits_charset_contracts_when_derivation_gate_fails():
+    facade = FakeDerivationFacade({"success": True, "issues": [], "contracts": []})
+    connection = SimpleNamespace(
+        facade=facade,
+        connection_id="conn-1",
+        endpoint=FakeEndpoint(),
+    )
+    worker = OneClickMigrationWorker(
+        connector=SimpleNamespace(connection=connection),
+        schema="app",
+        dry_run=False,
+        backup_confirmed=True,
+    )
+
+    payload = worker._core_payload(connection)
+
+    assert "issues" not in payload
+    assert "charset_contracts" not in payload
 
 
 def test_oneclick_dialog_keeps_dry_run_default_but_allows_limited_real_execution():

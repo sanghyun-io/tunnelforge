@@ -233,12 +233,23 @@ class OneClickMigrationWorker(QThread):
                 "One-Click real execution requires backup confirmation. "
                 "Enable Dry-run unless a current backup has been completed."
             )
-        return {
+        payload = {
             "connection": connection.endpoint.to_payload(),
             "schema": self.schema,
             "dry_run": self.dry_run,
             "backup_confirmed": self.backup_confirmed,
         }
+        if hasattr(connection.facade, "derive_oneclick_charset_contracts"):
+            derivation = connection.facade.derive_oneclick_charset_contracts({
+                "connection": connection.endpoint.to_payload(),
+                "schema": self.schema,
+            })
+            issues = derivation.get("issues") if isinstance(derivation, dict) else None
+            contracts = derivation.get("contracts") if isinstance(derivation, dict) else None
+            if issues and contracts:
+                payload["issues"] = issues
+                payload["charset_contracts"] = contracts
+        return payload
 
     def _create_empty_report(self) -> MigrationReport:
         """이슈가 없을 때 빈 리포트 생성"""

@@ -178,6 +178,29 @@ def test_facade_uses_oneclick_apply_fixes_protocol():
     assert events[0]["phase"] == "execution"
 
 
+def test_facade_uses_oneclick_derive_charset_contracts_protocol():
+    process = FakeProcess([
+        '{"event":"phase","phase":"recommendation","message":"started"}',
+        '{"event":"result","command":"oneclick.derive_charset_contracts","success":true,"contracts":[{"issue_index":0}]}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    events = []
+
+    result = facade.derive_oneclick_charset_contracts(
+        {"schema": "tf_oneclick_app"},
+        on_event=events.append,
+    )
+
+    sent = json.loads(process.stdin.getvalue().strip())
+    assert sent["command"] == "oneclick.derive_charset_contracts"
+    assert result["contracts"] == [{"issue_index": 0}]
+    assert events[0]["phase"] == "recommendation"
+
+
 def test_rust_connector_masks_success_message_shape():
     class FakeFacade:
         def open_connection(self, endpoint):

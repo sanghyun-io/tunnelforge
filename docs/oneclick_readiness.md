@@ -57,14 +57,16 @@ The current supported scope is intentionally narrow:
   local `tf_oneclick_` scopes through Rust DB Core APIs.
 - Charset/collation derivation command:
   `oneclick.derive_charset_contracts` can derive complete local-safe
-  `charset_contracts[]` from supplied Rust-owned table/FK facts. PyQt is not
-  connected to this command yet.
+  `charset_contracts[]` from supplied Rust-owned table/FK facts or from live
+  MySQL `information_schema` facts. PyQt calls this command before
+  `oneclick.run` and includes derived issues/contracts only when the derivation
+  gate returns both.
 
 ## Not Yet Supported
 
 - Production database usage.
-- Automatic PyQt charset contract derivation from live inspection facts.
-  GitHub #140 tracks that follow-up.
+- Production-ready automatic PyQt charset contract derivation evidence.
+  GitHub #140 tracks the remaining local evidence and closure work.
 
 ## Automatic Fix Coverage
 

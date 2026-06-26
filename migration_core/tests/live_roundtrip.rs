@@ -446,6 +446,73 @@ fn oneclick_run_live_charset_contract_when_env_is_configured() {
 }
 
 #[test]
+fn oneclick_derive_charset_contracts_live_facts_when_env_is_configured() {
+    let Some(base_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
+        eprintln!("skipping oneclick charset live derivation: TF_MYSQL_* is not configured");
+        return;
+    };
+
+    let schema = "tf_oneclick_derive_charset";
+    let parent = unique_table("tf_oneclick_parent");
+    let child = unique_table("tf_oneclick_child");
+    let mut admin = mysql_conn(&base_endpoint);
+    admin
+        .query_drop(format!("DROP DATABASE IF EXISTS `{schema}`"))
+        .unwrap();
+    admin
+        .query_drop(format!(
+            "CREATE DATABASE `{schema}` CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci"
+        ))
+        .unwrap();
+
+    let mut charset_endpoint = base_endpoint.clone();
+    charset_endpoint.database = schema.to_string();
+    let mut mysql = mysql_conn(&charset_endpoint);
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE `{parent}` (`id` INT NOT NULL PRIMARY KEY, `name` VARCHAR(32) NOT NULL) \
+             ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci"
+        ))
+        .unwrap();
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE `{child}` (`id` INT NOT NULL PRIMARY KEY, `parent_id` INT NOT NULL, \
+             `name` VARCHAR(32) NOT NULL, CONSTRAINT `fk_child_parent_derive` FOREIGN KEY (`parent_id`) \
+             REFERENCES `{parent}` (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci"
+        ))
+        .unwrap();
+
+    let result = result_payload(handle_request(Request {
+        command: "oneclick.derive_charset_contracts".to_string(),
+        request_id: None,
+        payload: json!({
+            "connection": endpoint_json(&charset_endpoint),
+            "schema": schema,
+            "target_charset": "utf8mb4",
+            "target_collation": "utf8mb4_0900_ai_ci"
+        }),
+    }));
+
+    assert_eq!(result["success"], true);
+    assert_eq!(result["issues"].as_array().unwrap().len(), 1);
+    assert_eq!(result["issues"][0]["issue_type"], "charset_issue");
+    assert_eq!(result["issues"][0]["table_name"], parent);
+    assert_eq!(result["contracts"].as_array().unwrap().len(), 1);
+    assert_eq!(result["contracts"][0]["tables"], json!([parent, child]));
+    assert_eq!(
+        result["contracts"][0]["rollback_sql"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    admin
+        .query_drop(format!("DROP DATABASE IF EXISTS `{schema}`"))
+        .unwrap();
+}
+
+#[test]
 fn live_guide_includes_row_values_and_sql_when_env_is_configured() {
     let Some((mysql_endpoint, postgres_endpoint)) = test_endpoints() else {
         eprintln!("skipping live guide: TF_MYSQL_* and TF_POSTGRES_* are not configured");
