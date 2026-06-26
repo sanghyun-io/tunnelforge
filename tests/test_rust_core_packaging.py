@@ -1384,6 +1384,14 @@ def test_macos_support_gate_rejects_hard_coded_current_issue_head(capsys):
     assert gate.check_final_issue_handoff(body_with_latest_run) is False
     assert "must not label a fixed GitHub Actions run URL as latest" in capsys.readouterr().err
 
+    body_with_branch_main_run_lookup = (
+        "- Current repository-side gate source: latest pushed `main`\n"
+        '- Reference Version Gate run: https://github.com/sanghyun-io/tunnelforge/actions/runs/123. '
+        'Use `gh run list --workflow "Version Gate" --branch main` for newer runs.\n'
+    )
+    assert gate.check_final_issue_handoff(body_with_branch_main_run_lookup) is False
+    assert "must not use --branch main for PR workflow run lookup" in capsys.readouterr().err
+
 
 def test_macos_support_gate_accepts_merged_pr_with_unknown_merge_state(monkeypatch, capsys):
     gate = load_macos_support_gate_module()

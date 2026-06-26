@@ -317,6 +317,13 @@ def check_final_issue_handoff(body: str) -> bool:
         )
         return False
 
+    if re.search(r"gh run list --workflow [^\n`]+ --branch main", body):
+        fail(
+            f"#{FINAL_ISSUE} Current Evidence must not use --branch main for PR workflow run lookup; "
+            "use --event pull_request or workflow_dispatch filters that return the relevant runs"
+        )
+        return False
+
     if "latest pushed `main`" not in body and "latest pushed main" not in body:
         fail(f"#{FINAL_ISSUE} Current Evidence must tell operators to use the latest pushed main")
         return False
