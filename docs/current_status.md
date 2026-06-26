@@ -497,6 +497,35 @@ Next action:
 1. Prefer live reproduction evidence if another `ERROR 3140` report appears,
    because malformed source JSON should still fail as data-invalid.
 
+### TF-STATUS-014: Large SQL Editor Rendering
+
+Status: `closed`
+Severity: Medium
+Area: SQL editor UI
+
+Evidence:
+
+- GitHub issue #86 reported severe slowdown when opening a large SQL file of
+  roughly 645KB.
+- `SQLEditorTab` now detects SQL text at or above 512KB and enables a
+  large-document mode before calling `setPlainText`.
+- Large-document mode detaches the syntax/validation highlighter, stops the
+  validation debounce timer, and skips whole-document validation requests.
+- The tab shows an inline notice that syntax highlighting and real-time
+  validation are disabled for the large SQL document.
+- Returning to small content re-enables the normal validator highlighter.
+- GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/86
+
+Impact:
+
+- Large SQL files avoid the expensive whole-document regex highlighter and SQL
+  validator passes that were the dominant app-side rendering cost.
+
+Next action:
+
+1. Revisit true virtualized SQL rendering only if large plain-text insertion
+   remains a measured bottleneck after this guard.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -514,6 +543,7 @@ Next action:
 | TF-STATUS-011 | High | closed | Rust Core schema fidelity | MySQL FK charset/collation fidelity | Keep FK fidelity regression coverage |
 | TF-STATUS-012 | Medium | closed | Import UI telemetry | Cumulative Import rows/s and ETA | Re-check wording with real long-running imports |
 | TF-STATUS-013 | High | closed | Rust Core import | MySQL JSON fallback encoding | Watch for malformed-source JSON reports |
+| TF-STATUS-014 | Medium | closed | SQL editor UI | Large SQL rendering guard | Revisit virtual rendering if measured bottleneck remains |
 
 ## Recommended Execution Order
 
@@ -541,3 +571,4 @@ Next action:
 | 2026-06-26 | Classified post-load DDL execution failures with the failing SQL statement for diagnosis of errors such as GitHub #126. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl_errors_include_classification_and_sql_context --lib`; `cargo test --manifest-path migration_core\Cargo.toml` |
 | 2026-06-26 | Added cumulative Import telemetry for GitHub #128: Rust row events now carry table-local and manifest-wide row counts, Python forwards them, and the UI separates average speed, current speed, ETA, and post-load phase text. | `migration_core/src/lib.rs`, `src/exporters/rust_dump_exporter.py`, `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `tests/test_rust_dump_exporter.py`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `pytest tests/test_db_dialogs.py::test_format_import_row_labels_reports_cumulative_average_current_and_eta tests/test_db_dialogs.py::test_format_import_row_labels_stops_row_eta_during_post_load_phase tests/test_rust_dump_exporter.py::TestRustDumpImporter::test_import_row_progress_forwards_cumulative_totals_to_detail_callback`; `cargo test --manifest-path migration_core\Cargo.toml dump_import_row_progress_event_reports_table_and_overall_rows`; final: `pytest tests/test_db_dialogs.py tests/test_rust_dump_exporter.py`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `pytest -q`; `python -m compileall -q main.py src tests`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Hardened MySQL JSON fallback INSERT handling for GitHub #118 by using `_utf8mb4` JSON literals and removing `NO_BACKSLASH_ESCAPES` during import session tuning. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml mysql_json_literal_uses_utf8mb4_introducer_for_unicode_json_text --lib`; `cargo test --manifest-path migration_core\Cargo.toml mysql_dump_import_uses_fast_session_tuning_statements --lib`; final: `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `pytest -q`; `python -m compileall -q main.py src tests`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
+| 2026-06-26 | Added a large-document guard for GitHub #86 so SQL files at or above 512KB open with syntax highlighting and real-time validation disabled, then restore normal editor features for smaller content. | `src/ui/dialogs/sql_editor_dialog.py`, `src/core/i18n.py`, `tests/test_sql_editor_dialog.py`, `docs/current_status.md` | RED/GREEN: `pytest tests/test_sql_editor_dialog.py::test_large_sql_file_disables_expensive_editor_features tests/test_sql_editor_dialog.py::test_small_content_reenables_editor_features_after_large_file`; final: `pytest tests/test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests/test_sql_editor_dialog.py`; `pytest -q`; `python -m compileall -q main.py src tests`; `git diff --check` |

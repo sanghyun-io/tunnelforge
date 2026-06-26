@@ -273,6 +273,8 @@ _EN_TEXT_TRANSLATIONS = {
     "다음": "Next",
     "닫기": "Close",
     "대기 중": "Waiting",
+    "대용량 SQL 파일: 구문 하이라이트와 실시간 검증이 비활성화되었습니다.": "Large SQL file: syntax highlighting and real-time validation are disabled.",
+    "대용량 SQL: 구문 하이라이트와 실시간 검증을 비활성화했습니다.": "Large SQL: syntax highlighting and real-time validation have been disabled.",
     "데이터 없음": "No Data",
     "로그": "Logs",
     "로그 레벨:": "Log level:",

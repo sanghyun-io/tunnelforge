@@ -7,7 +7,12 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 
 from src.core.sql_validator import SchemaMetadata
-from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog, format_metadata_db_version
+from src.ui.dialogs.sql_editor_dialog import (
+    LARGE_SQL_RENDER_LIMIT_BYTES,
+    SQLEditorDialog,
+    SQLEditorTab,
+    format_metadata_db_version,
+)
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -338,3 +343,36 @@ def test_metadata_loaded_does_not_crash_on_empty_version(monkeypatch):
         assert "unknown" in dialog.validation_label.text()
     finally:
         close_dialog(dialog)
+
+
+def test_large_sql_file_disables_expensive_editor_features(tmp_path):
+    tab = SQLEditorTab(tab_index=1)
+    large_sql = "SELECT * FROM users;\n" * ((LARGE_SQL_RENDER_LIMIT_BYTES // 20) + 2000)
+    file_path = tmp_path / "fixedStyle.sql"
+    file_path.write_text(large_sql, encoding="utf-8")
+    try:
+        assert tab.load_file(str(file_path)) is True
+
+        assert tab.editor.is_large_document_mode() is True
+        assert tab.editor.highlighter.document() is None
+        assert not tab.editor._validation_timer.isActive()
+        assert "대용량 SQL" in tab.validation_label.text()
+    finally:
+        tab.close()
+
+
+def test_small_content_reenables_editor_features_after_large_file(tmp_path):
+    tab = SQLEditorTab(tab_index=1)
+    large_sql = "SELECT * FROM users;\n" * ((LARGE_SQL_RENDER_LIMIT_BYTES // 20) + 2000)
+    file_path = tmp_path / "fixedStyle.sql"
+    file_path.write_text(large_sql, encoding="utf-8")
+    try:
+        assert tab.load_file(str(file_path)) is True
+
+        tab.set_content("SELECT 1;")
+
+        assert tab.editor.is_large_document_mode() is False
+        assert tab.editor.highlighter.document() == tab.editor.document()
+        assert tab.validation_label.text() == ""
+    finally:
+        tab.close()

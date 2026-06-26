@@ -27,6 +27,8 @@ from typing import List, Dict, Optional, Tuple
 
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 
+LARGE_SQL_RENDER_LIMIT_BYTES = 512 * 1024
+
 
 def create_sql_editor_connector(engine, host, port, user, password, database=None, schema=None):
     db_engine = normalize_db_engine(engine, port)
@@ -536,6 +538,7 @@ class ValidatingCodeEditor(CodeEditor):
 
         # 검증 하이라이터로 교체
         self.highlighter = SQLValidatorHighlighter(self.document())
+        self._large_document_mode = False
 
         # 검증 이슈 목록 (툴팁용)
         self._issues: List = []
@@ -559,17 +562,43 @@ class ValidatingCodeEditor(CodeEditor):
 
     def _schedule_validation(self):
         """검증 예약 (debounce)"""
+        if self._large_document_mode:
+            return
         self._validation_timer.stop()
         self._validation_timer.start()
 
     def _trigger_validation(self):
         """검증 실행 시그널 발생"""
+        if self._large_document_mode:
+            return
         self.validation_requested.emit(self.toPlainText())
 
     def set_validation_issues(self, issues: list):
         """검증 이슈 설정"""
         self._issues = issues
-        self.highlighter.set_issues(issues)
+        if not self._large_document_mode:
+            self.highlighter.set_issues(issues)
+
+    def set_large_document_mode(self, enabled: bool):
+        """Disable expensive whole-document features for large SQL text."""
+        enabled = bool(enabled)
+        if self._large_document_mode == enabled:
+            return
+
+        self._large_document_mode = enabled
+        self._validation_timer.stop()
+        self._issues = []
+
+        if enabled:
+            if self.highlighter:
+                self.highlighter.setDocument(None)
+            self.setToolTip("대용량 SQL 파일: 구문 하이라이트와 실시간 검증이 비활성화되었습니다.")
+        else:
+            self.highlighter = SQLValidatorHighlighter(self.document())
+            self.setToolTip("")
+
+    def is_large_document_mode(self) -> bool:
+        return self._large_document_mode
 
     def get_issue_at_position(self, pos: int) -> Optional[object]:
         """특정 위치의 이슈 반환"""
@@ -1480,6 +1509,7 @@ class SQLEditorTab(QWidget):
 
     def set_content(self, text: str):
         """내용 설정 (수정 플래그 초기화)"""
+        self._set_large_document_mode_for_text(text)
         self.editor.blockSignals(True)
         self.editor.setPlainText(text)
         self.editor.blockSignals(False)
@@ -1495,6 +1525,7 @@ class SQLEditorTab(QWidget):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
+            self._set_large_document_mode_for_text(content)
             self.editor.blockSignals(True)
             self.editor.setPlainText(content)
             self.editor.blockSignals(False)
@@ -1504,6 +1535,17 @@ class SQLEditorTab(QWidget):
             return True
         except Exception:
             return False
+
+    def _set_large_document_mode_for_text(self, text: str):
+        byte_size = len(text.encode("utf-8", errors="ignore"))
+        is_large = byte_size >= LARGE_SQL_RENDER_LIMIT_BYTES
+        self.editor.set_large_document_mode(is_large)
+        if is_large:
+            self.validation_label.setText(
+                "대용량 SQL: 구문 하이라이트와 실시간 검증을 비활성화했습니다."
+            )
+        else:
+            self.validation_label.setText("")
 
     def save_file(self, file_path: str = None) -> tuple:
         """파일 저장
