@@ -60,13 +60,16 @@ The current supported scope is intentionally narrow:
   `charset_contracts[]` from supplied Rust-owned table/FK facts or from live
   MySQL `information_schema` facts. PyQt calls this command before
   `oneclick.run` and includes derived issues/contracts only when the derivation
-  gate returns both.
+  gate returns both. Completed local evidence in
+  `reports\oneclick_readiness\oneclick-charset-derivation-evidence.json`
+  proves this PyQt-triggered derivation path runs through `oneclick.run`
+  with `dry_run=false` and converts the FK-connected local test tables.
 
 ## Not Yet Supported
 
 - Production database usage.
-- Production-ready automatic PyQt charset contract derivation evidence.
-  GitHub #140 tracks the remaining local evidence and closure work.
+- Production database charset/collation execution or production-readiness
+  evidence.
 
 ## Automatic Fix Coverage
 
@@ -75,7 +78,7 @@ Current Rust Core recommendation coverage:
 | Issue type | Status | Strategy | Notes |
 | --- | --- | --- | --- |
 | `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. `oneclick.apply_fixes` and UI-facing `oneclick.run dry_run=false` execute only this strategy through Rust Core. PyQt requires backup confirmation before sending a non-dry-run payload. |
-| `charset_issue` | local contract allowlisted, PyQt derivation pending | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify and execute charset fixes only when the request includes complete safe contract data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. `oneclick.apply_fixes dry_run=false` and UI-facing `oneclick.run dry_run=false` execute that supplied contract through Rust Core; PyQt rendering/count copy is covered, while automatic contract derivation is tracked by #140. |
+| `charset_issue` | local derivation allowlisted | `charset_collation_fk_safe` when Rust Core derives or receives a complete local-safe contract; otherwise `manual` | Rust Core can classify and execute charset fixes only with complete safe contract data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. `oneclick.apply_fixes dry_run=false`, UI-facing `oneclick.run dry_run=false`, and PyQt-triggered derivation evidence are covered for local test scopes. |
 | `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
 | `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
 | `float_precision` | manual | `manual` | Requires precision/scale policy review. |
@@ -87,9 +90,9 @@ Current Rust Core recommendation coverage:
 Charset/collation command-level execution is allowlisted only for complete
 `charset_collation_fk_safe` contracts. Local MySQL evidence for the command
 path is captured and validator-backed. UI-facing `oneclick.run dry_run=false`
-can execute the same supplied complete contract shape; automatic PyQt contract
-derivation is tracked separately in GitHub #140. The following policy defines
-the only eligible scope.
+can execute the same supplied complete contract shape, and PyQt-triggered live
+derivation evidence is captured for the local test scope. The following policy
+defines the only eligible scope.
 
 Eligible automatic subset:
 
@@ -147,6 +150,11 @@ Implementation gate:
   `issues[]` and `charset_contracts[]`, shifts contract indexes behind
   inspection-derived issues, and sequences the same allowlisted apply path for
   complete local-safe charset contracts.
+- `scripts\validate-oneclick-charset-derivation-evidence.py` and
+  `reports\oneclick_readiness\oneclick-charset-derivation-evidence.json`
+  prove the PyQt worker requests Rust Core derivation from live
+  `information_schema` facts, includes the derived payload in `oneclick.run`,
+  and converts the FK-connected local test tables.
 
 ## Real-Execution Gate Outcome
 

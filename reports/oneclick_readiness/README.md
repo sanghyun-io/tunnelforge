@@ -33,6 +33,12 @@ This directory stores machine-checkable One-Click readiness evidence.
   `charset_issue -> charset_collation_fk_safe` path changed those local test
   tables from `utf8mb3` / `utf8mb3_general_ci` to `utf8mb4` /
   `utf8mb4_0900_ai_ci`, preserved FK evidence, and captured rollback metadata.
+- `oneclick-charset-derivation-evidence.json` is captured from a local MySQL
+  container using PyQt's `OneClickMigrationWorker._core_payload()` path. It
+  proves PyQt calls Rust Core `oneclick.derive_charset_contracts`, includes the
+  derived `issues[]` and `charset_contracts[]` in `oneclick.run dry_run=false`,
+  and converts the FK-connected `tf_oneclick_derive_charset` tables to
+  `utf8mb4` / `utf8mb4_0900_ai_ci`.
 
 Validate it with:
 
@@ -50,6 +56,12 @@ Validate future charset/collation evidence with:
 
 ```powershell
 python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.json
+```
+
+Validate PyQt-triggered charset derivation evidence with:
+
+```powershell
+python scripts\validate-oneclick-charset-derivation-evidence.py reports\oneclick_readiness\oneclick-charset-derivation-evidence.json
 ```
 
 A clean checkout can also require this evidence through the Rust Core regression
@@ -71,6 +83,13 @@ The charset/collation evidence gate can be required with:
 
 ```powershell
 $env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE='1'
+powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
+```
+
+The charset/collation derivation evidence gate can be required with:
+
+```powershell
+$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_DERIVATION_EVIDENCE='1'
 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1
 ```
 
@@ -98,6 +117,14 @@ Refresh the charset/collation evidence with:
 cargo build --manifest-path migration_core\Cargo.toml --release
 python scripts\capture-oneclick-charset-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-charset-evidence.json
 python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.json
+```
+
+Refresh the PyQt-triggered charset derivation evidence with:
+
+```powershell
+cargo build --manifest-path migration_core\Cargo.toml --release
+python scripts\capture-oneclick-charset-derivation-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-charset-derivation-evidence.json
+python scripts\validate-oneclick-charset-derivation-evidence.py reports\oneclick_readiness\oneclick-charset-derivation-evidence.json
 ```
 
 Do not use production databases for this evidence.

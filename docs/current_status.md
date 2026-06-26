@@ -94,6 +94,7 @@ Version references are aligned at `2.1.6` across:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-26 | One-Click PyQt charset derivation evidence | `pytest tests\test_oneclick_charset_derivation_evidence.py -q` RED/GREEN; `pytest tests\test_oneclick_charset_derivation_capture.py -q` RED/GREEN; `pytest tests\test_oneclick_charset_capture.py tests\test_oneclick_charset_evidence.py tests\test_oneclick_charset_derivation_capture.py tests\test_oneclick_charset_derivation_evidence.py -q`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `python scripts\capture-oneclick-charset-derivation-evidence.py --seed-local-container --mysql-container tf-live-mysql --mysql-host 127.0.0.1 --mysql-port 3406 --mysql-user root --mysql-password test --schema tf_oneclick_derive_charset --output reports\oneclick_readiness\oneclick-charset-derivation-evidence.json`; `python scripts\validate-oneclick-charset-derivation-evidence.py reports\oneclick_readiness\oneclick-charset-derivation-evidence.json`; `$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_DERIVATION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS | #140 local evidence proves PyQt-triggered Rust Core derivation feeds `oneclick.run dry_run=false` and converts 2 FK-connected local tables |
 | 2026-06-26 | Main merge/status and next issue analysis | `git fetch origin --prune`; `git status --short --branch`; `gh issue list --state open --limit 20 --json number,title,labels,updatedAt,assignees,url`; `gh issue view 140 --comments --json number,title,state,body,comments,labels,url,updatedAt`; `gh issue view 116 --json number,title,state,body,labels,url,updatedAt`; `rg -n "TF-STATUS-022|#140|derive_charset|oneclick.derive_charset|charset_contracts|OneClickMigrationWorker|derive_oneclick_charset_contracts" ...` | PASS | `main` is aligned with `origin/main`; #140 remains the next actionable in-repo issue, while #116 remains external real-Mac evidence |
 | 2026-06-26 | Current main full Python suite | `pytest -q` | PASS | 1729 passed, 5 warnings |
 | 2026-06-26 | Current main Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 166 lib tests, JSONL CLI test, 6 live-roundtrip tests, 2 non-ignored stress tests, doctests |
@@ -947,8 +948,9 @@ Evidence:
   `utf8mb3_general_ci` to `utf8mb4` / `utf8mb4_0900_ai_ci`.
 - PyQt rendering/count/copy coverage now proves charset automatic, manual, and
   skip payloads are counted and logged accurately.
-- GitHub #140 tracks automatic PyQt charset contract derivation separately from
-  the supplied-contract execution scope proven in #139.
+- GitHub #140 / TF-STATUS-022 is closed after local PyQt-triggered derivation
+  evidence proved `OneClickMigrationWorker._core_payload()` feeds derived
+  `issues[]` / `charset_contracts[]` into `oneclick.run dry_run=false`.
 
 GitHub issue:
 
@@ -957,18 +959,18 @@ GitHub issue:
 Impact:
 
 - Users can still run One-Click dry-run and the validated engine fix. Charset
-  execution is available only for supplied complete local-safe Rust Core
-  contracts; automatic PyQt contract derivation remains tracked separately in
-  #140.
-- Enabling charset/collation real execution without FK ordering, rollback, and
-  target policy evidence would risk unsafe schema changes.
+  execution is available only for complete local-safe Rust Core contracts,
+  including contracts derived by Rust Core for the PyQt worker path in local
+  `tf_oneclick_` evidence scopes.
+- Production charset/collation execution remains out of scope without separate
+  production-readiness evidence.
 
 Next action:
 
 1. Keep #139 evidence refreshed if the supplied charset contract, validator, or
    One-Click event payload changes.
-2. Work TF-STATUS-022 / GitHub #140 for automatic PyQt charset contract
-   derivation.
+2. Keep #140 derivation evidence refreshed if PyQt payload construction,
+   Rust Core derivation, or One-Click event payloads change.
 
 ## Issue Tracker
 
@@ -995,14 +997,13 @@ Next action:
 | TF-STATUS-019 | Medium | closed | One-Click migration UI | Dry-run preview One-Click entry point | Keep preview evidence aligned if event payloads change |
 | TF-STATUS-020 | High | closed | One-Click migration UI / Rust Core automatic fixes | Real execution and automatic fix coverage | Track any additional automatic fix class as a separate issue |
 | TF-STATUS-021 | High | closed | One-Click migration UI / Rust Core automatic fixes | Charset/collation automatic fix coverage | Keep validator/live evidence aligned if the charset contract changes |
-| TF-STATUS-022 | High | in_progress | One-Click migration UI / Rust Core automatic fixes | Derive charset contracts for PyQt execution | Capture local evidence for the PyQt-triggered derivation path before closing #140 |
+| TF-STATUS-022 | High | closed | One-Click migration UI / Rust Core automatic fixes | Derive charset contracts for PyQt execution | Keep derivation evidence aligned if PyQt payload construction or Rust Core derivation changes |
 
 ## Recommended Execution Order
 
-1. Work TF-STATUS-022 / GitHub #140 for PyQt charset contract derivation.
-2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
+1. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence.
-3. Track additional One-Click automatic fix classes as separate GitHub issues
+2. Track additional One-Click automatic fix classes as separate GitHub issues
    before implementation.
 
 ## Session Log
@@ -1071,3 +1072,4 @@ Next action:
 | 2026-06-26 | Started #140 by adding a Rust Core `oneclick.derive_charset_contracts` command and pure facts-based derivation helper. The helper derives complete local-safe `charset_contracts[]` only from safe table facts, FK closure/order, explicit target charset/collation, and rollback SQL; unsafe or incomplete facts produce no contract. | `migration_core/src/lib.rs`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED: `cargo test --manifest-path migration_core\Cargo.toml oneclick_derives_charset_contract --lib` failed because derivation structs/helper did not exist; RED: `cargo test --manifest-path migration_core\Cargo.toml oneclick_derive_charset_contracts_command_returns_contracts_from_safe_facts --lib` failed because no result command existed; GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `cargo test --manifest-path migration_core\Cargo.toml service_hello_advertises_core_protocol --lib` |
 | 2026-06-26 | Extended #140 derivation from static facts to live Rust-owned MySQL facts and connected PyQt payload construction to `oneclick.derive_charset_contracts`. The Rust command now synthesizes safe charset issues/contracts from live `information_schema` facts, and `OneClickMigrationWorker._core_payload()` includes derived issues/contracts only when the derivation gate returns both. | `migration_core/src/lib.rs`, `migration_core/tests/live_roundtrip.rs`, `src/core/db_core_service.py`, `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_db_core_service.py`, `tests/test_oneclick_rust_core_gate.py`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `TF_MYSQL_HOST=127.0.0.1; TF_MYSQL_PORT=3406; TF_MYSQL_USER=root; TF_MYSQL_PASSWORD=test; TF_MYSQL_DATABASE=tf_oneclick_real_execution; cargo test --manifest-path migration_core\Cargo.toml oneclick_derive_charset_contracts_live_facts_when_env_is_configured --test live_roundtrip -- --nocapture`; RED/GREEN: `pytest tests\test_db_core_service.py::test_facade_uses_oneclick_derive_charset_contracts_protocol -q`; RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_includes_derived_charset_contracts_when_gate_passes tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_omits_charset_contracts_when_derivation_gate_fails -q`; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `python -m compileall -q src\core\db_core_service.py src\ui\dialogs\oneclick_migration_dialog.py tests\test_db_core_service.py tests\test_oneclick_rust_core_gate.py` |
 | 2026-06-26 | Rechecked `main`/`origin/main` after the merge request and analyzed the next open issue. The #140 commits are already on `main`; #140 should continue with derivation-specific validator-backed local evidence, and #116 remains separate because it needs real operator Mac validation. | `docs/current_status.md` | `git fetch origin --prune`; `git status --short --branch`; `gh issue list --state open --limit 20 --json number,title,labels,updatedAt,assignees,url`; `gh issue view 140 --comments --json ...`; `gh issue view 116 --json ...`; `rg -n "TF-STATUS-022|#140|derive_charset|oneclick.derive_charset|charset_contracts|OneClickMigrationWorker|derive_oneclick_charset_contracts" ...` |
+| 2026-06-26 | Added validator-backed #140 local evidence for PyQt-triggered charset derivation and closed TF-STATUS-022. The archived report proves `OneClickMigrationWorker._core_payload()` calls Rust Core derivation, includes derived `issues[]` / `charset_contracts[]`, and `oneclick.run dry_run=false` converts the FK-connected local tables. | `scripts/validate-oneclick-charset-derivation-evidence.py`, `scripts/capture-oneclick-charset-derivation-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_oneclick_charset_derivation_evidence.py`, `tests/test_oneclick_charset_derivation_capture.py`, `reports/oneclick_readiness/oneclick-charset-derivation-evidence.json`, `reports/oneclick_readiness/README.md`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_charset_derivation_evidence.py -q`; RED/GREEN: `pytest tests\test_oneclick_charset_derivation_capture.py -q`; final: `pytest tests\test_oneclick_charset_capture.py tests\test_oneclick_charset_evidence.py tests\test_oneclick_charset_derivation_capture.py tests\test_oneclick_charset_derivation_evidence.py -q`; `cargo build --manifest-path migration_core\Cargo.toml --release`; capture: `python scripts\capture-oneclick-charset-derivation-evidence.py --seed-local-container ...`; validator: `python scripts\validate-oneclick-charset-derivation-evidence.py reports\oneclick_readiness\oneclick-charset-derivation-evidence.json`; gate: `$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_DERIVATION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |

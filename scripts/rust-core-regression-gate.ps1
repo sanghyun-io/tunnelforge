@@ -91,6 +91,13 @@ try {
         }
     }
 
+    if ($env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_DERIVATION_EVIDENCE -eq "1") {
+        python scripts/validate-oneclick-charset-derivation-evidence.py reports/oneclick_readiness/oneclick-charset-derivation-evidence.json
+        if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+        }
+    }
+
     $securityForbidden = @(
         "mysql_local_infile_sql",
         "ensure_mysql_local_infile_for_import",

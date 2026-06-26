@@ -1,0 +1,205 @@
+{
+  "issue": 140,
+  "git_sha": "9829e3f3d0cc176d42bc84e90748c4c725347a25",
+  "source_type": "local_mysql_container",
+  "feature_flags": {
+    "oneclick_ui_enabled": true,
+    "oneclick_real_execution_enabled": true
+  },
+  "service_hello": {
+    "capabilities": [
+      "connection.open",
+      "connection.close",
+      "connection.test",
+      "schema.list",
+      "schema.inspect",
+      "schema.diff",
+      "query.execute",
+      "query.cancel",
+      "dump.run",
+      "dump.import",
+      "migration.plan",
+      "migration.run",
+      "migration.verify",
+      "migration.resume",
+      "oneclick.run",
+      "oneclick.preflight",
+      "oneclick.analyze",
+      "oneclick.recommend",
+      "oneclick.derive_charset_contracts",
+      "oneclick.apply_fixes",
+      "oneclick.validate",
+      "oneclick.report",
+      "job.cancel",
+      "service.shutdown"
+    ]
+  },
+  "scope": {
+    "schema": "tf_oneclick_derive_charset",
+    "allowed_fix_types": [
+      "charset_issue"
+    ],
+    "allowed_strategies": [
+      "charset_collation_fk_safe"
+    ],
+    "target_charset": "utf8mb4",
+    "target_collation": "utf8mb4_0900_ai_ci",
+    "requires_fk_safe_ordering": true,
+    "requires_rollback_metadata": true
+  },
+  "run": {
+    "command": "oneclick.run",
+    "dry_run": false,
+    "backup_confirmed": true,
+    "success": true,
+    "schema": "tf_oneclick_derive_charset",
+    "attempted_fix_types": [
+      "charset_issue"
+    ],
+    "attempted_strategies": [
+      "charset_collation_fk_safe"
+    ],
+    "disallowed_fix_attempts": [],
+    "applied_fixes": [
+      {
+        "fk_order": [
+          "tf_oneclick_parent",
+          "tf_oneclick_child"
+        ],
+        "issue_type": "charset_issue",
+        "rollback_sql": [
+          "ALTER TABLE `tf_oneclick_derive_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+          "ALTER TABLE `tf_oneclick_derive_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+        ],
+        "schema": "tf_oneclick_derive_charset",
+        "sql": [
+          "ALTER TABLE `tf_oneclick_derive_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+          "ALTER TABLE `tf_oneclick_derive_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+        ],
+        "strategy": "charset_collation_fk_safe",
+        "success": true,
+        "tables": [
+          "tf_oneclick_parent",
+          "tf_oneclick_child"
+        ],
+        "target_charset": "utf8mb4",
+        "target_collation": "utf8mb4_0900_ai_ci"
+      }
+    ]
+  },
+  "before": {
+    "tables": [
+      {
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci",
+        "schema": "tf_oneclick_derive_charset",
+        "table": "tf_oneclick_parent"
+      },
+      {
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci",
+        "schema": "tf_oneclick_derive_charset",
+        "table": "tf_oneclick_child"
+      }
+    ],
+    "foreign_keys": [
+      {
+        "constraint": "fk_child_parent",
+        "referenced_table": "tf_oneclick_parent",
+        "schema": "tf_oneclick_derive_charset",
+        "table": "tf_oneclick_child"
+      }
+    ]
+  },
+  "after": {
+    "tables": [
+      {
+        "charset": "utf8mb4",
+        "collation": "utf8mb4_0900_ai_ci",
+        "schema": "tf_oneclick_derive_charset",
+        "table": "tf_oneclick_parent"
+      },
+      {
+        "charset": "utf8mb4",
+        "collation": "utf8mb4_0900_ai_ci",
+        "schema": "tf_oneclick_derive_charset",
+        "table": "tf_oneclick_child"
+      }
+    ],
+    "foreign_keys_valid": true,
+    "unrelated_tables_unchanged": true
+  },
+  "rollback": {
+    "metadata_captured": true,
+    "tables": [
+      {
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci",
+        "schema": "tf_oneclick_derive_charset",
+        "table": "tf_oneclick_parent"
+      },
+      {
+        "charset": "utf8mb3",
+        "collation": "utf8mb3_general_ci",
+        "schema": "tf_oneclick_derive_charset",
+        "table": "tf_oneclick_child"
+      }
+    ]
+  },
+  "validation": {
+    "all_fixed": true,
+    "remaining_issues": 0,
+    "fk_constraints_valid": true,
+    "post_charset": "utf8mb4",
+    "post_collation": "utf8mb4_0900_ai_ci"
+  },
+  "derivation": {
+    "command": "oneclick.derive_charset_contracts",
+    "success": true,
+    "source": "live_mysql_information_schema",
+    "schema": "tf_oneclick_derive_charset",
+    "payload_had_table_facts": false,
+    "payload_had_issues": false,
+    "issues_count": 1,
+    "contracts_count": 1,
+    "issues": [
+      {
+        "blocking": false,
+        "issue_type": "charset_issue",
+        "location": "tf_oneclick_derive_charset.tf_oneclick_parent",
+        "message": "Table uses a legacy charset/collation.",
+        "severity": "warning",
+        "suggestion": "Convert table charset/collation after FK-safe review.",
+        "table_name": "tf_oneclick_parent"
+      }
+    ],
+    "contracts": [
+      {
+        "fk_order": [
+          "tf_oneclick_parent",
+          "tf_oneclick_child"
+        ],
+        "issue_index": 0,
+        "rollback_sql": [
+          "ALTER TABLE `tf_oneclick_derive_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+          "ALTER TABLE `tf_oneclick_derive_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+        ],
+        "tables": [
+          "tf_oneclick_parent",
+          "tf_oneclick_child"
+        ],
+        "target_charset": "utf8mb4",
+        "target_collation": "utf8mb4_0900_ai_ci"
+      }
+    ]
+  },
+  "pyqt_payload": {
+    "builder": "OneClickMigrationWorker._core_payload",
+    "dry_run": false,
+    "backup_confirmed": true,
+    "included_derived_issues": true,
+    "included_charset_contracts": true,
+    "issues_count": 1,
+    "contracts_count": 1
+  }
+}
