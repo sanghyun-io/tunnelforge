@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-06-26
+Last reviewed: 2026-06-27
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -66,6 +66,12 @@ display-only `int_display_width` skip policy. No repo-side One-Click follow-up
 issue is currently open; track each additional automatic-fix class as a
 separate issue before implementation.
 
+On 2026-06-27, the remaining repo-side #116 handoff drift found in the next
+issue analysis was closed: macOS artifact download defaults now use the PR head
+before merge, or current merged main HEAD after PR #117 is merged, matching the
+final gate/report SHA policy. #116 itself remains open only for real operator
+Mac validation evidence.
+
 ## Verified On 2026-06-26
 
 Commands run locally:
@@ -92,10 +98,25 @@ Version references are aligned at `2.1.6` across:
 - `pyproject.toml`
 - `installer/TunnelForge.iss`
 
+## Focused Verification On 2026-06-27
+
+Commands run locally:
+
+| Check | Result |
+| --- | --- |
+| `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q` | RED then PASS |
+| `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 52 passed |
+| `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
+| `pytest tests\test_current_status_docs.py -q` | PASS |
+| `python scripts\check-macos-support-gate.py --skip-github` | PASS |
+| `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py` | PASS |
+| `git diff --check` | PASS |
+
 ## Verification Log
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | macOS artifact default source after PR #117 merge | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh`; `pytest tests\test_current_status_docs.py -q`; `python scripts\check-macos-support-gate.py --skip-github`; `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py`; `git diff --check` | PASS | `macos-download-validation-artifacts.sh` now finds the latest successful manual `macOS App Validation` run for PR head before merge, or current merged main HEAD after PR #117 is merged, so downloaded artifact provenance matches the final report/gate SHA policy |
 | 2026-06-26 | Direct DB Export/Import Rust Core endpoint host | RED/GREEN: `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump -q`; RED/GREEN: `pytest tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q`; `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q` | PASS | `RustDumpExportDialog` and `RustDumpImportDialog` now preserve direct connector `host` when creating `RustDumpConfig`; tunnel connections still use their connector host, normally `127.0.0.1` |
 | 2026-06-26 | Export table selection audit | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_export_table_selection_audit -q`; `git status --short --branch`; `gh issue list --state open --limit 30 --json number,title,state,labels,updatedAt,url`; `rg -n "class RustDumpExportDialog|export_tables|dump.run|selected_tables|table selection" src tests docs README.md README.ko.md migration_core\src migration_core\tests`; code inspection of `RustDumpExportDialog`, `RustDumpExporter.export_tables`, `RustDumpWorker`, and Rust `dump.run` table filtering | PASS | Export individual table selection is currently implemented: PyQt exposes `선택 테이블 Export`, checkbox table list, select-all/deselect-all, and FK parent auto-include; Python forwards selected tables through `RustDumpExporter.export_tables`; Rust Core `dump.run` filters schema tables from the `tables` payload |
 | 2026-06-26 | GitHub #116 final evidence attachment wording | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate tests\test_rust_core_packaging.py::test_macos_manual_validation_report_finalize_can_post_github_comment -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py -q`; `python scripts\check-macos-support-gate.py`; `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py`; `git diff --check` | PASS | Finalizer stdout, generated GitHub comment, and macOS support docs now tell operators to attach final real-Mac evidence to #116 first; PR #117 is only a traceability mirror |
@@ -1024,6 +1045,41 @@ Next action:
 1. Keep direct-connection endpoint coverage aligned if Export/Import worker
    construction moves or if PostgreSQL dump support is added later.
 
+### TF-STATUS-025: macOS Artifact Lookup Uses Current Main After PR Merge
+
+Status: closed
+Severity: High
+Area: macOS release validation
+
+Evidence:
+
+- 2026-06-27 next-issue analysis found `scripts/macos-download-validation-artifacts.sh`
+  still defaulted to the latest successful manual `macOS App Validation` run
+  for `PR #117 head`.
+- That conflicted with the already-fixed final report gate policy:
+  `scripts/check-macos-support-gate.py` expects report Git SHA to match PR head
+  before merge, or current merged main HEAD after PR #117 is merged.
+- RED/GREEN coverage now simulates merged PR #117 with a fake `gh` binary and
+  fails unless the artifact lookup query uses local `git rev-parse HEAD`
+  instead of the stale PR head.
+
+Resolution:
+
+- `scripts/macos-download-validation-artifacts.sh` now resolves the default
+  artifact run target as PR head before merge, or current merged main HEAD after
+  PR #117 is merged.
+- `scripts/macos-manual-validation-report.sh` and `docs/macos_support.md`
+  describe the same default, keeping operator instructions aligned with the
+  final gate.
+
+Next action:
+
+1. Keep the artifact lookup default aligned with
+   `check-macos-support-gate.py::expected_final_report_sha` if the final
+   validation branch/merge policy changes.
+2. #116 still requires real operator Mac validation evidence before it can be
+   closed.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1052,6 +1108,7 @@ Next action:
 | TF-STATUS-022 | High | closed | One-Click migration UI / Rust Core automatic fixes | Derive charset contracts for PyQt execution | Keep derivation evidence aligned if PyQt payload construction or Rust Core derivation changes |
 | TF-STATUS-023 | Medium | closed | One-Click migration UI / Rust Core automatic fixes | Align `int_display_width` skip semantics | Keep display-only skip policy aligned if Rust Core begins emitting this class |
 | TF-STATUS-024 | High | closed | Export/Import UI | Direct DB Rust Core endpoint host | Keep direct connector host coverage when worker construction changes |
+| TF-STATUS-025 | High | closed | macOS release validation | Artifact lookup uses current main after PR merge | Keep artifact lookup default aligned with final report SHA policy |
 
 ## Recommended Execution Order
 
@@ -1146,3 +1203,4 @@ Next action:
 | 2026-06-26 | Tightened #116 final evidence attachment wording so the finalizer and docs direct operators to attach the real-Mac bundle to #116 before closing it, while PR #117 remains only a mirrored traceability target. | `scripts/macos-manual-validation-report.sh`, `docs/macos_support.md`, `tests/test_rust_core_packaging.py`, `docs/current_status.md` | RED/GREEN: focused finalizer pytest; final: focused macOS/docs pytest, full #116 gate, compileall, `git diff --check` |
 | 2026-06-26 | Audited the original Export table-selection question and recorded the current contract: the app can export individually selected tables today through `RustDumpExportDialog` -> `RustDumpExporter.export_tables` -> Rust Core `dump.run` `tables` filtering. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_export_table_selection_audit -q`; source/doc/GitHub issue scan |
 | 2026-06-26 | Fixed TF-STATUS-024 after finding that direct DB Export/Import dialogs hard-coded the Rust DB Core endpoint host to `127.0.0.1`; both dialogs now preserve `connector.host` while tunnel flows still use their local connector host. | `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `docs/current_status.md` | RED/GREEN: focused Export and Import direct-host pytest |
+| 2026-06-27 | Analyzed the next remaining issue after main alignment. #116 still needs external real-Mac evidence, but the repo-side handoff had one drift: artifact download defaults still targeted PR #117 head after merge. Fixed TF-STATUS-025 so artifact lookup now follows PR head before merge and current merged main HEAD after PR #117 is merged. | `scripts/macos-download-validation-artifacts.sh`, `scripts/macos-manual-validation-report.sh`, `docs/macos_support.md`, `tests/test_rust_core_packaging.py`, `tests/test_macos_support_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; final: macOS/docs focused pytest, shell syntax, current-status tests, #116 gate skip-github, compileall, `git diff --check` |

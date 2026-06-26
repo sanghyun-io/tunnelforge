@@ -17,7 +17,8 @@ Options:
                               Set MACOS_RELEASE_SMOKE_APPLICATIONS=1 to include /Applications install smoke.
   --download-artifacts        Download and checksum-verify GitHub Actions macOS artifacts before report creation.
   --artifact-run-id <id>      Download artifacts from a specific macOS App Validation workflow run.
-                              Omit this option to use the default latest successful manual run for PR #117 head.
+                              Omit this option to use the default latest successful manual run for the PR head
+                              before merge, or current merged main HEAD after PR #117 is merged.
   --artifact-output-dir <dir> Destination for downloaded artifacts.
   --artifact-arch <arch>      Artifact architecture to download: arm64, x86_64, or all. Default: current Mac arch.
   --check-complete <report>   Verify a completed manual validation report has no open gates.
@@ -727,7 +728,7 @@ cat > "$REPORT_PATH" <<EOF
 - Applications install smoke: set \`MACOS_RELEASE_SMOKE_APPLICATIONS=1\` before \`--run-smoke\` to include it in the smoke log
 - Completion check: \`bash scripts/macos-manual-validation-report.sh --check-complete ${REPORT_PATH}\`
 - Evidence bundle: \`bash scripts/macos-manual-validation-report.sh --bundle-evidence ${REPORT_PATH}\`
-- Artifact download: \`bash scripts/macos-download-validation-artifacts.sh --arch ${ARTIFACT_ARCH} --output-dir ${ARTIFACT_DIR}\` defaults to the latest successful manual run for PR #117 head.
+- Artifact download: \`bash scripts/macos-download-validation-artifacts.sh --arch ${ARTIFACT_ARCH} --output-dir ${ARTIFACT_DIR}\` defaults to the latest successful manual run for the PR head before merge, or current merged main HEAD after PR #117 is merged.
 - Artifact run override: Add \`--run-id ${ARTIFACT_WORKFLOW_RUN:-<workflow-run-id>}\` only when pinning a specific run.
 
 ## Automated Smoke

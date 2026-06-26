@@ -18,7 +18,8 @@ Usage:
 
 Options:
   --run-id <id>          Download artifacts from a specific macOS App Validation run.
-                         Defaults to the latest successful manual workflow_dispatch run for PR #117 head.
+                         Defaults to the latest successful manual workflow_dispatch run for the PR head before merge,
+                         or current merged main HEAD after PR #117 is merged.
   --repo <owner/name>    GitHub repository. Defaults to `gh repo view`.
   --arch <arch|all>      Artifact architecture to download: arm64, x86_64, or all. Default: all.
   --output-dir <dir>     Destination directory. Default: build/macos-validation-artifacts.
@@ -81,7 +82,9 @@ resolve_repo() {
 
 resolve_run_id() {
   local repo="$1"
-  local pr_head_sha=""
+  local target=""
+  local target_sha=""
+  local target_label=""
   local run_id=""
 
   if [[ -n "$RUN_ID" ]]; then
@@ -89,19 +92,46 @@ resolve_run_id() {
     return
   fi
 
-  pr_head_sha="$("$GH_BIN" pr view "$PR_NUMBER" --repo "$repo" --json headRefOid --jq .headRefOid)"
+  target="$(resolve_default_run_target "$repo")"
+  target_sha="${target%%$'\t'*}"
+  target_label="${target#*$'\t'}"
   run_id="$(
     "$GH_BIN" api "repos/${repo}/actions/workflows/${WORKFLOW_FILE}/runs?event=${WORKFLOW_EVENT}&status=success&per_page=20" \
-      --jq ".workflow_runs[] | select(.head_sha == \"${pr_head_sha}\") | .id" \
+      --jq ".workflow_runs[] | select(.head_sha == \"${target_sha}\") | .id" \
       | head -n 1
   )"
 
   if [[ -z "$run_id" ]]; then
-    echo "No successful manual ${WORKFLOW_NAME} ${WORKFLOW_EVENT} run found for PR #${PR_NUMBER} head ${pr_head_sha}." >&2
+    echo "No successful manual ${WORKFLOW_NAME} ${WORKFLOW_EVENT} run found for ${target_label} ${target_sha}." >&2
     exit 1
   fi
 
   echo "$run_id"
+}
+
+local_head_sha() {
+  git rev-parse HEAD 2>/dev/null || true
+}
+
+resolve_default_run_target() {
+  local repo="$1"
+  local pr_state=""
+  local pr_head_sha=""
+  local head_sha=""
+
+  pr_state="$("$GH_BIN" pr view "$PR_NUMBER" --repo "$repo" --json headRefOid,state --jq .state)"
+  if [[ "$pr_state" == "MERGED" ]]; then
+    head_sha="$(local_head_sha)"
+    if [[ -z "$head_sha" ]]; then
+      echo "Could not resolve local HEAD SHA for merged PR #${PR_NUMBER} artifact lookup." >&2
+      exit 1
+    fi
+    printf '%s\t%s\n' "$head_sha" "current merged main HEAD"
+    return
+  fi
+
+  pr_head_sha="$("$GH_BIN" pr view "$PR_NUMBER" --repo "$repo" --json headRefOid,state --jq .headRefOid)"
+  printf '%s\t%s\n' "$pr_head_sha" "PR #${PR_NUMBER} head"
 }
 
 verify_checksum_file() {

@@ -354,6 +354,7 @@ def test_macos_manual_validation_report_script_records_remaining_gates():
     assert "macos-download-validation-artifacts.sh" in script
     assert 'ARTIFACT_ARCH="${ARTIFACT_ARCH_ARG:-${ARCH}}"' in script
     assert "defaults to the latest successful manual run" in script
+    assert "current merged main HEAD after PR #117 is merged" in script
     assert "Default: current Mac arch." in script
     assert "--arch ${ARTIFACT_ARCH} --output-dir ${ARTIFACT_DIR}" in script
     assert "Add \\`--run-id ${ARTIFACT_WORKFLOW_RUN:-<workflow-run-id>}\\` only when pinning a specific run." in script
@@ -439,11 +440,112 @@ def test_macos_validation_artifact_download_script_fetches_manual_run_artifacts(
     assert "Checksum verified" in script
     assert "clean_existing_artifacts" in script
     assert 'find "$output_dir" -mindepth 1 -maxdepth 1 -name "$artifact_pattern" -print0' in script
+    assert "resolve_default_run_target" in script
+    assert "--json headRefOid,state --jq .state" in script
+    assert "current merged main HEAD" in script
     assert "--write-env <file>" in script
     assert "MACOS_VALIDATION_ARTIFACT_RUN_ID" in script
     assert "MACOS_VALIDATION_ARTIFACT_HEAD_SHA" in script
     assert "MACOS_VALIDATION_ARTIFACT_DIR" in script
     assert "MACOS_VALIDATION_ARTIFACT_CHECKSUMS" in script
+
+
+def test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge(tmp_path):
+    if shutil.which("bash") is None:
+        pytest.skip("bash is required for shell script validation")
+
+    current_head = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=True,
+    ).stdout.strip()
+
+    fake_bin = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-fake-gh-merged-bin"
+    fake_bin.mkdir(parents=True, exist_ok=True)
+    fake_gh = fake_bin / "gh"
+    fake_gh.write_text(
+        """#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$1" == "repo" && "$2" == "view" ]]; then
+  printf 'sanghyun-io/tunnelforge\\n'
+  exit 0
+fi
+if [[ "$1" == "pr" && "$2" == "view" ]]; then
+  if [[ "$*" == *"--jq .state"* ]]; then
+    printf 'MERGED\\n'
+    exit 0
+  fi
+  if [[ "$*" == *"--jq .headRefOid"* ]]; then
+    printf 'old-pr-head\\n'
+    exit 0
+  fi
+fi
+if [[ "$1" == "api" ]]; then
+  if [[ "$*" != *"${EXPECTED_HEAD}"* ]]; then
+    echo "manual run lookup did not use current merged main head: $*" >&2
+    exit 8
+  fi
+  printf '26477946208\\n'
+  exit 0
+fi
+if [[ "$1" == "run" && "$2" == "view" ]]; then
+  printf '%s\\n' "$EXPECTED_HEAD"
+  exit 0
+fi
+if [[ "$1" == "run" && "$2" == "download" ]]; then
+  output_dir=""
+  for ((i = 1; i <= $#; i++)); do
+    if [[ "${!i}" == "--dir" ]]; then
+      next=$((i + 1))
+      output_dir="${!next}"
+    fi
+  done
+  artifact_dir="${output_dir}/TunnelForge-macOS-2.0.5-arm64"
+  mkdir -p "$artifact_dir"
+  printf fake-dmg > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg"
+  shasum -a 256 "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg" > "${artifact_dir}/TunnelForge-macOS-2.0.5-arm64.dmg.sha256"
+  exit 0
+fi
+echo "unexpected gh invocation: $*" >&2
+exit 1
+""",
+        encoding="utf-8",
+        newline="\n",
+    )
+    fake_gh.chmod(0o755)
+
+    output_dir = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-merged-artifacts"
+    env_file = PROJECT_ROOT / "build" / f"pytest-{tmp_path.name}-merged-artifacts.env"
+    output_dir_arg = output_dir.relative_to(PROJECT_ROOT).as_posix()
+    env_file_arg = env_file.relative_to(PROJECT_ROOT).as_posix()
+    fake_gh_arg = shlex.quote(fake_gh.relative_to(PROJECT_ROOT).as_posix())
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-c",
+            "EXPECTED_HEAD="
+            + shlex.quote(current_head)
+            + " GH="
+            + fake_gh_arg
+            + " bash scripts/macos-download-validation-artifacts.sh"
+            + " --arch arm64"
+            + f" --output-dir {shlex.quote(output_dir_arg)}"
+            + f" --write-env {shlex.quote(env_file_arg)}",
+        ],
+        cwd=PROJECT_ROOT,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    env_text = env_file.read_text(encoding="utf-8")
+    assert "MACOS_VALIDATION_ARTIFACT_RUN_ID=26477946208" in env_text
+    assert f"MACOS_VALIDATION_ARTIFACT_HEAD_SHA={current_head}" in env_text
+    assert "old-pr-head" not in result.stderr
 
 
 def test_macos_validation_artifact_download_script_writes_env_file(tmp_path):

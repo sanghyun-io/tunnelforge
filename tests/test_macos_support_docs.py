@@ -62,6 +62,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "Artifact workflow run" in doc
     assert "Artifact head SHA" in doc
     assert "Artifact checksum verification" in doc
+    assert "artifacts for the PR head before merge, or current merged main HEAD after PR #117 is merged" in doc
     assert "Final app path" in doc
     assert "python main.py --ui-smoke-check" in doc
     assert "copied DMG install" in doc
