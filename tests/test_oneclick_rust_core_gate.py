@@ -71,7 +71,7 @@ def test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens():
         backup_confirmed=True,
     )
 
-    with pytest.raises(RuntimeError, match="production-readiness gate"):
+    with pytest.raises(RuntimeError, match="GitHub #138"):
         worker._core_payload(connection)
 
 
@@ -86,7 +86,7 @@ def test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens():
 
     assert dialog.chk_dry_run.isChecked()
     assert not dialog.chk_dry_run.isEnabled()
-    assert "GitHub #137" in dialog.chk_dry_run.toolTip()
+    assert "GitHub #138" in dialog.chk_dry_run.toolTip()
     dialog.close()
 
 

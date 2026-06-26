@@ -231,7 +231,7 @@ class OneClickMigrationWorker(QThread):
         if not self.dry_run and not ONECLICK_REAL_EXECUTION_ENABLED:
             raise RuntimeError(
                 "One-Click migration real execution is disabled until the "
-                "production-readiness gate in GitHub #137 is complete. "
+                "automatic-fix coverage gate in GitHub #138 is complete. "
                 "Keep Dry-run enabled."
             )
         return {
@@ -782,8 +782,8 @@ class OneClickMigrationDialog(QDialog):
         if not ONECLICK_REAL_EXECUTION_ENABLED:
             self.chk_dry_run.setEnabled(False)
             self.chk_dry_run.setToolTip(
-                "One-Click allows Dry-run only until the GitHub #137 "
-                "production-readiness gate is complete."
+                "One-Click allows Dry-run only until the GitHub #138 "
+                "automatic-fix coverage gate is complete."
             )
         options_layout.addWidget(self.chk_dry_run)
 

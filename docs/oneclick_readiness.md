@@ -1,7 +1,8 @@
 # One-Click Migration Readiness
 
-This document tracks the release scope for the One-Click migration UI gate in
-GitHub #137.
+This document tracks the release scope for the One-Click migration UI gate.
+GitHub #137 covered dry-run preview exposure; GitHub #138 now tracks real
+execution and automatic fix coverage.
 
 ## Current Decision
 
@@ -36,15 +37,16 @@ The current supported scope is dry-run preview only:
 - Claiming automatic remediation coverage beyond the Rust Core dry-run event
   contract.
 
-## Gate To Revisit
+## Real-Execution Gate
 
-Before exposing the UI as preview, beta, or fully enabled:
+Before removing the dry-run lock or enabling real execution:
 
 1. Define which issue types can be automatically fixed and which remain manual.
 2. Add contract coverage for every additional event payload the UI renders.
-3. Capture realistic Rust Core dry-run evidence for the supported scope.
+3. Capture realistic Rust Core non-production real-execution evidence for the
+   supported automatic-fix scope.
 4. Decide and document whether the UI remains dry-run preview/beta or becomes
-   fully enabled.
+   real-execution capable.
 5. Update the feature flags, user-facing docs, and `docs\current_status.md` in
    the same change if the decision changes.
 
@@ -73,3 +75,8 @@ Recommended next repo-side change:
 2. Keep the migration analyzer entry point labeled as dry-run preview.
 3. Do not remove the dry-run lock or enable automatic SQL fixes until Rust Core
    defines, implements, and proves automatic fix coverage.
+
+Follow-up tracking:
+
+- Dry-run preview gate: GitHub #137.
+- Real execution and automatic fix coverage: GitHub #138.
