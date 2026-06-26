@@ -110,7 +110,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1865 passed, 5 warnings" not in doc
     assert "PASS, 1867 passed, 5 warnings" not in doc
     assert "PASS, 1869 passed, 5 warnings" not in doc
-    assert "PASS, 1870 passed, 5 warnings" in doc
+    assert "PASS, 1870 passed, 5 warnings" not in doc
+    assert "PASS, 1871 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -237,7 +238,7 @@ def test_current_status_tracks_sql_statement_parser_mismatch_issue():
     assert "GitHub #155 is fixed" in summary
     assert "src/core/sql_statement_parser.py" in doc
     assert "find_sql_statement_at_position" in doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_dollar_quote_helper_guard_issue():
@@ -252,7 +253,7 @@ def test_current_status_tracks_dollar_quote_helper_guard_issue():
     assert "read_dollar_quote" in doc
     assert "out-of-range" in normalized_doc
     assert "GitHub #156 is fixed" in summary
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_records_post_156_next_issue_analysis():
@@ -269,7 +270,7 @@ def test_current_status_records_post_156_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_oneclick_next_action_wording_issue():
@@ -283,7 +284,7 @@ def test_current_status_tracks_oneclick_next_action_wording_issue():
     assert "One-Click readiness next-action wording" in doc
     assert "Recommended next repo-side change" in normalized_doc
     assert "GitHub #157 is fixed" in summary
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_dollar_quote_none_input_issue():
@@ -299,7 +300,7 @@ def test_current_status_tracks_dollar_quote_none_input_issue():
     assert "SQLExecutionWorker._read_dollar_quote(None, 0)" in doc
     assert "GitHub #158 is fixed" in summary
     assert "fail-closed" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_partial_export_fk_parent_rust_inspect_issue():
@@ -316,7 +317,7 @@ def test_current_status_tracks_partial_export_fk_parent_rust_inspect_issue():
     assert "MySQLConnector" in doc
     assert "GitHub #160 is fixed" in summary
     assert "Rust Core-owned schema inspection" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_postgresql_rust_dump_engine_issue():
@@ -334,7 +335,7 @@ def test_current_status_tracks_postgresql_rust_dump_engine_issue():
     assert "dump.import" in doc
     assert "GitHub #161 is fixed" in summary
     assert "PostgreSQL Export/Import" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_postgresql_import_timezone_issue():
@@ -351,7 +352,7 @@ def test_current_status_tracks_postgresql_import_timezone_issue():
     assert "SET TIME ZONE" in doc
     assert "GitHub #162 is fixed" in summary
     assert "default auto timezone mode skips MySQL timezone table detection" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_postgresql_import_timezone_core_validation_issue():
@@ -368,7 +369,7 @@ def test_current_status_tracks_postgresql_import_timezone_core_validation_issue(
     assert "SET SESSION time_zone" in doc
     assert "GitHub #163 is fixed" in summary
     assert "Rust Core `dump.import` accepts PostgreSQL `SET TIME ZONE` timezone SQL" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_postgresql_dump_wrapper_engine_issue():
@@ -386,7 +387,7 @@ def test_current_status_tracks_postgresql_dump_wrapper_engine_issue():
     assert "RustDumpConfig" in doc
     assert "GitHub #164 is fixed" in summary
     assert "convenience wrappers preserve PostgreSQL engine" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_scheduled_backup_postgresql_engine_issue():
@@ -404,7 +405,7 @@ def test_current_status_tracks_scheduled_backup_postgresql_engine_issue():
     assert "GitHub #165 is fixed" in summary
     assert "preserves PostgreSQL tunnel engine metadata into `RustDumpConfig`" in normalized_doc
     assert "scheduled Rust dump backups now normalize tunnel `db_engine` metadata" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_scheduled_backup_tuple_connection_issue():
@@ -422,7 +423,7 @@ def test_current_status_tracks_scheduled_backup_tuple_connection_issue():
     assert "RustDumpConfig" in doc
     assert "GitHub #166 is fixed" in summary
     assert "scheduled Rust dump backups now accept real `TunnelEngine.get_connection_info()` tuple output" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_records_post_166_next_issue_reaudit():
@@ -438,7 +439,25 @@ def test_current_status_records_post_166_next_issue_reaudit():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
+
+
+def test_current_status_records_manual_macos_workflow_evidence():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-070" in doc
+    assert "manual macOS workflow evidence" in normalized_doc
+    assert "28264164795" in doc
+    assert "6ad09590bf14d678a568fd64ac74765fd1eff0c9" in doc
+    assert "manual macOS signing/notarization workflow passed for arm64" in doc
+    assert "manual macOS signing/notarization workflow passed for x86_64" in doc
+    assert "no macOS manual validation report found under build/" in doc
+    assert "GitHub #116 remains external" in summary
+    assert "Refresh current-head manual workflow evidence after any status-only commit" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_records_post_151_next_issue_analysis():
@@ -456,7 +475,7 @@ def test_current_status_records_post_151_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_current_baseline_section_is_not_stale_dated():
@@ -568,7 +587,7 @@ def test_current_status_tracks_legacy_python_auto_fix_wizard_issue():
     assert "FixWizardWorker" in doc
     assert "GitHub #142 is fixed" in summary
     assert "Legacy Auto-Fix Wizard is dry-run/manual SQL only" in doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_records_post_142_next_issue_analysis():
@@ -648,7 +667,7 @@ def test_current_status_records_post_146_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a new repo-side implementation issue" in normalized_doc
-    assert "No repo-side implementation issue is currently open after TF-STATUS-069" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-070" in order
 
 
 def test_current_status_tracks_post_release_version_drift_issue():
