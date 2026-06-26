@@ -72,6 +72,11 @@ before merge, or current merged main HEAD after PR #117 is merged, matching the
 final gate/report SHA policy. #116 itself remains open only for real operator
 Mac validation evidence.
 
+The scheduled-backup guide is also reconfirmed as an internal/reactivation
+memo while `SCHEDULE_FEATURE_ENABLED = False`; it must not read like current
+public UI instructions until the feature flag is intentionally re-enabled and
+runtime evidence is refreshed.
+
 ## Verified On 2026-06-26
 
 Commands run locally:
@@ -116,6 +121,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Schedule guide hidden-feature wording | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; `pytest tests\test_schedule_docs.py tests\test_current_status_docs.py -q`; `rg -n -F -e '메인 툴바에서 **"스케줄"** 버튼을 클릭' -e '스케줄 시간을 기다리지 않고 바로 백업하려면:' -e '스케줄 관리 창의 **"백업 로그"** 탭에서' -e '스케줄이 작동하려면 TunnelForge가 실행 중이어야 합니다' SCHEDULE.md`; `python -m compileall -q tests\test_schedule_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | `SCHEDULE.md` now reads as an internal/reactivation memo while `SCHEDULE_FEATURE_ENABLED = False`, and no longer gives public-toolbar/log/immediate-run instructions as current user steps |
 | 2026-06-27 | macOS artifact default source after PR #117 merge | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh`; `pytest tests\test_current_status_docs.py -q`; `python scripts\check-macos-support-gate.py --skip-github`; `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py`; `git diff --check` | PASS | `macos-download-validation-artifacts.sh` now finds the latest successful manual `macOS App Validation` run for PR head before merge, or current merged main HEAD after PR #117 is merged, so downloaded artifact provenance matches the final report/gate SHA policy |
 | 2026-06-26 | Direct DB Export/Import Rust Core endpoint host | RED/GREEN: `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump -q`; RED/GREEN: `pytest tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q`; `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q` | PASS | `RustDumpExportDialog` and `RustDumpImportDialog` now preserve direct connector `host` when creating `RustDumpConfig`; tunnel connections still use their connector host, normally `127.0.0.1` |
 | 2026-06-26 | Export table selection audit | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_export_table_selection_audit -q`; `git status --short --branch`; `gh issue list --state open --limit 30 --json number,title,state,labels,updatedAt,url`; `rg -n "class RustDumpExportDialog|export_tables|dump.run|selected_tables|table selection" src tests docs README.md README.ko.md migration_core\src migration_core\tests`; code inspection of `RustDumpExportDialog`, `RustDumpExporter.export_tables`, `RustDumpWorker`, and Rust `dump.run` table filtering | PASS | Export individual table selection is currently implemented: PyQt exposes `선택 테이블 Export`, checkbox table list, select-all/deselect-all, and FK parent auto-include; Python forwards selected tables through `RustDumpExporter.export_tables`; Rust Core `dump.run` filters schema tables from the `tables` payload |
@@ -1080,6 +1086,36 @@ Next action:
 2. #116 still requires real operator Mac validation evidence before it can be
    closed.
 
+### TF-STATUS-026: Schedule Guide Stays Internal While Feature Is Hidden
+
+Status: closed
+Severity: Medium
+Area: Docs/UI feature flags
+
+Evidence:
+
+- 2026-06-27 stale-doc scan found that `SCHEDULE.md` opened with the correct
+  hidden-feature warning, but later still told readers to click the toolbar
+  schedule button, use the backup log tab, and run schedules immediately as if
+  the feature were public.
+- `src/ui/main_window.py` still sets `SCHEDULE_FEATURE_ENABLED = False`, so
+  those instructions were not reachable in normal builds.
+- RED/GREEN coverage in `tests/test_schedule_docs.py` now rejects public-UI
+  wording while the guide is marked disabled/internal.
+
+Resolution:
+
+- `SCHEDULE.md` is now titled and worded as an internal implementation /
+  reactivation memo.
+- Current-user steps were converted into reactivation verification items for
+  entry point, create/save, immediate run, logs, and app lifecycle behavior.
+
+Next action:
+
+1. If `SCHEDULE_FEATURE_ENABLED` is intentionally enabled, rewrite
+   `SCHEDULE.md` back into a public user guide and add fresh UI/runtime
+   verification evidence in the same session.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1109,6 +1145,7 @@ Next action:
 | TF-STATUS-023 | Medium | closed | One-Click migration UI / Rust Core automatic fixes | Align `int_display_width` skip semantics | Keep display-only skip policy aligned if Rust Core begins emitting this class |
 | TF-STATUS-024 | High | closed | Export/Import UI | Direct DB Rust Core endpoint host | Keep direct connector host coverage when worker construction changes |
 | TF-STATUS-025 | High | closed | macOS release validation | Artifact lookup uses current main after PR merge | Keep artifact lookup default aligned with final report SHA policy |
+| TF-STATUS-026 | Medium | closed | Docs/UI feature flags | Schedule guide hidden-feature wording | Rewrite as public guide only when schedule feature is re-enabled with evidence |
 
 ## Recommended Execution Order
 
@@ -1204,3 +1241,4 @@ Next action:
 | 2026-06-26 | Audited the original Export table-selection question and recorded the current contract: the app can export individually selected tables today through `RustDumpExportDialog` -> `RustDumpExporter.export_tables` -> Rust Core `dump.run` `tables` filtering. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_export_table_selection_audit -q`; source/doc/GitHub issue scan |
 | 2026-06-26 | Fixed TF-STATUS-024 after finding that direct DB Export/Import dialogs hard-coded the Rust DB Core endpoint host to `127.0.0.1`; both dialogs now preserve `connector.host` while tunnel flows still use their local connector host. | `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `docs/current_status.md` | RED/GREEN: focused Export and Import direct-host pytest |
 | 2026-06-27 | Analyzed the next remaining issue after main alignment. #116 still needs external real-Mac evidence, but the repo-side handoff had one drift: artifact download defaults still targeted PR #117 head after merge. Fixed TF-STATUS-025 so artifact lookup now follows PR head before merge and current merged main HEAD after PR #117 is merged. | `scripts/macos-download-validation-artifacts.sh`, `scripts/macos-manual-validation-report.sh`, `docs/macos_support.md`, `tests/test_rust_core_packaging.py`, `tests/test_macos_support_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; final: macOS/docs focused pytest, shell syntax, current-status tests, #116 gate skip-github, compileall, `git diff --check` |
+| 2026-06-27 | Re-scanned disabled-feature docs after #116 remained external and fixed TF-STATUS-026: `SCHEDULE.md` no longer mixes a hidden-feature warning with current public UI instructions. | `SCHEDULE.md`, `tests/test_schedule_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; final: schedule/current-status docs pytest, stale-phrase scan, compileall, `git diff --check` |
