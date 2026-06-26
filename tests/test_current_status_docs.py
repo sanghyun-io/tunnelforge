@@ -86,7 +86,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1807 passed, 5 warnings" not in doc
     assert "PASS, 1808 passed, 5 warnings" not in doc
     assert "PASS, 1809 passed, 5 warnings" not in doc
-    assert "PASS, 1811 passed, 5 warnings" in doc
+    assert "PASS, 1811 passed, 5 warnings" not in doc
+    assert "PASS, 1812 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -188,6 +189,17 @@ def test_current_status_tracks_legacy_python_auto_fix_wizard_issue():
     assert "GitHub #142 is fixed" in summary
     assert "Legacy Auto-Fix Wizard is dry-run/manual SQL only" in doc
     assert "No repo-side implementation issue is currently open" in order
+
+
+def test_current_status_records_post_142_next_issue_analysis():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "Post-#142 next issue analysis" in doc
+    assert "#116 is still the only open GitHub issue" in summary
+    assert "python scripts\\check-macos-support-gate.py --final" in doc
+    assert "no macOS manual validation report found under build" in doc
+    assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
