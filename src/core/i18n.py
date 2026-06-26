@@ -629,6 +629,7 @@ _EN_PHRASE_TRANSLATIONS = {
     "기존 데이터 유지, 새로운 것만 추가": "Keep existing data and add only new items",
     "중복 객체가 있으면 오류 발생": "Duplicate objects cause errors",
     "모든 객체": "All objects",
+    "   테이블 구조와 데이터를 재생성\n   ℹ️ View는 가능한 경우 복원되며 프로시저/트리거/이벤트는 별도 확인 필요": "   Recreate table structure and data\n   ℹ️ Views are restored when possible; procedures/triggers/events require separate review",
     "재생성": "recreate",
     "데이터베이스 삭제 후 처음부터 재생성": "Delete the database and recreate from scratch",
     "모든 데이터 손실": "all data is lost",

@@ -3292,7 +3292,17 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     restore_result?;
     local_infile_restore_result?;
     let target_engine = adapter.engine().to_string();
-    apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
+    if should_apply_post_load_ddl(mode) {
+        apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
+    } else {
+        emit(json!({
+            "event": "phase",
+            "request_id": request.request_id,
+            "phase": "dump_import_post_load",
+            "message": post_load_ddl_skip_message(mode),
+            "strategy": "existing_schema"
+        }));
+    }
     verify_imported_row_counts(&tables, &imported_rows_by_table)?;
 
     // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
@@ -8384,6 +8394,14 @@ pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> V
     ddl
 }
 
+fn should_apply_post_load_ddl(mode: &str) -> bool {
+    matches!(mode, "replace" | "recreate")
+}
+
+fn post_load_ddl_skip_message(mode: &str) -> String {
+    format!("skipping post-load DDL for {mode} import; existing objects must already match")
+}
+
 fn apply_post_load_ddl<A: MigrationAdapter>(
     target: &mut A,
     schema: &NormalizedSchema,
@@ -10048,6 +10066,21 @@ mod tests {
         assert!(report_text.contains("\"row_counts\": \"passed\""));
 
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn post_load_ddl_policy_applies_for_recreated_targets_only() {
+        assert!(should_apply_post_load_ddl("replace"));
+        assert!(should_apply_post_load_ddl("recreate"));
+        assert!(!should_apply_post_load_ddl("merge"));
+    }
+
+    #[test]
+    fn merge_import_does_not_claim_post_load_ddl_phase() {
+        assert_eq!(
+            post_load_ddl_skip_message("merge"),
+            "skipping post-load DDL for merge import; existing objects must already match"
+        );
     }
 
     #[test]

@@ -1,0 +1,100 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>TunnelForge Export/Import Remediation Report</title>
+  <style>
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      line-height: 1.55;
+      margin: 32px auto;
+      max-width: 1080px;
+      color: #1f2933;
+    }
+    h1, h2 {
+      color: #102a43;
+    }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 16px 0 24px;
+    }
+    th, td {
+      border: 1px solid #bcccdc;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #f0f4f8;
+    }
+    code {
+      background: #f0f4f8;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    .status-pass {
+      color: #0b7285;
+      font-weight: 700;
+    }
+    .status-watch {
+      color: #9a6700;
+      font-weight: 700;
+    }
+  </style>
+</head>
+<body>
+  <h1>TunnelForge Export/Import Remediation Report</h1>
+  <p><strong>Date:</strong> 2026-06-26</p>
+  <p><strong>Scope:</strong> Rust Core dump export/import recovery work tracked from the 2026-06-01 review.</p>
+
+  <h2>Remediation Summary</h2>
+  <ul>
+    <li>Python now forwards import intent fields including <code>timezone_sql</code> and <code>strict_manifest</code> to Rust Core.</li>
+    <li>Rust Core validates <code>timezone_sql</code> and only accepts a single <code>SET SESSION time_zone</code> statement with a safe literal value.</li>
+    <li>Strict import rejects incomplete dump manifests with missing chunk checksum metadata before DB connection or target mutation.</li>
+    <li>Classified Rust import failures such as <code>export_invalid</code> and <code>post_load_validation_failed</code> are preserved through the Python wrapper.</li>
+    <li>Import success is gated by per-table imported row-count verification.</li>
+    <li>Successful imports write <code>_tunnelforge_import_report.json</code> beside the dump and return the report path in the result payload.</li>
+    <li>Merge import no longer reapplies post-load DDL intended for recreated targets.</li>
+    <li>Export manifests now record <code>snapshot_policy</code>, <code>strict_export</code>, and <code>manifest_warnings</code>.</li>
+    <li>Parallel exports are marked <code>non_consistent_parallel</code> and non-strict instead of implying an unproven shared snapshot.</li>
+    <li>Import UI wording no longer promises that every object type is restored automatically.</li>
+  </ul>
+
+  <h2>Verification Evidence</h2>
+  <table>
+    <tr><th>Command</th><th>Result</th><th>Notes</th></tr>
+    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="status-pass">PASS</td><td>152 Rust lib tests, JSONL CLI test, live-roundtrip gated tests, doctests.</td></tr>
+    <tr><td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td><td class="status-pass">PASS</td><td>Release Rust core binary builds.</td></tr>
+    <tr><td><code>.venv\Scripts\python -m pytest -q</code></td><td class="status-pass">PASS</td><td>1710 Python tests passed, 3 collection warnings from existing test helper classes.</td></tr>
+    <tr><td><code>.venv\Scripts\python -m compileall -q main.py src tests</code></td><td class="status-pass">PASS</td><td>Python syntax check passed.</td></tr>
+    <tr><td><code>cargo fmt --manifest-path migration_core\Cargo.toml --check</code></td><td class="status-pass">PASS</td><td>Rust formatting check passed.</td></tr>
+    <tr><td><code>git diff --check</code></td><td class="status-pass">PASS</td><td>No whitespace errors at the latest check before report creation.</td></tr>
+  </table>
+
+  <h2>Key Regression Coverage</h2>
+  <table>
+    <tr><th>Risk</th><th>Evidence</th></tr>
+    <tr><td>Unsafe timezone SQL forwarding</td><td><code>import_timezone_sql_accepts_session_time_zone_only</code></td></tr>
+    <tr><td>Strict import accepts incomplete manifest</td><td><code>strict_manifest_validation_rejects_missing_chunk_checksums</code>, <code>dump_import_strict_manifest_rejects_missing_checksums_before_connect</code></td></tr>
+    <tr><td>Import success without row verification</td><td><code>import_row_count_verification_rejects_missing_rows</code>, <code>import_row_count_verification_accepts_matching_counts</code></td></tr>
+    <tr><td>Missing import report artifact</td><td><code>write_dump_import_report_creates_json_file</code></td></tr>
+    <tr><td>Unclassified Rust import failure in Python UI layer</td><td><code>test_import_dump_preserves_classified_core_error</code></td></tr>
+    <tr><td>Export manifest lacks consistency metadata</td><td><code>dump_manifest_strictness_fields_default_for_legacy_json</code>, <code>dump_manifest_consistency_metadata_marks_parallel_as_non_strict</code></td></tr>
+    <tr><td>Merge import reapplies recreated-target DDL</td><td><code>post_load_ddl_policy_applies_for_recreated_targets_only</code>, <code>merge_import_does_not_claim_post_load_ddl_phase</code></td></tr>
+    <tr><td>Import UI overpromises all-object restoration</td><td><code>test_import_dialog_does_not_claim_all_objects_are_recreated</code></td></tr>
+  </table>
+
+  <h2>Residual Limits</h2>
+  <ul>
+    <li class="status-watch">The current Rust <code>dump_import()</code> path performs direct replace/recreate/merge work; the shadow-schema switch architecture described in the original design is not present in the current implementation.</li>
+    <li class="status-watch">View import remains best-effort. Procedures, triggers, and events still require separate review instead of automatic restoration.</li>
+    <li class="status-watch">Parallel exports are now honestly classified as non-strict, but they do not yet provide a shared consistent snapshot guarantee.</li>
+    <li class="status-watch">macOS production readiness still requires the separate real-Mac validation bundle tracked outside this report.</li>
+  </ul>
+
+  <h2>Current Tracking</h2>
+  <p>The canonical status and continuation tracker is <code>docs/current_status.md</code>. New sessions should read it before continuing recovery, release, or documentation work.</p>
+</body>
+</html>

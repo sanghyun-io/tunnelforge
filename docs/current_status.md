@@ -111,6 +111,12 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Export consistency policy | `cargo test --manifest-path migration_core\Cargo.toml dump_manifest_consistency_metadata --lib` | PASS | Parallel exports are marked non-strict; single-thread exports are marked connection-consistent |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 150 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
 | 2026-06-26 | Import wrapper/dialog focused tests | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 63 passed after export metadata change |
+| 2026-06-26 | Merge post-load DDL policy TDD | `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl_policy --lib` | FAIL then PASS | Initial RED failed because merge/recreate DDL policy helpers did not exist |
+| 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 152 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
+| 2026-06-26 | Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Release Rust core binary builds |
+| 2026-06-26 | Python syntax | `.venv\Scripts\python -m compileall -q main.py src tests` | PASS | No compile errors |
+| 2026-06-26 | Full Python suite | `.venv\Scripts\python -m pytest -q` | FAIL then PASS | Initial failure exposed missing English translation for new import UI wording; final run passed 1710 tests with 3 warnings |
+| 2026-06-26 | Final remediation report | `Get-Item reports\export_import_flow_review_20260601.html` | PASS | Report exists, length 6104 bytes |
 
 ## Existing Status And Planning Documents
 
@@ -207,7 +213,7 @@ Next action:
 
 ### TF-STATUS-003: Import UI Overpromises Object Restoration
 
-Status: `fixed_pending_full_verify`
+Status: `closed`
 Severity: High
 Area: Import UI
 
@@ -220,13 +226,14 @@ Evidence:
 
 Impact:
 
-- This specific overpromise is fixed, but broader unsupported object reporting
-  still belongs in the remaining Recovery work.
+- The overpromising object restoration wording is fixed and verified by the
+  focused UI regression plus the full Python suite.
+- Unsupported object restoration remains a documented residual limit in the
+  final remediation report.
 
 Next action:
 
 1. Keep the regression test that rejects `모든 객체`.
-2. Continue surfacing unsupported object warnings from Rust in the import UI.
 
 ### TF-STATUS-004: Export Consistency Is Explicit In The Manifest
 
@@ -302,9 +309,9 @@ Next action:
 
 ## Lower Priority / Tracking
 
-### TF-STATUS-007: Referenced Export/Import HTML Report Is Missing
+### TF-STATUS-007: Referenced Export/Import HTML Report Exists
 
-Status: `open`
+Status: `closed`
 Severity: Low
 Area: Documentation/reporting
 
@@ -312,12 +319,13 @@ Evidence:
 
 - `reports/export_import_flow_review_20260601.html` is referenced by the
   recovery design and plan.
-- The repository currently has no `reports/` directory.
+- 2026-06-26 update: `reports/export_import_flow_review_20260601.html` exists
+  and has been converted into a remediation report with verification evidence
+  and residual limits.
 
 Next action:
 
-1. Create the final remediation report after recovery work is implemented and
-   verified, or update the design/plan to point to the correct report location.
+1. Keep the report aligned when recovery scope changes.
 
 ### TF-STATUS-008: macOS Support Still Requires Real-Mac Final Validation
 
@@ -335,23 +343,47 @@ Next action:
 1. Do not call macOS support production-ready until the final manual validation
    evidence bundle exists.
 
+### TF-STATUS-009: Merge Import Reapplied Post-Load DDL
+
+Status: `closed`
+Severity: High
+Area: Rust Core dump.import
+
+Evidence:
+
+- 2026-06-26 discovery: `dump_import()` applied post-load DDL unconditionally,
+  including `merge` imports.
+- 2026-06-26 update: `should_apply_post_load_ddl()` limits post-load DDL to
+  `replace` and `recreate`; `merge` emits an explicit existing-schema skip
+  phase.
+
+Impact:
+
+- Merge import no longer treats an existing target schema as if it had just
+  been recreated.
+
+Next action:
+
+1. Keep the policy tests for merge/recreate behavior.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
 | TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Continue remaining recovery work in TF-STATUS-002 and TF-STATUS-004 |
 | TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Continue export consistency metadata in TF-STATUS-004 |
-| TF-STATUS-003 | High | fixed_pending_full_verify | Import UI | Object restoration wording | Keep focused regression; add unsupported-object UI surfacing |
+| TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
 | TF-STATUS-004 | High | closed | Rust Core export | Export consistency explicit | Update final remediation report in TF-STATUS-007 |
 | TF-STATUS-005 | Medium | open | Docs/UI flags | Docs mention disabled features | Decide support status for schedule and SQL file execution |
 | TF-STATUS-006 | Medium | watch | Maintainability | Very large files | Keep fixes narrow; split later if behavior stabilizes |
-| TF-STATUS-007 | Low | open | Reporting | Referenced HTML report missing | Create/update final remediation report |
+| TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
 | TF-STATUS-008 | Low | watch | macOS | Final real-Mac validation pending | Require evidence bundle before production-ready claim |
+| TF-STATUS-009 | High | closed | Rust Core import | Merge import post-load DDL policy | Keep merge/recreate policy tests |
 
 ## Recommended Execution Order
 
-1. Update or create final remediation report after the recovery work is
-   verified.
+1. Decide support status for scheduled backup and SQL file execution docs.
+2. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -363,3 +395,4 @@ Next action:
 | 2026-06-26 | Added strict manifest classification before dump import target mutation and preserved classified core errors through Python import messages. | `migration_core/src/lib.rs`, `tests/test_rust_dump_exporter.py`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Added dump import row-count success gate and `_tunnelforge_import_report.json` success artifact. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo test --manifest-path migration_core\Cargo.toml write_dump_import_report_creates_json_file --lib` |
 | 2026-06-26 | Added dump manifest consistency metadata for strict and non-strict export paths. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
+| 2026-06-26 | Added merge import post-load DDL skip policy, fixed English translation for import UI wording, and created the final remediation report. | `migration_core/src/lib.rs`, `src/core/i18n.py`, `reports/export_import_flow_review_20260601.html`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `.venv\Scripts\python -m pytest -q`; `compileall`; `git diff --check` |
