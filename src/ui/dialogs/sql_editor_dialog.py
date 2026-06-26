@@ -15,7 +15,8 @@ from PyQt6.QtWidgets import (
     QGroupBox, QSplitter, QPlainTextEdit, QTextEdit, QWidget, QTabWidget,
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
     QStatusBar, QApplication, QAbstractItemView, QListWidget, QListWidgetItem, QProgressBar,
-    QDialogButtonBox, QMenu, QCheckBox, QFrame, QToolTip, QLineEdit
+    QDialogButtonBox, QMenu, QCheckBox, QFrame, QToolTip, QLineEdit,
+    QTreeWidget, QTreeWidgetItem
 )
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QThread, QTimer, QPoint
 from PyQt6.QtGui import (
@@ -1795,7 +1796,30 @@ class SQLEditorDialog(QDialog):
 
         layout.addLayout(toolbar)
 
-        # --- 메인 스플리터 (에디터 + 결과) ---
+        # --- 메인 스플리터 (스키마 트리 + 에디터/결과) ---
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+
+        schema_group = QGroupBox("스키마 / 테이블")
+        schema_layout = QVBoxLayout(schema_group)
+        schema_layout.setContentsMargins(4, 8, 4, 4)
+
+        self.schema_tree = QTreeWidget()
+        self.schema_tree.setHeaderLabels(["이름"])
+        self.schema_tree.setMinimumWidth(180)
+        self.schema_tree.setStyleSheet("""
+            QTreeWidget {
+                border: 1px solid #d8e0e8;
+                border-radius: 4px;
+                background-color: #fafafa;
+            }
+            QTreeWidget::item {
+                padding: 3px 4px;
+            }
+        """)
+        self.schema_tree.itemClicked.connect(self._on_schema_tree_item_clicked)
+        schema_layout.addWidget(self.schema_tree)
+        main_splitter.addWidget(schema_group)
+
         splitter = QSplitter(Qt.Orientation.Vertical)
 
         # 에디터 영역 (멀티 탭)
@@ -1996,7 +2020,9 @@ class SQLEditorDialog(QDialog):
         splitter.addWidget(result_group)
 
         splitter.setSizes([350, 300])
-        layout.addWidget(splitter)
+        main_splitter.addWidget(splitter)
+        main_splitter.setSizes([220, 780])
+        layout.addWidget(main_splitter)
 
         # --- 프로그레스 바 ---
         self.progress_bar = QProgressBar()
@@ -3703,6 +3729,7 @@ class SQLEditorDialog(QDialog):
 
         # 캐시된 메타데이터 업데이트
         self.metadata_provider._metadata = metadata
+        self._populate_schema_tree(metadata)
 
         table_count = len(metadata.tables)
         version = format_metadata_db_version(metadata.db_version)
@@ -3710,6 +3737,54 @@ class SQLEditorDialog(QDialog):
 
         # 현재 SQL 재검증
         self._on_validation_requested(self.editor.toPlainText())
+
+    def _populate_schema_tree(self, metadata):
+        """Populate the side schema/table tree from loaded metadata."""
+        self.schema_tree.clear()
+        schema_name = self.db_combo.currentText().strip() or self.config.get("default_database") or "Schema"
+        schema_names = [
+            self.db_combo.itemText(index).strip()
+            for index in range(self.db_combo.count())
+            if self.db_combo.itemText(index).strip()
+        ] or [schema_name]
+
+        selected_root = None
+        for name in schema_names:
+            root = QTreeWidgetItem([name])
+            root.setData(0, Qt.ItemDataRole.UserRole, {"kind": "schema", "name": name})
+            self.schema_tree.addTopLevelItem(root)
+            if name != schema_name:
+                continue
+            selected_root = root
+            for table in sorted(metadata.tables):
+                table_item = QTreeWidgetItem([table])
+                table_item.setData(0, Qt.ItemDataRole.UserRole, {"kind": "table", "name": table})
+                root.addChild(table_item)
+
+                for column in sorted(metadata.columns.get(table, [])):
+                    column_item = QTreeWidgetItem([column])
+                    column_item.setData(
+                        0,
+                        Qt.ItemDataRole.UserRole,
+                        {"kind": "column", "name": column, "table": table},
+                    )
+                    table_item.addChild(column_item)
+
+        if selected_root:
+            selected_root.setExpanded(True)
+
+    def _on_schema_tree_item_clicked(self, item, _column):
+        payload = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if not isinstance(payload, dict) or payload.get("kind") != "table":
+            return
+        if not self.editor:
+            return
+        self.editor.insertPlainText(f"{self._quote_editor_identifier(payload.get('name') or '')} ")
+
+    def _quote_editor_identifier(self, name: str) -> str:
+        if self._db_engine() == "postgresql":
+            return f'"{name.replace(chr(34), chr(34) + chr(34))}"'
+        return f"`{name.replace('`', '``')}`"
 
     def _on_metadata_error(self, error: str):
         """메타데이터 로드 오류"""

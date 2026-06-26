@@ -345,6 +345,60 @@ def test_metadata_loaded_does_not_crash_on_empty_version(monkeypatch):
         close_dialog(dialog)
 
 
+def test_metadata_loaded_populates_schema_tree(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        dialog.db_combo.addItem("app")
+        dialog.db_combo.addItem("archive")
+        dialog.db_combo.setCurrentText("app")
+        metadata = SchemaMetadata()
+        metadata.tables = {"orders", "users"}
+        metadata.columns = {
+            "users": {"id", "email"},
+            "orders": {"id", "user_id"},
+        }
+        metadata.db_version = (8, 4, 0)
+
+        dialog._on_metadata_loaded(metadata)
+
+        assert [
+            dialog.schema_tree.topLevelItem(i).text(0)
+            for i in range(dialog.schema_tree.topLevelItemCount())
+        ] == ["app", "archive"]
+        root = dialog.schema_tree.topLevelItem(0)
+        assert root.text(0) == "app"
+        assert [root.child(i).text(0) for i in range(root.childCount())] == [
+            "orders",
+            "users",
+        ]
+        users = root.child(1)
+        assert [users.child(i).text(0) for i in range(users.childCount())] == [
+            "email",
+            "id",
+        ]
+    finally:
+        close_dialog(dialog)
+
+
+def test_schema_tree_table_click_inserts_quoted_table_name(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    try:
+        metadata = SchemaMetadata()
+        metadata.tables = {"users"}
+        metadata.columns = {"users": {"id"}}
+        dialog._on_metadata_loaded(metadata)
+        dialog.editor.setPlainText("SELECT * FROM ")
+        dialog.editor.moveCursor(dialog.editor.textCursor().MoveOperation.End)
+
+        root = dialog.schema_tree.topLevelItem(0)
+        table_item = root.child(0)
+        dialog._on_schema_tree_item_clicked(table_item, 0)
+
+        assert dialog.editor.toPlainText() == "SELECT * FROM `users` "
+    finally:
+        close_dialog(dialog)
+
+
 def test_large_sql_file_disables_expensive_editor_features(tmp_path):
     tab = SQLEditorTab(tab_index=1)
     large_sql = "SELECT * FROM users;\n" * ((LARGE_SQL_RENDER_LIMIT_BYTES // 20) + 2000)

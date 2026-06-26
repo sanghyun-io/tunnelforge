@@ -526,6 +526,36 @@ Next action:
 1. Revisit true virtualized SQL rendering only if large plain-text insertion
    remains a measured bottleneck after this guard.
 
+### TF-STATUS-015: SQL Editor Schema Tree
+
+Status: `closed`
+Severity: Medium
+Area: SQL editor UI
+
+Evidence:
+
+- GitHub issue #92 requested a SQL editor side panel for schema/table browsing
+  so users do not need to type table names manually.
+- The SQL editor now has a left-side `스키마 / 테이블` tree panel next to the
+  editor/results splitter.
+- The tree shows DB/schema roots from the SQL editor selector and populates
+  tables and columns under the currently loaded schema metadata.
+- Clicking a table item inserts the table identifier into the current editor,
+  quoted with backticks for MySQL and double quotes for PostgreSQL.
+- Focused tests cover tree population from loaded metadata and table-click
+  insertion into the editor.
+- GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/92
+
+Impact:
+
+- SQL editor users can discover available schemas/tables/columns in-place and
+  insert table names without memorizing or manually typing them.
+
+Next action:
+
+1. Consider column insertion or drag/drop later if users ask for richer query
+   composition.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -544,6 +574,7 @@ Next action:
 | TF-STATUS-012 | Medium | closed | Import UI telemetry | Cumulative Import rows/s and ETA | Re-check wording with real long-running imports |
 | TF-STATUS-013 | High | closed | Rust Core import | MySQL JSON fallback encoding | Watch for malformed-source JSON reports |
 | TF-STATUS-014 | Medium | closed | SQL editor UI | Large SQL rendering guard | Revisit virtual rendering if measured bottleneck remains |
+| TF-STATUS-015 | Medium | closed | SQL editor UI | Schema/table tree panel | Consider richer query composition later |
 
 ## Recommended Execution Order
 
@@ -572,3 +603,4 @@ Next action:
 | 2026-06-26 | Added cumulative Import telemetry for GitHub #128: Rust row events now carry table-local and manifest-wide row counts, Python forwards them, and the UI separates average speed, current speed, ETA, and post-load phase text. | `migration_core/src/lib.rs`, `src/exporters/rust_dump_exporter.py`, `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `tests/test_rust_dump_exporter.py`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `pytest tests/test_db_dialogs.py::test_format_import_row_labels_reports_cumulative_average_current_and_eta tests/test_db_dialogs.py::test_format_import_row_labels_stops_row_eta_during_post_load_phase tests/test_rust_dump_exporter.py::TestRustDumpImporter::test_import_row_progress_forwards_cumulative_totals_to_detail_callback`; `cargo test --manifest-path migration_core\Cargo.toml dump_import_row_progress_event_reports_table_and_overall_rows`; final: `pytest tests/test_db_dialogs.py tests/test_rust_dump_exporter.py`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `pytest -q`; `python -m compileall -q main.py src tests`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Hardened MySQL JSON fallback INSERT handling for GitHub #118 by using `_utf8mb4` JSON literals and removing `NO_BACKSLASH_ESCAPES` during import session tuning. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml mysql_json_literal_uses_utf8mb4_introducer_for_unicode_json_text --lib`; `cargo test --manifest-path migration_core\Cargo.toml mysql_dump_import_uses_fast_session_tuning_statements --lib`; final: `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `pytest -q`; `python -m compileall -q main.py src tests`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Added a large-document guard for GitHub #86 so SQL files at or above 512KB open with syntax highlighting and real-time validation disabled, then restore normal editor features for smaller content. | `src/ui/dialogs/sql_editor_dialog.py`, `src/core/i18n.py`, `tests/test_sql_editor_dialog.py`, `docs/current_status.md` | RED/GREEN: `pytest tests/test_sql_editor_dialog.py::test_large_sql_file_disables_expensive_editor_features tests/test_sql_editor_dialog.py::test_small_content_reenables_editor_features_after_large_file`; final: `pytest tests/test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests/test_sql_editor_dialog.py`; `pytest -q`; `python -m compileall -q main.py src tests`; `git diff --check` |
+| 2026-06-26 | Added the SQL editor schema/table tree panel for GitHub #92 with schema roots, loaded table/column children, and table-click insertion into the current editor. | `src/ui/dialogs/sql_editor_dialog.py`, `tests/test_sql_editor_dialog.py`, `docs/current_status.md` | RED/GREEN: `pytest tests/test_sql_editor_dialog.py::test_metadata_loaded_populates_schema_tree tests/test_sql_editor_dialog.py::test_schema_tree_table_click_inserts_quoted_table_name`; final: `pytest tests/test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests/test_sql_editor_dialog.py`; `pytest -q`; `python -m compileall -q main.py src tests`; `git diff --check` |
