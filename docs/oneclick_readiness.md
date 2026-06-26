@@ -58,8 +58,8 @@ The current supported scope is intentionally narrow:
 ## Not Yet Supported
 
 - Production database usage.
-- Automatic PyQt charset contract derivation and dedicated charset
-  rendering/count copy tests.
+- Automatic PyQt charset contract derivation. GitHub #140 tracks that separate
+  follow-up.
 
 ## Automatic Fix Coverage
 
@@ -68,7 +68,7 @@ Current Rust Core recommendation coverage:
 | Issue type | Status | Strategy | Notes |
 | --- | --- | --- | --- |
 | `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. `oneclick.apply_fixes` and UI-facing `oneclick.run dry_run=false` execute only this strategy through Rust Core. PyQt requires backup confirmation before sending a non-dry-run payload. |
-| `charset_issue` | local contract allowlisted, PyQt derivation pending | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify and execute charset fixes only when the request includes complete safe contract data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. `oneclick.apply_fixes dry_run=false` and UI-facing `oneclick.run dry_run=false` execute that supplied contract through Rust Core; automatic PyQt contract derivation/rendering coverage remains pending. |
+| `charset_issue` | local contract allowlisted, PyQt derivation pending | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify and execute charset fixes only when the request includes complete safe contract data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. `oneclick.apply_fixes dry_run=false` and UI-facing `oneclick.run dry_run=false` execute that supplied contract through Rust Core; PyQt rendering/count copy is covered, while automatic contract derivation is tracked by #140. |
 | `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
 | `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
 | `float_precision` | manual | `manual` | Requires precision/scale policy review. |
@@ -81,8 +81,8 @@ Charset/collation command-level execution is allowlisted only for complete
 `charset_collation_fk_safe` contracts. Local MySQL evidence for the command
 path is captured and validator-backed. UI-facing `oneclick.run dry_run=false`
 can execute the same supplied complete contract shape; automatic PyQt contract
-derivation is still pending. The following policy defines the only eligible
-scope.
+derivation is tracked separately in GitHub #140. The following policy defines
+the only eligible scope.
 
 Eligible automatic subset:
 

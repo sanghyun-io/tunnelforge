@@ -164,3 +164,63 @@ def test_oneclick_worker_translates_core_events_to_ui_signals():
     assert analysis == [(2, 1, 1)]
     assert plans[0][0] == [{"location": "backup"}]
     assert "analysis started" in logs
+
+
+def test_oneclick_dialog_renders_charset_plan_counts_and_copy():
+    app = QApplication.instance() or QApplication([])
+    dialog = OneClickMigrationDialog(
+        None,
+        connector=SimpleNamespace(),
+        schema="app",
+    )
+    logs = []
+    dialog._on_log = lambda message, style: logs.append(message)
+
+    dialog._on_execution_plan_ready(
+        [
+            {
+                "issue_type": "charset_issue",
+                "location": "app.tf_oneclick_parent",
+                "description": "Legacy charset",
+                "selected_option": {
+                    "strategy": "charset_collation_fk_safe",
+                    "label": "Convert charset/collation with FK-safe order",
+                    "description": "Convert to utf8mb4 / utf8mb4_0900_ai_ci.",
+                    "sql_template": "ALTER TABLE `app`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
+                },
+            },
+            {
+                "issue_type": "charset_issue",
+                "location": "app.legacy_customer",
+                "description": "Legacy charset without a complete contract",
+                "selected_option": {
+                    "strategy": "manual",
+                    "label": "Manual review",
+                    "description": "Review charset/collation manually.",
+                    "sql_template": "",
+                },
+            },
+            {
+                "issue_type": "int_display_width",
+                "location": "app.orders.id",
+                "description": "Display width is ignored by MySQL 8.4",
+                "selected_option": {
+                    "strategy": "skip",
+                    "label": "No DB action required",
+                    "description": "MySQL 8.4 ignores integer display width.",
+                    "sql_template": "",
+                },
+            },
+        ],
+        {"total_issues": 3, "auto_fixable": 1, "manual_review": 1, "skip_recommended": 1},
+    )
+
+    widget = dialog.execution_plan_widget
+    assert "(1개)" in widget.auto_group.title()
+    assert "Convert charset/collation with FK-safe order" in widget.auto_text.toPlainText()
+    assert "(1개)" in widget.manual_group.title()
+    assert "Review charset/collation manually." in widget.manual_text.toPlainText()
+    assert "(1개)" in widget.skip_group.title()
+    assert "MySQL 8.4 ignores integer display width." in widget.skip_label.text()
+    assert logs == ["📋 실행 계획: 전체 3개, 자동 1개, 수동 1개, 조치 불필요 1개"]
+    dialog.close()

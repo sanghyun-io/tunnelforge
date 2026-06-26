@@ -1000,8 +1000,9 @@ class OneClickMigrationDialog(QDialog):
         total = summary.get("total_issues", 0) if isinstance(summary, dict) else 0
         auto_fixable = summary.get("auto_fixable", 0) if isinstance(summary, dict) else 0
         manual = summary.get("manual_review", 0) if isinstance(summary, dict) else 0
+        skip = summary.get("skip_recommended", 0) if isinstance(summary, dict) else 0
         self._on_log(
-            f"📋 실행 계획: 전체 {total}개, 자동 {auto_fixable}개, 수동 {manual}개",
+            f"📋 실행 계획: 전체 {total}개, 자동 {auto_fixable}개, 수동 {manual}개, 조치 불필요 {skip}개",
             STYLE_INFO,
         )
 
