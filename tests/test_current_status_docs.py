@@ -61,3 +61,12 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
 
     assert "PASS, 1729 passed" not in doc
     assert "Current main full Python suite" in doc
+
+
+def test_current_status_records_export_table_selection_audit():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+
+    assert "Export table selection audit" in doc
+    assert "RustDumpExportDialog" in doc
+    assert "RustDumpExporter.export_tables" in doc
+    assert "dump.run" in doc
