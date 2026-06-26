@@ -96,6 +96,12 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Rust timezone validation TDD | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_session_time_zone_only --lib` | FAIL then PASS | Initial RED failed because `validated_timezone_sql` did not exist; GREEN passed after helper implementation |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 139 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
 | 2026-06-26 | Import wrapper/dialog focused tests | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 62 passed after Rust timezone change |
+| 2026-06-26 | Strict manifest classification TDD | `cargo test --manifest-path migration_core\Cargo.toml strict_manifest_validation_rejects_missing_chunk_checksums --lib` | FAIL then PASS | Initial RED failed because strictness/classification helpers did not exist; GREEN covered strict reject, legacy warning, classified formatting |
+| 2026-06-26 | Strict import wiring | `cargo test --manifest-path migration_core\Cargo.toml dump_import_strict_manifest_rejects_missing_checksums_before_connect --lib` | PASS | Confirms strict import fails before dummy DB connection |
+| 2026-06-26 | Classified error wrapper | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py::TestRustDumpImporter::test_import_dump_preserves_classified_core_error -q` | PASS | Confirms `export_invalid` and scope survive Python wrapper |
+| 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 143 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
+| 2026-06-26 | Import wrapper/dialog focused tests | `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 63 passed after classified error regression |
+| 2026-06-26 | Rust format and diff hygiene | `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` | PASS | No formatting or whitespace issues |
 
 ## Existing Status And Planning Documents
 
@@ -131,9 +137,9 @@ unchecked task lists. They should not be interpreted as completed work.
 
 ## High Priority Issues
 
-### TF-STATUS-001: Export/Import Recovery Plan Is Not Complete
+### TF-STATUS-001: Initial Import Intent And Strictness Gates
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: Export/Import Recovery
 
@@ -145,22 +151,23 @@ Evidence:
 - 2026-06-26 update: Rust now validates `timezone_sql` as a single
   `SET SESSION time_zone` statement with a literal value and applies it on the
   import adapter session immediately after connection.
-- The recovery plan asks for `classified_import_error`,
-  `validate_dump_import_manifest_strictness`, `verify_imported_row_counts`,
-  `dump_import_report_path`, and related tests. These helpers are not present
-  in `migration_core/src/lib.rs`.
+- 2026-06-26 update: Rust now rejects strict imports with missing
+  `chunk_sha256` metadata before DB connection/target mutation; non-strict
+  legacy imports emit warning events.
+- 2026-06-26 update: classified Rust import errors are preserved through the
+  Python import wrapper message.
 
 Impact:
 
-- Strict-vs-legacy import guarantees are represented in the Python payload, but
-  Rust strict manifest behavior is not implemented yet.
-- Existing recovery plan completion criteria are not met.
+- Initial import intent and strictness gates are now enforced at the Rust Core
+  boundary instead of only being represented in Python payloads.
+- Remaining recovery plan work is tracked separately by `TF-STATUS-002` and
+  `TF-STATUS-004`.
 
 Next action:
 
-1. Add strict manifest classification helpers and tests in Rust.
-2. Preserve Rust classified failure details through the Python wrapper.
-3. Continue import success gating in `TF-STATUS-002`.
+1. Continue import success gating in `TF-STATUS-002`.
+2. Add export consistency manifest metadata in `TF-STATUS-004`.
 
 ### TF-STATUS-002: Import Success Is Not Gated By Complete Verification
 
@@ -322,7 +329,7 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
-| TF-STATUS-001 | High | open | Export/Import Recovery | Recovery plan incomplete | Add strict manifest classification and classified error propagation |
+| TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Continue remaining recovery work in TF-STATUS-002 and TF-STATUS-004 |
 | TF-STATUS-002 | High | open | Rust Core import | Import success not fully verified | Add row-count verification and import report artifact |
 | TF-STATUS-003 | High | fixed_pending_full_verify | Import UI | Object restoration wording | Keep focused regression; add unsupported-object UI surfacing |
 | TF-STATUS-004 | High | open | Rust Core export | Export consistency not explicit | Add snapshot/strictness manifest metadata |
@@ -333,18 +340,15 @@ Next action:
 
 ## Recommended Execution Order
 
-1. Add Rust strict manifest classification:
-   - reject incomplete strict manifests before target mutation
-   - legacy warning path if intentionally allowed
-2. Add Rust import verification:
+1. Add Rust import verification:
    - per-table imported row counts
    - success only after verification
    - import report artifact
-3. Add export strictness metadata:
+2. Add export strictness metadata:
    - snapshot policy
    - strict export marker
    - manifest warnings
-4. Update or create final remediation report after the recovery work is
+3. Update or create final remediation report after the recovery work is
    verified.
 
 ## Session Log
@@ -354,3 +358,4 @@ Next action:
 | 2026-06-26 | Created canonical status inventory after full repo survey. | `docs/current_status.md` | `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `compileall`; `git diff --check`; `service.hello` |
 | 2026-06-26 | Added Python import payload forwarding for `timezone_sql` and `strict_manifest`; removed import UI `모든 객체` overpromise; added focused regression tests. | `src/exporters/rust_dump_exporter.py`, `src/ui/dialogs/db_dialogs.py`, `tests/test_rust_dump_exporter.py`, `tests/test_db_dialogs.py`, `docs/current_status.md` | `python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `git diff --check` |
 | 2026-06-26 | Added Rust validation/application for dump import `timezone_sql`; arbitrary SQL and multi-statement payloads are rejected before DB connection. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_session_time_zone_only --lib`; `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` |
+| 2026-06-26 | Added strict manifest classification before dump import target mutation and preserved classified core errors through Python import messages. | `migration_core/src/lib.rs`, `tests/test_rust_dump_exporter.py`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |

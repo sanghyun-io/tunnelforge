@@ -3129,8 +3129,23 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         return Err("dump.import found no tables to import".to_string());
     }
 
+    let strict_manifest = request
+        .payload
+        .get("strict_manifest")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    let manifest_warnings = validate_dump_import_manifest_strictness(&tables, strict_manifest)?;
     let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
+    for warning in &manifest_warnings {
+        emit(json!({
+            "event": "warning",
+            "request_id": request.request_id,
+            "phase": "dump_import_manifest",
+            "classification": "legacy_dump",
+            "message": warning
+        }));
+    }
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     if let Some(sql) = timezone_sql.as_deref() {
         adapter.execute_sql(sql)?;
@@ -7808,6 +7823,46 @@ fn dump_manifest_chunk_path(
     Ok(chunk_path)
 }
 
+fn classified_import_error(code: &str, message: &str, scope: Option<&str>) -> String {
+    match scope.filter(|value| !value.trim().is_empty()) {
+        Some(scope) => format!("{code}: {scope}: {message}"),
+        None => format!("{code}: {message}"),
+    }
+}
+
+fn validate_dump_import_manifest_strictness(
+    tables: &[DumpTableManifest],
+    strict: bool,
+) -> Result<Vec<String>, String> {
+    let mut warnings = Vec::new();
+    for table in tables {
+        if table.chunks > 0 && table.chunk_sha256.len() < table.chunks as usize {
+            let message = if table.chunk_sha256.is_empty() {
+                format!(
+                    "table {} has chunks but no chunk_sha256 metadata",
+                    table.name
+                )
+            } else {
+                format!(
+                    "table {} has {} chunks but only {} chunk_sha256 entries",
+                    table.name,
+                    table.chunks,
+                    table.chunk_sha256.len()
+                )
+            };
+            if strict {
+                return Err(classified_import_error(
+                    "export_invalid",
+                    &format!("missing chunk_sha256; {message}"),
+                    Some(&table.name),
+                ));
+            }
+            warnings.push(format!("legacy dump: {message}"));
+        }
+    }
+    Ok(warnings)
+}
+
 fn validate_dump_manifest_chunks(
     input_path: &Path,
     tables: &[DumpTableManifest],
@@ -9706,6 +9761,112 @@ mod tests {
             validated_timezone_sql(Some("SET SESSION time_zone = '+09:00' -- trailing")).is_err()
         );
         assert!(validated_timezone_sql(Some("SET GLOBAL time_zone = '+09:00'")).is_err());
+    }
+
+    #[test]
+    fn strict_manifest_validation_rejects_missing_chunk_checksums() {
+        let table = DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 10,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        };
+
+        let err = validate_dump_import_manifest_strictness(&[table], true).unwrap_err();
+
+        assert!(err.contains("export_invalid"));
+        assert!(err.contains("users"));
+        assert!(err.contains("missing chunk_sha256"));
+    }
+
+    #[test]
+    fn legacy_manifest_validation_allows_missing_checksums_when_not_strict() {
+        let table = DumpTableManifest {
+            name: "users".to_string(),
+            path: "0001_users".to_string(),
+            rows: 10,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        };
+
+        let warnings = validate_dump_import_manifest_strictness(&[table], false).unwrap();
+
+        assert_eq!(
+            warnings,
+            vec!["legacy dump: table users has chunks but no chunk_sha256 metadata".to_string()]
+        );
+    }
+
+    #[test]
+    fn classified_import_error_formats_code_scope_and_message() {
+        let err = classified_import_error(
+            "import_plan_invalid",
+            "full replacement worker target is unresolved",
+            Some("users"),
+        );
+
+        assert_eq!(
+            err,
+            "import_plan_invalid: users: full replacement worker target is unresolved"
+        );
+    }
+
+    #[test]
+    fn dump_import_strict_manifest_rejects_missing_checksums_before_connect() {
+        let dir = std::env::temp_dir().join(format!(
+            "tunnelforge-strict-import-test-{}",
+            current_unix_seconds()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let table = schema().tables[0].clone();
+        let manifest = DumpManifest {
+            format: "tunnelforge-dump".to_string(),
+            format_version: 2,
+            data_format: "tsv".to_string(),
+            compression: "none".to_string(),
+            source_engine: "mysql".to_string(),
+            database: "app".to_string(),
+            schema: schema(),
+            chunk_size: 50_000,
+            created_unix_seconds: 1,
+            tables: vec![DumpTableManifest {
+                name: table.name,
+                path: "0001_users".to_string(),
+                rows: 10,
+                chunks: 1,
+                chunk_sha256: BTreeMap::new(),
+            }],
+            views: Vec::new(),
+        };
+        write_dump_manifest(&dir, &manifest).unwrap();
+
+        let events = handle_request(Request {
+            command: "dump.import".to_string(),
+            request_id: Some("strict-import".to_string()),
+            payload: json!({
+                "input_dir": dir.to_string_lossy(),
+                "target": {
+                    "engine": "mysql",
+                    "host": "127.0.0.1",
+                    "port": 1,
+                    "user": "root",
+                    "password": "",
+                    "database": "app"
+                }
+            }),
+        });
+
+        let message = events
+            .iter()
+            .find(|event| event.get("event") == Some(&json!("error")))
+            .and_then(|event| event.get("message"))
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(message.contains("export_invalid"));
+        assert!(message.contains("missing chunk_sha256"));
+
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

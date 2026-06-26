@@ -348,6 +348,40 @@ class TestRustDumpImporter:
         assert facade.payload["timezone_sql"] == "SET SESSION time_zone = '+09:00'"
         assert facade.payload["strict_manifest"] is True
 
+    def test_import_dump_preserves_classified_core_error(self, tmp_path):
+        """Rust classified error code/scope가 Python import 메시지에 보존된다"""
+        from src.core.db_core_service import DbCoreServiceError
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        table_dir = dump_dir / '0001_users'
+        table_dir.mkdir(parents=True)
+        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":1,"database":"app",'
+            '"tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                raise DbCoreServiceError(
+                    "export_invalid: users: missing chunk_sha256; "
+                    "table users has chunks but no chunk_sha256 metadata"
+                )
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        importer = RustDumpImporter(config, facade=facade)
+
+        success, msg, results = importer.import_dump(str(dump_dir), import_mode='replace')
+
+        assert success is False
+        assert results["users"]["status"] == "pending"
+        assert "export_invalid" in msg
+        assert "users" in msg
+        assert "missing chunk_sha256" in msg
+
     def test_import_dump_reports_view_results_in_message(self, tmp_path):
         """import 결과의 views_imported/failed/skipped 가 메시지에 반영됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
