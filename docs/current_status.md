@@ -77,6 +77,12 @@ memo while `SCHEDULE_FEATURE_ENABLED = False`; it must not read like current
 public UI instructions until the feature flag is intentionally re-enabled and
 runtime evidence is refreshed.
 
+One-Click readiness wording is reconfirmed against the current limited
+real-execution gate: the app supports only backup-confirmed
+`deprecated_engine -> engine_innodb` non-dry-run execution, while broad
+production automatic remediation and production charset/collation execution
+remain unsupported.
+
 ## Verified On 2026-06-26
 
 Commands run locally:
@@ -121,6 +127,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | One-Click limited production scope wording | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; `pytest tests\test_oneclick_readiness_docs.py -q`; `pytest tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | Readiness docs no longer say all production database usage is unsupported; they distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution |
 | 2026-06-27 | Schedule guide hidden-feature wording | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; `pytest tests\test_schedule_docs.py tests\test_current_status_docs.py -q`; `rg -n -F -e '메인 툴바에서 **"스케줄"** 버튼을 클릭' -e '스케줄 시간을 기다리지 않고 바로 백업하려면:' -e '스케줄 관리 창의 **"백업 로그"** 탭에서' -e '스케줄이 작동하려면 TunnelForge가 실행 중이어야 합니다' SCHEDULE.md`; `python -m compileall -q tests\test_schedule_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | `SCHEDULE.md` now reads as an internal/reactivation memo while `SCHEDULE_FEATURE_ENABLED = False`, and no longer gives public-toolbar/log/immediate-run instructions as current user steps |
 | 2026-06-27 | macOS artifact default source after PR #117 merge | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh`; `pytest tests\test_current_status_docs.py -q`; `python scripts\check-macos-support-gate.py --skip-github`; `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py`; `git diff --check` | PASS | `macos-download-validation-artifacts.sh` now finds the latest successful manual `macOS App Validation` run for PR head before merge, or current merged main HEAD after PR #117 is merged, so downloaded artifact provenance matches the final report/gate SHA policy |
 | 2026-06-26 | Direct DB Export/Import Rust Core endpoint host | RED/GREEN: `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump -q`; RED/GREEN: `pytest tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q`; `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q` | PASS | `RustDumpExportDialog` and `RustDumpImportDialog` now preserve direct connector `host` when creating `RustDumpConfig`; tunnel connections still use their connector host, normally `127.0.0.1` |
@@ -1116,6 +1123,39 @@ Next action:
    `SCHEDULE.md` back into a public user guide and add fresh UI/runtime
    verification evidence in the same session.
 
+### TF-STATUS-027: One-Click Production Scope Wording Matches Limited Gate
+
+Status: closed
+Severity: Medium
+Area: One-Click migration docs
+
+Evidence:
+
+- 2026-06-27 repo-side scan found `docs/oneclick_readiness.md` still said
+  `Production database usage` was not supported, even though the current UI
+  gate allows backup-confirmed non-dry-run execution for the validated
+  `deprecated_engine -> engine_innodb` path.
+- The same document already stated `ONECLICK_REAL_EXECUTION_ENABLED = True`,
+  Dry-run default, backup confirmation requirement, and limited
+  `engine_innodb` execution, so the old production-usage bullet was stale
+  scope wording rather than the active implementation policy.
+- RED/GREEN coverage now rejects the broad stale bullet and requires the docs
+  to distinguish backup-confirmed `engine_innodb` from unsupported broad
+  production automatic remediation and production charset/collation execution.
+
+Resolution:
+
+- `docs/oneclick_readiness.md` now states that broad production automatic
+  remediation is unsupported, while the only current non-dry-run
+  production-facing path is backup-confirmed
+  `deprecated_engine -> engine_innodb`.
+- Production charset/collation execution remains explicitly unsupported.
+
+Next action:
+
+1. Keep this wording aligned if the One-Click real-execution allowlist expands
+   beyond `engine_innodb`.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1146,6 +1186,7 @@ Next action:
 | TF-STATUS-024 | High | closed | Export/Import UI | Direct DB Rust Core endpoint host | Keep direct connector host coverage when worker construction changes |
 | TF-STATUS-025 | High | closed | macOS release validation | Artifact lookup uses current main after PR merge | Keep artifact lookup default aligned with final report SHA policy |
 | TF-STATUS-026 | Medium | closed | Docs/UI feature flags | Schedule guide hidden-feature wording | Rewrite as public guide only when schedule feature is re-enabled with evidence |
+| TF-STATUS-027 | Medium | closed | One-Click migration docs | Limited production scope wording | Keep docs aligned if the real-execution allowlist expands |
 
 ## Recommended Execution Order
 
@@ -1242,3 +1283,4 @@ Next action:
 | 2026-06-26 | Fixed TF-STATUS-024 after finding that direct DB Export/Import dialogs hard-coded the Rust DB Core endpoint host to `127.0.0.1`; both dialogs now preserve `connector.host` while tunnel flows still use their local connector host. | `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `docs/current_status.md` | RED/GREEN: focused Export and Import direct-host pytest |
 | 2026-06-27 | Analyzed the next remaining issue after main alignment. #116 still needs external real-Mac evidence, but the repo-side handoff had one drift: artifact download defaults still targeted PR #117 head after merge. Fixed TF-STATUS-025 so artifact lookup now follows PR head before merge and current merged main HEAD after PR #117 is merged. | `scripts/macos-download-validation-artifacts.sh`, `scripts/macos-manual-validation-report.sh`, `docs/macos_support.md`, `tests/test_rust_core_packaging.py`, `tests/test_macos_support_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; final: macOS/docs focused pytest, shell syntax, current-status tests, #116 gate skip-github, compileall, `git diff --check` |
 | 2026-06-27 | Re-scanned disabled-feature docs after #116 remained external and fixed TF-STATUS-026: `SCHEDULE.md` no longer mixes a hidden-feature warning with current public UI instructions. | `SCHEDULE.md`, `tests/test_schedule_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; final: schedule/current-status docs pytest, stale-phrase scan, compileall, `git diff --check` |
+| 2026-06-27 | Re-scanned One-Click readiness wording and fixed TF-STATUS-027: docs now distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; final: One-Click/current-status docs pytest, compileall, `git diff --check` |

@@ -28,6 +28,15 @@ def test_oneclick_readiness_does_not_present_closed_issues_as_current_tracking()
         assert phrase not in doc
 
 
+def test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support():
+    doc = (PROJECT_ROOT / "docs" / "oneclick_readiness.md").read_text(encoding="utf-8")
+
+    assert "- Production database usage." not in doc
+    assert "backup-confirmed `deprecated_engine -> engine_innodb`" in doc
+    assert "Broad production automatic remediation is not supported" in doc
+    assert "Production charset/collation execution" in doc
+
+
 def test_oneclick_evidence_readme_does_not_describe_completed_evidence_as_future():
     readme = (
         PROJECT_ROOT / "reports" / "oneclick_readiness" / "README.md"

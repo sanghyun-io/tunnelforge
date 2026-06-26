@@ -69,9 +69,11 @@ The current supported scope is intentionally narrow:
 
 ## Not Yet Supported
 
-- Production database usage.
-- Production database charset/collation execution or production-readiness
-  evidence.
+- Broad production automatic remediation is not supported. The only current
+  non-dry-run production-facing path is the backup-confirmed `deprecated_engine -> engine_innodb`
+  fix described above.
+- Production charset/collation execution or production-readiness evidence is
+  not supported.
 
 ## Automatic Fix Coverage
 
