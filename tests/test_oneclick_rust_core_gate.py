@@ -1,8 +1,27 @@
 from types import SimpleNamespace
 
 import pytest
+from PyQt6.QtWidgets import QApplication
 
-from src.ui.dialogs.oneclick_migration_dialog import OneClickMigrationWorker
+from src.ui.dialogs.oneclick_migration_dialog import (
+    OneClickMigrationDialog,
+    OneClickMigrationWorker,
+)
+
+
+class FakeEndpoint:
+    engine = "mysql"
+
+    def to_payload(self):
+        return {
+            "engine": "mysql",
+            "host": "localhost",
+            "port": 3306,
+            "user": "root",
+            "password": "",
+            "database": "app",
+            "schema": "",
+        }
 
 
 def test_oneclick_worker_rejects_non_rust_core_connector():
@@ -21,7 +40,7 @@ def test_oneclick_worker_accepts_rust_core_connector_shape():
     connection = SimpleNamespace(
         facade=object(),
         connection_id="conn-1",
-        endpoint=SimpleNamespace(engine="mysql"),
+        endpoint=FakeEndpoint(),
     )
     worker = OneClickMigrationWorker(
         connector=SimpleNamespace(connection=connection),
@@ -31,6 +50,38 @@ def test_oneclick_worker_accepts_rust_core_connector_shape():
     )
 
     worker._ensure_rust_core_connector()
+
+
+def test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens():
+    connection = SimpleNamespace(
+        facade=object(),
+        connection_id="conn-1",
+        endpoint=FakeEndpoint(),
+    )
+    worker = OneClickMigrationWorker(
+        connector=SimpleNamespace(connection=connection),
+        schema="app",
+        dry_run=False,
+        backup_confirmed=True,
+    )
+
+    with pytest.raises(RuntimeError, match="production-readiness gate"):
+        worker._core_payload(connection)
+
+
+def test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens():
+    app = QApplication.instance() or QApplication([])
+
+    dialog = OneClickMigrationDialog(
+        None,
+        connector=SimpleNamespace(),
+        schema="app",
+    )
+
+    assert dialog.chk_dry_run.isChecked()
+    assert not dialog.chk_dry_run.isEnabled()
+    assert "GitHub #137" in dialog.chk_dry_run.toolTip()
+    dialog.close()
 
 
 def test_oneclick_worker_translates_core_events_to_ui_signals():

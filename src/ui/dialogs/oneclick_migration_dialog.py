@@ -33,6 +33,8 @@ STYLE_WARNING = "color: #f39c12; font-weight: bold;"
 STYLE_INFO = "color: #3498db;"
 STYLE_MUTED = "color: #7f8c8d;"
 
+ONECLICK_REAL_EXECUTION_ENABLED = False
+
 
 class OneClickMigrationWorker(QThread):
     """전체 마이그레이션 프로세스 실행 Worker.
@@ -88,12 +90,7 @@ class OneClickMigrationWorker(QThread):
             self.log_message.emit("🦀 Rust DB Core 연결 확인 완료", STYLE_MUTED)
             _mig_logger.info("Rust DB Core connector verified")
 
-            payload = {
-                "connection": connection.endpoint.to_payload(),
-                "schema": self.schema,
-                "dry_run": self.dry_run,
-                "backup_confirmed": self.backup_confirmed,
-            }
+            payload = self._core_payload(connection)
             result = connection.facade.run_oneclick(payload, on_event=self._handle_core_event)
             report = self._report_from_core_payload(result.get("report") or {}, _log_path)
             _mig_logger.info(f"=== 마이그레이션 완료: success={result.get('success')} ===")
@@ -229,6 +226,20 @@ class OneClickMigrationWorker(QThread):
                 "Legacy Python DB connections are not supported."
             )
         return connection
+
+    def _core_payload(self, connection) -> dict:
+        if not self.dry_run and not ONECLICK_REAL_EXECUTION_ENABLED:
+            raise RuntimeError(
+                "One-Click migration real execution is disabled until the "
+                "production-readiness gate in GitHub #137 is complete. "
+                "Keep Dry-run enabled."
+            )
+        return {
+            "connection": connection.endpoint.to_payload(),
+            "schema": self.schema,
+            "dry_run": self.dry_run,
+            "backup_confirmed": self.backup_confirmed,
+        }
 
     def _create_empty_report(self) -> MigrationReport:
         """이슈가 없을 때 빈 리포트 생성"""
@@ -768,6 +779,12 @@ class OneClickMigrationDialog(QDialog):
         self.chk_dry_run = QCheckBox("Dry-run (실제 실행하지 않음)")
         self.chk_dry_run.setToolTip("체크하면 실제 SQL을 실행하지 않고 시뮬레이션만 합니다.")
         self.chk_dry_run.setChecked(True)
+        if not ONECLICK_REAL_EXECUTION_ENABLED:
+            self.chk_dry_run.setEnabled(False)
+            self.chk_dry_run.setToolTip(
+                "One-Click allows Dry-run only until the GitHub #137 "
+                "production-readiness gate is complete."
+            )
         options_layout.addWidget(self.chk_dry_run)
 
         self.chk_backup = QCheckBox("백업 완료 확인")
@@ -998,7 +1015,7 @@ class OneClickMigrationDialog(QDialog):
         """완료 핸들러"""
         self.btn_start.setEnabled(True)
         self.btn_cancel.setEnabled(False)
-        self.chk_dry_run.setEnabled(True)
+        self.chk_dry_run.setEnabled(ONECLICK_REAL_EXECUTION_ENABLED)
         self.chk_backup.setEnabled(True)
 
         if report:
