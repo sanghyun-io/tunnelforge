@@ -313,6 +313,28 @@ def test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml():
     assert cursor.fetchall() == []
 
 
+def test_rust_db_cursor_rowcount_uses_call_local_rows_affected():
+    class FakeFacade:
+        last_rows_affected = 999
+
+        def execute_on_connection(self, connection_id, query, params=None):
+            assert connection_id == "conn-1"
+            return []
+
+        def execute_on_connection_result(self, connection_id, query, params=None):
+            assert connection_id == "conn-1"
+            return {"rows": [], "rows_affected": 7}
+
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
+    connection = RustDbConnection(endpoint, FakeFacade(), "conn-1")
+
+    with connection.cursor() as cursor:
+        rowcount = cursor.execute("UPDATE users SET active = 0")
+
+    assert rowcount == 7
+    assert cursor.rowcount == 7
+
+
 def test_rust_db_cursor_executemany_rejects_python_batch_helper():
     class FakeFacade:
         def __init__(self):

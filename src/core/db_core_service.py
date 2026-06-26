@@ -201,7 +201,6 @@ class DbCoreFacade:
 
     def __init__(self, client: Optional[DbCoreServiceClient] = None):
         self.client = client or DbCoreServiceClient()
-        self.last_rows_affected = 0
 
     def hello(self) -> Dict[str, Any]:
         return self.client.request("service.hello")
@@ -243,13 +242,24 @@ class DbCoreFacade:
         sql: str,
         params: Optional[Sequence[Any]] = None,
     ) -> List[Dict[str, Any]]:
+        result = self.execute_query_result(endpoint, sql, params=params)
+        return result["rows"]
+
+    def execute_query_result(
+        self,
+        endpoint: DbEndpoint,
+        sql: str,
+        params: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
         result = self.client.request(
             "query.execute",
             {"connection": endpoint.to_payload(), "sql": sql, "params": list(params or [])},
         )
-        self.last_rows_affected = int(result.get("rows_affected") or 0)
         rows = result.get("rows")
-        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        return {
+            "rows": [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
+            "rows_affected": int(result.get("rows_affected") or 0),
+        }
 
     def execute_on_connection(
         self,
@@ -257,13 +267,24 @@ class DbCoreFacade:
         sql: str,
         params: Optional[Sequence[Any]] = None,
     ) -> List[Dict[str, Any]]:
+        result = self.execute_on_connection_result(connection_id, sql, params=params)
+        return result["rows"]
+
+    def execute_on_connection_result(
+        self,
+        connection_id: str,
+        sql: str,
+        params: Optional[Sequence[Any]] = None,
+    ) -> Dict[str, Any]:
         result = self.client.request(
             "query.execute",
             {"connection_id": connection_id, "sql": sql, "params": list(params or [])},
         )
-        self.last_rows_affected = int(result.get("rows_affected") or 0)
         rows = result.get("rows")
-        return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+        return {
+            "rows": [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
+            "rows_affected": int(result.get("rows_affected") or 0),
+        }
 
     def execute_on_connection_streaming(
         self,
@@ -619,11 +640,21 @@ class RustDbCursor:
         return False
 
     def execute(self, query: str, params: Optional[Sequence[Any]] = None) -> int:
-        self._rows = self.connection.facade.execute_on_connection(
-            self.connection.connection_id,
-            query,
-            params=params,
-        )
+        if hasattr(self.connection.facade, "execute_on_connection_result"):
+            result = self.connection.facade.execute_on_connection_result(
+                self.connection.connection_id,
+                query,
+                params=params,
+            )
+            self._rows = result.get("rows", [])
+            rows_affected = int(result.get("rows_affected") or 0)
+        else:
+            self._rows = self.connection.facade.execute_on_connection(
+                self.connection.connection_id,
+                query,
+                params=params,
+            )
+            rows_affected = int(getattr(self.connection.facade, "last_rows_affected", len(self._rows)))
         if self._rows:
             self.description = [(column,) for column in self._rows[0].keys()]
         elif query_returns_rows(query):
@@ -633,7 +664,7 @@ class RustDbCursor:
         if query_returns_rows(query):
             self.rowcount = len(self._rows)
         else:
-            self.rowcount = int(getattr(self.connection.facade, "last_rows_affected", len(self._rows)))
+            self.rowcount = rows_affected
         return self.rowcount
 
     def executemany(self, query: str, data: Sequence[Sequence[Any]]) -> int:

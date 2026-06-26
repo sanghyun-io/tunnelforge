@@ -186,7 +186,7 @@ merged main HEAD. This remains external real-Mac validation work, not a
 repo-side implementation issue.
 
 GitHub #152 is fixed as the post-#151 full-suite evidence refresh: after adding
-post-#151 current-status coverage, `pytest -q` now reports `1837 passed, 5
+post-#151 current-status coverage, `pytest -q` now reports `1839 passed, 5
 warnings`, and stale 1832-count wording cannot return as current evidence.
 
 GitHub #153 is fixed as a Rust Core DML affected-row reporting follow-up:
@@ -195,6 +195,12 @@ statements, Python `DbCoreFacade` preserves that metadata, and
 `RustDbCursor.rowcount` uses it for DML. Scheduled SQL and SQL editor DML
 reporting can now show real affected-row counts instead of the previous
 empty-row fallback count.
+
+GitHub #154 is fixed as the call-local affected-row metadata follow-up:
+`DbCoreFacade.execute_query_result` and `execute_on_connection_result` now
+return rows plus `rows_affected` together, and `RustDbCursor.rowcount` consumes
+that per-call result instead of shared facade state. This prevents concurrent
+cursor calls on the shared Rust Core facade from mixing DML rowcount metadata.
 
 The current full Python suite count was refreshed again on 2026-06-27 after
 the current-status re-audit regression coverage was added.
@@ -244,7 +250,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before this document |
-| `pytest -q` | PASS, 1837 passed, 5 warnings |
+| `pytest -q` | PASS, 1839 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -268,7 +274,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1837 passed, 5 warnings |
+| `pytest -q` | PASS, 1839 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -316,8 +322,9 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | Rust Core DML affected row counts | RED/GREEN: `pytest tests\test_db_core_service.py::test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml -q`; RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml query_result_includes_non_row_rows_affected --lib`; `gh issue create` created #153; focused Python/Rust query result tests; `cargo test --manifest-path migration_core\Cargo.toml`; `pytest -q` | PASS | GitHub #153 is fixed: Rust Core query execution carries `rows_affected` metadata and `RustDbCursor.rowcount` preserves it for scheduled SQL and SQL editor DML reporting; full Python suite is now `1837 passed, 5 warnings` |
-| 2026-06-27 | Post-#151 full-suite evidence refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_151_full_pytest_refresh_issue tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count tests\test_current_status_docs.py::test_current_status_does_not_describe_stale_full_pytest_count_as_current -q`; `gh issue create` created #152; `pytest -q` | PASS | GitHub #152 is fixed: current full Python suite evidence is refreshed to `1837 passed, 5 warnings`, and stale 1832/1834/1835-count wording cannot return as current evidence |
+| 2026-06-27 | Call-local Rust cursor affected-row metadata | RED/GREEN: `pytest tests\test_db_core_service.py::test_rust_db_cursor_rowcount_uses_call_local_rows_affected -q`; `gh issue create` created #154; focused DB core/current-status pytest; `pytest -q` | PASS | GitHub #154 is fixed: `RustDbCursor.rowcount` uses call-local `execute_on_connection_result` metadata instead of shared facade state; full Python suite is now `1839 passed, 5 warnings` |
+| 2026-06-27 | Rust Core DML affected row counts | RED/GREEN: `pytest tests\test_db_core_service.py::test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml -q`; RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml query_result_includes_non_row_rows_affected --lib`; `gh issue create` created #153; focused Python/Rust query result tests; `cargo test --manifest-path migration_core\Cargo.toml`; `pytest -q` | PASS | GitHub #153 is fixed: Rust Core query execution carries `rows_affected` metadata and `RustDbCursor.rowcount` preserves it for scheduled SQL and SQL editor DML reporting; full Python suite is superseded by the current `1839 passed, 5 warnings` evidence |
+| 2026-06-27 | Post-#151 full-suite evidence refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_151_full_pytest_refresh_issue tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count tests\test_current_status_docs.py::test_current_status_does_not_describe_stale_full_pytest_count_as_current -q`; `gh issue create` created #152; `pytest -q` | PASS | GitHub #152 is fixed: current full Python suite evidence is refreshed to `1839 passed, 5 warnings`, and stale 1832/1834/1835/1837-count wording cannot return as current evidence |
 | 2026-06-27 | Post-#151 main merge and next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_151_next_issue_analysis -q`; `git fetch --all --prune`; `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 20`; `gh issue view 116 --json number,title,state,labels,milestone,updatedAt,url,body`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL for `--final` only | `main` was aligned with `origin/main` before this status update, and this status update was pushed to `origin/main`; #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for current merged main HEAD, so no new repo-side implementation issue was created |
 | 2026-06-27 | Stale current pytest count wording cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_describe_stale_full_pytest_count_as_current -q`; `gh issue create` created #151; stale full-suite wording scan in `docs\current_status.md` and `tests\test_current_status_docs.py` | PASS | GitHub #151 is fixed: older TF-STATUS-049 wording no longer describes the prior full-suite count as current evidence; current full-suite evidence is superseded above |
 | 2026-06-27 | RustDbCursor executemany batch helper fail-closed | RED/GREEN: `pytest tests\test_db_core_service.py::test_rust_db_cursor_executemany_rejects_python_batch_helper -q`; `gh issue create` created #150; `pytest tests\test_current_status_docs.py::test_current_status_tracks_rust_db_cursor_executemany_issue -q`; `rg -n "executemany\(|execute_many\(" src tests migration_core\src migration_core\tests`; `pytest -q` | PASS | GitHub #150 is fixed: `RustDbCursor.executemany` now rejects the unused Python-side batch helper before any query/facade call; single-query Rust Core paths remain unchanged; full-suite evidence is superseded above |
@@ -1980,6 +1987,7 @@ Next action:
 | TF-STATUS-052 | Low | closed | Status documentation / macOS release validation | Post-#151 main merge and next issue analysis | Keep #116 external until real operator Mac validation evidence is attached |
 | TF-STATUS-053 | Low | closed | Status documentation | Post-#151 full-suite evidence refresh | Keep current full-suite count aligned when current-status tests are added |
 | TF-STATUS-054 | Medium | closed | Rust Core query execution / SQL reporting | Rust Core DML affected row counts | Preserve Rust Core affected-row metadata in Python cursor shims |
+| TF-STATUS-055 | Medium | closed | Rust Core Python shim / SQL reporting | Call-local affected-row metadata | Do not store per-query rowcount metadata on shared facade state |
 
 ## Recommended Execution Order
 
@@ -1996,7 +2004,8 @@ Next action:
    GitHub #151 removed stale current-tense `1830 passed` wording; TF-STATUS-052
    reconfirmed no new repo-side issue after #151 closure; TF-STATUS-053 /
    GitHub #152 refreshed the post-#151 full-suite evidence count; TF-STATUS-054
-   / GitHub #153 fixed Rust Core DML affected-row reporting.
+   / GitHub #153 fixed Rust Core DML affected-row reporting; TF-STATUS-055 /
+   GitHub #154 removed shared facade state from cursor rowcount propagation.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence; #116 remains external.
 3. Track additional One-Click automatic fix classes as separate GitHub issues
@@ -2006,6 +2015,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-06-27 | Created and fixed TF-STATUS-055 / GitHub #154 after finding that the #153 Python cursor shim used shared facade state for affected-row metadata. | `src/core/db_core_service.py`, `tests/test_db_core_service.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #154 | RED/GREEN: call-local rowcount metadata pytest |
 | 2026-06-27 | Created and fixed TF-STATUS-054 / GitHub #153 after finding that Rust Core DML execution returned empty rows without affected-row metadata, causing Python cursor shims to report `rowcount=0` for successful DML. | `migration_core/src/lib.rs`, `src/core/db_core_service.py`, `tests/test_db_core_service.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #153 | RED/GREEN: Rust/Python affected-row tests; focused scheduler/SQL worker tests |
 | 2026-06-27 | Created and fixed TF-STATUS-053 / GitHub #152 after the post-#151 status coverage increased the full Python suite; the count is now superseded by TF-STATUS-054 at `1837 passed, 5 warnings`. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #152 | RED/GREEN: full-suite count current-status pytest; final: `pytest -q` |
 | 2026-06-27 | Re-analyzed the next issue after #151 and confirmed `main` was aligned with `origin/main` before this status update, then pushed this status update to `origin/main`. #116 is the only open GitHub issue; the normal repository-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#151 current-status pytest; final: #116 gate pass, expected-failing final gate |
