@@ -260,6 +260,12 @@ addition to the existing MySQL `SET SESSION time_zone` form, while still
 rejecting multi-statement SQL, comments, global timezone mutation, and unsafe
 timezone literals.
 
+GitHub #164 is fixed as the PostgreSQL dump wrapper API follow-up: the
+module-level `export_schema`, `export_tables`, and `import_dump` convenience
+wrappers now accept an optional `engine` parameter, default to MySQL for
+backward compatibility, and preserve `engine="postgresql"` into
+`RustDumpConfig` for Rust Core endpoints.
+
 Post-#142 next issue analysis on 2026-06-27 found #116 is still the only open
 GitHub issue. The normal repository-side macOS support gate passes, but
 `python scripts\check-macos-support-gate.py --final` currently fails because
@@ -305,7 +311,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before the latest status update |
-| `pytest -q` | PASS, 1861 passed, 5 warnings |
+| `pytest -q` | PASS, 1865 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -329,7 +335,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1861 passed, 5 warnings |
+| `pytest -q` | PASS, 1865 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -397,12 +403,15 @@ Commands run locally:
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_import_timezone_issue -q` | RED then PASS |
 | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_mysql_and_postgresql_timezone_forms --lib` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_import_timezone_core_validation_issue -q` | RED then PASS |
+| `pytest tests\test_rust_dump_exporter.py -q -k "wrapper_preserves_postgresql_engine"` | RED then PASS, 3 passed |
+| `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_dump_wrapper_engine_issue -q` | RED then PASS |
 
 ## Verification Log
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | PostgreSQL Import timezone Core validation | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_mysql_and_postgresql_timezone_forms --lib`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_import_timezone_core_validation_issue -q`; `gh issue create` created #163; `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml` | PASS | GitHub #163 is fixed: Rust Core `dump.import` accepts PostgreSQL `SET TIME ZONE` timezone SQL as well as MySQL `SET SESSION time_zone`, while preserving single-statement and safe-literal validation; current full Python suite is `1861 passed, 5 warnings` |
+| 2026-06-27 | PostgreSQL dump wrapper engine | RED/GREEN: `pytest tests\test_rust_dump_exporter.py -q -k "wrapper_preserves_postgresql_engine"`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_dump_wrapper_engine_issue -q`; `gh issue create` created #164; `pytest -q` | PASS | GitHub #164 is fixed: `export_schema`, `export_tables`, and `import_dump` convenience wrappers preserve PostgreSQL engine into `RustDumpConfig`; current full Python suite is `1865 passed, 5 warnings` |
+| 2026-06-27 | PostgreSQL Import timezone Core validation | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_mysql_and_postgresql_timezone_forms --lib`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_import_timezone_core_validation_issue -q`; `gh issue create` created #163; `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml` | PASS | GitHub #163 is fixed: Rust Core `dump.import` accepts PostgreSQL `SET TIME ZONE` timezone SQL as well as MySQL `SET SESSION time_zone`, while preserving single-statement and safe-literal validation; full-suite count is superseded by TF-STATUS-066 |
 | 2026-06-27 | PostgreSQL Import timezone SQL | RED/GREEN: `pytest tests\test_db_dialogs.py -q -k "postgresql_import_auto_timezone or postgresql_import_forced_kst"`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_import_timezone_issue -q`; i18n regression: `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests\test_db_dialogs.py -q -k "direct_hardcoded or postgresql_import_auto_timezone or postgresql_import_forced_kst"`; `gh issue create` created #162; `pytest -q` | PASS | GitHub #162 is fixed: PostgreSQL dump import default auto timezone mode skips MySQL timezone table detection and sends no MySQL timezone correction SQL; forced KST/UTC use PostgreSQL `SET TIME ZONE`; full-suite count is superseded by TF-STATUS-065 |
 | 2026-06-27 | PostgreSQL Rust dump endpoint engine | RED/GREEN: `pytest tests\test_rust_dump_exporter.py::TestRustDumpConfig::test_config_preserves_postgresql_engine tests\test_rust_dump_exporter.py::TestRustDumpExporter::test_export_full_schema_preserves_postgresql_engine_in_rust_payload tests\test_rust_dump_exporter.py::TestRustDumpImporter::test_import_dump_preserves_postgresql_engine_in_rust_payload -q`; RED/GREEN: `pytest tests\test_db_dialogs.py::test_preselected_export_tunnel_uses_postgres_connector_for_postgresql tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_rust_dump_engine_issue -q`; `gh issue create` created #161; `pytest -q` | PASS | GitHub #161 is fixed: `RustDumpConfig` preserves `engine`, PostgreSQL Export/Import dialogs pass `PostgresConnector.engine`, preselected PostgreSQL tunnels construct `PostgresConnector`, and Rust Core `dump.run`/`dump.import` payloads use `postgresql` endpoints; full-suite count is superseded by TF-STATUS-064 |
 | 2026-06-27 | Partial export FK parent resolution | RED/GREEN: `pytest tests\test_rust_dump_exporter.py::TestRustDumpExporter::test_export_tables_resolves_fk_parents_through_rust_schema_inspect -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_partial_export_fk_parent_rust_inspect_issue -q`; `gh issue create` created #160; `pytest tests\test_rust_dump_exporter.py -q`; `pytest -q` | PASS | GitHub #160 is fixed: `RustDumpExporter.export_tables(... include_fk_parents=True)` now uses Rust Core-owned `schema.inspect` to include transitive FK parent tables before `dump.run`, without instantiating Python `MySQLConnector`; full-suite count is superseded by TF-STATUS-063 |
@@ -2089,11 +2098,12 @@ Next action:
 | TF-STATUS-063 | High | closed | Rust Core Export/Import | PostgreSQL Rust dump endpoint engine | Keep PostgreSQL Export/Import endpoint engine preserved through `RustDumpConfig` into Rust Core dump commands |
 | TF-STATUS-064 | High | closed | Rust Core Export/Import | PostgreSQL Import timezone SQL | Keep PostgreSQL dump import from using MySQL timezone detection or MySQL timezone correction SQL |
 | TF-STATUS-065 | High | closed | Rust Core dump.import | PostgreSQL Import timezone Core validation | Keep Rust Core timezone validation aligned with MySQL and PostgreSQL import timezone SQL forms |
+| TF-STATUS-066 | Medium | closed | Rust Core Export/Import helper API | PostgreSQL dump wrapper engine | Keep module-level dump helper wrappers engine-aware while preserving MySQL default compatibility |
 
 ## Recommended Execution Order
 
-1. No repo-side implementation issue is currently open after TF-STATUS-065 /
-   GitHub #163 aligned Rust Core PostgreSQL Import timezone validation. `main` is
+1. No repo-side implementation issue is currently open after TF-STATUS-066 /
+   GitHub #164 preserved PostgreSQL engine through dump convenience wrappers. `main` is
    aligned with `origin/main`, and #116 remains the only open GitHub issue.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence; #116 remains external.
@@ -2104,6 +2114,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-06-27 | Fixed TF-STATUS-066 / GitHub #164 by adding optional `engine` parameters to the module-level `export_schema`, `export_tables`, and `import_dump` convenience wrappers so PostgreSQL helper callers preserve Rust Core endpoint engines. | `src/exporters/rust_dump_exporter.py`, `tests/test_rust_dump_exporter.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #164 | RED/GREEN: wrapper engine pytest and current-status pytest; final: full `pytest -q` at 1865 passed |
 | 2026-06-27 | Fixed TF-STATUS-065 / GitHub #163 by allowing Rust Core `dump.import` timezone validation to accept PostgreSQL `SET TIME ZONE` while preserving the existing MySQL `SET SESSION time_zone` allowlist and injection rejection. | `migration_core/src/lib.rs`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #163 | RED/GREEN: Rust timezone validator pytest and current-status pytest; final: Rust core tests, full `pytest -q` at 1861 passed |
 | 2026-06-27 | Fixed TF-STATUS-064 / GitHub #162 by skipping MySQL timezone auto-detection for PostgreSQL dump import and using PostgreSQL `SET TIME ZONE` syntax for forced timezone options. | `src/ui/dialogs/db_dialogs.py`, `src/core/i18n.py`, `tests/test_db_dialogs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #162 | RED/GREEN: PostgreSQL import timezone pytest and current-status pytest; i18n regression; final: full `pytest -q` at 1860 passed |
 | 2026-06-27 | Fixed TF-STATUS-063 / GitHub #161 by preserving PostgreSQL engine through RustDumpConfig, Export/Import dialog worker config, preselected PostgreSQL tunnel connectors, and Rust Core dump endpoints. | `src/exporters/rust_dump_exporter.py`, `src/ui/dialogs/db_dialogs.py`, `src/core/db_connector.py`, `src/core/postgres_connector.py`, `tests/test_rust_dump_exporter.py`, `tests/test_db_dialogs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #161 | RED/GREEN: PostgreSQL dump endpoint engine pytest, dialog worker config pytest, current-status pytest; full-suite count superseded by TF-STATUS-064 |

@@ -855,8 +855,9 @@ def export_schema(
     output_dir: str,
     threads: int = 8,
     progress_callback: Optional[Callable[[str], None]] = None,
+    engine: str = "mysql",
 ) -> Tuple[bool, str]:
-    config = RustDumpConfig(host, port, user, password)
+    config = RustDumpConfig(host, port, user, password, engine=engine)
     exporter = RustDumpExporter(config)
     return exporter.export_full_schema(schema, output_dir, threads, progress_callback=progress_callback)
 
@@ -872,8 +873,9 @@ def export_tables(
     threads: int = 8,
     include_fk_parents: bool = True,
     progress_callback: Optional[Callable[[str], None]] = None,
+    engine: str = "mysql",
 ) -> Tuple[bool, str, List[str]]:
-    config = RustDumpConfig(host, port, user, password)
+    config = RustDumpConfig(host, port, user, password, engine=engine)
     exporter = RustDumpExporter(config)
     return exporter.export_tables(
         schema,
@@ -896,8 +898,9 @@ def import_dump(
     import_mode: str = "replace",
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+    engine: str = "mysql",
 ) -> Tuple[bool, str, dict]:
-    config = RustDumpConfig(host, port, user, password)
+    config = RustDumpConfig(host, port, user, password, engine=engine)
     importer = RustDumpImporter(config)
     return importer.import_dump(
         input_dir,

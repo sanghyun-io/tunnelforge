@@ -356,6 +356,131 @@ class TestRustDumpExporter:
         assert facade.payload["source"]["database"] == "public"
 
 
+def test_export_schema_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
+    from src.exporters import rust_dump_exporter
+
+    captured = {}
+
+    class FakeExporter:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def export_full_schema(self, schema, output_dir, threads, progress_callback=None):
+            captured["schema"] = schema
+            captured["output_dir"] = output_dir
+            captured["threads"] = threads
+            return True, "ok"
+
+    monkeypatch.setattr(rust_dump_exporter, "RustDumpExporter", FakeExporter)
+
+    success, message = rust_dump_exporter.export_schema(
+        "pg.example.com",
+        5432,
+        "postgres",
+        "secret",
+        "analytics",
+        str(tmp_path),
+        engine="postgresql",
+    )
+
+    assert success is True
+    assert message == "ok"
+    assert captured["config"].engine == "postgresql"
+    assert captured["schema"] == "analytics"
+
+
+def test_export_tables_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
+    from src.exporters import rust_dump_exporter
+
+    captured = {}
+
+    class FakeExporter:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def export_tables(
+            self,
+            schema,
+            tables,
+            output_dir,
+            threads,
+            include_fk_parents=True,
+            progress_callback=None,
+        ):
+            captured["schema"] = schema
+            captured["tables"] = tables
+            captured["output_dir"] = output_dir
+            captured["threads"] = threads
+            captured["include_fk_parents"] = include_fk_parents
+            return True, "ok", ["users"]
+
+    monkeypatch.setattr(rust_dump_exporter, "RustDumpExporter", FakeExporter)
+
+    success, message, exported = rust_dump_exporter.export_tables(
+        "pg.example.com",
+        5432,
+        "postgres",
+        "secret",
+        "analytics",
+        ["users"],
+        str(tmp_path),
+        include_fk_parents=False,
+        engine="postgresql",
+    )
+
+    assert success is True
+    assert message == "ok"
+    assert exported == ["users"]
+    assert captured["config"].engine == "postgresql"
+    assert captured["tables"] == ["users"]
+    assert captured["include_fk_parents"] is False
+
+
+def test_import_dump_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
+    from src.exporters import rust_dump_exporter
+
+    captured = {}
+
+    class FakeImporter:
+        def __init__(self, config):
+            captured["config"] = config
+
+        def import_dump(
+            self,
+            input_dir,
+            target_schema=None,
+            threads=8,
+            import_mode="replace",
+            progress_callback=None,
+            table_chunk_progress_callback=None,
+        ):
+            captured["input_dir"] = input_dir
+            captured["target_schema"] = target_schema
+            captured["threads"] = threads
+            captured["import_mode"] = import_mode
+            return True, "ok", {}
+
+    monkeypatch.setattr(rust_dump_exporter, "RustDumpImporter", FakeImporter)
+
+    success, message, results = rust_dump_exporter.import_dump(
+        "pg.example.com",
+        5432,
+        "postgres",
+        "secret",
+        str(tmp_path),
+        target_schema="analytics",
+        import_mode="merge",
+        engine="postgresql",
+    )
+
+    assert success is True
+    assert message == "ok"
+    assert results == {}
+    assert captured["config"].engine == "postgresql"
+    assert captured["target_schema"] == "analytics"
+    assert captured["import_mode"] == "merge"
+
+
 class TestRustDumpImporter:
     """RustDumpImporter 클래스 테스트"""
 
