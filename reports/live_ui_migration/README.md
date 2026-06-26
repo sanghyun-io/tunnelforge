@@ -1,7 +1,7 @@
 # Live UI Migration Evidence
 
-This directory defines the final evidence shape for GitHub #136 and the
-remaining #99 closure gate.
+This directory preserves the final evidence for closed GitHub #136 and the
+closed #99 Rust Core Service epic.
 
 The completed evidence file is `live-ui-migration-evidence.json`. It was
 produced from a live MySQL/PostgreSQL validation run through the PyQt worker
@@ -50,7 +50,7 @@ final validator.
 
 ## Final Evidence
 
-- `live-ui-migration-evidence.json` is the validator-passing #136 evidence.
+- `live-ui-migration-evidence.json` is the validator-passing #136/#99 evidence.
 - `stress-10m-rss.json` is the 10M synthetic adapter RSS measurement used inside
   the final evidence file.
 - Final validation command:

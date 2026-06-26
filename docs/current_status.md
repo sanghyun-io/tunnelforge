@@ -648,7 +648,7 @@ Next action:
 1. Refresh the archived evidence if Rust Core migration/verify streaming
    semantics change.
 
-### TF-STATUS-018: Rust Core Live UI Performance Evidence Pending
+### TF-STATUS-018: Rust Core Live UI Performance Evidence Complete
 
 Status: `closed`
 Severity: High
@@ -693,7 +693,7 @@ Evidence:
   measurement. `python scripts\validate-live-ui-migration-evidence.py
   reports\live_ui_migration\live-ui-migration-evidence.json` passes with 2
   directions and 12,000,000 rows checked.
-- GitHub issue #136 now tracks this remaining #99 closure evidence.
+- GitHub issue #136 tracked this final #99 closure evidence and is now closed.
 - Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
 - Follow-up GitHub issue:
   https://github.com/sanghyun-io/tunnelforge/issues/136
@@ -773,3 +773,4 @@ Next action:
 | 2026-06-26 | Captured and preserved partial #136 evidence for the live 1M bidirectional PyQt worker path; both directions passed migrate+verify with heartbeat max gap 125ms, leaving only real 10M RSS evidence before final validator closure. | `reports/live_ui_migration/live-ui-migration-evidence-1m-local-partial.json`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | `python scripts\capture-live-ui-migration-evidence.py --rows 1000000 ...`; expected reject: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-1m-local-partial.json` |
 | 2026-06-26 | Added and ran the Rust Core 10M synthetic stress RSS harness, generated the final #136 evidence file, and closed TF-STATUS-018 after the final validator passed. | `migration_core/tests/stress_rss.rs`, `reports/live_ui_migration/stress-10m-rss.json`, `reports/live_ui_migration/live-ui-migration-evidence.json`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml --test stress_rss synthetic_stress_run_reports_resume_verify_and_rss_bound -- --nocapture`; ignored 10M: `cargo test --manifest-path migration_core\Cargo.toml --test stress_rss synthetic_10m_stress_resume_verify_reports_rss_bound -- --ignored --nocapture`; final: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json` |
 | 2026-06-26 | Re-audited the last open issue #116 after #99/#136 closure; local macOS support gates still pass, but the issue remains open for external real operator Mac evidence. | `docs/current_status.md` | `python scripts\check-macos-support-gate.py --skip-github`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python -m compileall -q scripts tests` |
+| 2026-06-26 | Cleaned up stale wording after closing #99/#136 so the evidence READMEs and status heading describe completed evidence instead of pending closure gates. | `docs/current_status.md`, `reports/live_ui_migration/README.md`, `reports/rust_core_performance/README.md` | `rg -n "remaining #99|GitHub issue #136 now tracks|Live UI Performance Evidence Pending|should remain open until the live|#99 remains open|#136 still remains open" docs reports scripts tests README.md README.ko.md`; `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json`; `python scripts\validate-rust-core-performance-evidence.py`; `git diff --check` |

@@ -1,6 +1,6 @@
 # Rust Core Performance Evidence
 
-This directory preserves the large-scale Rust DB Core evidence required by
+This directory preserves the large-scale Rust DB Core evidence used to close
 GitHub #99 and #135.
 
 Archived evidence:
@@ -23,4 +23,5 @@ and do not report verification mismatches.
 To refresh the evidence, regenerate the corresponding JSONL files under
 `migration_core\target`, rerun the Rust Core performance gate with
 `RUST_CORE_REQUIRE_PERF_EVIDENCE=1`, copy the refreshed four files into this
-directory, and rerun the validator above before updating #99/#135.
+directory, and rerun the validator above before posting refreshed evidence to
+the closed #99/#135 history.
