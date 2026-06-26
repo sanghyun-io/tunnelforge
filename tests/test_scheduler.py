@@ -488,6 +488,36 @@ class TestBackupScheduler:
         queries = self.scheduler._parse_sql_queries('SELECT 1;')
         assert queries == ['SELECT 1']
 
+    def test_parse_sql_queries_preserves_comments_dollar_quotes_and_delimiters(self):
+        """예약 SQL도 SQL 파일 실행과 같은 robust parser를 사용"""
+        sql = """-- comment; ignored
+SELECT 'a;b';
+CREATE FUNCTION f() RETURNS void AS $body$
+BEGIN
+    RAISE NOTICE 'x;y';
+END
+$body$ LANGUAGE plpgsql;
+DELIMITER //
+CREATE PROCEDURE p()
+BEGIN
+    SELECT 'c;d';
+END//
+DELIMITER ;
+SELECT 1;"""
+
+        queries = self.scheduler._parse_sql_queries(sql)
+
+        assert queries == [
+            "-- comment; ignored\nSELECT 'a;b'",
+            "CREATE FUNCTION f() RETURNS void AS $body$\n"
+            "BEGIN\n"
+            "    RAISE NOTICE 'x;y';\n"
+            "END\n"
+            "$body$ LANGUAGE plpgsql",
+            "CREATE PROCEDURE p()\nBEGIN\n    SELECT 'c;d';\nEND",
+            "SELECT 1",
+        ]
+
     def test_sql_query_task_uses_engine_aware_rust_connector(self, monkeypatch):
         """예약 SQL 실행은 터널의 db_engine을 Rust Core connector로 전달"""
         created = {}

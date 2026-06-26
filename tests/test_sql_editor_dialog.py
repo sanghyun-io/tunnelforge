@@ -63,6 +63,60 @@ def test_message_panel_is_separate_from_result_tabs(monkeypatch):
         close_dialog(dialog)
 
 
+def test_split_queries_preserves_comments_dollar_quotes_and_delimiters():
+    sql = """-- comment; ignored
+SELECT 'a;b';
+CREATE FUNCTION f() RETURNS void AS $body$
+BEGIN
+    RAISE NOTICE 'x;y';
+END
+$body$ LANGUAGE plpgsql;
+DELIMITER //
+CREATE PROCEDURE p()
+BEGIN
+    SELECT 'c;d';
+END//
+DELIMITER ;
+SELECT 1;"""
+
+    assert SQLEditorDialog._split_queries(None, sql) == [
+        "-- comment; ignored\nSELECT 'a;b'",
+        "CREATE FUNCTION f() RETURNS void AS $body$\n"
+        "BEGIN\n"
+        "    RAISE NOTICE 'x;y';\n"
+        "END\n"
+        "$body$ LANGUAGE plpgsql",
+        "CREATE PROCEDURE p()\nBEGIN\n    SELECT 'c;d';\nEND",
+        "SELECT 1",
+    ]
+
+
+def test_get_query_at_cursor_uses_statement_parser_ranges(monkeypatch):
+    dialog = make_dialog(monkeypatch)
+    sql = """SELECT 1;
+CREATE FUNCTION f() RETURNS void AS $body$
+BEGIN
+    RAISE NOTICE 'x;y';
+END
+$body$ LANGUAGE plpgsql;
+SELECT 2;"""
+    try:
+        dialog.editor.setPlainText(sql)
+        cursor = dialog.editor.textCursor()
+        cursor.setPosition(sql.index("RAISE NOTICE"))
+        dialog.editor.setTextCursor(cursor)
+
+        assert dialog._get_query_at_cursor() == (
+            "CREATE FUNCTION f() RETURNS void AS $body$\n"
+            "BEGIN\n"
+            "    RAISE NOTICE 'x;y';\n"
+            "END\n"
+            "$body$ LANGUAGE plpgsql"
+        )
+    finally:
+        close_dialog(dialog)
+
+
 def test_message_panel_toggle_changes_height(monkeypatch):
     dialog = make_dialog(monkeypatch)
     try:

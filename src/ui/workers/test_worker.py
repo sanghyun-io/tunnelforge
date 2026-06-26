@@ -5,6 +5,7 @@ import os
 from enum import Enum
 from PyQt6.QtCore import QThread, pyqtSignal
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+from src.core.sql_statement_parser import parse_sql_statements, read_dollar_quote
 
 
 class TestType(Enum):
@@ -331,136 +332,11 @@ class SQLExecutionWorker(QThread):
 
     @staticmethod
     def _parse_sql_statements(sql_text: str) -> list:
-        """Split SQL text into statements while preserving semicolons in strings/comments."""
-        if not sql_text or not sql_text.strip():
-            return []
-
-        statements = []
-        current = []
-        delimiter = ";"
-        quote = None
-        dollar_quote = None
-        line_comment = False
-        block_comment = False
-        escape_next = False
-        i = 0
-
-        while i < len(sql_text):
-            char = sql_text[i]
-            next_char = sql_text[i + 1] if i + 1 < len(sql_text) else ""
-
-            if not any([quote, dollar_quote, line_comment, block_comment]):
-                line_start = i == 0 or sql_text[i - 1] == "\n"
-                if line_start:
-                    line_end = sql_text.find("\n", i)
-                    if line_end == -1:
-                        line_end = len(sql_text)
-                    line = sql_text[i:line_end]
-                    stripped = line.strip()
-                    if stripped.upper().startswith("DELIMITER "):
-                        delimiter = stripped.split(None, 1)[1].strip() or ";"
-                        i = line_end + (1 if line_end < len(sql_text) else 0)
-                        continue
-
-            if line_comment:
-                current.append(char)
-                if char == "\n":
-                    line_comment = False
-                i += 1
-                continue
-
-            if block_comment:
-                current.append(char)
-                if char == "*" and next_char == "/":
-                    current.append(next_char)
-                    block_comment = False
-                    i += 2
-                else:
-                    i += 1
-                continue
-
-            if dollar_quote:
-                if sql_text.startswith(dollar_quote, i):
-                    current.append(dollar_quote)
-                    i += len(dollar_quote)
-                    dollar_quote = None
-                else:
-                    current.append(char)
-                    i += 1
-                continue
-
-            if quote:
-                current.append(char)
-                if escape_next:
-                    escape_next = False
-                elif char == "\\":
-                    escape_next = True
-                elif char == quote:
-                    quote = None
-                i += 1
-                continue
-
-            marker = SQLExecutionWorker._read_dollar_quote(sql_text, i)
-            if marker:
-                dollar_quote = marker
-                current.append(marker)
-                i += len(marker)
-                continue
-
-            if char in ("'", '"', "`"):
-                quote = char
-                current.append(char)
-                i += 1
-                continue
-
-            if char == "-" and next_char == "-":
-                line_comment = True
-                current.extend([char, next_char])
-                i += 2
-                continue
-
-            if char == "#":
-                line_comment = True
-                current.append(char)
-                i += 1
-                continue
-
-            if char == "/" and next_char == "*":
-                block_comment = True
-                current.extend([char, next_char])
-                i += 2
-                continue
-
-            if delimiter and sql_text.startswith(delimiter, i):
-                statement = "".join(current).strip()
-                if statement:
-                    statements.append(statement)
-                current = []
-                i += len(delimiter)
-                continue
-
-            current.append(char)
-            i += 1
-
-        statement = "".join(current).strip()
-        if statement:
-            statements.append(statement)
-        return statements
+        return parse_sql_statements(sql_text)
 
     @staticmethod
     def _read_dollar_quote(sql_text: str, start: int) -> str:
-        if sql_text[start] != "$":
-            return ""
-        end = sql_text.find("$", start + 1)
-        if end == -1:
-            return ""
-        tag = sql_text[start + 1:end]
-        if tag:
-            if not (tag[0].isalpha() or tag[0] == "_"):
-                return ""
-            if not all(char.isalnum() or char == "_" for char in tag[1:]):
-                return ""
-        return sql_text[start:end + 1]
+        return read_dollar_quote(sql_text, start)
 
     @staticmethod
     def _format_rows(rows: list) -> str:

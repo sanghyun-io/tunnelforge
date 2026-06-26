@@ -101,7 +101,7 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1834 passed, 5 warnings" not in doc
     assert "PASS, 1835 passed, 5 warnings" not in doc
     assert "PASS, 1837 passed, 5 warnings" not in doc
-    assert "PASS, 1839 passed, 5 warnings" in doc
+    assert "PASS, 1843 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -125,6 +125,9 @@ def test_current_status_does_not_describe_stale_full_pytest_count_as_current():
         "current full Python suite is now `1837 passed, 5 warnings`",
         "current `1837 passed, 5 warnings` evidence",
         "now reports `1837 passed, 5 warnings`",
+        "current full Python suite is now `1839 passed, 5 warnings`",
+        "current `1839 passed, 5 warnings` evidence",
+        "now reports `1839 passed, 5 warnings`",
     ]
 
     for phrase in stale_current_phrases:
@@ -139,9 +142,9 @@ def test_current_status_tracks_post_151_full_pytest_refresh_issue():
     assert "TF-STATUS-053" in doc
     assert "GitHub #152" in doc
     assert "post-#151 full-suite evidence refresh" in normalized_doc
-    assert "1839 passed, 5 warnings" in doc
+    assert "1839-test suite evidence" in doc
     assert "GitHub #152 is fixed" in summary
-    assert "stale 1832-count wording cannot return as current evidence" in normalized_doc
+    assert "that count is now superseded by TF-STATUS-056 full-suite evidence" in normalized_doc
 
 
 def test_current_status_tracks_rust_core_dml_rowcount_issue():
@@ -185,8 +188,10 @@ def test_current_status_tracks_sql_statement_parser_mismatch_issue():
     assert "SQLExecutionWorker._parse_sql_statements" in doc
     assert "PostgreSQL dollar quote" in normalized_doc
     assert "MySQL DELIMITER" in normalized_doc
-    assert "GitHub #155 is open" in summary
-    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
+    assert "GitHub #155 is fixed" in summary
+    assert "src/core/sql_statement_parser.py" in doc
+    assert "find_sql_statement_at_position" in doc
+    assert "No repo-side implementation issue is currently open after TF-STATUS-056" in order
 
 
 def test_current_status_records_post_151_next_issue_analysis():
@@ -204,7 +209,7 @@ def test_current_status_records_post_151_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a repo-side implementation issue" in normalized_doc
-    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-056" in order
 
 
 def test_current_status_current_baseline_section_is_not_stale_dated():
@@ -304,7 +309,7 @@ def test_current_status_tracks_legacy_python_auto_fix_wizard_issue():
     assert "FixWizardWorker" in doc
     assert "GitHub #142 is fixed" in summary
     assert "Legacy Auto-Fix Wizard is dry-run/manual SQL only" in doc
-    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-056" in order
 
 
 def test_current_status_records_post_142_next_issue_analysis():
@@ -384,7 +389,7 @@ def test_current_status_records_post_146_next_issue_analysis():
     assert "no macOS manual validation report found under build/" in doc
     assert "no successful manual macOS App Validation workflow_dispatch run found for current merged main HEAD" in doc
     assert "not a new repo-side implementation issue" in normalized_doc
-    assert "TF-STATUS-056 / GitHub #155 is the next repo-side implementation issue" in order
+    assert "No repo-side implementation issue is currently open after TF-STATUS-056" in order
 
 
 def test_current_status_tracks_post_release_version_drift_issue():

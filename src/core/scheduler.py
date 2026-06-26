@@ -20,6 +20,7 @@ from src.core.logger import get_logger
 from src.core.platform_paths import log_dir as platform_log_dir
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+from src.core.sql_statement_parser import parse_sql_statements
 
 logger = get_logger(__name__)
 
@@ -734,40 +735,8 @@ class BackupScheduler:
             return False, error_msg
 
     def _parse_sql_queries(self, sql_text: str) -> List[str]:
-        """SQL 텍스트를 개별 쿼리로 파싱
-
-        세미콜론으로 구분, 문자열 내부 세미콜론은 무시
-        """
-        if not sql_text or not sql_text.strip():
-            return []
-
-        queries = []
-        current_query = []
-        in_string = False
-        string_char = None
-
-        for char in sql_text:
-            if char in ('"', "'") and not in_string:
-                in_string = True
-                string_char = char
-            elif char == string_char and in_string:
-                in_string = False
-                string_char = None
-
-            if char == ';' and not in_string:
-                query = ''.join(current_query).strip()
-                if query:
-                    queries.append(query)
-                current_query = []
-            else:
-                current_query.append(char)
-
-        # 마지막 쿼리 (세미콜론 없이 끝난 경우)
-        last_query = ''.join(current_query).strip()
-        if last_query:
-            queries.append(last_query)
-
-        return queries
+        """SQL 텍스트를 개별 쿼리로 파싱."""
+        return parse_sql_statements(sql_text)
 
     def _execute_single_query(
         self,

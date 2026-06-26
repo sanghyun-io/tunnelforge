@@ -27,6 +27,10 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+from src.core.sql_statement_parser import (
+    find_sql_statement_at_position,
+    parse_sql_statements,
+)
 
 LARGE_SQL_RENDER_LIMIT_BYTES = 512 * 1024
 
@@ -2389,52 +2393,14 @@ class SQLEditorDialog(QDialog):
         self._execute_sql(sql_text, single_query=False)
 
     def _get_query_at_cursor(self):
-        """커서 위치의 쿼리 반환 (세미콜론 기준)"""
+        """커서 위치의 쿼리 반환"""
         full_text = self.editor.toPlainText()
         cursor_pos = self.editor.textCursor().position()
 
         if not full_text.strip():
             return ""
 
-        # 세미콜론으로 쿼리 경계 찾기 (문자열 내 세미콜론 무시)
-        query_ranges = []
-        current_start = 0
-        in_string = False
-        string_char = None
-
-        for i, char in enumerate(full_text):
-            if char in ("'", '"') and not in_string:
-                in_string = True
-                string_char = char
-            elif char == string_char and in_string:
-                in_string = False
-                string_char = None
-            elif char == ';' and not in_string:
-                query_ranges.append((current_start, i + 1))
-                current_start = i + 1
-
-        # 마지막 쿼리 (세미콜론 없이 끝난 경우)
-        if current_start < len(full_text):
-            query_ranges.append((current_start, len(full_text)))
-
-        # 커서 위치가 포함된 쿼리 찾기
-        for start, end in query_ranges:
-            if start <= cursor_pos <= end:
-                query = full_text[start:end].strip()
-                # 끝의 세미콜론 제거 (나중에 다시 붙음)
-                if query.endswith(';'):
-                    query = query[:-1].strip()
-                return query
-
-        # 못 찾으면 마지막 쿼리
-        if query_ranges:
-            start, end = query_ranges[-1]
-            query = full_text[start:end].strip()
-            if query.endswith(';'):
-                query = query[:-1].strip()
-            return query
-
-        return full_text.strip()
+        return find_sql_statement_at_position(full_text, cursor_pos)
 
     def _execute_sql(self, sql_text, single_query=False):
         """SQL 실행 (내부 메서드)"""
@@ -2821,34 +2787,8 @@ class SQLEditorDialog(QDialog):
         self.btn_toggle_pending.setText("▲ 접기" if not is_visible else "▼ 상세")
 
     def _split_queries(self, sql_text):
-        """SQL 텍스트를 개별 쿼리로 분리 (문자열 내 세미콜론 무시)"""
-        queries = []
-        current_query = []
-        in_string = False
-        string_char = None
-
-        for char in sql_text:
-            if char in ("'", '"') and not in_string:
-                in_string = True
-                string_char = char
-            elif char == string_char and in_string:
-                in_string = False
-                string_char = None
-
-            if char == ';' and not in_string:
-                query = ''.join(current_query).strip()
-                if query:
-                    queries.append(query)
-                current_query = []
-            else:
-                current_query.append(char)
-
-        # 마지막 쿼리 (세미콜론 없이 끝난 경우)
-        query = ''.join(current_query).strip()
-        if query:
-            queries.append(query)
-
-        return queries
+        """SQL 텍스트를 개별 쿼리로 분리."""
+        return parse_sql_statements(sql_text)
 
     def _get_limit_value(self):
         """LIMIT 설정값 반환 (None이면 제한 없음)"""
