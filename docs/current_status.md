@@ -262,27 +262,31 @@ Next action:
 
 ## Medium Priority Issues
 
-### TF-STATUS-005: Public Docs Mention Features Disabled In Main UI
+### TF-STATUS-005: Disabled UI Features Are Labeled In Docs
 
-Status: `open`
+Status: `closed`
 Severity: Medium
 Area: Docs/UI feature flags
 
 Evidence:
 
-- `SCHEDULE.md` documents scheduled backup flows.
+- 2026-06-26 update: `SCHEDULE.md` now states that scheduled backup is
+  disabled in the main UI and is retained as internal/reactivation
+  documentation.
 - `src/ui/main_window.py` sets `SCHEDULE_FEATURE_ENABLED = False`.
 - `src/ui/main_window.py` sets `SQL_FILE_EXECUTION_FEATURE_ENABLED = False`.
+- No separate public SQL file execution guide is tracked; the main context menu
+  entry remains hidden by the feature flag.
 
 Impact:
 
-- User-facing capability expectations can diverge from the app surface.
+- Public schedule documentation no longer implies the feature is currently
+  available in the main UI.
 
 Next action:
 
-1. Decide whether scheduled backup and SQL file execution are supported,
-   hidden, or retired.
-2. Update docs or feature flags accordingly.
+1. If either feature is re-enabled, update the docs and add fresh UI/runtime
+   verification evidence in the same session.
 
 ### TF-STATUS-006: Large Files Increase Change Risk
 
@@ -374,7 +378,7 @@ Next action:
 | TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Continue export consistency metadata in TF-STATUS-004 |
 | TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
 | TF-STATUS-004 | High | closed | Rust Core export | Export consistency explicit | Update final remediation report in TF-STATUS-007 |
-| TF-STATUS-005 | Medium | open | Docs/UI flags | Docs mention disabled features | Decide support status for schedule and SQL file execution |
+| TF-STATUS-005 | Medium | closed | Docs/UI flags | Disabled UI features labeled | Reverify docs if feature flags change |
 | TF-STATUS-006 | Medium | watch | Maintainability | Very large files | Keep fixes narrow; split later if behavior stabilizes |
 | TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
 | TF-STATUS-008 | Low | watch | macOS | Final real-Mac validation pending | Require evidence bundle before production-ready claim |
@@ -382,8 +386,7 @@ Next action:
 
 ## Recommended Execution Order
 
-1. Decide support status for scheduled backup and SQL file execution docs.
-2. Keep macOS real-device validation tracked separately.
+1. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -396,3 +399,4 @@ Next action:
 | 2026-06-26 | Added dump import row-count success gate and `_tunnelforge_import_report.json` success artifact. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo test --manifest-path migration_core\Cargo.toml write_dump_import_report_creates_json_file --lib` |
 | 2026-06-26 | Added dump manifest consistency metadata for strict and non-strict export paths. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Added merge import post-load DDL skip policy, fixed English translation for import UI wording, and created the final remediation report. | `migration_core/src/lib.rs`, `src/core/i18n.py`, `reports/export_import_flow_review_20260601.html`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `.venv\Scripts\python -m pytest -q`; `compileall`; `git diff --check` |
+| 2026-06-26 | Marked scheduled backup documentation as disabled/internal while the main UI feature flag remains off. | `SCHEDULE.md`, `docs/current_status.md` | `rg -n "SCHEDULE_FEATURE_ENABLED|SQL_FILE_EXECUTION_FEATURE_ENABLED|스케줄" src docs SCHEDULE.md` |
