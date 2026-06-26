@@ -490,6 +490,28 @@ def pr_head_sha(repo: str) -> str:
     return pr["headRefOid"]
 
 
+def expected_final_report_sha(repo: str) -> tuple[str | None, str]:
+    pr = gh_json(
+        [
+            "pr",
+            "view",
+            str(PR_NUMBER),
+            "--repo",
+            repo,
+            "--json",
+            "headRefOid,state",
+        ]
+    )
+    if pr.get("state") == "MERGED":
+        head_sha = local_head_sha()
+        if head_sha:
+            ok(f"using local HEAD for final report Git SHA after PR #{PR_NUMBER} merge")
+            return head_sha, "current merged main HEAD"
+        fail("could not resolve local HEAD SHA for merged PR final report")
+        return None, "current merged main HEAD"
+    return pr["headRefOid"], "PR head"
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Check the macOS support milestone, PR, and manual validation gate."
@@ -567,7 +589,11 @@ def main() -> int:
                 passed = check_pr(repo, args.skip_pr_checks) and passed
                 if args.final:
                     if report is not None:
-                        passed = check_report_git_sha(report, pr_head_sha(repo), "PR head") and passed
+                        expected_sha, expected_label = expected_final_report_sha(repo)
+                        if expected_sha:
+                            passed = check_report_git_sha(report, expected_sha, expected_label) and passed
+                        else:
+                            passed = False
                     manual_workflow_passed, manual_run_id = check_manual_macos_validation_workflow(repo)
                     passed = manual_workflow_passed and passed
                     if report is not None and manual_run_id is not None:

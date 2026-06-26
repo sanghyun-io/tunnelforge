@@ -56,6 +56,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "successful /Applications install smoke" in doc
     assert "pre-check" in doc
     assert "Git SHA" in doc
+    assert "current PR head before merge, or the current merged main HEAD after PR #117 has merged" in doc
     assert "macOS version" in doc
     assert "Mac architecture" in doc
     assert "Artifact workflow run" in doc

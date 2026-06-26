@@ -1365,6 +1365,23 @@ def test_macos_support_gate_accepts_merged_pr_with_unknown_merge_state(monkeypat
     assert "PR #117 is merged" in output
 
 
+def test_macos_support_gate_uses_local_head_for_final_report_after_pr_merge(monkeypatch, capsys):
+    gate = load_macos_support_gate_module()
+
+    def fake_gh_json(command):
+        assert command[:3] == ["pr", "view", "117"]
+        return {"state": "MERGED", "headRefOid": "old-pr-head"}
+
+    monkeypatch.setattr(gate, "gh_json", fake_gh_json)
+    monkeypatch.setattr(gate, "local_head_sha", lambda: "current-main-head")
+
+    sha, label = gate.expected_final_report_sha("sanghyun-io/tunnelforge")
+
+    assert sha == "current-main-head"
+    assert label == "current merged main HEAD"
+    assert "using local HEAD for final report Git SHA after PR #117 merge" in capsys.readouterr().out
+
+
 def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     if shutil.which("bash") is None:
         pytest.skip("bash is required for shell script validation")
