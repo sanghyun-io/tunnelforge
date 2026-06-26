@@ -95,7 +95,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1823 passed, 5 warnings" not in doc
     assert "PASS, 1825 passed, 5 warnings" not in doc
     assert "PASS, 1826 passed, 5 warnings" not in doc
-    assert "PASS, 1827 passed, 5 warnings" in doc
+    assert "PASS, 1827 passed, 5 warnings" not in doc
+    assert "PASS, 1830 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -290,7 +291,7 @@ def test_current_status_tracks_post_release_version_drift_issue():
     assert "v2.1.6" in doc
     assert "2.1.7" in doc
     assert "GitHub #147 is fixed" in summary
-    assert "Version references are aligned at `2.1.7`" in doc
+    assert "next unreleased source version to `2.1.7`" in summary
 
 
 def test_current_status_tracks_v217_release_publication_issue():
@@ -322,6 +323,20 @@ def test_current_status_records_post_148_next_issue_analysis():
     assert "current merged main HEAD" in doc
     assert "no successful manual `macOS App Validation` `workflow_dispatch` run" in doc
     assert "not a repo-side implementation issue" in normalized_doc
+
+
+def test_current_status_tracks_post_v217_version_drift_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-049" in doc
+    assert "GitHub #149" in doc
+    assert "post-v2.1.7 version drift" in normalized_doc
+    assert "v2.1.7" in doc
+    assert "2.1.8" in doc
+    assert "GitHub #149 is fixed" in summary
+    assert "Version references are aligned at `2.1.8`" in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():

@@ -161,6 +161,11 @@ successful manual `macOS App Validation` `workflow_dispatch` run exists for
 the current merged main HEAD. This remains external real-Mac validation
 work, not a repo-side implementation issue.
 
+GitHub #149 is fixed as the next release-readiness follow-up: post-v2.1.7
+version drift after release-tracking commits was resolved by bumping the next
+unreleased source version to `2.1.8` across `src/version.py`,
+`pyproject.toml`, and `installer/TunnelForge.iss`.
+
 The current full Python suite count was refreshed again on 2026-06-27 after
 the current-status re-audit regression coverage was added.
 
@@ -209,7 +214,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before this document |
-| `pytest -q` | PASS, 1827 passed, 5 warnings |
+| `pytest -q` | PASS, 1830 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 166 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -221,7 +226,7 @@ those commands are rerun.
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 53 passed |
 
-Version references are aligned at `2.1.7` across:
+Version references are aligned at `2.1.8` across:
 
 - `src/version.py`
 - `pyproject.toml`
@@ -233,7 +238,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1827 passed, 5 warnings |
+| `pytest -q` | PASS, 1830 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -265,6 +270,8 @@ Commands run locally:
 | `pytest tests\test_current_status_docs.py::test_current_status_records_post_148_next_issue_analysis -q` | RED then PASS |
 | `git status --short --branch` | `## main...origin/main`, no local changes before #116 re-analysis |
 | `gh issue list --state open --limit 20` | PASS, only #116 open |
+| `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_v217_version_drift_issue -q` | RED then PASS |
+| `python scripts\bump_version.py --bump-type patch` | PASS, bumped `2.1.7` to `2.1.8` |
 | `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL, missing real-Mac report and current-HEAD manual workflow_dispatch evidence |
 | `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
 | `pytest tests\test_current_status_docs.py -q` | PASS |
@@ -275,6 +282,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Post-v2.1.7 version drift fix | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_v217_version_drift_issue -q`; `gh issue create` created #149; `git rev-list --count v2.1.7..HEAD`; `gh release list --limit 5`; `python scripts\bump_version.py --bump-type patch`; `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q`; `pytest -q` | PASS | GitHub #149 is fixed: current source/package/installer version is `2.1.8`, ahead of already published release `v2.1.7` after main accumulated release-tracking commits; current full Python suite is now `1830 passed, 5 warnings` |
 | 2026-06-27 | Post-#148 next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_148_next_issue_analysis -q`; `git status --short --branch`; `gh issue list --state open --limit 20`; `gh issue view 116 --json number,title,state,labels,body,comments,url,updatedAt`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL for `--final` only | Current `main` is aligned with `origin/main`; #116 is the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for the current merged main HEAD, so no new repo-side implementation issue was created |
 | 2026-06-27 | v2.1.7 release publication | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_v217_release_publication_issue -q`; `git status --short --branch`; `gh issue list --state open --limit 20`; `git tag -a v2.1.7 -m "Release v2.1.7"`; `git push origin v2.1.7`; `gh run view 28255274238 --json status,conclusion,url`; `gh release view v2.1.7 --json tagName,name,url,assets,publishedAt,targetCommitish,isDraft,isPrerelease` | PASS | GitHub #148 is fixed: release `v2.1.7` was published from current `main` with `TunnelForge-Setup-2.1.7.exe`, `TunnelForge-WebSetup.exe`, `TunnelForge-macOS-2.1.7-arm64.dmg`, `TunnelForge-macOS-2.1.7-arm64.zip`, `TunnelForge-macOS-2.1.7-x86_64.dmg`, `TunnelForge-macOS-2.1.7-x86_64.zip`, and checksum assets |
 | 2026-06-27 | Post-release version drift fix | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_post_release_version_drift_issue -q`; `gh issue create` created #147; `python scripts\bump_version.py --bump-type patch`; `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q`; `git log --oneline v2.1.6..HEAD`; `gh release list --limit 10` | PASS | GitHub #147 is fixed: current source/package/installer version is `2.1.7` after `v2.1.6` was already released and main accumulated post-release commits |
@@ -1927,6 +1935,7 @@ Next action:
 | TF-STATUS-046 | Medium | closed | Release versioning | Post-release version drift | Keep source/package/installer versions ahead of the latest released tag before release tagging |
 | TF-STATUS-047 | Medium | closed | Release publication | v2.1.7 release publication | Keep release tags/assets aligned when version bumps land directly on main |
 | TF-STATUS-048 | Low | closed | Status documentation / macOS release validation | Post-#148 next issue analysis | Keep #116 external until real operator Mac validation evidence is attached |
+| TF-STATUS-049 | Medium | closed | Release versioning | Post-v2.1.7 version drift | Keep source/package/installer versions ahead of the latest released tag before release tagging |
 
 ## Recommended Execution Order
 
@@ -1936,7 +1945,9 @@ Next action:
    and verified; TF-STATUS-045 found no new repo-side implementation issue,
    TF-STATUS-046 / GitHub #147 fixed the post-release version drift, and
    TF-STATUS-047 / GitHub #148 published release `v2.1.7`; TF-STATUS-048
-   reconfirmed no new repo-side issue after #148 closure.
+   reconfirmed no new repo-side issue after #148 closure; TF-STATUS-049 /
+   GitHub #149 fixed the post-v2.1.7 version drift by advancing current source
+   version references to `2.1.8`.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence; #116 remains external.
 3. Track additional One-Click automatic fix classes as separate GitHub issues
@@ -1946,6 +1957,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-06-27 | Created and fixed TF-STATUS-049 / GitHub #149 after finding that `main` had post-`v2.1.7` commits while source/package/installer references still declared `2.1.7`. | `src/version.py`, `pyproject.toml`, `installer/TunnelForge.iss`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #149 | RED/GREEN: post-v2.1.7 version drift current-status pytest; version sync pytest; full pytest `1830 passed, 5 warnings` |
 | 2026-06-27 | Re-analyzed the next issue after #148 closure. #116 is the only open GitHub issue; the normal repository-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#148 current-status pytest; final: #116 gate pass, expected-failing final gate |
 | 2026-06-27 | Created and fixed TF-STATUS-047 / GitHub #148 after direct `main` version bumping left release publication behind; pushed tag `v2.1.7`, verified Build and Release workflow run `28255274238`, and confirmed the GitHub release assets. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #148, release `v2.1.7` | RED/GREEN: v2.1.7 release-publication current-status pytest; final: release workflow success and `gh release view v2.1.7` |
 | 2026-06-27 | Created and fixed TF-STATUS-046 / GitHub #147 after finding that `main` still declared `2.1.6` even though release/tag `v2.1.6` already exists and post-release commits have accumulated. | `src/version.py`, `pyproject.toml`, `installer/TunnelForge.iss`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #147 | RED/GREEN: post-release version drift current-status pytest; version sync pytest; final: full pytest, #116 gate, compileall, `git diff --check` |
