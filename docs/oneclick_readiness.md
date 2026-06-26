@@ -31,8 +31,11 @@ The current supported scope is dry-run preview only:
   `reports\oneclick_readiness\oneclick-dry-run-evidence.json`.
 - Real-execution evidence contract:
   `scripts\validate-oneclick-real-execution-evidence.py` and
-  `reports\oneclick_readiness\oneclick-real-execution-evidence.template.json`.
-  Completed real-execution evidence has not been captured yet.
+  `reports\oneclick_readiness\oneclick-real-execution-evidence.json`.
+  Completed evidence proves Rust Core `oneclick.apply_fixes` can convert the
+  controlled local test table
+  `tf_oneclick_real_execution.tf_oneclick_legacy_engine_table` from `MyISAM` to
+  `InnoDB`.
 
 ## Not Yet Supported
 
@@ -62,12 +65,18 @@ Before removing the dry-run lock or enabling real execution:
 1. Define which issue types can be automatically fixed and which remain manual.
 2. Add contract coverage for every additional event payload the UI renders.
 3. Capture realistic Rust Core non-production real-execution evidence for the
-   supported automatic-fix scope.
+   supported automatic-fix scope. Done for `oneclick.apply_fixes` /
+   `engine_innodb` in
+   `reports\oneclick_readiness\oneclick-real-execution-evidence.json`.
 4. Validate that evidence with
-   `scripts\validate-oneclick-real-execution-evidence.py`.
-5. Decide and document whether the UI remains dry-run preview/beta or becomes
+   `scripts\validate-oneclick-real-execution-evidence.py`. Done for the
+   archived local evidence.
+5. Decide and document how `oneclick.run` should invoke/sequence automatic
+   fixes, because the UI currently calls `oneclick.run`, not
+   `oneclick.apply_fixes` directly.
+6. Decide and document whether the UI remains dry-run preview/beta or becomes
    real-execution capable.
-6. Update the feature flags, user-facing docs, and `docs\current_status.md` in
+7. Update the feature flags, user-facing docs, and `docs\current_status.md` in
    the same change if the decision changes.
 
 The #138 real-execution evidence validator currently requires:
@@ -102,12 +111,16 @@ Reasons:
   `deprecated_engine -> engine_innodb` action through Rust Core
   `MigrationAdapter::execute_sql`; manual/skip steps remain skipped, disallowed
   strategies are blocked, and missing endpoints fail closed.
+- `reports\oneclick_readiness\oneclick-real-execution-evidence.json` now proves
+  `oneclick.apply_fixes` changed the controlled local MySQL table from
+  `MyISAM` to `InnoDB`.
 - The full `oneclick.run` execution phase still does not perform automatic SQL
-  fixes, and no local before/after real-execution evidence has been captured
-  yet.
+  fixes, so app-level real execution remains disabled until the UI-facing run
+  orchestration is connected and tested.
 - `scripts\validate-oneclick-real-execution-evidence.py` defines the
   machine-checkable proof required before `engine_innodb` real execution can be
-  considered ready, but the matching real evidence file is still absent.
+  considered ready; the current archived evidence passes that validator for
+  `oneclick.apply_fixes`.
 - The migration analyzer button copy and tooltip now label the entry point as
   dry-run preview and avoid automatic-fix claims.
 - The dialog backup checkbox defaults unchecked. If preview is exposed, dry-run

@@ -320,6 +320,13 @@ class DbCoreFacade:
     ) -> Dict[str, Any]:
         return self.client.request("oneclick.run", payload, on_event=on_event)
 
+    def apply_oneclick_fixes(
+        self,
+        payload: Dict[str, Any],
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        return self.client.request("oneclick.apply_fixes", payload, on_event=on_event)
+
 
 _shared_facade_lock = threading.Lock()
 _shared_facade: Optional[DbCoreFacade] = None

@@ -1,0 +1,94 @@
+{
+  "issue": 138,
+  "git_sha": "ce3682a97720a095424207677548a79967a0a4b3",
+  "source_type": "local_mysql_container",
+  "feature_flags": {
+    "oneclick_ui_enabled": true,
+    "oneclick_real_execution_enabled": false
+  },
+  "service_hello": {
+    "capabilities": [
+      "connection.open",
+      "connection.close",
+      "connection.test",
+      "schema.list",
+      "schema.inspect",
+      "schema.diff",
+      "query.execute",
+      "query.cancel",
+      "dump.run",
+      "dump.import",
+      "migration.plan",
+      "migration.run",
+      "migration.verify",
+      "migration.resume",
+      "oneclick.run",
+      "oneclick.preflight",
+      "oneclick.analyze",
+      "oneclick.recommend",
+      "oneclick.apply_fixes",
+      "oneclick.validate",
+      "oneclick.report",
+      "job.cancel",
+      "service.shutdown"
+    ]
+  },
+  "scope": {
+    "schema": "tf_oneclick_real_execution",
+    "allowed_fix_types": [
+      "deprecated_engine"
+    ],
+    "allowed_strategies": [
+      "engine_innodb"
+    ]
+  },
+  "run": {
+    "command": "oneclick.apply_fixes",
+    "dry_run": false,
+    "backup_confirmed": true,
+    "success": true,
+    "schema": "tf_oneclick_real_execution",
+    "attempted_fix_types": [
+      "deprecated_engine"
+    ],
+    "attempted_strategies": [
+      "engine_innodb"
+    ],
+    "disallowed_fix_attempts": [],
+    "applied_fixes": [
+      {
+        "issue_type": "deprecated_engine",
+        "rows_affected": 0,
+        "schema": "tf_oneclick_real_execution",
+        "sql": "ALTER TABLE `tf_oneclick_real_execution`.`tf_oneclick_legacy_engine_table` ENGINE=InnoDB;",
+        "strategy": "engine_innodb",
+        "success": true,
+        "table": "tf_oneclick_legacy_engine_table"
+      }
+    ]
+  },
+  "before": {
+    "tables": [
+      {
+        "engine": "MyISAM",
+        "schema": "tf_oneclick_real_execution",
+        "table": "tf_oneclick_legacy_engine_table"
+      }
+    ]
+  },
+  "after": {
+    "tables": [
+      {
+        "engine": "InnoDB",
+        "schema": "tf_oneclick_real_execution",
+        "table": "tf_oneclick_legacy_engine_table"
+      }
+    ],
+    "unrelated_tables_unchanged": true
+  },
+  "validation": {
+    "all_fixed": true,
+    "remaining_issues": 0,
+    "post_engine": "InnoDB"
+  }
+}
