@@ -1,0 +1,48 @@
+{
+  "issue": 136,
+  "git_sha": "4a91ad7437d8374befe7092d74e513b187f07d45",
+  "source_type": "local_containers",
+  "directions": {
+    "mysql_to_postgresql": {
+      "rows_migrated": 1000000,
+      "migration_success": true,
+      "verify_success": true,
+      "mismatches": 0,
+      "worker_progress_events": 201,
+      "ui_heartbeat": {
+        "samples": 72,
+        "max_gap_ms": 125,
+        "max_allowed_gap_ms": 1000
+      },
+      "notes": "mysql_to_postgresql captured through CrossEngineMigrationWorker"
+    },
+    "postgresql_to_mysql": {
+      "rows_migrated": 1000000,
+      "migration_success": true,
+      "verify_success": true,
+      "mismatches": 0,
+      "worker_progress_events": 201,
+      "ui_heartbeat": {
+        "samples": 103,
+        "max_gap_ms": 125,
+        "max_allowed_gap_ms": 1000
+      },
+      "notes": "postgresql_to_mysql captured through CrossEngineMigrationWorker"
+    }
+  },
+  "stress_10m": {
+    "chunks": {
+      "cancelled_rows": 600000,
+      "chunk_size": 200000,
+      "resumed_rows": 9400000
+    },
+    "mismatches": 0,
+    "notes": "Measured in migration_core/tests/stress_rss.rs using synthetic MigrationAdapter resume+verify path.",
+    "peak_rss_mb": 921,
+    "resume_success": true,
+    "rows": 10000000,
+    "rss_limit_mb": 2048,
+    "source_type": "synthetic_adapter",
+    "verify_success": true
+  }
+}

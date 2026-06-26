@@ -3,9 +3,9 @@
 This directory defines the final evidence shape for GitHub #136 and the
 remaining #99 closure gate.
 
-The actual completed evidence file is intentionally not checked in yet. It must
-be produced from a live MySQL/PostgreSQL validation run through the PyQt worker
-path.
+The completed evidence file is `live-ui-migration-evidence.json`. It was
+produced from a live MySQL/PostgreSQL validation run through the PyQt worker
+path plus the Rust Core synthetic 10M stress RSS harness.
 
 Preferred capture command for local Docker validation:
 
@@ -44,8 +44,20 @@ Use `source_type` values such as `local_containers`, `remote_real_databases`,
 or `synthetic_adapter` so #99 can distinguish live DB evidence from Rust-only
 synthetic evidence.
 
-Do not commit smoke reports with fewer than 1,000,000 rows. They are useful only
-for checking the capture script path and must fail the final validator.
+Do not replace the completed evidence with smoke reports below 1,000,000 rows.
+They are useful only for checking the capture script path and must fail the
+final validator.
+
+## Final Evidence
+
+- `live-ui-migration-evidence.json` is the validator-passing #136 evidence.
+- `stress-10m-rss.json` is the 10M synthetic adapter RSS measurement used inside
+  the final evidence file.
+- Final validation command:
+
+```powershell
+python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json
+```
 
 ## Partial Evidence
 
@@ -54,5 +66,4 @@ for checking the capture script path and must fail the final validator.
   both 1M directions and heartbeat sampling, but it intentionally sets
   `stress_10m.peak_rss_mb` and `stress_10m.rss_limit_mb` to `0` because 10M RSS
   was not measured in that run. The final validator must reject this partial
-  file, and it must not be copied to `live-ui-migration-evidence.json` until the
-  10M RSS fields are backed by real measurement evidence.
+  file.

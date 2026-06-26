@@ -100,6 +100,8 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | Live UI evidence negative check | `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-smoke.json` | FAIL expected | Validator rejected the smoke report because rows were below 1,000,000 |
 | 2026-06-26 | Live UI 1M partial capture | `python scripts\capture-live-ui-migration-evidence.py --rows 1000000 --chunk-size 10000 --seed-local-containers --output reports\live_ui_migration\live-ui-migration-evidence-1m-local.json --stress-source-type synthetic_adapter --stress-peak-rss-mb 0 --stress-rss-limit-mb 0 --stress-notes "placeholder; RSS not measured in this run, do not use as final #136 evidence"` | PASS | Both 1M directions migrated+verified through `CrossEngineMigrationWorker`; max heartbeat gap 125ms; renamed to `live-ui-migration-evidence-1m-local-partial.json` |
 | 2026-06-26 | Live UI partial evidence negative check | `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-1m-local-partial.json` | FAIL expected | Validator rejects the partial because 10M RSS fields are intentionally 0 |
+| 2026-06-26 | Rust Core 10M stress RSS | `TF_STRESS_ROWS=10000000 TF_STRESS_CHUNK_SIZE=200000 TF_STRESS_RSS_REPORT=<abs>\stress-10m-rss.json TF_STRESS_RSS_LIMIT_MB=2048 cargo test --manifest-path migration_core\Cargo.toml --test stress_rss synthetic_10m_stress_resume_verify_reports_rss_bound -- --ignored --nocapture` | PASS | 10M synthetic adapter resume+verify succeeded; peak RSS 921MB / 2048MB |
+| 2026-06-26 | Final live UI evidence validator | `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json` | PASS | 2 directions and 12,000,000 rows checked |
 | 2026-06-26 | Import wrapper/dialog focused tests | `python -m pytest tests\test_rust_dump_exporter.py tests\test_db_dialogs.py -q` | PASS | 62 passed after payload/UI wording fixes |
 | 2026-06-26 | Rust timezone validation TDD | `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_session_time_zone_only --lib` | FAIL then PASS | Initial RED failed because `validated_timezone_sql` did not exist; GREEN passed after helper implementation |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | 139 lib tests, 1 JSONL CLI test, 6 live-roundtrip tests, doctests |
@@ -642,7 +644,7 @@ Next action:
 
 ### TF-STATUS-018: Rust Core Live UI Performance Evidence Pending
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: Rust Core live migration / PyQt responsiveness evidence
 
@@ -676,6 +678,15 @@ Evidence:
   emitted 201 worker progress events, and recorded a 125ms max Qt heartbeat gap
   against a 1000ms threshold. The file remains partial because the 10M RSS
   fields are intentionally 0 and therefore fail the final validator.
+- 2026-06-26 update: `migration_core\tests\stress_rss.rs` adds an ignored
+  10M synthetic adapter RSS harness. The committed harness measured 10M
+  resume+verify success, 0 mismatches, and 921MB peak RSS against a 2048MB
+  limit, writing `reports\live_ui_migration\stress-10m-rss.json`.
+- 2026-06-26 update: `reports\live_ui_migration\live-ui-migration-evidence.json`
+  combines the live bidirectional 1M PyQt worker evidence with the 10M RSS
+  measurement. `python scripts\validate-live-ui-migration-evidence.py
+  reports\live_ui_migration\live-ui-migration-evidence.json` passes with 2
+  directions and 12,000,000 rows checked.
 - GitHub issue #136 now tracks this remaining #99 closure evidence.
 - Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
 - Follow-up GitHub issue:
@@ -683,22 +694,16 @@ Evidence:
 
 Impact:
 
-- #99 should remain open until the live bidirectional 1M/UI responsiveness
-  evidence is captured or explicitly scoped out.
-- The small live roundtrip smoke proves endpoint wiring, but it is not enough to
-  satisfy #136 because it does not run 1M rows or measure the PyQt worker/dialog
-  event-loop heartbeat during a long migration.
+- #99/#136 now have durable validator-passing evidence for live bidirectional
+  1M PyQt worker responsiveness and 10M stress RSS bounds.
+- Keep the final validator in the release evidence path if migration worker,
+  Rust Core migration streaming, or stress adapter semantics change.
 
 Next action:
 
-1. Capture durable live MySQL/PostgreSQL bidirectional 1M migration+verify
-   evidence with UI responsiveness proof, save it as
-   `reports\live_ui_migration\live-ui-migration-evidence.json`, and run the
-   live UI evidence validator.
-2. Measure or regenerate the 10M stress/resume/verify run with a real peak RSS
-   value and accepted RSS limit, then either update the partial 1M artifact into
-   the final `reports\live_ui_migration\live-ui-migration-evidence.json` or run
-   the full capture again. Commit the final file only if the validator passes.
+1. Refresh `reports\live_ui_migration\live-ui-migration-evidence.json` only if
+   migration worker, Rust Core streaming, heartbeat sampling, or stress/RSS
+   semantics change.
 
 ## Issue Tracker
 
@@ -721,13 +726,11 @@ Next action:
 | TF-STATUS-015 | Medium | closed | SQL editor UI | Schema/table tree panel | Consider richer query composition later |
 | TF-STATUS-016 | Medium | closed | Rust Core dump.import diagnostics | MySQL ERROR 1114 table-full guidance | Collect target storage/tmpdir evidence if it recurs |
 | TF-STATUS-017 | High | closed | Rust Core migration performance evidence | 1M/10M evidence archived and validated | Refresh if migration/verify streaming semantics change |
-| TF-STATUS-018 | High | open | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence pending | Capture durable MySQL/PostgreSQL 1M UI responsiveness evidence for #99/#136 |
+| TF-STATUS-018 | High | closed | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence captured | Refresh final validator evidence if migration/RSS semantics change |
 
 ## Recommended Execution Order
 
-1. Capture live bidirectional 1M Rust Core UI responsiveness evidence for
-   #99/#136.
-2. Keep macOS real-device validation tracked separately.
+1. Keep macOS real-device validation tracked separately.
 
 ## Session Log
 
@@ -762,3 +765,4 @@ Next action:
 | 2026-06-26 | Analyzed GitHub #136 after merging prior work to main; confirmed local MySQL/PostgreSQL live endpoint wiring passes small Rust Core roundtrip tests, but #136 still requires durable 1M bidirectional PyQt heartbeat evidence. | `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` |
 | 2026-06-26 | Added the #136 live UI evidence capture helper with deterministic local-container seeding, CrossEngineMigrationWorker execution, Qt heartbeat sampling, and validator-compatible report generation; verified the path with a 1,000-row smoke that must not be used as final evidence. | `scripts/capture-live-ui-migration-evidence.py`, `tests/test_live_ui_migration_capture.py`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_capture.py -q`; smoke: `python scripts\capture-live-ui-migration-evidence.py --rows 1000 ...`; expected reject: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-smoke.json` |
 | 2026-06-26 | Captured and preserved partial #136 evidence for the live 1M bidirectional PyQt worker path; both directions passed migrate+verify with heartbeat max gap 125ms, leaving only real 10M RSS evidence before final validator closure. | `reports/live_ui_migration/live-ui-migration-evidence-1m-local-partial.json`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | `python scripts\capture-live-ui-migration-evidence.py --rows 1000000 ...`; expected reject: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence-1m-local-partial.json` |
+| 2026-06-26 | Added and ran the Rust Core 10M synthetic stress RSS harness, generated the final #136 evidence file, and closed TF-STATUS-018 after the final validator passed. | `migration_core/tests/stress_rss.rs`, `reports/live_ui_migration/stress-10m-rss.json`, `reports/live_ui_migration/live-ui-migration-evidence.json`, `reports/live_ui_migration/README.md`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml --test stress_rss synthetic_stress_run_reports_resume_verify_and_rss_bound -- --nocapture`; ignored 10M: `cargo test --manifest-path migration_core\Cargo.toml --test stress_rss synthetic_10m_stress_resume_verify_reports_rss_bound -- --ignored --nocapture`; final: `python scripts\validate-live-ui-migration-evidence.py reports\live_ui_migration\live-ui-migration-evidence.json` |

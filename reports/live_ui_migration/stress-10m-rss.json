@@ -1,0 +1,15 @@
+{
+  "chunks": {
+    "cancelled_rows": 600000,
+    "chunk_size": 200000,
+    "resumed_rows": 9400000
+  },
+  "mismatches": 0,
+  "notes": "Measured in migration_core/tests/stress_rss.rs using synthetic MigrationAdapter resume+verify path.",
+  "peak_rss_mb": 921,
+  "resume_success": true,
+  "rows": 10000000,
+  "rss_limit_mb": 2048,
+  "source_type": "synthetic_adapter",
+  "verify_success": true
+}
