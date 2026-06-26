@@ -3874,6 +3874,7 @@ fn validated_timezone_sql(value: Option<&str>) -> Result<Option<String>, String>
     let Some(sql) = value.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(None);
     };
+    let invalid_message = "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone or SET TIME ZONE is allowed";
     let normalized = sql.to_ascii_lowercase();
     if normalized.contains(';')
         || normalized.contains("--")
@@ -3881,42 +3882,34 @@ fn validated_timezone_sql(value: Option<&str>) -> Result<Option<String>, String>
         || normalized.contains("*/")
         || normalized.contains('\0')
     {
-        return Err(
-            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
-                .to_string(),
-        );
+        return Err(invalid_message.to_string());
     }
 
     let Some(after_set) = normalized.strip_prefix("set") else {
-        return Err(
-            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
-                .to_string(),
-        );
+        return Err(invalid_message.to_string());
     };
-    let Some(after_session) = after_set.trim_start().strip_prefix("session") else {
-        return Err(
-            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
-                .to_string(),
-        );
+
+    let after_set = after_set.trim_start();
+    let value = if let Some(after_session) = after_set.strip_prefix("session") {
+        let Some(after_variable) = after_session.trim_start().strip_prefix("time_zone") else {
+            return Err(invalid_message.to_string());
+        };
+        let Some(value) = after_variable.trim_start().strip_prefix('=') else {
+            return Err(invalid_message.to_string());
+        };
+        value
+    } else if let Some(after_time) = after_set.strip_prefix("time") {
+        let Some(value) = after_time.trim_start().strip_prefix("zone") else {
+            return Err(invalid_message.to_string());
+        };
+        value
+    } else {
+        return Err(invalid_message.to_string());
     };
-    let Some(after_variable) = after_session.trim_start().strip_prefix("time_zone") else {
-        return Err(
-            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
-                .to_string(),
-        );
-    };
-    let Some(value) = after_variable.trim_start().strip_prefix('=') else {
-        return Err(
-            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
-                .to_string(),
-        );
-    };
+
     let value = value.trim();
     if value.is_empty() || !is_safe_timezone_literal(value) {
-        return Err(
-            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
-                .to_string(),
-        );
+        return Err(invalid_message.to_string());
     }
 
     Ok(Some(sql.to_string()))
@@ -12160,10 +12153,14 @@ mod tests {
     }
 
     #[test]
-    fn import_timezone_sql_accepts_session_time_zone_only() {
+    fn import_timezone_sql_accepts_mysql_and_postgresql_timezone_forms() {
         assert_eq!(
             validated_timezone_sql(Some("SET SESSION time_zone = '+09:00'")).unwrap(),
             Some("SET SESSION time_zone = '+09:00'".to_string())
+        );
+        assert_eq!(
+            validated_timezone_sql(Some("SET TIME ZONE '+09:00'")).unwrap(),
+            Some("SET TIME ZONE '+09:00'".to_string())
         );
         assert_eq!(validated_timezone_sql(None).unwrap(), None);
         assert_eq!(validated_timezone_sql(Some("   ")).unwrap(), None);
@@ -12175,6 +12172,7 @@ mod tests {
         assert!(
             validated_timezone_sql(Some("SET SESSION time_zone = '+09:00' -- trailing")).is_err()
         );
+        assert!(validated_timezone_sql(Some("SET TIME ZONE '+09:00' -- trailing")).is_err());
         assert!(validated_timezone_sql(Some("SET GLOBAL time_zone = '+09:00'")).is_err());
     }
 
