@@ -13,6 +13,7 @@ class PostgresConnector:
         self.user = user
         self.password = password
         self.database = database or "postgres"
+        self.engine = "postgresql"
         self.facade = DbCoreFacade()
         self.connection = None
 

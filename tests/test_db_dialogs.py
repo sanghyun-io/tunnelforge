@@ -540,6 +540,60 @@ def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
     }
 
 
+def test_preselected_export_tunnel_uses_postgres_connector_for_postgresql(monkeypatch):
+    captured = {}
+
+    class FailingMySQLConnector:
+        def __init__(self, *args, **kwargs):
+            raise AssertionError("PostgreSQL tunnel must not create MySQLConnector")
+
+    class FakePostgresConnector:
+        engine = "postgresql"
+
+        def __init__(self, host, port, user, password, database=None):
+            captured["host"] = host
+            captured["port"] = port
+            captured["user"] = user
+            captured["password"] = password
+            captured["database"] = database
+
+        def connect(self):
+            return True, "ok"
+
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.MySQLConnector", FailingMySQLConnector)
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.PostgresConnector", FakePostgresConnector)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("postgres", "tunnelpass")
+    tunnel_engine = MagicMock()
+    tunnel_engine.is_running.return_value = True
+    tunnel_engine.get_connection_info.return_value = ("127.0.0.1", 55432)
+
+    wizard = RustDumpWizard(
+        tunnel_engine=tunnel_engine,
+        config_manager=config_manager,
+        preselected_tunnel={
+            "id": "pg-tunnel",
+            "name": "PostgreSQL 터널",
+            "db_engine": "postgresql",
+            "default_database": "postgres",
+            "default_schema": "public",
+        },
+    )
+
+    connector, connection_info = wizard._connect_preselected_tunnel()
+
+    assert connector is not None
+    assert connector.engine == "postgresql"
+    assert connection_info == "PostgreSQL 터널_postgres"
+    assert captured == {
+        "host": "127.0.0.1",
+        "port": 55432,
+        "user": "postgres",
+        "password": "tunnelpass",
+        "database": "postgres",
+    }
+
+
 def test_export_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp_path):
     app = QApplication.instance() or QApplication([])
 
@@ -570,9 +624,10 @@ def test_export_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp
 
     class FakeConnector:
         host = "db.example.com"
-        port = 3307
+        port = 5432
         user = "exporter"
         password = "secret"
+        engine = "postgresql"
 
         def get_schemas(self):
             return ["app"]
@@ -601,9 +656,10 @@ def test_export_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp
 
     assert captured["task_type"] == "export_schema"
     assert captured["config"].host == "db.example.com"
-    assert captured["config"].port == 3307
+    assert captured["config"].port == 5432
     assert captured["config"].user == "exporter"
     assert captured["config"].password == "secret"
+    assert captured["config"].engine == "postgresql"
     assert captured["started"] is True
     dialog.deleteLater()
 
@@ -641,9 +697,10 @@ def test_import_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp
 
     class FakeConnector:
         host = "db.example.com"
-        port = 3307
+        port = 5432
         user = "importer"
         password = "secret"
+        engine = "postgresql"
 
         def get_schemas(self):
             return ["app"]
@@ -665,8 +722,9 @@ def test_import_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp
 
     assert captured["task_type"] == "import"
     assert captured["config"].host == "db.example.com"
-    assert captured["config"].port == 3307
+    assert captured["config"].port == 5432
     assert captured["config"].user == "importer"
     assert captured["config"].password == "secret"
+    assert captured["config"].engine == "postgresql"
     assert captured["started"] is True
     dialog.deleteLater()

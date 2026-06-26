@@ -96,6 +96,20 @@ class TestRustDumpConfig:
         assert '****' in masked
         assert 'db.example.com:3307' in masked
 
+    def test_config_preserves_postgresql_engine(self):
+        """PostgreSQL dump 설정은 Rust Core endpoint engine으로 보존된다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig
+
+        config = RustDumpConfig(
+            host='db.example.com',
+            port=5432,
+            user='postgres',
+            password='secret',
+            engine='postgresql',
+        )
+
+        assert config.engine == 'postgresql'
+
 
 class TestForeignKeyResolver:
     """ForeignKeyResolver 클래스 테스트"""
@@ -316,6 +330,31 @@ class TestRustDumpExporter:
         assert success is True
         assert "View 2개" in msg
 
+    def test_export_full_schema_preserves_postgresql_engine_in_rust_payload(self, tmp_path):
+        """PostgreSQL export는 Rust dump.run payload에 postgresql endpoint를 보낸다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_dumped": 0}
+
+        facade = FakeFacade()
+        config = RustDumpConfig(
+            "pg.example.com",
+            5432,
+            "postgres",
+            "secret",
+            engine="postgresql",
+        )
+        exporter = RustDumpExporter(config, facade=facade)
+
+        success, _msg = exporter.export_full_schema("public", str(tmp_path / "dump"))
+
+        assert success is True
+        assert facade.payload["source"]["engine"] == "postgresql"
+        assert facade.payload["source"]["database"] == "public"
+
 
 class TestRustDumpImporter:
     """RustDumpImporter 클래스 테스트"""
@@ -362,6 +401,41 @@ class TestRustDumpImporter:
         assert "mysql_local_infile_policy" not in facade.payload
         assert results["users"]["status"] == "done"
         assert "1" in msg
+
+    def test_import_dump_preserves_postgresql_engine_in_rust_payload(self, tmp_path):
+        """PostgreSQL import는 Rust dump.import payload에 postgresql endpoint를 보낸다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        table_dir = dump_dir / '0001_users'
+        table_dir.mkdir(parents=True)
+        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":1,"database":"public",'
+            '"tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_imported": 1}
+
+        facade = FakeFacade()
+        config = RustDumpConfig(
+            'pg.example.com',
+            5432,
+            'postgres',
+            'secret',
+            engine='postgresql',
+        )
+        importer = RustDumpImporter(config, facade=facade)
+
+        success, _msg, _results = importer.import_dump(str(dump_dir), import_mode='replace')
+
+        assert success is True
+        assert facade.payload["target"]["engine"] == "postgresql"
+        assert facade.payload["target"]["database"] == "public"
 
     def test_import_dump_forwards_timezone_and_strict_manifest(self, tmp_path):
         """Import 의도(timezone/strict manifest)가 Rust payload로 전달된다"""

@@ -1407,7 +1407,8 @@ class RustDumpExportDialog(QDialog):
             host=getattr(self.connector, 'host', "127.0.0.1"),
             port=self.connector.port if hasattr(self.connector, 'port') else 3306,
             user=self.connector.user if hasattr(self.connector, 'user') else "root",
-            password=self.connector.password if hasattr(self.connector, 'password') else ""
+            password=self.connector.password if hasattr(self.connector, 'password') else "",
+            engine=getattr(self.connector, 'engine', "mysql"),
         )
 
         # 작업 스레드 시작
@@ -2677,7 +2678,8 @@ class RustDumpImportDialog(QDialog):
             host=getattr(self.connector, 'host', "127.0.0.1"),
             port=self.connector.port if hasattr(self.connector, 'port') else 3306,
             user=self.connector.user if hasattr(self.connector, 'user') else "root",
-            password=self.connector.password if hasattr(self.connector, 'password') else ""
+            password=self.connector.password if hasattr(self.connector, 'password') else "",
+            engine=getattr(self.connector, 'engine', "mysql"),
         )
 
         # 타임존 설정 결정
@@ -3286,8 +3288,10 @@ class RustDumpWizard:
             tunnel.get('default_schema') if db_engine == 'mysql' else None
         )
 
-        # MySQLConnector 생성 및 연결
-        connector = MySQLConnector(host, port, db_user, db_password, database)
+        if db_engine == "postgresql":
+            connector = PostgresConnector(host, port, db_user, db_password, database)
+        else:
+            connector = MySQLConnector(host, port, db_user, db_password, database)
         success, msg = connector.connect()
 
         if not success:

@@ -12,6 +12,7 @@ from src.core.db_core_service import (
     DbCoreServiceError,
     DbEndpoint,
     get_shared_db_core_facade,
+    normalize_db_engine,
 )
 from src.core.logger import get_logger
 
@@ -72,6 +73,10 @@ class RustDumpConfig:
     user: str
     password: str
     schema: str = ""
+    engine: str = "mysql"
+
+    def __post_init__(self) -> None:
+        self.engine = normalize_db_engine(self.engine, self.port)
 
     def get_uri(self) -> str:
         return f"{self.user}:{self.password}@{self.host}:{self.port}"
@@ -343,7 +348,7 @@ class RustDumpExporter:
 
     def _endpoint(self, schema: str) -> DbEndpoint:
         return DbEndpoint(
-            engine="mysql",
+            engine=self.config.engine,
             host=self.config.host,
             port=int(self.config.port),
             user=self.config.user,
@@ -565,7 +570,7 @@ class RustDumpImporter:
 
     def _endpoint(self, schema: str) -> DbEndpoint:
         return DbEndpoint(
-            engine="mysql",
+            engine=self.config.engine,
             host=self.config.host,
             port=int(self.config.port),
             user=self.config.user,

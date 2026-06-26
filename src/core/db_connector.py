@@ -102,6 +102,7 @@ class MySQLConnector:
         self.user = user
         self.password = password
         self.database = database
+        self.engine = "mysql"
         self.connection: Optional[RustDbConnection] = None
         self._facade = DbCoreFacade()
 
