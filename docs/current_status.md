@@ -286,16 +286,22 @@ still fails only because no macOS manual validation report is present under
 run exists for the current merged main HEAD. Rust Core baseline and stale
 handoff scans found no new repo-side implementation issue.
 
-GitHub #116 manual macOS workflow evidence was refreshed on 2026-06-27:
-manual `macOS App Validation` workflow_dispatch run `28264164795` passed for
-the then-current main HEAD `6ad09590bf14d678a568fd64ac74765fd1eff0c9`,
-including both `arm64` and `x86_64` jobs. The final gate reported
-`manual macOS signing/notarization workflow passed for arm64` and
-`manual macOS signing/notarization workflow passed for x86_64`. GitHub #116
-remains external because the final gate still fails only for missing real
-operator Mac validation report evidence under `build/`. If main advances after
-status-only commits, rerun the manual workflow before treating #116 evidence as
-current-head evidence.
+GitHub #167 is fixed as the #116 current-head workflow evidence handoff
+follow-up: `docs/current_status.md` no longer treats an exact manual macOS
+workflow run ID or SHA as durable current-head evidence. Exact current-head
+manual workflow evidence is tracked on GitHub #116 comments after status-only
+commits, and `scripts\check-macos-support-gate.py --final` is the authoritative
+check that the latest successful manual `macOS App Validation`
+`workflow_dispatch` run matches current `main`. GitHub #116 remains external
+because the final gate still fails only for missing real operator Mac validation
+report evidence under `build/`.
+
+GitHub #116 manual macOS workflow evidence was refreshed during this session:
+a manual `macOS App Validation` workflow_dispatch run passed for the
+then-current main HEAD, including both `arm64` and `x86_64` jobs. That evidence
+is historical in this document because status-only commits advance `main`;
+rerun the manual workflow after such commits and record the exact current-head
+run on #116.
 
 Post-#142 next issue analysis on 2026-06-27 found #116 is still the only open
 GitHub issue. The normal repository-side macOS support gate passes, but
@@ -342,7 +348,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before the latest status update |
-| `pytest -q` | PASS, 1871 passed, 5 warnings |
+| `pytest -q` | PASS, 1872 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -366,7 +372,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1871 passed, 5 warnings |
+| `pytest -q` | PASS, 1872 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -406,7 +412,7 @@ Commands run locally:
 | `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL, missing real-Mac report and current-HEAD manual workflow_dispatch evidence |
 | `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh` | PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_records_post_151_next_issue_analysis -q` | RED then PASS |
-| `pytest tests\test_current_status_docs.py -q` | PASS, 48 passed |
+| `pytest tests\test_current_status_docs.py -q` | PASS, 49 passed |
 | `python -m compileall -q src\core\i18n.py src\ui\dialogs\fix_wizard_dialog.py src\ui\workers\fix_wizard_worker.py tests\test_fix_wizard_dialog.py tests\test_current_status_docs.py` | PASS |
 | `git diff --check` | PASS |
 | `gh issue create --title "Unify SQL statement parsing across SQL Editor and execution paths" ...` | PASS, created #155 |
@@ -442,11 +448,13 @@ Commands run locally:
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_scheduled_backup_tuple_connection_issue -q` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_records_post_166_next_issue_reaudit -q` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_records_manual_macos_workflow_evidence -q` | RED then PASS |
+| `pytest tests\test_current_status_docs.py::test_current_status_tracks_non_self_stale_macos_workflow_evidence_policy -q` | RED then PASS |
 
 ## Verification Log
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Non-self-stale macOS workflow evidence policy | `gh issue create` created #167; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_non_self_stale_macos_workflow_evidence_policy -q` | PASS | GitHub #167 is fixed: current-status summary now treats exact current-head manual workflow run IDs/SHAs as non-durable after status-only commits and points to GitHub #116 comments plus `scripts\check-macos-support-gate.py --final` as authoritative current-head evidence |
 | 2026-06-27 | Manual macOS workflow evidence refresh | `gh workflow run "macOS App Validation" --ref main`; `gh run watch 28264164795 --interval 30 --exit-status`; `gh run view 28264164795 --json status,conclusion,headSha,event,workflowName,url,createdAt,updatedAt,jobs`; `python scripts\check-macos-support-gate.py --final`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_manual_macos_workflow_evidence -q` | EXPECTED FAIL for `--final` only | Manual `macOS App Validation` workflow_dispatch run `28264164795` passed for then-current main HEAD `6ad09590bf14d678a568fd64ac74765fd1eff0c9`, including arm64 and x86_64. Final gate accepted that workflow evidence for that HEAD and failed only because no real-Mac manual validation report was present under `build/`; rerun after status-only commits if main advances. |
 | 2026-06-27 | Post-#166 next issue re-audit | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_166_next_issue_reaudit -q`; `git status --short --branch`; `gh issue list --state open --limit 30`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; Rust Core baseline and stale handoff scans | EXPECTED FAIL for `--final` only | `main` was aligned with `origin/main`; #116 is the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for current merged main HEAD, so no new repo-side implementation issue was created. |
 | 2026-06-27 | Scheduled backup tuple connection info | RED/GREEN: `pytest tests\test_scheduler.py::TestBackupScheduler::test_backup_task_accepts_tuple_connection_info_for_rust_dump -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_scheduled_backup_tuple_connection_issue -q`; `gh issue create` created #166 | PASS | GitHub #166 is fixed: scheduled Rust dump backups now accept real `TunnelEngine.get_connection_info()` tuple output and resolve DB credentials outside the connection-info tuple before creating `RustDumpConfig` |
@@ -2144,15 +2152,18 @@ Next action:
 | TF-STATUS-068 | Medium | closed | Hidden Scheduler / Rust Core dump backup | Scheduled backup tuple connection info | Keep scheduled backup connection normalization aligned with real `TunnelEngine.get_connection_info()` tuple output |
 | TF-STATUS-069 | Low | closed | Status documentation / macOS release validation | Post-#166 next issue re-audit | Keep #116 external until real operator Mac validation evidence is attached |
 | TF-STATUS-070 | Low | closed | macOS release validation | Manual macOS workflow evidence refresh | Keep workflow_dispatch evidence refreshed before final real-Mac report finalization |
+| TF-STATUS-071 | Low | closed | Status documentation / macOS release validation | Non-self-stale macOS workflow evidence policy | Keep exact current-head workflow run IDs/SHAs on #116 comments and final gate output, not as durable current-status summary evidence |
 
 ## Recommended Execution Order
 
-1. No repo-side implementation issue is currently open after TF-STATUS-070 /
-   manual macOS workflow evidence refresh. `main` is aligned with
+1. No repo-side implementation issue is currently open after TF-STATUS-071 /
+   non-self-stale macOS workflow evidence policy. `main` is aligned with
    `origin/main`; #116 remains external and is the only open GitHub issue.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
-   operator Mac validation report evidence. Refresh current-head manual workflow
-   evidence after any status-only commit that advances `main`.
+   operator Mac validation report evidence. Do not hard-code exact current-head
+   workflow run IDs or SHAs as durable status summary evidence; use #116
+   comments and `scripts\check-macos-support-gate.py --final` for the latest
+   current-head manual workflow proof.
 3. Track additional One-Click automatic fix classes as separate GitHub issues
    before implementation.
 
@@ -2160,6 +2171,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-06-27 | Fixed TF-STATUS-071 / GitHub #167 by changing current-status macOS workflow evidence handoff to avoid self-stale exact current-head run IDs/SHAs in durable status summary text; #116 comments and the final gate remain authoritative for the latest current-head workflow proof. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #167 | RED/GREEN: non-self-stale macOS workflow policy current-status pytest |
 | 2026-06-27 | Triggered and verified manual `macOS App Validation` workflow_dispatch run `28264164795` for GitHub #116; both arm64 and x86_64 jobs passed for the then-current main HEAD, leaving only real-Mac manual validation report evidence before final closure. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116, GitHub Actions run 28264164795 | RED/GREEN: manual workflow current-status pytest; final gate expected-failing for missing real-Mac report only |
 | 2026-06-27 | Re-audited the next issue after #166 and confirmed `main` was aligned with `origin/main`; #116 is the only open GitHub issue, the normal repo-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#166 current-status pytest; final gate expected-failing for external evidence only |
 | 2026-06-27 | Fixed TF-STATUS-068 / GitHub #166 by normalizing real tuple-shaped scheduled backup connection info and resolving credentials before building `RustDumpConfig`. | `src/core/scheduler.py`, `tests/test_scheduler.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #166 | RED/GREEN: tuple connection backup pytest and current-status pytest; final: full `pytest -q` at 1869 passed |
