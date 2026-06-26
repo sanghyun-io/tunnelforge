@@ -323,10 +323,14 @@ _EN_TEXT_TRANSLATIONS = {
     "업데이트 확인": "Check for Updates",
     "업데이트를 확인하는 중입니다...": "Checking for updates...",
     "최신 버전": "latest version",
-    "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 dry-run으로 실행합니다.\n실제 변경은 수행하지 않으며 자동 SQL 수정은 아직 활성화되지 않았습니다.": (
+    "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 기본 dry-run으로 실행합니다.\n백업 확인 후 검증된 MyISAM/deprecated engine 테이블만 InnoDB로 자동 변경할 수 있습니다.": (
         "Run the Rust Core-backed One-Click preflight, analysis, recommendation, "
-        "and validation flow as a dry-run.\nNo real changes are performed and "
-        "automatic SQL fixes are not enabled yet."
+        "and validation flow as dry-run by default.\nAfter backup confirmation, "
+        "only verified MyISAM/deprecated engine tables can be changed to InnoDB."
+    ),
+    "기본값은 dry-run입니다. 해제하면 백업 확인 후 검증된 MyISAM/deprecated engine 테이블만 InnoDB로 변경할 수 있습니다.": (
+        "Dry-run is the default. If disabled, only verified MyISAM/deprecated "
+        "engine tables can be changed to InnoDB after backup confirmation."
     ),
     "업데이트 사용 가능": "Update Available",
     "연결 복사 - 새 연결 만들기": "Copy Connection - Create New Connection",

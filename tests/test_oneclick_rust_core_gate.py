@@ -58,7 +58,7 @@ def test_oneclick_worker_accepts_rust_core_connector_shape():
     worker._ensure_rust_core_connector()
 
 
-def test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens():
+def test_oneclick_worker_rejects_real_execution_without_backup_confirmation():
     connection = SimpleNamespace(
         facade=object(),
         connection_id="conn-1",
@@ -71,11 +71,31 @@ def test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens():
         backup_confirmed=True,
     )
 
-    with pytest.raises(RuntimeError, match="GitHub #138"):
+    worker.backup_confirmed = False
+    with pytest.raises(RuntimeError, match="backup"):
         worker._core_payload(connection)
 
 
-def test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens():
+def test_oneclick_worker_allows_limited_real_execution_with_backup_confirmation():
+    connection = SimpleNamespace(
+        facade=object(),
+        connection_id="conn-1",
+        endpoint=FakeEndpoint(),
+    )
+    worker = OneClickMigrationWorker(
+        connector=SimpleNamespace(connection=connection),
+        schema="app",
+        dry_run=False,
+        backup_confirmed=True,
+    )
+
+    payload = worker._core_payload(connection)
+
+    assert payload["dry_run"] is False
+    assert payload["backup_confirmed"] is True
+
+
+def test_oneclick_dialog_keeps_dry_run_default_but_allows_limited_real_execution():
     app = QApplication.instance() or QApplication([])
 
     dialog = OneClickMigrationDialog(
@@ -85,12 +105,12 @@ def test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens():
     )
 
     assert dialog.chk_dry_run.isChecked()
-    assert not dialog.chk_dry_run.isEnabled()
-    assert "GitHub #138" in dialog.chk_dry_run.toolTip()
+    assert dialog.chk_dry_run.isEnabled()
+    assert "InnoDB" in dialog.chk_dry_run.toolTip()
     dialog.close()
 
 
-def test_migration_analyzer_exposes_oneclick_as_dry_run_preview_only():
+def test_migration_analyzer_exposes_oneclick_with_limited_real_execution_copy():
     app = QApplication.instance() or QApplication([])
 
     dialog = migration_dialogs.MigrationAnalyzerDialog(
@@ -100,12 +120,11 @@ def test_migration_analyzer_exposes_oneclick_as_dry_run_preview_only():
 
     assert migration_dialogs.ONE_CLICK_MIGRATION_FEATURE_ENABLED is True
     assert not dialog.btn_oneclick.isHidden()
-    assert "Dry-run Preview" in dialog.btn_oneclick.text()
+    assert "One-Click Migration" in dialog.btn_oneclick.text()
     tooltip = dialog.btn_oneclick.toolTip()
     assert "dry-run" in tooltip.lower()
-    assert "실제 변경" in tooltip
-    assert "자동 수행" not in tooltip
-    assert "자동 수정 → 검증" not in tooltip
+    assert "InnoDB" in tooltip
+    assert "백업" in tooltip
     dialog.close()
 
 

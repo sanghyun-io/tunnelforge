@@ -159,13 +159,13 @@ def test_oneclick_real_execution_evidence_requires_before_after_engine_proof(tmp
         validator.validate_report(report)
 
 
-def test_oneclick_real_execution_evidence_requires_app_real_execution_disabled(tmp_path):
+def test_oneclick_real_execution_evidence_requires_boolean_real_execution_flag(tmp_path):
     validator = _load_validator()
     evidence = _valid_evidence()
-    evidence["feature_flags"]["oneclick_real_execution_enabled"] = True
+    evidence["feature_flags"]["oneclick_real_execution_enabled"] = "yes"
     report = _write_report(tmp_path, evidence)
 
-    with pytest.raises(validator.EvidenceError, match="oneclick_real_execution_enabled"):
+    with pytest.raises(validator.EvidenceError, match="boolean"):
         validator.validate_report(report)
 
 

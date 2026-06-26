@@ -44,11 +44,6 @@ def _require_bool(value: Any, label: str) -> None:
         raise EvidenceError(f"{label} must be true")
 
 
-def _require_false(value: Any, label: str) -> None:
-    if value is not False:
-        raise EvidenceError(f"{label} must be false")
-
-
 def _require_int_at_least(value: Any, label: str, minimum: int) -> int:
     try:
         number = int(value)
@@ -79,10 +74,11 @@ def validate_report(report_path: Path | str) -> Dict[str, Any]:
 
     flags = _require_mapping(report.get("feature_flags"), "feature_flags")
     _require_bool(flags.get("oneclick_ui_enabled"), "feature_flags.oneclick_ui_enabled")
-    _require_false(
+    if "oneclick_real_execution_enabled" in flags and not isinstance(
         flags.get("oneclick_real_execution_enabled"),
-        "feature_flags.oneclick_real_execution_enabled",
-    )
+        bool,
+    ):
+        raise EvidenceError("feature_flags.oneclick_real_execution_enabled must be boolean")
 
     hello = _require_mapping(report.get("service_hello"), "service_hello")
     capabilities = {str(item) for item in hello.get("capabilities") or []}

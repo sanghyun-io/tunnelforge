@@ -89,6 +89,18 @@ def test_oneclick_dry_run_evidence_accepts_complete_report(tmp_path):
     assert summary == {"issue": 137, "phase_events": 5, "progress_events": 6}
 
 
+def test_oneclick_dry_run_evidence_allows_current_limited_real_execution_flag(tmp_path):
+    validator = _load_validator()
+    evidence = _valid_evidence()
+    evidence["feature_flags"]["oneclick_real_execution_enabled"] = True
+    report = tmp_path / "oneclick-evidence.json"
+    report.write_text(json.dumps(evidence), encoding="utf-8")
+
+    summary = validator.validate_report(report)
+
+    assert summary["issue"] == 137
+
+
 def test_oneclick_dry_run_evidence_rejects_real_execution(tmp_path):
     validator = _load_validator()
     evidence = _valid_evidence()

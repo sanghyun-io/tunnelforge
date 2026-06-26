@@ -7,16 +7,17 @@ This directory stores machine-checkable One-Click readiness evidence.
 - `oneclick-dry-run-evidence.json` was captured from a local MySQL container
   using Rust Core `oneclick.run` with `dry_run=true`.
 - The report proves that Rust Core advertises the `oneclick.*` command surface,
-  the PyQt entry point is exposed only as a dry-run preview, real One-Click
-  execution remains disabled, and the dry-run workflow emitted preflight,
+  the PyQt entry point is exposed, and the dry-run workflow emitted preflight,
   analysis, recommendation, execution, validation, and final result events.
 - `oneclick-real-execution-evidence.json` was captured from a local MySQL
   container using Rust Core `oneclick.apply_fixes` with `dry_run=false` against
   `tf_oneclick_real_execution.tf_oneclick_legacy_engine_table`.
 - The real-execution report proves the first allowed automatic fix,
   `deprecated_engine -> engine_innodb`, changed that local test table from
-  `MyISAM` to `InnoDB` while the app-level real-execution feature flag remained
-  disabled.
+  `MyISAM` to `InnoDB`. It was captured while the app-level real-execution
+  feature flag remained disabled; the UI gate was opened only after this
+  evidence and the UI-facing `oneclick.run dry_run=false` sequencing were
+  proven.
 - `oneclick-real-execution-evidence.template.json` documents the required
   GitHub #138 evidence shape for a future controlled local non-dry-run
   `deprecated_engine -> engine_innodb` run. It is a template only, not

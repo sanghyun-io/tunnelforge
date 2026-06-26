@@ -184,8 +184,8 @@ class MigrationAnalyzerDialog(QDialog):
         self.btn_analyze.clicked.connect(self.start_analysis)
         btn_layout.addWidget(self.btn_analyze)
 
-        # One-Click dry-run preview button
-        self.btn_oneclick = QPushButton("🚀 One-Click Dry-run Preview")
+        # One-Click migration button
+        self.btn_oneclick = QPushButton("🚀 One-Click Migration")
         self.btn_oneclick.setStyleSheet("""
             QPushButton {
                 background-color: #27ae60; color: white; font-weight: bold;
@@ -196,8 +196,8 @@ class MigrationAnalyzerDialog(QDialog):
             QPushButton:disabled { background-color: #bdc3c7; }
         """)
         self.btn_oneclick.setToolTip(
-            "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 dry-run으로 실행합니다.\n"
-            "실제 변경은 수행하지 않으며 자동 SQL 수정은 아직 활성화되지 않았습니다."
+            "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 기본 dry-run으로 실행합니다.\n"
+            "백업 확인 후 검증된 MyISAM/deprecated engine 테이블만 InnoDB로 자동 변경할 수 있습니다."
         )
         self.btn_oneclick.clicked.connect(self.start_oneclick_migration)
         self.btn_oneclick.setVisible(ONE_CLICK_MIGRATION_FEATURE_ENABLED)

@@ -59,8 +59,9 @@ Python/PyQt responsible for UI, orchestration, signals, and dialogs.
 
 Open GitHub issue #116 remains external: its remaining unchecked criterion is
 real operator Mac validation evidence. GitHub issue #137 covered the One-Click
-dry-run preview gate; GitHub issue #138 now tracks the remaining
-real-execution and automatic-fix gate.
+dry-run preview gate; GitHub issue #138 covers the now-validated limited
+real-execution and automatic-fix gate for
+`deprecated_engine -> engine_innodb`.
 
 ## Verified On 2026-06-26
 
@@ -80,7 +81,7 @@ Commands run locally:
 | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 47 passed |
-| `tunnelforge-core service.hello` | PASS, advertises `oneclick.*` commands; PyQt exposes a dry-run-only One-Click preview |
+| `tunnelforge-core service.hello` | PASS, advertises `oneclick.*` commands; PyQt exposes One-Click with Dry-run default and limited backup-gated `engine_innodb` real execution |
 
 Version references are aligned at `2.1.6` across:
 
@@ -112,6 +113,8 @@ Version references are aligned at `2.1.6` across:
 | 2026-06-26 | One-Click real-execution evidence capture | `pytest tests\test_db_core_service.py::test_facade_uses_oneclick_apply_fixes_protocol -q` RED/GREEN; `pytest tests\test_oneclick_real_execution_capture.py -q` RED/GREEN; `cargo build --manifest-path migration_core\Cargo.toml --release`; `python scripts\capture-oneclick-real-execution-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-real-execution-evidence.json`; `pytest tests\test_oneclick_real_execution_capture.py tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_rust_core_gate.py tests\test_db_core_service.py -q`; `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python -m compileall -q src\core\db_core_service.py scripts\capture-oneclick-real-execution-evidence.py tests\test_oneclick_real_execution_capture.py tests\test_db_core_service.py`; `git diff --check` | PASS | Local MySQL evidence captured: Rust Core `oneclick.apply_fixes` converted `tf_oneclick_real_execution.tf_oneclick_legacy_engine_table` from `MyISAM` to `InnoDB` while app real execution stayed disabled |
 | 2026-06-26 | One-Click deprecated engine live discovery | `cargo test --manifest-path migration_core\Cargo.toml oneclick_issues_classify_deprecated_engine_marker_as_auto_fixable --lib` RED/GREEN; `cargo test --manifest-path migration_core\Cargo.toml mysql_deprecated_engine_sql_targets_table_engines --lib` RED/GREEN; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `cargo test --manifest-path migration_core\Cargo.toml`; `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json`; `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` | PASS | MySQL inspection can now emit deprecated-engine markers for MyISAM tables and One-Click converts those markers into typed `deprecated_engine` auto-fix candidates |
 | 2026-06-26 | One-Click run orchestration for engine_innodb | `TF_MYSQL_HOST=127.0.0.1; TF_MYSQL_PORT=3406; TF_MYSQL_USER=root; TF_MYSQL_PASSWORD=test; TF_MYSQL_DATABASE=tf_oneclick_real_execution; cargo test --manifest-path migration_core\Cargo.toml oneclick_run_live_engine_innodb_when_env_is_configured --test live_roundtrip -- --nocapture` RED/GREEN | PASS | UI-facing Rust Core `oneclick.run dry_run=false` now sequences the validated `engine_innodb` apply path and converts a live MyISAM table to InnoDB |
+| 2026-06-26 | One-Click limited real-execution PyQt gate | `pytest tests\test_oneclick_rust_core_gate.py -q` RED then GREEN; `pytest tests\test_oneclick_rust_core_gate.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_real_execution_capture.py tests\test_db_core_service.py -q`; `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json` | PASS | PyQt keeps Dry-run default, allows limited backup-confirmed real execution, and rejects non-dry-run without backup confirmation |
+| 2026-06-26 | One-Click #138 closure gate | `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `TF_MYSQL_HOST=127.0.0.1; TF_MYSQL_PORT=3406; TF_MYSQL_USER=root; TF_MYSQL_PASSWORD=test; TF_MYSQL_DATABASE=tf_oneclick_real_execution; cargo test --manifest-path migration_core\Cargo.toml oneclick_run_live_engine_innodb_when_env_is_configured --test live_roundtrip -- --nocapture`; `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py src\ui\dialogs\migration_dialogs.py src\core\i18n.py scripts\validate-oneclick-dry-run-evidence.py scripts\validate-oneclick-real-execution-evidence.py tests\test_oneclick_rust_core_gate.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_real_execution_evidence.py`; `git diff --check` | PASS | #138 acceptance is satisfied for the exact `deprecated_engine -> engine_innodb` automatic scope |
 | 2026-06-26 | Full Python suite | `pytest -q` | PASS | 1707 passed, 3 warnings |
 | 2026-06-26 | Rust core tests | `cargo test --manifest-path migration_core\Cargo.toml` | PASS | Unit, CLI, and gated live tests pass or skip according to env |
 | 2026-06-26 | Rust release build | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS | Produced `migration_core\target\release\tunnelforge-core.exe` |
@@ -804,20 +807,20 @@ Closure evidence:
 
 ### TF-STATUS-020: One-Click Real Execution / Automatic Fix Coverage
 
-Status: `open`
+Status: `closed`
 Severity: High
 Area: One-Click migration UI / Rust Core automatic fixes
 
 Evidence:
 
-- GitHub #138 tracks the remaining scope after #137: define, implement, and
+- GitHub #138 tracked the remaining scope after #137: define, implement, and
   prove the automatic fix classes before real One-Click execution is enabled.
 - Current Rust Core recommendation behavior marks `deprecated_engine` payload
   issues with `table_name` as automatic candidates using `engine_innodb`
   recommendation metadata. `oneclick.apply_fixes` can execute only those
   planned `engine_innodb` actions through Rust Core `MigrationAdapter`; other
   issue classes remain manual/skipped or blocked as disallowed.
-- `scripts\validate-oneclick-real-execution-evidence.py` now defines the
+- `scripts\validate-oneclick-real-execution-evidence.py` defines the
   machine-checkable #138 evidence contract for a controlled local
   `deprecated_engine -> engine_innodb` non-dry-run proof. It requires a safe
   `tf_oneclick_` schema, app real execution still disabled, all `oneclick.*`
@@ -833,31 +836,44 @@ Evidence:
 - MySQL live inspection now emits deprecated-engine markers for MyISAM base
   tables, and One-Click converts those markers into typed
   `deprecated_engine` issues that can be recommended as `engine_innodb`.
-- The UI-facing Rust command `oneclick.run dry_run=false` now sequences the
-  validated `engine_innodb` apply path. App real execution remains disabled
-  until the PyQt dry-run lock and user-facing safety gate are updated and
-  tested.
-- `src\ui\dialogs\oneclick_migration_dialog.py` keeps
-  `ONECLICK_REAL_EXECUTION_ENABLED = False`, so non-dry-run payloads fail
-  closed.
+- The UI-facing Rust command `oneclick.run dry_run=false` sequences the
+  validated `engine_innodb` apply path.
+- `src\ui\dialogs\oneclick_migration_dialog.py` now keeps
+  `ONECLICK_REAL_EXECUTION_ENABLED = True`, leaves Dry-run checked by default,
+  and fails closed when a non-dry-run payload lacks backup confirmation.
+- `src\ui\dialogs\migration_dialogs.py` now exposes `One-Click Migration` with
+  user-facing copy that says Dry-run is the default and the only automatic
+  non-dry-run scope is verified MyISAM/deprecated engine tables becoming
+  `InnoDB` after backup confirmation.
 
-Follow-up GitHub issue:
+GitHub issue:
 
 - https://github.com/sanghyun-io/tunnelforge/issues/138
 
 Impact:
 
-- The preview is usable for dry-run inspection, but users cannot run automatic
-  One-Click remediation.
-- Any future real-execution enablement needs non-production before/after
-  evidence proving only allowed fixes were applied.
+- Users can run dry-run inspection by default.
+- Users can opt into non-dry-run only after backup confirmation, and Rust Core
+  applies only the validated `deprecated_engine -> engine_innodb` strategy.
+- Automatic remediation for every other issue class remains out of scope and
+  must be tracked separately.
+
+Closure evidence:
+
+1. Rust Core contract tests, local MySQL before/after evidence, and the
+   machine-checkable real-execution validator all pass for
+   `deprecated_engine -> engine_innodb`.
+2. PyQt tests prove the dialog keeps Dry-run default, allows limited
+   non-dry-run with backup confirmation, and rejects non-dry-run without backup
+   confirmation.
+3. Docs and user-facing copy document the exact automatic/manual split.
 
 Next action:
 
-1. Work GitHub #138: update/test the PyQt dry-run lock and user-facing copy for
-   the now-validated `engine_innodb` real-execution path. Keep
-   `ONECLICK_REAL_EXECUTION_ENABLED = False` until the UI safety gate is changed
-   and documented in the same commit.
+1. Create separate issues for any additional automatic fix class before
+   enabling it.
+2. Keep production database usage out of One-Click real execution until there
+   is explicit production-readiness evidence.
 
 ## Issue Tracker
 
@@ -882,13 +898,14 @@ Next action:
 | TF-STATUS-017 | High | closed | Rust Core migration performance evidence | 1M/10M evidence archived and validated | Refresh if migration/verify streaming semantics change |
 | TF-STATUS-018 | High | closed | Rust Core live migration / UI evidence | Bidirectional 1M live UI evidence captured | Refresh final validator evidence if migration/RSS semantics change |
 | TF-STATUS-019 | Medium | closed | One-Click migration UI | Dry-run preview One-Click entry point | Keep preview evidence aligned if event payloads change |
-| TF-STATUS-020 | High | open | One-Click migration UI / Rust Core automatic fixes | Real execution and automatic fix coverage | Work GitHub #138; update/test PyQt real-execution safety gate before enabling app execution |
+| TF-STATUS-020 | High | closed | One-Click migration UI / Rust Core automatic fixes | Real execution and automatic fix coverage | Track any additional automatic fix class as a separate issue |
 
 ## Recommended Execution Order
 
-1. Work TF-STATUS-020 / GitHub #138 because it is actionable in-repo.
-2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
+1. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence.
+2. Track additional One-Click automatic fix classes as separate GitHub issues
+   before implementation.
 
 ## Session Log
 
@@ -940,3 +957,4 @@ Next action:
 | 2026-06-26 | Added and ran the controlled local real-execution evidence capture for #138. The archived evidence proves Rust Core `oneclick.apply_fixes` changed the test table from `MyISAM` to `InnoDB`; the PyQt real-execution flag remains disabled because `oneclick.run` still needs UI-facing automatic-fix orchestration. | `src/core/db_core_service.py`, `scripts/capture-oneclick-real-execution-evidence.py`, `tests/test_db_core_service.py`, `tests/test_oneclick_real_execution_capture.py`, `reports/oneclick_readiness/oneclick-real-execution-evidence.json`, `reports/oneclick_readiness/README.md`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_db_core_service.py::test_facade_uses_oneclick_apply_fixes_protocol -q`; RED/GREEN: `pytest tests\test_oneclick_real_execution_capture.py -q`; capture: `cargo build --manifest-path migration_core\Cargo.toml --release`; `python scripts\capture-oneclick-real-execution-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-real-execution-evidence.json`; final: `pytest tests\test_oneclick_real_execution_capture.py tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_rust_core_gate.py tests\test_db_core_service.py -q`; `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json`; `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python -m compileall -q src\core\db_core_service.py scripts\capture-oneclick-real-execution-evidence.py tests\test_oneclick_real_execution_capture.py tests\test_db_core_service.py`; `git diff --check` |
 | 2026-06-26 | Added live MySQL discovery for deprecated engine One-Click candidates. Rust Core now marks MyISAM base tables during inspection and converts those markers into typed `deprecated_engine` issues for `engine_innodb` recommendations. | `migration_core/src/lib.rs`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick_issues_classify_deprecated_engine_marker_as_auto_fixable --lib`; RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml mysql_deprecated_engine_sql_targets_table_engines --lib`; final: `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `cargo test --manifest-path migration_core\Cargo.toml`; `python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json`; `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Connected `oneclick.run dry_run=false` to the validated `engine_innodb` apply path. The live MySQL regression creates a MyISAM table, runs the UI-facing Rust command, and verifies the table becomes InnoDB. | `migration_core/src/lib.rs`, `migration_core/tests/live_roundtrip.rs`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `TF_MYSQL_HOST=127.0.0.1; TF_MYSQL_PORT=3406; TF_MYSQL_USER=root; TF_MYSQL_PASSWORD=test; TF_MYSQL_DATABASE=tf_oneclick_real_execution; cargo test --manifest-path migration_core\Cargo.toml oneclick_run_live_engine_innodb_when_env_is_configured --test live_roundtrip -- --nocapture` |
+| 2026-06-26 | Opened the PyQt One-Click real-execution gate only for the validated `deprecated_engine -> engine_innodb` scope, kept Dry-run as the default, required backup confirmation for non-dry-run payloads, updated evidence validators/docs/status, and prepared GitHub #138 for closure. | `src/ui/dialogs/oneclick_migration_dialog.py`, `src/ui/dialogs/migration_dialogs.py`, `src/core/i18n.py`, `scripts/validate-oneclick-dry-run-evidence.py`, `scripts/validate-oneclick-real-execution-evidence.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_oneclick_dry_run_evidence.py`, `tests/test_oneclick_real_execution_evidence.py`, `docs/oneclick_readiness.md`, `docs/current_status.md`, `reports/oneclick_readiness/README.md` | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py -q`; final: `pytest tests\test_oneclick_rust_core_gate.py tests\test_oneclick_dry_run_evidence.py tests\test_oneclick_real_execution_evidence.py tests\test_oneclick_real_execution_capture.py tests\test_db_core_service.py -q`; `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; live: `cargo test --manifest-path migration_core\Cargo.toml oneclick_run_live_engine_innodb_when_env_is_configured --test live_roundtrip -- --nocapture`; evidence gate: `$env:RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE='1'; $env:RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `python -m compileall -q ...`; `git diff --check` |

@@ -33,7 +33,7 @@ STYLE_WARNING = "color: #f39c12; font-weight: bold;"
 STYLE_INFO = "color: #3498db;"
 STYLE_MUTED = "color: #7f8c8d;"
 
-ONECLICK_REAL_EXECUTION_ENABLED = False
+ONECLICK_REAL_EXECUTION_ENABLED = True
 
 
 class OneClickMigrationWorker(QThread):
@@ -228,11 +228,10 @@ class OneClickMigrationWorker(QThread):
         return connection
 
     def _core_payload(self, connection) -> dict:
-        if not self.dry_run and not ONECLICK_REAL_EXECUTION_ENABLED:
+        if not self.dry_run and not self.backup_confirmed:
             raise RuntimeError(
-                "One-Click migration real execution is disabled until the "
-                "automatic-fix coverage gate in GitHub #138 is complete. "
-                "Keep Dry-run enabled."
+                "One-Click real execution requires backup confirmation. "
+                "Enable Dry-run unless a current backup has been completed."
             )
         return {
             "connection": connection.endpoint.to_payload(),
@@ -777,7 +776,10 @@ class OneClickMigrationDialog(QDialog):
         options_layout = QHBoxLayout()
 
         self.chk_dry_run = QCheckBox("Dry-run (실제 실행하지 않음)")
-        self.chk_dry_run.setToolTip("체크하면 실제 SQL을 실행하지 않고 시뮬레이션만 합니다.")
+        self.chk_dry_run.setToolTip(
+            "기본값은 dry-run입니다. 해제하면 백업 확인 후 검증된 MyISAM/deprecated engine "
+            "테이블만 InnoDB로 변경할 수 있습니다."
+        )
         self.chk_dry_run.setChecked(True)
         if not ONECLICK_REAL_EXECUTION_ENABLED:
             self.chk_dry_run.setEnabled(False)
