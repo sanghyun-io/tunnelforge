@@ -75,7 +75,9 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1786 passed" not in doc
     assert "PASS, 1793 passed, 5 warnings" not in doc
     assert "PASS, 1794 passed, 5 warnings" not in doc
-    assert "PASS, 1795 passed, 5 warnings" in doc
+    assert "PASS, 1795 passed, 5 warnings" not in doc
+    assert "PASS, 1796 passed, 5 warnings" not in doc
+    assert "PASS, 1799 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -105,6 +107,17 @@ def test_current_status_records_current_main_next_issue_reaudit():
     assert "Current main next-issue re-audit" in doc
     assert "GitHub #116 is the only open issue" in summary
     assert "no new repo-side Rust Core baseline violation" in summary
+
+
+def test_current_status_records_rust_core_export_import_menu_wording():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+
+    assert "TF-STATUS-034" in doc
+    assert "Rust Core Export/Import menu wording" in doc
+    assert "Rust DB Core Export" in doc
+    assert "Rust DB Core Import" in doc
+    assert "Shell Export" not in doc
+    assert "Shell Import" not in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():

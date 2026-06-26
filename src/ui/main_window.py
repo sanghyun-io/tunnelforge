@@ -419,11 +419,11 @@ class TunnelManagerUI(QMainWindow):
 
     def _on_tree_export(self, tunnel):
         """트리에서 Export 요청"""
-        self._context_shell_export(tunnel)
+        self._context_rust_core_export(tunnel)
 
     def _on_tree_import(self, tunnel):
         """트리에서 Import 요청"""
-        self._context_shell_import(tunnel)
+        self._context_rust_core_import(tunnel)
 
     def _on_tree_test_connection(self, tunnel):
         """트리에서 연결 테스트 요청"""
@@ -1195,9 +1195,9 @@ class TunnelManagerUI(QMainWindow):
 
         menu.addSeparator()
 
-        # Shell Export/Import
-        menu.addAction("🚀 Shell Export", lambda: self._context_shell_export(tunnel))
-        menu.addAction("📥 Shell Import", lambda: self._context_shell_import(tunnel))
+        # Rust DB Core Export/Import
+        menu.addAction("🚀 Rust DB Core Export", lambda: self._context_rust_core_export(tunnel))
+        menu.addAction("📥 Rust DB Core Import", lambda: self._context_rust_core_import(tunnel))
         menu.addAction("🔍 고아 레코드 분석", lambda: self._context_orphan_check(tunnel))
 
         menu.addSeparator()
@@ -1259,8 +1259,8 @@ class TunnelManagerUI(QMainWindow):
         dialog = SQLExecutionDialog(self, tunnel, self.config_mgr, self.engine)
         dialog.exec()
 
-    def _context_shell_export(self, tunnel):
-        """특정 터널용 Shell Export - 인증정보 자동 사용"""
+    def _context_rust_core_export(self, tunnel):
+        """특정 터널용 Rust DB Core Export - 인증정보 자동 사용"""
         # 자격 증명 확인
         user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
         if not user:
@@ -1287,8 +1287,8 @@ class TunnelManagerUI(QMainWindow):
         )
         wizard.start_export()
 
-    def _context_shell_import(self, tunnel):
-        """특정 터널용 Shell Import - 인증정보 자동 사용"""
+    def _context_rust_core_import(self, tunnel):
+        """특정 터널용 Rust DB Core Import - 인증정보 자동 사용"""
         # 자격 증명 확인
         user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
         if not user:
