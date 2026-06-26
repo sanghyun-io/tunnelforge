@@ -647,6 +647,9 @@ Evidence:
   responsiveness during a live 1M migration run.
 - Cross-engine worker/dialog tests cover progress, checkpoint, resume, and
   worker signal plumbing, but they do not run a live 1M row UI workflow.
+- 2026-06-26 update: `scripts\validate-live-ui-migration-evidence.py` and
+  `reports\live_ui_migration\live-ui-migration-evidence.template.json` now
+  define the machine-checkable final evidence shape for #136.
 - GitHub issue #136 now tracks this remaining #99 closure evidence.
 - Parent GitHub epic: https://github.com/sanghyun-io/tunnelforge/issues/99
 - Follow-up GitHub issue:
@@ -660,7 +663,9 @@ Impact:
 Next action:
 
 1. Capture durable live MySQL/PostgreSQL bidirectional 1M migration+verify
-   evidence with UI responsiveness proof.
+   evidence with UI responsiveness proof, save it as
+   `reports\live_ui_migration\live-ui-migration-evidence.json`, and run the
+   live UI evidence validator.
 
 ## Issue Tracker
 
@@ -720,3 +725,4 @@ Next action:
 | 2026-06-26 | Analyzed GitHub #99 and created #135 for the remaining Rust Core 1M/10M performance evidence durability gap. | `docs/current_status.md` | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `git status --ignored --short migration_core\target\perf_*.jsonl`; `gh issue create` |
 | 2026-06-26 | Archived Rust Core 1M/10M performance evidence under `reports\rust_core_performance`, added a validator, and wired the optional performance regression gate to the archived evidence for GitHub #135/#99. | `reports/rust_core_performance`, `scripts/validate-rust-core-performance-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_rust_core_performance_evidence.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_performance_evidence.py -q`; final: `python scripts\validate-rust-core-performance-evidence.py`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
 | 2026-06-26 | Audited GitHub #99 closure criteria after #135 and created #136 for the remaining live bidirectional 1M UI responsiveness evidence. | `migration_core/src/lib.rs`, `docs/current_status.md` | `cargo test --manifest-path migration_core\Cargo.toml`; focused Python Rust Core/UI plumbing tests; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `RUST_CORE_REQUIRE_PERF_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `rg` direct DB driver scan |
+| 2026-06-26 | Added a machine-checkable #136 live UI migration evidence validator and JSON template so future real 1M bidirectional runs can be accepted or rejected consistently. | `scripts/validate-live-ui-migration-evidence.py`, `tests/test_live_ui_migration_evidence.py`, `reports/live_ui_migration`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_live_ui_migration_evidence.py -q`; final: `python -m compileall -q scripts tests`; `git diff --check` |
