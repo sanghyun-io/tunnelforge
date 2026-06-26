@@ -57,6 +57,7 @@ def test_macos_support_plan_documents_scope_and_validation_gates():
     assert "pre-check" in doc
     assert "Git SHA" in doc
     assert "current PR head before merge, or the current merged main HEAD after PR #117 has merged" in doc
+    assert "manual workflow_dispatch artifact run follows the same head policy" in doc
     assert "macOS version" in doc
     assert "Mac architecture" in doc
     assert "Artifact workflow run" in doc

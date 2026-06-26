@@ -64,7 +64,8 @@ def test_current_status_does_not_keep_stale_macos_focused_test_count():
 
     assert "PASS, 47 passed" not in doc
     assert "PASS, 51 passed" not in baseline
-    assert "PASS, 52 passed" in baseline
+    assert "PASS, 52 passed" not in baseline
+    assert "PASS, 53 passed" in baseline
     assert "Current main macOS focused tests" in doc
 
 
@@ -81,7 +82,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1801 passed, 5 warnings" not in doc
     assert "1801 passed, 5 warnings" not in doc
     assert "PASS, 1803 passed, 5 warnings" not in doc
-    assert "PASS, 1805 passed, 5 warnings" in doc
+    assert "PASS, 1805 passed, 5 warnings" not in doc
+    assert "PASS, 1807 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -149,6 +151,15 @@ def test_current_status_records_build_doc_installer_version_cleanup():
     assert "BUILD installer version examples" in doc
     assert "TunnelForge-Setup-{version}.exe" in doc
     assert "TunnelForge-Setup-1.0.0.exe" not in doc
+
+
+def test_current_status_records_macos_manual_workflow_head_policy():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+
+    assert "TF-STATUS-038" in doc
+    assert "macOS manual workflow head policy" in doc
+    assert "manual workflow_dispatch artifact run now follows the same head policy" in normalized_doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():

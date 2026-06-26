@@ -440,7 +440,10 @@ def check_pr(repo: str, skip_checks: bool) -> bool:
 
 
 def check_manual_macos_validation_workflow(repo: str) -> tuple[bool, str | None, str | None]:
-    head_sha = pr_head_sha(repo)
+    head_sha, head_label = expected_pr_or_local_head_sha(repo, "manual macOS workflow")
+    if not head_sha:
+        return False, None, None
+
     runs = gh_json(
         [
             "run",
@@ -468,7 +471,7 @@ def check_manual_macos_validation_workflow(repo: str) -> tuple[bool, str | None,
     if not matching_runs:
         fail(
             f"no successful manual {MANUAL_MACOS_WORKFLOW} {MANUAL_MACOS_WORKFLOW_EVENT} "
-            f"run found for PR head {head_sha}"
+            f"run found for {head_label} {head_sha}"
         )
         return False, None, None
 
@@ -527,22 +530,7 @@ def check_manual_macos_validation_workflow(repo: str) -> tuple[bool, str | None,
     return passed, run_id, run_head_sha
 
 
-def pr_head_sha(repo: str) -> str:
-    pr = gh_json(
-        [
-            "pr",
-            "view",
-            str(PR_NUMBER),
-            "--repo",
-            repo,
-            "--json",
-            "headRefOid",
-        ]
-    )
-    return pr["headRefOid"]
-
-
-def expected_final_report_sha(repo: str) -> tuple[str | None, str]:
+def expected_pr_or_local_head_sha(repo: str, purpose: str) -> tuple[str | None, str]:
     pr = gh_json(
         [
             "pr",
@@ -557,11 +545,15 @@ def expected_final_report_sha(repo: str) -> tuple[str | None, str]:
     if pr.get("state") == "MERGED":
         head_sha = local_head_sha()
         if head_sha:
-            ok(f"using local HEAD for final report Git SHA after PR #{PR_NUMBER} merge")
+            ok(f"using local HEAD for {purpose} after PR #{PR_NUMBER} merge")
             return head_sha, "current merged main HEAD"
-        fail("could not resolve local HEAD SHA for merged PR final report")
+        fail(f"could not resolve local HEAD SHA for merged PR {purpose}")
         return None, "current merged main HEAD"
     return pr["headRefOid"], "PR head"
+
+
+def expected_final_report_sha(repo: str) -> tuple[str | None, str]:
+    return expected_pr_or_local_head_sha(repo, "final report Git SHA")
 
 
 def parse_args() -> argparse.Namespace:

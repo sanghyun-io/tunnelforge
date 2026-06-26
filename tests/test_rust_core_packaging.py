@@ -1539,6 +1539,68 @@ def test_macos_support_gate_uses_local_head_for_final_report_after_pr_merge(monk
     assert "using local HEAD for final report Git SHA after PR #117 merge" in capsys.readouterr().out
 
 
+def test_macos_support_gate_uses_local_head_for_manual_workflow_after_pr_merge(monkeypatch, capsys):
+    gate = load_macos_support_gate_module()
+    commands = []
+
+    def fake_gh_json(command):
+        commands.append(command)
+        if command[:3] == ["pr", "view", "117"]:
+            return {"state": "MERGED", "headRefOid": "old-pr-head"}
+        if command[:3] == ["run", "list", "--repo"]:
+            return [
+                {
+                    "databaseId": 101,
+                    "headSha": "current-main-head",
+                    "status": "completed",
+                    "conclusion": "success",
+                    "url": "https://example.test/runs/101",
+                }
+            ]
+        if command[:3] == ["run", "view", "101"]:
+            return {
+                "url": "https://example.test/runs/101",
+                "jobs": [
+                    {
+                        "name": "Validate macOS App (arm64)",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "steps": [
+                            {
+                                "name": "Verify signed and notarized artifacts",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ],
+                    },
+                    {
+                        "name": "Validate macOS App (x86_64)",
+                        "status": "completed",
+                        "conclusion": "success",
+                        "steps": [
+                            {
+                                "name": "Verify signed and notarized artifacts",
+                                "status": "completed",
+                                "conclusion": "success",
+                            }
+                        ],
+                    },
+                ],
+            }
+        raise AssertionError(f"unexpected gh_json command: {command}")
+
+    monkeypatch.setattr(gate, "gh_json", fake_gh_json)
+    monkeypatch.setattr(gate, "local_head_sha", lambda: "current-main-head")
+
+    passed, run_id, run_head_sha = gate.check_manual_macos_validation_workflow("sanghyun-io/tunnelforge")
+
+    assert passed is True
+    assert run_id == "101"
+    assert run_head_sha == "current-main-head"
+    assert "using local HEAD for manual macOS workflow after PR #117 merge" in capsys.readouterr().out
+    assert any(command[:3] == ["run", "list", "--repo"] for command in commands)
+
+
 def test_macos_support_gate_script_accepts_local_final_report(tmp_path):
     if shutil.which("bash") is None:
         pytest.skip("bash is required for shell script validation")
