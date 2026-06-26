@@ -286,17 +286,10 @@ class MySQLConnector:
 
     def execute_many(self, query: str, data: List[tuple]) -> int:
         """배치 쿼리 실행"""
-        if not self.connection:
-            return 0
-
-        try:
-            with self.connection.cursor() as cursor:
-                cursor.executemany(query, data)
-                self.connection.commit()
-                return cursor.rowcount
-        except Exception as e:
-            logger.error(f"배치 쿼리 오류: {e}")
-            return 0
+        raise RuntimeError(
+            "Legacy Python execute_many mutation helper is disabled. "
+            "DB mutations must be owned by Rust Core."
+        )
 
     def get_db_version(self) -> Tuple[int, int, int]:
         """DB 버전 반환 (major, minor, patch)

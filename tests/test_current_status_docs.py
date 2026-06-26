@@ -92,7 +92,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1816 passed, 5 warnings" not in doc
     assert "PASS, 1820 passed, 5 warnings" not in doc
     assert "PASS, 1822 passed, 5 warnings" not in doc
-    assert "PASS, 1823 passed, 5 warnings" in doc
+    assert "PASS, 1823 passed, 5 warnings" not in doc
+    assert "PASS, 1825 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -245,6 +246,19 @@ def test_current_status_tracks_legacy_cleanup_worker_issue():
     assert "CleanupWorker(..., dry_run=False)" in doc
     assert "GitHub #145 is fixed" in summary
     assert "Dry-run cleanup worker construction remains available" in doc
+
+
+def test_current_status_tracks_legacy_execute_many_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-044" in doc
+    assert "GitHub #146" in doc
+    assert "legacy MySQLConnector execute_many mutation helper" in normalized_doc
+    assert "MySQLConnector.execute_many" in doc
+    assert "GitHub #146 is fixed" in summary
+    assert "read/query helper behavior is unchanged" in doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():

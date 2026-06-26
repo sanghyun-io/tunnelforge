@@ -311,6 +311,20 @@ class TestMySQLConnector:
         result = self.connector.execute("INVALID SQL")
         assert result == []
 
+    def test_execute_many_rejects_legacy_python_mutation_helper(self):
+        """Rust Core baseline: unused Python batch mutation helper is fail-closed."""
+        mock_conn = MagicMock()
+        self.connector.connection = mock_conn
+
+        with pytest.raises(RuntimeError, match="Rust Core"):
+            self.connector.execute_many(
+                "INSERT INTO users (id, name) VALUES (%s, %s)",
+                [(1, "Alice")],
+            )
+
+        mock_conn.cursor.assert_not_called()
+        mock_conn.commit.assert_not_called()
+
     def test_invalidate_cache_all(self):
         """전체 캐시 무효화 확인"""
         # 캐시에 항목 추가
