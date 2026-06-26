@@ -310,6 +310,19 @@ def test_current_status_tracks_v217_release_publication_issue():
     assert "#116 remains external" in order
 
 
+def test_current_status_records_post_148_next_issue_analysis():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-048" in doc
+    assert "Post-#148 next issue analysis" in doc
+    assert "#116 is the only open GitHub issue" in summary
+    assert "normal repository-side #116 gate passes" in normalized_doc
+    assert "current merged main HEAD `8edcb88" in doc
+    assert "not a repo-side implementation issue" in normalized_doc
+
+
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     focused = _section(doc, "Focused Verification On 2026-06-27")
