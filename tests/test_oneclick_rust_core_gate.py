@@ -132,7 +132,7 @@ def test_oneclick_worker_translates_core_events_to_ui_signals():
     worker._handle_core_event({"event": "progress", "percent": 40, "message": "Analysis completed"})
     worker._handle_core_event({
         "event": "analysis",
-        "summary": {"total_issues": 2, "auto_fixable": 0, "manual_review": 2},
+        "summary": {"total_issues": 2, "auto_fixable": 1, "manual_review": 1},
     })
     worker._handle_core_event({
         "event": "execution_plan",
@@ -142,6 +142,6 @@ def test_oneclick_worker_translates_core_events_to_ui_signals():
 
     assert phases == [("analysis", "분석")]
     assert progress == [(40, "Analysis completed")]
-    assert analysis == [(2, 0, 2)]
+    assert analysis == [(2, 1, 1)]
     assert plans[0][0] == [{"location": "backup"}]
     assert "analysis started" in logs

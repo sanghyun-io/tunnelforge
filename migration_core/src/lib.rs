@@ -30,11 +30,17 @@ pub struct Request {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MigrationIssue {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issue_type: Option<String>,
     pub severity: String,
     pub location: String,
     pub message: String,
     pub suggestion: String,
     pub blocking: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub column_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5203,7 +5209,7 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "recommendation",
         "one-click recommendations ready",
     ));
-    let recommendations = oneclick_recommendations(&state.issues);
+    let recommendations = oneclick_recommendations(&state.issues, &state.schema_name);
     let recommendation_summary = oneclick_recommendation_summary(&recommendations);
     emit(json!({
         "event": "execution_plan",
@@ -5251,11 +5257,14 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     let validation_issues = match inspect_live(&state.endpoint) {
         Ok(inspection) => oneclick_issues_from_inspection(&inspection),
         Err(err) => vec![MigrationIssue {
+            issue_type: None,
             severity: "error".to_string(),
             location: "validation".to_string(),
             message: err,
             suggestion: "Check the database connection and rerun validation.".to_string(),
             blocking: true,
+            table_name: None,
+            column_name: None,
         }],
     };
     let validation_success = validation_issues.is_empty();
@@ -5342,8 +5351,13 @@ fn oneclick_recommend(request: &Request) -> Vec<Value> {
         "recommendation",
         "one-click recommendation started",
     )];
+    let schema = request
+        .payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let issues = oneclick_payload_issues(&request.payload);
-    let recommendations = oneclick_recommendations(&issues);
+    let recommendations = oneclick_recommendations(&issues, schema);
     let summary = oneclick_recommendation_summary(&recommendations);
     events.push(json!({
         "event": "result",
@@ -5393,11 +5407,14 @@ fn oneclick_validate(request: &Request) -> Vec<Value> {
             let issues = match inspect_live(&endpoint) {
                 Ok(inspection) => oneclick_issues_from_inspection(&inspection),
                 Err(err) => vec![MigrationIssue {
+                    issue_type: None,
                     severity: "error".to_string(),
                     location: "validation".to_string(),
                     message: err,
                     suggestion: "Check the database connection and rerun validation.".to_string(),
                     blocking: true,
+                    table_name: None,
+                    column_name: None,
                 }],
             };
             events.push(json!({
@@ -5472,11 +5489,14 @@ fn oneclick_preflight_state(request: &Request) -> Result<OneClickState, String> 
             "One-Click migration currently supports MySQL endpoints only.",
         ));
         issues.push(MigrationIssue {
+            issue_type: None,
             severity: "error".to_string(),
             location: "connection".to_string(),
             message: "One-Click migration currently supports MySQL endpoints only.".to_string(),
             suggestion: "Use Cross-Engine Migration for PostgreSQL workflows.".to_string(),
             blocking: true,
+            table_name: None,
+            column_name: None,
         });
     } else {
         checks.push(oneclick_check(
@@ -5507,11 +5527,14 @@ fn oneclick_preflight_state(request: &Request) -> Result<OneClickState, String> 
             "Backup confirmation was not provided.",
         ));
         issues.push(MigrationIssue {
+            issue_type: None,
             severity: "warning".to_string(),
             location: "backup".to_string(),
             message: "Backup confirmation was not provided.".to_string(),
             suggestion: "Confirm a restorable backup before running destructive fixes.".to_string(),
             blocking: false,
+            table_name: None,
+            column_name: None,
         });
     }
 
@@ -5535,12 +5558,15 @@ fn oneclick_preflight_state(request: &Request) -> Result<OneClickState, String> 
         Err(err) => {
             checks.push(oneclick_check("Schema inspect", false, "error", &err));
             issues.push(MigrationIssue {
+                issue_type: None,
                 severity: "error".to_string(),
                 location: "schema".to_string(),
                 message: err,
                 suggestion: "Check database connection, schema, and inspection permissions."
                     .to_string(),
                 blocking: true,
+                table_name: None,
+                column_name: None,
             });
             Ok(OneClickState {
                 endpoint,
@@ -5586,12 +5612,15 @@ fn oneclick_issues_from_inspection(inspection: &InspectionResult) -> Vec<Migrati
         .unsupported_objects
         .iter()
         .map(|object| MigrationIssue {
+            issue_type: None,
             severity: "warning".to_string(),
             location: object.clone(),
             message: format!("Unsupported object detected: {object}"),
             suggestion: "Review this object manually before promoting One-Click migration."
                 .to_string(),
             blocking: false,
+            table_name: None,
+            column_name: None,
         })
         .collect()
 }
@@ -5630,33 +5659,70 @@ fn oneclick_analysis_summary(inspection: &InspectionResult, issues: &[MigrationI
     })
 }
 
-fn oneclick_recommendations(issues: &[MigrationIssue]) -> Vec<Value> {
+fn oneclick_recommendations(issues: &[MigrationIssue], schema: &str) -> Vec<Value> {
     issues
         .iter()
         .enumerate()
         .map(|(index, issue)| {
+            let selected_option = oneclick_auto_fix_option(issue, schema)
+                .unwrap_or_else(|| oneclick_manual_option(issue));
             json!({
                 "issue_index": index,
+                "issue_type": issue.issue_type.clone().unwrap_or_else(|| "unknown".to_string()),
                 "location": issue.location,
                 "description": issue.message,
-                "selected_option": {
-                    "strategy": "manual",
-                    "label": "Manual review",
-                    "description": issue.suggestion,
-                    "sql_template": ""
-                }
+                "selected_option": selected_option
             })
         })
         .collect()
 }
 
 fn oneclick_recommendation_summary(steps: &[Value]) -> Value {
+    let auto_fixable = steps
+        .iter()
+        .filter(|step| {
+            step.get("selected_option")
+                .and_then(|option| option.get("strategy"))
+                .and_then(Value::as_str)
+                .map(|strategy| strategy != "manual" && strategy != "skip")
+                .unwrap_or(false)
+        })
+        .count();
     json!({
         "total_issues": steps.len(),
-        "auto_fixable": 0,
-        "manual_review": steps.len(),
+        "auto_fixable": auto_fixable,
+        "manual_review": steps.len().saturating_sub(auto_fixable),
         "skip_recommended": 0
     })
+}
+
+fn oneclick_manual_option(issue: &MigrationIssue) -> Value {
+    json!({
+        "strategy": "manual",
+        "label": "Manual review",
+        "description": issue.suggestion,
+        "sql_template": ""
+    })
+}
+
+fn oneclick_auto_fix_option(issue: &MigrationIssue, schema: &str) -> Option<Value> {
+    if issue.issue_type.as_deref() != Some("deprecated_engine") {
+        return None;
+    }
+    let table = issue.table_name.as_deref()?.trim();
+    if table.is_empty() || schema.trim().is_empty() {
+        return None;
+    }
+    Some(json!({
+        "strategy": "engine_innodb",
+        "label": "Convert table to InnoDB",
+        "description": "Convert this deprecated storage engine table to InnoDB.",
+        "sql_template": format!(
+            "ALTER TABLE {}.{} ENGINE=InnoDB;",
+            quote_ident("mysql", schema.trim()),
+            quote_ident("mysql", table),
+        )
+    }))
 }
 
 fn oneclick_progress_event(request: &Request, percent: u64, message: &str) -> Value {
@@ -5923,12 +5989,15 @@ fn direction_guide(payload: &Value, source: &Endpoint, target: &Endpoint) -> Val
                     );
                 }
                 Err(err) => issues.push(MigrationIssue {
+                    issue_type: None,
                     severity: "error".to_string(),
                     location: "source".to_string(),
                     message: err,
                     suggestion: "Check source database connection before generating row guide."
                         .to_string(),
                     blocking: true,
+                    table_name: None,
+                    column_name: None,
                 }),
             }
 
@@ -6003,11 +6072,14 @@ fn build_table_guides<A: MigrationAdapter>(
             Ok(count) => count,
             Err(err) => {
                 issues.push(MigrationIssue {
+                    issue_type: None,
                     severity: "error".to_string(),
                     location: table.name.clone(),
                     message: err,
                     suggestion: "Check table read permissions.".to_string(),
                     blocking: true,
+                    table_name: None,
+                    column_name: None,
                 });
                 0
             }
@@ -6016,11 +6088,14 @@ fn build_table_guides<A: MigrationAdapter>(
             Ok(rows) => rows,
             Err(err) => {
                 issues.push(MigrationIssue {
+                    issue_type: None,
                     severity: "error".to_string(),
                     location: table.name.clone(),
                     message: err,
                     suggestion: "Check table read permissions.".to_string(),
                     blocking: true,
+                    table_name: None,
+                    column_name: None,
                 });
                 Vec::new()
             }
@@ -6511,48 +6586,63 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
 
     if source.is_empty() || target.is_empty() {
         issues.push(MigrationIssue {
+            issue_type: None,
             severity: "error".to_string(),
             location: "connection".to_string(),
             message: "source_engine and target_engine are required".to_string(),
             suggestion: "Provide mysql or postgresql for both endpoints.".to_string(),
             blocking: true,
+            table_name: None,
+            column_name: None,
         });
     } else if source == target {
         issues.push(MigrationIssue {
+            issue_type: None,
             severity: "error".to_string(),
             location: "direction".to_string(),
             message: "cross-engine migration requires different source and target engines"
                 .to_string(),
             suggestion: "Choose mysql -> postgresql or postgresql -> mysql.".to_string(),
             blocking: true,
+            table_name: None,
+            column_name: None,
         });
     } else if !is_supported_direction(&source, &target) {
         issues.push(MigrationIssue {
+            issue_type: None,
             severity: "error".to_string(),
             location: "direction".to_string(),
             message: format!("unsupported direction: {source} -> {target}"),
             suggestion: "v1 supports mysql <-> postgresql only.".to_string(),
             blocking: true,
+            table_name: None,
+            column_name: None,
         });
     } else {
         issues.push(MigrationIssue {
+            issue_type: None,
             severity: "warning".to_string(),
             location: "users_grants".to_string(),
             message: "database users and grants are report-only in cross-engine v1".to_string(),
             suggestion: "Recreate users, roles, and grants manually after validating table data."
                 .to_string(),
             blocking: false,
+            table_name: None,
+            column_name: None,
         });
     }
 
     for object_name in unsupported_objects(payload) {
         issues.push(MigrationIssue {
+            issue_type: None,
             severity: "warning".to_string(),
             location: object_name,
             message: "object is report-only in cross-engine v1".to_string(),
             suggestion: "Review and recreate this object manually after table data is moved."
                 .to_string(),
             blocking: false,
+            table_name: None,
+            column_name: None,
         });
     }
 
@@ -6563,12 +6653,15 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
             for table in &schema.tables {
                 if target.row_count(&table.name) > 0 {
                     issues.push(MigrationIssue {
+                        issue_type: None,
                         severity: "error".to_string(),
                         location: table.name.clone(),
                         message: "target table is not empty".to_string(),
                         suggestion: "Use an empty target table or run with a non-create_only mode."
                             .to_string(),
                         blocking: true,
+                        table_name: None,
+                        column_name: None,
                     });
                 }
             }
@@ -6594,11 +6687,14 @@ fn live_preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
         Ok(None) => return Vec::new(),
         Err(err) => {
             return vec![MigrationIssue {
+                issue_type: None,
                 severity: "error".to_string(),
                 location: "target".to_string(),
                 message: err,
                 suggestion: "Check the target endpoint settings.".to_string(),
                 blocking: true,
+                table_name: None,
+                column_name: None,
             }];
         }
     };
@@ -6606,16 +6702,20 @@ fn live_preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
         Ok(target) => target,
         Err(err) => {
             return vec![MigrationIssue {
+                issue_type: None,
                 severity: "error".to_string(),
                 location: "target".to_string(),
                 message: err,
                 suggestion: "Check the target database connection.".to_string(),
                 blocking: true,
+                table_name: None,
+                column_name: None,
             }];
         }
     };
     if options.cleanup_before_migrate {
         return vec![MigrationIssue {
+            issue_type: None,
             severity: "warning".to_string(),
             location: "target".to_string(),
             message: "target cleanup is planned before migration".to_string(),
@@ -6623,6 +6723,8 @@ fn live_preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
                 "Review the plan and start DB migration only when target cleanup is intended."
                     .to_string(),
             blocking: false,
+            table_name: None,
+            column_name: None,
         }];
     }
     create_only_issues_with_adapter(&schema, &options, &mut target)
@@ -6825,11 +6927,14 @@ fn migration_error_result(
         chunks_copied,
         state,
         issues: vec![MigrationIssue {
+            issue_type: None,
             severity: "error".to_string(),
             location: table.name.clone(),
             message: err,
             suggestion: "Resolve the database error and resume the migration.".to_string(),
             blocking: true,
+            table_name: None,
+            column_name: None,
         }],
     }
 }
@@ -6846,19 +6951,25 @@ fn create_only_issues_with_adapter<T: MigrationAdapter>(
     for table in &schema.tables {
         match target.row_count(&table.name) {
             Ok(count) if count > 0 => issues.push(MigrationIssue {
+                issue_type: None,
                 severity: "error".to_string(),
                 location: table.name.clone(),
                 message: "target table is not empty".to_string(),
                 suggestion: "Use an empty target table or run with a non-create_only mode."
                     .to_string(),
                 blocking: true,
+                table_name: None,
+                column_name: None,
             }),
             Err(err) => issues.push(MigrationIssue {
+                issue_type: None,
                 severity: "error".to_string(),
                 location: table.name.clone(),
                 message: err,
                 suggestion: "Check target connectivity and permissions.".to_string(),
                 blocking: true,
+                table_name: None,
+                column_name: None,
             }),
             _ => {}
         }
@@ -9955,6 +10066,55 @@ mod tests {
         assert_eq!(result["success"], true);
         assert_eq!(result["summary"]["manual_review"], 1);
         assert_eq!(result["steps"][0]["selected_option"]["strategy"], "manual");
+    }
+
+    #[test]
+    fn oneclick_recommend_classifies_deprecated_engine_as_auto_fixable() {
+        let events = handle_request(Request {
+            command: "oneclick.recommend".to_string(),
+            request_id: Some("oneclick-rec-auto-1".to_string()),
+            payload: json!({
+                "schema": "app",
+                "issues": [{
+                    "issue_type": "deprecated_engine",
+                    "severity": "warning",
+                    "location": "app.legacy_table",
+                    "table_name": "legacy_table",
+                    "message": "Deprecated storage engine detected.",
+                    "suggestion": "Convert the table to InnoDB.",
+                    "blocking": false
+                }, {
+                    "issue_type": "zerofill_usage",
+                    "severity": "warning",
+                    "location": "app.orders.code",
+                    "table_name": "orders",
+                    "column_name": "code",
+                    "message": "ZEROFILL usage detected.",
+                    "suggestion": "Handle display padding in the application.",
+                    "blocking": false
+                }]
+            }),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["command"], "oneclick.recommend");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["summary"]["total_issues"], 2);
+        assert_eq!(result["summary"]["auto_fixable"], 1);
+        assert_eq!(result["summary"]["manual_review"], 1);
+        assert_eq!(result["steps"][0]["issue_type"], "deprecated_engine");
+        assert_eq!(
+            result["steps"][0]["selected_option"]["strategy"],
+            "engine_innodb"
+        );
+        assert_eq!(
+            result["steps"][0]["selected_option"]["sql_template"],
+            "ALTER TABLE `app`.`legacy_table` ENGINE=InnoDB;"
+        );
+        assert_eq!(result["steps"][1]["selected_option"]["strategy"], "manual");
     }
 
     #[test]

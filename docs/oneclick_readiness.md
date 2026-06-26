@@ -37,6 +37,20 @@ The current supported scope is dry-run preview only:
 - Claiming automatic remediation coverage beyond the Rust Core dry-run event
   contract.
 
+## Automatic Fix Coverage
+
+Current Rust Core recommendation coverage:
+
+| Issue type | Status | Strategy | Notes |
+| --- | --- | --- | --- |
+| `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. This is recommendation metadata only while real execution remains disabled. |
+| `charset_issue` | manual | `manual` | FK-safe ordering, rollback, and collation/charset target selection must be proven before automatic execution. |
+| `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
+| `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
+| `float_precision` | manual | `manual` | Requires precision/scale policy review. |
+| `int_display_width` | manual or skip | `manual` | MySQL 8.4 ignores display width semantics; no automatic DDL is currently applied. |
+| `enum_empty_value` | manual | `manual` | Requires data cleanup policy. |
+
 ## Real-Execution Gate
 
 Before removing the dry-run lock or enabling real execution:
@@ -58,9 +72,9 @@ support full enablement.
 Reasons:
 
 - Rust Core `oneclick.run` emits a complete phase/progress/report stream, but
-  `oneclick_analysis_summary` reports `auto_fixable = 0` and
-  `manual_review = issues.len()`.
-- `oneclick_recommendations` currently returns manual review steps only.
+  live-inspection issues still do not carry typed automatic-fix metadata.
+- `oneclick_recommendations` currently marks only `deprecated_engine` payload
+  issues with `table_name` as automatic candidates.
 - `oneclick_apply_fixes` and the execution phase do not apply SQL fixes; a
   non-dry-run request logs that no automatic Rust Core fixes are currently
   required.

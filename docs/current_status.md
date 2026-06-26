@@ -774,9 +774,8 @@ Evidence:
 - `scripts\rust-core-regression-gate.ps1` can require the evidence when
   `RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE=1`.
 - 2026-06-26 follow-up analysis in `docs\oneclick_readiness.md` concluded that
-  the current backend supports hidden or dry-run preview scope only, not full
-  enablement: Rust Core reports `auto_fixable = 0`, recommendations are manual,
-  and non-dry-run execution does not apply automatic SQL fixes.
+  the then-current backend supported hidden or dry-run preview scope only, not
+  full enablement.
 - 2026-06-26 update: the migration analyzer now exposes the entry point as
   `One-Click Dry-run Preview`, with tooltip copy that says no real changes are
   performed and automatic SQL fixes are not enabled.
@@ -808,8 +807,10 @@ Evidence:
 
 - GitHub #138 tracks the remaining scope after #137: define, implement, and
   prove the automatic fix classes before real One-Click execution is enabled.
-- Current Rust Core behavior reports `auto_fixable = 0`, returns manual
-  recommendations only, and non-dry-run execution does not apply SQL fixes.
+- Current Rust Core recommendation behavior marks `deprecated_engine` payload
+  issues with `table_name` as automatic candidates using `engine_innodb`
+  recommendation metadata. Other issue classes remain manual, and non-dry-run
+  execution does not apply SQL fixes.
 - `src\ui\dialogs\oneclick_migration_dialog.py` keeps
   `ONECLICK_REAL_EXECUTION_ENABLED = False`, so non-dry-run payloads fail
   closed.
@@ -828,7 +829,8 @@ Impact:
 Next action:
 
 1. Work GitHub #138: define automatic fix classes, add Rust/Python contract
-   coverage, add a real-execution evidence validator, and keep
+   coverage beyond the initial `deprecated_engine` recommendation, add a
+   real-execution evidence validator, and keep
    `ONECLICK_REAL_EXECUTION_ENABLED = False` until that validator passes.
 
 ## Issue Tracker
@@ -906,3 +908,4 @@ Next action:
 | 2026-06-26 | Analyzed the next #137 decision after merging One-Click evidence: current Rust Core behavior supports hidden or dry-run-only preview scope, but not full enablement because automatic fix coverage is not implemented. | `docs/oneclick_readiness.md`, `docs/current_status.md` | `rg -n "ONE_CLICK_MIGRATION_FEATURE_ENABLED|ONECLICK_REAL_EXECUTION_ENABLED|oneclick|OneClick" src migration_core tests docs README.md README.ko.md`; `gh issue view 137`; Rust Core `oneclick_*` function inspection |
 | 2026-06-26 | Exposed #137 as a dry-run-only preview: the migration analyzer shows `One-Click Dry-run Preview`, real execution remains blocked, and refreshed evidence now requires preview UI enabled plus real execution disabled. | `src/ui/dialogs/migration_dialogs.py`, `src/core/i18n.py`, `scripts/validate-oneclick-dry-run-evidence.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_oneclick_dry_run_evidence.py`, `reports/oneclick_readiness`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_migration_analyzer_exposes_oneclick_as_dry_run_preview_only -q`; RED/GREEN: `pytest tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_accepts_complete_report tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_requires_preview_ui_enabled -q`; i18n: `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; capture: `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; validator: `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json` |
 | 2026-06-26 | Split the remaining One-Click real-execution work into GitHub #138, marked TF-STATUS-019 as the closed dry-run preview gate, opened TF-STATUS-020 for automatic fix coverage, and updated the real-execution lock copy to point at #138. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `docs/current_status.md`, `docs/oneclick_readiness.md` | `gh issue create` created #138; `gh issue view 137`; `gh issue view 138`; RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens -q`; `rg -n "TF-STATUS-019|TF-STATUS-020|#138|ONECLICK_REAL_EXECUTION_ENABLED" docs src tests migration_core` |
+| 2026-06-26 | Started GitHub #138 automatic-fix coverage by adding typed Rust Core recommendation metadata: `deprecated_engine` with `table_name` becomes an `engine_innodb` automatic candidate while real execution remains disabled. | `migration_core/src/lib.rs`, `tests/test_oneclick_rust_core_gate.py`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick_recommend_classifies_deprecated_engine_as_auto_fixable --lib` |
