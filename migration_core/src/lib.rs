@@ -3117,6 +3117,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .unwrap_or(8)
         .max(1);
     let mysql_local_infile_policy = mysql_local_infile_policy_from_payload(&request.payload)?;
+    let timezone_sql =
+        validated_timezone_sql(request.payload.get("timezone_sql").and_then(Value::as_str))?;
     let tables: Vec<DumpTableManifest> = manifest
         .tables
         .iter()
@@ -3130,6 +3132,9 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     let mut adapter = LiveAdapter::connect(&endpoint)?;
+    if let Some(sql) = timezone_sql.as_deref() {
+        adapter.execute_sql(sql)?;
+    }
     let local_infile_restore = prepare_mysql_local_infile_policy(
         &mut adapter,
         &endpoint,
@@ -3678,6 +3683,70 @@ fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
         || lower.contains("loading local data is disabled")
         || lower.contains("local infile")
             && (lower.contains("disabled") || lower.contains("not allowed"))
+}
+
+fn validated_timezone_sql(value: Option<&str>) -> Result<Option<String>, String> {
+    let Some(sql) = value.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let normalized = sql.to_ascii_lowercase();
+    if normalized.contains(';')
+        || normalized.contains("--")
+        || normalized.contains("/*")
+        || normalized.contains("*/")
+        || normalized.contains('\0')
+    {
+        return Err(
+            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
+                .to_string(),
+        );
+    }
+
+    let Some(after_set) = normalized.strip_prefix("set") else {
+        return Err(
+            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
+                .to_string(),
+        );
+    };
+    let Some(after_session) = after_set.trim_start().strip_prefix("session") else {
+        return Err(
+            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
+                .to_string(),
+        );
+    };
+    let Some(after_variable) = after_session.trim_start().strip_prefix("time_zone") else {
+        return Err(
+            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
+                .to_string(),
+        );
+    };
+    let Some(value) = after_variable.trim_start().strip_prefix('=') else {
+        return Err(
+            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
+                .to_string(),
+        );
+    };
+    let value = value.trim();
+    if value.is_empty() || !is_safe_timezone_literal(value) {
+        return Err(
+            "import_plan_invalid: unsupported timezone_sql; only SET SESSION time_zone is allowed"
+                .to_string(),
+        );
+    }
+
+    Ok(Some(sql.to_string()))
+}
+
+fn is_safe_timezone_literal(value: &str) -> bool {
+    let value = if value.starts_with('\'') && value.ends_with('\'') && value.len() >= 2 {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '+' | '-' | '_' | ':' | '/'))
 }
 
 fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
@@ -9618,6 +9687,25 @@ mod tests {
             "mysql_local_infile_policy": "always"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn import_timezone_sql_accepts_session_time_zone_only() {
+        assert_eq!(
+            validated_timezone_sql(Some("SET SESSION time_zone = '+09:00'")).unwrap(),
+            Some("SET SESSION time_zone = '+09:00'".to_string())
+        );
+        assert_eq!(validated_timezone_sql(None).unwrap(), None);
+        assert_eq!(validated_timezone_sql(Some("   ")).unwrap(), None);
+        assert!(validated_timezone_sql(Some("DROP DATABASE prod")).is_err());
+        assert!(
+            validated_timezone_sql(Some("SET SESSION time_zone = '+09:00'; DROP TABLE users"))
+                .is_err()
+        );
+        assert!(
+            validated_timezone_sql(Some("SET SESSION time_zone = '+09:00' -- trailing")).is_err()
+        );
+        assert!(validated_timezone_sql(Some("SET GLOBAL time_zone = '+09:00'")).is_err());
     }
 
     #[test]
