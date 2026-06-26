@@ -3308,6 +3308,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         }));
     }
     verify_imported_row_counts(&tables, &imported_rows_by_table)?;
+    verify_target_row_counts(&mut adapter, &tables, mode)?;
 
     // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
@@ -7974,6 +7975,33 @@ fn verify_imported_row_counts(
     Ok(())
 }
 
+fn verify_target_row_counts<A: MigrationAdapter>(
+    target: &mut A,
+    tables: &[DumpTableManifest],
+    mode: &str,
+) -> Result<(), String> {
+    if !matches!(mode, "replace" | "recreate") {
+        return Ok(());
+    }
+    for table in tables {
+        let target_rows = target.row_count(&table.name).map_err(|err| {
+            classified_import_error(
+                "post_load_validation_failed",
+                &format!("target row count verification failed: {err}"),
+                Some(&table.name),
+            )
+        })? as u64;
+        if target_rows != table.rows {
+            return Err(classified_import_error(
+                "post_load_validation_failed",
+                &format!("expected {} rows, target has {}", table.rows, target_rows),
+                Some(&table.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Result<(), String> {
     for table in &schema.tables {
         for fk in &table.foreign_keys {
@@ -9690,11 +9718,12 @@ mod tests {
     #[derive(Default)]
     struct RecordingAdapter {
         executed_sql: Vec<String>,
+        row_counts: BTreeMap<String, usize>,
     }
 
     impl MigrationAdapter for RecordingAdapter {
-        fn row_count(&mut self, _table: &str) -> Result<usize, String> {
-            Ok(0)
+        fn row_count(&mut self, table: &str) -> Result<usize, String> {
+            Ok(self.row_counts.get(table).copied().unwrap_or(0))
         }
 
         fn create_table(&mut self, _table: &NormalizedTable, _ddl: &str) -> Result<(), String> {
@@ -10230,6 +10259,44 @@ mod tests {
         imported.insert("users".to_string(), 3_u64);
 
         verify_imported_row_counts(&tables, &imported).unwrap();
+    }
+
+    #[test]
+    fn replace_import_target_row_verification_rejects_extra_rows() {
+        let tables = vec![DumpTableManifest {
+            name: "login_attempts".to_string(),
+            path: "0001_login_attempts".to_string(),
+            rows: 77_198,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut adapter = RecordingAdapter {
+            row_counts: BTreeMap::from([("login_attempts".to_string(), 77_208)]),
+            ..RecordingAdapter::default()
+        };
+
+        let err = verify_target_row_counts(&mut adapter, &tables, "replace").unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("login_attempts"));
+        assert!(err.contains("expected 77198 rows, target has 77208"));
+    }
+
+    #[test]
+    fn merge_import_target_row_verification_allows_existing_rows() {
+        let tables = vec![DumpTableManifest {
+            name: "login_attempts".to_string(),
+            path: "0001_login_attempts".to_string(),
+            rows: 77_198,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        }];
+        let mut adapter = RecordingAdapter {
+            row_counts: BTreeMap::from([("login_attempts".to_string(), 77_208)]),
+            ..RecordingAdapter::default()
+        };
+
+        verify_target_row_counts(&mut adapter, &tables, "merge").unwrap();
     }
 
     #[test]

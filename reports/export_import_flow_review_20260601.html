@@ -68,7 +68,7 @@
   <h2>Verification Evidence</h2>
   <table>
     <tr><th>Command</th><th>Result</th><th>Notes</th></tr>
-    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="status-pass">PASS</td><td>159 Rust lib tests, JSONL CLI test, live-roundtrip gated tests, doctests.</td></tr>
+    <tr><td><code>cargo test --manifest-path migration_core\Cargo.toml</code></td><td class="status-pass">PASS</td><td>161 Rust lib tests, JSONL CLI test, live-roundtrip gated tests, doctests.</td></tr>
     <tr><td><code>cargo build --manifest-path migration_core\Cargo.toml --release</code></td><td class="status-pass">PASS</td><td>Release Rust core binary builds.</td></tr>
     <tr><td><code>.venv\Scripts\python -m pytest -q</code></td><td class="status-pass">PASS</td><td>1710 Python tests passed, 3 collection warnings from existing test helper classes.</td></tr>
     <tr><td><code>.venv\Scripts\python -m compileall -q main.py src tests</code></td><td class="status-pass">PASS</td><td>Python syntax check passed.</td></tr>
@@ -82,6 +82,7 @@
     <tr><td>Unsafe timezone SQL forwarding</td><td><code>import_timezone_sql_accepts_session_time_zone_only</code></td></tr>
     <tr><td>Strict import accepts incomplete manifest</td><td><code>strict_manifest_validation_rejects_missing_chunk_checksums</code>, <code>dump_import_strict_manifest_rejects_missing_checksums_before_connect</code></td></tr>
     <tr><td>Import success without row verification</td><td><code>import_row_count_verification_rejects_missing_rows</code>, <code>import_row_count_verification_accepts_matching_counts</code></td></tr>
+    <tr><td>Replace/recreate target keeps extra rows after import</td><td><code>replace_import_target_row_verification_rejects_extra_rows</code>, <code>merge_import_target_row_verification_allows_existing_rows</code></td></tr>
     <tr><td>Missing import report artifact</td><td><code>write_dump_import_report_creates_json_file</code></td></tr>
     <tr><td>Unclassified Rust import failure in Python UI layer</td><td><code>test_import_dump_preserves_classified_core_error</code></td></tr>
     <tr><td>Export manifest lacks consistency metadata</td><td><code>dump_manifest_strictness_fields_default_for_legacy_json</code>, <code>dump_manifest_consistency_metadata_marks_parallel_as_non_strict</code></td></tr>
