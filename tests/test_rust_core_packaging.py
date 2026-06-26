@@ -1377,6 +1377,13 @@ def test_macos_support_gate_rejects_hard_coded_current_issue_head(capsys):
     assert gate.check_final_issue_handoff("- Current repository-side gate head: `3360cd9`.\n") is False
     assert "must not hard-code a current gate head SHA" in capsys.readouterr().err
 
+    body_with_latest_run = (
+        "- Current repository-side gate source: latest pushed `main`\n"
+        "- Latest Version Gate: https://github.com/sanghyun-io/tunnelforge/actions/runs/123\n"
+    )
+    assert gate.check_final_issue_handoff(body_with_latest_run) is False
+    assert "must not label a fixed GitHub Actions run URL as latest" in capsys.readouterr().err
+
 
 def test_macos_support_gate_accepts_merged_pr_with_unknown_merge_state(monkeypatch, capsys):
     gate = load_macos_support_gate_module()

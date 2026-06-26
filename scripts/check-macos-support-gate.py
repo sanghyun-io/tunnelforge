@@ -310,6 +310,13 @@ def check_final_issue_handoff(body: str) -> bool:
         )
         return False
 
+    if re.search(r"^- Latest [^\n:]+:\s*https://github\.com/[^\s]+/actions/runs/\d+", body, re.MULTILINE):
+        fail(
+            f"#{FINAL_ISSUE} Current Evidence must not label a fixed GitHub Actions run URL as latest; "
+            "use reference run wording or rely on the gate to resolve current runs"
+        )
+        return False
+
     if "latest pushed `main`" not in body and "latest pushed main" not in body:
         fail(f"#{FINAL_ISSUE} Current Evidence must tell operators to use the latest pushed main")
         return False
