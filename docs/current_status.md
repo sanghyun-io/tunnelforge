@@ -176,13 +176,12 @@ Impact:
 
 - Initial import intent and strictness gates are now enforced at the Rust Core
   boundary instead of only being represented in Python payloads.
-- Remaining recovery plan work is tracked separately by `TF-STATUS-002` and
-  `TF-STATUS-004`.
+- Remaining release-readiness watch items are tracked separately.
 
 Next action:
 
-1. Continue import success gating in `TF-STATUS-002`.
-2. Add export consistency manifest metadata in `TF-STATUS-004`.
+1. Keep the regression tests and report aligned if import intent handling
+   changes.
 
 ### TF-STATUS-002: Import Success Is Gated By Row Verification
 
@@ -204,12 +203,11 @@ Impact:
 
 - Import success now has an explicit row-count verification gate and persisted
   report artifact.
-- Export consistency metadata remains separate and is tracked by
-  `TF-STATUS-004`.
+- Export consistency metadata is tracked separately and is now closed.
 
 Next action:
 
-1. Add export consistency manifest metadata in `TF-STATUS-004`.
+1. Keep row verification and report artifact coverage when import modes change.
 
 ### TF-STATUS-003: Import UI Overpromises Object Restoration
 
@@ -258,7 +256,7 @@ Impact:
 
 Next action:
 
-1. Update or create the final remediation report tracked by `TF-STATUS-007`.
+1. Keep export consistency metadata coverage when export scheduling changes.
 
 ## Medium Priority Issues
 
@@ -374,10 +372,10 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
-| TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Continue remaining recovery work in TF-STATUS-002 and TF-STATUS-004 |
-| TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Continue export consistency metadata in TF-STATUS-004 |
+| TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Keep regression coverage aligned with import intent changes |
+| TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Keep row verification/report coverage aligned with import mode changes |
 | TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
-| TF-STATUS-004 | High | closed | Rust Core export | Export consistency explicit | Update final remediation report in TF-STATUS-007 |
+| TF-STATUS-004 | High | closed | Rust Core export | Export consistency explicit | Keep metadata coverage aligned with export scheduling changes |
 | TF-STATUS-005 | Medium | closed | Docs/UI flags | Disabled UI features labeled | Reverify docs if feature flags change |
 | TF-STATUS-006 | Medium | watch | Maintainability | Very large files | Keep fixes narrow; split later if behavior stabilizes |
 | TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
