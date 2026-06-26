@@ -60,6 +60,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
 
     assert "PASS, 1729 passed" not in doc
+    assert "PASS, 1786 passed" not in doc
+    assert "PASS, 1793 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
