@@ -65,6 +65,15 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "Current main full Python suite" in doc
 
 
+def test_current_status_current_baseline_section_is_not_stale_dated():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    headings = [line for line in doc.splitlines() if line.startswith("## ")]
+
+    assert "## Current Baseline Verification" in doc
+    assert "## Verified On 2026-06-26" not in headings
+    assert "Full-suite count refreshed on 2026-06-27" in doc
+
+
 def test_current_status_records_export_table_selection_audit():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
 

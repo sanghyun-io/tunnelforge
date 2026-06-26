@@ -86,9 +86,11 @@ remain unsupported.
 The current full Python suite count was refreshed on 2026-06-27 after the
 schedule and One-Click documentation regression tests were added.
 
-## Verified On 2026-06-26
+## Current Baseline Verification
 
-Commands run locally:
+Commands run locally. Full-suite count refreshed on 2026-06-27; some broader
+Rust/macOS evidence rows are preserved from the 2026-06-26 baseline sweep until
+those commands are rerun.
 
 | Check | Result |
 | --- | --- |
@@ -130,6 +132,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-06-27 | Current baseline verification heading | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top status no longer labels the mixed current baseline as `Verified On 2026-06-26`; the section now distinguishes the refreshed 2026-06-27 full-suite count from preserved 2026-06-26 broader baseline evidence |
 | 2026-06-27 | Current full Python suite count refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py`; `git diff --check` | PASS | Updated top current-status full Python suite count from stale `1786 passed` to current `1793 passed, 5 warnings` after recent documentation regression tests |
 | 2026-06-27 | One-Click limited production scope wording | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; `pytest tests\test_oneclick_readiness_docs.py -q`; `pytest tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | Readiness docs no longer say all production database usage is unsupported; they distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution |
 | 2026-06-27 | Schedule guide hidden-feature wording | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; `pytest tests\test_schedule_docs.py tests\test_current_status_docs.py -q`; `rg -n -F -e '메인 툴바에서 **"스케줄"** 버튼을 클릭' -e '스케줄 시간을 기다리지 않고 바로 백업하려면:' -e '스케줄 관리 창의 **"백업 로그"** 탭에서' -e '스케줄이 작동하려면 TunnelForge가 실행 중이어야 합니다' SCHEDULE.md`; `python -m compileall -q tests\test_schedule_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | `SCHEDULE.md` now reads as an internal/reactivation memo while `SCHEDULE_FEATURE_ENABLED = False`, and no longer gives public-toolbar/log/immediate-run instructions as current user steps |
@@ -1184,6 +1187,34 @@ Next action:
 1. Refresh the count again whenever new tests are added and a full `pytest -q`
    run is completed.
 
+### TF-STATUS-029: Current Baseline Verification Heading Is Not Stale-Dated
+
+Status: closed
+Severity: Low
+Area: Status documentation
+
+Evidence:
+
+- 2026-06-27 status audit found the top verification table still used
+  `## Verified On 2026-06-26` even after its `pytest -q` row had been refreshed
+  with 2026-06-27 evidence.
+- That heading made the mixed baseline ambiguous: the full Python suite count
+  was current, while broader Rust/macOS rows were preserved from the 2026-06-26
+  sweep.
+- RED/GREEN coverage now rejects the stale-dated heading and requires explicit
+  wording that the full-suite count was refreshed on 2026-06-27.
+
+Resolution:
+
+- The section is now `## Current Baseline Verification`.
+- The paragraph under the heading states which evidence was refreshed on
+  2026-06-27 and which broader baseline rows are preserved until rerun.
+
+Next action:
+
+1. If a full broad baseline sweep is rerun, replace the preservation note with
+   that sweep's concrete date and command evidence.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -1216,6 +1247,7 @@ Next action:
 | TF-STATUS-026 | Medium | closed | Docs/UI feature flags | Schedule guide hidden-feature wording | Rewrite as public guide only when schedule feature is re-enabled with evidence |
 | TF-STATUS-027 | Medium | closed | One-Click migration docs | Limited production scope wording | Keep docs aligned if the real-execution allowlist expands |
 | TF-STATUS-028 | Low | closed | Status documentation | Full Python suite count refresh | Refresh count when new tests are added and full pytest is rerun |
+| TF-STATUS-029 | Low | closed | Status documentation | Baseline verification heading | Replace preservation note after a full broad baseline sweep is rerun |
 
 ## Recommended Execution Order
 
@@ -1314,3 +1346,4 @@ Next action:
 | 2026-06-27 | Re-scanned disabled-feature docs after #116 remained external and fixed TF-STATUS-026: `SCHEDULE.md` no longer mixes a hidden-feature warning with current public UI instructions. | `SCHEDULE.md`, `tests/test_schedule_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; final: schedule/current-status docs pytest, stale-phrase scan, compileall, `git diff --check` |
 | 2026-06-27 | Re-scanned One-Click readiness wording and fixed TF-STATUS-027: docs now distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; final: One-Click/current-status docs pytest, compileall, `git diff --check` |
 | 2026-06-27 | Refreshed TF-STATUS-028 after rerunning the full Python suite. The current suite is now `1793 passed, 5 warnings`, replacing the stale `1786 passed` handoff count. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; final: `pytest -q`, docs pytest, compileall, `git diff --check` |
+| 2026-06-27 | Fixed TF-STATUS-029 after noticing the top verification table still said `Verified On 2026-06-26` while containing a 2026-06-27 full pytest count. The section now describes a current baseline with preserved broader rows. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; final: current-status pytest, compileall, `git diff --check` |
