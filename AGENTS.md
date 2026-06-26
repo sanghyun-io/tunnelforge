@@ -8,6 +8,11 @@ Rust Core migration is the active architecture baseline. Treat `tunnelforge-core
 
 Do not reintroduce direct Python DB driver hot paths, external dump tool paths, or retired helper aliases in `src/`, tests, packaging, or user-facing docs. Packaging should include the single Rust DB core binary `tunnelforge-core(.exe)`.
 
+## Session Continuity & Status Tracking
+`docs/current_status.md` is the canonical handoff and issue-tracking document. For any non-trivial investigation, implementation, verification, release, or documentation work, read it before deciding next steps. When a session discovers a new issue, changes an existing issue, runs meaningful verification, changes feature status, or resolves work, update `docs/current_status.md` in the same session.
+
+Use stable issue IDs in the `TF-STATUS-###` format and do not renumber them. Do not mark an issue `closed` without fresh command evidence in that session. If a focused fix lands but broader verification or downstream work remains, use `fixed_pending_full_verify`. Keep the `Issue Tracker`, `Verification Log`, `Recommended Execution Order`, and `Session Log` aligned.
+
 ## Build, Test, and Development Commands
 Create and activate a virtual environment before development:
 

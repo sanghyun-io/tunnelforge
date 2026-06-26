@@ -646,7 +646,10 @@ class RustDumpImporter:
                 "input_dir": input_dir,
                 "mode": import_mode,
                 "threads": max(1, int(threads)),
+                "strict_manifest": True,
             }
+            if timezone_sql:
+                payload["timezone_sql"] = timezone_sql
             if retry_tables:
                 payload["tables"] = retry_tables
 

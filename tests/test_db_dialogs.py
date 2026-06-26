@@ -2,7 +2,7 @@ import json
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from src.ui.dialogs.db_dialogs import (
     RustDumpExportDialog,
@@ -304,6 +304,21 @@ def test_rust_dump_import_browse_starts_from_export_base_when_no_dump(tmp_path, 
 
     assert dialog.input_dir.text() == ""
     assert dialog._get_input_browse_start_dir() == str(tmp_path)
+    dialog.close()
+
+
+def test_import_dialog_does_not_claim_all_objects_are_recreated(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+
+    dialog = RustDumpImportDialog()
+    labels = "\n".join(label.text() for label in dialog.findChildren(QLabel))
+
+    assert "모든 객체" not in labels
+    assert "테이블" in labels
     dialog.close()
 
 

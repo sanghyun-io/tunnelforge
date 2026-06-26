@@ -2039,7 +2039,10 @@ class RustDumpImportDialog(QDialog):
         mode_replace_layout = QVBoxLayout()
         self.radio_replace = QRadioButton("전체 교체 Import (권장) ⭐")
         self.radio_replace.setChecked(True)  # 기본값
-        mode_replace_desc = QLabel("   모든 객체(테이블/뷰/프로시저/이벤트) 재생성\n   ✅ Export → Import 시 권장")
+        mode_replace_desc = QLabel(
+            "   테이블 구조와 데이터를 재생성\n"
+            "   ℹ️ View는 가능한 경우 복원되며 프로시저/트리거/이벤트는 별도 확인 필요"
+        )
         mode_replace_desc.setStyleSheet("color: #27ae60; font-size: 10pt; font-weight: bold; margin-left: 20px;")
         mode_replace_layout.addWidget(self.radio_replace)
         mode_replace_layout.addWidget(mode_replace_desc)
