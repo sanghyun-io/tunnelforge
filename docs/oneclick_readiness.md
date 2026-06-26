@@ -48,7 +48,9 @@ The current supported scope is intentionally narrow:
   `tf_oneclick_charset.tf_oneclick_parent` and
   `tf_oneclick_charset.tf_oneclick_child` from `utf8mb3` /
   `utf8mb3_general_ci` to `utf8mb4` / `utf8mb4_0900_ai_ci`, while preserving
-  FK evidence and rollback metadata.
+  FK evidence and rollback metadata. A live Rust Core regression also proves
+  UI-facing `oneclick.run dry_run=false` executes the same supplied complete
+  contract shape.
 - Charset/collation capture helper:
   `scripts\capture-oneclick-charset-evidence.py` seeds and captures only safe
   local `tf_oneclick_` scopes through Rust DB Core APIs.
@@ -56,7 +58,8 @@ The current supported scope is intentionally narrow:
 ## Not Yet Supported
 
 - Production database usage.
-- UI-facing `oneclick.run dry_run=false` charset/collation execution.
+- Automatic PyQt charset contract derivation and dedicated charset
+  rendering/count copy tests.
 
 ## Automatic Fix Coverage
 
@@ -65,7 +68,7 @@ Current Rust Core recommendation coverage:
 | Issue type | Status | Strategy | Notes |
 | --- | --- | --- | --- |
 | `deprecated_engine` | automatic candidate | `engine_innodb` | Generates `ALTER TABLE <schema>.<table> ENGINE=InnoDB;` when `schema` and `table_name` are present. `oneclick.apply_fixes` and UI-facing `oneclick.run dry_run=false` execute only this strategy through Rust Core. PyQt requires backup confirmation before sending a non-dry-run payload. |
-| `charset_issue` | command-level allowlisted, evidence pending | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify and execute a command-level charset fix only when the request includes complete safe contract data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. UI-facing `oneclick.run dry_run=false`, capture tooling, and completed local MySQL evidence remain pending. |
+| `charset_issue` | local contract allowlisted, PyQt derivation pending | `charset_collation_fk_safe` when a complete contract is supplied; otherwise `manual` | Rust Core can classify and execute charset fixes only when the request includes complete safe contract data: safe `tf_oneclick_` identifiers, explicit target charset/collation, FK order covering the conversion set, and rollback SQL. `oneclick.apply_fixes dry_run=false` and UI-facing `oneclick.run dry_run=false` execute that supplied contract through Rust Core; automatic PyQt contract derivation/rendering coverage remains pending. |
 | `invalid_date` | manual | `manual` | Requires value policy and data-loss review. |
 | `zerofill_usage` | manual | `manual` | Usually requires application display formatting changes. |
 | `float_precision` | manual | `manual` | Requires precision/scale policy review. |
@@ -77,8 +80,9 @@ Current Rust Core recommendation coverage:
 Charset/collation command-level execution is allowlisted only for complete
 `charset_collation_fk_safe` contracts. Local MySQL evidence for the command
 path is captured and validator-backed. UI-facing `oneclick.run dry_run=false`
-charset execution is still pending. The following policy defines the only
-eligible scope.
+can execute the same supplied complete contract shape; automatic PyQt contract
+derivation is still pending. The following policy defines the only eligible
+scope.
 
 Eligible automatic subset:
 
@@ -132,6 +136,10 @@ Implementation gate:
   can execute the contract SQL through the Rust adapter path and includes
   rollback metadata in the applied-fix payload; validator-backed live MySQL
   evidence for this command path is captured.
+- UI-facing `oneclick.run dry_run=false` now merges supplied payload
+  `issues[]` and `charset_contracts[]`, shifts contract indexes behind
+  inspection-derived issues, and sequences the same allowlisted apply path for
+  complete local-safe charset contracts.
 
 ## Real-Execution Gate Outcome
 

@@ -112,6 +112,22 @@ fn mysql_table_engine(conn: &mut mysql::PooledConn, database: &str, table: &str)
     .unwrap()
 }
 
+fn mysql_table_charset_collation(
+    conn: &mut mysql::PooledConn,
+    database: &str,
+    table: &str,
+) -> Option<(String, String)> {
+    conn.exec_first::<(String, String), _, _>(
+        "SELECT ccsa.CHARACTER_SET_NAME, t.TABLE_COLLATION \
+         FROM information_schema.TABLES t \
+         JOIN information_schema.COLLATION_CHARACTER_SET_APPLICABILITY ccsa \
+         ON t.TABLE_COLLATION = ccsa.COLLATION_NAME \
+         WHERE t.TABLE_SCHEMA = ? AND t.TABLE_NAME = ?",
+        (database, table),
+    )
+    .unwrap()
+}
+
 fn unsupported_objects_from_inspect(endpoint: &Endpoint) -> Vec<String> {
     let inspect = result_payload(handle_request(Request {
         command: "inspect".to_string(),
@@ -338,6 +354,94 @@ fn oneclick_run_live_engine_innodb_when_env_is_configured() {
 
     mysql
         .query_drop(format!("DROP TABLE IF EXISTS `{table}`"))
+        .unwrap();
+}
+
+#[test]
+fn oneclick_run_live_charset_contract_when_env_is_configured() {
+    let Some(base_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
+        eprintln!("skipping oneclick charset live apply: TF_MYSQL_* is not configured");
+        return;
+    };
+
+    let schema = "tf_oneclick_run_charset";
+    let parent = unique_table("tf_oneclick_parent");
+    let child = unique_table("tf_oneclick_child");
+    let mut admin = mysql_conn(&base_endpoint);
+    admin
+        .query_drop(format!("DROP DATABASE IF EXISTS `{schema}`"))
+        .unwrap();
+    admin
+        .query_drop(format!(
+            "CREATE DATABASE `{schema}` CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci"
+        ))
+        .unwrap();
+
+    let mut charset_endpoint = base_endpoint.clone();
+    charset_endpoint.database = schema.to_string();
+    let mut mysql = mysql_conn(&charset_endpoint);
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE `{parent}` (`id` INT NOT NULL PRIMARY KEY, `name` VARCHAR(32) NOT NULL) \
+             ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci"
+        ))
+        .unwrap();
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE `{child}` (`id` INT NOT NULL PRIMARY KEY, `parent_id` INT NOT NULL, \
+             `name` VARCHAR(32) NOT NULL, CONSTRAINT `fk_child_parent` FOREIGN KEY (`parent_id`) \
+             REFERENCES `{parent}` (`id`)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb3 COLLATE=utf8mb3_general_ci"
+        ))
+        .unwrap();
+
+    assert_eq!(
+        mysql_table_charset_collation(&mut mysql, schema, &parent).as_ref(),
+        Some(&(String::from("utf8mb3"), String::from("utf8mb3_general_ci")))
+    );
+
+    let result = result_payload(handle_request(Request {
+        command: "oneclick.run".to_string(),
+        request_id: None,
+        payload: json!({
+            "connection": endpoint_json(&charset_endpoint),
+            "schema": schema,
+            "dry_run": false,
+            "backup_confirmed": true,
+            "issues": [{
+                "issue_type": "charset_issue",
+                "severity": "warning",
+                "location": format!("{schema}.{parent}"),
+                "table_name": parent,
+                "message": "Table uses a legacy charset.",
+                "suggestion": "Convert table charset/collation after FK-safe review.",
+                "blocking": false
+            }],
+            "charset_contracts": [{
+                "issue_index": 0,
+                "tables": [parent, child],
+                "fk_order": [parent, child],
+                "target_charset": "utf8mb4",
+                "target_collation": "utf8mb4_0900_ai_ci",
+                "rollback_sql": [
+                    format!("ALTER TABLE `{schema}`.`{child}` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"),
+                    format!("ALTER TABLE `{schema}`.`{parent}` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;")
+                ]
+            }]
+        }),
+    }));
+
+    assert_eq!(result["success"], true);
+    assert_eq!(
+        mysql_table_charset_collation(&mut mysql, schema, &parent).as_ref(),
+        Some(&(String::from("utf8mb4"), String::from("utf8mb4_0900_ai_ci")))
+    );
+    assert_eq!(
+        mysql_table_charset_collation(&mut mysql, schema, &child).as_ref(),
+        Some(&(String::from("utf8mb4"), String::from("utf8mb4_0900_ai_ci")))
+    );
+
+    admin
+        .query_drop(format!("DROP DATABASE IF EXISTS `{schema}`"))
         .unwrap();
 }
 

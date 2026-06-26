@@ -5191,13 +5191,16 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     };
     emit(oneclick_preflight_event(request, &state));
     emit(oneclick_progress_event(request, 20, "Pre-flight completed"));
-    if state.issues.iter().any(|issue| issue.blocking) {
+    let mut run_issues = state.issues.clone();
+    let payload_issue_offset = run_issues.len();
+    run_issues.extend(oneclick_payload_issues(&request.payload));
+    if run_issues.iter().any(|issue| issue.blocking) {
         emit(oneclick_final_result(
             request,
             &state.schema_name,
             false,
-            &state.issues,
-            &state.issues,
+            &run_issues,
+            &run_issues,
             vec!["Pre-flight blocked execution.".to_string()],
         ));
         return;
@@ -5208,7 +5211,7 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "analysis",
         "one-click analysis started",
     ));
-    let analysis = oneclick_analysis_summary(&state.inspection, &state.issues);
+    let analysis = oneclick_analysis_summary(&state.inspection, &run_issues);
     emit(json!({
         "event": "analysis",
         "request_id": request.request_id,
@@ -5221,9 +5224,12 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         "recommendation",
         "one-click recommendations ready",
     ));
-    let charset_contracts = BTreeMap::new();
+    let charset_contracts = oneclick_charset_contracts_by_issue_index_with_offset(
+        &request.payload,
+        payload_issue_offset,
+    );
     let recommendations =
-        oneclick_recommendations(&state.issues, &state.schema_name, &charset_contracts);
+        oneclick_recommendations(&run_issues, &state.schema_name, &charset_contracts);
     let recommendation_summary = oneclick_recommendation_summary(&recommendations);
     emit(json!({
         "event": "execution_plan",
@@ -5374,7 +5380,7 @@ fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
         request,
         &state.schema_name,
         validation_success,
-        &state.issues,
+        &run_issues,
         &validation_issues,
         report_execution_log,
     ));
@@ -5942,6 +5948,13 @@ fn oneclick_auto_fix_option(
 }
 
 fn oneclick_charset_contracts_by_issue_index(payload: &Value) -> BTreeMap<usize, Value> {
+    oneclick_charset_contracts_by_issue_index_with_offset(payload, 0)
+}
+
+fn oneclick_charset_contracts_by_issue_index_with_offset(
+    payload: &Value,
+    offset: usize,
+) -> BTreeMap<usize, Value> {
     payload
         .get("charset_contracts")
         .and_then(Value::as_array)
@@ -5949,7 +5962,7 @@ fn oneclick_charset_contracts_by_issue_index(payload: &Value) -> BTreeMap<usize,
         .flatten()
         .filter_map(|contract| {
             let index = contract.get("issue_index").and_then(Value::as_u64)? as usize;
-            Some((index, contract.clone()))
+            Some((index + offset, contract.clone()))
         })
         .collect()
 }
