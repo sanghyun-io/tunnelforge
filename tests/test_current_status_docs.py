@@ -83,7 +83,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "1801 passed, 5 warnings" not in doc
     assert "PASS, 1803 passed, 5 warnings" not in doc
     assert "PASS, 1805 passed, 5 warnings" not in doc
-    assert "PASS, 1807 passed, 5 warnings" in doc
+    assert "PASS, 1807 passed, 5 warnings" not in doc
+    assert "PASS, 1808 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -160,6 +161,16 @@ def test_current_status_records_macos_manual_workflow_head_policy():
     assert "TF-STATUS-038" in doc
     assert "macOS manual workflow head policy" in doc
     assert "manual workflow_dispatch artifact run now follows the same head policy" in normalized_doc
+
+
+def test_current_status_records_post_merge_next_issue_external_reaudit():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+
+    assert "TF-STATUS-039" in doc
+    assert "Post-merge next-issue external re-audit" in doc
+    assert "no new GitHub issue was created from this pass" in normalized_doc
+    assert "SQL editor query execution also routes through the Rust connector shim" in normalized_doc
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():
