@@ -35,3 +35,15 @@ def test_current_status_top_handoff_does_not_present_closed_issues_as_current_wo
 
     for phrase in stale_current_work_phrases:
         assert phrase not in top_handoff
+
+
+def test_current_status_does_not_describe_old_gate_head_as_current():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+
+    stale_phrases = [
+        "#116 Current Evidence now points operators at current `main` / gate head `6da13f7`",
+        "#116 Current Evidence now points operators at current `main` / gate head `c12e9b7`",
+    ]
+
+    for phrase in stale_phrases:
+        assert phrase not in doc
