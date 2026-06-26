@@ -10304,6 +10304,27 @@ mod tests {
     }
 
     #[test]
+    fn endpoint_error_redaction_removes_password_value() {
+        let endpoint = Endpoint {
+            engine: "mysql".to_string(),
+            host: "db.local".to_string(),
+            port: 3306,
+            user: "app".to_string(),
+            password: "super-secret-password".to_string(),
+            database: "prod".to_string(),
+            schema: None,
+        };
+
+        let message = redact_endpoint_secret(
+            "access denied for app using super-secret-password",
+            &endpoint,
+        );
+
+        assert!(!message.contains("super-secret-password"));
+        assert!(message.contains("***"));
+    }
+
+    #[test]
     fn dump_import_ddl_error_includes_classification_table_and_operation() {
         let err = dump_import_ddl_error("create_table", "users", "mysql create table error");
 
