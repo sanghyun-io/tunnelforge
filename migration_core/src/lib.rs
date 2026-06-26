@@ -8659,11 +8659,20 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
 }
 
 fn post_load_ddl_error(sql: &str, err: &str) -> String {
-    classified_import_error(
-        "post_load_validation_failed",
-        &format!("post-load DDL failed while executing {sql}: {err}"),
-        None,
-    )
+    let message = if is_mysql_table_full_error(err) {
+        format!(
+            "post-load DDL failed while executing {sql}: {err}; target MySQL storage or temporary table space is full. Increase target disk space, tmpdir capacity, or innodb_temp_data_file_path before retrying the import."
+        )
+    } else {
+        format!("post-load DDL failed while executing {sql}: {err}")
+    };
+    classified_import_error("post_load_validation_failed", &message, None)
+}
+
+fn is_mysql_table_full_error(err: &str) -> bool {
+    let normalized = err.to_ascii_lowercase();
+    normalized.contains("error 1114")
+        || normalized.contains("the table") && normalized.contains("is full")
 }
 
 pub fn count_sql(engine: &str, table: &str) -> String {
@@ -11977,6 +11986,20 @@ mod tests {
         assert!(err.contains("post_load_validation_failed"));
         assert!(err.contains("CREATE INDEX `idx_login_attempts_user_id`"));
         assert!(err.contains("ERROR 1114"));
+    }
+
+    #[test]
+    fn post_load_ddl_mysql_table_full_error_includes_storage_guidance() {
+        let err = post_load_ddl_error(
+            "ALTER TABLE `login_attempts` ADD INDEX `idx_user_id` (`user_id`)",
+            "mysql SQL execution error: ERROR 1114 (HY000): The table '#sql-1cbc_17b' is full",
+        );
+
+        assert!(err.contains("post_load_validation_failed"));
+        assert!(err.contains("ERROR 1114"));
+        assert!(err.contains("target MySQL storage or temporary table space is full"));
+        assert!(err.contains("tmpdir"));
+        assert!(err.contains("innodb_temp_data_file_path"));
     }
 
     #[test]

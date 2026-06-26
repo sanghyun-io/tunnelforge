@@ -556,6 +556,38 @@ Next action:
 1. Consider column insertion or drag/drop later if users ask for richer query
    composition.
 
+### TF-STATUS-016: MySQL Post-Load DDL Table-Full Guidance
+
+Status: `closed`
+Severity: Medium
+Area: Rust Core dump.import diagnostics
+
+Evidence:
+
+- GitHub issue #126 reported MySQL `ERROR 1114 (HY000): The table
+  '#sql-1cbc_17b' is full` during replace import post-load DDL.
+- Earlier handling classified the failure as `post_load_validation_failed` and
+  included the exact failing post-load DDL statement.
+- The current update adds a specific guidance suffix for MySQL table-full
+  errors, telling the operator that target MySQL storage or temporary table
+  space is full and to increase disk space, `tmpdir` capacity, or
+  `innodb_temp_data_file_path` before retrying.
+- Focused regression coverage verifies the `ERROR 1114` guidance while keeping
+  the existing SQL-context classification behavior.
+- GitHub issue: https://github.com/sanghyun-io/tunnelforge/issues/126
+
+Impact:
+
+- TunnelForge now distinguishes this class as an actionable target
+  environment/resource condition instead of leaving users with a raw MySQL
+  temporary table name.
+
+Next action:
+
+1. If another `ERROR 1114` report appears after this guidance, collect target
+   MySQL storage, `tmpdir`, and InnoDB temporary tablespace evidence rather than
+   changing import semantics first.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -575,6 +607,7 @@ Next action:
 | TF-STATUS-013 | High | closed | Rust Core import | MySQL JSON fallback encoding | Watch for malformed-source JSON reports |
 | TF-STATUS-014 | Medium | closed | SQL editor UI | Large SQL rendering guard | Revisit virtual rendering if measured bottleneck remains |
 | TF-STATUS-015 | Medium | closed | SQL editor UI | Schema/table tree panel | Consider richer query composition later |
+| TF-STATUS-016 | Medium | closed | Rust Core dump.import diagnostics | MySQL ERROR 1114 table-full guidance | Collect target storage/tmpdir evidence if it recurs |
 
 ## Recommended Execution Order
 
@@ -604,3 +637,4 @@ Next action:
 | 2026-06-26 | Hardened MySQL JSON fallback INSERT handling for GitHub #118 by using `_utf8mb4` JSON literals and removing `NO_BACKSLASH_ESCAPES` during import session tuning. | `migration_core/src/lib.rs`, `docs/current_status.md`, `reports/export_import_flow_review_20260601.html` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml mysql_json_literal_uses_utf8mb4_introducer_for_unicode_json_text --lib`; `cargo test --manifest-path migration_core\Cargo.toml mysql_dump_import_uses_fast_session_tuning_statements --lib`; final: `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `pytest -q`; `python -m compileall -q main.py src tests`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
 | 2026-06-26 | Added a large-document guard for GitHub #86 so SQL files at or above 512KB open with syntax highlighting and real-time validation disabled, then restore normal editor features for smaller content. | `src/ui/dialogs/sql_editor_dialog.py`, `src/core/i18n.py`, `tests/test_sql_editor_dialog.py`, `docs/current_status.md` | RED/GREEN: `pytest tests/test_sql_editor_dialog.py::test_large_sql_file_disables_expensive_editor_features tests/test_sql_editor_dialog.py::test_small_content_reenables_editor_features_after_large_file`; final: `pytest tests/test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests/test_sql_editor_dialog.py`; `pytest -q`; `python -m compileall -q main.py src tests`; `git diff --check` |
 | 2026-06-26 | Added the SQL editor schema/table tree panel for GitHub #92 with schema roots, loaded table/column children, and table-click insertion into the current editor. | `src/ui/dialogs/sql_editor_dialog.py`, `tests/test_sql_editor_dialog.py`, `docs/current_status.md` | RED/GREEN: `pytest tests/test_sql_editor_dialog.py::test_metadata_loaded_populates_schema_tree tests/test_sql_editor_dialog.py::test_schema_tree_table_click_inserts_quoted_table_name`; final: `pytest tests/test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests/test_sql_editor_dialog.py`; `pytest -q`; `python -m compileall -q main.py src tests`; `git diff --check` |
+| 2026-06-26 | Analyzed GitHub #126 and added MySQL `ERROR 1114` storage/tmpdir guidance to post-load DDL import failures. | `migration_core/src/lib.rs`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl_mysql_table_full_error_includes_storage_guidance --lib`; focused regression: `cargo test --manifest-path migration_core\Cargo.toml post_load_ddl --lib`; final: `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; `cargo fmt --manifest-path migration_core\Cargo.toml --check`; `git diff --check` |
