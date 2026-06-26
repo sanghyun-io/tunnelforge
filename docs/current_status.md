@@ -266,12 +266,11 @@ wrappers now accept an optional `engine` parameter, default to MySQL for
 backward compatibility, and preserve `engine="postgresql"` into
 `RustDumpConfig` for Rust Core endpoints.
 
-GitHub #165 now tracks the next repo-side issue found after the #164 main
-merge: hidden scheduled Rust dump backups do not preserve PostgreSQL tunnel
-engine metadata into `RustDumpConfig`, even though scheduled SQL execution
-already uses engine-aware Rust Core connector creation. Because
-`SCHEDULE_FEATURE_ENABLED = False`, this is a reactivation/internal-path issue
-rather than a current public UI regression.
+GitHub #165 is fixed as the hidden scheduled backup follow-up:
+`BackupScheduler._execute_backup` now preserves PostgreSQL tunnel engine
+metadata into `RustDumpConfig`, matching the engine-aware scheduled SQL path.
+Because `SCHEDULE_FEATURE_ENABLED = False`, this was a reactivation/internal
+path issue rather than a current public UI regression.
 
 Post-#142 next issue analysis on 2026-06-27 found #116 is still the only open
 GitHub issue. The normal repository-side macOS support gate passes, but
@@ -318,7 +317,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before the latest status update |
-| `pytest -q` | PASS, 1865 passed, 5 warnings |
+| `pytest -q` | PASS, 1867 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -342,7 +341,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1865 passed, 5 warnings |
+| `pytest -q` | PASS, 1867 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -413,13 +412,14 @@ Commands run locally:
 | `pytest tests\test_rust_dump_exporter.py -q -k "wrapper_preserves_postgresql_engine"` | RED then PASS, 3 passed |
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_dump_wrapper_engine_issue -q` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_scheduled_backup_postgresql_engine_issue -q` | RED then PASS |
+| `pytest tests\test_scheduler.py::TestBackupScheduler::test_backup_task_preserves_postgresql_engine_for_rust_dump -q` | RED then PASS |
 
 ## Verification Log
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | Scheduled backup PostgreSQL engine analysis | `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30`; `rg -n "_execute_backup\|RustDumpConfig\|db_engine\|get_connection_info\|tunnel_configs\|export_full_schema\|export_tables" src\core\scheduler.py tests\test_scheduler.py`; `gh issue create` created #165; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_scheduled_backup_postgresql_engine_issue -q` | PASS | GitHub #165 is open: scheduled SQL already preserves `db_engine`, but scheduled Rust dump backups build `RustDumpConfig` without an engine and therefore fall back to MySQL for PostgreSQL tunnels |
-| 2026-06-27 | PostgreSQL dump wrapper engine | RED/GREEN: `pytest tests\test_rust_dump_exporter.py -q -k "wrapper_preserves_postgresql_engine"`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_dump_wrapper_engine_issue -q`; `gh issue create` created #164; `pytest -q` | PASS | GitHub #164 is fixed: `export_schema`, `export_tables`, and `import_dump` convenience wrappers preserve PostgreSQL engine into `RustDumpConfig`; current full Python suite is `1865 passed, 5 warnings` |
+| 2026-06-27 | Scheduled backup PostgreSQL engine | `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30`; `rg -n "_execute_backup\|RustDumpConfig\|db_engine\|get_connection_info\|tunnel_configs\|export_full_schema\|export_tables" src\core\scheduler.py tests\test_scheduler.py`; `gh issue create` created #165; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_scheduled_backup_postgresql_engine_issue -q`; RED/GREEN: `pytest tests\test_scheduler.py::TestBackupScheduler::test_backup_task_preserves_postgresql_engine_for_rust_dump -q` | PASS | GitHub #165 is fixed: scheduled Rust dump backups now normalize tunnel `db_engine` metadata and pass it into `RustDumpConfig`, preserving PostgreSQL while keeping the MySQL default fallback |
+| 2026-06-27 | PostgreSQL dump wrapper engine | RED/GREEN: `pytest tests\test_rust_dump_exporter.py -q -k "wrapper_preserves_postgresql_engine"`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_dump_wrapper_engine_issue -q`; `gh issue create` created #164; `pytest -q` | PASS | GitHub #164 is fixed: `export_schema`, `export_tables`, and `import_dump` convenience wrappers preserve PostgreSQL engine into `RustDumpConfig`; full-suite count is superseded by TF-STATUS-067 |
 | 2026-06-27 | PostgreSQL Import timezone Core validation | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_mysql_and_postgresql_timezone_forms --lib`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_import_timezone_core_validation_issue -q`; `gh issue create` created #163; `pytest -q`; `cargo test --manifest-path migration_core\Cargo.toml` | PASS | GitHub #163 is fixed: Rust Core `dump.import` accepts PostgreSQL `SET TIME ZONE` timezone SQL as well as MySQL `SET SESSION time_zone`, while preserving single-statement and safe-literal validation; full-suite count is superseded by TF-STATUS-066 |
 | 2026-06-27 | PostgreSQL Import timezone SQL | RED/GREEN: `pytest tests\test_db_dialogs.py -q -k "postgresql_import_auto_timezone or postgresql_import_forced_kst"`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_import_timezone_issue -q`; i18n regression: `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation tests\test_db_dialogs.py -q -k "direct_hardcoded or postgresql_import_auto_timezone or postgresql_import_forced_kst"`; `gh issue create` created #162; `pytest -q` | PASS | GitHub #162 is fixed: PostgreSQL dump import default auto timezone mode skips MySQL timezone table detection and sends no MySQL timezone correction SQL; forced KST/UTC use PostgreSQL `SET TIME ZONE`; full-suite count is superseded by TF-STATUS-065 |
 | 2026-06-27 | PostgreSQL Rust dump endpoint engine | RED/GREEN: `pytest tests\test_rust_dump_exporter.py::TestRustDumpConfig::test_config_preserves_postgresql_engine tests\test_rust_dump_exporter.py::TestRustDumpExporter::test_export_full_schema_preserves_postgresql_engine_in_rust_payload tests\test_rust_dump_exporter.py::TestRustDumpImporter::test_import_dump_preserves_postgresql_engine_in_rust_payload -q`; RED/GREEN: `pytest tests\test_db_dialogs.py::test_preselected_export_tunnel_uses_postgres_connector_for_postgresql tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_postgresql_rust_dump_engine_issue -q`; `gh issue create` created #161; `pytest -q` | PASS | GitHub #161 is fixed: `RustDumpConfig` preserves `engine`, PostgreSQL Export/Import dialogs pass `PostgresConnector.engine`, preselected PostgreSQL tunnels construct `PostgresConnector`, and Rust Core `dump.run`/`dump.import` payloads use `postgresql` endpoints; full-suite count is superseded by TF-STATUS-064 |
@@ -2108,14 +2108,13 @@ Next action:
 | TF-STATUS-064 | High | closed | Rust Core Export/Import | PostgreSQL Import timezone SQL | Keep PostgreSQL dump import from using MySQL timezone detection or MySQL timezone correction SQL |
 | TF-STATUS-065 | High | closed | Rust Core dump.import | PostgreSQL Import timezone Core validation | Keep Rust Core timezone validation aligned with MySQL and PostgreSQL import timezone SQL forms |
 | TF-STATUS-066 | Medium | closed | Rust Core Export/Import helper API | PostgreSQL dump wrapper engine | Keep module-level dump helper wrappers engine-aware while preserving MySQL default compatibility |
-| TF-STATUS-067 | Medium | open | Hidden Scheduler / Rust Core dump backup | Scheduled PostgreSQL backup engine | Add regression coverage and pass normalized tunnel `db_engine` into scheduled backup `RustDumpConfig` |
+| TF-STATUS-067 | Medium | closed | Hidden Scheduler / Rust Core dump backup | Scheduled PostgreSQL backup engine | Keep scheduled backup `RustDumpConfig` engine derivation aligned with scheduled SQL connector derivation |
 
 ## Recommended Execution Order
 
-1. TF-STATUS-067 / GitHub #165 is the next repo-side implementation issue:
-   scheduled Rust dump backups must preserve PostgreSQL tunnel engine metadata
-   into `RustDumpConfig` while keeping the MySQL default fallback for missing
-   metadata.
+1. No repo-side implementation issue is currently open after TF-STATUS-067 /
+   GitHub #165 fixed scheduled PostgreSQL Rust dump backup engine preservation.
+   `main` should stay aligned with `origin/main` after the fix is pushed.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence; #116 remains external.
 3. Track additional One-Click automatic fix classes as separate GitHub issues
@@ -2125,7 +2124,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
-| 2026-06-27 | Created TF-STATUS-067 / GitHub #165 after confirming the next repo-side issue: hidden scheduled Rust dump backups do not preserve PostgreSQL tunnel engine metadata into `RustDumpConfig`, while scheduled SQL already does. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #165 | Issue analysis commands; RED/GREEN focused current-status pytest |
+| 2026-06-27 | Fixed TF-STATUS-067 / GitHub #165 by passing the normalized tunnel `db_engine` into scheduled backup `RustDumpConfig`, matching the existing scheduled SQL Rust Core connector path. | `src/core/scheduler.py`, `tests/test_scheduler.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #165 | RED/GREEN: scheduled backup engine pytest and current-status pytest; final: full `pytest -q` at 1867 passed |
 | 2026-06-27 | Fixed TF-STATUS-066 / GitHub #164 by adding optional `engine` parameters to the module-level `export_schema`, `export_tables`, and `import_dump` convenience wrappers so PostgreSQL helper callers preserve Rust Core endpoint engines. | `src/exporters/rust_dump_exporter.py`, `tests/test_rust_dump_exporter.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #164 | RED/GREEN: wrapper engine pytest and current-status pytest; final: full `pytest -q` at 1865 passed |
 | 2026-06-27 | Fixed TF-STATUS-065 / GitHub #163 by allowing Rust Core `dump.import` timezone validation to accept PostgreSQL `SET TIME ZONE` while preserving the existing MySQL `SET SESSION time_zone` allowlist and injection rejection. | `migration_core/src/lib.rs`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #163 | RED/GREEN: Rust timezone validator pytest and current-status pytest; final: Rust core tests, full `pytest -q` at 1861 passed |
 | 2026-06-27 | Fixed TF-STATUS-064 / GitHub #162 by skipping MySQL timezone auto-detection for PostgreSQL dump import and using PostgreSQL `SET TIME ZONE` syntax for forced timezone options. | `src/ui/dialogs/db_dialogs.py`, `src/core/i18n.py`, `tests/test_db_dialogs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #162 | RED/GREEN: PostgreSQL import timezone pytest and current-status pytest; i18n regression; final: full `pytest -q` at 1860 passed |

@@ -442,6 +442,10 @@ class BackupScheduler:
                     self._log_backup(schedule, False, error_msg)
                     return False, error_msg
 
+            tunnel_config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(
+                schedule.tunnel_id, {}
+            )
+
             # 연결 정보 가져오기
             conn_info = self.tunnel_engine.get_connection_info(schedule.tunnel_id)
             if not conn_info:
@@ -456,12 +460,18 @@ class BackupScheduler:
             os.makedirs(output_subdir, exist_ok=True)
 
             # RustDump Export 실행
+            local_port = conn_info.get('local_port', DEFAULT_MYSQL_PORT)
+            engine = normalize_db_engine(
+                tunnel_config.get('db_engine'),
+                tunnel_config.get('remote_port') or local_port,
+            )
             config = RustDumpConfig(
                 host=conn_info.get('host', DEFAULT_LOCAL_HOST),
-                port=conn_info.get('local_port', DEFAULT_MYSQL_PORT),
+                port=local_port,
                 user=conn_info.get('db_user', 'root'),
                 password=conn_info.get('db_password', ''),
-                schema=schedule.schema
+                schema=schedule.schema,
+                engine=engine,
             )
 
             exporter = RustDumpExporter(config)
