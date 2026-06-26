@@ -6,6 +6,7 @@ from src.core.db_core_service import (
     DbCoreServiceError,
     DbCoreServiceClient,
     DbEndpoint,
+    RustDbConnection,
     RustDbConnector,
     create_rust_db_connector,
     normalize_db_engine,
@@ -290,6 +291,34 @@ def test_execute_on_connection_streaming_collects_row_batches():
     assert sent["payload"]["row_batch_size"] == 1
     assert batches == [[{"id": 1}], [{"id": 2}]]
     assert result["rows_streamed"] == 2
+
+
+def test_rust_db_cursor_executemany_rejects_python_batch_helper():
+    class FakeFacade:
+        def __init__(self):
+            self.calls = []
+
+        def execute_on_connection(self, connection_id, query, params=None):
+            self.calls.append((connection_id, query, params))
+            return []
+
+    facade = FakeFacade()
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
+    connection = RustDbConnection(endpoint, facade, "conn-1")
+
+    with connection.cursor() as cursor:
+        try:
+            cursor.executemany(
+                "INSERT INTO users (id, name) VALUES (%s, %s)",
+                [(1, "Alice")],
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("RustDbCursor.executemany should fail closed")
+
+    assert "Rust Core" in message
+    assert facade.calls == []
 
 
 def test_create_rust_db_connector_resolves_postgresql_engine_from_config():

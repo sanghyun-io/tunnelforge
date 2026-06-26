@@ -96,7 +96,8 @@ def test_current_status_does_not_keep_stale_full_pytest_count():
     assert "PASS, 1825 passed, 5 warnings" not in doc
     assert "PASS, 1826 passed, 5 warnings" not in doc
     assert "PASS, 1827 passed, 5 warnings" not in doc
-    assert "PASS, 1830 passed, 5 warnings" in doc
+    assert "PASS, 1830 passed, 5 warnings" not in doc
+    assert "PASS, 1832 passed, 5 warnings" in doc
     assert "Current main full Python suite" in doc
 
 
@@ -337,6 +338,19 @@ def test_current_status_tracks_post_v217_version_drift_issue():
     assert "2.1.8" in doc
     assert "GitHub #149 is fixed" in summary
     assert "Version references are aligned at `2.1.8`" in doc
+
+
+def test_current_status_tracks_rust_db_cursor_executemany_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    summary = " ".join(_section(doc, "Summary").split())
+
+    assert "TF-STATUS-050" in doc
+    assert "GitHub #150" in doc
+    assert "RustDbCursor executemany batch helper" in normalized_doc
+    assert "RustDbCursor.executemany" in doc
+    assert "GitHub #150 is fixed" in summary
+    assert "batch db operations must be modeled as explicit rust core commands" in normalized_doc.lower()
 
 
 def test_current_status_focused_verification_has_no_duplicate_check_rows():

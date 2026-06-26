@@ -631,11 +631,10 @@ class RustDbCursor:
         return self.rowcount
 
     def executemany(self, query: str, data: Sequence[Sequence[Any]]) -> int:
-        total = 0
-        for params in data:
-            total += self.execute(query, params)
-        self.rowcount = total
-        return total
+        raise RuntimeError(
+            "RustDbCursor.executemany is disabled. "
+            "Batch DB operations must be modeled as explicit Rust Core commands."
+        )
 
     def fetchall(self) -> List[Dict[str, Any]]:
         return list(self._rows)
