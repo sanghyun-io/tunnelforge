@@ -239,6 +239,11 @@ validation work, not a repo-side implementation issue.
 The current full Python suite count was refreshed again on 2026-06-27 after
 the latest status update regression coverage was added.
 
+GitHub #160 is fixed: partial Export FK parent auto-inclusion now resolves
+transitive parent tables through Rust Core-owned schema inspection
+(`schema.inspect`) instead of constructing a Python `MySQLConnector` in
+`RustDumpExporter.export_tables`.
+
 Post-#142 next issue analysis on 2026-06-27 found #116 is still the only open
 GitHub issue. The normal repository-side macOS support gate passes, but
 `python scripts\check-macos-support-gate.py --final` currently fails because
@@ -284,7 +289,7 @@ those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | `## main...origin/main`, no local changes before the latest status update |
-| `pytest -q` | PASS, 1850 passed, 5 warnings |
+| `pytest -q` | PASS, 1852 passed, 5 warnings |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -308,7 +313,7 @@ Commands run locally:
 
 | Check | Result |
 | --- | --- |
-| `pytest -q` | PASS, 1850 passed, 5 warnings |
+| `pytest -q` | PASS, 1852 passed, 5 warnings |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `python scripts\check-macos-support-gate.py` | PASS |
 | `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q` | RED then PASS |
@@ -365,12 +370,16 @@ Commands run locally:
 | `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q` | PASS, 73 passed, 2 warnings |
 | `pytest tests\test_current_status_docs.py::test_current_status_tracks_dollar_quote_none_input_issue -q` | RED then PASS |
 | `pytest tests\test_current_status_docs.py::test_current_status_baseline_provenance_uses_latest_status_update -q` | RED then PASS |
+| `pytest tests\test_rust_dump_exporter.py::TestRustDumpExporter::test_export_tables_resolves_fk_parents_through_rust_schema_inspect -q` | RED then PASS |
+| `pytest tests\test_rust_dump_exporter.py -q` | PASS, 37 passed, 2 warnings |
+| `pytest tests\test_current_status_docs.py::test_current_status_tracks_partial_export_fk_parent_rust_inspect_issue -q` | RED then PASS |
 
 ## Verification Log
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
-| 2026-06-27 | Current-status baseline provenance refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_baseline_provenance_uses_latest_status_update -q`; `gh issue create` created #159; `pytest tests\test_current_status_docs.py -q`; `pytest -q` | PASS | GitHub #159 is fixed: top current-status baseline provenance now refers to the latest status update instead of stale post-#156 wording; current full Python suite is `1850 passed, 5 warnings` |
+| 2026-06-27 | Partial export FK parent resolution | RED/GREEN: `pytest tests\test_rust_dump_exporter.py::TestRustDumpExporter::test_export_tables_resolves_fk_parents_through_rust_schema_inspect -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_partial_export_fk_parent_rust_inspect_issue -q`; `gh issue create` created #160; `pytest tests\test_rust_dump_exporter.py -q`; `pytest -q` | PASS | GitHub #160 is fixed: `RustDumpExporter.export_tables(... include_fk_parents=True)` now uses Rust Core-owned `schema.inspect` to include transitive FK parent tables before `dump.run`, without instantiating Python `MySQLConnector`; current full Python suite is `1852 passed, 5 warnings` |
+| 2026-06-27 | Current-status baseline provenance refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_baseline_provenance_uses_latest_status_update -q`; `gh issue create` created #159; `pytest tests\test_current_status_docs.py -q`; `pytest -q` | PASS | GitHub #159 is fixed: top current-status baseline provenance now refers to the latest status update instead of stale post-#156 wording; full-suite count is superseded by TF-STATUS-062 |
 | 2026-06-27 | SQL dollar quote helper None input guard | RED/GREEN: `pytest tests\test_sql_execution_worker.py::test_dollar_quote_reader_fails_closed_for_none_sql_text -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_dollar_quote_none_input_issue -q`; `gh issue create` created #158; `pytest tests\test_sql_execution_worker.py tests\test_sql_editor_dialog.py tests\test_scheduler.py -q`; `pytest -q` | PASS | GitHub #158 is fixed: `read_dollar_quote(None, 0)` and `SQLExecutionWorker._read_dollar_quote(None, 0)` now fail closed with `""` instead of raising `TypeError`; full-suite count is superseded by TF-STATUS-061 |
 | 2026-06-27 | One-Click readiness next-action wording cleanup | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_does_not_present_closed_issues_as_current_tracking -q`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_tracks_oneclick_next_action_wording_issue -q`; `gh issue create` created #157; `pytest -q` | PASS | GitHub #157 is fixed: `docs/oneclick_readiness.md` now frames additional One-Click automatic-fix work as standing policy/watch guidance instead of a current `Recommended next repo-side change`; full-suite count is superseded by TF-STATUS-060 |
 | 2026-06-27 | Post-#156 main merge and next issue analysis | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_156_next_issue_analysis -q`; `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30 --json number,title,labels,url,updatedAt`; `gh issue view 116 --json number,title,state,labels,body,comments,url,updatedAt`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; `pytest -q` | EXPECTED FAIL for `--final` only | `main` was already aligned with `origin/main`; #116 is still the only open GitHub issue. Normal repo-side gate passes. Final gate fails only for missing real-Mac report under `build/` and missing successful manual `macOS App Validation` workflow_dispatch evidence for current merged main HEAD, so no new repo-side implementation issue was created. Full-suite count is superseded by TF-STATUS-060 |
@@ -2049,11 +2058,13 @@ Next action:
 | TF-STATUS-059 | Low | closed | One-Click readiness docs | One-Click readiness next-action wording | Keep completed One-Click readiness guidance framed as standing policy, not current next repo-side work |
 | TF-STATUS-060 | Low | closed | SQL parser helper | SQL dollar quote helper None input | Keep dollar quote marker detection fail-closed for invalid and missing SQL text |
 | TF-STATUS-061 | Low | closed | Status documentation | Current-status baseline provenance refresh | Keep current baseline provenance tied to the latest status update |
+| TF-STATUS-062 | Medium | closed | Rust Core baseline / Export | Partial export FK parent resolution | Keep partial Export FK parent auto-inclusion owned by Rust Core schema inspection, not Python DB connectors |
 
 ## Recommended Execution Order
 
-1. No repo-side implementation issue is currently open after TF-STATUS-061 /
-   GitHub #159 refreshed current-status baseline provenance. `main` is
+1. No repo-side implementation issue is currently open after TF-STATUS-062 /
+   GitHub #160 routed partial Export FK parent resolution through Rust Core
+   schema inspection. `main` is
    aligned with `origin/main`, and #116 remains the only open GitHub issue.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation evidence; #116 remains external.
@@ -2064,7 +2075,8 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
-| 2026-06-27 | Fixed TF-STATUS-061 / GitHub #159 by refreshing the current-status baseline provenance wording after TF-STATUS-060. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #159 | RED/GREEN: current-status baseline provenance pytest; final: full `pytest -q` at 1850 passed |
+| 2026-06-27 | Fixed TF-STATUS-062 / GitHub #160 by routing partial Export FK parent resolution through Rust Core `schema.inspect` instead of Python `MySQLConnector`. | `src/exporters/rust_dump_exporter.py`, `tests/test_rust_dump_exporter.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #160 | RED/GREEN: partial export FK parent Rust inspect pytest and current-status pytest; exporter suite; final: full `pytest -q` at 1852 passed |
+| 2026-06-27 | Fixed TF-STATUS-061 / GitHub #159 by refreshing the current-status baseline provenance wording after TF-STATUS-060. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #159 | RED/GREEN: current-status baseline provenance pytest; full-suite count superseded by TF-STATUS-062 |
 | 2026-06-27 | Fixed TF-STATUS-060 / GitHub #158 by making the SQL dollar quote helper fail closed for `None` SQL text. | `src/core/sql_statement_parser.py`, `tests/test_sql_execution_worker.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #158 | RED/GREEN: dollar quote None-input pytest and current-status pytest; parser suite; final: full `pytest -q` at 1849 passed |
 | 2026-06-27 | Fixed TF-STATUS-059 / GitHub #157 by changing One-Click readiness follow-up wording from a current next repo-side change to standing policy/watch guidance. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md`, GitHub #157 | RED/GREEN: One-Click readiness docs pytest and current-status pytest; full-suite count superseded by TF-STATUS-060 |
 | 2026-06-27 | Re-analyzed the next issue after #156 and confirmed `main` was already aligned with `origin/main`. #116 is the only open GitHub issue; the normal repository-side macOS support gate passes, and the final gate remains blocked only by missing current-main real-Mac evidence and manual workflow_dispatch evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#156 current-status pytest; final: #116 gate pass, expected-failing final gate; full-suite count superseded by TF-STATUS-060 |

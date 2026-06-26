@@ -171,7 +171,7 @@ class TestRustDumpExporter:
         exporter = RustDumpExporter(config)
 
         assert exporter.config == config
-        assert exporter._connector is None
+        assert not hasattr(exporter, "_connector")
 
     def test_export_full_schema_uses_rust_dump_command(self, tmp_path):
         """전체 스키마 export가 Rust dump.run을 호출"""
@@ -249,6 +249,55 @@ class TestRustDumpExporter:
         assert facade.payload["chunk_size"] == 50000
         assert facade.payload["data_format"] == "tsv"
         assert facade.payload["compression"] == "zstd"
+
+    def test_export_tables_resolves_fk_parents_through_rust_schema_inspect(
+        self, tmp_path, monkeypatch
+    ):
+        """부분 export FK 부모 자동 포함은 Python MySQLConnector를 열지 않는다."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FailingConnector:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("partial export must not instantiate MySQLConnector")
+
+        class FakeFacade:
+            def inspect_schema(self, endpoint):
+                self.inspect_endpoint = endpoint
+                return {
+                    "tables": [
+                        {"name": "users", "foreign_keys": []},
+                        {
+                            "name": "orders",
+                            "foreign_keys": [{"name": "fk_orders_users", "referenced_table": "users"}],
+                        },
+                        {
+                            "name": "order_items",
+                            "foreign_keys": [{"name": "fk_items_orders", "referenced_table": "orders"}],
+                        },
+                    ]
+                }
+
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 3, "rows_dumped": 0}
+
+        monkeypatch.setattr("src.exporters.rust_dump_exporter.MySQLConnector", FailingConnector)
+        facade = FakeFacade()
+        config = RustDumpConfig("localhost", 3306, "root", "password")
+        exporter = RustDumpExporter(config, facade=facade)
+
+        success, msg, tables = exporter.export_tables(
+            "app",
+            ["order_items"],
+            str(tmp_path / "dump"),
+            include_fk_parents=True,
+        )
+
+        assert success is True
+        assert tables == ["order_items", "orders", "users"]
+        assert facade.inspect_endpoint.database == "app"
+        assert facade.payload["tables"] == ["order_items", "orders", "users"]
+        assert "3개 테이블" in msg
 
     def test_export_full_schema_reports_view_count(self, tmp_path):
         """전체 export 결과에 View 개수가 메시지로 포함됨"""

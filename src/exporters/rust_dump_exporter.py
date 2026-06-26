@@ -339,24 +339,7 @@ class RustDumpExporter:
 
     def __init__(self, config: RustDumpConfig, facade: Optional[DbCoreFacade] = None):
         self.config = config
-        self._connector: Optional[MySQLConnector] = None
         self.facade = facade or get_shared_db_core_facade()
-
-    def _get_connector(self) -> MySQLConnector:
-        if self._connector is None:
-            self._connector = MySQLConnector(
-                self.config.host,
-                self.config.port,
-                self.config.user,
-                self.config.password,
-            )
-            self._connector.connect()
-        return self._connector
-
-    def _cleanup(self) -> None:
-        if self._connector:
-            self._connector.disconnect()
-            self._connector = None
 
     def _endpoint(self, schema: str) -> DbEndpoint:
         return DbEndpoint(
@@ -367,6 +350,44 @@ class RustDumpExporter:
             password=self.config.password,
             database=schema,
         )
+
+    def _resolve_required_tables_from_rust_schema(
+        self,
+        selected_tables: List[str],
+        schema: str,
+    ) -> Tuple[List[str], List[str]]:
+        inspected = self.facade.inspect_schema(self._endpoint(schema))
+        table_deps: Dict[str, Set[str]] = {}
+        for table in inspected.get("tables", []) if isinstance(inspected, dict) else []:
+            if not isinstance(table, dict):
+                continue
+            table_name = str(table.get("name") or "")
+            if not table_name:
+                continue
+            parents: Set[str] = set()
+            foreign_keys = table.get("foreign_keys")
+            if isinstance(foreign_keys, list):
+                for foreign_key in foreign_keys:
+                    if not isinstance(foreign_key, dict):
+                        continue
+                    referenced_table = str(foreign_key.get("referenced_table") or "")
+                    if referenced_table and referenced_table != table_name:
+                        parents.add(referenced_table)
+            if parents:
+                table_deps[table_name] = parents
+
+        required = set(selected_tables)
+        added: Set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for table_name in list(required):
+                for parent in table_deps.get(table_name, set()):
+                    if parent not in required:
+                        required.add(parent)
+                        added.add(parent)
+                        changed = True
+        return sorted(required), sorted(added)
 
     def _emit_core_event(
         self,
@@ -487,8 +508,10 @@ class RustDumpExporter:
             if include_fk_parents:
                 if progress_callback:
                     progress_callback("FK 의존성 분석 중...")
-                resolver = ForeignKeyResolver(self._get_connector())
-                final_tables, added_tables = resolver.resolve_required_tables(tables, schema)
+                final_tables, added_tables = self._resolve_required_tables_from_rust_schema(
+                    tables,
+                    schema,
+                )
 
             success, message = self._run_rust_dump(
                 schema=schema,
@@ -510,8 +533,6 @@ class RustDumpExporter:
             return False, f"Rust DB Core export 오류: {exc}", []
         except Exception as exc:
             return False, f"Export 오류: {exc}", []
-        finally:
-            self._cleanup()
 
     def _write_metadata(
         self,
