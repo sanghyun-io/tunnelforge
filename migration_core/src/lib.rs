@@ -4620,6 +4620,14 @@ fn inspect_mysql_unsupported_objects(
     database: &str,
 ) -> Result<Vec<String>, String> {
     let mut objects = Vec::new();
+    let deprecated_engines: Vec<String> = conn
+        .exec_map(
+            inspect_mysql_deprecated_engines_sql(),
+            (database,),
+            |(table, engine): (String, String)| format!("deprecated_engine:{table}:{engine}"),
+        )
+        .map_err(|err| format!("mysql deprecated engine inspect error: {err}"))?;
+    objects.extend(deprecated_engines);
     let views: Vec<String> = conn
         .exec_map(
             "SELECT TABLE_NAME FROM information_schema.views WHERE TABLE_SCHEMA = ? ORDER BY TABLE_NAME",
@@ -4645,6 +4653,10 @@ fn inspect_mysql_unsupported_objects(
         .map_err(|err| format!("mysql routine inspect error: {err}"))?;
     objects.extend(routines);
     Ok(objects)
+}
+
+fn inspect_mysql_deprecated_engines_sql() -> &'static str {
+    "SELECT TABLE_NAME, ENGINE FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' AND ENGINE IN ('MyISAM') ORDER BY TABLE_NAME"
 }
 
 fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
@@ -5696,17 +5708,39 @@ fn oneclick_issues_from_inspection(inspection: &InspectionResult) -> Vec<Migrati
         .unsupported_objects
         .iter()
         .map(|object| MigrationIssue {
-            issue_type: None,
+            issue_type: oneclick_deprecated_engine_marker(object)
+                .map(|_| "deprecated_engine".to_string()),
             severity: "warning".to_string(),
-            location: object.clone(),
-            message: format!("Unsupported object detected: {object}"),
-            suggestion: "Review this object manually before promoting One-Click migration."
-                .to_string(),
+            location: oneclick_deprecated_engine_marker(object)
+                .map(|(table, _)| table.clone())
+                .unwrap_or_else(|| object.clone()),
+            message: oneclick_deprecated_engine_marker(object)
+                .map(|(table, engine)| {
+                    format!("Deprecated storage engine detected on table {table}: {engine}")
+                })
+                .unwrap_or_else(|| format!("Unsupported object detected: {object}")),
+            suggestion: oneclick_deprecated_engine_marker(object)
+                .map(|_| "Convert the table to InnoDB.".to_string())
+                .unwrap_or_else(|| {
+                    "Review this object manually before promoting One-Click migration.".to_string()
+                }),
             blocking: false,
-            table_name: None,
+            table_name: oneclick_deprecated_engine_marker(object).map(|(table, _)| table),
             column_name: None,
         })
         .collect()
+}
+
+fn oneclick_deprecated_engine_marker(object: &str) -> Option<(String, String)> {
+    let mut parts = object.splitn(3, ':');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some("deprecated_engine"), Some(table), Some(engine))
+            if !table.trim().is_empty() && !engine.trim().is_empty() =>
+        {
+            Some((table.trim().to_string(), engine.trim().to_string()))
+        }
+        _ => None,
+    }
 }
 
 fn oneclick_payload_issues(payload: &Value) -> Vec<MigrationIssue> {
@@ -10369,6 +10403,34 @@ mod tests {
     }
 
     #[test]
+    fn oneclick_issues_classify_deprecated_engine_marker_as_auto_fixable() {
+        let inspection = InspectionResult {
+            schema: NormalizedSchema {
+                tables: vec![NormalizedTable {
+                    name: "legacy_table".to_string(),
+                    columns: Vec::new(),
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                }],
+            },
+            unsupported_objects: vec!["deprecated_engine:legacy_table:MyISAM".to_string()],
+        };
+
+        let issues = oneclick_issues_from_inspection(&inspection);
+        let recommendations = oneclick_recommendations(&issues, "app");
+        let summary = oneclick_recommendation_summary(&recommendations);
+
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].issue_type.as_deref(), Some("deprecated_engine"));
+        assert_eq!(issues[0].table_name.as_deref(), Some("legacy_table"));
+        assert_eq!(summary["auto_fixable"], 1);
+        assert_eq!(
+            recommendations[0]["selected_option"]["strategy"],
+            "engine_innodb"
+        );
+    }
+
+    #[test]
     fn oneclick_apply_fixes_defaults_to_dry_run() {
         let events = handle_request(Request {
             command: "oneclick.apply_fixes".to_string(),
@@ -13572,6 +13634,15 @@ mod tests {
         assert!(inspect_keys_sql("mysql").contains("KEY_COLUMN_USAGE"));
         assert!(inspect_foreign_keys_sql("postgresql").contains("FOREIGN KEY"));
         assert!(inspect_indexes_sql("postgresql").contains("pg_index"));
+    }
+
+    #[test]
+    fn mysql_deprecated_engine_sql_targets_table_engines() {
+        let sql = inspect_mysql_deprecated_engines_sql();
+
+        assert!(sql.contains("information_schema.tables"));
+        assert!(sql.contains("ENGINE"));
+        assert!(sql.contains("MyISAM"));
     }
 
     #[test]

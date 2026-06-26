@@ -103,8 +103,9 @@ support full enablement.
 
 Reasons:
 
-- Rust Core `oneclick.run` emits a complete phase/progress/report stream, but
-  live-inspection issues still do not carry typed automatic-fix metadata.
+- Rust Core MySQL inspection emits `deprecated_engine:<table>:<engine>` markers
+  for MyISAM base tables, and One-Click converts those markers into typed
+  `deprecated_engine` issues that can be recommended as `engine_innodb`.
 - `oneclick_recommendations` currently marks only `deprecated_engine` payload
   issues with `table_name` as automatic candidates.
 - `oneclick_apply_fixes` now plans and executes only the allowed
