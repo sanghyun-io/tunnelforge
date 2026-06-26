@@ -896,6 +896,9 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "oneclick.preflight" => emit_all_events(oneclick_preflight(&request), emit),
         "oneclick.analyze" => emit_all_events(oneclick_analyze(&request), emit),
         "oneclick.recommend" => emit_all_events(oneclick_recommend(&request), emit),
+        "oneclick.derive_charset_contracts" => {
+            emit_all_events(oneclick_derive_charset_contracts(&request), emit)
+        }
         "oneclick.apply_fixes" => emit_all_events(oneclick_apply_fixes(&request), emit),
         "oneclick.validate" => emit_all_events(oneclick_validate(&request), emit),
         "oneclick.report" => emit_all_events(oneclick_report(&request), emit),
@@ -971,6 +974,7 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "oneclick.preflight",
             "oneclick.analyze",
             "oneclick.recommend",
+            "oneclick.derive_charset_contracts",
             "oneclick.apply_fixes",
             "oneclick.validate",
             "oneclick.report",
@@ -5468,6 +5472,54 @@ fn oneclick_recommend(request: &Request) -> Vec<Value> {
     events
 }
 
+fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value> {
+    let mut events = vec![phase_event(
+        request,
+        "recommendation",
+        "one-click charset contract derivation started",
+    )];
+    let schema = request
+        .payload
+        .get("schema")
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let target_charset = request
+        .payload
+        .get("target_charset")
+        .and_then(Value::as_str)
+        .unwrap_or("utf8mb4");
+    let target_collation = request
+        .payload
+        .get("target_collation")
+        .and_then(Value::as_str)
+        .unwrap_or("utf8mb4_0900_ai_ci");
+    let issues = oneclick_payload_issues(&request.payload);
+    let table_facts = oneclick_charset_table_facts_from_payload(&request.payload);
+    let fk_facts = oneclick_charset_fk_facts_from_payload(&request.payload);
+    let contracts = oneclick_derive_charset_contracts_from_facts(
+        &issues,
+        schema,
+        &table_facts,
+        &fk_facts,
+        target_charset,
+        target_collation,
+    );
+    events.push(json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": "oneclick.derive_charset_contracts",
+        "success": true,
+        "schema": schema,
+        "contracts": contracts,
+        "summary": {
+            "total_issues": issues.len(),
+            "derived_contracts": contracts.len(),
+            "manual_review": issues.len().saturating_sub(contracts.len())
+        }
+    }));
+    events
+}
+
 fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
     let dry_run = request
         .payload
@@ -5945,6 +5997,192 @@ fn oneclick_auto_fix_option(
         }),
         _ => None,
     }
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct OneClickCharsetTableFact {
+    table: String,
+    charset: String,
+    collation: String,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+struct OneClickCharsetFkFact {
+    table: String,
+    referenced_table: String,
+}
+
+fn oneclick_charset_table_facts_from_payload(payload: &Value) -> Vec<OneClickCharsetTableFact> {
+    payload
+        .get("table_facts")
+        .and_then(Value::as_array)
+        .map(|facts| {
+            facts
+                .iter()
+                .filter_map(|fact| {
+                    serde_json::from_value::<OneClickCharsetTableFact>(fact.clone()).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn oneclick_charset_fk_facts_from_payload(payload: &Value) -> Vec<OneClickCharsetFkFact> {
+    payload
+        .get("foreign_key_facts")
+        .and_then(Value::as_array)
+        .map(|facts| {
+            facts
+                .iter()
+                .filter_map(|fact| {
+                    serde_json::from_value::<OneClickCharsetFkFact>(fact.clone()).ok()
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn oneclick_derive_charset_contracts_from_facts(
+    issues: &[MigrationIssue],
+    schema: &str,
+    table_facts: &[OneClickCharsetTableFact],
+    fk_facts: &[OneClickCharsetFkFact],
+    target_charset: &str,
+    target_collation: &str,
+) -> Vec<Value> {
+    let Ok(schema) = oneclick_safe_charset_identifier(schema, "schema") else {
+        return Vec::new();
+    };
+    let Ok(target_charset) = oneclick_safe_charset_token(Some(target_charset), "target_charset")
+    else {
+        return Vec::new();
+    };
+    let Ok(target_collation) =
+        oneclick_safe_charset_token(Some(target_collation), "target_collation")
+    else {
+        return Vec::new();
+    };
+    let table_by_name = table_facts
+        .iter()
+        .map(|fact| (fact.table.as_str(), fact))
+        .collect::<BTreeMap<_, _>>();
+
+    issues
+        .iter()
+        .enumerate()
+        .filter_map(|(issue_index, issue)| {
+            if issue.issue_type.as_deref() != Some("charset_issue") || issue.blocking {
+                return None;
+            }
+            let table = issue.table_name.as_deref()?.trim();
+            oneclick_safe_charset_identifier(table, "table").ok()?;
+            let closure = oneclick_charset_fk_closure(table, &table_by_name, fk_facts)?;
+            let fk_order = oneclick_charset_fk_order(&closure, fk_facts)?;
+            let mut before_charset: Option<&str> = None;
+            let mut before_collation: Option<&str> = None;
+            for table in &fk_order {
+                let fact = *table_by_name.get(table.as_str())?;
+                oneclick_safe_charset_identifier(&fact.table, "table").ok()?;
+                let charset = fact.charset.trim();
+                let collation = fact.collation.trim();
+                if charset.is_empty() || collation.is_empty() {
+                    return None;
+                }
+                if charset.eq_ignore_ascii_case(&target_charset)
+                    && collation.eq_ignore_ascii_case(&target_collation)
+                {
+                    return None;
+                }
+                match (before_charset, before_collation) {
+                    (Some(existing_charset), Some(existing_collation))
+                        if !charset.eq_ignore_ascii_case(existing_charset)
+                            || !collation.eq_ignore_ascii_case(existing_collation) =>
+                    {
+                        return None;
+                    }
+                    (None, None) => {
+                        before_charset = Some(charset);
+                        before_collation = Some(collation);
+                    }
+                    _ => {}
+                }
+            }
+
+            let rollback_sql = fk_order
+                .iter()
+                .rev()
+                .map(|table| {
+                    let fact = *table_by_name.get(table.as_str())?;
+                    Some(format!(
+                        "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
+                        quote_ident("mysql", &schema),
+                        quote_ident("mysql", table),
+                        fact.charset.trim(),
+                        fact.collation.trim()
+                    ))
+                })
+                .collect::<Option<Vec<_>>>()?;
+
+            Some(json!({
+                "issue_index": issue_index,
+                "tables": fk_order,
+                "fk_order": fk_order,
+                "target_charset": target_charset,
+                "target_collation": target_collation,
+                "rollback_sql": rollback_sql
+            }))
+        })
+        .collect()
+}
+
+fn oneclick_charset_fk_closure(
+    seed_table: &str,
+    table_by_name: &BTreeMap<&str, &OneClickCharsetTableFact>,
+    fk_facts: &[OneClickCharsetFkFact],
+) -> Option<BTreeSet<String>> {
+    table_by_name.get(seed_table)?;
+    let mut closure = BTreeSet::from([seed_table.to_string()]);
+    loop {
+        let before_len = closure.len();
+        for fk in fk_facts {
+            if closure.contains(&fk.table) || closure.contains(&fk.referenced_table) {
+                table_by_name.get(fk.table.as_str())?;
+                table_by_name.get(fk.referenced_table.as_str())?;
+                oneclick_safe_charset_identifier(&fk.table, "table").ok()?;
+                oneclick_safe_charset_identifier(&fk.referenced_table, "table").ok()?;
+                closure.insert(fk.table.clone());
+                closure.insert(fk.referenced_table.clone());
+            }
+        }
+        if closure.len() == before_len {
+            return Some(closure);
+        }
+    }
+}
+
+fn oneclick_charset_fk_order(
+    closure: &BTreeSet<String>,
+    fk_facts: &[OneClickCharsetFkFact],
+) -> Option<Vec<String>> {
+    let mut remaining = closure.clone();
+    let mut ordered = Vec::new();
+    while !remaining.is_empty() {
+        let next = remaining.iter().find_map(|table| {
+            let has_unresolved_parent = fk_facts.iter().any(|fk| {
+                fk.table == *table
+                    && closure.contains(&fk.referenced_table)
+                    && remaining.contains(&fk.referenced_table)
+            });
+            if has_unresolved_parent {
+                None
+            } else {
+                Some(table.clone())
+            }
+        })?;
+        remaining.remove(&next);
+        ordered.push(next);
+    }
+    Some(ordered)
 }
 
 fn oneclick_charset_contracts_by_issue_index(payload: &Value) -> BTreeMap<usize, Value> {
@@ -10718,6 +10956,10 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("oneclick.run")));
+        assert!(result["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("oneclick.derive_charset_contracts")));
     }
 
     #[test]
@@ -10938,6 +11180,142 @@ mod tests {
             ])
         );
         assert_eq!(option["rollback_sql"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn oneclick_derives_charset_contract_from_safe_fk_facts() {
+        let issues = vec![MigrationIssue {
+            issue_type: Some("charset_issue".to_string()),
+            severity: "warning".to_string(),
+            location: "tf_oneclick_charset.tf_oneclick_parent".to_string(),
+            message: "Table uses a legacy charset.".to_string(),
+            suggestion: "Convert table charset/collation after FK-safe review.".to_string(),
+            blocking: false,
+            table_name: Some("tf_oneclick_parent".to_string()),
+            column_name: None,
+        }];
+        let table_facts = vec![
+            OneClickCharsetTableFact {
+                table: "tf_oneclick_parent".to_string(),
+                charset: "utf8mb3".to_string(),
+                collation: "utf8mb3_general_ci".to_string(),
+            },
+            OneClickCharsetTableFact {
+                table: "tf_oneclick_child".to_string(),
+                charset: "utf8mb3".to_string(),
+                collation: "utf8mb3_general_ci".to_string(),
+            },
+        ];
+        let fk_facts = vec![OneClickCharsetFkFact {
+            table: "tf_oneclick_child".to_string(),
+            referenced_table: "tf_oneclick_parent".to_string(),
+        }];
+
+        let contracts = oneclick_derive_charset_contracts_from_facts(
+            &issues,
+            "tf_oneclick_charset",
+            &table_facts,
+            &fk_facts,
+            "utf8mb4",
+            "utf8mb4_0900_ai_ci",
+        );
+
+        assert_eq!(contracts.len(), 1);
+        assert_eq!(contracts[0]["issue_index"], 0);
+        assert_eq!(
+            contracts[0]["tables"],
+            json!(["tf_oneclick_parent", "tf_oneclick_child"])
+        );
+        assert_eq!(
+            contracts[0]["fk_order"],
+            json!(["tf_oneclick_parent", "tf_oneclick_child"])
+        );
+        assert_eq!(contracts[0]["target_charset"], "utf8mb4");
+        assert_eq!(contracts[0]["target_collation"], "utf8mb4_0900_ai_ci");
+        assert_eq!(
+            contracts[0]["rollback_sql"],
+            json!([
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
+                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
+            ])
+        );
+    }
+
+    #[test]
+    fn oneclick_derives_no_charset_contract_for_unsafe_or_incomplete_facts() {
+        let issues = vec![MigrationIssue {
+            issue_type: Some("charset_issue".to_string()),
+            severity: "warning".to_string(),
+            location: "prod.customer".to_string(),
+            message: "Table uses a legacy charset.".to_string(),
+            suggestion: "Convert table charset/collation after FK-safe review.".to_string(),
+            blocking: false,
+            table_name: Some("customer".to_string()),
+            column_name: None,
+        }];
+        let table_facts = vec![OneClickCharsetTableFact {
+            table: "customer".to_string(),
+            charset: "utf8mb3".to_string(),
+            collation: "utf8mb3_general_ci".to_string(),
+        }];
+
+        let contracts = oneclick_derive_charset_contracts_from_facts(
+            &issues,
+            "prod",
+            &table_facts,
+            &[],
+            "utf8mb4",
+            "utf8mb4_0900_ai_ci",
+        );
+
+        assert!(contracts.is_empty());
+    }
+
+    #[test]
+    fn oneclick_derive_charset_contracts_command_returns_contracts_from_safe_facts() {
+        let events = handle_request(Request {
+            command: "oneclick.derive_charset_contracts".to_string(),
+            request_id: Some("derive-charset-1".to_string()),
+            payload: json!({
+                "schema": "tf_oneclick_charset",
+                "target_charset": "utf8mb4",
+                "target_collation": "utf8mb4_0900_ai_ci",
+                "issues": [{
+                    "issue_type": "charset_issue",
+                    "severity": "warning",
+                    "location": "tf_oneclick_charset.tf_oneclick_parent",
+                    "table_name": "tf_oneclick_parent",
+                    "message": "Table uses a legacy charset.",
+                    "suggestion": "Convert table charset/collation after FK-safe review.",
+                    "blocking": false
+                }],
+                "table_facts": [{
+                    "table": "tf_oneclick_parent",
+                    "charset": "utf8mb3",
+                    "collation": "utf8mb3_general_ci"
+                }, {
+                    "table": "tf_oneclick_child",
+                    "charset": "utf8mb3",
+                    "collation": "utf8mb3_general_ci"
+                }],
+                "foreign_key_facts": [{
+                    "table": "tf_oneclick_child",
+                    "referenced_table": "tf_oneclick_parent"
+                }]
+            }),
+        });
+        let result = events
+            .into_iter()
+            .find(|event| event.get("event") == Some(&json!("result")))
+            .unwrap();
+
+        assert_eq!(result["command"], "oneclick.derive_charset_contracts");
+        assert_eq!(result["success"], true);
+        assert_eq!(result["contracts"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            result["contracts"][0]["fk_order"],
+            json!(["tf_oneclick_parent", "tf_oneclick_child"])
+        );
     }
 
     #[test]

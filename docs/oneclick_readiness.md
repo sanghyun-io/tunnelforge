@@ -22,7 +22,8 @@ and only for the validated `deprecated_engine -> engine_innodb` path.
 The current supported scope is intentionally narrow:
 
 - Rust Core command contract: `oneclick.run`, `oneclick.preflight`,
-  `oneclick.analyze`, `oneclick.recommend`, `oneclick.apply_fixes`,
+  `oneclick.analyze`, `oneclick.recommend`,
+  `oneclick.derive_charset_contracts`, `oneclick.apply_fixes`,
   `oneclick.validate`, and `oneclick.report`.
 - Backend: Rust Core only. Legacy Python-owned One-Click phase orchestration is
   not supported.
@@ -54,12 +55,16 @@ The current supported scope is intentionally narrow:
 - Charset/collation capture helper:
   `scripts\capture-oneclick-charset-evidence.py` seeds and captures only safe
   local `tf_oneclick_` scopes through Rust DB Core APIs.
+- Charset/collation derivation command:
+  `oneclick.derive_charset_contracts` can derive complete local-safe
+  `charset_contracts[]` from supplied Rust-owned table/FK facts. PyQt is not
+  connected to this command yet.
 
 ## Not Yet Supported
 
 - Production database usage.
-- Automatic PyQt charset contract derivation. GitHub #140 tracks that separate
-  follow-up.
+- Automatic PyQt charset contract derivation from live inspection facts.
+  GitHub #140 tracks that follow-up.
 
 ## Automatic Fix Coverage
 
