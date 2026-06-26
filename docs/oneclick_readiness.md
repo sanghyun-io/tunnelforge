@@ -45,6 +45,11 @@ The current supported scope is intentionally narrow:
   `reports\oneclick_readiness\oneclick-charset-evidence.template.json`.
   This is a contract/template only; no completed charset/collation evidence has
   been captured yet.
+- Charset/collation capture scaffold:
+  `scripts\capture-oneclick-charset-evidence.py` can build a validator-backed
+  #139 report from captured inputs and rejects unsafe non-`tf_oneclick_`
+  evidence scopes. Its live capture entry point intentionally fails closed until
+  Rust Core implements the allowlisted charset/collation execution path.
 
 ## Not Yet Supported
 
@@ -112,6 +117,9 @@ Implementation gate:
   `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` must pass against
   `reports\oneclick_readiness\oneclick-charset-evidence.json` before
   `charset_issue` is added to the real-execution allowlist.
+- `scripts\capture-oneclick-charset-evidence.py` must remain fail-closed for
+  live capture until the Rust Core allowlist path exists. The scaffold is only
+  a report-shape and safe-scope helper at this stage.
 
 ## Real-Execution Gate Outcome
 

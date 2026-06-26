@@ -916,6 +916,12 @@ Evidence:
   conversion, FK ADD, and recovery SQL, but #139 must not route One-Click real
   execution through Python DB drivers. The reusable idea is the contract shape;
   execution ownership must stay in `tunnelforge-core`.
+- `scripts\capture-oneclick-charset-evidence.py` and
+  `tests\test_oneclick_charset_capture.py` now scaffold the #139 capture/report
+  layer. The report builder can create validator-compatible charset evidence
+  from captured inputs, and the live capture entry point rejects unsafe scopes
+  before failing closed because Rust Core charset execution is not implemented
+  yet.
 
 GitHub issue:
 
@@ -930,17 +936,14 @@ Impact:
 
 Next action:
 
-1. Add #139 capture/report scaffolding first so local MySQL before/after
-   evidence can be produced in the validator's required shape without opening
-   the charset execution allowlist early.
-2. Add Rust Core contract tests for `charset_issue -> charset_collation_fk_safe`
+1. Add Rust Core contract tests for `charset_issue -> charset_collation_fk_safe`
    recommendation payloads, target policy, disallowed strategies, FK closure,
    rollback metadata, and generated SQL.
-3. Implement the Rust Core allowlisted charset path only after those failing
+2. Implement the Rust Core allowlisted charset path only after those failing
    tests exist; keep `oneclick.apply_fixes` and `oneclick.run dry_run=false`
    fail-closed for every other charset strategy.
-4. Add PyQt rendering/count/copy tests for automatic vs manual charset payloads.
-5. Capture completed local MySQL evidence and enable
+3. Add PyQt rendering/count/copy tests for automatic vs manual charset payloads.
+4. Capture completed local MySQL evidence and enable
    `RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE=1` in the final verification
    pass before documenting or closing #139.
 
@@ -1034,3 +1037,4 @@ Next action:
 | 2026-06-26 | Added the #139 charset/collation evidence validator, JSON template, and optional regression-gate hook without enabling charset real execution. | `scripts/validate-oneclick-charset-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_oneclick_charset_evidence.py`, `reports/oneclick_readiness/oneclick-charset-evidence.template.json`, `reports/oneclick_readiness/README.md`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_charset_evidence.py -q`; expected reject: `python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.template.json`; expected reject until evidence capture: `$env:RUST_CORE_REQUIRE_ONECLICK_CHARSET_EVIDENCE='1'; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
 | 2026-06-26 | Documented the #139 charset/collation automation policy boundary before enabling any Rust Core recommendation or execution path. | `docs/oneclick_readiness.md`, `docs/current_status.md` | Policy-only change; no charset real execution enabled |
 | 2026-06-26 | Reconfirmed the latest changes are already on `main`/`origin/main` and analyzed the next open issue. #139 is the next in-repo issue; #116 remains external real-Mac evidence. The next safe #139 step is evidence capture/report scaffolding before any Rust Core charset allowlist expansion. | `docs/current_status.md` | `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30 --json number,title,labels,updatedAt,createdAt,url,assignees`; `gh issue view 139 --comments --json ...`; `gh issue view 116 --json ...`; `rg -n "charset_issue|charset|collation|oneclick_auto_fix_option|oneclick_apply_actions|engine_innodb|deprecated_engine" migration_core\src\lib.rs tests docs\oneclick_readiness.md src` |
+| 2026-06-26 | Added the #139 charset/collation capture/report scaffold without enabling live charset execution. The report builder produces validator-backed evidence shape from captured inputs, unsafe `tf_oneclick_` scope checks run before capture, and the live capture entry point fails closed until Rust Core implements the allowlisted path. | `scripts/capture-oneclick-charset-evidence.py`, `tests/test_oneclick_charset_capture.py`, `docs/oneclick_readiness.md`, `reports/oneclick_readiness/README.md`, `docs/current_status.md` | RED: `pytest tests\test_oneclick_charset_capture.py -q` failed because `scripts\capture-oneclick-charset-evidence.py` did not exist; RED: `pytest tests\test_oneclick_charset_capture.py::test_oneclick_charset_capture_cli_fails_closed_without_traceback -q` failed because the CLI raised `CaptureNotImplementedError`; GREEN: `pytest tests\test_oneclick_charset_capture.py tests\test_oneclick_charset_evidence.py -q`; expected fail-closed: `python scripts\capture-oneclick-charset-evidence.py --schema tf_oneclick_charset`; expected template reject: `python scripts\validate-oneclick-charset-evidence.py reports\oneclick_readiness\oneclick-charset-evidence.template.json`; `python -m compileall -q scripts\capture-oneclick-charset-evidence.py tests\test_oneclick_charset_capture.py`; `git diff --check` |

@@ -25,6 +25,10 @@ This directory stores machine-checkable One-Click readiness evidence.
 - `oneclick-charset-evidence.template.json` documents the GitHub #139 evidence
   shape for future controlled local `charset_issue -> charset_collation_fk_safe`
   runs. It is a template only, not completed evidence.
+- `scripts\capture-oneclick-charset-evidence.py` now provides the #139
+  validator-backed report builder and safe `tf_oneclick_` scope checks. Its
+  live capture path intentionally fails closed until Rust Core implements the
+  charset/collation allowlisted execution path.
 
 Validate it with:
 
@@ -84,5 +88,15 @@ cargo build --manifest-path migration_core\Cargo.toml --release
 python scripts\capture-oneclick-real-execution-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-real-execution-evidence.json
 python scripts\validate-oneclick-real-execution-evidence.py reports\oneclick_readiness\oneclick-real-execution-evidence.json
 ```
+
+The charset/collation capture helper is scaffolded, but it cannot produce
+completed evidence yet:
+
+```powershell
+python scripts\capture-oneclick-charset-evidence.py --output reports\oneclick_readiness\oneclick-charset-evidence.json
+```
+
+That command is expected to fail closed until Rust Core exposes the #139
+`charset_issue -> charset_collation_fk_safe` real-execution path.
 
 Do not use production databases for this evidence.
