@@ -3261,6 +3261,33 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let mut imported_rows_by_table: BTreeMap<String, u64> = BTreeMap::new();
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
+
+    // replace/recreate는 대상 테이블을 통째로 재생성한다. 두 가지 사전 조치가 필요하다:
+    //
+    // (1) Surviving-FK preflight (MySQL 전용, abort): import set 밖의 타겟 테이블이
+    //     대상 테이블을 참조하는 FK를 갖고 있으면, 부모 재생성 시 그 살아있는 자식 FK가
+    //     새 부모와 (charset/collation) 호환되지 않아 ERROR 3780이 난다. 타겟을 손대지
+    //     않고 명확한 에러로 차단한다.
+    //
+    // (2) Drop-all-then-create-all 순서: import set 내부의 모든 대상 테이블을 자식 우선
+    //     (역의존성) 순서로 먼저 DROP한 뒤 루프에서 생성한다. 이렇게 하지 않고 테이블별로
+    //     즉시 DROP→CREATE 하면, 부모를 재생성하는 시점에 아직 DROP되지 않은 자식의 FK가
+    //     살아 있어 동일한 ERROR 3780을 유발한다.
+    if matches!(mode, "replace" | "recreate") {
+        let import_set: BTreeSet<String> =
+            tables.iter().map(|table| table.name.clone()).collect();
+        let target_schema = endpoint_schema(&endpoint);
+        preflight_surviving_referencing_fks(&mut adapter, &target_schema, &import_set)?;
+
+        // tables는 parent-first(dependency order)이므로 rev()는 child-first가 된다.
+        // foreign_key_checks=0이 이미 켜져 있어 역순 DROP은 안전하다.
+        for table_manifest in tables.iter().rev() {
+            adapter
+                .execute_sql(&drop_table_sql(adapter.engine(), &table_manifest.name))
+                .map_err(|err| dump_import_ddl_error("drop_table", &table_manifest.name, &err))?;
+        }
+    }
+
     let import_result = (|| -> Result<(), String> {
         for (index, table_manifest) in tables.iter().enumerate() {
             let table = manifest
@@ -3279,11 +3306,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             }));
             let table_rows_before = rows_imported;
 
-            if matches!(mode, "replace" | "recreate") {
-                adapter
-                    .execute_sql(&drop_table_sql(adapter.engine(), &table.name))
-                    .map_err(|err| dump_import_ddl_error("drop_table", &table.name, &err))?;
-            }
+            // replace/recreate의 DROP은 루프 진입 전에 일괄(자식 우선)로 끝냈다.
+            // 여기서는 생성과 적재만 수행한다.
             let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
                 .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
             adapter
@@ -9199,6 +9223,79 @@ fn dump_import_ddl_error(operation: &str, table: &str, err: &str) -> String {
     )
 }
 
+/// import set 밖의 타겟 테이블이 import set 안의 테이블을 참조하는 살아있는 FK를 가려낸다.
+///
+/// replace/recreate 모드는 대상 테이블을 통째로 재생성하는데, 덤프에 포함되지 않은
+/// 타겟 테이블이 대상 테이블을 참조하는 FK를 갖고 있으면, 부모를 재생성하는 시점에
+/// 그 살아있는 자식 FK가 새 부모 정의와 (특히 charset/collation) 호환되지 않아
+/// MySQL ERROR 3780이 발생할 수 있다. 이런 경우 import를 차단해야 한다.
+///
+/// `rows`는 `(referencing_table, constraint_name, referenced_table)` 튜플 목록이다.
+/// 반환값은 `"<referencing_table>.<constraint_name> -> <referenced_table>"` 형식의
+/// 정렬·중복제거된 위반 목록이다.
+fn surviving_fk_offenders(
+    rows: &[(String, String, String)],
+    import_set: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut offenders: Vec<String> = rows
+        .iter()
+        .filter(|(table, _constraint, referenced)| {
+            import_set.contains(referenced) && !import_set.contains(table)
+        })
+        .map(|(table, constraint, referenced)| format!("{table}.{constraint} -> {referenced}"))
+        .collect();
+    offenders.sort();
+    offenders.dedup();
+    offenders
+}
+
+/// 타겟 DB에서 import set 밖의 살아있는 referencing FK를 조회해, 있으면 import를 abort한다.
+///
+/// MySQL 전용. 비-MySQL 어댑터는 그대로 통과시킨다(ERROR 3780은 MySQL 고유 증상이며,
+/// PostgreSQL은 `information_schema.KEY_COLUMN_USAGE`에 `REFERENCED_TABLE_NAME`을
+/// 노출하지 않아 별도 쿼리가 필요하다 — 후속 과제).
+///
+/// 타겟을 수정하지 않고 오직 조회만 한다. 위반이 있으면 어떤 테이블의 어떤 FK가
+/// 충돌하는지 명시한 `preflight_surviving_fk` 에러를 반환한다.
+fn preflight_surviving_referencing_fks(
+    adapter: &mut LiveAdapter,
+    schema: &str,
+    import_set: &BTreeSet<String>,
+) -> Result<(), String> {
+    let conn = match adapter {
+        LiveAdapter::MySql(conn) => conn,
+        _ => return Ok(()),
+    };
+    let rows: Vec<(String, String, String)> = conn
+        .exec_map(
+            "SELECT TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+             GROUP BY TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME \
+             ORDER BY TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME",
+            (schema,),
+            |(table, constraint, referenced): (String, String, String)| {
+                (table, constraint, referenced)
+            },
+        )
+        .map_err(|err| format!("mysql surviving-FK preflight inspect error: {err}"))?;
+
+    let offenders = surviving_fk_offenders(&rows, import_set);
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(classified_import_error(
+            "preflight_surviving_fk",
+            &format!(
+                "target tables outside the import set still reference tables being recreated; \
+                 drop or detach these foreign keys on the target before re-importing: {}",
+                offenders.join(", ")
+            ),
+            None,
+        ))
+    }
+}
+
 fn validate_dump_import_manifest_strictness(
     tables: &[DumpTableManifest],
     strict: bool,
@@ -13179,6 +13276,87 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["users", "orders"]
         );
+    }
+
+    #[test]
+    fn dump_import_replace_drops_children_before_parents() {
+        // dependency order는 parent-first(users -> orders)이므로,
+        // replace/recreate가 일괄 DROP할 때 쓰는 rev()는 child-first(orders -> users)여야 한다.
+        // 자식을 먼저 drop해야 부모를 재생성할 때 살아있는 자식 FK와 충돌(ERROR 3780)하지 않는다.
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+                empty_table("users", Vec::new()),
+            ],
+        };
+        let make_manifest = |name: &str, path: &str| DumpTableManifest {
+            name: name.to_string(),
+            path: path.to_string(),
+            rows: 1,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        };
+        let tables = vec![
+            make_manifest("orders", "0001_orders"),
+            make_manifest("users", "0002_users"),
+        ];
+
+        let ordered = dependency_ordered_dump_tables(&schema, tables);
+        let drop_order: Vec<&str> = ordered
+            .iter()
+            .rev()
+            .map(|table| table.name.as_str())
+            .collect();
+
+        assert_eq!(drop_order, vec!["orders", "users"]);
+    }
+
+    #[test]
+    fn surviving_fk_offenders_flags_only_external_references() {
+        let import_set: BTreeSet<String> =
+            ["audit_category", "df_evaluation_results"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+
+        let rows = vec![
+            // import set 밖의 테이블이 import set 안의 부모를 참조 → 위반
+            (
+                "legacy_audit_log".to_string(),
+                "fk_legacy_audit".to_string(),
+                "audit_category".to_string(),
+            ),
+            // import set 내부끼리의 FK → 위반 아님 (자식부터 drop되므로 안전)
+            (
+                "df_evaluation_results".to_string(),
+                "df_evaluation_results_ibfk_3".to_string(),
+                "audit_category".to_string(),
+            ),
+            // import set 밖의 테이블을 참조 → 위반 아님 (재생성 대상 아님)
+            (
+                "df_evaluation_results".to_string(),
+                "fk_eval_other".to_string(),
+                "some_external_table".to_string(),
+            ),
+        ];
+
+        let offenders = surviving_fk_offenders(&rows, &import_set);
+        assert_eq!(
+            offenders,
+            vec!["legacy_audit_log.fk_legacy_audit -> audit_category".to_string()]
+        );
+    }
+
+    #[test]
+    fn surviving_fk_offenders_empty_when_no_external_references() {
+        let import_set: BTreeSet<String> =
+            ["audit_category"].into_iter().map(String::from).collect();
+        let rows = vec![(
+            "audit_category".to_string(),
+            "fk_self".to_string(),
+            "audit_category".to_string(),
+        )];
+        assert!(surviving_fk_offenders(&rows, &import_set).is_empty());
     }
 
     #[test]
