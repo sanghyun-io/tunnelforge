@@ -9931,12 +9931,35 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
             .execute_sql(&sql)
             .map_err(|err| post_load_ddl_error(&sql, &err))?;
     }
-    for sql in generate_post_data_ddl(schema, target_engine) {
+
+    // MySQL: post-load 인덱스/FK DDL을 foreign_key_checks=0 상태에서 실행한다.
+    //
+    // 소스(Prod) 데이터에 원래부터 고아 레코드가 있을 수 있다(예: 삭제된 user를 참조하는
+    // is_read_comment 행). foreign_key_checks=1 상태에서 ADD FOREIGN KEY를 하면 MySQL이
+    // 기존 행을 검증해 ERROR 1452로 실패한다. mysqldump가 복원 전체를 FOREIGN_KEY_CHECKS=0
+    // 으로 감싸는 것과 동일하게, 여기서도 checks를 꺼서 FK를 생성한다. FK 제약 자체는 정상
+    // 등록되며, 이후 INSERT/UPDATE에는 그대로 강제된다 — 생성 시점의 기존 고아만 예외로 남는다
+    // (소스 상태를 그대로 재현). 인덱스 생성은 checks와 무관하므로 함께 감싸도 결과가 같다.
+    let is_mysql = target_engine == "mysql";
+    if is_mysql {
         target
-            .execute_sql(&sql)
-            .map_err(|err| post_load_ddl_error(&sql, &err))?;
+            .execute_sql("SET SESSION foreign_key_checks=0")
+            .map_err(|err| post_load_ddl_error("SET SESSION foreign_key_checks=0", &err))?;
     }
-    Ok(())
+    let ddl_result = (|| -> Result<(), String> {
+        for sql in generate_post_data_ddl(schema, target_engine) {
+            target
+                .execute_sql(&sql)
+                .map_err(|err| post_load_ddl_error(&sql, &err))?;
+        }
+        Ok(())
+    })();
+    if is_mysql {
+        // 성공/실패 무관하게 복원한다(세션 상태 leak 방지). 복원 실패는 원 DDL 에러를
+        // 가리지 않도록 best-effort로 무시한다.
+        let _ = target.execute_sql("SET SESSION foreign_key_checks=1");
+    }
+    ddl_result
 }
 
 fn post_load_ddl_error(sql: &str, err: &str) -> String {
@@ -14041,10 +14064,136 @@ mod tests {
 
         apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap();
 
+        // MySQL post-load DDL은 foreign_key_checks=0으로 감싸 실행된다(고아 허용).
         assert_eq!(
             adapter.executed_sql,
-            vec!["CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);"]
+            vec![
+                "SET SESSION foreign_key_checks=0".to_string(),
+                "CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);".to_string(),
+                "SET SESSION foreign_key_checks=1".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn post_load_ddl_mysql_wraps_fk_ddl_with_checks_disabled() {
+        // 부모/자식 + FK가 있는 스키마에서, FK ALTER가 foreign_key_checks=0 구간 안에서
+        // 실행되는지 검증한다(소스에 고아가 있어도 1452 없이 FK 생성).
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "users".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+                NormalizedTable {
+                    name: "is_read_comment".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "user_id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "is_read_comment_ibfk_1".to_string(),
+                        columns: vec!["user_id".to_string()],
+                        referenced_table: "users".to_string(),
+                        referenced_columns: vec!["id".to_string()],
+                    }],
+                },
+            ],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap();
+
+        assert_eq!(adapter.executed_sql.first().map(String::as_str), Some("SET SESSION foreign_key_checks=0"));
+        assert_eq!(adapter.executed_sql.last().map(String::as_str), Some("SET SESSION foreign_key_checks=1"));
+        // FK ALTER가 두 SET 사이에 존재한다.
+        let fk_idx = adapter
+            .executed_sql
+            .iter()
+            .position(|sql| sql.contains("ADD CONSTRAINT") && sql.contains("is_read_comment_ibfk_1"))
+            .expect("FK ALTER present");
+        assert!(fk_idx > 0 && fk_idx < adapter.executed_sql.len() - 1);
+    }
+
+    #[test]
+    fn post_load_ddl_restores_fk_checks_on_ddl_error() {
+        // post-load DDL 중간에 실패해도 foreign_key_checks=1 복원이 실행되고, 원 에러가 전파된다.
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "orders".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "user_id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: vec![NormalizedIndex {
+                    name: "idx_orders_user_id".to_string(),
+                    columns: vec!["user_id".to_string()],
+                    unique: false,
+                }],
+                foreign_keys: Vec::new(),
+            }],
+        };
+        let mut adapter = RecordingAdapter {
+            fail_sql_contains: Some("CREATE INDEX".to_string()),
+            ..RecordingAdapter::default()
+        };
+
+        let err = apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        // checks=0으로 열었고, 실패했어도 checks=1 복원이 마지막에 실행됐다.
+        assert_eq!(adapter.executed_sql.first().map(String::as_str), Some("SET SESSION foreign_key_checks=0"));
+        assert_eq!(adapter.executed_sql.last().map(String::as_str), Some("SET SESSION foreign_key_checks=1"));
+    }
+
+    #[test]
+    fn post_load_ddl_postgres_does_not_toggle_fk_checks() {
+        // PostgreSQL 타겟에는 MySQL 전용 foreign_key_checks SET 문이 나오지 않는다.
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "orders".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "user_id".to_string(),
+                    type_name: "integer".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: vec![NormalizedIndex {
+                    name: "idx_orders_user_id".to_string(),
+                    columns: vec!["user_id".to_string()],
+                    unique: false,
+                }],
+                foreign_keys: Vec::new(),
+            }],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        apply_post_load_ddl(&mut adapter, &schema, "postgresql").unwrap();
+
+        assert!(adapter
+            .executed_sql
+            .iter()
+            .all(|sql| !sql.contains("foreign_key_checks")));
     }
 
     #[test]
