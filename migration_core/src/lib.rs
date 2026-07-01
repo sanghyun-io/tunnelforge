@@ -15,6 +15,14 @@ use postgres::{error::SqlState, NoTls};
 const MYSQL_INSERT_FALLBACK_BATCH_ROWS: usize = 500;
 const MYSQL_INSERT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
 const MYSQL_DUMP_TARGET_BYTES_PER_CHUNK: u64 = 64_000_000;
+/// 순차 MySQL 덤프에서 단일 result set(청크)당 절대 행수 상한.
+///
+/// InnoDB의 `AVG_ROW_LENGTH`는 off-page(overflow) 저장되는 대형 TEXT/JSON/BLOB의
+/// 실제 바이트를 과소계상한다(main page 위주 집계). 바이트 목표만 믿고 청크 크기를
+/// 정하면 이런 wide 테이블에서 한 result set가 과대해져 MySQL 스트리밍 프로토콜
+/// 코덱이 크래시(`CodecError: bytes remaining on stream`)할 수 있다. 이 상한이
+/// avg가 0/과소계상이어도 청크 행 수를 물리적으로 묶어 크래시를 원천 차단한다.
+const MYSQL_DUMP_SEQUENTIAL_MAX_ROWS_PER_CHUNK: usize = 2_000;
 const MYSQL_PK_RANGE_MAX_SPAN_TO_ROW_RATIO: u128 = 8;
 const MYSQL_DUMP_ZSTD_LEVEL: i32 = 1;
 const DUMP_DIR_MARKER: &str = ".tunnelforge_dump_dir";
@@ -1713,6 +1721,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                     let mut adapter = LiveAdapter::connect(&endpoint)?;
                     dump_tables_sequential(
                         &mut adapter,
+                        &endpoint,
                         output_path,
                         &export_tables,
                         chunk_size,
@@ -1752,6 +1761,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             let mut adapter = LiveAdapter::connect(&endpoint)?;
             dump_tables_sequential(
                 &mut adapter,
+                &endpoint,
                 output_path,
                 &export_tables,
                 chunk_size,
@@ -1887,6 +1897,7 @@ fn has_tunnelforge_dump_marker(output_path: &Path) -> bool {
 
 fn dump_tables_sequential<F: FnMut(Value)>(
     adapter: &mut LiveAdapter,
+    endpoint: &Endpoint,
     output_path: &Path,
     tables: &[NormalizedTable],
     chunk_size: usize,
@@ -1903,6 +1914,7 @@ fn dump_tables_sequential<F: FnMut(Value)>(
     for (index, table) in tables.iter().enumerate() {
         let (manifest, rows, chunks) = dump_one_table(
             adapter,
+            endpoint,
             output_path,
             table,
             index,
@@ -2751,6 +2763,7 @@ fn spawn_dump_global_worker(
                 let started = Instant::now();
                 dump_one_table(
                     &mut adapter,
+                    &endpoint,
                     &output_path,
                     &work.table,
                     work.table_index,
@@ -2872,6 +2885,7 @@ fn spawn_dump_table_worker(
             let mut adapter = LiveAdapter::connect(&endpoint)?;
             dump_one_table(
                 &mut adapter,
+                &endpoint,
                 &output_path,
                 &table,
                 index,
@@ -2903,6 +2917,7 @@ fn spawn_dump_table_worker(
 
 fn dump_one_table<F: FnMut(Value)>(
     adapter: &mut LiveAdapter,
+    endpoint: &Endpoint,
     output_path: &Path,
     table: &NormalizedTable,
     index: usize,
@@ -2916,6 +2931,7 @@ fn dump_one_table<F: FnMut(Value)>(
     if let LiveAdapter::MySql(conn) = adapter {
         return dump_one_mysql_table(
             conn,
+            endpoint,
             output_path,
             table,
             index,
@@ -3022,6 +3038,7 @@ fn dump_one_table<F: FnMut(Value)>(
 
 fn dump_one_mysql_table<F: FnMut(Value)>(
     conn: &mut mysql::PooledConn,
+    endpoint: &Endpoint,
     output_path: &Path,
     table: &NormalizedTable,
     index: usize,
@@ -3049,6 +3066,12 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
         .query_first::<u64, _>(count_sql("mysql", &table.name))
         .map(|count| count.unwrap_or(0))
         .unwrap_or(0);
+    // 청크당 행 수를 바이트 목표(≈64MB) + 절대 행수 상한으로 산출한다. 대형 TEXT/JSON
+    // 컬럼 테이블에서 하나의 result set가 과대해져 스트리밍 코덱이 크래시하는 것을 막는다.
+    // 병렬 경로와 동일한 avg-row-length 헬퍼를 재사용하며, 조회 실패/통계 부재 시
+    // avg=0 → fallback(chunk_size) → 상한이 지배하도록 안전하게 degrade한다.
+    let avg_row_bytes = mysql_table_avg_row_length(conn, endpoint, &table.name);
+    let effective_chunk_size = sequential_mysql_chunk_size(chunk_size, avg_row_bytes);
     let columns = column_names(table);
     let key_columns = key_columns(table);
     let use_keyset = !key_columns.is_empty();
@@ -3059,7 +3082,8 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
     let mut chunk_sha256 = BTreeMap::new();
 
     loop {
-        let Some(read_limit) = bounded_dump_chunk_limit(table_row_count, rows_dumped, chunk_size)
+        let Some(read_limit) =
+            bounded_dump_chunk_limit(table_row_count, rows_dumped, effective_chunk_size)
         else {
             break;
         };
@@ -9185,6 +9209,19 @@ fn mysql_range_chunk_size_for_avg_row(fallback_chunk_size: usize, avg_row_bytes:
         .max(1) as usize
 }
 
+/// 순차 MySQL 덤프의 청크 행 수를 산출한다.
+///
+/// 병렬 경로와 동일하게 바이트 목표(≈64MB) 기반으로 1차 산출하되, `AVG_ROW_LENGTH`가
+/// off-page 대형 컬럼을 과소계상하는 경우를 대비해 절대 행수 상한
+/// (`MYSQL_DUMP_SEQUENTIAL_MAX_ROWS_PER_CHUNK`)으로 한 번 더 묶는다. avg가 0이면
+/// `mysql_range_chunk_size_for_avg_row`가 fallback을 반환하므로, 결과적으로 avg를
+/// 신뢰할 수 없을 때는 상한이 지배해 스트리밍 코덱 크래시를 원천 차단한다.
+fn sequential_mysql_chunk_size(fallback_chunk_size: usize, avg_row_bytes: u64) -> usize {
+    mysql_range_chunk_size_for_avg_row(fallback_chunk_size, avg_row_bytes)
+        .min(MYSQL_DUMP_SEQUENTIAL_MAX_ROWS_PER_CHUNK)
+        .max(1)
+}
+
 fn learned_mysql_range_chunk_size(
     fallback_chunk_size: usize,
     avg_row_bytes: u64,
@@ -13734,6 +13771,34 @@ mod tests {
     fn mysql_range_chunk_size_keeps_row_fallback_for_narrow_or_unknown_tables() {
         assert_eq!(mysql_range_chunk_size_for_avg_row(50_000, 0), 50_000);
         assert_eq!(mysql_range_chunk_size_for_avg_row(50_000, 128), 50_000);
+    }
+
+    #[test]
+    fn sequential_chunk_size_caps_rows_when_avg_underreports() {
+        // avg=0 (통계 없음/과소계상) → byte_target=fallback(50000)이지만 hard cap이 지배.
+        assert_eq!(
+            sequential_mysql_chunk_size(50_000, 0),
+            MYSQL_DUMP_SEQUENTIAL_MAX_ROWS_PER_CHUNK
+        );
+        // avg가 작아(128) byte_target이 커도 hard cap으로 묶인다.
+        assert_eq!(
+            sequential_mysql_chunk_size(50_000, 128),
+            MYSQL_DUMP_SEQUENTIAL_MAX_ROWS_PER_CHUNK
+        );
+        // avg가 중간(9462)이라 byte_target=6764여도 hard cap(2000)이 더 작아 지배.
+        assert_eq!(
+            sequential_mysql_chunk_size(50_000, 9_462),
+            MYSQL_DUMP_SEQUENTIAL_MAX_ROWS_PER_CHUNK
+        );
+    }
+
+    #[test]
+    fn sequential_chunk_size_uses_byte_target_for_very_wide_rows() {
+        // 행이 매우 크면(예: 64KB/행) byte_target = 64MB/64KB ≈ 1000행 < hard cap → byte_target 지배.
+        let n = sequential_mysql_chunk_size(50_000, 65_536);
+        assert_eq!(n, mysql_range_chunk_size_for_avg_row(50_000, 65_536));
+        assert!(n < MYSQL_DUMP_SEQUENTIAL_MAX_ROWS_PER_CHUNK);
+        assert!(n >= 1);
     }
 
     #[test]
