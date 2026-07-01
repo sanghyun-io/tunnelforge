@@ -615,6 +615,14 @@ fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
         .user(Some(endpoint.user.clone()))
         .pass(Some(endpoint.password.clone()))
         .db_name(Some(endpoint.database.clone()))
+        // TCP keepalive: 유휴 소켓에 주기적 하트비트를 흘려 SSH 터널/방화벽/LB의
+        // idle-timeout으로 연결이 끊기는 것을 막는다(대량 import 중 pooled 연결이
+        // 쿼리 없이 대기하는 구간 방어). 밀리초 단위, Windows 포함 전 플랫폼 지원.
+        // 주의: tcp_keepalive_probe_* / tcp_user_timeout_ms는 Linux 전용 cfg라
+        // Windows 빌드가 깨지므로 사용하지 않는다.
+        .tcp_keepalive_time_ms(Some(10_000))
+        // 재접속/최초 접속이 무한 대기하지 않도록 상한(재시도 루프에서 특히 중요).
+        .tcp_connect_timeout(Some(std::time::Duration::from_secs(30)))
 }
 
 fn postgres_config(endpoint: &Endpoint) -> postgres::Config {
@@ -3679,60 +3687,105 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         };
     }
 
-    let mut rows_imported = 0_u64;
-    let mut chunks_imported = 0_u64;
-    for chunk_index in 1..=table_manifest.chunks {
-        let chunk_path = dump_manifest_chunk_path(
-            input_path,
-            &table_manifest.path,
-            chunk_index,
-            "tsv",
-            compression,
-        )?;
-        let started = Instant::now();
-        let rows = match load_mysql_tsv_chunk(conn, table, &chunk_path, compression) {
-            Ok(rows) => rows,
-            Err(err) if is_mysql_local_infile_disabled_error(&err) => {
+    // 테이블 재시작 안전망: 청크 단위 재접속 재시도(load_chunk_with_reconnect)가 최종
+    // 실패해도, transient 끊김이면 이 테이블을 TRUNCATE 후 첫 청크부터 한 번 더 재적재한다.
+    // TRUNCATE가 "서버 OK 직후 클라 수신 직전" 좁은 창의 부분 커밋/중복 잔여 위험까지 제거한다.
+    // (replace/recreate는 대상 테이블을 미리 일괄 DROP하므로 이 재시작이 안전하다.)
+    const MAX_TABLE_ATTEMPTS: u32 = 2;
+    let mut table_attempt: u32 = 0;
+    loop {
+        table_attempt += 1;
+        let mut rows_imported = 0_u64;
+        let mut chunks_imported = 0_u64;
+        let mut retryable_table_error: Option<String> = None;
+
+        for chunk_index in 1..=table_manifest.chunks {
+            let chunk_path = dump_manifest_chunk_path(
+                input_path,
+                &table_manifest.path,
+                chunk_index,
+                "tsv",
+                compression,
+            )?;
+            let started = Instant::now();
+            let rows = match load_chunk_with_reconnect(endpoint, conn, table, &chunk_path, compression)
+            {
+                Ok(rows) => rows,
+                Err(err) if is_mysql_local_infile_disabled_error(&err) => {
+                    emit(json!({
+                        "event": "phase",
+                        "request_id": request_id,
+                        "phase": "dump_import",
+                        "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
+                        "strategy": "insert_fallback",
+                        "performance": "safe_fallback"
+                    }));
+                    return import_mysql_tsv_table_insert_fallback(
+                        conn,
+                        input_path,
+                        table,
+                        table_manifest,
+                        compression,
+                        request_id,
+                        overall_rows_before,
+                        overall_rows_total,
+                        emit,
+                    );
+                }
+                Err(err) if is_transient_disconnect_error(&err) => {
+                    // 청크 재접속 재시도로도 복구 안 된 지속적 끊김.
+                    retryable_table_error = Some(err);
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            rows_imported += rows;
+            chunks_imported += 1;
+            emit(dump_import_row_progress_event(
+                request_id.clone(),
+                &table.name,
+                rows_imported,
+                table_manifest.rows,
+                overall_rows_before,
+                overall_rows_total,
+                rows,
+                Some(chunks_imported),
+                Some(table_manifest.chunks),
+                Some(chunk_index),
+                Some(started.elapsed().as_millis() as u64),
+                "load_data_local_infile",
+            ));
+        }
+
+        match retryable_table_error {
+            None => return Ok((rows_imported, chunks_imported)),
+            Some(err) => {
+                if table_attempt >= MAX_TABLE_ATTEMPTS {
+                    return Err(err);
+                }
                 emit(json!({
                     "event": "phase",
                     "request_id": request_id,
                     "phase": "dump_import",
-                    "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
-                    "strategy": "insert_fallback",
-                    "performance": "safe_fallback"
+                    "message": format!(
+                        "연결 끊김으로 테이블 [{}] 재시작 (TRUNCATE 후 재적재)",
+                        table.name
+                    ),
+                    "strategy": "table_restart"
                 }));
-                return import_mysql_tsv_table_insert_fallback(
-                    conn,
-                    input_path,
-                    table,
-                    table_manifest,
-                    compression,
-                    request_id,
-                    overall_rows_before,
-                    overall_rows_total,
-                    emit,
-                );
+                // 재접속 후 TRUNCATE. 새 세션은 튜닝이 초기화되므로 튜닝 적용된 커넥션으로 교체.
+                *conn = connect_tuned_mysql_import_conn(endpoint)?;
+                conn.query_drop(format!(
+                    "TRUNCATE TABLE {}",
+                    quote_ident("mysql", &table.name)
+                ))
+                .map_err(|truncate_err| {
+                    format!("mysql table restart truncate error: {truncate_err}")
+                })?;
+                // 루프 상단으로 → 첫 청크부터 재적재.
             }
-            Err(err) => return Err(err),
-        };
-        rows_imported += rows;
-        chunks_imported += 1;
-        emit(dump_import_row_progress_event(
-            request_id.clone(),
-            &table.name,
-            rows_imported,
-            table_manifest.rows,
-            overall_rows_before,
-            overall_rows_total,
-            rows,
-            Some(chunks_imported),
-            Some(table_manifest.chunks),
-            Some(chunk_index),
-            Some(started.elapsed().as_millis() as u64),
-            "load_data_local_infile",
-        ));
+        }
     }
-    Ok((rows_imported, chunks_imported))
 }
 
 fn mysql_local_infile_enabled(conn: &mut mysql::PooledConn) -> bool {
@@ -3958,11 +4011,20 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION foreign_key_checks=1".to_string(),
         ]
+        // net_read_timeout / net_write_timeout / wait_timeout은 복원하지 않는다.
+        // 세션 스코프 변수이고 이 커넥션은 import 종료 후 닫히는 1회용이라 세션 종료로
+        // 자동 소멸한다. 또한 원래 글로벌 기본값을 알 수 없어 되돌릴 대상이 애매하다.
     } else {
         vec![
             "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=0".to_string(),
+            // 서버 측 세션 idle/전송 타임아웃 상향 — 대량 청크 전송 중 서버가
+            // net_read/net_write_timeout(기본 30/60s)이나 wait_timeout으로 먼저
+            // 연결을 끊는 것을 방어한다. keepalive(mysql_opts)와 이중 방어.
+            "SET SESSION net_read_timeout = 600".to_string(),
+            "SET SESSION net_write_timeout = 600".to_string(),
+            "SET SESSION wait_timeout = 28800".to_string(),
         ]
     }
 }
@@ -3975,6 +4037,40 @@ fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> 
         adapter.execute_sql(&sql)?;
     }
     Ok(())
+}
+
+/// import용 세션 튜닝(fk/unique/sql_mode + timeout)이 적용된 MySQL 커넥션을 생성한다.
+///
+/// 새 세션은 항상 튜닝이 초기화되므로, connect 직후 반드시 튜닝을 재적용한다.
+/// 병렬 워커 생성부와 청크 재접속 재시도부에서 공용으로 사용한다 — 그 전에는 병렬
+/// 워커가 어떤 세션 튜닝도 하지 않아 fk_checks/timeout이 누락돼 있었다.
+fn connect_tuned_mysql_import_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
+    let mut adapter = LiveAdapter::connect(endpoint)?;
+    set_mysql_import_session_tuning(&mut adapter, false)?;
+    match adapter {
+        LiveAdapter::MySql(conn) => Ok(conn),
+        _ => Err("mysql import: unexpected adapter kind".to_string()),
+    }
+}
+
+/// 커넥션 끊김/네트워크성 transient 에러인지 판정한다.
+///
+/// 이 에러들만 재접속 재시도 대상이다. 데이터/스키마 에러(1452/3780/1062 등)나
+/// local_infile 비활성(3948)은 절대 포함하지 않는다 — 그런 에러를 재시도하면
+/// 무한 반복하거나 다른 fallback 경로를 우회하게 된다.
+fn is_transient_disconnect_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("server disconnected")
+        || lower.contains("gone away") // MySQL 2006
+        || lower.contains("lost connection") // MySQL 2013
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("connection aborted")
+        || lower.contains("packets out of order")
+        || lower.contains("unexpected end of file")
+        || lower.contains("unexpectedeof")
+        || lower.contains("timed out")
+        || lower.contains("connection refused") // 재접속 시 서버 재기동 대기
 }
 
 fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
@@ -4183,12 +4279,9 @@ fn spawn_mysql_import_chunk_worker(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
-            let mut conn = match LiveAdapter::connect(&endpoint)? {
-                LiveAdapter::MySql(conn) => conn,
-                LiveAdapter::PostgreSql(_) => {
-                    return Err("mysql TSV import requires mysql endpoint".to_string())
-                }
-            };
+            // 워커 커넥션에도 세션 튜닝(fk/unique/sql_mode + timeout)을 적용한다.
+            // 이전에는 워커가 튜닝 없이 연결해 fk_checks/timeout이 누락돼 있었다.
+            let mut conn = connect_tuned_mysql_import_conn(&endpoint)?;
             let chunk_path = dump_manifest_chunk_path(
                 &input_path,
                 &table_path,
@@ -4197,7 +4290,8 @@ fn spawn_mysql_import_chunk_worker(
                 &compression,
             )?;
             let started = Instant::now();
-            let rows = load_mysql_tsv_chunk(&mut conn, &table, &chunk_path, &compression)?;
+            let rows =
+                load_chunk_with_reconnect(&endpoint, &mut conn, &table, &chunk_path, &compression)?;
             Ok((rows, started.elapsed().as_millis() as u64))
         })();
         match result {
@@ -4213,6 +4307,48 @@ fn spawn_mysql_import_chunk_worker(
             }
         }
     })
+}
+
+/// 청크 LOAD DATA를 transient 끊김에 한해 재접속 후 재시도한다.
+///
+/// - transient 끊김(server disconnected 등)일 때만 backoff 후 새 커넥션으로 재시도.
+/// - 데이터/설정 에러(1452/3780/local_infile disabled 등)는 재시도하지 않고 즉시 전파.
+/// - `*conn`을 새 커넥션으로 교체하므로, 호출자는 이 청크 이후에도 같은 conn을 계속 쓴다.
+///
+/// 멱등성: `LOAD DATA`는 InnoDB + autocommit=1에서 단일 statement = 단일 트랜잭션이며,
+/// statement 완결(서버 OK) 전에 끊기면 서버가 롤백하므로 재시도가 이론상 안전하다.
+/// replace/recreate는 대상 테이블을 미리 일괄 DROP(fresh)하므로 재적재 시 중복 위험이
+/// 구조적으로 낮다. 순차 경로는 상위에 테이블 재시작(truncate) 안전망을 둔다.
+fn load_chunk_with_reconnect(
+    endpoint: &Endpoint,
+    conn: &mut mysql::PooledConn,
+    table: &NormalizedTable,
+    chunk_path: &Path,
+    compression: &str,
+) -> Result<u64, String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let backoffs = [
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(2),
+    ];
+    let mut attempt: u32 = 0;
+    loop {
+        match load_mysql_tsv_chunk(conn, table, chunk_path, compression) {
+            Ok(rows) => return Ok(rows),
+            Err(err) => {
+                attempt += 1;
+                let retryable = is_transient_disconnect_error(&err)
+                    && !is_mysql_local_infile_disabled_error(&err);
+                if !retryable || attempt >= MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                std::thread::sleep(backoffs[(attempt - 1) as usize]);
+                // 재접속 + 세션 튜닝 재적용(새 세션은 튜닝이 초기화됨).
+                *conn = connect_tuned_mysql_import_conn(endpoint)?;
+            }
+        }
+    }
 }
 
 fn load_mysql_tsv_chunk(
@@ -15127,8 +15263,12 @@ mod tests {
                 "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=0".to_string(),
+                "SET SESSION net_read_timeout = 600".to_string(),
+                "SET SESSION net_write_timeout = 600".to_string(),
+                "SET SESSION wait_timeout = 28800".to_string(),
             ]
         );
+        // 복원 분기에는 timeout SET을 넣지 않는다(세션 종료로 자동 소멸).
         assert_eq!(
             mysql_import_session_tuning_sql(true),
             vec![
@@ -15144,6 +15284,42 @@ mod tests {
         assert!(is_mysql_local_infile_disabled_error(
             "ERROR 3948 (42000): Loading local data is disabled"
         ));
+    }
+
+    #[test]
+    fn transient_disconnect_errors_are_retryable() {
+        for msg in [
+            "mysql LOAD DATA error: IoError { server disconnected }",
+            "ERROR 2006 (HY000): MySQL server has gone away",
+            "ERROR 2013 (HY000): Lost connection to MySQL server during query",
+            "Broken pipe (os error 32)",
+            "Connection reset by peer",
+            "Packets out of order",
+            "operation timed out",
+            "Connection refused (os error 111)",
+        ] {
+            assert!(
+                is_transient_disconnect_error(msg),
+                "expected transient: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_and_schema_errors_are_not_retryable() {
+        // 재시도하면 안 되는 에러들(무한 반복/우회 방지). 특히 1452/3780/1062/3948.
+        for msg in [
+            "ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails",
+            "Referencing column 'x' and referenced column 'y' in foreign key constraint are incompatible", // 3780
+            "ERROR 1062 (23000): Duplicate entry '1' for key 'PRIMARY'",
+            "ERROR 3948 (42000): Loading local data is disabled",
+            "ERROR 1054 (42S22): Unknown column 'foo' in 'field list'",
+        ] {
+            assert!(
+                !is_transient_disconnect_error(msg),
+                "expected NOT transient: {msg}"
+            );
+        }
     }
 
     #[test]
