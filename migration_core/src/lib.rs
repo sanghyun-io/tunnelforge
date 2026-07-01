@@ -3424,8 +3424,12 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             "strategy": "existing_schema"
         }));
     }
+    // import가 실제로 적재한 행 수가 덤프와 일치하는지만 검증한다(적재 정확성).
+    // 타겟 DB를 다시 세는 검증(verify_target_row_counts)은 하지 않는다 — 타겟이
+    // 살아있는 DB면 import 동안 외부 write(예: login_attempts에 새 로그인 시도)로
+    // row 수가 정상적으로 달라질 수 있어, 정확 일치를 요구하면 오탐으로 실패한다.
+    // (foreign_key_checks=0/unique_checks=0으로 관용 적재하는 정책과도 일관.)
     verify_imported_row_counts(&tables, &imported_rows_by_table)?;
-    verify_target_row_counts(&mut adapter, &tables, mode)?;
 
     // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
@@ -9485,33 +9489,6 @@ fn verify_imported_row_counts(
     Ok(())
 }
 
-fn verify_target_row_counts<A: MigrationAdapter>(
-    target: &mut A,
-    tables: &[DumpTableManifest],
-    mode: &str,
-) -> Result<(), String> {
-    if !matches!(mode, "replace" | "recreate") {
-        return Ok(());
-    }
-    for table in tables {
-        let target_rows = target.row_count(&table.name).map_err(|err| {
-            classified_import_error(
-                "post_load_validation_failed",
-                &format!("target row count verification failed: {err}"),
-                Some(&table.name),
-            )
-        })? as u64;
-        if target_rows != table.rows {
-            return Err(classified_import_error(
-                "post_load_validation_failed",
-                &format!("expected {} rows, target has {}", table.rows, target_rows),
-                Some(&table.name),
-            ));
-        }
-    }
-    Ok(())
-}
-
 fn validate_foreign_key_column_compatibility(schema: &NormalizedSchema) -> Result<(), String> {
     for table in &schema.tables {
         for fk in &table.foreign_keys {
@@ -12607,41 +12584,20 @@ mod tests {
     }
 
     #[test]
-    fn replace_import_target_row_verification_rejects_extra_rows() {
+    fn imported_row_verification_ignores_extra_target_rows() {
+        // 살아있는 타겟에 외부 write로 여분 행이 생겨도, import가 넣은 수가 덤프와
+        // 맞으면 통과해야 한다(타겟 재조회 검증을 제거했으므로). login_attempts처럼
+        // import 중에도 계속 쌓이는 테이블에서 정확 일치를 요구하면 오탐이 된다.
         let tables = vec![DumpTableManifest {
             name: "login_attempts".to_string(),
             path: "0001_login_attempts".to_string(),
-            rows: 77_198,
+            rows: 87_603,
             chunks: 1,
             chunk_sha256: BTreeMap::new(),
         }];
-        let mut adapter = RecordingAdapter {
-            row_counts: BTreeMap::from([("login_attempts".to_string(), 77_208)]),
-            ..RecordingAdapter::default()
-        };
-
-        let err = verify_target_row_counts(&mut adapter, &tables, "replace").unwrap_err();
-
-        assert!(err.contains("post_load_validation_failed"));
-        assert!(err.contains("login_attempts"));
-        assert!(err.contains("expected 77198 rows, target has 77208"));
-    }
-
-    #[test]
-    fn merge_import_target_row_verification_allows_existing_rows() {
-        let tables = vec![DumpTableManifest {
-            name: "login_attempts".to_string(),
-            path: "0001_login_attempts".to_string(),
-            rows: 77_198,
-            chunks: 1,
-            chunk_sha256: BTreeMap::new(),
-        }];
-        let mut adapter = RecordingAdapter {
-            row_counts: BTreeMap::from([("login_attempts".to_string(), 77_208)]),
-            ..RecordingAdapter::default()
-        };
-
-        verify_target_row_counts(&mut adapter, &tables, "merge").unwrap();
+        // import가 넣은 수는 덤프와 정확히 일치 → 통과.
+        let imported = BTreeMap::from([("login_attempts".to_string(), 87_603_u64)]);
+        verify_imported_row_counts(&tables, &imported).unwrap();
     }
 
     #[test]
