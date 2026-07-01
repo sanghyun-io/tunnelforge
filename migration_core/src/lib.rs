@@ -615,6 +615,14 @@ fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
         .user(Some(endpoint.user.clone()))
         .pass(Some(endpoint.password.clone()))
         .db_name(Some(endpoint.database.clone()))
+        // TCP keepalive: 유휴 소켓에 주기적 하트비트를 흘려 SSH 터널/방화벽/LB의
+        // idle-timeout으로 연결이 끊기는 것을 막는다(대량 import 중 pooled 연결이
+        // 쿼리 없이 대기하는 구간 방어). 밀리초 단위, Windows 포함 전 플랫폼 지원.
+        // 주의: tcp_keepalive_probe_* / tcp_user_timeout_ms는 Linux 전용 cfg라
+        // Windows 빌드가 깨지므로 사용하지 않는다.
+        .tcp_keepalive_time_ms(Some(10_000))
+        // 재접속/최초 접속이 무한 대기하지 않도록 상한(재시도 루프에서 특히 중요).
+        .tcp_connect_timeout(Some(std::time::Duration::from_secs(30)))
 }
 
 fn postgres_config(endpoint: &Endpoint) -> postgres::Config {
@@ -3261,6 +3269,33 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let mut imported_rows_by_table: BTreeMap<String, u64> = BTreeMap::new();
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
+
+    // replace/recreate는 대상 테이블을 통째로 재생성한다. 두 가지 사전 조치가 필요하다:
+    //
+    // (1) Surviving-FK preflight (MySQL 전용, abort): import set 밖의 타겟 테이블이
+    //     대상 테이블을 참조하는 FK를 갖고 있으면, 부모 재생성 시 그 살아있는 자식 FK가
+    //     새 부모와 (charset/collation) 호환되지 않아 ERROR 3780이 난다. 타겟을 손대지
+    //     않고 명확한 에러로 차단한다.
+    //
+    // (2) Drop-all-then-create-all 순서: import set 내부의 모든 대상 테이블을 자식 우선
+    //     (역의존성) 순서로 먼저 DROP한 뒤 루프에서 생성한다. 이렇게 하지 않고 테이블별로
+    //     즉시 DROP→CREATE 하면, 부모를 재생성하는 시점에 아직 DROP되지 않은 자식의 FK가
+    //     살아 있어 동일한 ERROR 3780을 유발한다.
+    if matches!(mode, "replace" | "recreate") {
+        let import_set: BTreeSet<String> =
+            tables.iter().map(|table| table.name.clone()).collect();
+        let target_schema = endpoint_schema(&endpoint);
+        preflight_surviving_referencing_fks(&mut adapter, &target_schema, &import_set)?;
+
+        // tables는 parent-first(dependency order)이므로 rev()는 child-first가 된다.
+        // foreign_key_checks=0이 이미 켜져 있어 역순 DROP은 안전하다.
+        for table_manifest in tables.iter().rev() {
+            adapter
+                .execute_sql(&drop_table_sql(adapter.engine(), &table_manifest.name))
+                .map_err(|err| dump_import_ddl_error("drop_table", &table_manifest.name, &err))?;
+        }
+    }
+
     let import_result = (|| -> Result<(), String> {
         for (index, table_manifest) in tables.iter().enumerate() {
             let table = manifest
@@ -3279,11 +3314,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             }));
             let table_rows_before = rows_imported;
 
-            if matches!(mode, "replace" | "recreate") {
-                adapter
-                    .execute_sql(&drop_table_sql(adapter.engine(), &table.name))
-                    .map_err(|err| dump_import_ddl_error("drop_table", &table.name, &err))?;
-            }
+            // replace/recreate의 DROP은 루프 진입 전에 일괄(자식 우선)로 끝냈다.
+            // 여기서는 생성과 적재만 수행한다.
             let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
                 .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
             adapter
@@ -3392,8 +3424,12 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
             "strategy": "existing_schema"
         }));
     }
+    // import가 실제로 적재한 행 수가 덤프와 일치하는지만 검증한다(적재 정확성).
+    // 타겟 DB를 다시 세는 검증(verify_target_row_counts)은 하지 않는다 — 타겟이
+    // 살아있는 DB면 import 동안 외부 write(예: login_attempts에 새 로그인 시도)로
+    // row 수가 정상적으로 달라질 수 있어, 정확 일치를 요구하면 오탐으로 실패한다.
+    // (foreign_key_checks=0/unique_checks=0으로 관용 적재하는 정책과도 일관.)
     verify_imported_row_counts(&tables, &imported_rows_by_table)?;
-    verify_target_row_counts(&mut adapter, &tables, mode)?;
 
     // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
@@ -3655,60 +3691,105 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         };
     }
 
-    let mut rows_imported = 0_u64;
-    let mut chunks_imported = 0_u64;
-    for chunk_index in 1..=table_manifest.chunks {
-        let chunk_path = dump_manifest_chunk_path(
-            input_path,
-            &table_manifest.path,
-            chunk_index,
-            "tsv",
-            compression,
-        )?;
-        let started = Instant::now();
-        let rows = match load_mysql_tsv_chunk(conn, table, &chunk_path, compression) {
-            Ok(rows) => rows,
-            Err(err) if is_mysql_local_infile_disabled_error(&err) => {
+    // 테이블 재시작 안전망: 청크 단위 재접속 재시도(load_chunk_with_reconnect)가 최종
+    // 실패해도, transient 끊김이면 이 테이블을 TRUNCATE 후 첫 청크부터 한 번 더 재적재한다.
+    // TRUNCATE가 "서버 OK 직후 클라 수신 직전" 좁은 창의 부분 커밋/중복 잔여 위험까지 제거한다.
+    // (replace/recreate는 대상 테이블을 미리 일괄 DROP하므로 이 재시작이 안전하다.)
+    const MAX_TABLE_ATTEMPTS: u32 = 2;
+    let mut table_attempt: u32 = 0;
+    loop {
+        table_attempt += 1;
+        let mut rows_imported = 0_u64;
+        let mut chunks_imported = 0_u64;
+        let mut retryable_table_error: Option<String> = None;
+
+        for chunk_index in 1..=table_manifest.chunks {
+            let chunk_path = dump_manifest_chunk_path(
+                input_path,
+                &table_manifest.path,
+                chunk_index,
+                "tsv",
+                compression,
+            )?;
+            let started = Instant::now();
+            let rows = match load_chunk_with_reconnect(endpoint, conn, table, &chunk_path, compression)
+            {
+                Ok(rows) => rows,
+                Err(err) if is_mysql_local_infile_disabled_error(&err) => {
+                    emit(json!({
+                        "event": "phase",
+                        "request_id": request_id,
+                        "phase": "dump_import",
+                        "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
+                        "strategy": "insert_fallback",
+                        "performance": "safe_fallback"
+                    }));
+                    return import_mysql_tsv_table_insert_fallback(
+                        conn,
+                        input_path,
+                        table,
+                        table_manifest,
+                        compression,
+                        request_id,
+                        overall_rows_before,
+                        overall_rows_total,
+                        emit,
+                    );
+                }
+                Err(err) if is_transient_disconnect_error(&err) => {
+                    // 청크 재접속 재시도로도 복구 안 된 지속적 끊김.
+                    retryable_table_error = Some(err);
+                    break;
+                }
+                Err(err) => return Err(err),
+            };
+            rows_imported += rows;
+            chunks_imported += 1;
+            emit(dump_import_row_progress_event(
+                request_id.clone(),
+                &table.name,
+                rows_imported,
+                table_manifest.rows,
+                overall_rows_before,
+                overall_rows_total,
+                rows,
+                Some(chunks_imported),
+                Some(table_manifest.chunks),
+                Some(chunk_index),
+                Some(started.elapsed().as_millis() as u64),
+                "load_data_local_infile",
+            ));
+        }
+
+        match retryable_table_error {
+            None => return Ok((rows_imported, chunks_imported)),
+            Some(err) => {
+                if table_attempt >= MAX_TABLE_ATTEMPTS {
+                    return Err(err);
+                }
                 emit(json!({
                     "event": "phase",
                     "request_id": request_id,
                     "phase": "dump_import",
-                    "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
-                    "strategy": "insert_fallback",
-                    "performance": "safe_fallback"
+                    "message": format!(
+                        "연결 끊김으로 테이블 [{}] 재시작 (TRUNCATE 후 재적재)",
+                        table.name
+                    ),
+                    "strategy": "table_restart"
                 }));
-                return import_mysql_tsv_table_insert_fallback(
-                    conn,
-                    input_path,
-                    table,
-                    table_manifest,
-                    compression,
-                    request_id,
-                    overall_rows_before,
-                    overall_rows_total,
-                    emit,
-                );
+                // 재접속 후 TRUNCATE. 새 세션은 튜닝이 초기화되므로 튜닝 적용된 커넥션으로 교체.
+                *conn = connect_tuned_mysql_import_conn(endpoint)?;
+                conn.query_drop(format!(
+                    "TRUNCATE TABLE {}",
+                    quote_ident("mysql", &table.name)
+                ))
+                .map_err(|truncate_err| {
+                    format!("mysql table restart truncate error: {truncate_err}")
+                })?;
+                // 루프 상단으로 → 첫 청크부터 재적재.
             }
-            Err(err) => return Err(err),
-        };
-        rows_imported += rows;
-        chunks_imported += 1;
-        emit(dump_import_row_progress_event(
-            request_id.clone(),
-            &table.name,
-            rows_imported,
-            table_manifest.rows,
-            overall_rows_before,
-            overall_rows_total,
-            rows,
-            Some(chunks_imported),
-            Some(table_manifest.chunks),
-            Some(chunk_index),
-            Some(started.elapsed().as_millis() as u64),
-            "load_data_local_infile",
-        ));
+        }
     }
-    Ok((rows_imported, chunks_imported))
 }
 
 fn mysql_local_infile_enabled(conn: &mut mysql::PooledConn) -> bool {
@@ -3934,11 +4015,20 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION foreign_key_checks=1".to_string(),
         ]
+        // net_read_timeout / net_write_timeout / wait_timeout은 복원하지 않는다.
+        // 세션 스코프 변수이고 이 커넥션은 import 종료 후 닫히는 1회용이라 세션 종료로
+        // 자동 소멸한다. 또한 원래 글로벌 기본값을 알 수 없어 되돌릴 대상이 애매하다.
     } else {
         vec![
             "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=0".to_string(),
+            // 서버 측 세션 idle/전송 타임아웃 상향 — 대량 청크 전송 중 서버가
+            // net_read/net_write_timeout(기본 30/60s)이나 wait_timeout으로 먼저
+            // 연결을 끊는 것을 방어한다. keepalive(mysql_opts)와 이중 방어.
+            "SET SESSION net_read_timeout = 600".to_string(),
+            "SET SESSION net_write_timeout = 600".to_string(),
+            "SET SESSION wait_timeout = 28800".to_string(),
         ]
     }
 }
@@ -3951,6 +4041,40 @@ fn set_mysql_import_session_tuning(adapter: &mut LiveAdapter, restore: bool) -> 
         adapter.execute_sql(&sql)?;
     }
     Ok(())
+}
+
+/// import용 세션 튜닝(fk/unique/sql_mode + timeout)이 적용된 MySQL 커넥션을 생성한다.
+///
+/// 새 세션은 항상 튜닝이 초기화되므로, connect 직후 반드시 튜닝을 재적용한다.
+/// 병렬 워커 생성부와 청크 재접속 재시도부에서 공용으로 사용한다 — 그 전에는 병렬
+/// 워커가 어떤 세션 튜닝도 하지 않아 fk_checks/timeout이 누락돼 있었다.
+fn connect_tuned_mysql_import_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
+    let mut adapter = LiveAdapter::connect(endpoint)?;
+    set_mysql_import_session_tuning(&mut adapter, false)?;
+    match adapter {
+        LiveAdapter::MySql(conn) => Ok(conn),
+        _ => Err("mysql import: unexpected adapter kind".to_string()),
+    }
+}
+
+/// 커넥션 끊김/네트워크성 transient 에러인지 판정한다.
+///
+/// 이 에러들만 재접속 재시도 대상이다. 데이터/스키마 에러(1452/3780/1062 등)나
+/// local_infile 비활성(3948)은 절대 포함하지 않는다 — 그런 에러를 재시도하면
+/// 무한 반복하거나 다른 fallback 경로를 우회하게 된다.
+fn is_transient_disconnect_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("server disconnected")
+        || lower.contains("gone away") // MySQL 2006
+        || lower.contains("lost connection") // MySQL 2013
+        || lower.contains("broken pipe")
+        || lower.contains("connection reset")
+        || lower.contains("connection aborted")
+        || lower.contains("packets out of order")
+        || lower.contains("unexpected end of file")
+        || lower.contains("unexpectedeof")
+        || lower.contains("timed out")
+        || lower.contains("connection refused") // 재접속 시 서버 재기동 대기
 }
 
 fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
@@ -4159,12 +4283,9 @@ fn spawn_mysql_import_chunk_worker(
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
-            let mut conn = match LiveAdapter::connect(&endpoint)? {
-                LiveAdapter::MySql(conn) => conn,
-                LiveAdapter::PostgreSql(_) => {
-                    return Err("mysql TSV import requires mysql endpoint".to_string())
-                }
-            };
+            // 워커 커넥션에도 세션 튜닝(fk/unique/sql_mode + timeout)을 적용한다.
+            // 이전에는 워커가 튜닝 없이 연결해 fk_checks/timeout이 누락돼 있었다.
+            let mut conn = connect_tuned_mysql_import_conn(&endpoint)?;
             let chunk_path = dump_manifest_chunk_path(
                 &input_path,
                 &table_path,
@@ -4173,7 +4294,8 @@ fn spawn_mysql_import_chunk_worker(
                 &compression,
             )?;
             let started = Instant::now();
-            let rows = load_mysql_tsv_chunk(&mut conn, &table, &chunk_path, &compression)?;
+            let rows =
+                load_chunk_with_reconnect(&endpoint, &mut conn, &table, &chunk_path, &compression)?;
             Ok((rows, started.elapsed().as_millis() as u64))
         })();
         match result {
@@ -4189,6 +4311,48 @@ fn spawn_mysql_import_chunk_worker(
             }
         }
     })
+}
+
+/// 청크 LOAD DATA를 transient 끊김에 한해 재접속 후 재시도한다.
+///
+/// - transient 끊김(server disconnected 등)일 때만 backoff 후 새 커넥션으로 재시도.
+/// - 데이터/설정 에러(1452/3780/local_infile disabled 등)는 재시도하지 않고 즉시 전파.
+/// - `*conn`을 새 커넥션으로 교체하므로, 호출자는 이 청크 이후에도 같은 conn을 계속 쓴다.
+///
+/// 멱등성: `LOAD DATA`는 InnoDB + autocommit=1에서 단일 statement = 단일 트랜잭션이며,
+/// statement 완결(서버 OK) 전에 끊기면 서버가 롤백하므로 재시도가 이론상 안전하다.
+/// replace/recreate는 대상 테이블을 미리 일괄 DROP(fresh)하므로 재적재 시 중복 위험이
+/// 구조적으로 낮다. 순차 경로는 상위에 테이블 재시작(truncate) 안전망을 둔다.
+fn load_chunk_with_reconnect(
+    endpoint: &Endpoint,
+    conn: &mut mysql::PooledConn,
+    table: &NormalizedTable,
+    chunk_path: &Path,
+    compression: &str,
+) -> Result<u64, String> {
+    const MAX_ATTEMPTS: u32 = 3;
+    let backoffs = [
+        std::time::Duration::from_millis(500),
+        std::time::Duration::from_secs(1),
+        std::time::Duration::from_secs(2),
+    ];
+    let mut attempt: u32 = 0;
+    loop {
+        match load_mysql_tsv_chunk(conn, table, chunk_path, compression) {
+            Ok(rows) => return Ok(rows),
+            Err(err) => {
+                attempt += 1;
+                let retryable = is_transient_disconnect_error(&err)
+                    && !is_mysql_local_infile_disabled_error(&err);
+                if !retryable || attempt >= MAX_ATTEMPTS {
+                    return Err(err);
+                }
+                std::thread::sleep(backoffs[(attempt - 1) as usize]);
+                // 재접속 + 세션 튜닝 재적용(새 세션은 튜닝이 초기화됨).
+                *conn = connect_tuned_mysql_import_conn(endpoint)?;
+            }
+        }
+    }
 }
 
 fn load_mysql_tsv_chunk(
@@ -9199,6 +9363,79 @@ fn dump_import_ddl_error(operation: &str, table: &str, err: &str) -> String {
     )
 }
 
+/// import set 밖의 타겟 테이블이 import set 안의 테이블을 참조하는 살아있는 FK를 가려낸다.
+///
+/// replace/recreate 모드는 대상 테이블을 통째로 재생성하는데, 덤프에 포함되지 않은
+/// 타겟 테이블이 대상 테이블을 참조하는 FK를 갖고 있으면, 부모를 재생성하는 시점에
+/// 그 살아있는 자식 FK가 새 부모 정의와 (특히 charset/collation) 호환되지 않아
+/// MySQL ERROR 3780이 발생할 수 있다. 이런 경우 import를 차단해야 한다.
+///
+/// `rows`는 `(referencing_table, constraint_name, referenced_table)` 튜플 목록이다.
+/// 반환값은 `"<referencing_table>.<constraint_name> -> <referenced_table>"` 형식의
+/// 정렬·중복제거된 위반 목록이다.
+fn surviving_fk_offenders(
+    rows: &[(String, String, String)],
+    import_set: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut offenders: Vec<String> = rows
+        .iter()
+        .filter(|(table, _constraint, referenced)| {
+            import_set.contains(referenced) && !import_set.contains(table)
+        })
+        .map(|(table, constraint, referenced)| format!("{table}.{constraint} -> {referenced}"))
+        .collect();
+    offenders.sort();
+    offenders.dedup();
+    offenders
+}
+
+/// 타겟 DB에서 import set 밖의 살아있는 referencing FK를 조회해, 있으면 import를 abort한다.
+///
+/// MySQL 전용. 비-MySQL 어댑터는 그대로 통과시킨다(ERROR 3780은 MySQL 고유 증상이며,
+/// PostgreSQL은 `information_schema.KEY_COLUMN_USAGE`에 `REFERENCED_TABLE_NAME`을
+/// 노출하지 않아 별도 쿼리가 필요하다 — 후속 과제).
+///
+/// 타겟을 수정하지 않고 오직 조회만 한다. 위반이 있으면 어떤 테이블의 어떤 FK가
+/// 충돌하는지 명시한 `preflight_surviving_fk` 에러를 반환한다.
+fn preflight_surviving_referencing_fks(
+    adapter: &mut LiveAdapter,
+    schema: &str,
+    import_set: &BTreeSet<String>,
+) -> Result<(), String> {
+    let conn = match adapter {
+        LiveAdapter::MySql(conn) => conn,
+        _ => return Ok(()),
+    };
+    let rows: Vec<(String, String, String)> = conn
+        .exec_map(
+            "SELECT TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE \
+             WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
+             GROUP BY TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME \
+             ORDER BY TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME",
+            (schema,),
+            |(table, constraint, referenced): (String, String, String)| {
+                (table, constraint, referenced)
+            },
+        )
+        .map_err(|err| format!("mysql surviving-FK preflight inspect error: {err}"))?;
+
+    let offenders = surviving_fk_offenders(&rows, import_set);
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(classified_import_error(
+            "preflight_surviving_fk",
+            &format!(
+                "target tables outside the import set still reference tables being recreated; \
+                 drop or detach these foreign keys on the target before re-importing: {}",
+                offenders.join(", ")
+            ),
+            None,
+        ))
+    }
+}
+
 fn validate_dump_import_manifest_strictness(
     tables: &[DumpTableManifest],
     strict: bool,
@@ -9245,33 +9482,6 @@ fn verify_imported_row_counts(
             return Err(classified_import_error(
                 "post_load_validation_failed",
                 &format!("expected {} rows, imported {}", table.rows, imported),
-                Some(&table.name),
-            ));
-        }
-    }
-    Ok(())
-}
-
-fn verify_target_row_counts<A: MigrationAdapter>(
-    target: &mut A,
-    tables: &[DumpTableManifest],
-    mode: &str,
-) -> Result<(), String> {
-    if !matches!(mode, "replace" | "recreate") {
-        return Ok(());
-    }
-    for table in tables {
-        let target_rows = target.row_count(&table.name).map_err(|err| {
-            classified_import_error(
-                "post_load_validation_failed",
-                &format!("target row count verification failed: {err}"),
-                Some(&table.name),
-            )
-        })? as u64;
-        if target_rows != table.rows {
-            return Err(classified_import_error(
-                "post_load_validation_failed",
-                &format!("expected {} rows, target has {}", table.rows, target_rows),
                 Some(&table.name),
             ));
         }
@@ -9834,12 +10044,35 @@ fn apply_post_load_ddl<A: MigrationAdapter>(
             .execute_sql(&sql)
             .map_err(|err| post_load_ddl_error(&sql, &err))?;
     }
-    for sql in generate_post_data_ddl(schema, target_engine) {
+
+    // MySQL: post-load 인덱스/FK DDL을 foreign_key_checks=0 상태에서 실행한다.
+    //
+    // 소스(Prod) 데이터에 원래부터 고아 레코드가 있을 수 있다(예: 삭제된 user를 참조하는
+    // is_read_comment 행). foreign_key_checks=1 상태에서 ADD FOREIGN KEY를 하면 MySQL이
+    // 기존 행을 검증해 ERROR 1452로 실패한다. mysqldump가 복원 전체를 FOREIGN_KEY_CHECKS=0
+    // 으로 감싸는 것과 동일하게, 여기서도 checks를 꺼서 FK를 생성한다. FK 제약 자체는 정상
+    // 등록되며, 이후 INSERT/UPDATE에는 그대로 강제된다 — 생성 시점의 기존 고아만 예외로 남는다
+    // (소스 상태를 그대로 재현). 인덱스 생성은 checks와 무관하므로 함께 감싸도 결과가 같다.
+    let is_mysql = target_engine == "mysql";
+    if is_mysql {
         target
-            .execute_sql(&sql)
-            .map_err(|err| post_load_ddl_error(&sql, &err))?;
+            .execute_sql("SET SESSION foreign_key_checks=0")
+            .map_err(|err| post_load_ddl_error("SET SESSION foreign_key_checks=0", &err))?;
     }
-    Ok(())
+    let ddl_result = (|| -> Result<(), String> {
+        for sql in generate_post_data_ddl(schema, target_engine) {
+            target
+                .execute_sql(&sql)
+                .map_err(|err| post_load_ddl_error(&sql, &err))?;
+        }
+        Ok(())
+    })();
+    if is_mysql {
+        // 성공/실패 무관하게 복원한다(세션 상태 leak 방지). 복원 실패는 원 DDL 에러를
+        // 가리지 않도록 best-effort로 무시한다.
+        let _ = target.execute_sql("SET SESSION foreign_key_checks=1");
+    }
+    ddl_result
 }
 
 fn post_load_ddl_error(sql: &str, err: &str) -> String {
@@ -12351,41 +12584,20 @@ mod tests {
     }
 
     #[test]
-    fn replace_import_target_row_verification_rejects_extra_rows() {
+    fn imported_row_verification_ignores_extra_target_rows() {
+        // 살아있는 타겟에 외부 write로 여분 행이 생겨도, import가 넣은 수가 덤프와
+        // 맞으면 통과해야 한다(타겟 재조회 검증을 제거했으므로). login_attempts처럼
+        // import 중에도 계속 쌓이는 테이블에서 정확 일치를 요구하면 오탐이 된다.
         let tables = vec![DumpTableManifest {
             name: "login_attempts".to_string(),
             path: "0001_login_attempts".to_string(),
-            rows: 77_198,
+            rows: 87_603,
             chunks: 1,
             chunk_sha256: BTreeMap::new(),
         }];
-        let mut adapter = RecordingAdapter {
-            row_counts: BTreeMap::from([("login_attempts".to_string(), 77_208)]),
-            ..RecordingAdapter::default()
-        };
-
-        let err = verify_target_row_counts(&mut adapter, &tables, "replace").unwrap_err();
-
-        assert!(err.contains("post_load_validation_failed"));
-        assert!(err.contains("login_attempts"));
-        assert!(err.contains("expected 77198 rows, target has 77208"));
-    }
-
-    #[test]
-    fn merge_import_target_row_verification_allows_existing_rows() {
-        let tables = vec![DumpTableManifest {
-            name: "login_attempts".to_string(),
-            path: "0001_login_attempts".to_string(),
-            rows: 77_198,
-            chunks: 1,
-            chunk_sha256: BTreeMap::new(),
-        }];
-        let mut adapter = RecordingAdapter {
-            row_counts: BTreeMap::from([("login_attempts".to_string(), 77_208)]),
-            ..RecordingAdapter::default()
-        };
-
-        verify_target_row_counts(&mut adapter, &tables, "merge").unwrap();
+        // import가 넣은 수는 덤프와 정확히 일치 → 통과.
+        let imported = BTreeMap::from([("login_attempts".to_string(), 87_603_u64)]);
+        verify_imported_row_counts(&tables, &imported).unwrap();
     }
 
     #[test]
@@ -13182,6 +13394,87 @@ mod tests {
     }
 
     #[test]
+    fn dump_import_replace_drops_children_before_parents() {
+        // dependency order는 parent-first(users -> orders)이므로,
+        // replace/recreate가 일괄 DROP할 때 쓰는 rev()는 child-first(orders -> users)여야 한다.
+        // 자식을 먼저 drop해야 부모를 재생성할 때 살아있는 자식 FK와 충돌(ERROR 3780)하지 않는다.
+        let schema = NormalizedSchema {
+            tables: vec![
+                empty_table("orders", vec![fk("fk_orders_users", "users")]),
+                empty_table("users", Vec::new()),
+            ],
+        };
+        let make_manifest = |name: &str, path: &str| DumpTableManifest {
+            name: name.to_string(),
+            path: path.to_string(),
+            rows: 1,
+            chunks: 1,
+            chunk_sha256: BTreeMap::new(),
+        };
+        let tables = vec![
+            make_manifest("orders", "0001_orders"),
+            make_manifest("users", "0002_users"),
+        ];
+
+        let ordered = dependency_ordered_dump_tables(&schema, tables);
+        let drop_order: Vec<&str> = ordered
+            .iter()
+            .rev()
+            .map(|table| table.name.as_str())
+            .collect();
+
+        assert_eq!(drop_order, vec!["orders", "users"]);
+    }
+
+    #[test]
+    fn surviving_fk_offenders_flags_only_external_references() {
+        let import_set: BTreeSet<String> =
+            ["audit_category", "df_evaluation_results"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+
+        let rows = vec![
+            // import set 밖의 테이블이 import set 안의 부모를 참조 → 위반
+            (
+                "legacy_audit_log".to_string(),
+                "fk_legacy_audit".to_string(),
+                "audit_category".to_string(),
+            ),
+            // import set 내부끼리의 FK → 위반 아님 (자식부터 drop되므로 안전)
+            (
+                "df_evaluation_results".to_string(),
+                "df_evaluation_results_ibfk_3".to_string(),
+                "audit_category".to_string(),
+            ),
+            // import set 밖의 테이블을 참조 → 위반 아님 (재생성 대상 아님)
+            (
+                "df_evaluation_results".to_string(),
+                "fk_eval_other".to_string(),
+                "some_external_table".to_string(),
+            ),
+        ];
+
+        let offenders = surviving_fk_offenders(&rows, &import_set);
+        assert_eq!(
+            offenders,
+            vec!["legacy_audit_log.fk_legacy_audit -> audit_category".to_string()]
+        );
+    }
+
+    #[test]
+    fn surviving_fk_offenders_empty_when_no_external_references() {
+        let import_set: BTreeSet<String> =
+            ["audit_category"].into_iter().map(String::from).collect();
+        let rows = vec![(
+            "audit_category".to_string(),
+            "fk_self".to_string(),
+            "audit_category".to_string(),
+        )];
+        assert!(surviving_fk_offenders(&rows, &import_set).is_empty());
+    }
+
+    #[test]
     fn migration_plan_alias_preserves_service_command_name() {
         let result = handle_request(Request {
             command: "migration.plan".to_string(),
@@ -13863,10 +14156,136 @@ mod tests {
 
         apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap();
 
+        // MySQL post-load DDL은 foreign_key_checks=0으로 감싸 실행된다(고아 허용).
         assert_eq!(
             adapter.executed_sql,
-            vec!["CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);"]
+            vec![
+                "SET SESSION foreign_key_checks=0".to_string(),
+                "CREATE INDEX `idx_orders_user_id` ON `orders` (`user_id`);".to_string(),
+                "SET SESSION foreign_key_checks=1".to_string(),
+            ]
         );
+    }
+
+    #[test]
+    fn post_load_ddl_mysql_wraps_fk_ddl_with_checks_disabled() {
+        // 부모/자식 + FK가 있는 스키마에서, FK ALTER가 foreign_key_checks=0 구간 안에서
+        // 실행되는지 검증한다(소스에 고아가 있어도 1452 없이 FK 생성).
+        let schema = NormalizedSchema {
+            tables: vec![
+                NormalizedTable {
+                    name: "users".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: true,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: Vec::new(),
+                },
+                NormalizedTable {
+                    name: "is_read_comment".to_string(),
+                    columns: vec![NormalizedColumn {
+                        name: "user_id".to_string(),
+                        type_name: "int".to_string(),
+                        default_value: None,
+                        nullable: false,
+                        primary_key: false,
+                        unique: false,
+                    }],
+                    indexes: Vec::new(),
+                    foreign_keys: vec![NormalizedForeignKey {
+                        name: "is_read_comment_ibfk_1".to_string(),
+                        columns: vec!["user_id".to_string()],
+                        referenced_table: "users".to_string(),
+                        referenced_columns: vec!["id".to_string()],
+                    }],
+                },
+            ],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap();
+
+        assert_eq!(adapter.executed_sql.first().map(String::as_str), Some("SET SESSION foreign_key_checks=0"));
+        assert_eq!(adapter.executed_sql.last().map(String::as_str), Some("SET SESSION foreign_key_checks=1"));
+        // FK ALTER가 두 SET 사이에 존재한다.
+        let fk_idx = adapter
+            .executed_sql
+            .iter()
+            .position(|sql| sql.contains("ADD CONSTRAINT") && sql.contains("is_read_comment_ibfk_1"))
+            .expect("FK ALTER present");
+        assert!(fk_idx > 0 && fk_idx < adapter.executed_sql.len() - 1);
+    }
+
+    #[test]
+    fn post_load_ddl_restores_fk_checks_on_ddl_error() {
+        // post-load DDL 중간에 실패해도 foreign_key_checks=1 복원이 실행되고, 원 에러가 전파된다.
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "orders".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "user_id".to_string(),
+                    type_name: "int".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: vec![NormalizedIndex {
+                    name: "idx_orders_user_id".to_string(),
+                    columns: vec!["user_id".to_string()],
+                    unique: false,
+                }],
+                foreign_keys: Vec::new(),
+            }],
+        };
+        let mut adapter = RecordingAdapter {
+            fail_sql_contains: Some("CREATE INDEX".to_string()),
+            ..RecordingAdapter::default()
+        };
+
+        let err = apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap_err();
+
+        assert!(err.contains("post_load_validation_failed"));
+        // checks=0으로 열었고, 실패했어도 checks=1 복원이 마지막에 실행됐다.
+        assert_eq!(adapter.executed_sql.first().map(String::as_str), Some("SET SESSION foreign_key_checks=0"));
+        assert_eq!(adapter.executed_sql.last().map(String::as_str), Some("SET SESSION foreign_key_checks=1"));
+    }
+
+    #[test]
+    fn post_load_ddl_postgres_does_not_toggle_fk_checks() {
+        // PostgreSQL 타겟에는 MySQL 전용 foreign_key_checks SET 문이 나오지 않는다.
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "orders".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "user_id".to_string(),
+                    type_name: "integer".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: vec![NormalizedIndex {
+                    name: "idx_orders_user_id".to_string(),
+                    columns: vec!["user_id".to_string()],
+                    unique: false,
+                }],
+                foreign_keys: Vec::new(),
+            }],
+        };
+        let mut adapter = RecordingAdapter::default();
+
+        apply_post_load_ddl(&mut adapter, &schema, "postgresql").unwrap();
+
+        assert!(adapter
+            .executed_sql
+            .iter()
+            .all(|sql| !sql.contains("foreign_key_checks")));
     }
 
     #[test]
@@ -14800,8 +15219,12 @@ mod tests {
                 "SET SESSION sql_mode = TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ','))".to_string(),
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=0".to_string(),
+                "SET SESSION net_read_timeout = 600".to_string(),
+                "SET SESSION net_write_timeout = 600".to_string(),
+                "SET SESSION wait_timeout = 28800".to_string(),
             ]
         );
+        // 복원 분기에는 timeout SET을 넣지 않는다(세션 종료로 자동 소멸).
         assert_eq!(
             mysql_import_session_tuning_sql(true),
             vec![
@@ -14817,6 +15240,42 @@ mod tests {
         assert!(is_mysql_local_infile_disabled_error(
             "ERROR 3948 (42000): Loading local data is disabled"
         ));
+    }
+
+    #[test]
+    fn transient_disconnect_errors_are_retryable() {
+        for msg in [
+            "mysql LOAD DATA error: IoError { server disconnected }",
+            "ERROR 2006 (HY000): MySQL server has gone away",
+            "ERROR 2013 (HY000): Lost connection to MySQL server during query",
+            "Broken pipe (os error 32)",
+            "Connection reset by peer",
+            "Packets out of order",
+            "operation timed out",
+            "Connection refused (os error 111)",
+        ] {
+            assert!(
+                is_transient_disconnect_error(msg),
+                "expected transient: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn data_and_schema_errors_are_not_retryable() {
+        // 재시도하면 안 되는 에러들(무한 반복/우회 방지). 특히 1452/3780/1062/3948.
+        for msg in [
+            "ERROR 1452 (23000): Cannot add or update a child row: a foreign key constraint fails",
+            "Referencing column 'x' and referenced column 'y' in foreign key constraint are incompatible", // 3780
+            "ERROR 1062 (23000): Duplicate entry '1' for key 'PRIMARY'",
+            "ERROR 3948 (42000): Loading local data is disabled",
+            "ERROR 1054 (42S22): Unknown column 'foo' in 'field list'",
+        ] {
+            assert!(
+                !is_transient_disconnect_error(msg),
+                "expected NOT transient: {msg}"
+            );
+        }
     }
 
     #[test]
