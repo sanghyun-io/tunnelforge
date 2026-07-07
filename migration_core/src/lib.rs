@@ -81,6 +81,11 @@ pub struct NormalizedTable {
     pub indexes: Vec<NormalizedIndex>,
     #[serde(default)]
     pub foreign_keys: Vec<NormalizedForeignKey>,
+    /// 테이블 기본 collation(information_schema.tables.TABLE_COLLATION).
+    /// 같은 엔진(MySQL→MySQL) dump/import에서 테이블 레벨 DEFAULT COLLATE를 재현하기 위해 보존한다.
+    /// PostgreSQL 소스나 cross-engine에서는 None(PostgreSQL은 테이블 레벨 collation 개념이 없음).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub table_collation: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -3306,8 +3311,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     //     즉시 DROP→CREATE 하면, 부모를 재생성하는 시점에 아직 DROP되지 않은 자식의 FK가
     //     살아 있어 동일한 ERROR 3780을 유발한다.
     if matches!(mode, "replace" | "recreate") {
-        let import_set: BTreeSet<String> =
-            tables.iter().map(|table| table.name.clone()).collect();
+        let import_set: BTreeSet<String> = tables.iter().map(|table| table.name.clone()).collect();
         let target_schema = endpoint_schema(&endpoint);
         preflight_surviving_referencing_fks(&mut adapter, &target_schema, &import_set)?;
 
@@ -3736,8 +3740,13 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                 compression,
             )?;
             let started = Instant::now();
-            let rows = match load_chunk_with_reconnect(endpoint, conn, table, &chunk_path, compression)
-            {
+            let rows = match load_chunk_with_reconnect(
+                endpoint,
+                conn,
+                table,
+                &chunk_path,
+                compression,
+            ) {
                 Ok(rows) => rows,
                 Err(err) if is_mysql_local_infile_disabled_error(&err) => {
                     emit(json!({
@@ -4606,6 +4615,20 @@ fn normalized_schema_diff(source: &NormalizedSchema, target: &NormalizedSchema) 
         let Some(target_table) = target_tables.get(table_name) else {
             continue;
         };
+        // 테이블 레벨 collation 비교. 양쪽이 모두 Some(둘 다 MySQL에서 inspect)일 때만 비교하여
+        // cross-engine(PostgreSQL은 table_collation=None) 비교로 인한 오탐을 피한다.
+        if let (Some(source_collation), Some(target_collation)) =
+            (&source_table.table_collation, &target_table.table_collation)
+        {
+            if source_collation != target_collation {
+                differences.push(json!({
+                    "kind": "table_collation_mismatch",
+                    "table": table_name,
+                    "source_collation": source_collation,
+                    "target_collation": target_collation
+                }));
+            }
+        }
         let source_columns: BTreeMap<String, &NormalizedColumn> = source_table
             .columns
             .iter()
@@ -4733,16 +4756,16 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let mut conn = pool
         .get_conn()
         .map_err(|err| format!("mysql connection error: {err}"))?;
-    let table_names: Vec<String> = conn
+    let table_names: Vec<(String, Option<String>)> = conn
         .exec_map(
             inspect_tables_sql("mysql"),
             (&schema_name,),
-            |table_name: String| table_name,
+            |(table_name, table_collation): (String, Option<String>)| (table_name, table_collation),
         )
         .map_err(|err| format!("mysql table inspect error: {err}"))?;
     let mut tables = Vec::new();
 
-    for table_name in table_names {
+    for (table_name, table_collation) in table_names {
         let columns: Vec<NormalizedColumn> =
             conn
                 .exec_map(
@@ -4809,6 +4832,7 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
             columns: apply_key_flags(columns, &keys),
             indexes: group_indexes(index_rows),
             foreign_keys: group_foreign_keys(foreign_key_rows),
+            table_collation: table_collation.filter(|value| !value.trim().is_empty()),
         });
     }
 
@@ -4967,6 +4991,7 @@ fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
             columns: apply_key_flags(columns, &keys),
             indexes,
             foreign_keys,
+            table_collation: None,
         });
     }
 
@@ -7262,6 +7287,26 @@ fn direction_guide(payload: &Value, source: &Endpoint, target: &Endpoint) -> Val
                 }),
             }
 
+            let create_table_sql =
+                match generate_schema_ddl(&schema, &source.engine, &target.engine) {
+                    Ok(ddl) => ddl,
+                    Err(err) => {
+                        issues.push(MigrationIssue {
+                            issue_type: None,
+                            severity: "error".to_string(),
+                            location: "schema".to_string(),
+                            message: err,
+                            suggestion:
+                                "Reject or fix the invalid table collation before migrating."
+                                    .to_string(),
+                            blocking: true,
+                            table_name: None,
+                            column_name: None,
+                        });
+                        Vec::new()
+                    }
+                };
+
             json!({
                 "direction": direction,
                 "source_engine": source.engine,
@@ -7277,7 +7322,7 @@ fn direction_guide(payload: &Value, source: &Endpoint, target: &Endpoint) -> Val
                         "5. Run full verify and inspect mismatches before cutover."
                     ],
                     "row_sample_limit": row_limit,
-                    "create_table_sql": generate_schema_ddl(&schema, &source.engine, &target.engine),
+                    "create_table_sql": create_table_sql,
                     "sequence_reset_sql": generate_sequence_reset_ddl(&schema, &target.engine),
                     "post_data_sql": generate_post_data_ddl(&schema, &target.engine),
                     "unsupported_objects": check_payload["unsupported_objects"].clone(),
@@ -7400,7 +7445,19 @@ fn plan(request: &Request) -> Vec<Value> {
     let target = read_engine(&request.payload, "target_engine");
     let schema =
         dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
-    let ddl = generate_schema_ddl(&schema, &source, &target);
+    let ddl = match generate_schema_ddl(&schema, &source, &target) {
+        Ok(ddl) => ddl,
+        Err(err) => {
+            return vec![
+                phase_event(request, "plan", "migration plan generation started"),
+                json!({
+                    "event": "error",
+                    "request_id": request.request_id,
+                    "message": err
+                }),
+            ];
+        }
+    };
     let table_order = table_dependency_order(&schema);
     let tables = plan_table_summaries(request, &schema);
 
@@ -8054,7 +8111,23 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
     let ddl = if source_engine.is_empty() || target_engine.is_empty() {
         Vec::new()
     } else {
-        generate_schema_ddl(&ordered_schema, source_engine, target_engine)
+        match generate_schema_ddl(&ordered_schema, source_engine, target_engine) {
+            Ok(ddl) => ddl,
+            Err(err) => {
+                let table = ordered_schema
+                    .tables
+                    .first()
+                    .cloned()
+                    .unwrap_or(NormalizedTable {
+                        name: "schema_ddl".to_string(),
+                        columns: Vec::new(),
+                        indexes: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        table_collation: None,
+                    });
+                return migration_error_result(state, rows_copied, chunks_copied, &table, err);
+            }
+        }
     };
 
     for (table_index, table) in ordered_schema.tables.iter().enumerate() {
@@ -8163,6 +8236,7 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             });
         return migration_error_result(state, rows_copied, chunks_copied, &table, err);
     }
@@ -9977,11 +10051,25 @@ fn unsupported_objects(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn generate_schema_ddl(schema: &NormalizedSchema, source: &str, target: &str) -> Vec<String> {
+pub fn generate_schema_ddl(
+    schema: &NormalizedSchema,
+    source: &str,
+    target: &str,
+) -> Result<Vec<String>, String> {
+    // generate_table_ddl이 None을 주는 경우(변조 매니페스트의 유효하지 않은 table_collation 등)를
+    // filter_map으로 조용히 누락하면, 미리보기/계획에서 테이블이 사라지고 migrate 경로에서는
+    // ddl 인덱스가 어긋난다. 누락 대신 구조화된 에러로 전파해 fail-closed로 만든다.
     schema
         .tables
         .iter()
-        .filter_map(|table| generate_table_ddl(table, source, target))
+        .map(|table| {
+            generate_table_ddl(table, source, target).ok_or_else(|| {
+                format!(
+                    "cannot generate DDL for table `{}` (invalid table collation?)",
+                    table.name
+                )
+            })
+        })
         .collect()
 }
 
@@ -10749,7 +10837,7 @@ pub fn inspect_tables_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
         "SELECT table_name FROM information_schema.tables WHERE table_schema = $1 AND table_type = 'BASE TABLE' ORDER BY table_name"
     } else {
-        "SELECT TABLE_NAME AS table_name FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY TABLE_NAME"
+        "SELECT TABLE_NAME AS table_name, TABLE_COLLATION AS table_collation FROM information_schema.tables WHERE table_schema = ? AND table_type = 'BASE TABLE' ORDER BY TABLE_NAME"
     }
 }
 
@@ -10864,7 +10952,15 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
 
     for column in &table.columns {
         let auto_increment = is_auto_increment_type(&column.type_name);
-        let mapped_type = map_type(source, target, &strip_generation_marker(&column.type_name));
+        let stripped = strip_generation_marker(&column.type_name);
+        let mapped_type = map_type(source, target, &stripped);
+        // 최종 DDL에 들어가는 타입 문자열(mapped_type)을 검증한다. same-engine은 원문이 그대로 들어가고,
+        // cross-engine도 map_type이 varchar/decimal/numeric 등에서 원문을 대문자화만 해 통과시키므로
+        // (예: `varchar(45), evil int` -> `VARCHAR(45), EVIL INT`), 변환 후 값을 검증해야 same/cross-engine
+        // 모든 경로에서 컬럼 정의 탈출(CTAS/추가 컬럼 주입)을 fail-closed로 막을 수 있다.
+        if !is_safe_column_type(&mapped_type) {
+            return None;
+        }
         let default_sql = if auto_increment {
             String::new()
         } else {
@@ -10895,11 +10991,254 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
         lines.push(format!("  PRIMARY KEY ({})", primary_keys.join(", ")));
     }
 
+    // 테이블 레벨 기본 collation 재현은 같은 엔진(MySQL→MySQL)에서만 한다.
+    // cross-engine이나 PostgreSQL 타겟에는 테이블 레벨 DEFAULT COLLATE 개념이 없어 붙이면 오류가 난다.
+    // COLLATE만 지정해도 MySQL이 해당 collation의 charset을 자동 결정하므로 charset은 별도로 방출하지 않는다.
+    let table_suffix =
+        if source.eq_ignore_ascii_case(target) && target.eq_ignore_ascii_case("mysql") {
+            match table
+                .table_collation
+                .as_deref()
+                .map(str::trim)
+                .filter(|collation| !collation.is_empty())
+            {
+                // dump 매니페스트는 변조 가능한 파일이므로, collation 값을 그대로 DDL에 끼우면
+                // `utf8mb4_bin AS SELECT ...`(CTAS) 나 `utf8mb4_bin ENGINE=MyISAM` 같은
+                // 테이블 옵션/구문 주입이 가능하다(SQL injection). MySQL collation 식별자 형태만
+                // 허용하고, 위반 시 fail-closed로 DDL 생성을 거부한다(import 중단).
+                Some(collation) if is_valid_mysql_collation_ident(collation) => {
+                    format!(" COLLATE={collation}")
+                }
+                Some(_) => return None,
+                None => String::new(),
+            }
+        } else {
+            String::new()
+        };
+
     Some(format!(
-        "CREATE TABLE {} (\n{}\n);",
+        "CREATE TABLE {} (\n{}\n){};",
         quote_ident(target, &table.name),
-        lines.join(",\n")
+        lines.join(",\n"),
+        table_suffix
     ))
+}
+
+/// dump 매니페스트에서 온 collation 문자열이 MySQL collation 식별자로 안전한지 검사한다.
+/// 영숫자와 밑줄로만 이루어진 1~64자만 허용하여, 공백/괄호/세미콜론/등호 등을 통한
+/// CTAS·table_options SQL 주입을 fail-closed로 차단한다.
+fn is_valid_mysql_collation_ident(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// dump 매니페스트에서 온 MySQL 컬럼 타입 문자열이 안전한 문법인지 검사한다.
+/// 같은 엔진(MySQL→MySQL) import 시 type_name은 검증 없이 그대로 CREATE TABLE 컬럼 정의에 들어가므로,
+/// 변조된 값(`int) AS (SELECT ...`, `int, evil int`, `int; ...` 등)이 컬럼 정의를 탈출하지 못하게 막는다.
+/// 허용 문법: <base ident> [ '(' (숫자리스트 | 따옴표문자열리스트) ')' ] [ modifier ]*
+///   modifier = unsigned | zerofill | (character set | charset | collate) <ident>
+/// enum('a','b'), decimal(10,2), varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin 등 정상 타입은 통과한다.
+/// enum/set 값 리스트는 따옴표 문자열이라 단순 식별자 allowlist로는 걸러낼 수 없어 구조적으로 파싱한다.
+fn is_safe_column_type(type_name: &str) -> bool {
+    let s = type_name.trim();
+    if s.is_empty() || s.len() > 512 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+
+    // 1) base 식별자: ascii 알파벳으로 시작, 이후 영숫자/밑줄
+    if !bytes[i].is_ascii_alphabetic() {
+        return false;
+    }
+    i += 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+
+    // 2) 선택적 인자 그룹 '(' ... ')'
+    if i < bytes.len() && bytes[i] == b'(' {
+        i += 1;
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'\'' {
+            // 따옴표 문자열 리스트 (enum/set): qstr (',' qstr)*
+            loop {
+                if i >= bytes.len() || bytes[i] != b'\'' {
+                    return false;
+                }
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return false; // 닫히지 않은 문자열
+                    }
+                    // enum/set 문자열 값에 백슬래시가 있으면 fail-closed로 거부한다.
+                    // 백슬래시를 일반 문자로 취급하면 기본 MySQL 모드(백슬래시=이스케이프)에서 validator와
+                    // 서버의 따옴표 경계가 어긋나 우회되고(예: enum('a\', ') , evil int -- ')), 반대로
+                    // 이스케이프로 취급하면 NO_BACKSLASH_ESCAPES 모드에서 어긋난다. 어느 모드에서도 안전하도록
+                    // 백슬래시를 포함한 값 자체를 거부한다(정상 enum/set 값에 백슬래시는 실사용상 드묾).
+                    match bytes[i] {
+                        b'\\' => return false,
+                        b'\'' => {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                                i += 2; // '' 이스케이프된 따옴표
+                            } else {
+                                i += 1; // 닫는 따옴표
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b',' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+        } else {
+            // 숫자 리스트: digits (',' digits)*
+            loop {
+                let ds = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == ds {
+                    return false;
+                }
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b',' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b')' {
+            return false;
+        }
+        i += 1;
+    }
+
+    // 3) 후행 modifier들 (공백 구분)
+    loop {
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let ws = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == ws {
+            return false; // 비단어 문자(괄호/세미콜론/등호 등) → 거부
+        }
+        let word = s[ws..i].to_ascii_lowercase();
+        match word.as_str() {
+            "unsigned" | "zerofill" => {}
+            // PostgreSQL 원형 다단어 타입 꼬리 허용: `double precision`, `bit/character varying`,
+            // `timestamp/time with|without time zone`. same-engine PostgreSQL에서는 map_type이
+            // 원문 type_name을 그대로 반환하므로, 이 타입들을 거부하면 정상 import가 깨진다(fidelity).
+            "precision" => {}
+            "varying" => {
+                // character varying(255) / bit varying(8) — 선택적 길이 인자를 허용한다.
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'(' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    let ds = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i == ds {
+                        return false;
+                    }
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    if i >= bytes.len() || bytes[i] != b')' {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
+            "with" | "without" => {
+                for expected in ["time", "zone"] {
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    let ws2 = i;
+                    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    if !s[ws2..i].eq_ignore_ascii_case(expected) {
+                        return false;
+                    }
+                }
+            }
+            "charset" | "collate" => {
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let is2 = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if i == is2 {
+                    return false;
+                }
+            }
+            "character" => {
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let ss = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if !s[ss..i].eq_ignore_ascii_case("set") {
+                    return false;
+                }
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let is2 = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if i == is2 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    true
 }
 
 fn default_clause(target: &str, default_value: Option<&str>, source_type: &str) -> String {
@@ -10951,11 +11290,26 @@ fn map_default_literal(target: &str, default_value: &str, source_type: &str) -> 
         }
         return upper;
     }
-    if (value.starts_with('\'') && value.ends_with('\'')) || value.starts_with("b'") {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "''"))
+    // bit 리터럴 b'0101'은 정확한 형태(0/1로만 채워지고 정상적으로 닫힌 경우)만 그대로 통과시킨다.
+    // 변조된 `b'0') AS (SELECT ...`처럼 닫는 따옴표 없이 컬럼 정의를 탈출하는 값은 여기서 걸러져
+    // 아래 문자열 재이스케이프 경로로 떨어진다.
+    if let Some(bits) = value
+        .strip_prefix("b'")
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        if !bits.is_empty() && bits.bytes().all(|b| b == b'0' || b == b'1') {
+            return value.to_string();
+        }
     }
+    // 그 외에는 항상 하나의 안전한 문자열 리터럴로 재이스케이프한다. 이미 '...'로 감싼 값도 그대로
+    // 통과시키지 않고 dequote 후 재이스케이프하여 `'x', evil int, y varchar(1) DEFAULT 'z'` 같은
+    // 컬럼 정의 주입을 차단한다(변조 매니페스트 대비).
+    let inner = if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].replace("''", "'")
+    } else {
+        value.to_string()
+    };
+    format!("'{}'", inner.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn strip_postgresql_type_cast(value: &str) -> &str {
@@ -11285,6 +11639,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         }
     }
@@ -11295,6 +11650,7 @@ mod tests {
             columns: Vec::new(),
             indexes: Vec::new(),
             foreign_keys,
+            table_collation: None,
         }
     }
 
@@ -11551,6 +11907,7 @@ mod tests {
                     columns: Vec::new(),
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 }],
             },
             unsupported_objects: vec!["deprecated_engine:legacy_table:MyISAM".to_string()],
@@ -11580,6 +11937,7 @@ mod tests {
                     columns: Vec::new(),
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 }],
             },
             unsupported_objects: vec!["int_display_width:orders.id".to_string()],
@@ -12654,6 +13012,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -12673,6 +13032,7 @@ mod tests {
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
                     }],
+                    table_collation: None,
                 },
             ],
         };
@@ -12702,6 +13062,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -12721,6 +13082,7 @@ mod tests {
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
                     }],
+                    table_collation: None,
                 },
             ],
         };
@@ -13088,18 +13450,21 @@ mod tests {
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             },
             NormalizedTable {
                 name: "huge".to_string(),
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             },
             NormalizedTable {
                 name: "medium".to_string(),
                 columns: Vec::new(),
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             },
         ];
         let mut counts = BTreeMap::new();
@@ -13262,6 +13627,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
         let rows = vec![json!({"id": "1", "body": "a\tb\nc\\d", "empty": null})];
         let path = dir.join("chunk_000001.tsv");
@@ -13291,6 +13657,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
         let rows = vec![json!({"importance": "MEDIUM"})];
         let path = dir.join("chunk_000001.tsv");
@@ -13330,6 +13697,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
         let rows = vec![
             json!({"id": "1", "notes": "hello\tworld"}),
@@ -13465,11 +13833,10 @@ mod tests {
 
     #[test]
     fn surviving_fk_offenders_flags_only_external_references() {
-        let import_set: BTreeSet<String> =
-            ["audit_category", "df_evaluation_results"]
-                .into_iter()
-                .map(String::from)
-                .collect();
+        let import_set: BTreeSet<String> = ["audit_category", "df_evaluation_results"]
+            .into_iter()
+            .map(String::from)
+            .collect();
 
         let rows = vec![
             // import set 밖의 테이블이 import set 안의 부모를 참조 → 위반
@@ -13631,6 +13998,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert_eq!(single_numeric_primary_key(&table), Some("id"));
@@ -13660,6 +14028,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert_eq!(single_numeric_primary_key(&table), None);
@@ -13679,6 +14048,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert!(should_use_pk_range_dump(&table, 200_000, 50_000));
@@ -13698,6 +14068,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert!(!should_use_pk_range_dump_for_span(
@@ -13723,6 +14094,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert!(should_use_pk_range_dump_for_span(
@@ -13744,6 +14116,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert!(!should_use_pk_range_dump(&table, 10_000, 50_000));
@@ -14059,18 +14432,19 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
 
         assert_eq!(
-            generate_schema_ddl(&schema, "mysql", "mysql")[0],
+            generate_schema_ddl(&schema, "mysql", "mysql").unwrap()[0],
             "CREATE TABLE `df_evaluations_norm` (\n  `importance` enum('HIGH','MEDIUM','LOW') DEFAULT 'MEDIUM' NOT NULL\n);"
         );
     }
 
     #[test]
     fn generates_create_table_ddl() {
-        let ddl = generate_schema_ddl(&schema(), "mysql", "postgresql");
+        let ddl = generate_schema_ddl(&schema(), "mysql", "postgresql").unwrap();
         assert_eq!(ddl.len(), 1);
         assert!(ddl[0].contains("CREATE TABLE \"users\""));
         assert!(ddl[0].contains("\"id\" INTEGER NOT NULL"));
@@ -14093,6 +14467,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 },
                 NormalizedTable {
                     name: "orders".to_string(),
@@ -14125,6 +14500,7 @@ mod tests {
                         referenced_table: "users".to_string(),
                         referenced_columns: vec!["id".to_string()],
                     }],
+                    table_collation: None,
                 },
             ],
         };
@@ -14162,6 +14538,7 @@ mod tests {
                         referenced_table: "cr_industry_briefs".to_string(),
                         referenced_columns: vec!["slug".to_string()],
                     }],
+                    table_collation: None,
                 },
                 NormalizedTable {
                     name: "cr_industry_briefs".to_string(),
@@ -14179,6 +14556,7 @@ mod tests {
                         unique: true,
                     }],
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 },
             ],
         };
@@ -14215,6 +14593,7 @@ mod tests {
                     unique: false,
                 }],
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut adapter = RecordingAdapter::default();
@@ -14250,6 +14629,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 },
                 NormalizedTable {
                     name: "is_read_comment".to_string(),
@@ -14268,6 +14648,7 @@ mod tests {
                         referenced_table: "users".to_string(),
                         referenced_columns: vec!["id".to_string()],
                     }],
+                    table_collation: None,
                 },
             ],
         };
@@ -14275,13 +14656,21 @@ mod tests {
 
         apply_post_load_ddl(&mut adapter, &schema, "mysql").unwrap();
 
-        assert_eq!(adapter.executed_sql.first().map(String::as_str), Some("SET SESSION foreign_key_checks=0"));
-        assert_eq!(adapter.executed_sql.last().map(String::as_str), Some("SET SESSION foreign_key_checks=1"));
+        assert_eq!(
+            adapter.executed_sql.first().map(String::as_str),
+            Some("SET SESSION foreign_key_checks=0")
+        );
+        assert_eq!(
+            adapter.executed_sql.last().map(String::as_str),
+            Some("SET SESSION foreign_key_checks=1")
+        );
         // FK ALTER가 두 SET 사이에 존재한다.
         let fk_idx = adapter
             .executed_sql
             .iter()
-            .position(|sql| sql.contains("ADD CONSTRAINT") && sql.contains("is_read_comment_ibfk_1"))
+            .position(|sql| {
+                sql.contains("ADD CONSTRAINT") && sql.contains("is_read_comment_ibfk_1")
+            })
             .expect("FK ALTER present");
         assert!(fk_idx > 0 && fk_idx < adapter.executed_sql.len() - 1);
     }
@@ -14306,6 +14695,7 @@ mod tests {
                     unique: false,
                 }],
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut adapter = RecordingAdapter {
@@ -14317,8 +14707,14 @@ mod tests {
 
         assert!(err.contains("post_load_validation_failed"));
         // checks=0으로 열었고, 실패했어도 checks=1 복원이 마지막에 실행됐다.
-        assert_eq!(adapter.executed_sql.first().map(String::as_str), Some("SET SESSION foreign_key_checks=0"));
-        assert_eq!(adapter.executed_sql.last().map(String::as_str), Some("SET SESSION foreign_key_checks=1"));
+        assert_eq!(
+            adapter.executed_sql.first().map(String::as_str),
+            Some("SET SESSION foreign_key_checks=0")
+        );
+        assert_eq!(
+            adapter.executed_sql.last().map(String::as_str),
+            Some("SET SESSION foreign_key_checks=1")
+        );
     }
 
     #[test]
@@ -14341,6 +14737,7 @@ mod tests {
                     unique: false,
                 }],
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut adapter = RecordingAdapter::default();
@@ -14370,6 +14767,7 @@ mod tests {
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
+                    table_collation: None,
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -14393,6 +14791,7 @@ mod tests {
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
                     }],
+                    table_collation: None,
                 },
             ],
         };
@@ -14423,6 +14822,7 @@ mod tests {
                     unique: false,
                 }],
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut adapter = RecordingAdapter {
@@ -14466,6 +14866,7 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let postgresql_schema = NormalizedSchema {
@@ -14481,15 +14882,16 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
 
         assert_eq!(
-            generate_schema_ddl(&mysql_schema, "mysql", "postgresql")[0],
+            generate_schema_ddl(&mysql_schema, "mysql", "postgresql").unwrap()[0],
             "CREATE TABLE \"users\" (\n  \"id\" INTEGER GENERATED BY DEFAULT AS IDENTITY NOT NULL,\n  PRIMARY KEY (\"id\")\n);"
         );
         assert_eq!(
-            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql")[0],
+            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql").unwrap()[0],
             "CREATE TABLE `users` (\n  `id` INT AUTO_INCREMENT NOT NULL,\n  PRIMARY KEY (`id`)\n);"
         );
         assert_eq!(
@@ -14523,6 +14925,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let postgresql_schema = NormalizedSchema {
@@ -14538,15 +14941,16 @@ mod tests {
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
 
         assert_eq!(
-            generate_schema_ddl(&mysql_schema, "mysql", "postgresql")[0],
+            generate_schema_ddl(&mysql_schema, "mysql", "postgresql").unwrap()[0],
             "CREATE TABLE \"users\" (\n  \"status\" VARCHAR(16) DEFAULT 'new' NOT NULL,\n  \"enabled\" BOOLEAN DEFAULT TRUE NOT NULL\n);"
         );
         assert_eq!(
-            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql")[0],
+            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql").unwrap()[0],
             "CREATE TABLE `users` (\n  `enabled` TINYINT(1) DEFAULT 1 NOT NULL\n);"
         );
     }
@@ -14974,6 +15378,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let source = MemoryAdapter::from_value(Some(&json!({
@@ -15047,6 +15452,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -15102,6 +15508,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -15151,6 +15558,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -15202,6 +15610,7 @@ mod tests {
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
+                table_collation: None,
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -15367,6 +15776,7 @@ mod tests {
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert_eq!(
@@ -15438,6 +15848,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
         let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
 
@@ -15467,6 +15878,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
         let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
 
@@ -15496,6 +15908,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
         let mysql_schema = NormalizedTable {
             name: "flags".to_string(),
@@ -15509,6 +15922,7 @@ mod tests {
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
+            table_collation: None,
         };
 
         assert_eq!(
@@ -15537,6 +15951,302 @@ mod tests {
         assert!(inspect_keys_sql("mysql").contains("KEY_COLUMN_USAGE"));
         assert!(inspect_foreign_keys_sql("postgresql").contains("FOREIGN KEY"));
         assert!(inspect_indexes_sql("postgresql").contains("pg_index"));
+    }
+
+    #[test]
+    fn inspect_tables_sql_mysql_reads_table_collation() {
+        // 같은 엔진 dump에서 테이블 기본 collation을 재현하려면 조사 쿼리가 TABLE_COLLATION을 읽어야 한다.
+        assert!(inspect_tables_sql("mysql").contains("TABLE_COLLATION"));
+        // PostgreSQL은 테이블 레벨 collation 개념이 없으므로 컬럼을 추가하지 않는다.
+        assert!(!inspect_tables_sql("postgresql")
+            .to_ascii_uppercase()
+            .contains("TABLE_COLLATION"));
+    }
+
+    fn single_pk_table_with_collation(table_collation: Option<&str>) -> NormalizedTable {
+        NormalizedTable {
+            name: "docs".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "id".to_string(),
+                type_name: "int".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: true,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            table_collation: table_collation.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn generate_table_ddl_emits_table_collation_same_engine_mysql() {
+        let table = single_pk_table_with_collation(Some("utf8mb4_unicode_ci"));
+        let ddl = generate_table_ddl(&table, "mysql", "mysql").expect("ddl");
+        assert!(
+            ddl.trim_end().ends_with(") COLLATE=utf8mb4_unicode_ci;"),
+            "same-engine MySQL DDL should carry the table collation suffix: {ddl}"
+        );
+    }
+
+    #[test]
+    fn generate_table_ddl_omits_table_collation_cross_engine() {
+        let table = single_pk_table_with_collation(Some("utf8mb4_unicode_ci"));
+        let ddl = generate_table_ddl(&table, "mysql", "postgresql").expect("ddl");
+        assert!(
+            !ddl.to_ascii_uppercase().contains("COLLATE"),
+            "cross-engine DDL must not emit a table collation: {ddl}"
+        );
+    }
+
+    #[test]
+    fn generate_table_ddl_omits_table_collation_for_same_engine_postgres() {
+        // PostgreSQL→PostgreSQL도 테이블 레벨 COLLATE를 붙이지 않는다(MySQL 전용 표현).
+        let table = single_pk_table_with_collation(Some("utf8mb4_unicode_ci"));
+        let ddl = generate_table_ddl(&table, "postgresql", "postgresql").expect("ddl");
+        assert!(!ddl.to_ascii_uppercase().contains("COLLATE"), "{ddl}");
+    }
+
+    #[test]
+    fn generate_table_ddl_rejects_injection_via_table_collation() {
+        // 변조된 매니페스트가 collation 자리에 SQL을 주입하면 fail-closed로 DDL 생성을 거부한다.
+        for payload in [
+            "utf8mb4_unicode_ci AS SELECT id, email FROM users",
+            "utf8mb4_bin ENGINE=MyISAM",
+            "foo; DROP TABLE users",
+            "utf8mb4_bin)",
+            "utf8mb4 bin",
+            "utf8mb4_bin,ROW_FORMAT=DYNAMIC",
+            "utf8mb4_bin`",
+        ] {
+            let table = single_pk_table_with_collation(Some(payload));
+            assert!(
+                generate_table_ddl(&table, "mysql", "mysql").is_none(),
+                "malicious collation must fail-closed (no DDL): {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_table_ddl_accepts_real_mysql8_collation() {
+        let table = single_pk_table_with_collation(Some("utf8mb4_0900_ai_ci"));
+        let ddl = generate_table_ddl(&table, "mysql", "mysql").expect("valid collation");
+        assert!(
+            ddl.trim_end().ends_with(") COLLATE=utf8mb4_0900_ai_ci;"),
+            "{ddl}"
+        );
+    }
+
+    #[test]
+    fn is_valid_mysql_collation_ident_accepts_names_and_rejects_injection() {
+        assert!(is_valid_mysql_collation_ident("utf8mb4_0900_ai_ci"));
+        assert!(is_valid_mysql_collation_ident("latin1_swedish_ci"));
+        assert!(is_valid_mysql_collation_ident(&"a".repeat(64)));
+        assert!(!is_valid_mysql_collation_ident(""));
+        assert!(!is_valid_mysql_collation_ident("has space"));
+        assert!(!is_valid_mysql_collation_ident("semi;colon"));
+        assert!(!is_valid_mysql_collation_ident("paren)"));
+        assert!(!is_valid_mysql_collation_ident("eq=sign"));
+        assert!(!is_valid_mysql_collation_ident(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn is_safe_column_type_accepts_normal_types() {
+        for ok in [
+            "int",
+            "bigint unsigned",
+            "varchar(255)",
+            "decimal(10,2)",
+            "tinyint(1)",
+            "enum('a','b','c')",
+            "set('x','y')",
+            "timestamp",
+            "datetime(6)",
+            "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            "int unsigned zerofill",
+            "enum('a,b','c''d')",
+            "char(1) charset ascii",
+            "timestamp with time zone",
+            "timestamp without time zone",
+            "time with time zone",
+            "double precision",
+            "character varying(255)",
+            "bit varying(8)",
+        ] {
+            assert!(is_safe_column_type(ok), "should accept: {ok}");
+        }
+    }
+
+    #[test]
+    fn is_safe_column_type_rejects_injection() {
+        for bad in [
+            "int) AS (SELECT user FROM mysql.user",
+            "int, evil int",
+            "int; DROP TABLE users",
+            "varchar(45) COLLATE utf8mb4_bin; --",
+            "int) ENGINE=MyISAM",
+            "enum('a') , x int",
+            "int /* c */",
+            "varchar(45) CHARACTER SET utf8mb4, y int",
+            "",
+            "int(",
+            "'quoted'",
+            "int)",
+            "enum('unterminated",
+            "enum('a\\', evil int) -- ')",
+            "int with evil",
+            "timestamp with evil zone",
+            "enum('a\\', ') , injected_col INT, -- ')",
+            "enum('x\\y')",
+        ] {
+            assert!(!is_safe_column_type(bad), "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn generate_table_ddl_rejects_injection_via_type_name() {
+        let mut table = single_pk_table_with_collation(None);
+        table.columns.push(NormalizedColumn {
+            name: "c".to_string(),
+            type_name: "int) AS (SELECT user, authentication_string FROM mysql.user".to_string(),
+            default_value: None,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+        });
+        assert!(
+            generate_table_ddl(&table, "mysql", "mysql").is_none(),
+            "malicious type_name must fail-closed (no DDL)"
+        );
+    }
+
+    #[test]
+    fn generate_table_ddl_rejects_cross_engine_type_injection() {
+        // cross-engine에서도 map_type이 varchar/decimal을 원문 대문자화만 해 통과시키므로,
+        // 변환 후(mapped_type) 검증이 컬럼 정의 탈출을 막아야 한다.
+        let mut table = single_pk_table_with_collation(None);
+        table.columns.push(NormalizedColumn {
+            name: "c".to_string(),
+            type_name: "varchar(45), evil int".to_string(),
+            default_value: None,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+        });
+        assert!(
+            generate_table_ddl(&table, "postgresql", "mysql").is_none(),
+            "cross-engine (pg->mysql) varchar injection must fail-closed"
+        );
+        assert!(
+            generate_table_ddl(&table, "mysql", "postgresql").is_none(),
+            "cross-engine (mysql->pg) varchar injection must fail-closed"
+        );
+    }
+
+    #[test]
+    fn map_default_literal_neutralizes_quoted_injection_and_preserves_normal() {
+        // 컬럼 정의 주입 시도는 하나의 문자열 리터럴로 감싸져 바깥으로 토큰이 새지 않아야 한다.
+        let out = map_default_literal("mysql", "'x', evil int", "varchar(10)");
+        assert!(out.starts_with('\'') && out.ends_with('\''), "{out}");
+        // well-formed 문자열 리터럴이면 작은따옴표 개수가 짝수(내부는 모두 '' 이스케이프).
+        assert_eq!(out.matches('\'').count() % 2, 0, "unbalanced quotes: {out}");
+        // 정상 값 보존
+        assert_eq!(
+            map_default_literal("mysql", "'MEDIUM'", "enum('x')"),
+            "'MEDIUM'"
+        );
+        assert_eq!(
+            map_default_literal("mysql", "MEDIUM", "varchar(10)"),
+            "'MEDIUM'"
+        );
+        assert_eq!(
+            map_default_literal("mysql", "'a''b'", "varchar(10)"),
+            "'a''b'"
+        );
+        // 정상 bit 리터럴은 그대로 통과
+        assert_eq!(map_default_literal("mysql", "b'0101'", "bit(4)"), "b'0101'");
+        // 변조 bit 리터럴(닫히지 않음)은 문자열로 중화
+        let bad_bit = map_default_literal("mysql", "b'0') AS (SELECT 1", "bit(1)");
+        assert!(
+            bad_bit.starts_with('\'') && bad_bit.ends_with('\''),
+            "{bad_bit}"
+        );
+    }
+
+    #[test]
+    fn generate_schema_ddl_errors_on_invalid_table_collation() {
+        // 유효하지 않은(변조된) table_collation은 조용히 누락되지 않고 에러로 전파되어야 한다.
+        let schema = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some(
+                "utf8mb4_bin AS SELECT 1",
+            ))],
+        };
+        assert!(generate_schema_ddl(&schema, "mysql", "mysql").is_err());
+    }
+
+    #[test]
+    fn normalized_schema_diff_reports_table_collation_mismatch() {
+        let src = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some("utf8mb4_general_ci"))],
+        };
+        let tgt = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some("utf8mb4_unicode_ci"))],
+        };
+        let diffs = normalized_schema_diff(&src, &tgt);
+        assert!(
+            diffs
+                .iter()
+                .any(|d| d["kind"] == "table_collation_mismatch"),
+            "{diffs:?}"
+        );
+    }
+
+    #[test]
+    fn normalized_schema_diff_ignores_table_collation_when_one_side_none() {
+        // cross-engine(한쪽 table_collation=None)에서는 collation 비교로 오탐을 내지 않는다.
+        let src = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some("utf8mb4_general_ci"))],
+        };
+        let tgt = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(None)],
+        };
+        let diffs = normalized_schema_diff(&src, &tgt);
+        assert!(
+            !diffs
+                .iter()
+                .any(|d| d["kind"] == "table_collation_mismatch"),
+            "{diffs:?}"
+        );
+    }
+
+    #[test]
+    fn generate_table_ddl_omits_collation_when_absent() {
+        let table = single_pk_table_with_collation(None);
+        let ddl = generate_table_ddl(&table, "mysql", "mysql").expect("ddl");
+        assert!(
+            !ddl.contains("COLLATE="),
+            "no collation info means no COLLATE clause: {ddl}"
+        );
+    }
+
+    #[test]
+    fn normalized_table_deserializes_legacy_manifest_without_table_collation() {
+        // 구버전 매니페스트(table_collation 필드 없음)도 역직렬화되며 None이 되어야 한다(하위호환).
+        let json = r#"{"name":"legacy","columns":[],"indexes":[],"foreign_keys":[]}"#;
+        let table: NormalizedTable =
+            serde_json::from_str(json).expect("legacy manifest must deserialize");
+        assert_eq!(table.table_collation, None);
+    }
+
+    #[test]
+    fn normalized_table_skips_serializing_none_table_collation() {
+        // None이면 직렬화 산출물에 table_collation 키가 빠져야 한다(skip_serializing_if로 매니페스트 노이즈 방지).
+        let json = serde_json::to_string(&single_pk_table_with_collation(None)).expect("serialize");
+        assert!(!json.contains("table_collation"), "{json}");
+        let json_with = serde_json::to_string(&single_pk_table_with_collation(Some("utf8mb4_bin")))
+            .expect("serialize");
+        assert!(json_with.contains("utf8mb4_bin"), "{json_with}");
     }
 
     #[test]

@@ -147,6 +147,7 @@ fn stress_table() -> NormalizedTable {
         ],
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
+        table_collation: None,
     }
 }
 
