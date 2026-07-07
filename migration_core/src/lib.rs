@@ -4615,6 +4615,20 @@ fn normalized_schema_diff(source: &NormalizedSchema, target: &NormalizedSchema) 
         let Some(target_table) = target_tables.get(table_name) else {
             continue;
         };
+        // 테이블 레벨 collation 비교. 양쪽이 모두 Some(둘 다 MySQL에서 inspect)일 때만 비교하여
+        // cross-engine(PostgreSQL은 table_collation=None) 비교로 인한 오탐을 피한다.
+        if let (Some(source_collation), Some(target_collation)) =
+            (&source_table.table_collation, &target_table.table_collation)
+        {
+            if source_collation != target_collation {
+                differences.push(json!({
+                    "kind": "table_collation_mismatch",
+                    "table": table_name,
+                    "source_collation": source_collation,
+                    "target_collation": target_collation
+                }));
+            }
+        }
         let source_columns: BTreeMap<String, &NormalizedColumn> = source_table
             .columns
             .iter()
@@ -7273,6 +7287,26 @@ fn direction_guide(payload: &Value, source: &Endpoint, target: &Endpoint) -> Val
                 }),
             }
 
+            let create_table_sql =
+                match generate_schema_ddl(&schema, &source.engine, &target.engine) {
+                    Ok(ddl) => ddl,
+                    Err(err) => {
+                        issues.push(MigrationIssue {
+                            issue_type: None,
+                            severity: "error".to_string(),
+                            location: "schema".to_string(),
+                            message: err,
+                            suggestion:
+                                "Reject or fix the invalid table collation before migrating."
+                                    .to_string(),
+                            blocking: true,
+                            table_name: None,
+                            column_name: None,
+                        });
+                        Vec::new()
+                    }
+                };
+
             json!({
                 "direction": direction,
                 "source_engine": source.engine,
@@ -7288,7 +7322,7 @@ fn direction_guide(payload: &Value, source: &Endpoint, target: &Endpoint) -> Val
                         "5. Run full verify and inspect mismatches before cutover."
                     ],
                     "row_sample_limit": row_limit,
-                    "create_table_sql": generate_schema_ddl(&schema, &source.engine, &target.engine),
+                    "create_table_sql": create_table_sql,
                     "sequence_reset_sql": generate_sequence_reset_ddl(&schema, &target.engine),
                     "post_data_sql": generate_post_data_ddl(&schema, &target.engine),
                     "unsupported_objects": check_payload["unsupported_objects"].clone(),
@@ -7411,7 +7445,19 @@ fn plan(request: &Request) -> Vec<Value> {
     let target = read_engine(&request.payload, "target_engine");
     let schema =
         dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
-    let ddl = generate_schema_ddl(&schema, &source, &target);
+    let ddl = match generate_schema_ddl(&schema, &source, &target) {
+        Ok(ddl) => ddl,
+        Err(err) => {
+            return vec![
+                phase_event(request, "plan", "migration plan generation started"),
+                json!({
+                    "event": "error",
+                    "request_id": request.request_id,
+                    "message": err
+                }),
+            ];
+        }
+    };
     let table_order = table_dependency_order(&schema);
     let tables = plan_table_summaries(request, &schema);
 
@@ -8065,7 +8111,23 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
     let ddl = if source_engine.is_empty() || target_engine.is_empty() {
         Vec::new()
     } else {
-        generate_schema_ddl(&ordered_schema, source_engine, target_engine)
+        match generate_schema_ddl(&ordered_schema, source_engine, target_engine) {
+            Ok(ddl) => ddl,
+            Err(err) => {
+                let table = ordered_schema
+                    .tables
+                    .first()
+                    .cloned()
+                    .unwrap_or(NormalizedTable {
+                        name: "schema_ddl".to_string(),
+                        columns: Vec::new(),
+                        indexes: Vec::new(),
+                        foreign_keys: Vec::new(),
+                        table_collation: None,
+                    });
+                return migration_error_result(state, rows_copied, chunks_copied, &table, err);
+            }
+        }
     };
 
     for (table_index, table) in ordered_schema.tables.iter().enumerate() {
@@ -9989,11 +10051,25 @@ fn unsupported_objects(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-pub fn generate_schema_ddl(schema: &NormalizedSchema, source: &str, target: &str) -> Vec<String> {
+pub fn generate_schema_ddl(
+    schema: &NormalizedSchema,
+    source: &str,
+    target: &str,
+) -> Result<Vec<String>, String> {
+    // generate_table_ddl이 None을 주는 경우(변조 매니페스트의 유효하지 않은 table_collation 등)를
+    // filter_map으로 조용히 누락하면, 미리보기/계획에서 테이블이 사라지고 migrate 경로에서는
+    // ddl 인덱스가 어긋난다. 누락 대신 구조화된 에러로 전파해 fail-closed로 만든다.
     schema
         .tables
         .iter()
-        .filter_map(|table| generate_table_ddl(table, source, target))
+        .map(|table| {
+            generate_table_ddl(table, source, target).ok_or_else(|| {
+                format!(
+                    "cannot generate DDL for table `{}` (invalid table collation?)",
+                    table.name
+                )
+            })
+        })
         .collect()
 }
 
@@ -14132,14 +14208,14 @@ mod tests {
         };
 
         assert_eq!(
-            generate_schema_ddl(&schema, "mysql", "mysql")[0],
+            generate_schema_ddl(&schema, "mysql", "mysql").unwrap()[0],
             "CREATE TABLE `df_evaluations_norm` (\n  `importance` enum('HIGH','MEDIUM','LOW') DEFAULT 'MEDIUM' NOT NULL\n);"
         );
     }
 
     #[test]
     fn generates_create_table_ddl() {
-        let ddl = generate_schema_ddl(&schema(), "mysql", "postgresql");
+        let ddl = generate_schema_ddl(&schema(), "mysql", "postgresql").unwrap();
         assert_eq!(ddl.len(), 1);
         assert!(ddl[0].contains("CREATE TABLE \"users\""));
         assert!(ddl[0].contains("\"id\" INTEGER NOT NULL"));
@@ -14582,11 +14658,11 @@ mod tests {
         };
 
         assert_eq!(
-            generate_schema_ddl(&mysql_schema, "mysql", "postgresql")[0],
+            generate_schema_ddl(&mysql_schema, "mysql", "postgresql").unwrap()[0],
             "CREATE TABLE \"users\" (\n  \"id\" INTEGER GENERATED BY DEFAULT AS IDENTITY NOT NULL,\n  PRIMARY KEY (\"id\")\n);"
         );
         assert_eq!(
-            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql")[0],
+            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql").unwrap()[0],
             "CREATE TABLE `users` (\n  `id` INT AUTO_INCREMENT NOT NULL,\n  PRIMARY KEY (`id`)\n);"
         );
         assert_eq!(
@@ -14641,11 +14717,11 @@ mod tests {
         };
 
         assert_eq!(
-            generate_schema_ddl(&mysql_schema, "mysql", "postgresql")[0],
+            generate_schema_ddl(&mysql_schema, "mysql", "postgresql").unwrap()[0],
             "CREATE TABLE \"users\" (\n  \"status\" VARCHAR(16) DEFAULT 'new' NOT NULL,\n  \"enabled\" BOOLEAN DEFAULT TRUE NOT NULL\n);"
         );
         assert_eq!(
-            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql")[0],
+            generate_schema_ddl(&postgresql_schema, "postgresql", "mysql").unwrap()[0],
             "CREATE TABLE `users` (\n  `enabled` TINYINT(1) DEFAULT 1 NOT NULL\n);"
         );
     }
@@ -15744,6 +15820,52 @@ mod tests {
         assert!(!is_valid_mysql_collation_ident("paren)"));
         assert!(!is_valid_mysql_collation_ident("eq=sign"));
         assert!(!is_valid_mysql_collation_ident(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn generate_schema_ddl_errors_on_invalid_table_collation() {
+        // 유효하지 않은(변조된) table_collation은 조용히 누락되지 않고 에러로 전파되어야 한다.
+        let schema = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some(
+                "utf8mb4_bin AS SELECT 1",
+            ))],
+        };
+        assert!(generate_schema_ddl(&schema, "mysql", "mysql").is_err());
+    }
+
+    #[test]
+    fn normalized_schema_diff_reports_table_collation_mismatch() {
+        let src = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some("utf8mb4_general_ci"))],
+        };
+        let tgt = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some("utf8mb4_unicode_ci"))],
+        };
+        let diffs = normalized_schema_diff(&src, &tgt);
+        assert!(
+            diffs
+                .iter()
+                .any(|d| d["kind"] == "table_collation_mismatch"),
+            "{diffs:?}"
+        );
+    }
+
+    #[test]
+    fn normalized_schema_diff_ignores_table_collation_when_one_side_none() {
+        // cross-engine(한쪽 table_collation=None)에서는 collation 비교로 오탐을 내지 않는다.
+        let src = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(Some("utf8mb4_general_ci"))],
+        };
+        let tgt = NormalizedSchema {
+            tables: vec![single_pk_table_with_collation(None)],
+        };
+        let diffs = normalized_schema_diff(&src, &tgt);
+        assert!(
+            !diffs
+                .iter()
+                .any(|d| d["kind"] == "table_collation_mismatch"),
+            "{diffs:?}"
+        );
     }
 
     #[test]
