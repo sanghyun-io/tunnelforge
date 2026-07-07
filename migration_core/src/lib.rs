@@ -11076,8 +11076,10 @@ fn is_safe_column_type(type_name: &str) -> bool {
                     if i >= bytes.len() {
                         return false; // 닫히지 않은 문자열
                     }
+                    // 백슬래시를 이스케이프로 해석하지 않고 일반 문자로 취급한다. NO_BACKSLASH_ESCAPES
+                    // 서버에서 validator와 서버의 따옴표 경계 해석이 어긋나 우회되는 것을 막기 위함이며,
+                    // 그 결과 `\'`(백슬래시로 이스케이프한 따옴표)를 포함한 enum/set 값은 fail-closed로 거부된다.
                     match bytes[i] {
-                        b'\\' => i += 2, // MySQL 백슬래시 이스케이프
                         b'\'' => {
                             if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                                 i += 2; // '' 이스케이프된 따옴표
@@ -11151,6 +11153,24 @@ fn is_safe_column_type(type_name: &str) -> bool {
         let word = s[ws..i].to_ascii_lowercase();
         match word.as_str() {
             "unsigned" | "zerofill" => {}
+            // PostgreSQL 원형 다단어 타입 꼬리 허용: `double precision`, `bit/character varying`,
+            // `timestamp/time with|without time zone`. same-engine PostgreSQL에서는 map_type이
+            // 원문 type_name을 그대로 반환하므로, 이 타입들을 거부하면 정상 import가 깨진다(fidelity).
+            "precision" | "varying" => {}
+            "with" | "without" => {
+                for expected in ["time", "zone"] {
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    let ws2 = i;
+                    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                        i += 1;
+                    }
+                    if !s[ws2..i].eq_ignore_ascii_case(expected) {
+                        return false;
+                    }
+                }
+            }
             "charset" | "collate" => {
                 while i < bytes.len() && bytes[i] == b' ' {
                     i += 1;
@@ -16018,6 +16038,10 @@ mod tests {
             "int unsigned zerofill",
             "enum('a,b','c''d')",
             "char(1) charset ascii",
+            "timestamp with time zone",
+            "timestamp without time zone",
+            "time with time zone",
+            "double precision",
         ] {
             assert!(is_safe_column_type(ok), "should accept: {ok}");
         }
@@ -16039,6 +16063,9 @@ mod tests {
             "'quoted'",
             "int)",
             "enum('unterminated",
+            "enum('a\\', evil int) -- ')",
+            "int with evil",
+            "timestamp with evil zone",
         ] {
             assert!(!is_safe_column_type(bad), "should reject: {bad}");
         }
