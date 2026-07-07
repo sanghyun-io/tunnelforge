@@ -11076,10 +11076,13 @@ fn is_safe_column_type(type_name: &str) -> bool {
                     if i >= bytes.len() {
                         return false; // 닫히지 않은 문자열
                     }
-                    // 백슬래시를 이스케이프로 해석하지 않고 일반 문자로 취급한다. NO_BACKSLASH_ESCAPES
-                    // 서버에서 validator와 서버의 따옴표 경계 해석이 어긋나 우회되는 것을 막기 위함이며,
-                    // 그 결과 `\'`(백슬래시로 이스케이프한 따옴표)를 포함한 enum/set 값은 fail-closed로 거부된다.
+                    // enum/set 문자열 값에 백슬래시가 있으면 fail-closed로 거부한다.
+                    // 백슬래시를 일반 문자로 취급하면 기본 MySQL 모드(백슬래시=이스케이프)에서 validator와
+                    // 서버의 따옴표 경계가 어긋나 우회되고(예: enum('a\', ') , evil int -- ')), 반대로
+                    // 이스케이프로 취급하면 NO_BACKSLASH_ESCAPES 모드에서 어긋난다. 어느 모드에서도 안전하도록
+                    // 백슬래시를 포함한 값 자체를 거부한다(정상 enum/set 값에 백슬래시는 실사용상 드묾).
                     match bytes[i] {
+                        b'\\' => return false,
                         b'\'' => {
                             if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
                                 i += 2; // '' 이스케이프된 따옴표
@@ -11156,7 +11159,33 @@ fn is_safe_column_type(type_name: &str) -> bool {
             // PostgreSQL 원형 다단어 타입 꼬리 허용: `double precision`, `bit/character varying`,
             // `timestamp/time with|without time zone`. same-engine PostgreSQL에서는 map_type이
             // 원문 type_name을 그대로 반환하므로, 이 타입들을 거부하면 정상 import가 깨진다(fidelity).
-            "precision" | "varying" => {}
+            "precision" => {}
+            "varying" => {
+                // character varying(255) / bit varying(8) — 선택적 길이 인자를 허용한다.
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'(' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    let ds = i;
+                    while i < bytes.len() && bytes[i].is_ascii_digit() {
+                        i += 1;
+                    }
+                    if i == ds {
+                        return false;
+                    }
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    if i >= bytes.len() || bytes[i] != b')' {
+                        return false;
+                    }
+                    i += 1;
+                }
+            }
             "with" | "without" => {
                 for expected in ["time", "zone"] {
                     while i < bytes.len() && bytes[i] == b' ' {
@@ -16042,6 +16071,8 @@ mod tests {
             "timestamp without time zone",
             "time with time zone",
             "double precision",
+            "character varying(255)",
+            "bit varying(8)",
         ] {
             assert!(is_safe_column_type(ok), "should accept: {ok}");
         }
@@ -16066,6 +16097,8 @@ mod tests {
             "enum('a\\', evil int) -- ')",
             "int with evil",
             "timestamp with evil zone",
+            "enum('a\\', ') , injected_col INT, -- ')",
+            "enum('x\\y')",
         ] {
             assert!(!is_safe_column_type(bad), "should reject: {bad}");
         }
