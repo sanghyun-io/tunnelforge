@@ -10912,13 +10912,22 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
     // COLLATE만 지정해도 MySQL이 해당 collation의 charset을 자동 결정하므로 charset은 별도로 방출하지 않는다.
     let table_suffix =
         if source.eq_ignore_ascii_case(target) && target.eq_ignore_ascii_case("mysql") {
-            table
+            match table
                 .table_collation
                 .as_deref()
                 .map(str::trim)
                 .filter(|collation| !collation.is_empty())
-                .map(|collation| format!(" COLLATE={collation}"))
-                .unwrap_or_default()
+            {
+                // dump 매니페스트는 변조 가능한 파일이므로, collation 값을 그대로 DDL에 끼우면
+                // `utf8mb4_bin AS SELECT ...`(CTAS) 나 `utf8mb4_bin ENGINE=MyISAM` 같은
+                // 테이블 옵션/구문 주입이 가능하다(SQL injection). MySQL collation 식별자 형태만
+                // 허용하고, 위반 시 fail-closed로 DDL 생성을 거부한다(import 중단).
+                Some(collation) if is_valid_mysql_collation_ident(collation) => {
+                    format!(" COLLATE={collation}")
+                }
+                Some(_) => return None,
+                None => String::new(),
+            }
         } else {
             String::new()
         };
@@ -10929,6 +10938,17 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
         lines.join(",\n"),
         table_suffix
     ))
+}
+
+/// dump 매니페스트에서 온 collation 문자열이 MySQL collation 식별자로 안전한지 검사한다.
+/// 영숫자와 밑줄로만 이루어진 1~64자만 허용하여, 공백/괄호/세미콜론/등호 등을 통한
+/// CTAS·table_options SQL 주입을 fail-closed로 차단한다.
+fn is_valid_mysql_collation_ident(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
 fn default_clause(target: &str, default_value: Option<&str>, source_type: &str) -> String {
@@ -15684,6 +15704,49 @@ mod tests {
     }
 
     #[test]
+    fn generate_table_ddl_rejects_injection_via_table_collation() {
+        // 변조된 매니페스트가 collation 자리에 SQL을 주입하면 fail-closed로 DDL 생성을 거부한다.
+        for payload in [
+            "utf8mb4_unicode_ci AS SELECT id, email FROM users",
+            "utf8mb4_bin ENGINE=MyISAM",
+            "foo; DROP TABLE users",
+            "utf8mb4_bin)",
+            "utf8mb4 bin",
+            "utf8mb4_bin,ROW_FORMAT=DYNAMIC",
+            "utf8mb4_bin`",
+        ] {
+            let table = single_pk_table_with_collation(Some(payload));
+            assert!(
+                generate_table_ddl(&table, "mysql", "mysql").is_none(),
+                "malicious collation must fail-closed (no DDL): {payload:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn generate_table_ddl_accepts_real_mysql8_collation() {
+        let table = single_pk_table_with_collation(Some("utf8mb4_0900_ai_ci"));
+        let ddl = generate_table_ddl(&table, "mysql", "mysql").expect("valid collation");
+        assert!(
+            ddl.trim_end().ends_with(") COLLATE=utf8mb4_0900_ai_ci;"),
+            "{ddl}"
+        );
+    }
+
+    #[test]
+    fn is_valid_mysql_collation_ident_accepts_names_and_rejects_injection() {
+        assert!(is_valid_mysql_collation_ident("utf8mb4_0900_ai_ci"));
+        assert!(is_valid_mysql_collation_ident("latin1_swedish_ci"));
+        assert!(is_valid_mysql_collation_ident(&"a".repeat(64)));
+        assert!(!is_valid_mysql_collation_ident(""));
+        assert!(!is_valid_mysql_collation_ident("has space"));
+        assert!(!is_valid_mysql_collation_ident("semi;colon"));
+        assert!(!is_valid_mysql_collation_ident("paren)"));
+        assert!(!is_valid_mysql_collation_ident("eq=sign"));
+        assert!(!is_valid_mysql_collation_ident(&"a".repeat(65)));
+    }
+
+    #[test]
     fn generate_table_ddl_omits_collation_when_absent() {
         let table = single_pk_table_with_collation(None);
         let ddl = generate_table_ddl(&table, "mysql", "mysql").expect("ddl");
@@ -15707,9 +15770,8 @@ mod tests {
         // None이면 직렬화 산출물에 table_collation 키가 빠져야 한다(skip_serializing_if로 매니페스트 노이즈 방지).
         let json = serde_json::to_string(&single_pk_table_with_collation(None)).expect("serialize");
         assert!(!json.contains("table_collation"), "{json}");
-        let json_with =
-            serde_json::to_string(&single_pk_table_with_collation(Some("utf8mb4_bin")))
-                .expect("serialize");
+        let json_with = serde_json::to_string(&single_pk_table_with_collation(Some("utf8mb4_bin")))
+            .expect("serialize");
         assert!(json_with.contains("utf8mb4_bin"), "{json_with}");
     }
 
