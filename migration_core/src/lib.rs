@@ -10953,16 +10953,14 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
     for column in &table.columns {
         let auto_increment = is_auto_increment_type(&column.type_name);
         let stripped = strip_generation_marker(&column.type_name);
-        // same-engine MySQL에서 type_name은 검증 없이 그대로 컬럼 정의에 삽입되므로, 변조 매니페스트가
-        // `int) AS (SELECT ...` 처럼 컬럼 정의를 탈출해 CTAS/추가 컬럼을 주입하는 것을 fail-closed로 막는다.
-        // cross-engine은 map_type이 화이트리스트 타입으로 매핑하므로 raw 통과가 없어 여기서 검사하지 않는다.
-        if source.eq_ignore_ascii_case(target)
-            && target.eq_ignore_ascii_case("mysql")
-            && !is_safe_mysql_type(&stripped)
-        {
+        let mapped_type = map_type(source, target, &stripped);
+        // 최종 DDL에 들어가는 타입 문자열(mapped_type)을 검증한다. same-engine은 원문이 그대로 들어가고,
+        // cross-engine도 map_type이 varchar/decimal/numeric 등에서 원문을 대문자화만 해 통과시키므로
+        // (예: `varchar(45), evil int` -> `VARCHAR(45), EVIL INT`), 변환 후 값을 검증해야 same/cross-engine
+        // 모든 경로에서 컬럼 정의 탈출(CTAS/추가 컬럼 주입)을 fail-closed로 막을 수 있다.
+        if !is_safe_column_type(&mapped_type) {
             return None;
         }
-        let mapped_type = map_type(source, target, &stripped);
         let default_sql = if auto_increment {
             String::new()
         } else {
@@ -11044,7 +11042,7 @@ fn is_valid_mysql_collation_ident(value: &str) -> bool {
 ///   modifier = unsigned | zerofill | (character set | charset | collate) <ident>
 /// enum('a','b'), decimal(10,2), varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin 등 정상 타입은 통과한다.
 /// enum/set 값 리스트는 따옴표 문자열이라 단순 식별자 allowlist로는 걸러낼 수 없어 구조적으로 파싱한다.
-fn is_safe_mysql_type(type_name: &str) -> bool {
+fn is_safe_column_type(type_name: &str) -> bool {
     let s = type_name.trim();
     if s.is_empty() || s.len() > 512 {
         return false;
@@ -16005,7 +16003,7 @@ mod tests {
     }
 
     #[test]
-    fn is_safe_mysql_type_accepts_normal_types() {
+    fn is_safe_column_type_accepts_normal_types() {
         for ok in [
             "int",
             "bigint unsigned",
@@ -16021,12 +16019,12 @@ mod tests {
             "enum('a,b','c''d')",
             "char(1) charset ascii",
         ] {
-            assert!(is_safe_mysql_type(ok), "should accept: {ok}");
+            assert!(is_safe_column_type(ok), "should accept: {ok}");
         }
     }
 
     #[test]
-    fn is_safe_mysql_type_rejects_injection() {
+    fn is_safe_column_type_rejects_injection() {
         for bad in [
             "int) AS (SELECT user FROM mysql.user",
             "int, evil int",
@@ -16042,7 +16040,7 @@ mod tests {
             "int)",
             "enum('unterminated",
         ] {
-            assert!(!is_safe_mysql_type(bad), "should reject: {bad}");
+            assert!(!is_safe_column_type(bad), "should reject: {bad}");
         }
     }
 
@@ -16060,6 +16058,29 @@ mod tests {
         assert!(
             generate_table_ddl(&table, "mysql", "mysql").is_none(),
             "malicious type_name must fail-closed (no DDL)"
+        );
+    }
+
+    #[test]
+    fn generate_table_ddl_rejects_cross_engine_type_injection() {
+        // cross-engine에서도 map_type이 varchar/decimal을 원문 대문자화만 해 통과시키므로,
+        // 변환 후(mapped_type) 검증이 컬럼 정의 탈출을 막아야 한다.
+        let mut table = single_pk_table_with_collation(None);
+        table.columns.push(NormalizedColumn {
+            name: "c".to_string(),
+            type_name: "varchar(45), evil int".to_string(),
+            default_value: None,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+        });
+        assert!(
+            generate_table_ddl(&table, "postgresql", "mysql").is_none(),
+            "cross-engine (pg->mysql) varchar injection must fail-closed"
+        );
+        assert!(
+            generate_table_ddl(&table, "mysql", "postgresql").is_none(),
+            "cross-engine (mysql->pg) varchar injection must fail-closed"
         );
     }
 
