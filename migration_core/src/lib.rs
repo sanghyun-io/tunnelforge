@@ -10952,7 +10952,17 @@ fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Op
 
     for column in &table.columns {
         let auto_increment = is_auto_increment_type(&column.type_name);
-        let mapped_type = map_type(source, target, &strip_generation_marker(&column.type_name));
+        let stripped = strip_generation_marker(&column.type_name);
+        // same-engine MySQL에서 type_name은 검증 없이 그대로 컬럼 정의에 삽입되므로, 변조 매니페스트가
+        // `int) AS (SELECT ...` 처럼 컬럼 정의를 탈출해 CTAS/추가 컬럼을 주입하는 것을 fail-closed로 막는다.
+        // cross-engine은 map_type이 화이트리스트 타입으로 매핑하므로 raw 통과가 없어 여기서 검사하지 않는다.
+        if source.eq_ignore_ascii_case(target)
+            && target.eq_ignore_ascii_case("mysql")
+            && !is_safe_mysql_type(&stripped)
+        {
+            return None;
+        }
+        let mapped_type = map_type(source, target, &stripped);
         let default_sql = if auto_increment {
             String::new()
         } else {
@@ -11027,6 +11037,163 @@ fn is_valid_mysql_collation_ident(value: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
 }
 
+/// dump 매니페스트에서 온 MySQL 컬럼 타입 문자열이 안전한 문법인지 검사한다.
+/// 같은 엔진(MySQL→MySQL) import 시 type_name은 검증 없이 그대로 CREATE TABLE 컬럼 정의에 들어가므로,
+/// 변조된 값(`int) AS (SELECT ...`, `int, evil int`, `int; ...` 등)이 컬럼 정의를 탈출하지 못하게 막는다.
+/// 허용 문법: <base ident> [ '(' (숫자리스트 | 따옴표문자열리스트) ')' ] [ modifier ]*
+///   modifier = unsigned | zerofill | (character set | charset | collate) <ident>
+/// enum('a','b'), decimal(10,2), varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin 등 정상 타입은 통과한다.
+/// enum/set 값 리스트는 따옴표 문자열이라 단순 식별자 allowlist로는 걸러낼 수 없어 구조적으로 파싱한다.
+fn is_safe_mysql_type(type_name: &str) -> bool {
+    let s = type_name.trim();
+    if s.is_empty() || s.len() > 512 {
+        return false;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+
+    // 1) base 식별자: ascii 알파벳으로 시작, 이후 영숫자/밑줄
+    if !bytes[i].is_ascii_alphabetic() {
+        return false;
+    }
+    i += 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+
+    // 2) 선택적 인자 그룹 '(' ... ')'
+    if i < bytes.len() && bytes[i] == b'(' {
+        i += 1;
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'\'' {
+            // 따옴표 문자열 리스트 (enum/set): qstr (',' qstr)*
+            loop {
+                if i >= bytes.len() || bytes[i] != b'\'' {
+                    return false;
+                }
+                i += 1;
+                loop {
+                    if i >= bytes.len() {
+                        return false; // 닫히지 않은 문자열
+                    }
+                    match bytes[i] {
+                        b'\\' => i += 2, // MySQL 백슬래시 이스케이프
+                        b'\'' => {
+                            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                                i += 2; // '' 이스케이프된 따옴표
+                            } else {
+                                i += 1; // 닫는 따옴표
+                                break;
+                            }
+                        }
+                        _ => i += 1,
+                    }
+                }
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b',' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+        } else {
+            // 숫자 리스트: digits (',' digits)*
+            loop {
+                let ds = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == ds {
+                    return false;
+                }
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b',' {
+                    i += 1;
+                    while i < bytes.len() && bytes[i] == b' ' {
+                        i += 1;
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b')' {
+            return false;
+        }
+        i += 1;
+    }
+
+    // 3) 후행 modifier들 (공백 구분)
+    loop {
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let ws = i;
+        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+            i += 1;
+        }
+        if i == ws {
+            return false; // 비단어 문자(괄호/세미콜론/등호 등) → 거부
+        }
+        let word = s[ws..i].to_ascii_lowercase();
+        match word.as_str() {
+            "unsigned" | "zerofill" => {}
+            "charset" | "collate" => {
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let is2 = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if i == is2 {
+                    return false;
+                }
+            }
+            "character" => {
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let ss = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if !s[ss..i].eq_ignore_ascii_case("set") {
+                    return false;
+                }
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let is2 = i;
+                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                    i += 1;
+                }
+                if i == is2 {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    true
+}
+
 fn default_clause(target: &str, default_value: Option<&str>, source_type: &str) -> String {
     let Some(default_value) = default_value
         .map(str::trim)
@@ -11076,11 +11243,26 @@ fn map_default_literal(target: &str, default_value: &str, source_type: &str) -> 
         }
         return upper;
     }
-    if (value.starts_with('\'') && value.ends_with('\'')) || value.starts_with("b'") {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "''"))
+    // bit 리터럴 b'0101'은 정확한 형태(0/1로만 채워지고 정상적으로 닫힌 경우)만 그대로 통과시킨다.
+    // 변조된 `b'0') AS (SELECT ...`처럼 닫는 따옴표 없이 컬럼 정의를 탈출하는 값은 여기서 걸러져
+    // 아래 문자열 재이스케이프 경로로 떨어진다.
+    if let Some(bits) = value
+        .strip_prefix("b'")
+        .and_then(|rest| rest.strip_suffix('\''))
+    {
+        if !bits.is_empty() && bits.bytes().all(|b| b == b'0' || b == b'1') {
+            return value.to_string();
+        }
     }
+    // 그 외에는 항상 하나의 안전한 문자열 리터럴로 재이스케이프한다. 이미 '...'로 감싼 값도 그대로
+    // 통과시키지 않고 dequote 후 재이스케이프하여 `'x', evil int, y varchar(1) DEFAULT 'z'` 같은
+    // 컬럼 정의 주입을 차단한다(변조 매니페스트 대비).
+    let inner = if value.len() >= 2 && value.starts_with('\'') && value.ends_with('\'') {
+        value[1..value.len() - 1].replace("''", "'")
+    } else {
+        value.to_string()
+    };
+    format!("'{}'", inner.replace('\\', "\\\\").replace('\'', "''"))
 }
 
 fn strip_postgresql_type_cast(value: &str) -> &str {
@@ -15820,6 +16002,95 @@ mod tests {
         assert!(!is_valid_mysql_collation_ident("paren)"));
         assert!(!is_valid_mysql_collation_ident("eq=sign"));
         assert!(!is_valid_mysql_collation_ident(&"a".repeat(65)));
+    }
+
+    #[test]
+    fn is_safe_mysql_type_accepts_normal_types() {
+        for ok in [
+            "int",
+            "bigint unsigned",
+            "varchar(255)",
+            "decimal(10,2)",
+            "tinyint(1)",
+            "enum('a','b','c')",
+            "set('x','y')",
+            "timestamp",
+            "datetime(6)",
+            "varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin",
+            "int unsigned zerofill",
+            "enum('a,b','c''d')",
+            "char(1) charset ascii",
+        ] {
+            assert!(is_safe_mysql_type(ok), "should accept: {ok}");
+        }
+    }
+
+    #[test]
+    fn is_safe_mysql_type_rejects_injection() {
+        for bad in [
+            "int) AS (SELECT user FROM mysql.user",
+            "int, evil int",
+            "int; DROP TABLE users",
+            "varchar(45) COLLATE utf8mb4_bin; --",
+            "int) ENGINE=MyISAM",
+            "enum('a') , x int",
+            "int /* c */",
+            "varchar(45) CHARACTER SET utf8mb4, y int",
+            "",
+            "int(",
+            "'quoted'",
+            "int)",
+            "enum('unterminated",
+        ] {
+            assert!(!is_safe_mysql_type(bad), "should reject: {bad}");
+        }
+    }
+
+    #[test]
+    fn generate_table_ddl_rejects_injection_via_type_name() {
+        let mut table = single_pk_table_with_collation(None);
+        table.columns.push(NormalizedColumn {
+            name: "c".to_string(),
+            type_name: "int) AS (SELECT user, authentication_string FROM mysql.user".to_string(),
+            default_value: None,
+            nullable: true,
+            primary_key: false,
+            unique: false,
+        });
+        assert!(
+            generate_table_ddl(&table, "mysql", "mysql").is_none(),
+            "malicious type_name must fail-closed (no DDL)"
+        );
+    }
+
+    #[test]
+    fn map_default_literal_neutralizes_quoted_injection_and_preserves_normal() {
+        // 컬럼 정의 주입 시도는 하나의 문자열 리터럴로 감싸져 바깥으로 토큰이 새지 않아야 한다.
+        let out = map_default_literal("mysql", "'x', evil int", "varchar(10)");
+        assert!(out.starts_with('\'') && out.ends_with('\''), "{out}");
+        // well-formed 문자열 리터럴이면 작은따옴표 개수가 짝수(내부는 모두 '' 이스케이프).
+        assert_eq!(out.matches('\'').count() % 2, 0, "unbalanced quotes: {out}");
+        // 정상 값 보존
+        assert_eq!(
+            map_default_literal("mysql", "'MEDIUM'", "enum('x')"),
+            "'MEDIUM'"
+        );
+        assert_eq!(
+            map_default_literal("mysql", "MEDIUM", "varchar(10)"),
+            "'MEDIUM'"
+        );
+        assert_eq!(
+            map_default_literal("mysql", "'a''b'", "varchar(10)"),
+            "'a''b'"
+        );
+        // 정상 bit 리터럴은 그대로 통과
+        assert_eq!(map_default_literal("mysql", "b'0101'", "bit(4)"), "b'0101'");
+        // 변조 bit 리터럴(닫히지 않음)은 문자열로 중화
+        let bad_bit = map_default_literal("mysql", "b'0') AS (SELECT 1", "bit(1)");
+        assert!(
+            bad_bit.starts_with('\'') && bad_bit.ends_with('\''),
+            "{bad_bit}"
+        );
     }
 
     #[test]
