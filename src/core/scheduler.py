@@ -5,9 +5,11 @@
 - 백업 보관 정책 (개수, 기간)
 - SQL 쿼리 실행 (SELECT → CSV/JSON, DML → commit)
 """
+import copy
 import csv
 import json
 import os
+import queue
 import re
 import shutil
 import threading
@@ -21,6 +23,7 @@ from src.core.platform_paths import log_dir as platform_log_dir
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 from src.core.sql_statement_parser import parse_sql_statements
+from src.core.sql_query_classifier import classify_sql_statement
 
 logger = get_logger(__name__)
 
@@ -89,6 +92,23 @@ class ScheduleConfig:
         return self.result_output_dir or self.output_dir
 
 
+@dataclass
+class _ExecutionJob:
+    """실행 큐에 올라가는 작업 단위 (스케줄 스냅샷 + 실행 후 처리 방식)"""
+    schedule: ScheduleConfig
+    update_next_run: bool
+
+
+@dataclass(frozen=True)
+class _ResolvedConnection:
+    """백업/SQL 실행이 공유하는 해석된 연결 정보"""
+    host: str
+    port: int
+    user: str
+    password: str
+    engine: str
+
+
 class CronParser:
     """간단한 Cron 표현식 파서
 
@@ -101,23 +121,32 @@ class CronParser:
     """
 
     @staticmethod
-    def parse_field(field: str, min_val: int, max_val: int, current: int) -> List[int]:
-        """크론 필드를 값 목록으로 파싱"""
+    def parse_field(field: str, min_val: int, max_val: int, current: int, normalize_dow_7: bool = False) -> List[int]:
+        """크론 필드를 값 목록으로 파싱
+
+        Args:
+            normalize_dow_7: 요일 필드에서 7을 0(일요일)으로 취급 (cron 관용 표기 0/7=일요일 모두 허용)
+        """
         if field == '*':
             return list(range(min_val, max_val + 1))
+
+        def _normalize(v: int) -> int:
+            if normalize_dow_7 and v == 7:
+                return 0
+            return v
 
         values = []
         for part in field.split(','):
             # 범위 (예: 1-5)
             if '-' in part:
                 start, end = part.split('-')
-                values.extend(range(int(start), int(end) + 1))
+                values.extend(_normalize(v) for v in range(int(start), int(end) + 1))
             # 간격 (예: */5)
             elif part.startswith('*/'):
                 step = int(part[2:])
                 values.extend(range(min_val, max_val + 1, step))
             else:
-                values.append(int(part))
+                values.append(_normalize(int(part)))
 
         return sorted(set(v for v in values if min_val <= v <= max_val))
 
@@ -152,7 +181,7 @@ class CronParser:
                 hours = CronParser.parse_field(hour_field, 0, 23, check_time.hour)
                 days = CronParser.parse_field(day_field, 1, 31, check_time.day)
                 months = CronParser.parse_field(month_field, 1, 12, check_time.month)
-                dows = CronParser.parse_field(dow_field, 0, 6, check_time.weekday())
+                dows = CronParser.parse_field(dow_field, 0, 6, check_time.weekday(), normalize_dow_7=True)
                 # cron에서 0=일요일, Python에서 0=월요일 변환
                 # Python weekday(): 월=0, 화=1, ..., 일=6
                 # Cron: 일=0, 월=1, ..., 토=6
@@ -194,7 +223,8 @@ class CronParser:
             dow_names = ['일', '월', '화', '수', '목', '금', '토']
             if day == '*' and month == '*' and dow != '*':
                 if dow.isdigit():
-                    day_name = dow_names[int(dow)]
+                    dow_index = 0 if int(dow) == 7 else int(dow)
+                    day_name = dow_names[dow_index]
                     return f"매주 {day_name}요일 {hour}:{minute.zfill(2)}"
                 elif dow == '1-5':
                     return f"평일 {hour}:{minute.zfill(2)}"
@@ -226,6 +256,12 @@ class BackupScheduler:
         self._stop_event = threading.Event()
         self._callbacks: List[Callable[[str, bool, str], None]] = []
         self._lock = threading.Lock()
+
+        # 실행 큐 상태 (run_now/스케줄 due 작업이 공유하는 직렬화된 실행 경로)
+        self._execution_queue: "queue.Queue[_ExecutionJob]" = queue.Queue()
+        self._execution_thread: Optional[threading.Thread] = None
+        self._execution_stop_event = threading.Event()
+        self._active_schedule_ids: set = set()
 
         # 스케줄 로드
         self._load_schedules()
@@ -290,6 +326,13 @@ class BackupScheduler:
         if self._thread and self._thread.is_alive():
             self._thread.join(timeout=5)
         self._thread = None
+
+        # 실행 워커 스레드도 협조적으로 중지 (강제 종료 없음)
+        self._execution_stop_event.set()
+        if self._execution_thread and self._execution_thread.is_alive():
+            self._execution_thread.join(timeout=5)
+        self._execution_thread = None
+
         logger.info("백업 스케줄러 중지")
 
     def is_running(self) -> bool:
@@ -367,17 +410,34 @@ class BackupScheduler:
             self._save_schedules()
             logger.info(f"스케줄 {'활성화' if enabled else '비활성화'}: {schedule.name}")
 
+    def _find_schedule_locked(self, schedule_id: str) -> Optional[ScheduleConfig]:
+        """ID로 스케줄 조회 (호출자가 이미 _lock을 보유한 상태에서 사용)"""
+        for schedule in self._schedules:
+            if schedule.id == schedule_id:
+                return schedule
+        return None
+
     def run_now(self, schedule_id: str) -> tuple:
-        """즉시 실행
+        """즉시 실행 요청을 실행 큐에 등록 (비동기)
+
+        run_now와 스케줄 due 실행은 동일한 직렬화된 백그라운드 실행 경로를 공유한다.
+        완료 여부는 기존 콜백(add_callback)으로 통지된다.
 
         Returns:
-            (success, message)
+            (success, message) - message는 "등록됨"을 의미하며 "완료"를 의미하지 않는다.
         """
-        schedule = self.get_schedule(schedule_id)
-        if not schedule:
-            return False, "스케줄을 찾을 수 없습니다."
+        with self._lock:
+            schedule = self._find_schedule_locked(schedule_id)
+            if not schedule:
+                return False, "스케줄을 찾을 수 없습니다."
+            if schedule.id in self._active_schedule_ids:
+                return False, "이미 실행 중인 스케줄입니다."
+            self._active_schedule_ids.add(schedule.id)
+            job = _ExecutionJob(copy.deepcopy(schedule), update_next_run=False)
 
-        return self._execute_task(schedule)
+        self._ensure_execution_thread()
+        self._execution_queue.put(job)
+        return True, "실행 요청이 등록되었습니다. 완료되면 실행 로그와 알림으로 표시됩니다."
 
     def _execute_task(self, schedule: ScheduleConfig) -> tuple:
         """작업 유형별 분기 실행
@@ -389,37 +449,136 @@ class BackupScheduler:
             return self._execute_sql_query(schedule)
         return self._execute_backup(schedule)
 
+    def _ensure_execution_thread(self):
+        """실행 워커 스레드가 살아있지 않으면 새로 시작"""
+        if self._execution_thread and self._execution_thread.is_alive():
+            return
+        self._execution_stop_event.clear()
+        self._execution_thread = threading.Thread(
+            target=self._execution_worker_loop,
+            daemon=True,
+            name="TunnelForgeSchedulerExecution",
+        )
+        self._execution_thread.start()
+
+    def _execution_worker_loop(self):
+        """실행 큐에서 작업을 꺼내 순차 실행 (run_now/due 스케줄 공용)"""
+        while not self._execution_stop_event.is_set():
+            try:
+                job = self._execution_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+            try:
+                self._run_execution_job(job)
+            finally:
+                self._execution_queue.task_done()
+
+    def _run_execution_job(self, job: "_ExecutionJob"):
+        """실행 큐에서 꺼낸 작업 하나를 실행하고 결과를 반영"""
+        success = False
+        message = ""
+        try:
+            success, message = self._execute_task(job.schedule)
+        except Exception as e:
+            message = f"스케줄 실행 오류: {e}"
+            logger.exception(message)
+
+        self._notify_callbacks(job.schedule.name, success, message)
+
+        with self._lock:
+            live = self._find_schedule_locked(job.schedule.id)
+            if live:
+                if job.schedule.last_run:
+                    live.last_run = job.schedule.last_run
+                if job.update_next_run and live.enabled:
+                    next_run = CronParser.get_next_run(live.cron_expression)
+                    live.next_run = next_run.isoformat() if next_run else None
+                self._save_schedules()
+            self._active_schedule_ids.discard(job.schedule.id)
+
+    def _snapshot_due_jobs(self, now: datetime) -> List["_ExecutionJob"]:
+        """실행 대상 스케줄을 락 안에서 스냅샷만 뜨고, 실제 실행은 락 밖에서 진행하기 위한 준비"""
+        jobs = []
+        with self._lock:
+            for schedule in self._schedules:
+                if not schedule.enabled or not schedule.next_run:
+                    continue
+                if schedule.id in self._active_schedule_ids:
+                    continue
+                try:
+                    if datetime.fromisoformat(schedule.next_run) <= now:
+                        self._active_schedule_ids.add(schedule.id)
+                        jobs.append(_ExecutionJob(copy.deepcopy(schedule), update_next_run=True))
+                except Exception as e:
+                    logger.error(f"스케줄 체크 오류 ({schedule.name}): {e}")
+        return jobs
+
     def _run_loop(self):
-        """메인 루프 (60초 간격 체크)"""
+        """메인 루프 (60초 간격 체크)
+
+        due 스케줄은 락 안에서 스냅샷만 뜨고, 실제 실행은 실행 큐를 통해 락 밖에서 처리한다
+        (UI/다른 스레드가 _lock을 기다리며 블로킹되는 것을 방지).
+        """
         while self._running and not self._stop_event.is_set():
             now = datetime.now()
 
-            with self._lock:
-                for schedule in self._schedules:
-                    if not schedule.enabled:
-                        continue
-
-                    if not schedule.next_run:
-                        continue
-
-                    try:
-                        next_run = datetime.fromisoformat(schedule.next_run)
-                        if next_run <= now:
-                            # 작업 실행 (백업 또는 SQL 쿼리)
-                            success, message = self._execute_task(schedule)
-                            self._notify_callbacks(schedule.name, success, message)
-
-                            # next_run 갱신
-                            new_next = CronParser.get_next_run(schedule.cron_expression)
-                            if new_next:
-                                schedule.next_run = new_next.isoformat()
-
-                            self._save_schedules()
-                    except Exception as e:
-                        logger.error(f"스케줄 체크 오류 ({schedule.name}): {e}")
+            jobs = self._snapshot_due_jobs(now)
+            for job in jobs:
+                self._ensure_execution_thread()
+                self._execution_queue.put(job)
 
             # 60초 대기 (중단 가능)
             self._stop_event.wait(60)
+
+    def _resolve_connection(self, schedule: ScheduleConfig) -> Tuple[Optional["_ResolvedConnection"], str]:
+        """백업/SQL 실행이 공유하는 터널 연결 정보 + 복호화된 자격 증명 해석
+
+        Returns:
+            (resolved, error_message) - 실패 시 resolved는 None이고 error_message에 사유가 담긴다.
+        """
+        config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(schedule.tunnel_id)
+        if not config:
+            stored_tunnels = self.config_manager.load_config().get('tunnels', [])
+            config = next((t for t in stored_tunnels if t.get('id') == schedule.tunnel_id), None)
+        if not config:
+            return None, "터널 설정을 찾을 수 없습니다."
+
+        # 터널 연결 확인
+        if not self.tunnel_engine.is_running(schedule.tunnel_id):
+            # 터널 시작 시도 (설정 딕셔너리 전체를 전달 - 터널 ID 문자열이 아님)
+            success, msg = self.tunnel_engine.start_tunnel(config)
+            if not success:
+                return None, f"터널 연결 실패: {msg}"
+
+        # 연결 정보 가져오기 (host, port) 튜플만 반환됨
+        host, port = self.tunnel_engine.get_connection_info(schedule.tunnel_id)
+        if host is None or port is None:
+            return None, "연결 정보를 가져올 수 없습니다."
+
+        # 저장된 자격 증명 복호화
+        credential_result = None
+        get_credentials = getattr(self.config_manager, 'get_tunnel_credentials', None)
+        if callable(get_credentials):
+            credential_result = get_credentials(schedule.tunnel_id)
+
+        credential_user = ''
+        credential_password = ''
+        if isinstance(credential_result, (tuple, list)) and len(credential_result) >= 2:
+            credential_user = credential_result[0] or ''
+            credential_password = credential_result[1] or ''
+
+        user = credential_user or config.get('db_user') or config.get('db_username') or 'root'
+        password = credential_password or config.get('db_password') or ''
+        engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port') or port)
+
+        resolved = _ResolvedConnection(
+            host=host or DEFAULT_LOCAL_HOST,
+            port=int(port),
+            user=user,
+            password=password,
+            engine=engine,
+        )
+        return resolved, ""
 
     def _execute_backup(self, schedule: ScheduleConfig) -> tuple:
         """백업 실행
@@ -432,24 +591,8 @@ class BackupScheduler:
         logger.info(f"백업 시작: {schedule.name}")
 
         try:
-            # 터널 연결 확인
-            if not self.tunnel_engine.is_running(schedule.tunnel_id):
-                # 터널 시작 시도
-                success, msg = self.tunnel_engine.start_tunnel(schedule.tunnel_id)
-                if not success:
-                    error_msg = f"터널 연결 실패: {msg}"
-                    logger.error(error_msg)
-                    self._log_backup(schedule, False, error_msg)
-                    return False, error_msg
-
-            tunnel_config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(
-                schedule.tunnel_id, {}
-            )
-
-            # 연결 정보 가져오기
-            conn_info = self.tunnel_engine.get_connection_info(schedule.tunnel_id)
-            if not conn_info:
-                error_msg = "연결 정보를 가져올 수 없습니다."
+            resolved, error_msg = self._resolve_connection(schedule)
+            if error_msg:
                 logger.error(error_msg)
                 self._log_backup(schedule, False, error_msg)
                 return False, error_msg
@@ -459,57 +602,14 @@ class BackupScheduler:
             output_subdir = os.path.join(schedule.output_dir, f"{schedule.name}_{timestamp}")
             os.makedirs(output_subdir, exist_ok=True)
 
-            credential_result = None
-            get_credentials = getattr(self.config_manager, 'get_tunnel_credentials', None)
-            if callable(get_credentials):
-                credential_result = get_credentials(schedule.tunnel_id)
-
-            credential_user = ''
-            credential_password = ''
-            if isinstance(credential_result, (tuple, list)) and len(credential_result) >= 2:
-                credential_user = credential_result[0] or ''
-                credential_password = credential_result[1] or ''
-
-            if isinstance(conn_info, dict):
-                host = conn_info.get('host', DEFAULT_LOCAL_HOST)
-                local_port = int(conn_info.get('local_port') or conn_info.get('port') or DEFAULT_MYSQL_PORT)
-                user = (
-                    conn_info.get('db_user')
-                    or conn_info.get('db_username')
-                    or credential_user
-                    or tunnel_config.get('db_user')
-                    or tunnel_config.get('db_username')
-                    or 'root'
-                )
-                password = (
-                    conn_info.get('db_password')
-                    or credential_password
-                    or tunnel_config.get('db_password')
-                    or ''
-                )
-            else:
-                host, local_port = conn_info
-                local_port = int(local_port or DEFAULT_MYSQL_PORT)
-                user = (
-                    credential_user
-                    or tunnel_config.get('db_user')
-                    or tunnel_config.get('db_username')
-                    or 'root'
-                )
-                password = credential_password or tunnel_config.get('db_password') or ''
-
             # RustDump Export 실행
-            engine = normalize_db_engine(
-                tunnel_config.get('db_engine'),
-                tunnel_config.get('remote_port') or local_port,
-            )
             config = RustDumpConfig(
-                host=host or DEFAULT_LOCAL_HOST,
-                port=local_port,
-                user=user,
-                password=password,
+                host=resolved.host,
+                port=resolved.port,
+                user=resolved.user,
+                password=resolved.password,
                 schema=schedule.schema,
-                engine=engine,
+                engine=resolved.engine,
             )
 
             exporter = RustDumpExporter(config)
@@ -679,47 +779,21 @@ class BackupScheduler:
         logger.info(f"SQL 쿼리 실행 시작: {schedule.name}")
 
         try:
-            # 터널 연결 확인
-            if not self.tunnel_engine.is_running(schedule.tunnel_id):
-                success, msg = self.tunnel_engine.start_tunnel(schedule.tunnel_id)
-                if not success:
-                    error_msg = f"터널 연결 실패: {msg}"
-                    logger.error(error_msg)
-                    self._log_backup(schedule, False, error_msg)
-                    return False, error_msg
-
-            config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(schedule.tunnel_id, {})
-
-            # 연결 정보 가져오기
-            conn_info = self.tunnel_engine.get_connection_info(schedule.tunnel_id)
-            if not conn_info:
-                error_msg = "연결 정보를 가져올 수 없습니다."
+            resolved, error_msg = self._resolve_connection(schedule)
+            if error_msg:
                 logger.error(error_msg)
                 self._log_backup(schedule, False, error_msg)
                 return False, error_msg
 
-            if isinstance(conn_info, dict):
-                host = conn_info.get('host', DEFAULT_LOCAL_HOST)
-                port = int(conn_info.get('local_port') or conn_info.get('port') or DEFAULT_MYSQL_PORT)
-                user = conn_info.get('db_user') or conn_info.get('db_username') or config.get('db_username') or 'root'
-                password = conn_info.get('db_password') or config.get('db_password') or ''
-            else:
-                host, port = conn_info
-                port = int(port or DEFAULT_MYSQL_PORT)
-                user = config.get('db_user') or config.get('db_username') or 'root'
-                password = config.get('db_password') or ''
-
-            engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port') or port)
-
-            # DB 연결
+            # DB 연결 (복호화된 자격 증명 사용)
             connector = create_rust_db_connector(
-                engine,
-                host or DEFAULT_LOCAL_HOST,
-                port,
-                user,
-                password,
+                resolved.engine,
+                resolved.host,
+                resolved.port,
+                resolved.user,
+                resolved.password,
                 schedule.schema if schedule.schema else None,
-                schema=schedule.schema if engine == 'postgresql' else "",
+                schema=schedule.schema if resolved.engine == 'postgresql' else "",
             )
 
             success, msg = connector.connect()
@@ -800,14 +874,12 @@ class BackupScheduler:
             {
                 'success': bool,
                 'error': str (실패 시),
-                'file_path': str (SELECT 결과 저장 시),
+                'file_path': str (결과셋 저장 시),
+                'row_count': int (결과셋인 경우),
                 'affected_rows': int (DML 실행 시)
             }
         """
         try:
-            query_upper = query.upper().strip()
-            is_select = query_upper.startswith('SELECT')
-
             with connector.connection.cursor() as cursor:
                 # 타임아웃 설정 (MySQL 8.0+)
                 engine = getattr(getattr(connector, "connection", None), "endpoint", None)
@@ -827,12 +899,21 @@ class BackupScheduler:
                 # 쿼리 실행
                 cursor.execute(query)
 
-                if is_select:
-                    # SELECT 결과 저장
-                    columns = [desc[0] for desc in cursor.description] if cursor.description else []
+                # 결과셋 여부는 cursor.description으로만 판단한다 (SELECT 접두사 문자열 검사 금지 -
+                # WITH(CTE), SHOW, DESC 등도 결과셋을 반환하지만 'SELECT'로 시작하지 않는다).
+                classification = classify_sql_statement(query)
+                has_result_set = cursor.description is not None
+                logger.debug(
+                    f"쿼리 분류: leading_keyword={classification.leading_keyword}, "
+                    f"has_result_set={has_result_set}"
+                )
+
+                if has_result_set:
+                    columns = [desc[0] for desc in cursor.description] if cursor.description is not None else []
                     rows = cursor.fetchall()
 
-                    if schedule.result_format != 'none' and rows:
+                    if schedule.result_format != 'none':
+                        # 0행이어도 헤더만 있는 결과 파일을 저장한다.
                         file_path = self._save_query_result(
                             schedule, columns, rows, timestamp, query_index
                         )
@@ -841,7 +922,7 @@ class BackupScheduler:
                             'file_path': file_path,
                             'row_count': len(rows)
                         }
-                    return {'success': True, 'row_count': len(rows) if rows else 0}
+                    return {'success': True, 'row_count': len(rows)}
                 else:
                     # DML (INSERT, UPDATE, DELETE)
                     connector.connection.commit()
