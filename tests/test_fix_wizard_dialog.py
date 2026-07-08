@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from src.ui.dialogs import fix_wizard_dialog
+from src.ui.dialogs import fix_wizard_execution_page
 from src.ui.workers import fix_wizard_worker
 
 
@@ -65,7 +66,7 @@ def test_legacy_fix_wizard_execution_page_runs_dry_run_only(monkeypatch):
         captured["worker"] = worker
         return worker
 
-    monkeypatch.setattr(fix_wizard_dialog, "FixWizardWorker", fake_worker)
+    monkeypatch.setattr(fix_wizard_execution_page, "FixWizardWorker", fake_worker)
     monkeypatch.setattr(
         fix_wizard_dialog.QMessageBox,
         "warning",
