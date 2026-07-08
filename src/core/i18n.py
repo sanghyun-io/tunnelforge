@@ -380,6 +380,33 @@ _EN_TEXT_TRANSLATIONS = {
     "필수 항목 누락": "Required Field Missing",
     "현재 상태": "Current Status",
     "ℹ️ <b>FK 안전 변경 방식</b>으로 모든 테이블이 일괄 처리됩니다.<br>체크 해제 시 해당 테이블을 건너뜁니다.<br>FK 관계로 인해 연쇄적으로 건너뛰어야 하는 테이블이 있을 수 있습니다.": "ℹ️ All tables are processed in batch using the <b>FK-safe change method</b>.<br>Uncheck a table to skip it.<br>Some tables may need to be skipped together because of FK relationships.",
+    "MySQL DDL은 암묵적 COMMIT을 발생시켜 이전 미커밋 변경을 롤백할 수 없게 됩니다. 계속 실행하시겠습니까?": (
+        "MySQL DDL triggers an implicit COMMIT, so previously uncommitted changes cannot be rolled back. Continue anyway?"
+    ),
+    "⚠️ DDL로 인해 이전 미커밋 변경이 자동 커밋되었습니다. 롤백할 수 없습니다.": (
+        "⚠️ Previously uncommitted changes were auto-committed due to DDL. They cannot be rolled back."
+    ),
+    "✅ [DDL] {}행 영향 ({}초) - 자동 커밋됨": "✅ [DDL] {} row(s) affected ({}s) - auto-committed",
+    "⚠️ PostgreSQL 오류로 트랜잭션이 즉시 롤백되었습니다. 이전 미커밋 변경은 적용되지 않았습니다. 쿼리를 수정한 뒤 다시 실행하세요.": (
+        "⚠️ The transaction was immediately rolled back due to a PostgreSQL error. "
+        "Previously uncommitted changes were not applied. Fix the query and run it again."
+    ),
+    "저장되지 않은 셀 편집 {}건이 있습니다. {} 손실됩니다. 계속하시겠습니까?": (
+        "There are {} unsaved cell edit(s). {} will be lost. Continue anyway?"
+    ),
+    "PostgreSQL 오류로 트랜잭션 롤백됨 - 쿼리를 다시 실행하세요": "Transaction rolled back due to a PostgreSQL error - run the query again",
+    "쿼리 실행 중에는 커밋할 수 없습니다.": "You cannot commit while a query is running.",
+    "PostgreSQL 오류로 트랜잭션이 롤백되었습니다. 쿼리를 다시 실행하세요.": (
+        "The transaction was rolled back due to a PostgreSQL error. Run the query again."
+    ),
+    "쿼리 실행 중에는 롤백할 수 없습니다.": "You cannot roll back while a query is running.",
+    "DB/스키마를 변경하면 현재 미커밋 변경사항과 셀 편집이 롤백/삭제됩니다. 계속하시겠습니까?": (
+        "Changing the DB/schema will roll back uncommitted changes and discard cell edits. Continue anyway?"
+    ),
+    "쿼리가 실행 중입니다. 현재 DB 작업은 즉시 중단되지 않을 수 있습니다. 종료 전에 완료를 기다리시겠습니까?": (
+        "A query is running. The current DB operation may not stop immediately. Wait for it to finish before closing?"
+    ),
+    "저장되지 않은 셀 편집 {}건": "{} unsaved cell edit(s)",
 }
 
 _EN_PHRASE_TRANSLATIONS = {
