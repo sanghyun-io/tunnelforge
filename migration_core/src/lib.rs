@@ -1197,12 +1197,18 @@ fn schema_diff(request: &Request) -> Vec<Value> {
 
 fn query_execute(request: &Request) -> Vec<Value> {
     if let Some(rows) = request.payload.get("rows") {
+        let columns = request
+            .payload
+            .get("columns")
+            .cloned()
+            .unwrap_or_else(|| json!(memory_test_columns_from_rows(rows)));
         return vec![json!({
             "event": "result",
             "request_id": request.request_id,
             "command": "query.execute",
             "success": true,
             "rows": rows,
+            "columns": columns,
             "rows_affected": 0
         })];
     }
@@ -1243,8 +1249,17 @@ fn query_execute(request: &Request) -> Vec<Value> {
     }
 }
 
+fn memory_test_columns_from_rows(rows: &Value) -> Vec<String> {
+    rows.as_array()
+        .and_then(|items| items.first())
+        .and_then(Value::as_object)
+        .map(|object| object.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
 struct QueryExecutionResult {
     rows: Vec<Value>,
+    columns: Vec<String>,
     rows_affected: u64,
 }
 
@@ -1261,6 +1276,7 @@ fn query_result_events(request: &Request, result: QueryExecutionResult) -> Vec<V
             "command": "query.execute",
             "success": true,
             "rows": result.rows,
+            "columns": result.columns,
             "rows_affected": result.rows_affected
         })];
     }
@@ -1272,7 +1288,12 @@ fn query_result_events(request: &Request, result: QueryExecutionResult) -> Vec<V
         .unwrap_or(500)
         .max(1) as usize;
     let total = result.rows.len();
-    let mut events = Vec::new();
+    let mut events = vec![json!({
+        "event": "columns",
+        "request_id": request.request_id,
+        "command": "query.execute",
+        "columns": result.columns.clone()
+    })];
     for (index, chunk) in result.rows.chunks(batch_size).enumerate() {
         events.push(json!({
             "event": "row_batch",
@@ -1289,6 +1310,7 @@ fn query_result_events(request: &Request, result: QueryExecutionResult) -> Vec<V
         "command": "query.execute",
         "success": true,
         "rows": [],
+        "columns": result.columns,
         "rows_streamed": total,
         "rows_affected": result.rows_affected
     }));
@@ -4518,26 +4540,30 @@ fn execute_query_adapter(
                     .map_err(|err| format!("mysql SQL execution error: {err}"))?;
                 return Ok(QueryExecutionResult {
                     rows: Vec::new(),
+                    columns: Vec::new(),
                     rows_affected: conn.affected_rows(),
                 });
             }
-            let rows: Vec<mysql::Row> = conn
-                .query(sql)
+            let result = conn
+                .query_iter(sql)
                 .map_err(|err| format!("mysql query error: {err}"))?;
-            let columns: Vec<String> = rows
-                .first()
-                .map(|row| {
-                    row.columns_ref()
-                        .iter()
-                        .map(|column| column.name_str().to_string())
-                        .collect()
-                })
-                .unwrap_or_default();
+            // Read column metadata before consuming rows so 0-row result sets still carry columns.
+            let columns: Vec<String> = result
+                .columns()
+                .as_ref()
+                .iter()
+                .map(|column| column.name_str().to_string())
+                .collect();
+            let mut rows = Vec::new();
+            for row in result {
+                rows.push(row.map_err(|err| format!("mysql query error: {err}"))?);
+            }
             Ok(QueryExecutionResult {
                 rows: rows
                     .into_iter()
                     .map(|row| mysql_row_to_json(&columns, row))
                     .collect(),
+                columns,
                 rows_affected: 0,
             })
         }
@@ -4548,10 +4574,20 @@ fn execute_query_adapter(
                     .map_err(|err| format!("postgresql SQL execution error: {err}"))?;
                 return Ok(QueryExecutionResult {
                     rows: Vec::new(),
+                    columns: Vec::new(),
                     rows_affected,
                 });
             }
             let trimmed = sql.trim().trim_end_matches(';');
+            // Prepare the original statement for column metadata; 0-row results still carry it.
+            let statement = client
+                .prepare(trimmed)
+                .map_err(|err| format!("postgresql query error: {err}"))?;
+            let columns: Vec<String> = statement
+                .columns()
+                .iter()
+                .map(|column| column.name().to_string())
+                .collect();
             let wrapped = format!("SELECT row_to_json(_tf_row)::text FROM ({trimmed}) AS _tf_row");
             let rows = client
                 .query(&wrapped, &[])
@@ -4566,17 +4602,57 @@ fn execute_query_adapter(
             }
             Ok(QueryExecutionResult {
                 rows: values,
+                columns,
                 rows_affected: 0,
             })
         }
     }
 }
 
+fn strip_leading_comments_and_parens(sql: &str) -> &str {
+    let mut text = sql.trim_start();
+    loop {
+        if let Some(rest) = text.strip_prefix("--") {
+            text = match rest.find('\n') {
+                Some(idx) => rest[idx + 1..].trim_start(),
+                None => "",
+            };
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix('#') {
+            text = match rest.find('\n') {
+                Some(idx) => rest[idx + 1..].trim_start(),
+                None => "",
+            };
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix("/*") {
+            text = match rest.find("*/") {
+                Some(idx) => rest[idx + 2..].trim_start(),
+                None => "",
+            };
+            continue;
+        }
+        if let Some(rest) = text.strip_prefix('(') {
+            text = rest.trim_start();
+            continue;
+        }
+        return text;
+    }
+}
+
+fn leading_sql_keyword(sql: &str) -> String {
+    let text = strip_leading_comments_and_parens(sql);
+    let end = text
+        .find(|ch: char| !(ch.is_ascii_alphabetic() || ch == '_'))
+        .unwrap_or(text.len());
+    text[..end].to_ascii_lowercase()
+}
+
 fn query_returns_rows(sql: &str) -> bool {
-    let lower = sql.trim_start().to_ascii_lowercase();
-    ["select", "with", "show", "desc", "describe", "explain"]
-        .iter()
-        .any(|prefix| lower.starts_with(prefix))
+    let keyword = leading_sql_keyword(sql);
+    ["select", "with", "show", "desc", "describe", "explain", "call", "values", "table"]
+        .contains(&keyword.as_str())
 }
 
 fn normalized_schema_diff(source: &NormalizedSchema, target: &NormalizedSchema) -> Vec<Value> {
@@ -14315,15 +14391,19 @@ mod tests {
             },
             QueryExecutionResult {
                 rows: vec![json!({"id": 1}), json!({"id": 2})],
+                columns: vec!["id".to_string()],
                 rows_affected: 0,
             },
         );
 
-        assert_eq!(events[0]["event"], "row_batch");
-        assert_eq!(events[0]["rows"][0]["id"], 1);
+        assert_eq!(events[0]["event"], "columns");
+        assert_eq!(events[0]["columns"], json!(["id"]));
         assert_eq!(events[1]["event"], "row_batch");
-        assert_eq!(events[2]["event"], "result");
-        assert_eq!(events[2]["rows_streamed"], 2);
+        assert_eq!(events[1]["rows"][0]["id"], 1);
+        assert_eq!(events[2]["event"], "row_batch");
+        assert_eq!(events[3]["event"], "result");
+        assert_eq!(events[3]["rows_streamed"], 2);
+        assert_eq!(events[3]["columns"], json!(["id"]));
     }
 
     #[test]
@@ -14336,6 +14416,7 @@ mod tests {
             },
             QueryExecutionResult {
                 rows: Vec::new(),
+                columns: Vec::new(),
                 rows_affected: 7,
             },
         );
@@ -14343,6 +14424,24 @@ mod tests {
         assert_eq!(events[0]["event"], "result");
         assert_eq!(events[0]["rows_affected"], 7);
         assert_eq!(events[0]["rows"], json!([]));
+        assert_eq!(events[0]["columns"], json!([]));
+    }
+
+    #[test]
+    fn query_returns_rows_skips_leading_comments_and_parentheses() {
+        for sql in [
+            "-- x\nSELECT 1",
+            "# x\nSELECT 1",
+            "/*x*/ SELECT 1",
+            "(SELECT 1)",
+            "VALUES (1)",
+            "TABLE users",
+            "CALL proc()",
+        ] {
+            assert!(query_returns_rows(sql), "expected rows for: {sql}");
+        }
+
+        assert!(!query_returns_rows("/*x*/ UPDATE users SET name='a'"));
     }
 
     #[test]
