@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 from src.core.migration_analyzer import ActionType, CleanupAction
 from src.ui.dialogs import migration_dialogs
 from src.ui.workers.migration_worker import CleanupWorker
+from src.ui.workers.fix_wizard_worker import FixWizardWorker
 from tests.conftest import FakeMySQLConnector
 
 # 모듈 레벨에서 QApplication을 생성하고 참조를 유지한다. 변수에 바인딩하지 않으면
@@ -48,7 +49,31 @@ def test_cleanup_worker_allows_dry_run_mode():
         dry_run=True,
     )
 
-    assert worker.dry_run is True
+    assert worker.schema == "app"
+    assert worker.actions
+    assert not hasattr(worker, "dry_run")
+
+
+def test_fix_wizard_worker_rejects_legacy_actual_execution_mode():
+    with pytest.raises(RuntimeError, match="Rust Core"):
+        FixWizardWorker(
+            connector=FakeMySQLConnector(),
+            schema="app",
+            steps=[],
+            dry_run=False,
+        )
+
+
+def test_fix_wizard_worker_allows_dry_run_mode():
+    worker = FixWizardWorker(
+        connector=FakeMySQLConnector(),
+        schema="app",
+        steps=[],
+        dry_run=True,
+    )
+
+    assert worker.schema == "app"
+    assert not hasattr(worker, "dry_run")
 
 
 # ============================================================

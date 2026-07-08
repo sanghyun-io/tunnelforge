@@ -88,7 +88,6 @@ class FixWizardWorker(QThread):
         self.connector = connector
         self.schema = schema
         self.steps = steps
-        self.dry_run = dry_run
         self.charset_tables_to_fix = charset_tables_to_fix or set()
         self._cancel_requested = False
 
@@ -108,7 +107,7 @@ class FixWizardWorker(QThread):
                 return
 
             combined_result = CombinedExecutionResult()
-            mode = "[DRY-RUN]" if self.dry_run else "[실행]"
+            mode = "[DRY-RUN]"
 
             # === 1. 문자셋 변경 ===
             if self.charset_tables_to_fix:
@@ -121,7 +120,7 @@ class FixWizardWorker(QThread):
                     tables=self.charset_tables_to_fix,
                     charset="utf8mb4",
                     collation="utf8mb4_unicode_ci",
-                    dry_run=self.dry_run,
+                    dry_run=True,
                     progress_callback=lambda msg: self.progress.emit(f"   {msg}")
                 )
 
@@ -157,7 +156,7 @@ class FixWizardWorker(QThread):
                 executor = BatchFixExecutor(self.connector, self.schema)
                 executor.set_progress_callback(lambda msg: self.progress.emit(msg))
 
-                other_result = executor.execute_batch(self.steps, dry_run=self.dry_run)
+                other_result = executor.execute_batch(self.steps, dry_run=True)
                 combined_result.other_result = other_result
 
             # === 결과 요약 ===
