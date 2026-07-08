@@ -313,6 +313,7 @@ class TunnelManagerUI(QMainWindow):
         self.tunnel_tree.tunnel_sql_editor.connect(self._on_tree_sql_editor)
         self.tunnel_tree.tunnel_export.connect(self._on_tree_export)
         self.tunnel_tree.tunnel_import.connect(self._on_tree_import)
+        self.tunnel_tree.tunnel_orphan_check.connect(self._on_tree_orphan_check)
         self.tunnel_tree.tunnel_test.connect(self._on_tree_test_connection)
         self.tunnel_tree.tunnel_duplicate.connect(self.duplicate_tunnel)
         self.tunnel_tree.group_connect_all.connect(self._connect_all_in_group)
@@ -417,6 +418,10 @@ class TunnelManagerUI(QMainWindow):
     def _on_tree_import(self, tunnel):
         """트리에서 Import 요청"""
         self._context_rust_core_import(tunnel)
+
+    def _on_tree_orphan_check(self, tunnel):
+        """트리에서 고아 레코드 분석 요청"""
+        self._context_orphan_check(tunnel)
 
     def _on_tree_test_connection(self, tunnel):
         """트리에서 연결 테스트 요청"""

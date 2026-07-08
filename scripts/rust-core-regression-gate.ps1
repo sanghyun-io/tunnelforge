@@ -15,10 +15,8 @@ $engineLockedPattern = "from src\.core\.db_connector import MySQLConnector"
 $allowedEngineLocked = @(
     "src/core/db_connector.py",
     "src/core/migration_analyzer.py",
-    "src/core/migration_auto_recommend.py",
     "src/core/migration_fix_wizard.py",
     "src/core/migration_preflight.py",
-    "src/core/migration_validator.py",
     "src/exporters/rust_dump_exporter.py",
     "src/ui/dialogs/db_dialogs.py",
     "src/ui/dialogs/diff_dialog.py",
@@ -26,7 +24,6 @@ $allowedEngineLocked = @(
     "src/ui/dialogs/migration_dialogs.py",
     "src/ui/dialogs/oneclick_migration_dialog.py",
     "src/ui/workers/fix_wizard_worker.py",
-    "src/ui/workers/metadata_worker.py",
     "src/ui/workers/migration_worker.py"
 )
 
