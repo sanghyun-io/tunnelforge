@@ -5,11 +5,13 @@ import subprocess
 import threading
 import uuid
 import atexit
+from collections import deque
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 from src.core.cross_engine_migration import db_core_executable, parse_helper_event
 from src.core.platform_integration import no_window_creation_flags
+from src.core.sql_query_classifier import statement_returns_rows
 
 
 class DbCoreServiceError(RuntimeError):
@@ -113,12 +115,20 @@ class DbCoreServiceClient:
         self._popen_factory = popen_factory or subprocess.Popen
         self._process: Optional[subprocess.Popen] = None
         self._lock = threading.Lock()
+        self._stderr_tail: Deque[str] = deque(maxlen=200)
+        self._stderr_lock = threading.Lock()
+        self._stderr_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
+        with self._lock:
+            self._start_locked()
+
+    def _start_locked(self) -> None:
+        """Start the core process. Caller must already hold `_lock`."""
         if self._process and self._process.poll() is None:
             return
         try:
-            self._process = self._popen_factory(
+            process = self._popen_factory(
                 [self.executable],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
@@ -135,6 +145,75 @@ class DbCoreServiceClient:
                 "소스 실행이면 `cargo build --manifest-path migration_core\\Cargo.toml --release`를 먼저 실행하고, "
                 "설치본이면 배포 패키지에 tunnelforge-core 실행 파일이 포함되어 있는지 확인하세요."
             ) from exc
+        self._process = process
+        with self._stderr_lock:
+            self._stderr_tail.clear()
+        self._start_stderr_drain_locked(process)
+
+    def _start_stderr_drain_locked(self, process: subprocess.Popen) -> None:
+        """Spawn a background thread draining stderr so it never fills the OS pipe buffer."""
+        if process.stderr is None:
+            return
+
+        def _drain() -> None:
+            try:
+                while True:
+                    line = process.stderr.readline()
+                    if line == "":
+                        return
+                    text = line.rstrip()
+                    if not text:
+                        continue
+                    with self._stderr_lock:
+                        self._stderr_tail.append(text[-4000:])
+            except (ValueError, OSError):
+                return
+
+        thread = threading.Thread(target=_drain, daemon=True)
+        self._stderr_thread = thread
+        thread.start()
+
+    def _stderr_tail_text(self) -> str:
+        with self._stderr_lock:
+            return "\n".join(self._stderr_tail)
+
+    def _send_locked(
+        self,
+        command: str,
+        payload: Optional[Dict[str, Any]],
+        request_id: str,
+        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
+    ) -> Dict[str, Any]:
+        """Send one JSONL request and read its result. Caller must already hold `_lock`."""
+        body = {
+            "command": command,
+            "request_id": request_id,
+            "payload": payload or {},
+        }
+        process = self._process
+        assert process is not None
+        stdin = process.stdin
+        stdout = process.stdout
+        if stdin is None or stdout is None:
+            raise DbCoreServiceError("DB core service pipes are not available")
+
+        stdin.write(json.dumps(body, ensure_ascii=False) + "\n")
+        stdin.flush()
+
+        while True:
+            line = stdout.readline()
+            if line == "":
+                raise DbCoreServiceError(self._stderr_tail_text() or "DB core service stopped before a result")
+
+            event = parse_helper_event(line)
+            if event.request_id not in (None, request_id):
+                continue
+            if on_event:
+                on_event(event.payload)
+            if event.event == "result":
+                return event.payload
+            if event.event == "error":
+                raise DbCoreServiceError(_format_error_event(event.payload))
 
     def request(
         self,
@@ -144,48 +223,22 @@ class DbCoreServiceClient:
         on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
     ) -> Dict[str, Any]:
         request_id = request_id or f"py-{uuid.uuid4().hex}"
-        body = {
-            "command": command,
-            "request_id": request_id,
-            "payload": payload or {},
-        }
-
         with self._lock:
-            self.start()
-            assert self._process is not None
-            if self._process.stdin is None or self._process.stdout is None:
-                raise DbCoreServiceError("DB core service pipes are not available")
-
-            self._process.stdin.write(json.dumps(body, ensure_ascii=False) + "\n")
-            self._process.stdin.flush()
-
-            while True:
-                line = self._process.stdout.readline()
-                if line == "":
-                    stderr = self._process.stderr.read().strip() if self._process.stderr else ""
-                    raise DbCoreServiceError(stderr or "DB core service stopped before a result")
-
-                event = parse_helper_event(line)
-                if event.request_id not in (None, request_id):
-                    continue
-                if on_event:
-                    on_event(event.payload)
-                if event.event == "result":
-                    return event.payload
-                if event.event == "error":
-                    raise DbCoreServiceError(_format_error_event(event.payload))
+            self._start_locked()
+            return self._send_locked(command, payload, request_id, on_event)
 
     def shutdown(self) -> None:
-        process = self._process
-        if not process:
-            return
-        try:
-            if process.poll() is None:
-                self.request("service.shutdown")
-        except Exception:
-            process.terminate()
-        finally:
-            self._process = None
+        with self._lock:
+            process = self._process
+            if not process:
+                return
+            try:
+                if process.poll() is None:
+                    self._send_locked("service.shutdown", None, f"py-{uuid.uuid4().hex}")
+            except Exception:
+                process.terminate()
+            finally:
+                self._process = None
 
     def __enter__(self) -> "DbCoreServiceClient":
         self.start()
@@ -256,8 +309,10 @@ class DbCoreFacade:
             {"connection": endpoint.to_payload(), "sql": sql, "params": list(params or [])},
         )
         rows = result.get("rows")
+        columns = result.get("columns")
         return {
             "rows": [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
+            "columns": [str(column) for column in columns] if isinstance(columns, list) else [],
             "rows_affected": int(result.get("rows_affected") or 0),
         }
 
@@ -281,8 +336,10 @@ class DbCoreFacade:
             {"connection_id": connection_id, "sql": sql, "params": list(params or [])},
         )
         rows = result.get("rows")
+        columns = result.get("columns")
         return {
             "rows": [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
+            "columns": [str(column) for column in columns] if isinstance(columns, list) else [],
             "rows_affected": int(result.get("rows_affected") or 0),
         }
 
@@ -295,6 +352,7 @@ class DbCoreFacade:
         on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
     ) -> Dict[str, Any]:
         def handle_event(payload: Dict[str, Any]) -> None:
+            # Ignores the leading "columns" progress event; only row_batch is consumed here.
             if payload.get("event") != "row_batch" or not on_batch:
                 return
             rows = payload.get("rows")
@@ -566,8 +624,15 @@ class RustDbConnection:
         return RustDbCursor(self)
 
     def ping(self, reconnect: bool = False) -> None:
+        # `reconnect` is accepted for DB-API shim compatibility only; the Rust core owns
+        # connection lifecycle and Python does not implement reconnect.
         if not self.open:
             raise DbCoreServiceError("connection is closed")
+        try:
+            self.facade.execute_on_connection(self.connection_id, "SELECT 1")
+        except Exception:
+            self.open = False
+            raise
 
     def close(self) -> None:
         if self.open:
@@ -640,6 +705,7 @@ class RustDbCursor:
         return False
 
     def execute(self, query: str, params: Optional[Sequence[Any]] = None) -> int:
+        columns: Optional[List[str]] = None
         if hasattr(self.connection.facade, "execute_on_connection_result"):
             result = self.connection.facade.execute_on_connection_result(
                 self.connection.connection_id,
@@ -647,6 +713,7 @@ class RustDbCursor:
                 params=params,
             )
             self._rows = result.get("rows", [])
+            columns = result.get("columns") or None
             rows_affected = int(result.get("rows_affected") or 0)
         else:
             self._rows = self.connection.facade.execute_on_connection(
@@ -655,15 +722,16 @@ class RustDbCursor:
                 params=params,
             )
             rows_affected = int(getattr(self.connection.facade, "last_rows_affected", len(self._rows)))
-        if self._rows:
-            self.description = [(column,) for column in self._rows[0].keys()]
-        elif query_returns_rows(query):
-            self.description = []
-        else:
-            self.description = None
-        if query_returns_rows(query):
+
+        if not columns and self._rows:
+            columns = list(self._rows[0].keys())
+
+        returns_rows = bool(columns) or statement_returns_rows(query)
+        if returns_rows:
+            self.description = [(column,) for column in columns] if columns else []
             self.rowcount = len(self._rows)
         else:
+            self.description = None
             self.rowcount = rows_affected
         return self.rowcount
 
@@ -680,34 +748,5 @@ class RustDbCursor:
         return self._rows[0] if self._rows else None
 
 
-def bind_sql_params(query: str, params: Optional[Sequence[Any]]) -> str:
-    if not params:
-        return query
-    rendered = query
-    if isinstance(params, dict):
-        for key, value in params.items():
-            rendered = rendered.replace(f"%({key})s", sql_literal(value))
-        return rendered
-    for value in params:
-        rendered = rendered.replace("%s", sql_literal(value), 1)
-    return rendered
-
-
-def sql_literal(value: Any) -> str:
-    if value is None:
-        return "NULL"
-    if isinstance(value, bool):
-        return "TRUE" if value else "FALSE"
-    if isinstance(value, (int, float)):
-        return str(value)
-    text = str(value).replace("\\", "\\\\").replace("'", "''")
-    return f"'{text}'"
-
-
 def quote_mysql_ident(identifier: str) -> str:
     return "`" + identifier.replace("`", "``") + "`"
-
-
-def query_returns_rows(sql: str) -> bool:
-    lower = sql.lstrip().lower()
-    return lower.startswith(("select", "with", "show", "desc", "describe", "explain"))
