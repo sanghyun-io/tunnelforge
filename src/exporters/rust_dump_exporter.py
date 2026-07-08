@@ -11,7 +11,6 @@ from src.core.db_core_service import (
     DbCoreFacade,
     DbCoreServiceError,
     DbEndpoint,
-    get_shared_db_core_facade,
     normalize_db_engine,
 )
 from src.core.logger import get_logger
@@ -64,6 +63,15 @@ def _format_import_phase_message(event: dict) -> Optional[str]:
     return str(event.get("message") or event.get("phase") or "Rust DB Core 작업 중...")
 
 
+def _shutdown_owned_facade(facade: DbCoreFacade, owns_facade: bool) -> None:
+    if not owns_facade:
+        return
+    try:
+        facade.client.shutdown()
+    except Exception as exc:
+        logger.warning("Rust DB Core dedicated facade shutdown failed: %s", exc)
+
+
 @dataclass
 class RustDumpConfig:
     """Connection settings for Rust DB Core dump operations."""
@@ -77,9 +85,6 @@ class RustDumpConfig:
 
     def __post_init__(self) -> None:
         self.engine = normalize_db_engine(self.engine, self.port)
-
-    def get_uri(self) -> str:
-        return f"{self.user}:{self.password}@{self.host}:{self.port}"
 
     def get_masked_uri(self) -> str:
         return f"{self.user}:****@{self.host}:{self.port}"
@@ -318,33 +323,14 @@ WHERE c.`{column}` IS NOT NULL AND p.`{ref_column}` IS NULL;
             )
         return "\n".join(queries)
 
-    def resolve_required_tables(
-        self,
-        selected_tables: List[str],
-        schema: str,
-    ) -> Tuple[List[str], List[str]]:
-        all_deps = self.get_all_dependencies(schema)
-        required = set(selected_tables)
-        added = []
-
-        changed = True
-        while changed:
-            changed = False
-            for table in list(required):
-                for parent in all_deps.get(table, set()):
-                    if parent not in required:
-                        required.add(parent)
-                        added.append(parent)
-                        changed = True
-        return sorted(required), sorted(added)
-
 
 class RustDumpExporter:
     """Rust DB Core backed dump exporter."""
 
     def __init__(self, config: RustDumpConfig, facade: Optional[DbCoreFacade] = None):
         self.config = config
-        self.facade = facade or get_shared_db_core_facade()
+        self.facade = facade if facade is not None else DbCoreFacade()
+        self._owns_facade = facade is None
 
     def _endpoint(self, schema: str) -> DbEndpoint:
         return DbEndpoint(
@@ -492,6 +478,8 @@ class RustDumpExporter:
             return False, f"Rust DB Core export 오류: {exc}"
         except Exception as exc:
             return False, f"Export 오류: {exc}"
+        finally:
+            _shutdown_owned_facade(self.facade, self._owns_facade)
 
     def export_tables(
         self,
@@ -538,6 +526,8 @@ class RustDumpExporter:
             return False, f"Rust DB Core export 오류: {exc}", []
         except Exception as exc:
             return False, f"Export 오류: {exc}", []
+        finally:
+            _shutdown_owned_facade(self.facade, self._owns_facade)
 
     def _write_metadata(
         self,
@@ -561,12 +551,27 @@ class RustDumpExporter:
             json.dump(metadata, file, indent=2, ensure_ascii=False)
 
 
+def _mark_non_done_import_results_error(
+    import_results: dict,
+    message: str,
+    table_status_callback: Optional[Callable[[str, str, str], None]] = None,
+) -> None:
+    for table, result in list(import_results.items()):
+        status = result.get("status") if isinstance(result, dict) else None
+        if status == "done":
+            continue
+        import_results[table] = {"status": "error", "message": message}
+        if table_status_callback:
+            table_status_callback(table, "error", message)
+
+
 class RustDumpImporter:
     """Rust DB Core backed dump importer."""
 
     def __init__(self, config: RustDumpConfig, facade: Optional[DbCoreFacade] = None):
         self.config = config
-        self.facade = facade or get_shared_db_core_facade()
+        self.facade = facade if facade is not None else DbCoreFacade()
+        self._owns_facade = facade is None
 
     def _endpoint(self, schema: str) -> DbEndpoint:
         return DbEndpoint(
@@ -711,9 +716,13 @@ class RustDumpImporter:
                 message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
             return True, message, import_results
         except DbCoreServiceError as exc:
+            _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
             return False, f"Rust DB Core import 오류: {exc}", import_results
         except Exception as exc:
+            _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
             return False, f"Import 오류: {exc}", import_results
+        finally:
+            _shutdown_owned_facade(self.facade, self._owns_facade)
 
 
 class TableProgressTracker:

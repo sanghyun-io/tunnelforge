@@ -63,20 +63,14 @@ class TestRustDumpChecker:
 class TestRustDumpConfig:
     """RustDumpConfig 클래스 테스트"""
 
-    def test_get_uri(self):
-        """URI 생성 테스트"""
+    def test_config_does_not_expose_plaintext_uri_accessor(self):
+        """평문 비밀번호가 포함된 URI 접근자는 존재하지 않는다"""
         from src.exporters.rust_dump_exporter import RustDumpConfig
 
-        config = RustDumpConfig(
-            host='localhost',
-            port=3306,
-            user='root',
-            password='secret123'
-        )
+        config = RustDumpConfig("localhost", 3306, "root", "secret123")
 
-        uri = config.get_uri()
-
-        assert uri == 'root:secret123@localhost:3306'
+        assert not hasattr(config, "get_uri")
+        assert "secret123" not in config.get_masked_uri()
 
     def test_get_masked_uri(self):
         """마스킹된 URI 생성 테스트"""
@@ -119,40 +113,6 @@ class TestForeignKeyResolver:
         """MySQLConnector Mock"""
         connector = MagicMock()
         return connector
-
-    def test_resolve_required_tables_no_deps(self, mock_connector):
-        """FK 의존성 없는 경우"""
-        from src.exporters.rust_dump_exporter import ForeignKeyResolver
-
-        # 빈 FK 정보 반환
-        mock_connector.execute.return_value = []
-
-        resolver = ForeignKeyResolver(mock_connector)
-        selected = ['users', 'products']
-        required, added = resolver.resolve_required_tables(selected, 'mydb')
-
-        assert 'users' in required
-        assert 'products' in required
-        assert len(added) == 0
-
-    def test_resolve_required_tables_with_deps(self, mock_connector):
-        """FK 의존성 있는 경우"""
-        from src.exporters.rust_dump_exporter import ForeignKeyResolver
-
-        # FK 정보 반환: orders -> users, order_items -> orders
-        mock_connector.execute.return_value = [
-            {'TABLE_NAME': 'orders', 'REFERENCED_TABLE_NAME': 'users'},
-            {'TABLE_NAME': 'order_items', 'REFERENCED_TABLE_NAME': 'orders'}
-        ]
-
-        resolver = ForeignKeyResolver(mock_connector)
-        # order_items만 선택하면 orders와 users도 추가되어야 함
-        selected = ['order_items']
-        required, added = resolver.resolve_required_tables(selected, 'mydb')
-
-        assert 'order_items' in required
-        assert 'orders' in required or 'orders' in added
-        assert 'users' in required or 'users' in added
 
     def test_get_all_dependencies(self, mock_connector):
         """전체 FK 의존성 조회"""
@@ -313,6 +273,65 @@ class TestRustDumpExporter:
         assert facade.payload["tables"] == ["order_items", "orders", "users"]
         assert "3개 테이블" in msg
 
+    def test_resolve_required_tables_from_rust_schema_no_deps(self):
+        """FK 의존성이 없으면 선택한 테이블만 정렬되어 반환된다"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def inspect_schema(self, endpoint):
+                self.inspect_endpoint = endpoint
+                return {
+                    "tables": [
+                        {"name": "users", "foreign_keys": []},
+                        {"name": "products", "foreign_keys": []},
+                    ]
+                }
+
+        facade = FakeFacade()
+        config = RustDumpConfig("localhost", 3306, "root", "password")
+        exporter = RustDumpExporter(config, facade=facade)
+
+        required, added = exporter._resolve_required_tables_from_rust_schema(
+            ["products", "users"], "app"
+        )
+
+        assert required == ["products", "users"]
+        assert added == []
+        assert facade.inspect_endpoint.database == "app"
+
+    def test_resolve_required_tables_from_rust_schema_transitive_deps(self):
+        """전이적 FK 의존성(order_items -> orders -> users)이 모두 required에 포함된다"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def inspect_schema(self, endpoint):
+                self.inspect_endpoint = endpoint
+                return {
+                    "tables": [
+                        {"name": "users", "foreign_keys": []},
+                        {
+                            "name": "orders",
+                            "foreign_keys": [{"name": "fk_orders_users", "referenced_table": "users"}],
+                        },
+                        {
+                            "name": "order_items",
+                            "foreign_keys": [{"name": "fk_items_orders", "referenced_table": "orders"}],
+                        },
+                    ]
+                }
+
+        facade = FakeFacade()
+        config = RustDumpConfig("localhost", 3306, "root", "password")
+        exporter = RustDumpExporter(config, facade=facade)
+
+        required, added = exporter._resolve_required_tables_from_rust_schema(
+            ["order_items"], "app"
+        )
+
+        assert required == ["order_items", "orders", "users"]
+        assert added == ["orders", "users"]
+        assert facade.inspect_endpoint.database == "app"
+
     def test_export_full_schema_reports_view_count(self, tmp_path):
         """전체 export 결과에 View 개수가 메시지로 포함됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
@@ -354,6 +373,53 @@ class TestRustDumpExporter:
         assert success is True
         assert facade.payload["source"]["engine"] == "postgresql"
         assert facade.payload["source"]["database"] == "public"
+
+    def test_exporter_default_uses_dedicated_facade_and_shuts_it_down(self, tmp_path, monkeypatch):
+        """기본 Exporter는 공유 facade 대신 전용 DbCoreFacade를 생성하고, 사용 후 종료한다"""
+        from src.exporters import rust_dump_exporter
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        created = []
+
+        class FakeDedicatedFacade:
+            def __init__(self):
+                self.client = MagicMock()
+                created.append(self)
+
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_dumped": 1}
+
+        monkeypatch.setattr(rust_dump_exporter, "DbCoreFacade", FakeDedicatedFacade)
+
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        exporter = RustDumpExporter(config)
+
+        success, _msg = exporter.export_full_schema('app', str(tmp_path / 'dump'))
+
+        assert success is True
+        assert len(created) == 1
+        created[0].client.shutdown.assert_called_once()
+
+    def test_exporter_does_not_shutdown_injected_facade(self, tmp_path):
+        """주입된 facade는 export 성공 후에도 종료되지 않는다"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        class FakeFacade:
+            def __init__(self):
+                self.client = MagicMock()
+
+            def run_dump(self, payload, on_event=None):
+                return {"success": True, "tables": 1, "rows_dumped": 1}
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        exporter = RustDumpExporter(config, facade=facade)
+
+        success, _msg = exporter.export_full_schema('app', str(tmp_path / 'dump'))
+
+        assert success is True
+        facade.client.shutdown.assert_not_called()
 
 
 def test_export_schema_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):
@@ -527,6 +593,42 @@ class TestRustDumpImporter:
         assert results["users"]["status"] == "done"
         assert "1" in msg
 
+    def test_importer_default_uses_dedicated_facade_and_shuts_it_down(self, tmp_path, monkeypatch):
+        """기본 Importer는 전용 DbCoreFacade를 생성하고, import 완료 후 종료한다"""
+        from src.exporters import rust_dump_exporter
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        table_dir = dump_dir / '0001_users'
+        table_dir.mkdir(parents=True)
+        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":1,"database":"app","tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
+            encoding='utf-8',
+        )
+
+        created = []
+
+        class FakeDedicatedFacade:
+            def __init__(self):
+                self.client = MagicMock()
+                created.append(self)
+
+            def import_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_imported": 1}
+
+        monkeypatch.setattr(rust_dump_exporter, "DbCoreFacade", FakeDedicatedFacade)
+
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        importer = RustDumpImporter(config)
+
+        success, _msg, _results = importer.import_dump(str(dump_dir), import_mode='replace')
+
+        assert success is True
+        assert len(created) == 1
+        created[0].client.shutdown.assert_called_once()
+
     def test_import_dump_preserves_postgresql_engine_in_rust_payload(self, tmp_path):
         """PostgreSQL import는 Rust dump.import payload에 postgresql endpoint를 보낸다."""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
@@ -625,10 +727,64 @@ class TestRustDumpImporter:
         success, msg, results = importer.import_dump(str(dump_dir), import_mode='replace')
 
         assert success is False
-        assert results["users"]["status"] == "pending"
+        assert results["users"]["status"] == "error"
+        assert "export_invalid" in results["users"]["message"]
+        assert "missing chunk_sha256" in results["users"]["message"]
         assert "export_invalid" in msg
         assert "users" in msg
         assert "missing chunk_sha256" in msg
+
+    def test_import_dump_marks_remaining_tables_error_on_exception(self, tmp_path):
+        """import 도중 예외가 발생하면 done이 아닌 모든 테이블이 error로 표시된다 (재시도 UI 회귀 테스트)"""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        dump_dir.mkdir(parents=True)
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 1,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "0001_users", "rows": 1, "chunks": 1},
+                        {"name": "orders", "path": "0002_orders", "rows": 1, "chunks": 1},
+                        {"name": "products", "path": "0003_products", "rows": 1, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                if on_event:
+                    on_event({"event": "table_progress", "table": "users", "status": "completed", "current": 1, "total": 3})
+                    on_event({"event": "table_progress", "table": "orders", "status": "importing", "current": 2, "total": 3})
+                raise RuntimeError("connection lost during import")
+
+        facade = FakeFacade()
+        config = RustDumpConfig('localhost', 3306, 'root', 'password')
+        importer = RustDumpImporter(config, facade=facade)
+
+        status_events = []
+        success, msg, results = importer.import_dump(
+            str(dump_dir),
+            import_mode='replace',
+            table_status_callback=lambda table, status, message: status_events.append((table, status, message)),
+        )
+
+        assert success is False
+        assert results["users"]["status"] == "done"
+        assert results["orders"]["status"] == "error"
+        assert results["products"]["status"] == "error"
+        assert "connection lost during import" in results["orders"]["message"]
+        assert "connection lost during import" in results["products"]["message"]
+        assert "connection lost during import" in msg
+
+        error_events = {(table, status) for table, status, _ in status_events if status == "error"}
+        assert ("orders", "error") in error_events
+        assert ("products", "error") in error_events
 
     def test_import_dump_reports_view_results_in_message(self, tmp_path):
         """import 결과의 views_imported/failed/skipped 가 메시지에 반영됨"""
