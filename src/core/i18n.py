@@ -936,7 +936,6 @@ _EN_PHRASE_TRANSLATIONS = {
     "출력 경로를 선택하세요.": "Select an output path.",
     "서버가 지역명 타임존을 지원하지 않으면 자동으로 +09:00(KST)로 보정합니다.": "If the server does not support named time zones, it is automatically adjusted to +09:00 (KST).",
     "FK 안전 변경 방식으로 모든 테이블이 일괄 처리됩니다.": "All tables are processed in batch using the FK-safe change method.",
-    "체크 해제 시 해당 테이블을 건너뜁니다.": "Uncheck to skip that table.",
     "사전 검사": "Pre-flight Check",
     "마이그레이션 전 필수 요건을 검사합니다.": "Checks required conditions before migration.",
     "검사 항목": "Check Items",
@@ -969,7 +968,6 @@ _EN_PHRASE_TRANSLATIONS = {
     "마지막 실행": "Last Run",
     "활성화": "Enabled",
     "Export/Import 오류 시 자동으로 GitHub 이슈 생성": "Create GitHub issues automatically on Export/Import errors",
-    "백업 목록": "Backup List",
     "최근": "recent",
     "선택한 백업으로 설정을 복원하시겠습니까?": "Do you want to restore settings from the selected backup?",
     "선택한 파일에서 설정을 가져오시겠습니까?": "Do you want to import settings from the selected file?",
@@ -1063,8 +1061,6 @@ _EN_PHRASE_TRANSLATIONS = {
     "셀 편집": "Cell edits",
     "버튼": "button",
     "클릭하여": "click to",
-    "항목": "items",
-    "자동 커밋": "auto commit",
     "커밋 완료": "Commit complete",
     "커밋에 실패했습니다": "Commit failed",
     "롤백 완료": "Rollback complete",
@@ -1095,7 +1091,6 @@ _EN_PHRASE_TRANSLATIONS = {
     "남은 이슈": "Remaining issues",
     "새 이슈": "New issues",
     "풀": "pools",
-    "사용 중": "in use",
     "인증 테스트 건너뜀": "auth test skipped",
     "자격 증명 없음": "no credentials",
     "도달 실패": "reach failed",
@@ -1120,7 +1115,6 @@ _EN_PHRASE_TRANSLATIONS = {
     "주소": "address",
     "목적지": "destination",
     "기본 DB 이름": "Default DB name",
-    "기본 스키마": "Default schema",
     "위험 작업 시": "for dangerous operations",
     "직접 입력 필요": "manual input required",
     "다이얼로그 표시": "show dialog",
@@ -1503,16 +1497,8 @@ def install_qt_i18n() -> bool:
     patch_method(QPlainTextEdit, "appendPlainText", [0])
 
     patch_method(QComboBox, "setPlaceholderText", [0])
+    # Combo inserted items can be schema/database identifiers; preserve them exactly.
     patch_method(QComboBox, "setItemText", [1])
-    patch_all_string_args_method(QComboBox, "addItem")
-    patch_all_string_args_method(QComboBox, "insertItem")
-    original_add_items = QComboBox.addItems
-    if not getattr(original_add_items, "_tf_i18n_wrapped", False):
-        def add_items(self, texts):
-            return original_add_items(self, _translate_sequence(list(texts)))
-
-        add_items._tf_i18n_wrapped = True
-        QComboBox.addItems = add_items
 
     patch_all_string_args_method(QTabWidget, "addTab")
     patch_method(QTabWidget, "setTabText", [1])

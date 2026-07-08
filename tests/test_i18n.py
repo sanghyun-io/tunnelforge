@@ -92,6 +92,9 @@ def test_translate_text_handles_common_hardcoded_ui_phrases():
     assert i18n.translate_text("Mismatch: {}개") == "Mismatch: {}"
     assert i18n.translate_text("Rust Core 검사 완료: {}개 테이블") == "Rust Core inspection complete: {} tables"
     assert i18n.translate_text("✅ {}개 테이블 로드됨 (MySQL {})") == "✅ {} tables loaded (MySQL {})"
+    assert i18n.translate_text("항목") == "Item"
+    assert i18n.translate_text("자동 커밋") == "Auto Commit"
+    assert i18n.translate_text("사용 중") == "In Use"
 
 
 def test_qt_i18n_hooks_translate_hardcoded_widget_text(monkeypatch):
@@ -122,7 +125,8 @@ def test_qt_i18n_hooks_translate_hardcoded_widget_text(monkeypatch):
     field = QLineEdit()
     form.addRow("이름:", field)
     combo = QComboBox()
-    combo.addItem("삭제")
+    combo.addItem("백업")
+    assert combo.itemText(0) == "백업"
     combo.setItemText(0, "취소")
     table = QTableWidget(1, 2)
     table.setHorizontalHeaderLabels(["시간", "메시지"])
@@ -147,6 +151,55 @@ def test_qt_i18n_hooks_translate_hardcoded_widget_text(monkeypatch):
     assert container.windowTitle() == "Tunnel Status"
 
 
+def test_qcombobox_inserted_identity_text_is_not_translated(monkeypatch):
+    monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication, QComboBox
+
+    app = QApplication.instance() or QApplication([])
+    assert app is not None
+
+    i18n.set_language("en")
+    i18n.install_qt_i18n()
+
+    combo = QComboBox()
+    combo.addItem("백업")
+    combo.insertItem(0, "로그")
+    combo.addItems(["스키마", "데이터베이스"])
+    combo.addItem("원본", "백업")
+
+    assert combo.itemText(0) == "로그"
+    assert combo.itemText(1) == "백업"
+    assert combo.itemText(2) == "스키마"
+    assert combo.itemText(3) == "데이터베이스"
+    assert combo.itemText(4) == "원본"
+    assert combo.itemData(4) == "백업"
+
+
+def test_en_phrase_translations_have_no_duplicate_source_keys():
+    project_root = Path(__file__).resolve().parents[1]
+    source_path = project_root / "src" / "core" / "i18n.py"
+    tree = ast.parse(source_path.read_text(encoding="utf-8"))
+
+    duplicates = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(target, ast.Name) and target.id == "_EN_PHRASE_TRANSLATIONS" for target in node.targets):
+            continue
+
+        seen = {}
+        for key_node in node.value.keys:
+            if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+                continue
+            key = key_node.value
+            if key in seen:
+                duplicates.append((key, seen[key], key_node.lineno))
+            else:
+                seen[key] = key_node.lineno
+
+    assert duplicates == []
+
+
 def test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation():
     ui_functions = {
         "QLabel", "QPushButton", "QCheckBox", "QRadioButton", "QGroupBox",
@@ -156,7 +209,7 @@ def test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation():
     ui_methods = {
         "setWindowTitle", "setText", "setTitle", "setToolTip", "setStatusTip",
         "setWhatsThis", "setPlaceholderText", "addTab", "setTabText",
-        "addRow", "addItem", "insertItem", "addItems", "setItemText",
+        "addRow", "setItemText",
         "setHeaderLabels", "setHorizontalHeaderLabels", "setVerticalHeaderLabels",
         "showMessage", "information", "warning", "critical", "question",
         "getOpenFileName", "getSaveFileName", "getExistingDirectory",
