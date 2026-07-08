@@ -2,6 +2,8 @@
 BackupScheduler, CronParser, ScheduleConfig 단위 테스트
 """
 import os
+import threading
+import time
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, call
@@ -127,6 +129,26 @@ class TestCronParser:
         expr = 'invalid expr'
         desc = CronParser.describe(expr)
         assert desc == expr
+
+    def test_get_next_run_accepts_dow_7_as_sunday(self):
+        """cron 요일 필드 7도 일요일(0)로 인식"""
+        from src.core.scheduler import CronParser
+
+        after = datetime(2025, 1, 4, 12, 0, 0)  # 토요일
+        next_run = CronParser.get_next_run('0 3 * * 7', after=after)
+
+        assert next_run is not None
+        assert next_run.date() == datetime(2025, 1, 5).date()  # 다음 일요일
+        assert next_run.hour == 3
+        assert next_run.minute == 0
+
+    def test_describe_accepts_dow_7_as_sunday(self):
+        """describe도 요일 필드 7을 일요일로 표시"""
+        from src.core.scheduler import CronParser
+
+        desc = CronParser.describe('0 3 * * 7')
+        assert '매주' in desc
+        assert '일' in desc
 
 
 # =====================================================================
@@ -416,16 +438,15 @@ class TestBackupScheduler:
                 captured["threads"] = threads
                 return True, "ok"
 
-        self.mock_engine.get_connection_info.return_value = {
-            "host": "127.0.0.1",
-            "local_port": 15432,
-            "db_user": "pg_user",
-            "db_password": "pg_pw",
-        }
+        # get_connection_info는 실제 TunnelEngine처럼 (host, port) 튜플만 반환한다
+        # (dict 분기는 제거됨). db_user/db_password는 tunnel_configs의 평문 값으로 폴백.
+        self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 15432)
         self.mock_engine.tunnel_configs = {
             "tunnel-001": {
                 "db_engine": "postgresql",
                 "remote_port": 5432,
+                "db_user": "pg_user",
+                "db_password": "pg_pw",
             }
         }
         monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", FakeExporter)
@@ -500,6 +521,438 @@ class TestBackupScheduler:
         success, msg = self.scheduler.run_now('nonexistent')
         assert success is False
         assert '찾을 수 없' in msg
+
+    def test_backup_starts_stopped_tunnel_with_config_dict(self, monkeypatch, tmp_path):
+        """중지된 터널은 tunnel_id 문자열이 아닌 전체 설정 딕셔너리로 시작"""
+        captured = {}
+
+        class FakeExporter:
+            def __init__(self, config):
+                captured["config"] = config
+
+            def export_full_schema(self, schema, output_dir, threads):
+                return True, "ok"
+
+        self.mock_engine.is_running.return_value = False
+        self.mock_engine.start_tunnel.return_value = (True, "연결 성공")
+        self.mock_engine.tunnel_configs = {}  # 아직 활성화된 터널 없음 -> 저장된 설정으로 폴백
+        self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 13306)
+        self.mock_config_manager.load_config.return_value = {
+            "tunnels": [{"id": "tunnel-001", "db_engine": "mysql"}]
+        }
+        monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", FakeExporter)
+
+        schedule = self.ScheduleConfig(
+            id="backup-003",
+            name="StoppedTunnel Backup",
+            tunnel_id="tunnel-001",
+            schema="analytics",
+            output_dir=str(tmp_path),
+        )
+
+        success, message = self.scheduler._execute_backup(schedule)
+
+        assert success is True
+        self.mock_engine.start_tunnel.assert_called_once()
+        called_config = self.mock_engine.start_tunnel.call_args[0][0]
+        assert isinstance(called_config, dict)
+        assert called_config.get("id") == "tunnel-001"
+
+    def test_sql_starts_stopped_tunnel_with_config_dict(self, monkeypatch):
+        """SQL 실행도 중지된 터널을 tunnel_id 문자열이 아닌 전체 설정 딕셔너리로 시작"""
+        created = {}
+
+        class FakeCursor:
+            description = None
+            rowcount = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def execute(self, query):
+                pass
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+            def commit(self):
+                pass
+
+        class FakeConnector:
+            connection = FakeConnection()
+
+            def connect(self):
+                return True, "ok"
+
+            def disconnect(self):
+                pass
+
+        def fake_create(engine, host, port, user, password, database=None, schema=""):
+            created["host"] = host
+            return FakeConnector()
+
+        self.mock_engine.is_running.return_value = False
+        self.mock_engine.start_tunnel.return_value = (True, "연결 성공")
+        self.mock_engine.tunnel_configs = {}
+        self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 13306)
+        self.mock_config_manager.load_config.return_value = {
+            "tunnels": [{"id": "tunnel-001", "db_engine": "mysql"}]
+        }
+        monkeypatch.setattr("src.core.scheduler.create_rust_db_connector", fake_create)
+
+        schedule = self.ScheduleConfig(
+            id="sql-002",
+            name="StoppedTunnel SQL",
+            tunnel_id="tunnel-001",
+            schema="analytics",
+            task_type="sql_query",
+            sql_query="UPDATE t SET a=1",
+            result_format="none",
+        )
+
+        success, _ = self.scheduler._execute_sql_query(schedule)
+
+        assert success is True
+        self.mock_engine.start_tunnel.assert_called_once()
+        called_config = self.mock_engine.start_tunnel.call_args[0][0]
+        assert isinstance(called_config, dict)
+        assert called_config.get("id") == "tunnel-001"
+        # 문자열 tunnel_id가 실수로 start_tunnel에 전달되지 않았는지 확인
+        assert not isinstance(called_config, str)
+
+    def test_resolve_connection_rejects_none_tuple(self, monkeypatch, tmp_path):
+        """(None, None) 연결 정보는 즉시 실패 처리"""
+        captured = {}
+
+        class FakeExporter:
+            def __init__(self, config):
+                captured["constructed"] = True
+
+            def export_full_schema(self, schema, output_dir, threads):
+                return True, "ok"
+
+        self.mock_engine.tunnel_configs = {"tunnel-001": {"db_engine": "mysql"}}
+        self.mock_engine.get_connection_info.return_value = (None, None)
+        monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", FakeExporter)
+
+        schedule = self.ScheduleConfig(
+            id="backup-004",
+            name="NoneConnInfo",
+            tunnel_id="tunnel-001",
+            schema="analytics",
+            output_dir=str(tmp_path),
+        )
+
+        success, message = self.scheduler._execute_backup(schedule)
+
+        assert success is False
+        assert "연결 정보를 가져올 수 없습니다" in message
+        assert "constructed" not in captured
+
+    def test_sql_query_uses_decrypted_credentials(self, monkeypatch):
+        """평문 자격 증명이 없어도 config_manager에서 복호화된 자격 증명을 사용"""
+        created = {}
+
+        class FakeCursor:
+            description = None
+            rowcount = 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def execute(self, query):
+                pass
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+            def commit(self):
+                pass
+
+        class FakeConnector:
+            connection = FakeConnection()
+
+            def connect(self):
+                return True, "ok"
+
+            def disconnect(self):
+                pass
+
+        def fake_create(engine, host, port, user, password, database=None, schema=""):
+            created["user"] = user
+            created["password"] = password
+            return FakeConnector()
+
+        self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 15432)
+        self.mock_engine.tunnel_configs = {
+            "tunnel-001": {"db_engine": "mysql"}  # 평문 db_user/db_password 없음
+        }
+        self.mock_config_manager.get_tunnel_credentials.return_value = ("db_user", "decrypted_pw")
+        monkeypatch.setattr("src.core.scheduler.create_rust_db_connector", fake_create)
+
+        schedule = self.ScheduleConfig(
+            id="sql-003",
+            name="Decrypted",
+            tunnel_id="tunnel-001",
+            schema="analytics",
+            task_type="sql_query",
+            sql_query="UPDATE t SET a=1",
+            result_format="none",
+        )
+
+        success, _ = self.scheduler._execute_sql_query(schedule)
+
+        assert success is True
+        assert created["user"] == "db_user"
+        assert created["password"] == "decrypted_pw"
+
+    def test_run_now_queues_background_execution(self):
+        """run_now는 즉시 반환하고 실제 실행은 백그라운드 실행 큐에서 처리"""
+        schedule = self._make_schedule()
+        self.scheduler.add_schedule(schedule)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_execute_task(sched):
+            started.set()
+            release.wait(timeout=5)
+            return True, "완료"
+
+        self.scheduler._execute_task = fake_execute_task
+
+        callback = MagicMock()
+        self.scheduler.add_callback(callback)
+
+        try:
+            success, message = self.scheduler.run_now('sched-001')
+
+            assert success is True
+            assert '등록' in message
+            assert started.wait(timeout=2)
+        finally:
+            release.set()
+
+        deadline = time.time() + 5
+        while not callback.called and time.time() < deadline:
+            time.sleep(0.05)
+
+        callback.assert_called_once()
+        args = callback.call_args[0]
+        assert args[0] == 'Test Backup'
+        assert args[1] is True
+
+        self.scheduler.stop()
+
+    def test_run_now_rejects_duplicate_active_schedule(self):
+        """이미 실행 중인 스케줄은 중복 run_now 요청을 거부"""
+        schedule = self._make_schedule()
+        self.scheduler.add_schedule(schedule)
+
+        started = threading.Event()
+        release = threading.Event()
+
+        def fake_execute_task(sched):
+            started.set()
+            release.wait(timeout=5)
+            return True, "완료"
+
+        self.scheduler._execute_task = fake_execute_task
+
+        try:
+            success1, _ = self.scheduler.run_now('sched-001')
+            assert success1 is True
+            assert started.wait(timeout=2)
+
+            success2, message2 = self.scheduler.run_now('sched-001')
+            assert success2 is False
+            assert '이미 실행 중' in message2
+        finally:
+            release.set()
+            # 백그라운드 작업이 마무리되어 _active_schedule_ids가 정리될 시간을 준다
+            deadline = time.time() + 5
+            while 'sched-001' in self.scheduler._active_schedule_ids and time.time() < deadline:
+                time.sleep(0.05)
+            self.scheduler.stop()
+
+    def test_snapshot_due_jobs_does_not_hold_lock_during_execution(self):
+        """_snapshot_due_jobs는 락 안에서 스냅샷만 뜨고 즉시 락을 반환"""
+        schedule = self._make_schedule()
+        self.scheduler.add_schedule(schedule)
+        # add_schedule은 cron 표현식으로 next_run을 재계산하므로, 추가 이후에 과거 시각으로 덮어써야 한다
+        schedule.next_run = (datetime.now() - timedelta(minutes=1)).isoformat()
+
+        jobs = self.scheduler._snapshot_due_jobs(datetime.now())
+
+        assert len(jobs) == 1
+        assert jobs[0].schedule.id == 'sched-001'
+
+        # 스냅샷 직후 락을 블로킹 없이 즉시 재획득할 수 있어야 한다 (실행이 락 밖에서 진행됨을 증명)
+        acquired = self.scheduler._lock.acquire(timeout=1)
+        assert acquired
+        self.scheduler._lock.release()
+
+    def test_execute_single_query_saves_cte_results_by_description(self, tmp_path):
+        """SELECT로 시작하지 않는 CTE(WITH)도 description 기준으로 결과 저장"""
+        class FakeCursor:
+            description = [("value",)]
+            rowcount = 1
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def execute(self, query):
+                pass
+
+            def fetchall(self):
+                return [{"value": 1}]
+
+        class FakeConnection:
+            def __init__(self):
+                self.commit_called = False
+
+            def cursor(self):
+                return FakeCursor()
+
+            def commit(self):
+                self.commit_called = True
+
+        class FakeConnector:
+            def __init__(self):
+                self.connection = FakeConnection()
+
+        connector = FakeConnector()
+        schedule = self.ScheduleConfig(
+            id="sql-cte",
+            name="CTE",
+            tunnel_id="tunnel-001",
+            schema="db",
+            task_type="sql_query",
+            result_format="csv",
+            result_output_dir=str(tmp_path),
+        )
+
+        result = self.scheduler._execute_single_query(
+            connector, schedule, "WITH recent AS (SELECT 1) SELECT * FROM recent",
+            "20250101_000000", 0
+        )
+
+        assert result['success'] is True
+        assert 'file_path' in result
+        assert os.path.exists(result['file_path'])
+        assert connector.connection.commit_called is False
+
+    def test_execute_single_query_saves_zero_row_result_file(self, tmp_path):
+        """결과 0행이어도 result_format이 none이 아니면 헤더만 있는 파일을 저장"""
+        class FakeCursor:
+            description = [("value",)]
+            rowcount = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def execute(self, query):
+                pass
+
+            def fetchall(self):
+                return []
+
+        class FakeConnection:
+            def cursor(self):
+                return FakeCursor()
+
+            def commit(self):
+                pass
+
+        class FakeConnector:
+            def __init__(self):
+                self.connection = FakeConnection()
+
+        connector = FakeConnector()
+        schedule = self.ScheduleConfig(
+            id="sql-zero",
+            name="ZeroRow",
+            tunnel_id="tunnel-001",
+            schema="db",
+            task_type="sql_query",
+            result_format="csv",
+            result_output_dir=str(tmp_path),
+        )
+
+        result = self.scheduler._execute_single_query(
+            connector, schedule, "SELECT * FROM empty_table WHERE 1=0",
+            "20250101_000000", 0
+        )
+
+        assert result['success'] is True
+        assert os.path.exists(result['file_path'])
+        with open(result['file_path'], encoding='utf-8-sig') as f:
+            content = f.read()
+        assert 'value' in content
+
+    def test_execute_single_query_empty_description_is_still_result_set(self):
+        """description=[] (빈 리스트)도 None이 아니므로 결과셋으로 처리 (commit 금지)"""
+        class FakeCursor:
+            description = []
+            rowcount = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, exc_type, exc_val, exc_tb):
+                return False
+
+            def execute(self, query):
+                pass
+
+            def fetchall(self):
+                return []
+
+        class FakeConnection:
+            def __init__(self):
+                self.commit_called = False
+
+            def cursor(self):
+                return FakeCursor()
+
+            def commit(self):
+                self.commit_called = True
+
+        class FakeConnector:
+            def __init__(self):
+                self.connection = FakeConnection()
+
+        connector = FakeConnector()
+        schedule = self.ScheduleConfig(
+            id="sql-empty-desc",
+            name="EmptyDesc",
+            tunnel_id="tunnel-001",
+            schema="db",
+            task_type="sql_query",
+            result_format="none",
+        )
+
+        result = self.scheduler._execute_single_query(
+            connector, schedule, "SHOW TABLES", "20250101_000000", 0
+        )
+
+        assert result['success'] is True
+        assert result['row_count'] == 0
+        assert connector.connection.commit_called is False
 
     def test_get_schedules_empty(self):
         """스케줄 없을 때 빈 리스트"""
