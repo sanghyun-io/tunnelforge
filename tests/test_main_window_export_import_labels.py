@@ -46,6 +46,15 @@ def test_main_window_export_import_labels_match_rust_core_implementation():
     assert "_context_rust_core_import" in source
 
 
+def test_tree_orphan_check_signal_is_wired_to_context_handler():
+    # 고아 레코드 분석 트리 진입점이 복원되어 _context_orphan_check로 연결되는지.
+    source = (PROJECT_ROOT / "src" / "ui" / "main_window.py").read_text(encoding="utf-8")
+
+    assert "tunnel_orphan_check.connect(self._on_tree_orphan_check)" in source
+    handler = inspect.getsource(TunnelManagerUI._on_tree_orphan_check)
+    assert "_context_orphan_check" in handler
+
+
 # --- 1. 자동시작 경로가 _ensure_tunnel_running 래퍼를 거치는지 ---
 
 def test_auto_start_paths_route_through_ensure_tunnel_running():

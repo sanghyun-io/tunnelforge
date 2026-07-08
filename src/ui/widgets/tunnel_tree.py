@@ -27,6 +27,7 @@ class TunnelTreeWidget(QTreeWidget):
     tunnel_sql_editor = pyqtSignal(dict)         # SQL 에디터 요청
     tunnel_export = pyqtSignal(dict)             # Export 요청
     tunnel_import = pyqtSignal(dict)             # Import 요청
+    tunnel_orphan_check = pyqtSignal(dict)       # 고아 레코드 분석 요청
     tunnel_test = pyqtSignal(dict)               # 연결 테스트 요청
     tunnel_duplicate = pyqtSignal(dict)          # 터널 복사 요청
     group_connect_all = pyqtSignal(str)          # 그룹 전체 연결
@@ -352,6 +353,9 @@ class TunnelTreeWidget(QTreeWidget):
 
             action_import = menu.addAction("📥 Import")
             action_import.triggered.connect(lambda: self.tunnel_import.emit(tunnel_data))
+
+            action_orphan = menu.addAction("🔍 고아 레코드 분석")
+            action_orphan.triggered.connect(lambda: self.tunnel_orphan_check.emit(tunnel_data))
 
             menu.addSeparator()
 

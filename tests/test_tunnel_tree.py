@@ -51,6 +51,21 @@ def test_tunnel_tree_no_unused_column_ratio_api():
     assert not hasattr(TunnelTreeWidget, "set_column_ratios")
 
 
+def test_tunnel_tree_exposes_orphan_check_signal():
+    # 고아 레코드 분석 진입점(트리 컨텍스트 메뉴 시그널)이 복원되어 있어야 한다.
+    assert hasattr(TunnelTreeWidget, "tunnel_orphan_check")
+
+
+def test_context_menu_wires_orphan_check_action():
+    # 컨텍스트 메뉴 액션이 tunnel_orphan_check 시그널을 emit하도록 연결됐는지
+    # 소스 레벨로 검증(오프스크린에서 실제 메뉴를 띄우지 않음).
+    import inspect
+
+    source = inspect.getsource(TunnelTreeWidget._show_context_menu)
+    assert "고아 레코드 분석" in source
+    assert "self.tunnel_orphan_check.emit" in source
+
+
 def test_update_tunnel_status_toggles_icon_without_reload():
     tree = TunnelTreeWidget()
     try:
