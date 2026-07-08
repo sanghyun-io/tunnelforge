@@ -33,6 +33,7 @@ from ..migration_constants import (
     INVALID_DATE_VALUES_PATTERN,
     TIMESTAMP_PATTERN,
 )
+from ..migration_parsers import CreateTableParser
 
 if TYPE_CHECKING:
     from ..db_connector import MySQLConnector
@@ -74,9 +75,12 @@ class DataIntegrityRules:
         columns = self.connector.execute(query, (schema,))
 
         for col in columns:
-            # COLUMN_TYPE에서 빈 문자열 '' 찾기
+            # COLUMN_TYPE의 ENUM 요소를 파싱하여 실제 빈 문자열 요소만 확인
+            # (이스케이프된 작은따옴표('')를 단순 부분 문자열로 찾으면
+            #  enum('don''t','other') 같은 정상 값을 오탐하게 된다)
             column_type = col.get('COLUMN_TYPE', '')
-            if "''" in column_type or ", ''" in column_type or ",''" in column_type:
+            elements = self._extract_enum_elements(column_type)
+            if any(element == "" for element in elements):
                 issues.append(CompatibilityIssue(
                     issue_type=IssueType.ENUM_EMPTY_VALUE,
                     severity="error",
@@ -159,6 +163,184 @@ class DataIntegrityRules:
     # VALUES 행 패턴
     _VALUES_ROW_PATTERN = re.compile(r'\(([^)]+)\)')
 
+    def _find_statement_end(self, content: str, start: int) -> int:
+        """start 이후 문자열/식별자 밖의 첫 세미콜론 위치(문장 경계)를 찾는다
+
+        작은따옴표, 큰따옴표, 백틱 안의 세미콜론은 무시하며, 백슬래시
+        이스케이프와 이중 작은따옴표('')로 이스케이프된 따옴표도 처리한다.
+        종료 세미콜론이 없으면 len(content)를 반환한다.
+        """
+        in_single = False
+        in_double = False
+        in_backtick = False
+        i = start
+        n = len(content)
+        while i < n:
+            ch = content[i]
+            if in_single:
+                if ch == '\\':
+                    i += 2
+                    continue
+                if ch == "'":
+                    if i + 1 < n and content[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_single = False
+                i += 1
+                continue
+            if in_double:
+                if ch == '\\':
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+            if in_backtick:
+                if ch == '`':
+                    in_backtick = False
+                i += 1
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch == '`':
+                in_backtick = True
+            elif ch == ';':
+                return i
+            i += 1
+        return n
+
+    def _iter_create_table_statements(self, content: str):
+        """content에서 CREATE TABLE 문 전체 텍스트를 하나씩 생성한다
+
+        CreateTableParser.TABLE_NAME_PATTERN으로 문장 시작 위치를 찾고
+        _find_statement_end로 종료 세미콜론까지 경계를 잡는다. 이렇게 얻은
+        완전한 문장을 CreateTableParser.parse()에 넘기면, 파서의 괄호
+        균형 기반 바디 추출(_extract_body)이 varchar(255) DEFAULT ... 같은
+        중첩 괄호에서도 CREATE TABLE 바디를 올바르게 잘라낸다.
+        """
+        for table_match in CreateTableParser.TABLE_NAME_PATTERN.finditer(content):
+            start = table_match.start()
+            end = self._find_statement_end(content, start)
+            yield content[start:end]
+
+    def _iter_values_rows(self, values_segment: str):
+        """VALUES (...) 세그먼트에서 최상위 행 바디만 추출한다
+
+        따옴표 상태와 괄호 중첩(깊이)을 함께 추적하여, 문자열 리터럴 안의
+        괄호나 함수 호출의 중첩 괄호가 행 경계로 오인되지 않도록 한다.
+        """
+        depth = 0
+        in_quote = False
+        buf: list = []
+        i = 0
+        n = len(values_segment)
+        while i < n:
+            ch = values_segment[i]
+
+            if in_quote:
+                if ch == '\\' and i + 1 < n:
+                    if depth >= 1:
+                        buf.append(values_segment[i:i + 2])
+                    i += 2
+                    continue
+                if ch == "'":
+                    if i + 1 < n and values_segment[i + 1] == "'":
+                        if depth >= 1:
+                            buf.append("''")
+                        i += 2
+                        continue
+                    in_quote = False
+                if depth >= 1:
+                    buf.append(ch)
+                i += 1
+                continue
+
+            if ch == "'":
+                in_quote = True
+                if depth >= 1:
+                    buf.append(ch)
+                i += 1
+                continue
+
+            if ch == '(':
+                if depth == 0:
+                    buf = []
+                else:
+                    buf.append(ch)
+                depth += 1
+                i += 1
+                continue
+
+            if ch == ')':
+                depth -= 1
+                if depth == 0:
+                    yield ''.join(buf)
+                elif depth > 0:
+                    buf.append(ch)
+                else:
+                    depth = 0
+                i += 1
+                continue
+
+            if depth >= 1:
+                buf.append(ch)
+            i += 1
+
+    def _split_sql_values(self, row_body: str) -> List[str]:
+        """행 바디를 최상위 콤마 기준으로 분리한다 (따옴표/괄호 안 콤마 제외)
+
+        작게 유지되는 로컬 헬퍼로, 외부 파서를 별도로 손대지 않는다.
+        """
+        parts: List[str] = []
+        current: list = []
+        in_quote = False
+        depth = 0
+        i = 0
+        n = len(row_body)
+        while i < n:
+            ch = row_body[i]
+            if in_quote:
+                current.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    current.append(row_body[i + 1])
+                    i += 2
+                    continue
+                if ch == "'":
+                    if i + 1 < n and row_body[i + 1] == "'":
+                        current.append("'")
+                        i += 2
+                        continue
+                    in_quote = False
+                i += 1
+                continue
+            if ch == "'":
+                in_quote = True
+                current.append(ch)
+                i += 1
+                continue
+            if ch == '(':
+                depth += 1
+                current.append(ch)
+                i += 1
+                continue
+            if ch == ')':
+                depth = max(depth - 1, 0)
+                current.append(ch)
+                i += 1
+                continue
+            if ch == ',' and depth == 0:
+                parts.append(''.join(current))
+                current = []
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+        parts.append(''.join(current))
+        return parts
+
     def check_enum_numeric_index(self, content: str, location: str) -> List[CompatibilityIssue]:
         """INSERT 문에서 ENUM 컬럼에 숫자 인덱스 사용 확인
 
@@ -168,20 +350,20 @@ class DataIntegrityRules:
         """
         issues = []
 
-        # Step 1: content에서 ENUM 컬럼이 있는 테이블 수집
+        # Step 1: CreateTableParser로 ENUM 컬럼이 있는 테이블 수집
         # table_name -> set of enum column names
         enum_columns: dict = {}
-        for table_match in re.finditer(
-            r'CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?\s*\((.+?)\)\s*(?:ENGINE|DEFAULT|;)',
-            content, re.IGNORECASE | re.DOTALL
-        ):
-            table_name = table_match.group(1).lower()
-            body = table_match.group(2)
-            for col_match in self._ENUM_COL_PATTERN.finditer(body):
-                col_name = col_match.group(1).lower()
-                if table_name not in enum_columns:
-                    enum_columns[table_name] = set()
-                enum_columns[table_name].add(col_name)
+        for statement in self._iter_create_table_statements(content):
+            parsed = CreateTableParser().parse(statement)
+            if not parsed:
+                continue
+            cols = {
+                col.name.lower()
+                for col in parsed.columns
+                if col.data_type.upper() == "ENUM"
+            }
+            if cols:
+                enum_columns[parsed.name.lower()] = cols
 
         if not enum_columns:
             return issues
@@ -200,11 +382,13 @@ class DataIntegrityRules:
             if not enum_col_indices:
                 continue
 
-            # VALUES 행 검사 (per-INSERT 로컬 플래그로 교차 오염 방지)
-            rest = content[insert_match.end():]
+            # 현재 INSERT 문 범위로만 스캔 (다음 문장의 튜플을 읽지 않도록 경계 제한)
+            statement_end = self._find_statement_end(content, insert_match.start())
+            values_segment = content[insert_match.end():statement_end]
+
             found_in_current_insert = False
-            for row_match in self._VALUES_ROW_PATTERN.finditer(rest[:5000]):
-                values = [v.strip() for v in row_match.group(1).split(',')]
+            for row_body in self._iter_values_rows(values_segment):
+                values = self._split_sql_values(row_body)
                 for idx in enum_col_indices:
                     if idx < len(values):
                         val = values[idx].strip()
@@ -494,10 +678,17 @@ class DataIntegrityRules:
             if out_of_range_count > 0:
                 issues.append(CompatibilityIssue(
                     issue_type=IssueType.TIMESTAMP_RANGE,
-                    severity="error",
+                    # 덤프 파일만으로는 이 값이 TIMESTAMP 컬럼인지 DATETIME 컬럼인지
+                    # 구분할 수 없으므로 error가 아닌 warning으로 완화한다
+                    severity="warning",
                     location=file_path.name,
-                    description=f"TIMESTAMP 범위 초과 값: {out_of_range_count}개",
-                    suggestion="TIMESTAMP는 1970-2038 범위만 지원, DATETIME 사용 권장",
+                    description=f"TIMESTAMP 범위 초과 후보 값: {out_of_range_count}개 (컬럼 타입 미확인)",
+                    suggestion=(
+                        "덤프 파일만으로는 TIMESTAMP/DATETIME 컬럼 여부를 구분할 수 없습니다. "
+                        "원본 컬럼 타입을 확인하세요: TIMESTAMP 컬럼이라면 1970-2038 범위를 "
+                        "벗어나는 값을 변환/처리해야 하고, DATETIME 컬럼이라면 이 값은 유효한 "
+                        "sentinel 값일 수 있습니다."
+                    ),
                     code_snippet=f"값: {', '.join(sample_values[:3])}"
                 ))
 
@@ -528,6 +719,9 @@ class DataIntegrityRules:
 
     # 컬럼 수 상한: 이 수를 초과하면 부분 스캔 경고를 표시
     _MAX_COLUMNS_TO_CHECK = 50
+
+    # ZEROFILL 패딩 의존성 검사 시 스캔할 최대 행 수 (대용량 테이블 전체 스캔 방지)
+    _MAX_ZEROFILL_ROWS_TO_SCAN = 100000
 
     def check_latin1_non_ascii(self, schema: str) -> List[CompatibilityIssue]:
         """latin1 컬럼에서 비ASCII 데이터 확인 (배치 쿼리 방식)"""
@@ -685,7 +879,10 @@ class DataIntegrityRules:
             col_list = list(col_group)
             # 각 컬럼의 패딩 의존 여부를 단일 SELECT로 판별
             # LENGTH(CAST(col AS CHAR)) < width 인 행이 존재하면 패딩 의존
+            # 집계 자체에는 LIMIT을 걸 수 없으므로(집계 전 행 제한이 무의미),
+            # 행 수 상한을 내부 서브쿼리에 적용해 대용량 테이블 전체 스캔을 방지한다
             select_parts = []
+            inner_columns = []
             for c in col_list:
                 w = c['width']
                 cname = c['COLUMN_NAME']
@@ -694,10 +891,12 @@ class DataIntegrityRules:
                     f"AND `{cname}` IS NOT NULL AND `{cname}` > 0 THEN 1 ELSE 0 END) "
                     f"AS `{cname}`"
                 )
+                inner_columns.append(f"`{cname}`")
             batch_query = (
                 f"SELECT {', '.join(select_parts)} "
+                f"FROM (SELECT {', '.join(inner_columns)} "
                 f"FROM `{schema}`.`{table_name}` "
-                f"LIMIT 100"
+                f"LIMIT {self._MAX_ZEROFILL_ROWS_TO_SCAN}) AS sampled"
             )
             try:
                 result = self.connector.execute(batch_query)
@@ -762,19 +961,31 @@ class DataIntegrityRules:
                         truncated = True
                         break
 
-                    # 0000-00-00 패턴
-                    if INVALID_DATE_PATTERN.search(line) or INVALID_DATETIME_PATTERN.search(line):
-                        invalid_count += 1
-                        if len(sample_values) < max_samples:
-                            match = INVALID_DATE_PATTERN.search(line) or INVALID_DATETIME_PATTERN.search(line)
-                            if match:
-                                sample_values.append(match.group(0))
+                    # 0000-00-00 / 0000-00-00 00:00:00 / 연·월·일이 00인 경우를
+                    # 모두 검사하되, 같은 위치(span)를 여러 패턴이 중복으로
+                    # 매치하면 한 행에서 두 번 세는 문제가 있었다. span 기준으로
+                    # 중복 제거한 뒤, 행에 하나라도 있으면 행 단위로 1회만 카운트한다
+                    # (설명 텍스트가 "개 행" 단위이므로 값 개수가 아닌 행 개수여야 함)
+                    seen_spans = []
+                    line_values = []
+                    for pattern in (
+                        INVALID_DATETIME_PATTERN,
+                        INVALID_DATE_PATTERN,
+                        INVALID_DATE_VALUES_PATTERN,
+                    ):
+                        for match in pattern.finditer(line):
+                            span = match.span()
+                            if span in seen_spans:
+                                continue
+                            seen_spans.append(span)
+                            line_values.append(match.group(0))
 
-                    # 연/월/일이 00인 경우
-                    for match in INVALID_DATE_VALUES_PATTERN.finditer(line):
+                    if line_values:
                         invalid_count += 1
-                        if len(sample_values) < max_samples:
-                            sample_values.append(match.group(0))
+                        for value in line_values:
+                            if len(sample_values) >= max_samples:
+                                break
+                            sample_values.append(value)
 
             if invalid_count > 0:
                 issues.append(CompatibilityIssue(

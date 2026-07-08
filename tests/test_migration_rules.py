@@ -47,6 +47,39 @@ class TestDataIntegrityRulesSQL:
         issues = rules.check_enum_numeric_index(content, "test.sql")
         assert len(issues) == 0
 
+    def test_enum_numeric_index_parses_enum_after_varchar_default(self):
+        """varchar(255) DEFAULT ... 같은 중첩 괄호 이후에 오는 ENUM 컬럼도
+        정규식 단독 스캔이 아닌 CreateTableParser 기반 파싱으로 인식해야 한다"""
+        rules = DataIntegrityRules()
+        content = (
+            "CREATE TABLE `t` (\n"
+            "  `id` int(11) NOT NULL,\n"
+            "  `memo` varchar(255) DEFAULT NULL,\n"
+            "  `status` enum('new','done') DEFAULT 'new'\n"
+            ") ENGINE=InnoDB;\n"
+            "\n"
+            "INSERT INTO `t` (`id`, `memo`, `status`) VALUES (1, 'hello', 2);\n"
+        )
+        issues = rules.check_enum_numeric_index(content, "test.sql")
+        assert len(issues) == 1
+        assert issues[0].issue_type == IssueType.ENUM_NUMERIC_INDEX
+        assert issues[0].column_name == "status"
+
+    def test_enum_numeric_index_does_not_cross_statement_boundary(self):
+        """한 INSERT 문의 튜플 검사가 다음 문장의 튜플까지 읽어서는 안 된다"""
+        rules = DataIntegrityRules()
+        content = (
+            "CREATE TABLE `t` (\n"
+            "  `id` int(11) NOT NULL,\n"
+            "  `status` enum('new','done') DEFAULT 'new'\n"
+            ") ENGINE=InnoDB;\n"
+            "\n"
+            "INSERT INTO `t` (`id`, `status`) VALUES (1, 'new');\n"
+            "INSERT INTO `unrelated` (`a`, `b`) VALUES (1, 2);\n"
+        )
+        issues = rules.check_enum_numeric_index(content, "test.sql")
+        assert issues == []
+
     def test_check_all_sql_content(self):
         rules = DataIntegrityRules()
         content = (
@@ -108,6 +141,10 @@ class TestDataIntegrityRulesFiles:
         issues = rules.check_timestamp_range(data_file)
         assert len(issues) >= 1
         assert issues[0].issue_type == IssueType.TIMESTAMP_RANGE
+        # 덤프 파일만으로는 TIMESTAMP/DATETIME 컬럼 여부를 구분할 수 없으므로
+        # error가 아닌 warning이어야 한다
+        assert issues[0].severity == "warning"
+        assert "컬럼 타입 미확인" in issues[0].description
 
     def test_invalid_datetime(self, tmp_path):
         data_file = tmp_path / "data.tsv"
@@ -121,6 +158,17 @@ class TestDataIntegrityRulesFiles:
         issues = rules.check_invalid_datetime(data_file)
         assert len(issues) >= 1
         assert issues[0].issue_type == IssueType.INVALID_DATE
+
+    def test_invalid_datetime_single_value_not_double_counted(self, tmp_path):
+        """같은 위치를 여러 패턴이 중복 매치해도 행 단위로 1회만 카운트해야 한다"""
+        data_file = tmp_path / "data.tsv"
+        data_file.write_text("1\t'0000-00-00'\n", encoding='utf-8')
+
+        rules = DataIntegrityRules()
+        issues = rules.check_invalid_datetime(data_file)
+        assert len(issues) == 1
+        assert "1개 행" in issues[0].description
+        assert "2개" not in issues[0].description
 
     def test_check_all_data_file(self, tmp_path):
         data_file = tmp_path / "data.tsv"
@@ -144,6 +192,19 @@ class TestDataIntegrityRulesLiveDB:
         rules = DataIntegrityRules(connector=conn)
         issues = rules.check_enum_empty_value_definition("test_db")
         assert len(issues) >= 1
+        assert issues[0].severity == "error"
+
+    def test_enum_empty_value_definition_ignores_escaped_apostrophe(self):
+        """enum('don''t','other')는 이스케이프된 작은따옴표이지 빈 값이 아니다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {
+            "enum": [
+                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'note', 'COLUMN_TYPE': "enum('don''t','other')"}
+            ]
+        }
+        rules = DataIntegrityRules(connector=conn)
+        issues = rules.check_enum_empty_value_definition("test_db")
+        assert issues == []
 
     def test_enum_element_length(self):
         long_value = 'x' * 300
@@ -168,6 +229,28 @@ class TestDataIntegrityRulesLiveDB:
         rules = DataIntegrityRules(connector=conn)
         issues = rules.check_set_element_length("test_db")
         assert len(issues) >= 1
+
+    def test_zerofill_data_dependency_uses_limited_subquery(self):
+        """ZEROFILL 배치 쿼리는 집계 레벨 LIMIT이 아니라, 내부 서브쿼리에
+        행 수 상한을 적용한 bounded subquery를 사용해야 한다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {
+            "ZEROFILL": [
+                {'TABLE_NAME': 't', 'COLUMN_NAME': 'code', 'COLUMN_TYPE': 'int(8) unsigned zerofill'}
+            ],
+            "FROM (SELECT": [
+                {'code': 1}
+            ],
+        }
+        rules = DataIntegrityRules(connector=conn)
+        issues = rules.check_zerofill_data_dependency("test_db")
+        assert len(issues) == 1
+        assert issues[0].issue_type == IssueType.ZEROFILL_USAGE
+
+        batch_query = conn.executed_queries[-1][0]
+        assert "FROM (SELECT" in batch_query
+        assert "LIMIT 100000" in batch_query
+        assert not batch_query.rstrip().endswith("LIMIT 100")
 
     def test_no_connector_returns_empty(self):
         rules = DataIntegrityRules()  # no connector
@@ -252,6 +335,36 @@ class TestSchemaRulesSQL:
         issues = rules.check_generated_column_functions(content, "test.sql")
         assert len(issues) >= 1
 
+    def test_generated_column_functions_password_reports_once(self):
+        """ALL_REMOVED_FUNCTIONS에 중복이 섞여 있어도 PASSWORD는 한 번만 보고돼야 한다"""
+        rules = SchemaRules()
+        content = "`hash` VARCHAR(100) GENERATED ALWAYS AS (PASSWORD('test'))"
+        issues = rules.check_generated_column_functions(content, "test.sql")
+        assert len(issues) == 1
+        assert issues[0].description.endswith("PASSWORD")
+
+    def test_generated_column_functions_no_false_positive_on_identifier_substring(self):
+        """shift_rate처럼 함수명을 부분 문자열로 포함하는 식별자는 오탐하면 안 된다"""
+        rules = SchemaRules()
+        content = "`total` DECIMAL(10,2) GENERATED ALWAYS AS (price * shift_rate)"
+        issues = rules.check_generated_column_functions(content, "test.sql")
+        assert issues == []
+
+    def test_generated_column_functions_ifnull_not_duplicated_as_if(self):
+        """IFNULL(...) 사용 시 IF와 IFNULL 두 건으로 중복 보고되면 안 된다"""
+        rules = SchemaRules()
+        content = "`x` INT GENERATED ALWAYS AS (IFNULL(a,b))"
+        issues = rules.check_generated_column_functions(content, "test.sql")
+        reported_funcs = [issue.description.split(":")[-1].strip() for issue in issues]
+        assert reported_funcs == ["IFNULL"]
+
+    def test_generated_column_functions_case_still_detected(self):
+        """CASE는 함수 호출이 아닌 키워드이므로 괄호 없이도 계속 감지돼야 한다"""
+        rules = SchemaRules()
+        content = "`x` INT GENERATED ALWAYS AS (CASE WHEN a THEN b ELSE c END)"
+        issues = rules.check_generated_column_functions(content, "test.sql")
+        assert any(issue.description.endswith("CASE") for issue in issues)
+
     def test_check_all_sql_content(self):
         rules = SchemaRules()
         content = (
@@ -327,6 +440,73 @@ class TestSchemaRulesLiveDB:
         rules = SchemaRules(connector=conn)
         issues = rules.check_mysql_schema_conflict("db")
         assert len(issues) >= 1
+
+    def test_routine_definer_missing_mysql_user_permission_failure_returns_info_only(self):
+        """mysql.user 조회 권한이 없으면 모든 definer를 '존재하지 않음'으로
+        오판(spam)하지 말고, 검증 불가 info 이슈 1건만 반환해야 한다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {
+            "INFORMATION_SCHEMA.ROUTINES": [
+                {'ROUTINE_NAME': 'r1', 'ROUTINE_TYPE': 'PROCEDURE', 'DEFINER': 'app@localhost'},
+                {'ROUTINE_NAME': 'r2', 'ROUTINE_TYPE': 'FUNCTION', 'DEFINER': 'app@localhost'},
+            ],
+        }
+        conn.fail_on = {"mysql.user": PermissionError("denied")}
+        rules = SchemaRules(connector=conn)
+        issues = rules.check_routine_definer_missing("test_db")
+        assert len(issues) == 1
+        assert issues[0].severity == "info"
+        assert "Definer 검증 불가" in issues[0].description
+        assert "존재하지 않음" not in issues[0].description
+
+    def test_view_definer_missing_mysql_user_permission_failure_returns_info_only(self):
+        conn = FakeMySQLConnector()
+        conn.query_results = {
+            "INFORMATION_SCHEMA.VIEWS": [
+                {'TABLE_NAME': 'v1', 'DEFINER': 'app@localhost'},
+                {'TABLE_NAME': 'v2', 'DEFINER': 'app@localhost'},
+            ],
+        }
+        conn.fail_on = {"mysql.user": PermissionError("denied")}
+        rules = SchemaRules(connector=conn)
+        issues = rules.check_view_definer_missing("test_db")
+        assert len(issues) == 1
+        assert issues[0].severity == "info"
+        assert "Definer 검증 불가" in issues[0].description
+        assert "존재하지 않음" not in issues[0].description
+
+    def test_routine_definer_missing_normal_behavior_still_flags_missing_user(self):
+        """mysql.user 조회가 정상 동작하면 기존처럼 누락된 definer를 warning으로 보고해야 한다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {
+            "INFORMATION_SCHEMA.ROUTINES": [
+                {'ROUTINE_NAME': 'r1', 'ROUTINE_TYPE': 'PROCEDURE', 'DEFINER': 'ghost@localhost'},
+            ],
+            "mysql.user": [
+                {'definer': 'app@localhost'},
+            ],
+        }
+        rules = SchemaRules(connector=conn)
+        issues = rules.check_routine_definer_missing("test_db")
+        assert len(issues) == 1
+        assert issues[0].severity == "warning"
+        assert "존재하지 않음" in issues[0].description
+
+    def test_view_definer_missing_normal_behavior_still_flags_missing_user(self):
+        conn = FakeMySQLConnector()
+        conn.query_results = {
+            "INFORMATION_SCHEMA.VIEWS": [
+                {'TABLE_NAME': 'v1', 'DEFINER': 'ghost@localhost'},
+            ],
+            "mysql.user": [
+                {'definer': 'app@localhost'},
+            ],
+        }
+        rules = SchemaRules(connector=conn)
+        issues = rules.check_view_definer_missing("test_db")
+        assert len(issues) == 1
+        assert issues[0].severity == "warning"
+        assert "존재하지 않음" in issues[0].description
 
     def test_no_connector_returns_empty(self):
         rules = SchemaRules()
