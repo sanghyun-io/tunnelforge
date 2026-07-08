@@ -6,6 +6,7 @@ migration_constants.py 단위 테스트
 import re
 import pytest
 
+import src.core.migration_parsers as migration_parsers
 from src.core.migration_constants import (
     REMOVED_SYS_VARS_84,
     NEW_RESERVED_KEYWORDS_84,
@@ -23,6 +24,7 @@ from src.core.migration_constants import (
     CHARSET_MIGRATION_MAP,
     CHARSET_BYTES_PER_CHAR,
     STORAGE_ENGINE_STATUS,
+    ENGINE_POLICIES,
     MYSQL_SCHEMA_TABLES,
     DEPRECATED_SYNTAX_PATTERNS,
     UPGRADE_CHECK_IDS,
@@ -48,6 +50,7 @@ from src.core.migration_constants import (
     CONTROL_CHAR_PATTERN,
     TIMESTAMP_PATTERN,
     BLOB_TEXT_DEFAULT_PATTERN,
+    INVALID_57_NAME_MULTIPLE_DOTS_PATTERN,
 )
 
 
@@ -99,6 +102,17 @@ class TestReservedKeywords:
 
     def test_80_keywords_not_empty(self):
         assert len(RESERVED_KEYWORDS_80) > 0
+
+
+class TestAllRemovedFunctions:
+    """ALL_REMOVED_FUNCTIONS 중복 제거 불변량 검증"""
+
+    def test_no_duplicates(self):
+        assert len(set(ALL_REMOVED_FUNCTIONS)) == len(ALL_REMOVED_FUNCTIONS)
+
+    def test_contains_all_source_members(self):
+        expected = set(REMOVED_FUNCTIONS_84) | set(REMOVED_FUNCTIONS_80X) | set(DEPRECATED_FUNCTIONS_84)
+        assert set(ALL_REMOVED_FUNCTIONS) == expected
 
 
 class TestObsoleteSqlModes:
@@ -189,6 +203,26 @@ class TestStorageEngineStatus:
     def test_recommended_is_innodb(self):
         assert STORAGE_ENGINE_STATUS['recommended'] == 'InnoDB'
 
+    def test_deprecated_is_derived_from_engine_policies(self):
+        """deprecated 목록은 ENGINE_POLICIES 키에서 파생된 단일 소스여야 한다"""
+        assert STORAGE_ENGINE_STATUS['deprecated'] == list(ENGINE_POLICIES.keys())
+
+
+class TestEnginePolicies:
+    """ENGINE_POLICIES 정책 dict 검증"""
+
+    @pytest.mark.parametrize("engine", ["MERGE", "CSV", "EXAMPLE", "NDB"])
+    def test_known_engines_present(self, engine):
+        assert engine in ENGINE_POLICIES
+
+    def test_merge_severity_is_error(self):
+        assert ENGINE_POLICIES["MERGE"]["severity"] == "error"
+
+    def test_every_policy_has_non_empty_fields(self):
+        for engine, policy in ENGINE_POLICIES.items():
+            assert policy.get("severity"), f"{engine} policy missing severity"
+            assert policy.get("suggestion"), f"{engine} policy missing suggestion"
+
 
 class TestMysqlSchemaTables:
     """MYSQL_SCHEMA_TABLES 검증"""
@@ -232,6 +266,11 @@ class TestIssueType:
     def test_from_value_roundtrip(self):
         for e in IssueType:
             assert IssueType(e.value) is e
+
+    def test_removed_members_absent(self):
+        """실제 사용처가 없던 구식 구문 이슈 타입은 제거되어야 한다"""
+        assert "TRIGGER_OLD_SYNTAX" not in IssueType.__members__
+        assert "EVENT_OLD_SYNTAX" not in IssueType.__members__
 
 
 # ============================================================
@@ -495,6 +534,67 @@ class TestControlCharPattern:
             text = "`na\x1fme`"
         result = CONTROL_CHAR_PATTERN.search(text) is not None
         assert result == expected
+
+
+class TestIdentifierPatternFalsePositiveRegressions:
+    """DOLLAR_SIGN/TRAILING_SPACE/CONTROL_CHAR 패턴의 오탐 회귀 테스트.
+
+    과거 raw regex는 백틱 쌍이 맞는지 확인하지 않아, 인접한 두 식별자
+    사이(개행 포함)나 식별자 밖의 문자열 리터럴을 하나의 식별자로 오인했다.
+    """
+
+    MULTILINE_CREATE_TABLE = (
+        "CREATE TABLE `t` (\n"
+        "  `id` int NOT NULL,\n"
+        "  `name` varchar(255) DEFAULT NULL\n"
+        ")"
+    )
+
+    def test_trailing_space_no_false_positive_across_lines(self):
+        assert TRAILING_SPACE_PATTERN.search(self.MULTILINE_CREATE_TABLE) is None
+
+    def test_control_char_no_false_positive_across_lines(self):
+        assert CONTROL_CHAR_PATTERN.search(self.MULTILINE_CREATE_TABLE) is None
+
+    def test_dollar_sign_no_false_positive_in_string_literal(self):
+        content = (
+            "CREATE TABLE `t` (`amount` decimal(10,2) DEFAULT '$0.00', "
+            "`name` varchar(20));"
+        )
+        assert DOLLAR_SIGN_PATTERN.search(content) is None
+
+    def test_dollar_sign_still_matches_real_identifier(self):
+        content = "CREATE TABLE t (`price$usd` INT)"
+        assert DOLLAR_SIGN_PATTERN.search(content) is not None
+
+    def test_trailing_space_still_matches_standalone_identifier(self):
+        assert TRAILING_SPACE_PATTERN.search("`name `") is not None
+
+    def test_control_char_still_matches_standalone_identifier(self):
+        assert CONTROL_CHAR_PATTERN.search("`na\x00me`") is not None
+
+
+class TestInvalid57NameMultipleDotsContext:
+    """INVALID_57_NAME_MULTIPLE_DOTS_PATTERN의 컨텍스트 제한 검증"""
+
+    def test_no_match_in_insert_string_literal(self):
+        content = "INSERT INTO t VALUES ('see notes..thanks');"
+        assert INVALID_57_NAME_MULTIPLE_DOTS_PATTERN.search(content) is None
+
+    def test_matches_schema_table_reference(self):
+        content = "SELECT * FROM schema..table;"
+        match = INVALID_57_NAME_MULTIPLE_DOTS_PATTERN.search(content)
+        assert match is not None
+        assert match.group(0) == "schema..table"
+
+
+class TestMigrationParsersDocstring:
+    """migration_parsers 모듈 docstring이 실제 구현과 일치하는지 검증"""
+
+    def test_removed_parsers_not_documented(self):
+        doc = migration_parsers.__doc__ or ""
+        assert "ConfigFileParser" not in doc
+        assert "DumpMetadataParser" not in doc
 
 
 class TestTimestampPattern:
