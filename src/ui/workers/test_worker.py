@@ -18,7 +18,11 @@ class TestType(Enum):
 class ConnectionTestWorker(QThread):
     """연결 테스트 Worker"""
     progress = pyqtSignal(str)          # 진행 메시지
-    finished = pyqtSignal(bool, str)    # (성공여부, 결과메시지)
+    # ⛔ 이름을 "finished"로 두면 QThread 내장 finished() 시그널(스레드가 실제로
+    # 정지했을 때 발화)을 shadow해서 더 이상 접근할 수 없게 된다. 결과 전달용
+    # 시그널은 별도 이름(test_finished)을 쓰고, 호출자는 worker 참조 해제를
+    # 반드시 내장 finished()를 받은 뒤에만 하도록 한다(WP-3.9 Finding 1).
+    test_finished = pyqtSignal(bool, str)    # (성공여부, 결과메시지)
 
     def __init__(self, test_type: TestType, tunnel_config: dict,
                  tunnel_engine, config_manager, parent=None):
@@ -37,13 +41,13 @@ class ConnectionTestWorker(QThread):
             else:
                 self._test_integrated()
         except Exception as e:
-            self.finished.emit(False, f"테스트 중 오류 발생: {str(e)}")
+            self.test_finished.emit(False, f"테스트 중 오류 발생: {str(e)}")
 
     def _test_tunnel(self):
         """SSH 터널 연결만 테스트"""
         self.progress.emit("🔗 SSH 터널 연결 테스트 중...")
         success, msg = self.engine.test_connection(self.config)
-        self.finished.emit(success, msg)
+        self.test_finished.emit(success, msg)
 
     def _test_db(self):
         """DB 인증 테스트 (터널 경유)"""
@@ -134,7 +138,7 @@ class ConnectionTestWorker(QThread):
                 self.engine.close_temp_tunnel(temp_server)
 
             # 모든 정리 후 결과 전달
-            self.finished.emit(result_success, result_msg)
+            self.test_finished.emit(result_success, result_msg)
 
     def _test_integrated(self):
         """통합 테스트 (터널 + DB)"""
@@ -223,7 +227,7 @@ class ConnectionTestWorker(QThread):
                 self.engine.close_temp_tunnel(temp_server)
 
             # 모든 정리 후 결과 전달
-            self.finished.emit(result_success, result_msg)
+            self.test_finished.emit(result_success, result_msg)
 
     def _resolve_db_engine(self, host: str, port: int) -> str:
         engine = self.config.get('db_engine')
