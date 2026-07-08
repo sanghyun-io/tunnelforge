@@ -109,7 +109,6 @@ class CleanupWorker(QThread):
         self.connector = connector
         self.schema = schema
         self.actions = actions
-        self.dry_run = dry_run
 
     def run(self):
         try:
@@ -120,13 +119,13 @@ class CleanupWorker(QThread):
             total_affected = 0
             all_success = True
 
-            mode = "[DRY-RUN]" if self.dry_run else "[실행]"
+            mode = "[DRY-RUN]"
             self.progress.emit(f"🔧 {mode} 정리 작업 시작 ({len(self.actions)}개)")
 
             for i, action in enumerate(self.actions, 1):
                 self.progress.emit(f"  {mode} 처리 중: {action.table} ({i}/{len(self.actions)})")
 
-                success, msg, affected = analyzer.execute_cleanup(action, dry_run=self.dry_run)
+                success, msg, affected = analyzer.execute_cleanup(action, dry_run=True)
 
                 results[action.table] = {
                     'success': success,
@@ -142,7 +141,7 @@ class CleanupWorker(QThread):
                 else:
                     all_success = False
 
-            summary = f"✅ {mode} 완료: {total_affected}개 행 {'영향받음' if self.dry_run else '처리됨'}"
+            summary = f"✅ {mode} 완료: {total_affected}개 행 영향받음"
             self.progress.emit(summary)
             self.finished.emit(all_success, summary, results)
 
