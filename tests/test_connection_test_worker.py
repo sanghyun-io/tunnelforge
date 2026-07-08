@@ -88,3 +88,29 @@ def test_mysql_core_connector_uses_default_database(monkeypatch):
     assert captured["engine"] == "mysql"
     assert captured["database"] == "tf_source84"
     assert captured["schema"] == ""
+
+
+def test_connection_test_worker_does_not_shadow_builtin_finished_signal():
+    """WP-3.9 Finding 1 회귀: 결과 전달용 시그널이 QThread 내장 finished()를
+    shadow하면 worker 참조 해제 타이밍을 "스레드가 실제로 정지한 뒤"로 안전하게
+    잡을 방법이 없어진다. test_finished(bool, str)와 내장 finished()가 서로
+    독립적으로 동작해야 한다. 실제 QThread는 절대 start()하지 않고 시그널만
+    직접 emit해서 검증한다.
+    """
+    worker = ConnectionTestWorker(
+        TestType.TUNNEL_ONLY, {}, tunnel_engine=None, config_manager=None,
+    )
+
+    test_finished_calls = []
+    thread_finished_calls = []
+    worker.test_finished.connect(lambda success, msg: test_finished_calls.append((success, msg)))
+    worker.finished.connect(lambda: thread_finished_calls.append(True))
+
+    worker.test_finished.emit(True, "ok")
+    assert test_finished_calls == [(True, "ok")]
+    assert thread_finished_calls == []  # 결과 시그널만으로는 스레드 종료 시그널이 울리면 안 된다
+
+    worker.finished.emit()
+    assert thread_finished_calls == [True]
+    # 내장 finished()는 인자를 받지 않는다 (test_finished와 시그니처가 다름을 재확인)
+    assert test_finished_calls == [(True, "ok")]

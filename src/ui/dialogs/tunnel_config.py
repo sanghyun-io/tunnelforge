@@ -13,6 +13,53 @@ from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
 
 
+class _RunningTestProgressDialog(TestProgressDialog):
+    """테스트 실행 중에는 ESC/닫기로 dismiss될 수 없는 진행 다이얼로그.
+
+    ConnectionTestWorker(QThread) 실행 중 reject()가 호출되면(ESC 키,
+    Alt+F4 등 QDialog.closeEvent도 내부적으로 reject()를 호출한다)
+    exec()가 즉시 반환되어 로컬 worker 참조가 사라지고, 실행 중인 QThread의
+    마지막 파이썬 참조가 사라져 크래시로 이어진다(WP-3.9 Finding 1).
+    allow_dismiss()가 호출되기 전까지는 reject 경로를 막는다.
+    """
+
+    def __init__(self, parent, title: str = "연결 테스트"):
+        super().__init__(parent, title)
+        self._dismissable = False
+
+    def allow_dismiss(self):
+        """워커의 내장 QThread.finished()가 발화한 뒤에만 호출해야 한다."""
+        self._dismissable = True
+
+    def reject(self):
+        if not self._dismissable:
+            return
+        super().reject()
+
+
+class _TempCredentials:
+    """DB 테스트용 임시 자격 증명 제공자.
+
+    ConfigManager와 동일한 get_tunnel_credentials(tunnel_id) 인터페이스를
+    제공해 ConnectionTestWorker가 실제 ConfigManager와 구분 없이 사용할 수
+    있게 한다. _test_db_only/_test_integrated에 각각 인라인으로 중복
+    정의되어 있던 동일한 클래스를 하나로 통합했다(WP-3.9 Finding 2).
+    """
+
+    def __init__(self, user, password, encrypted_password, encryptor):
+        self._user = user
+        self._password = password
+        self._encrypted = encrypted_password
+        self._encryptor = encryptor
+
+    def get_tunnel_credentials(self, tunnel_id):
+        if self._password:
+            return self._user, self._password
+        elif self._encrypted and self._encryptor:
+            return self._user, self._encryptor.decrypt(self._encrypted)
+        return self._user, None
+
+
 class TunnelConfigDialog(QDialog):
     def __init__(self, parent=None, tunnel_data=None, tunnel_engine=None):
         super().__init__(parent)
@@ -21,6 +68,11 @@ class TunnelConfigDialog(QDialog):
 
         # 엔진 인스턴스 저장 (테스트 연결용)
         self.engine = tunnel_engine
+
+        # 현재 실행 중인 ConnectionTestWorker(QThread) 참조.
+        # 내장 QThread.finished()가 발화하기 전까지는 절대 None으로 해제하지
+        # 않는다 (WP-3.9 Finding 1).
+        self._test_worker = None
 
         # 수정 모드일 경우 기존 데이터, 아니면 빈 딕셔너리
         self.tunnel_data = tunnel_data or {}
@@ -396,11 +448,10 @@ class TunnelConfigDialog(QDialog):
             )
             return
 
-        dialog = TestProgressDialog(self, f"터널 테스트 - {temp_config.get('name', 'Unknown')}")
-        worker = ConnectionTestWorker(TestType.TUNNEL_ONLY, temp_config, self.engine, None)
-        worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(lambda s, m: self._on_test_finished(dialog, s, m))
-        worker.start()
+        dialog = self._start_connection_test(
+            TestType.TUNNEL_ONLY, temp_config, None,
+            f"터널 테스트 - {temp_config.get('name', 'Unknown')}"
+        )
         dialog.exec()
 
     def _test_db_only(self):
@@ -427,38 +478,21 @@ class TunnelConfigDialog(QDialog):
             QMessageBox.warning(self, "경고", "DB 비밀번호를 입력해주세요.")
             return
 
-        dialog = TestProgressDialog(self, f"DB 인증 테스트 - {temp_config.get('name', 'Unknown')}")
-
-        # DB 테스트용 임시 ConfigManager 생성 (현재 입력값 사용)
-        class TempConfigManager:
-            def __init__(self, user, password, encrypted_password, encryptor):
-                self._user = user
-                self._password = password
-                self._encrypted = encrypted_password
-                self._encryptor = encryptor
-
-            def get_tunnel_credentials(self, tunnel_id):
-                if self._password:
-                    return self._user, self._password
-                elif self._encrypted and self._encryptor:
-                    return self._user, self._encryptor.decrypt(self._encrypted)
-                return self._user, None
-
         # 부모 창(main_window)에서 encryptor 가져오기
         encryptor = None
         if hasattr(self.parent(), 'config_mgr'):
             encryptor = self.parent().config_mgr.encryptor
 
-        temp_config_mgr = TempConfigManager(
+        temp_config_mgr = _TempCredentials(
             db_user, db_password,
             self.tunnel_data.get('db_password_encrypted'),
             encryptor
         )
 
-        worker = ConnectionTestWorker(TestType.DB_ONLY, temp_config, self.engine, temp_config_mgr)
-        worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(lambda s, m: self._on_test_finished(dialog, s, m))
-        worker.start()
+        dialog = self._start_connection_test(
+            TestType.DB_ONLY, temp_config, temp_config_mgr,
+            f"DB 인증 테스트 - {temp_config.get('name', 'Unknown')}"
+        )
         dialog.exec()
 
     def _test_integrated(self):
@@ -471,42 +505,53 @@ class TunnelConfigDialog(QDialog):
         if not temp_config.get('db_engine'):
             QMessageBox.warning(self, "필수 항목 누락", "DB Engine을 먼저 선택해주세요.")
             return
-        dialog = TestProgressDialog(self, f"통합 테스트 - {temp_config.get('name', 'Unknown')}")
 
         # DB 자격 증명 확인 (선택 사항)
         db_user = self.input_db_user.text() if self.chk_save_credentials.isChecked() else None
         db_password = self.input_db_password.text() if self.chk_save_credentials.isChecked() else None
 
-        # 임시 ConfigManager
-        class TempConfigManager:
-            def __init__(self, user, password, encrypted_password, encryptor):
-                self._user = user
-                self._password = password
-                self._encrypted = encrypted_password
-                self._encryptor = encryptor
-
-            def get_tunnel_credentials(self, tunnel_id):
-                if self._password:
-                    return self._user, self._password
-                elif self._encrypted and self._encryptor:
-                    return self._user, self._encryptor.decrypt(self._encrypted)
-                return self._user, None
-
         encryptor = None
         if hasattr(self.parent(), 'config_mgr'):
             encryptor = self.parent().config_mgr.encryptor
 
-        temp_config_mgr = TempConfigManager(
+        temp_config_mgr = _TempCredentials(
             db_user, db_password,
             self.tunnel_data.get('db_password_encrypted') if db_user else None,
             encryptor
         )
 
-        worker = ConnectionTestWorker(TestType.INTEGRATED, temp_config, self.engine, temp_config_mgr)
-        worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(lambda s, m: self._on_test_finished(dialog, s, m))
-        worker.start()
+        dialog = self._start_connection_test(
+            TestType.INTEGRATED, temp_config, temp_config_mgr,
+            f"통합 테스트 - {temp_config.get('name', 'Unknown')}"
+        )
         dialog.exec()
 
-    def _on_test_finished(self, dialog, success: bool, message: str):
+    def _start_connection_test(self, test_type: TestType, temp_config: dict,
+                                config_mgr, title: str) -> "_RunningTestProgressDialog":
+        """ConnectionTestWorker를 생성해 진행 다이얼로그와 연결한 뒤 시작한다.
+
+        worker는 self._test_worker에 보관해 로컬 변수 스코프가 끝나도 참조가
+        사라지지 않게 하고, 내장 QThread.finished()가 발화하기 전까지는
+        해제하지 않는다. 반환된 dialog는 호출자가 exec()해야 한다
+        (WP-3.9 Finding 1).
+        """
+        dialog = _RunningTestProgressDialog(self, title)
+        worker = ConnectionTestWorker(test_type, temp_config, self.engine, config_mgr)
+        self._test_worker = worker
+
+        worker.progress.connect(dialog.update_progress)
+        worker.test_finished.connect(lambda s, m: self._on_test_result(dialog, s, m))
+        # 내장 QThread.finished()(무인자) — 실제로 스레드가 정지한 뒤에만 발화.
+        # 이 시점에야 dialog dismiss를 허용하고 worker 참조를 해제한다.
+        worker.finished.connect(lambda: self._on_test_worker_thread_finished(dialog))
+
+        worker.start()
+        return dialog
+
+    def _on_test_result(self, dialog, success: bool, message: str):
         dialog.show_result(success, message)
+
+    def _on_test_worker_thread_finished(self, dialog):
+        """내장 QThread.finished() 핸들러. worker가 실제로 정지한 뒤 호출된다."""
+        dialog.allow_dismiss()
+        self._test_worker = None
