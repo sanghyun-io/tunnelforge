@@ -2,11 +2,19 @@
 BackupScheduler, CronParser, ScheduleConfig 단위 테스트
 """
 import os
+import sys
 import threading
 import time
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, call
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication
+
+app = QApplication.instance() or QApplication(sys.argv)
 
 
 # =====================================================================
@@ -1166,3 +1174,220 @@ SELECT 1;"""
         found = self.scheduler.get_schedule('disabled-001')
         # 비활성화 상태이므로 next_run이 설정되지 않음
         assert found.enabled is False
+
+
+# =====================================================================
+# ScheduleEditDialog - 위험 SQL 쿼리 검사 (문장 단위 분리, WP-3.7)
+# =====================================================================
+
+class TestScheduleEditDialogDangerousQuery:
+    """SQL 위험 쿼리 검사가 통짜 텍스트가 아니라 문장 단위로 이뤄지는지 확인"""
+
+    def _make_dialog(self):
+        from src.ui.dialogs.schedule_dialog import ScheduleEditDialog
+
+        return ScheduleEditDialog(parent=None, tunnel_list=[('t1', 'Tunnel 1')])
+
+    def test_update_without_where_flagged_even_with_later_where_statement(self):
+        """회귀 방지: 뒤 문장에 WHERE가 있으면 앞 UPDATE(WHERE 없음)를
+        안전하다고 오판하던 버그(통짜 정규식의 부정 탐색이 문장 경계를 넘어감)"""
+        dialog = self._make_dialog()
+        dialog.sql_editor.setPlainText(
+            "UPDATE users SET status='inactive'; SELECT * FROM logs WHERE id=1;"
+        )
+
+        assert not dialog.sql_warning_label.isHidden()
+        assert "UPDATE" in dialog.sql_warning_label.text()
+
+    def test_update_with_where_not_flagged(self):
+        """WHERE 절이 있는 UPDATE는 위험 경고가 없어야 한다"""
+        dialog = self._make_dialog()
+        dialog.sql_editor.setPlainText("UPDATE users SET status='inactive' WHERE id=1;")
+
+        assert dialog.sql_warning_label.isHidden()
+
+    def test_drop_table_flagged(self):
+        """DROP TABLE은 문장이 하나뿐이어도 위험 경고"""
+        dialog = self._make_dialog()
+        dialog.sql_editor.setPlainText("DROP TABLE users;")
+
+        assert not dialog.sql_warning_label.isHidden()
+        assert "DROP" in dialog.sql_warning_label.text()
+
+    def test_safe_select_not_flagged(self):
+        """WHERE 있는 SELECT는 위험 경고 없음"""
+        dialog = self._make_dialog()
+        dialog.sql_editor.setPlainText("SELECT * FROM users WHERE id=1;")
+
+        assert dialog.sql_warning_label.isHidden()
+
+    def test_duplicate_pattern_message_shown_once(self):
+        """여러 문장에서 같은 위험 패턴이 걸려도 동일 메시지는 한 번만 표시"""
+        dialog = self._make_dialog()
+        dialog.sql_editor.setPlainText("DELETE FROM logs; DELETE FROM audit;")
+
+        text = dialog.sql_warning_label.text()
+        assert text.count("DELETE") == 1
+
+    def test_empty_query_hides_warning(self):
+        """빈 쿼리는 경고를 표시하지 않는다"""
+        dialog = self._make_dialog()
+        dialog.sql_editor.setPlainText("DROP TABLE users;")
+        assert not dialog.sql_warning_label.isHidden()
+
+        dialog.sql_editor.setPlainText("")
+        assert dialog.sql_warning_label.isHidden()
+
+
+# =====================================================================
+# ScheduleListDialog - 활성화 체크박스 & 비동기 run_now 콜백 (WP-3.7)
+# =====================================================================
+
+class TestScheduleListDialogUi:
+    """체크박스 토글이 scheduler.set_enabled()에 반영되는지,
+    run_now의 비동기 완료가 콜백으로 다이얼로그에 전달되는지 확인"""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        from src.core.scheduler import BackupScheduler, ScheduleConfig
+        from src.ui.dialogs.schedule_dialog import ScheduleListDialog
+
+        self.mock_config_manager = MagicMock()
+        self.mock_config_manager.get_app_setting.return_value = []
+        self.mock_engine = MagicMock()
+        self.mock_engine.is_running.return_value = True
+
+        self.scheduler = BackupScheduler(
+            config_manager=self.mock_config_manager,
+            tunnel_engine=self.mock_engine,
+        )
+        self.ScheduleConfig = ScheduleConfig
+        self.ScheduleListDialog = ScheduleListDialog
+
+    def teardown_method(self):
+        if self.scheduler.is_running():
+            self.scheduler.stop()
+
+    def _make_schedule(self, schedule_id, enabled=True):
+        return self.ScheduleConfig(
+            id=schedule_id,
+            name=f'Schedule {schedule_id}',
+            tunnel_id='t1',
+            schema='db',
+            cron_expression='0 3 * * *',
+            enabled=enabled,
+        )
+
+    def test_unchecking_checkbox_disables_schedule(self):
+        """활성화 체크박스를 해제하면 scheduler.set_enabled(False)가 반영된다"""
+        self.scheduler.add_schedule(self._make_schedule('sched-ui-1', enabled=True))
+
+        dialog = self.ScheduleListDialog(parent=None, scheduler=self.scheduler, tunnel_list=[])
+        try:
+            item = dialog.table.item(0, 6)
+            assert item is not None
+            item.setCheckState(Qt.CheckState.Unchecked)
+
+            found = self.scheduler.get_schedule('sched-ui-1')
+            assert found.enabled is False
+        finally:
+            dialog.close()
+
+    def test_checking_checkbox_enables_schedule(self):
+        """활성화 체크박스를 체크하면 scheduler.set_enabled(True)가 반영된다"""
+        self.scheduler.add_schedule(self._make_schedule('sched-ui-2', enabled=False))
+
+        dialog = self.ScheduleListDialog(parent=None, scheduler=self.scheduler, tunnel_list=[])
+        try:
+            item = dialog.table.item(0, 6)
+            item.setCheckState(Qt.CheckState.Checked)
+
+            found = self.scheduler.get_schedule('sched-ui-2')
+            assert found.enabled is True
+        finally:
+            dialog.close()
+
+    def test_table_refresh_does_not_reenter_set_enabled(self, monkeypatch):
+        """_refresh_table_inner가 체크박스를 재세팅해도 set_enabled가 재호출되면 안 된다"""
+        self.scheduler.add_schedule(self._make_schedule('sched-ui-3', enabled=True))
+
+        dialog = self.ScheduleListDialog(parent=None, scheduler=self.scheduler, tunnel_list=[])
+        try:
+            calls = []
+            original_set_enabled = self.scheduler.set_enabled
+
+            def spy(schedule_id, enabled):
+                calls.append((schedule_id, enabled))
+                return original_set_enabled(schedule_id, enabled)
+
+            monkeypatch.setattr(self.scheduler, "set_enabled", spy)
+
+            dialog._refresh_table()
+
+            assert calls == []
+        finally:
+            dialog.close()
+
+    def test_run_now_success_message_reflects_async_registration(self):
+        """run_now 성공 메시지는 '완료'가 아니라 큐 등록을 의미해야 한다"""
+        self.scheduler.add_schedule(self._make_schedule('sched-ui-4', enabled=True))
+
+        success, message = self.scheduler.run_now('sched-ui-4')
+
+        assert success is True
+        assert '등록' in message
+        self.scheduler.stop()
+
+    def test_run_now_completion_triggers_dialog_refresh_via_callback(self):
+        """run_now는 등록만 하고 비동기 실행되므로, 실제 완료는
+        scheduler의 add_callback 통지가 시그널을 거쳐 다이얼로그 갱신을 트리거해야 한다"""
+        self.scheduler.add_schedule(self._make_schedule('sched-ui-5', enabled=True))
+
+        release = threading.Event()
+
+        def fake_execute_task(sched):
+            release.wait(timeout=5)
+            return True, "완료"
+
+        self.scheduler._execute_task = fake_execute_task
+
+        dialog = self.ScheduleListDialog(parent=None, scheduler=self.scheduler, tunnel_list=[])
+        try:
+            refreshed = threading.Event()
+            original_refresh = dialog._refresh_table
+
+            def spy_refresh():
+                original_refresh()
+                refreshed.set()
+
+            dialog._refresh_table = spy_refresh
+
+            success, message = self.scheduler.run_now('sched-ui-5')
+            assert success is True
+            assert '등록' in message
+            assert not refreshed.is_set()  # 아직 완료 전이므로 갱신되지 않음
+
+            release.set()
+
+            # 백그라운드 스레드의 콜백 emit은 Qt Queued Connection으로 전달되므로
+            # GUI 스레드 이벤트 루프를 짧게 돌려줘야 슬롯이 실행된다.
+            deadline = time.time() + 5
+            while not refreshed.is_set() and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.05)
+
+            assert refreshed.is_set()
+        finally:
+            release.set()
+            self.scheduler.stop()
+            dialog.close()
+
+    def test_dialog_removes_callback_on_close(self):
+        """다이얼로그가 닫히면 scheduler 콜백 등록이 해제되어야 한다 (누수 방지)"""
+        dialog = self.ScheduleListDialog(parent=None, scheduler=self.scheduler, tunnel_list=[])
+
+        assert dialog._on_schedule_completed in self.scheduler._callbacks
+
+        dialog.accept()  # "닫기" 버튼과 동일한 경로
+
+        assert dialog._on_schedule_completed not in self.scheduler._callbacks
