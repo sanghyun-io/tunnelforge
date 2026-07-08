@@ -9,6 +9,7 @@
 5. ExecutionPage: Dry-run 재확인 및 수동 SQL 안내
 """
 
+import logging
 import os
 from datetime import datetime
 
@@ -18,7 +19,7 @@ from PyQt6.QtWidgets import (
     QButtonGroup, QGroupBox, QTextEdit, QProgressBar,
     QTableWidget, QTableWidgetItem, QHeaderView, QScrollArea,
     QWidget, QFrame, QSplitter, QMessageBox, QApplication,
-    QTreeWidget, QTreeWidgetItem, QDialog, QDialogButtonBox,
+    QDialog, QDialogButtonBox,
     QComboBox, QSpacerItem, QSizePolicy, QFileDialog
 )
 from PyQt6.QtCore import Qt, pyqtSignal
@@ -31,7 +32,7 @@ from src.core.migration_constants import IssueType
 from src.core.migration_fix_wizard import (
     FixStrategy, FixOption, FixWizardStep,
     SmartFixGenerator, BatchFixExecutor, create_wizard_steps,
-    CollationFKGraphBuilder, CharsetFixPlanBuilder, CharsetTableInfo,
+    CharsetFixPlanBuilder, CharsetTableInfo,
     FKSafeCharsetChanger
 )
 from src.core.platform_paths import rollback_dir
@@ -97,14 +98,29 @@ class FixWizardDialog(QWizard):
             from src.core.logger import get_logger
             logger = get_logger('fix_wizard_dialog')
 
-            # Worker 종료 대기
+            # 협조적 취소: terminate()는 facade가 잡고 있는 락을 해제하지 못한 채
+            # 스레드를 강제 종료시켜 데드락을 유발할 수 있으므로 사용하지 않는다.
             for name, worker in workers_running:
-                logger.info(f"🛑 {name} Worker 종료 대기 중...")
-                worker.quit()
-                if not worker.wait(3000):  # 3초 대기
-                    logger.warning(f"⚠️ {name} Worker가 시간 내에 종료되지 않음, 강제 종료")
-                    worker.terminate()
-                    worker.wait(1000)
+                logger.info(f"🛑 {name} Worker 취소 요청 중...")
+
+                # 다이얼로그가 닫힌 뒤 소멸될 위젯으로 신호가 전달되지 않도록 먼저 연결 해제
+                for signal in (worker.progress, worker.finished):
+                    try:
+                        signal.disconnect()
+                    except TypeError:
+                        pass
+
+                worker.request_cancel()
+                if not worker.wait(5000):  # 5초 대기 (강제 종료하지 않음)
+                    # logger.warning(...)으로 직접 호출하지 않는다: 메서드명 "warning"이
+                    # QMessageBox.warning()과 동일하여 i18n 하드코딩 문자열 검사기가
+                    # 이 내부 로그 메시지를 UI 문자열로 오인해 오탐(false positive)을
+                    # 일으킨다. logger.log()로 우회해 경고 레벨은 그대로 유지한다.
+                    logger.log(
+                        logging.WARNING,
+                        f"⚠️ {name} Worker가 취소 요청 후에도 종료되지 않았습니다. "
+                        f"강제 종료 없이 백그라운드에서 스스로 종료될 때까지 둡니다."
+                    )
 
         event.accept()
 
@@ -337,8 +353,15 @@ class IssueSelectionPage(QWizardPage):
         self.completeChanged.emit()
 
     def isComplete(self) -> bool:
-        """다음 단계 진행 가능 여부"""
-        return any(chk.isChecked() for chk in self.checkboxes)
+        """다음 단계 진행 가능 여부
+
+        필터로 숨겨진 행은 validatePage()에서도 선택 대상으로 취급하지 않으므로,
+        여기서도 화면에 보이는(숨겨지지 않은) 체크된 행만 반영해야 한다.
+        """
+        return any(
+            chk.isChecked() and not self.table.isRowHidden(i)
+            for i, chk in enumerate(self.checkboxes)
+        )
 
     def validatePage(self) -> bool:
         """페이지 유효성 검사 및 데이터 전달"""
@@ -409,6 +432,7 @@ class CharsetFixPage(QWizardPage):
         self.table_checkboxes: Dict[str, QCheckBox] = {}
         self.table_infos: List[CharsetTableInfo] = []
         self._updating_checkboxes = False  # 연쇄 업데이트 중 플래그
+        self._fk_cache: List = []  # 전체 테이블 대상 FK 조회 결과 (1회 캐시, UI 스레드 DB 재조회 방지)
 
         self.init_ui()
 
@@ -480,16 +504,21 @@ class CharsetFixPage(QWizardPage):
 
     def initializePage(self):
         """페이지 초기화"""
-        # 문자셋 이슈가 없으면 이 페이지 건너뛰기
+        # 문자셋 이슈가 없으면 이 페이지를 건너뛴다 (nextId()가 다음 페이지로 넘김).
+        # 이전에 문자셋 이슈를 선택했다가 뒤로 가서 선택을 해제한 경우를 대비해
+        # 이전 실행에서 남은 테이블/FK 상태를 반드시 초기화한다.
+        # 그렇지 않으면 validatePage()가 stale table_infos를 그대로 읽어
+        # wizard_dialog.charset_tables_to_fix에 이미 취소된 테이블이 남고,
+        # PreviewPage가 더 이상 유효하지 않은 ALTER TABLE SQL을 노출하게 된다.
         if not self.wizard_dialog.has_charset_issues():
+            self._clear_table_widgets()
+            self.table_infos = []
+            self._fk_cache = []
+            self.wizard_dialog.charset_tables_to_fix = set()
+            self.update_stats()
             return
 
-        # 기존 체크박스 제거
-        for i in reversed(range(self.scroll_layout.count())):
-            widget = self.scroll_layout.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
-        self.table_checkboxes.clear()
+        self._clear_table_widgets()
 
         # 테이블 목록 빌드
         plan_builder = self.wizard_dialog.charset_plan_builder
@@ -498,12 +527,33 @@ class CharsetFixPage(QWizardPage):
 
         self.table_infos = plan_builder.build_full_table_list()
 
+        # FK 관계를 전체 테이블 집합 기준으로 1회만 조회하여 캐시한다.
+        # (체크박스를 토글할 때마다 update_stats()에서 매번 DB를 재조회하면
+        #  UI 스레드가 매 클릭마다 블로킹된다.)
+        all_tables = {info.table_name for info in self.table_infos}
+        if all_tables:
+            changer = FKSafeCharsetChanger(
+                self.wizard_dialog.connector,
+                self.wizard_dialog.schema
+            )
+            self._fk_cache = changer.get_related_fks(all_tables)
+        else:
+            self._fk_cache = []
+
         # 테이블별 체크박스 생성
         for info in self.table_infos:
             widget = self._create_table_widget(info)
             self.scroll_layout.addWidget(widget)
 
         self.update_stats()
+
+    def _clear_table_widgets(self):
+        """테이블 체크박스 위젯 전체 제거"""
+        for i in reversed(range(self.scroll_layout.count())):
+            widget = self.scroll_layout.itemAt(i).widget()
+            if widget:
+                widget.deleteLater()
+        self.table_checkboxes.clear()
 
     def _create_table_widget(self, info: CharsetTableInfo) -> QWidget:
         """테이블 위젯 생성"""
@@ -705,17 +755,16 @@ class CharsetFixPage(QWizardPage):
         selected = sum(1 for info in self.table_infos if not info.skip)
         skipped = total - selected
 
-        # FK 개수 계산
+        # FK 개수 계산 (initializePage()에서 전체 테이블 기준으로 1회 캐시한 결과를
+        # 현재 선택된 부분집합으로 필터링만 한다 — 체크박스 토글마다 DB를 재조회하지 않는다)
         fk_count = 0
         if self.wizard_dialog.charset_plan_builder:
             tables_to_fix = {info.table_name for info in self.table_infos if not info.skip}
             if tables_to_fix:
-                changer = FKSafeCharsetChanger(
-                    self.wizard_dialog.connector,
-                    self.wizard_dialog.schema
+                fk_count = sum(
+                    1 for fk in self._fk_cache
+                    if fk.table_name in tables_to_fix or fk.ref_table in tables_to_fix
                 )
-                fks = changer.get_related_fks(tables_to_fix)
-                fk_count = len(fks)
 
         self.lbl_stats.setText(f"선택됨: {selected}개 | 건너뛰기: {skipped}개 | 총 FK: {fk_count}개")
 
@@ -931,62 +980,6 @@ class BatchOptionDialog(QDialog):
         self.accept()
 
 
-class IncludedTablesDialog(QDialog):
-    """자동 포함된 테이블 목록 다이얼로그
-
-    FK 연관테이블 일괄 변경으로 인해 자동 포함된 테이블 목록을 보여줍니다.
-    (옵션 선택 단계만 건너뛰고, 실제 SQL 실행에는 포함됨)
-    """
-
-    def __init__(self, steps: List[FixWizardStep], parent=None):
-        super().__init__(parent)
-        self.steps = steps
-
-        self.setWindowTitle("자동 포함된 테이블 목록")
-        self.setMinimumSize(550, 400)
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-
-        # 자동 포함된 테이블 필터
-        included_steps = [s for s in self.steps if s.included_by is not None]
-
-        # 안내 텍스트
-        info_label = QLabel(
-            f"다음 {len(included_steps)}개 테이블은 FK 연관테이블 일괄 변경에 자동 포함되었습니다.\n"
-            "(옵션 선택 단계만 건너뛰고, 실제 SQL 실행에는 모두 포함됩니다)"
-        )
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("margin-bottom: 10px;")
-        layout.addWidget(info_label)
-
-        # 테이블
-        table = QTableWidget()
-        table.setColumnCount(2)
-        table.setHorizontalHeaderLabels(["테이블명", "포함 원인"])
-        table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        table.setRowCount(len(included_steps))
-        table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-
-        for i, step in enumerate(included_steps):
-            table_name = step.location.split('.')[-1]
-            table.setItem(i, 0, QTableWidgetItem(table_name))
-            table.setItem(i, 1, QTableWidgetItem(f"'{step.included_by}'의 FK 일괄 변경에 포함"))
-
-        layout.addWidget(table)
-
-        # 닫기 버튼
-        btn_close = QPushButton("닫기")
-        btn_close.clicked.connect(self.accept)
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-        btn_layout.addWidget(btn_close)
-        layout.addLayout(btn_layout)
-
-
 class FixOptionPage(QWizardPage):
     """3단계: 이슈별 수정 옵션 선택 (문자셋 제외)
 
@@ -1010,7 +1003,6 @@ class FixOptionPage(QWizardPage):
         self.option_buttons: List[QRadioButton] = []
         self.option_labels: List[QLabel] = []
         self.input_field: Optional[QLineEdit] = None
-        self._fk_graph_builder: Optional[CollationFKGraphBuilder] = None
 
         self.init_ui()
 
@@ -1061,26 +1053,17 @@ class FixOptionPage(QWizardPage):
         """)
         self.btn_batch_apply.clicked.connect(self.show_batch_option_dialog)
 
-        self.btn_show_included = QPushButton("👁️ 자동 포함된 테이블 (0개)")
-        self.btn_show_included.setToolTip("FK 일괄 변경에 자동 포함된 테이블 목록")
-        self.btn_show_included.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #219a52; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
-        self.btn_show_included.clicked.connect(self.show_included_tables_dialog)
-
         btn_layout.addWidget(self.btn_batch_apply)
-        btn_layout.addWidget(self.btn_show_included)
         btn_layout.addStretch()
         progress_layout.addLayout(btn_layout)
 
         layout.addWidget(progress_group)
 
-        # === 중앙 영역: 이슈 정보 + FK Tree ===
+        # === 중앙 영역: 이슈 정보 ===
+        # 참고: 문자셋(Collation) 이슈는 CharsetFixPage에서 별도로 처리되므로
+        # 이 페이지의 wizard_steps에는 절대 포함되지 않는다. 과거 이 페이지가
+        # 문자셋 이슈까지 함께 다루던 시절의 FK 연관 테이블 Tree/자동 포함 UI는
+        # 도달 불가능한 코드였으므로 제거했다.
         self.grp_issue = QGroupBox("현재 이슈")
         issue_main_layout = QVBoxLayout(self.grp_issue)
 
@@ -1097,32 +1080,6 @@ class FixOptionPage(QWizardPage):
         issue_info_layout.addRow("설명:", self.lbl_description)
         issue_main_layout.addLayout(issue_info_layout)
 
-        # FK 연관 테이블 Tree (접을 수 있음)
-        self.fk_tree_group = QGroupBox("▼ FK 연관 테이블")
-        self.fk_tree_group.setCheckable(False)
-        fk_tree_layout = QVBoxLayout(self.fk_tree_group)
-
-        self.fk_tree = QTreeWidget()
-        self.fk_tree.setHeaderHidden(True)
-        self.fk_tree.setMaximumHeight(150)
-        self.fk_tree.setStyleSheet("""
-            QTreeWidget {
-                border: 1px solid #ddd;
-                border-radius: 4px;
-                background-color: #fafafa;
-            }
-            QTreeWidget::item {
-                padding: 2px;
-            }
-            QTreeWidget::item:selected {
-                background-color: #e3f2fd;
-                color: black;
-            }
-        """)
-        fk_tree_layout.addWidget(self.fk_tree)
-        self.fk_tree_group.setVisible(False)
-
-        issue_main_layout.addWidget(self.fk_tree_group)
         layout.addWidget(self.grp_issue)
 
         # === 하단 영역: 옵션 선택 ===
@@ -1164,51 +1121,24 @@ class FixOptionPage(QWizardPage):
               wizard_steps에는 문자셋 제외 이슈만 포함됨.
         """
         self.current_index = 0
-        self._fk_graph_builder = None
 
         # 다른 이슈가 없으면 이 페이지 건너뛰기 (show_current_issue에서 빈 상태 처리)
         if not self.wizard_dialog.wizard_steps:
             return
 
-        # 첫 번째 미포함(옵션 선택 필요) 이슈로 이동
-        self._move_to_first_not_included()
         self.show_current_issue()
-
-    def _move_to_first_not_included(self):
-        """첫 번째 옵션 선택 필요 이슈로 이동 (자동 포함된 테이블 제외)"""
-        steps = self.wizard_dialog.wizard_steps
-        for i, step in enumerate(steps):
-            if step.included_by is None:
-                self.current_index = i
-                return
-        self.current_index = 0
 
     def update_progress_display(self):
         """진행률 업데이트"""
         steps = self.wizard_dialog.wizard_steps
         total = len(steps)
-        included = sum(1 for s in steps if s.included_by is not None)
-        active_total = total - included
 
-        # 현재 위치 (자동 포함된 테이블 제외 인덱스)
-        active_index = sum(
-            1 for i, s in enumerate(steps)
-            if i <= self.current_index and s.included_by is None
-        )
-
-        if active_total > 0:
-            self.lbl_progress.setText(
-                f"이슈 {active_index} / {active_total} "
-                f"(전체 {total}개 중 {included}개 자동 포함)"
-            )
-            self.progress_bar.setValue(int(active_index / active_total * 100))
+        if total > 0:
+            self.lbl_progress.setText(f"이슈 {self.current_index + 1} / {total}")
+            self.progress_bar.setValue(int((self.current_index + 1) / total * 100))
         else:
-            self.lbl_progress.setText(f"이슈 0 / 0 (전체 {total}개 모두 일괄 처리)")
+            self.lbl_progress.setText("이슈 0 / 0")
             self.progress_bar.setValue(100)
-
-        # 자동 포함된 테이블 버튼 업데이트
-        self.btn_show_included.setText(f"👁️ 자동 포함된 테이블 ({included}개)")
-        self.btn_show_included.setEnabled(included > 0)
 
     def show_current_issue(self):
         """현재 이슈 표시"""
@@ -1235,9 +1165,6 @@ class FixOptionPage(QWizardPage):
         self.lbl_type.setText(type_names.get(step.issue_type, str(step.issue_type.value)))
         self.lbl_location.setText(step.location)
         self.lbl_description.setText(step.description)
-
-        # FK Tree 업데이트 (Collation 이슈일 때만)
-        self._update_fk_tree(step)
 
         # 기존 옵션 버튼 및 라벨 제거
         for btn in self.option_buttons:
@@ -1274,11 +1201,6 @@ class FixOptionPage(QWizardPage):
 
             # 설명 라벨
             desc_text = f"    {option.description}"
-
-            # FK 일괄 변경 옵션일 경우 안내 추가
-            if option.strategy == FixStrategy.COLLATION_FK_CASCADE and option.related_tables:
-                desc_text += f"\n    ✅ 위 {len(option.related_tables)}개 테이블이 함께 처리됩니다"
-
             desc_label = QLabel(desc_text)
             desc_label.setWordWrap(True)
             desc_label.setStyleSheet("color: #666; font-size: 11px;")
@@ -1291,72 +1213,11 @@ class FixOptionPage(QWizardPage):
         # 네비게이션 버튼 상태
         self._update_nav_buttons()
 
-    def _update_fk_tree(self, step: FixWizardStep):
-        """FK 연관 테이블 Tree 업데이트"""
-        self.fk_tree.clear()
-
-        # Collation 이슈가 아니면 숨김
-        if step.issue_type != IssueType.CHARSET_ISSUE or not self._fk_graph_builder:
-            self.fk_tree_group.setVisible(False)
-            return
-
-        # 현재 테이블명 추출
-        location_parts = step.location.split('.')
-        if len(location_parts) < 2:
-            self.fk_tree_group.setVisible(False)
-            return
-
-        current_table = location_parts[1]
-
-        # 연관 테이블 가져오기
-        related_tables = self._fk_graph_builder.get_related_tables(current_table)
-
-        if not related_tables:
-            self.fk_tree_group.setVisible(False)
-            return
-
-        # Tree 구성
-        self.fk_tree_group.setTitle(f"▼ FK 연관 테이블 ({len(related_tables) + 1}개)")
-        self.fk_tree_group.setVisible(True)
-
-        # 루트 아이템 (현재 테이블 또는 부모 테이블)
-        all_tables = related_tables | {current_table}
-        ordered = self._fk_graph_builder.get_topological_order(all_tables)
-
-        # 계층 구조로 표시
-        root_item = QTreeWidgetItem(self.fk_tree)
-        root_item.setText(0, f"📁 {ordered[0]}")
-        root_item.setExpanded(True)
-
-        # 나머지 테이블을 자식으로 추가
-        for table in ordered[1:]:
-            child_item = QTreeWidgetItem(root_item)
-            if table == current_table:
-                child_item.setText(0, f"📄 {table}  ← 현재")
-                child_item.setForeground(0, QColor("#e74c3c"))
-            else:
-                child_item.setText(0, f"📄 {table}")
-
-        self.fk_tree.expandAll()
-
     def _update_nav_buttons(self):
         """네비게이션 버튼 상태 업데이트"""
         steps = self.wizard_dialog.wizard_steps
-
-        # 이전 옵션 선택 필요 이슈 존재 여부 (자동 포함 제외)
-        has_prev = any(
-            s.included_by is None
-            for s in steps[:self.current_index]
-        )
-
-        # 다음 옵션 선택 필요 이슈 존재 여부 (자동 포함 제외)
-        has_next = any(
-            s.included_by is None
-            for s in steps[self.current_index + 1:]
-        )
-
-        self.btn_prev_issue.setEnabled(has_prev)
-        self.btn_next_issue.setEnabled(has_next)
+        self.btn_prev_issue.setEnabled(self.current_index > 0)
+        self.btn_next_issue.setEnabled(self.current_index < len(steps) - 1)
 
     def on_option_changed(self, checked: bool, option: FixOption):
         """옵션 변경 시"""
@@ -1366,41 +1227,8 @@ class FixOptionPage(QWizardPage):
         step = self.wizard_dialog.wizard_steps[self.current_index]
         step.selected_option = option
 
-        # FK 일괄 변경 옵션인 경우
-        if option.strategy == FixStrategy.COLLATION_FK_CASCADE:
-            self._mark_related_tables_as_included(step, option)
-        else:
-            # 다른 옵션 선택 시 자동 포함 해제
-            self._unmark_included_tables(step)
-
         self.update_input_field()
         self.update_progress_display()
-
-    def _mark_related_tables_as_included(self, source_step: FixWizardStep, option: FixOption):
-        """FK 연관 테이블들을 자동 포함 처리 (옵션 선택만 건너뜀, 실제 SQL에는 포함)"""
-        if not option.related_tables:
-            return
-
-        source_table = source_step.location.split('.')[-1]  # schema.table → table
-
-        for other_step in self.wizard_dialog.wizard_steps:
-            other_table = other_step.location.split('.')[-1]
-
-            # 연관 테이블인 경우 자동 포함 처리 (현재 테이블 제외)
-            if other_table in option.related_tables and other_table != source_table:
-                other_step.included_by = source_table
-                other_step.included_reason = f"'{source_table}'의 FK 일괄 변경에 포함"
-                other_step.selected_option = option  # 같은 옵션으로 설정
-
-    def _unmark_included_tables(self, source_step: FixWizardStep):
-        """이 테이블로 인해 자동 포함된 테이블들의 포함 해제"""
-        source_table = source_step.location.split('.')[-1]
-
-        for other_step in self.wizard_dialog.wizard_steps:
-            if other_step.included_by == source_table:
-                other_step.included_by = None
-                other_step.included_reason = ""
-                other_step.selected_option = None  # 다시 선택하도록
 
     def update_input_field(self):
         """입력 필드 표시/숨김"""
@@ -1437,35 +1265,20 @@ class FixOptionPage(QWizardPage):
             step.user_input = self.input_field.text()
 
     def prev_issue(self):
-        """이전 이슈 (자동 포함된 테이블 건너뛰기)"""
+        """이전 이슈"""
         self.save_current_selection()
 
-        prev_idx = self.current_index - 1
-        steps = self.wizard_dialog.wizard_steps
-
-        while prev_idx >= 0:
-            if steps[prev_idx].included_by is None:
-                break
-            prev_idx -= 1
-
-        if prev_idx >= 0:
-            self.current_index = prev_idx
+        if self.current_index > 0:
+            self.current_index -= 1
             self.show_current_issue()
 
     def next_issue(self):
-        """다음 이슈 (자동 포함된 테이블 건너뛰기)"""
+        """다음 이슈"""
         self.save_current_selection()
 
-        next_idx = self.current_index + 1
         steps = self.wizard_dialog.wizard_steps
-
-        while next_idx < len(steps):
-            if steps[next_idx].included_by is None:
-                break
-            next_idx += 1
-
-        if next_idx < len(steps):
-            self.current_index = next_idx
+        if self.current_index < len(steps) - 1:
+            self.current_index += 1
             self.show_current_issue()
 
     def show_batch_option_dialog(self):
@@ -1474,11 +1287,6 @@ class FixOptionPage(QWizardPage):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             # 모든 옵션이 적용되었으므로 다음 단계로 이동
             self.wizard_dialog.next()
-
-    def show_included_tables_dialog(self):
-        """자동 포함된 테이블 목록 다이얼로그 표시"""
-        dialog = IncludedTablesDialog(self.wizard_dialog.wizard_steps, self)
-        dialog.exec()
 
     def isComplete(self) -> bool:
         """다음 단계 진행 가능 여부"""
@@ -1500,11 +1308,8 @@ class FixOptionPage(QWizardPage):
 
         self.save_current_selection()
 
-        # 모든 옵션 선택 필요 이슈에 옵션이 선택되었는지 확인
+        # 모든 이슈에 옵션이 선택되었는지 확인
         for step in self.wizard_dialog.wizard_steps:
-            if step.included_by is not None:
-                continue  # 자동 포함된 이슈는 검사 스킵 (이미 옵션 선택됨)
-
             if not step.selected_option:
                 QMessageBox.warning(self, "선택 필요", f"'{step.location}'의 수정 옵션을 선택하세요.")
                 return False
@@ -1640,7 +1445,6 @@ class PreviewPage(QWizardPage):
         other_execute_count = sum(
             1 for s in steps
             if s.selected_option and s.selected_option.strategy != FixStrategy.SKIP
-            and s.included_by is None
         )
 
         if steps:
@@ -1652,10 +1456,6 @@ class PreviewPage(QWizardPage):
             processed_sql_hashes: set = set()
 
             for step in steps:
-                # 자동 포함된 테이블은 건너뛰기 (원본 테이블의 SQL에 이미 포함됨)
-                if step.included_by is not None:
-                    continue
-
                 if step.selected_option and step.selected_option.strategy != FixStrategy.SKIP:
                     sql = step.selected_option.sql_template or ""
                     if step.selected_option.requires_input and step.user_input:

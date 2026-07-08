@@ -90,9 +90,23 @@ class FixWizardWorker(QThread):
         self.steps = steps
         self.dry_run = dry_run
         self.charset_tables_to_fix = charset_tables_to_fix or set()
+        self._cancel_requested = False
+
+    def request_cancel(self):
+        """협조적 취소 요청
+
+        QThread.terminate()는 facade가 잡고 있는 락을 해제하지 못한 채
+        스레드를 강제 종료시켜 데드락을 유발할 수 있다. 대신 안전한 체크포인트
+        (각 단계 시작 전)에서 스스로 중단하도록 플래그만 세운다.
+        """
+        self._cancel_requested = True
 
     def run(self):
         try:
+            if self._cancel_requested:
+                self.finished.emit(False, "사용자 요청으로 취소되었습니다.", CombinedExecutionResult())
+                return
+
             combined_result = CombinedExecutionResult()
             mode = "[DRY-RUN]" if self.dry_run else "[실행]"
 
@@ -129,6 +143,12 @@ class FixWizardWorker(QThread):
                     self.progress.emit(f"   ❌ 문자셋 변경 실패: {message}")
 
                 self.progress.emit("")
+
+            # 단계 사이 취소 체크포인트 (facade 락을 오래 잡지 않는 안전 지점)
+            if self._cancel_requested:
+                self.progress.emit("🛑 취소 요청으로 나머지 작업을 건너뜁니다.")
+                self.finished.emit(False, "사용자 요청으로 취소되었습니다.", combined_result)
+                return
 
             # === 2. 기타 이슈 처리 ===
             if self.steps:
