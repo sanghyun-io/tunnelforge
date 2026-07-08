@@ -110,6 +110,11 @@ class CleanupAction:
     sql: str
     affected_rows: int
     dry_run: bool = True
+    # dry-run 시 COUNT 쿼리를 만들 때 쓰는 실행 메타데이터.
+    # sql 텍스트를 문자열 분해(split)로 재파싱하지 않기 위해 생성 시점에
+    # 직접 저장해둔다 (테이블명에 FROM/WHERE/SET 같은 키워드가 포함돼도 안전).
+    target_schema: Optional[str] = None
+    target_table: Optional[str] = None
 
 
 @dataclass
@@ -171,7 +176,9 @@ class AnalysisResult:
                 description=a['description'],
                 sql=a['sql'],
                 affected_rows=a['affected_rows'],
-                dry_run=a.get('dry_run', True)
+                dry_run=a.get('dry_run', True),
+                target_schema=a.get('target_schema'),
+                target_table=a.get('target_table')
             )
             for a in data.get('cleanup_actions', [])
         ]
@@ -498,7 +505,11 @@ class MigrationAnalyzer:
             definition = routine['ROUTINE_DEFINITION'].upper() if routine['ROUTINE_DEFINITION'] else ""
 
             for func in self.DEPRECATED_FUNCTIONS:
-                if func in definition:
+                # 단순 부분 문자열 매칭(`func in definition`)은 `password`
+                # 같은 컬럼/변수명에도 오탐한다. 함수 호출 경계(뒤에 '('가
+                # 오는지)까지 확인해 실제 호출만 잡는다. 언더스코어는 단어
+                # 문자라서 \b가 AES_ENCRYPT 안의 ENCRYPT에는 걸리지 않는다.
+                if re.search(r'\b' + re.escape(func) + r'\s*\(', definition):
                     # removed vs deprecated 차등화
                     is_deprecated_only = func in self._DEPRECATED_ONLY
                     severity = "warning" if is_deprecated_only else "error"
@@ -557,22 +568,31 @@ class MigrationAnalyzer:
         schema: str,
         dry_run: bool = True
     ) -> CleanupAction:
-        """고아 레코드 정리 SQL 생성"""
+        """고아 레코드 정리 SQL 생성
+
+        NOT IN 대신 NOT EXISTS를 사용한다. 부모 테이블의 참조 컬럼에 NULL이
+        하나라도 있으면 `col NOT IN (SELECT ... )`의 서브쿼리 결과에 NULL이
+        섞여 비교 결과가 전부 UNKNOWN이 되어, 실제로는 고아 레코드가 있어도
+        0건으로 처리되는 NULL-안전성 문제가 있다. find_orphan_records()의
+        대용량 테이블 경로와 동일하게 NOT EXISTS로 통일한다.
+        """
         if action == ActionType.DELETE:
-            sql = f"""DELETE FROM `{schema}`.`{orphan.child_table}`
-WHERE `{orphan.child_column}` NOT IN (
-    SELECT `{orphan.parent_column}` FROM `{schema}`.`{orphan.parent_table}`
-)
-AND `{orphan.child_column}` IS NOT NULL"""
+            sql = f"""DELETE c FROM `{schema}`.`{orphan.child_table}` AS c
+WHERE c.`{orphan.child_column}` IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM `{schema}`.`{orphan.parent_table}` AS p
+        WHERE p.`{orphan.parent_column}` = c.`{orphan.child_column}`
+    )"""
             description = f"{orphan.child_table}에서 고아 레코드 {orphan.orphan_count}개 삭제"
 
         elif action == ActionType.SET_NULL:
-            sql = f"""UPDATE `{schema}`.`{orphan.child_table}`
-SET `{orphan.child_column}` = NULL
-WHERE `{orphan.child_column}` NOT IN (
-    SELECT `{orphan.parent_column}` FROM `{schema}`.`{orphan.parent_table}`
-)
-AND `{orphan.child_column}` IS NOT NULL"""
+            sql = f"""UPDATE `{schema}`.`{orphan.child_table}` AS c
+SET c.`{orphan.child_column}` = NULL
+WHERE c.`{orphan.child_column}` IS NOT NULL
+    AND NOT EXISTS (
+        SELECT 1 FROM `{schema}`.`{orphan.parent_table}` AS p
+        WHERE p.`{orphan.parent_column}` = c.`{orphan.child_column}`
+    )"""
             description = f"{orphan.child_table}.{orphan.child_column}을 NULL로 설정 ({orphan.orphan_count}개)"
 
         else:
@@ -585,7 +605,9 @@ AND `{orphan.child_column}` IS NOT NULL"""
             description=description,
             sql=sql,
             affected_rows=orphan.orphan_count,
-            dry_run=dry_run
+            dry_run=dry_run,
+            target_schema=schema,
+            target_table=orphan.child_table
         )
 
     def execute_cleanup(
@@ -616,27 +638,31 @@ AND `{orphan.child_column}` IS NOT NULL"""
             if action.action_type == ActionType.MANUAL:
                 return True, "수동 처리 필요", 0
 
+            if not action.target_schema or not action.target_table:
+                # sql 텍스트를 split('FROM')/split('UPDATE') 등으로 재파싱해
+                # 테이블명을 추측하지 않는다. 테이블명이 SETTINGS/ASSETS처럼
+                # FROM/SET 같은 키워드를 포함하면 잘못 잘려나가는 문제가 있었다.
+                # 메타데이터가 없으면(예: 구버전 직렬화 복원) 추측 대신 명시적으로 실패시킨다.
+                return False, "❌ 정리 대상 메타데이터 없음", 0
+
             # COUNT 쿼리로 변환하여 영향받는 행 수 확인
-            # DELETE/UPDATE의 WHERE 절 추출
+            # DELETE/UPDATE의 WHERE 절만 추출하고, 테이블은 생성 시점에
+            # CleanupAction에 저장해둔 target_schema/target_table을 그대로 사용한다.
             sql_upper = action.sql.upper()
-            if 'WHERE' in sql_upper:
-                where_idx = action.sql.upper().find('WHERE')
-                where_clause = action.sql[where_idx:]
+            if 'WHERE' not in sql_upper:
+                return True, "[DRY-RUN] 영향 분석 완료", action.affected_rows
 
-                # 테이블명 추출
-                if action.action_type == ActionType.DELETE:
-                    # DELETE FROM `schema`.`table` WHERE ...
-                    count_sql = f"SELECT COUNT(*) as cnt FROM {action.sql.split('FROM')[1].split('WHERE')[0].strip()} {where_clause}"
-                else:
-                    # UPDATE `schema`.`table` SET ... WHERE ...
-                    count_sql = f"SELECT COUNT(*) as cnt FROM {action.sql.split('UPDATE')[1].split('SET')[0].strip()} {where_clause}"
+            where_idx = action.sql.upper().find('WHERE')
+            where_clause = action.sql[where_idx:]
 
-                result = self.connector.execute(count_sql)
-                affected = result[0]['cnt'] if result else 0
+            count_sql = (
+                f"SELECT COUNT(*) as cnt FROM `{action.target_schema}`.`{action.target_table}` AS c "
+                f"{where_clause}"
+            )
+            result = self.connector.execute(count_sql)
+            affected = result[0]['cnt'] if result else 0
 
-                return True, f"[DRY-RUN] {affected}개 행이 영향받음", affected
-
-            return True, "[DRY-RUN] 영향 분석 완료", action.affected_rows
+            return True, f"[DRY-RUN] {affected}개 행이 영향받음", affected
 
     def analyze_schema(
         self,
@@ -654,7 +680,8 @@ AND `{orphan.child_column}` IS NOT NULL"""
         check_year2: bool = True,
         check_deprecated_engines: bool = True,
         check_enum_empty: bool = True,
-        check_timestamp_range: bool = True
+        check_timestamp_range: bool = True,
+        check_int_display_width: bool = True
     ) -> AnalysisResult:
         """
         스키마 전체 분석
@@ -675,6 +702,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
             check_deprecated_engines: deprecated 스토리지 엔진 검사 여부
             check_enum_empty: ENUM 빈 문자열 검사 여부
             check_timestamp_range: TIMESTAMP 2038년 범위 검사 여부
+            check_int_display_width: INT(11) 등 표시 너비 검사 여부
 
         Returns:
             AnalysisResult
@@ -706,6 +734,7 @@ AND `{orphan.child_column}` IS NOT NULL"""
                 check_deprecated_engines=check_deprecated_engines,
                 check_enum_empty=check_enum_empty,
                 check_timestamp_range=check_timestamp_range,
+                check_int_display_width=check_int_display_width,
             )
         finally:
             self.connector.set_session_sql_mode(original_sql_mode)
@@ -726,7 +755,8 @@ AND `{orphan.child_column}` IS NOT NULL"""
         check_year2: bool = True,
         check_deprecated_engines: bool = True,
         check_enum_empty: bool = True,
-        check_timestamp_range: bool = True
+        check_timestamp_range: bool = True,
+        check_int_display_width: bool = True
     ) -> 'AnalysisResult':
         """analyze_schema 내부 구현 (sql_mode 완화 상태에서 실행)"""
         from datetime import datetime
@@ -748,64 +778,68 @@ AND `{orphan.child_column}` IS NOT NULL"""
 
         # 고아 레코드 검사
         if check_orphans and fk_list:
-            self._log("📌 [1/14] 고아 레코드 검사 시작...")
+            self._log("📌 [1/15] 고아 레코드 검사 시작...")
             result.orphan_records = self.find_orphan_records(schema)
-            self._log(f"✅ [1/14] 고아 레코드 검사 완료 (발견: {len(result.orphan_records)}건)")
+            self._log(f"✅ [1/15] 고아 레코드 검사 완료 (발견: {len(result.orphan_records)}건)")
 
         # 호환성 검사들 (기존)
         if check_charset:
-            self._log("📌 [2/14] 문자셋 이슈 검사...")
+            self._log("📌 [2/15] 문자셋 이슈 검사...")
             result.compatibility_issues.extend(self.check_charset_issues(schema))
 
         if check_keywords:
-            self._log("📌 [3/14] 예약어 충돌 검사...")
+            self._log("📌 [3/15] 예약어 충돌 검사...")
             result.compatibility_issues.extend(self.check_reserved_keywords(schema))
 
         if check_routines:
-            self._log("📌 [4/14] 저장 프로시저/함수 검사...")
+            self._log("📌 [4/15] 저장 프로시저/함수 검사...")
             result.compatibility_issues.extend(self.check_deprecated_in_routines(schema))
 
         if check_sql_mode:
-            self._log("📌 [5/14] SQL 모드 검사...")
+            self._log("📌 [5/15] SQL 모드 검사...")
             result.compatibility_issues.extend(self.check_sql_modes())
 
         # MySQL 8.4 Upgrade Checker 검사들
         if check_auth_plugins:
-            self._log("📌 [6/14] 인증 플러그인 검사...")
+            self._log("📌 [6/15] 인증 플러그인 검사...")
             result.compatibility_issues.extend(self.check_auth_plugins())
 
         if check_zerofill:
-            self._log("📌 [7/14] ZEROFILL 속성 검사...")
+            self._log("📌 [7/15] ZEROFILL 속성 검사...")
             result.compatibility_issues.extend(self.check_zerofill_columns(schema))
 
         if check_float_precision:
-            self._log("📌 [8/14] FLOAT(M,D) 구문 검사...")
+            self._log("📌 [8/15] FLOAT(M,D) 구문 검사...")
             result.compatibility_issues.extend(self.check_float_precision(schema))
 
         if check_fk_name_length:
-            self._log("📌 [9/14] FK 이름 길이 검사...")
+            self._log("📌 [9/15] FK 이름 길이 검사...")
             result.compatibility_issues.extend(self.check_fk_name_length(schema))
 
         if check_invalid_dates:
-            self._log("📌 [10/14] 0000-00-00 날짜값 검사...")
+            self._log("📌 [10/15] 0000-00-00 날짜값 검사...")
             result.compatibility_issues.extend(self.check_invalid_date_values(schema))
 
         # 추가 호환성 검사들
         if check_year2:
-            self._log("📌 [11/14] YEAR(2) 타입 검사...")
+            self._log("📌 [11/15] YEAR(2) 타입 검사...")
             result.compatibility_issues.extend(self.check_year2_type(schema))
 
         if check_deprecated_engines:
-            self._log("📌 [12/14] deprecated 스토리지 엔진 검사...")
+            self._log("📌 [12/15] deprecated 스토리지 엔진 검사...")
             result.compatibility_issues.extend(self.check_deprecated_engines(schema))
 
         if check_enum_empty:
-            self._log("📌 [13/14] ENUM 빈 문자열 검사...")
+            self._log("📌 [13/15] ENUM 빈 문자열 검사...")
             result.compatibility_issues.extend(self.check_enum_empty_value(schema))
 
         if check_timestamp_range:
-            self._log("📌 [14/14] TIMESTAMP 범위 검사...")
+            self._log("📌 [14/15] TIMESTAMP 범위 검사...")
             result.compatibility_issues.extend(self.check_timestamp_range(schema))
+
+        if check_int_display_width:
+            self._log("📌 [15/15] INT 표시 너비 검사...")
+            result.compatibility_issues.extend(self.check_int_display_width(schema))
 
         # 정리 작업 생성 (고아 레코드에 대해)
         for orphan in result.orphan_records:
@@ -1187,7 +1221,14 @@ AND `{orphan.child_column}` IS NOT NULL"""
         return issues
 
     def check_timestamp_range(self, schema: str) -> List[CompatibilityIssue]:
-        """TIMESTAMP 범위 초과 데이터 검사 (2038년 문제)"""
+        """TIMESTAMP 2038년 범위 제한 검사
+
+        TIMESTAMP는 애초에 '2038-01-19 03:14:07' UTC를 초과하는 값을 저장할
+        수 없는 타입이므로, 저장된 데이터를 `WHERE col > '2038-01-19 03:14:07'`
+        로 조회해 "범위 초과 데이터"를 찾으려는 시도는 절대 참이 될 수 없어
+        항상 0건만 반환하는 무의미한 검사였다. 대신 TIMESTAMP 컬럼이 존재한다는
+        사실 자체를 스키마 레벨 advisory(경고)로 보고한다.
+        """
         self._log("🔍 TIMESTAMP 범위 확인 중...")
 
         issues = []
@@ -1205,36 +1246,21 @@ AND `{orphan.child_column}` IS NOT NULL"""
             table = col['TABLE_NAME']
             column = col['COLUMN_NAME']
 
-            try:
-                # 2038-01-19 이후 데이터 확인
-                check_query = f"""
-                SELECT COUNT(*) as cnt
-                FROM `{schema}`.`{table}`
-                WHERE `{column}` > '2038-01-19 03:14:07'
-                """
-                result = self.connector.execute(check_query)
-                count = result[0]['cnt'] if result else 0
-
-                if count > 0:
-                    issues.append(CompatibilityIssue(
-                        issue_type=IssueType.TIMESTAMP_RANGE,
-                        severity="error",
-                        location=f"{schema}.{table}.{column}",
-                        description=f"TIMESTAMP 범위 초과 데이터 {count:,}개 (2038년 문제)",
-                        suggestion="DATETIME으로 타입 변경 권장",
-                        table_name=table,
-                        column_name=column,
-                        fix_query=f"ALTER TABLE `{schema}`.`{table}` MODIFY `{column}` DATETIME;"
-                    ))
-
-            except Exception as e:
-                self._log(f"    ⏭️ {table}.{column} TIMESTAMP 검사 스킵: {str(e)[:80]}")
-                continue
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.TIMESTAMP_RANGE,
+                severity="warning",
+                location=f"{schema}.{table}.{column}",
+                description="TIMESTAMP 컬럼은 2038년 범위 제한이 있습니다",
+                suggestion="2038년 이후 값이 필요한 컬럼은 DATETIME으로 변경을 검토하세요",
+                table_name=table,
+                column_name=column,
+                fix_query=f"ALTER TABLE `{schema}`.`{table}` MODIFY `{column}` DATETIME;"
+            ))
 
         if issues:
-            self._log(f"  ⚠️ TIMESTAMP 범위 초과 {len(issues)}개 발견")
+            self._log(f"  ⚠️ TIMESTAMP 범위 제한 컬럼 {len(issues)}개 발견")
         else:
-            self._log(f"  ✅ TIMESTAMP 범위 정상")
+            self._log("  ✅ TIMESTAMP 컬럼 없음")
 
         return issues
 
@@ -1623,9 +1649,18 @@ class TableIndexInfo:
     is_primary: bool
 
     def covers_columns(self, cols: List[str]) -> bool:
-        """주어진 컬럼들이 이 인덱스로 커버되는지 확인"""
+        """주어진 컬럼 목록과 이 인덱스의 컬럼이 완전히 일치하는지 확인
+
+        FK 참조 컬럼이 PK/UNIQUE로 보장되는지 판정하는 데 쓰인다. prefix만
+        일치해도 True를 반환하던 이전 로직은 UNIQUE(a,b) 인덱스가 FK 참조
+        (a) 하나만으로도 유니크함을 보장한다고 잘못 판단했다 - UNIQUE(a,b)는
+        (a)만으로는 유니크함을 보장하지 않으므로 길이와 순서를 모두 엄격히
+        비교해야 한다.
+        """
+        if len(cols) != len(self.columns):
+            return False
         cols_lower = [c.lower() for c in cols]
-        idx_cols_lower = [c.lower() for c in self.columns[:len(cols)]]
+        idx_cols_lower = [c.lower() for c in self.columns]
         return cols_lower == idx_cols_lower
 
 

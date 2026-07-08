@@ -66,13 +66,14 @@ class TestParsedIndex:
         idx = ParsedIndex(name="idx1", columns=["a", "b", "c"])
         assert idx.covers_columns(["a", "b", "c"]) is True
 
-    def test_covers_columns_prefix(self):
+    def test_covers_columns_prefix_is_not_exact_match(self):
+        """UNIQUE(a,b,c)는 (a,b) prefix만으로 유니크함을 보장하지 않는다"""
         idx = ParsedIndex(name="idx1", columns=["a", "b", "c"])
-        assert idx.covers_columns(["a", "b"]) is True
+        assert idx.covers_columns(["a", "b"]) is False
 
-    def test_covers_columns_single(self):
+    def test_covers_columns_single_of_composite_is_not_exact_match(self):
         idx = ParsedIndex(name="idx1", columns=["a", "b"])
-        assert idx.covers_columns(["a"]) is True
+        assert idx.covers_columns(["a"]) is False
 
     def test_covers_columns_wrong_order(self):
         idx = ParsedIndex(name="idx1", columns=["a", "b"])
@@ -82,8 +83,12 @@ class TestParsedIndex:
         idx = ParsedIndex(name="idx1", columns=["Name", "Email"])
         assert idx.covers_columns(["name", "email"]) is True
 
-    def test_covers_columns_empty(self):
+    def test_covers_columns_empty_cols_against_nonempty_index_is_false(self):
         idx = ParsedIndex(name="idx1", columns=["a"])
+        assert idx.covers_columns([]) is False
+
+    def test_covers_columns_both_empty_is_true(self):
+        idx = ParsedIndex(name="idx1", columns=[])
         assert idx.covers_columns([]) is True
 
     def test_defaults(self):
@@ -900,3 +905,81 @@ class TestParserEdgeCases:
         table_parser._parse_table_options("no paren here at all", table)
         # 옵션 파싱 없이 정상 반환 (예외 없음)
         assert table.engine is None
+
+
+# ============================================================
+# phantom index / prefix index / quote-aware 파싱 회귀 테스트
+# ============================================================
+class TestParserPhantomIndexAndQuoteAwareRegressions:
+    """_parse_indexes가 PRIMARY KEY/FOREIGN KEY 절에 오매칭되어 존재하지
+    않는 phantom index를 만들어내던 문제, prefix length가 있는 인덱스가
+    깨지던 문제, 문자열 리터럴 내부의 콤마/괄호가 정의를 잘못 쪼개던
+    문제에 대한 회귀 테스트."""
+
+    @pytest.fixture
+    def parser(self):
+        return CreateTableParser()
+
+    def test_pk_fk_clauses_do_not_create_phantom_indexes(self, parser):
+        sql = """CREATE TABLE `t` (
+  `id` INT,
+  `user_id` INT,
+  PRIMARY KEY (`id`),
+  KEY `idx_user` (`user_id`),
+  CONSTRAINT `fk_user` FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+);"""
+        result = parser.parse(sql)
+        non_primary_names = [i.name for i in result.indexes if not i.is_primary]
+        assert non_primary_names == ["idx_user"]
+
+    def test_simple_foreign_key_without_constraint_does_not_create_phantom_index(self, parser):
+        """CONSTRAINT 없는 단순 FOREIGN KEY 절도 phantom index를 만들면 안 된다"""
+        sql = """CREATE TABLE `t` (
+  `id` INT,
+  `user_id` INT,
+  PRIMARY KEY (`id`),
+  FOREIGN KEY (`user_id`) REFERENCES `users` (`id`)
+);"""
+        result = parser.parse(sql)
+        non_primary = [i for i in result.indexes if not i.is_primary]
+        assert non_primary == []
+
+    def test_prefix_index_parses_through_full_parse(self, parser):
+        """KEY `idx_n` (`name`(10)) - 중첩 괄호(prefix length)가 있는 인덱스"""
+        sql = "CREATE TABLE `t` (\n  `name` VARCHAR(100),\n  KEY `idx_n` (`name`(10))\n);"
+        result = parser.parse(sql)
+        idx = next(i for i in result.indexes if i.name == "idx_n")
+        assert idx.columns == ["name"]
+        assert idx.prefix_lengths == [10]
+
+    def test_body_extraction_not_truncated_by_paren_inside_quoted_comment(self, parser):
+        """COMMENT '50%) discount' 안의 ')'가 body 추출을 조기 종료시키면 안 된다"""
+        sql = "CREATE TABLE `t` (`a` INT COMMENT '50%) discount', `b` INT NOT NULL, `c` VARCHAR(10));"
+        result = parser.parse(sql)
+        col_names = [c.name for c in result.columns]
+        assert col_names == ["a", "b", "c"]
+
+    def test_split_definitions_ignores_comma_inside_quoted_string(self, parser):
+        body = "`a` VARCHAR(20) DEFAULT 'x,y', `b` VARCHAR(20) COMMENT 'note, with comma'"
+        defs = parser._split_definitions(body)
+        assert len(defs) == 2
+        assert "'x,y'" in defs[0]
+        assert "'note, with comma'" in defs[1]
+
+    def test_split_definitions_ignores_paren_inside_quoted_string(self, parser):
+        body = "`a` INT COMMENT '50%) discount', `b` INT NOT NULL"
+        defs = parser._split_definitions(body)
+        assert len(defs) == 2
+        assert "COMMENT '50%) discount'" in defs[0]
+        assert defs[1].strip() == "`b` INT NOT NULL"
+
+    def test_split_definitions_handles_backslash_escaped_quote_with_comma(self, parser):
+        body = r"`note` VARCHAR(100) DEFAULT 'it\'s, a test', `flag` TINYINT(1)"
+        defs = parser._split_definitions(body)
+        assert len(defs) == 2
+
+    def test_find_matching_paren_returns_none_when_unclosed(self, parser):
+        assert parser._find_matching_paren("(abc", 0) is None
+
+    def test_extract_parenthesized_basic(self, parser):
+        assert parser._extract_parenthesized("(`a`, `b`)", 0) == "`a`, `b`"

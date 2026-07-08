@@ -61,9 +61,17 @@ class ParsedIndex:
     index_type: Optional[str] = None  # BTREE, HASH
 
     def covers_columns(self, cols: List[str]) -> bool:
-        """주어진 컬럼들이 이 인덱스로 커버되는지 확인"""
+        """주어진 컬럼 목록과 이 인덱스의 컬럼이 완전히 일치하는지 확인
+
+        prefix(왼쪽부터 일부)만 일치해도 True를 반환하던 과거 로직은
+        UNIQUE(a,b) 인덱스가 (a) 하나만으로도 유니크함을 보장한다고
+        잘못 판단하게 만든다. FK 참조 검증처럼 "이 컬럼 목록으로 유니크함이
+        보장되는가"를 확인하는 용도이므로 길이와 순서를 모두 엄격히 비교한다.
+        """
+        if len(cols) != len(self.columns):
+            return False
         cols_lower = [c.lower() for c in cols]
-        idx_cols_lower = [c.lower() for c in self.columns[:len(cols)]]
+        idx_cols_lower = [c.lower() for c in self.columns]
         return cols_lower == idx_cols_lower
 
 
@@ -173,11 +181,16 @@ class CreateTableParser:
         re.IGNORECASE
     )
 
+    # 정의(definition) 시작 부분에만 앵커링된 "헤더" 패턴.
+    # 컬럼 목록은 여기서 캡처하지 않고 balanced-paren 스캔(_extract_parenthesized)으로
+    # 별도 추출한다 - `[^)]+`로는 `name`(10)처럼 중첩된 괄호(prefix length)를
+    # 다루지 못하고, PRIMARY KEY/FOREIGN KEY 절 내부의 "...KEY (...)" 부분에도
+    # 오매칭되어 phantom index를 만들어내는 문제가 있었다.
     INDEX_PATTERN = re.compile(
-        r'(?:(UNIQUE|FULLTEXT|SPATIAL)\s+)?'
+        r'^(?:(UNIQUE|FULLTEXT|SPATIAL)\s+)?'
         r'(?:KEY|INDEX)\s+'
         r'(?:`?(\w+)`?\s*)?'  # 인덱스명
-        r'\(\s*([^)]+)\s*\)',
+        r'\(',
         re.IGNORECASE
     )
 
@@ -241,18 +254,64 @@ class CreateTableParser:
         if start == -1:
             return None
 
-        depth = 0
-        end = start
-        for i in range(start, len(sql)):
-            if sql[i] == '(':
-                depth += 1
-            elif sql[i] == ')':
-                depth -= 1
-                if depth == 0:
-                    end = i
-                    break
+        end = self._find_matching_paren(sql, start)
+        if end is None:
+            # 닫는 괄호가 없는 불완전한 SQL - 여는 괄호 이후 전체를 body로 취급
+            return sql[start + 1:]
 
         return sql[start + 1:end]
+
+    def _find_matching_paren(self, text: str, open_idx: int) -> Optional[int]:
+        """open_idx 위치의 '('에 대응하는 닫는 ')' 인덱스를 찾는다
+
+        작은따옴표/큰따옴표/백틱으로 감싸인 문자열 리터럴 내부의 괄호는
+        깊이 계산에서 제외한다 (예: COMMENT '50%) discount' 안의 ')'가
+        괄호를 조기에 닫힌 것으로 오인되는 문제 방지).
+        """
+        depth = 0
+        quote: Optional[str] = None
+        i = open_idx
+        n = len(text)
+
+        while i < n:
+            char = text[i]
+
+            if quote:
+                if char == '\\' and quote != '`' and i + 1 < n:
+                    # 백슬래시 이스케이프: 다음 문자를 리터럴로 그대로 소비
+                    i += 2
+                    continue
+                if char == quote:
+                    if i + 1 < n and text[i + 1] == quote:
+                        # 이스케이프된 따옴표 반복('' / `` / "") - 문자열 계속
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+
+            if char in ("'", '"', '`'):
+                quote = char
+            elif char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+                if depth == 0:
+                    return i
+            i += 1
+
+        return None
+
+    def _extract_parenthesized(self, text: str, open_idx: int) -> Optional[str]:
+        """open_idx 위치의 '('부터 대응하는 ')'까지의 내부 텍스트를 반환"""
+        if open_idx < 0 or open_idx >= len(text) or text[open_idx] != '(':
+            return None
+
+        close_idx = self._find_matching_paren(text, open_idx)
+        if close_idx is None:
+            return None
+
+        return text[open_idx + 1:close_idx]
 
     def _parse_columns(self, body: str) -> List[ParsedColumn]:
         """컬럼 정의 파싱"""
@@ -366,13 +425,33 @@ class CreateTableParser:
         )
 
     def _parse_indexes(self, body: str) -> List[ParsedIndex]:
-        """인덱스 정의 파싱"""
+        """인덱스 정의 파싱
+
+        definition 단위(_split_definitions)로 순회하며 PRIMARY KEY/FOREIGN
+        KEY/CONSTRAINT 절은 미리 건너뛴다. 예전에는 INDEX_PATTERN을 body
+        전체에 finditer로 적용해서 "FOREIGN KEY (`col`)" 같은 절의 "KEY
+        (`col`)" 부분에도 오매칭되어 존재하지 않는 phantom index를
+        만들어냈다. 컬럼 목록도 정규식의 [^)]+ 대신 balanced-paren 스캔으로
+        추출해 `name`(10) 같은 prefix length 표기를 올바르게 처리한다.
+        """
         indexes = []
 
-        for match in self.INDEX_PATTERN.finditer(body):
+        for defn in self._split_definitions(body):
+            defn_upper = defn.upper()
+            if defn_upper.startswith('PRIMARY') or defn_upper.startswith('FOREIGN') or defn_upper.startswith('CONSTRAINT'):
+                continue
+
+            match = self.INDEX_PATTERN.match(defn)
+            if not match:
+                continue
+
             index_type = match.group(1) or ""
             index_name = match.group(2) or f"idx_{len(indexes)}"
-            columns_str = match.group(3)
+
+            open_idx = match.end() - 1  # 패턴이 여는 '('까지 소비하므로 바로 그 위치
+            columns_str = self._extract_parenthesized(defn, open_idx)
+            if columns_str is None:
+                continue
 
             columns, prefix_lengths = self._parse_index_columns(columns_str)
 
@@ -499,26 +578,58 @@ class CreateTableParser:
             table.comment = comment_match.group(1)
 
     def _split_definitions(self, body: str) -> List[str]:
-        """콤마로 정의 분리 (괄호 안 콤마 제외)"""
-        definitions = []
-        current = ""
-        depth = 0
+        """콤마로 정의 분리 (괄호 안 콤마 제외)
 
-        for char in body:
-            if char == '(':
+        문자열 리터럴(작은따옴표/큰따옴표/백틱) 내부의 콤마와 괄호는
+        구분자로 보지 않는다. 예전 구현은 따옴표를 모르는 채로 depth만
+        추적해서 `DEFAULT 'a,b'`나 `COMMENT '50%) discount'`처럼 리터럴
+        안에 콤마/괄호가 들어간 정의를 잘못 쪼갰다.
+        """
+        definitions = []
+        current: List[str] = []
+        depth = 0
+        quote: Optional[str] = None
+        i = 0
+        n = len(body)
+
+        while i < n:
+            char = body[i]
+
+            if quote:
+                current.append(char)
+                if char == '\\' and quote != '`' and i + 1 < n:
+                    # 백슬래시 이스케이프: 다음 문자를 리터럴로 그대로 소비
+                    current.append(body[i + 1])
+                    i += 2
+                    continue
+                if char == quote:
+                    if i + 1 < n and body[i + 1] == quote:
+                        # 이스케이프된 따옴표 반복('' / `` / "") - 문자열 계속
+                        current.append(body[i + 1])
+                        i += 2
+                        continue
+                    quote = None
+                i += 1
+                continue
+
+            if char in ("'", '"', '`'):
+                quote = char
+                current.append(char)
+            elif char == '(':
                 depth += 1
-                current += char
+                current.append(char)
             elif char == ')':
                 depth -= 1
-                current += char
+                current.append(char)
             elif char == ',' and depth == 0:
-                definitions.append(current.strip())
-                current = ""
+                definitions.append(''.join(current).strip())
+                current = []
             else:
-                current += char
+                current.append(char)
+            i += 1
 
-        if current.strip():
-            definitions.append(current.strip())
+        if ''.join(current).strip():
+            definitions.append(''.join(current).strip())
 
         return definitions
 
