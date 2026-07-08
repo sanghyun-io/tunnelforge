@@ -9,9 +9,13 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
+from src.core.constants import SYSTEM_SCHEMAS
 from src.core.cross_engine_migration import db_core_executable, parse_helper_event
+from src.core.logger import get_logger
 from src.core.platform_integration import no_window_creation_flags
 from src.core.sql_query_classifier import statement_returns_rows
+
+logger = get_logger("db_core_service")
 
 
 class DbCoreServiceError(RuntimeError):
@@ -466,9 +470,12 @@ class RustDbConnector:
             database=database or ("postgres" if engine == "postgresql" else ""),
             schema=schema,
         )
-        self.facade = facade or get_shared_db_core_facade()
+        self.facade = facade if facade is not None else get_shared_db_core_facade()
         self.connection_id: Optional[str] = None
         self.connection: Optional[RustDbConnection] = None
+
+    def _log_metadata_error(self, operation: str, exc: Exception) -> None:
+        logger.exception("%s 메타데이터 조회 실패: %s", operation, exc)
 
     def connect(self) -> Tuple[bool, str]:
         try:
@@ -501,7 +508,11 @@ class RustDbConnector:
                 else:
                     cursor.execute("SHOW DATABASES LIKE %s", (schema_name,))
                 return cursor.fetchone() is not None
-        except Exception:
+        except DbCoreServiceError as exc:
+            self._log_metadata_error("schema_exists", exc)
+            raise
+        except Exception as exc:
+            self._log_metadata_error("schema_exists", exc)
             return False
 
     def get_schemas(self, use_cache: bool = True) -> List[str]:
@@ -520,13 +531,16 @@ class RustDbConnector:
                     )
                     return [str(row.get("schema_name")) for row in cursor.fetchall()]
                 cursor.execute("SHOW DATABASES")
-                excluded = {"information_schema", "performance_schema", "mysql", "sys"}
                 return [
                     str(row.get("Database"))
                     for row in cursor.fetchall()
-                    if str(row.get("Database")) not in excluded
+                    if str(row.get("Database")) not in SYSTEM_SCHEMAS
                 ]
-        except Exception:
+        except DbCoreServiceError as exc:
+            self._log_metadata_error("get_schemas", exc)
+            raise
+        except Exception as exc:
+            self._log_metadata_error("get_schemas", exc)
             return []
 
     def get_tables(self, schema: Optional[str] = None, use_cache: bool = True) -> List[str]:
@@ -541,7 +555,14 @@ class RustDbConnector:
                 database=self.endpoint.database if self.endpoint.engine == "postgresql" else schema,
                 schema=schema if self.endpoint.engine == "postgresql" else "",
             )
-        return self.facade.list_tables(endpoint)
+        try:
+            return self.facade.list_tables(endpoint)
+        except DbCoreServiceError as exc:
+            self._log_metadata_error("get_tables", exc)
+            raise
+        except Exception as exc:
+            self._log_metadata_error("get_tables", exc)
+            return []
 
     def get_db_version(self) -> Tuple[int, int, int]:
         return parse_db_version_tuple(self.get_db_version_string())
@@ -556,7 +577,11 @@ class RustDbConnector:
                 cursor.execute("SELECT VERSION() AS version" if self.endpoint.engine == "mysql" else "SELECT version() AS version")
                 row = cursor.fetchone() or {}
                 return str(row.get("version", ""))
-        except Exception:
+        except DbCoreServiceError as exc:
+            self._log_metadata_error("get_db_version_string", exc)
+            raise
+        except Exception as exc:
+            self._log_metadata_error("get_db_version_string", exc)
             return ""
 
     def get_column_names(self, table: str, schema: Optional[str] = None) -> List[str]:
@@ -581,7 +606,11 @@ class RustDbConnector:
                         (schema or self.endpoint.database, table),
                     )
                 return [str(row.get("column_name")) for row in cursor.fetchall()]
-        except Exception:
+        except DbCoreServiceError as exc:
+            self._log_metadata_error("get_column_names", exc)
+            raise
+        except Exception as exc:
+            self._log_metadata_error("get_column_names", exc)
             return []
 
 

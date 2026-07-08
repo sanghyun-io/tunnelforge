@@ -3,6 +3,8 @@ import json
 import threading
 import time
 
+import pytest
+
 import src.core.db_core_service as db_core_service
 from src.core.db_core_service import (
     DbCoreFacade,
@@ -663,3 +665,157 @@ def test_shutdown_and_concurrent_request_are_serialized_by_lock():
     assert results["value"]["success"] is True
     assert client._process is second_process
     assert len(popen_calls) == 2
+
+
+# =====================================================================
+# RustDbConnector: 공유 facade / SYSTEM_SCHEMAS / 메타데이터 예외 처리
+# (WP-2.10: connector-facade 통합)
+# =====================================================================
+
+def test_rust_connector_uses_shared_facade_by_default(monkeypatch):
+    """facade 미지정 시 앱 공유 facade를 사용해야 한다 (커넥터별 전용 프로세스 금지)."""
+    sentinel = object()
+    monkeypatch.setattr(db_core_service, "get_shared_db_core_facade", lambda: sentinel)
+
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app")
+
+    assert connector.facade is sentinel
+
+
+def test_rust_connector_uses_injected_facade_without_shared_lookup(monkeypatch):
+    """facade가 주입되면 공유 facade 조회를 건너뛴다."""
+    called = []
+    monkeypatch.setattr(
+        db_core_service, "get_shared_db_core_facade",
+        lambda: called.append(True) or object(),
+    )
+    sentinel = object()
+
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=sentinel)
+
+    assert connector.facade is sentinel
+    assert called == []
+
+
+def test_rust_connector_uses_constants_for_system_schema_filtering(monkeypatch):
+    """MySQL 스키마 필터링은 하드코딩이 아닌 SYSTEM_SCHEMAS 상수를 사용해야 한다."""
+    monkeypatch.setattr(db_core_service, "SYSTEM_SCHEMAS", frozenset({"mysql", "ndbinfo"}))
+
+    class FakeCursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, *a, **k):
+            pass
+
+        def fetchall(self):
+            return [{"Database": "app"}, {"Database": "mysql"}, {"Database": "ndbinfo"}]
+
+    class FakeConnection:
+        def cursor(self):
+            return FakeCursor()
+
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
+    connector.connection = FakeConnection()
+
+    assert connector.get_schemas() == ["app"]
+
+
+class _FailingCursor:
+    """execute 호출 시 지정된 예외를 던지는 cursor 스텁."""
+
+    def __init__(self, exc):
+        self._exc = exc
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def execute(self, *a, **k):
+        raise self._exc
+
+
+class _FailingConnection:
+    def __init__(self, exc):
+        self._exc = exc
+
+    def cursor(self):
+        return _FailingCursor(self._exc)
+
+
+def test_get_schemas_propagates_and_logs_db_core_service_error(caplog):
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
+    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+
+    caplog.set_level("ERROR")
+    with pytest.raises(DbCoreServiceError):
+        connector.get_schemas()
+
+    assert "get_schemas" in caplog.text
+    assert "Access denied" in caplog.text
+
+
+def test_schema_exists_propagates_and_logs_db_core_service_error(caplog):
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
+    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+
+    caplog.set_level("ERROR")
+    with pytest.raises(DbCoreServiceError):
+        connector.schema_exists("app")
+
+    assert "schema_exists" in caplog.text
+    assert "Access denied" in caplog.text
+
+
+def test_get_tables_propagates_and_logs_db_core_service_error(caplog):
+    class FailingFacade:
+        def list_tables(self, endpoint):
+            raise DbCoreServiceError("Access denied")
+
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=FailingFacade())
+
+    caplog.set_level("ERROR")
+    with pytest.raises(DbCoreServiceError):
+        connector.get_tables()
+
+    assert "get_tables" in caplog.text
+    assert "Access denied" in caplog.text
+
+
+def test_get_db_version_string_propagates_and_logs_db_core_service_error(caplog):
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
+    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+
+    caplog.set_level("ERROR")
+    with pytest.raises(DbCoreServiceError):
+        connector.get_db_version_string()
+
+    assert "get_db_version_string" in caplog.text
+    assert "Access denied" in caplog.text
+
+
+def test_get_column_names_propagates_and_logs_db_core_service_error(caplog):
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
+    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+
+    caplog.set_level("ERROR")
+    with pytest.raises(DbCoreServiceError):
+        connector.get_column_names("users")
+
+    assert "get_column_names" in caplog.text
+    assert "Access denied" in caplog.text
+
+
+def test_get_schemas_generic_exception_is_logged_and_returns_empty_default():
+    """facade 예외가 아닌 일반 예외는 기존 계약대로 빈 기본값을 반환한다 (호환성 유지)."""
+    connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
+    connector.connection = _FailingConnection(RuntimeError("boom"))
+
+    result = connector.get_schemas()
+
+    assert result == []

@@ -7,7 +7,12 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.logger import get_logger
 from src.core.constants import SYSTEM_SCHEMAS
-from src.core.db_core_service import DbCoreFacade, DbEndpoint, RustDbConnection
+from src.core.db_core_service import (
+    RustDbConnection,
+    RustDbConnector,
+    get_shared_db_core_facade,
+    quote_mysql_ident,
+)
 
 logger = get_logger('db_connector')
 
@@ -87,7 +92,7 @@ class MySQLConnector:
     """
 
     def __init__(self, host: str, port: int, user: str, password: str,
-                 database: str = None, use_cache: bool = True):
+                 database: str = None, use_cache: bool = True, facade: Optional[Any] = None):
         """
         Args:
             host: MySQL 호스트
@@ -96,6 +101,7 @@ class MySQLConnector:
             password: MySQL 비밀번호
             database: 기본 데이터베이스
             use_cache: 메타데이터 캐싱 사용 여부 (기본 True)
+            facade: 주입할 Rust DB core facade (없으면 앱 공유 facade 사용)
         """
         self.host = host
         self.port = port
@@ -104,7 +110,12 @@ class MySQLConnector:
         self.database = database
         self.engine = "mysql"
         self.connection: Optional[RustDbConnection] = None
-        self._facade = DbCoreFacade()
+        self.facade = facade if facade is not None else get_shared_db_core_facade()
+        # 연결 프로토콜은 RustDbConnector에 위임 — 커넥터별 전용 서브프로세스를 띄우지 않는다.
+        self._delegate = RustDbConnector(
+            "mysql", host, port, user, password,
+            database=database, facade=self.facade,
+        )
 
         # 캐싱 설정
         self._use_cache = use_cache
@@ -113,20 +124,11 @@ class MySQLConnector:
 
     def connect(self) -> Tuple[bool, str]:
         """데이터베이스 연결"""
-        try:
-            endpoint = DbEndpoint(
-                engine="mysql",
-                host=self.host,
-                port=int(self.port),
-                user=self.user,
-                password=self.password,
-                database=self.database or "",
-            )
-            connection_id = self._facade.open_connection(endpoint)
-            self.connection = RustDbConnection(endpoint, self._facade, connection_id)
+        success, msg = self._delegate.connect()
+        if success:
+            self.connection = self._delegate.connection
             return True, "연결 성공"
-        except Exception as e:
-            return False, f"MySQL 오류: {str(e)}"
+        return False, f"MySQL 오류: {msg}"
 
     def disconnect(self):
         """연결 종료"""
@@ -137,6 +139,9 @@ class MySQLConnector:
                 pass
             finally:
                 self.connection = None
+        # delegate가 참조하던 연결 정보도 함께 정리 (재사용 시 잔여 상태 방지)
+        self._delegate.connection = None
+        self._delegate.connection_id = None
 
     def is_connected(self) -> bool:
         """연결 상태 확인"""
@@ -392,18 +397,25 @@ class MySQLConnector:
         tables = self.get_tables(schema)
         return table in tables
 
+    def _qualified_table_ref(self, table: str, schema: str = None) -> str:
+        """스키마 한정 테이블 참조 생성 (현재 세션의 DB를 전환하지 않음)"""
+        if schema:
+            return f"{quote_mysql_ident(schema)}.{quote_mysql_ident(table)}"
+        return quote_mysql_ident(table)
+
     def get_create_table_statement(self, table: str, schema: str = None) -> str:
-        """CREATE TABLE 문 조회"""
+        """CREATE TABLE 문 조회
+
+        schema가 지정되어도 세션의 현재 DB(self.database)는 전환하지 않고,
+        스키마 한정 식별자(`schema`.`table`)로 조회한다.
+        """
         if not self.connection:
             return ""
 
         try:
-            # 스키마가 지정되면 해당 스키마로 전환
-            if schema and schema != self.database:
-                self.connection.select_db(schema)
-
+            table_ref = self._qualified_table_ref(table, schema)
             with self.connection.cursor() as cursor:
-                cursor.execute(f"SHOW CREATE TABLE `{table}`")
+                cursor.execute(f"SHOW CREATE TABLE {table_ref}")
                 result = cursor.fetchone()
                 if result:
                     return result.get('Create Table', '')
@@ -413,22 +425,24 @@ class MySQLConnector:
             return ""
 
     def get_table_data(self, table: str, schema: str = None, limit: int = None) -> List[Dict[str, Any]]:
-        """테이블 데이터 조회"""
-        if schema and schema != self.database:
-            self.connection.select_db(schema)
+        """테이블 데이터 조회
 
-        query = f"SELECT * FROM `{table}`"
+        schema가 지정되어도 세션의 현재 DB(self.database)는 전환하지 않는다.
+        """
+        table_ref = self._qualified_table_ref(table, schema)
+        query = f"SELECT * FROM {table_ref}"
         if limit:
-            query += f" LIMIT {limit}"
+            query += f" LIMIT {int(limit)}"
 
         return self.execute(query)
 
     def get_row_count(self, table: str, schema: str = None) -> int:
-        """테이블 행 수 조회"""
-        if schema and schema != self.database:
-            self.connection.select_db(schema)
+        """테이블 행 수 조회
 
-        result = self.execute(f"SELECT COUNT(*) as cnt FROM `{table}`")
+        schema가 지정되어도 세션의 현재 DB(self.database)는 전환하지 않는다.
+        """
+        table_ref = self._qualified_table_ref(table, schema)
+        result = self.execute(f"SELECT COUNT(*) AS cnt FROM {table_ref}")
         if result:
             return result[0].get('cnt', 0)
         return 0
