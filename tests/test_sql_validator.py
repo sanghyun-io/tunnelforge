@@ -13,7 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.core.sql_validator import (
     SchemaMetadata, SchemaMetadataProvider, SQLValidator, SQLAutoCompleter,
-    ValidationIssue, IssueSeverity
+    ValidationIssue, IssueSeverity, extract_table_aliases
 )
 
 
@@ -134,6 +134,84 @@ class TestSchemaMetadata(unittest.TestCase):
         self.assertEqual(len(suggestions), 0)
 
 
+class TestSchemaMetadataProvider(unittest.TestCase):
+    """SchemaMetadataProvider 캐시 동작 테스트 (스키마별 캐시, 동기 DB 조회 없음)"""
+
+    def _make_metadata(self, tables):
+        metadata = SchemaMetadata()
+        metadata.tables = set(tables)
+        return metadata
+
+    def test_metadata_cache_is_schema_scoped(self):
+        """[SUCCESS] 스키마별로 독립된 캐시를 가진다 (스키마 전환 시 오염되지 않음)"""
+        provider = SchemaMetadataProvider()
+        db1_metadata = self._make_metadata({'users'})
+        db2_metadata = self._make_metadata({'customers'})
+
+        provider.set_metadata("db1", db1_metadata)
+        provider.set_metadata("db2", db2_metadata)
+
+        self.assertTrue(provider.get_metadata("db1").has_table("users"))
+        self.assertFalse(provider.get_metadata("db1").has_table("customers"))
+        self.assertTrue(provider.get_metadata("db2").has_table("customers"))
+        self.assertFalse(provider.get_metadata("db2").has_table("users"))
+
+    def test_unknown_schema_returns_empty_metadata_not_previous_schema(self):
+        """[FAIL] 캐시에 없는 스키마 조회 시 이전 스키마가 아닌 빈 메타데이터 반환"""
+        provider = SchemaMetadataProvider()
+        provider.set_metadata("db1", self._make_metadata({'users'}))
+
+        result = provider.get_metadata("db2")
+        self.assertEqual(result.tables, set())
+
+    def test_invalidate_specific_schema(self):
+        """[SUCCESS] 특정 스키마만 무효화, 다른 스키마 캐시는 유지"""
+        provider = SchemaMetadataProvider()
+        provider.set_metadata("db1", self._make_metadata({'users'}))
+        provider.set_metadata("db2", self._make_metadata({'customers'}))
+
+        provider.invalidate("db1")
+
+        self.assertEqual(provider.get_metadata("db1").tables, set())
+        self.assertTrue(provider.get_metadata("db2").has_table("customers"))
+
+    def test_get_metadata_does_not_query_connector_on_cache_miss(self):
+        """[SUCCESS] 캐시 미스여도 커넥터에 동기 DB 조회를 하지 않는다"""
+
+        class FakeConnector:
+            database = "db1"
+
+            def get_db_version(self):
+                raise AssertionError("get_db_version이 호출되면 안 됨 (동기 DB 조회 금지)")
+
+            def get_tables(self, schema=None):
+                raise AssertionError("get_tables가 호출되면 안 됨 (동기 DB 조회 금지)")
+
+            def get_column_names(self, table, schema=None):
+                raise AssertionError("get_column_names가 호출되면 안 됨 (동기 DB 조회 금지)")
+
+        provider = SchemaMetadataProvider()
+        provider.set_connector(FakeConnector())
+
+        result = provider.get_metadata("db1")
+        self.assertEqual(result.tables, set())
+
+    def test_legacy_metadata_assignment_uses_active_connector_schema(self):
+        """[SUCCESS] 호환용 `_metadata` 직접 대입은 활성 커넥터의 스키마에 매핑된다"""
+
+        class FakeConnector:
+            database = "db1"
+
+        provider = SchemaMetadataProvider()
+        provider.set_connector(FakeConnector())
+
+        db1_metadata = self._make_metadata({'users'})
+        provider._metadata = db1_metadata  # 레거시 UI 호환 경로 (out-of-scope UI 파일이 사용)
+
+        self.assertIs(provider.get_metadata("db1"), db1_metadata)
+        self.assertEqual(provider.get_metadata("db2").tables, set())
+
+
 class TestSQLValidator(unittest.TestCase):
     """SQLValidator 클래스 테스트"""
 
@@ -150,7 +228,7 @@ class TestSQLValidator(unittest.TestCase):
             'products': {'id', 'name', 'price', 'category_id'},
         }
         metadata.db_version = (5, 7, 44)  # MySQL 5.7 (8.0 기능 미지원)
-        self.provider._metadata = metadata
+        self.provider.set_metadata(None, metadata)
 
         self.validator = SQLValidator(self.provider)
 
@@ -358,7 +436,9 @@ class TestSQLValidator(unittest.TestCase):
     def test_validate_version_no_warning_on_mysql8(self):
         """[SUCCESS] MySQL 8.0에서는 경고 없음"""
         # MySQL 8.0으로 변경
-        self.provider._metadata.db_version = (8, 0, 32)
+        metadata = self.provider.get_metadata()
+        metadata.db_version = (8, 0, 32)
+        self.provider.set_metadata(None, metadata)
 
         sql = "SELECT id, ROW_NUMBER() OVER (ORDER BY id) as rn FROM users"
         issues = self.validator.validate(sql)
@@ -409,6 +489,96 @@ WHERE id = 1"""
         column_warnings = [i for i in issues if 'created_at' in i.message and 'orders' in i.message]
         self.assertEqual(len(column_warnings), 1)
 
+    # =========================================================================
+    # CTE(WITH 절) 검증 테스트
+    # =========================================================================
+    def test_validate_cte_name_not_reported_as_missing_table(self):
+        """[SUCCESS] CTE 이름은 존재하지 않는 테이블로 오탐되지 않음"""
+        sql = """
+        WITH cte AS (
+            SELECT id, name FROM users
+        )
+        SELECT * FROM cte
+        """
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_multiple_ctes_not_reported_as_missing_tables(self):
+        """[SUCCESS] 콤마로 연결된 여러 CTE 모두 오탐되지 않음"""
+        sql = """
+        WITH first_cte AS (
+            SELECT id FROM users
+        ), second_cte AS (
+            SELECT id FROM first_cte
+        )
+        SELECT * FROM second_cte
+        """
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_recursive_cte_not_reported_as_missing_table(self):
+        """[SUCCESS] WITH RECURSIVE CTE도 오탐되지 않음"""
+        sql = """
+        WITH RECURSIVE nums AS (
+            SELECT id FROM users
+            UNION ALL
+            SELECT id FROM nums
+        )
+        SELECT * FROM nums
+        """
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_unknown_real_table_still_errors_when_with_present(self):
+        """[FAIL] WITH 절이 있어도 실제로 존재하지 않는 테이블은 여전히 에러"""
+        sql = """
+        WITH cte AS (
+            SELECT id FROM users
+        )
+        SELECT * FROM missing_table
+        """
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 1)
+        self.assertIn('missing_table', table_errors[0].message)
+
+    # =========================================================================
+    # 파생 테이블(서브쿼리) 별칭 검증 테스트
+    # =========================================================================
+    def test_validate_derived_table_alias_not_reported_as_missing_table(self):
+        """[SUCCESS] 파생 테이블 별칭은 존재하지 않는 테이블로 오탐되지 않음"""
+        sql = """
+        SELECT d.id
+        FROM (
+            SELECT id FROM users
+        ) AS d
+        """
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 0)
+
+    def test_validate_table_inside_derived_query_still_checked(self):
+        """[FAIL] 파생 테이블 내부의 실제 테이블 오타는 여전히 검증됨"""
+        sql = """
+        SELECT d.id
+        FROM (
+            SELECT id FROM userss
+        ) AS d
+        """
+        issues = self.validator.validate(sql)
+
+        table_errors = [i for i in issues if i.severity == IssueSeverity.ERROR and '테이블' in i.message]
+        self.assertEqual(len(table_errors), 1)
+        self.assertIn('userss', table_errors[0].message)
+
 
 class TestSQLAutoCompleter(unittest.TestCase):
     """SQLAutoCompleter 클래스 테스트"""
@@ -424,7 +594,7 @@ class TestSQLAutoCompleter(unittest.TestCase):
             'orders': {'id', 'user_id', 'total_amount'},
             'products': {'id', 'name', 'price'},
         }
-        self.provider._metadata = metadata
+        self.provider.set_metadata(None, metadata)
 
         self.completer = SQLAutoCompleter(self.provider)
 
@@ -481,6 +651,11 @@ class TestSQLAutoCompleter(unittest.TestCase):
         self.assertIn('email', column_labels)
         self.assertIn('name', column_labels)
         self.assertNotIn('total_amount', column_labels)
+
+        # alias. 뒤에서는 키워드/함수가 포함되면 안됨 (table. 뒤와 동일)
+        types = set(c['type'] for c in completions)
+        self.assertNotIn('keyword', types, "alias. 뒤에서 키워드가 포함되면 안됨")
+        self.assertNotIn('function', types, "alias. 뒤에서 함수가 포함되면 안됨")
 
     def test_autocomplete_after_schema_dot_in_table_context(self):
         """[SUCCESS] FROM schema. 뒤 → 테이블 목록"""
@@ -555,6 +730,15 @@ class TestSQLAutoCompleter(unittest.TestCase):
         # COUNT()가 포함되어야 함
         self.assertTrue(any('COUNT' in label for label in function_labels))
 
+    # =========================================================================
+    # 공용 별칭 파서(extract_table_aliases) 직접 테스트
+    # =========================================================================
+    def test_extract_table_aliases_helper_maps_alias_to_table(self):
+        """[SUCCESS] extract_table_aliases가 AS 별칭을 실제 테이블명으로 매핑"""
+        metadata = self.provider.get_metadata()
+        aliases = extract_table_aliases("SELECT * FROM users AS u", metadata)
+        self.assertEqual(aliases["u"], "users")
+
 
 class TestValidationIssue(unittest.TestCase):
     """ValidationIssue 데이터클래스 테스트"""
@@ -596,7 +780,7 @@ class TestEdgeCases(unittest.TestCase):
             'user_logs': {'id', 'user_id', 'action'},
             'user_settings': {'id', 'user_id', 'key', 'value'},
         }
-        self.provider._metadata = metadata
+        self.provider.set_metadata(None, metadata)
         self.validator = SQLValidator(self.provider)
 
     def test_empty_sql(self):
