@@ -20,6 +20,7 @@ from src.core.migration_analyzer import (
     CleanupAction,
     ActionType,
     ForeignKeyInfo,
+    TwoPassAnalyzer,
 )
 from tests.conftest import FakeMySQLConnector
 
@@ -154,6 +155,83 @@ class TestCheckDeprecatedInRoutines:
         issues = analyzer.check_deprecated_in_routines("test_db")
         assert len(issues) == 0
 
+    def test_password_column_reference_is_not_a_false_positive(self, fake_connector):
+        """컬럼/식별자 'password'는 PASSWORD() 함수 호출이 아니므로 오탐하면 안 된다"""
+        fake_connector.query_results = {
+            'ROUTINE_DEFINITION': [
+                {
+                    'ROUTINE_NAME': 'get_user',
+                    'ROUTINE_TYPE': 'FUNCTION',
+                    'ROUTINE_DEFINITION': "SELECT password FROM users WHERE id = 1"
+                }
+            ]
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        issues = analyzer.check_deprecated_in_routines("test_db")
+        assert issues == []
+
+    def test_aes_encrypt_is_not_flagged_as_encrypt(self, fake_connector):
+        """AES_ENCRYPT()는 ENCRYPT()와 다른 함수이므로 오탐하면 안 된다"""
+        fake_connector.query_results = {
+            'ROUTINE_DEFINITION': [
+                {
+                    'ROUTINE_NAME': 'enc_func',
+                    'ROUTINE_TYPE': 'FUNCTION',
+                    'ROUTINE_DEFINITION': "SELECT AES_ENCRYPT(secret, 'k')"
+                }
+            ]
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        issues = analyzer.check_deprecated_in_routines("test_db")
+        assert issues == []
+
+    def test_actual_password_call_still_reported(self, fake_connector):
+        """실제 PASSWORD(...) 호출은 여전히 탐지되어야 한다"""
+        fake_connector.query_results = {
+            'ROUTINE_DEFINITION': [
+                {
+                    'ROUTINE_NAME': 'get_hash',
+                    'ROUTINE_TYPE': 'FUNCTION',
+                    'ROUTINE_DEFINITION': "SELECT PASSWORD('test')"
+                }
+            ]
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        issues = analyzer.check_deprecated_in_routines("test_db")
+        assert len(issues) == 1
+
+    def test_duplicate_calls_of_same_function_reported_once(self, fake_connector):
+        """동일 함수가 여러 번 호출돼도 함수당 이슈는 1개만 보고한다"""
+        fake_connector.query_results = {
+            'ROUTINE_DEFINITION': [
+                {
+                    'ROUTINE_NAME': 'paginated_query',
+                    'ROUTINE_TYPE': 'PROCEDURE',
+                    'ROUTINE_DEFINITION': "SELECT FOUND_ROWS(); SELECT FOUND_ROWS();"
+                }
+            ]
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        issues = analyzer.check_deprecated_in_routines("test_db")
+        found_rows_issues = [i for i in issues if "FOUND_ROWS" in i.description]
+        assert len(found_rows_issues) == 1
+
+    def test_sql_calc_found_rows_without_parens_not_flagged_by_call_boundary(self, fake_connector):
+        """SQL_CALC_FOUND_ROWS는 SELECT 수정자로 괄호 없이 쓰이므로 함수-호출
+        경계 검사(뒤에 '(' 필요)에서는 잡히지 않는다 - 알려진 트레이드오프."""
+        fake_connector.query_results = {
+            'ROUTINE_DEFINITION': [
+                {
+                    'ROUTINE_NAME': 'legacy_paginate',
+                    'ROUTINE_TYPE': 'PROCEDURE',
+                    'ROUTINE_DEFINITION': "SELECT SQL_CALC_FOUND_ROWS * FROM users LIMIT 10"
+                }
+            ]
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        issues = analyzer.check_deprecated_in_routines("test_db")
+        assert issues == []
+
 
 class TestCheckSqlModes:
     """check_sql_modes 테스트"""
@@ -285,17 +363,87 @@ class TestCheckEnumEmptyValue:
 
 
 class TestCheckTimestampRange:
-    def test_finds_out_of_range(self, fake_connector):
+    def test_timestamp_column_reported_as_advisory(self, fake_connector):
+        """TIMESTAMP는 '2038-01-19 03:14:07'를 초과하는 값을 애초에 저장할 수
+        없으므로, 실데이터를 조회해 초과 여부를 판정하는 것은 항상 0건만
+        나오는 무의미한 검사다. 컬럼 존재 자체를 advisory로 보고해야 한다."""
         fake_connector.query_results = {
             "timestamp": [
                 {'TABLE_NAME': 'events', 'COLUMN_NAME': 'event_time'}
             ],
-            "2038-01-19": [{'cnt': 5}],
         }
         analyzer = MigrationAnalyzer(fake_connector)
         issues = analyzer.check_timestamp_range("test_db")
-        assert len(issues) >= 1
+        assert len(issues) == 1
         assert issues[0].issue_type == IssueType.TIMESTAMP_RANGE
+        assert issues[0].severity == "warning"
+        # 항상 거짓인 라이브 데이터 조회를 더 이상 실행하지 않아야 한다
+        assert not any(
+            "2038-01-19 03:14:07" in (query or "")
+            for query, _ in fake_connector.executed_queries
+        )
+
+    def test_no_timestamp_columns_no_issues(self, fake_connector):
+        fake_connector.query_results = {"timestamp": []}
+        analyzer = MigrationAnalyzer(fake_connector)
+        issues = analyzer.check_timestamp_range("test_db")
+        assert issues == []
+
+
+class TestCheckIntDisplayWidth:
+    """check_int_display_width 직접 호출 + 파이프라인 연결 테스트
+
+    이 메서드는 정의만 되어 있고 analyze_schema/_analyze_schema_impl
+    파이프라인 어디에서도 호출되지 않던 죽은 코드였다.
+    """
+
+    INT_DISPLAY_WIDTH_QUERY_KEY = "COLUMN_TYPE REGEXP '^(tinyint|smallint|mediumint|int|bigint)"
+
+    def test_finds_int_display_width(self, fake_connector):
+        fake_connector.query_results = {
+            self.INT_DISPLAY_WIDTH_QUERY_KEY: [
+                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'age', 'COLUMN_TYPE': 'int(11)'}
+            ],
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        issues = analyzer.check_int_display_width("test_db")
+        assert len(issues) == 1
+        assert issues[0].issue_type == IssueType.INT_DISPLAY_WIDTH
+        assert issues[0].severity == "info"
+
+    def _pipeline_kwargs(self, enabled: bool) -> dict:
+        return dict(
+            check_orphans=False, check_charset=False, check_keywords=False,
+            check_routines=False, check_sql_mode=False, check_auth_plugins=False,
+            check_zerofill=False, check_float_precision=False, check_fk_name_length=False,
+            check_invalid_dates=False, check_year2=False, check_deprecated_engines=False,
+            check_enum_empty=False, check_timestamp_range=False,
+            check_int_display_width=enabled,
+        )
+
+    def test_wired_into_pipeline_when_enabled(self, fake_connector):
+        fake_connector._tables = {"test_db": []}
+        fake_connector.query_results = {
+            self.INT_DISPLAY_WIDTH_QUERY_KEY: [
+                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'age', 'COLUMN_TYPE': 'int(11)'}
+            ],
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        result = analyzer._analyze_schema_impl("test_db", **self._pipeline_kwargs(True))
+        int_issues = [i for i in result.compatibility_issues if i.issue_type == IssueType.INT_DISPLAY_WIDTH]
+        assert len(int_issues) == 1
+
+    def test_not_run_in_pipeline_when_disabled(self, fake_connector):
+        fake_connector._tables = {"test_db": []}
+        fake_connector.query_results = {
+            self.INT_DISPLAY_WIDTH_QUERY_KEY: [
+                {'TABLE_NAME': 'users', 'COLUMN_NAME': 'age', 'COLUMN_TYPE': 'int(11)'}
+            ],
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        result = analyzer._analyze_schema_impl("test_db", **self._pipeline_kwargs(False))
+        int_issues = [i for i in result.compatibility_issues if i.issue_type == IssueType.INT_DISPLAY_WIDTH]
+        assert int_issues == []
 
 
 class TestCheckInvalidDateValues:
@@ -335,10 +483,26 @@ class TestGenerateCleanupSql:
             orphan_count=5, sample_values=[99, 100]
         )
         action = analyzer.generate_cleanup_sql(orphan, ActionType.DELETE, "test_db")
-        assert "DELETE FROM" in action.sql
+        assert "DELETE" in action.sql
+        assert "FROM" in action.sql
         assert action.action_type == ActionType.DELETE
         assert action.affected_rows == 5
         assert action.dry_run is True
+        assert action.target_schema == "test_db"
+        assert action.target_table == "orders"
+
+    def test_delete_action_uses_not_exists_not_not_in(self, fake_connector):
+        """NOT IN은 부모 참조 컬럼에 NULL이 있으면 전체가 UNKNOWN이 되어
+        실제 고아 레코드가 있어도 0건으로 처리되는 NULL-안전성 문제가 있다."""
+        analyzer = MigrationAnalyzer(fake_connector)
+        orphan = OrphanRecord(
+            child_table="orders", child_column="user_id",
+            parent_table="users", parent_column="id",
+            orphan_count=5
+        )
+        action = analyzer.generate_cleanup_sql(orphan, ActionType.DELETE, "test_db")
+        assert "NOT EXISTS" in action.sql
+        assert "NOT IN" not in action.sql
 
     def test_set_null_action(self, fake_connector):
         analyzer = MigrationAnalyzer(fake_connector)
@@ -348,7 +512,12 @@ class TestGenerateCleanupSql:
             orphan_count=3
         )
         action = analyzer.generate_cleanup_sql(orphan, ActionType.SET_NULL, "test_db")
-        assert "SET `user_id` = NULL" in action.sql
+        assert "SET" in action.sql
+        assert "`user_id` = NULL" in action.sql
+        assert "NOT EXISTS" in action.sql
+        assert "NOT IN" not in action.sql
+        assert action.target_schema == "test_db"
+        assert action.target_table == "orders"
 
     def test_manual_action(self, fake_connector):
         analyzer = MigrationAnalyzer(fake_connector)
@@ -373,6 +542,8 @@ class TestExecuteCleanup:
             description="delete orphan orders",
             sql="DELETE FROM `test_db`.`orders` WHERE `user_id` IS NULL",
             affected_rows=3,
+            target_schema="test_db",
+            target_table="orders",
         )
 
         success, message, affected = analyzer.execute_cleanup(action, dry_run=True)
@@ -381,6 +552,46 @@ class TestExecuteCleanup:
         assert affected == 7
         assert "[DRY-RUN]" in message
         assert len(fake_connector.executed_queries) == 1
+
+    def test_dry_run_without_metadata_fails_explicitly(self, fake_connector):
+        """target_schema/target_table이 없으면 sql 텍스트를 재파싱해 추측하지
+        않고 명시적으로 실패한다 (구버전 직렬화 복원 등)."""
+        analyzer = MigrationAnalyzer(fake_connector)
+        action = CleanupAction(
+            action_type=ActionType.DELETE,
+            table="orders",
+            description="delete orphan orders",
+            sql="DELETE FROM `test_db`.`orders` WHERE `user_id` IS NULL",
+            affected_rows=3,
+        )
+
+        success, message, affected = analyzer.execute_cleanup(action, dry_run=True)
+
+        assert success is False
+        assert affected == 0
+        assert "메타데이터" in message
+        assert fake_connector.executed_queries == []
+
+    def test_dry_run_table_name_containing_from_and_set_keywords(self, fake_connector):
+        """테이블명이 SETTINGS/ASSETS처럼 FROM/SET 키워드를 포함해도
+        저장된 target_schema/target_table을 그대로 쓰므로 안전하다."""
+        fake_connector.query_results = {
+            "SELECT COUNT(*)": [{"cnt": 2}],
+        }
+        analyzer = MigrationAnalyzer(fake_connector)
+        orphan = OrphanRecord(
+            child_table="ASSETS", child_column="owner_id",
+            parent_table="users", parent_column="id",
+            orphan_count=2
+        )
+        action = analyzer.generate_cleanup_sql(orphan, ActionType.SET_NULL, "test_db")
+
+        success, message, affected = analyzer.execute_cleanup(action, dry_run=True)
+
+        assert success is True
+        assert affected == 2
+        executed_sql = fake_connector.executed_queries[0][0]
+        assert "FROM `test_db`.`ASSETS` AS c" in executed_sql
 
     def test_actual_cleanup_rejects_legacy_python_mutation_mode(self, fake_connector):
         analyzer = MigrationAnalyzer(fake_connector)
@@ -424,7 +635,10 @@ class TestAnalysisResultSerialization:
                 )
             ],
             cleanup_actions=[
-                CleanupAction(ActionType.DELETE, "orders", "desc", "DELETE ...", 3)
+                CleanupAction(
+                    ActionType.DELETE, "orders", "desc", "DELETE ...", 3,
+                    target_schema="test_db", target_table="orders"
+                )
             ],
             fk_tree={"users": ["orders"]}
         )
@@ -441,6 +655,33 @@ class TestAnalysisResultSerialization:
         assert restored.orphan_records[0].orphan_count == 3
         assert len(restored.compatibility_issues) == 1
         assert restored.compatibility_issues[0].issue_type == IssueType.CHARSET_ISSUE
+        assert len(restored.cleanup_actions) == 1
+        assert restored.cleanup_actions[0].target_schema == "test_db"
+        assert restored.cleanup_actions[0].target_table == "orders"
+
+    def test_from_dict_defaults_target_metadata_when_absent(self):
+        """구버전 직렬화(target_schema/target_table 없음) 복원 시 예외 없이 None으로 채워진다"""
+        d = {
+            'schema': "test_db",
+            'analyzed_at': "2024-01-01T00:00:00",
+            'total_tables': 1,
+            'total_fk_relations': 0,
+            'orphan_records': [],
+            'compatibility_issues': [],
+            'cleanup_actions': [
+                {
+                    'action_type': 'delete',
+                    'table': 'orders',
+                    'description': 'desc',
+                    'sql': 'DELETE ...',
+                    'affected_rows': 3,
+                }
+            ],
+            'fk_tree': {},
+        }
+        restored = AnalysisResult.from_dict(d)
+        assert restored.cleanup_actions[0].target_schema is None
+        assert restored.cleanup_actions[0].target_table is None
 
 
 # ============================================================
@@ -580,3 +821,54 @@ class TestDumpFileAnalyzerSqlPatterns:
             "orders.triggers.sql",
         )
         assert not any(i.issue_type == IssueType.REMOVED_SYS_VAR for i in issues)
+
+
+# ============================================================
+# TwoPassAnalyzer FK 유니크 참조 정확 매칭 회귀 테스트
+# ============================================================
+class TestTwoPassAnalyzerFkUniquenessCrossValidation:
+    """FK 참조 컬럼이 실제로 PK/UNIQUE에 의해 유니크함을 보장받는지 검증.
+
+    UNIQUE(a,b) 같은 복합 인덱스의 prefix (a)만으로 FK를 참조하는 경우는
+    실제로는 유니크함이 보장되지 않으므로 FK_NON_UNIQUE_REF로 잡혀야 한다.
+    """
+
+    def test_fk_referencing_prefix_of_composite_unique_is_flagged(self, tmp_path):
+        (tmp_path / "schema.sql").write_text(
+            """
+CREATE TABLE `parent` (
+  `tenant_id` int,
+  `code` int,
+  UNIQUE KEY `uniq_tenant_code` (`tenant_id`, `code`)
+);
+CREATE TABLE `child` (
+  `tenant_id` int,
+  CONSTRAINT `fk_child_parent` FOREIGN KEY (`tenant_id`) REFERENCES `parent` (`tenant_id`)
+);
+""",
+            encoding="utf-8",
+        )
+        analyzer = TwoPassAnalyzer()
+        result = analyzer.analyze_dump_folder(str(tmp_path))
+        non_unique = [i for i in result.compatibility_issues if i.issue_type == IssueType.FK_NON_UNIQUE_REF]
+        assert len(non_unique) == 1
+
+    def test_fk_referencing_exact_unique_column_is_valid(self, tmp_path):
+        (tmp_path / "schema.sql").write_text(
+            """
+CREATE TABLE `parent` (
+  `tenant_id` int,
+  `code` int,
+  UNIQUE KEY `uniq_tenant` (`tenant_id`)
+);
+CREATE TABLE `child` (
+  `tenant_id` int,
+  CONSTRAINT `fk_child_parent` FOREIGN KEY (`tenant_id`) REFERENCES `parent` (`tenant_id`)
+);
+""",
+            encoding="utf-8",
+        )
+        analyzer = TwoPassAnalyzer()
+        result = analyzer.analyze_dump_folder(str(tmp_path))
+        non_unique = [i for i in result.compatibility_issues if i.issue_type == IssueType.FK_NON_UNIQUE_REF]
+        assert non_unique == []
