@@ -5,9 +5,8 @@ Rust DB Core로 Pre-flight → Analysis → Execution Plan → Validation 흐름
 실행합니다. 기본값은 dry-run이며, 실제 변경은 백업 확인 후 검증된 제한
 범위에서만 실행됩니다.
 """
-import threading
 from datetime import datetime
-from typing import Optional, List, Any
+from typing import Optional
 
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QStackedWidget,
@@ -41,7 +40,9 @@ class OneClickMigrationWorker(QThread):
     """전체 마이그레이션 프로세스 실행 Worker.
 
     This hidden workflow is owned by Rust DB Core. Python only starts the
-    command, handles cancellation intent, and renders structured events.
+    command and renders structured events. `run_oneclick()` is a single
+    blocking call with no interrupt protocol, so this worker cannot cancel
+    or pause a run in progress once started.
     """
 
     phase_changed = pyqtSignal(str, str)  # phase, phase_name
@@ -49,8 +50,8 @@ class OneClickMigrationWorker(QThread):
     log_message = pyqtSignal(str, str)  # message, style
     preflight_result = pyqtSignal(object)  # PreflightResult
     analysis_result = pyqtSignal(int, int, int)  # total, auto_fixable, manual
-    execution_plan_ready = pyqtSignal(object, object)  # steps, summary (Phase 3 완료 후 일시 정지)
-    finished = pyqtSignal(bool, object)  # success, MigrationReport
+    execution_plan_ready = pyqtSignal(object, object)  # steps, summary (실행 로그 표시용, 일시정지 없음)
+    migration_finished = pyqtSignal(bool, object)  # success, MigrationReport
 
     def __init__(
         self,
@@ -64,19 +65,7 @@ class OneClickMigrationWorker(QThread):
         self.schema = schema
         self.dry_run = dry_run
         self.backup_confirmed = backup_confirmed
-        self._is_cancelled = False
         self._started_at: Optional[datetime] = None
-        self._pre_issues: List[Any] = []
-        self._execution_gate = threading.Event()  # Phase 3→4 사용자 확인 게이트
-
-    def cancel(self):
-        """작업 취소 요청"""
-        self._is_cancelled = True
-        self._execution_gate.set()  # 대기 중이면 즉시 해제
-
-    def resume_execution(self):
-        """실행 재개 (ExecutionPlanWidget에서 호출)"""
-        self._execution_gate.set()
 
     def run(self):
         """Run the Rust Core-owned One-Click workflow and render emitted events."""
@@ -89,27 +78,30 @@ class OneClickMigrationWorker(QThread):
 
             connection = self._ensure_rust_core_connector()
             self.log_message.emit("🦀 Rust DB Core 연결 확인 완료", STYLE_MUTED)
+            self.log_message.emit(
+                "⚠️ Rust 코어에서 실행 중인 작업은 중단할 수 없습니다. "
+                "창을 닫아도 백그라운드에서 계속 진행됩니다.",
+                STYLE_WARNING,
+            )
             _mig_logger.info("Rust DB Core connector verified")
 
             payload = self._core_payload(connection)
             result = connection.facade.run_oneclick(payload, on_event=self._handle_core_event)
             report = self._report_from_core_payload(result.get("report") or {}, _log_path)
             _mig_logger.info(f"=== 마이그레이션 완료: success={result.get('success')} ===")
-            self.finished.emit(bool(result.get("success")), report)
+            self.migration_finished.emit(bool(result.get("success")), report)
 
         except Exception as e:
             if _mig_logger:
                 _mig_logger.exception(f"마이그레이션 오류: {e}")
             self.log_message.emit(f"❌ 오류 발생: {str(e)}", STYLE_ERROR)
-            self.finished.emit(False, None)
+            self.migration_finished.emit(False, None)
         finally:
             if _mig_logger:
                 close_oneclick_logger(_mig_logger)
 
     def _handle_core_event(self, event: dict):
         """Translate Rust Core One-Click events into UI signals."""
-        if self._is_cancelled:
-            return
         event_type = event.get("event")
         if event_type == "phase":
             phase = str(event.get("phase", ""))
@@ -252,24 +244,64 @@ class OneClickMigrationWorker(QThread):
                 payload["charset_contracts"] = contracts
         return payload
 
-    def _create_empty_report(self) -> MigrationReport:
-        """이슈가 없을 때 빈 리포트 생성"""
-        return MigrationReport(
-            schema=self.schema,
-            started_at=self._started_at.isoformat() if self._started_at else "",
-            completed_at=datetime.now().isoformat(),
-            pre_issue_count=0,
-            post_issue_count=0,
-            success=True,
-            duration_seconds=0.0
-        )
+
+def _categorize_execution_plan_steps(steps):
+    """Rust 실행 계획의 각 단계를 자동/조치불필요/수동 항목 문자열 목록으로 분류한다.
+
+    Rust `run_oneclick()`은 일시 정지 프로토콜이 없으므로 이 분류 결과는
+    (더 이상 존재하지 않는) 승인 화면이 아니라 실행 로그에만 사용된다.
+    """
+    auto_items = []
+    skip_items = []
+    manual_items = []
+
+    for step in steps:
+        if isinstance(step, dict):
+            option = step.get("selected_option") if isinstance(step.get("selected_option"), dict) else {}
+            location = str(step.get("location") or "")
+            description = str(step.get("description") or "")
+            strategy = str(option.get("strategy") or "manual")
+            sql = str(option.get("sql_template") or "")
+            label = str(option.get("label") or description)
+            option_description = str(option.get("description") or description)
+        else:
+            option = getattr(step, "selected_option", None)
+            location = getattr(step, "location", "")
+            description = getattr(step, "description", "")
+            if not option:
+                manual_items.append(f"• {location}: {description}")
+                continue
+            strategy = str(getattr(option, "strategy", "manual"))
+            sql = getattr(option, "sql_template", "") or ""
+            label = getattr(option, "label", "") or description
+            option_description = getattr(option, "description", "") or description
+
+        if not option:
+            manual_items.append(f"• {location}: {description}")
+            continue
+
+        if strategy.endswith("SKIP") or strategy == "skip":
+            skip_items.append(f"• {location}: {option_description}")
+        elif strategy.endswith("COLLATION_FK_SAFE"):
+            auto_items.append(f"• {location}: {label}")
+        elif not sql or sql.startswith("--"):
+            manual_items.append(f"• {location}: {option_description}")
+        else:
+            auto_items.append(f"• {location}: {label}")
+
+    return auto_items, skip_items, manual_items
 
 
 class PreflightWidget(QWidget):
-    """Pre-flight 검사 결과 위젯"""
+    """Pre-flight 검사 결과 위젯.
+
+    검사 항목은 Rust Core가 이벤트로 보낸 이름을 그대로 사용해 동적으로
+    행을 생성한다. 미리 정의된 한글 체크 이름 목록에 의존하지 않는다.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.check_rows = {}
         self._setup_ui()
 
     def _setup_ui(self):
@@ -285,34 +317,9 @@ class PreflightWidget(QWidget):
         desc.setStyleSheet("color: #7f8c8d;")
         layout.addWidget(desc)
 
-        # 검사 결과 그룹
+        # 검사 결과 그룹 (행은 Rust 이벤트 수신 시 동적으로 추가)
         self.checks_group = QGroupBox("검사 항목")
-        checks_layout = QVBoxLayout(self.checks_group)
-
-        self.check_labels = {}
-        check_items = [
-            ("permissions", "권한 검사"),
-            ("disk_space", "디스크 공간"),
-            ("connections", "활성 연결"),
-            ("backup", "백업 상태"),
-            ("version", "MySQL 버전"),
-        ]
-
-        for key, label_text in check_items:
-            row = QHBoxLayout()
-            status = QLabel("⏳")
-            status.setFixedWidth(30)
-            label = QLabel(label_text)
-            detail = QLabel("")
-            detail.setStyleSheet("color: #95a5a6;")
-
-            row.addWidget(status)
-            row.addWidget(label)
-            row.addWidget(detail, 1)
-
-            self.check_labels[key] = (status, label, detail)
-            checks_layout.addLayout(row)
-
+        self.checks_layout = QVBoxLayout(self.checks_group)
         layout.addWidget(self.checks_group)
 
         # 결과 요약
@@ -322,30 +329,62 @@ class PreflightWidget(QWidget):
 
         layout.addStretch()
 
+    def reset(self):
+        """이전 실행의 검사 행/요약을 초기화 (재실행 대비)"""
+        self._clear_check_rows()
+        self.result_label.setText("")
+
+    def _clear_check_rows(self):
+        """생성된 모든 검사 행 위젯/레이아웃 제거"""
+        while self.checks_layout.count():
+            item = self.checks_layout.takeAt(0)
+            row_layout = item.layout()
+            if row_layout is not None:
+                while row_layout.count():
+                    child = row_layout.takeAt(0)
+                    widget = child.widget()
+                    if widget is not None:
+                        widget.deleteLater()
+        self.check_rows.clear()
+
+    def _ensure_check_row(self, name: str):
+        """주어진 이름의 검사 행이 없으면 새로 만들고 (status, label, detail)을 반환"""
+        if name in self.check_rows:
+            return self.check_rows[name]
+
+        row = QHBoxLayout()
+        status = QLabel("⏳")
+        status.setFixedWidth(30)
+        label = QLabel(name)
+        detail = QLabel("")
+        detail.setStyleSheet("color: #95a5a6;")
+
+        row.addWidget(status)
+        row.addWidget(label)
+        row.addWidget(detail, 1)
+
+        self.checks_layout.addLayout(row)
+        self.check_rows[name] = (status, label, detail)
+        return self.check_rows[name]
+
+    @staticmethod
+    def _status_icon(passed: bool, severity: CheckSeverity) -> str:
+        if passed:
+            return "✅"
+        if severity == CheckSeverity.ERROR:
+            return "❌"
+        return "⚠️"
+
+    def update_check(self, name: str, passed: bool, severity: CheckSeverity, message: str = ""):
+        """단일 검사 항목의 상태/메시지 업데이트 (없으면 행 생성)"""
+        status, _label, detail = self._ensure_check_row(name)
+        status.setText(self._status_icon(passed, severity))
+        detail.setText(message[:50] + "..." if len(message) > 50 else message)
+
     def update_result(self, result: PreflightResult):
-        """검사 결과 업데이트"""
-        # 각 검사 항목 업데이트
-        check_mapping = {
-            "권한 검사": "permissions",
-            "디스크 공간 검사": "disk_space",
-            "활성 연결 검사": "connections",
-            "백업 상태 확인": "backup",
-            "MySQL 버전 확인": "version",
-        }
-
+        """Rust Core 검사 결과로 업데이트. 체크 이름을 그대로 행 이름으로 사용한다."""
         for check in result.checks:
-            key = check_mapping.get(check.name)
-            if key and key in self.check_labels:
-                status, label, detail = self.check_labels[key]
-
-                if check.passed:
-                    status.setText("✅")
-                elif check.severity == CheckSeverity.ERROR:
-                    status.setText("❌")
-                else:
-                    status.setText("⚠️")
-
-                detail.setText(check.message[:50] + "..." if len(check.message) > 50 else check.message)
+            self.update_check(check.name, check.passed, check.severity, check.message)
 
         # 결과 요약
         if result.passed:
@@ -616,135 +655,11 @@ class ResultWidget(QWidget):
             QMessageBox.information(self, "저장 완료", f"리포트가 저장되었습니다:\n{path}")
 
 
-class ExecutionPlanWidget(QWidget):
-    """실행 계획 확인 위젯 (Phase 3 완료 후 사용자 확인)"""
-
-    start_requested = pyqtSignal()  # "실행 시작" 버튼 클릭
-
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self._setup_ui()
-
-    def _setup_ui(self):
-        layout = QVBoxLayout(self)
-
-        title = QLabel("📋 실행 계획 확인")
-        title.setFont(QFont("", 14, QFont.Weight.Bold))
-        layout.addWidget(title)
-
-        desc = QLabel("아래 내용을 확인 후 실행을 시작하세요.")
-        desc.setStyleSheet("color: #7f8c8d;")
-        layout.addWidget(desc)
-
-        # 자동 실행 대상
-        self.auto_group = QGroupBox("🔧 자동 실행 대상 (0개)")
-        auto_layout = QVBoxLayout(self.auto_group)
-        self.auto_text = QTextEdit()
-        self.auto_text.setReadOnly(True)
-        self.auto_text.setMaximumHeight(120)
-        self.auto_text.setStyleSheet("font-size: 11px;")
-        auto_layout.addWidget(self.auto_text)
-        layout.addWidget(self.auto_group)
-
-        # 조치 불필요 (SKIP)
-        self.skip_group = QGroupBox("ℹ️ 조치 불필요 (MySQL 8.4에서 자동 처리) (0개)")
-        skip_layout = QVBoxLayout(self.skip_group)
-        self.skip_label = QLabel("")
-        self.skip_label.setWordWrap(True)
-        self.skip_label.setStyleSheet("color: #7f8c8d; font-size: 11px;")
-        skip_layout.addWidget(self.skip_label)
-        layout.addWidget(self.skip_group)
-
-        # 마이그레이션 후 처리 필요
-        self.manual_group = QGroupBox("📋 마이그레이션 후 수동 처리 필요 (0개)")
-        manual_layout = QVBoxLayout(self.manual_group)
-        manual_note = QLabel("⚠️ 아래 항목은 DB가 아닌 애플리케이션 또는 설정 변경이 필요합니다.")
-        manual_note.setStyleSheet("color: #e67e22; font-size: 11px;")
-        manual_note.setWordWrap(True)
-        manual_layout.addWidget(manual_note)
-        self.manual_text = QTextEdit()
-        self.manual_text.setReadOnly(True)
-        self.manual_text.setMaximumHeight(100)
-        self.manual_text.setStyleSheet("font-size: 11px;")
-        manual_layout.addWidget(self.manual_text)
-        layout.addWidget(self.manual_group)
-
-        # 실행 버튼
-        btn_layout = QHBoxLayout()
-        self.btn_execute = QPushButton("▶ 실행 시작")
-        self.btn_execute.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60;
-                color: white;
-                font-weight: bold;
-                padding: 8px 24px;
-                border-radius: 4px;
-                border: none;
-            }
-            QPushButton:hover { background-color: #219a52; }
-        """)
-        self.btn_execute.clicked.connect(self.start_requested)
-        btn_layout.addWidget(self.btn_execute)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
-
-        layout.addStretch()
-
-    def update_plan(self, steps, summary):
-        """실행 계획 데이터로 UI 업데이트"""
-        auto_items = []
-        skip_items = []
-        manual_items = []
-
-        for step in steps:
-            if isinstance(step, dict):
-                option = step.get("selected_option") if isinstance(step.get("selected_option"), dict) else {}
-                location = str(step.get("location") or "")
-                description = str(step.get("description") or "")
-                strategy = str(option.get("strategy") or "manual")
-                sql = str(option.get("sql_template") or "")
-                label = str(option.get("label") or description)
-                option_description = str(option.get("description") or description)
-            else:
-                option = getattr(step, "selected_option", None)
-                location = getattr(step, "location", "")
-                description = getattr(step, "description", "")
-                if not option:
-                    manual_items.append(f"• {location}: {description}")
-                    continue
-                strategy = str(getattr(option, "strategy", "manual"))
-                sql = getattr(option, "sql_template", "") or ""
-                label = getattr(option, "label", "") or description
-                option_description = getattr(option, "description", "") or description
-
-            if not option:
-                manual_items.append(f"• {location}: {description}")
-                continue
-
-            if strategy.endswith("SKIP") or strategy == "skip":
-                skip_items.append(f"• {location}: {option_description}")
-            elif strategy.endswith("COLLATION_FK_SAFE"):
-                auto_items.append(f"• {location}: {label}")
-            elif not sql or sql.startswith("--"):
-                manual_items.append(f"• {location}: {option_description}")
-            else:
-                auto_items.append(f"• {location}: {label}")
-
-        self.auto_group.setTitle(f"🔧 자동 실행 대상 ({len(auto_items)}개)")
-        self.auto_text.setPlainText("\n".join(auto_items) if auto_items else "(없음)")
-
-        self.skip_group.setTitle(f"ℹ️ 조치 불필요 (MySQL 8.4에서 자동 처리) ({len(skip_items)}개)")
-        self.skip_label.setText("\n".join(skip_items) if skip_items else "(없음)")
-        self.skip_group.setVisible(bool(skip_items))
-
-        self.manual_group.setTitle(f"📋 마이그레이션 후 수동 처리 필요 ({len(manual_items)}개)")
-        self.manual_text.setPlainText("\n".join(manual_items) if manual_items else "(없음)")
-        self.manual_group.setVisible(bool(manual_items))
-
-        # 실행 버튼 활성화 여부
-        self.btn_execute.setEnabled(bool(auto_items))
-        if not auto_items:
-            self.btn_execute.setText("실행할 항목 없음")
+# Rust `run_oneclick()`는 취소/일시정지 프로토콜이 없는 단일 블로킹 호출이다.
+# 다이얼로그가 실행 중에 닫혀도 워커를 강제 종료(terminate)하지 않고 백그라운드에서
+# 계속 실행되도록 분리(detach)하며, 이 집합이 detach된 워커에 대한 참조를 유지해
+# QThread 객체가 조기에 GC되는 것을 방지한다. 완료 시 콜백에서 스스로 제거된다.
+_DETACHED_ONECLICK_WORKERS: set = set()
 
 
 class OneClickMigrationDialog(QDialog):
@@ -772,13 +687,11 @@ class OneClickMigrationDialog(QDialog):
 
         self.preflight_widget = PreflightWidget()
         self.analysis_widget = AnalysisWidget()
-        self.execution_plan_widget = ExecutionPlanWidget()
         self.execution_widget = ExecutionWidget()
         self.result_widget = ResultWidget()
 
         self.stack.addWidget(self.preflight_widget)
         self.stack.addWidget(self.analysis_widget)
-        self.stack.addWidget(self.execution_plan_widget)
         self.stack.addWidget(self.execution_widget)
         self.stack.addWidget(self.result_widget)
 
@@ -830,11 +743,6 @@ class OneClickMigrationDialog(QDialog):
         """)
         self.btn_start.clicked.connect(self.start_migration)
         btn_layout.addWidget(self.btn_start)
-
-        self.btn_cancel = QPushButton("취소")
-        self.btn_cancel.clicked.connect(self.cancel_migration)
-        self.btn_cancel.setEnabled(False)
-        btn_layout.addWidget(self.btn_cancel)
 
         btn_layout.addStretch()
 
@@ -923,13 +831,13 @@ class OneClickMigrationDialog(QDialog):
     def start_migration(self):
         """마이그레이션 시작"""
         self.btn_start.setEnabled(False)
-        self.btn_cancel.setEnabled(True)
         self.chk_dry_run.setEnabled(False)
         self.chk_backup.setEnabled(False)
 
-        # UI 초기화 (재실행 시 이전 로그 제거)
+        # UI 초기화 (재실행 시 이전 로그/검사 결과 제거)
         self.execution_widget.log_text.clear()
         self.execution_widget.update_progress(0, "시작 중...")
+        self.preflight_widget.reset()
 
         # 실행 위젯으로 전환
         self.stack.setCurrentWidget(self.execution_widget)
@@ -948,26 +856,60 @@ class OneClickMigrationDialog(QDialog):
         self.worker.preflight_result.connect(self._on_preflight_result)
         self.worker.analysis_result.connect(self._on_analysis_result)
         self.worker.execution_plan_ready.connect(self._on_execution_plan_ready)
-        self.worker.finished.connect(self._on_finished)
+        self.worker.migration_finished.connect(self._on_finished)
+        # 스레드 생명주기 정리는 상속받은 QThread.finished로만 처리한다.
+        self.worker.finished.connect(self.worker.deleteLater)
 
         self.worker.start()
 
-    def cancel_migration(self):
-        """마이그레이션 취소"""
-        if self.worker and self.worker.isRunning():
-            reply = QMessageBox.question(
-                self,
-                "취소 확인",
-                "마이그레이션을 취소하시겠습니까?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-            )
+    def _disconnect_worker_ui_signals(self, worker: "OneClickMigrationWorker"):
+        """워커의 UI 시그널을 다이얼로그 핸들러에서 분리한다.
 
-            if reply == QMessageBox.StandardButton.Yes:
-                self.worker.cancel()
-                self.btn_cancel.setEnabled(False)
+        다이얼로그가 닫힌 뒤에도 워커가 백그라운드에서 계속 실행되므로,
+        이미 파괴되었을 수 있는 다이얼로그 위젯에 이벤트가 전달되지 않도록 한다.
+        """
+        signal_slot_pairs = (
+            (worker.phase_changed, self._on_phase_changed),
+            (worker.progress, self._on_progress),
+            (worker.log_message, self._on_log),
+            (worker.preflight_result, self._on_preflight_result),
+            (worker.analysis_result, self._on_analysis_result),
+            (worker.execution_plan_ready, self._on_execution_plan_ready),
+            (worker.migration_finished, self._on_finished),
+        )
+        for signal, slot in signal_slot_pairs:
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+
+    def _detach_running_worker(self):
+        """실행 중인 워커를 다이얼로그에서 분리해 백그라운드에서 계속 실행되게 둔다.
+
+        Rust `run_oneclick()`은 취소 프로토콜이 없는 단일 블로킹 호출이므로
+        여기서 quit()/wait()/terminate()를 호출하지 않는다.
+        """
+        worker = self.worker
+        if worker is None:
+            return
+        self._disconnect_worker_ui_signals(worker)
+        _DETACHED_ONECLICK_WORKERS.add(worker)
+
+        def _cleanup():
+            _DETACHED_ONECLICK_WORKERS.discard(worker)
+            worker.deleteLater()
+
+        worker.finished.connect(_cleanup)
+        self.worker = None
 
     def closeEvent(self, event):
-        """다이얼로그 닫기 이벤트 처리"""
+        """다이얼로그 닫기 이벤트 처리.
+
+        Rust 코어 run_oneclick()은 취소 프로토콜이 없는 단일 블로킹 호출이므로
+        quit()/wait()/terminate()로 강제 종료하면 facade 세션이 손상될 수 있다.
+        실행 중이면 워커를 안전하게 분리(detach)하고 백그라운드에서 계속 실행되게 둔다.
+        (중단할 수 없음/백그라운드 지속 안내는 실행 시작 시 실행 로그에 이미 표시된다.)
+        """
         if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(
                 self, "작업 중",
@@ -977,11 +919,7 @@ class OneClickMigrationDialog(QDialog):
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            self.worker.cancel()
-            self.worker.quit()
-            if not self.worker.wait(3000):
-                self.worker.terminate()
-                self.worker.wait(1000)
+            self._detach_running_worker()
         event.accept()
 
     def _on_phase_changed(self, phase: str, phase_name: str):
@@ -1007,8 +945,11 @@ class OneClickMigrationDialog(QDialog):
         self.analysis_widget.update_result(total, auto_fixable, manual)
 
     def _on_execution_plan_ready(self, steps, summary):
-        """실행 계획 준비 완료 핸들러"""
-        self.execution_plan_widget.update_plan(steps, summary)
+        """Rust 실행 계획 수신 핸들러.
+
+        Rust `run_oneclick()`은 일시 정지 프로토콜이 없는 단일 블로킹 호출이므로
+        계획 확인을 위해 실행을 멈추지 않는다. 분류된 계획 내역은 실행 로그에만 기록한다.
+        """
         total = summary.get("total_issues", 0) if isinstance(summary, dict) else 0
         auto_fixable = summary.get("auto_fixable", 0) if isinstance(summary, dict) else 0
         manual = summary.get("manual_review", 0) if isinstance(summary, dict) else 0
@@ -1018,20 +959,26 @@ class OneClickMigrationDialog(QDialog):
             STYLE_INFO,
         )
 
-    def _on_start_execution_confirmed(self):
-        """사용자가 실행 계획 확인 후 "실행 시작" 클릭"""
-        # 실행 로그 위젯으로 전환
-        self.stack.setCurrentWidget(self.execution_widget)
-        # Worker 재개
-        if self.worker:
-            self.worker.resume_execution()
+        auto_items, skip_items, manual_items = _categorize_execution_plan_steps(steps)
+        if auto_items:
+            self._on_log("🔧 자동 실행 대상:", STYLE_INFO)
+            for item in auto_items:
+                self._on_log(item, STYLE_INFO)
+        if skip_items:
+            self._on_log("ℹ️ 조치 불필요 (MySQL 8.4에서 자동 처리):", STYLE_MUTED)
+            for item in skip_items:
+                self._on_log(item, STYLE_MUTED)
+        if manual_items:
+            self._on_log("📋 마이그레이션 후 수동 처리 필요:", STYLE_WARNING)
+            for item in manual_items:
+                self._on_log(item, STYLE_WARNING)
 
     def _on_finished(self, success: bool, report):
-        """완료 핸들러"""
+        """마이그레이션 결과 완료 핸들러 (스레드 생명주기가 아닌 Rust 실행 결과 처리)"""
         self.btn_start.setEnabled(True)
-        self.btn_cancel.setEnabled(False)
         self.chk_dry_run.setEnabled(ONECLICK_REAL_EXECUTION_ENABLED)
         self.chk_backup.setEnabled(True)
+        self.worker = None
 
         if report:
             self.result_widget.update_result(report)
