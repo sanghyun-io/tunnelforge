@@ -9,7 +9,7 @@ SQL 에디터 다이얼로그
 """
 import os
 import time
-import threading
+import logging
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QComboBox,
     QGroupBox, QSplitter, QPlainTextEdit, QTextEdit, QWidget, QTabWidget,
@@ -27,10 +27,17 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+from src.core.sql_query_classifier import (
+    classify_sql_statement,
+    is_mysql_implicit_commit_ddl,
+    statement_returns_rows,
+)
 from src.core.sql_statement_parser import (
     find_sql_statement_at_position,
     parse_sql_statements,
 )
+
+logger = logging.getLogger(__name__)
 
 LARGE_SQL_RENDER_LIMIT_BYTES = 512 * 1024
 
@@ -752,12 +759,12 @@ class ValidatingCodeEditor(CodeEditor):
 
 
 # =====================================================================
-# SQL 쿼리 실행 워커
+# SQL 쿼리 실행 워커 (자동 커밋 모드)
 # =====================================================================
 class SQLQueryWorker(QThread):
-    """SQL 쿼리 실행 워커"""
+    """SQL 쿼리 실행 워커 (자동 커밋)"""
     progress = pyqtSignal(str)
-    query_result = pyqtSignal(int, list, list, str, int, float)  # idx, columns, rows, error, affected, time
+    query_result = pyqtSignal(int, bool, list, list, str, int, float)  # idx, returns_rows, columns, rows, error, affected, time
     finished = pyqtSignal(bool, str)
 
     def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None):
@@ -797,6 +804,10 @@ class SQLQueryWorker(QThread):
             error_count = 0
 
             for idx, query in enumerate(self.queries):
+                if self.isInterruptionRequested():
+                    self.finished.emit(False, "⚠️ 실행이 취소되었습니다")
+                    return
+
                 query = query.strip()
                 if not query:
                     continue
@@ -805,22 +816,22 @@ class SQLQueryWorker(QThread):
 
                 start_time = time.time()
                 try:
-                    if query_returns_rows(query):
+                    if statement_returns_rows(query):
                         rows = []
 
                         def collect_batch(batch):
                             rows.extend(batch)
 
-                        connector.connection.facade.execute_on_connection_streaming(
+                        result = connector.connection.facade.execute_on_connection_streaming(
                             connector.connection.connection_id,
                             query,
                             row_batch_size=500,
                             on_batch=collect_batch,
                         )
-                        columns = list(rows[0].keys()) if rows else []
+                        columns = result.get("columns") or []
                         row_list = [[row.get(col) for col in columns] for row in rows]
                         execution_time = time.time() - start_time
-                        self.query_result.emit(idx, columns, row_list, "", len(row_list), execution_time)
+                        self.query_result.emit(idx, True, columns, row_list, "", len(row_list), execution_time)
                         success_count += 1
                         continue
 
@@ -828,9 +839,9 @@ class SQLQueryWorker(QThread):
                     with connector.connection.cursor() as cursor:
                         cursor.execute(query)
 
-                        # SELECT 쿼리인지 확인
-                        if cursor.description:
-                            # SELECT 결과
+                        # 행을 반환하는 statement인지 확인 (None만 비행-statement)
+                        if cursor.description is not None:
+                            # SELECT 결과 (0행이어도 columns == [] 로 반환됨)
                             columns = [desc[0] for desc in cursor.description]
                             rows = cursor.fetchall()
                             # Dict to list 변환
@@ -842,19 +853,21 @@ class SQLQueryWorker(QThread):
                                     row_list.append(list(row))
 
                             execution_time = time.time() - start_time
-                            self.query_result.emit(idx, columns, row_list, "", len(row_list), execution_time)
+                            self.query_result.emit(idx, True, columns, row_list, "", len(row_list), execution_time)
                             success_count += 1
                         else:
                             # INSERT, UPDATE, DELETE 등
                             affected = cursor.rowcount
                             connector.connection.commit()
                             execution_time = time.time() - start_time
-                            self.query_result.emit(idx, [], [], "", affected, execution_time)
+                            self.query_result.emit(idx, False, [], [], "", affected, execution_time)
                             success_count += 1
 
                 except Exception as e:
                     execution_time = time.time() - start_time
-                    self.query_result.emit(idx, [], [], str(e), 0, execution_time)
+                    self.query_result.emit(
+                        idx, statement_returns_rows(query), [], [], str(e), 0, execution_time
+                    )
                     error_count += 1
 
             if error_count == 0:
@@ -871,167 +884,81 @@ class SQLQueryWorker(QThread):
                 try:
                     connector.disconnect()
                 except Exception:
-                    pass
+                    logger.debug("자동 커밋 워커 연결 정리 실패", exc_info=True)
 
 
 # =====================================================================
-# 트랜잭션 대기 워커 (수정 쿼리용 - 커밋 전 확인)
+# SQL 트랜잭션 실행 워커 (지속 연결 모드 - 커밋/롤백은 다이얼로그가 소유)
 # =====================================================================
-class SQLTransactionWorker(QThread):
-    """수정 쿼리 실행 워커 (트랜잭션 분리 - 커밋 전 확인 대기)"""
-    progress = pyqtSignal(str)
-    preview_result = pyqtSignal(int, str, int, float, str)  # idx, query_type, affected, time, preview_info
-    select_result = pyqtSignal(int, list, list, str, int, float)  # idx, columns, rows, error, affected, time
-    error_result = pyqtSignal(int, str, float)  # idx, error, time
-    ready_for_confirm = pyqtSignal()  # 커밋 대기 상태
+class SQLTransactionExecutionWorker(QThread):
+    """지속 트랜잭션 연결에서 쿼리를 순차 실행하는 워커.
+
+    커밋/롤백은 이 워커가 아니라 SQLEditorDialog가 소유한 연결에서 처리한다.
+    PostgreSQL은 에러 발생 시 트랜잭션 전체가 aborted 상태가 되므로 즉시 롤백하고 중단한다.
+    """
+    progress = pyqtSignal(int, int, str, str)  # idx, total, query_type, preview
+    query_result = pyqtSignal(int, str, bool, list, list, str, int, float)  # idx, query, returns_rows, columns, rows, error, affected, time
+    postgres_rolled_back = pyqtSignal(str)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None):
+    def __init__(self, connection, queries, engine):
         super().__init__()
-        self.engine = normalize_db_engine(engine, port)
-        self.host = host
-        self.port = port
-        self.user = user
-        self.password = password
-        self.database = database
-        self.schema = schema
+        self.connection = connection
         self.queries = queries
-        self.connector = None
-        self.pending_commit = False
-        self.should_commit = None  # None: 대기 중, True: 커밋, False: 롤백
+        self.engine = engine
 
     def run(self):
-        try:
-            # autocommit=False로 연결
-            self.connector = create_sql_editor_connector(
-                self.engine,
-                self.host,
-                self.port,
-                self.user,
-                self.password,
-                self.database,
-                self.schema,
-            )
-            success, msg = self.connector.connect()
-
-            if not success:
-                self.finished.emit(False, f"연결 실패: {msg}")
+        total = len(self.queries)
+        for idx, raw_query in enumerate(self.queries):
+            if self.isInterruptionRequested():
+                self.finished.emit(False, "⚠️ 실행이 취소되었습니다")
                 return
 
-            # autocommit 비활성화
-            self.connector.connection.autocommit(False)
-            self.progress.emit(f"✅ 연결 성공 (트랜잭션 모드): {self.host}:{self.port}")
+            query = raw_query.strip()
+            if not query:
+                continue
 
-            total_queries = len(self.queries)
-            has_modification = False
-            modification_queries = []
+            classification = classify_sql_statement(query)
+            query_type = (classification.leading_keyword or "other").upper()
+            preview = query[:100] + ("..." if len(query) > 100 else "")
+            self.progress.emit(idx, total, query_type, preview)
 
-            for idx, query in enumerate(self.queries):
-                query = query.strip()
-                if not query:
-                    continue
+            start_time = time.time()
+            try:
+                with self.connection.cursor() as cursor:
+                    cursor.execute(query)
 
-                query_type = self._get_query_type(query)
-                self.progress.emit(f"📄 쿼리 {idx + 1}/{total_queries} 실행 중... ({query_type})")
+                    if cursor.description is not None:
+                        columns = [desc[0] for desc in cursor.description]
+                        rows = cursor.fetchall()
+                        row_list = []
+                        for row in rows:
+                            if isinstance(row, dict):
+                                row_list.append([row.get(col) for col in columns])
+                            else:
+                                row_list.append(list(row))
+                        execution_time = time.time() - start_time
+                        self.query_result.emit(idx, query, True, columns, row_list, "", len(row_list), execution_time)
+                    else:
+                        affected = cursor.rowcount
+                        execution_time = time.time() - start_time
+                        self.query_result.emit(idx, query, False, [], [], "", affected, execution_time)
 
-                start_time = time.time()
-                try:
-                    with self.connector.connection.cursor() as cursor:
-                        cursor.execute(query)
-
-                        if cursor.description:
-                            # SELECT 결과
-                            columns = [desc[0] for desc in cursor.description]
-                            rows = cursor.fetchall()
-                            row_list = []
-                            for row in rows:
-                                if isinstance(row, dict):
-                                    row_list.append([row.get(col) for col in columns])
-                                else:
-                                    row_list.append(list(row))
-
-                            execution_time = time.time() - start_time
-                            self.select_result.emit(idx, columns, row_list, "", len(row_list), execution_time)
-                        else:
-                            # 수정 쿼리 (INSERT, UPDATE, DELETE 등)
-                            affected = cursor.rowcount
-                            execution_time = time.time() - start_time
-                            has_modification = True
-                            modification_queries.append((idx, query_type, affected, execution_time, query[:100]))
-
-                            # 미리보기 정보 전송
-                            preview_info = query[:100] + ("..." if len(query) > 100 else "")
-                            self.preview_result.emit(idx, query_type, affected, execution_time, preview_info)
-
-                except Exception as e:
-                    execution_time = time.time() - start_time
-                    self.error_result.emit(idx, str(e), execution_time)
-                    self.connector.connection.rollback()
-                    self.connector.disconnect()
-                    self.finished.emit(False, "❌ 오류 발생, 트랜잭션 롤백됨")
+            except Exception as e:
+                execution_time = time.time() - start_time
+                if self.engine == "postgresql":
+                    try:
+                        self.connection.rollback()
+                    except Exception:
+                        logger.debug("PostgreSQL 오류 후 롤백 실패", exc_info=True)
+                    self.postgres_rolled_back.emit(str(e))
+                    self.query_result.emit(idx, query, False, [], [], str(e), 0, execution_time)
+                    self.finished.emit(False, "❌ PostgreSQL 오류로 트랜잭션이 롤백되었습니다")
                     return
+                # MySQL 등: 이전 쿼리는 이미 반영되었으므로 실패만 기록하고 계속 진행
+                self.query_result.emit(idx, query, False, [], [], str(e), 0, execution_time)
 
-            # 수정 쿼리가 있으면 커밋 확인 대기
-            if has_modification:
-                self.pending_commit = True
-                self.progress.emit("⏳ 커밋 확인 대기 중...")
-                self.ready_for_confirm.emit()
-
-                # 커밋/롤백 결정 대기
-                while self.should_commit is None:
-                    self.msleep(100)
-
-                if self.should_commit:
-                    self.connector.connection.commit()
-                    self.progress.emit("✅ 트랜잭션 커밋 완료")
-                    self.finished.emit(True, f"✅ {len(modification_queries)}개 수정 쿼리 커밋됨")
-                else:
-                    self.connector.connection.rollback()
-                    self.progress.emit("⚠️ 트랜잭션 롤백됨")
-                    self.finished.emit(False, "⚠️ 사용자에 의해 롤백됨")
-            else:
-                self.finished.emit(True, "✅ SELECT 쿼리 실행 완료")
-
-            self.connector.disconnect()
-
-        except Exception as e:
-            if self.connector:
-                try:
-                    self.connector.connection.rollback()
-                    self.connector.disconnect()
-                except Exception:
-                    pass
-            self.finished.emit(False, f"❌ 오류: {str(e)}")
-
-    def _get_query_type(self, query):
-        """쿼리 타입 반환"""
-        query_upper = query.upper().strip()
-        if query_upper.startswith('SELECT'):
-            return 'SELECT'
-        elif query_upper.startswith('INSERT'):
-            return 'INSERT'
-        elif query_upper.startswith('UPDATE'):
-            return 'UPDATE'
-        elif query_upper.startswith('DELETE'):
-            return 'DELETE'
-        elif query_upper.startswith('TRUNCATE'):
-            return 'TRUNCATE'
-        elif query_upper.startswith('DROP'):
-            return 'DROP'
-        elif query_upper.startswith('ALTER'):
-            return 'ALTER'
-        elif query_upper.startswith('CREATE'):
-            return 'CREATE'
-        else:
-            return 'OTHER'
-
-    def do_commit(self):
-        """커밋 실행"""
-        self.should_commit = True
-
-    def do_rollback(self):
-        """롤백 실행"""
-        self.should_commit = False
+        self.finished.emit(True, "✅ 실행 완료")
 
 
 # =====================================================================
@@ -1593,7 +1520,6 @@ class SQLEditorDialog(QDialog):
         self.config_mgr = config_manager
         self.engine = tunnel_engine
         self.worker = None
-        self.temp_server = None
         self._tab_counter = 0  # 탭 번호 카운터
         self._result_counter = 0  # 결과 탭 번호 카운터
         self._message_collapsed = True
@@ -1602,6 +1528,15 @@ class SQLEditorDialog(QDialog):
         self.db_connection = None
         self._db_connector = None
         self.pending_queries = []  # 미커밋 쿼리 목록: [(query, type, affected, timestamp, history_id), ...]
+
+        # 임시 터널 소유권 분리 — 지속 트랜잭션 연결 vs 자동 커밋 1회성 실행
+        self._persistent_temp_server = None
+        self._autocommit_temp_server = None
+        self._connected_target = None  # (database, schema) — db_connection이 실제로 물려있는 대상
+        self._query_executing = False
+        self._schema_change_guard = False
+        self._pg_rolled_back_due_to_error = False
+        self._retired_workers = []  # 취소되었지만 finished 시그널까지 유지해야 하는 워커들
 
         # 히스토리 매니저
         from src.core.sql_history import SQLHistory
@@ -1656,9 +1591,6 @@ class SQLEditorDialog(QDialog):
             return None, None, None, f"터널 생성 실패: {error}"
         host = '127.0.0.1'
         port = int(self.engine.get_temp_tunnel_port(temp_server))
-        if keep_temp_tunnel:
-            self.temp_server = temp_server
-            temp_server = None
         if log_temp_tunnel:
             self.message_text.append(f"✅ 임시 터널: localhost:{port}")
         return host, port, temp_server, None
@@ -2045,46 +1977,46 @@ class SQLEditorDialog(QDialog):
         layout.addWidget(self.status_bar)
 
     def setup_shortcuts(self):
-        """단축키 설정"""
+        """단축키 설정 (쿼리 실행 중에는 실행 단축키를 비활성화하기 위해 self에 보관)"""
         # F5: 전체 실행
-        shortcut_f5 = QShortcut(QKeySequence("F5"), self)
-        shortcut_f5.activated.connect(self.execute_all_queries)
+        self.shortcut_f5 = QShortcut(QKeySequence("F5"), self)
+        self.shortcut_f5.activated.connect(self.execute_all_queries)
 
         # Ctrl+Enter: 현재 쿼리 실행
-        shortcut_ctrl_enter = QShortcut(QKeySequence("Ctrl+Return"), self)
-        shortcut_ctrl_enter.activated.connect(self.execute_current_query)
+        self.shortcut_ctrl_enter = QShortcut(QKeySequence("Ctrl+Return"), self)
+        self.shortcut_ctrl_enter.activated.connect(self.execute_current_query)
 
         # Ctrl+Shift+Enter: 전체 실행
-        shortcut_ctrl_shift_enter = QShortcut(QKeySequence("Ctrl+Shift+Return"), self)
-        shortcut_ctrl_shift_enter.activated.connect(self.execute_all_queries)
+        self.shortcut_ctrl_shift_enter = QShortcut(QKeySequence("Ctrl+Shift+Return"), self)
+        self.shortcut_ctrl_shift_enter.activated.connect(self.execute_all_queries)
 
         # Ctrl+O: 열기
-        shortcut_open = QShortcut(QKeySequence("Ctrl+O"), self)
-        shortcut_open.activated.connect(self.open_file)
+        self.shortcut_open = QShortcut(QKeySequence("Ctrl+O"), self)
+        self.shortcut_open.activated.connect(self.open_file)
 
         # Ctrl+S: 저장
-        shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
-        shortcut_save.activated.connect(self.save_file)
+        self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.shortcut_save.activated.connect(self.save_file)
 
         # Ctrl+Shift+S: 다른 이름으로 저장
-        shortcut_save_as = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
-        shortcut_save_as.activated.connect(self.save_file_as)
+        self.shortcut_save_as = QShortcut(QKeySequence("Ctrl+Shift+S"), self)
+        self.shortcut_save_as.activated.connect(self.save_file_as)
 
         # Ctrl+N: 새 탭
-        shortcut_new_tab = QShortcut(QKeySequence("Ctrl+N"), self)
-        shortcut_new_tab.activated.connect(self._add_new_tab)
+        self.shortcut_new_tab = QShortcut(QKeySequence("Ctrl+N"), self)
+        self.shortcut_new_tab.activated.connect(self._add_new_tab)
 
         # Ctrl+W: 현재 탭 닫기
-        shortcut_close_tab = QShortcut(QKeySequence("Ctrl+W"), self)
-        shortcut_close_tab.activated.connect(self._close_current_tab)
+        self.shortcut_close_tab = QShortcut(QKeySequence("Ctrl+W"), self)
+        self.shortcut_close_tab.activated.connect(self._close_current_tab)
 
         # Ctrl+Tab: 다음 탭
-        shortcut_next_tab = QShortcut(QKeySequence("Ctrl+Tab"), self)
-        shortcut_next_tab.activated.connect(self._next_tab)
+        self.shortcut_next_tab = QShortcut(QKeySequence("Ctrl+Tab"), self)
+        self.shortcut_next_tab.activated.connect(self._next_tab)
 
         # Ctrl+Shift+Tab: 이전 탭
-        shortcut_prev_tab = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
-        shortcut_prev_tab.activated.connect(self._prev_tab)
+        self.shortcut_prev_tab = QShortcut(QKeySequence("Ctrl+Shift+Tab"), self)
+        self.shortcut_prev_tab.activated.connect(self._prev_tab)
 
     # =====================================================================
     # 에디터 탭 관리
@@ -2315,17 +2247,32 @@ class SQLEditorDialog(QDialog):
                 self.engine.close_temp_tunnel(temp_server)
 
     def _ensure_connection(self):
-        """지속 연결 확보 (없으면 생성)"""
+        """지속 연결 확보 (없으면 생성).
+
+        db_combo에서 선택된 DB/스키마가 현재 지속 연결의 대상과 다르면,
+        미커밋 변경이 있는 동안은 재연결을 거부하고 없으면 재연결한다.
+        """
+        selected = self.db_combo.currentText().strip()
+        target = self._database_and_schema_for_selection(selected)
+
         if self.db_connection and self.db_connection.open:
-            return True, None
+            if self._connected_target == target:
+                return True, None
+            if self.pending_queries or self._collect_all_pending_edits():
+                return False, (
+                    "선택된 DB/스키마가 현재 트랜잭션 연결과 다릅니다. "
+                    "미커밋 변경을 커밋하거나 롤백한 뒤 다시 실행하세요."
+                )
+            self._close_db_connection()
 
         db_user, db_password = self._db_credentials()
 
         if not db_user:
             return False, "DB 자격 증명이 설정되지 않았습니다."
 
+        temp_server = None
         try:
-            host, port, _temp_server, error = self._resolve_db_target(
+            host, port, temp_server, error = self._resolve_db_target(
                 allow_temp_tunnel=True,
                 keep_temp_tunnel=True,
                 log_temp_tunnel=True,
@@ -2333,8 +2280,7 @@ class SQLEditorDialog(QDialog):
             if error:
                 return False, error
 
-            selected = self.db_combo.currentText().strip()
-            database, schema = self._database_and_schema_for_selection(selected)
+            database, schema = target
 
             db_engine = self._db_engine()
             connector = self._create_db_connector(
@@ -2350,6 +2296,8 @@ class SQLEditorDialog(QDialog):
                 return False, msg
             self.db_connection = connector.connection
             self._db_connector = connector
+            self._persistent_temp_server = temp_server
+            temp_server = None  # 소유권이 self._persistent_temp_server로 이전됨
             self.db_connection.autocommit(False)
             # READ COMMITTED: 각 SELECT가 최신 커밋 데이터를 조회 (외부 변경 즉시 반영)
             if db_engine == 'postgresql':
@@ -2360,12 +2308,17 @@ class SQLEditorDialog(QDialog):
                 self.db_connection.cursor().execute(
                     "SET SESSION TRANSACTION ISOLATION LEVEL READ COMMITTED"
                 )
+            self._connected_target = target
             self.message_text.append(f"✅ DB 연결 성공 (트랜잭션 모드): {host}:{port}")
             self._update_tx_status()
             return True, None
 
         except Exception as e:
             return False, str(e)
+        finally:
+            # 연결 성공 시 temp_server는 이미 None으로 비워짐 — 실패 시에만 여기서 정리
+            if temp_server:
+                self.engine.close_temp_tunnel(temp_server)
 
     def execute_current_query(self):
         """커서 위치의 현재 쿼리만 실행 (Ctrl+Enter)"""
@@ -2403,8 +2356,8 @@ class SQLEditorDialog(QDialog):
         return find_sql_statement_at_position(full_text, cursor_pos)
 
     def _execute_sql(self, sql_text, single_query=False):
-        """SQL 실행 (내부 메서드)"""
-        if self.worker and self.worker.isRunning():
+        """SQL 실행 (내부 메서드) — 트랜잭션 모드는 QThread 워커로 순차 실행한다."""
+        if self._query_executing or (self.worker and self.worker.isRunning()):
             QMessageBox.warning(self, "경고", "쿼리가 이미 실행 중입니다.")
             return
 
@@ -2453,9 +2406,24 @@ class SQLEditorDialog(QDialog):
             QMessageBox.warning(self, "경고", error)
             return
 
-        # 단일 쿼리 실행 시 결과 탭 유지, 전체 실행 시 초기화
+        # MySQL DDL은 암묵적 COMMIT을 일으켜 이전 미커밋 변경을 되돌릴 수 없게 만든다 — 사전 확인
+        if (
+            self._db_engine() == 'mysql'
+            and self.pending_queries
+            and any(is_mysql_implicit_commit_ddl(q) for q in queries)
+        ):
+            reply = QMessageBox.question(
+                self, "DDL 실행 확인",
+                "MySQL DDL은 암묵적 COMMIT을 발생시켜 이전 미커밋 변경을 롤백할 수 없게 됩니다. 계속 실행하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
+        # 단일 쿼리 실행 시 결과 탭 유지, 전체 실행 시 초기화 (미저장 셀 편집이 있으면 확인)
         if not single_query:
-            self._clear_result_tabs()
+            if not self._clear_result_tabs():
+                return
 
         self._set_executing_state(True)
 
@@ -2464,86 +2432,98 @@ class SQLEditorDialog(QDialog):
         self.message_text.append(f"🚀 {query_label} 실행")
         self.message_text.append(f"{'─'*40}")
 
-        # 쿼리 실행
-        from datetime import datetime
+        if len(queries) > 1:
+            self.progress_bar.setMaximum(len(queries))
 
-        total = len(queries)
+        self.worker = SQLTransactionExecutionWorker(self.db_connection, queries, self._db_engine())
+        self.worker.progress.connect(self._on_transaction_progress)
+        self.worker.query_result.connect(self._on_transaction_query_result)
+        self.worker.postgres_rolled_back.connect(self._on_postgres_transaction_rolled_back)
+        self.worker.finished.connect(self._on_transaction_finished)
+        self.worker.start()
+
+    def _on_transaction_progress(self, idx, total, query_type, preview):
+        """트랜잭션 워커가 쿼리 실행을 시작하기 전 진행 상황을 알림"""
         if total > 1:
-            self.progress_bar.setMaximum(total)
+            self.progress_bar.setValue(idx)
+            self._exec_query_progress = f"{idx + 1}/{total}"
+        self.message_text.append(f"📄 쿼리 {idx + 1}/{total} 실행 중... ({query_type})")
 
-        for idx, query in enumerate(queries):
-            query = query.strip()
-            if not query:
-                continue
+    def _on_transaction_query_result(self, idx, query, returns_rows, columns, rows, error, affected, exec_time):
+        """트랜잭션 워커에서 쿼리 1건 실행 결과 수신"""
+        preview = query[:60] + "..." if len(query) > 60 else query
+        preview = preview.replace('\n', ' ')
 
-            # 실행할 쿼리 미리보기 (짧게)
-            preview = query[:60] + "..." if len(query) > 60 else query
-            preview = preview.replace('\n', ' ')
+        if error:
+            self.message_text.append(f"❌ {error}")
+            self.message_text.append(f"   └ {preview}")
+            self.history_manager.add_query(query, False, 0, exec_time, status='error', error=error)
+        elif returns_rows:
+            # columns == [] 인 0행 결과도 결과 탭으로 표시 (SELECT 실행 자체는 성공)
+            self._add_result_table(columns, rows, exec_time, query)
+            self.message_text.append(f"✅ {len(rows)}행 반환 ({exec_time:.3f}초)")
+            self.message_text.append(f"   └ {preview}")
+            self.history_manager.add_query(query, True, len(rows), exec_time)
+        else:
+            query_type = (classify_sql_statement(query).leading_keyword or "other").upper()
+            if self._db_engine() == 'mysql' and is_mysql_implicit_commit_ddl(query):
+                # MySQL 암묵적 COMMIT DDL: 이전 미커밋 변경은 이미 서버에 커밋되어 되돌릴 수 없다
+                if self.pending_queries:
+                    history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
+                    if history_ids:
+                        self.history_manager.update_status_batch(history_ids, 'auto_committed_by_ddl')
+                    self.pending_queries.clear()
+                    self.message_text.append("⚠️ DDL로 인해 이전 미커밋 변경이 자동 커밋되었습니다. 롤백할 수 없습니다.")
+                self.history_manager.add_query(query, True, affected, exec_time, status='committed')
+                self.message_text.append(f"✅ [DDL] {affected}행 영향 ({exec_time:.3f}초) - 자동 커밋됨")
+                self.message_text.append(f"   └ {preview}")
+            else:
+                history_id = self.history_manager.add_query(
+                    query, True, affected, exec_time, status='pending'
+                )
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%H:%M:%S")
+                self.pending_queries.append({
+                    'query': query,
+                    'type': query_type,
+                    'affected': affected,
+                    'timestamp': timestamp,
+                    'history_id': history_id,
+                })
+                self.message_text.append(f"📝 [{query_type}] {affected}행 영향 ({exec_time:.3f}초) - 미커밋")
+                self.message_text.append(f"   └ {preview}")
 
-            # 진행률 업데이트
-            if total > 1:
-                self.progress_bar.setValue(idx)
-                self._exec_query_progress = f"{idx + 1}/{total}"
+        total = len(self.worker.queries) if self.worker is not None else 0
+        if total > 1:
+            self.progress_bar.setValue(idx + 1)
+            self._exec_query_progress = f"{idx + 1}/{total}"
 
-            start_time = time.time()
-            query_type = self._get_query_type(query)
-
-            try:
-                with self.db_connection.cursor() as db_cursor:
-                    self._execute_query_in_thread(db_cursor, query)
-
-                    if db_cursor.description:
-                        # SELECT 결과
-                        columns = [desc[0] for desc in db_cursor.description]
-                        rows = db_cursor.fetchall()
-                        row_list = [[row.get(col) for col in columns] for row in rows]
-                        exec_time = time.time() - start_time
-
-                        self._add_result_table(columns, row_list, exec_time, query)
-                        self.message_text.append(f"✅ {len(rows)}행 반환 ({exec_time:.3f}초)")
-                        self.message_text.append(f"   └ {preview}")
-
-                        # 히스토리 저장 (SELECT - 즉시 완료)
-                        self.history_manager.add_query(query, True, len(rows), exec_time)
-                    else:
-                        # 수정 쿼리
-                        affected = db_cursor.rowcount
-                        exec_time = time.time() - start_time
-
-                        # 히스토리 저장 (pending 상태)
-                        history_id = self.history_manager.add_query(
-                            query, True, affected, exec_time, status='pending'
-                        )
-
-                        # 미커밋 목록에 추가
-                        timestamp = datetime.now().strftime("%H:%M:%S")
-                        self.pending_queries.append({
-                            'query': query,
-                            'type': query_type,
-                            'affected': affected,
-                            'timestamp': timestamp,
-                            'history_id': history_id
-                        })
-
-                        self.message_text.append(f"📝 [{query_type}] {affected}행 영향 ({exec_time:.3f}초) - 미커밋")
-                        self.message_text.append(f"   └ {preview}")
-
-            except Exception as e:
-                exec_time = time.time() - start_time
-                self.message_text.append(f"❌ {str(e)}")
-                self.history_manager.add_query(query, False, 0, exec_time, error=str(e))
-
-            # 쿼리 완료 후 진행률 갱신
-            if total > 1:
-                self.progress_bar.setValue(idx + 1)
-                self._exec_query_progress = f"{idx + 1}/{total}"
-
-        # 상태 업데이트
-        total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
-        self._set_executing_state(False)
         self._update_tx_status()
+
+    def _on_postgres_transaction_rolled_back(self, error):
+        """PostgreSQL은 에러 발생 시 트랜잭션 전체가 aborted 상태가 되어 즉시 롤백된다"""
+        history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
+        if history_ids:
+            self.history_manager.update_status_batch(history_ids, 'rolled_back_due_to_error')
+        self.pending_queries.clear()
+        self._pg_rolled_back_due_to_error = True
+        self.message_text.append(
+            "⚠️ PostgreSQL 오류로 트랜잭션이 즉시 롤백되었습니다. "
+            "이전 미커밋 변경은 적용되지 않았습니다. 쿼리를 수정한 뒤 다시 실행하세요."
+        )
+        self._update_tx_status()
+
+    def _on_transaction_finished(self, success, msg):
+        """트랜잭션 워커 실행 종료 — 지속 연결은 유지, 커밋/롤백은 사용자가 결정"""
+        total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
+        self.message_text.append(f"\n{msg}")
+        self._set_message_summary(f"{msg} · {total_elapsed:.1f}초")
+        self._set_executing_state(False)
         pending_count = len(self.pending_queries)
-        self.status_bar.showMessage(f"✅ 실행 완료 ({total_elapsed:.1f}초, 미커밋 변경: {pending_count}건)")
+        self.status_bar.showMessage(f"{msg} ({total_elapsed:.1f}초, 미커밋 변경: {pending_count}건)")
+        if self.worker is not None:
+            self.worker.deleteLater()
+        self.worker = None
 
     def _execute_with_autocommit(self, queries, sql_text):
         """자동 커밋 모드로 실행 (기존 워커 사용)"""
@@ -2554,7 +2534,7 @@ class SQLEditorDialog(QDialog):
             return
 
         try:
-            host, port, _temp_server, error = self._resolve_db_target(
+            host, port, temp_server, error = self._resolve_db_target(
                 allow_temp_tunnel=True,
                 keep_temp_tunnel=True,
                 log_temp_tunnel=True,
@@ -2562,11 +2542,16 @@ class SQLEditorDialog(QDialog):
             if error:
                 self.message_text.append(f"❌ {error}")
                 return
+            self._autocommit_temp_server = temp_server
 
             selected = self.db_combo.currentText().strip()
             database, schema = self._database_and_schema_for_selection(selected)
 
-            self._clear_result_tabs()
+            if not self._clear_result_tabs():
+                if self._autocommit_temp_server:
+                    self.engine.close_temp_tunnel(self._autocommit_temp_server)
+                    self._autocommit_temp_server = None
+                return
 
             self._set_executing_state(True)
             self.progress_bar.setMaximum(len(queries))
@@ -2589,19 +2574,9 @@ class SQLEditorDialog(QDialog):
             self.worker.finished.connect(self._on_finished)
             self.worker.start()
 
-            self.history_manager.add_query(sql_text, True, 0, 0)
-
         except Exception as e:
             self.message_text.append(f"❌ 오류: {str(e)}")
             self._cleanup()
-
-    def _get_query_type(self, query):
-        """쿼리 타입 반환"""
-        query_upper = query.upper().strip()
-        for kw in ['SELECT', 'INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'DROP', 'ALTER', 'CREATE']:
-            if query_upper.startswith(kw):
-                return kw
-        return 'OTHER'
 
     def _add_result_table(self, columns, rows, exec_time, query=''):
         """결과 테이블 탭 추가"""
@@ -2673,11 +2648,44 @@ class SQLEditorDialog(QDialog):
         # 편집 가능성 분석 + 설정
         self._setup_result_table_editability(table, query, columns, rows)
 
-    def _clear_result_tabs(self):
-        """모든 결과 탭 삭제"""
+    def _pending_edit_count_for_result_tab(self, index: int) -> int:
+        """특정 결과 탭의 미저장 셀 편집 건수"""
+        widget = self.result_tabs.widget(index)
+        if not isinstance(widget, QTableWidget):
+            return 0
+        ctx = getattr(widget, '_edit_context', None)
+        if not ctx:
+            return 0
+        return len(ctx['pending_edits'])
+
+    def _confirm_discard_pending_edits(self, count: int, action_label: str) -> bool:
+        """미저장 셀 편집이 있으면 확인 다이얼로그를 띄우고, 계속 여부를 반환"""
+        if count <= 0:
+            return True
+        reply = QMessageBox.question(
+            self, "확인",
+            f"저장되지 않은 셀 편집 {count}건이 있습니다. {action_label} 손실됩니다. 계속하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
+
+    def _discard_all_pending_edits(self):
+        """모든 결과 탭의 미저장 셀 편집을 원본값으로 되돌림"""
+        for table, _ctx in self._collect_all_pending_edits():
+            self._discard_pending_edits(table)
+
+    def _clear_result_tabs(self) -> bool:
+        """모든 결과 탭 삭제 (미저장 셀 편집이 있으면 확인). 실행 여부를 반환."""
+        total_pending = sum(
+            self._pending_edit_count_for_result_tab(i)
+            for i in range(self.result_tabs.count())
+        )
+        if not self._confirm_discard_pending_edits(total_pending, "결과 탭을 삭제하면"):
+            return False
         while self.result_tabs.count() > 0:
             self.result_tabs.removeTab(0)
         self._result_counter = 0
+        return True
 
     def _set_message_panel_collapsed(self, collapsed: bool):
         """메시지 영역 접힘/펼침 상태 적용"""
@@ -2720,7 +2728,11 @@ class SQLEditorDialog(QDialog):
         menu.exec(tab_bar.mapToGlobal(position))
 
     def _update_tx_status(self):
-        """트랜잭션 상태 UI 업데이트"""
+        """트랜잭션 상태 UI 업데이트.
+
+        쿼리 실행 중이거나 PostgreSQL 오류로 롤백된 직후에는 커밋/롤백 버튼을
+        pending 건수와 무관하게 별도로 가드한다.
+        """
         pending_count = len(self.pending_queries)
         try:
             cell_edit_count = sum(
@@ -2730,7 +2742,9 @@ class SQLEditorDialog(QDialog):
         except Exception:
             cell_edit_count = 0
 
-        if pending_count > 0 or cell_edit_count > 0:
+        has_pending = pending_count > 0 or cell_edit_count > 0
+
+        if has_pending:
             self.tx_status_frame.setStyleSheet("""
                 QFrame {
                     background-color: #FFF3CD;
@@ -2750,8 +2764,6 @@ class SQLEditorDialog(QDialog):
 
             self.tx_info_label.setText(label_text)
             self.tx_info_label.setStyleSheet("color: #856404; font-weight: bold; background: transparent; border: none;")
-            self.btn_commit.setEnabled(True)
-            self.btn_rollback.setEnabled(True)
             self.btn_toggle_pending.setVisible(pending_count > 0)
 
             # 미커밋 쿼리 목록 업데이트 (DML만 — 셀 편집은 노랑 배경/*N으로 별도 표시)
@@ -2774,11 +2786,25 @@ class SQLEditorDialog(QDialog):
             self.tx_status_icon.setText("💾")
             self.tx_info_label.setText("트랜잭션: 대기 중")
             self.tx_info_label.setStyleSheet("color: #004085; background: transparent; border: none;")
-            self.btn_commit.setEnabled(False)
-            self.btn_rollback.setEnabled(False)
             self.btn_toggle_pending.setVisible(False)
             self.pending_list_widget.setVisible(False)
             self.pending_list_widget.clear()
+
+        if self._pg_rolled_back_due_to_error:
+            self.tx_info_label.setText("PostgreSQL 오류로 트랜잭션 롤백됨 - 쿼리를 다시 실행하세요")
+            self.tx_info_label.setStyleSheet("color: #856404; font-weight: bold; background: transparent; border: none;")
+            commit_enabled = False
+            rollback_enabled = cell_edit_count > 0
+        else:
+            commit_enabled = has_pending
+            rollback_enabled = has_pending
+
+        if self._query_executing:
+            commit_enabled = False
+            rollback_enabled = False
+
+        self.btn_commit.setEnabled(commit_enabled)
+        self.btn_rollback.setEnabled(rollback_enabled)
 
     def _toggle_pending_list(self):
         """미커밋 쿼리 목록 펼치기/접기"""
@@ -2801,39 +2827,24 @@ class SQLEditorDialog(QDialog):
             return None
 
     def _apply_limit(self, query, limit_value):
-        """SELECT 쿼리에 LIMIT 자동 적용 (이미 LIMIT이 있으면 적용 안함)"""
-        query_upper = query.upper().strip()
-
-        # SELECT 쿼리가 아니면 그대로 반환
-        if not query_upper.startswith('SELECT'):
+        """SELECT/WITH 쿼리에 LIMIT 자동 적용 (이미 LIMIT이 있거나 SHOW/DESCRIBE/EXPLAIN/CALL이면 적용 안함)"""
+        classification = classify_sql_statement(query)
+        if classification.leading_keyword not in {"select", "with"} or not classification.returns_rows:
             return query
+
+        # 문자열 리터럴/주석을 동일 길이 공백으로 치환 — LIMIT 오탐지(문자열·주석 내부) 방지
+        cleaned = re.sub(r"'(?:[^'\\]|\\.)*'", lambda m: ' ' * len(m.group(0)), query, flags=re.DOTALL)
+        cleaned = re.sub(r'"(?:[^"\\]|\\.)*"', lambda m: ' ' * len(m.group(0)), cleaned, flags=re.DOTALL)
+        cleaned = re.sub(r'--[^\n]*', lambda m: ' ' * len(m.group(0)), cleaned)
+        cleaned = re.sub(r'#[^\n]*', lambda m: ' ' * len(m.group(0)), cleaned)
+        cleaned = re.sub(r'/\*.*?\*/', lambda m: ' ' * len(m.group(0)), cleaned, flags=re.DOTALL)
 
         # 이미 LIMIT이 있으면 그대로 반환
-        # LIMIT 키워드 검색 (문자열 내부 제외)
-        in_string = False
-        string_char = None
-        check_text = []
-
-        for char in query:
-            if char in ("'", '"') and not in_string:
-                in_string = True
-                string_char = char
-                check_text.append(' ')
-            elif char == string_char and in_string:
-                in_string = False
-                string_char = None
-                check_text.append(' ')
-            elif in_string:
-                check_text.append(' ')
-            else:
-                check_text.append(char)
-
-        clean_query = ''.join(check_text).upper()
-        if ' LIMIT ' in clean_query or clean_query.endswith(' LIMIT'):
+        if re.search(r'\bLIMIT\b', cleaned, re.IGNORECASE):
             return query
 
-        # LIMIT 추가
-        return f"{query} LIMIT {limit_value}"
+        # 줄바꿈 후 LIMIT 추가 — 같은 줄에 붙이면 trailing `-- comment`에 삼켜질 수 있음
+        return f"{query.rstrip()}\nLIMIT {limit_value}"
 
     def _on_progress(self, msg):
         """진행 메시지"""
@@ -2841,28 +2852,36 @@ class SQLEditorDialog(QDialog):
         self._set_message_summary(msg)
         self.status_bar.showMessage(msg)
 
-    def _on_query_result(self, idx, columns, rows, error, affected, exec_time):
-        """쿼리 결과 수신"""
+    def _on_query_result(self, idx, returns_rows, columns, rows, error, affected, exec_time):
+        """쿼리 결과 수신 (자동 커밋 모드).
+
+        returns_rows로 분기하며(columns가 빈 리스트여도 0행 SELECT는 결과 탭으로 표시),
+        히스토리는 배치 시작 시점이 아니라 쿼리별로 여기서 기록한다.
+        """
+        worker_query = ''
+        if self.worker is not None and hasattr(self.worker, 'queries'):
+            try:
+                worker_query = self.worker.queries[idx]
+            except (IndexError, TypeError):
+                worker_query = ''
+
         if error:
             self.message_text.append(f"❌ 쿼리 {idx + 1}: {error}")
             self._set_message_summary(f"쿼리 {idx + 1} 실패 · {error}")
-        elif columns:
+            self.history_manager.add_query(worker_query, False, 0, exec_time, status='error', error=error)
+        elif returns_rows:
             # 편집 가능성 분석 + 설정 (워커에 실행된 원본 쿼리 사용)
-            worker_query = ''
-            if self.worker is not None and hasattr(self.worker, 'queries'):
-                try:
-                    worker_query = self.worker.queries[idx]
-                except (IndexError, TypeError):
-                    worker_query = ''
             self._add_result_table(columns, rows, exec_time, worker_query)
 
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {len(rows)}행 반환 ({exec_time:.3f}초)")
             self._set_message_summary(f"쿼리 {idx + 1} 완료 · {len(rows)}행 반환 · {exec_time:.3f}초")
             self._set_message_panel_collapsed(True)
+            self.history_manager.add_query(worker_query, True, len(rows), exec_time)
         else:
             # INSERT/UPDATE/DELETE
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {affected}행 영향받음 ({exec_time:.3f}초)")
             self._set_message_summary(f"쿼리 {idx + 1} 완료 · {affected}행 영향 · {exec_time:.3f}초")
+            self.history_manager.add_query(worker_query, True, affected, exec_time)
 
         self.progress_bar.setValue(idx + 1)
         self.status_bar.showMessage(f"쿼리 {idx + 1} 완료 ({exec_time:.3f}초)")
@@ -2875,21 +2894,14 @@ class SQLEditorDialog(QDialog):
         self._cleanup()
         self.status_bar.showMessage(f"✅ {msg} ({total_elapsed:.1f}초)")
 
-    def _is_modification_query(self, query):
-        """수정 쿼리인지 확인 (SELECT가 아닌 쿼리)"""
-        query_upper = query.upper().strip()
-        # 주석 제거
-        while query_upper.startswith('--') or query_upper.startswith('#'):
-            newline_idx = query_upper.find('\n')
-            if newline_idx == -1:
-                return False
-            query_upper = query_upper[newline_idx + 1:].strip()
-
-        modification_keywords = ['INSERT', 'UPDATE', 'DELETE', 'TRUNCATE', 'DROP', 'ALTER', 'CREATE', 'REPLACE']
-        return any(query_upper.startswith(kw) for kw in modification_keywords)
-
     def _do_commit(self):
         """트랜잭션 커밋 — DML pending_queries + 모든 탭의 셀 편집을 동일 트랜잭션에서 처리"""
+        if self._query_executing:
+            QMessageBox.warning(self, "경고", "쿼리 실행 중에는 커밋할 수 없습니다.")
+            return
+        if self._pg_rolled_back_due_to_error:
+            QMessageBox.warning(self, "경고", "PostgreSQL 오류로 트랜잭션이 롤백되었습니다. 쿼리를 다시 실행하세요.")
+            return
         if not self.db_connection or not self.db_connection.open:
             return
 
@@ -2977,11 +2989,19 @@ class SQLEditorDialog(QDialog):
                 self.db_connection.rollback()
             except Exception:
                 pass
+            history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
+            if history_ids:
+                self.history_manager.update_status_batch(history_ids, 'rolled_back')
+            self.pending_queries.clear()
+            self._update_tx_status()
             self.message_text.append(f"❌ 커밋 실패: {str(e)}")
             QMessageBox.critical(self, "커밋 오류", f"커밋에 실패했습니다:\n{str(e)}")
 
     def _do_rollback(self):
         """트랜잭션 롤백 — DML + 셀 편집 모두 원복"""
+        if self._query_executing:
+            QMessageBox.warning(self, "경고", "쿼리 실행 중에는 롤백할 수 없습니다.")
+            return
         if not self.db_connection or not self.db_connection.open:
             return
 
@@ -3009,6 +3029,7 @@ class SQLEditorDialog(QDialog):
 
         try:
             self.db_connection.rollback()
+            self._pg_rolled_back_due_to_error = False
 
             # 히스토리 상태 업데이트
             history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
@@ -3027,7 +3048,7 @@ class SQLEditorDialog(QDialog):
             self.message_text.append(f"❌ 롤백 실패: {str(e)}")
 
     def _close_db_connection(self):
-        """DB 연결 종료 (미커밋 시 롤백)"""
+        """DB 연결 종료 (미커밋 시 롤백, 지속 트랜잭션 터널도 함께 정리)"""
         if self.db_connection:
             try:
                 if self.pending_queries:
@@ -3045,18 +3066,36 @@ class SQLEditorDialog(QDialog):
                 else:
                     self.db_connection.close()
             except Exception:
-                pass
+                logger.debug("DB 연결 종료 중 정리 실패", exc_info=True)
             self.db_connection = None
             self._db_connector = None
             self.pending_queries.clear()
 
+            if self._persistent_temp_server:
+                self.engine.close_temp_tunnel(self._persistent_temp_server)
+                self._persistent_temp_server = None
+
+        self._connected_target = None
+        self._pg_rolled_back_due_to_error = False
+
     def _set_executing_state(self, is_executing: bool):
-        """쿼리 실행 상태 UI 전환"""
+        """쿼리 실행 상태 UI 전환.
+
+        실행 중에는 실행 버튼/커밋/롤백/DB 콤보/자동 커밋 체크박스와 실행 단축키를 비활성화한다.
+        """
         self.btn_execute_current.setEnabled(not is_executing)
         self.btn_execute_all.setEnabled(not is_executing)
+        self.db_combo.setEnabled(not is_executing)
+        self.auto_commit_check.setEnabled(not is_executing)
         self.progress_bar.setVisible(is_executing)
 
+        for shortcut in (self.shortcut_f5, self.shortcut_ctrl_enter, self.shortcut_ctrl_shift_enter):
+            shortcut.setEnabled(not is_executing)
+
         if is_executing:
+            self._query_executing = True
+            self.btn_commit.setEnabled(False)
+            self.btn_rollback.setEnabled(False)
             self.progress_bar.setValue(0)
             self.progress_bar.setMaximum(0)  # indeterminate 모드 (단일 쿼리)
             self._exec_start_time = time.time()
@@ -3066,34 +3105,14 @@ class SQLEditorDialog(QDialog):
             self._exec_timer.start(100)
             self.status_bar.showMessage("⏳ 쿼리 실행 중...")
         else:
+            self._query_executing = False
             self.progress_bar.setMaximum(100)  # determinate 복귀
             self._exec_query_progress = None
             if hasattr(self, '_exec_timer') and self._exec_timer:
                 self._exec_timer.stop()
                 self._exec_timer = None
             self._exec_start_time = None
-
-    def _execute_query_in_thread(self, db_cursor, query):
-        """쿼리를 백그라운드 스레드에서 실행 (메인 스레드 UI 블록 방지)"""
-        result = {'done': False, 'error': None}
-
-        def run():
-            try:
-                db_cursor.execute(query)
-            except Exception as e:
-                result['error'] = e
-            finally:
-                result['done'] = True
-
-        thread = threading.Thread(target=run, daemon=True)
-        thread.start()
-
-        while not result['done']:
-            QApplication.processEvents()
-            thread.join(timeout=0.05)
-
-        if result['error']:
-            raise result['error']
+            self._update_tx_status()
 
     def _update_elapsed_time(self):
         """경과 시간 실시간 업데이트"""
@@ -3106,13 +3125,13 @@ class SQLEditorDialog(QDialog):
                 self.status_bar.showMessage(f"⏳ 쿼리 실행 중... ({elapsed:.1f}초)")
 
     def _cleanup(self):
-        """정리"""
+        """정리 (자동 커밋 모드의 1회성 임시 터널만 종료 — 지속 트랜잭션 터널은 유지)"""
         self._set_executing_state(False)
 
-        if self.temp_server:
+        if self._autocommit_temp_server:
             self.message_text.append("🛑 임시 터널 종료...")
-            self.engine.close_temp_tunnel(self.temp_server)
-            self.temp_server = None
+            self.engine.close_temp_tunnel(self._autocommit_temp_server)
+            self._autocommit_temp_server = None
 
     def _show_table_context_menu(self, position, table, columns):
         """결과 테이블 컨텍스트 메뉴"""
@@ -3258,12 +3277,32 @@ class SQLEditorDialog(QDialog):
         return {'schema': schema, 'table': table}
 
     def _fetch_primary_keys(self, schema, table):
-        """INFORMATION_SCHEMA에서 테이블의 PK 컬럼명 조회"""
+        """PK 컬럼명 조회 (엔진별 분기).
+
+        PostgreSQL의 information_schema.columns에는 MySQL의 COLUMN_KEY가 없으므로
+        table_constraints/key_column_usage 조인으로 PK를 조회해야 한다.
+        """
         if not self.db_connection or not self.db_connection.open:
             return []
+        db_engine = self._db_engine()
         try:
             with self.db_connection.cursor() as cursor:
-                if schema:
+                if db_engine == 'postgresql':
+                    pg_schema = schema or self.db_combo.currentText().strip() or "public"
+                    cursor.execute(
+                        "SELECT kcu.column_name "
+                        "FROM information_schema.table_constraints tc "
+                        "JOIN information_schema.key_column_usage kcu "
+                        "  ON tc.constraint_name = kcu.constraint_name "
+                        " AND tc.table_schema = kcu.table_schema "
+                        " AND tc.table_name = kcu.table_name "
+                        "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                        "  AND tc.table_schema = %s "
+                        "  AND tc.table_name = %s "
+                        "ORDER BY kcu.ordinal_position",
+                        (pg_schema, table)
+                    )
+                elif schema:
                     cursor.execute(
                         "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
                         "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_KEY='PRI' "
@@ -3279,6 +3318,7 @@ class SQLEditorDialog(QDialog):
                     )
                 rows = cursor.fetchall()
         except Exception:
+            logger.debug("PK 컬럼 조회 실패: schema=%s table=%s", schema, table, exc_info=True)
             return []
 
         pks = []
@@ -3427,7 +3467,10 @@ class SQLEditorDialog(QDialog):
         failed = []
         for table, ctx in table_edits:
             schema, tbl = ctx['schema'], ctx['table']
-            qualified = f"`{schema}`.`{tbl}`" if schema else f"`{tbl}`"
+            qualified = (
+                f"{self._quote_editor_identifier(schema)}.{self._quote_editor_identifier(tbl)}"
+                if schema else self._quote_editor_identifier(tbl)
+            )
             columns = ctx['columns']
             pk_cols = ctx['pk_columns']
             pk_indices = ctx['pk_indices']
@@ -3442,16 +3485,17 @@ class SQLEditorDialog(QDialog):
                 set_parts = []
                 params = []
                 for c, v in col_values.items():
-                    set_parts.append(f"`{columns[c]}`=%s")
+                    set_parts.append(f"{self._quote_editor_identifier(columns[c])}=%s")
                     params.append(v)
                 where_parts = []
                 for i, pk_idx in enumerate(pk_indices):
                     itm = table.item(row_idx, pk_idx)
                     raw = itm.data(Qt.ItemDataRole.UserRole) if itm else None
+                    quoted_pk = self._quote_editor_identifier(pk_cols[i])
                     if raw is None:
-                        where_parts.append(f"`{pk_cols[i]}` IS NULL")
+                        where_parts.append(f"{quoted_pk} IS NULL")
                     else:
-                        where_parts.append(f"`{pk_cols[i]}`=%s")
+                        where_parts.append(f"{quoted_pk}=%s")
                         params.append(raw)
                 sql = (
                     f"UPDATE {qualified} SET {', '.join(set_parts)} "
@@ -3513,9 +3557,13 @@ class SQLEditorDialog(QDialog):
         self._update_tx_status()
 
     def close_result_tab(self, index):
-        """결과 탭 닫기"""
-        if 0 <= index < self.result_tabs.count():
-            self.result_tabs.removeTab(index)
+        """결과 탭 닫기 (미저장 셀 편집이 있으면 확인)"""
+        if not (0 <= index < self.result_tabs.count()):
+            return
+        count = self._pending_edit_count_for_result_tab(index)
+        if not self._confirm_discard_pending_edits(count, "이 탭을 닫으면"):
+            return
+        self.result_tabs.removeTab(index)
         if self.result_tabs.count() == 0:
             self._result_counter = 0
 
@@ -3585,21 +3633,95 @@ class SQLEditorDialog(QDialog):
     # SQL 검증 및 자동완성
     # =====================================================================
     def _on_schema_changed(self, schema: str):
-        """스키마 변경 시 메타데이터 리로드"""
+        """스키마 변경 시 메타데이터 리로드.
+
+        지속 트랜잭션 연결의 대상과 다른 DB/스키마로 바뀌면, 미커밋 변경이 있는 동안은
+        확인 후에만 진행하고 취소 시 콤보를 원래 선택으로 되돌린다.
+        """
+        if self._schema_change_guard:
+            return
         if not schema or not schema.strip():
             return
 
+        target = self._database_and_schema_for_selection(schema)
+
+        if target != self._connected_target and self.db_connection and self.db_connection.open:
+            has_pending = bool(self.pending_queries) or bool(self._collect_all_pending_edits())
+            if has_pending:
+                reply = QMessageBox.question(
+                    self, "DB/스키마 변경",
+                    "DB/스키마를 변경하면 현재 미커밋 변경사항과 셀 편집이 롤백/삭제됩니다. 계속하시겠습니까?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    self._restore_db_combo_to_connected_target()
+                    return
+                self._close_db_connection()
+                self._discard_all_pending_edits()
+            else:
+                self._close_db_connection()
+
         self.metadata_provider.invalidate()
         self._load_metadata(schema)
+
+    def _restore_db_combo_to_connected_target(self):
+        """스키마 변경을 취소했을 때 db_combo를 현재 연결된 대상으로 되돌림"""
+        if self._connected_target is None:
+            return
+        database, schema = self._connected_target
+        previous_text = schema if self._db_engine() == "postgresql" else database
+        if not previous_text:
+            return
+        self._schema_change_guard = True
+        try:
+            index = self.db_combo.findText(previous_text)
+            if index >= 0:
+                self.db_combo.setCurrentIndex(index)
+            else:
+                self.db_combo.setCurrentText(previous_text)
+        finally:
+            self._schema_change_guard = False
+
+    def _retire_worker(self, worker, cancel: bool = True, cleanup=None):
+        """실행 중인 워커를 finished 시그널이 올 때까지 참조를 유지한 채 취소/교체한다.
+
+        QThread를 곧바로 교체하면 아직 실행 중인 스레드 객체의 참조가 끊겨 GC 크래시로
+        이어질 수 있으므로, finished가 발생할 때까지 self._retired_workers에 보관한다.
+        """
+        if worker is None:
+            return
+        if cancel and hasattr(worker, 'cancel') and worker.isRunning():
+            worker.cancel()
+
+        self._retired_workers.append(worker)
+
+        def _on_finished(w=worker):
+            if w in self._retired_workers:
+                self._retired_workers.remove(w)
+            if cleanup:
+                cleanup()
+            w.deleteLater()
+
+        worker.finished.connect(_on_finished)
 
     def _load_metadata(self, schema: str = None):
         """메타데이터 백그라운드 로드"""
         from src.ui.workers.validation_worker import MetadataLoadWorker
 
-        # 기존 워커 취소
+        # 기존 워커 취소 — 연결은 그 워커가 실제로 끝날 때까지 유지 후 정리
         if self.metadata_worker and self.metadata_worker.isRunning():
-            self.metadata_worker.cancel()
-            self.metadata_worker.wait()
+            old_connector = self._metadata_connector
+
+            def _cleanup_old_connector(connector=old_connector):
+                if connector:
+                    try:
+                        connector.disconnect()
+                    except Exception:
+                        logger.debug("메타데이터 연결 정리 실패", exc_info=True)
+
+            self._retire_worker(self.metadata_worker, cleanup=_cleanup_old_connector)
+            self._metadata_connector = None
+        self.metadata_worker = None
 
         # 연결 확보
         db_user, db_password = self._db_credentials()
@@ -3616,14 +3738,6 @@ class SQLEditorDialog(QDialog):
             if not target_schema:
                 return
 
-            # 이전 연결 정리
-            if self._metadata_connector:
-                try:
-                    self._metadata_connector.disconnect()
-                except Exception:
-                    pass
-                self._metadata_connector = None
-
             database, connector_schema = self._database_and_schema_for_selection(target_schema)
             connector = self._create_db_connector(
                 host,
@@ -3633,8 +3747,11 @@ class SQLEditorDialog(QDialog):
                 database,
                 connector_schema,
             )
-            success, _ = connector.connect()
+            success, msg = connector.connect()
             if not success:
+                error_text = f"❌ 메타데이터 DB 연결 실패: {msg}"
+                self.validation_label.setText(error_text)
+                self.message_text.append(error_text)
                 return
 
             # 연결 저장 (워커 완료 후 정리용)
@@ -3751,9 +3868,9 @@ class SQLEditorDialog(QDialog):
         if not self.metadata_provider._metadata or not self.metadata_provider._metadata.tables:
             return
 
-        # 기존 워커 취소
+        # 기존 워커 취소 (finished까지 참조 유지)
         if self.validation_worker and self.validation_worker.isRunning():
-            self.validation_worker.cancel()
+            self._retire_worker(self.validation_worker)
 
         schema = self.db_combo.currentText().strip()
         self.validation_worker = ValidationWorker(self.sql_validator, sql, schema)
@@ -3791,9 +3908,9 @@ class SQLEditorDialog(QDialog):
         # 메타데이터가 없으면 키워드만 제공
         schema = self.db_combo.currentText().strip()
 
-        # 기존 워커 취소
+        # 기존 워커 취소 (finished까지 참조 유지)
         if self.autocomplete_worker and self.autocomplete_worker.isRunning():
-            self.autocomplete_worker.cancel()
+            self._retire_worker(self.autocomplete_worker)
 
         self.autocomplete_worker = AutoCompleteWorker(
             self.sql_completer, sql, cursor_pos, schema
@@ -3806,21 +3923,36 @@ class SQLEditorDialog(QDialog):
         self.editor.show_autocomplete_popup(completions)
 
     def closeEvent(self, event):
-        """다이얼로그 닫기"""
-        # 실행 중 확인
+        """다이얼로그 닫기.
+
+        실행 중인 쿼리는 강제로 끊지 않는다 — 완료를 기다리거나(협조적 인터럽션 요청)
+        닫기 자체를 취소한다. DB 작업 도중 다이얼로그를 파괴하면 워커 스레드가 이미
+        사라진 connection을 참조해 크래시할 수 있기 때문이다.
+        """
         if self.worker and self.worker.isRunning():
             reply = QMessageBox.question(
-                self, "확인", "쿼리가 실행 중입니다. 정말 닫으시겠습니까?",
+                self, "확인",
+                "쿼리가 실행 중입니다. 현재 DB 작업은 즉시 중단되지 않을 수 있습니다. "
+                "종료 전에 완료를 기다리시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
-            if reply == QMessageBox.StandardButton.No:
+            if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
+            self.worker.requestInterruption()
+            self.worker.wait()
 
-        # 미커밋 + 모든 탭 수정 상태 확인
+        # 미커밋 쿼리 + 미저장 셀 편집 + 수정된 탭 확인
         warnings = []
         if self.pending_queries:
             warnings.append(f"미커밋 변경사항 {len(self.pending_queries)}건 (롤백됨)")
+
+        pending_edit_count = sum(
+            self._pending_edit_count_for_result_tab(i)
+            for i in range(self.result_tabs.count())
+        )
+        if pending_edit_count > 0:
+            warnings.append(f"저장되지 않은 셀 편집 {pending_edit_count}건")
 
         # 수정된 탭 목록 확인
         modified_tabs = []
@@ -3847,23 +3979,19 @@ class SQLEditorDialog(QDialog):
         self._close_db_connection()
         self._cleanup()
 
-        # 검증 워커 정리
-        if self.validation_worker and self.validation_worker.isRunning():
-            self.validation_worker.cancel()
-            self.validation_worker.wait()
-        if self.metadata_worker and self.metadata_worker.isRunning():
-            self.metadata_worker.cancel()
-            self.metadata_worker.wait()
-        if self.autocomplete_worker and self.autocomplete_worker.isRunning():
-            self.autocomplete_worker.cancel()
-            self.autocomplete_worker.wait()
+        # 검증/자동완성/메타데이터 워커 정리 — 닫는 시점에는 완전히 멈출 때까지 대기해도 무방
+        for worker_attr in ('validation_worker', 'autocomplete_worker', 'metadata_worker'):
+            worker = getattr(self, worker_attr)
+            if worker and worker.isRunning():
+                worker.cancel()
+                worker.wait()
 
-        # 메타데이터 연결 정리
+        # 메타데이터 연결 정리 (워커가 완전히 멈춘 뒤에만)
         if self._metadata_connector:
             try:
                 self._metadata_connector.disconnect()
             except Exception:
-                pass
+                logger.debug("메타데이터 연결 정리 실패 (닫기)", exc_info=True)
             self._metadata_connector = None
 
         event.accept()
