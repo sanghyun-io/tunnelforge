@@ -7,6 +7,9 @@
 import os
 import json
 import shutil
+import html
+import re
+import threading
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QLineEdit, QSpinBox, QPushButton, QComboBox,
@@ -38,6 +41,106 @@ LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP = (
     "현재는 Dry-Run과 SQL 미리보기만 사용할 수 있습니다."
 )
 
+# 다이얼로그가 닫힌 뒤에도 백그라운드에서 계속 실행 중인 Worker (강제 종료 대신 완료까지 추적)
+_DETACHED_MIGRATION_WORKERS = set()
+
+
+def _disconnect_connector_in_background(connector) -> None:
+    """DB 커넥터 연결 해제를 백그라운드 스레드에서 수행 (UI 스레드 블로킹 방지)"""
+    if not connector:
+        return
+
+    def _run():
+        try:
+            connector.disconnect()
+            logger.info("✅ 백그라운드에서 DB 커넥터 연결 해제 완료")
+        except Exception as e:
+            logger.error(f"백그라운드 커넥터 연결 해제 오류: {e}", exc_info=True)
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _detach_workers_until_finished(workers, connector) -> None:
+    """다이얼로그가 닫힌 뒤 실행 중인 Worker를 강제 종료하지 않고 백그라운드에서 계속 실행시킨다.
+
+    모든 Worker가 완료되면 커넥터를 백그라운드에서 정리한다. UI 스레드를 블로킹하지 않는다.
+    """
+    remaining = {id(worker): worker for worker in workers}
+    if not remaining:
+        _disconnect_connector_in_background(connector)
+        return
+
+    for worker in remaining.values():
+        _DETACHED_MIGRATION_WORKERS.add(worker)
+
+    def _make_on_finished(worker):
+        def _on_finished(*_args):
+            _DETACHED_MIGRATION_WORKERS.discard(worker)
+            remaining.pop(id(worker), None)
+            if not remaining:
+                _disconnect_connector_in_background(connector)
+        return _on_finished
+
+    for worker in list(remaining.values()):
+        try:
+            worker.finished.connect(_make_on_finished(worker))
+        except Exception as e:
+            logger.error(f"디태치 Worker 완료 신호 연결 오류: {e}", exc_info=True)
+            remaining.pop(id(worker), None)
+            _DETACHED_MIGRATION_WORKERS.discard(worker)
+
+    if not remaining:
+        _disconnect_connector_in_background(connector)
+
+
+def _safe_disconnect_all(signal) -> None:
+    """시그널에 연결된 모든 슬롯을 best-effort로 해제 (연결이 없어도 예외를 삼킨다)"""
+    if signal is None:
+        return
+    try:
+        signal.disconnect()
+    except (TypeError, RuntimeError):
+        pass
+
+
+def _format_fk_tree_text(fk_tree: Dict[str, List[str]]) -> str:
+    """FK 트리를 ASCII 텍스트로 변환하는 순수 포맷터 (DB 접근 없이 fk_tree 데이터만 사용)"""
+    if not fk_tree:
+        return "FK 관계가 없습니다."
+
+    all_children = set()
+    for children in fk_tree.values():
+        all_children.update(children)
+
+    root_tables = sorted(set(fk_tree.keys()) - all_children)
+    rendered: set = set()
+    lines = ["FK 관계 트리:"]
+
+    def _walk(table: str, prefix: str, visited: set):
+        rendered.add(table)
+        for i, child in enumerate(fk_tree.get(table, [])):
+            is_last = (i == len(fk_tree.get(table, [])) - 1)
+            branch = "└── " if is_last else "├── "
+            if child in visited:
+                lines.append(f"{prefix}{branch}🔄 {child} (순환 참조)")
+                continue
+            lines.append(f"{prefix}{branch}{child}")
+            next_prefix = prefix + ("    " if is_last else "│   ")
+            _walk(child, next_prefix, visited | {child})
+
+    for root in root_tables:
+        lines.append(f"📁 {root}")
+        _walk(root, "", {root})
+
+    # 루트에서 도달하지 못한 테이블(사이클 전용)도 최상위 진입점으로 렌더
+    for table in sorted(fk_tree.keys()):
+        if table in rendered:
+            continue
+        lines.append(f"📁 {table}")
+        _walk(table, "", {table})
+
+    return "\n".join(lines)
+
 
 class MigrationAnalyzerDialog(QDialog):
     """마이그레이션 분석 다이얼로그"""
@@ -54,12 +157,18 @@ class MigrationAnalyzerDialog(QDialog):
         self.cleanup_worker: Optional[CleanupWorker] = None
         self._is_closing = False  # 닫기 진행 중 플래그
         self._auto_saved_path: Optional[str] = None  # 자동 저장 경로
+        self._disconnect_deferred_to_worker_completion = False  # 커넥터 해제를 Worker 완료로 위임했는지 여부
 
         self.init_ui()
         self.load_schemas()
 
+    @property
+    def disconnect_deferred_to_worker_completion(self) -> bool:
+        """닫기 시 커넥터 연결 해제가 백그라운드 Worker 완료 시점으로 지연되었는지 여부"""
+        return self._disconnect_deferred_to_worker_completion
+
     def closeEvent(self, event):
-        """다이얼로그 닫기 이벤트 - Worker 정리"""
+        """다이얼로그 닫기 이벤트 - 실행 중인 Worker를 강제 종료하지 않고 백그라운드로 분리"""
         self._is_closing = True
 
         # 실행 중인 Worker가 있는지 확인
@@ -71,6 +180,8 @@ class MigrationAnalyzerDialog(QDialog):
 
         if workers_running:
             # 사용자에게 확인
+            # 주의: 이 문구는 src/core/i18n.py의 정규식 번역 항목과 정확히 일치해야 한다
+            # (i18n.py는 WP-3.6 허용 파일 범위 밖이라 문구를 변경하면 런타임 영어 번역이 깨진다).
             reply = QMessageBox.question(
                 self,
                 "작업 진행 중",
@@ -85,14 +196,26 @@ class MigrationAnalyzerDialog(QDialog):
                 event.ignore()
                 return
 
-            # Worker 종료 대기
+            # 닫힌 다이얼로그가 이후 완료 신호로 UI를 건드리지 않도록 결과 슬롯 연결을 먼저 해제
+            if self.worker:
+                _safe_disconnect_all(self.worker.progress)
+                _safe_disconnect_all(self.worker.analysis_complete)
+                _safe_disconnect_all(self.worker.finished)
+            if self.cleanup_worker:
+                _safe_disconnect_all(self.cleanup_worker.progress)
+                _safe_disconnect_all(self.cleanup_worker.action_complete)
+                _safe_disconnect_all(self.cleanup_worker.finished)
+
             for name, worker in workers_running:
-                logger.info(f"🛑 {name} Worker 종료 대기 중...")
-                worker.quit()
-                if not worker.wait(3000):  # 3초 대기
-                    logger.warning(f"⚠️ {name} Worker가 시간 내에 종료되지 않음, 강제 종료")
-                    worker.terminate()
-                    worker.wait(1000)
+                logger.info(f"🔀 {name} Worker를 백그라운드로 분리하여 계속 실행합니다 (강제 종료하지 않음)")
+                request_interruption = getattr(worker, "requestInterruption", None)
+                if callable(request_interruption):
+                    request_interruption()
+
+            # quit()/wait()/terminate()로 블로킹하거나 강제 종료하지 않고,
+            # Worker가 스스로 끝날 때까지 백그라운드에서 추적한 뒤 커넥터를 정리한다.
+            self._disconnect_deferred_to_worker_completion = True
+            _detach_workers_until_finished([w for _, w in workers_running], self.connector)
 
         logger.info("✅ MigrationAnalyzerDialog 정상 종료")
         event.accept()
@@ -615,6 +738,8 @@ class MigrationAnalyzerDialog(QDialog):
 
     def on_analysis_complete(self, result: AnalysisResult):
         """분석 완료 시"""
+        if self._is_closing:
+            return
         try:
             self.analysis_result = result
             self.update_overview(result)
@@ -635,6 +760,8 @@ class MigrationAnalyzerDialog(QDialog):
 
     def on_analysis_finished(self, success: bool, message: str):
         """분석 종료 시"""
+        if self._is_closing:
+            return
         self.set_ui_enabled(True)
         self.progress_bar.setVisible(False)
 
@@ -777,7 +904,8 @@ class MigrationAnalyzerDialog(QDialog):
         self.table_issues.setUpdatesEnabled(True)
 
     def update_fk_tree(self, fk_tree: Dict[str, List[str]], schema: str):
-        """FK 트리 업데이트"""
+        """FK 트리 업데이트 (분석 결과 fk_tree 데이터만 사용, 동기 DB 재조회 없음)"""
+        # schema는 호출부 호환을 위해 유지되며 여기서는 사용하지 않는다 (DB 접근 금지)
         self.tree_fk.clear()
 
         if not fk_tree:
@@ -790,27 +918,33 @@ class MigrationAnalyzerDialog(QDialog):
             all_children.update(children)
 
         root_tables = set(fk_tree.keys()) - all_children
+        rendered: set = set()
 
         def add_tree_items(parent_item, table: str, visited: set):
-            if table in fk_tree:
-                for child in fk_tree[table]:
-                    # 순환 참조 방지
-                    if child in visited:
-                        child_item = QTreeWidgetItem(parent_item, [f"🔄 {child} (순환 참조)"])
-                        continue
-                    child_item = QTreeWidgetItem(parent_item, [f"└── {child}"])
-                    add_tree_items(child_item, child, visited | {child})
+            rendered.add(table)
+            for child in fk_tree.get(table, []):
+                # 순환 참조 방지
+                if child in visited:
+                    QTreeWidgetItem(parent_item, [f"🔄 {child} (순환 참조)"])
+                    continue
+                child_item = QTreeWidgetItem(parent_item, [f"└── {child}"])
+                add_tree_items(child_item, child, visited | {child})
 
         for root in sorted(root_tables):
             root_item = QTreeWidgetItem(self.tree_fk, [f"📁 {root}"])
             add_tree_items(root_item, root, {root})
 
+        # 루트에서 도달하지 못한 테이블(사이클 전용)도 최상위 진입점으로 렌더
+        for table in sorted(fk_tree.keys()):
+            if table in rendered:
+                continue
+            cycle_root_item = QTreeWidgetItem(self.tree_fk, [f"📁 {table}"])
+            add_tree_items(cycle_root_item, table, {table})
+
         self.tree_fk.expandAll()
 
-        # ASCII 트리 텍스트
-        analyzer = MigrationAnalyzer(self.connector)
-        tree_text = analyzer.get_fk_visualization(schema)
-        self.txt_fk_tree.setText(tree_text)
+        # ASCII 트리 텍스트 - 워커 분석 결과(fk_tree)만으로 렌더링, 동기 DB 재조회 없음
+        self.txt_fk_tree.setText(_format_fk_tree_text(fk_tree))
 
     def on_orphan_selected(self):
         """고아 레코드 선택 시"""
@@ -950,19 +1084,6 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             QMessageBox.warning(self, "선택 필요", "정리할 고아 레코드를 선택하세요.")
             return
 
-        # 실제 실행 시 확인
-        if not dry_run:
-            reply = QMessageBox.warning(
-                self,
-                "실행 확인",
-                f"선택된 {len(selected_rows)}개 항목에 대해 정리 작업을 실행합니다.\n\n"
-                "이 작업은 되돌릴 수 없습니다. 계속하시겠습니까?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No
-            )
-            if reply != QMessageBox.StandardButton.Yes:
-                return
-
         # 정리 작업 목록 생성
         schema = self.analysis_result.schema
         action = ActionType.DELETE if self.radio_delete.isChecked() else ActionType.SET_NULL
@@ -1000,11 +1121,15 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
 
     def on_action_complete(self, table: str, success: bool, message: str, affected: int):
         """개별 정리 작업 완료 시"""
+        if self._is_closing:
+            return
         status = "✅" if success else "❌"
         self.add_log(f"  {status} {table}: {message}")
 
     def on_cleanup_finished(self, success: bool, message: str, results: dict):
         """정리 작업 완료 시"""
+        if self._is_closing:
+            return
         self.btn_dry_run.setEnabled(True)
         self.btn_execute.setEnabled(False)
         self.progress_bar.setVisible(False)
@@ -1467,6 +1592,45 @@ class ManualGuideDialog(QDialog):
         if self.issues:
             self.issue_list.selectRow(0)
 
+    @staticmethod
+    def _markdown_to_safe_html(content: str) -> str:
+        """가이드 텍스트의 마크다운 서브셋(굵게/코드 펜스/구분선)을 안전한 HTML로 변환.
+
+        위치/설명 등 분석 결과에서 온 텍스트가 섞여 있을 수 있으므로 항상 먼저 이스케이프한다.
+        """
+        escaped = html.escape(content)
+
+        lines = []
+        in_fence = False
+        for raw_line in escaped.split("\n"):
+            stripped = raw_line.strip()
+            if stripped.startswith("```"):
+                if in_fence:
+                    lines.append("</code></pre>")
+                    in_fence = False
+                else:
+                    lines.append('<pre style="background-color:#f0f0f0; padding:8px;"><code>')
+                    in_fence = True
+                continue
+
+            if in_fence:
+                lines.append(raw_line)
+                continue
+
+            if stripped == "---":
+                lines.append("<hr>")
+                continue
+
+            lines.append(raw_line)
+
+        if in_fence:
+            # 닫히지 않은 펜스는 방어적으로 닫는다
+            lines.append("</code></pre>")
+
+        result = "\n".join(lines)
+        result = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", result)
+        return result.replace("\n", "<br>")
+
     def on_issue_selected(self):
         """이슈 선택 시 가이드 표시"""
         selected = self.issue_list.selectedItems()
@@ -1489,12 +1653,7 @@ class ManualGuideDialog(QDialog):
 
 {guide['solution']}
 """
-        # Markdown 스타일 적용 (간단한 변환)
-        content = content.replace("```sql", '<pre style="background-color:#f0f0f0; padding:8px;">')
-        content = content.replace("```", "</pre>")
-        content = content.replace("**", "<b>").replace("**", "</b>")
-
-        self.guide_content.setHtml(content.replace("\n", "<br>"))
+        self.guide_content.setHtml(self._markdown_to_safe_html(content))
 
 
 class MigrationWizard:
@@ -1525,11 +1684,14 @@ class MigrationWizard:
             return False
 
         # 2단계: 마이그레이션 분석 다이얼로그
+        analyzer_dialog = None
         try:
             analyzer_dialog = MigrationAnalyzerDialog(parent, connector, config_manager)
             analyzer_dialog.exec()
             return True
         finally:
-            # 연결 종료
-            if connector:
+            # 다이얼로그가 닫히면서 백그라운드 Worker 완료 시점으로 연결 해제를 위임한 경우,
+            # 여기서 다시 동기적으로 disconnect()하지 않는다 (이중 해제/경합 방지).
+            deferred = getattr(analyzer_dialog, "disconnect_deferred_to_worker_completion", False)
+            if connector and not deferred:
                 connector.disconnect()
