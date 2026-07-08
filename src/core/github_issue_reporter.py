@@ -38,6 +38,7 @@ class GitHubIssueReporter:
         self.token = token
         self.repo = repo
         self._github_app = None  # GitHub App 인스턴스 (동적 토큰 갱신용)
+        self._last_error_status: Optional[int] = None  # 마지막 API 실패의 HTTP status (재시도 판단용)
 
         if headers:
             self._headers = headers
@@ -302,6 +303,7 @@ class GitHubIssueReporter:
             return None
 
         except requests.RequestException as e:
+            self._last_error_status = self._extract_status_code(e)
             print(f"GitHub API 오류 (이슈 검색): {e}")
             return None
 
@@ -348,6 +350,7 @@ class GitHubIssueReporter:
             return True, f"이슈 #{issue_number} 생성됨: {issue_url}", issue_number
 
         except requests.RequestException as e:
+            self._last_error_status = self._extract_status_code(e)
             error_msg = str(e)
             if hasattr(e, 'response') and e.response is not None:
                 try:
@@ -400,13 +403,19 @@ class GitHubIssueReporter:
             return True, f"이슈 #{issue_number}에 코멘트 추가됨"
 
         except requests.RequestException as e:
+            self._last_error_status = self._extract_status_code(e)
             return False, f"코멘트 추가 실패: {str(e)}"
+
+    @staticmethod
+    def _extract_status_code(exc: Exception) -> Optional[int]:
+        """예외에서 HTTP status code 추출 (response가 없으면 None)"""
+        if hasattr(exc, 'response') and exc.response is not None:
+            return getattr(exc.response, 'status_code', None)
+        return None
 
     def _is_auth_error(self, exc: Exception) -> bool:
         """401/403 인증 오류인지 확인"""
-        if hasattr(exc, 'response') and exc.response is not None:
-            return exc.response.status_code in (401, 403)
-        return False
+        return self._extract_status_code(exc) in (401, 403)
 
     def report_error(self, error_type: str, error_message: str,
                      context: Optional[Dict] = None) -> Tuple[bool, str]:
@@ -417,6 +426,11 @@ class GitHubIssueReporter:
         2. 유사 이슈 검색
         3. 없으면 생성, 있으면 코멘트 추가
         4. 401/403 시 토큰 갱신 후 1회 재시도
+
+        주의: find_similar_issue/create_issue/add_comment는 모두 RequestException을
+        내부에서 잡아 (False, msg) 형태의 반환값으로 바꾸므로, 여기서 RequestException을
+        캐치하는 경로는 정상적으로는 도달하지 않는다. 따라서 auth 실패 감지는 각 메서드가
+        기록한 self._last_error_status(반환된 status)를 검사해서 판단한다.
 
         Args:
             error_type: "export" 또는 "import"
@@ -434,9 +448,20 @@ class GitHubIssueReporter:
             return False, "GitHub App이 설정되지 않았습니다"
 
         try:
-            return self._do_report(error_type, error_message, context)
+            self._last_error_status = None
+            success, msg = self._do_report(error_type, error_message, context)
+
+            if not success and self._github_app and self._last_error_status in (401, 403):
+                try:
+                    self._refresh_headers_if_needed(force=True)
+                    self._last_error_status = None
+                    return self._do_report(error_type, error_message, context)
+                except Exception as retry_e:
+                    return False, f"토큰 갱신 후 재시도 실패: {str(retry_e)}"
+
+            return success, msg
         except requests.RequestException as e:
-            # 401/403 인증 오류 시 토큰 갱신 후 1회 재시도
+            # 안전망: 향후 변경으로 예외가 실제로 전파되는 경우를 대비
             if self._github_app and self._is_auth_error(e):
                 try:
                     self._refresh_headers_if_needed(force=True)
