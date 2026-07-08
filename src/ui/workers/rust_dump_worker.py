@@ -5,6 +5,8 @@ from src.exporters.rust_dump_exporter import (
     DEFAULT_DUMP_COMPRESSION, RustDumpConfig, RustDumpExporter, RustDumpImporter
 )
 
+CANCELLED_MESSAGE = "작업이 취소되었습니다."
+
 
 class RustDumpWorker(QThread):
     """Rust DB Core 작업 스레드"""
@@ -25,6 +27,33 @@ class RustDumpWorker(QThread):
         self.task_type = task_type
         self.config = config
         self.kwargs = kwargs
+        self._cancel_requested = False
+        self._active_runner = None
+
+    def cancel(self) -> bool:
+        """실행 중인 dump/import 작업의 취소를 요청한다.
+
+        RustDumpExporter/RustDumpImporter가 이 워커를 위해 전용으로 만든
+        DbCoreFacade(`_owns_facade=True`)의 Rust core 프로세스만 직접 terminate()한다.
+        DbCoreServiceClient.shutdown()은 request()가 블로킹 중에 잡고 있는 것과
+        동일한 락을 요구하므로, dump.run/dump.import가 진행 중일 때 UI 스레드에서
+        호출하면 그대로 멈춘다. 프로세스를 직접 종료시키면 워커 스레드가 블로킹 중인
+        읽기에서 즉시 깨어나 예외/실패 결과로 빠져나온다.
+        """
+        self._cancel_requested = True
+        runner = self._active_runner
+        if runner is not None and getattr(runner, "_owns_facade", False):
+            facade = getattr(runner, "facade", None)
+            client = getattr(facade, "client", None) if facade is not None else None
+            process = getattr(client, "_process", None) if client is not None else None
+            if process is not None and process.poll() is None:
+                process.terminate()
+        return True
+
+    def _is_cancelled_message(self, success: bool, msg: str):
+        if self._cancel_requested:
+            return False, CANCELLED_MESSAGE
+        return success, msg
 
     def run(self):
         def callback(msg):
@@ -36,6 +65,7 @@ class RustDumpWorker(QThread):
         try:
             if self.task_type == "export_schema":
                 exporter = RustDumpExporter(self.config)
+                self._active_runner = exporter
 
                 # 상세 콜백 함수들
                 def detail_callback(info: dict):
@@ -58,10 +88,12 @@ class RustDumpWorker(QThread):
                     table_status_callback,
                     raw_output_callback
                 )
+                success, msg = self._is_cancelled_message(success, msg)
                 self.finished.emit(success, msg)
 
             elif self.task_type == "export_tables":
                 exporter = RustDumpExporter(self.config)
+                self._active_runner = exporter
 
                 # 상세 콜백 함수들
                 def detail_callback(info: dict):
@@ -86,10 +118,12 @@ class RustDumpWorker(QThread):
                     table_status_callback,
                     raw_output_callback
                 )
+                success, msg = self._is_cancelled_message(success, msg)
                 self.finished.emit(success, msg)
 
             elif self.task_type == "import":
                 importer = RustDumpImporter(self.config)
+                self._active_runner = importer
 
                 # 상세 콜백 함수들
                 def detail_callback(info: dict):
@@ -122,8 +156,17 @@ class RustDumpWorker(QThread):
                     metadata_callback,
                     table_chunk_progress_callback,
                 )
+                success, msg = self._is_cancelled_message(success, msg)
                 self.import_finished.emit(success, msg, results)
                 self.finished.emit(success, msg)
 
         except Exception as e:
-            self.finished.emit(False, str(e))
+            if self._cancel_requested:
+                message = CANCELLED_MESSAGE
+                if self.task_type == "import":
+                    self.import_finished.emit(False, message, {})
+                self.finished.emit(False, message)
+            else:
+                self.finished.emit(False, str(e))
+        finally:
+            self._active_runner = None

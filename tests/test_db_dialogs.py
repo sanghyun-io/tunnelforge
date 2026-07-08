@@ -1,10 +1,14 @@
 import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from PyQt6.QtWidgets import QApplication, QLabel
+from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from src.ui.dialogs.db_dialogs import (
+    OrphanAnalysisWorker,
+    OrphanRecordDialog,
+    OrphanReportWorker,
     RustDumpExportDialog,
     RustDumpImportDialog,
     RustDumpWizard,
@@ -19,6 +23,8 @@ from src.ui.dialogs.db_dialogs import (
     format_export_table_status,
     next_export_percent,
 )
+from src.exporters.rust_dump_exporter import OrphanRecordInfo, RustDumpConfig
+from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 
 def test_cap_incomplete_export_percent_prevents_early_100():
@@ -299,7 +305,9 @@ def test_import_raw_output_shows_visible_telemetry_summary():
         "2,335 rows/s, load_data_local_infile"
     ]
     assert dialog.log_entries[0].endswith("load_data_local_infile")
-    assert "[rust_dump]" in dialog.log_entries[1]
+    # 원시 JSONL 라인은 더 이상 persisted 로그에 남기지 않는다 (자격 증명 유출 방지).
+    assert len(dialog.log_entries) == 1
+    assert not any("[rust_dump]" in entry for entry in dialog.log_entries)
 
 
 def test_rust_dump_export_dialog_defaults_to_zstd():
@@ -442,10 +450,16 @@ def test_export_add_log_enables_save_log_before_finish(monkeypatch):
     dialog.close()
 
 
-def test_export_close_while_running_keeps_dialog_open_and_log_available(monkeypatch):
+def test_export_close_running_can_request_cancel_without_disconnect(monkeypatch):
     class FakeWorker:
+        def __init__(self):
+            self.cancel_called = False
+
         def isRunning(self):
             return True
+
+        def cancel(self):
+            self.cancel_called = True
 
     class FakeConnector:
         def __init__(self):
@@ -461,6 +475,13 @@ def test_export_close_while_running_keeps_dialog_open_and_log_available(monkeypa
         def setEnabled(self, enabled):
             self.enabled = enabled
 
+    class FakeLabel:
+        def __init__(self):
+            self.text = ""
+
+        def setText(self, text):
+            self.text = text
+
     class FakeEvent:
         def __init__(self):
             self.accepted = False
@@ -472,16 +493,18 @@ def test_export_close_while_running_keeps_dialog_open_and_log_available(monkeypa
         def ignore(self):
             self.ignored = True
 
-    warnings = []
     monkeypatch.setattr(
-        "src.ui.dialogs.db_dialogs.QMessageBox.warning",
-        lambda *args: warnings.append(args),
+        "src.ui.dialogs.db_dialogs.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
     )
     dialog = type("DummyDialog", (), {})()
     dialog.worker = FakeWorker()
     dialog.connector = FakeConnector()
     dialog.btn_save_log = FakeButton()
+    dialog.label_status = FakeLabel()
     dialog.log_entries = []
+    dialog._cancel_requested = False
+    dialog._close_after_cancel = False
     dialog._add_log = lambda message: dialog.log_entries.append(message)
     event = FakeEvent()
 
@@ -490,9 +513,10 @@ def test_export_close_while_running_keeps_dialog_open_and_log_available(monkeypa
     assert event.ignored
     assert not event.accepted
     assert not dialog.connector.disconnected
+    assert dialog.worker.cancel_called
+    assert dialog._cancel_requested
+    assert dialog._close_after_cancel
     assert dialog.btn_save_log.enabled
-    assert any("닫기 차단" in entry for entry in dialog.log_entries)
-    assert warnings
 
 
 def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
@@ -857,3 +881,758 @@ def test_postgresql_import_forced_kst_uses_postgresql_timezone_sql(monkeypatch, 
     assert captured["kwargs"]["timezone_sql"] == "SET TIME ZONE '+09:00'"
     assert captured["started"] is True
     dialog.deleteLater()
+
+
+# ---------------------------------------------------------------------------
+# WP-3.1: RustDumpWorker.cancel()
+# ---------------------------------------------------------------------------
+
+
+def _make_worker_with_fake_runner(owns_facade: bool):
+    config = RustDumpConfig(host="127.0.0.1", port=3306, user="root", password="pw", engine="mysql")
+    worker = RustDumpWorker("export_schema", config)
+
+    class FakeProcess:
+        def __init__(self):
+            self.terminated = False
+
+        def poll(self):
+            return None
+
+        def terminate(self):
+            self.terminated = True
+
+    class FakeClient:
+        def __init__(self, process):
+            self._process = process
+
+    class FakeFacade:
+        def __init__(self, client):
+            self.client = client
+
+    class FakeRunner:
+        def __init__(self, facade, owns):
+            self.facade = facade
+            self._owns_facade = owns
+
+    process = FakeProcess()
+    runner = FakeRunner(FakeFacade(FakeClient(process)), owns_facade)
+    worker._active_runner = runner
+    return worker, process
+
+
+def test_rust_dump_worker_cancel_terminates_owned_dedicated_process():
+    worker, process = _make_worker_with_fake_runner(owns_facade=True)
+
+    result = worker.cancel()
+
+    assert result is True
+    assert worker._cancel_requested is True
+    assert process.terminated is True
+
+
+def test_rust_dump_worker_cancel_does_not_touch_shared_facade_process():
+    worker, process = _make_worker_with_fake_runner(owns_facade=False)
+
+    result = worker.cancel()
+
+    assert result is True
+    assert worker._cancel_requested is True
+    assert process.terminated is False
+
+
+# ---------------------------------------------------------------------------
+# WP-3.1: sanitization helpers
+# ---------------------------------------------------------------------------
+
+
+def test_sanitized_rust_event_redacts_password_and_credentials_recursively():
+    from src.ui.dialogs.db_dialogs import _sanitized_rust_event
+
+    sanitized = _sanitized_rust_event({
+        "event": "error",
+        "password": "s3cr3t",
+        "nested": {"credentials": {"user": "root", "password": "s3cr3t"}},
+    })
+
+    flattened = json.dumps(sanitized)
+    assert "s3cr3t" not in flattened
+
+
+def test_sanitize_plain_rust_line_masks_password_assignment():
+    from src.ui.dialogs.db_dialogs import _sanitize_plain_rust_line
+
+    sanitized = _sanitize_plain_rust_line("connecting with password=s3cr3t to host")
+    assert "s3cr3t" not in sanitized
+
+
+# ---------------------------------------------------------------------------
+# WP-3.1: Export dialog — output dir regeneration, GitHub workers, cancel-close
+# ---------------------------------------------------------------------------
+
+
+def test_export_do_export_regenerates_existing_auto_output_dir(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    captured = {}
+
+    class FakeWorker:
+        progress = FakeSignal()
+        table_progress = FakeSignal()
+        detail_progress = FakeSignal()
+        table_status = FakeSignal()
+        raw_output = FakeSignal()
+        finished = FakeSignal()
+
+        def __init__(self, task_type, config, **kwargs):
+            captured["kwargs"] = kwargs
+
+        def start(self):
+            captured["started"] = True
+
+        def isRunning(self):
+            return False
+
+    class FakeConnector:
+        host = "127.0.0.1"
+        port = 3306
+        user = "root"
+        password = "pw"
+        engine = "mysql"
+
+        def get_schemas(self):
+            return ["app"]
+
+        def get_tables(self, _schema):
+            return ["users"]
+
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(tmp_path) if key == "rust_dump_export_base_dir" else default
+    )
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
+
+    dialog = RustDumpExportDialog(
+        connector=FakeConnector(),
+        config_manager=config_manager,
+        connection_info="conn",
+    )
+    dialog.combo_schema.setCurrentText("app")
+
+    # 미리보기 시점의 output_dir 를 실제 디스크에 미리 만들어 충돌 상황을 재현한다.
+    preview_path = dialog.input_output_dir.text()
+    os.makedirs(preview_path, exist_ok=True)
+
+    dialog.do_export()
+
+    used_output_dir = captured["kwargs"]["output_dir"]
+    assert used_output_dir != preview_path
+    assert not os.path.exists(used_output_dir)
+    assert dialog.input_output_dir.text() == used_output_dir
+    dialog.deleteLater()
+
+
+def test_export_github_workers_are_retained_until_finished(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeGithubSignal:
+        def __init__(self):
+            self._slot = None
+
+        def connect(self, slot):
+            self._slot = slot
+
+        def emit(self, *args):
+            self._slot(*args)
+
+    class FakeGithubWorker:
+        def __init__(self, config_manager, error_type, error_message, context):
+            self.finished = FakeGithubSignal()
+
+        def start(self):
+            pass
+
+        def deleteLater(self):
+            pass
+
+    monkeypatch.setattr(
+        "src.ui.workers.github_worker.GitHubReportWorker", FakeGithubWorker
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: default
+    dialog = RustDumpExportDialog(config_manager=config_manager)
+    dialog.export_schema = "app"
+    dialog.export_tables = []
+
+    dialog._report_error_to_github("export", "error 1")
+    dialog._report_error_to_github("export", "error 2")
+
+    assert len(dialog._github_workers) == 2
+    worker1, worker2 = dialog._github_workers
+
+    worker1.finished.emit(True, "ok")
+
+    assert dialog._github_workers == [worker2]
+    dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# WP-3.1: Import dialog — raw output sanitization, log cap, button click,
+# upgrade check, fresh-run reset, save_log status, cancel-close, GitHub workers
+# ---------------------------------------------------------------------------
+
+
+def test_import_raw_output_redacts_password_and_credentials_from_saved_log():
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = lambda message: dialog.log_entries.append(f"[00:00:00] {message}")
+
+    # message가 비어 있으면 format_import_visible_telemetry의 "error" 분기가
+    # 이벤트 dict 전체를 문자열로 echo한다. 정제되지 않으면 여기서 그대로 유출된다.
+    RustDumpImportDialog.on_raw_output(dialog, json.dumps({
+        "event": "error",
+        "password": "s3cr3t-pw",
+        "credentials": {"user": "root", "password": "s3cr3t-pw"},
+    }))
+
+    combined = "\n".join(dialog.log_entries)
+    assert "s3cr3t-pw" not in combined
+
+
+def test_import_log_entries_are_capped(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog()
+
+    for i in range(600):
+        dialog._add_log(f"entry-{i}")
+
+    assert len(dialog.log_entries) == 500
+    assert dialog.log_entries[-1].endswith("entry-599")
+    dialog.close()
+
+
+def test_import_button_click_does_not_pass_checked_bool_as_retry_tables(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog()
+    dialog.do_import = MagicMock()
+
+    dialog.btn_import.click()
+
+    dialog.do_import.assert_called_once_with()
+    dialog.close()
+
+
+def test_import_default_dump_dir_runs_upgrade_check(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    dump_dir = tmp_path / "dataflare_20260528_090000"
+    dump_dir.mkdir()
+    (dump_dir / "_tunnelforge_dump.json").write_text(
+        json.dumps({"format": "tunnelforge-dump", "tables": []}),
+        encoding="utf-8",
+    )
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = lambda key, default=None: (
+        str(dump_dir) if key == "rust_dump_export_dir" else default
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    calls = []
+    monkeypatch.setattr(
+        RustDumpImportDialog, "_run_upgrade_check",
+        lambda self, path: calls.append(path),
+    )
+
+    dialog = RustDumpImportDialog(config_manager=config_manager)
+
+    assert calls == [str(dump_dir)]
+    dialog.close()
+
+
+def test_import_input_editing_finished_runs_upgrade_check_for_valid_dir(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+    (dump_dir / "_tunnelforge_dump.json").write_text(
+        json.dumps({"format": "tunnelforge-dump", "tables": []}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog()
+
+    calls = []
+    dialog._run_upgrade_check = lambda path: calls.append(path)
+
+    dialog.input_dir.setText(str(dump_dir))
+    dialog.input_dir.editingFinished.emit()
+
+    assert calls == [str(dump_dir)]
+    dialog.close()
+
+
+def test_import_fresh_run_clears_stale_progress_state(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    class FakeWorker:
+        progress = FakeSignal()
+        table_progress = FakeSignal()
+        detail_progress = FakeSignal()
+        table_status = FakeSignal()
+        raw_output = FakeSignal()
+        import_finished = FakeSignal()
+        finished = FakeSignal()
+        metadata_analyzed = FakeSignal()
+        table_chunk_progress = FakeSignal()
+
+        def __init__(self, task_type, config, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def isRunning(self):
+            return False
+
+    class FakeConnector:
+        host = "127.0.0.1"
+        port = 3306
+        user = "root"
+        password = "pw"
+        engine = "mysql"
+
+        def get_schemas(self):
+            return ["app"]
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.RustDumpWorker", FakeWorker)
+
+    dump_dir = tmp_path / "dump"
+    dump_dir.mkdir()
+
+    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog.input_dir.setText(str(dump_dir))
+    dialog.radio_tz_none.setChecked(True)
+
+    dialog.import_table_rows_done["users"] = 10
+    dialog.import_table_rows_total["users"] = 100
+    dialog.table_chunk_progress["users"] = (1, 4)
+    dialog.dump_metadata = {"schema": "old"}
+
+    dialog.do_import()
+
+    assert dialog.import_table_rows_done == {}
+    assert dialog.import_table_rows_total == {}
+    assert dialog.table_chunk_progress == {}
+    assert dialog.dump_metadata is None
+    dialog.deleteLater()
+
+
+def test_import_save_log_uses_running_status_when_success_unknown(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog()
+    dialog.log_entries = ["[00:00:00] started"]
+    dialog.import_success = None
+
+    captured = {}
+
+    def fake_get_save_file_name(parent, title, default_path, filter_str):
+        captured["default_path"] = default_path
+        return "", ""
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.QFileDialog.getSaveFileName",
+        fake_get_save_file_name,
+    )
+
+    dialog.save_log()
+
+    assert "_running_" in captured["default_path"]
+    dialog.close()
+
+
+def test_import_close_running_requests_cancel_and_keeps_dialog_until_finished(monkeypatch):
+    class FakeWorker:
+        def __init__(self):
+            self.cancel_called = False
+
+        def isRunning(self):
+            return True
+
+        def cancel(self):
+            self.cancel_called = True
+
+    class FakeConnector:
+        def __init__(self):
+            self.disconnected = False
+
+        def disconnect(self):
+            self.disconnected = True
+
+    class FakeButton:
+        def __init__(self):
+            self.enabled = False
+
+        def setEnabled(self, enabled):
+            self.enabled = enabled
+
+    class FakeLabel:
+        def __init__(self):
+            self.text = ""
+
+        def setText(self, text):
+            self.text = text
+
+    class FakeEvent:
+        def __init__(self):
+            self.accepted = False
+            self.ignored = False
+
+        def accept(self):
+            self.accepted = True
+
+        def ignore(self):
+            self.ignored = True
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    dialog = type("DummyDialog", (), {})()
+    dialog.worker = FakeWorker()
+    dialog.connector = FakeConnector()
+    dialog.btn_save_log = FakeButton()
+    dialog.label_status = FakeLabel()
+    dialog.log_entries = []
+    dialog._cancel_requested = False
+    dialog._close_after_cancel = False
+    dialog._add_log = lambda message: dialog.log_entries.append(message)
+    event = FakeEvent()
+
+    RustDumpImportDialog.closeEvent(dialog, event)
+
+    assert event.ignored
+    assert not event.accepted
+    assert not dialog.connector.disconnected
+    assert dialog.worker.cancel_called
+    assert dialog._cancel_requested
+    assert dialog._close_after_cancel
+
+
+def test_import_github_workers_are_retained_until_finished(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeGithubSignal:
+        def __init__(self):
+            self._slot = None
+
+        def connect(self, slot):
+            self._slot = slot
+
+        def emit(self, *args):
+            self._slot(*args)
+
+    class FakeGithubWorker:
+        def __init__(self, config_manager, error_type, error_message, context):
+            self.finished = FakeGithubSignal()
+
+        def start(self):
+            pass
+
+        def deleteLater(self):
+            pass
+
+    monkeypatch.setattr(
+        "src.ui.workers.github_worker.GitHubReportWorker", FakeGithubWorker
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+
+    dialog = RustDumpImportDialog(config_manager=MagicMock())
+    dialog.import_results = {}
+
+    dialog._report_error_to_github("import", "error 1")
+    dialog._report_error_to_github("import", "error 2")
+
+    assert len(dialog._github_workers) == 2
+    worker1, worker2 = dialog._github_workers
+
+    worker1.finished.emit(True, "ok")
+
+    assert dialog._github_workers == [worker2]
+    dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# WP-3.1: Import mode label — single Korean-label source
+# ---------------------------------------------------------------------------
+
+
+def test_import_mode_text_uses_single_korean_label_source(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog()
+
+    dialog.radio_merge.setChecked(True)
+    assert dialog._get_import_mode_text() == "증분 Import (병합)"
+
+    dialog.radio_replace.setChecked(True)
+    assert dialog._get_import_mode_text() == "전체 교체 Import"
+
+    dialog.radio_recreate.setChecked(True)
+    assert dialog._get_import_mode_text() == "완전 재생성 Import"
+
+    dialog.close()
+
+
+# ---------------------------------------------------------------------------
+# WP-3.1: Orphan analysis/report threading and connector cleanup
+# ---------------------------------------------------------------------------
+
+
+def test_orphan_analysis_worker_emits_results_without_gui_thread_process_events(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+
+    fake_results = [object()]
+
+    class FakeResolver:
+        def __init__(self, connector):
+            self.connector = connector
+
+        def find_orphan_records(self, schema, progress_callback=None):
+            if progress_callback:
+                progress_callback("검사 중...")
+            return fake_results
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.ForeignKeyResolver", FakeResolver
+    )
+
+    worker = OrphanAnalysisWorker(connector=MagicMock(), schema="app")
+
+    received = {}
+    worker.analysis_finished.connect(lambda results: received.setdefault("results", results))
+    worker.progress.connect(lambda msg: received.setdefault("progress", []).append(msg))
+
+    # QThread.start()를 통한 실제 OS 스레드 생성 없이 run()을 직접 호출한다.
+    worker.run()
+
+    assert received["results"] == fake_results
+    assert received["progress"] == ["검사 중..."]
+
+
+def test_orphan_dialog_start_analysis_starts_worker_and_disables_reentrant_actions(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    class FakeWorker:
+        progress = FakeSignal()
+        analysis_finished = FakeSignal()
+        failed = FakeSignal()
+        finished = FakeSignal()
+
+        def __init__(self, connector, schema):
+            self.connector = connector
+            self.schema = schema
+            self.started = False
+
+        def isRunning(self):
+            return False
+
+        def start(self):
+            self.started = True
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.OrphanAnalysisWorker", FakeWorker
+    )
+
+    connector = MagicMock()
+    connector.get_schemas.return_value = ["app"]
+
+    dialog = OrphanRecordDialog(connector=connector)
+    dialog.schema_combo.setCurrentText("app")
+
+    dialog.start_analysis()
+
+    assert isinstance(dialog.worker, FakeWorker)
+    assert dialog.worker.started
+    assert not dialog.analyze_btn.isEnabled()
+    dialog.close()
+
+
+def test_orphan_export_report_uses_current_results_not_resolver_rerun(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeSignal:
+        def connect(self, _callback):
+            pass
+
+    captured = {}
+
+    class FakeWorker:
+        report_finished = FakeSignal()
+        finished = FakeSignal()
+
+        def __init__(self, schema, output_path, orphan_results):
+            captured["schema"] = schema
+            captured["output_path"] = output_path
+            captured["orphan_results"] = orphan_results
+
+        def isRunning(self):
+            return False
+
+        def start(self):
+            captured["started"] = True
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.OrphanReportWorker", FakeWorker
+    )
+
+    connector = MagicMock()
+    connector.get_schemas.return_value = ["app"]
+
+    dialog = OrphanRecordDialog(connector=connector)
+    dialog.schema_combo.setCurrentText("app")
+
+    seeded_results = [
+        OrphanRecordInfo(
+            table="orders", column="user_id", referenced_table="users",
+            referenced_column="id", orphan_count=3, sample_values=["1"], query="SELECT 1",
+        )
+    ]
+    dialog.orphan_results = seeded_results
+
+    output_path = str(tmp_path / "report.md")
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.QFileDialog.getSaveFileName",
+        lambda *args, **kwargs: (output_path, ""),
+    )
+
+    dialog.export_report()
+
+    assert captured["orphan_results"] == seeded_results
+    assert captured["started"] is True
+    dialog.close()
+
+
+def test_orphan_dialog_close_blocks_while_worker_running(monkeypatch):
+    class FakeWorker:
+        def isRunning(self):
+            return True
+
+    class FakeEvent:
+        def __init__(self):
+            self.accepted = False
+            self.ignored = False
+
+        def accept(self):
+            self.accepted = True
+
+        def ignore(self):
+            self.ignored = True
+
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.worker = FakeWorker()
+    event = FakeEvent()
+
+    OrphanRecordDialog.closeEvent(dialog, event)
+
+    assert event.ignored
+    assert not event.accepted
+    assert warnings
+
+
+def test_start_orphan_check_disconnects_connector_after_dialog_exec(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+
+    class FakeConnector:
+        def __init__(self):
+            self.disconnect_calls = 0
+
+        def get_schemas(self):
+            return []
+
+        def disconnect(self):
+            self.disconnect_calls += 1
+
+    connector = FakeConnector()
+
+    wizard = RustDumpWizard(preselected_tunnel={"id": "t1"})
+    monkeypatch.setattr(
+        wizard, "_connect_preselected_tunnel", lambda: (connector, "info")
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.OrphanRecordDialog.exec", lambda self: None
+    )
+
+    result = wizard.start_orphan_check()
+
+    assert result is True
+    assert connector.disconnect_calls == 1
