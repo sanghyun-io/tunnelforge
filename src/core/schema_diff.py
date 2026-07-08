@@ -3,6 +3,11 @@
 - 두 DB 스키마 구조 비교
 - 테이블/컬럼/인덱스/FK 차이 분석
 - 동기화 SQL 스크립트 생성
+
+owner 참고: 현재 UI 노출 스키마 비교/동기화 스크립트 생성은 이 모듈의
+Python SchemaComparator / SyncScriptGenerator가 담당한다. Rust facade의
+schema.diff 정리/라우팅은 이후 Rust-contract WP에서 다룬다. 이 모듈이
+DB 작업 전체를 소유한다는 의미는 아니다.
 """
 import re
 from dataclasses import dataclass, field
@@ -58,6 +63,19 @@ class DiffType(Enum):
     UNCHANGED = "unchanged"
 
 
+def _normalize_column_extra(extra: Optional[str]) -> str:
+    """MySQL INFORMATION_SCHEMA EXTRA 값을 비교/SQL 출력용으로 정규화.
+
+    MySQL 8.0은 DEFAULT CURRENT_TIMESTAMP 등 컬럼의 EXTRA에
+    DEFAULT_GENERATED를 자동으로 붙이지만 MySQL 5.7은 붙이지 않아,
+    정규화하지 않으면 버전 차이만으로 잘못된 SQL/거짓 diff가 발생한다.
+    """
+    if not extra:
+        return ""
+    cleaned = re.sub(r"\bDEFAULT_GENERATED\b", "", extra, flags=re.IGNORECASE)
+    return " ".join(cleaned.split())
+
+
 @dataclass
 class ColumnInfo:
     """컬럼 정보"""
@@ -88,8 +106,9 @@ class ColumnInfo:
             else:
                 parts.append(f"DEFAULT '{self.default}'")
 
-        if self.extra:
-            parts.append(self.extra)
+        extra = _normalize_column_extra(self.extra)
+        if extra:
+            parts.append(extra)
 
         return " ".join(parts)
 
@@ -334,7 +353,7 @@ class SchemaExtractor:
                     data_type=row['COLUMN_TYPE'],
                     nullable=(row['IS_NULLABLE'] == 'YES'),
                     default=row['COLUMN_DEFAULT'],
-                    extra=row['EXTRA'] or '',
+                    extra=_normalize_column_extra(row['EXTRA']),
                     key=row['COLUMN_KEY'] or '',
                     charset=row['CHARACTER_SET_NAME'] or '',
                     collation=row['COLLATION_NAME'] or ''
@@ -604,8 +623,10 @@ class SchemaComparator:
                     if src.default != tgt.default:
                         differences.append(f"Default: {src.default} → {tgt.default}")
 
-                    if src.extra.lower() != tgt.extra.lower():
-                        differences.append(f"Extra: {src.extra} → {tgt.extra}")
+                    src_extra = _normalize_column_extra(src.extra)
+                    tgt_extra = _normalize_column_extra(tgt.extra)
+                    if src_extra.lower() != tgt_extra.lower():
+                        differences.append(f"Extra: {src_extra} → {tgt_extra}")
 
                 # Strict 모드: charset + collation 추가 비교
                 if compare_level == CompareLevel.STRICT:
@@ -1209,14 +1230,15 @@ class SyncScriptGenerator:
         col_defs = [f"    {col.to_sql_definition()}" for col in table.columns]
 
         # PRIMARY KEY
-        pk_cols = [col.name for col in table.columns if col.key == 'PRI']
-        if pk_cols:
-            pk_def = ", ".join(f"`{c}`" for c in pk_cols)
-            col_defs.append(f"    PRIMARY KEY ({pk_def})")
+        # 컬럼 ordinal 스캔이 아닌 PRIMARY 인덱스 메타데이터(SEQ_IN_INDEX 순서)로
+        # 생성해야 복합 PK의 실제 컬럼 순서가 보존된다.
+        primary_idx = table.get_index("PRIMARY")
+        if primary_idx and primary_idx.columns:
+            col_defs.append(f"    {primary_idx.to_sql_definition(table.name)}")
 
         # 인덱스 (PRIMARY 제외)
         for idx in table.indexes:
-            if idx.name != 'PRIMARY':
+            if idx.name.upper() != "PRIMARY":
                 col_defs.append(f"    {idx.to_sql_definition(table.name)}")
 
         # FK

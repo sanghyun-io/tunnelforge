@@ -73,6 +73,36 @@ class TestColumnInfo:
         sql = col.to_sql_definition()
         assert 'CHARACTER SET utf8mb4' in sql
 
+    def test_to_sql_definition_strips_default_generated(self):
+        """MySQL 8 EXTRA의 DEFAULT_GENERATED는 SQL 출력에서 제거되어야 함"""
+        from src.core.schema_diff import ColumnInfo
+
+        col = ColumnInfo(
+            name='created_at',
+            data_type='datetime',
+            nullable=True,
+            default='CURRENT_TIMESTAMP',
+            extra='DEFAULT_GENERATED'
+        )
+        sql = col.to_sql_definition()
+        assert 'DEFAULT CURRENT_TIMESTAMP' in sql
+        assert 'DEFAULT_GENERATED' not in sql
+
+    def test_to_sql_definition_preserves_on_update_extra(self):
+        """DEFAULT_GENERATED 제거 후에도 on update CURRENT_TIMESTAMP는 보존되어야 함"""
+        from src.core.schema_diff import ColumnInfo
+
+        col = ColumnInfo(
+            name='updated_at',
+            data_type='datetime',
+            nullable=True,
+            default='CURRENT_TIMESTAMP',
+            extra='DEFAULT_GENERATED on update CURRENT_TIMESTAMP'
+        )
+        sql = col.to_sql_definition()
+        assert 'on update CURRENT_TIMESTAMP' in sql
+        assert 'DEFAULT_GENERATED' not in sql
+
 
 class TestIndexInfo:
     """IndexInfo 데이터클래스 테스트"""
@@ -307,6 +337,25 @@ class TestSchemaExtractor:
         assert columns[0].nullable is False
         assert columns[0].extra == 'auto_increment'
 
+    def test_get_columns_strips_default_generated_extra(self):
+        """추출 단계에서 MySQL 8 EXTRA의 DEFAULT_GENERATED가 정규화되어야 함"""
+        self.mock_connector.execute.return_value = [
+            {
+                'COLUMN_NAME': 'updated_at',
+                'COLUMN_TYPE': 'datetime',
+                'IS_NULLABLE': 'YES',
+                'COLUMN_DEFAULT': 'CURRENT_TIMESTAMP',
+                'EXTRA': 'DEFAULT_GENERATED on update CURRENT_TIMESTAMP',
+                'COLUMN_KEY': '',
+                'CHARACTER_SET_NAME': None,
+                'COLLATION_NAME': None
+            }
+        ]
+
+        columns = self.extractor._get_columns('mydb', 'users')
+
+        assert columns[0].extra == 'on update CURRENT_TIMESTAMP'
+
     def test_get_indexes_parses_result(self):
         """인덱스 정보 파싱 확인 (멀티 컬럼 인덱스 포함)"""
         self.mock_connector.execute.return_value = [
@@ -470,6 +519,107 @@ class TestSchemaComparator:
 
         assert len(diffs) == 1
         assert diffs[0].diff_type == DiffType.REMOVED
+
+    def test_compare_columns_ignores_default_generated_only_extra(self):
+        """EXTRA가 DEFAULT_GENERATED 유무만 다르면 MODIFIED로 취급하지 않아야 함"""
+        from src.core.schema_diff import ColumnInfo, DiffType
+
+        src_col = ColumnInfo(
+            name='created_at', data_type='datetime', nullable=True,
+            default='CURRENT_TIMESTAMP', extra=''
+        )
+        tgt_col = ColumnInfo(
+            name='created_at', data_type='datetime', nullable=True,
+            default='CURRENT_TIMESTAMP', extra='DEFAULT_GENERATED'
+        )
+        self.source.columns = [src_col]
+        self.target.columns = [tgt_col]
+
+        diff = self.comparator.compare_tables(self.source, self.target)
+
+        col_diff = diff.column_diffs[0]
+        assert col_diff.diff_type == DiffType.UNCHANGED
+
+    def test_compare_columns_ignores_default_generated_with_on_update(self):
+        """양쪽 다 on update가 있고 DEFAULT_GENERATED 유무만 다르면 차이 없음"""
+        from src.core.schema_diff import ColumnInfo, DiffType
+
+        src_col = ColumnInfo(
+            name='updated_at', data_type='datetime', nullable=True,
+            default='CURRENT_TIMESTAMP', extra='on update CURRENT_TIMESTAMP'
+        )
+        tgt_col = ColumnInfo(
+            name='updated_at', data_type='datetime', nullable=True,
+            default='CURRENT_TIMESTAMP',
+            extra='DEFAULT_GENERATED on update CURRENT_TIMESTAMP'
+        )
+        self.source.columns = [src_col]
+        self.target.columns = [tgt_col]
+
+        diff = self.comparator.compare_tables(self.source, self.target)
+
+        col_diff = diff.column_diffs[0]
+        assert col_diff.diff_type == DiffType.UNCHANGED
+
+
+# =====================================================================
+# SyncScriptGenerator 테스트
+# =====================================================================
+
+class TestSyncScriptGenerator:
+    """SyncScriptGenerator 클래스 테스트"""
+
+    def test_generate_modify_column_strips_default_generated(self):
+        """MODIFY COLUMN 문에서도 DEFAULT_GENERATED가 제거되어야 함"""
+        from src.core.schema_diff import (
+            SyncScriptGenerator, TableDiff, ColumnDiff, ColumnInfo, DiffType
+        )
+
+        generator = SyncScriptGenerator()
+
+        source_info = ColumnInfo(
+            name='created_at', data_type='datetime', nullable=True,
+            default='CURRENT_TIMESTAMP', extra='DEFAULT_GENERATED'
+        )
+        col_diff = ColumnDiff(
+            column_name='created_at',
+            diff_type=DiffType.MODIFIED,
+            source_info=source_info,
+            differences=['Extra:  → DEFAULT_GENERATED']
+        )
+        table_diff = TableDiff(
+            table_name='users',
+            diff_type=DiffType.MODIFIED,
+            column_diffs=[col_diff]
+        )
+
+        script = generator.generate_sync_script([table_diff], 'target_db')
+
+        assert 'DEFAULT_GENERATED' not in script
+        assert 'MODIFY COLUMN `created_at` datetime NULL DEFAULT CURRENT_TIMESTAMP' in script
+
+    def test_generate_create_table_uses_primary_index_order(self):
+        """복합 PK 컬럼 순서는 PRIMARY 인덱스 메타데이터 순서를 따라야 함"""
+        from src.core.schema_diff import (
+            SyncScriptGenerator, TableSchema, ColumnInfo, IndexInfo
+        )
+
+        generator = SyncScriptGenerator()
+
+        table = TableSchema(name='accounts')
+        table.columns = [
+            ColumnInfo(name='tenant_id', data_type='int', nullable=False, default=None, key='PRI'),
+            ColumnInfo(name='code', data_type='varchar(50)', nullable=False, default=None, key='PRI'),
+        ]
+        table.indexes = [
+            IndexInfo(name='PRIMARY', columns=['code', 'tenant_id'], unique=True)
+        ]
+
+        script = generator._generate_create_table('target_db', table)
+
+        assert 'PRIMARY KEY (`code`, `tenant_id`)' in script
+        assert 'PRIMARY KEY (`tenant_id`, `code`)' not in script
+        assert script.count('PRIMARY KEY') == 1
 
 
 # =====================================================================
