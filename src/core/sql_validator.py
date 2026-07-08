@@ -5,10 +5,229 @@ SQL 구문 Validator
 - 정규식 기반 파싱 (의존성 없음)
 """
 import re
+import threading
 from enum import Enum
 from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional, Tuple
 from difflib import get_close_matches
+
+
+# 별칭/CTE 파싱에서 공통으로 사용하는 예약어 스킵 목록
+ALIAS_STOP_WORDS = {
+    'WHERE', 'ON', 'AND', 'OR', 'SET', 'VALUES',
+    'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS', 'FULL',
+    'JOIN', 'ORDER', 'GROUP', 'HAVING', 'LIMIT', 'OFFSET',
+    'UNION', 'ALL', 'SELECT', 'FROM', 'BY', 'AS',
+}
+
+
+def _schema_key(schema: Optional[str]) -> Optional[str]:
+    """스키마명을 캐시 키로 정규화 (None/빈 문자열/공백만 있으면 None)"""
+    if schema is None:
+        return None
+    stripped = schema.strip()
+    return stripped or None
+
+
+def _normalize_identifier(identifier: str) -> str:
+    """식별자를 감싸는 백틱 한 겹 제거 (없으면 그대로 반환)"""
+    if len(identifier) >= 2 and identifier[0] == '`' and identifier[-1] == '`':
+        return identifier[1:-1]
+    return identifier
+
+
+def _read_identifier(sql: str, pos: int) -> Tuple[Optional[str], int]:
+    """pos 위치(앞쪽 공백 허용)부터 식별자 하나를 읽는다.
+
+    백틱 식별자(`name`)와 일반 \\w+ 식별자를 모두 지원한다.
+
+    Returns:
+        (식별자, 다음 위치) 또는 식별자를 읽지 못하면 (None, pos)
+    """
+    length = len(sql)
+    i = pos
+    while i < length and sql[i].isspace():
+        i += 1
+
+    if i >= length:
+        return None, pos
+
+    if sql[i] == '`':
+        end = sql.find('`', i + 1)
+        if end == -1:
+            return None, pos
+        return sql[i + 1:end], end + 1
+
+    match = re.match(r'\w+', sql[i:])
+    if not match:
+        return None, pos
+    return match.group(0), i + match.end()
+
+
+def _skip_balanced_parentheses(sql: str, open_pos: int) -> int:
+    """open_pos가 가리키는 '('과 짝이 맞는 ')' 바로 다음 위치를 반환한다.
+
+    문자열 리터럴(작은따옴표/큰따옴표) 내부의 괄호는 무시하며,
+    이스케이프 처리는 `_find_string_regions`와 동일하게 따옴표 2개 연속을 이스케이프로 본다.
+    짝이 맞지 않으면 len(sql)을 반환한다.
+    """
+    length = len(sql)
+    if open_pos >= length or sql[open_pos] != '(':
+        return open_pos
+
+    depth = 0
+    in_string = False
+    string_char = None
+    i = open_pos
+
+    while i < length:
+        char = sql[i]
+
+        if in_string:
+            if char == string_char:
+                if i + 1 < length and sql[i + 1] == string_char:
+                    i += 1  # 이스케이프된 따옴표 스킵
+                else:
+                    in_string = False
+                    string_char = None
+        else:
+            if char in ("'", '"'):
+                in_string = True
+                string_char = char
+            elif char == '(':
+                depth += 1
+            elif char == ')':
+                depth -= 1
+                if depth == 0:
+                    return i + 1
+
+        i += 1
+
+    return length
+
+
+def extract_cte_names(sql: str) -> Set[str]:
+    """WITH 절에 정의된 CTE 이름 목록 추출 (테이블 존재 검증 제외용)
+
+    지원 형태:
+        WITH cte AS (...) SELECT * FROM cte
+        WITH a AS (...), b AS (...) SELECT * FROM b
+        WITH RECURSIVE cte AS (...) SELECT * FROM cte
+        WITH `cte` AS (...) SELECT * FROM `cte`
+    """
+    names: Set[str] = set()
+
+    with_match = re.search(r'\bWITH\b', sql, re.IGNORECASE)
+    if not with_match:
+        return names
+
+    length = len(sql)
+    pos = with_match.end()
+
+    recursive_match = re.match(r'\s+RECURSIVE\b', sql[pos:], re.IGNORECASE)
+    if recursive_match:
+        pos += recursive_match.end()
+
+    while True:
+        name, pos = _read_identifier(sql, pos)
+        if not name:
+            break
+        names.add(_normalize_identifier(name).lower())
+
+        while pos < length and sql[pos].isspace():
+            pos += 1
+
+        # 선택적 컬럼 목록: cte(col1, col2)
+        if pos < length and sql[pos] == '(':
+            pos = _skip_balanced_parentheses(sql, pos)
+            while pos < length and sql[pos].isspace():
+                pos += 1
+
+        as_match = re.match(r'AS\b', sql[pos:], re.IGNORECASE)
+        if not as_match:
+            break
+        pos += as_match.end()
+
+        while pos < length and sql[pos].isspace():
+            pos += 1
+
+        if pos >= length or sql[pos] != '(':
+            break
+        pos = _skip_balanced_parentheses(sql, pos)
+
+        while pos < length and sql[pos].isspace():
+            pos += 1
+
+        if pos < length and sql[pos] == ',':
+            pos += 1
+            continue
+        break
+
+    return names
+
+
+def extract_derived_table_aliases(sql: str) -> Set[str]:
+    """FROM (...) AS alias / JOIN (...) AS alias 형태의 파생 테이블 별칭 추출
+
+    파생 테이블 별칭은 실제 테이블이 아니므로, 테이블 존재 검증에서 제외하기 위한
+    스킵 목록으로만 사용한다 (메타데이터 조회용이 아님).
+    """
+    aliases: Set[str] = set()
+    length = len(sql)
+
+    for match in re.finditer(r'\b(?:FROM|JOIN)\s*\(', sql, re.IGNORECASE):
+        open_pos = match.end() - 1
+        pos = _skip_balanced_parentheses(sql, open_pos)
+
+        while pos < length and sql[pos].isspace():
+            pos += 1
+
+        as_match = re.match(r'AS\b', sql[pos:], re.IGNORECASE)
+        if as_match:
+            pos += as_match.end()
+
+        alias, _ = _read_identifier(sql, pos)
+        if not alias:
+            continue
+
+        normalized = _normalize_identifier(alias)
+        if normalized.upper() not in ALIAS_STOP_WORDS:
+            aliases.add(normalized.lower())
+
+    return aliases
+
+
+def extract_table_aliases(sql: str, metadata: 'SchemaMetadata') -> Dict[str, str]:
+    """FROM/JOIN 절의 실제 테이블 참조에서 별칭(별칭 → 테이블명) 추출
+
+    CTE 이름과 파생 테이블(서브쿼리)은 실제 테이블이 아니므로 별칭 매핑에서 제외한다.
+    Validator와 AutoCompleter가 공용으로 사용하는 단일 파서다.
+    """
+    aliases: Dict[str, str] = {}
+    cte_names = extract_cte_names(sql)
+
+    # FROM/JOIN 뒤가 '('인 경우(파생 테이블)는 이 패턴에서 제외
+    pattern = r'\b(?:FROM|JOIN)\s+(?!\()(?:`?(\w+)`?\.)?`?(\w+)`?(?:\s+(?:AS\s+)?`?(\w+)`?)?'
+
+    for match in re.finditer(pattern, sql, re.IGNORECASE):
+        table = match.group(2)
+        alias = match.group(3)
+
+        # CTE 이름이면서 실제 메타데이터 테이블이 아니면 별칭 소스로 사용하지 않음
+        if table.lower() in cte_names and not metadata.has_table(table):
+            continue
+
+        if alias and alias.upper() in ALIAS_STOP_WORDS:
+            alias = None
+
+        if alias:
+            aliases[alias.lower()] = table
+
+    # 테이블 자체도 추가 (self-reference)
+    for real_table in metadata.tables:
+        aliases[real_table.lower()] = real_table
+
+    return aliases
 
 
 class IssueSeverity(Enum):
@@ -84,49 +303,87 @@ class SchemaMetadata:
 
 
 class SchemaMetadataProvider:
-    """스키마 메타데이터 제공자 (캐싱)"""
+    """스키마 메타데이터 제공자 (스키마별 인메모리 캐시)
+
+    Python 쪽에서는 동기 DB 조회를 하지 않는다. 메타데이터는 반드시
+    `set_metadata()` (또는 호환용 `_metadata` 직접 대입)로 채워져야 하며,
+    캐시 미스 시에는 커넥터를 호출하지 않고 빈 SchemaMetadata를 반환한다.
+    이는 ValidationWorker가 MetadataLoadWorker와 같은 커넥터를 두고
+    경쟁(race)하는 것을 방지하기 위함이다.
+    """
 
     def __init__(self):
-        self._metadata: Optional[SchemaMetadata] = None
+        self._metadata_by_schema: Dict[Optional[str], SchemaMetadata] = {}
+        self._active_schema_key: Optional[str] = None
         self._connector = None
+        self._lock = threading.RLock()
+
+    @property
+    def _metadata(self) -> Optional[SchemaMetadata]:
+        """호환용 속성 (UI 등 외부에서 `_metadata`를 직접 읽는 경우 대응)"""
+        with self._lock:
+            if self._active_schema_key in self._metadata_by_schema:
+                return self._metadata_by_schema[self._active_schema_key]
+            return self._metadata_by_schema.get(None)
+
+    @_metadata.setter
+    def _metadata(self, value: Optional[SchemaMetadata]):
+        """호환용 속성 (UI 등 외부에서 `_metadata`를 직접 대입하는 경우 대응)
+
+        `set_connector(connector)` 직후 활성 스키마(`connector.database`)에
+        매핑해 저장한다. 신규 코드는 `set_metadata(schema, metadata)`를 사용할 것.
+        """
+        with self._lock:
+            if value is None:
+                if self._active_schema_key is not None:
+                    self._metadata_by_schema.pop(self._active_schema_key, None)
+                else:
+                    self._metadata_by_schema.clear()
+                return
+            self._metadata_by_schema[self._active_schema_key] = value
 
     def set_connector(self, connector):
-        """DB 커넥터 설정"""
-        self._connector = connector
-        self._metadata = None  # 캐시 무효화
+        """DB 커넥터 설정
+
+        커넥터가 바뀌면 이전 캐시가 다른 연결의 것일 수 있으므로 무효화한다.
+        여기서는 DB에 동기 조회를 하지 않는다.
+        """
+        with self._lock:
+            self._connector = connector
+            self._active_schema_key = _schema_key(getattr(connector, "database", None))
+            self._metadata_by_schema.clear()
+
+    def set_metadata(self, schema: str, metadata: SchemaMetadata):
+        """스키마에 대한 메타데이터를 캐시에 저장 (백그라운드 로드 완료 후 호출)"""
+        if metadata is None:
+            raise ValueError("metadata는 None일 수 없습니다")
+
+        key = _schema_key(schema)
+        with self._lock:
+            self._metadata_by_schema[key] = metadata
+            self._active_schema_key = key
 
     def get_metadata(self, schema: str = None) -> SchemaMetadata:
-        """메타데이터 조회 (캐싱)"""
-        if self._metadata:
-            return self._metadata
-
-        if not self._connector:
+        """메타데이터 조회 (캐시 히트만 반환, 캐시 미스 시 커넥터 조회하지 않음)"""
+        key = _schema_key(schema)
+        with self._lock:
+            if key in self._metadata_by_schema:
+                return self._metadata_by_schema[key]
+            if key is None and None in self._metadata_by_schema:
+                return self._metadata_by_schema[None]
             return SchemaMetadata()
 
-        metadata = SchemaMetadata()
+    def invalidate(self, schema: str = None):
+        """캐시 무효화
 
-        try:
-            # DB 버전
-            metadata.db_version = self._connector.get_db_version()
-
-            # 테이블 목록
-            tables = self._connector.get_tables(schema)
-            metadata.tables = set(tables)
-
-            # 각 테이블의 컬럼 정보
-            for table in tables:
-                columns = self._connector.get_column_names(table, schema)
-                metadata.columns[table] = set(columns)
-
-        except Exception as e:
-            print(f"메타데이터 조회 오류: {e}")
-
-        self._metadata = metadata
-        return metadata
-
-    def invalidate(self):
-        """캐시 무효화"""
-        self._metadata = None
+        Args:
+            schema: 지정하면 해당 스키마만 무효화, None이면 전체 무효화
+        """
+        with self._lock:
+            if schema is None:
+                self._metadata_by_schema.clear()
+            else:
+                self._metadata_by_schema.pop(_schema_key(schema), None)
 
 
 class SQLValidator:
@@ -234,6 +491,9 @@ class SQLValidator:
         comment_regions = self._find_comment_regions(sql)
         excluded_regions = string_regions + comment_regions
 
+        # CTE 이름 / 파생 테이블(서브쿼리) 별칭은 실제 테이블이 아니므로 존재 검증에서 제외
+        virtual_tables = extract_cte_names(sql) | extract_derived_table_aliases(sql)
+
         # 이미 검증한 위치 추적 (중복 방지)
         validated_positions = set()
 
@@ -266,6 +526,10 @@ class SQLValidator:
                 if self._is_in_regions(table_start, excluded_regions):
                     continue
 
+                # CTE/파생 테이블 별칭이면 존재하지 않는 테이블로 오탐하지 않도록 스킵
+                if table_name.lower() in virtual_tables:
+                    continue
+
                 # 테이블 존재 여부 확인
                 if not metadata.has_table(table_name):
                     line, col = self._offset_to_line_col(table_start, line_offsets)
@@ -290,8 +554,8 @@ class SQLValidator:
         # 문자열 리터럴 영역
         string_regions = self._find_string_regions(sql)
 
-        # FROM 절에서 테이블/별칭 매핑 추출
-        table_aliases = self._extract_table_aliases(sql, metadata)
+        # FROM 절에서 테이블/별칭 매핑 추출 (Validator/AutoCompleter 공용 파서)
+        table_aliases = extract_table_aliases(sql, metadata)
 
         # table.column 패턴 검증
         column_pattern = r'`?(\w+)`?\s*\.\s*`?(\w+)`?'
@@ -432,30 +696,6 @@ class SQLValidator:
                 return True
         return False
 
-    def _extract_table_aliases(self, sql: str, metadata: SchemaMetadata) -> Dict[str, str]:
-        """테이블 별칭 추출 (별칭 → 테이블명)"""
-        aliases = {}
-
-        # FROM table AS alias / FROM table alias
-        pattern = r'\b(?:FROM|JOIN)\s+(?:`?(\w+)`?\.)?`?(\w+)`?\s+(?:AS\s+)?`?(\w+)`?'
-
-        for match in re.finditer(pattern, sql, re.IGNORECASE):
-            # schema = match.group(1)
-            table = match.group(2)
-            alias = match.group(3)
-
-            # alias가 키워드가 아닌지 확인
-            if alias and alias.upper() not in {'WHERE', 'ON', 'AND', 'OR', 'SET', 'VALUES',
-                                                 'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS',
-                                                 'JOIN', 'ORDER', 'GROUP', 'HAVING', 'LIMIT'}:
-                aliases[alias.lower()] = table
-
-        # 테이블 자체도 추가 (self-reference)
-        for table in metadata.tables:
-            aliases[table.lower()] = table
-
-        return aliases
-
 
 class SQLAutoCompleter:
     """SQL 자동완성 제공자"""
@@ -518,11 +758,10 @@ class SQLAutoCompleter:
             target_table = context.get('table')
 
             if target_table:
-                # 특정 테이블의 컬럼
-                real_table = metadata.get_table_name(target_table)
-                if not real_table:
-                    aliases = self._extract_table_aliases(sql, metadata)
-                    real_table = aliases.get(target_table.lower())
+                # 특정 테이블의 컬럼 (별칭 → 실제 테이블명 변환은 조회 전에 수행)
+                aliases = extract_table_aliases(sql, metadata)
+                resolved_table = aliases.get(target_table.lower(), target_table)
+                real_table = metadata.get_table_name(resolved_table)
                 if real_table and real_table in metadata.columns:
                     for col in sorted(metadata.columns[real_table]):
                         if self._matches_prefix(col, prefix):
@@ -613,34 +852,17 @@ class SQLAutoCompleter:
         return item.lower().startswith(prefix.lower())
 
     def _extract_from_tables(self, sql: str, metadata: SchemaMetadata) -> List[str]:
-        """FROM 절에서 테이블 추출"""
+        """FROM 절에서 테이블 추출 (CTE 이름 / 파생 테이블 별칭은 제외)"""
         tables = []
+        virtual_tables = extract_cte_names(sql) | extract_derived_table_aliases(sql)
         pattern = r'\b(?:FROM|JOIN)\s+(?:`?(\w+)`?\.)?`?(\w+)`?'
 
         for match in re.finditer(pattern, sql, re.IGNORECASE):
             table = match.group(2)
+            if table.lower() in virtual_tables:
+                continue
             real_table = metadata.get_table_name(table)
             if real_table and real_table not in tables:
                 tables.append(real_table)
 
         return tables
-
-    def _extract_table_aliases(self, sql: str, metadata: SchemaMetadata) -> Dict[str, str]:
-        """테이블 별칭 추출 (별칭 → 테이블명)."""
-        aliases = {}
-        pattern = r'\b(?:FROM|JOIN)\s+(?:`?(\w+)`?\.)?`?(\w+)`?\s+(?:AS\s+)?`?(\w+)`?'
-        keywords = {
-            'WHERE', 'ON', 'AND', 'OR', 'SET', 'VALUES',
-            'LEFT', 'RIGHT', 'INNER', 'OUTER', 'CROSS',
-            'JOIN', 'ORDER', 'GROUP', 'HAVING', 'LIMIT',
-        }
-
-        for match in re.finditer(pattern, sql, re.IGNORECASE):
-            table = match.group(2)
-            alias = match.group(3)
-            if alias and alias.upper() not in keywords:
-                aliases[alias.lower()] = table
-
-        for table in metadata.tables:
-            aliases[table.lower()] = table
-        return aliases
