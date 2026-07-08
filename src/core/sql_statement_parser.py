@@ -121,12 +121,18 @@ def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
             i += 1
             continue
 
-        marker = read_dollar_quote(sql_text, i)
-        if marker:
-            dollar_quote = marker
-            append_text(marker, i)
-            i += len(marker)
+        if delimiter != ";" and delimiter and sql_text.startswith(delimiter, i):
+            flush(i, i + len(delimiter))
+            i += len(delimiter)
             continue
+
+        if delimiter == ";":
+            marker = read_dollar_quote(sql_text, i)
+            if marker:
+                dollar_quote = marker
+                append_text(marker, i)
+                i += len(marker)
+                continue
 
         if char in ("'", '"', "`"):
             quote = char
