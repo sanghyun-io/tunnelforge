@@ -183,6 +183,46 @@ class TestSmartFixGenerator:
         strategies = [o.strategy for o in options]
         assert FixStrategy.COLLATION_SINGLE in strategies
 
+    def test_charset_column_level_escapes_quoted_default(self, generator):
+        """컬럼 DEFAULT 값에 작은따옴표가 있으면 이스케이프해야 한다
+        (공유 헬퍼 미사용 시 잘못된 DDL이 생성되던 버그의 회귀 테스트)"""
+        generator.connector.query_results = {
+            'INFORMATION_SCHEMA.COLUMNS': [{
+                'COLUMN_TYPE': 'varchar(255)',
+                'IS_NULLABLE': 'NO',
+                'COLUMN_DEFAULT': "O'Brien",
+                'EXTRA': '',
+            }],
+        }
+        issue = make_issue(
+            IssueType.CHARSET_ISSUE,
+            location="test_db.users.name",
+        )
+        options = generator.get_fix_options(issue)
+        single_opt = next(o for o in options if o.strategy == FixStrategy.COLLATION_SINGLE)
+        assert "DEFAULT 'O''Brien'" in single_opt.sql_template
+        # 이스케이프되지 않은 원본 그대로 들어가면 DDL이 깨짐 - 부재 확인
+        assert "DEFAULT 'O'Brien'" not in single_opt.sql_template
+
+    def test_charset_column_level_numeric_default_unquoted(self, generator):
+        """숫자형 컬럼의 DEFAULT는 따옴표 없이 생성돼야 한다 (공유 헬퍼 위임 확인)"""
+        generator.connector.query_results = {
+            'INFORMATION_SCHEMA.COLUMNS': [{
+                'COLUMN_TYPE': 'int(11)',
+                'IS_NULLABLE': 'NO',
+                'COLUMN_DEFAULT': '0',
+                'EXTRA': '',
+            }],
+        }
+        issue = make_issue(
+            IssueType.CHARSET_ISSUE,
+            location="test_db.users.retry_count",
+        )
+        options = generator.get_fix_options(issue)
+        single_opt = next(o for o in options if o.strategy == FixStrategy.COLLATION_SINGLE)
+        assert "DEFAULT 0" in single_opt.sql_template
+        assert "DEFAULT '0'" not in single_opt.sql_template
+
     def test_charset_column_level_no_definition(self, generator):
         """컬럼 정의 조회 실패 시 MANUAL"""
         issue = make_issue(
@@ -212,6 +252,26 @@ class TestSmartFixGenerator:
         # DECIMAL 변환 옵션은 requires_input
         decimal_opt = [o for o in options if o.requires_input]
         assert len(decimal_opt) >= 1
+
+    def test_float_precision_decimal_uses_user_input_precision(self, generator):
+        """DECIMAL 옵션의 sql_template은 {precision} 플레이스홀더를 써서
+        사용자 입력이 실제로 반영돼야 한다 (하드코딩된 DECIMAL(10,2) 회귀 방지)"""
+        issue = make_issue(
+            IssueType.FLOAT_PRECISION,
+            table_name="orders", column_name="amount",
+        )
+        options = generator.get_fix_options(issue)
+        decimal_opt = next(o for o in options if o.requires_input)
+
+        step = _make_step(
+            0, IssueType.FLOAT_PRECISION,
+            location="test_db.orders.amount",
+            selected_option=decimal_opt,
+            user_input="12,4",
+        )
+        sql = generator.generate_sql(step)
+        assert "DECIMAL(12,4)" in sql
+        assert "{precision}" not in sql
 
     def test_int_display_width_recommends_skip(self, generator):
         issue = make_issue(IssueType.INT_DISPLAY_WIDTH)
@@ -598,6 +658,48 @@ class TestBatchFixExecutor:
                        user_input="2000-01-01"),
         ]
         result = executor.execute_batch(steps, dry_run=True)
+        assert result.success_count == 1
+
+    def test_fk_safe_batch_dry_run_message_includes_summary(self, executor):
+        """FK 안전 변경 배치의 dry-run 결과 메시지는 실제 DRY-RUN 요약(FK/테이블
+        개수)을 포함해야 한다 (이전에는 계산해 놓고 고정 문자열만 사용해 버렸었다)"""
+        steps = [
+            _make_step(0, IssueType.CHARSET_ISSUE,
+                       location="test_db.users",
+                       selected_option=_make_option(
+                           FixStrategy.COLLATION_FK_SAFE,
+                           related_tables=["users"],
+                       )),
+        ]
+        result = executor.execute_batch(steps, dry_run=True)
+        assert result.success_count == 1
+        assert "DRY-RUN" in result.results[0].message
+        assert "FK" in result.results[0].message
+        assert "테이블" in result.results[0].message
+
+    def test_dedup_by_step_identity_preserves_other_step_at_same_location(self, executor):
+        """같은 location에 issue_type/strategy가 다른 두 step이 있을 때,
+        한 step이 COLLATION_FK_SAFE 배치로 처리돼도 다른 step의 선택된 fix가
+        조용히 누락되면 안 된다 (location 문자열 기반 dedup의 회귀 버그)"""
+        fk_safe_step = _make_step(
+            0, IssueType.CHARSET_ISSUE,
+            location="test_db.users",
+            selected_option=_make_option(
+                FixStrategy.COLLATION_FK_SAFE,
+                related_tables=["users"],
+            ),
+        )
+        unrelated_step_same_location = _make_step(
+            1, IssueType.DEPRECATED_ENGINE,
+            location="test_db.users",
+            selected_option=_make_option(FixStrategy.SKIP),
+        )
+        steps = [fk_safe_step, unrelated_step_same_location]
+        result = executor.execute_batch(steps, dry_run=True)
+
+        assert result.total_steps == 2
+        assert len(result.results) == 2  # 두 step 모두 결과가 있어야 한다
+        assert result.skip_count == 1
         assert result.success_count == 1
 
 
@@ -1065,7 +1167,11 @@ def _make_charset_step(idx, col_name, table="users", schema="test_db"):
 
 
 def _make_executor_with_session_mocks():
-    """dry_run=False 지원을 위해 세션 메서드가 mocking된 executor 반환"""
+    """세션 메서드를 mocking한 executor 반환
+
+    dry_run=False가 세션 상태(sql_mode 등)를 건드리기 전에 즉시 거부되는지
+    검증하기 위해, get/set_session_sql_mode 호출 여부를 감시할 수 있게 한다.
+    """
     conn = FakeMySQLConnector()
     conn.query_results = {'KEY_COLUMN_USAGE': []}
     conn.get_session_sql_mode = MagicMock(return_value='STRICT_TRANS_TABLES')
@@ -1074,7 +1180,7 @@ def _make_executor_with_session_mocks():
 
 
 class TestSessionGuardFaultInjection:
-    """_session_guard try/finally 및 2-phase bookkeeping 오류 주입 테스트"""
+    """dry-run-only fail-closed 가드 및 2-phase bookkeeping 오류 주입 테스트"""
 
     def test_batch_executor_rejects_legacy_python_mutation_mode(self):
         """Rust Core baseline: legacy core executor must not run DB mutations."""
