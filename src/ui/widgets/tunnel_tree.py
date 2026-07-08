@@ -84,15 +84,6 @@ class TunnelTreeWidget(QTreeWidget):
             tr("main.default_schema"), tr("main.power"), tr("main.manage")
         ])
 
-    def set_column_ratios(self, ratios: list):
-        """컬럼 너비 비율 설정"""
-        total_width = self.viewport().width()
-        if total_width > 0:
-            header = self.header()
-            for i, ratio in enumerate(ratios):
-                if i < header.count():
-                    header.resizeSection(i, int(total_width * ratio))
-
     def load_data(self, tunnels: list, groups: list, ungrouped_order: list):
         """데이터 로드 및 트리 구성
 
