@@ -166,8 +166,12 @@ class TunnelMonitor:
         logger.info("터널 모니터링 중지")
 
     def _cleanup_health_connection(self, tunnel_id: str):
-        """특정 터널의 health check 연결 정리"""
-        conn = self._health_connections.pop(tunnel_id, None)
+        """특정 터널의 health check 연결 정리
+
+        딕셔너리 pop만 락으로 보호하고, 실제 연결 종료(I/O)는 락 밖에서 수행한다.
+        """
+        with self._lock:
+            conn = self._health_connections.pop(tunnel_id, None)
         if conn:
             try:
                 conn.close()
@@ -176,9 +180,17 @@ class TunnelMonitor:
                 pass
 
     def _cleanup_all_health_connections(self):
-        """모든 health check 연결 정리"""
-        for tunnel_id in list(self._health_connections.keys()):
-            self._cleanup_health_connection(tunnel_id)
+        """모든 health check 연결 정리 (딕셔너리 정리만 락으로 보호)"""
+        with self._lock:
+            connections = dict(self._health_connections)
+            self._health_connections.clear()
+
+        for tunnel_id, conn in connections.items():
+            try:
+                conn.close()
+                logger.debug(f"Health check 연결 정리: {tunnel_id}")
+            except Exception:
+                pass
 
     def is_running(self) -> bool:
         """모니터링 실행 중 여부"""
@@ -249,12 +261,18 @@ class TunnelMonitor:
             self._stop_event.wait(interval)
 
     def _check_all_tunnels(self):
-        """모든 활성 터널 상태 확인"""
+        """모든 활성 터널 상태 확인
+
+        Latency 측정(네트워크 I/O)은 self._lock을 점유하지 않은 상태에서 수행한다.
+        상태 전이는 1단계(락 보유)에서 처리하고, 연결 중인 터널 목록만 모아
+        락 밖에서 측정한 뒤 2단계(락 재획득)에서 결과를 반영한다.
+        """
         # 현재 활성 터널 목록
         active_ids = set(self.tunnel_engine.active_tunnels.keys())
+        latency_targets: List[str] = []
 
+        # 1단계: 상태 전이 및 이벤트 처리 (락 보유)
         with self._lock:
-            # 연결된 터널 체크
             for tunnel_id in active_ids:
                 status = self._statuses.get(tunnel_id)
                 if not status:
@@ -273,16 +291,9 @@ class TunnelMonitor:
                         status.error_message = None
                         self._add_event(tunnel_id, "connected", "터널 연결됨")
 
-                    # Latency 측정
-                    latency = self._measure_latency(tunnel_id)
-                    if latency >= 0:
-                        status.latency_ms = latency
-                        status.latency_history.append(latency)
-                        # 히스토리 최대 100개 유지
-                        if len(status.latency_history) > 100:
-                            status.latency_history = status.latency_history[-100:]
-
                     status.last_check = datetime.now()
+                    # Latency 측정은 락 밖에서 수행하도록 대상만 기록
+                    latency_targets.append(tunnel_id)
                 else:
                     # 연결 끊김 감지
                     if was_connected:
@@ -298,7 +309,7 @@ class TunnelMonitor:
                         if self._auto_reconnect:
                             self._attempt_reconnect(tunnel_id)
 
-                self._notify_callbacks(tunnel_id, status)
+                    self._notify_callbacks(tunnel_id, status)
 
             # 비활성 터널 상태 업데이트
             for tunnel_id, status in list(self._statuses.items()):
@@ -311,6 +322,65 @@ class TunnelMonitor:
                         # Health check 연결 정리
                         self._cleanup_health_connection(tunnel_id)
                         self._notify_callbacks(tunnel_id, status)
+
+        # 2단계: 락 밖에서 Latency 측정 (DB 프로토콜 통신 포함)
+        latency_results = {
+            tunnel_id: self._measure_latency(tunnel_id)
+            for tunnel_id in latency_targets
+        }
+
+        # 3단계: 측정 결과 반영 (락 재획득)
+        with self._lock:
+            for tunnel_id, latency in latency_results.items():
+                status = self._statuses.get(tunnel_id)
+                if not status:
+                    continue
+                # 측정 도중 터널이 끊어졌으면 결과를 반영하지 않는다
+                if not self.tunnel_engine.is_running(tunnel_id):
+                    continue
+
+                if latency >= 0:
+                    status.latency_ms = latency
+                    status.latency_history.append(latency)
+                    # 히스토리 최대 100개 유지
+                    if len(status.latency_history) > 100:
+                        status.latency_history = status.latency_history[-100:]
+                else:
+                    status.latency_ms = None
+
+                self._notify_callbacks(tunnel_id, status)
+
+    def _get_health_credentials(self, tunnel_id: str, config: Dict[str, Any]) -> tuple:
+        """Health check용 DB 자격 증명 조회
+
+        config_manager가 있으면 실제 저장 키(db_user)와 암호화된 비밀번호
+        (db_password_encrypted)를 복호화하여 사용한다. config_manager가 없으면
+        평문 비밀번호를 추측하지 않고, 암호화된 비밀번호가 존재할 경우
+        health check 자체를 스킵한다.
+
+        Args:
+            tunnel_id: 터널 ID
+            config: 터널 설정 dict
+
+        Returns:
+            (db_user, db_password) 튜플. 조회 불가 시 ("", "")
+        """
+        get_credentials = getattr(self.config_manager, 'get_tunnel_credentials', None)
+        if callable(get_credentials):
+            try:
+                db_user, db_password = get_credentials(tunnel_id)
+                return db_user or '', db_password or ''
+            except Exception as e:
+                logger.debug(f"자격 증명 조회 실패 ({tunnel_id}): {e}")
+                return '', ''
+
+        db_user = config.get('db_user', '')
+        if config.get('db_password_encrypted'):
+            # 복호화 가능한 config_manager가 없어 암호문을 그대로 쓸 수 없음
+            logger.debug(f"Latency 측정 스킵 (비밀번호 복호화 불가): {tunnel_id}")
+            return '', ''
+
+        return db_user, ''
 
     def _measure_latency(self, tunnel_id: str) -> float:
         """Latency 측정 (Rust DB Core 연결 사용)
@@ -328,10 +398,9 @@ class TunnelMonitor:
             if not config:
                 return -1
 
-            # DB 인증 정보 확인
-            db_username = config.get('db_username', '')
-            db_password = config.get('db_password', '')
-            db_name = config.get('db_name') or config.get('default_database') or config.get('default_schema') or ''
+            # DB 인증 정보 확인 (실제 config 키: db_user + 암호화된 db_password_encrypted)
+            db_username, db_password = self._get_health_credentials(tunnel_id, config)
+            db_name = config.get('default_database') or config.get('db_name') or config.get('default_schema') or ''
             db_engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port'))
 
             # 인증 정보가 없으면 측정 불가
@@ -352,10 +421,11 @@ class TunnelMonitor:
                 host = DEFAULT_LOCAL_HOST
                 port = int(local_port)
 
-            # 캐시된 연결 사용 또는 새 연결 생성
-            conn = self._health_connections.get(tunnel_id)
+            # 캐시된 연결 조회 (딕셔너리 조회만 락으로 보호)
+            with self._lock:
+                conn = self._health_connections.get(tunnel_id)
 
-            # 연결이 없거나 끊어진 경우 재연결
+            # 연결이 없거나 끊어진 경우 재연결 (연결 생성은 락 밖에서 수행)
             if conn is None:
                 conn = self._create_health_connection(
                     tunnel_id, db_engine, host, port, db_username, db_password, db_name
@@ -385,6 +455,9 @@ class TunnelMonitor:
     ) -> Optional[Any]:
         """Health check용 DB 연결 생성
 
+        Rust 커넥터 connect()/autocommit() 같은 블로킹 I/O는 락 밖에서 수행하고,
+        캐시 딕셔너리 갱신만 락으로 보호한다.
+
         Args:
             tunnel_id: 터널 ID
             host: DB 호스트
@@ -411,8 +484,26 @@ class TunnelMonitor:
                 return None
             connector.connection.autocommit(True)
             conn = connector.connection
-            self._health_connections[tunnel_id] = conn
-            logger.debug(f"Health check 연결 생성: {tunnel_id}")
+
+            # 다른 스레드가 동시에 같은 터널의 연결을 이미 캐시했다면
+            # 기존 것을 사용하고 방금 만든 연결은 락 밖에서 닫는다.
+            duplicate = None
+            with self._lock:
+                existing = self._health_connections.get(tunnel_id)
+                if existing is not None:
+                    duplicate = conn
+                    conn = existing
+                else:
+                    self._health_connections[tunnel_id] = conn
+
+            if duplicate is not None:
+                try:
+                    duplicate.close()
+                except Exception:
+                    pass
+            else:
+                logger.debug(f"Health check 연결 생성: {tunnel_id}")
+
             return conn
         except Exception as e:
             logger.debug(f"Health check 연결 생성 실패 ({tunnel_id}): {e}")
@@ -421,36 +512,40 @@ class TunnelMonitor:
     def _attempt_reconnect(self, tunnel_id: str):
         """자동 재연결 시도
 
+        재연결 상태(state/error_message/reconnect_count) 변경은 항상 self._lock을
+        직접 획득하여 보호한다 (호출자가 이미 락을 쥐고 있어도 RLock이라 안전).
+
         Args:
             tunnel_id: 터널 ID
         """
-        status = self._statuses.get(tunnel_id)
-        if not status:
-            return
+        with self._lock:
+            status = self._statuses.get(tunnel_id)
+            if not status:
+                return
 
-        # 최대 재연결 시도 횟수 체크
-        if status.reconnect_count >= self._max_reconnect_attempts:
-            status.state = TunnelState.ERROR
-            status.error_message = "최대 재연결 시도 횟수 초과"
+            # 최대 재연결 시도 횟수 체크
+            if status.reconnect_count >= self._max_reconnect_attempts:
+                status.state = TunnelState.ERROR
+                status.error_message = "최대 재연결 시도 횟수 초과"
+                self._add_event(
+                    tunnel_id, "error",
+                    f"재연결 실패 (시도 {status.reconnect_count}회)"
+                )
+                return
+
+            # 백오프 딜레이: 1s, 2s, 5s, 10s, 30s, 60s
+            backoff = [1, 2, 5, 10, 30, 60]
+            delay = backoff[min(status.reconnect_count, len(backoff) - 1)]
+
+            status.state = TunnelState.RECONNECTING
+            status.reconnect_count += 1
+
             self._add_event(
-                tunnel_id, "error",
-                f"재연결 실패 (시도 {status.reconnect_count}회)"
+                tunnel_id, "reconnecting",
+                f"재연결 시도 {status.reconnect_count}/{self._max_reconnect_attempts} ({delay}초 대기)"
             )
-            return
 
-        # 백오프 딜레이: 1s, 2s, 5s, 10s, 30s, 60s
-        backoff = [1, 2, 5, 10, 30, 60]
-        delay = backoff[min(status.reconnect_count, len(backoff) - 1)]
-
-        status.state = TunnelState.RECONNECTING
-        status.reconnect_count += 1
-
-        self._add_event(
-            tunnel_id, "reconnecting",
-            f"재연결 시도 {status.reconnect_count}/{self._max_reconnect_attempts} ({delay}초 대기)"
-        )
-
-        # 별도 스레드에서 재연결 시도
+        # 별도 스레드에서 재연결 시도 (락을 점유하지 않은 상태로 예약)
         def reconnect():
             time.sleep(delay)
 
@@ -480,6 +575,7 @@ class TunnelMonitor:
                     config, check_port=False
                 )
 
+                should_retry = False
                 with self._lock:
                     if success:
                         status.state = TunnelState.CONNECTED
@@ -490,11 +586,14 @@ class TunnelMonitor:
                     else:
                         status.state = TunnelState.ERROR
                         status.error_message = msg
-                        # 다시 재연결 시도
-                        if self._auto_reconnect and self._running:
-                            self._attempt_reconnect(tunnel_id)
+                        should_retry = self._auto_reconnect and self._running
 
                     self._notify_callbacks(tunnel_id, status)
+
+                # 재귀 호출(및 그에 이은 sleep)은 락을 놓은 뒤 수행하여
+                # 대기 중에도 다른 스레드가 상태를 조회/갱신할 수 있게 한다.
+                if should_retry:
+                    self._attempt_reconnect(tunnel_id)
 
             except Exception as e:
                 logger.error(f"재연결 오류 ({tunnel_id}): {e}")
