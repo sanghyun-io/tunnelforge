@@ -1,10 +1,59 @@
 """
 TunnelMonitor 단위 테스트
 """
+import threading
 import time
 import pytest
 from datetime import datetime, timedelta
 from unittest.mock import MagicMock, patch, call
+
+
+class _TrackingLock:
+    """RLock을 감싸서 현재 스레드의 락 보유 깊이를 노출하는 테스트 헬퍼
+
+    threading.RLock 자체는 보유 깊이를 외부에 노출하지 않으므로,
+    "이 코드가 락을 들고 있지 않은 상태에서 실행되는지"를 검증하기 위해
+    별도로 깊이 카운터를 둔다.
+    """
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._depth = 0
+
+    def __enter__(self):
+        self._lock.acquire()
+        self._depth += 1
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self._depth -= 1
+        self._lock.release()
+
+    @property
+    def depth(self):
+        return self._depth
+
+
+class _LockGuardedStatus:
+    """지정된 필드를 락 보유 없이 쓰면 즉시 실패시키는 TunnelStatus 래퍼
+
+    _attempt_reconnect가 state/error_message/reconnect_count를 변경할 때
+    반드시 tracking_lock을 들고 있는지 검증하기 위해 사용한다.
+    """
+
+    _GUARDED = {'state', 'error_message', 'reconnect_count'}
+
+    def __init__(self, status, tracking_lock):
+        object.__setattr__(self, '_status', status)
+        object.__setattr__(self, '_tracking_lock', tracking_lock)
+
+    def __getattr__(self, name):
+        return getattr(self._status, name)
+
+    def __setattr__(self, name, value):
+        if name in self._GUARDED and self._tracking_lock.depth == 0:
+            raise AssertionError(f"{name} written without holding the lock")
+        setattr(self._status, name, value)
 
 
 # =====================================================================
@@ -345,10 +394,10 @@ class TestTunnelMonitor:
         result = self.monitor._measure_latency('no_config_tunnel')
         assert result == -1
 
-    def test_measure_latency_no_db_username(self):
-        """DB 사용자명 없을 때 latency -1 반환"""
+    def test_measure_latency_no_db_user(self):
+        """DB 사용자명(db_user) 없을 때 latency -1 반환"""
         self.mock_engine.tunnel_configs = {
-            'tunnel1': {'db_username': '', 'connection_mode': 'ssh'}
+            'tunnel1': {'db_user': '', 'connection_mode': 'ssh'}
         }
 
         result = self.monitor._measure_latency('tunnel1')
@@ -387,6 +436,118 @@ class TestTunnelMonitor:
         assert created["engine"] == "postgresql"
         assert created["database"] == "analytics"
 
+    def test_check_all_tunnels_measures_latency_outside_monitor_lock(self):
+        """_measure_latency 호출 시점에 self._lock을 점유하고 있지 않은지 확인"""
+        tracking_lock = _TrackingLock()
+        self.monitor._lock = tracking_lock
+
+        self.mock_engine.active_tunnels = {'tunnel1': MagicMock()}
+        self.mock_engine.is_running.return_value = True
+
+        captured = {}
+
+        def fake_measure_latency(tunnel_id):
+            captured['depth'] = tracking_lock.depth
+            return 12.5
+
+        with patch.object(self.monitor, '_measure_latency', side_effect=fake_measure_latency):
+            self.monitor._check_all_tunnels()
+
+        assert captured['depth'] == 0
+
+        status = self.monitor.get_status('tunnel1')
+        assert status.latency_ms == 12.5
+        assert status.latency_history == [12.5]
+
+    def test_measure_latency_uses_config_manager_credentials(self, monkeypatch):
+        """config_manager.get_tunnel_credentials로 복호화된 자격 증명을 사용"""
+        mock_config = MagicMock()
+        mock_config.get_tunnel_credentials.return_value = ("alice", "secret")
+        self.monitor.config_manager = mock_config
+
+        self.mock_engine.tunnel_configs = {
+            'tunnel1': {
+                # 실제 config에는 db_user/db_password_encrypted만 존재하지만
+                # config_manager 경로를 타면 이 값들이 사용되지 않아야 함
+                'db_user': 'ignored',
+                'db_password_encrypted': 'ignored-cipher',
+                'connection_mode': 'direct',
+                'remote_host': '127.0.0.1',
+                'remote_port': 3306,
+            }
+        }
+
+        created = {}
+
+        class FakeConnection:
+            def autocommit(self, enabled):
+                pass
+
+            def ping(self, reconnect=False):
+                pass
+
+            def close(self):
+                pass
+
+        class FakeConnector:
+            def __init__(self, user, password):
+                created['user'] = user
+                created['password'] = password
+                self.connection = FakeConnection()
+
+            def connect(self):
+                return True, "ok"
+
+        def fake_create(engine, host, port, user, password, database=None, schema=""):
+            return FakeConnector(user, password)
+
+        monkeypatch.setattr("src.core.tunnel_monitor.create_rust_db_connector", fake_create)
+
+        result = self.monitor._measure_latency('tunnel1')
+
+        assert created["user"] == "alice"
+        assert created["password"] == "secret"
+        assert result >= 0
+
+    def test_measure_latency_skips_when_config_manager_cannot_resolve_user(self, monkeypatch):
+        """config_manager가 자격 증명을 못 찾으면 연결 시도 없이 -1 반환"""
+        mock_config = MagicMock()
+        mock_config.get_tunnel_credentials.return_value = ("", "")
+        self.monitor.config_manager = mock_config
+
+        self.mock_engine.tunnel_configs = {
+            'tunnel1': {'connection_mode': 'ssh', 'local_port': 16000}
+        }
+
+        def fail_create(*args, **kwargs):
+            raise AssertionError("db user 없이는 connector를 생성하면 안 됨")
+
+        monkeypatch.setattr("src.core.tunnel_monitor.create_rust_db_connector", fail_create)
+
+        result = self.monitor._measure_latency('tunnel1')
+        assert result == -1
+
+    def test_measure_latency_failure_clears_cached_connection(self):
+        """ping 실패 시 캐시된 연결을 제거하고 닫는지 확인"""
+        mock_conn = MagicMock()
+        mock_conn.ping.side_effect = Exception("connection reset")
+        self.monitor._health_connections['tunnel1'] = mock_conn
+
+        self.mock_engine.tunnel_configs = {
+            'tunnel1': {
+                'db_user': 'alice',
+                'connection_mode': 'direct',
+                'remote_host': '127.0.0.1',
+                'remote_port': 3306,
+            }
+        }
+
+        result = self.monitor._measure_latency('tunnel1')
+
+        assert result == -1
+        assert 'tunnel1' not in self.monitor._health_connections
+        mock_conn.close.assert_called_once()
+
     def test_attempt_reconnect_exceeds_max(self):
         """최대 재연결 시도 초과 시 ERROR 상태로 전환"""
         from src.core.tunnel_monitor import TunnelStatus, TunnelState
@@ -399,6 +560,43 @@ class TestTunnelMonitor:
         # sleep이 포함된 스레드 생성 없이 max 초과 분기만 테스트
         with patch('time.sleep'):
             self.monitor._attempt_reconnect('tunnel1')
+
+        assert status.state == TunnelState.ERROR
+        assert '최대' in status.error_message
+
+    def test_attempt_reconnect_mutates_status_under_lock(self):
+        """재연결 스케줄링 시 state/reconnect_count 변경이 락 보유 중에만 발생"""
+        from src.core.tunnel_monitor import TunnelStatus, TunnelState
+
+        tracking_lock = _TrackingLock()
+        self.monitor._lock = tracking_lock
+
+        status = TunnelStatus(tunnel_id='tunnel1')
+        guarded = _LockGuardedStatus(status, tracking_lock)
+        self.monitor._statuses['tunnel1'] = guarded
+        self.monitor._max_reconnect_attempts = 5
+
+        with patch('threading.Thread') as mock_thread:
+            self.monitor._attempt_reconnect('tunnel1')
+
+        mock_thread.assert_called_once()
+        assert status.state == TunnelState.RECONNECTING
+        assert status.reconnect_count == 1
+
+    def test_attempt_reconnect_exceeds_max_mutates_under_lock(self):
+        """최대 횟수 초과 분기의 state/error_message 변경도 락 보유 중에만 발생"""
+        from src.core.tunnel_monitor import TunnelStatus, TunnelState
+
+        tracking_lock = _TrackingLock()
+        self.monitor._lock = tracking_lock
+
+        status = TunnelStatus(tunnel_id='tunnel1')
+        status.reconnect_count = 5
+        guarded = _LockGuardedStatus(status, tracking_lock)
+        self.monitor._statuses['tunnel1'] = guarded
+        self.monitor._max_reconnect_attempts = 5
+
+        self.monitor._attempt_reconnect('tunnel1')
 
         assert status.state == TunnelState.ERROR
         assert '최대' in status.error_message
