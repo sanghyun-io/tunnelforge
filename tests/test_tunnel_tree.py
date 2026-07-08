@@ -45,3 +45,23 @@ def test_load_data_removes_previous_item_widgets():
         assert old_actions.parent() is None
     finally:
         tree.close()
+
+
+def test_tunnel_tree_no_unused_column_ratio_api():
+    assert not hasattr(TunnelTreeWidget, "set_column_ratios")
+
+
+def test_update_tunnel_status_toggles_icon_without_reload():
+    tree = TunnelTreeWidget()
+    try:
+        tunnel = sample_tunnel()
+        tree.load_data([tunnel], [], [])
+        item = tree._tunnel_items[tunnel["id"]]
+
+        tree.update_tunnel_status(tunnel["id"], True)
+        assert item.text(0) == "🟢"
+
+        tree.update_tunnel_status(tunnel["id"], False)
+        assert item.text(0) == "⚪"
+    finally:
+        tree.close()
