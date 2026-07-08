@@ -33,7 +33,9 @@ class SchemaCompareThread(QThread):
     """스키마 비교 백그라운드 스레드"""
 
     progress = pyqtSignal(str)
-    finished = pyqtSignal(list, object, object)  # diffs, SeveritySummary, VersionContext
+    # NOTE: QThread에는 인자 없는 기본 finished 시그널이 있으므로,
+    # 이름을 겹치지 않게 compare_finished로 분리한다.
+    compare_finished = pyqtSignal(list, object, object)  # diffs, SeveritySummary, VersionContext
     error = pyqtSignal(str)
 
     def __init__(self, source_connector, target_connector,
@@ -76,10 +78,55 @@ class SchemaCompareThread(QThread):
             classifier = SeverityClassifier(version_ctx)
             diffs, summary = classifier.classify(diffs)
 
-            self.finished.emit(diffs, summary, version_ctx)
+            self.compare_finished.emit(diffs, summary, version_ctx)
 
         except Exception as e:
             self.error.emit(str(e))
+
+
+class SchemaLoadThread(QThread):
+    """스키마 목록 조회 백그라운드 스레드
+
+    DB 연결/조회/해제가 UI 스레드를 블로킹하지 않도록 별도 스레드에서 수행한다.
+    """
+
+    loaded = pyqtSignal(str, list)       # side, schema_names
+    load_failed = pyqtSignal(str, str)   # side, display_message
+
+    def __init__(self, side: str, host: str, port: int,
+                 user: str, password: str):
+        super().__init__()
+        self.side = side
+        self.host = host
+        self.port = port
+        self.user = user
+        self.password = password
+
+    def run(self):
+        connector = None
+        try:
+            connector = MySQLConnector(
+                host=self.host, port=self.port,
+                user=self.user, password=self.password
+            )
+
+            success, _ = connector.connect()
+            if not success:
+                self.load_failed.emit(self.side, "(연결 실패)")
+                return
+
+            schemas = connector.get_schemas(use_cache=False)
+            self.loaded.emit(self.side, list(schemas))
+
+        except Exception as e:
+            logger.error(f"스키마 로드 실패: {e}")
+            self.load_failed.emit(self.side, "(오류)")
+        finally:
+            if connector:
+                try:
+                    connector.disconnect()
+                except Exception:
+                    pass
 
 
 class PixelLoadingWidget(QWidget):
@@ -324,6 +371,13 @@ class SchemaDiffDialog(QDialog):
         self._compare_thread = None
         self._severity_summary = None
         self._version_ctx = None
+        # 비교 시작 시점에 캡처한 스키마 이름 (비교 도중 콤보 변경과 무관하게 고정)
+        self._compared_source_schema = None
+        self._compared_target_schema = None
+        # side('source'/'target') -> 현재 진행 중인 SchemaLoadThread (stale 결과 판별용)
+        self._schema_load_threads: Dict[str, "SchemaLoadThread"] = {}
+        # 종료 전까지 참조를 유지해 GC로 인한 스레드 파괴를 방지
+        self._pending_schema_threads: List["SchemaLoadThread"] = []
 
         self._setup_ui()
         self._connect_signals()
@@ -510,7 +564,7 @@ class SchemaDiffDialog(QDialog):
         return (True, host, port, db_user, db_password)
 
     def _load_schemas(self, side: str):
-        """스키마 목록 로드"""
+        """스키마 목록 로드 (백그라운드 스레드에서 조회, UI 스레드 블로킹 방지)"""
         if side == 'source':
             combo = self.source_tunnel_combo
             schema_combo = self.source_schema_combo
@@ -531,33 +585,37 @@ class SchemaDiffDialog(QDialog):
 
         _, host, port, db_user, db_password = result
 
-        # DB 연결
-        connector = None
-        try:
-            connector = MySQLConnector(
-                host=host, port=port,
-                user=db_user, password=db_password
-            )
+        thread = SchemaLoadThread(side, host, port, db_user, db_password)
+        thread.loaded.connect(self._on_schema_loaded)
+        thread.load_failed.connect(self._on_schema_load_failed)
+        thread.finished.connect(lambda t=thread: self._on_schema_thread_finished(t))
 
-            success, msg = connector.connect()
-            if not success:
-                schema_combo.addItem("(연결 실패)")
-                return
+        # 같은 side의 이전 결과는 stale로 취급 (아래 콜백에서 sender 비교)
+        self._schema_load_threads[side] = thread
+        self._pending_schema_threads.append(thread)
+        thread.start()
 
-            # 스키마 목록 조회
-            schemas = connector.get_schemas(use_cache=False)
-            for schema_name in schemas:
-                schema_combo.addItem(schema_name)
+    def _on_schema_loaded(self, side: str, schemas: list):
+        """스키마 목록 로드 완료 콜백 (stale 결과는 무시)"""
+        if self._schema_load_threads.get(side) is not self.sender():
+            return
+        schema_combo = self.source_schema_combo if side == 'source' else self.target_schema_combo
+        schema_combo.clear()
+        for schema_name in schemas:
+            schema_combo.addItem(schema_name)
 
-        except Exception as e:
-            logger.error(f"스키마 로드 실패: {e}")
-            schema_combo.addItem("(오류)")
-        finally:
-            if connector:
-                try:
-                    connector.disconnect()
-                except Exception:
-                    pass
+    def _on_schema_load_failed(self, side: str, message: str):
+        """스키마 목록 로드 실패 콜백 (stale 결과는 무시)"""
+        if self._schema_load_threads.get(side) is not self.sender():
+            return
+        schema_combo = self.source_schema_combo if side == 'source' else self.target_schema_combo
+        schema_combo.clear()
+        schema_combo.addItem(message)
+
+    def _on_schema_thread_finished(self, thread: "SchemaLoadThread"):
+        """스레드 종료 후 보관 참조 정리 (실행 중 GC로 파괴되는 것 방지용 목록)"""
+        if thread in self._pending_schema_threads:
+            self._pending_schema_threads.remove(thread)
 
     def _start_compare(self):
         """비교 시작"""
@@ -587,6 +645,24 @@ class SchemaDiffDialog(QDialog):
 
         _, source_host, source_port, source_user, source_pw = source_params
         _, target_host, target_port, target_user, target_pw = target_params
+
+        # 이전 비교에서 남아있는 커넥터 정리 (반복 비교 시 세션 누수 방지)
+        if self._source_connector:
+            try:
+                self._source_connector.disconnect()
+            except Exception:
+                pass
+            self._source_connector = None
+        if self._target_connector:
+            try:
+                self._target_connector.disconnect()
+            except Exception:
+                pass
+            self._target_connector = None
+
+        # 비교 시작 시점의 스키마 이름을 캡처 (비교 중 콤보가 바뀌어도 결과와 일치 보장)
+        self._compared_source_schema = source_schema
+        self._compared_target_schema = target_schema
 
         # 연결 생성
         try:
@@ -649,7 +725,7 @@ class SchemaDiffDialog(QDialog):
             source_schema, target_schema, compare_level
         )
         self._compare_thread.progress.connect(self._on_progress)
-        self._compare_thread.finished.connect(self._on_compare_finished)
+        self._compare_thread.compare_finished.connect(self._on_compare_finished)
         self._compare_thread.error.connect(self._on_compare_error)
         self._compare_thread.start()
 
@@ -964,7 +1040,8 @@ class SchemaDiffDialog(QDialog):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
-        target_schema = self.target_schema_combo.currentText()
+        # 비교 시작 시점에 캡처한 스키마를 사용한다 (완료 후 콤보를 바꿔도 결과와 일치)
+        target_schema = self._compared_target_schema or self.target_schema_combo.currentText()
         generator = SyncScriptGenerator()
         script = generator.generate_sync_script(self._diffs, target_schema)
 
@@ -974,20 +1051,64 @@ class SchemaDiffDialog(QDialog):
 
     def closeEvent(self, event):
         """다이얼로그 닫힐 때"""
+        # 진행 중인 스레드를 먼저 정리(시그널 해제 + 대기)한 뒤 커넥터를 정리해야
+        # 스레드가 사용 중인 커넥터를 도중에 끊어버리는 경합을 피할 수 있다.
+        self._cancel_compare_thread()
+        self._cancel_schema_load_threads()
+
         # 연결 정리
         if self._source_connector:
             try:
                 self._source_connector.disconnect()
             except Exception:
                 pass
+            self._source_connector = None
 
         if self._target_connector:
             try:
                 self._target_connector.disconnect()
             except Exception:
                 pass
+            self._target_connector = None
 
         super().closeEvent(event)
+
+    def _cancel_compare_thread(self):
+        """진행 중인 비교 스레드를 정리한다.
+
+        다이얼로그가 파괴된 뒤 완료 콜백이 죽은 위젯을 건드리지 않도록
+        시그널을 먼저 해제하고, 스레드가 끝날 때까지 기다린 뒤 반환한다.
+        """
+        thread = self._compare_thread
+        if thread is None:
+            return
+
+        for signal, slot in (
+            (thread.progress, self._on_progress),
+            (thread.compare_finished, self._on_compare_finished),
+            (thread.error, self._on_compare_error),
+        ):
+            try:
+                signal.disconnect(slot)
+            except (TypeError, RuntimeError):
+                pass
+
+        if thread.isRunning():
+            thread.wait(5000)
+
+    def _cancel_schema_load_threads(self):
+        """진행 중인 스키마 로드 스레드를 정리한다."""
+        for thread in list(self._pending_schema_threads):
+            for signal, slot in (
+                (thread.loaded, self._on_schema_loaded),
+                (thread.load_failed, self._on_schema_load_failed),
+            ):
+                try:
+                    signal.disconnect(slot)
+                except (TypeError, RuntimeError):
+                    pass
+            if thread.isRunning():
+                thread.wait(3000)
 
 
 class SyncScriptDialog(QDialog):
