@@ -1,5 +1,7 @@
+import copy
 import json
 import os
+import threading
 import uuid
 import shutil
 from datetime import datetime
@@ -17,6 +19,32 @@ CONFIG_FILE = str(config_file())
 KEY_FILE = str(encryption_key_file())
 BACKUP_DIR = str(backups_dir())
 MAX_BACKUPS = 5
+
+# load_config/save_config를 여러 스레드(스케줄러, UI)가 동시에 호출해도
+# 설정 파일이 중간 상태로 노출되지 않도록 보호하는 프로세스 전역 락.
+# 공개 메서드들이 서로를 호출할 수 있어 재진입 가능한 RLock을 사용한다.
+_CONFIG_LOCK = threading.RLock()
+
+# _merge_snapshot_changes에서 "이 키는 원본에 존재하지 않았다"를 None과 구분하기 위한 sentinel
+_MISSING = object()
+
+
+class ConfigLoadError(RuntimeError):
+    """설정 파일이 손상되었고 복원 가능한 백업도 없을 때 발생하는 예외"""
+    pass
+
+
+class _ConfigSnapshot(dict):
+    """load_config()가 반환하는 설정 스냅샷.
+
+    저장 시점에 디스크의 실제 상태가 로드 시점과 달라졌는지(스테일 여부) 판단하기 위해
+    로드 당시의 파일 리비전과 원본 페이로드를 함께 보관한다.
+    """
+
+    def __init__(self, payload: dict, source_revision: Optional[Tuple[int, int]], original_payload: dict):
+        super().__init__(payload)
+        self._source_revision = source_revision
+        self._original_payload = original_payload
 
 
 class CredentialEncryptor:
@@ -61,77 +89,243 @@ class ConfigManager:
         self._encryptor = None
         self._ensure_config_exists()
 
+    def _default_config(self) -> dict:
+        """초기 실행 시 보여줄 더미 데이터"""
+        return {
+            "tunnels": [
+                {
+                    "id": str(uuid.uuid4()),
+                    "name": "테스트 서버 (예시)",
+                    "bastion_host": "1.2.3.4",
+                    "bastion_port": 22,
+                    "bastion_user": "ec2-user",
+                    "bastion_key": "", # 키 파일 경로 비어있음
+                    "remote_host": "rds-endpoint.amazonaws.com",
+                    "remote_port": DEFAULT_MYSQL_PORT,
+                    "db_engine": "mysql",
+                    "local_port": 3308
+                }
+            ]
+        }
+
     def _ensure_config_exists(self):
         """설정 폴더와 파일이 없으면 기본값을 생성합니다."""
-        if not os.path.exists(APP_DIR):
-            os.makedirs(APP_DIR)
-        
-        if not os.path.exists(CONFIG_FILE):
-            # 초기 실행 시 보여줄 더미 데이터
-            default_config = {
-                "tunnels": [
-                    {
-                        "id": str(uuid.uuid4()),
-                        "name": "테스트 서버 (예시)",
-                        "bastion_host": "1.2.3.4",
-                        "bastion_port": 22,
-                        "bastion_user": "ec2-user",
-                        "bastion_key": "", # 키 파일 경로 비어있음
-                        "remote_host": "rds-endpoint.amazonaws.com",
-                        "remote_port": DEFAULT_MYSQL_PORT,
-                        "db_engine": "mysql",
-                        "local_port": 3308
-                    }
-                ]
-            }
-            self.save_config(default_config)
+        with _CONFIG_LOCK:
+            if not os.path.exists(APP_DIR):
+                os.makedirs(APP_DIR)
+
+            if not os.path.exists(CONFIG_FILE):
+                # 첫 실행이므로 백업 없이 원자적으로 생성
+                self._write_config_atomic_unlocked(self._default_config())
+
+    def _file_revision(self, path: str) -> Optional[Tuple[int, int]]:
+        """파일의 (수정시각_ns, 크기)를 반환. 파일이 없으면 None."""
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
+    def _is_config_payload_valid(self, data) -> bool:
+        """설정 데이터의 최소 구조 검증 (dict, tunnels는 필수 list, settings는 있으면 dict)"""
+        if not isinstance(data, dict):
+            return False
+        if not isinstance(data.get('tunnels'), list):
+            return False
+        if 'settings' in data and not isinstance(data['settings'], dict):
+            return False
+        return True
+
+    def _read_json_file(self, path: str) -> dict:
+        """UTF-8 JSON 파일을 읽어 파싱한다."""
+        with open(path, 'r', encoding='utf-8') as f:
+            return json.load(f)
+
+    def _write_config_atomic_unlocked(self, data: dict):
+        """임시 파일에 쓴 뒤 os.replace로 원자적으로 교체한다.
+
+        호출자가 _CONFIG_LOCK을 보유하고 있어야 한다.
+        """
+        tmp_path = f"{CONFIG_FILE}.tmp.{os.getpid()}.{threading.get_ident()}"
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp_path, CONFIG_FILE)
+        except Exception:
+            if os.path.exists(tmp_path):
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
+            raise
+        logger.debug(f"설정 저장 완료: {CONFIG_FILE}")
+
+    def _restore_newest_valid_backup_unlocked(self, error: Exception) -> "_ConfigSnapshot":
+        """가장 최신 백업부터 검사해 첫 유효한 백업으로 CONFIG_FILE을 복구한다.
+
+        손상된 백업은 삭제하지 않고 건너뛴다. 유효한 백업이 하나도 없으면
+        ConfigLoadError를 발생시킨다. 호출자가 _CONFIG_LOCK을 보유하고 있어야 한다.
+        """
+        for filename, _, _ in self._get_backup_files():
+            backup_path = os.path.join(BACKUP_DIR, filename)
+            try:
+                data = self._read_json_file(backup_path)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                continue
+
+            if not self._is_config_payload_valid(data):
+                continue
+
+            self._write_config_atomic_unlocked(data)
+            logger.warning(f"손상된 설정 파일을 백업에서 복원했습니다: {filename}")
+            revision = self._file_revision(CONFIG_FILE)
+            return _ConfigSnapshot(data, revision, copy.deepcopy(data))
+
+        raise ConfigLoadError("설정 파일이 손상되었고 복원 가능한 백업이 없습니다.") from error
+
+    def _merge_setting_values(self, original_settings: dict, new_settings: dict, current_settings: dict) -> dict:
+        """settings의 개별 키 단위 병합.
+
+        스테일 스냅샷에서 실제로 바뀐 설정 키만 최신 settings 위에 덮어써서,
+        그 사이 동시에 저장된 다른 설정 키(예: 스케줄러의 schedules)를 보존한다.
+        """
+        merged_settings = dict(current_settings)
+        for setting_key, setting_value in new_settings.items():
+            old_value = original_settings.get(setting_key, _MISSING)
+            if old_value is _MISSING or old_value != setting_value:
+                merged_settings[setting_key] = copy.deepcopy(setting_value)
+        return merged_settings
+
+    def _merge_snapshot_changes(self, snapshot: "_ConfigSnapshot", current_data: dict) -> dict:
+        """스테일 스냅샷을 저장할 때, 최신 디스크 데이터 위에 스냅샷에서
+        실제로 변경된 최상위 키만 반영한다."""
+        original = snapshot._original_payload
+        merged = copy.deepcopy(current_data)
+
+        for key, new_value in snapshot.items():
+            if key == 'settings':
+                merged['settings'] = self._merge_setting_values(
+                    original.get('settings') or {},
+                    new_value or {},
+                    merged.get('settings') or {},
+                )
+                continue
+
+            old_value = original.get(key, _MISSING)
+            if old_value is _MISSING or old_value != new_value:
+                merged[key] = copy.deepcopy(new_value)
+
+        return merged
+
+    def _save_config_unlocked(self, data, *, exclude_backup_paths: Optional[set] = None):
+        """백업 생성 후 (스테일 스냅샷이면 병합하여) 원자적으로 기록한다.
+
+        호출자가 _CONFIG_LOCK을 보유하고 있어야 한다.
+        """
+        self._create_backup(exclude_paths=exclude_backup_paths)
+
+        payload = data
+        if isinstance(data, _ConfigSnapshot):
+            current_revision = self._file_revision(CONFIG_FILE)
+            if current_revision == data._source_revision:
+                payload = dict(data)
+            else:
+                try:
+                    current_data = self._read_json_file(CONFIG_FILE)
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    current_data = None
+
+                if current_data is not None and self._is_config_payload_valid(current_data):
+                    payload = self._merge_snapshot_changes(data, current_data)
+                else:
+                    payload = dict(data)
+
+        self._write_config_atomic_unlocked(payload)
 
     def load_config(self):
-        """설정 파일을 읽어서 반환합니다."""
-        try:
-            with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"설정 로드 오류: {e}")
-            return {"tunnels": []}
+        """설정 파일을 읽어서 반환합니다.
+
+        파일이 손상됐거나(JSON/인코딩 오류, 구조 불일치) 읽을 수 없으면
+        가장 최신 유효 백업으로 자동 복원한다. 복원 가능한 백업이 없으면
+        ConfigLoadError를 발생시킨다 (조용히 빈 설정을 반환하지 않는다).
+        """
+        with _CONFIG_LOCK:
+            try:
+                data = self._read_json_file(CONFIG_FILE)
+            except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+                logger.error(f"설정 로드 오류: {e}")
+                return self._restore_newest_valid_backup_unlocked(e)
+
+            if not self._is_config_payload_valid(data):
+                error = ConfigLoadError("설정 파일 구조가 올바르지 않습니다. (tunnels 필드 누락/잘못된 타입)")
+                logger.error(str(error))
+                return self._restore_newest_valid_backup_unlocked(error)
+
+            revision = self._file_revision(CONFIG_FILE)
+            return _ConfigSnapshot(data, revision, copy.deepcopy(data))
 
     def save_config(self, data):
         """설정 데이터를 파일에 저장합니다."""
-        # 저장 전 자동 백업
-        self._create_backup()
+        with _CONFIG_LOCK:
+            self._save_config_unlocked(data)
 
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
-        logger.debug(f"설정 저장 완료: {CONFIG_FILE}")
+    def _create_backup(self, exclude_paths: Optional[set] = None):
+        """설정 변경 전 자동 백업.
 
-    def _create_backup(self):
-        """설정 변경 전 자동 백업"""
+        현재 CONFIG_FILE이 손상되어 있으면(파싱 실패/구조 불일치) 백업하지 않는다.
+        호출자가 _CONFIG_LOCK을 보유하고 있어야 한다.
+        """
         if not os.path.exists(CONFIG_FILE):
             return
 
         try:
+            current_data = self._read_json_file(CONFIG_FILE)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError) as e:
+            logger.warning(f"손상된 설정 파일은 백업하지 않습니다: {e}")
+            return
+
+        if not self._is_config_payload_valid(current_data):
+            logger.warning("설정 파일 구조가 올바르지 않아 백업하지 않습니다.")
+            return
+
+        try:
             os.makedirs(BACKUP_DIR, exist_ok=True)
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             backup_path = os.path.join(BACKUP_DIR, f'config.backup.{timestamp}.json')
             shutil.copy2(CONFIG_FILE, backup_path)
             logger.debug(f"설정 백업 생성: {backup_path}")
-            self._cleanup_old_backups()
+            self._cleanup_old_backups(exclude_paths=exclude_paths)
         except Exception as e:
             logger.warning(f"백업 생성 실패: {e}")
 
-    def _cleanup_old_backups(self):
-        """오래된 백업 파일 정리 (MAX_BACKUPS 초과 시 삭제)"""
+    def _cleanup_old_backups(self, exclude_paths: Optional[set] = None):
+        """오래된 백업 파일 정리 (MAX_BACKUPS 초과 시 삭제)
+
+        exclude_paths에 포함된 백업(예: 복원 대상)은 순번과 무관하게 삭제하지 않는다.
+        """
+        exclude_paths = exclude_paths or set()
         try:
             if not os.path.exists(BACKUP_DIR):
                 return
 
             backups = self._get_backup_files()
-            if len(backups) > MAX_BACKUPS:
-                # 가장 오래된 백업부터 삭제
-                for backup_file, _, _ in backups[MAX_BACKUPS:]:
-                    backup_path = os.path.join(BACKUP_DIR, backup_file)
-                    os.remove(backup_path)
-                    logger.debug(f"오래된 백업 삭제: {backup_file}")
+            if len(backups) <= MAX_BACKUPS:
+                return
+
+            kept = 0
+            for filename, _, _ in backups:
+                if kept < MAX_BACKUPS:
+                    kept += 1
+                    continue
+
+                backup_path = os.path.join(BACKUP_DIR, filename)
+                if backup_path in exclude_paths or filename in exclude_paths:
+                    continue
+
+                os.remove(backup_path)
+                logger.debug(f"오래된 백업 삭제: {filename}")
         except Exception as e:
             logger.warning(f"백업 정리 실패: {e}")
 
@@ -140,23 +334,36 @@ class ConfigManager:
         if not os.path.exists(BACKUP_DIR):
             return []
 
-        backups = []
+        parsed = []
+        prefix, suffix = 'config.backup.', '.json'
         for filename in os.listdir(BACKUP_DIR):
-            if filename.startswith('config.backup.') and filename.endswith('.json'):
-                filepath = os.path.join(BACKUP_DIR, filename)
-                # 파일명에서 타임스탬프 추출: config.backup.YYYYMMDD_HHMMSS.json
-                try:
-                    timestamp_str = filename[14:-5]  # "YYYYMMDD_HHMMSS" 부분
-                    dt = datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
-                    display_time = dt.strftime('%Y-%m-%d %H:%M:%S')
-                    size = os.path.getsize(filepath)
-                    backups.append((filename, display_time, size))
-                except (ValueError, OSError):
-                    continue
+            if not (filename.startswith(prefix) and filename.endswith(suffix)):
+                continue
 
-        # 최신순 정렬
-        backups.sort(key=lambda x: x[0], reverse=True)
-        return backups
+            filepath = os.path.join(BACKUP_DIR, filename)
+            timestamp_str = filename[len(prefix):-len(suffix)]
+
+            dt = None
+            for fmt in ('%Y%m%d_%H%M%S_%f', '%Y%m%d_%H%M%S'):
+                try:
+                    dt = datetime.strptime(timestamp_str, fmt)
+                    break
+                except ValueError:
+                    continue
+            if dt is None:
+                continue
+
+            try:
+                size = os.path.getsize(filepath)
+            except OSError:
+                continue
+
+            display_time = dt.strftime('%Y-%m-%d %H:%M:%S')
+            parsed.append((dt, filename, display_time, size))
+
+        # 최신순 정렬 (파싱된 timestamp 기준, 동률이면 파일명 기준)
+        parsed.sort(key=lambda item: (item[0], item[1]), reverse=True)
+        return [(filename, display_time, size) for _, filename, display_time, size in parsed]
 
     def list_backups(self) -> List[Tuple[str, str, int]]:
         """백업 목록 반환 [(파일명, 타임스탬프, 크기), ...]"""
@@ -176,24 +383,28 @@ class ConfigManager:
         if not os.path.exists(backup_path):
             return False, f"백업 파일을 찾을 수 없습니다: {filename}"
 
-        try:
-            # 복원 전 현재 설정 백업
-            self._create_backup()
+        with _CONFIG_LOCK:
+            # 백업 회전으로 복원 대상이 삭제되지 않도록, 먼저 내용을 읽고 검증한다.
+            try:
+                restore_data = self._read_json_file(backup_path)
+            except json.JSONDecodeError:
+                return False, "백업 파일이 손상되었습니다."
+            except Exception as e:
+                logger.error(f"설정 복원 실패: {e}")
+                return False, f"복원 중 오류 발생: {e}"
 
-            # 백업 파일 검증 (유효한 JSON인지 확인)
-            with open(backup_path, 'r', encoding='utf-8') as f:
-                json.load(f)  # 유효성 검증만 수행
+            if not self._is_config_payload_valid(restore_data):
+                return False, "백업 파일이 손상되었습니다."
 
-            # 복원 실행
-            shutil.copy2(backup_path, CONFIG_FILE)
-            logger.info(f"설정 복원 완료: {filename}")
-            return True, f"설정이 복원되었습니다: {filename}"
-
-        except json.JSONDecodeError:
-            return False, "백업 파일이 손상되었습니다."
-        except Exception as e:
-            logger.error(f"설정 복원 실패: {e}")
-            return False, f"복원 중 오류 발생: {e}"
+            try:
+                # 복원 전 현재 설정을 백업하되, 복원 대상 백업은 회전에서 보호한다.
+                self._create_backup(exclude_paths={backup_path})
+                self._write_config_atomic_unlocked(restore_data)
+                logger.info(f"설정 복원 완료: {filename}")
+                return True, f"설정이 복원되었습니다: {filename}"
+            except Exception as e:
+                logger.error(f"설정 복원 실패: {e}")
+                return False, f"복원 중 오류 발생: {e}"
 
     def export_config(self, export_path: str) -> Tuple[bool, str]:
         """설정 파일을 외부 경로로 내보내기
@@ -311,11 +522,11 @@ class ConfigManager:
             if not is_valid:
                 return False, validation_msg
 
-            # 현재 설정 백업
-            self._create_backup()
+            # 현재 설정 백업 + 원자적 교체 (shutil.copy2로 in-place 교체하지 않음)
+            with _CONFIG_LOCK:
+                self._create_backup()
+                self._write_config_atomic_unlocked(import_data)
 
-            # 가져오기 실행
-            shutil.copy2(import_path, CONFIG_FILE)
             logger.info(f"설정 가져오기 완료: {import_path}")
             return True, f"설정이 가져오기되었습니다: {import_path}"
 
@@ -361,11 +572,12 @@ class ConfigManager:
 
     def set_app_setting(self, key, value):
         """앱 설정 값 저장 (기존 설정 유지)"""
-        config = self.load_config()
-        if 'settings' not in config:
-            config['settings'] = {}
-        config['settings'][key] = value
-        self.save_config(config)
+        with _CONFIG_LOCK:
+            config = self.load_config()
+            if 'settings' not in config:
+                config['settings'] = {}
+            config['settings'][key] = value
+            self.save_config(config)
 
     @property
     def encryptor(self):
@@ -387,9 +599,10 @@ class ConfigManager:
 
     def save_active_tunnels(self, tunnel_ids: list):
         """종료 시 활성화된 터널 ID 목록 저장"""
-        config = self.load_config()
-        config['last_active_tunnels'] = tunnel_ids
-        self.save_config(config)
+        with _CONFIG_LOCK:
+            config = self.load_config()
+            config['last_active_tunnels'] = tunnel_ids
+            self.save_config(config)
         logger.info(f"활성 터널 상태 저장: {len(tunnel_ids)}개")
 
     def get_last_active_tunnels(self) -> list:
@@ -420,27 +633,28 @@ class ConfigManager:
         Returns:
             (success, message, group_id) 튜플
         """
-        config = self.load_config()
+        with _CONFIG_LOCK:
+            config = self.load_config()
 
-        if 'tunnel_groups' not in config:
-            config['tunnel_groups'] = []
+            if 'tunnel_groups' not in config:
+                config['tunnel_groups'] = []
 
-        # 중복 이름 확인
-        for group in config['tunnel_groups']:
-            if group['name'] == name:
-                return False, f"이미 존재하는 그룹 이름입니다: {name}", None
+            # 중복 이름 확인
+            for group in config['tunnel_groups']:
+                if group['name'] == name:
+                    return False, f"이미 존재하는 그룹 이름입니다: {name}", None
 
-        group_id = str(uuid.uuid4())
-        new_group = {
-            "id": group_id,
-            "name": name,
-            "color": color,
-            "collapsed": False,
-            "tunnel_ids": []
-        }
+            group_id = str(uuid.uuid4())
+            new_group = {
+                "id": group_id,
+                "name": name,
+                "color": color,
+                "collapsed": False,
+                "tunnel_ids": []
+            }
 
-        config['tunnel_groups'].append(new_group)
-        self.save_config(config)
+            config['tunnel_groups'].append(new_group)
+            self.save_config(config)
         logger.info(f"그룹 생성: {name} (ID: {group_id})")
         return True, f"그룹이 생성되었습니다: {name}", group_id
 
@@ -454,27 +668,28 @@ class ConfigManager:
         Returns:
             (success, message) 튜플
         """
-        config = self.load_config()
-        groups = config.get('tunnel_groups', [])
+        with _CONFIG_LOCK:
+            config = self.load_config()
+            groups = config.get('tunnel_groups', [])
 
-        for group in groups:
-            if group['id'] == group_id:
-                # 이름 변경 시 중복 확인
-                if 'name' in data and data['name'] != group['name']:
-                    for other in groups:
-                        if other['id'] != group_id and other['name'] == data['name']:
-                            return False, f"이미 존재하는 그룹 이름입니다: {data['name']}"
+            for group in groups:
+                if group['id'] == group_id:
+                    # 이름 변경 시 중복 확인
+                    if 'name' in data and data['name'] != group['name']:
+                        for other in groups:
+                            if other['id'] != group_id and other['name'] == data['name']:
+                                return False, f"이미 존재하는 그룹 이름입니다: {data['name']}"
 
-                # 허용된 필드만 업데이트
-                for key in ['name', 'color', 'collapsed']:
-                    if key in data:
-                        group[key] = data[key]
+                    # 허용된 필드만 업데이트
+                    for key in ['name', 'color', 'collapsed']:
+                        if key in data:
+                            group[key] = data[key]
 
-                self.save_config(config)
-                logger.info(f"그룹 수정: {group_id}")
-                return True, "그룹이 수정되었습니다."
+                    self.save_config(config)
+                    logger.info(f"그룹 수정: {group_id}")
+                    return True, "그룹이 수정되었습니다."
 
-        return False, f"그룹을 찾을 수 없습니다: {group_id}"
+            return False, f"그룹을 찾을 수 없습니다: {group_id}"
 
     def delete_group(self, group_id: str) -> Tuple[bool, str]:
         """그룹 삭제 (터널은 그룹 없음으로 이동)
@@ -485,25 +700,26 @@ class ConfigManager:
         Returns:
             (success, message) 튜플
         """
-        config = self.load_config()
-        groups = config.get('tunnel_groups', [])
+        with _CONFIG_LOCK:
+            config = self.load_config()
+            groups = config.get('tunnel_groups', [])
 
-        for i, group in enumerate(groups):
-            if group['id'] == group_id:
-                group_name = group['name']
+            for i, group in enumerate(groups):
+                if group['id'] == group_id:
+                    group_name = group['name']
 
-                # 그룹에 속한 터널들을 ungrouped_order로 이동
-                if 'ungrouped_order' not in config:
-                    config['ungrouped_order'] = []
-                config['ungrouped_order'].extend(group.get('tunnel_ids', []))
+                    # 그룹에 속한 터널들을 ungrouped_order로 이동
+                    if 'ungrouped_order' not in config:
+                        config['ungrouped_order'] = []
+                    config['ungrouped_order'].extend(group.get('tunnel_ids', []))
 
-                # 그룹 삭제
-                groups.pop(i)
-                self.save_config(config)
-                logger.info(f"그룹 삭제: {group_name} (ID: {group_id})")
-                return True, f"그룹이 삭제되었습니다: {group_name}"
+                    # 그룹 삭제
+                    groups.pop(i)
+                    self.save_config(config)
+                    logger.info(f"그룹 삭제: {group_name} (ID: {group_id})")
+                    return True, f"그룹이 삭제되었습니다: {group_name}"
 
-        return False, f"그룹을 찾을 수 없습니다: {group_id}"
+            return False, f"그룹을 찾을 수 없습니다: {group_id}"
 
     def move_tunnel_to_group(self, tunnel_id: str, group_id: Optional[str]) -> Tuple[bool, str]:
         """터널을 그룹으로 이동
@@ -515,40 +731,41 @@ class ConfigManager:
         Returns:
             (success, message) 튜플
         """
-        config = self.load_config()
+        with _CONFIG_LOCK:
+            config = self.load_config()
 
-        # 터널 존재 확인
-        tunnel_exists = any(t['id'] == tunnel_id for t in config.get('tunnels', []))
-        if not tunnel_exists:
-            return False, f"터널을 찾을 수 없습니다: {tunnel_id}"
+            # 터널 존재 확인
+            tunnel_exists = any(t['id'] == tunnel_id for t in config.get('tunnels', []))
+            if not tunnel_exists:
+                return False, f"터널을 찾을 수 없습니다: {tunnel_id}"
 
-        # ungrouped_order 초기화
-        if 'ungrouped_order' not in config:
-            config['ungrouped_order'] = []
+            # ungrouped_order 초기화
+            if 'ungrouped_order' not in config:
+                config['ungrouped_order'] = []
 
-        # 기존 그룹에서 터널 제거
-        for group in config.get('tunnel_groups', []):
-            if tunnel_id in group.get('tunnel_ids', []):
-                group['tunnel_ids'].remove(tunnel_id)
-
-        # ungrouped_order에서도 제거
-        if tunnel_id in config['ungrouped_order']:
-            config['ungrouped_order'].remove(tunnel_id)
-
-        # 새 그룹에 추가 또는 ungrouped로 이동
-        if group_id is None:
-            config['ungrouped_order'].append(tunnel_id)
-        else:
+            # 기존 그룹에서 터널 제거
             for group in config.get('tunnel_groups', []):
-                if group['id'] == group_id:
-                    if 'tunnel_ids' not in group:
-                        group['tunnel_ids'] = []
-                    group['tunnel_ids'].append(tunnel_id)
-                    break
-            else:
-                return False, f"대상 그룹을 찾을 수 없습니다: {group_id}"
+                if tunnel_id in group.get('tunnel_ids', []):
+                    group['tunnel_ids'].remove(tunnel_id)
 
-        self.save_config(config)
+            # ungrouped_order에서도 제거
+            if tunnel_id in config['ungrouped_order']:
+                config['ungrouped_order'].remove(tunnel_id)
+
+            # 새 그룹에 추가 또는 ungrouped로 이동
+            if group_id is None:
+                config['ungrouped_order'].append(tunnel_id)
+            else:
+                for group in config.get('tunnel_groups', []):
+                    if group['id'] == group_id:
+                        if 'tunnel_ids' not in group:
+                            group['tunnel_ids'] = []
+                        group['tunnel_ids'].append(tunnel_id)
+                        break
+                else:
+                    return False, f"대상 그룹을 찾을 수 없습니다: {group_id}"
+
+            self.save_config(config)
         logger.debug(f"터널 이동: {tunnel_id} -> 그룹 {group_id or '(없음)'}")
         return True, "터널이 이동되었습니다."
 
@@ -579,12 +796,13 @@ class ConfigManager:
         Returns:
             성공 여부
         """
-        config = self.load_config()
+        with _CONFIG_LOCK:
+            config = self.load_config()
 
-        for group in config.get('tunnel_groups', []):
-            if group['id'] == group_id:
-                group['collapsed'] = collapsed
-                self.save_config(config)
-                return True
+            for group in config.get('tunnel_groups', []):
+                if group['id'] == group_id:
+                    group['collapsed'] = collapsed
+                    self.save_config(config)
+                    return True
 
-        return False
+            return False
