@@ -8,7 +8,7 @@ import tempfile
 from pathlib import Path
 from unittest.mock import MagicMock
 
-from src.core.migration_constants import IssueType
+from src.core.migration_constants import IssueType, ENGINE_POLICIES
 from src.core.migration_rules.data_rules import DataIntegrityRules
 from src.core.migration_rules.schema_rules import SchemaRules
 from src.core.migration_rules.storage_rules import StorageRules
@@ -262,6 +262,36 @@ class TestSchemaRulesSQL:
         issues = rules.check_all_sql_content(content, "test.sql")
         assert len(issues) >= 3
 
+    def test_multiline_create_table_no_identifier_false_positives(self):
+        """여러 줄 CREATE TABLE은 인접 식별자 사이를 오탐하지 않아야 한다"""
+        rules = SchemaRules()
+        content = (
+            "CREATE TABLE `t` (\n"
+            "  `id` int NOT NULL,\n"
+            "  `name` varchar(255) DEFAULT NULL\n"
+            ")"
+        )
+        issues = rules.check_all_sql_content(content, "test.sql")
+        false_positive_types = {
+            IssueType.DOLLAR_SIGN_NAME,
+            IssueType.TRAILING_SPACE_NAME,
+            IssueType.CONTROL_CHAR_NAME,
+        }
+        assert not any(issue.issue_type in false_positive_types for issue in issues)
+
+    def test_invalid_57_name_multiple_dots_no_match_in_insert_data(self):
+        rules = SchemaRules()
+        content = "INSERT INTO t VALUES ('see notes..thanks');"
+        issues = rules.check_invalid_57_name_multiple_dots(content, "test.sql")
+        assert issues == []
+
+    def test_invalid_57_name_multiple_dots_matches_schema_reference(self):
+        rules = SchemaRules()
+        content = "SELECT * FROM schema..table;"
+        issues = rules.check_invalid_57_name_multiple_dots(content, "test.sql")
+        assert len(issues) == 1
+        assert issues[0].issue_type == IssueType.INVALID_57_NAME_MULTIPLE_DOTS
+
 
 class TestSchemaRulesLiveDB:
     """라이브 DB 기반 스키마 검사"""
@@ -393,6 +423,22 @@ class TestStorageRulesSQL:
         issues = rules.check_all_sql_content(content, "test.sql")
         assert len(issues) >= 2
 
+    def test_merge_engine_uses_engine_policies_severity(self):
+        rules = StorageRules()
+        content = "CREATE TABLE `t` (`id` INT) ENGINE=MERGE;"
+        issues = rules.check_deprecated_engines_in_sql(content, "test.sql")
+        assert len(issues) >= 1
+        assert issues[0].severity == "error"
+        assert issues[0].suggestion == ENGINE_POLICIES["MERGE"]["suggestion"]
+
+    def test_csv_engine_detected_with_engine_policies(self):
+        rules = StorageRules()
+        content = "CREATE TABLE `t` (`id` INT) ENGINE=CSV;"
+        issues = rules.check_deprecated_engines_in_sql(content, "test.sql")
+        assert len(issues) >= 1
+        assert issues[0].severity == ENGINE_POLICIES["CSV"]["severity"]
+        assert issues[0].suggestion == ENGINE_POLICIES["CSV"]["suggestion"]
+
 
 class TestStorageRulesLiveDB:
     """라이브 DB 기반 스토리지 엔진 검사"""
@@ -445,3 +491,22 @@ class TestStorageRulesLiveDB:
         rules.set_progress_callback(lambda m: messages.append(m))
         rules.check_deprecated_engines("db")
         assert len(messages) >= 1
+
+    def test_merge_and_csv_use_engine_policies_not_hardcoded(self):
+        """MERGE/CSV의 severity/suggestion은 ENGINE_POLICIES에서 와야 하며
+        과거처럼 하드코딩된 warning 텍스트를 사용해서는 안 된다"""
+        conn = FakeMySQLConnector()
+        conn.query_results = {
+            "ENGINE IN": [
+                {'TABLE_NAME': 'merged', 'ENGINE': 'MERGE'},
+                {'TABLE_NAME': 'logs_csv', 'ENGINE': 'CSV'},
+            ]
+        }
+        rules = StorageRules(connector=conn)
+        issues = rules.check_deprecated_engines("db")
+        by_table = {issue.table_name: issue for issue in issues}
+
+        assert by_table['merged'].severity == ENGINE_POLICIES['MERGE']['severity']
+        assert by_table['merged'].suggestion == ENGINE_POLICIES['MERGE']['suggestion']
+        assert by_table['logs_csv'].severity == ENGINE_POLICIES['CSV']['severity']
+        assert by_table['logs_csv'].suggestion == ENGINE_POLICIES['CSV']['suggestion']
