@@ -174,7 +174,6 @@ def test_dialog_initial_button_states_and_running_toggle():
     try:
         assert not dialog.btn_save_report.isEnabled()
         assert not dialog.btn_cancel.isEnabled()
-        assert not dialog.btn_migrate.isEnabled()
         assert not dialog.btn_full_run.isVisible()
         assert not dialog.source_form.combo_engine.isEnabled()
         assert not dialog.target_form.combo_engine.isEnabled()
@@ -188,20 +187,51 @@ def test_dialog_initial_button_states_and_running_toggle():
         dialog._set_running(True)
 
         assert not dialog.btn_inspect.isEnabled()
-        assert not dialog.btn_preflight.isEnabled()
         assert not dialog.btn_plan.isEnabled()
-        assert not dialog.btn_migrate.isEnabled()
         assert dialog.btn_cancel.isEnabled()
         assert not dialog.btn_next.isEnabled()
 
         dialog._set_running(False)
 
         assert dialog.btn_inspect.isEnabled()
-        assert dialog.btn_preflight.isEnabled()
         assert dialog.btn_plan.isEnabled()
-        assert not dialog.btn_migrate.isEnabled()
         assert not dialog.btn_cancel.isEnabled()
         assert dialog.btn_next.isEnabled()
+    finally:
+        dialog.close()
+
+
+def test_set_running_locks_and_unlocks_mutable_input_controls():
+    dialog = make_dialog()
+    try:
+        assert dialog.source_form.combo_tunnel.isEnabled()
+        assert dialog.source_form.input_schema.isEnabled()
+        assert dialog.txt_schema.isEnabled()
+        assert dialog.input_approval_schema.isEnabled()
+
+        dialog._set_running(True)
+
+        assert not dialog.source_form.combo_tunnel.isEnabled()
+        assert not dialog.source_form.input_schema.isEnabled()
+        assert not dialog.target_form.combo_tunnel.isEnabled()
+        assert not dialog.txt_schema.isEnabled()
+        assert not dialog.chk_show_schema_json.isEnabled()
+        assert not dialog.input_approval_schema.isEnabled()
+        # Tunnel-only endpoint fields keep their locked state either way;
+        # combo_engine is permanently disabled regardless of running state.
+        assert dialog.source_form.input_host.isReadOnly()
+        assert not dialog.source_form.input_port.isEnabled()
+        assert not dialog.source_form.combo_engine.isEnabled()
+
+        dialog._set_running(False)
+
+        assert dialog.source_form.combo_tunnel.isEnabled()
+        assert dialog.source_form.input_schema.isEnabled()
+        assert dialog.txt_schema.isEnabled()
+        assert dialog.input_approval_schema.isEnabled()
+        assert dialog.source_form.input_host.isReadOnly()
+        assert not dialog.source_form.input_port.isEnabled()
+        assert not dialog.source_form.combo_engine.isEnabled()
     finally:
         dialog.close()
 
@@ -268,7 +298,6 @@ def test_wizard_next_requires_current_step_completion():
 
         dialog._show_step("execute")
         dialog.input_approval_schema.setText("target_db")
-        assert dialog.btn_migrate.isEnabled()
         assert dialog.btn_next.isEnabled()
         assert dialog.btn_next.text() == "DB 변경 실행"
 
@@ -714,10 +743,6 @@ def test_empty_schema_runs_inspect_before_requested_plan(monkeypatch):
     }
 
     monkeypatch.setattr(
-        "src.ui.dialogs.cross_engine_migration_dialog.QTimer.singleShot",
-        lambda _msec, callback: callback(),
-    )
-    monkeypatch.setattr(
         dialog,
         "_start_command_with_payload",
         lambda command, payload, workflow=False: started.append((command, payload, workflow)),
@@ -735,9 +760,17 @@ def test_empty_schema_runs_inspect_before_requested_plan(monkeypatch):
             "schema": schema,
         })
 
+        # The pending command must not be dispatched from _on_result anymore.
+        assert len(started) == 1
+        assert dialog._pending_after_inspect == "plan"
+        assert "Rust Core 검사 완료" in dialog.lbl_schema_status.text()
+
+        dialog._current_command = "inspect"
+        dialog._on_finished(True, {"command": "inspect", "success": True, "schema": schema})
+
         assert started[1][0] == "plan"
         assert started[1][1]["schema"] == schema
-        assert "Rust Core 검사 완료" in dialog.lbl_schema_status.text()
+        assert dialog._pending_after_inspect is None
     finally:
         dialog.close()
 
@@ -756,8 +789,13 @@ def test_migrate_result_saves_resume_state(monkeypatch, tmp_path):
     )
 
     dialog = make_dialog()
+    dialog._active_state_key = "cached-worker-start-key"
     state = {"tables": [{"table": "users", "completed": False, "rows_copied": 5000}]}
     try:
+        # Live UI is mutated to an invalid schema after the worker started; the
+        # migrate-result save must use the cached key, not recompute _payload().
+        dialog.txt_schema.setPlainText("not valid json")
+
         dialog._on_result({
             "event": "result",
             "command": "migrate",
@@ -766,8 +804,94 @@ def test_migrate_result_saves_resume_state(monkeypatch, tmp_path):
         })
 
         assert saved["state"] == state
-        assert saved["key"]
+        assert saved["key"] == "cached-worker-start-key"
         assert "재개 상태 저장" in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+def test_on_result_migrate_without_cached_state_key_logs_failure_and_skips_save(monkeypatch):
+    saved = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.save_resume_state",
+        lambda key, state: saved.append((key, state)),
+    )
+
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "migrate",
+            "success": False,
+            "state": {"tables": []},
+        })
+
+        assert saved == []
+        assert "재개 상태 저장 실패" in dialog.txt_log.toPlainText()
+    finally:
+        dialog.close()
+
+
+class _NoOpSignal:
+    """Stand-in for a pyqtSignal that just swallows connect() calls."""
+
+    def connect(self, *args, **kwargs):
+        pass
+
+
+class FakeCrossEngineMigrationWorker:
+    """Non-blocking stand-in for CrossEngineMigrationWorker.
+
+    Never spawns a real QThread/subprocess so tests can exercise
+    `_start_command_with_payload` without hanging on tunnelforge-core.
+    """
+
+    def __init__(self, command, payload):
+        self.command = command
+        self.payload = payload
+        self.phase_changed = _NoOpSignal()
+        self.table_progress = _NoOpSignal()
+        self.row_progress = _NoOpSignal()
+        self.checkpoint = _NoOpSignal()
+        self.issue = _NoOpSignal()
+        self.log_message = _NoOpSignal()
+        self.failed = _NoOpSignal()
+        self.result = _NoOpSignal()
+        self.finished = _NoOpSignal()
+
+    def start(self):
+        pass
+
+    def isRunning(self):
+        return False
+
+
+def test_start_command_with_payload_caches_worker_start_state_key_for_checkpoint(monkeypatch):
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.CrossEngineMigrationWorker",
+        FakeCrossEngineMigrationWorker,
+    )
+    saved = {}
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.save_resume_state",
+        lambda key, state: saved.update(key=key, state=state),
+    )
+
+    dialog = make_dialog()
+    try:
+        payload = dialog._payload(prepare_tunnels=False)
+        dialog._start_command_with_payload("migrate", payload)
+
+        original_key = dialog._active_state_key
+        assert original_key
+
+        # Mutate live UI to invalid JSON after the worker has started; the
+        # checkpoint save must use the cached key, not recompute _payload().
+        dialog.txt_schema.setPlainText("not valid json")
+
+        dialog._save_checkpoint({"tables": []})
+
+        assert saved["key"] == original_key
     finally:
         dialog.close()
 
@@ -966,16 +1090,15 @@ def test_execute_requires_exact_target_schema_text_before_migrate(monkeypatch):
     try:
         dialog._show_step("execute")
 
-        assert not dialog.btn_migrate.isEnabled()
         assert not dialog.btn_next.isEnabled()
 
         dialog.input_approval_schema.setText("wrong")
 
-        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
 
         dialog.input_approval_schema.setText("target_db")
 
-        assert dialog.btn_migrate.isEnabled()
+        assert dialog.btn_next.isEnabled()
         dialog._start_command("migrate")
 
         assert started
@@ -994,12 +1117,10 @@ def test_execute_approval_uses_public_when_postgresql_target_schema_blank():
 
         dialog.input_approval_schema.setText("postgres")
 
-        assert not dialog.btn_migrate.isEnabled()
         assert not dialog.btn_next.isEnabled()
 
         dialog.input_approval_schema.setText("public")
 
-        assert dialog.btn_migrate.isEnabled()
         assert dialog.btn_next.isEnabled()
         assert dialog.btn_next.text() == "DB 변경 실행"
     finally:
@@ -1018,14 +1139,12 @@ def test_execute_approval_invalidates_when_target_schema_changes():
         })
         dialog.input_approval_schema.setText("target_db")
 
-        assert dialog.btn_migrate.isEnabled()
         assert dialog.btn_next.isEnabled()
         assert dialog.btn_next.text() == "DB 변경 실행"
 
         dialog.target_form.input_schema.setText("changed_target")
 
         assert not dialog._approval_matches_target_schema()
-        assert not dialog.btn_migrate.isEnabled()
         assert not dialog.btn_next.isEnabled()
     finally:
         dialog.close()
@@ -1134,7 +1253,8 @@ def test_verify_progress_updates_status_panel():
 def test_db_change_unlocks_after_preflight_success_and_locks_on_input_change():
     dialog = make_dialog()
     try:
-        assert not dialog.btn_migrate.isEnabled()
+        dialog._show_step("execute")
+        assert not dialog.btn_next.isEnabled()
 
         dialog._on_result({
             "event": "result",
@@ -1143,16 +1263,16 @@ def test_db_change_unlocks_after_preflight_success_and_locks_on_input_change():
             "issues": [],
         })
 
-        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
         assert "Target schema 이름 입력 후" in dialog.lbl_execution_lock.text()
 
         dialog.input_approval_schema.setText("target_db")
 
-        assert dialog.btn_migrate.isEnabled()
+        assert dialog.btn_next.isEnabled()
 
         dialog.source_form.input_database.setText("changed_schema")
 
-        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
         assert "사전 점검 또는 계획 생성 성공 후" in dialog.lbl_execution_lock.text()
     finally:
         dialog.close()
@@ -1161,6 +1281,7 @@ def test_db_change_unlocks_after_preflight_success_and_locks_on_input_change():
 def test_plan_failure_keeps_db_change_locked():
     dialog = make_dialog()
     try:
+        dialog._show_step("execute")
         dialog._on_result({
             "event": "result",
             "command": "plan",
@@ -1168,7 +1289,7 @@ def test_plan_failure_keeps_db_change_locked():
             "issues": [{"blocking": True}],
         })
 
-        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
         assert "차단 이슈가 있어" in dialog.txt_log.toPlainText()
     finally:
         dialog.close()
@@ -1385,13 +1506,13 @@ def test_preflight_blocks_execution_when_target_is_not_empty():
                 {
                     "severity": "error",
                     "location": "target.public",
-                    "message": "target schema is not empty",
+                    "issue_type": "target_not_empty",
+                    "message": "대상 스키마에 12개 테이블이 있습니다",
                     "blocking": True,
                 }
             ],
         })
 
-        assert not dialog.btn_migrate.isEnabled()
         assert "점검 실패" in dialog.lbl_safety_summary.text()
         assert "차단 이슈 1개" in dialog.lbl_safety_summary.text()
         assert "아직 전환 가능 여부를 점검하지 않았습니다" not in dialog.lbl_safety_summary.text()
@@ -1401,9 +1522,34 @@ def test_preflight_blocks_execution_when_target_is_not_empty():
         dialog.close()
 
 
+def test_preflight_target_message_without_stable_issue_type_does_not_unlock_cleanup():
+    dialog = make_dialog()
+    try:
+        dialog._on_result({
+            "event": "result",
+            "command": "preflight",
+            "success": False,
+            "issues": [
+                {
+                    "severity": "error",
+                    "location": "target.public",
+                    "message": "target schema is not empty",
+                    "blocking": True,
+                }
+            ],
+        })
+
+        assert "점검 실패" in dialog.lbl_safety_summary.text()
+        assert not dialog.btn_target_advanced.isVisible()
+        assert "기존 테이블 또는 데이터 차단 이슈가 없습니다" in dialog.lbl_target_safety.text()
+    finally:
+        dialog.close()
+
+
 def test_preflight_success_with_nonblocking_target_warning_unlocks_execution():
     dialog = make_dialog()
     try:
+        dialog._show_step("execute")
         dialog._on_result({
             "event": "result",
             "command": "preflight",
@@ -1418,10 +1564,10 @@ def test_preflight_success_with_nonblocking_target_warning_unlocks_execution():
             ],
         })
 
-        assert not dialog.btn_migrate.isEnabled()
+        assert not dialog.btn_next.isEnabled()
         dialog.input_approval_schema.setText("target_db")
 
-        assert dialog.btn_migrate.isEnabled()
+        assert dialog.btn_next.isEnabled()
         assert "점검 통과" in dialog.lbl_safety_summary.text()
         assert "경고 1개" in dialog.lbl_safety_summary.text()
         assert "기존 테이블 또는 데이터 차단 이슈가 없습니다" in dialog.lbl_target_safety.text()
@@ -1443,6 +1589,7 @@ def test_target_advanced_button_expands_inline_without_leaving_safety_step():
                 {
                     "severity": "error",
                     "location": "target.public",
+                    "issue_type": "target_not_empty",
                     "message": "target schema is not empty",
                     "blocking": True,
                 }
@@ -1484,6 +1631,7 @@ def test_safety_advanced_cleanup_is_planned_not_executed(monkeypatch):
                 {
                     "severity": "error",
                     "location": "target.public",
+                    "issue_type": "target_not_empty",
                     "message": "target schema is not empty",
                     "blocking": True,
                 }
@@ -1561,7 +1709,7 @@ def test_execute_step_uses_bottom_next_button_as_db_change_cta(monkeypatch):
         dialog._set_execution_unlocked(True)
         dialog._show_step("execute")
 
-        assert not dialog.btn_migrate.isVisible()
+        assert not hasattr(dialog, "btn_migrate")
         assert dialog.btn_next.text() == "DB 변경 실행"
         assert not dialog.btn_next.isEnabled()
 
@@ -1572,6 +1720,19 @@ def test_execute_step_uses_bottom_next_button_as_db_change_cta(monkeypatch):
 
         assert started[0][0] == "migrate"
         assert dialog.current_step_id == "execute"
+    finally:
+        dialog.close()
+
+
+def test_execute_step_hint_prompts_execution_not_generic_next_step():
+    dialog = make_dialog()
+    try:
+        dialog._set_execution_unlocked(True)
+        dialog._show_step("execute")
+        dialog.input_approval_schema.setText("target_db")
+
+        assert dialog.btn_next.text() == "DB 변경 실행"
+        assert dialog.lbl_next_hint.text() == "DB 변경 실행 버튼을 누르면 전환이 시작됩니다."
     finally:
         dialog.close()
 
@@ -1642,10 +1803,9 @@ def test_safety_step_exposes_only_primary_preflight_action_by_default():
         assert all("양방향" not in text for text in visible_button_texts)
         assert dialog.btn_run_safety.isVisible()
         assert_widget_reachable(dialog.btn_run_safety, dialog)
-        assert not dialog.btn_readiness.isVisible()
-        assert dialog.btn_readiness.parentWidget() is None
-        assert not dialog.btn_preflight.isVisible()
-        assert dialog.btn_preflight.parentWidget() is None
+        assert not hasattr(dialog, "btn_readiness")
+        assert not hasattr(dialog, "btn_preflight")
+        assert not hasattr(dialog, "btn_migrate")
     finally:
         dialog.close()
 

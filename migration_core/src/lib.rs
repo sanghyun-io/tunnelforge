@@ -7973,6 +7973,24 @@ fn phase_event(request: &Request, phase: &str, message: &str) -> Value {
     })
 }
 
+/// Stable, machine-readable issue code for a non-empty create_only target table.
+/// The PyQt UI matches on this code (never on `message`/`location` substrings) to
+/// decide whether to offer the "clean up target before migrate" workflow.
+const ISSUE_TARGET_NOT_EMPTY: &str = "target_not_empty";
+
+fn target_not_empty_issue(location: String) -> MigrationIssue {
+    MigrationIssue {
+        issue_type: Some(ISSUE_TARGET_NOT_EMPTY.to_string()),
+        severity: "error".to_string(),
+        location,
+        message: "target table is not empty".to_string(),
+        suggestion: "Use an empty target table or run with a non-create_only mode.".to_string(),
+        blocking: true,
+        table_name: None,
+        column_name: None,
+    }
+}
+
 pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
     let source = read_engine(payload, "source_engine");
     let target = read_engine(payload, "target_engine");
@@ -8046,17 +8064,7 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
         if let Ok(schema) = parse_schema(&payload["schema"]) {
             for table in &schema.tables {
                 if target.row_count(&table.name) > 0 {
-                    issues.push(MigrationIssue {
-                        issue_type: None,
-                        severity: "error".to_string(),
-                        location: table.name.clone(),
-                        message: "target table is not empty".to_string(),
-                        suggestion: "Use an empty target table or run with a non-create_only mode."
-                            .to_string(),
-                        blocking: true,
-                        table_name: None,
-                        column_name: None,
-                    });
+                    issues.push(target_not_empty_issue(table.name.clone()));
                 }
             }
         }
@@ -8361,17 +8369,7 @@ fn create_only_issues_with_adapter<T: MigrationAdapter>(
     let mut issues = Vec::new();
     for table in &schema.tables {
         match target.row_count(&table.name) {
-            Ok(count) if count > 0 => issues.push(MigrationIssue {
-                issue_type: None,
-                severity: "error".to_string(),
-                location: table.name.clone(),
-                message: "target table is not empty".to_string(),
-                suggestion: "Use an empty target table or run with a non-create_only mode."
-                    .to_string(),
-                blocking: true,
-                table_name: None,
-                column_name: None,
-            }),
+            Ok(count) if count > 0 => issues.push(target_not_empty_issue(table.name.clone())),
             Err(err) => issues.push(MigrationIssue {
                 issue_type: None,
                 severity: "error".to_string(),
@@ -15073,7 +15071,10 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(result.rows_copied, 0);
-        assert!(result.issues.iter().any(|issue| issue.blocking));
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.blocking && issue.issue_type.as_deref() == Some("target_not_empty")));
         assert_eq!(target.row_count("users"), 1);
     }
 
@@ -15096,7 +15097,10 @@ mod tests {
 
         assert!(!result.success);
         assert_eq!(result.rows_copied, 0);
-        assert!(result.issues.iter().any(|issue| issue.blocking));
+        assert!(result
+            .issues
+            .iter()
+            .any(|issue| issue.blocking && issue.issue_type.as_deref() == Some("target_not_empty")));
         assert_eq!(target.row_count("users"), 1);
     }
 
@@ -16503,6 +16507,30 @@ mod tests {
         assert_eq!(unsupported.severity, "warning");
         assert!(!unsupported.blocking);
         assert!(issues.iter().any(|issue| issue.location == "users_grants"));
+    }
+
+    #[test]
+    fn preflight_reports_stable_target_not_empty_issue_type_for_non_empty_target() {
+        let issues = preflight_issues(&json!({
+            "source_engine": "mysql",
+            "target_engine": "postgresql",
+            "schema": {
+                "tables": [{
+                    "name": "users",
+                    "columns": [
+                        {"name": "id", "type": "int(11)", "nullable": false, "primary_key": true}
+                    ]
+                }]
+            },
+            "execution_options": {"mode": "create_only"},
+            "target_data": {"users": [{"id": 1}]}
+        }));
+
+        let target_issue = issues
+            .iter()
+            .find(|issue| issue.location == "users" && issue.blocking)
+            .expect("expected a blocking issue for the non-empty target table");
+        assert_eq!(target_issue.issue_type.as_deref(), Some("target_not_empty"));
     }
 
     #[test]

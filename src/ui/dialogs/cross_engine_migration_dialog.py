@@ -1,4 +1,5 @@
 """MySQL <-> PostgreSQL migration dialog."""
+import copy
 import json
 from typing import Any, Dict, List, Optional, cast
 
@@ -52,6 +53,8 @@ class CrossEngineMigrationDialog(QDialog):
         self._workflow_active = False
         self._current_command: Optional[str] = None
         self._pending_after_inspect: Optional[str] = None
+        self._active_payload: Optional[Dict[str, Any]] = None
+        self._active_state_key: Optional[str] = None
         self._execution_unlocked = False
         self._verify_result_received = False
         self._safety_activity_base = ""
@@ -354,12 +357,9 @@ class CrossEngineMigrationDialog(QDialog):
 
         self.btn_full_run = QPushButton("전체 실행")
         self.btn_inspect = QPushButton("스키마 검사")
-        self.btn_preflight = QPushButton("사전 점검")
-        self.btn_readiness = QPushButton("양방향 점검")
         self.btn_guide = QPushButton("상세 가이드")
         self.btn_plan = QPushButton("계획 생성")
         self.btn_run_plan = self.btn_plan
-        self.btn_migrate = QPushButton("DB 변경 실행")
         self.btn_resume = QPushButton("중단 지점부터 재개")
         self.btn_cleanup_failed = QPushButton("실패한 전환 정리")
         self.btn_verify = QPushButton("검증")
@@ -371,23 +371,14 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_previous.setObjectName("WizardBackButton")
         self.btn_next.setObjectName("WizardNextButton")
         self.btn_full_run.hide()
-        self.btn_migrate.hide()
-        self.btn_migrate.setToolTip("대상 DB에 스키마 생성과 데이터 적재를 실행합니다.")
         self.btn_resume.setToolTip("저장된 상태부터 대상 DB 변경 작업을 재개합니다.")
         self.btn_cleanup_failed.setToolTip("실패한 전환에서 생성된 Target 테이블을 정리합니다.")
         self.btn_cleanup_failed.hide()
-        self.btn_migrate.setStyleSheet(
-            "QPushButton { background-color: #b42318; color: white; font-weight: 600; }"
-            "QPushButton:disabled { background-color: #d0d5dd; color: #667085; }"
-        )
 
         self.btn_full_run.clicked.connect(self._start_full_workflow)
         self.btn_inspect.clicked.connect(lambda: self._start_command("inspect"))
-        self.btn_preflight.clicked.connect(lambda: self._start_command("preflight"))
-        self.btn_readiness.clicked.connect(lambda: self._start_command("readiness"))
         self.btn_guide.clicked.connect(lambda: self._start_command("guide"))
         self.btn_plan.clicked.connect(lambda: self._start_command("plan"))
-        self.btn_migrate.clicked.connect(lambda: self._start_command("migrate"))
         self.btn_resume.clicked.connect(self._resume_migration)
         self.btn_cleanup_failed.clicked.connect(self._cleanup_failed_migration)
         self.btn_verify.clicked.connect(lambda: self._start_command("verify"))
@@ -399,7 +390,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_save_report.setEnabled(False)
         self.btn_cancel.setEnabled(False)
         self.input_approval_schema.textChanged.connect(self._update_execution_state_from_approval)
-        self._update_execution_state(False)
+        self._update_execution_state()
 
         self.plan_group = QGroupBox("실행 계획 확인")
         plan_layout = QVBoxLayout(self.plan_group)
@@ -714,12 +705,8 @@ class CrossEngineMigrationDialog(QDialog):
             return False
         if issue.get("blocking") is not True:
             return False
-        location = str(issue.get("location", "")).lower()
-        message = str(issue.get("message", "")).lower()
-        text = f"{location} {message}"
-        has_target = "target" in text
-        has_non_empty = any(marker in text for marker in ("not empty", "non-empty", "existing"))
-        return has_target and has_non_empty
+        code = str(issue.get("code") or issue.get("issue_type") or "").strip()
+        return code == "target_not_empty"
 
     def _update_target_safety_from_issues(self, issues) -> bool:
         issue_list = issues if isinstance(issues, list) else []
@@ -835,14 +822,16 @@ class CrossEngineMigrationDialog(QDialog):
             if self._cleanup_plan_resolves_safety_blockers():
                 return "Target 정리를 실행 직전에 수행하도록 계획했습니다. 다음 단계로 이동할 수 있습니다."
             return "전환 가능 여부 점검이 통과되면 다음 단계로 이동할 수 있습니다."
+        if self.current_step_id == "execute":
+            if self._step_completed.get("execute", False):
+                return "DB 변경 실행이 완료되었습니다. 다음 단계로 이동할 수 있습니다."
+            if not self._approval_matches_target_schema():
+                return "Target schema 이름을 정확히 입력한 뒤 DB 변경 실행을 눌러 주세요."
+            return "DB 변경 실행 버튼을 누르면 전환이 시작됩니다."
         if self._next_enabled_for_current_step():
             return "현재 단계가 완료되었습니다. 다음 단계로 이동할 수 있습니다."
         if self.current_step_id == "plan":
             return "실행 계획 생성이 완료되면 다음 단계로 이동할 수 있습니다."
-        if self.current_step_id == "execute":
-            if not self._approval_matches_target_schema():
-                return "Target schema 이름을 정확히 입력한 뒤 DB 변경 실행을 눌러 주세요."
-            return "DB 변경 실행이 완료되면 다음 단계로 이동할 수 있습니다."
         if self.current_step_id == "verify":
             return "검증 결과를 받은 뒤 완료할 수 있습니다."
         return ""
@@ -974,6 +963,8 @@ class CrossEngineMigrationDialog(QDialog):
         self._current_command = command
         if command == "verify":
             self._verify_result_received = False
+        self._active_payload = copy.deepcopy(payload)
+        self._active_state_key = state_key_from_payload(payload)
         self._reset_command_ui(command)
         self._append_log(f"[{command}] 시작")
         self._set_running(True)
@@ -990,16 +981,20 @@ class CrossEngineMigrationDialog(QDialog):
         self.worker.start()
 
     def _save_checkpoint(self, state: Dict):
-        key = state_key_from_payload(self._payload())
-        self._last_checkpoint_path = save_resume_state(key, state)
+        if not self._active_state_key:
+            self._append_log("재개 상태 저장 실패: 활성 작업 상태 키가 없습니다.")
+            return
+        self._last_checkpoint_path = save_resume_state(self._active_state_key, state)
 
     def _on_result(self, payload: Dict):
         self.last_result = payload
         self.btn_save_report.setEnabled(True)
         if payload.get("command") == "migrate" and isinstance(payload.get("state"), dict):
-            key = state_key_from_payload(self._payload())
-            path = save_resume_state(key, payload["state"])
-            self._append_log(f"재개 상태 저장: {path}")
+            if self._active_state_key:
+                path = save_resume_state(self._active_state_key, payload["state"])
+                self._append_log(f"재개 상태 저장: {path}")
+            else:
+                self._append_log("재개 상태 저장 실패: 활성 작업 상태 키가 없습니다.")
         schema = schema_from_inspect_result(payload)
         if schema is not None:
             self.txt_schema.setPlainText(json.dumps(schema, ensure_ascii=False, indent=2))
@@ -1049,11 +1044,6 @@ class CrossEngineMigrationDialog(QDialog):
             self._append_log(json.dumps(payload, ensure_ascii=False, indent=2))
         self._refresh_navigation_state()
 
-        if payload.get("command") == "inspect" and payload.get("success") and self._pending_after_inspect:
-            next_command = self._pending_after_inspect
-            self._pending_after_inspect = None
-            QTimer.singleShot(0, lambda: self._start_command(next_command, workflow=self._workflow_active))
-
     def _append_readiness_summary(self, payload: Dict):
         selected = self._selected_direction_result(payload)
         if not selected:
@@ -1095,6 +1085,13 @@ class CrossEngineMigrationDialog(QDialog):
             return
         self.worker = None
         self._set_running(False)
+        if finished_command == "inspect" and success and self._pending_after_inspect:
+            next_command = self._pending_after_inspect
+            pending_workflow = self._workflow_active
+            self._pending_after_inspect = None
+            self._append_log(f"[inspect] 완료 후 {next_command} 실행")
+            self._start_command(next_command, workflow=pending_workflow)
+            return
         if finished_command == "preflight":
             self._finish_safety_activity(success)
         if finished_command == "plan" and not success:
@@ -1109,13 +1106,6 @@ class CrossEngineMigrationDialog(QDialog):
                 self.lbl_migration_result.setText("DB 변경 실패: Rust Core가 상세 실패 원인을 반환하지 않았습니다.")
                 self.lbl_migration_result.show()
                 self.btn_cleanup_failed.show()
-        if finished_command == "cleanup" and success:
-            self.btn_cleanup_failed.hide()
-            self.lbl_migration_result.setText("실패한 전환 정리가 완료되었습니다. 전환 가능 여부 점검을 다시 실행하세요.")
-            self.lbl_migration_result.show()
-            self.lbl_safety_summary.setText("Target 정리 완료: 전환 가능 여부 점검을 다시 실행하세요.")
-            self.lbl_target_safety.setText("Target 정리가 완료되었습니다. 다시 점검해 빈 Target 상태를 확인하세요.")
-            self._append_safety_log("Target 정리 완료")
         self._append_log("완료" if success else "실패")
         if self._workflow_active and finished_command:
             next_command = next_workflow_command(finished_command, success)
@@ -1124,8 +1114,6 @@ class CrossEngineMigrationDialog(QDialog):
             else:
                 self._workflow_active = False
                 self._current_command = None
-        elif finished_command == "cleanup":
-            self._current_command = None
         self._refresh_navigation_state()
 
     def _wait_for_worker_finish(self) -> bool:
@@ -1213,35 +1201,40 @@ class CrossEngineMigrationDialog(QDialog):
             self.btn_full_run,
             self.btn_auto_inspect,
             self.btn_inspect,
-            self.btn_preflight,
-            self.btn_readiness,
             self.btn_run_safety,
             self.btn_guide,
             self.btn_plan,
-            self.btn_migrate,
             self.btn_resume,
             self.btn_cleanup_failed,
             self.btn_verify,
             self.btn_close,
         ):
             button.setEnabled(not running)
-        self._update_execution_state(running)
+        self._set_input_controls_enabled(not running)
+        self._update_execution_state()
         self.btn_cancel.setEnabled(running)
         if hasattr(self, "btn_previous"):
             self.btn_previous.setEnabled((not running) and self._current_step_index() > 0)
         if hasattr(self, "btn_next"):
             self.btn_next.setEnabled((not running) and self._next_enabled_for_current_step())
 
+    def _set_input_controls_enabled(self, enabled: bool):
+        self.source_form.set_inputs_enabled(enabled)
+        self.target_form.set_inputs_enabled(enabled)
+        self.txt_schema.setEnabled(enabled)
+        self.btn_load_schema.setEnabled(enabled)
+        self.chk_show_schema_json.setEnabled(enabled)
+        self.chk_create_only.setEnabled(enabled)
+        self.spin_chunk_size.setEnabled(enabled)
+        self.spin_guide_row_limit.setEnabled(enabled)
+        self.chk_cleanup_before_migrate.setEnabled(enabled)
+        self.input_approval_schema.setEnabled(enabled)
+
     def _set_execution_unlocked(self, unlocked: bool):
         self._execution_unlocked = unlocked
-        running = bool(self.worker and self.worker.isRunning())
-        self._update_execution_state(running)
+        self._update_execution_state()
 
-    def _update_execution_state(self, running: bool):
-        approved = self._approval_matches_target_schema() if hasattr(self, "input_approval_schema") else True
-        can_execute = (not running) and self._execution_unlocked and approved
-        if hasattr(self, "btn_migrate"):
-            self.btn_migrate.setEnabled(can_execute)
+    def _update_execution_state(self):
         if hasattr(self, "lbl_execution_lock"):
             if self._execution_unlocked:
                 self.lbl_execution_lock.setText(
@@ -1265,9 +1258,8 @@ class CrossEngineMigrationDialog(QDialog):
         return self.input_approval_schema.text().strip() == self._target_approval_schema()
 
     def _update_execution_state_from_approval(self):
-        self._update_execution_state(bool(self.worker and self.worker.isRunning()))
-        if hasattr(self, "btn_next"):
-            self.btn_next.setEnabled(self._next_enabled_for_current_step())
+        self._update_execution_state()
+        self._refresh_navigation_state()
 
     def _on_phase_changed(self, phase: str, message: str):
         self.lbl_execution_phase.setText(message or phase)
@@ -1311,8 +1303,8 @@ class CrossEngineMigrationDialog(QDialog):
         self._append_log(f"[rows:{table}] {rows}/{total if total is not None else '?'}")
 
     def _reset_command_ui(self, command: str):
-        if command in ("migrate", "cleanup"):
-            self.lbl_execution_phase.setText("DB 변경 준비 중" if command == "migrate" else "정리 준비 중")
+        if command == "migrate":
+            self.lbl_execution_phase.setText("DB 변경 준비 중")
             self.lbl_current_table.setText("현재 테이블: -")
             self.lbl_current_rows.setText("현재 rows: -")
             self.lbl_migration_result.clear()
@@ -1729,6 +1721,26 @@ class EndpointForm(QGroupBox):
         self.input_user.setReadOnly(True)
         self.input_password.setReadOnly(True)
         self.input_database.setReadOnly(True)
+
+    def set_inputs_enabled(self, enabled: bool):
+        """Lock/unlock the mutable inputs while a worker is running.
+
+        `combo_engine` is intentionally excluded: it stays permanently disabled
+        (auto-detected from the tunnel). For tunnel-only forms, host/port/user/
+        password/database are already read-only/disabled via
+        `_apply_tunnel_only_state` and must stay that way even after
+        re-enabling; only `combo_tunnel` and `input_schema` are interactive.
+        """
+        self.combo_tunnel.setEnabled(enabled)
+        if self.require_tunnel:
+            self.input_schema.setEnabled(enabled)
+        else:
+            self.input_host.setEnabled(enabled)
+            self.input_port.setEnabled(enabled)
+            self.input_user.setEnabled(enabled)
+            self.input_password.setEnabled(enabled)
+            self.input_database.setEnabled(enabled)
+            self.input_schema.setEnabled(enabled)
 
     def _prepare_selected_tunnel(self):
         data = self.combo_tunnel.currentData()
