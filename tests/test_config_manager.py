@@ -4,64 +4,35 @@ ConfigManager 테스트
 import pytest
 import os
 import json
-import importlib.util
+import importlib
 import threading
-import types
 from unittest.mock import patch, MagicMock
 
 # 테스트 전 APP_DIR 패치를 위한 준비
-import sys
 from pathlib import Path
+
+# 실제 패키지로 import해둔다. 각 테스트는 patch.dict(os.environ, ...)를 적용한
+# 뒤 이 모듈을 reload해서 모듈 레벨 경로 상수를 그 테스트의 임시 디렉토리
+# 기준으로 다시 계산하게 만든다.
+import src.core.config_manager as _config_manager_module
 
 
 def _load_config_manager_module():
-    """src.core 패키지 import 부작용 없이 config_manager만 로드"""
-    src_pkg = types.ModuleType('src')
-    core_pkg = types.ModuleType('src.core')
-    logger_mod = types.ModuleType('src.core.logger')
+    """환경변수(LOCALAPPDATA/HOME) 패치가 적용된 상태에서 config_manager를 reload한다.
 
-    class _DummyLogger:
-        def debug(self, *args, **kwargs):
-            pass
+    실제 패키지(import src.core.config_manager)를 사용하므로 이 테스트 파일을
+    단독으로 실행해도 config_manager 내부의 `from src.core.constants import ...`
+    같은 서브모듈 임포트가 정상 동작한다. (예전에는 importlib.util로 가짜
+    src/src.core 패키지를 sys.modules에 주입해 격리 로드했는데, 가짜 패키지에는
+    __path__가 없어 단독 실행 시 constants 서브모듈을 찾지 못하고 실패했다 —
+    전체 스위트에서 다른 테스트가 src.core.constants를 먼저 정상 import해
+    캐시해둔 경우에만 우연히 통과했다.)
 
-        def info(self, *args, **kwargs):
-            pass
-
-        def warning(self, *args, **kwargs):
-            pass
-
-        def error(self, *args, **kwargs):
-            pass
-
-    logger_mod.get_logger = lambda _name: _DummyLogger()
-
-    module_overrides = {
-        'src': src_pkg,
-        'src.core': core_pkg,
-        'src.core.logger': logger_mod,
-    }
-
-    original_modules = {
-        name: sys.modules.get(name)
-        for name in module_overrides
-    }
-
-    module_name = 'config_manager_under_test'
-    module_path = Path(__file__).resolve().parents[1] / 'src' / 'core' / 'config_manager.py'
-    try:
-        sys.modules.update(module_overrides)
-
-        spec = importlib.util.spec_from_file_location(module_name, module_path)
-        module = importlib.util.module_from_spec(spec)
-        assert spec and spec.loader
-        spec.loader.exec_module(module)
-        return module
-    finally:
-        for name, original in original_modules.items():
-            if original is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = original
+    reload는 APP_DIR/CONFIG_FILE/KEY_FILE/BACKUP_DIR 같은 모듈 레벨 경로 상수와
+    _CONFIG_LOCK을 현재 patch.dict(os.environ, ...)가 적용된 상태 기준으로 다시
+    계산해, 테스트마다 격리된 임시 디렉토리를 사용하게 한다.
+    """
+    return importlib.reload(_config_manager_module)
 
 
 class TestCredentialEncryptor:
