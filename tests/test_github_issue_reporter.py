@@ -581,6 +581,111 @@ class TestReportError:
 
 
 # ============================================================
+# 401/403 인증 실패 후 헤더 refresh + 1회 재시도 (report_error)
+#
+# find_similar_issue/create_issue/add_comment는 RequestException을 내부에서
+# 잡아 반환값으로 바꾸므로, report_error의 except RequestException 경로는
+# 도달하지 않는다. 대신 각 메서드가 기록하는 self._last_error_status(반환된
+# status)로 auth 실패를 감지해 재시도해야 한다.
+# ============================================================
+
+class TestReportErrorAuthRetry:
+
+    def test_retries_after_auth_failure_via_returned_status(self, reporter_with_app):
+        import requests as real_requests
+
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = []  # 유사 이슈 없음
+
+        error_response = MagicMock()
+        error_response.status_code = 401
+        auth_error = real_requests.HTTPError(response=error_response)
+
+        success_response = MagicMock()
+        success_response.json.return_value = {
+            'number': 5,
+            'html_url': 'https://github.com/owner/repo/issues/5'
+        }
+
+        with patch('src.core.github_issue_reporter.HAS_REQUESTS', True), \
+             patch('src.core.github_issue_reporter.requests') as mock_requests:
+            mock_requests.RequestException = real_requests.RequestException
+            mock_requests.get.return_value = mock_get_response
+            mock_requests.post.side_effect = [auth_error, success_response]
+
+            ok, msg = reporter_with_app.report_error("export", "ERROR 1045: Access denied")
+
+        assert ok is True
+        assert '#5' in msg
+        assert mock_requests.post.call_count == 2
+        reporter_with_app._github_app.get_installation_token.assert_called_with(force_refresh=True)
+
+    def test_no_retry_without_github_app(self, reporter):
+        import requests as real_requests
+
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = []
+
+        error_response = MagicMock()
+        error_response.status_code = 401
+        auth_error = real_requests.HTTPError(response=error_response)
+
+        with patch('src.core.github_issue_reporter.HAS_REQUESTS', True), \
+             patch('src.core.github_issue_reporter.requests') as mock_requests:
+            mock_requests.RequestException = real_requests.RequestException
+            mock_requests.get.return_value = mock_get_response
+            mock_requests.post.side_effect = auth_error
+
+            ok, msg = reporter.report_error("export", "some error")
+
+        assert ok is False
+        assert mock_requests.post.call_count == 1
+
+    def test_no_retry_on_non_auth_failure(self, reporter_with_app):
+        import requests as real_requests
+
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = []
+
+        error_response = MagicMock()
+        error_response.status_code = 500
+        server_error = real_requests.HTTPError(response=error_response)
+
+        with patch('src.core.github_issue_reporter.HAS_REQUESTS', True), \
+             patch('src.core.github_issue_reporter.requests') as mock_requests:
+            mock_requests.RequestException = real_requests.RequestException
+            mock_requests.get.return_value = mock_get_response
+            mock_requests.post.side_effect = server_error
+
+            ok, msg = reporter_with_app.report_error("export", "some error")
+
+        assert ok is False
+        assert mock_requests.post.call_count == 1
+
+    def test_retry_failure_after_refresh_reports_message(self, reporter_with_app):
+        import requests as real_requests
+
+        mock_get_response = MagicMock()
+        mock_get_response.json.return_value = []
+
+        error_response = MagicMock()
+        error_response.status_code = 401
+        auth_error = real_requests.HTTPError(response=error_response)
+
+        with patch('src.core.github_issue_reporter.HAS_REQUESTS', True), \
+             patch('src.core.github_issue_reporter.requests') as mock_requests:
+            mock_requests.RequestException = real_requests.RequestException
+            mock_requests.get.return_value = mock_get_response
+            # 재시도 후에도 계속 401
+            mock_requests.post.side_effect = [auth_error, auth_error]
+
+            ok, msg = reporter_with_app.report_error("export", "some error")
+
+        assert ok is False
+        assert mock_requests.post.call_count == 2
+
+
+# ============================================================
 # from_github_app
 # ============================================================
 
