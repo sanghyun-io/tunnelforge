@@ -620,6 +620,7 @@ def test_small_content_reenables_editor_features_after_large_file(tmp_path):
 # =====================================================================
 def test_autocommit_worker_uses_classifier_and_streaming_columns_for_empty_select(monkeypatch):
     from src.ui.dialogs import sql_editor_dialog as module
+    from src.ui.dialogs import sql_editor_workers as workers_module
 
     connection = FakeConnection()
     connection.connection_id = "conn-1"
@@ -632,7 +633,7 @@ def test_autocommit_worker_uses_classifier_and_streaming_columns_for_empty_selec
     connector.connect.return_value = (True, "ok")
     connector.connection = connection
 
-    monkeypatch.setattr(module, "create_sql_editor_connector", lambda *a, **k: connector)
+    monkeypatch.setattr(workers_module, "create_sql_editor_connector", lambda *a, **k: connector)
 
     worker = module.SQLQueryWorker(
         "127.0.0.1", 3306, "user", "pass", "db",
