@@ -61,6 +61,22 @@ def test_parse_issue_event():
     assert event.issue.location == "direction"
 
 
+def test_parse_issue_event_preserves_stable_issue_type_in_raw_payload():
+    event = parse_helper_event(json.dumps({
+        "event": "issue",
+        "issue": {
+            "issue_type": "target_not_empty",
+            "severity": "error",
+            "location": "target.public",
+            "message": "대상 스키마에 12개 테이블이 있습니다",
+            "blocking": True,
+        },
+    }))
+    assert event.payload["issue"]["issue_type"] == "target_not_empty"
+    assert event.issue is not None
+    assert event.issue.blocking is True
+
+
 def test_parse_result_event_keeps_payload():
     event = parse_helper_event('{"event":"result","success":true,"plan":{"ddl":[]}}')
     assert event.event == "result"
