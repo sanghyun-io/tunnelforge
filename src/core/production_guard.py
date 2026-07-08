@@ -328,12 +328,17 @@ class ProductionGuard:
 
         elif environment == Environment.STAGING:
             # Staging: Yes/No 확인 (기본값 No)
+            message = (
+                f"<b>{operation}</b> 작업을 실행하시겠습니까?<br><br>"
+                f"스키마: <b>{schema_name}</b><br><br>"
+            )
+            if details:
+                message += details
+
             reply = QMessageBox.warning(
                 self.parent,
                 f"🟠 STAGING 환경 - {operation}",
-                f"<b>{operation}</b> 작업을 실행하시겠습니까?<br><br>"
-                f"스키마: <b>{schema_name}</b><br><br>"
-                f"{details}" if details else "",
+                message,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No  # 기본값: No
             )
