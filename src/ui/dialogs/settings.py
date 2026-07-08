@@ -25,120 +25,18 @@ from src.core.platform_integration import (
 )
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
+from src.ui.dialogs.settings_close_confirm_dialog import CloseConfirmDialog
+from src.ui.dialogs.settings_update_helpers import (
+    UpdatePackageActionText,
+    update_package_action_text,
+    UpdateCheckerThread,
+)
 
 
-@dataclass(frozen=True)
-class UpdatePackageActionText:
-    button: str
-    done_message: str
-    confirm_title: str
-    confirm_question: str
-    confirm_body: str
 
 
-def update_package_action_text(strategy: Optional[str] = None) -> UpdatePackageActionText:
-    launch_strategy = strategy or update_package_launch_strategy()
-    if launch_strategy == "open":
-        return UpdatePackageActionText(
-            button="📂 패키지 열기",
-            done_message="✅ 다운로드 완료! '패키지 열기' 버튼을 클릭하세요.",
-            confirm_title="패키지 열기 확인",
-            confirm_question="다운로드한 TunnelForge 패키지를 여시겠습니까?",
-            confirm_body="다운로드한 패키지를 열면 현재 앱이 종료됩니다.",
-        )
-
-    return UpdatePackageActionText(
-        button="🚀 설치 시작",
-        done_message="✅ 다운로드 완료! '설치 시작' 버튼을 클릭하세요.",
-        confirm_title="설치 확인",
-        confirm_question="TunnelForge 설치를 시작하시겠습니까?",
-        confirm_body="설치를 위해 현재 앱이 종료됩니다.",
-    )
 
 
-class CloseConfirmDialog(QDialog):
-    """종료 시 선택 다이얼로그"""
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("프로그램 종료")
-        self.setFixedSize(350, 180)
-        self.init_ui()
-
-    def init_ui(self):
-        layout = QVBoxLayout(self)
-
-        # 안내 메시지
-        label = QLabel("프로그램을 어떻게 처리하시겠습니까?")
-        label.setStyleSheet("font-size: 13px; margin-bottom: 10px;")
-        layout.addWidget(label)
-
-        # 라디오 버튼 그룹
-        self.btn_group = QButtonGroup(self)
-
-        self.radio_minimize = QRadioButton("시스템 트레이로 최소화 (백그라운드 실행)")
-        self.radio_minimize.setChecked(True)
-        self.btn_group.addButton(self.radio_minimize)
-        layout.addWidget(self.radio_minimize)
-
-        self.radio_exit = QRadioButton("프로그램 완전 종료")
-        self.btn_group.addButton(self.radio_exit)
-        layout.addWidget(self.radio_exit)
-
-        # 기억 체크박스
-        self.chk_remember = QCheckBox("이 선택을 기억하고 다시 묻지 않기")
-        self.chk_remember.setStyleSheet("margin-top: 10px;")
-        layout.addWidget(self.chk_remember)
-
-        # 버튼
-        button_layout = QHBoxLayout()
-        btn_ok = QPushButton("확인")
-        btn_ok.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
-        btn_ok.clicked.connect(self.accept)
-
-        btn_cancel = QPushButton("취소")
-        btn_cancel.setStyleSheet("""
-            QPushButton {
-                background-color: #ecf0f1; color: #2c3e50;
-                padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
-            }
-            QPushButton:hover { background-color: #d5dbdb; }
-        """)
-        btn_cancel.clicked.connect(self.reject)
-
-        button_layout.addStretch()
-        button_layout.addWidget(btn_ok)
-        button_layout.addWidget(btn_cancel)
-        layout.addLayout(button_layout)
-
-    def get_result(self):
-        """선택된 동작과 기억 여부 반환"""
-        action = 'minimize' if self.radio_minimize.isChecked() else 'exit'
-        remember = self.chk_remember.isChecked()
-        return action, remember
-
-
-class UpdateCheckerThread(QThread):
-    """업데이트 확인 백그라운드 스레드"""
-    update_checked = pyqtSignal(bool, str, str, str)  # needs_update, latest_version, download_url, error_msg
-
-    def __init__(self, config_manager=None):
-        super().__init__()
-        self._config_manager = config_manager
-
-    def run(self):
-        try:
-            from src.core.update_checker import UpdateChecker
-            checker = UpdateChecker(config_manager=self._config_manager)
-            needs_update, latest_version, download_url, error_msg = checker.check_update()
-            self.update_checked.emit(needs_update, latest_version or "", download_url or "", error_msg or "")
-        except Exception as e:
-            self.update_checked.emit(False, "", "", f"업데이트 확인 실패: {str(e)}")
 
 
 class SettingsDialog(QDialog):
