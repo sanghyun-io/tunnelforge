@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QWidget, QAbstractItemView,
     QSplitter, QScrollArea
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from typing import List, Optional
 from datetime import datetime
 import json
@@ -26,6 +26,48 @@ from src.exporters.rust_dump_exporter import (
 )
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
+
+_REDACTED_KEYS = {"password", "credentials"}
+_REDACTED_PLACEHOLDER = "***REDACTED***"
+
+
+def _sanitized_rust_event(event: dict) -> dict:
+    """민감 키(password/credentials)를 재귀적으로 마스킹한 이벤트 복사본을 반환."""
+
+    def _sanitize_value(value):
+        if isinstance(value, dict):
+            return {
+                key: (_REDACTED_PLACEHOLDER if key.lower() in _REDACTED_KEYS else _sanitize_value(val))
+                for key, val in value.items()
+            }
+        if isinstance(value, list):
+            return [_sanitize_value(item) for item in value]
+        return value
+
+    return _sanitize_value(dict(event))
+
+
+def _sanitize_plain_rust_line(line: str) -> str:
+    """JSON으로 파싱되지 않는 원시 출력 라인에서 자격 증명으로 보이는 조각을 마스킹."""
+    import re
+
+    sanitized = line
+    sanitized = re.sub(
+        r'(?i)("?password"?\s*[:=]\s*)"[^"]*"',
+        lambda m: f'{m.group(1)}"{_REDACTED_PLACEHOLDER}"',
+        sanitized,
+    )
+    sanitized = re.sub(
+        r"(?i)(password\s*=\s*)\S+",
+        lambda m: f"{m.group(1)}{_REDACTED_PLACEHOLDER}",
+        sanitized,
+    )
+    sanitized = re.sub(
+        r'(?i)("?credentials"?\s*[:=]\s*)\{[^}]*\}',
+        lambda m: f'{m.group(1)}{{"{_REDACTED_PLACEHOLDER}": true}}',
+        sanitized,
+    )
+    return sanitized
 
 logger = get_logger("db_dialogs")
 
@@ -641,6 +683,11 @@ class RustDumpExportDialog(QDialog):
         self.connection_info = connection_info  # 터널명 또는 host_port
         self.worker: Optional[RustDumpWorker] = None
 
+        # GitHub 이슈 보고 워커 목록 (완료 전까지 참조 유지)
+        self._github_workers: List[object] = []
+        self._cancel_requested = False
+        self._close_after_cancel = False
+
         # 로그 수집용 변수
         self.log_entries: List[str] = []
         self.export_start_time: Optional[datetime] = None
@@ -1167,6 +1214,17 @@ class RustDumpExportDialog(QDialog):
         """기본 출력 디렉토리 (초기값)"""
         return self._generate_output_dir("")
 
+    def _unique_output_dir(self, path: str) -> str:
+        """이미 존재하는 폴더면 `_2`, `_3`, ... 을 붙여 충돌하지 않는 경로를 반환."""
+        if not path or not os.path.exists(path):
+            return path
+        counter = 2
+        while True:
+            candidate = f"{path}_{counter}"
+            if not os.path.exists(candidate):
+                return candidate
+            counter += 1
+
     def _load_naming_settings(self):
         """폴더 네이밍 설정 로드"""
         if not self.config_manager:
@@ -1322,14 +1380,9 @@ class RustDumpExportDialog(QDialog):
 
     def do_export(self):
         schema = self.combo_schema.currentText()
-        output_dir = self.input_output_dir.text()
 
         if not schema:
             QMessageBox.warning(self, "오류", "스키마를 선택하세요.")
-            return
-
-        if not output_dir:
-            QMessageBox.warning(self, "오류", "출력 폴더를 선택하세요.")
             return
 
         # 일부 테이블 Export 시 테이블 확인
@@ -1338,6 +1391,22 @@ class RustDumpExportDialog(QDialog):
             if not tables:
                 QMessageBox.warning(self, "오류", "최소 하나의 테이블을 선택하세요.")
                 return
+
+        # 실행 시점 기준으로 출력 폴더를 재생성한다.
+        # 미리보기(_update_output_dir_preview)는 스키마 변경 시 등 이전 시점에
+        # 생성된 값이라 타임스탬프가 오래됐을 수 있어, 같은 세션에서 연속 Export
+        # 시 동일 폴더를 재사용하는 문제가 있었다.
+        output_dir = self.input_output_dir.text()
+        is_auto_mode = not self.radio_manual_naming.isChecked()
+        if is_auto_mode and self.chk_timestamp.isChecked():
+            output_dir = self._generate_output_dir(schema)
+        output_dir = self._unique_output_dir(output_dir)
+
+        if not output_dir:
+            QMessageBox.warning(self, "오류", "출력 폴더를 선택하세요.")
+            return
+
+        self.input_output_dir.setText(output_dir)
 
         # 설정 저장
         if self.config_manager:
@@ -1363,6 +1432,8 @@ class RustDumpExportDialog(QDialog):
         self.export_table_started_at = {}
         self.export_table_finished_at = {}
         self.btn_save_log.setEnabled(False)
+        self._cancel_requested = False
+        self._close_after_cancel = False
 
         # 로그 헤더 추가
         self._add_log(f"{'='*60}")
@@ -1519,17 +1590,24 @@ class RustDumpExportDialog(QDialog):
             self.label_data.setText("📦 데이터: Export 실패")
             self.label_estimated_rows.setText("📐 예상 전체: -")
             self.label_speed.setText("⚡ 속도: -")
-            self.label_status.setText("❌ Export 실패")
+            self.label_status.setText("⏹ Export 취소됨" if self._cancel_requested else "❌ Export 실패")
             # 테이블 완료 수 계산
             done_count = sum(1 for item in self.table_items.values()
                            if item.text().startswith("✅"))
             total_count = len(self.table_items)
             if total_count > 0:
                 self.label_tables.setText(f"📋 테이블: {done_count} / {total_count} 완료")
-            QMessageBox.warning(self, "Export 실패", f"❌ {message}")
 
-            # GitHub 이슈 자동 보고
-            self._report_error_to_github("export", message)
+            if self._cancel_requested:
+                self._add_log("Export가 취소되었습니다.")
+            else:
+                QMessageBox.warning(self, "Export 실패", f"❌ {message}")
+
+                # GitHub 이슈 자동 보고
+                self._report_error_to_github("export", message)
+
+        if self._close_after_cancel:
+            QTimer.singleShot(0, self.close)
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
@@ -1687,18 +1765,25 @@ class RustDumpExportDialog(QDialog):
         }
 
         from src.ui.workers.github_worker import GitHubReportWorker
-        self._github_worker = GitHubReportWorker(
+        worker = GitHubReportWorker(
             self.config_manager, error_type, error_message, context
         )
-        self._github_worker.finished.connect(self._on_github_report_finished)
-        self._github_worker.start()
+        self._github_workers.append(worker)
+        worker.finished.connect(
+            lambda success, message, worker=worker: self._on_github_report_finished(success, message, worker)
+        )
+        worker.start()
 
-    def _on_github_report_finished(self, success: bool, message: str):
+    def _on_github_report_finished(self, success: bool, message: str, worker=None):
         """GitHub 이슈 보고 완료 콜백"""
         if success:
             self._add_log(f"🐙 GitHub: {message}")
         else:
             self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
+        if worker is not None and worker in self._github_workers:
+            self._github_workers.remove(worker)
+        if worker is not None:
+            worker.deleteLater()
 
     def _export_table_duration_seconds(self, table_name: str) -> float:
         start = self.export_table_started_at.get(table_name)
@@ -1855,15 +1940,24 @@ class RustDumpExportDialog(QDialog):
 
     def closeEvent(self, event):
         if self.worker and self.worker.isRunning():
-            self._add_log("닫기 차단: Export가 실행 중입니다. 로그 저장은 계속 사용할 수 있습니다.")
             self.btn_save_log.setEnabled(True)
-            QMessageBox.warning(
+            reply = QMessageBox.question(
                 self,
                 translate_text("Export 실행 중"),
                 translate_text(
-                    "Export가 실행 중입니다.\n로그 저장은 가능하지만, 진행 중에는 창을 닫을 수 없습니다."
-                )
+                    "Export가 실행 중입니다.\n"
+                    "취소하면 전용 Rust DB Core 프로세스를 종료합니다. "
+                    "생성 중인 dump 폴더는 불완전할 수 있습니다.\n\n"
+                    "취소하시겠습니까?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._cancel_requested = True
+                self._close_after_cancel = True
+                self._add_log("Export 취소 요청: 전용 Rust DB Core 프로세스 종료를 요청했습니다.")
+                self.worker.cancel()
+                self.label_status.setText(translate_text("⏹ Export 취소 요청 중..."))
             event.ignore()
             return
         if self.connector:
@@ -1884,6 +1978,11 @@ class RustDumpImportDialog(QDialog):
         self.config_manager = config_manager
         self.tunnel_config = tunnel_config  # Production 환경 보호용
         self.worker: Optional[RustDumpWorker] = None
+
+        # GitHub 이슈 보고 워커 목록 (완료 전까지 참조 유지)
+        self._github_workers: List[object] = []
+        self._cancel_requested = False
+        self._close_after_cancel = False
 
         self.rust_dump_installed, self.rust_dump_msg = check_rust_dump()
 
@@ -1964,6 +2063,7 @@ class RustDumpImportDialog(QDialog):
 
         self.input_dir = QLineEdit()
         self.input_dir.setPlaceholderText("rust_dump dump 폴더 선택...")
+        self.input_dir.editingFinished.connect(self._run_upgrade_check_for_current_input_dir)
 
         btn_browse = QPushButton("선택")
         btn_browse.setStyleSheet("""
@@ -2284,7 +2384,7 @@ class RustDumpImportDialog(QDialog):
             }
             QPushButton:hover { background-color: #d35400; }
         """)
-        self.btn_import.clicked.connect(self.do_import)
+        self.btn_import.clicked.connect(lambda: self.do_import())
         self.btn_import.setEnabled(self.rust_dump_installed)
 
         self.btn_save_log = QPushButton("📄 로그 저장")
@@ -2404,7 +2504,19 @@ class RustDumpImportDialog(QDialog):
         for path in self._configured_dump_dirs():
             if self._is_valid_dump_dir(path):
                 self.input_dir.setText(path)
+                self._run_upgrade_check(path)
                 return
+
+    def _run_upgrade_check_for_current_input_dir(self):
+        """input_dir 텍스트가 직접 수정된 경우(자동완성/붙여넣기 포함) 호환성 검사를 갱신."""
+        path = self.input_dir.text().strip()
+        if self._is_valid_dump_dir(path):
+            self._run_upgrade_check(path)
+        else:
+            self._upgrade_issues = []
+            self.btn_view_issues.setVisible(False)
+            self.lbl_upgrade_status.setText("📋 Dump 폴더를 선택하면 자동 검사됩니다.")
+            self.lbl_upgrade_status.setStyleSheet("color: #7f8c8d;")
 
     def _get_input_browse_start_dir(self) -> str:
         """Dump 선택창 시작 위치. 빈 값이면 Windows가 설치 폴더를 잡으므로 항상 명시한다."""
@@ -2431,7 +2543,6 @@ class RustDumpImportDialog(QDialog):
         self.lbl_upgrade_status.setText("🔍 호환성 검사 중...")
         self.lbl_upgrade_status.setStyleSheet("color: #3498db;")
         self.btn_view_issues.setVisible(False)
-        QApplication.processEvents()
 
         try:
             analyzer = DumpFileAnalyzer()
@@ -2525,7 +2636,6 @@ class RustDumpImportDialog(QDialog):
         self.radio_merge.setEnabled(enabled)
         self.radio_replace.setEnabled(enabled)
         self.radio_recreate.setEnabled(enabled)
-        self.radio_recreate.setEnabled(enabled)
         self.radio_tz_auto.setEnabled(enabled)
         self.radio_tz_kst.setEnabled(enabled)
         self.radio_tz_utc.setEnabled(enabled)
@@ -2549,10 +2659,12 @@ class RustDumpImportDialog(QDialog):
             return False
 
     def _add_log(self, msg: str):
-        """로그 항목 추가 (수집용)"""
+        """로그 항목 추가 (수집용, 최대 500개 유지)"""
         timestamp = datetime.now().strftime('%H:%M:%S')
         log_entry = f"[{timestamp}] {msg}"
         self.log_entries.append(log_entry)
+        if len(self.log_entries) > 500:
+            del self.log_entries[:-500]
 
     def _get_dump_schema_name(self, dump_dir: str) -> str:
         """덤프 디렉토리의 @.done.json에서 원본 스키마명 읽기"""
@@ -2579,6 +2691,8 @@ class RustDumpImportDialog(QDialog):
 
     def do_import(self, retry_tables: list = None):
         """Import 실행 (retry_tables가 주어지면 해당 테이블만 재시도)"""
+        self._cancel_requested = False
+        self._close_after_cancel = False
         input_dir = self.input_dir.text()
 
         if not input_dir:
@@ -2641,6 +2755,11 @@ class RustDumpImportDialog(QDialog):
             self.table_list.clear()
             self.table_items.clear()
             self.import_results.clear()
+            # 이전 실행의 잔여 진행 상태 초기화 (누적 방지)
+            self.import_table_rows_done.clear()
+            self.import_table_rows_total.clear()
+            self.table_chunk_progress.clear()
+            self.dump_metadata = None
             # 로그 수집 초기화
             self.log_entries.clear()
             self.import_start_time = datetime.now()
@@ -2937,7 +3056,11 @@ class RustDumpImportDialog(QDialog):
             item.setText(display_text)
 
     def on_raw_output(self, line: str):
-        """Rust Core 실시간 출력 처리."""
+        """Rust Core 실시간 출력 처리.
+
+        원시 JSONL 라인은 자격 증명을 포함할 수 있으므로 화면/로그에 그대로
+        남기지 않는다. 표시/저장은 정제된 요약(visible_summary)만 사용한다.
+        """
         # 너무 많은 로그 방지 (최대 500줄)
         if self.txt_log.count() > 500:
             self.txt_log.takeItem(0)
@@ -2946,16 +3069,15 @@ class RustDumpImportDialog(QDialog):
         try:
             event = json.loads(line)
             if isinstance(event, dict):
-                visible_summary = format_import_visible_telemetry(event)
+                sanitized_event = _sanitized_rust_event(event)
+                visible_summary = format_import_visible_telemetry(sanitized_event)
         except json.JSONDecodeError:
-            visible_summary = line
+            visible_summary = _sanitize_plain_rust_line(line)
 
         if visible_summary:
             self.txt_log.addItem(visible_summary)
             self.txt_log.scrollToBottom()
             self._add_log(visible_summary)
-
-        self._add_log(f"[rust_dump] {line}")
 
     def on_metadata_analyzed(self, metadata: dict):
         """
@@ -3068,22 +3190,32 @@ class RustDumpImportDialog(QDialog):
             self.txt_log.addItem(f"✅ 완료: {message}")
             QMessageBox.information(self, "Import 완료", f"✅ Import가 완료되었습니다.\n\n성공: {done_count}개 테이블")
         else:
-            self.label_status.setText(f"❌ Import 실패: {error_count}/{total_count} 테이블 오류")
+            self.label_status.setText(
+                f"⏹ Import 취소됨: {done_count}/{total_count} 테이블 완료"
+                if self._cancel_requested
+                else f"❌ Import 실패: {error_count}/{total_count} 테이블 오류"
+            )
             self.txt_log.addItem(f"❌ 실패: {message}")
 
-            if error_count > 0:
-                QMessageBox.warning(
-                    self, "Import 실패",
-                    f"❌ Import 중 오류가 발생했습니다.\n\n"
-                    f"성공: {done_count}개 테이블\n"
-                    f"실패: {error_count}개 테이블\n\n"
-                    f"실패한 테이블을 선택하여 재시도할 수 있습니다."
-                )
+            if self._cancel_requested:
+                self._add_log("Import가 취소되었습니다.")
             else:
-                QMessageBox.warning(self, "Import 실패", f"❌ {message}")
+                if error_count > 0:
+                    QMessageBox.warning(
+                        self, "Import 실패",
+                        f"❌ Import 중 오류가 발생했습니다.\n\n"
+                        f"성공: {done_count}개 테이블\n"
+                        f"실패: {error_count}개 테이블\n\n"
+                        f"실패한 테이블을 선택하여 재시도할 수 있습니다."
+                    )
+                else:
+                    QMessageBox.warning(self, "Import 실패", f"❌ {message}")
 
-            # GitHub 이슈 자동 보고
-            self._report_error_to_github("import", message, error_count)
+                # GitHub 이슈 자동 보고
+                self._report_error_to_github("import", message, error_count)
+
+        if self._close_after_cancel:
+            QTimer.singleShot(0, self.close)
 
     def _report_error_to_github(self, error_type: str, error_message: str, error_count: int = 0):
         """GitHub 이슈 자동 보고 (백그라운드)"""
@@ -3108,27 +3240,25 @@ class RustDumpImportDialog(QDialog):
             combined_error += "\n\n실패한 테이블 오류:\n" + "\n".join(failed_messages[:3])
 
         from src.ui.workers.github_worker import GitHubReportWorker
-        self._github_worker = GitHubReportWorker(
+        worker = GitHubReportWorker(
             self.config_manager, error_type, combined_error, context
         )
-        self._github_worker.finished.connect(self._on_github_report_finished)
-        self._github_worker.start()
+        self._github_workers.append(worker)
+        worker.finished.connect(
+            lambda success, message, worker=worker: self._on_github_report_finished(success, message, worker)
+        )
+        worker.start()
 
-    def _on_github_report_finished(self, success: bool, message: str):
+    def _on_github_report_finished(self, success: bool, message: str, worker=None):
         """GitHub 이슈 보고 완료 콜백"""
         if success:
             self._add_log(f"🐙 GitHub: {message}")
         else:
             self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
-
-    def _get_import_mode_text(self) -> str:
-        """Import 모드 텍스트 반환"""
-        if self.radio_merge.isChecked():
-            return "merge (기존 데이터 유지)"
-        elif self.radio_replace.isChecked():
-            return "replace (기존 테이블 삭제)"
-        else:
-            return "recreate (스키마 재생성)"
+        if worker is not None and worker in self._github_workers:
+            self._github_workers.remove(worker)
+        if worker is not None:
+            worker.deleteLater()
 
     def select_failed_tables(self):
         """실패한 테이블 모두 선택"""
@@ -3173,7 +3303,10 @@ class RustDumpImportDialog(QDialog):
 
         # 기본 파일명 생성
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        status = "success" if self.import_success else "failed"
+        if self.import_success is None:
+            status = "running"
+        else:
+            status = "success" if self.import_success else "failed"
 
         # 스키마 이름 추출 (폴더명에서)
         schema_name = "unknown"
@@ -3212,7 +3345,11 @@ class RustDumpImportDialog(QDialog):
 
                 f.write(f"Dump 폴더: {self.last_input_dir}\n")
                 f.write(f"대상 스키마: {self.last_target_schema if self.last_target_schema else '원본 스키마명 사용'}\n")
-                f.write(f"결과: {'성공 ✅' if self.import_success else '실패 ❌'}\n")
+                if self.import_success is None:
+                    result_label = "진행 중"
+                else:
+                    result_label = "성공 ✅" if self.import_success else "실패 ❌"
+                f.write(f"결과: {result_label}\n")
                 f.write(f"테이블 통계: 성공 {done_count}개, 실패 {error_count}개, 총 {total_count}개\n")
 
                 if self.import_start_time:
@@ -3250,6 +3387,27 @@ class RustDumpImportDialog(QDialog):
             )
 
     def closeEvent(self, event):
+        if self.worker and self.worker.isRunning():
+            self.btn_save_log.setEnabled(True)
+            reply = QMessageBox.question(
+                self,
+                translate_text("Import 실행 중"),
+                translate_text(
+                    "Import가 실행 중입니다.\n"
+                    "취소하면 전용 Rust DB Core 프로세스를 종료합니다.\n"
+                    "대상 스키마에 일부 데이터가 반영되었을 수 있습니다.\n\n"
+                    "취소하시겠습니까?"
+                ),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self._cancel_requested = True
+                self._close_after_cancel = True
+                self._add_log("Import 취소 요청: 전용 Rust DB Core 프로세스 종료를 요청했습니다.")
+                self.worker.cancel()
+                self.label_status.setText(translate_text("⏹ Import 취소 요청 중..."))
+            event.ignore()
+            return
         if self.connector:
             self.connector.disconnect()
         event.accept()
@@ -3422,9 +3580,98 @@ class RustDumpWizard:
             connector=connector,
             config_manager=self.config_manager
         )
-        orphan_dialog.exec()
+        try:
+            orphan_dialog.exec()
+        finally:
+            if connector:
+                connector.disconnect()
 
         return True
+
+
+def _build_orphan_queries_sql(schema: str, orphan_results: List[OrphanRecordInfo]) -> str:
+    """이미 수집된 고아 레코드 결과로부터 조회 쿼리 모음을 생성 (DB 재조회 없음)."""
+    lines = [
+        f"-- 고아 레코드 조회 쿼리 (스키마: {schema})",
+        f"-- 생성일시: {datetime.now().isoformat()}",
+        f"-- 발견된 고아 관계: {len(orphan_results)}건",
+        "",
+    ]
+    for index, item in enumerate(orphan_results, 1):
+        lines.append(
+            f"-- [{index}] {item.table}.{item.column} -> "
+            f"{item.referenced_table}.{item.referenced_column} "
+            f"({item.orphan_count:,}건)"
+        )
+        lines.append(item.query.rstrip() + ";")
+        lines.append("")
+    return "\n".join(lines)
+
+
+class OrphanAnalysisWorker(QThread):
+    """스키마의 고아 레코드를 분석하는 백그라운드 워커 (GUI 스레드 블로킹 방지)."""
+    progress = pyqtSignal(str)
+    analysis_finished = pyqtSignal(list)
+    failed = pyqtSignal(str)
+
+    def __init__(self, connector, schema: str):
+        super().__init__()
+        self.connector = connector
+        self.schema = schema
+
+    def run(self):
+        try:
+            resolver = ForeignKeyResolver(self.connector)
+            results = resolver.find_orphan_records(
+                self.schema,
+                progress_callback=lambda msg: self.progress.emit(msg),
+            )
+            self.analysis_finished.emit(results)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
+class OrphanReportWorker(QThread):
+    """이미 수집된 고아 레코드 결과로 보고서 파일을 작성하는 백그라운드 워커 (DB 재조회 없음)."""
+    progress = pyqtSignal(str)
+    report_finished = pyqtSignal(bool, str, int)
+
+    def __init__(self, schema: str, output_path: str, orphan_results: List[OrphanRecordInfo]):
+        super().__init__()
+        self.schema = schema
+        self.output_path = output_path
+        self.orphan_results = orphan_results
+
+    def run(self):
+        try:
+            orphans = self.orphan_results
+            with open(self.output_path, "w", encoding="utf-8") as file:
+                file.write("# 고아 레코드 분석 보고서\n")
+                file.write(f"# 스키마: {self.schema}\n")
+                file.write(f"# 생성일시: {datetime.now().isoformat()}\n")
+                file.write(f"# 발견된 고아 관계: {len(orphans)}건\n")
+                file.write("=" * 80 + "\n\n")
+                if not orphans:
+                    file.write("고아 레코드가 발견되지 않았습니다.\n")
+                else:
+                    total_orphans = sum(item.orphan_count for item in orphans)
+                    file.write(f"총 {total_orphans:,}개의 고아 레코드 발견\n\n")
+                    for index, item in enumerate(orphans, 1):
+                        file.write(
+                            f"## [{index}] {item.table}.{item.column} -> "
+                            f"{item.referenced_table}.{item.referenced_column}\n"
+                        )
+                        file.write(f"   고아 레코드 수: {item.orphan_count:,}건\n")
+                        file.write(f"   샘플 값: {', '.join(item.sample_values)}\n")
+                        file.write("\n   조회 쿼리:\n")
+                        file.write("   ```sql\n")
+                        for line in item.query.split("\n"):
+                            file.write(f"   {line}\n")
+                        file.write("   ```\n\n")
+                        file.write("-" * 80 + "\n\n")
+            self.report_finished.emit(True, f"보고서 저장 완료: {self.output_path}", len(orphans))
+        except Exception as exc:
+            self.report_finished.emit(False, f"보고서 저장 실패: {exc}", 0)
 
 
 class OrphanRecordDialog(QDialog):
@@ -3435,6 +3682,7 @@ class OrphanRecordDialog(QDialog):
         self.connector = connector
         self.config_manager = config_manager
         self.resolver: Optional[ForeignKeyResolver] = None
+        self.worker: Optional[QThread] = None
         self.orphan_results: List[OrphanRecordInfo] = []
 
         self.setWindowTitle("🔍 고아 레코드 분석")
@@ -3548,10 +3796,13 @@ class OrphanRecordDialog(QDialog):
             QMessageBox.warning(self, "경고", f"스키마 목록 로드 실패:\n{str(e)}")
 
     def start_analysis(self):
-        """고아 레코드 분석 시작"""
+        """고아 레코드 분석 시작 (백그라운드 워커, GUI 스레드 블로킹 없음)"""
         schema = self.schema_combo.currentText()
         if not schema:
             QMessageBox.warning(self, "경고", "스키마를 선택해주세요.")
+            return
+
+        if self.worker is not None and self.worker.isRunning():
             return
 
         self.result_list.clear()
@@ -3562,33 +3813,37 @@ class OrphanRecordDialog(QDialog):
         self.export_report_btn.setEnabled(False)
 
         self.analyze_btn.setEnabled(False)
+        self.export_all_queries_btn.setEnabled(False)
+        self.export_report_btn.setEnabled(False)
         self.progress_label.setText("분석 중...")
         self.progress_bar.setVisible(True)
         self.progress_bar.setRange(0, 0)  # Indeterminate
 
-        QApplication.processEvents()
+        self.worker = OrphanAnalysisWorker(self.connector, schema)
+        self.worker.progress.connect(self.progress_label.setText)
+        self.worker.analysis_finished.connect(self._on_orphan_analysis_finished)
+        self.worker.failed.connect(self._on_orphan_worker_failed)
+        self.worker.finished.connect(self._clear_orphan_worker)
+        self.worker.start()
 
-        try:
-            self.resolver = ForeignKeyResolver(self.connector)
+    def _on_orphan_analysis_finished(self, results: list):
+        """분석 워커 완료 처리"""
+        self.orphan_results = results
+        self.display_results()
+        self.analyze_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
 
-            def progress_cb(msg):
-                self.progress_label.setText(msg)
-                QApplication.processEvents()
+    def _on_orphan_worker_failed(self, message: str):
+        """분석 워커 실패 처리"""
+        QMessageBox.critical(self, "오류", f"분석 중 오류 발생:\n{message}")
+        self.analyze_btn.setEnabled(True)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("")
 
-            self.orphan_results = self.resolver.find_orphan_records(
-                schema,
-                progress_callback=progress_cb
-            )
-
-            # 결과 표시
-            self.display_results()
-
-        except Exception as e:
-            QMessageBox.critical(self, "오류", f"분석 중 오류 발생:\n{str(e)}")
-        finally:
-            self.analyze_btn.setEnabled(True)
-            self.progress_bar.setVisible(False)
-            self.progress_label.setText("")
+    def _clear_orphan_worker(self):
+        """워커 스레드 참조 정리 (QThread.finished 시그널에 연결)"""
+        self.worker = None
 
     def display_results(self):
         """분석 결과 표시"""
@@ -3657,8 +3912,9 @@ class OrphanRecordDialog(QDialog):
         self.progress_label.setText("✅ 쿼리가 클립보드에 복사되었습니다.")
 
     def export_all_queries(self):
-        """전체 쿼리 내보내기"""
-        if not self.resolver:
+        """전체 쿼리 내보내기 (현재 세션의 orphan_results 기반, DB 재조회 없음)"""
+        if not self.orphan_results:
+            QMessageBox.information(self, "내보내기", translate_text("내보낼 고아 레코드 쿼리가 없습니다."))
             return
 
         schema = self.schema_combo.currentText()
@@ -3678,7 +3934,7 @@ class OrphanRecordDialog(QDialog):
             return
 
         try:
-            all_queries = self.resolver.get_all_orphan_queries(schema)
+            all_queries = _build_orphan_queries_sql(schema, self.orphan_results)
             with open(file_path, 'w', encoding='utf-8') as f:
                 f.write(all_queries)
 
@@ -3693,12 +3949,16 @@ class OrphanRecordDialog(QDialog):
             )
 
     def export_report(self):
-        """보고서 저장"""
-        if not self.resolver:
+        """보고서 저장 (백그라운드 워커, 현재 orphan_results 재사용, DB 재조회 없음)"""
+        if not self.orphan_results:
+            QMessageBox.information(self, "내보내기", translate_text("내보낼 고아 레코드 결과가 없습니다."))
             return
 
         schema = self.schema_combo.currentText()
         if not schema:
+            return
+
+        if self.worker is not None and self.worker.isRunning():
             return
 
         # 파일 저장 다이얼로그
@@ -3713,25 +3973,40 @@ class OrphanRecordDialog(QDialog):
         if not file_path:
             return
 
-        def progress_cb(msg):
-            self.progress_label.setText(msg)
-            QApplication.processEvents()
+        self.analyze_btn.setEnabled(False)
+        self.export_all_queries_btn.setEnabled(False)
+        self.export_report_btn.setEnabled(False)
 
-        success, msg, count = self.resolver.export_orphan_report(
-            schema,
-            file_path,
-            progress_callback=progress_cb
-        )
+        self.worker = OrphanReportWorker(schema, file_path, self.orphan_results)
+        self.worker.report_finished.connect(self._on_orphan_report_finished)
+        self.worker.finished.connect(self._clear_orphan_worker)
+        self.worker.start()
 
+    def _on_orphan_report_finished(self, success: bool, message: str, count: int):
+        """보고서 저장 워커 완료 처리"""
+        self.analyze_btn.setEnabled(True)
+        self.export_all_queries_btn.setEnabled(bool(self.orphan_results))
+        self.export_report_btn.setEnabled(bool(self.orphan_results))
         if success:
             QMessageBox.information(
                 self, "저장 완료",
-                f"✅ 보고서가 저장되었습니다.\n\n{file_path}\n\n발견된 고아 관계: {count}건"
+                f"✅ {message}\n\n발견된 고아 관계: {count}건"
             )
         else:
-            QMessageBox.critical(self, "저장 실패", f"❌ {msg}")
+            QMessageBox.critical(self, "저장 실패", f"❌ {message}")
 
     def closeEvent(self, event):
         """다이얼로그 닫기"""
-        # connector는 외부에서 관리하므로 여기서 닫지 않음
+        if self.worker is not None and self.worker.isRunning():
+            QMessageBox.warning(
+                self,
+                translate_text("분석 실행 중"),
+                translate_text(
+                    "고아 레코드 분석 또는 보고서 저장이 실행 중입니다.\n"
+                    "현재 단계는 안전하게 중단할 수 없습니다. 완료 후 닫아주세요."
+                )
+            )
+            event.ignore()
+            return
+        # connector는 외부에서 관리하므로 여기서 닫지 않음 (RustDumpWizard.start_orphan_check가 처리)
         event.accept()
