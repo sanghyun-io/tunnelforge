@@ -1,4 +1,4 @@
-from src.core.sql_statement_parser import read_dollar_quote
+from src.core.sql_statement_parser import find_sql_statement_at_position, read_dollar_quote
 from src.ui.workers.test_worker import SQLExecutionWorker
 
 
@@ -126,6 +126,40 @@ def test_sql_statement_parser_supports_client_delimiters():
         "CREATE PROCEDURE p()\n    BEGIN\n        SELECT 'a;b';\n    END",
         "SELECT 1",
     ]
+
+
+def test_sql_statement_parser_supports_mysql_dollar_delimiter():
+    sql = """
+    DELIMITER $$
+    CREATE PROCEDURE p()
+    BEGIN
+        SELECT 'a;b';
+    END$$
+    DELIMITER ;
+    SELECT 1;
+    """
+
+    assert SQLExecutionWorker._parse_sql_statements(sql) == [
+        "CREATE PROCEDURE p()\n    BEGIN\n        SELECT 'a;b';\n    END",
+        "SELECT 1",
+    ]
+
+
+def test_find_sql_statement_at_position_supports_mysql_dollar_delimiter():
+    sql = """
+    DELIMITER $$
+    CREATE PROCEDURE p()
+    BEGIN
+        SELECT 'a;b';
+    END$$
+    DELIMITER ;
+    SELECT 1;
+    """
+
+    procedure = "CREATE PROCEDURE p()\n    BEGIN\n        SELECT 'a;b';\n    END"
+
+    assert find_sql_statement_at_position(sql, sql.index("SELECT 'a;b'")) == procedure
+    assert find_sql_statement_at_position(sql, sql.rindex("SELECT 1")) == "SELECT 1"
 
 
 def test_sql_statement_parser_supports_postgresql_dollar_quotes():
