@@ -10,10 +10,9 @@ from .sql_validator import (
     SchemaMetadata, ValidationIssue, IssueSeverity
 )
 # One-Click 마이그레이션 모듈
-from .migration_preflight import PreflightChecker, PreflightResult, CheckResult, CheckSeverity
-from .migration_auto_recommend import AutoRecommendationEngine, RecommendationSummary
-from .migration_state_tracker import MigrationStateTracker, MigrationState, MigrationPhase, get_state_tracker
-from .migration_validator import PostMigrationValidator, ValidationResult, MigrationReport
+from .migration_preflight import PreflightResult, CheckResult, CheckSeverity
+from .migration_state_tracker import MigrationPhase
+from .migration_report_renderer import MigrationReport, MigrationReportRenderer
 
 __all__ = [
     'ConfigManager', 'TunnelEngine', 'MySQLConnector', 'test_mysql_connection',
@@ -24,8 +23,7 @@ __all__ = [
     'SQLValidator', 'SQLAutoCompleter', 'SchemaMetadataProvider',
     'SchemaMetadata', 'ValidationIssue', 'IssueSeverity',
     # One-Click 마이그레이션
-    'PreflightChecker', 'PreflightResult', 'CheckResult', 'CheckSeverity',
-    'AutoRecommendationEngine', 'RecommendationSummary',
-    'MigrationStateTracker', 'MigrationState', 'MigrationPhase', 'get_state_tracker',
-    'PostMigrationValidator', 'ValidationResult', 'MigrationReport'
+    'PreflightResult', 'CheckResult', 'CheckSeverity',
+    'MigrationPhase',
+    'MigrationReport', 'MigrationReportRenderer',
 ]

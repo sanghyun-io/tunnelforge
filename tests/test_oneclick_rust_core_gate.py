@@ -612,3 +612,22 @@ def test_preflight_widget_has_no_legacy_korean_checker_mapping():
 
     for legacy_label in ("권한 검사", "디스크 공간 검사", "활성 연결 검사", "MySQL 버전 확인"):
         assert legacy_label not in source
+
+
+def test_oneclick_dialog_has_no_retired_python_migration_core_imports():
+    """One-Click 다이얼로그는 Rust Core로 이관되어 삭제된 죽은 Python
+    마이그레이션 서브시스템(PostMigrationValidator, MigrationStateTracker 등)을
+    더 이상 import하지 않아야 한다."""
+    source = _read_dialog_source()
+
+    for token in (
+        "PostMigrationValidator",
+        "migration_validator",
+        "MigrationStateTracker",
+        "MigrationState",
+        "get_state_tracker",
+    ):
+        assert token not in source
+
+    assert "from src.core.migration_state_tracker import MigrationPhase" in source
+    assert "from src.core.migration_report_renderer import MigrationReport, MigrationReportRenderer" in source

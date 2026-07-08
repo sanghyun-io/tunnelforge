@@ -1,8 +1,9 @@
 """
 마이그레이션 종단간 매핑 커버리지 테스트
 
-IssueType → FixQueryGenerator → SmartFixGenerator → AutoRecommendationEngine 간
-종단간 연결을 검증합니다.
+IssueType → FixQueryGenerator → SmartFixGenerator 간 종단간 연결을 검증합니다.
+AutoRecommendationEngine(Python 자동 추천 엔진)은 Rust DB Core로 이관되어
+삭제되었으므로, 이 테스트는 더 이상 Python 추천 선택을 검증하지 않는다.
 """
 import pytest
 
@@ -12,10 +13,6 @@ from src.core.migration_fix_wizard import (
     FixStrategy,
     SmartFixGenerator,
     create_wizard_steps,
-)
-from src.core.migration_auto_recommend import (
-    AutoRecommendationEngine,
-    DEFAULT_RECOMMENDATION_RULES,
 )
 from tests.conftest import FakeMySQLConnector, make_issue
 
@@ -154,65 +151,6 @@ class TestSmartFixGeneratorCoverage:
 
 
 # ============================================================
-# AutoRecommendationEngine 매핑 커버리지
-# ============================================================
-class TestAutoRecommendCoverage:
-    """DEFAULT_RECOMMENDATION_RULES 매핑 커버리지 검증"""
-
-    def test_recommendation_rules_cover_fix_generator(self):
-        """FixQueryGenerator가 지원하는 타입은 추천 규칙에도 있어야 함"""
-        fix_gen_types = TestFixQueryGeneratorCoverage.EXPECTED_FIX_GENERATOR_TYPES
-        for issue_type in fix_gen_types:
-            assert issue_type in DEFAULT_RECOMMENDATION_RULES, (
-                f"{issue_type} has fix generator but no recommendation rule"
-            )
-
-    def test_recommendation_rules_strategies_valid(self):
-        """추천 규칙의 strategy가 유효한 FixStrategy인지"""
-        for issue_type, rule in DEFAULT_RECOMMENDATION_RULES.items():
-            assert isinstance(rule.strategy, FixStrategy), (
-                f"{issue_type}: {rule.strategy} is not FixStrategy"
-            )
-
-    @pytest.mark.parametrize("issue_type", list(IssueType))
-    def test_recommend_for_issue_never_crashes(self, issue_type):
-        """모든 IssueType에 대해 recommend_for_issue가 크래시하지 않음"""
-        conn = FakeMySQLConnector()
-        conn.query_results = {
-            'IS_NULLABLE': [{'IS_NULLABLE': 'YES'}],
-        }
-        engine = AutoRecommendationEngine(conn, "test_db")
-        issue = make_issue(
-            issue_type,
-            location="test_db.table.col",
-            table_name="table",
-            column_name="col",
-        )
-        options = [
-            FixStrategy.MANUAL,
-            FixStrategy.SKIP,
-        ]
-        from src.core.migration_fix_wizard import FixOption
-        fix_options = [
-            FixOption(strategy=s, label=str(s), description="desc")
-            for s in options
-        ]
-        # 크래시 없이 반환해야 함
-        result = engine.recommend_for_issue(issue, fix_options)
-        # None이거나 FixOption이어야 함
-        assert result is None or isinstance(result, FixOption)
-
-    @pytest.mark.parametrize("issue_type", list(IssueType))
-    def test_calculate_risk_score_valid_range(self, issue_type):
-        """모든 IssueType에 대해 risk score가 0~100 범위"""
-        conn = FakeMySQLConnector()
-        engine = AutoRecommendationEngine(conn, "test_db")
-        issue = make_issue(issue_type)
-        score = engine.calculate_risk_score(issue)
-        assert 0 <= score <= 100, f"{issue_type}: score={score}"
-
-
-# ============================================================
 # DOC_LINKS 커버리지
 # ============================================================
 class TestDocLinksCoverage:
@@ -234,10 +172,15 @@ class TestDocLinksCoverage:
 # 종단간 Flow 테스트
 # ============================================================
 class TestEndToEndFlow:
-    """IssueType → FixQueryGenerator → SmartFixGenerator → AutoRecommend 흐름"""
+    """IssueType → FixQueryGenerator → SmartFixGenerator → create_wizard_steps 흐름
+
+    AutoRecommendationEngine(Python 자동 추천 선택)은 Rust DB Core로
+    이관되어 삭제되었으므로, 여기서는 create_wizard_steps까지만 검증하고
+    Python 추천 선택 결과는 assert하지 않는다.
+    """
 
     def test_invalid_date_full_flow(self):
-        """INVALID_DATE: 발견 → fix_query → wizard options → recommendation"""
+        """INVALID_DATE: 발견 → fix_query → wizard options"""
         conn = FakeMySQLConnector()
         conn.query_results = {
             'IS_NULLABLE': [{'IS_NULLABLE': 'YES'}],
@@ -260,15 +203,10 @@ class TestEndToEndFlow:
         wizard_gen = SmartFixGenerator(conn, "test_db")
         options = wizard_gen.get_fix_options(issue)
         assert len(options) >= 2
-
-        # Step 3: AutoRecommendationEngine
-        engine = AutoRecommendationEngine(conn, "test_db")
-        recommended = engine.recommend_for_issue(issue, options)
-        assert recommended is not None
-        assert recommended.strategy == FixStrategy.DATE_TO_NULL
+        assert any(o.strategy == FixStrategy.DATE_TO_NULL for o in options)
 
     def test_charset_full_flow(self):
-        """CHARSET_ISSUE: 발견 → fix_query → wizard options → recommendation"""
+        """CHARSET_ISSUE: 발견 → fix_query → wizard options"""
         conn = FakeMySQLConnector()
         conn.query_results = {
             'KEY_COLUMN_USAGE': [],
@@ -289,13 +227,8 @@ class TestEndToEndFlow:
         options = wizard_gen.get_fix_options(issue)
         assert any(o.strategy == FixStrategy.COLLATION_SINGLE for o in options)
 
-        # Step 3: AutoRecommendationEngine
-        engine = AutoRecommendationEngine(conn, "test_db")
-        recommended = engine.recommend_for_issue(issue, options)
-        assert recommended is not None
-
     def test_int_display_width_full_flow(self):
-        """INT_DISPLAY_WIDTH: 항상 SKIP 권장"""
+        """INT_DISPLAY_WIDTH: SKIP 옵션이 항상 마지막에 포함됨"""
         conn = FakeMySQLConnector()
         conn.query_results = {'KEY_COLUMN_USAGE': []}
 
@@ -311,14 +244,11 @@ class TestEndToEndFlow:
 
         wizard_gen = SmartFixGenerator(conn, "test_db")
         options = wizard_gen.get_fix_options(issue)
-
-        engine = AutoRecommendationEngine(conn, "test_db")
-        recommended = engine.recommend_for_issue(issue, options)
-        assert recommended is not None
-        assert recommended.strategy == FixStrategy.SKIP
+        assert len(options) >= 1
+        assert options[-1].strategy == FixStrategy.SKIP
 
     def test_deprecated_engine_full_flow(self):
-        """DEPRECATED_ENGINE: InnoDB 변경 권장"""
+        """DEPRECATED_ENGINE: 발견 → fix_query → wizard options"""
         conn = FakeMySQLConnector()
         conn.query_results = {'KEY_COLUMN_USAGE': []}
 
@@ -333,15 +263,10 @@ class TestEndToEndFlow:
 
         wizard_gen = SmartFixGenerator(conn, "test_db")
         options = wizard_gen.get_fix_options(issue)
+        assert len(options) >= 1
 
-        engine = AutoRecommendationEngine(conn, "test_db")
-        recommended = engine.recommend_for_issue(issue, options)
-        assert recommended is not None
-        # MANUAL (InnoDB로 변경) 권장
-        assert recommended.strategy == FixStrategy.MANUAL
-
-    def test_create_wizard_steps_and_recommend_all(self):
-        """create_wizard_steps → recommend_all 흐름"""
+    def test_create_wizard_steps_produces_step_per_issue(self):
+        """create_wizard_steps: 이슈마다 옵션이 채워진 FixWizardStep 생성"""
         conn = FakeMySQLConnector()
         conn.query_results = {
             'IS_NULLABLE': [{'IS_NULLABLE': 'YES'}],
@@ -358,43 +283,7 @@ class TestEndToEndFlow:
             ),
         ]
 
-        # Step 1: create_wizard_steps
         steps = create_wizard_steps(issues, conn, "test_db")
         assert len(steps) == 3
-
-        # Step 2: recommend_all
-        engine = AutoRecommendationEngine(conn, "test_db")
-        recommended_steps = engine.recommend_all(issues, steps)
-        assert len(recommended_steps) == 3
-
-        # 각 step에 selected_option이 설정됨
-        for step in recommended_steps:
-            assert step.selected_option is not None
-
-        # INT_DISPLAY_WIDTH → SKIP
-        assert recommended_steps[0].selected_option.strategy == FixStrategy.SKIP
-
-    def test_summary_after_recommendation(self):
-        """recommend_all 후 summary 생성"""
-        conn = FakeMySQLConnector()
-        conn.query_results = {
-            'IS_NULLABLE': [{'IS_NULLABLE': 'YES'}],
-            'KEY_COLUMN_USAGE': [],
-        }
-
-        issues = [
-            make_issue(IssueType.INT_DISPLAY_WIDTH),
-            make_issue(
-                IssueType.INVALID_DATE,
-                location="test_db.t.c",
-                table_name="t", column_name="c",
-            ),
-        ]
-
-        steps = create_wizard_steps(issues, conn, "test_db")
-        engine = AutoRecommendationEngine(conn, "test_db")
-        recommended_steps = engine.recommend_all(issues, steps)
-
-        summary = engine.get_summary(recommended_steps, issues)
-        assert summary.total_issues == 2
-        assert summary.skip_recommended >= 1  # INT_DISPLAY_WIDTH는 SKIP
+        for step in steps:
+            assert len(step.options) >= 1

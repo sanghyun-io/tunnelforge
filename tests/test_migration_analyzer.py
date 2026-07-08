@@ -1,7 +1,7 @@
 """
 migration_analyzer.py 단위 테스트
 
-MigrationAnalyzer, DumpFileAnalyzer, TwoPassAnalyzer 검증.
+MigrationAnalyzer, DumpFileAnalyzer 검증.
 DB 없이 FakeMySQLConnector로 동작을 검증합니다.
 """
 import pytest
@@ -20,7 +20,6 @@ from src.core.migration_analyzer import (
     CleanupAction,
     ActionType,
     ForeignKeyInfo,
-    TwoPassAnalyzer,
 )
 from tests.conftest import FakeMySQLConnector
 
@@ -821,54 +820,3 @@ class TestDumpFileAnalyzerSqlPatterns:
             "orders.triggers.sql",
         )
         assert not any(i.issue_type == IssueType.REMOVED_SYS_VAR for i in issues)
-
-
-# ============================================================
-# TwoPassAnalyzer FK 유니크 참조 정확 매칭 회귀 테스트
-# ============================================================
-class TestTwoPassAnalyzerFkUniquenessCrossValidation:
-    """FK 참조 컬럼이 실제로 PK/UNIQUE에 의해 유니크함을 보장받는지 검증.
-
-    UNIQUE(a,b) 같은 복합 인덱스의 prefix (a)만으로 FK를 참조하는 경우는
-    실제로는 유니크함이 보장되지 않으므로 FK_NON_UNIQUE_REF로 잡혀야 한다.
-    """
-
-    def test_fk_referencing_prefix_of_composite_unique_is_flagged(self, tmp_path):
-        (tmp_path / "schema.sql").write_text(
-            """
-CREATE TABLE `parent` (
-  `tenant_id` int,
-  `code` int,
-  UNIQUE KEY `uniq_tenant_code` (`tenant_id`, `code`)
-);
-CREATE TABLE `child` (
-  `tenant_id` int,
-  CONSTRAINT `fk_child_parent` FOREIGN KEY (`tenant_id`) REFERENCES `parent` (`tenant_id`)
-);
-""",
-            encoding="utf-8",
-        )
-        analyzer = TwoPassAnalyzer()
-        result = analyzer.analyze_dump_folder(str(tmp_path))
-        non_unique = [i for i in result.compatibility_issues if i.issue_type == IssueType.FK_NON_UNIQUE_REF]
-        assert len(non_unique) == 1
-
-    def test_fk_referencing_exact_unique_column_is_valid(self, tmp_path):
-        (tmp_path / "schema.sql").write_text(
-            """
-CREATE TABLE `parent` (
-  `tenant_id` int,
-  `code` int,
-  UNIQUE KEY `uniq_tenant` (`tenant_id`)
-);
-CREATE TABLE `child` (
-  `tenant_id` int,
-  CONSTRAINT `fk_child_parent` FOREIGN KEY (`tenant_id`) REFERENCES `parent` (`tenant_id`)
-);
-""",
-            encoding="utf-8",
-        )
-        analyzer = TwoPassAnalyzer()
-        result = analyzer.analyze_dump_folder(str(tmp_path))
-        non_unique = [i for i in result.compatibility_issues if i.issue_type == IssueType.FK_NON_UNIQUE_REF]
-        assert non_unique == []
