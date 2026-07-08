@@ -9,8 +9,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
                              QWidget, QTextBrowser, QSizePolicy, QTextEdit,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
-                             QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox,
-                             QProgressBar, QApplication)
+                             QSpinBox, QProgressBar, QApplication)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QCursor, QFont
 from PyQt6.QtCore import QUrl
@@ -150,6 +149,8 @@ class SettingsDialog(QDialog):
         self.setWindowTitle(tr("settings.title"))
         self.setMinimumSize(600, 420)
         self._update_checker_thread = None
+        self._original_theme_type = ThemeManager.instance().current_theme_type
+        self._theme_saved = False
         self.init_ui()
 
     def init_ui(self):
@@ -158,7 +159,6 @@ class SettingsDialog(QDialog):
         # 탭 위젯 생성
         self.tabs = QTabWidget()
         self.tabs.addTab(self._create_general_tab(), tr("settings.general"))
-        self.tabs.addTab(self._create_pool_tab(), tr("settings.connection_pool"))
         self.tabs.addTab(self._create_log_tab(), tr("settings.logs"))
         self.tabs.addTab(self._create_about_tab(), tr("settings.about"))
         layout.addWidget(self.tabs)
@@ -257,19 +257,21 @@ class SettingsDialog(QDialog):
         self.theme_combo.addItem(tr("settings.light_mode"), ThemeType.LIGHT.value)
         self.theme_combo.addItem(tr("settings.dark_mode"), ThemeType.DARK.value)
         self.theme_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 150px;")
+
+        # 현재 테마 설정 로드 (시그널 연결 전에 인덱스를 맞춰서 다이얼로그를 여는 것만으로
+        # 미리보기/저장이 트리거되지 않도록 함)
+        theme_mgr = ThemeManager.instance()
+        current_theme = theme_mgr.current_theme_type.value
+        index = self.theme_combo.findData(current_theme)
+        if index >= 0:
+            self.theme_combo.setCurrentIndex(index)
+
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         theme_layout.addWidget(self.theme_combo)
 
         theme_layout.addStretch()
 
         layout.addWidget(theme_group)
-
-        # 현재 테마 설정 로드
-        theme_mgr = ThemeManager.instance()
-        current_theme = theme_mgr.current_theme_type.value
-        index = self.theme_combo.findData(current_theme)
-        if index >= 0:
-            self.theme_combo.setCurrentIndex(index)
 
         # GitHub 이슈 자동 보고 설정 그룹
         github_group = QGroupBox(tr("settings.github_auto_report"))
@@ -538,135 +540,6 @@ class SettingsDialog(QDialog):
                     self._refresh_backup_list()
                 else:
                     QMessageBox.warning(self, "가져오기 실패", msg)
-
-    def _create_pool_tab(self) -> QWidget:
-        """연결 풀 상태 탭 생성"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-
-        # 설명
-        desc_label = QLabel("DB 연결 풀 상태를 모니터링합니다. 연결 풀은 DB 연결을 재사용하여 성능을 향상시킵니다.")
-        desc_label.setStyleSheet("color: #666; font-size: 11px; padding: 8px;")
-        desc_label.setWordWrap(True)
-        layout.addWidget(desc_label)
-
-        # 풀 상태 테이블
-        pool_group = QGroupBox("활성 연결 풀")
-        pool_layout = QVBoxLayout(pool_group)
-
-        self.pool_table = QTableWidget()
-        self.pool_table.setColumnCount(5)
-        self.pool_table.setHorizontalHeaderLabels(["풀 키", "생성됨", "사용 중", "대기 중", "최대"])
-        self.pool_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
-        self.pool_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
-        self.pool_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        self.pool_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        self.pool_table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        self.pool_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
-        self.pool_table.setAlternatingRowColors(True)
-        self.pool_table.setStyleSheet("""
-            QTableWidget {
-                font-size: 12px;
-            }
-            QTableWidget::item {
-                padding: 4px;
-            }
-        """)
-        pool_layout.addWidget(self.pool_table)
-
-        # 컨트롤 버튼
-        btn_layout = QHBoxLayout()
-
-        btn_refresh_pool = QPushButton("🔄 새로고침")
-        btn_refresh_pool.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
-        btn_refresh_pool.clicked.connect(self._refresh_pool_status)
-        btn_layout.addWidget(btn_refresh_pool)
-
-        btn_close_all = QPushButton("🛑 모든 연결 종료")
-        btn_close_all.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #c0392b; }
-        """)
-        btn_close_all.clicked.connect(self._close_all_pools)
-        btn_layout.addWidget(btn_close_all)
-
-        btn_layout.addStretch()
-        pool_layout.addLayout(btn_layout)
-
-        layout.addWidget(pool_group)
-
-        # 정보 레이블
-        self.pool_info_label = QLabel("풀 상태를 새로고침하려면 '새로고침' 버튼을 클릭하세요.")
-        self.pool_info_label.setStyleSheet("color: #666; font-size: 11px; padding: 8px;")
-        layout.addWidget(self.pool_info_label)
-
-        layout.addStretch()
-
-        # 초기 로드
-        self._refresh_pool_status()
-
-        return tab
-
-    def _refresh_pool_status(self):
-        """연결 풀 상태 새로고침"""
-        try:
-            from src.core.connection_pool import get_pool_registry
-            registry = get_pool_registry()
-            stats_list = registry.get_all_stats()
-
-            self.pool_table.setRowCount(len(stats_list))
-
-            for row, stats in enumerate(stats_list):
-                # 풀 키
-                self.pool_table.setItem(row, 0, QTableWidgetItem(stats['pool_key']))
-                # 생성됨
-                self.pool_table.setItem(row, 1, QTableWidgetItem(str(stats['total_created'])))
-                # 사용 중
-                self.pool_table.setItem(row, 2, QTableWidgetItem(str(stats['in_use'])))
-                # 대기 중 (available)
-                self.pool_table.setItem(row, 3, QTableWidgetItem(str(stats['available'])))
-                # 최대
-                self.pool_table.setItem(row, 4, QTableWidgetItem(str(stats['max_connections'])))
-
-            if stats_list:
-                total_created = sum(s['total_created'] for s in stats_list)
-                total_in_use = sum(s['in_use'] for s in stats_list)
-                self.pool_info_label.setText(f"✅ {len(stats_list)}개 풀, 총 {total_created}개 연결 ({total_in_use}개 사용 중)")
-            else:
-                self.pool_info_label.setText("ℹ️ 활성 연결 풀이 없습니다.")
-
-        except Exception as e:
-            self.pool_info_label.setText(f"❌ 풀 상태 조회 실패: {str(e)}")
-
-    def _close_all_pools(self):
-        """모든 연결 풀 종료"""
-        reply = QMessageBox.question(
-            self, "확인",
-            "모든 DB 연결 풀을 종료하시겠습니까?\n\n"
-            "활성 연결이 있으면 작업이 중단될 수 있습니다.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-
-        if reply == QMessageBox.StandardButton.Yes:
-            try:
-                from src.core.connection_pool import get_pool_registry
-                registry = get_pool_registry()
-                registry.close_all_pools()
-                self._refresh_pool_status()
-                QMessageBox.information(self, "완료", "모든 연결 풀이 종료되었습니다.")
-            except Exception as e:
-                QMessageBox.warning(self, "오류", f"풀 종료 실패: {str(e)}")
 
     def _create_log_tab(self) -> QWidget:
         """로그 뷰어 탭 생성"""
@@ -955,12 +828,12 @@ class SettingsDialog(QDialog):
         return tab
 
     def _on_theme_changed(self, index: int):
-        """테마 선택 변경 시 즉시 적용"""
+        """테마 선택 변경 시 미리보기만 적용 (저장은 save_settings에서 처리)"""
         theme_value = self.theme_combo.currentData()
         try:
             theme_type = ThemeType(theme_value)
             theme_mgr = ThemeManager.instance()
-            theme_mgr.set_theme(theme_type)
+            theme_mgr.set_theme(theme_type, save=False)
         except ValueError:
             pass
 
@@ -979,7 +852,13 @@ class SettingsDialog(QDialog):
         set_language(language)
         self.config_mgr.set_app_setting('language', language)
 
-        # 테마 설정은 _on_theme_changed에서 이미 저장됨
+        # 테마 설정 저장 (미리보기 중이던 값을 확정 저장)
+        theme_value = self.theme_combo.currentData()
+        try:
+            ThemeManager.instance().set_theme(ThemeType(theme_value), save=True)
+            self._theme_saved = True
+        except ValueError:
+            pass
 
         # GitHub 자동 보고 설정 저장
         auto_report = self.chk_auto_report.isChecked()
@@ -1001,6 +880,16 @@ class SettingsDialog(QDialog):
             self._set_startup_registry(self.chk_startup.isChecked())
 
         self.accept()
+
+    def _restore_original_theme_if_unsaved(self):
+        """테마가 저장되지 않은 채 다이얼로그가 닫히면 미리보기 이전 테마로 복원"""
+        if not getattr(self, "_theme_saved", False):
+            ThemeManager.instance().set_theme(self._original_theme_type, save=False)
+
+    def reject(self):
+        """취소(또는 창 닫기) 시 미리보기 중이던 테마를 원래 상태로 복원"""
+        self._restore_original_theme_if_unsaved()
+        super().reject()
 
     def _is_startup_registered(self) -> bool:
         """레지스트리에 시작 프로그램 등록 여부 확인"""
