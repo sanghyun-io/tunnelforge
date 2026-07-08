@@ -1,20 +1,22 @@
 """PostgreSQL database connection helpers."""
-from typing import Optional, Tuple
+from typing import Any, Optional, Tuple
 
-from src.core.db_core_service import DbCoreFacade, DbEndpoint, RustDbConnection
+from src.core.db_core_service import DbEndpoint, RustDbConnection, get_shared_db_core_facade
 
 
 class PostgresConnector:
     """Small PostgreSQL connector used for connection tests."""
 
-    def __init__(self, host: str, port: int, user: str, password: str, database: str = None):
+    def __init__(self, host: str, port: int, user: str, password: str, database: str = None,
+                 facade: Optional[Any] = None):
         self.host = host
         self.port = port
         self.user = user
         self.password = password
         self.database = database or "postgres"
         self.engine = "postgresql"
-        self.facade = DbCoreFacade()
+        # 앱 공유 facade 재사용 — 커넥터별 전용 Rust 서브프로세스를 띄우지 않는다.
+        self.facade = facade if facade is not None else get_shared_db_core_facade()
         self.connection = None
 
     def connect(self) -> Tuple[bool, str]:

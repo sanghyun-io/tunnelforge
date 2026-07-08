@@ -141,7 +141,7 @@ class TestMySQLConnector:
 
     def test_connect_success(self):
         """연결 성공 테스트"""
-        self.connector._facade = FakeFacade()
+        self.connector._delegate.facade = FakeFacade()
 
         success, msg = self.connector.connect()
 
@@ -151,7 +151,7 @@ class TestMySQLConnector:
 
     def test_connect_mysql_error(self):
         """MySQL 에러 발생 시 실패 반환"""
-        self.connector._facade = FakeFacade(Exception("Access denied"))
+        self.connector._delegate.facade = FakeFacade(Exception("Access denied"))
 
         success, msg = self.connector.connect()
 
@@ -160,7 +160,7 @@ class TestMySQLConnector:
 
     def test_connect_general_error(self):
         """일반 예외 발생 시 실패 반환"""
-        self.connector._facade = FakeFacade(Exception("Connection refused"))
+        self.connector._delegate.facade = FakeFacade(Exception("Connection refused"))
 
         success, msg = self.connector.connect()
 
@@ -351,7 +351,7 @@ class TestMySQLConnector:
 
     def test_context_manager_connects_and_disconnects(self):
         """컨텍스트 매니저 연결/해제 확인"""
-        self.connector._facade = FakeFacade()
+        self.connector._delegate.facade = FakeFacade()
 
         with self.connector:
             assert self.connector.connection is not None
@@ -423,3 +423,121 @@ class TestMySQLConnector:
         """테이블 미존재 확인"""
         self.connector.get_tables = MagicMock(return_value=['users', 'orders'])
         assert self.connector.table_exists('products') is False
+
+    def test_get_create_table_statement_uses_qualified_name_without_switching_database(self):
+        """CREATE TABLE 조회 시 스키마 한정 식별자만 사용하고 self.database는 유지"""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.fetchone.return_value = {'Create Table': 'CREATE TABLE `users` (id INT)'}
+        mock_conn.cursor.return_value = mock_cursor
+        self.connector.connection = mock_conn
+
+        ddl = self.connector.get_create_table_statement('users', schema='schema_b')
+
+        assert 'CREATE TABLE' in ddl
+        assert self.connector.database == 'test_db'
+        mock_conn.select_db.assert_not_called()
+        executed_sql = mock_cursor.execute.call_args[0][0]
+        assert '`schema_b`.`users`' in executed_sql
+
+    def test_get_table_data_uses_qualified_name_without_switching_database(self):
+        """테이블 데이터 조회 시 스키마 한정 식별자만 사용하고 self.database는 유지"""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.fetchall.return_value = [{'id': 1}]
+        mock_conn.cursor.return_value = mock_cursor
+        self.connector.connection = mock_conn
+
+        rows = self.connector.get_table_data('users', schema='schema_b', limit=10)
+
+        assert rows == [{'id': 1}]
+        assert self.connector.database == 'test_db'
+        mock_conn.select_db.assert_not_called()
+        executed_sql = mock_cursor.execute.call_args[0][0]
+        assert '`schema_b`.`users`' in executed_sql
+        assert 'LIMIT 10' in executed_sql
+
+    def test_get_row_count_uses_qualified_name_without_switching_database(self):
+        """행 수 조회 시 스키마 한정 식별자만 사용하고 self.database는 유지"""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.fetchall.return_value = [{'cnt': 5}]
+        mock_conn.cursor.return_value = mock_cursor
+        self.connector.connection = mock_conn
+
+        count = self.connector.get_row_count('users', schema='schema_b')
+
+        assert count == 5
+        assert self.connector.database == 'test_db'
+        mock_conn.select_db.assert_not_called()
+        executed_sql = mock_cursor.execute.call_args[0][0]
+        assert '`schema_b`.`users`' in executed_sql
+
+    def test_mysql_temporary_schema_methods_do_not_switch_database(self):
+        """세 메서드 모두 schema 지정 시에도 connector.database가 바뀌지 않음을 종합 확인"""
+        from src.core.db_connector import MySQLConnector
+        connector = MySQLConnector(
+            host='127.0.0.1', port=3306, user='u', password='p', database='schema_a'
+        )
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        mock_cursor.fetchone.return_value = {'Create Table': 'CREATE TABLE `users` (id INT)'}
+        mock_cursor.fetchall.return_value = [{'cnt': 5}]
+        mock_conn.cursor.return_value = mock_cursor
+        connector.connection = mock_conn
+
+        connector.get_create_table_statement('users', schema='schema_b')
+        connector.get_table_data('users', schema='schema_b', limit=10)
+        connector.get_row_count('users', schema='schema_b')
+
+        assert connector.database == 'schema_a'
+        mock_conn.select_db.assert_not_called()
+
+
+# =====================================================================
+# Facade 주입/공유 테스트 (WP-2.10: connector-facade 통합)
+# =====================================================================
+
+class TestMySQLConnectorFacadeUnification:
+    """MySQLConnector가 커넥터별 전용 facade를 만들지 않고 공유 facade를 사용하는지 검증"""
+
+    def test_mysql_connector_uses_shared_facade_by_default(self):
+        """facade 미지정 시 앱 공유 facade를 사용하고, delegate에 그대로 주입됨을 확인"""
+        from src.core import db_connector
+
+        sentinel = object()
+        with patch.object(db_connector, 'get_shared_db_core_facade', return_value=sentinel) as mock_get_shared, \
+                patch.object(db_connector, 'RustDbConnector') as mock_rust_connector:
+            connector = db_connector.MySQLConnector(
+                host='127.0.0.1', port=3306, user='u', password='p', database='db'
+            )
+
+            mock_get_shared.assert_called_once()
+            assert connector.facade is sentinel
+            _, kwargs = mock_rust_connector.call_args
+            assert kwargs['facade'] is sentinel
+
+    def test_mysql_connector_uses_injected_facade_without_shared_lookup(self):
+        """facade를 주입하면 공유 facade 조회를 건너뛰고 delegate에 주입된 facade를 그대로 사용"""
+        from src.core import db_connector
+
+        sentinel = object()
+        with patch.object(db_connector, 'get_shared_db_core_facade') as mock_get_shared, \
+                patch.object(db_connector, 'RustDbConnector') as mock_rust_connector:
+            connector = db_connector.MySQLConnector(
+                host='127.0.0.1', port=3306, user='u', password='p', database='db',
+                facade=sentinel,
+            )
+
+            mock_get_shared.assert_not_called()
+            assert connector.facade is sentinel
+            _, kwargs = mock_rust_connector.call_args
+            assert kwargs['facade'] is sentinel
