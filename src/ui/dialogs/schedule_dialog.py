@@ -22,6 +22,7 @@ from PyQt6.QtCore import Qt, QTime, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QColor, QTextCharFormat, QSyntaxHighlighter
 
 from src.core.scheduler import ScheduleConfig, CronParser, BackupScheduler, ScheduleTaskType
+from src.core.sql_statement_parser import parse_sql_statements
 from src.core.logger import get_logger
 from src.core.i18n import translate_text
 
@@ -129,11 +130,16 @@ class ScheduleEditDialog(QDialog):
     """스케줄 추가/수정 다이얼로그"""
 
     # 위험 쿼리 패턴
+    # 주의: 아래 패턴은 문장 단위로 분리된 SQL(1개 statement)에 대해 검사되어야 한다.
+    # 여러 statement가 이어진 통짜 텍스트에 그대로 돌리면, 특히 UPDATE 패턴의
+    # 부정 탐색(negative lookahead)이 뒤에 오는 다른 statement의 WHERE까지
+    # 봐버려 정작 WHERE 없는 UPDATE를 놓칠 수 있다 (_check_dangerous_query 참고).
     DANGER_PATTERNS = [
         (r'\bDROP\s+(TABLE|DATABASE|INDEX)\b', "DROP 문은 데이터를 완전히 삭제합니다!"),
         (r'\bTRUNCATE\s+TABLE\b', "TRUNCATE는 테이블의 모든 데이터를 삭제합니다!"),
         (r'\bDELETE\s+FROM\s+\w+\s*(?:;|$)', "DELETE에 WHERE 절이 없어 전체 데이터가 삭제됩니다!"),
-        (r'\bUPDATE\s+\w+\s+SET\s+.*?(?:;|$)(?!.*WHERE)', "UPDATE에 WHERE 절이 없어 전체 데이터가 수정됩니다!"),
+        # SET절 이후 문장이 끝날 때까지(;/끝) WHERE가 한 번도 등장하지 않아야 매치된다.
+        (r'\bUPDATE\s+\w+\s+SET\s+(?:(?!\bWHERE\b|;).)*(?:;|$)', "UPDATE에 WHERE 절이 없어 전체 데이터가 수정됩니다!"),
     ]
 
     def __init__(self, parent=None, tunnel_list: List[tuple] = None,
@@ -476,19 +482,28 @@ class ScheduleEditDialog(QDialog):
         self.time_widget.setVisible(button_id != 3)  # 매시간이 아닐 때만 시간 표시
 
     def _check_dangerous_query(self):
-        """위험한 SQL 쿼리 검사"""
+        """위험한 SQL 쿼리 검사
+
+        여러 SQL 문이 세미콜론으로 이어진 경우, 통짜 텍스트에 정규식을 돌리면
+        UPDATE의 `(?!.*WHERE)` 부정 탐색이 뒤에 오는 다른 문의 WHERE까지 봐서
+        정작 WHERE 없는 UPDATE를 놓칠 수 있다. 공유 파서로 문 단위로 나눈 뒤
+        문장별로 검사한다.
+        """
         sql_text = self.sql_editor.toPlainText()
         if not sql_text.strip():
             self.sql_warning_label.hide()
             return
 
-        warnings = []
-        for pattern, message in self.DANGER_PATTERNS:
-            if re.search(pattern, sql_text, re.IGNORECASE | re.DOTALL):
-                warnings.append(f"⚠️ {message}")
+        statements = parse_sql_statements(sql_text) or [sql_text]
 
-        if warnings:
-            self.sql_warning_label.setText("\n".join(warnings))
+        messages: List[str] = []
+        for statement in statements:
+            for pattern, message in self.DANGER_PATTERNS:
+                if re.search(pattern, statement, re.IGNORECASE | re.DOTALL) and message not in messages:
+                    messages.append(message)
+
+        if messages:
+            self.sql_warning_label.setText("\n".join(f"⚠️ {m}" for m in messages))
             self.sql_warning_label.show()
         else:
             self.sql_warning_label.hide()
@@ -708,6 +723,9 @@ class ScheduleListDialog(QDialog):
     """스케줄 목록 관리 다이얼로그"""
 
     schedule_changed = pyqtSignal()
+    # BackupScheduler 콜백은 백그라운드 실행 스레드에서 호출되므로,
+    # 시그널을 거쳐 GUI 스레드로 안전하게 전달한다 (Qt Queued Connection).
+    _execution_finished = pyqtSignal(str, bool, str)
 
     def __init__(self, parent=None, scheduler: BackupScheduler = None,
                  tunnel_list: List[tuple] = None):
@@ -720,10 +738,14 @@ class ScheduleListDialog(QDialog):
         super().__init__(parent)
         self.scheduler = scheduler
         self.tunnel_list = tunnel_list or []
+        self._refreshing = False
 
         self._setup_ui()
         self._connect_signals()
         self._refresh_table()
+
+        if self.scheduler:
+            self.scheduler.add_callback(self._on_schedule_completed)
 
     def _setup_ui(self):
         """UI 구성"""
@@ -810,6 +832,9 @@ class ScheduleListDialog(QDialog):
         """시그널 연결"""
         self.table.cellDoubleClicked.connect(self._edit_schedule)
         self.table.itemSelectionChanged.connect(self._update_buttons)
+        self.table.itemChanged.connect(self._on_table_item_changed)
+        self._execution_finished.connect(self._handle_execution_finished)
+        self.finished.connect(self._on_dialog_finished)
 
     def _update_buttons(self):
         """버튼 상태 업데이트"""
@@ -819,7 +844,18 @@ class ScheduleListDialog(QDialog):
         self.run_now_btn.setEnabled(has_selection)
 
     def _refresh_table(self):
-        """테이블 새로고침"""
+        """테이블 새로고침
+
+        체크박스 아이템을 다시 세팅하는 동안 itemChanged가 발생하므로,
+        재진입 방지를 위해 _refreshing 플래그로 감싼다.
+        """
+        self._refreshing = True
+        try:
+            self._refresh_table_inner()
+        finally:
+            self._refreshing = False
+
+    def _refresh_table_inner(self):
         self.table.setRowCount(0)
 
         if not self.scheduler:
@@ -895,6 +931,50 @@ class ScheduleListDialog(QDialog):
         id_item = self.table.item(row, 6)  # 유형 컬럼 추가로 인덱스 변경
         return id_item.data(Qt.ItemDataRole.UserRole) if id_item else None
 
+    def _on_table_item_changed(self, item: QTableWidgetItem):
+        """활성화 체크박스 토글을 scheduler.set_enabled()에 반영
+
+        _refresh_table_inner()가 체크박스를 다시 세팅할 때도 itemChanged가
+        발생하므로 _refreshing 플래그로 사용자 클릭과 구분한다.
+        """
+        if self._refreshing or item.column() != 6 or not self.scheduler:
+            return
+
+        schedule_id = item.data(Qt.ItemDataRole.UserRole)
+        if not schedule_id:
+            return
+
+        enabled = item.checkState() == Qt.CheckState.Checked
+        try:
+            self.scheduler.set_enabled(schedule_id, enabled)
+            self.schedule_changed.emit()
+        except Exception as e:
+            QMessageBox.critical(self, "오류", f"스케줄 상태 변경 실패: {e}")
+
+        self._refresh_table()
+
+    def _on_schedule_completed(self, name: str, success: bool, message: str):
+        """BackupScheduler 콜백 (백그라운드 실행 스레드에서 호출)
+
+        GUI를 직접 건드리지 않고 시그널만 emit해 GUI 스레드로 넘긴다.
+        """
+        self._execution_finished.emit(name, success, message)
+
+    def _handle_execution_finished(self, name: str, success: bool, message: str):
+        """실행 완료 알림 (GUI 스레드, _execution_finished 시그널 슬롯)
+
+        run_now는 등록만 하고 비동기로 실행되므로, 실제 완료 시점에
+        목록/로그를 갱신해 최신 상태를 보여준다. 예약된(cron) 실행도
+        같은 콜백을 타므로 팝업 없이 조용히 갱신만 한다.
+        """
+        self._refresh_table()
+        self._refresh_logs()
+
+    def _on_dialog_finished(self, result: int):
+        """다이얼로그 종료 시 콜백 해제 (누수 방지)"""
+        if self.scheduler:
+            self.scheduler.remove_callback(self._on_schedule_completed)
+
     def _add_schedule(self):
         """스케줄 추가"""
         dialog = ScheduleEditDialog(self, self.tunnel_list)
@@ -967,9 +1047,12 @@ class ScheduleListDialog(QDialog):
         )
 
         if reply == QMessageBox.StandardButton.Yes:
+            # run_now는 실행 큐에 등록만 하고 즉시 반환한다 (비동기).
+            # 실제 완료 여부는 scheduler의 add_callback 통지로 이 다이얼로그가
+            # 받아 _handle_execution_finished에서 표/로그를 갱신한다.
             success, message = self.scheduler.run_now(schedule_id)
             if success:
-                QMessageBox.information(self, "실행 완료", message)
+                QMessageBox.information(self, translate_text("실행 등록됨"), message)
             else:
                 QMessageBox.warning(self, "실행 실패", message)
             self._refresh_table()
