@@ -67,7 +67,7 @@ def dialog(sample_tunnels, mock_tunnel_engine, mock_config_manager):
     전에 두 스레드가 끝나도록 대기한다. 대기하지 않으면 스레드가 patch 해제 후에
     실제 MySQLConnector를 호출하려는 경합이 생긴다.
     """
-    with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConnector:
+    with patch('src.ui.dialogs.diff_workers.MySQLConnector') as MockConnector:
         mock_conn = MagicMock()
         mock_conn.connect.return_value = (True, 'OK')
         mock_conn.get_schemas.return_value = ['db1', 'db2']
@@ -131,7 +131,7 @@ class TestLoadSchemas:
 
     def test_success_loads_schemas(self, dialog, mock_tunnel_engine, mock_config_manager):
         """정상 경로: 스키마 목록이 콤보박스에 로드됨"""
-        with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConn:
+        with patch('src.ui.dialogs.diff_workers.MySQLConnector') as MockConn:
             mock_conn = MagicMock()
             mock_conn.connect.return_value = (True, 'OK')
             mock_conn.get_schemas.return_value = ['schema_a', 'schema_b', 'schema_c']
@@ -161,7 +161,7 @@ class TestLoadSchemas:
 
     def test_load_schemas_is_non_blocking(self, dialog):
         """_load_schemas 호출 직후 UI 스레드가 즉시 반환되어야 한다 (동기 블로킹 금지)"""
-        with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConn:
+        with patch('src.ui.dialogs.diff_workers.MySQLConnector') as MockConn:
             def _slow_connect():
                 time.sleep(0.2)
                 return (True, 'OK')
@@ -213,7 +213,7 @@ class TestLoadSchemas:
 
     def test_connection_failure(self, dialog):
         """DB 연결 실패 시 '(연결 실패)' 표시"""
-        with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConn:
+        with patch('src.ui.dialogs.diff_workers.MySQLConnector') as MockConn:
             mock_conn = MagicMock()
             mock_conn.connect.return_value = (False, '연결 거부')
             MockConn.return_value = mock_conn
@@ -228,7 +228,7 @@ class TestLoadSchemas:
 
     def test_exception_shows_error_and_cleanup(self, dialog):
         """예외 발생 시 '(오류)' 표시 + connector cleanup"""
-        with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConn:
+        with patch('src.ui.dialogs.diff_workers.MySQLConnector') as MockConn:
             mock_conn = MagicMock()
             mock_conn.connect.side_effect = Exception("네트워크 오류")
             MockConn.return_value = mock_conn
@@ -243,7 +243,7 @@ class TestLoadSchemas:
 
     def test_disconnect_exception_swallowed(self, dialog):
         """disconnect에서 예외가 발생해도 무시됨"""
-        with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConn:
+        with patch('src.ui.dialogs.diff_workers.MySQLConnector') as MockConn:
             mock_conn = MagicMock()
             mock_conn.connect.return_value = (True, 'OK')
             mock_conn.get_schemas.return_value = ['db1']
@@ -261,7 +261,7 @@ class TestLoadSchemas:
 
     def test_target_side(self, dialog, mock_tunnel_engine, mock_config_manager):
         """'target' side도 정상 동작"""
-        with patch('src.ui.dialogs.diff_dialog.MySQLConnector') as MockConn:
+        with patch('src.ui.dialogs.diff_workers.MySQLConnector') as MockConn:
             mock_conn = MagicMock()
             mock_conn.connect.return_value = (True, 'OK')
             mock_conn.get_schemas.return_value = ['target_db']
