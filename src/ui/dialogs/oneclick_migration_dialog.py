@@ -19,10 +19,8 @@ from PyQt6.QtGui import QFont, QColor
 
 from src.core.db_connector import MySQLConnector
 from src.core.migration_preflight import PreflightResult, CheckResult, CheckSeverity
-from src.core.migration_state_tracker import (
-    MigrationStateTracker, MigrationState, MigrationPhase, get_state_tracker
-)
-from src.core.migration_validator import PostMigrationValidator, MigrationReport
+from src.core.migration_state_tracker import MigrationPhase
+from src.core.migration_report_renderer import MigrationReport, MigrationReportRenderer
 from src.core.oneclick_log import create_oneclick_logger, close_oneclick_logger
 
 
@@ -633,8 +631,8 @@ class ResultWidget(QWidget):
         )
 
         if path:
-            validator = PostMigrationValidator(None)  # connector 불필요
-            validator.export_report_html(self._report, path)
+            renderer = MigrationReportRenderer()
+            renderer.export_report_html(self._report, path)
             QMessageBox.information(self, "저장 완료", f"리포트가 저장되었습니다:\n{path}")
 
     def _download_json(self):
@@ -650,8 +648,8 @@ class ResultWidget(QWidget):
         )
 
         if path:
-            validator = PostMigrationValidator(None)
-            validator.export_report_json(self._report, path)
+            renderer = MigrationReportRenderer()
+            renderer.export_report_json(self._report, path)
             QMessageBox.information(self, "저장 완료", f"리포트가 저장되었습니다:\n{path}")
 
 
