@@ -121,6 +121,99 @@ class ButtonStyles:
         QPushButton:hover { color: #2980b9; text-decoration: underline; }
     """
 
+    # 정보 버튼 (작은 크기) - settings.py btn_export, btn_refresh_log
+    INFO_SMALL = """
+            QPushButton {
+                background-color: #3498db; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+        """
+
+    # 회색 버튼 (작은 크기) - settings.py btn_import, btn_open_log_folder
+    MUTED_SMALL = """
+            QPushButton {
+                background-color: #95a5a6; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #7f8c8d; }
+        """
+
+    # 회색 버튼 (작은 크기 + 최소 높이) - settings.py btn_test
+    MUTED_SMALL_TALL = """
+                QPushButton {
+                    background-color: #95a5a6; color: white;
+                    padding: 6px 12px; border-radius: 4px; border: none;
+                    font-size: 11px;
+                    min-height: 26px;
+                }
+                QPushButton:hover { background-color: #7f8c8d; }
+            """
+
+    # 성공 버튼 (작은 크기) - settings.py btn_restore
+    SUCCESS_SMALL = """
+            QPushButton {
+                background-color: #27ae60; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #219a52; }
+        """
+
+    # 위험 버튼 (작은 크기) - settings.py btn_clear_log
+    DANGER_SMALL = """
+            QPushButton {
+                background-color: #e74c3c; color: white;
+                padding: 6px 12px; border-radius: 4px; border: none;
+                font-size: 11px;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """
+
+    # 기본 버튼 (중간 크기, disabled 포함) - settings.py btn_check_update
+    PRIMARY_MD = """
+            QPushButton {
+                background-color: #3498db; color: white;
+                padding: 8px 16px; border-radius: 4px; border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #2980b9; }
+            QPushButton:disabled { background-color: #bdc3c7; }
+        """
+
+    # 성공 버튼 (중간 크기, disabled 포함) - settings.py btn_download
+    SUCCESS_MD = """
+            QPushButton {
+                background-color: #27ae60; color: white;
+                padding: 8px 16px; border-radius: 4px; border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #229954; }
+            QPushButton:disabled { background-color: #bdc3c7; }
+        """
+
+    # 위험 버튼 (중간 크기) - settings.py btn_cancel_download
+    DANGER_MD = """
+            QPushButton {
+                background-color: #e74c3c; color: white;
+                padding: 8px 12px; border-radius: 4px; border: none;
+                font-size: 12px;
+            }
+            QPushButton:hover { background-color: #c0392b; }
+        """
+
+    # 설치 전환 버튼 - settings.py _on_download_finished 에서 btn_download 재스타일
+    INSTALL = """
+                QPushButton {
+                    background-color: #9b59b6; color: white;
+                    padding: 8px 16px; border-radius: 4px; border: none;
+                    font-size: 12px; font-weight: bold;
+                }
+                QPushButton:hover { background-color: #8e44ad; }
+            """
+
 
 class LabelStyles:
     """라벨 스타일 정의"""
@@ -153,229 +246,12 @@ class LabelStyles:
     HIGHLIGHT = "color: #2c3e50; font-weight: bold;"
 
 
-class InputStyles:
-    """입력 필드 스타일 정의"""
-
-    # 기본 입력 필드
-    DEFAULT = """
-        QLineEdit, QSpinBox, QComboBox {
-            padding: 6px 10px;
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-            background-color: white;
-        }
-        QLineEdit:focus, QSpinBox:focus, QComboBox:focus {
-            border-color: #3498db;
-        }
-        QLineEdit:disabled, QSpinBox:disabled, QComboBox:disabled {
-            background-color: #ecf0f1;
-            color: #95a5a6;
-        }
-    """
-
-    # 오류 상태
-    ERROR = """
-        QLineEdit, QSpinBox {
-            border: 1px solid #e74c3c;
-            background-color: #fdf2f0;
-        }
-    """
-
-    # 성공 상태
-    SUCCESS = """
-        QLineEdit, QSpinBox {
-            border: 1px solid #27ae60;
-            background-color: #f0fdf4;
-        }
-    """
-
-
-class GroupBoxStyles:
-    """그룹박스 스타일 정의"""
-
-    DEFAULT = """
-        QGroupBox {
-            font-weight: bold;
-            border: 1px solid #bdc3c7;
-            border-radius: 6px;
-            margin-top: 12px;
-            padding-top: 10px;
-        }
-        QGroupBox::title {
-            subcontrol-origin: margin;
-            left: 10px;
-            padding: 0 5px;
-            color: #2c3e50;
-        }
-    """
-
-
-class TableStyles:
-    """테이블 스타일 정의"""
-
-    DEFAULT = """
-        QTableWidget {
-            border: 1px solid #bdc3c7;
-            gridline-color: #ecf0f1;
-            selection-background-color: #d5f5e3;
-        }
-        QTableWidget::item {
-            padding: 5px;
-        }
-        QHeaderView::section {
-            background-color: #ecf0f1;
-            padding: 8px;
-            border: none;
-            border-bottom: 1px solid #bdc3c7;
-            font-weight: bold;
-        }
-    """
-
-
-class ProgressStyles:
-    """프로그레스바 스타일 정의"""
-
-    DEFAULT = """
-        QProgressBar {
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-            text-align: center;
-            height: 20px;
-        }
-        QProgressBar::chunk {
-            background-color: #3498db;
-            border-radius: 3px;
-        }
-    """
-
-    SUCCESS = """
-        QProgressBar::chunk {
-            background-color: #27ae60;
-        }
-    """
-
-    WARNING = """
-        QProgressBar::chunk {
-            background-color: #f1c40f;
-        }
-    """
-
-
-class TextEditStyles:
-    """텍스트 에디터 스타일 정의"""
-
-    # 로그 출력용 (모노스페이스)
-    LOG = """
-        QTextEdit {
-            font-family: Consolas, 'Courier New', monospace;
-            font-size: 12px;
-            background-color: #1e1e1e;
-            color: #d4d4d4;
-            border: 1px solid #3c3c3c;
-            border-radius: 4px;
-            padding: 8px;
-        }
-    """
-
-    # 일반 텍스트 에디터
-    DEFAULT = """
-        QTextEdit {
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-            padding: 8px;
-        }
-        QTextEdit:focus {
-            border-color: #3498db;
-        }
-    """
-
-
-class TabStyles:
-    """탭 위젯 스타일 정의"""
-
-    DEFAULT = """
-        QTabWidget::pane {
-            border: 1px solid #bdc3c7;
-            border-radius: 4px;
-        }
-        QTabBar::tab {
-            background-color: #ecf0f1;
-            padding: 8px 16px;
-            margin-right: 2px;
-            border-top-left-radius: 4px;
-            border-top-right-radius: 4px;
-        }
-        QTabBar::tab:selected {
-            background-color: white;
-            border: 1px solid #bdc3c7;
-            border-bottom: none;
-        }
-        QTabBar::tab:hover:!selected {
-            background-color: #d5dbdb;
-        }
-    """
-
-
-class DialogStyles:
-    """다이얼로그 스타일 정의"""
-
-    # 다이얼로그 기본 배경
-    DEFAULT = "background-color: #f8f9f9;"
-
-
-# 자주 사용하는 색상 상수
-class Colors:
-    """색상 상수"""
-
-    PRIMARY = "#3498db"
-    PRIMARY_DARK = "#2980b9"
-
-    SUCCESS = "#27ae60"
-    SUCCESS_LIGHT = "#2ecc71"
-
-    DANGER = "#e74c3c"
-    DANGER_DARK = "#c0392b"
-
-    WARNING = "#f1c40f"
-    WARNING_DARK = "#d4ac0d"
-
-    INFO = "#3498db"
-
-    GRAY_LIGHT = "#ecf0f1"
-    GRAY = "#bdc3c7"
-    GRAY_DARK = "#95a5a6"
-
-    TEXT_PRIMARY = "#2c3e50"
-    TEXT_SECONDARY = "#7f8c8d"
-
-    WHITE = "#ffffff"
-    BLACK = "#333333"
-
-
-def apply_button_style(button, style: str):
-    """버튼에 스타일 적용 헬퍼 함수
-
-    Args:
-        button: QPushButton 인스턴스
-        style: ButtonStyles 클래스의 스타일 상수
-    """
-    button.setStyleSheet(style)
-
-
-def apply_label_style(label, style: str):
-    """라벨에 스타일 적용 헬퍼 함수
-
-    Args:
-        label: QLabel 인스턴스
-        style: LabelStyles 클래스의 스타일 상수
-    """
-    label.setStyleSheet(style)
-
-
 # =============================================================================
 # 동적 테마 스타일 생성 함수
 # =============================================================================
 
+# NOTE(Round 3 call-site 마이그레이션 대상): get_dynamic_button_style/get_dynamic_label_style는
+# 현재 호출부가 없으나 ButtonStyles/LabelStyles(정적 상수)를 대체할 목표 API라 유지한다.
 def get_dynamic_button_style(variant: str, colors: ThemeColors = None) -> str:
     """테마 기반 동적 버튼 스타일 생성
 
@@ -681,6 +557,7 @@ def get_dynamic_progress_style(colors: ThemeColors = None) -> str:
     """
 
 
+# NOTE(Round 3 call-site 마이그레이션 대상): 위 get_dynamic_button_style와 동일한 사유로 유지.
 def get_dynamic_label_style(variant: str, colors: ThemeColors = None) -> str:
     """테마 기반 동적 라벨 스타일
 
