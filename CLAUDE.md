@@ -87,7 +87,7 @@ main.py (Entry Point)
 
 - **DbCoreFacade** (`src/core/db_core_service.py`): Long-lived JSONL client for `tunnelforge-core`. DB credentials, schema calls, SQL execution, dump/import, and migration commands go through this facade.
 
-- **RustDumpExporter** (`src/exporters/rust_dump_exporter.py`): Export/import wrapper over Rust `dump.run` and `dump.import`. Partial exports auto-include FK parent tables via `RustDumpExporter._resolve_required_tables_from_rust_schema` (Rust-schema driven). `ForeignKeyResolver` in the same module is used for orphan-record dependency analysis, not for export table selection.
+- **RustDumpExporter** (`src/exporters/rust_dump_exporter.py`): Export/import wrapper over Rust `dump.run` and `dump.import`. Partial exports auto-include FK parent tables via `RustDumpExporter._resolve_required_tables_from_rust_schema` (Rust-schema driven). `ForeignKeyResolver` now lives in `src/core/foreign_key_resolver.py` and is used for orphan-record dependency analysis, not for export table selection; `rust_dump_exporter` re-exports it (along with `OrphanRecordInfo`) for backward compatibility.
 
 - **UI Threading**: Long operations run in `QThread` workers such as `src/ui/workers/rust_dump_worker.py` and `src/ui/workers/cross_engine_migration_worker.py` to keep UI responsive.
 
