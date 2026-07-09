@@ -25,6 +25,7 @@ from src.core.platform_integration import (
 )
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
+from src.ui.styles import ButtonStyles
 from src.ui.dialogs.settings_close_confirm_dialog import CloseConfirmDialog
 from src.ui.dialogs.settings_update_helpers import (
     UpdatePackageActionText,
@@ -64,23 +65,11 @@ class SettingsDialog(QDialog):
         # 버튼
         button_layout = QHBoxLayout()
         self.btn_save = QPushButton(tr("common.save"))
-        self.btn_save.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
+        self.btn_save.setStyleSheet(ButtonStyles.PRIMARY)
         self.btn_save.clicked.connect(self.save_settings)
 
         self.btn_cancel = QPushButton(tr("common.cancel"))
-        self.btn_cancel.setStyleSheet("""
-            QPushButton {
-                background-color: #ecf0f1; color: #2c3e50;
-                padding: 6px 16px; border-radius: 4px; border: 1px solid #bdc3c7;
-            }
-            QPushButton:hover { background-color: #d5dbdb; }
-        """)
+        self.btn_cancel.setStyleSheet(ButtonStyles.SECONDARY)
         self.btn_cancel.clicked.connect(self.reject)
 
         button_layout.addStretch()
@@ -197,15 +186,7 @@ class SettingsDialog(QDialog):
             test_layout = QHBoxLayout()
             test_layout.setContentsMargins(20, 5, 0, 0)
             btn_test = QPushButton("연결 테스트")
-            btn_test.setStyleSheet("""
-                QPushButton {
-                    background-color: #95a5a6; color: white;
-                    padding: 6px 12px; border-radius: 4px; border: none;
-                    font-size: 11px;
-                    min-height: 26px;
-                }
-                QPushButton:hover { background-color: #7f8c8d; }
-            """)
+            btn_test.setStyleSheet(ButtonStyles.MUTED_SMALL_TALL)
             btn_test.clicked.connect(self._test_github_connection)
             test_layout.addWidget(btn_test)
             test_layout.addStretch()
@@ -256,38 +237,17 @@ class SettingsDialog(QDialog):
         backup_btn_layout = QHBoxLayout()
 
         btn_restore = QPushButton("복원")
-        btn_restore.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #219a52; }
-        """)
+        btn_restore.setStyleSheet(ButtonStyles.SUCCESS_SMALL)
         btn_restore.clicked.connect(self._restore_selected_backup)
         backup_btn_layout.addWidget(btn_restore)
 
         btn_export = QPushButton("내보내기")
-        btn_export.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
+        btn_export.setStyleSheet(ButtonStyles.INFO_SMALL)
         btn_export.clicked.connect(self._export_config)
         backup_btn_layout.addWidget(btn_export)
 
         btn_import = QPushButton("가져오기")
-        btn_import.setStyleSheet("""
-            QPushButton {
-                background-color: #95a5a6; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #7f8c8d; }
-        """)
+        btn_import.setStyleSheet(ButtonStyles.MUTED_SMALL)
         btn_import.clicked.connect(self._import_config)
         backup_btn_layout.addWidget(btn_import)
 
@@ -463,40 +423,19 @@ class SettingsDialog(QDialog):
 
         # 새로고침 버튼
         btn_refresh_log = QPushButton("새로고침")
-        btn_refresh_log.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-        """)
+        btn_refresh_log.setStyleSheet(ButtonStyles.INFO_SMALL)
         btn_refresh_log.clicked.connect(self._refresh_log_viewer)
         control_layout.addWidget(btn_refresh_log)
 
         # 로그 폴더 열기 버튼
         btn_open_log_folder = QPushButton("로그 폴더 열기")
-        btn_open_log_folder.setStyleSheet("""
-            QPushButton {
-                background-color: #95a5a6; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #7f8c8d; }
-        """)
+        btn_open_log_folder.setStyleSheet(ButtonStyles.MUTED_SMALL)
         btn_open_log_folder.clicked.connect(self._open_log_folder)
         control_layout.addWidget(btn_open_log_folder)
 
         # 로그 초기화 버튼
         btn_clear_log = QPushButton("로그 초기화")
-        btn_clear_log.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c; color: white;
-                padding: 6px 12px; border-radius: 4px; border: none;
-                font-size: 11px;
-            }
-            QPushButton:hover { background-color: #c0392b; }
-        """)
+        btn_clear_log.setStyleSheet(ButtonStyles.DANGER_SMALL)
         btn_clear_log.clicked.connect(self._clear_log_file)
         control_layout.addWidget(btn_clear_log)
 
@@ -598,15 +537,7 @@ class SettingsDialog(QDialog):
         # 업데이트 확인 버튼
         btn_layout = QHBoxLayout()
         self.btn_check_update = QPushButton("업데이트 확인")
-        self.btn_check_update.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white;
-                padding: 8px 16px; border-radius: 4px; border: none;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
+        self.btn_check_update.setStyleSheet(ButtonStyles.PRIMARY_MD)
         self.btn_check_update.clicked.connect(self._check_for_updates)
         btn_layout.addWidget(self.btn_check_update)
         btn_layout.addStretch()
@@ -641,27 +572,12 @@ class SettingsDialog(QDialog):
         # 다운로드/설치 버튼 및 취소 버튼
         download_btn_layout = QHBoxLayout()
         self.btn_download = QPushButton("🔽 새 버전 다운로드")
-        self.btn_download.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60; color: white;
-                padding: 8px 16px; border-radius: 4px; border: none;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #229954; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
+        self.btn_download.setStyleSheet(ButtonStyles.SUCCESS_MD)
         self.btn_download.clicked.connect(self._start_download)
         download_btn_layout.addWidget(self.btn_download)
 
         self.btn_cancel_download = QPushButton("취소")
-        self.btn_cancel_download.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c; color: white;
-                padding: 8px 12px; border-radius: 4px; border: none;
-                font-size: 12px;
-            }
-            QPushButton:hover { background-color: #c0392b; }
-        """)
+        self.btn_cancel_download.setStyleSheet(ButtonStyles.DANGER_MD)
         self.btn_cancel_download.clicked.connect(self._cancel_download)
         self.btn_cancel_download.hide()
         download_btn_layout.addWidget(self.btn_cancel_download)
@@ -899,14 +815,7 @@ class SettingsDialog(QDialog):
             self.download_progress.setValue(100)
             self.btn_download.setText(action_text.button)
             self.btn_download.setEnabled(True)
-            self.btn_download.setStyleSheet("""
-                QPushButton {
-                    background-color: #9b59b6; color: white;
-                    padding: 8px 16px; border-radius: 4px; border: none;
-                    font-size: 12px; font-weight: bold;
-                }
-                QPushButton:hover { background-color: #8e44ad; }
-            """)
+            self.btn_download.setStyleSheet(ButtonStyles.INSTALL)
             # 버튼 클릭 이벤트 변경
             self.btn_download.clicked.disconnect()
             self.btn_download.clicked.connect(self._launch_installer)
