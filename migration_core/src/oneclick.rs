@@ -127,70 +127,12 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "steps": recommendations
     });
     let apply_plan = oneclick_apply_actions(&plan_payload);
-    let (
-        success_count,
-        fail_count,
-        skip_count,
-        disallowed_fix_attempts,
-        applied_fixes,
-        execution_log,
-    ) = if dry_run {
-        (
-            0usize,
-            0usize,
-            apply_plan.actions.len() + apply_plan.skipped,
-            apply_plan.disallowed,
-            Vec::new(),
-            vec!["DRY-RUN: no database changes were executed.".to_string()],
-        )
-    } else if !apply_plan.disallowed.is_empty() {
-        (
-            0,
-            apply_plan.disallowed.len(),
-            apply_plan.skipped,
-            apply_plan.disallowed,
-            Vec::new(),
-            vec!["Disallowed One-Click automatic fix attempt blocked.".to_string()],
-        )
-    } else if apply_plan.actions.is_empty() {
-        (
-            0,
-            0,
-            apply_plan.skipped,
-            Vec::new(),
-            Vec::new(),
-            vec!["No automatic Rust Core fixes are currently required.".to_string()],
-        )
-    } else {
-        match LiveAdapter::connect(&state.endpoint) {
-            Ok(mut adapter) => {
-                let outcome = oneclick_execute_apply_plan(&apply_plan, &mut adapter);
-                (
-                    outcome.success_count,
-                    outcome.fail_count,
-                    apply_plan.skipped,
-                    Vec::new(),
-                    outcome.applied_fixes,
-                    outcome.log,
-                )
-            }
-            Err(err) => (
-                0,
-                apply_plan.actions.len(),
-                apply_plan.skipped,
-                Vec::new(),
-                Vec::new(),
-                vec![format!(
-                    "FAILED: unable to connect for One-Click fixes: {err}"
-                )],
-            ),
-        }
-    };
-    let execution_success = fail_count == 0 && disallowed_fix_attempts.is_empty();
-    let report_execution_log = execution_log.clone();
-    let report_fail_count = fail_count;
-    let report_disallowed_count = disallowed_fix_attempts.len();
-    let report_applied_count = applied_fixes.len();
+    let outcome = oneclick_execute_stage(&state, &apply_plan, dry_run);
+    let execution_success = outcome.fail_count == 0 && outcome.disallowed_fix_attempts.is_empty();
+    let report_execution_log = outcome.log.clone();
+    let report_fail_count = outcome.fail_count;
+    let report_disallowed_count = outcome.disallowed_fix_attempts.len();
+    let report_applied_count = outcome.applied_fixes.len();
     let execution_message = if dry_run {
         "Execution completed"
     } else if execution_success {
@@ -202,12 +144,12 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "event": "execution",
         "request_id": request.request_id,
         "dry_run": dry_run,
-        "success_count": success_count,
-        "fail_count": fail_count,
-        "skip_count": skip_count,
-        "disallowed_fix_attempts": disallowed_fix_attempts,
-        "applied_fixes": applied_fixes,
-        "log": execution_log
+        "success_count": outcome.success_count,
+        "fail_count": outcome.fail_count,
+        "skip_count": outcome.skip_count,
+        "disallowed_fix_attempts": outcome.disallowed_fix_attempts,
+        "applied_fixes": outcome.applied_fixes,
+        "log": outcome.log
     }));
     emit(oneclick_progress_event(request, 80, execution_message));
 
@@ -1316,6 +1258,8 @@ struct OneClickApplyPlan {
 struct OneClickApplyOutcome {
     success_count: usize,
     fail_count: usize,
+    skip_count: usize,
+    disallowed_fix_attempts: Vec<String>,
     log: Vec<String>,
     applied_fixes: Vec<Value>,
 }
@@ -1544,8 +1488,61 @@ fn oneclick_execute_apply_plan<A: MigrationAdapter>(
     OneClickApplyOutcome {
         success_count,
         fail_count,
+        skip_count: plan.skipped,
+        disallowed_fix_attempts: Vec::new(),
         log,
         applied_fixes,
+    }
+}
+
+/// One-Click 실행 단계: dry-run / disallowed / no-action / live-apply 4분기를 처리해
+/// 타입드 OneClickApplyOutcome 로 반환한다. 기존 익명 6-tuple 을 대체한다(동작 보존).
+fn oneclick_execute_stage(
+    state: &OneClickState,
+    apply_plan: &OneClickApplyPlan,
+    dry_run: bool,
+) -> OneClickApplyOutcome {
+    if dry_run {
+        OneClickApplyOutcome {
+            success_count: 0,
+            fail_count: 0,
+            skip_count: apply_plan.actions.len() + apply_plan.skipped,
+            disallowed_fix_attempts: apply_plan.disallowed.clone(),
+            log: vec!["DRY-RUN: no database changes were executed.".to_string()],
+            applied_fixes: Vec::new(),
+        }
+    } else if !apply_plan.disallowed.is_empty() {
+        OneClickApplyOutcome {
+            success_count: 0,
+            fail_count: apply_plan.disallowed.len(),
+            skip_count: apply_plan.skipped,
+            disallowed_fix_attempts: apply_plan.disallowed.clone(),
+            log: vec!["Disallowed One-Click automatic fix attempt blocked.".to_string()],
+            applied_fixes: Vec::new(),
+        }
+    } else if apply_plan.actions.is_empty() {
+        OneClickApplyOutcome {
+            success_count: 0,
+            fail_count: 0,
+            skip_count: apply_plan.skipped,
+            disallowed_fix_attempts: Vec::new(),
+            log: vec!["No automatic Rust Core fixes are currently required.".to_string()],
+            applied_fixes: Vec::new(),
+        }
+    } else {
+        match LiveAdapter::connect(&state.endpoint) {
+            Ok(mut adapter) => oneclick_execute_apply_plan(apply_plan, &mut adapter),
+            Err(err) => OneClickApplyOutcome {
+                success_count: 0,
+                fail_count: apply_plan.actions.len(),
+                skip_count: apply_plan.skipped,
+                disallowed_fix_attempts: Vec::new(),
+                log: vec![format!(
+                    "FAILED: unable to connect for One-Click fixes: {err}"
+                )],
+                applied_fixes: Vec::new(),
+            },
+        }
     }
 }
 
