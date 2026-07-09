@@ -27,25 +27,6 @@ from src.core.migration_fix_models import (
 from src.core.migration_rollback_sql_generator import RollbackSQLGenerator
 
 
-
-
-@dataclass
-
-
-@dataclass
-
-
-@dataclass
-
-
-@dataclass
-
-
-@dataclass
-
-
-
-
 class SmartFixGenerator:
     """컨텍스트 인식 Fix 옵션 생성기
 
@@ -1304,11 +1285,6 @@ class BatchFixExecutor:
                 sql_executed=sql,
                 error=str(e)
             )
-
-
-
-
-@dataclass
 
 
 class CharsetFixPlanBuilder:
