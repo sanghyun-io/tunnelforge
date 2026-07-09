@@ -379,73 +379,41 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             "table_parallel"
         },
     ));
+    let ctx = DumpJobContext {
+        endpoint: endpoint.clone(),
+        output_path: output_path.to_path_buf(),
+        chunk_size,
+        data_format: data_format.clone(),
+        compression: compression.clone(),
+        request_id: request.request_id.clone(),
+    };
     let (table_manifests, total_rows, total_chunks) =
         if endpoint.engine == "mysql" && threads > 1 && table_total == 1 {
             match dump_single_mysql_table_parallel(
-                &endpoint,
-                output_path,
+                &ctx,
                 &export_tables[0],
-                chunk_size,
-                &data_format,
-                &compression,
                 parallel_limits.range_workers_per_table,
-                request.request_id.clone(),
                 |event| emit(event),
             )? {
                 Some(result) => result,
                 None => {
                     let mut adapter = LiveAdapter::connect(&endpoint)?;
-                    dump_tables_sequential(
-                        &mut adapter,
-                        &endpoint,
-                        output_path,
-                        &export_tables,
-                        chunk_size,
-                        &data_format,
-                        &compression,
-                        request.request_id.clone(),
-                        |event| emit(event),
-                    )?
+                    dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
                 }
             }
         } else if endpoint.engine == "mysql" && threads > 1 && table_total > 1 {
-            dump_tables_global_mysql(
-                &endpoint,
-                output_path,
-                &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
-                threads,
-                request.request_id.clone(),
-                |event| emit(event),
-            )?
+            dump_tables_global_mysql(&ctx, &export_tables, threads, |event| emit(event))?
         } else if threads > 1 && table_total > 1 {
             dump_tables_parallel(
-                &endpoint,
-                output_path,
+                &ctx,
                 &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
                 parallel_limits.table_workers,
                 parallel_limits.range_workers_per_table,
-                request.request_id.clone(),
                 |event| emit(event),
             )?
         } else {
             let mut adapter = LiveAdapter::connect(&endpoint)?;
-            dump_tables_sequential(
-                &mut adapter,
-                &endpoint,
-                output_path,
-                &export_tables,
-                chunk_size,
-                &data_format,
-                &compression,
-                request.request_id.clone(),
-                |event| emit(event),
-            )?
+            dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
         };
 
     // View 정의 수집 (전체 export 시에만). 실패해도 테이블 덤프는 유효하므로 fatal로 보지 않는다.
@@ -573,13 +541,8 @@ fn has_tunnelforge_dump_marker(output_path: &Path) -> bool {
 
 fn dump_tables_sequential<F: FnMut(Value)>(
     adapter: &mut LiveAdapter,
-    endpoint: &Endpoint,
-    output_path: &Path,
+    ctx: &DumpJobContext,
     tables: &[NormalizedTable],
-    chunk_size: usize,
-    data_format: &str,
-    compression: &str,
-    request_id: Option<String>,
     mut emit: F,
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
     let mut manifests = Vec::new();
@@ -588,19 +551,8 @@ fn dump_tables_sequential<F: FnMut(Value)>(
     let table_total = tables.len();
 
     for (index, table) in tables.iter().enumerate() {
-        let (manifest, rows, chunks) = dump_one_table(
-            adapter,
-            endpoint,
-            output_path,
-            table,
-            index,
-            table_total,
-            chunk_size,
-            data_format,
-            compression,
-            request_id.clone(),
-            |event| emit(event),
-        )?;
+        let (manifest, rows, chunks) =
+            dump_one_table(adapter, ctx, table, index, table_total, |event| emit(event))?;
         manifests.push(manifest);
         total_rows += rows;
         total_chunks += chunks;
@@ -631,6 +583,22 @@ impl DumpParallelLimits {
     fn estimated_mysql_connections(&self) -> usize {
         self.table_workers * (self.range_workers_per_table + 1)
     }
+}
+
+/// dump.run 한 번에 걸쳐 고정되는 공통 파라미터 묶음.
+///
+/// endpoint/output_path/chunk_size/data_format/compression/request_id는 모든 테이블·
+/// 청크 덤프 경로가 동일하게 참조하던 값이라, 개별 인자로 6개씩 관통시키는 대신
+/// 하나의 컨텍스트로 전달한다. 동기 경로는 `&DumpJobContext`로, 스레드 워커는
+/// clone 한 owned 값으로 넘긴다.
+#[derive(Clone)]
+struct DumpJobContext {
+    endpoint: Endpoint,
+    output_path: PathBuf,
+    chunk_size: usize,
+    data_format: String,
+    compression: String,
+    request_id: Option<String>,
 }
 
 fn dump_parallel_limits(threads: usize, table_total: usize) -> DumpParallelLimits {
@@ -670,15 +638,10 @@ fn dump_schedule_order(
 }
 
 fn dump_tables_parallel<F: FnMut(Value)>(
-    endpoint: &Endpoint,
-    output_path: &Path,
+    ctx: &DumpJobContext,
     tables: &[NormalizedTable],
-    chunk_size: usize,
-    data_format: &str,
-    compression: &str,
     table_threads: usize,
     range_threads: usize,
-    request_id: Option<String>,
     mut emit: F,
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
     let table_total = tables.len();
@@ -696,16 +659,11 @@ fn dump_tables_parallel<F: FnMut(Value)>(
     while active < max_threads {
         if let Some(index) = pending.pop_front() {
             handles.push(spawn_dump_table_worker(
-                endpoint.clone(),
-                output_path.to_path_buf(),
+                ctx.clone(),
                 tables[index].clone(),
                 index,
                 table_total,
-                chunk_size,
-                data_format.to_string(),
-                compression.to_string(),
                 range_threads,
-                request_id.clone(),
                 sender.clone(),
             ));
             active += 1;
@@ -730,16 +688,11 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 active = active.saturating_sub(1);
                 if let Some(next_index) = pending.pop_front() {
                     handles.push(spawn_dump_table_worker(
-                        endpoint.clone(),
-                        output_path.to_path_buf(),
+                        ctx.clone(),
                         tables[next_index].clone(),
                         next_index,
                         table_total,
-                        chunk_size,
-                        data_format.to_string(),
-                        compression.to_string(),
                         range_threads,
-                        request_id.clone(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -751,16 +704,11 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 active = active.saturating_sub(1);
                 if let Some(next_index) = pending.pop_front() {
                     handles.push(spawn_dump_table_worker(
-                        endpoint.clone(),
-                        output_path.to_path_buf(),
+                        ctx.clone(),
                         tables[next_index].clone(),
                         next_index,
                         table_total,
-                        chunk_size,
-                        data_format.to_string(),
-                        compression.to_string(),
                         range_threads,
-                        request_id.clone(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -788,18 +736,13 @@ fn dump_tables_parallel<F: FnMut(Value)>(
 }
 
 fn dump_tables_global_mysql<F: FnMut(Value)>(
-    endpoint: &Endpoint,
-    output_path: &Path,
+    ctx: &DumpJobContext,
     tables: &[NormalizedTable],
-    chunk_size: usize,
-    data_format: &str,
-    compression: &str,
     threads: usize,
-    request_id: Option<String>,
     mut emit: F,
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
     let table_total = tables.len();
-    let mut conn = match LiveAdapter::connect(endpoint)? {
+    let mut conn = match LiveAdapter::connect(&ctx.endpoint)? {
         LiveAdapter::MySql(conn) => conn,
         LiveAdapter::PostgreSql(_) => {
             return Err("global mysql dump requires mysql endpoint".to_string())
@@ -811,7 +754,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
 
     for (index, table) in tables.iter().enumerate() {
         let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
-        let table_dir = output_path.join(&table_path);
+        let table_dir = ctx.output_path.join(&table_path);
         fs::create_dir_all(&table_dir)
             .map_err(|err| format!("failed to create dump table dir: {err}"))?;
         let table_row_count = conn
@@ -819,11 +762,12 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
             .map(|count| count.unwrap_or(0))
             .unwrap_or(0);
         let mut chunks_total = 0_u64;
-        let avg_row_bytes = mysql_table_avg_row_length(&mut conn, endpoint, &table.name);
+        let avg_row_bytes = mysql_table_avg_row_length(&mut conn, &ctx.endpoint, &table.name);
         if let Some(pk_column) = single_numeric_primary_key(table) {
-            let profile_key = dump_profile_key(endpoint, &table.name, data_format, compression);
+            let profile_key =
+                dump_profile_key(&ctx.endpoint, &table.name, &ctx.data_format, &ctx.compression);
             let range_chunk_size = learned_mysql_range_chunk_size(
-                chunk_size,
+                ctx.chunk_size,
                 avg_row_bytes,
                 profiles.get(&profile_key),
             );
@@ -842,7 +786,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                     ranges_by_table.insert(table.name.clone(), ranges);
                     emit(json!({
                         "event": "table_progress",
-                        "request_id": request_id,
+                        "request_id": ctx.request_id,
                         "table": table.name,
                         "status": "dumping",
                         "current": index + 1,
@@ -919,14 +863,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
     while active < max_threads {
         if let Some(work) = pending.pop_front() {
             handles.push(spawn_dump_global_worker(
-                endpoint.clone(),
-                output_path.to_path_buf(),
+                ctx.clone(),
                 work,
                 table_total,
-                chunk_size,
-                data_format.to_string(),
-                compression.to_string(),
-                request_id.clone(),
                 sender.clone(),
             ));
             active += 1;
@@ -953,14 +892,14 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 state.chunks_done += 1;
                 state.work_ms = state.work_ms.saturating_add(stream_ms.max(1));
                 state.chunk_sha256.insert(
-                    dump_chunk_name(chunk_index, data_format, compression),
+                    dump_chunk_name(chunk_index, &ctx.data_format, &ctx.compression),
                     checksum,
                 );
                 completed_work += 1;
                 active = active.saturating_sub(1);
                 emit(json!({
                     "event": "row_progress",
-                    "request_id": request_id,
+                    "request_id": ctx.request_id,
                     "table": table.name,
                     "rows": state.rows_dumped,
                     "total": state.rows_total,
@@ -983,7 +922,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                     });
                     emit(json!({
                         "event": "table_progress",
-                        "request_id": request_id,
+                        "request_id": ctx.request_id,
                         "table": table.name,
                         "status": "completed",
                         "current": table_index + 1,
@@ -993,14 +932,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 }
                 if let Some(work) = pending.pop_front() {
                     handles.push(spawn_dump_global_worker(
-                        endpoint.clone(),
-                        output_path.to_path_buf(),
+                        ctx.clone(),
                         work,
                         table_total,
-                        chunk_size,
-                        data_format.to_string(),
-                        compression.to_string(),
-                        request_id.clone(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -1023,14 +957,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 active = active.saturating_sub(1);
                 if let Some(work) = pending.pop_front() {
                     handles.push(spawn_dump_global_worker(
-                        endpoint.clone(),
-                        output_path.to_path_buf(),
+                        ctx.clone(),
                         work,
                         table_total,
-                        chunk_size,
-                        data_format.to_string(),
-                        compression.to_string(),
-                        request_id.clone(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -1059,13 +988,13 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
             let duration_ms = state.work_ms.max(1);
             let rows_per_second = state.rows_dumped.saturating_mul(1000) / duration_ms;
             profiles.insert(
-                dump_profile_key(endpoint, &table.name, data_format, compression),
+                dump_profile_key(&ctx.endpoint, &table.name, &ctx.data_format, &ctx.compression),
                 DumpTablePerfProfile {
                     avg_row_bytes: state.avg_row_bytes,
                     chunk_rows: if state.chunks_done > 0 {
                         (state.rows_dumped / state.chunks_done).max(1) as usize
                     } else {
-                        chunk_size
+                        ctx.chunk_size
                     },
                     rows_per_second,
                     duration_ms,
@@ -1086,50 +1015,30 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
 }
 
 fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
-    endpoint: &Endpoint,
-    output_path: &Path,
+    ctx: &DumpJobContext,
     table: &NormalizedTable,
-    chunk_size: usize,
-    data_format: &str,
-    compression: &str,
     threads: usize,
-    request_id: Option<String>,
     mut emit: F,
 ) -> Result<Option<(Vec<DumpTableManifest>, u64, u64)>, String> {
-    Ok(dump_mysql_table_parallel_ranges(
-        endpoint,
-        output_path,
-        table,
-        0,
-        1,
-        chunk_size,
-        data_format,
-        compression,
-        threads,
-        request_id,
-        |event| emit(event),
-    )?
-    .map(|(manifest, rows, chunks)| (vec![manifest], rows, chunks)))
+    Ok(
+        dump_mysql_table_parallel_ranges(ctx, table, 0, 1, threads, |event| emit(event))?
+            .map(|(manifest, rows, chunks)| (vec![manifest], rows, chunks)),
+    )
 }
 
 fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
-    endpoint: &Endpoint,
-    output_path: &Path,
+    ctx: &DumpJobContext,
     table: &NormalizedTable,
     index: usize,
     table_total: usize,
-    chunk_size: usize,
-    data_format: &str,
-    compression: &str,
     threads: usize,
-    request_id: Option<String>,
     mut emit: F,
 ) -> Result<Option<(DumpTableManifest, u64, u64)>, String> {
     let Some(pk_column) = single_numeric_primary_key(table) else {
         return Ok(None);
     };
 
-    let mut conn = match LiveAdapter::connect(endpoint)? {
+    let mut conn = match LiveAdapter::connect(&ctx.endpoint)? {
         LiveAdapter::MySql(conn) => conn,
         LiveAdapter::PostgreSql(_) => return Ok(None),
     };
@@ -1137,8 +1046,8 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
         .query_first::<u64, _>(count_sql("mysql", &table.name))
         .map(|count| count.unwrap_or(0))
         .unwrap_or(0);
-    let avg_row_bytes = mysql_table_avg_row_length(&mut conn, endpoint, &table.name);
-    let range_chunk_size = mysql_range_chunk_size_for_avg_row(chunk_size, avg_row_bytes);
+    let avg_row_bytes = mysql_table_avg_row_length(&mut conn, &ctx.endpoint, &table.name);
+    let range_chunk_size = mysql_range_chunk_size_for_avg_row(ctx.chunk_size, avg_row_bytes);
     if !should_use_pk_range_dump(table, table_row_count, range_chunk_size) {
         return Ok(None);
     }
@@ -1157,7 +1066,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
 
     emit(json!({
         "event": "table_progress",
-        "request_id": request_id,
+        "request_id": ctx.request_id,
         "table": table.name,
         "status": "dumping",
         "current": index + 1,
@@ -1169,7 +1078,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
     }));
 
     let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
-    let table_dir = output_path.join(&table_path);
+    let table_dir = ctx.output_path.join(&table_path);
     fs::create_dir_all(&table_dir)
         .map_err(|err| format!("failed to create dump table dir: {err}"))?;
     let ranges = pk_ranges(min_key, max_key, table_row_count, range_chunk_size);
@@ -1187,14 +1096,14 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
     while active < max_threads {
         if let Some(range) = pending.pop_front() {
             handles.push(spawn_mysql_range_worker(
-                endpoint.clone(),
-                output_path.to_path_buf(),
+                ctx.endpoint.clone(),
+                ctx.output_path.clone(),
                 table.clone(),
                 table_path.clone(),
                 pk_column.to_string(),
                 range,
-                data_format.to_string(),
-                compression.to_string(),
+                ctx.data_format.clone(),
+                ctx.compression.clone(),
                 sender.clone(),
             ));
             active += 1;
@@ -1217,12 +1126,12 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                 completed += 1;
                 active = active.saturating_sub(1);
                 chunk_sha256.insert(
-                    dump_chunk_name(chunk_index, data_format, compression),
+                    dump_chunk_name(chunk_index, &ctx.data_format, &ctx.compression),
                     checksum,
                 );
                 emit(json!({
                     "event": "row_progress",
-                    "request_id": request_id,
+                    "request_id": ctx.request_id,
                     "table": table.name,
                     "rows": rows_dumped,
                     "total": table_row_count,
@@ -1237,14 +1146,14 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                 }));
                 if let Some(range) = pending.pop_front() {
                     handles.push(spawn_mysql_range_worker(
-                        endpoint.clone(),
-                        output_path.to_path_buf(),
+                        ctx.endpoint.clone(),
+                        ctx.output_path.clone(),
                         table.clone(),
                         table_path.clone(),
                         pk_column.to_string(),
                         range,
-                        data_format.to_string(),
-                        compression.to_string(),
+                        ctx.data_format.clone(),
+                        ctx.compression.clone(),
                         sender.clone(),
                     ));
                     active += 1;
@@ -1268,7 +1177,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
 
     emit(json!({
         "event": "table_progress",
-        "request_id": request_id,
+        "request_id": ctx.request_id,
         "table": table.name,
         "status": "completed",
         "current": index + 1,
@@ -1330,14 +1239,9 @@ fn spawn_mysql_range_worker(
 }
 
 fn spawn_dump_global_worker(
-    endpoint: Endpoint,
-    output_path: PathBuf,
+    ctx: DumpJobContext,
     work: DumpGlobalWorkItem,
     table_total: usize,
-    chunk_size: usize,
-    data_format: String,
-    compression: String,
-    request_id: Option<String>,
     sender: mpsc::Sender<DumpGlobalEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || match work.kind {
@@ -1347,14 +1251,14 @@ fn spawn_dump_global_worker(
             range,
         } => {
             let result = dump_mysql_range_chunk(
-                &endpoint,
-                &output_path,
+                &ctx.endpoint,
+                &ctx.output_path,
                 &work.table,
                 &table_path,
                 &pk_column,
                 &range,
-                &data_format,
-                &compression,
+                &ctx.data_format,
+                &ctx.compression,
             );
             match result {
                 Ok((rows, stream_ms, checksum)) => {
@@ -1375,19 +1279,14 @@ fn spawn_dump_global_worker(
         }
         DumpGlobalWorkKind::WholeTable => {
             let result = (|| {
-                let mut adapter = LiveAdapter::connect(&endpoint)?;
+                let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
                 let started = Instant::now();
                 dump_one_table(
                     &mut adapter,
-                    &endpoint,
-                    &output_path,
+                    &ctx,
                     &work.table,
                     work.table_index,
                     table_total,
-                    chunk_size,
-                    &data_format,
-                    &compression,
-                    request_id,
                     |event| {
                         let _ = sender.send(DumpGlobalEvent::Progress(event));
                     },
@@ -1465,32 +1364,22 @@ fn dump_mysql_range_chunk(
 }
 
 fn spawn_dump_table_worker(
-    endpoint: Endpoint,
-    output_path: std::path::PathBuf,
+    ctx: DumpJobContext,
     table: NormalizedTable,
     index: usize,
     table_total: usize,
-    chunk_size: usize,
-    data_format: String,
-    compression: String,
     range_threads: usize,
-    request_id: Option<String>,
     sender: mpsc::Sender<DumpTableEvent>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
-            if endpoint.engine == "mysql" {
+            if ctx.endpoint.engine == "mysql" {
                 if let Some(result) = dump_mysql_table_parallel_ranges(
-                    &endpoint,
-                    &output_path,
+                    &ctx,
                     &table,
                     index,
                     table_total,
-                    chunk_size,
-                    &data_format,
-                    &compression,
                     range_threads,
-                    request_id.clone(),
                     |event| {
                         let _ = sender.send(DumpTableEvent::Progress(event));
                     },
@@ -1498,18 +1387,13 @@ fn spawn_dump_table_worker(
                     return Ok(result);
                 }
             }
-            let mut adapter = LiveAdapter::connect(&endpoint)?;
+            let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
             dump_one_table(
                 &mut adapter,
-                &endpoint,
-                &output_path,
+                &ctx,
                 &table,
                 index,
                 table_total,
-                chunk_size,
-                &data_format,
-                &compression,
-                request_id,
                 |event| {
                     let _ = sender.send(DumpTableEvent::Progress(event));
                 },
@@ -1531,35 +1415,35 @@ fn spawn_dump_table_worker(
     })
 }
 
-fn dump_one_table<F: FnMut(Value)>(
-    adapter: &mut LiveAdapter,
-    endpoint: &Endpoint,
-    output_path: &Path,
+/// `run_table_dump_loop`가 한 청크를 기록한 결과. rows는 이 청크의 행 수,
+/// chunk_name은 sha256 맵의 키, checksum은 청크 파일 해시.
+struct ChunkOutcome {
+    rows: u64,
+    chunk_name: String,
+    checksum: String,
+}
+
+/// 단일 테이블 덤프의 공통 스캐폴딩: dumping/completed table_progress 이벤트,
+/// `{index+1:04}_{safe_name}` 디렉토리 생성, 청크 누적(rows/chunks/sha256), manifest 조립.
+///
+/// 엔진별로 다른 청크 read+write 로직은 `fetch_next_chunk` 클로저가 공급한다.
+/// 클로저는 (다음 청크 번호, 지금까지 누적 rows, table_dir, emit)을 받아 한 청크를
+/// 파일로 기록하고 `ChunkOutcome`을 반환하거나, 더 이상 쓸 데이터가 없으면 `None`을
+/// 반환한다. row_progress 이벤트는 청크 필드가 엔진마다 달라 클로저가 직접 emit한다.
+fn run_table_dump_loop<F: FnMut(Value)>(
     table: &NormalizedTable,
     index: usize,
     table_total: usize,
-    chunk_size: usize,
-    data_format: &str,
-    compression: &str,
+    output_path: &Path,
     request_id: Option<String>,
     mut emit: F,
+    mut fetch_next_chunk: impl FnMut(
+        u64,
+        u64,
+        &Path,
+        &mut dyn FnMut(Value),
+    ) -> Result<Option<ChunkOutcome>, String>,
 ) -> Result<(DumpTableManifest, u64, u64), String> {
-    if let LiveAdapter::MySql(conn) = adapter {
-        return dump_one_mysql_table(
-            conn,
-            endpoint,
-            output_path,
-            table,
-            index,
-            table_total,
-            chunk_size,
-            data_format,
-            compression,
-            request_id,
-            emit,
-        );
-    }
-
     emit(json!({
         "event": "table_progress",
         "request_id": request_id,
@@ -1573,61 +1457,19 @@ fn dump_one_table<F: FnMut(Value)>(
     fs::create_dir_all(&table_dir)
         .map_err(|err| format!("failed to create dump table dir: {err}"))?;
 
-    let table_row_count = adapter.row_count(&table.name).unwrap_or(0) as u64;
-    let key_columns = key_columns(table);
-    let use_keyset = !key_columns.is_empty();
-    let mut last_key: Option<String> = None;
-    let mut offset = 0_usize;
     let mut rows_dumped = 0_u64;
     let mut chunks_dumped = 0_u64;
     let mut chunk_sha256 = BTreeMap::new();
 
     loop {
-        let Some(read_limit) = bounded_dump_chunk_limit(table_row_count, rows_dumped, chunk_size)
-        else {
-            break;
-        };
-        let read_started = Instant::now();
-        let rows = if use_keyset {
-            adapter.read_rows_after_key(table, &key_columns, last_key.as_deref(), read_limit)?
-        } else {
-            adapter.read_rows(table, offset, read_limit)?
-        };
-        let read_ms = read_started.elapsed().as_millis() as u64;
-        if rows.is_empty() {
-            break;
+        match fetch_next_chunk(chunks_dumped + 1, rows_dumped, &table_dir, &mut emit)? {
+            Some(outcome) => {
+                chunk_sha256.insert(outcome.chunk_name, outcome.checksum);
+                rows_dumped += outcome.rows;
+                chunks_dumped += 1;
+            }
+            None => break,
         }
-        chunks_dumped += 1;
-        let chunk_name = dump_chunk_name(chunks_dumped, data_format, compression);
-        let write_started = Instant::now();
-        let checksum = write_dump_rows(
-            &table_dir.join(&chunk_name),
-            table,
-            &rows,
-            data_format,
-            compression,
-        )?;
-        chunk_sha256.insert(chunk_name, checksum);
-        let write_ms = write_started.elapsed().as_millis() as u64;
-
-        let copied_now = rows.len();
-        rows_dumped += copied_now as u64;
-        if use_keyset {
-            last_key = rows.last().and_then(|row| row_key_token(row, &key_columns));
-        } else {
-            offset += copied_now;
-        }
-
-        emit(json!({
-            "event": "row_progress",
-            "request_id": request_id,
-            "table": table.name,
-            "rows": rows_dumped,
-            "total": table_row_count,
-            "chunk_rows": copied_now,
-            "read_ms": read_ms,
-            "write_ms": write_ms
-        }));
     }
 
     emit(json!({
@@ -1652,32 +1494,96 @@ fn dump_one_table<F: FnMut(Value)>(
     ))
 }
 
-fn dump_one_mysql_table<F: FnMut(Value)>(
-    conn: &mut mysql::PooledConn,
-    endpoint: &Endpoint,
-    output_path: &Path,
+fn dump_one_table<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    ctx: &DumpJobContext,
     table: &NormalizedTable,
     index: usize,
     table_total: usize,
-    chunk_size: usize,
-    data_format: &str,
-    compression: &str,
-    request_id: Option<String>,
-    mut emit: F,
+    emit: F,
 ) -> Result<(DumpTableManifest, u64, u64), String> {
-    emit(json!({
-        "event": "table_progress",
-        "request_id": request_id,
-        "table": table.name,
-        "status": "dumping",
-        "current": index + 1,
-        "total": table_total
-    }));
-    let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
-    let table_dir = output_path.join(&table_path);
-    fs::create_dir_all(&table_dir)
-        .map_err(|err| format!("failed to create dump table dir: {err}"))?;
+    if let LiveAdapter::MySql(conn) = adapter {
+        return dump_one_mysql_table(conn, ctx, table, index, table_total, emit);
+    }
 
+    let table_row_count = adapter.row_count(&table.name).unwrap_or(0) as u64;
+    let key_columns = key_columns(table);
+    let use_keyset = !key_columns.is_empty();
+    let mut last_key: Option<String> = None;
+    let mut offset = 0_usize;
+
+    run_table_dump_loop(
+        table,
+        index,
+        table_total,
+        &ctx.output_path,
+        ctx.request_id.clone(),
+        emit,
+        |chunk_number: u64,
+         rows_dumped_before: u64,
+         table_dir: &Path,
+         emit: &mut dyn FnMut(Value)|
+         -> Result<Option<ChunkOutcome>, String> {
+            let Some(read_limit) =
+                bounded_dump_chunk_limit(table_row_count, rows_dumped_before, ctx.chunk_size)
+            else {
+                return Ok(None);
+            };
+            let read_started = Instant::now();
+            let rows = if use_keyset {
+                adapter.read_rows_after_key(table, &key_columns, last_key.as_deref(), read_limit)?
+            } else {
+                adapter.read_rows(table, offset, read_limit)?
+            };
+            let read_ms = read_started.elapsed().as_millis() as u64;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            let chunk_name = dump_chunk_name(chunk_number, &ctx.data_format, &ctx.compression);
+            let write_started = Instant::now();
+            let checksum = write_dump_rows(
+                &table_dir.join(&chunk_name),
+                table,
+                &rows,
+                &ctx.data_format,
+                &ctx.compression,
+            )?;
+            let write_ms = write_started.elapsed().as_millis() as u64;
+
+            let copied_now = rows.len();
+            if use_keyset {
+                last_key = rows.last().and_then(|row| row_key_token(row, &key_columns));
+            } else {
+                offset += copied_now;
+            }
+
+            emit(json!({
+                "event": "row_progress",
+                "request_id": ctx.request_id,
+                "table": table.name,
+                "rows": rows_dumped_before + copied_now as u64,
+                "total": table_row_count,
+                "chunk_rows": copied_now,
+                "read_ms": read_ms,
+                "write_ms": write_ms
+            }));
+            Ok(Some(ChunkOutcome {
+                rows: copied_now as u64,
+                chunk_name,
+                checksum,
+            }))
+        },
+    )
+}
+
+fn dump_one_mysql_table<F: FnMut(Value)>(
+    conn: &mut mysql::PooledConn,
+    ctx: &DumpJobContext,
+    table: &NormalizedTable,
+    index: usize,
+    table_total: usize,
+    emit: F,
+) -> Result<(DumpTableManifest, u64, u64), String> {
     let table_row_count = conn
         .query_first::<u64, _>(count_sql("mysql", &table.name))
         .map(|count| count.unwrap_or(0))
@@ -1686,120 +1592,109 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
     // 컬럼 테이블에서 하나의 result set가 과대해져 스트리밍 코덱이 크래시하는 것을 막는다.
     // 병렬 경로와 동일한 avg-row-length 헬퍼를 재사용하며, 조회 실패/통계 부재 시
     // avg=0 → fallback(chunk_size) → 상한이 지배하도록 안전하게 degrade한다.
-    let avg_row_bytes = mysql_table_avg_row_length(conn, endpoint, &table.name);
-    let effective_chunk_size = sequential_mysql_chunk_size(chunk_size, avg_row_bytes);
+    let avg_row_bytes = mysql_table_avg_row_length(conn, &ctx.endpoint, &table.name);
+    let effective_chunk_size = sequential_mysql_chunk_size(ctx.chunk_size, avg_row_bytes);
     let columns = column_names(table);
     let key_columns = key_columns(table);
     let use_keyset = !key_columns.is_empty();
     let mut last_key: Option<String> = None;
     let mut offset = 0_usize;
-    let mut rows_dumped = 0_u64;
-    let mut chunks_dumped = 0_u64;
-    let mut chunk_sha256 = BTreeMap::new();
 
-    loop {
-        let Some(read_limit) =
-            bounded_dump_chunk_limit(table_row_count, rows_dumped, effective_chunk_size)
-        else {
-            break;
-        };
-        chunks_dumped += 1;
-        let chunk_name = dump_chunk_name(chunks_dumped, data_format, compression);
-        let chunk_path = table_dir.join(&chunk_name);
+    run_table_dump_loop(
+        table,
+        index,
+        table_total,
+        &ctx.output_path,
+        ctx.request_id.clone(),
+        emit,
+        |chunk_number: u64,
+         rows_dumped_before: u64,
+         table_dir: &Path,
+         emit: &mut dyn FnMut(Value)|
+         -> Result<Option<ChunkOutcome>, String> {
+            let Some(read_limit) =
+                bounded_dump_chunk_limit(table_row_count, rows_dumped_before, effective_chunk_size)
+            else {
+                return Ok(None);
+            };
+            let chunk_name = dump_chunk_name(chunk_number, &ctx.data_format, &ctx.compression);
+            let chunk_path = table_dir.join(&chunk_name);
 
-        let stream_started = Instant::now();
-        let last_values = last_key.as_deref().and_then(decode_key_token);
-        let sql = if use_keyset {
-            select_chunk_text_after_key_sql(
-                "mysql",
-                table,
-                &key_columns,
-                last_values.as_deref(),
-                read_limit,
-            )
-        } else {
-            select_chunk_text_sql("mysql", table, &key_columns)
-        };
-        let sql = if use_keyset {
-            sql
-        } else {
-            sql.replacen('?', &(read_limit as u64).to_string(), 1)
-                .replacen('?', &(offset as u64).to_string(), 1)
-        };
-        let result = if use_keyset {
-            conn.query_iter(sql)
-                .map_err(|err| format!("mysql keyset select chunk error: {err}"))?
-        } else {
-            conn.query_iter(sql)
-                .map_err(|err| format!("mysql select chunk error: {err}"))?
-        };
+            let stream_started = Instant::now();
+            let last_values = last_key.as_deref().and_then(decode_key_token);
+            let sql = if use_keyset {
+                select_chunk_text_after_key_sql(
+                    "mysql",
+                    table,
+                    &key_columns,
+                    last_values.as_deref(),
+                    read_limit,
+                )
+            } else {
+                select_chunk_text_sql("mysql", table, &key_columns)
+            };
+            let sql = if use_keyset {
+                sql
+            } else {
+                sql.replacen('?', &(read_limit as u64).to_string(), 1)
+                    .replacen('?', &(offset as u64).to_string(), 1)
+            };
+            let result = if use_keyset {
+                conn.query_iter(sql)
+                    .map_err(|err| format!("mysql keyset select chunk error: {err}"))?
+            } else {
+                conn.query_iter(sql)
+                    .map_err(|err| format!("mysql select chunk error: {err}"))?
+            };
 
-        let mut chunk_rows = 0_usize;
-        let mut next_key: Option<String> = None;
-        {
-            let mut file = open_dump_writer(&chunk_path, compression)?;
-            for row in result {
-                let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
-                if data_format == "tsv" && !use_keyset {
-                    write_mysql_text_row_tsv(&mut file, row)?;
-                } else {
-                    let row_json = mysql_row_to_json(&columns, row);
-                    if use_keyset {
-                        next_key = row_key_token(&row_json, &key_columns);
+            let mut chunk_rows = 0_usize;
+            let mut next_key: Option<String> = None;
+            {
+                let mut file = open_dump_writer(&chunk_path, &ctx.compression)?;
+                for row in result {
+                    let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
+                    if ctx.data_format == "tsv" && !use_keyset {
+                        write_mysql_text_row_tsv(&mut file, row)?;
+                    } else {
+                        let row_json = mysql_row_to_json(&columns, row);
+                        if use_keyset {
+                            next_key = row_key_token(&row_json, &key_columns);
+                        }
+                        write_dump_row(&mut file, table, &row_json, &ctx.data_format)?;
                     }
-                    write_dump_row(&mut file, table, &row_json, data_format)?;
+                    chunk_rows += 1;
                 }
-                chunk_rows += 1;
             }
-        }
-        let stream_ms = stream_started.elapsed().as_millis() as u64;
+            let stream_ms = stream_started.elapsed().as_millis() as u64;
 
-        if chunk_rows == 0 {
-            fs::remove_file(&chunk_path).ok();
-            chunks_dumped -= 1;
-            break;
-        }
-        let checksum = sha256_file(&chunk_path)?;
-        chunk_sha256.insert(chunk_name, checksum);
+            if chunk_rows == 0 {
+                fs::remove_file(&chunk_path).ok();
+                return Ok(None);
+            }
+            let checksum = sha256_file(&chunk_path)?;
 
-        rows_dumped += chunk_rows as u64;
-        if use_keyset {
-            last_key = next_key;
-        } else {
-            offset += chunk_rows;
-        }
+            if use_keyset {
+                last_key = next_key;
+            } else {
+                offset += chunk_rows;
+            }
 
-        emit(json!({
-            "event": "row_progress",
-            "request_id": request_id,
-            "table": table.name,
-            "rows": rows_dumped,
-            "total": table_row_count,
-            "chunk_rows": chunk_rows,
-            "stream_ms": stream_ms
-        }));
-    }
-
-    emit(json!({
-        "event": "table_progress",
-        "request_id": request_id,
-        "table": table.name,
-        "status": "completed",
-        "current": index + 1,
-        "total": table_total
-    }));
-
-    Ok((
-        DumpTableManifest {
-            name: table.name.clone(),
-            path: table_path,
-            rows: rows_dumped,
-            chunks: chunks_dumped,
-            chunk_sha256,
+            emit(json!({
+                "event": "row_progress",
+                "request_id": ctx.request_id,
+                "table": table.name,
+                "rows": rows_dumped_before + chunk_rows as u64,
+                "total": table_row_count,
+                "chunk_rows": chunk_rows,
+                "stream_ms": stream_ms
+            }));
+            Ok(Some(ChunkOutcome {
+                rows: chunk_rows as u64,
+                chunk_name,
+                checksum,
+            }))
         },
-        rows_dumped,
-        chunks_dumped,
-    ))
+    )
 }
 
 
