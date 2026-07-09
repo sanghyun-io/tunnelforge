@@ -18,6 +18,7 @@ from src.core.migration_parsers import (
     CreateUserParser,
     GrantParser,
     SQLParser,
+    SqlStatementScanner,
 )
 
 
@@ -983,3 +984,42 @@ class TestParserPhantomIndexAndQuoteAwareRegressions:
 
     def test_extract_parenthesized_basic(self, parser):
         assert parser._extract_parenthesized("(`a`, `b`)", 0) == "`a`, `b`"
+
+
+# ============================================================
+# SqlStatementScanner 테스트 (data_rules에서 이동한 토크나이저)
+# ============================================================
+class TestSqlStatementScanner:
+    """따옴표/괄호 상태를 추적하는 SQL 문 스캐너 검증"""
+
+    @pytest.fixture
+    def scanner(self):
+        return SqlStatementScanner()
+
+    def test_find_statement_end_ignores_semicolon_in_string(self, scanner):
+        content = "INSERT INTO t VALUES ('a;b'); SELECT 1;"
+        end = scanner.find_statement_end(content, 0)
+        assert content[end] == ';'
+        assert content[:end] == "INSERT INTO t VALUES ('a;b')"
+
+    def test_find_statement_end_no_semicolon_returns_len(self, scanner):
+        content = "SELECT 1"
+        assert scanner.find_statement_end(content, 0) == len(content)
+
+    def test_iter_create_table_statements(self, scanner):
+        content = (
+            "CREATE TABLE `a` (`id` int);\n"
+            "INSERT INTO a VALUES (1);\n"
+            "CREATE TABLE `b` (`id` int);\n"
+        )
+        stmts = list(scanner.iter_create_table_statements(content))
+        assert len(stmts) == 2
+        assert "`a`" in stmts[0]
+        assert "`b`" in stmts[1]
+
+    def test_iter_values_rows_and_split(self, scanner):
+        segment = " (1, 'x,y', 2), (3, 'z', 4)"
+        rows = list(scanner.iter_values_rows(segment))
+        assert len(rows) == 2
+        first = scanner.split_sql_values(rows[0])
+        assert [v.strip() for v in first] == ["1", "'x,y'", "2"]

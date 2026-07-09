@@ -170,6 +170,18 @@ class TestDataIntegrityRulesFiles:
         assert "1개 행" in issues[0].description
         assert "2개" not in issues[0].description
 
+    def test_invalid_datetime_file_read_failure_returns_info_issue(self, tmp_path):
+        """파일 읽기 실패(존재하지 않는 경로) 시 형제 검사와 동일하게
+        info severity 이슈 1건을 반환해야 한다 (CC-088)"""
+        missing = tmp_path / "does_not_exist.tsv"
+
+        rules = DataIntegrityRules()
+        issues = rules.check_invalid_datetime(missing)
+        assert len(issues) == 1
+        assert issues[0].severity == "info"
+        assert issues[0].issue_type == IssueType.INVALID_DATE
+        assert "DATETIME 스캔 미완료" in issues[0].description
+
     def test_check_all_data_file(self, tmp_path):
         data_file = tmp_path / "data.tsv"
         data_file.write_bytes(b"1\t0000-00-00\thello\x00\n")
