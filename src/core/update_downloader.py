@@ -201,7 +201,7 @@ class UpdateDownloader:
             response = requests.get(
                 self.download_url,
                 stream=True,
-                timeout=30
+                timeout=self.timeout
             )
             response.raise_for_status()
 

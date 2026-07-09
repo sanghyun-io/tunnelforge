@@ -1,7 +1,12 @@
 """PostgreSQL database connection helpers."""
 from typing import Any, Optional, Tuple
 
-from src.core.db_core_service import DbEndpoint, RustDbConnection, get_shared_db_core_facade
+from src.core.db_core_service import (
+    DbEndpoint,
+    RustDbConnection,
+    RustDbConnector,
+    get_shared_db_core_facade,
+)
 
 
 class PostgresConnector:
@@ -45,14 +50,15 @@ class PostgresConnector:
                 self.connection = None
 
     def schema_exists(self, schema_name: Optional[str]) -> bool:
+        """스키마 존재 여부 확인 (조회는 RustDbConnector delegate에 위임)"""
         if not schema_name or not self.connection:
             return True
         try:
-            with self.connection.cursor() as cursor:
-                cursor.execute(
-                    "SELECT 1 FROM information_schema.schemata WHERE schema_name = %s",
-                    (schema_name,),
-                )
-                return cursor.fetchone() is not None
+            delegate = RustDbConnector(
+                "postgresql", self.host, self.port, self.user, self.password,
+                database=self.database, facade=self.facade,
+            )
+            delegate.connection = self.connection
+            return delegate.schema_exists(schema_name)
         except Exception:
             return False

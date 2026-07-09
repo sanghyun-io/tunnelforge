@@ -6,11 +6,11 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from src.core.logger import get_logger
-from src.core.constants import SYSTEM_SCHEMAS
 from src.core.db_core_service import (
     RustDbConnection,
     RustDbConnector,
     get_shared_db_core_facade,
+    parse_db_version_tuple,
     quote_mysql_ident,
 )
 
@@ -165,6 +165,8 @@ class MySQLConnector:
     def get_schemas(self, use_cache: bool = True) -> List[str]:
         """스키마(데이터베이스) 목록 조회 (시스템 DB 제외)
 
+        조회 자체는 RustDbConnector delegate에 위임하고, TTL 캐시만 이 wrapper가 감싼다.
+
         Args:
             use_cache: 캐시 사용 여부 (기본 True)
 
@@ -182,30 +184,29 @@ class MySQLConnector:
                 return cached
 
         try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SHOW DATABASES")
-                exclude = SYSTEM_SCHEMAS
-                result = [row['Database'] for row in cursor.fetchall()
-                          if row['Database'] not in exclude]
+            self._delegate.connection = self.connection
+            result = self._delegate.get_schemas()
 
-                # 캐시에 저장
-                if use_cache and self._cache:
-                    self._cache.set(cache_key, result)
+            # 캐시에 저장
+            if use_cache and self._cache:
+                self._cache.set(cache_key, result)
 
-                return result
+            return result
         except Exception as e:
             logger.error(f"스키마 조회 오류: {e}")
             return []
 
     def schema_exists(self, schema_name: str) -> bool:
-        """특정 스키마 존재 여부 확인 (시스템 DB 포함)"""
+        """특정 스키마 존재 여부 확인 (시스템 DB 포함)
+
+        조회는 RustDbConnector delegate에 위임한다.
+        """
         if not self.connection:
             return False
 
         try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SHOW DATABASES LIKE %s", (schema_name,))
-                return cursor.fetchone() is not None
+            self._delegate.connection = self.connection
+            return self._delegate.schema_exists(schema_name)
         except Exception:
             return False
 
@@ -305,26 +306,7 @@ class MySQLConnector:
         Returns:
             버전 튜플 (major, minor, patch) 또는 연결 실패 시 (0, 0, 0)
         """
-        if not self.connection:
-            return (0, 0, 0)
-
-        try:
-            with self.connection.cursor() as cursor:
-                cursor.execute("SELECT VERSION()")
-                result = cursor.fetchone()
-                if result:
-                    version_str = list(result.values())[0]
-                    # "8.0.32-ubuntu" → "8.0.32"
-                    version_clean = version_str.split('-')[0]
-                    parts = version_clean.split('.')
-                    major = int(parts[0]) if len(parts) > 0 else 0
-                    minor = int(parts[1]) if len(parts) > 1 else 0
-                    patch = int(parts[2]) if len(parts) > 2 else 0
-                    return (major, minor, patch)
-        except Exception as e:
-            logger.error(f"버전 조회 오류: {e}")
-
-        return (0, 0, 0)
+        return parse_db_version_tuple(self.get_db_version_string())
 
     def get_db_version_string(self) -> str:
         """DB 버전 문자열 반환 (원본)"""

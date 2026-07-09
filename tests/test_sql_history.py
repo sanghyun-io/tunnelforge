@@ -387,3 +387,16 @@ class TestSQLHistory:
 
         result = self.history._load_history()
         assert result == []
+
+    def test_load_history_invalid_json_logs_warning(self):
+        """손상된 JSON 파일 로드 시 경고 로그를 남김 (CC-011 회귀)"""
+        from unittest.mock import patch
+
+        with open(self.history.history_file, 'w') as f:
+            f.write('{invalid json}')
+
+        with patch('src.core.sql_history.logger.warning') as mock_warning:
+            result = self.history._load_history()
+
+        assert result == []
+        mock_warning.assert_called_once()
