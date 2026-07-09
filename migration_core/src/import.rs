@@ -9,6 +9,13 @@ use std::time::Instant;
 use mysql::{prelude::Queryable, LocalInfileHandler};
 use crate::*;
 
+/// MySQL `LOAD DATA LOCAL`이 비활성화됐을 때 반환되는 에러 코드(ERROR 3948) 매칭 토큰.
+const MYSQL_ERR_LOCAL_INFILE_DISABLED: &str = "3948";
+/// import 세션 튜닝에서 상향하는 net_read/net_write 타임아웃(초).
+const MYSQL_IMPORT_NET_TIMEOUT_SECS: u32 = 600;
+/// import 세션 튜닝에서 상향하는 wait_timeout(초).
+const MYSQL_IMPORT_WAIT_TIMEOUT_SECS: u32 = 28800;
+
 pub(crate) fn dump_import_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(json!({
         "event": "phase",
@@ -66,7 +73,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .get("threads")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or(8)
+        .unwrap_or(DEFAULT_DUMP_THREADS)
         .max(1);
     let mysql_local_infile_policy = mysql_local_infile_policy_from_payload(&request.payload)?;
     let timezone_sql =
@@ -220,10 +227,12 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                     table_rows_before,
                     overall_rows_total,
                     row_count as u64,
-                    Some(chunk_index),
-                    Some(table_manifest.chunks),
-                    Some(chunk_index),
-                    None,
+                    ChunkProgress {
+                        chunks_done: Some(chunk_index),
+                        chunks_total: Some(table_manifest.chunks),
+                        chunk_index: Some(chunk_index),
+                        load_ms: None,
+                    },
                     "insert_rows",
                 ));
             }
@@ -604,10 +613,12 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                 overall_rows_before,
                 overall_rows_total,
                 rows,
-                Some(chunks_imported),
-                Some(table_manifest.chunks),
-                Some(chunk_index),
-                Some(started.elapsed().as_millis() as u64),
+                ChunkProgress {
+                    chunks_done: Some(chunks_imported),
+                    chunks_total: Some(table_manifest.chunks),
+                    chunk_index: Some(chunk_index),
+                    load_ms: Some(started.elapsed().as_millis() as u64),
+                },
                 "load_data_local_infile",
             ));
         }
@@ -796,7 +807,7 @@ fn restore_mysql_local_infile_policy<F: FnMut(Value)>(
 
 fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("3948")
+    lower.contains(MYSQL_ERR_LOCAL_INFILE_DISABLED)
         || lower.contains("loading local data is disabled")
         || lower.contains("local infile")
             && (lower.contains("disabled") || lower.contains("not allowed"))
@@ -877,9 +888,9 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
             // 서버 측 세션 idle/전송 타임아웃 상향 — 대량 청크 전송 중 서버가
             // net_read/net_write_timeout(기본 30/60s)이나 wait_timeout으로 먼저
             // 연결을 끊는 것을 방어한다. keepalive(mysql_opts)와 이중 방어.
-            "SET SESSION net_read_timeout = 600".to_string(),
-            "SET SESSION net_write_timeout = 600".to_string(),
-            "SET SESSION wait_timeout = 28800".to_string(),
+            format!("SET SESSION net_read_timeout = {MYSQL_IMPORT_NET_TIMEOUT_SECS}"),
+            format!("SET SESSION net_write_timeout = {MYSQL_IMPORT_NET_TIMEOUT_SECS}"),
+            format!("SET SESSION wait_timeout = {MYSQL_IMPORT_WAIT_TIMEOUT_SECS}"),
         ]
     }
 }
@@ -967,10 +978,12 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
             overall_rows_before,
             overall_rows_total,
             rows,
-            Some(chunks_imported),
-            Some(table_manifest.chunks),
-            Some(chunk_index),
-            Some(started.elapsed().as_millis() as u64),
+            ChunkProgress {
+                chunks_done: Some(chunks_imported),
+                chunks_total: Some(table_manifest.chunks),
+                chunk_index: Some(chunk_index),
+                load_ms: Some(started.elapsed().as_millis() as u64),
+            },
             "insert_fallback",
         ));
     }
@@ -1052,10 +1065,12 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                     overall_rows_before,
                     overall_rows_total,
                     rows,
-                    Some(completed),
-                    Some(table_manifest.chunks),
-                    Some(chunk_index),
-                    Some(load_ms),
+                    ChunkProgress {
+                        chunks_done: Some(completed),
+                        chunks_total: Some(table_manifest.chunks),
+                        chunk_index: Some(chunk_index),
+                        load_ms: Some(load_ms),
+                    },
                     "parallel_load_data_local_infile",
                 ));
                 if let Some(next_chunk) = pending.pop_front() {

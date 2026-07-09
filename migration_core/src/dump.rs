@@ -10,6 +10,9 @@ use std::time::Instant;
 use mysql::prelude::Queryable;
 use crate::*;
 
+/// dump.run / dump.import 요청에 threads가 명시되지 않았을 때 사용하는 기본 워커 수.
+pub(crate) const DEFAULT_DUMP_THREADS: usize = 8;
+
 pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(json!({
         "event": "phase",
@@ -26,12 +29,6 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
             "message": err
         })),
     }
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct DumpTableStats {
-    rows: u64,
-    avg_row_bytes: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -98,10 +95,10 @@ fn global_dump_work_plan_for_ranges(
     global_dump_work_plan(tables, &range_counts)
 }
 
-fn dump_table_stats(
+fn dump_table_row_counts(
     endpoint: &Endpoint,
     tables: &[NormalizedTable],
-) -> BTreeMap<String, DumpTableStats> {
+) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
     if endpoint.engine != "mysql" || tables.is_empty() {
         return counts;
@@ -117,21 +114,15 @@ fn dump_table_stats(
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!(
-        "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0), COALESCE(AVG_ROW_LENGTH, 0) FROM information_schema.tables WHERE TABLE_SCHEMA = {} AND TABLE_NAME IN ({})",
+        "SELECT TABLE_NAME, COALESCE(TABLE_ROWS, 0) FROM information_schema.tables WHERE TABLE_SCHEMA = {} AND TABLE_NAME IN ({})",
         sql_literal(&Value::String(schema_name)),
         table_names
     );
-    let Ok(rows) = conn.query::<(String, u64, u64), _>(sql) else {
+    let Ok(rows) = conn.query::<(String, u64), _>(sql) else {
         return counts;
     };
-    for (table, rows, avg_row_bytes) in rows {
-        counts.insert(
-            table,
-            DumpTableStats {
-                rows,
-                avg_row_bytes,
-            },
-        );
+    for (table, rows) in rows {
+        counts.insert(table, rows);
     }
     counts
 }
@@ -234,6 +225,19 @@ fn dump_schedule_event(
     })
 }
 
+/// dump.import 진행률 이벤트의 청크 관련 필드 묶음.
+///
+/// 이전에는 네 개의 위치 인자 `Option<u64>`가 나란히 전달돼 호출부에서
+/// `chunks_done`과 `chunk_index`가 같은 값을 두 번 넘기는 등 의미가 불명확했다.
+/// named field 로 묶어 각 값의 역할을 호출부에서 자기문서화한다.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChunkProgress {
+    pub(crate) chunks_done: Option<u64>,
+    pub(crate) chunks_total: Option<u64>,
+    pub(crate) chunk_index: Option<u64>,
+    pub(crate) load_ms: Option<u64>,
+}
+
 pub(crate) fn dump_import_row_progress_event(
     request_id: Option<String>,
     table: &str,
@@ -242,10 +246,7 @@ pub(crate) fn dump_import_row_progress_event(
     overall_rows_before: u64,
     overall_rows_total: u64,
     chunk_rows: u64,
-    chunks_done: Option<u64>,
-    chunks_total: Option<u64>,
-    chunk_index: Option<u64>,
-    load_ms: Option<u64>,
+    chunk_progress: ChunkProgress,
     strategy: &str,
 ) -> Value {
     let raw_overall_rows_done = overall_rows_before.saturating_add(table_rows_done);
@@ -269,16 +270,16 @@ pub(crate) fn dump_import_row_progress_event(
     });
 
     if let Value::Object(fields) = &mut event {
-        if let Some(value) = chunks_done {
+        if let Some(value) = chunk_progress.chunks_done {
             fields.insert("chunks_done".to_string(), json!(value));
         }
-        if let Some(value) = chunks_total {
+        if let Some(value) = chunk_progress.chunks_total {
             fields.insert("chunks_total".to_string(), json!(value));
         }
-        if let Some(value) = chunk_index {
+        if let Some(value) = chunk_progress.chunk_index {
             fields.insert("chunk_index".to_string(), json!(value));
         }
-        if let Some(value) = load_ms {
+        if let Some(value) = chunk_progress.load_ms {
             fields.insert("load_ms".to_string(), json!(value));
         }
     }
@@ -306,7 +307,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         .get("threads")
         .and_then(Value::as_u64)
         .map(|value| value as usize)
-        .unwrap_or(8)
+        .unwrap_or(DEFAULT_DUMP_THREADS)
         .max(1);
     let overwrite = request
         .payload
@@ -349,22 +350,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         return Err("dump.run found no tables to export".to_string());
     }
 
-    let table_stats = dump_table_stats(&endpoint, &schema.tables);
-    let row_counts = table_stats
-        .iter()
-        .map(|(table, stats)| (table.clone(), stats.rows))
-        .collect::<BTreeMap<_, _>>();
-    let range_eligible_tables = schema
-        .tables
-        .iter()
-        .filter(|table| single_numeric_primary_key(table).is_some())
-        .map(|table| table.name.clone())
-        .collect::<BTreeSet<_>>();
-    let avg_row_lengths = table_stats
-        .iter()
-        .filter(|(table, _)| range_eligible_tables.contains(*table))
-        .map(|(table, stats)| (table.clone(), stats.avg_row_bytes))
-        .collect::<BTreeMap<_, _>>();
+    let row_counts = dump_table_row_counts(&endpoint, &schema.tables);
     emit(dump_plan_event(
         request.request_id.clone(),
         &schema.tables,
@@ -372,13 +358,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     ));
 
     let table_total = schema.tables.len();
-    let parallel_limits = adaptive_dump_parallel_limits_with_avg(
-        threads,
-        table_total,
-        chunk_size,
-        &row_counts,
-        &avg_row_lengths,
-    );
+    let parallel_limits = dump_parallel_limits(threads, table_total);
     let export_tables = if threads > 1 && table_total > 1 {
         dump_schedule_order(&schema.tables, &row_counts)
     } else {
@@ -667,66 +647,6 @@ fn dump_parallel_limits(threads: usize, table_total: usize) -> DumpParallelLimit
         table_workers,
         range_workers_per_table,
     }
-}
-
-#[cfg(test)]
-fn adaptive_dump_parallel_limits(
-    threads: usize,
-    table_total: usize,
-    chunk_size: usize,
-    row_counts: &BTreeMap<String, u64>,
-) -> DumpParallelLimits {
-    adaptive_dump_parallel_limits_with_avg(
-        threads,
-        table_total,
-        chunk_size,
-        row_counts,
-        &BTreeMap::new(),
-    )
-}
-
-fn adaptive_dump_parallel_limits_with_avg(
-    threads: usize,
-    table_total: usize,
-    chunk_size: usize,
-    row_counts: &BTreeMap<String, u64>,
-    avg_row_lengths: &BTreeMap<String, u64>,
-) -> DumpParallelLimits {
-    let baseline = dump_parallel_limits(threads, table_total);
-    let thread_budget = threads.max(1);
-    if table_total <= 1 || row_counts.is_empty() {
-        return baseline;
-    }
-    let fallback_chunk_size = chunk_size.max(1);
-    let heavy_tables = row_counts
-        .iter()
-        .filter(|(table, rows)| {
-            let effective_chunk_size = mysql_range_chunk_size_for_avg_row(
-                fallback_chunk_size,
-                avg_row_lengths.get(*table).copied().unwrap_or(0),
-            ) as u64;
-            rows.saturating_add(effective_chunk_size - 1) / effective_chunk_size
-                >= (thread_budget as u64).saturating_mul(2)
-        })
-        .count();
-    let max_estimated_chunks = row_counts
-        .iter()
-        .map(|(table, rows)| {
-            let effective_chunk_size = mysql_range_chunk_size_for_avg_row(
-                fallback_chunk_size,
-                avg_row_lengths.get(table).copied().unwrap_or(0),
-            ) as u64;
-            rows.saturating_add(effective_chunk_size - 1) / effective_chunk_size
-        })
-        .max()
-        .unwrap_or(0);
-    if heavy_tables > 1 {
-        return baseline;
-    }
-    if max_estimated_chunks >= (thread_budget as u64).saturating_mul(2) {
-        return baseline;
-    }
-    baseline
 }
 
 fn dump_schedule_order(
@@ -2002,10 +1922,12 @@ mod tests {
             1_000,
             2_000,
             25,
-            Some(2),
-            Some(8),
-            Some(4),
-            Some(500),
+            ChunkProgress {
+                chunks_done: Some(2),
+                chunks_total: Some(8),
+                chunk_index: Some(4),
+                load_ms: Some(500),
+            },
             "load_data_local_infile",
         );
 
@@ -2037,7 +1959,7 @@ mod tests {
         counts.insert("huge".to_string(), 2_000_000);
         counts.insert("medium".to_string(), 500_000);
         counts.insert("tiny".to_string(), 10);
-        let limits = adaptive_dump_parallel_limits(8, 3, 50_000, &counts);
+        let limits = dump_parallel_limits(8, 3);
 
         let event = dump_schedule_event(
             Some("req-1".to_string()),
@@ -2083,12 +2005,7 @@ mod tests {
 
     #[test]
     fn adaptive_dump_limits_prioritize_range_workers_for_heavy_chunked_tables() {
-        let mut counts = BTreeMap::new();
-        counts.insert("huge".to_string(), 2_000_000);
-        counts.insert("medium".to_string(), 500_000);
-        counts.insert("tiny".to_string(), 10);
-
-        let limits = adaptive_dump_parallel_limits(8, 208, 50_000, &counts);
+        let limits = dump_parallel_limits(8, 208);
 
         assert_eq!(limits.table_workers, 2);
         assert_eq!(limits.range_workers_per_table, 4);
@@ -2096,14 +2013,7 @@ mod tests {
 
     #[test]
     fn adaptive_dump_limits_use_byte_chunks_for_wide_tables() {
-        let mut counts = BTreeMap::new();
-        counts.insert("df_subs".to_string(), 223_502);
-        counts.insert("tiny".to_string(), 10);
-        let mut avg_row_lengths = BTreeMap::new();
-        avg_row_lengths.insert("df_subs".to_string(), 9_462);
-
-        let limits =
-            adaptive_dump_parallel_limits_with_avg(8, 208, 50_000, &counts, &avg_row_lengths);
+        let limits = dump_parallel_limits(8, 208);
 
         assert_eq!(limits.table_workers, 2);
         assert_eq!(limits.range_workers_per_table, 4);
@@ -2111,17 +2021,7 @@ mod tests {
 
     #[test]
     fn adaptive_dump_limits_keep_table_parallelism_for_pathological_wide_table() {
-        let mut counts = BTreeMap::new();
-        counts.insert("df_subs".to_string(), 387_398);
-        counts.insert("qe_view_factors_result".to_string(), 1_946_153);
-        counts.insert("df_call_logs".to_string(), 1_076_142);
-        let mut avg_row_lengths = BTreeMap::new();
-        avg_row_lengths.insert("df_subs".to_string(), 9_462);
-        avg_row_lengths.insert("qe_view_factors_result".to_string(), 128);
-        avg_row_lengths.insert("df_call_logs".to_string(), 128);
-
-        let limits =
-            adaptive_dump_parallel_limits_with_avg(8, 208, 50_000, &counts, &avg_row_lengths);
+        let limits = dump_parallel_limits(8, 208);
 
         assert_eq!(limits.table_workers, 2);
         assert_eq!(limits.range_workers_per_table, 4);
@@ -2129,12 +2029,7 @@ mod tests {
 
     #[test]
     fn adaptive_dump_limits_keep_multiple_heavy_tables_in_parallel() {
-        let mut counts = BTreeMap::new();
-        counts.insert("huge_a".to_string(), 2_000_000);
-        counts.insert("huge_b".to_string(), 1_900_000);
-        counts.insert("tiny".to_string(), 10);
-
-        let limits = adaptive_dump_parallel_limits(8, 208, 50_000, &counts);
+        let limits = dump_parallel_limits(8, 208);
 
         assert_eq!(limits.table_workers, 2);
         assert_eq!(limits.range_workers_per_table, 4);
