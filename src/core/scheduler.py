@@ -4,239 +4,40 @@
 - 자동 DB Export 실행
 - 백업 보관 정책 (개수, 기간)
 - SQL 쿼리 실행 (SELECT → CSV/JSON, DML → commit)
+
+BackupScheduler는 스케줄링 엔진(등록/실행 큐/직렬화 실행 루프)만 담당하며,
+실제 작업 실행은 아래 협력 모듈에 위임한다:
+- schedule_config: ScheduleConfig 등 데이터 모델
+- cron_parser: CronParser
+- execution_log_writer: ExecutionLogWriter (실행 로그 기록/조회)
+- backup_task_executor: BackupTaskExecutor (RustDumpExporter 백업 실행)
+- sql_query_task_executor: SqlQueryTaskExecutor (SQL 쿼리 실행)
+- retention_policy: 보관 정책 선정 로직 (위 두 executor가 공용)
 """
 import copy
-import csv
-import json
-import os
 import queue
-import re
-import shutil
 import threading
-from dataclasses import dataclass, field, asdict
-from datetime import datetime, timedelta
-from enum import Enum
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Callable, Tuple
 
 from src.core.logger import get_logger
-from src.core.platform_paths import log_dir as platform_log_dir
-from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
+from src.core.constants import DEFAULT_LOCAL_HOST
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
-from src.core.sql_statement_parser import parse_sql_statements
-from src.core.sql_query_classifier import classify_sql_statement
+from src.core.schedule_config import ScheduleTaskType, ScheduleConfig, _ExecutionJob, _ResolvedConnection
+from src.core.cron_parser import CronParser
+from src.core.execution_log_writer import ExecutionLogWriter
+from src.core.backup_task_executor import BackupTaskExecutor
+from src.core.sql_query_task_executor import SqlQueryTaskExecutor
+
+# 하위 호환 재노출 (consumer: src/ui/dialogs/schedule_dialog.py, src/ui/main_window.py)
+__all__ = [
+    "ScheduleTaskType",
+    "ScheduleConfig",
+    "CronParser",
+    "BackupScheduler",
+]
 
 logger = get_logger(__name__)
-
-
-class ScheduleTaskType(str, Enum):
-    """스케줄 작업 유형"""
-    BACKUP = "backup"
-    SQL_QUERY = "sql_query"
-
-
-@dataclass
-class ScheduleConfig:
-    """스케줄 백업/SQL 실행 설정"""
-    id: str
-    name: str
-    tunnel_id: str              # 사용할 터널 ID
-    schema: str                 # Export 대상 스키마
-    tables: List[str] = field(default_factory=list)  # 빈 리스트 = 전체
-    output_dir: str = ""        # 출력 디렉토리
-    cron_expression: str = "0 3 * * *"  # 기본: 매일 03:00
-    enabled: bool = True
-    retention_count: int = 5    # 보관할 백업 수
-    retention_days: int = 30    # 보관 기간 (일)
-    last_run: Optional[str] = None  # ISO format
-    next_run: Optional[str] = None  # ISO format
-
-    # === SQL 쿼리 실행 전용 필드 ===
-    task_type: str = "backup"           # 작업 유형: backup, sql_query
-    sql_query: str = ""                 # 실행할 SQL (;로 멀티 쿼리 구분)
-    result_format: str = "csv"          # 결과 저장 형식: csv, json, none
-    result_output_dir: str = ""         # 결과 저장 경로 (없으면 output_dir 사용)
-    result_filename_pattern: str = "{name}_{timestamp}"  # 파일명 패턴
-    query_timeout: int = 300            # 타임아웃 (초)
-    result_retention_count: int = 10    # 결과 파일 보관 개수
-    result_retention_days: int = 30     # 결과 파일 보관 기간
-
-    def to_dict(self) -> Dict[str, Any]:
-        """딕셔너리로 변환"""
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'ScheduleConfig':
-        """딕셔너리에서 생성 (하위 호환성 지원)"""
-        # 기존 설정에 새 필드가 없으면 기본값 적용
-        defaults = {
-            'task_type': 'backup',
-            'sql_query': '',
-            'result_format': 'csv',
-            'result_output_dir': '',
-            'result_filename_pattern': '{name}_{timestamp}',
-            'query_timeout': 300,
-            'result_retention_count': 10,
-            'result_retention_days': 30,
-        }
-        for key, default_value in defaults.items():
-            if key not in data:
-                data[key] = default_value
-        return cls(**data)
-
-    def is_sql_query_task(self) -> bool:
-        """SQL 쿼리 작업 여부"""
-        return self.task_type == ScheduleTaskType.SQL_QUERY.value
-
-    def get_result_output_path(self) -> str:
-        """결과 저장 경로 반환 (result_output_dir 우선, 없으면 output_dir)"""
-        return self.result_output_dir or self.output_dir
-
-
-@dataclass
-class _ExecutionJob:
-    """실행 큐에 올라가는 작업 단위 (스케줄 스냅샷 + 실행 후 처리 방식)"""
-    schedule: ScheduleConfig
-    update_next_run: bool
-
-
-@dataclass(frozen=True)
-class _ResolvedConnection:
-    """백업/SQL 실행이 공유하는 해석된 연결 정보"""
-    host: str
-    port: int
-    user: str
-    password: str
-    engine: str
-
-
-class CronParser:
-    """간단한 Cron 표현식 파서
-
-    지원 형식: "분 시 일 월 요일"
-    예:
-        "0 3 * * *"   = 매일 03:00
-        "0 0 * * 0"   = 매주 일요일 00:00
-        "0 12 1 * *"  = 매월 1일 12:00
-        "30 6 * * 1-5" = 평일 06:30
-    """
-
-    @staticmethod
-    def parse_field(field: str, min_val: int, max_val: int, current: int, normalize_dow_7: bool = False) -> List[int]:
-        """크론 필드를 값 목록으로 파싱
-
-        Args:
-            normalize_dow_7: 요일 필드에서 7을 0(일요일)으로 취급 (cron 관용 표기 0/7=일요일 모두 허용)
-        """
-        if field == '*':
-            return list(range(min_val, max_val + 1))
-
-        def _normalize(v: int) -> int:
-            if normalize_dow_7 and v == 7:
-                return 0
-            return v
-
-        values = []
-        for part in field.split(','):
-            # 범위 (예: 1-5)
-            if '-' in part:
-                start, end = part.split('-')
-                values.extend(_normalize(v) for v in range(int(start), int(end) + 1))
-            # 간격 (예: */5)
-            elif part.startswith('*/'):
-                step = int(part[2:])
-                values.extend(range(min_val, max_val + 1, step))
-            else:
-                values.append(_normalize(int(part)))
-
-        return sorted(set(v for v in values if min_val <= v <= max_val))
-
-    @staticmethod
-    def get_next_run(expression: str, after: datetime = None) -> Optional[datetime]:
-        """다음 실행 시간 계산
-
-        Args:
-            expression: Cron 표현식 "분 시 일 월 요일"
-            after: 이 시간 이후의 다음 실행 시간 (기본: 현재)
-
-        Returns:
-            다음 실행 datetime 또는 None (파싱 실패 시)
-        """
-        if after is None:
-            after = datetime.now()
-
-        try:
-            parts = expression.strip().split()
-            if len(parts) != 5:
-                logger.warning(f"잘못된 cron 표현식: {expression}")
-                return None
-
-            minute_field, hour_field, day_field, month_field, dow_field = parts
-
-            # 최대 1년간 검색
-            check_time = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
-            end_time = after + timedelta(days=366)
-
-            while check_time < end_time:
-                minutes = CronParser.parse_field(minute_field, 0, 59, check_time.minute)
-                hours = CronParser.parse_field(hour_field, 0, 23, check_time.hour)
-                days = CronParser.parse_field(day_field, 1, 31, check_time.day)
-                months = CronParser.parse_field(month_field, 1, 12, check_time.month)
-                dows = CronParser.parse_field(dow_field, 0, 6, check_time.weekday(), normalize_dow_7=True)
-                # cron에서 0=일요일, Python에서 0=월요일 변환
-                # Python weekday(): 월=0, 화=1, ..., 일=6
-                # Cron: 일=0, 월=1, ..., 토=6
-                python_dow = (check_time.weekday() + 1) % 7
-
-                if (check_time.month in months and
-                    check_time.day in days and
-                    check_time.hour in hours and
-                    check_time.minute in minutes and
-                    python_dow in dows):
-                    return check_time
-
-                check_time += timedelta(minutes=1)
-
-            return None
-
-        except Exception as e:
-            logger.error(f"Cron 파싱 오류: {e}")
-            return None
-
-    @staticmethod
-    def describe(expression: str) -> str:
-        """Cron 표현식을 사람이 읽기 쉬운 형태로 변환"""
-        try:
-            parts = expression.strip().split()
-            if len(parts) != 5:
-                return expression
-
-            minute, hour, day, month, dow = parts
-
-            # 매일
-            if day == '*' and month == '*' and dow == '*':
-                if minute == '0' and hour != '*':
-                    return f"매일 {hour}:00"
-                elif minute != '*' and hour != '*':
-                    return f"매일 {hour}:{minute.zfill(2)}"
-
-            # 매주
-            dow_names = ['일', '월', '화', '수', '목', '금', '토']
-            if day == '*' and month == '*' and dow != '*':
-                if dow.isdigit():
-                    dow_index = 0 if int(dow) == 7 else int(dow)
-                    day_name = dow_names[dow_index]
-                    return f"매주 {day_name}요일 {hour}:{minute.zfill(2)}"
-                elif dow == '1-5':
-                    return f"평일 {hour}:{minute.zfill(2)}"
-
-            # 매월
-            if day != '*' and month == '*' and dow == '*':
-                return f"매월 {day}일 {hour}:{minute.zfill(2)}"
-
-            return expression
-
-        except Exception:
-            return expression
 
 
 class BackupScheduler:
@@ -263,8 +64,29 @@ class BackupScheduler:
         self._execution_stop_event = threading.Event()
         self._active_schedule_ids: set = set()
 
+        # 작업 실행 협력자 조립 (DI - 아래 모듈들은 scheduler.py를 import하지 않는 leaf 모듈)
+        self._log_writer = ExecutionLogWriter()
+        self._backup_executor = BackupTaskExecutor(
+            resolve_connection=self._resolve_connection,
+            log_writer=self._log_writer,
+        )
+        self._sql_executor = SqlQueryTaskExecutor(
+            resolve_connection=self._resolve_connection,
+            connector_factory=self._make_connector,
+            log_writer=self._log_writer,
+        )
+
         # 스케줄 로드
         self._load_schedules()
+
+    def _make_connector(self, *args, **kwargs):
+        """SqlQueryTaskExecutor가 주입받는 connector factory
+
+        모듈 전역 이름(create_rust_db_connector)을 호출 시점에 조회하므로
+        monkeypatch.setattr("src.core.scheduler.create_rust_db_connector", ...)가 그대로 반영된다.
+        SqlQueryTaskExecutor가 create_rust_db_connector를 직접 import하면 이 monkeypatch가 무효화된다.
+        """
+        return create_rust_db_connector(*args, **kwargs)
 
     def _load_schedules(self):
         """설정에서 스케줄 로드"""
@@ -580,152 +402,22 @@ class BackupScheduler:
         )
         return resolved, ""
 
+    # =========================================================================
+    # 작업 실행 - BackupTaskExecutor / SqlQueryTaskExecutor로 위임
+    # (아래 얇은 위임 메서드는 tests/test_scheduler.py가 인스턴스에서 직접 호출하는
+    #  private 표면이므로 이름/시그니처를 그대로 유지한다)
+    # =========================================================================
+
     def _execute_backup(self, schedule: ScheduleConfig) -> tuple:
-        """백업 실행
+        """백업 실행 (BackupTaskExecutor에 위임)
 
         Returns:
             (success, message)
         """
-        from src.exporters.rust_dump_exporter import RustDumpExporter, RustDumpConfig
-
-        logger.info(f"백업 시작: {schedule.name}")
-
-        try:
-            resolved, error_msg = self._resolve_connection(schedule)
-            if error_msg:
-                logger.error(error_msg)
-                self._log_backup(schedule, False, error_msg)
-                return False, error_msg
-
-            # 출력 디렉토리 생성
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            output_subdir = os.path.join(schedule.output_dir, f"{schedule.name}_{timestamp}")
-            os.makedirs(output_subdir, exist_ok=True)
-
-            # RustDump Export 실행
-            config = RustDumpConfig(
-                host=resolved.host,
-                port=resolved.port,
-                user=resolved.user,
-                password=resolved.password,
-                schema=schedule.schema,
-                engine=resolved.engine,
-            )
-
-            exporter = RustDumpExporter(config)
-
-            if schedule.tables:
-                success, result, _ = exporter.export_tables(
-                    schema=schedule.schema,
-                    tables=schedule.tables,
-                    output_dir=output_subdir,
-                    threads=4
-                )
-            else:
-                success, result = exporter.export_full_schema(
-                    schema=schedule.schema,
-                    output_dir=output_subdir,
-                    threads=4
-                )
-
-            if success:
-                # 백업 정리
-                self._cleanup_old_backups(schedule)
-
-                # last_run 업데이트
-                schedule.last_run = datetime.now().isoformat()
-
-                message = f"백업 완료: {output_subdir}"
-                logger.info(message)
-                self._log_backup(schedule, True, message)
-                return True, message
-            else:
-                error_msg = f"Export 실패: {result}"
-                logger.error(error_msg)
-                self._log_backup(schedule, False, error_msg)
-                return False, error_msg
-
-        except Exception as e:
-            error_msg = f"백업 오류: {str(e)}"
-            logger.exception(error_msg)
-            self._log_backup(schedule, False, error_msg)
-            return False, error_msg
-
-    def _cleanup_old_backups(self, schedule: ScheduleConfig):
-        """오래된 백업 정리"""
-        try:
-            if not os.path.exists(schedule.output_dir):
-                return
-
-            # 백업 디렉토리 목록 (schedule.name_으로 시작하는 것만)
-            prefix = f"{schedule.name}_"
-            backup_dirs = []
-
-            for name in os.listdir(schedule.output_dir):
-                full_path = os.path.join(schedule.output_dir, name)
-                if os.path.isdir(full_path) and name.startswith(prefix):
-                    try:
-                        # 타임스탬프 추출
-                        timestamp_str = name[len(prefix):]
-                        timestamp = datetime.strptime(timestamp_str, '%Y%m%d_%H%M%S')
-                        backup_dirs.append((full_path, timestamp))
-                    except ValueError:
-                        continue
-
-            if not backup_dirs:
-                return
-
-            # 시간순 정렬 (오래된 것부터)
-            backup_dirs.sort(key=lambda x: x[1])
-
-            now = datetime.now()
-            to_delete = []
-
-            # retention_days 체크
-            cutoff = now - timedelta(days=schedule.retention_days)
-            for path, timestamp in backup_dirs:
-                if timestamp < cutoff:
-                    to_delete.append(path)
-
-            # retention_count 체크 (남은 것 중에서)
-            remaining = [b for b in backup_dirs if b[0] not in to_delete]
-            if len(remaining) > schedule.retention_count:
-                excess = len(remaining) - schedule.retention_count
-                for path, _ in remaining[:excess]:
-                    to_delete.append(path)
-
-            # 삭제 실행
-            for path in to_delete:
-                try:
-                    shutil.rmtree(path)
-                    logger.info(f"오래된 백업 삭제: {path}")
-                except Exception as e:
-                    logger.error(f"백업 삭제 실패: {path} - {e}")
-
-        except Exception as e:
-            logger.error(f"백업 정리 오류: {e}")
-
-    def _log_backup(self, schedule: ScheduleConfig, success: bool, message: str):
-        """백업 로그 저장"""
-        try:
-            # 로그 디렉토리
-            log_dir = str(platform_log_dir() / 'backup_logs')
-
-            os.makedirs(log_dir, exist_ok=True)
-
-            # 오늘 날짜 로그 파일
-            log_file = os.path.join(log_dir, f"backup_{datetime.now().strftime('%Y%m%d')}.log")
-
-            with open(log_file, 'a', encoding='utf-8') as f:
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                status = "성공" if success else "실패"
-                f.write(f"[{timestamp}] [{status}] {schedule.name}: {message}\n")
-
-        except Exception as e:
-            logger.error(f"백업 로그 저장 실패: {e}")
+        return self._backup_executor.execute(schedule)
 
     def get_backup_logs(self, days: int = 7) -> List[Dict[str, Any]]:
-        """최근 백업 로그 조회
+        """최근 백업 로그 조회 (ExecutionLogWriter에 위임)
 
         Args:
             days: 조회할 일수
@@ -733,132 +425,19 @@ class BackupScheduler:
         Returns:
             로그 항목 목록
         """
-        logs = []
-
-        try:
-            log_dir = str(platform_log_dir() / 'backup_logs')
-
-            if not os.path.exists(log_dir):
-                return logs
-
-            # 최근 N일간의 로그 파일
-            for i in range(days):
-                date = datetime.now() - timedelta(days=i)
-                log_file = os.path.join(log_dir, f"backup_{date.strftime('%Y%m%d')}.log")
-
-                if os.path.exists(log_file):
-                    with open(log_file, 'r', encoding='utf-8') as f:
-                        for line in f:
-                            # 파싱: [timestamp] [status] name: message
-                            match = re.match(
-                                r'\[(.+?)\] \[(.+?)\] (.+?): (.+)',
-                                line.strip()
-                            )
-                            if match:
-                                logs.append({
-                                    'timestamp': match.group(1),
-                                    'status': match.group(2),
-                                    'name': match.group(3),
-                                    'message': match.group(4)
-                                })
-        except Exception as e:
-            logger.error(f"백업 로그 조회 오류: {e}")
-
-        return logs
-
-    # =========================================================================
-    # SQL 쿼리 실행 기능
-    # =========================================================================
+        return self._log_writer.get_logs(days)
 
     def _execute_sql_query(self, schedule: ScheduleConfig) -> Tuple[bool, str]:
-        """SQL 쿼리 실행
+        """SQL 쿼리 실행 (SqlQueryTaskExecutor에 위임)
 
         Returns:
             (success, message)
         """
-        logger.info(f"SQL 쿼리 실행 시작: {schedule.name}")
-
-        try:
-            resolved, error_msg = self._resolve_connection(schedule)
-            if error_msg:
-                logger.error(error_msg)
-                self._log_backup(schedule, False, error_msg)
-                return False, error_msg
-
-            # DB 연결 (복호화된 자격 증명 사용)
-            connector = create_rust_db_connector(
-                resolved.engine,
-                resolved.host,
-                resolved.port,
-                resolved.user,
-                resolved.password,
-                schedule.schema if schedule.schema else None,
-                schema=schedule.schema if resolved.engine == 'postgresql' else "",
-            )
-
-            success, msg = connector.connect()
-            if not success:
-                error_msg = f"DB 연결 실패: {msg}"
-                logger.error(error_msg)
-                self._log_backup(schedule, False, error_msg)
-                return False, error_msg
-
-            try:
-                # 멀티 쿼리 파싱 (세미콜론으로 구분)
-                queries = self._parse_sql_queries(schedule.sql_query)
-                if not queries:
-                    error_msg = "실행할 SQL 쿼리가 없습니다."
-                    logger.error(error_msg)
-                    self._log_backup(schedule, False, error_msg)
-                    return False, error_msg
-
-                timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                results_saved = []
-                affected_rows_total = 0
-
-                for idx, query in enumerate(queries):
-                    query_result = self._execute_single_query(
-                        connector, schedule, query, timestamp, idx
-                    )
-                    if not query_result['success']:
-                        error_msg = f"쿼리 실행 실패 (#{idx + 1}): {query_result['error']}"
-                        logger.error(error_msg)
-                        self._log_backup(schedule, False, error_msg)
-                        return False, error_msg
-
-                    if query_result.get('file_path'):
-                        results_saved.append(query_result['file_path'])
-                    if query_result.get('affected_rows'):
-                        affected_rows_total += query_result['affected_rows']
-
-                # 결과 파일 정리 (보관 정책)
-                self._cleanup_old_results(schedule)
-
-                # last_run 업데이트
-                schedule.last_run = datetime.now().isoformat()
-
-                # 결과 메시지 생성
-                if results_saved:
-                    message = f"SQL 실행 완료: {len(queries)}개 쿼리, 결과 파일 {len(results_saved)}개 저장"
-                else:
-                    message = f"SQL 실행 완료: {len(queries)}개 쿼리, {affected_rows_total}행 영향"
-
-                logger.info(message)
-                self._log_backup(schedule, True, message)
-                return True, message
-
-            finally:
-                connector.disconnect()
-
-        except Exception as e:
-            error_msg = f"SQL 쿼리 실행 오류: {str(e)}"
-            logger.exception(error_msg)
-            self._log_backup(schedule, False, error_msg)
-            return False, error_msg
+        return self._sql_executor.execute(schedule)
 
     def _parse_sql_queries(self, sql_text: str) -> List[str]:
-        """SQL 텍스트를 개별 쿼리로 파싱."""
-        return parse_sql_statements(sql_text)
+        """SQL 텍스트를 개별 쿼리로 파싱 (SqlQueryTaskExecutor에 위임)."""
+        return self._sql_executor.parse_queries(sql_text)
 
     def _execute_single_query(
         self,
@@ -868,7 +447,7 @@ class BackupScheduler:
         timestamp: str,
         query_index: int
     ) -> Dict[str, Any]:
-        """단일 쿼리 실행
+        """단일 쿼리 실행 (SqlQueryTaskExecutor에 위임)
 
         Returns:
             {
@@ -879,199 +458,4 @@ class BackupScheduler:
                 'affected_rows': int (DML 실행 시)
             }
         """
-        try:
-            with connector.connection.cursor() as cursor:
-                # 타임아웃 설정 (MySQL 8.0+)
-                engine = getattr(getattr(connector, "connection", None), "endpoint", None)
-                engine_name = getattr(engine, "engine", "mysql")
-                if schedule.query_timeout > 0:
-                    try:
-                        if engine_name == "postgresql":
-                            cursor.execute(f"SET statement_timeout = {schedule.query_timeout * 1000}")
-                        else:
-                            cursor.execute(
-                                f"SET SESSION MAX_EXECUTION_TIME = {schedule.query_timeout * 1000}"
-                            )
-                    except Exception:
-                        # 엔진별 statement timeout 미지원 시 무시
-                        pass
-
-                # 쿼리 실행
-                cursor.execute(query)
-
-                # 결과셋 여부는 cursor.description으로만 판단한다 (SELECT 접두사 문자열 검사 금지 -
-                # WITH(CTE), SHOW, DESC 등도 결과셋을 반환하지만 'SELECT'로 시작하지 않는다).
-                classification = classify_sql_statement(query)
-                has_result_set = cursor.description is not None
-                logger.debug(
-                    f"쿼리 분류: leading_keyword={classification.leading_keyword}, "
-                    f"has_result_set={has_result_set}"
-                )
-
-                if has_result_set:
-                    columns = [desc[0] for desc in cursor.description] if cursor.description is not None else []
-                    rows = cursor.fetchall()
-
-                    if schedule.result_format != 'none':
-                        # 0행이어도 헤더만 있는 결과 파일을 저장한다.
-                        file_path = self._save_query_result(
-                            schedule, columns, rows, timestamp, query_index
-                        )
-                        return {
-                            'success': True,
-                            'file_path': file_path,
-                            'row_count': len(rows)
-                        }
-                    return {'success': True, 'row_count': len(rows)}
-                else:
-                    # DML (INSERT, UPDATE, DELETE)
-                    connector.connection.commit()
-                    return {
-                        'success': True,
-                        'affected_rows': cursor.rowcount
-                    }
-
-        except Exception as e:
-            return {
-                'success': False,
-                'error': str(e)
-            }
-
-    def _save_query_result(
-        self,
-        schedule: ScheduleConfig,
-        columns: List[str],
-        rows: List[Dict[str, Any]],
-        timestamp: str,
-        query_index: int
-    ) -> str:
-        """쿼리 결과를 파일로 저장
-
-        Returns:
-            저장된 파일 경로
-        """
-        # 출력 디렉토리
-        output_dir = schedule.get_result_output_path()
-        os.makedirs(output_dir, exist_ok=True)
-
-        # 파일명 생성
-        filename_base = schedule.result_filename_pattern.format(
-            name=schedule.name,
-            timestamp=timestamp,
-            date=timestamp[:8]  # YYYYMMDD
-        )
-
-        # 멀티 쿼리인 경우 suffix 추가
-        if query_index > 0:
-            filename_base = f"{filename_base}_{query_index + 1:02d}"
-
-        # 확장자
-        ext = 'csv' if schedule.result_format == 'csv' else 'json'
-        filename = f"{filename_base}.{ext}"
-        file_path = os.path.join(output_dir, filename)
-
-        # 저장
-        if schedule.result_format == 'csv':
-            self._save_as_csv(file_path, columns, rows)
-        else:
-            self._save_as_json(file_path, columns, rows)
-
-        logger.info(f"쿼리 결과 저장: {file_path} ({len(rows)}행)")
-        return file_path
-
-    def _save_as_csv(
-        self,
-        file_path: str,
-        columns: List[str],
-        rows: List[Dict[str, Any]]
-    ):
-        """CSV 형식으로 저장"""
-        with open(file_path, 'w', newline='', encoding='utf-8-sig') as f:
-            writer = csv.DictWriter(f, fieldnames=columns)
-            writer.writeheader()
-            writer.writerows(rows)
-
-    def _save_as_json(
-        self,
-        file_path: str,
-        columns: List[str],
-        rows: List[Dict[str, Any]]
-    ):
-        """JSON 형식으로 저장"""
-        # datetime 객체 직렬화 처리
-        def json_serializer(obj):
-            if isinstance(obj, datetime):
-                return obj.isoformat()
-            if hasattr(obj, '__str__'):
-                return str(obj)
-            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-
-        data = {
-            'columns': columns,
-            'row_count': len(rows),
-            'generated_at': datetime.now().isoformat(),
-            'data': rows
-        }
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2, default=json_serializer)
-
-    def _cleanup_old_results(self, schedule: ScheduleConfig):
-        """오래된 결과 파일 정리 (보관 정책 적용)"""
-        try:
-            output_dir = schedule.get_result_output_path()
-            if not os.path.exists(output_dir):
-                return
-
-            # 파일명 패턴에서 prefix 추출
-            prefix = schedule.name
-
-            # 결과 파일 목록
-            result_files = []
-            for name in os.listdir(output_dir):
-                if not name.startswith(prefix):
-                    continue
-
-                full_path = os.path.join(output_dir, name)
-                if not os.path.isfile(full_path):
-                    continue
-
-                # csv 또는 json 파일만
-                if not (name.endswith('.csv') or name.endswith('.json')):
-                    continue
-
-                # 파일 수정 시간
-                mtime = datetime.fromtimestamp(os.path.getmtime(full_path))
-                result_files.append((full_path, mtime))
-
-            if not result_files:
-                return
-
-            # 시간순 정렬 (오래된 것부터)
-            result_files.sort(key=lambda x: x[1])
-
-            now = datetime.now()
-            to_delete = []
-
-            # retention_days 체크
-            cutoff = now - timedelta(days=schedule.result_retention_days)
-            for path, mtime in result_files:
-                if mtime < cutoff:
-                    to_delete.append(path)
-
-            # retention_count 체크
-            remaining = [f for f in result_files if f[0] not in to_delete]
-            if len(remaining) > schedule.result_retention_count:
-                excess = len(remaining) - schedule.result_retention_count
-                for path, _ in remaining[:excess]:
-                    to_delete.append(path)
-
-            # 삭제 실행
-            for path in to_delete:
-                try:
-                    os.remove(path)
-                    logger.info(f"오래된 결과 파일 삭제: {path}")
-                except Exception as e:
-                    logger.error(f"결과 파일 삭제 실패: {path} - {e}")
-
-        except Exception as e:
-            logger.error(f"결과 파일 정리 오류: {e}")
+        return self._sql_executor.execute_single(connector, schedule, query, timestamp, query_index)
