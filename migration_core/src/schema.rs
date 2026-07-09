@@ -183,84 +183,36 @@ pub fn inspect_live(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     }
 }
 
-fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
-    let schema_name = endpoint_schema(endpoint);
-    let opts = mysql_opts(endpoint);
-    let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
-    let mut conn = pool
-        .get_conn()
-        .map_err(|err| format!("mysql connection error: {err}"))?;
-    let table_names: Vec<(String, Option<String>)> = conn
-        .exec_map(
-            inspect_tables_sql("mysql"),
-            (&schema_name,),
-            |(table_name, table_collation): (String, Option<String>)| (table_name, table_collation),
-        )
-        .map_err(|err| format!("mysql table inspect error: {err}"))?;
+/// per-table 스키마 inspect 를 엔진 독립적으로 수행하기 위한 어댑터.
+/// 드라이버 API 차이(mysql exec_map 클로저 vs postgres client.query + row.get 인덱스)는
+/// 각 impl 안에 캡슐화하고, inspect_generic 은 table_names → columns/keys/foreign_keys/indexes
+/// → apply_key_flags/group_indexes/group_foreign_keys → NormalizedTable push 의 5단계 시퀀스만
+/// 담당한다. DB 연결/쿼리는 tunnelforge-core 소유 그대로 유지한다.
+trait InspectAdapter {
+    fn table_names(&mut self, schema: &str) -> Result<Vec<(String, Option<String>)>, String>;
+    fn columns(&mut self, schema: &str, table: &str) -> Result<Vec<NormalizedColumn>, String>;
+    fn keys(&mut self, schema: &str, table: &str) -> Result<Vec<(String, String)>, String>;
+    fn foreign_keys(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String, String, String)>, String>;
+    fn indexes(&mut self, schema: &str, table: &str) -> Result<Vec<(String, String, bool)>, String>;
+    fn unsupported_objects(&mut self, schema: &str) -> Result<Vec<String>, String>;
+}
+
+fn inspect_generic<A: InspectAdapter>(
+    adapter: &mut A,
+    schema_name: &str,
+) -> Result<InspectionResult, String> {
+    let table_names = adapter.table_names(schema_name)?;
     let mut tables = Vec::new();
 
     for (table_name, table_collation) in table_names {
-        let columns: Vec<NormalizedColumn> =
-            conn
-                .exec_map(
-                    inspect_columns_sql("mysql"),
-                    (&schema_name, &table_name),
-                    |(
-                        name,
-                        type_name,
-                        character_set,
-                        collation,
-                        is_nullable,
-                        default_value,
-                        extra,
-                    ): (
-                        String,
-                        String,
-                        Option<String>,
-                        Option<String>,
-                        String,
-                        Option<String>,
-                        String,
-                    )| {
-                        let type_name =
-                            mysql_type_with_character_options(&type_name, character_set, collation);
-                        NormalizedColumn {
-                            name,
-                            type_name: with_auto_increment_marker(&type_name, &extra),
-                            default_value,
-                            nullable: is_nullable.eq_ignore_ascii_case("YES"),
-                            primary_key: false,
-                            unique: false,
-                        }
-                    },
-                )
-                .map_err(|err| format!("mysql column inspect error: {err}"))?;
-        let keys: Vec<(String, String)> = conn
-            .exec_map(
-                inspect_keys_sql("mysql"),
-                (&schema_name, &table_name),
-                |(name, constraint_type): (String, String)| (name, constraint_type),
-            )
-            .map_err(|err| format!("mysql key inspect error: {err}"))?;
-        let foreign_key_rows: Vec<(String, String, String, String)> = conn
-            .exec_map(
-                inspect_foreign_keys_sql("mysql"),
-                (&schema_name, &table_name),
-                |(name, column, referenced_table, referenced_column): (
-                    String,
-                    String,
-                    String,
-                    String,
-                )| (name, column, referenced_table, referenced_column),
-            )
-            .map_err(|err| format!("mysql FK inspect error: {err}"))?;
-        let index_rows: Vec<(String, String, bool)> = conn
-            .exec_map(
-                inspect_indexes_sql("mysql"),
-                (&schema_name, &table_name),
-                |(name, column, is_unique): (String, String, u8)| (name, column, is_unique == 1),
-            )
-            .map_err(|err| format!("mysql index inspect error: {err}"))?;
+        let columns = adapter.columns(schema_name, &table_name)?;
+        let keys = adapter.keys(schema_name, &table_name)?;
+        let foreign_key_rows = adapter.foreign_keys(schema_name, &table_name)?;
+        let index_rows = adapter.indexes(schema_name, &table_name)?;
         tables.push(NormalizedTable {
             name: table_name,
             columns: apply_key_flags(columns, &keys),
@@ -270,12 +222,125 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
         });
     }
 
-    let unsupported_objects = inspect_mysql_unsupported_objects(&mut conn, &schema_name)?;
+    let unsupported_objects = adapter.unsupported_objects(schema_name)?;
 
     Ok(InspectionResult {
         schema: NormalizedSchema { tables },
         unsupported_objects,
     })
+}
+
+struct MysqlInspectAdapter {
+    conn: mysql::PooledConn,
+}
+
+impl InspectAdapter for MysqlInspectAdapter {
+    fn table_names(&mut self, schema: &str) -> Result<Vec<(String, Option<String>)>, String> {
+        self.conn
+            .exec_map(
+                inspect_tables_sql("mysql"),
+                (schema,),
+                |(table_name, table_collation): (String, Option<String>)| {
+                    (table_name, table_collation)
+                },
+            )
+            .map_err(|err| format!("mysql table inspect error: {err}"))
+    }
+
+    fn columns(&mut self, schema: &str, table: &str) -> Result<Vec<NormalizedColumn>, String> {
+        self.conn
+            .exec_map(
+                inspect_columns_sql("mysql"),
+                (schema, table),
+                |(
+                    name,
+                    type_name,
+                    character_set,
+                    collation,
+                    is_nullable,
+                    default_value,
+                    extra,
+                ): (
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    String,
+                    Option<String>,
+                    String,
+                )| {
+                    let type_name =
+                        mysql_type_with_character_options(&type_name, character_set, collation);
+                    NormalizedColumn {
+                        name,
+                        type_name: with_auto_increment_marker(&type_name, &extra),
+                        default_value,
+                        nullable: is_nullable.eq_ignore_ascii_case("YES"),
+                        primary_key: false,
+                        unique: false,
+                    }
+                },
+            )
+            .map_err(|err| format!("mysql column inspect error: {err}"))
+    }
+
+    fn keys(&mut self, schema: &str, table: &str) -> Result<Vec<(String, String)>, String> {
+        self.conn
+            .exec_map(
+                inspect_keys_sql("mysql"),
+                (schema, table),
+                |(name, constraint_type): (String, String)| (name, constraint_type),
+            )
+            .map_err(|err| format!("mysql key inspect error: {err}"))
+    }
+
+    fn foreign_keys(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String, String, String)>, String> {
+        self.conn
+            .exec_map(
+                inspect_foreign_keys_sql("mysql"),
+                (schema, table),
+                |(name, column, referenced_table, referenced_column): (
+                    String,
+                    String,
+                    String,
+                    String,
+                )| { (name, column, referenced_table, referenced_column) },
+            )
+            .map_err(|err| format!("mysql FK inspect error: {err}"))
+    }
+
+    fn indexes(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String, bool)>, String> {
+        self.conn
+            .exec_map(
+                inspect_indexes_sql("mysql"),
+                (schema, table),
+                |(name, column, is_unique): (String, String, u8)| (name, column, is_unique == 1),
+            )
+            .map_err(|err| format!("mysql index inspect error: {err}"))
+    }
+
+    fn unsupported_objects(&mut self, schema: &str) -> Result<Vec<String>, String> {
+        inspect_mysql_unsupported_objects(&mut self.conn, schema)
+    }
+}
+
+fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
+    let schema_name = endpoint_schema(endpoint);
+    let opts = mysql_opts(endpoint);
+    let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
+    let conn = pool
+        .get_conn()
+        .map_err(|err| format!("mysql connection error: {err}"))?;
+    let mut adapter = MysqlInspectAdapter { conn };
+    inspect_generic(&mut adapter, &schema_name)
 }
 
 fn inspect_mysql_unsupported_objects(
@@ -322,25 +387,32 @@ fn inspect_mysql_deprecated_engines_sql() -> &'static str {
     "SELECT TABLE_NAME, ENGINE FROM information_schema.tables WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE' AND ENGINE IN ('MyISAM') ORDER BY TABLE_NAME"
 }
 
-fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
-    let schema_name = endpoint_schema(endpoint);
-    let mut client = postgres_config(endpoint)
-        .connect(NoTls)
-        .map_err(|err| format!("postgresql connection error: {err}"))?;
-    let table_rows = client
-        .query(inspect_tables_sql("postgresql"), &[&schema_name])
-        .map_err(|err| format!("postgresql table inspect error: {err}"))?;
-    let mut tables = Vec::new();
+struct PostgresInspectAdapter {
+    client: postgres::Client,
+}
 
-    for row in table_rows {
-        let table_name: String = row.get(0);
-        let column_rows = client
-            .query(
-                inspect_columns_sql("postgresql"),
-                &[&schema_name, &table_name],
-            )
+impl InspectAdapter for PostgresInspectAdapter {
+    fn table_names(&mut self, schema: &str) -> Result<Vec<(String, Option<String>)>, String> {
+        let rows = self
+            .client
+            .query(inspect_tables_sql("postgresql"), &[&schema])
+            .map_err(|err| format!("postgresql table inspect error: {err}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let table_name: String = row.get(0);
+                // PostgreSQL 은 table-level collation 을 노출하지 않으므로 항상 None.
+                (table_name, None)
+            })
+            .collect())
+    }
+
+    fn columns(&mut self, schema: &str, table: &str) -> Result<Vec<NormalizedColumn>, String> {
+        let column_rows = self
+            .client
+            .query(inspect_columns_sql("postgresql"), &[&schema, &table])
             .map_err(|err| format!("postgresql column inspect error: {err}"))?;
-        let columns = column_rows
+        Ok(column_rows
             .into_iter()
             .map(|column| {
                 let name: String = column.get(0);
@@ -373,68 +445,77 @@ fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
                     unique: false,
                 }
             })
-            .collect();
-        let key_rows = client
-            .query(inspect_keys_sql("postgresql"), &[&schema_name, &table_name])
+            .collect())
+    }
+
+    fn keys(&mut self, schema: &str, table: &str) -> Result<Vec<(String, String)>, String> {
+        let key_rows = self
+            .client
+            .query(inspect_keys_sql("postgresql"), &[&schema, &table])
             .map_err(|err| format!("postgresql key inspect error: {err}"))?;
-        let keys = key_rows
+        Ok(key_rows
             .into_iter()
             .map(|row| {
                 let name: String = row.get(0);
                 let constraint_type: String = row.get(1);
                 (name, constraint_type)
             })
-            .collect::<Vec<_>>();
-        let foreign_key_rows = client
-            .query(
-                inspect_foreign_keys_sql("postgresql"),
-                &[&schema_name, &table_name],
-            )
-            .map_err(|err| format!("postgresql FK inspect error: {err}"))?;
-        let foreign_keys = group_foreign_keys(
-            foreign_key_rows
-                .into_iter()
-                .map(|row| {
-                    let name: String = row.get(0);
-                    let column: String = row.get(1);
-                    let referenced_table: String = row.get(2);
-                    let referenced_column: String = row.get(3);
-                    (name, column, referenced_table, referenced_column)
-                })
-                .collect(),
-        );
-        let index_rows = client
-            .query(
-                inspect_indexes_sql("postgresql"),
-                &[&schema_name, &table_name],
-            )
-            .map_err(|err| format!("postgresql index inspect error: {err}"))?;
-        let indexes = group_indexes(
-            index_rows
-                .into_iter()
-                .map(|row| {
-                    let name: String = row.get(0);
-                    let column: String = row.get(1);
-                    let is_unique: bool = row.get(2);
-                    (name, column, is_unique)
-                })
-                .collect(),
-        );
-        tables.push(NormalizedTable {
-            name: table_name,
-            columns: apply_key_flags(columns, &keys),
-            indexes,
-            foreign_keys,
-            table_collation: None,
-        });
+            .collect())
     }
 
-    let unsupported_objects = inspect_postgresql_unsupported_objects(&mut client, &schema_name)?;
+    fn foreign_keys(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String, String, String)>, String> {
+        let foreign_key_rows = self
+            .client
+            .query(inspect_foreign_keys_sql("postgresql"), &[&schema, &table])
+            .map_err(|err| format!("postgresql FK inspect error: {err}"))?;
+        Ok(foreign_key_rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get(0);
+                let column: String = row.get(1);
+                let referenced_table: String = row.get(2);
+                let referenced_column: String = row.get(3);
+                (name, column, referenced_table, referenced_column)
+            })
+            .collect())
+    }
 
-    Ok(InspectionResult {
-        schema: NormalizedSchema { tables },
-        unsupported_objects,
-    })
+    fn indexes(
+        &mut self,
+        schema: &str,
+        table: &str,
+    ) -> Result<Vec<(String, String, bool)>, String> {
+        let index_rows = self
+            .client
+            .query(inspect_indexes_sql("postgresql"), &[&schema, &table])
+            .map_err(|err| format!("postgresql index inspect error: {err}"))?;
+        Ok(index_rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get(0);
+                let column: String = row.get(1);
+                let is_unique: bool = row.get(2);
+                (name, column, is_unique)
+            })
+            .collect())
+    }
+
+    fn unsupported_objects(&mut self, schema: &str) -> Result<Vec<String>, String> {
+        inspect_postgresql_unsupported_objects(&mut self.client, schema)
+    }
+}
+
+fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
+    let schema_name = endpoint_schema(endpoint);
+    let client = postgres_config(endpoint)
+        .connect(NoTls)
+        .map_err(|err| format!("postgresql connection error: {err}"))?;
+    let mut adapter = PostgresInspectAdapter { client };
+    inspect_generic(&mut adapter, &schema_name)
 }
 
 fn inspect_postgresql_unsupported_objects(
