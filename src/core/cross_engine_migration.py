@@ -1,7 +1,14 @@
-"""Cross-engine migration protocol models.
+"""Cross-engine migration protocol support for the tunnelforge-core helper.
 
-The PyQt UI talks to the Rust helper through newline-delimited JSON.  This
-module keeps that wire format isolated from widgets and worker orchestration.
+The PyQt UI talks to the Rust helper through newline-delimited JSON, and this
+module keeps four responsibilities isolated from widgets and worker
+orchestration:
+
+1. JSONL wire-format models, parsing, and request building for the
+   tunnelforge-core helper protocol.
+2. Locating the tunnelforge-core executable across dev/frozen/PATH layouts.
+3. Persisting and loading resume-state to/from disk between migration runs.
+4. Rendering human-readable text reports from migration result payloads.
 """
 import json
 import os
@@ -73,6 +80,8 @@ class HelperProtocolError(ValueError):
 
 
 FULL_MIGRATION_WORKFLOW = ("inspect", "preflight", "plan", "migrate", "verify")
+
+MAX_MISMATCHES_DISPLAYED = 50
 
 
 def next_workflow_command(completed_command: str, success: bool) -> Optional[str]:
@@ -266,6 +275,130 @@ def schema_from_inspect_result(payload: Dict[str, Any]) -> Optional[Dict[str, An
     return None
 
 
+def _render_issues(issues: Any) -> List[str]:
+    """Render the top-level payload issue list section."""
+    if not isinstance(issues, list):
+        return []
+    lines = ["", f"Issues: {len(issues)}"]
+    for issue in issues:
+        if isinstance(issue, dict):
+            lines.append(
+                f"- [{issue.get('severity', 'info')}] "
+                f"{issue.get('location', '')}: {issue.get('message', '')}"
+            )
+    return lines
+
+
+def _render_mismatches(mismatches: Any) -> List[str]:
+    """Render the verify-result mismatch list section."""
+    if not isinstance(mismatches, list):
+        return []
+    lines = ["", f"Mismatches: {len(mismatches)}"]
+    for mismatch in mismatches[:MAX_MISMATCHES_DISPLAYED]:
+        if isinstance(mismatch, dict):
+            table = mismatch.get("table", "")
+            kind = mismatch.get("kind", "")
+            detail = mismatch.get("column") or mismatch.get("digest") or mismatch.get("message") or ""
+            lines.append(f"- {table} {kind} {detail}".strip())
+    if len(mismatches) > MAX_MISMATCHES_DISPLAYED:
+        lines.append(f"... {len(mismatches) - MAX_MISMATCHES_DISPLAYED} more")
+    return lines
+
+
+def _render_plan(plan: Any) -> List[str]:
+    """Render the plan DDL section."""
+    if not isinstance(plan, dict):
+        return []
+    ddl = plan.get("ddl")
+    if not isinstance(ddl, list):
+        return []
+    lines = ["", "DDL:"]
+    lines.extend(str(item) for item in ddl)
+    return lines
+
+
+def _render_table_guide(table: Any) -> List[str]:
+    """Render one table's columns, row samples, and insert example."""
+    if not isinstance(table, dict):
+        return []
+    lines = [f"  Table {table.get('table', '')}: rows={table.get('row_count', 0)}"]
+
+    columns = table.get("columns")
+    if isinstance(columns, list):
+        for column in columns:
+            if not isinstance(column, dict):
+                continue
+            lines.append(
+                "    Column "
+                f"{column.get('name', '')}: "
+                f"{column.get('source_type', '')} -> "
+                f"{column.get('target_type', '')}"
+            )
+
+    rows = table.get("row_samples")
+    if isinstance(rows, list):
+        for index, row in enumerate(rows, start=1):
+            lines.append(
+                f"    Row sample {index}: "
+                f"{json.dumps(row, ensure_ascii=False, sort_keys=True)}"
+            )
+
+    insert_sql = table.get("insert_example_sql")
+    if insert_sql:
+        lines.append(f"    Insert example: {insert_sql}")
+
+    return lines
+
+
+def _render_direction_guide(guide: Dict[str, Any]) -> List[str]:
+    """Render a direction's create-table SQL, follow-up SQL, and table guides."""
+    lines: List[str] = []
+
+    create_sql = guide.get("create_table_sql")
+    if isinstance(create_sql, list) and create_sql:
+        lines.append("  Create table SQL:")
+        lines.extend(f"  {item}" for item in create_sql)
+
+    sequence_sql = guide.get("sequence_reset_sql")
+    post_data_sql = guide.get("post_data_sql")
+    followup_sql = []
+    if isinstance(sequence_sql, list):
+        followup_sql.extend(sequence_sql)
+    if isinstance(post_data_sql, list):
+        followup_sql.extend(post_data_sql)
+    if followup_sql:
+        lines.append("  Follow-up SQL:")
+        lines.extend(f"  {item}" for item in followup_sql)
+
+    tables = guide.get("tables")
+    if isinstance(tables, list):
+        for table in tables:
+            lines.extend(_render_table_guide(table))
+
+    return lines
+
+
+def _render_directions(directions: Any) -> List[str]:
+    """Render the direction readiness section."""
+    if not isinstance(directions, list):
+        return []
+    lines = ["", "Direction Readiness:"]
+    for direction in directions:
+        if not isinstance(direction, dict):
+            continue
+        status = "ready" if direction.get("success") else "blocked"
+        direction_issues = direction.get("issues")
+        issue_count = len(direction_issues) if isinstance(direction_issues, list) else 0
+        lines.append(
+            f"- {direction.get('direction', '')}: {status} "
+            f"tables={direction.get('table_count', 0)} issues={issue_count}"
+        )
+        guide = direction.get("guide")
+        if isinstance(guide, dict):
+            lines.extend(_render_direction_guide(guide))
+    return lines
+
+
 def render_result_report(payload: Dict[str, Any]) -> str:
     """Render a concise human-readable migration helper result."""
     command = payload.get("command", "unknown")
@@ -282,94 +415,9 @@ def render_result_report(payload: Dict[str, Any]) -> str:
     if "chunks_copied" in payload:
         lines.append(f"Chunks copied: {payload.get('chunks_copied')}")
 
-    issues = payload.get("issues")
-    if isinstance(issues, list):
-        lines.append("")
-        lines.append(f"Issues: {len(issues)}")
-        for issue in issues:
-            if isinstance(issue, dict):
-                lines.append(
-                    f"- [{issue.get('severity', 'info')}] "
-                    f"{issue.get('location', '')}: {issue.get('message', '')}"
-                )
-
-    mismatches = payload.get("mismatches")
-    if isinstance(mismatches, list):
-        lines.append("")
-        lines.append(f"Mismatches: {len(mismatches)}")
-        for mismatch in mismatches[:50]:
-            if isinstance(mismatch, dict):
-                table = mismatch.get("table", "")
-                kind = mismatch.get("kind", "")
-                detail = mismatch.get("column") or mismatch.get("digest") or mismatch.get("message") or ""
-                lines.append(f"- {table} {kind} {detail}".strip())
-        if len(mismatches) > 50:
-            lines.append(f"... {len(mismatches) - 50} more")
-
-    plan = payload.get("plan")
-    if isinstance(plan, dict):
-        ddl = plan.get("ddl")
-        if isinstance(ddl, list):
-            lines.append("")
-            lines.append("DDL:")
-            lines.extend(str(item) for item in ddl)
-
-    directions = payload.get("directions")
-    if isinstance(directions, list):
-        lines.append("")
-        lines.append("Direction Readiness:")
-        for direction in directions:
-            if isinstance(direction, dict):
-                status = "ready" if direction.get("success") else "blocked"
-                issues = direction.get("issues")
-                issue_count = len(issues) if isinstance(issues, list) else 0
-                lines.append(
-                    f"- {direction.get('direction', '')}: {status} "
-                    f"tables={direction.get('table_count', 0)} issues={issue_count}"
-                )
-                guide = direction.get("guide")
-                if isinstance(guide, dict):
-                    create_sql = guide.get("create_table_sql")
-                    if isinstance(create_sql, list) and create_sql:
-                        lines.append("  Create table SQL:")
-                        lines.extend(f"  {item}" for item in create_sql)
-                    sequence_sql = guide.get("sequence_reset_sql")
-                    post_data_sql = guide.get("post_data_sql")
-                    followup_sql = []
-                    if isinstance(sequence_sql, list):
-                        followup_sql.extend(sequence_sql)
-                    if isinstance(post_data_sql, list):
-                        followup_sql.extend(post_data_sql)
-                    if followup_sql:
-                        lines.append("  Follow-up SQL:")
-                        lines.extend(f"  {item}" for item in followup_sql)
-                    tables = guide.get("tables")
-                    if isinstance(tables, list):
-                        for table in tables:
-                            if not isinstance(table, dict):
-                                continue
-                            lines.append(
-                                f"  Table {table.get('table', '')}: rows={table.get('row_count', 0)}"
-                            )
-                            columns = table.get("columns")
-                            if isinstance(columns, list):
-                                for column in columns:
-                                    if isinstance(column, dict):
-                                        lines.append(
-                                            "    Column "
-                                            f"{column.get('name', '')}: "
-                                            f"{column.get('source_type', '')} -> "
-                                            f"{column.get('target_type', '')}"
-                                        )
-                            rows = table.get("row_samples")
-                            if isinstance(rows, list):
-                                for index, row in enumerate(rows, start=1):
-                                    lines.append(
-                                        f"    Row sample {index}: "
-                                        f"{json.dumps(row, ensure_ascii=False, sort_keys=True)}"
-                                    )
-                            insert_sql = table.get("insert_example_sql")
-                            if insert_sql:
-                                lines.append(f"    Insert example: {insert_sql}")
+    lines.extend(_render_issues(payload.get("issues")))
+    lines.extend(_render_mismatches(payload.get("mismatches")))
+    lines.extend(_render_plan(payload.get("plan")))
+    lines.extend(_render_directions(payload.get("directions")))
 
     return "\n".join(lines) + "\n"
