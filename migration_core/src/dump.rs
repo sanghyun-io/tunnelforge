@@ -714,6 +714,68 @@ fn dump_schedule_order(
     indexed.into_iter().map(|(_, table)| table).collect()
 }
 
+/// `run_bounded_pool`의 on_event 클로저가 반환하는, 워커 슬롯에 대한 지시.
+enum PoolAction {
+    /// 슬롯을 소비하지 않는 이벤트(진행률 pass-through 등). active/completed 불변.
+    KeepGoing,
+    /// 워커 하나가 종료. 슬롯을 반환하고 pending에서 다음 작업을 리필한다.
+    Advance,
+    /// 워커 하나가 종료. 슬롯은 반환하되 리필하지 않는다(에러 확산 중단 경로).
+    AdvanceNoRefill,
+}
+
+/// bounded worker-pool 디스패치 루프. `max_workers`개까지 워커를 채운 뒤, 각 이벤트를
+/// `on_event`에 넘긴다. on_event가 반환한 `PoolAction`에 따라 슬롯을 관리한다:
+/// KeepGoing은 슬롯 불변, Advance는 슬롯 반환 후 리필, AdvanceNoRefill은 반환만 한다.
+/// 이벤트별 emit·상태 누적·first_error 캡처는 전적으로 on_event가 담당해 각 호출자의
+/// bookkeeping을 그대로 보존한다. 종료 시 모든 워커 핸들을 join한다.
+fn run_bounded_pool<Item, Event>(
+    mut pending: VecDeque<Item>,
+    max_workers: usize,
+    receiver: &mpsc::Receiver<Event>,
+    mut spawn: impl FnMut(Item) -> thread::JoinHandle<()>,
+    mut on_event: impl FnMut(Event) -> PoolAction,
+) {
+    let total = pending.len();
+    let mut handles = Vec::new();
+    let mut active = 0_usize;
+    let mut completed = 0_usize;
+
+    while active < max_workers {
+        if let Some(item) = pending.pop_front() {
+            handles.push(spawn(item));
+            active += 1;
+        } else {
+            break;
+        }
+    }
+
+    while completed < total && active > 0 {
+        match receiver.recv() {
+            Ok(event) => match on_event(event) {
+                PoolAction::KeepGoing => {}
+                PoolAction::Advance => {
+                    completed += 1;
+                    active = active.saturating_sub(1);
+                    if let Some(item) = pending.pop_front() {
+                        handles.push(spawn(item));
+                        active += 1;
+                    }
+                }
+                PoolAction::AdvanceNoRefill => {
+                    completed += 1;
+                    active = active.saturating_sub(1);
+                }
+            },
+            Err(_) => break,
+        }
+    }
+
+    for handle in handles {
+        let _ = handle.join();
+    }
+}
+
 fn dump_tables_parallel<F: FnMut(Value)>(
     ctx: &DumpJobContext,
     tables: &[NormalizedTable],
@@ -723,81 +785,51 @@ fn dump_tables_parallel<F: FnMut(Value)>(
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
     let table_total = tables.len();
     let max_threads = table_threads.max(1).min(table_total);
-    let mut pending = (0..table_total).collect::<VecDeque<_>>();
-    let mut active = 0_usize;
-    let mut completed = 0_usize;
+    let pending = (0..table_total).collect::<VecDeque<_>>();
     let mut total_rows = 0_u64;
     let mut total_chunks = 0_u64;
     let mut first_error: Option<String> = None;
     let mut manifests: Vec<Option<DumpTableManifest>> = vec![None; table_total];
-    let mut handles = Vec::new();
     let (sender, receiver) = mpsc::channel::<DumpTableEvent>();
 
-    while active < max_threads {
-        if let Some(index) = pending.pop_front() {
-            handles.push(spawn_dump_table_worker(
+    run_bounded_pool(
+        pending,
+        max_threads,
+        &receiver,
+        |index| {
+            spawn_dump_table_worker(
                 ctx.clone(),
                 tables[index].clone(),
                 index,
                 table_total,
                 range_threads,
                 sender.clone(),
-            ));
-            active += 1;
-        } else {
-            break;
-        }
-    }
-
-    while completed < table_total && active > 0 {
-        match receiver.recv() {
-            Ok(DumpTableEvent::Progress(event)) => emit(event),
-            Ok(DumpTableEvent::Done {
+            )
+        },
+        |event| match event {
+            DumpTableEvent::Progress(event) => {
+                emit(event);
+                PoolAction::KeepGoing
+            }
+            DumpTableEvent::Done {
                 index,
                 manifest,
                 rows,
                 chunks,
-            }) => {
+            } => {
                 manifests[index] = Some(manifest);
                 total_rows += rows;
                 total_chunks += chunks;
-                completed += 1;
-                active = active.saturating_sub(1);
-                if let Some(next_index) = pending.pop_front() {
-                    handles.push(spawn_dump_table_worker(
-                        ctx.clone(),
-                        tables[next_index].clone(),
-                        next_index,
-                        table_total,
-                        range_threads,
-                        sender.clone(),
-                    ));
-                    active += 1;
-                }
+                PoolAction::Advance
             }
-            Ok(DumpTableEvent::Error(err)) => {
+            // 에러가 나도 나머지 테이블 워커는 계속 리필해 진행한다(기존 동작 보존).
+            DumpTableEvent::Error(err) => {
                 first_error.get_or_insert(err);
-                completed += 1;
-                active = active.saturating_sub(1);
-                if let Some(next_index) = pending.pop_front() {
-                    handles.push(spawn_dump_table_worker(
-                        ctx.clone(),
-                        tables[next_index].clone(),
-                        next_index,
-                        table_total,
-                        range_threads,
-                        sender.clone(),
-                    ));
-                    active += 1;
-                }
+                PoolAction::Advance
             }
-            Err(_) => break,
-        }
-    }
+        },
+    );
 
-    for handle in handles {
-        let _ = handle.join();
-    }
     if let Some(err) = first_error {
         return Err(err);
     }
@@ -931,30 +963,20 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
         return Ok((Vec::new(), 0, 0));
     }
     let max_threads = threads.max(1).min(work_total);
-    let mut active = 0_usize;
-    let mut completed_work = 0_usize;
     let mut first_error: Option<String> = None;
-    let mut handles = Vec::new();
     let (sender, receiver) = mpsc::channel::<DumpGlobalEvent>();
 
-    while active < max_threads {
-        if let Some(work) = pending.pop_front() {
-            handles.push(spawn_dump_global_worker(
-                ctx.clone(),
-                work,
-                table_total,
-                sender.clone(),
-            ));
-            active += 1;
-        } else {
-            break;
-        }
-    }
-
-    while completed_work < work_total && active > 0 {
-        match receiver.recv() {
-            Ok(DumpGlobalEvent::Progress(event)) => emit(event),
-            Ok(DumpGlobalEvent::RangeDone {
+    run_bounded_pool(
+        pending,
+        max_threads,
+        &receiver,
+        |work| spawn_dump_global_worker(ctx.clone(), work, table_total, sender.clone()),
+        |event| match event {
+            DumpGlobalEvent::Progress(event) => {
+                emit(event);
+                PoolAction::KeepGoing
+            }
+            DumpGlobalEvent::RangeDone {
                 table_index,
                 chunk_index,
                 rows,
@@ -962,7 +984,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 range_start,
                 range_end,
                 checksum,
-            }) => {
+            } => {
                 let table = &tables[table_index];
                 let state = &mut states[table_index];
                 state.rows_dumped += rows;
@@ -972,8 +994,6 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                     dump_chunk_name(chunk_index, &ctx.data_format, &ctx.compression),
                     checksum,
                 );
-                completed_work += 1;
-                active = active.saturating_sub(1);
                 emit(json!({
                     "event": "row_progress",
                     "request_id": ctx.request_id,
@@ -1007,53 +1027,30 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                         "strategy": "global_pk_range_parallel"
                     }));
                 }
-                if let Some(work) = pending.pop_front() {
-                    handles.push(spawn_dump_global_worker(
-                        ctx.clone(),
-                        work,
-                        table_total,
-                        sender.clone(),
-                    ));
-                    active += 1;
-                }
+                PoolAction::Advance
             }
-            Ok(DumpGlobalEvent::TableDone {
+            DumpGlobalEvent::TableDone {
                 index,
                 manifest,
                 rows,
                 chunks,
                 duration_ms,
-            }) => {
+            } => {
                 let state = &mut states[index];
                 state.rows_dumped = rows;
                 state.chunks_done = chunks;
                 state.chunks_total = chunks;
                 state.work_ms = duration_ms.max(1);
                 state.manifest = Some(manifest);
-                completed_work += 1;
-                active = active.saturating_sub(1);
-                if let Some(work) = pending.pop_front() {
-                    handles.push(spawn_dump_global_worker(
-                        ctx.clone(),
-                        work,
-                        table_total,
-                        sender.clone(),
-                    ));
-                    active += 1;
-                }
+                PoolAction::Advance
             }
-            Ok(DumpGlobalEvent::Error(err)) => {
+            // 글로벌 경로 에러는 리필하지 않고 슬롯만 반환한다(기존 동작 보존).
+            DumpGlobalEvent::Error(err) => {
                 first_error.get_or_insert(err);
-                completed_work += 1;
-                active = active.saturating_sub(1);
+                PoolAction::AdvanceNoRefill
             }
-            Err(_) => break,
-        }
-    }
-
-    for handle in handles {
-        let _ = handle.join();
-    }
+        },
+    );
     if let Some(err) = first_error {
         return Err(err);
     }
@@ -1161,18 +1158,21 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
     let ranges = pk_ranges(min_key, max_key, table_row_count, range_chunk_size);
     let total_ranges = ranges.len();
     let max_threads = threads.max(1).min(total_ranges.max(1));
-    let mut pending = ranges.into_iter().collect::<VecDeque<_>>();
-    let mut active = 0_usize;
-    let mut completed = 0_usize;
+    let pending = ranges.into_iter().collect::<VecDeque<_>>();
     let mut rows_dumped = 0_u64;
     let mut chunk_sha256 = BTreeMap::new();
     let mut first_error: Option<String> = None;
-    let mut handles = Vec::new();
+    // chunks_done는 기존 `completed`와 동일하게 매 종료 이벤트(Done+Error)마다 증가하며
+    // row_progress의 "chunks_done" 필드에 쓰인다. 풀 루프 카운터는 run_bounded_pool가 관리한다.
+    let mut chunks_done = 0_u64;
     let (sender, receiver) = mpsc::channel::<DumpRangeEvent>();
 
-    while active < max_threads {
-        if let Some(range) = pending.pop_front() {
-            handles.push(spawn_mysql_range_worker(
+    run_bounded_pool(
+        pending,
+        max_threads,
+        &receiver,
+        |range| {
+            spawn_mysql_range_worker(
                 ctx.endpoint.clone(),
                 ctx.output_path.clone(),
                 table.clone(),
@@ -1182,26 +1182,19 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                 ctx.data_format.clone(),
                 ctx.compression.clone(),
                 sender.clone(),
-            ));
-            active += 1;
-        } else {
-            break;
-        }
-    }
-
-    while completed < total_ranges && active > 0 {
-        match receiver.recv() {
-            Ok(DumpRangeEvent::Done {
+            )
+        },
+        |event| match event {
+            DumpRangeEvent::Done {
                 chunk_index,
                 rows,
                 stream_ms,
                 range_start,
                 range_end,
                 checksum,
-            }) => {
+            } => {
                 rows_dumped += rows;
-                completed += 1;
-                active = active.saturating_sub(1);
+                chunks_done += 1;
                 chunk_sha256.insert(
                     dump_chunk_name(chunk_index, &ctx.data_format, &ctx.compression),
                     checksum,
@@ -1213,7 +1206,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                     "rows": rows_dumped,
                     "total": table_row_count,
                     "chunk_rows": rows,
-                    "chunks_done": completed,
+                    "chunks_done": chunks_done,
                     "chunks_total": total_ranges,
                     "stream_ms": stream_ms,
                     "chunk_index": chunk_index,
@@ -1221,33 +1214,16 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                     "range_end": range_end,
                     "strategy": "pk_range_parallel"
                 }));
-                if let Some(range) = pending.pop_front() {
-                    handles.push(spawn_mysql_range_worker(
-                        ctx.endpoint.clone(),
-                        ctx.output_path.clone(),
-                        table.clone(),
-                        table_path.clone(),
-                        pk_column.to_string(),
-                        range,
-                        ctx.data_format.clone(),
-                        ctx.compression.clone(),
-                        sender.clone(),
-                    ));
-                    active += 1;
-                }
+                PoolAction::Advance
             }
-            Ok(DumpRangeEvent::Error(err)) => {
+            // range 워커 에러는 리필하지 않는다(기존 동작 보존). chunks_done는 계속 카운트.
+            DumpRangeEvent::Error(err) => {
                 first_error.get_or_insert(err);
-                completed += 1;
-                active = active.saturating_sub(1);
+                chunks_done += 1;
+                PoolAction::AdvanceNoRefill
             }
-            Err(_) => break,
-        }
-    }
-
-    for handle in handles {
-        let _ = handle.join();
-    }
+        },
+    );
     if let Some(err) = first_error {
         return Err(err);
     }
