@@ -1327,6 +1327,51 @@ struct OneClickDryRunPreview {
     disallowed: Vec<String>,
 }
 
+/// One-Click step 의 공통 분류 결과.
+/// apply(real) 와 dry-run preview 가 공유하는 per-step 판정만 담는다.
+/// real-apply 전용인 sql_template 불일치 검사는 여기 포함하지 않고
+/// oneclick_apply_actions 후처리에 남긴다(preview 출력 불변 보존).
+enum OneClickStepClassification {
+    Skip,
+    Disallowed(String),
+    Charset(Value),
+    Engine { table: String, sql: String },
+}
+
+fn classify_oneclick_step(step: &Value, schema: &str) -> OneClickStepClassification {
+    let issue_type = step
+        .get("issue_type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let selected = step.get("selected_option").unwrap_or(&Value::Null);
+    let strategy = selected
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("manual");
+
+    if strategy == "manual" || strategy == "skip" {
+        return OneClickStepClassification::Skip;
+    }
+    if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
+        return match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
+            Ok(option) => OneClickStepClassification::Charset(option),
+            Err(_) => OneClickStepClassification::Disallowed(format!("{issue_type}:{strategy}")),
+        };
+    }
+    if issue_type == "deprecated_engine" && strategy == "engine_innodb" {
+        let Some(table) = oneclick_apply_step_table(step, schema) else {
+            return OneClickStepClassification::Skip;
+        };
+        let sql = format!(
+            "ALTER TABLE {}.{} ENGINE=InnoDB;",
+            quote_ident("mysql", schema),
+            quote_ident("mysql", &table),
+        );
+        return OneClickStepClassification::Engine { table, sql };
+    }
+    OneClickStepClassification::Disallowed(format!("{issue_type}:{strategy}"))
+}
+
 fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
     let schema = payload
         .get("schema")
@@ -1343,94 +1388,68 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
         .into_iter()
         .flatten()
     {
-        let issue_type = step
-            .get("issue_type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let selected = step.get("selected_option").unwrap_or(&Value::Null);
-        let strategy = selected
-            .get("strategy")
-            .and_then(Value::as_str)
-            .unwrap_or("manual");
-
-        if strategy == "manual" || strategy == "skip" {
-            skipped += 1;
-            continue;
-        }
-        if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
-            match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
-                Ok(option) => {
-                    let tables = oneclick_required_string_list(option.get("tables"), "tables")
+        match classify_oneclick_step(step, schema) {
+            OneClickStepClassification::Skip => skipped += 1,
+            OneClickStepClassification::Disallowed(reason) => disallowed.push(reason),
+            OneClickStepClassification::Charset(option) => {
+                let tables = oneclick_required_string_list(option.get("tables"), "tables")
+                    .unwrap_or_default();
+                let fk_order = oneclick_required_string_list(option.get("fk_order"), "fk_order")
+                    .unwrap_or_default();
+                let sql_statements =
+                    oneclick_required_string_list(option.get("sql"), "sql").unwrap_or_default();
+                let rollback_sql =
+                    oneclick_required_string_list(option.get("rollback_sql"), "rollback_sql")
                         .unwrap_or_default();
-                    let fk_order =
-                        oneclick_required_string_list(option.get("fk_order"), "fk_order")
-                            .unwrap_or_default();
-                    let sql_statements =
-                        oneclick_required_string_list(option.get("sql"), "sql").unwrap_or_default();
-                    let rollback_sql =
-                        oneclick_required_string_list(option.get("rollback_sql"), "rollback_sql")
-                            .unwrap_or_default();
-                    actions.push(OneClickApplyAction {
-                        issue_type: issue_type.to_string(),
-                        strategy: strategy.to_string(),
-                        schema: schema.to_string(),
-                        table: tables.first().cloned().unwrap_or_default(),
-                        sql: sql_statements.first().cloned().unwrap_or_default(),
-                        tables,
-                        fk_order,
-                        sql_statements,
-                        rollback_sql,
-                        target_charset: option
-                            .get("target_charset")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string),
-                        target_collation: option
-                            .get("target_collation")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string),
-                    });
-                }
-                Err(_) => disallowed.push(format!("{issue_type}:{strategy}")),
+                actions.push(OneClickApplyAction {
+                    issue_type: "charset_issue".to_string(),
+                    strategy: "charset_collation_fk_safe".to_string(),
+                    schema: schema.to_string(),
+                    table: tables.first().cloned().unwrap_or_default(),
+                    sql: sql_statements.first().cloned().unwrap_or_default(),
+                    tables,
+                    fk_order,
+                    sql_statements,
+                    rollback_sql,
+                    target_charset: option
+                        .get("target_charset")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    target_collation: option
+                        .get("target_collation")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                });
             }
-            continue;
+            OneClickStepClassification::Engine { table, sql } => {
+                // real-apply 전용: 클라이언트가 보낸 sql_template 이 서버 산출 SQL 과
+                // 불일치하면 disallowed 로 거부한다(preview 경로에는 적용하지 않음).
+                let selected = step.get("selected_option").unwrap_or(&Value::Null);
+                if selected
+                    .get("sql_template")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|template| !template.is_empty() && *template != sql)
+                    .is_some()
+                {
+                    disallowed.push("deprecated_engine:engine_innodb:sql_mismatch".to_string());
+                    continue;
+                }
+                actions.push(OneClickApplyAction {
+                    issue_type: "deprecated_engine".to_string(),
+                    strategy: "engine_innodb".to_string(),
+                    schema: schema.to_string(),
+                    table: table.clone(),
+                    sql: sql.clone(),
+                    tables: vec![table],
+                    fk_order: Vec::new(),
+                    sql_statements: vec![sql],
+                    rollback_sql: Vec::new(),
+                    target_charset: None,
+                    target_collation: None,
+                });
+            }
         }
-        if issue_type != "deprecated_engine" || strategy != "engine_innodb" {
-            disallowed.push(format!("{issue_type}:{strategy}"));
-            continue;
-        }
-
-        let Some(table) = oneclick_apply_step_table(step, schema) else {
-            skipped += 1;
-            continue;
-        };
-        let sql = format!(
-            "ALTER TABLE {}.{} ENGINE=InnoDB;",
-            quote_ident("mysql", schema),
-            quote_ident("mysql", &table),
-        );
-        if selected
-            .get("sql_template")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|template| !template.is_empty() && *template != sql)
-            .is_some()
-        {
-            disallowed.push(format!("{issue_type}:{strategy}:sql_mismatch"));
-            continue;
-        }
-        actions.push(OneClickApplyAction {
-            issue_type: issue_type.to_string(),
-            strategy: strategy.to_string(),
-            schema: schema.to_string(),
-            table: table.clone(),
-            sql: sql.clone(),
-            tables: vec![table],
-            fk_order: Vec::new(),
-            sql_statements: vec![sql],
-            rollback_sql: Vec::new(),
-            target_charset: None,
-            target_collation: None,
-        });
     }
 
     OneClickApplyPlan {
@@ -1456,56 +1475,30 @@ fn oneclick_dry_run_preview_fixes(payload: &Value) -> OneClickDryRunPreview {
         .into_iter()
         .flatten()
     {
-        let issue_type = step
-            .get("issue_type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let selected = step.get("selected_option").unwrap_or(&Value::Null);
-        let strategy = selected
-            .get("strategy")
-            .and_then(Value::as_str)
-            .unwrap_or("manual");
-
-        if strategy == "manual" || strategy == "skip" {
-            skipped += 1;
-            continue;
-        }
-        if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
-            match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
-                Ok(mut plan) => {
-                    if let Some(object) = plan.as_object_mut() {
-                        object.insert("issue_type".to_string(), json!("charset_issue"));
-                        object.insert("schema".to_string(), json!(schema));
-                        object.insert("dry_run".to_string(), json!(true));
-                        object.insert("success".to_string(), json!(false));
-                    }
-                    planned_fixes.push(plan);
+        match classify_oneclick_step(step, schema) {
+            OneClickStepClassification::Skip => skipped += 1,
+            OneClickStepClassification::Disallowed(reason) => disallowed.push(reason),
+            OneClickStepClassification::Charset(mut plan) => {
+                if let Some(object) = plan.as_object_mut() {
+                    object.insert("issue_type".to_string(), json!("charset_issue"));
+                    object.insert("schema".to_string(), json!(schema));
+                    object.insert("dry_run".to_string(), json!(true));
+                    object.insert("success".to_string(), json!(false));
                 }
-                Err(_) => disallowed.push(format!("{issue_type}:{strategy}")),
+                planned_fixes.push(plan);
             }
-            continue;
+            OneClickStepClassification::Engine { table, sql } => {
+                planned_fixes.push(json!({
+                    "issue_type": "deprecated_engine",
+                    "strategy": "engine_innodb",
+                    "schema": schema,
+                    "table": table,
+                    "sql": sql,
+                    "dry_run": true,
+                    "success": false
+                }));
+            }
         }
-        if issue_type == "deprecated_engine" && strategy == "engine_innodb" {
-            let Some(table) = oneclick_apply_step_table(step, schema) else {
-                skipped += 1;
-                continue;
-            };
-            planned_fixes.push(json!({
-                "issue_type": "deprecated_engine",
-                "strategy": "engine_innodb",
-                "schema": schema,
-                "table": table,
-                "sql": format!(
-                    "ALTER TABLE {}.{} ENGINE=InnoDB;",
-                    quote_ident("mysql", schema),
-                    quote_ident("mysql", &table),
-                ),
-                "dry_run": true,
-                "success": false
-            }));
-            continue;
-        }
-        disallowed.push(format!("{issue_type}:{strategy}"));
     }
 
     OneClickDryRunPreview {
