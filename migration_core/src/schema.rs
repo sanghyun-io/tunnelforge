@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use mysql::prelude::Queryable;
 use postgres::NoTls;
 use crate::*;
+use crate::query::skip_sql_comment;
 
 pub(crate) fn normalized_schema_diff(source: &NormalizedSchema, target: &NormalizedSchema) -> Vec<Value> {
     let source_tables: BTreeMap<String, &NormalizedTable> = source
@@ -632,18 +633,9 @@ pub(crate) fn mysql_definition_has_residual_definer(sql: &str) -> bool {
     let len = bytes.len();
     let mut i = 0;
     while i < len {
-        if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
-            i += 2;
-            while i < len && bytes[i] != b'\n' {
-                i += 1;
-            }
-            cleaned.push(' ');
-        } else if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
-            i += 2;
-            while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                i += 1;
-            }
-            i += 2;
+        // allow_hash=false: '#' 은 주석이 아니라 리터럴로 취급(더 보수적, fail-closed 보존).
+        if let Some(end) = skip_sql_comment(bytes, i, false) {
+            i = end;
             cleaned.push(' ');
         } else {
             cleaned.push(bytes[i] as char);
@@ -680,6 +672,12 @@ pub(crate) fn validate_single_view_statement(sql: &str) -> Result<(), String> {
     let mut i = 0;
     let len = bytes.len();
     while i < len {
+        // 주석(-- , /* */) 은 공유 스캐너로 스킵한다. allow_hash=false 로 '#' 은 리터럴 취급.
+        // 기존 루프의 trailing `i += 1` 을 보존하기 위해 end + 1 로 재개한다.
+        if let Some(end) = skip_sql_comment(bytes, i, false) {
+            i = end + 1;
+            continue;
+        }
         let ch = bytes[i];
         match ch {
             b'\'' => {
@@ -714,21 +712,6 @@ pub(crate) fn validate_single_view_statement(sql: &str) -> Result<(), String> {
                 while i < len && bytes[i] != b'`' {
                     i += 1;
                 }
-            }
-            b'-' if i + 1 < len && bytes[i + 1] == b'-' => {
-                // 라인 주석
-                i += 2;
-                while i < len && bytes[i] != b'\n' {
-                    i += 1;
-                }
-            }
-            b'/' if i + 1 < len && bytes[i + 1] == b'*' => {
-                // 블록 주석
-                i += 2;
-                while i + 1 < len && !(bytes[i] == b'*' && bytes[i + 1] == b'/') {
-                    i += 1;
-                }
-                i += 2;
             }
             b';' => {
                 // 끝에 오는 세미콜론(뒤에 공백만 남음)은 허용, 그 외는 추가 statement로 간주.

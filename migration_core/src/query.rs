@@ -162,28 +162,53 @@ pub(crate) fn execute_query_adapter(
     }
 }
 
+/// SQL 주석 스캐너: `bytes[i]` 에서 시작하는 주석을 감지하면 그 주석 토큰 바로 다음
+/// 인덱스를 반환하고, 주석 시작이 아니면 `None` 을 반환한다.
+///
+/// - 라인 주석(`--`, `allow_hash` 시 `#`): 종료 개행 `'\n'` 의 인덱스(개행 미소비).
+///   개행이 없으면 `len`.
+/// - 블록 주석(`/* */`): 닫는 `*/` 바로 다음 인덱스. 닫힘이 없으면 기존 산술상 `len+1`.
+///
+/// 반환 인덱스와 스캔 산술은 세 호출부(query::strip_leading_comments_and_parens,
+/// schema::mysql_definition_has_residual_definer, schema::validate_single_view_statement)의
+/// 기존 수제 스캐너와 바이트 단위로 일치한다. `#` 인식은 `allow_hash` 로만 켜지므로,
+/// `allow_hash=false` 호출부(View 정의 검증기)는 지금처럼 `#` 을 리터럴로 취급한다.
+pub(crate) fn skip_sql_comment(bytes: &[u8], i: usize, allow_hash: bool) -> Option<usize> {
+    let len = bytes.len();
+    if i >= len {
+        return None;
+    }
+    if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+        let mut j = i + 2;
+        while j < len && bytes[j] != b'\n' {
+            j += 1;
+        }
+        return Some(j);
+    }
+    if allow_hash && bytes[i] == b'#' {
+        let mut j = i + 1;
+        while j < len && bytes[j] != b'\n' {
+            j += 1;
+        }
+        return Some(j);
+    }
+    if bytes[i] == b'/' && i + 1 < len && bytes[i + 1] == b'*' {
+        let mut j = i + 2;
+        while j + 1 < len && !(bytes[j] == b'*' && bytes[j + 1] == b'/') {
+            j += 1;
+        }
+        return Some(j + 2);
+    }
+    None
+}
+
 fn strip_leading_comments_and_parens(sql: &str) -> &str {
     let mut text = sql.trim_start();
     loop {
-        if let Some(rest) = text.strip_prefix("--") {
-            text = match rest.find('\n') {
-                Some(idx) => rest[idx + 1..].trim_start(),
-                None => "",
-            };
-            continue;
-        }
-        if let Some(rest) = text.strip_prefix('#') {
-            text = match rest.find('\n') {
-                Some(idx) => rest[idx + 1..].trim_start(),
-                None => "",
-            };
-            continue;
-        }
-        if let Some(rest) = text.strip_prefix("/*") {
-            text = match rest.find("*/") {
-                Some(idx) => rest[idx + 2..].trim_start(),
-                None => "",
-            };
+        if let Some(end) = skip_sql_comment(text.as_bytes(), 0, true) {
+            // 기존 &str 의미 보존: 주석 끝부터 다시 잘라내고 선행 공백을 trim_start 한다.
+            // 닫히지 않은 주석(end == len 또는 len+1)은 get 으로 안전하게 "" 로 수렴한다.
+            text = text.get(end..).unwrap_or("").trim_start();
             continue;
         }
         if let Some(rest) = text.strip_prefix('(') {
