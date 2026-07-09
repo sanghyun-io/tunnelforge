@@ -1,10 +1,12 @@
 """
 두 스키마 구조 비교기
 """
-from typing import List, Dict
+from typing import Any, Callable, Dict, List, Optional
 
 from src.core.schema_diff_models import (
-    ColumnDiff, ColumnInfo, CompareLevel, DiffType, ForeignKeyDiff,
+    ColumnDiff, ColumnInfo, CompareLevel, DIFF_PREFIX_CHARSET,
+    DIFF_PREFIX_COLLATION, DIFF_PREFIX_DEFAULT, DIFF_PREFIX_EXTRA,
+    DIFF_PREFIX_NULLABLE, DIFF_PREFIX_TYPE, DiffType, ForeignKeyDiff,
     ForeignKeyInfo, IndexDiff, IndexInfo, TableDiff, TableSchema,
     _normalize_column_extra,
 )
@@ -140,30 +142,30 @@ class SchemaComparator:
 
                 # 타입 비교 (모든 레벨)
                 if src.data_type.lower() != tgt.data_type.lower():
-                    differences.append(f"타입: {src.data_type} → {tgt.data_type}")
+                    differences.append(f"{DIFF_PREFIX_TYPE} {src.data_type} → {tgt.data_type}")
 
                 # Quick 모드: 타입만 비교
                 if compare_level != CompareLevel.QUICK:
                     if src.nullable != tgt.nullable:
                         src_null = "NULL" if src.nullable else "NOT NULL"
                         tgt_null = "NULL" if tgt.nullable else "NOT NULL"
-                        differences.append(f"Nullable: {src_null} → {tgt_null}")
+                        differences.append(f"{DIFF_PREFIX_NULLABLE} {src_null} → {tgt_null}")
 
                     if src.default != tgt.default:
-                        differences.append(f"Default: {src.default} → {tgt.default}")
+                        differences.append(f"{DIFF_PREFIX_DEFAULT} {src.default} → {tgt.default}")
 
                     src_extra = _normalize_column_extra(src.extra)
                     tgt_extra = _normalize_column_extra(tgt.extra)
                     if src_extra.lower() != tgt_extra.lower():
-                        differences.append(f"Extra: {src_extra} → {tgt_extra}")
+                        differences.append(f"{DIFF_PREFIX_EXTRA} {src_extra} → {tgt_extra}")
 
                 # Strict 모드: charset + collation 추가 비교
                 if compare_level == CompareLevel.STRICT:
                     if src.charset and tgt.charset and src.charset.lower() != tgt.charset.lower():
-                        differences.append(f"Charset: {src.charset} → {tgt.charset}")
+                        differences.append(f"{DIFF_PREFIX_CHARSET} {src.charset} → {tgt.charset}")
 
                     if src.collation and tgt.collation and src.collation.lower() != tgt.collation.lower():
-                        differences.append(f"Collation: {src.collation} → {tgt.collation}")
+                        differences.append(f"{DIFF_PREFIX_COLLATION} {src.collation} → {tgt.collation}")
 
                 if differences:
                     diffs.append(ColumnDiff(
@@ -199,58 +201,43 @@ class SchemaComparator:
             fk.on_update,
         )
 
-    def _compare_indexes(
+    def _compare_named_entities(
         self,
-        source_idx: List[IndexInfo],
-        target_idx: List[IndexInfo]
-    ) -> List[IndexDiff]:
-        """인덱스 비교 (rename 감지 포함)"""
-        diffs = []
+        source_map: Dict[str, Any],
+        target_map: Dict[str, Any],
+        content_key_fn: Callable[[Any], tuple],
+        diff_builder: Callable[..., Any],
+    ) -> List[Any]:
+        """이름 매칭 → content-key 기반 RENAMED 감지 → 잔여 ADDED/REMOVED
+        3단계 제네릭 비교 알고리즘 (인덱스/FK 비교가 공유).
 
-        source_map = {i.name.lower(): i for i in source_idx}
-        target_map = {i.name.lower(): i for i in target_idx}
+        diff_builder(src=None, tgt=None, diff_type=None, old_name=None)는
+        diff_type이 None이면 이름이 매칭된 src/tgt를 비교해 MODIFIED/UNCHANGED를
+        직접 판단하고, 그 외에는 지정된 diff_type(RENAMED/ADDED/REMOVED)으로
+        엔티티별 Diff 인스턴스를 만들어 반환해야 한다.
+        """
+        diffs = []
 
         # 1단계: 이름으로 매칭
         matched_source = set()
         matched_target = set()
 
         common_names = set(source_map.keys()) & set(target_map.keys())
-        for idx_name in sorted(common_names):
-            src = source_map[idx_name]
-            tgt = target_map[idx_name]
-            matched_source.add(idx_name)
-            matched_target.add(idx_name)
-
-            differences = []
-            if src.columns != tgt.columns:
-                differences.append(f"컬럼: {src.columns} → {tgt.columns}")
-            if src.unique != tgt.unique:
-                differences.append(f"Unique: {src.unique} → {tgt.unique}")
-
-            if differences:
-                diffs.append(IndexDiff(
-                    index_name=src.name,
-                    diff_type=DiffType.MODIFIED,
-                    source_info=src,
-                    target_info=tgt,
-                    differences=differences
-                ))
-            else:
-                diffs.append(IndexDiff(
-                    index_name=src.name,
-                    diff_type=DiffType.UNCHANGED,
-                    source_info=src,
-                    target_info=tgt
-                ))
+        for name in sorted(common_names):
+            src = source_map[name]
+            tgt = target_map[name]
+            matched_source.add(name)
+            matched_target.add(name)
+            diffs.append(diff_builder(src=src, tgt=tgt))
 
         # 2단계: 미매칭 항목에서 rename 감지
         unmatched_source = {k: v for k, v in source_map.items() if k not in matched_source}
         unmatched_target = {k: v for k, v in target_map.items() if k not in matched_target}
 
         # 타겟 미매칭을 내용 기반으로 인덱싱
-        target_by_content = {}
+        target_by_content: Dict[tuple, List[str]] = {}
         for tgt_name, tgt in unmatched_target.items():
-            key = self._index_content_key(tgt)
+            key = content_key_fn(tgt)
             target_by_content.setdefault(key, []).append(tgt_name)
 
         renamed_target = set()
@@ -258,7 +245,7 @@ class SchemaComparator:
 
         for src_name in sorted(unmatched_source.keys()):
             src = unmatched_source[src_name]
-            content_key = self._index_content_key(src)
+            content_key = content_key_fn(src)
             candidates = target_by_content.get(content_key, [])
             # 아직 매칭 안 된 후보 찾기
             match_found = False
@@ -266,13 +253,8 @@ class SchemaComparator:
                 if tgt_name not in renamed_target:
                     tgt = unmatched_target[tgt_name]
                     renamed_target.add(tgt_name)
-                    diffs.append(IndexDiff(
-                        index_name=src.name,
-                        diff_type=DiffType.RENAMED,
-                        source_info=src,
-                        target_info=tgt,
-                        differences=[f"이름 변경: {tgt.name} → {src.name}"],
-                        old_name=tgt.name
+                    diffs.append(diff_builder(
+                        src=src, tgt=tgt, diff_type=DiffType.RENAMED, old_name=tgt.name
                     ))
                     match_found = True
                     break
@@ -282,45 +264,60 @@ class SchemaComparator:
 
         # 3단계: 남은 미매칭 → ADDED / REMOVED
         for src in source_added:
-            diffs.append(IndexDiff(
-                index_name=src.name,
-                diff_type=DiffType.ADDED,
-                source_info=src
-            ))
+            diffs.append(diff_builder(src=src, diff_type=DiffType.ADDED))
 
         for tgt_name in sorted(unmatched_target.keys()):
             if tgt_name not in renamed_target:
                 tgt = unmatched_target[tgt_name]
-                diffs.append(IndexDiff(
-                    index_name=tgt.name,
-                    diff_type=DiffType.REMOVED,
-                    target_info=tgt
-                ))
+                diffs.append(diff_builder(tgt=tgt, diff_type=DiffType.REMOVED))
 
         return diffs
 
-    def _compare_foreign_keys(
-        self,
-        source_fks: List[ForeignKeyInfo],
-        target_fks: List[ForeignKeyInfo]
-    ) -> List[ForeignKeyDiff]:
-        """외래 키 비교 (rename 감지 포함)"""
-        diffs = []
+    @staticmethod
+    def _build_index_diff(
+        src: Optional[IndexInfo] = None,
+        tgt: Optional[IndexInfo] = None,
+        diff_type: Optional[DiffType] = None,
+        old_name: Optional[str] = None,
+    ) -> IndexDiff:
+        """이름 매칭된 인덱스의 MODIFIED/UNCHANGED 판정, 또는
+        RENAMED/ADDED/REMOVED IndexDiff 생성."""
+        if diff_type is None:
+            differences = []
+            if src.columns != tgt.columns:
+                differences.append(f"컬럼: {src.columns} → {tgt.columns}")
+            if src.unique != tgt.unique:
+                differences.append(f"Unique: {src.unique} → {tgt.unique}")
+            return IndexDiff(
+                index_name=src.name,
+                diff_type=DiffType.MODIFIED if differences else DiffType.UNCHANGED,
+                source_info=src,
+                target_info=tgt,
+                differences=differences
+            )
+        if diff_type == DiffType.RENAMED:
+            return IndexDiff(
+                index_name=src.name,
+                diff_type=DiffType.RENAMED,
+                source_info=src,
+                target_info=tgt,
+                differences=[f"이름 변경: {tgt.name} → {src.name}"],
+                old_name=old_name
+            )
+        if diff_type == DiffType.ADDED:
+            return IndexDiff(index_name=src.name, diff_type=DiffType.ADDED, source_info=src)
+        return IndexDiff(index_name=tgt.name, diff_type=DiffType.REMOVED, target_info=tgt)
 
-        source_map = {f.name.lower(): f for f in source_fks}
-        target_map = {f.name.lower(): f for f in target_fks}
-
-        # 1단계: 이름으로 매칭
-        matched_source = set()
-        matched_target = set()
-
-        common_names = set(source_map.keys()) & set(target_map.keys())
-        for fk_name in sorted(common_names):
-            src = source_map[fk_name]
-            tgt = target_map[fk_name]
-            matched_source.add(fk_name)
-            matched_target.add(fk_name)
-
+    @staticmethod
+    def _build_fk_diff(
+        src: Optional[ForeignKeyInfo] = None,
+        tgt: Optional[ForeignKeyInfo] = None,
+        diff_type: Optional[DiffType] = None,
+        old_name: Optional[str] = None,
+    ) -> ForeignKeyDiff:
+        """이름 매칭된 FK의 MODIFIED/UNCHANGED 판정, 또는
+        RENAMED/ADDED/REMOVED ForeignKeyDiff 생성."""
+        if diff_type is None:
             differences = []
             if src.ref_table != tgt.ref_table:
                 differences.append(f"참조 테이블: {src.ref_table} → {tgt.ref_table}")
@@ -330,74 +327,46 @@ class SchemaComparator:
                 differences.append(f"ON DELETE: {src.on_delete} → {tgt.on_delete}")
             if src.on_update != tgt.on_update:
                 differences.append(f"ON UPDATE: {src.on_update} → {tgt.on_update}")
-
-            if differences:
-                diffs.append(ForeignKeyDiff(
-                    fk_name=src.name,
-                    diff_type=DiffType.MODIFIED,
-                    source_info=src,
-                    target_info=tgt,
-                    differences=differences
-                ))
-            else:
-                diffs.append(ForeignKeyDiff(
-                    fk_name=src.name,
-                    diff_type=DiffType.UNCHANGED,
-                    source_info=src,
-                    target_info=tgt
-                ))
-
-        # 2단계: 미매칭 항목에서 rename 감지
-        unmatched_source = {k: v for k, v in source_map.items() if k not in matched_source}
-        unmatched_target = {k: v for k, v in target_map.items() if k not in matched_target}
-
-        target_by_content = {}
-        for tgt_name, tgt in unmatched_target.items():
-            key = self._fk_content_key(tgt)
-            target_by_content.setdefault(key, []).append(tgt_name)
-
-        renamed_target = set()
-        source_added = []
-
-        for src_name in sorted(unmatched_source.keys()):
-            src = unmatched_source[src_name]
-            content_key = self._fk_content_key(src)
-            candidates = target_by_content.get(content_key, [])
-
-            match_found = False
-            for tgt_name in candidates:
-                if tgt_name not in renamed_target:
-                    tgt = unmatched_target[tgt_name]
-                    renamed_target.add(tgt_name)
-                    diffs.append(ForeignKeyDiff(
-                        fk_name=src.name,
-                        diff_type=DiffType.RENAMED,
-                        source_info=src,
-                        target_info=tgt,
-                        differences=[f"이름 변경: {tgt.name} → {src.name}"],
-                        old_name=tgt.name
-                    ))
-                    match_found = True
-                    break
-
-            if not match_found:
-                source_added.append(src)
-
-        # 3단계: 남은 미매칭 → ADDED / REMOVED
-        for src in source_added:
-            diffs.append(ForeignKeyDiff(
+            return ForeignKeyDiff(
                 fk_name=src.name,
-                diff_type=DiffType.ADDED,
-                source_info=src
-            ))
+                diff_type=DiffType.MODIFIED if differences else DiffType.UNCHANGED,
+                source_info=src,
+                target_info=tgt,
+                differences=differences
+            )
+        if diff_type == DiffType.RENAMED:
+            return ForeignKeyDiff(
+                fk_name=src.name,
+                diff_type=DiffType.RENAMED,
+                source_info=src,
+                target_info=tgt,
+                differences=[f"이름 변경: {tgt.name} → {src.name}"],
+                old_name=old_name
+            )
+        if diff_type == DiffType.ADDED:
+            return ForeignKeyDiff(fk_name=src.name, diff_type=DiffType.ADDED, source_info=src)
+        return ForeignKeyDiff(fk_name=tgt.name, diff_type=DiffType.REMOVED, target_info=tgt)
 
-        for tgt_name in sorted(unmatched_target.keys()):
-            if tgt_name not in renamed_target:
-                tgt = unmatched_target[tgt_name]
-                diffs.append(ForeignKeyDiff(
-                    fk_name=tgt.name,
-                    diff_type=DiffType.REMOVED,
-                    target_info=tgt
-                ))
+    def _compare_indexes(
+        self,
+        source_idx: List[IndexInfo],
+        target_idx: List[IndexInfo]
+    ) -> List[IndexDiff]:
+        """인덱스 비교 (rename 감지 포함)"""
+        source_map = {i.name.lower(): i for i in source_idx}
+        target_map = {i.name.lower(): i for i in target_idx}
+        return self._compare_named_entities(
+            source_map, target_map, self._index_content_key, self._build_index_diff
+        )
 
-        return diffs
+    def _compare_foreign_keys(
+        self,
+        source_fks: List[ForeignKeyInfo],
+        target_fks: List[ForeignKeyInfo]
+    ) -> List[ForeignKeyDiff]:
+        """외래 키 비교 (rename 감지 포함)"""
+        source_map = {f.name.lower(): f for f in source_fks}
+        target_map = {f.name.lower(): f for f in target_fks}
+        return self._compare_named_entities(
+            source_map, target_map, self._fk_content_key, self._build_fk_diff
+        )

@@ -1,7 +1,7 @@
 """
 DB 스키마 구조 추출기
 """
-from typing import List, Dict, Optional, Tuple
+from typing import Callable, List, Dict, Optional, Tuple
 
 from src.core.logger import get_logger
 from src.core.schema_diff_models import (
@@ -21,6 +21,22 @@ class SchemaExtractor:
         """
         self.connector = connector
 
+    def _swallow_errors(
+        self, action: Callable[[], None], error_message: Optional[str] = None
+    ) -> None:
+        """action()을 실행하고 예외 발생 시 삼킨다 (반환값 없음).
+
+        action은 호출부의 지역 변수(리스트/딕셔너리 누산기 또는 outcome 딕셔너리)를
+        직접 채우는 클로저여야 하며, 호출부가 그 변수를 읽어 결과를 반환한다.
+        error_message가 주어지면 `f"{error_message}: {e}"` 형식으로 로깅하고,
+        None이면 조용히 삼킨다(로깅 없음) - 각 호출부의 기존 로깅 유무를 그대로 보존한다.
+        """
+        try:
+            action()
+        except Exception as e:
+            if error_message:
+                logger.error(f"{error_message}: {e}")
+
     def extract_table_schema(self, schema: str, table: str) -> Optional[TableSchema]:
         """테이블 스키마 정보 추출
 
@@ -31,23 +47,16 @@ class SchemaExtractor:
         Returns:
             TableSchema 또는 None
         """
-        try:
-            # 컬럼 정보
+        outcome = {}
+
+        def _fetch():
             columns = self._get_columns(schema, table)
-
-            # 인덱스 정보
             indexes = self._get_indexes(schema, table)
-
-            # 외래 키 정보
             foreign_keys = self._get_foreign_keys(schema, table)
-
-            # 테이블 옵션
             engine, charset, collation = self._get_table_options(schema, table)
-
-            # 행 수
             row_count = self._get_row_count(schema, table)
 
-            return TableSchema(
+            outcome['value'] = TableSchema(
                 name=table,
                 columns=columns,
                 indexes=indexes,
@@ -58,9 +67,8 @@ class SchemaExtractor:
                 row_count=row_count
             )
 
-        except Exception as e:
-            logger.error(f"테이블 스키마 추출 실패 ({schema}.{table}): {e}")
-            return None
+        self._swallow_errors(_fetch, f"테이블 스키마 추출 실패 ({schema}.{table})")
+        return outcome.get('value')
 
     def extract_all_tables(self, schema: str) -> Dict[str, TableSchema]:
         """스키마 내 모든 테이블 정보 추출
@@ -82,16 +90,15 @@ class SchemaExtractor:
             ORDER BY TABLE_NAME
         """
 
-        try:
+        def _fetch():
             result = self.connector.execute(query, (schema,))
             for row in result:
                 table_name = row['TABLE_NAME']
                 table_schema = self.extract_table_schema(schema, table_name)
                 if table_schema:
                     tables[table_name] = table_schema
-        except Exception as e:
-            logger.error(f"테이블 목록 조회 실패 ({schema}): {e}")
 
+        self._swallow_errors(_fetch, f"테이블 목록 조회 실패 ({schema})")
         return tables
 
     def _get_columns(self, schema: str, table: str) -> List[ColumnInfo]:
@@ -112,10 +119,11 @@ class SchemaExtractor:
         """
 
         columns = []
-        try:
+
+        def _fetch():
             result = self.connector.execute(query, (schema, table))
             for row in result:
-                col = ColumnInfo(
+                columns.append(ColumnInfo(
                     name=row['COLUMN_NAME'],
                     data_type=row['COLUMN_TYPE'],
                     nullable=(row['IS_NULLABLE'] == 'YES'),
@@ -124,11 +132,9 @@ class SchemaExtractor:
                     key=row['COLUMN_KEY'] or '',
                     charset=row['CHARACTER_SET_NAME'] or '',
                     collation=row['COLLATION_NAME'] or ''
-                )
-                columns.append(col)
-        except Exception as e:
-            logger.error(f"컬럼 정보 조회 실패: {e}")
+                ))
 
+        self._swallow_errors(_fetch, "컬럼 정보 조회 실패")
         return columns
 
     def _get_indexes(self, schema: str, table: str) -> List[IndexInfo]:
@@ -145,7 +151,8 @@ class SchemaExtractor:
         """
 
         index_map = {}
-        try:
+
+        def _fetch():
             result = self.connector.execute(query, (schema, table))
             for row in result:
                 idx_name = row['INDEX_NAME']
@@ -161,9 +168,8 @@ class SchemaExtractor:
                         type=idx_type
                     )
                 index_map[idx_name].columns.append(col_name)
-        except Exception as e:
-            logger.error(f"인덱스 정보 조회 실패: {e}")
 
+        self._swallow_errors(_fetch, "인덱스 정보 조회 실패")
         return list(index_map.values())
 
     def _get_foreign_keys(self, schema: str, table: str) -> List[ForeignKeyInfo]:
@@ -187,7 +193,8 @@ class SchemaExtractor:
         """
 
         fk_map = {}
-        try:
+
+        def _fetch():
             result = self.connector.execute(query, (schema, table))
             for row in result:
                 fk_name = row['CONSTRAINT_NAME']
@@ -208,9 +215,8 @@ class SchemaExtractor:
                     )
                 fk_map[fk_name].columns.append(col)
                 fk_map[fk_name].ref_columns.append(ref_col)
-        except Exception as e:
-            logger.error(f"FK 정보 조회 실패: {e}")
 
+        self._swallow_errors(_fetch, "FK 정보 조회 실패")
         return list(fk_map.values())
 
     def _get_table_options(self, schema: str, table: str) -> Tuple[str, str, str]:
@@ -221,7 +227,9 @@ class SchemaExtractor:
             WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s
         """
 
-        try:
+        outcome = {}
+
+        def _fetch():
             result = self.connector.execute(query, (schema, table))
             if result:
                 row = result[0]
@@ -230,19 +238,20 @@ class SchemaExtractor:
 
                 # Collation에서 charset 추출
                 charset = collation.split('_')[0] if collation else 'utf8mb4'
-                return engine or 'InnoDB', charset, collation or ''
-        except Exception as e:
-            logger.error(f"테이블 옵션 조회 실패: {e}")
+                outcome['value'] = (engine or 'InnoDB', charset, collation or '')
 
-        return 'InnoDB', 'utf8mb4', 'utf8mb4_general_ci'
+        self._swallow_errors(_fetch, "테이블 옵션 조회 실패")
+        return outcome.get('value', ('InnoDB', 'utf8mb4', 'utf8mb4_general_ci'))
 
     def _get_row_count(self, schema: str, table: str) -> int:
         """테이블 행 수 조회"""
         query = f"SELECT COUNT(*) as cnt FROM `{schema}`.`{table}`"
-        try:
+        outcome = {}
+
+        def _fetch():
             result = self.connector.execute(query)
             if result:
-                return result[0]['cnt']
-        except Exception:
-            pass
-        return 0
+                outcome['value'] = result[0]['cnt']
+
+        self._swallow_errors(_fetch)
+        return outcome.get('value', 0)

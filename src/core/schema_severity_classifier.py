@@ -5,8 +5,11 @@ import re
 from typing import List, Optional, Tuple
 
 from src.core.schema_diff_models import (
-    ColumnDiff, DiffSeverity, DiffType, ForeignKeyDiff, IndexDiff,
-    SeveritySummary, TableDiff, VersionContext,
+    AUTO_INCREMENT_KEYWORD, ColumnDiff, DIFF_PREFIX_CHARSET,
+    DIFF_PREFIX_COLLATION, DIFF_PREFIX_DEFAULT, DIFF_PREFIX_EXTRA,
+    DIFF_PREFIX_NULLABLE, DIFF_PREFIX_TYPE, DiffSeverity, DiffType,
+    ForeignKeyDiff, IndexDiff, SeveritySummary, TableDiff, VersionContext,
+    is_primary_key_index,
 )
 
 
@@ -17,6 +20,13 @@ class SeverityClassifier:
     _INTEGER_TYPES = frozenset([
         'tinyint', 'smallint', 'mediumint', 'int', 'integer', 'bigint'
     ])
+
+    # 심각도 우선순위 (숫자가 클수록 심각) - _max_severity에서 참조
+    _SEVERITY_ORDER = {
+        DiffSeverity.CRITICAL: 3,
+        DiffSeverity.WARNING: 2,
+        DiffSeverity.INFO: 1,
+    }
 
     def __init__(self, version_context: Optional[VersionContext] = None):
         self.version_context = version_context
@@ -86,15 +96,15 @@ class SeverityClassifier:
         max_severity = None
 
         for d in diff.differences:
-            if d.startswith("타입:"):
-                sev = self._classify_type_change(d, diff)
-            elif d.startswith("Nullable:"):
+            if d.startswith(DIFF_PREFIX_TYPE):
+                sev = self._classify_type_change(diff)
+            elif d.startswith(DIFF_PREFIX_NULLABLE):
                 sev = DiffSeverity.WARNING
-            elif d.startswith("Default:"):
+            elif d.startswith(DIFF_PREFIX_DEFAULT):
                 sev = DiffSeverity.WARNING
-            elif d.startswith("Extra:"):
+            elif d.startswith(DIFF_PREFIX_EXTRA):
                 sev = self._classify_extra_change(d)
-            elif d.startswith("Charset:") or d.startswith("Collation:"):
+            elif d.startswith(DIFF_PREFIX_CHARSET) or d.startswith(DIFF_PREFIX_COLLATION):
                 sev = DiffSeverity.WARNING
             else:
                 sev = DiffSeverity.WARNING
@@ -104,7 +114,7 @@ class SeverityClassifier:
         return max_severity
 
     def _classify_type_change(
-        self, diff_text: str, col_diff: ColumnDiff
+        self, col_diff: ColumnDiff
     ) -> DiffSeverity:
         """타입 변경 심각도 판단"""
         src_type = col_diff.source_info.data_type if col_diff.source_info else ""
@@ -140,7 +150,7 @@ class SeverityClassifier:
     def _classify_extra_change(self, diff_text: str) -> DiffSeverity:
         """Extra 필드 변경 심각도 판단"""
         diff_lower = diff_text.lower()
-        if 'auto_increment' in diff_lower:
+        if AUTO_INCREMENT_KEYWORD in diff_lower:
             return DiffSeverity.CRITICAL
         return DiffSeverity.WARNING
 
@@ -154,7 +164,7 @@ class SeverityClassifier:
             return DiffSeverity.INFO
 
         # PRIMARY KEY 변경은 Critical
-        if diff.index_name.upper() == 'PRIMARY':
+        if is_primary_key_index(diff.index_name):
             return DiffSeverity.CRITICAL
 
         # 기타 인덱스 변경은 Warning
@@ -182,11 +192,6 @@ class SeverityClassifier:
         if new is None:
             return current
 
-        order = {
-            DiffSeverity.CRITICAL: 3,
-            DiffSeverity.WARNING: 2,
-            DiffSeverity.INFO: 1,
-        }
-        if order.get(new, 0) > order.get(current, 0):
+        if self._SEVERITY_ORDER.get(new, 0) > self._SEVERITY_ORDER.get(current, 0):
             return new
         return current
