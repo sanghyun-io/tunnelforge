@@ -15,6 +15,10 @@ from src.core.sql_validator import (
     SchemaMetadata, SchemaMetadataProvider, SQLValidator, SQLAutoCompleter,
     ValidationIssue, IssueSeverity, extract_table_aliases
 )
+from src.core import constants
+from src.core import sql_metadata as sql_metadata_module
+from src.core import sql_autocompleter as sql_autocompleter_module
+from src.core import sql_identifier_utils
 
 
 class TestSchemaMetadata(unittest.TestCase):
@@ -824,6 +828,26 @@ class TestEdgeCases(unittest.TestCase):
         issues = self.validator.validate(sql)
         # 문자열 내부는 무시
         self.assertEqual(len([i for i in issues if 'nonexistent' in i.message]), 0)
+
+
+class TestReExportsAndSystemSchemas(unittest.TestCase):
+    """[CC-002/CC-008] 분할 이후 old import path 재수출 + SYSTEM_SCHEMAS 단일 소스화 가드 테스트"""
+
+    def test_old_path_reexports_are_identical_objects(self):
+        """[SUCCESS] old path(src.core.sql_validator) 재수출 객체가 신규 모듈의 객체와 동일(is)함"""
+        self.assertIs(SchemaMetadata, sql_metadata_module.SchemaMetadata)
+        self.assertIs(SchemaMetadataProvider, sql_metadata_module.SchemaMetadataProvider)
+        self.assertIs(SQLAutoCompleter, sql_autocompleter_module.SQLAutoCompleter)
+        self.assertIs(extract_table_aliases, sql_identifier_utils.extract_table_aliases)
+
+    def test_system_schemas_derived_from_constants_upper(self):
+        """[SUCCESS] SQLValidator.SYSTEM_SCHEMAS는 constants.SYSTEM_SCHEMAS의 대문자 파생이다"""
+        expected = frozenset(s.upper() for s in constants.SYSTEM_SCHEMAS)
+        self.assertEqual(SQLValidator.SYSTEM_SCHEMAS, expected)
+
+    def test_system_schemas_includes_ndbinfo(self):
+        """[SUCCESS] SYSTEM_SCHEMAS에 'NDBINFO'가 포함된다"""
+        self.assertIn('NDBINFO', SQLValidator.SYSTEM_SCHEMAS)
 
 
 if __name__ == '__main__':
