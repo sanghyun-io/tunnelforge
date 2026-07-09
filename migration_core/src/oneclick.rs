@@ -216,19 +216,7 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "validation",
         "one-click validation started",
     ));
-    let validation_issues = match inspect_live(&state.endpoint) {
-        Ok(inspection) => oneclick_issues_from_inspection(&inspection),
-        Err(err) => vec![MigrationIssue {
-            issue_type: None,
-            severity: "error".to_string(),
-            location: "validation".to_string(),
-            message: err,
-            suggestion: "Check the database connection and rerun validation.".to_string(),
-            blocking: true,
-            table_name: None,
-            column_name: None,
-        }],
-    };
+    let validation_issues = issues_from_inspect_result(inspect_live(&state.endpoint));
     let validation_success = validation_issues.is_empty()
         && execution_success
         && report_fail_count == 0
@@ -515,19 +503,7 @@ pub(crate) fn oneclick_validate(request: &Request) -> Vec<Value> {
     )];
     match oneclick_endpoint(request) {
         Ok((endpoint, schema_name)) => {
-            let issues = match inspect_live(&endpoint) {
-                Ok(inspection) => oneclick_issues_from_inspection(&inspection),
-                Err(err) => vec![MigrationIssue {
-                    issue_type: None,
-                    severity: "error".to_string(),
-                    location: "validation".to_string(),
-                    message: err,
-                    suggestion: "Check the database connection and rerun validation.".to_string(),
-                    blocking: true,
-                    table_name: None,
-                    column_name: None,
-                }],
-            };
+            let issues = issues_from_inspect_result(inspect_live(&endpoint));
             events.push(json!({
                 "event": "result",
                 "request_id": request.request_id,
@@ -740,6 +716,25 @@ fn oneclick_issues_from_inspection(inspection: &InspectionResult) -> Vec<Migrati
             column_name: None,
         })
         .collect()
+}
+
+/// inspect 결과(성공/실패)를 검증용 MigrationIssue 목록으로 변환한다.
+/// Ok → oneclick_issues_from_inspection, Err → 단일 validation-error MigrationIssue.
+/// oneclick_run_streaming 과 oneclick_validate 에 중복돼 있던 fallback 블록을 하나로 통합한다.
+fn issues_from_inspect_result(result: Result<InspectionResult, String>) -> Vec<MigrationIssue> {
+    match result {
+        Ok(inspection) => oneclick_issues_from_inspection(&inspection),
+        Err(err) => vec![MigrationIssue {
+            issue_type: None,
+            severity: "error".to_string(),
+            location: "validation".to_string(),
+            message: err,
+            suggestion: "Check the database connection and rerun validation.".to_string(),
+            blocking: true,
+            table_name: None,
+            column_name: None,
+        }],
+    }
 }
 
 fn oneclick_deprecated_engine_marker(object: &str) -> Option<(String, String)> {
