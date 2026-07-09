@@ -634,6 +634,190 @@ class CreateTableParser:
         return definitions
 
 
+class SqlStatementScanner:
+    """따옴표/괄호 상태를 추적하며 SQL 문을 토큰 경계로 스캔하는 헬퍼
+
+    정규식 하나로는 다루기 어려운, 문자열 리터럴 안의 세미콜론/콤마/괄호를
+    올바르게 무시한다. CREATE TABLE 문 경계 추출과 INSERT VALUES 행/값
+    분해에 사용된다 (CreateTableParser의 괄호 균형 파싱과 짝을 이룬다).
+    """
+
+    def find_statement_end(self, content: str, start: int) -> int:
+        """start 이후 문자열/식별자 밖의 첫 세미콜론 위치(문장 경계)를 찾는다
+
+        작은따옴표, 큰따옴표, 백틱 안의 세미콜론은 무시하며, 백슬래시
+        이스케이프와 이중 작은따옴표('')로 이스케이프된 따옴표도 처리한다.
+        종료 세미콜론이 없으면 len(content)를 반환한다.
+        """
+        in_single = False
+        in_double = False
+        in_backtick = False
+        i = start
+        n = len(content)
+        while i < n:
+            ch = content[i]
+            if in_single:
+                if ch == '\\':
+                    i += 2
+                    continue
+                if ch == "'":
+                    if i + 1 < n and content[i + 1] == "'":
+                        i += 2
+                        continue
+                    in_single = False
+                i += 1
+                continue
+            if in_double:
+                if ch == '\\':
+                    i += 2
+                    continue
+                if ch == '"':
+                    in_double = False
+                i += 1
+                continue
+            if in_backtick:
+                if ch == '`':
+                    in_backtick = False
+                i += 1
+                continue
+            if ch == "'":
+                in_single = True
+            elif ch == '"':
+                in_double = True
+            elif ch == '`':
+                in_backtick = True
+            elif ch == ';':
+                return i
+            i += 1
+        return n
+
+    def iter_create_table_statements(self, content: str):
+        """content에서 CREATE TABLE 문 전체 텍스트를 하나씩 생성한다
+
+        CreateTableParser.TABLE_NAME_PATTERN으로 문장 시작 위치를 찾고
+        find_statement_end로 종료 세미콜론까지 경계를 잡는다. 이렇게 얻은
+        완전한 문장을 CreateTableParser.parse()에 넘기면, 파서의 괄호
+        균형 기반 바디 추출(_extract_body)이 varchar(255) DEFAULT ... 같은
+        중첩 괄호에서도 CREATE TABLE 바디를 올바르게 잘라낸다.
+        """
+        for table_match in CreateTableParser.TABLE_NAME_PATTERN.finditer(content):
+            start = table_match.start()
+            end = self.find_statement_end(content, start)
+            yield content[start:end]
+
+    def iter_values_rows(self, values_segment: str):
+        """VALUES (...) 세그먼트에서 최상위 행 바디만 추출한다
+
+        따옴표 상태와 괄호 중첩(깊이)을 함께 추적하여, 문자열 리터럴 안의
+        괄호나 함수 호출의 중첩 괄호가 행 경계로 오인되지 않도록 한다.
+        """
+        depth = 0
+        in_quote = False
+        buf: list = []
+        i = 0
+        n = len(values_segment)
+        while i < n:
+            ch = values_segment[i]
+
+            if in_quote:
+                if ch == '\\' and i + 1 < n:
+                    if depth >= 1:
+                        buf.append(values_segment[i:i + 2])
+                    i += 2
+                    continue
+                if ch == "'":
+                    if i + 1 < n and values_segment[i + 1] == "'":
+                        if depth >= 1:
+                            buf.append("''")
+                        i += 2
+                        continue
+                    in_quote = False
+                if depth >= 1:
+                    buf.append(ch)
+                i += 1
+                continue
+
+            if ch == "'":
+                in_quote = True
+                if depth >= 1:
+                    buf.append(ch)
+                i += 1
+                continue
+
+            if ch == '(':
+                if depth == 0:
+                    buf = []
+                else:
+                    buf.append(ch)
+                depth += 1
+                i += 1
+                continue
+
+            if ch == ')':
+                depth -= 1
+                if depth == 0:
+                    yield ''.join(buf)
+                elif depth > 0:
+                    buf.append(ch)
+                else:
+                    depth = 0
+                i += 1
+                continue
+
+            if depth >= 1:
+                buf.append(ch)
+            i += 1
+
+    def split_sql_values(self, row_body: str) -> List[str]:
+        """행 바디를 최상위 콤마 기준으로 분리한다 (따옴표/괄호 안 콤마 제외)"""
+        parts: List[str] = []
+        current: list = []
+        in_quote = False
+        depth = 0
+        i = 0
+        n = len(row_body)
+        while i < n:
+            ch = row_body[i]
+            if in_quote:
+                current.append(ch)
+                if ch == '\\' and i + 1 < n:
+                    current.append(row_body[i + 1])
+                    i += 2
+                    continue
+                if ch == "'":
+                    if i + 1 < n and row_body[i + 1] == "'":
+                        current.append("'")
+                        i += 2
+                        continue
+                    in_quote = False
+                i += 1
+                continue
+            if ch == "'":
+                in_quote = True
+                current.append(ch)
+                i += 1
+                continue
+            if ch == '(':
+                depth += 1
+                current.append(ch)
+                i += 1
+                continue
+            if ch == ')':
+                depth = max(depth - 1, 0)
+                current.append(ch)
+                i += 1
+                continue
+            if ch == ',' and depth == 0:
+                parts.append(''.join(current))
+                current = []
+                i += 1
+                continue
+            current.append(ch)
+            i += 1
+        parts.append(''.join(current))
+        return parts
+
+
 class CreateUserParser:
     """CREATE USER 문 파서"""
 
@@ -707,6 +891,22 @@ class GrantParser:
 class SQLParser:
     """SQL 파서 팩토리"""
 
+    # 세미콜론까지의 문 추출용 패턴 (extract_* 공용)
+    _CREATE_TABLE_STMT_PATTERN = re.compile(
+        r'CREATE\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
+        r'[^;]+?'  # 테이블 정의
+        r';',
+        re.IGNORECASE | re.DOTALL
+    )
+    _CREATE_USER_STMT_PATTERN = re.compile(
+        r'CREATE\s+USER\s+[^;]+;',
+        re.IGNORECASE | re.DOTALL
+    )
+    _GRANT_STMT_PATTERN = re.compile(
+        r'GRANT\s+[^;]+;',
+        re.IGNORECASE | re.DOTALL
+    )
+
     def __init__(self):
         self.table_parser = CreateTableParser()
         self.user_parser = CreateUserParser()
@@ -735,47 +935,19 @@ class SQLParser:
 
         return None
 
+    @staticmethod
+    def _extract_statements(pattern: 're.Pattern', content: str) -> List[str]:
+        """미리 컴파일된 패턴으로 문 텍스트를 순서대로 추출한다"""
+        return [match.group(0) for match in pattern.finditer(content)]
+
     def extract_create_table_statements(self, content: str) -> List[str]:
         """SQL 파일에서 CREATE TABLE 문 추출"""
-        statements = []
-
-        # CREATE TABLE ... ; 패턴 (세미콜론까지)
-        pattern = re.compile(
-            r'CREATE\s+(?:TEMPORARY\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?'
-            r'[^;]+?'  # 테이블 정의
-            r';',
-            re.IGNORECASE | re.DOTALL
-        )
-
-        for match in pattern.finditer(content):
-            statements.append(match.group(0))
-
-        return statements
+        return self._extract_statements(self._CREATE_TABLE_STMT_PATTERN, content)
 
     def extract_create_user_statements(self, content: str) -> List[str]:
         """SQL 파일에서 CREATE USER 문 추출"""
-        statements = []
-
-        pattern = re.compile(
-            r'CREATE\s+USER\s+[^;]+;',
-            re.IGNORECASE | re.DOTALL
-        )
-
-        for match in pattern.finditer(content):
-            statements.append(match.group(0))
-
-        return statements
+        return self._extract_statements(self._CREATE_USER_STMT_PATTERN, content)
 
     def extract_grant_statements(self, content: str) -> List[str]:
         """SQL 파일에서 GRANT 문 추출"""
-        statements = []
-
-        pattern = re.compile(
-            r'GRANT\s+[^;]+;',
-            re.IGNORECASE | re.DOTALL
-        )
-
-        for match in pattern.finditer(content):
-            statements.append(match.group(0))
-
-        return statements
+        return self._extract_statements(self._GRANT_STMT_PATTERN, content)

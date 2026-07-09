@@ -21,6 +21,16 @@ from src.core.migration_constants import (
     SYS_VAR_USAGE_PATTERN,
 )
 
+# 예약어 충돌 검사용 precompiled 패턴 (CC-061: _analyze_sql_file 인라인 컴파일 제거)
+_CREATE_TABLE_NAME_PATTERN = re.compile(
+    r'CREATE\s+TABLE\s+`?(\w+)`?\s*\(',
+    re.IGNORECASE
+)
+_TYPED_COLUMN_NAME_PATTERN = re.compile(
+    r'`(\w+)`\s+(?:INT|VARCHAR|TEXT|DATE|DECIMAL|FLOAT|DOUBLE|CHAR|BLOB|ENUM|SET)',
+    re.IGNORECASE
+)
+
 
 @dataclass
 class DumpAnalysisResult:
@@ -138,7 +148,7 @@ class DumpFileAnalyzer:
         Returns:
             발견된 이슈 목록
         """
-        issues = []
+        issues: List[CompatibilityIssue] = []
 
         try:
             # 대용량 파일 가드레일: 100MB 초과 시 경고 후 스킵
@@ -156,131 +166,158 @@ class DumpFileAnalyzer:
                 return issues
 
             content = file_path.read_text(encoding='utf-8', errors='replace')
+            file_name = file_path.name
 
-            # 1. ZEROFILL 속성 검사
-            for match in ZEROFILL_PATTERN.finditer(content):
-                # 컨텍스트에서 테이블/컬럼 이름 추출 시도
-                line_start = content.rfind('\n', 0, match.start()) + 1
-                line_end = content.find('\n', match.end())
-                line = content[line_start:line_end]
-
-                issues.append(CompatibilityIssue(
-                    issue_type=IssueType.ZEROFILL_USAGE,
-                    severity="warning",
-                    location=f"{file_path.name}",
-                    description=f"ZEROFILL 속성 사용: {line.strip()[:80]}...",
-                    suggestion="ZEROFILL은 deprecated됨"
-                ))
-
-            # 2. FLOAT(M,D), DOUBLE(M,D) 구문 검사
-            for match in FLOAT_PRECISION_PATTERN.finditer(content):
-                issues.append(CompatibilityIssue(
-                    issue_type=IssueType.FLOAT_PRECISION,
-                    severity="warning",
-                    location=f"{file_path.name}",
-                    description=f"FLOAT/DOUBLE 정밀도 구문: {match.group(0)}",
-                    suggestion="FLOAT(M,D) 구문은 deprecated됨"
-                ))
-
-            # 3. FK 이름 64자 초과 검사
-            for match in FK_NAME_LENGTH_PATTERN.finditer(content):
-                fk_name = match.group(1)
-                issues.append(CompatibilityIssue(
-                    issue_type=IssueType.FK_NAME_LENGTH,
-                    severity="error",
-                    location=f"{file_path.name}",
-                    description=f"FK 이름 64자 초과: {fk_name[:30]}... ({len(fk_name)}자)",
-                    suggestion="FK 이름을 64자 이하로 변경 필요"
-                ))
-
-            # 4. 인증 플러그인 검사
-            for match in AUTH_PLUGIN_PATTERN.finditer(content):
-                plugin = match.group(1).lower()
-                # removed(fido 계열)=error, disabled(native)=error, deprecated(sha256)=warning
-                if plugin in ('authentication_fido', 'authentication_fido_client'):
-                    severity = "error"
-                    desc = f"{plugin} 플러그인 사용 (8.4에서 제거됨)"
-                elif plugin == 'mysql_native_password':
-                    severity = "error"
-                    desc = f"{plugin} 인증 사용 (8.4에서 기본 비활성화)"
-                else:
-                    severity = "warning"
-                    desc = f"{plugin} 인증 사용 (deprecated)"
-                issues.append(CompatibilityIssue(
-                    issue_type=IssueType.AUTH_PLUGIN_ISSUE,
-                    severity=severity,
-                    location=f"{file_path.name}",
-                    description=desc,
-                    suggestion="caching_sha2_password 사용 권장"
-                ))
-
-            # 5. FTS_ 테이블명 검사
-            for match in FTS_TABLE_PREFIX_PATTERN.finditer(content):
-                issues.append(CompatibilityIssue(
-                    issue_type=IssueType.FTS_TABLE_PREFIX,
-                    severity="error",
-                    location=f"{file_path.name}",
-                    description="FTS_ 접두사 테이블명 (내부 예약어)",
-                    suggestion="FTS_ 접두사는 내부 전문 검색용으로 예약됨, 테이블명 변경 필요"
-                ))
-
-            # 6. SUPER 권한 검사
-            for match in SUPER_PRIVILEGE_PATTERN.finditer(content):
-                issues.append(CompatibilityIssue(
-                    issue_type=IssueType.SUPER_PRIVILEGE,
-                    severity="warning",
-                    location=f"{file_path.name}",
-                    description="SUPER 권한 사용 (deprecated)",
-                    suggestion="동적 권한 (BINLOG_ADMIN, CONNECTION_ADMIN 등)으로 세분화 권장"
-                ))
-
-            # 7. 제거된 시스템 변수 사용 검사
-            for match in SYS_VAR_USAGE_PATTERN.finditer(content):
-                var_name = match.group(1)
-                issues.append(CompatibilityIssue(
-                    issue_type=IssueType.REMOVED_SYS_VAR,
-                    severity="error",
-                    location=f"{file_path.name}",
-                    description=f"제거된 시스템 변수 사용: {var_name}",
-                    suggestion=f"'{var_name}'은 8.4에서 제거됨, 대체 방법 확인 필요"
-                ))
-
-            # 8. 예약어 충돌 (테이블/컬럼 이름) - CREATE TABLE 문에서
-            table_pattern = re.compile(
-                r'CREATE\s+TABLE\s+`?(\w+)`?\s*\(',
-                re.IGNORECASE
-            )
-            column_pattern = re.compile(
-                r'`(\w+)`\s+(?:INT|VARCHAR|TEXT|DATE|DECIMAL|FLOAT|DOUBLE|CHAR|BLOB|ENUM|SET)',
-                re.IGNORECASE
-            )
-
-            keywords_upper = set(k.upper() for k in ALL_RESERVED_KEYWORDS)
-
-            for match in table_pattern.finditer(content):
-                table_name = match.group(1)
-                if table_name.upper() in keywords_upper:
-                    issues.append(CompatibilityIssue(
-                        issue_type=IssueType.RESERVED_KEYWORD,
-                        severity="error",
-                        location=f"{file_path.name}",
-                        description=f"테이블명 '{table_name}'이 예약어와 충돌",
-                        suggestion="테이블명 변경 또는 백틱(`) 사용 필요"
-                    ))
-
-            for match in column_pattern.finditer(content):
-                column_name = match.group(1)
-                if column_name.upper() in keywords_upper:
-                    issues.append(CompatibilityIssue(
-                        issue_type=IssueType.RESERVED_KEYWORD,
-                        severity="warning",
-                        location=f"{file_path.name}",
-                        description=f"컬럼명 '{column_name}'이 예약어와 충돌",
-                        suggestion="컬럼 참조 시 백틱(`) 사용 필요"
-                    ))
+            # 각 호환성 검사를 순서대로 실행하고 결과를 이어붙인다
+            issues.extend(self._check_zerofill(content, file_name))
+            issues.extend(self._check_float_precision(content, file_name))
+            issues.extend(self._check_fk_name_length(content, file_name))
+            issues.extend(self._check_auth_plugin(content, file_name))
+            issues.extend(self._check_fts_table_prefix(content, file_name))
+            issues.extend(self._check_super_privilege(content, file_name))
+            issues.extend(self._check_removed_sys_var(content, file_name))
+            issues.extend(self._check_reserved_keywords(content, file_name))
 
         except Exception as e:
             self._log(f"  ⚠️ 파일 읽기 오류: {file_path.name} - {str(e)}")
+
+        return issues
+
+    # 1. ZEROFILL 속성 검사
+    def _check_zerofill(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        for match in ZEROFILL_PATTERN.finditer(content):
+            # 컨텍스트에서 테이블/컬럼 이름 추출 시도
+            line_start = content.rfind('\n', 0, match.start()) + 1
+            line_end = content.find('\n', match.end())
+            line = content[line_start:line_end]
+
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.ZEROFILL_USAGE,
+                severity="warning",
+                location=file_name,
+                description=f"ZEROFILL 속성 사용: {line.strip()[:80]}...",
+                suggestion="ZEROFILL은 deprecated됨"
+            ))
+        return issues
+
+    # 2. FLOAT(M,D), DOUBLE(M,D) 구문 검사
+    def _check_float_precision(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        for match in FLOAT_PRECISION_PATTERN.finditer(content):
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.FLOAT_PRECISION,
+                severity="warning",
+                location=file_name,
+                description=f"FLOAT/DOUBLE 정밀도 구문: {match.group(0)}",
+                suggestion="FLOAT(M,D) 구문은 deprecated됨"
+            ))
+        return issues
+
+    # 3. FK 이름 64자 초과 검사
+    def _check_fk_name_length(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        for match in FK_NAME_LENGTH_PATTERN.finditer(content):
+            fk_name = match.group(1)
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.FK_NAME_LENGTH,
+                severity="error",
+                location=file_name,
+                description=f"FK 이름 64자 초과: {fk_name[:30]}... ({len(fk_name)}자)",
+                suggestion="FK 이름을 64자 이하로 변경 필요"
+            ))
+        return issues
+
+    # 4. 인증 플러그인 검사
+    def _check_auth_plugin(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        for match in AUTH_PLUGIN_PATTERN.finditer(content):
+            plugin = match.group(1).lower()
+            # removed(fido 계열)=error, disabled(native)=error, deprecated(sha256)=warning
+            if plugin in ('authentication_fido', 'authentication_fido_client'):
+                severity = "error"
+                desc = f"{plugin} 플러그인 사용 (8.4에서 제거됨)"
+            elif plugin == 'mysql_native_password':
+                severity = "error"
+                desc = f"{plugin} 인증 사용 (8.4에서 기본 비활성화)"
+            else:
+                severity = "warning"
+                desc = f"{plugin} 인증 사용 (deprecated)"
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.AUTH_PLUGIN_ISSUE,
+                severity=severity,
+                location=file_name,
+                description=desc,
+                suggestion="caching_sha2_password 사용 권장"
+            ))
+        return issues
+
+    # 5. FTS_ 테이블명 검사
+    def _check_fts_table_prefix(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        for match in FTS_TABLE_PREFIX_PATTERN.finditer(content):
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.FTS_TABLE_PREFIX,
+                severity="error",
+                location=file_name,
+                description="FTS_ 접두사 테이블명 (내부 예약어)",
+                suggestion="FTS_ 접두사는 내부 전문 검색용으로 예약됨, 테이블명 변경 필요"
+            ))
+        return issues
+
+    # 6. SUPER 권한 검사
+    def _check_super_privilege(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        for match in SUPER_PRIVILEGE_PATTERN.finditer(content):
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.SUPER_PRIVILEGE,
+                severity="warning",
+                location=file_name,
+                description="SUPER 권한 사용 (deprecated)",
+                suggestion="동적 권한 (BINLOG_ADMIN, CONNECTION_ADMIN 등)으로 세분화 권장"
+            ))
+        return issues
+
+    # 7. 제거된 시스템 변수 사용 검사
+    def _check_removed_sys_var(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        for match in SYS_VAR_USAGE_PATTERN.finditer(content):
+            var_name = match.group(1)
+            issues.append(CompatibilityIssue(
+                issue_type=IssueType.REMOVED_SYS_VAR,
+                severity="error",
+                location=file_name,
+                description=f"제거된 시스템 변수 사용: {var_name}",
+                suggestion=f"'{var_name}'은 8.4에서 제거됨, 대체 방법 확인 필요"
+            ))
+        return issues
+
+    # 8. 예약어 충돌 (테이블/컬럼 이름) - CREATE TABLE 문에서
+    def _check_reserved_keywords(self, content: str, file_name: str) -> List[CompatibilityIssue]:
+        issues = []
+        keywords_upper = set(k.upper() for k in ALL_RESERVED_KEYWORDS)
+
+        for match in _CREATE_TABLE_NAME_PATTERN.finditer(content):
+            table_name = match.group(1)
+            if table_name.upper() in keywords_upper:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.RESERVED_KEYWORD,
+                    severity="error",
+                    location=file_name,
+                    description=f"테이블명 '{table_name}'이 예약어와 충돌",
+                    suggestion="테이블명 변경 또는 백틱(`) 사용 필요"
+                ))
+
+        for match in _TYPED_COLUMN_NAME_PATTERN.finditer(content):
+            column_name = match.group(1)
+            if column_name.upper() in keywords_upper:
+                issues.append(CompatibilityIssue(
+                    issue_type=IssueType.RESERVED_KEYWORD,
+                    severity="warning",
+                    location=file_name,
+                    description=f"컬럼명 '{column_name}'이 예약어와 충돌",
+                    suggestion="컬럼 참조 시 백틱(`) 사용 필요"
+                ))
 
         return issues
 
