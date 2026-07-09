@@ -20,6 +20,7 @@ from src.core.migration_analyzer import (
     CleanupAction,
     ActionType,
     ForeignKeyInfo,
+    SchemaCheckOptions,
 )
 from tests.conftest import FakeMySQLConnector
 
@@ -410,8 +411,8 @@ class TestCheckIntDisplayWidth:
         assert issues[0].issue_type == IssueType.INT_DISPLAY_WIDTH
         assert issues[0].severity == "info"
 
-    def _pipeline_kwargs(self, enabled: bool) -> dict:
-        return dict(
+    def _pipeline_kwargs(self, enabled: bool) -> SchemaCheckOptions:
+        return SchemaCheckOptions(
             check_orphans=False, check_charset=False, check_keywords=False,
             check_routines=False, check_sql_mode=False, check_auth_plugins=False,
             check_zerofill=False, check_float_precision=False, check_fk_name_length=False,
@@ -428,7 +429,7 @@ class TestCheckIntDisplayWidth:
             ],
         }
         analyzer = MigrationAnalyzer(fake_connector)
-        result = analyzer._analyze_schema_impl("test_db", **self._pipeline_kwargs(True))
+        result = analyzer._analyze_schema_impl("test_db", self._pipeline_kwargs(True))
         int_issues = [i for i in result.compatibility_issues if i.issue_type == IssueType.INT_DISPLAY_WIDTH]
         assert len(int_issues) == 1
 
@@ -440,7 +441,7 @@ class TestCheckIntDisplayWidth:
             ],
         }
         analyzer = MigrationAnalyzer(fake_connector)
-        result = analyzer._analyze_schema_impl("test_db", **self._pipeline_kwargs(False))
+        result = analyzer._analyze_schema_impl("test_db", self._pipeline_kwargs(False))
         int_issues = [i for i in result.compatibility_issues if i.issue_type == IssueType.INT_DISPLAY_WIDTH]
         assert int_issues == []
 
