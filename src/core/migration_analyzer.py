@@ -18,6 +18,7 @@ from src.core.db_connector import MySQLConnector
 # ============================================================
 from src.core.migration_constants import (
     ALL_REMOVED_FUNCTIONS,
+    ALL_RESERVED_KEYWORDS,
     DEPRECATED_FUNCTIONS_84,
     OBSOLETE_SQL_MODES,
     IssueType,
@@ -174,16 +175,6 @@ class MigrationAnalyzer:
     DEPRECATED_FUNCTIONS = list(ALL_REMOVED_FUNCTIONS)
     # deprecated만 (경고 수준 차등화용)
     _DEPRECATED_ONLY = set(DEPRECATED_FUNCTIONS_84)
-
-    # MySQL 8.4에서 새로운 예약어들 (기존 22개 + 8.4 추가 4개)
-    NEW_RESERVED_KEYWORDS = [
-        'CUME_DIST', 'DENSE_RANK', 'EMPTY', 'EXCEPT', 'FIRST_VALUE',
-        'GROUPING', 'GROUPS', 'JSON_TABLE', 'LAG', 'LAST_VALUE', 'LATERAL',
-        'LEAD', 'NTH_VALUE', 'NTILE', 'OF', 'OVER', 'PERCENT_RANK',
-        'RANK', 'RECURSIVE', 'ROW_NUMBER', 'SYSTEM', 'WINDOW',
-        # MySQL 8.4 추가 예약어
-        'MANUAL', 'PARALLEL', 'QUALIFY', 'TABLESAMPLE'
-    ]
 
     def __init__(self, connector: MySQLConnector):
         self.connector = connector
@@ -419,7 +410,7 @@ class MigrationAnalyzer:
         self._log("🔍 예약어 충돌 확인 중...")
 
         issues = []
-        keywords_upper = set(k.upper() for k in self.NEW_RESERVED_KEYWORDS)
+        keywords_upper = set(k.upper() for k in ALL_RESERVED_KEYWORDS)
 
         # 테이블명 확인
         tables = self.connector.get_tables(schema)
