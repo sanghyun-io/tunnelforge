@@ -168,9 +168,8 @@ def filter_log_by_level(content: str, level: str) -> str:
 
     for line in content.splitlines():
         # 로그 레벨 확인 (포맷: [timestamp] LEVEL [module] message)
+        # level_upper == 'ERROR'인 경우는 위의 if에서 이미 처리되므로 별도 elif 불필요
         if f'] {level_upper} [' in line:
-            filtered_lines.append(line)
-        elif level_upper == 'ERROR' and '] ERROR [' in line:
             filtered_lines.append(line)
         elif level_upper == 'WARNING' and ('] WARNING [' in line or '] ERROR [' in line):
             filtered_lines.append(line)

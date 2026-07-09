@@ -74,6 +74,32 @@ class TunnelEngine:
             f"💡 OpenSSH 포맷인 경우 'pip install cryptography' 필요"
         )
 
+    def _build_forwarder(self, config, local_bind_address, pkey_obj, set_keepalive=None):
+        """SSHTunnelForwarder 공통 kwargs 조립 (모듈 전역 SSHTunnelForwarder 참조 필수)
+
+        Args:
+            config: 터널 설정 (bastion_host/bastion_port/bastion_user/remote_host/remote_port)
+            local_bind_address: 로컬 바인드 주소 튜플
+            pkey_obj: 이미 로드된 SSH 키 객체
+            set_keepalive: keepalive 간격(초). None이면 kwarg 자체를 생략(라이브러리 기본값 유지)
+
+        Returns:
+            생성된 (미시작) SSHTunnelForwarder 인스턴스
+        """
+        kwargs = dict(
+            ssh_username=config['bastion_user'],
+            ssh_pkey=pkey_obj,  # 경로 대신 키 객체 전달
+            remote_bind_address=(config['remote_host'], int(config['remote_port'])),
+            local_bind_address=local_bind_address,
+        )
+        if set_keepalive is not None:
+            kwargs['set_keepalive'] = set_keepalive
+
+        return SSHTunnelForwarder(
+            (config['bastion_host'], int(config['bastion_port'])),
+            **kwargs,
+        )
+
     def start_tunnel(self, config, check_port: bool = True):
         """SSH 터널 또는 직접 연결 시작
 
@@ -84,19 +110,19 @@ class TunnelEngine:
         Returns:
             (success, message) 튜플
         """
-        tid = config['id']
+        tunnel_id = config['id']
 
         # 이미 실행 중인지 확인
-        if tid in self.active_tunnels:
+        if tunnel_id in self.active_tunnels:
             if config.get('connection_mode') == 'direct':
                 return True, "이미 연결 중입니다."
-            elif self.active_tunnels[tid] and self.active_tunnels[tid].is_active:
+            elif self.active_tunnels[tunnel_id] and self.active_tunnels[tunnel_id].is_active:
                 return True, "이미 실행 중입니다."
 
         # 직접 연결 모드
         if config.get('connection_mode') == 'direct':
-            self.active_tunnels[tid] = None  # 터널 객체 없음 (직접 연결)
-            self.tunnel_configs[tid] = config
+            self.active_tunnels[tunnel_id] = None  # 터널 객체 없음 (직접 연결)
+            self.tunnel_configs[tunnel_id] = config
             logger.info(f"직접 연결 모드: {config['name']} -> {config['remote_host']}:{config['remote_port']}")
             return True, f"직접 연결: {config['remote_host']}:{config['remote_port']}"
 
@@ -111,7 +137,7 @@ class TunnelEngine:
 
     def _start_ssh_tunnel(self, config):
         """SSH 터널 시작 (내부 메서드)"""
-        tid = config['id']
+        tunnel_id = config['id']
         connection_logs = []
 
         try:
@@ -132,20 +158,18 @@ class TunnelEngine:
 
             connection_logs.append("SSH 터널 생성 중...")
             logger.debug("SSH 터널 생성 중...")
-            server = SSHTunnelForwarder(
-                (config['bastion_host'], int(config['bastion_port'])),
-                ssh_username=config['bastion_user'],
-                ssh_pkey=pkey_obj,  # 경로 대신 키 객체 전달
-                remote_bind_address=(config['remote_host'], int(config['remote_port'])),
+            server = self._build_forwarder(
+                config,
                 local_bind_address=('0.0.0.0', int(config['local_port'])),
-                set_keepalive=30.0
+                pkey_obj=pkey_obj,
+                set_keepalive=30.0,
             )
 
             connection_logs.append("터널 연결 시작...")
             logger.debug("터널 연결 시작...")
             server.start()
-            self.active_tunnels[tid] = server
-            self.tunnel_configs[tid] = config
+            self.active_tunnels[tunnel_id] = server
+            self.tunnel_configs[tunnel_id] = config
             logger.info(f"터널 연결 성공! (Local {config['local_port']} -> Remote {config['remote_host']})")
             return True, "연결 성공"
 
@@ -163,37 +187,37 @@ class TunnelEngine:
             logger.error(full_error)
             return False, full_error
 
-    def stop_tunnel(self, tid):
+    def stop_tunnel(self, tunnel_id):
         """터널 종료"""
-        if tid in self.active_tunnels:
+        if tunnel_id in self.active_tunnels:
             try:
-                server = self.active_tunnels[tid]
+                server = self.active_tunnels[tunnel_id]
                 if server is not None:  # SSH 터널인 경우만 stop 호출
                     server.stop()
-                del self.active_tunnels[tid]
-                if tid in self.tunnel_configs:
-                    del self.tunnel_configs[tid]
-                logger.info(f"터널 종료됨: {tid}")
+                del self.active_tunnels[tunnel_id]
+                if tunnel_id in self.tunnel_configs:
+                    del self.tunnel_configs[tunnel_id]
+                logger.info(f"터널 종료됨: {tunnel_id}")
                 return True
             except Exception as e:
                 logger.warning(f"터널 종료 중 오류: {e}")
         return False
 
-    def is_running(self, tid):
+    def is_running(self, tunnel_id):
         """터널/연결이 활성화 상태인지 확인"""
-        if tid in self.active_tunnels:
-            server = self.active_tunnels[tid]
+        if tunnel_id in self.active_tunnels:
+            server = self.active_tunnels[tunnel_id]
             if server is None:  # 직접 연결 모드
                 return True
             return server.is_active
         return False
 
-    def get_connection_info(self, tid):
+    def get_connection_info(self, tunnel_id):
         """실제 연결할 호스트/포트 반환"""
-        if tid not in self.tunnel_configs:
+        if tunnel_id not in self.tunnel_configs:
             return None, None
 
-        config = self.tunnel_configs[tid]
+        config = self.tunnel_configs[tunnel_id]
         if config.get('connection_mode') == 'direct':
             return config['remote_host'], int(config['remote_port'])
         else:
@@ -213,12 +237,10 @@ class TunnelEngine:
             pkey_obj = self._load_private_key(config['bastion_key'])
 
             # 임시 터널 생성 (포트 자동 할당)
-            temp_server = SSHTunnelForwarder(
-                (config['bastion_host'], int(config['bastion_port'])),
-                ssh_username=config['bastion_user'],
-                ssh_pkey=pkey_obj,
-                remote_bind_address=(config['remote_host'], int(config['remote_port'])),
-                local_bind_address=(DEFAULT_LOCAL_HOST, 0)  # 0 = 자동 할당
+            temp_server = self._build_forwarder(
+                config,
+                local_bind_address=(DEFAULT_LOCAL_HOST, 0),  # 0 = 자동 할당
+                pkey_obj=pkey_obj,
             )
 
             temp_server.start()
@@ -316,13 +338,13 @@ class TunnelEngine:
     def get_active_tunnels(self):
         """활성화된 터널/연결 목록 반환 (DB Export용)"""
         result = []
-        for tid, server in self.active_tunnels.items():
-            if tid in self.tunnel_configs:
-                config = self.tunnel_configs[tid]
-                host, port = self.get_connection_info(tid)
+        for tunnel_id, server in self.active_tunnels.items():
+            if tunnel_id in self.tunnel_configs:
+                config = self.tunnel_configs[tunnel_id]
+                host, port = self.get_connection_info(tunnel_id)
                 result.append({
-                    'id': tid,
-                    'tunnel_id': tid,  # DB 연결 다이얼로그에서 자격 증명 조회용
+                    'id': tunnel_id,
+                    'tunnel_id': tunnel_id,  # DB 연결 다이얼로그에서 자격 증명 조회용
                     'name': config.get('name', 'Unknown'),
                     'host': host,
                     'port': port,
@@ -332,8 +354,8 @@ class TunnelEngine:
 
     def stop_all(self):
         ids = list(self.active_tunnels.keys())
-        for tid in ids:
-            self.stop_tunnel(tid)
+        for tunnel_id in ids:
+            self.stop_tunnel(tunnel_id)
 
     def test_connection(self, config):
         """테스트 연결"""
@@ -375,12 +397,10 @@ class TunnelEngine:
             connection_logs.append("✅ SSH 키 로드 성공")
 
             connection_logs.append("🔗 임시 SSH 터널 생성 중...")
-            temp_server = SSHTunnelForwarder(
-                (config['bastion_host'], int(config['bastion_port'])),
-                ssh_username=config['bastion_user'],
-                ssh_pkey=pkey_obj,  # 경로 대신 키 객체 전달
-                remote_bind_address=(config['remote_host'], int(config['remote_port'])),
-                local_bind_address=(DEFAULT_LOCAL_HOST, 0)
+            temp_server = self._build_forwarder(
+                config,
+                local_bind_address=(DEFAULT_LOCAL_HOST, 0),
+                pkey_obj=pkey_obj,
             )
 
             connection_logs.append("🚀 Bastion Host 연결 시도...")

@@ -31,6 +31,7 @@ _KEY_LEN = 20        # login key 길이 (고정)
 _HEADER_LEN = 4      # 파일 앞 4바이트 key_len (uint32 LE, = _KEY_LEN)
 _KEY_OFFSET = _HEADER_LEN          # key 시작 위치
 _DATA_OFFSET = _KEY_OFFSET + _KEY_LEN  # 데이터 섹션 시작 위치 (= 24)
+_AES_BLOCK_SIZE_BITS = 128  # AES 블록 크기 (PKCS#7 패딩 단위, mysql_config_editor 호환)
 
 # Windows: %APPDATA%\MySQL\.mylogin.cnf
 # Unix:    ~/.mylogin.cnf
@@ -101,7 +102,7 @@ def _read_cnf(path: str = _MYLOGIN_CNF) -> Tuple[bytes, str]:
             padded_plain = dec.update(ciphertext) + dec.finalize()
             # PKCS#7 unpadding 시도, 실패 시 legacy NULL padding fallback
             try:
-                unpadder = PKCS7(128).unpadder()
+                unpadder = PKCS7(_AES_BLOCK_SIZE_BITS).unpadder()
                 plain = unpadder.update(padded_plain) + unpadder.finalize()
             except ValueError:
                 plain = padded_plain.rstrip(b'\x00')
@@ -145,7 +146,7 @@ def _write_cnf(login_key: bytes, ini_text: str, path: str = _MYLOGIN_CNF):
             # 줄 단위 개별 암호화 (PKCS#7 패딩: mysql_config_editor 호환)
             for line in text.splitlines(keepends=True):
                 plain = line.encode('utf-8')
-                padder = PKCS7(128).padder()
+                padder = PKCS7(_AES_BLOCK_SIZE_BITS).padder()
                 padded = padder.update(plain) + padder.finalize()
 
                 enc = Cipher(algorithms.AES(aes_key), modes.ECB()).encryptor()
@@ -220,12 +221,8 @@ class MysqlLoginPathManager:
         self._cnf_path = cnf_path or _MYLOGIN_CNF
 
     def is_available(self) -> bool:
-        """cryptography 라이브러리 사용 가능 여부 (의존성으로 항상 True)"""
-        try:
-            from cryptography.hazmat.primitives.ciphers import Cipher  # noqa
-            return True
-        except ImportError:
-            return False
+        """항상 True를 반환한다. cryptography는 필수 의존성으로 이미 설치되어 있다."""
+        return True
 
     @staticmethod
     def get_login_path_name(port: int) -> str:

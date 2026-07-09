@@ -10,7 +10,6 @@ import logging
 import os
 import uuid
 from datetime import datetime
-from typing import Optional
 
 from src.core.platform_paths import log_dir
 
