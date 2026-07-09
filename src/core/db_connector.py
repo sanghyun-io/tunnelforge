@@ -204,6 +204,11 @@ class MySQLConnector:
         if not self.connection:
             return False
 
+        # 빈 스키마명은 이전 MySQL 구현과 동일하게 항상 미존재로 취급한다
+        # (Rust delegate는 빈 문자열에 True를 반환할 수 있어 계약을 복원한다).
+        if not schema_name:
+            return False
+
         try:
             self._delegate.connection = self.connection
             return self._delegate.schema_exists(schema_name)
