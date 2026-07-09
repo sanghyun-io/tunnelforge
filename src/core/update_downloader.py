@@ -96,6 +96,7 @@ class UpdateDownloader:
     """GitHub Releases에서 설치 프로그램 다운로드"""
 
     DEFAULT_TIMEOUT = 10  # 기본 API 요청 타임아웃 (초)
+    DEFAULT_DOWNLOAD_TIMEOUT = 30  # 설치 파일 다운로드 스톨 타임아웃 하한 (초, 대용량 파일용)
     CHUNK_SIZE = 8192  # 다운로드 청크 크기 (바이트)
 
     def __init__(self, config_manager=None):
@@ -111,6 +112,16 @@ class UpdateDownloader:
         if self._config_manager is not None:
             return self._config_manager.get_network_timeout_download()
         return self.DEFAULT_TIMEOUT
+
+    @property
+    def download_timeout(self) -> int:
+        """설치 파일 다운로드용 타임아웃 (초).
+
+        `requests`의 timeout은 총 다운로드 시간이 아니라 read/connect 스톨 허용치다.
+        대용량 설치 파일은 API 호출보다 넉넉한 스톨 허용치가 필요하므로,
+        설정값(get_network_timeout_download)을 존중하되 최소 DEFAULT_DOWNLOAD_TIMEOUT(30초)을 보장한다.
+        """
+        return max(self.timeout, self.DEFAULT_DOWNLOAD_TIMEOUT)
 
     def cancel(self):
         """다운로드 취소"""
@@ -201,7 +212,7 @@ class UpdateDownloader:
             response = requests.get(
                 self.download_url,
                 stream=True,
-                timeout=self.timeout
+                timeout=self.download_timeout
             )
             response.raise_for_status()
 
