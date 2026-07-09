@@ -426,7 +426,9 @@ class TestTunnelMonitor:
             created["database"] = database
             return FakeConnector()
 
-        monkeypatch.setattr("src.core.tunnel_monitor.create_rust_db_connector", fake_create)
+        # CC-025: health check 로직이 tunnel_health_checker.py로 이관되어
+        # create_rust_db_connector 호출도 그 모듈 네임스페이스에서 일어난다.
+        monkeypatch.setattr("src.core.tunnel_health_checker.create_rust_db_connector", fake_create)
 
         conn = self.monitor._create_health_connection(
             "pg-tunnel", "postgresql", "127.0.0.1", 5432, "user", "pw", "analytics"
@@ -501,7 +503,8 @@ class TestTunnelMonitor:
         def fake_create(engine, host, port, user, password, database=None, schema=""):
             return FakeConnector(user, password)
 
-        monkeypatch.setattr("src.core.tunnel_monitor.create_rust_db_connector", fake_create)
+        # CC-025: create_rust_db_connector 호출은 이제 tunnel_health_checker.py 소속
+        monkeypatch.setattr("src.core.tunnel_health_checker.create_rust_db_connector", fake_create)
 
         result = self.monitor._measure_latency('tunnel1')
 
@@ -522,7 +525,8 @@ class TestTunnelMonitor:
         def fail_create(*args, **kwargs):
             raise AssertionError("db user 없이는 connector를 생성하면 안 됨")
 
-        monkeypatch.setattr("src.core.tunnel_monitor.create_rust_db_connector", fail_create)
+        # CC-025: create_rust_db_connector 호출은 이제 tunnel_health_checker.py 소속
+        monkeypatch.setattr("src.core.tunnel_health_checker.create_rust_db_connector", fail_create)
 
         result = self.monitor._measure_latency('tunnel1')
         assert result == -1

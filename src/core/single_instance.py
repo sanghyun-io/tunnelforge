@@ -11,6 +11,9 @@ from PyQt6.QtNetwork import QLocalServer, QLocalSocket
 DEFAULT_SERVER_NAME = "tunnelforge-single-instance-v1"
 DEFAULT_LOCK_FILE = os.path.join(tempfile.gettempdir(), "tunnelforge-single-instance.lock")
 
+_CONNECT_ATTEMPT_TIMEOUT_MS = 100
+_POLL_INTERVAL_SECONDS = 0.05
+
 
 class SingleInstanceGuard(QObject):
     """Own a local server so later launches can wake the first instance."""
@@ -88,15 +91,15 @@ class SingleInstanceGuard(QObject):
         while time.monotonic() < deadline:
             socket = QLocalSocket()
             socket.connectToServer(server_name)
-            if socket.waitForConnected(100):
+            if socket.waitForConnected(_CONNECT_ATTEMPT_TIMEOUT_MS):
                 message = f"activate:{sys.argv[0]}\n".encode("utf-8", errors="replace")
                 socket.write(message)
                 socket.flush()
-                socket.waitForBytesWritten(100)
+                socket.waitForBytesWritten(_CONNECT_ATTEMPT_TIMEOUT_MS)
                 socket.disconnectFromServer()
                 socket.deleteLater()
                 return True
             socket.deleteLater()
-            time.sleep(0.05)
+            time.sleep(_POLL_INTERVAL_SECONDS)
 
         return False

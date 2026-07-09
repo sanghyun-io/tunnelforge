@@ -21,6 +21,24 @@ def _environ(environ: Optional[Mapping[str, str]] = None) -> Mapping[str, str]:
     return environ if environ is not None else os.environ
 
 
+def _platform_base_dir(
+    system: str,
+    home_path: Path,
+    env: Mapping[str, str],
+    xdg_env_var: str,
+    xdg_default_subdir: str,
+) -> Path:
+    """Windows(LOCALAPPDATA fallback)와 Linux(XDG env fallback)의 공통 base 디렉토리.
+
+    macOS(Darwin)는 함수마다 서브패스가 다르므로(log_dir은 Library/Logs, 나머지는
+    Library/Application Support) 이 helper로 뭉개지 않고 각 호출부가 직접 처리한다.
+    """
+    if system == "Windows":
+        return Path(env.get("LOCALAPPDATA") or home_path / "AppData" / "Local")
+
+    return Path(env.get(xdg_env_var) or home_path / xdg_default_subdir)
+
+
 def app_support_dir(
     platform_name: Optional[str] = None,
     home: Optional[Path] = None,
@@ -31,14 +49,12 @@ def app_support_dir(
     home_path = _home_path(home)
     env = _environ(environ)
 
-    if system == "Windows":
-        base = Path(env.get("LOCALAPPDATA") or home_path / "AppData" / "Local")
-        return base / APP_NAME
     if system == "Darwin":
         return home_path / "Library" / "Application Support" / APP_NAME
+    if system == "Windows":
+        return _platform_base_dir(system, home_path, env, "XDG_CONFIG_HOME", ".config") / APP_NAME
 
-    base = Path(env.get("XDG_CONFIG_HOME") or home_path / ".config")
-    return base / APP_ID
+    return _platform_base_dir(system, home_path, env, "XDG_CONFIG_HOME", ".config") / APP_ID
 
 
 def data_dir(
@@ -51,14 +67,12 @@ def data_dir(
     home_path = _home_path(home)
     env = _environ(environ)
 
-    if system == "Windows":
-        base = Path(env.get("LOCALAPPDATA") or home_path / "AppData" / "Local")
-        return base / APP_NAME
     if system == "Darwin":
         return home_path / "Library" / "Application Support" / APP_NAME
+    if system == "Windows":
+        return _platform_base_dir(system, home_path, env, "XDG_DATA_HOME", ".local/share") / APP_NAME
 
-    base = Path(env.get("XDG_DATA_HOME") or home_path / ".local" / "share")
-    return base / APP_ID
+    return _platform_base_dir(system, home_path, env, "XDG_DATA_HOME", ".local/share") / APP_ID
 
 
 def log_dir(
@@ -71,14 +85,12 @@ def log_dir(
     home_path = _home_path(home)
     env = _environ(environ)
 
-    if system == "Windows":
-        base = Path(env.get("LOCALAPPDATA") or home_path / "AppData" / "Local")
-        return base / APP_NAME / "logs"
     if system == "Darwin":
         return home_path / "Library" / "Logs" / APP_NAME
+    if system == "Windows":
+        return _platform_base_dir(system, home_path, env, "XDG_STATE_HOME", ".local/state") / APP_NAME / "logs"
 
-    base = Path(env.get("XDG_STATE_HOME") or home_path / ".local" / "state")
-    return base / APP_ID / "logs"
+    return _platform_base_dir(system, home_path, env, "XDG_STATE_HOME", ".local/state") / APP_ID / "logs"
 
 
 def config_file(
