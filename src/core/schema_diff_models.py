@@ -64,6 +64,38 @@ def _normalize_column_extra(extra: Optional[str]) -> str:
     return " ".join(cleaned.split())
 
 
+PRIMARY_KEY_INDEX_NAME = "PRIMARY"
+
+
+def is_primary_key_index(name: str) -> bool:
+    """인덱스 이름이 PRIMARY KEY 인덱스인지 확인 (대소문자 무시).
+
+    MySQL INFORMATION_SCHEMA는 항상 대문자 'PRIMARY'를 반환하므로
+    대소문자 무시 비교로 통일해도 런타임 영향이 없다.
+    """
+    return name.upper() == PRIMARY_KEY_INDEX_NAME
+
+
+# 컬럼 diff 메시지 접두어 - 생산자(SchemaComparator)와 소비자(SeverityClassifier)가 공유
+DIFF_PREFIX_TYPE = "타입:"
+DIFF_PREFIX_NULLABLE = "Nullable:"
+DIFF_PREFIX_DEFAULT = "Default:"
+DIFF_PREFIX_EXTRA = "Extra:"
+DIFF_PREFIX_CHARSET = "Charset:"
+DIFF_PREFIX_COLLATION = "Collation:"
+AUTO_INCREMENT_KEYWORD = "auto_increment"
+
+
+def _quote_ident(name: str) -> str:
+    """MySQL 식별자를 백틱으로 감싼다."""
+    return f"`{name}`"
+
+
+def _quote_idents(names: List[str]) -> str:
+    """MySQL 식별자 목록을 백틱으로 감싸 콤마로 join한다."""
+    return ", ".join(_quote_ident(n) for n in names)
+
+
 @dataclass
 class ColumnInfo:
     """컬럼 정보"""
@@ -78,7 +110,7 @@ class ColumnInfo:
 
     def to_sql_definition(self) -> str:
         """SQL 컬럼 정의 생성"""
-        parts = [f"`{self.name}`", self.data_type]
+        parts = [_quote_ident(self.name), self.data_type]
 
         if self.charset and self.charset not in self.data_type:
             parts.append(f"CHARACTER SET {self.charset}")
@@ -111,13 +143,13 @@ class IndexInfo:
 
     def to_sql_definition(self, table_name: str) -> str:
         """인덱스 생성 SQL"""
-        cols = ", ".join(f"`{c}`" for c in self.columns)
-        if self.name == "PRIMARY":
+        cols = _quote_idents(self.columns)
+        if is_primary_key_index(self.name):
             return f"PRIMARY KEY ({cols})"
         elif self.unique:
-            return f"UNIQUE INDEX `{self.name}` ({cols}) USING {self.type}"
+            return f"UNIQUE INDEX {_quote_ident(self.name)} ({cols}) USING {self.type}"
         else:
-            return f"INDEX `{self.name}` ({cols}) USING {self.type}"
+            return f"INDEX {_quote_ident(self.name)} ({cols}) USING {self.type}"
 
 
 @dataclass
@@ -132,11 +164,11 @@ class ForeignKeyInfo:
 
     def to_sql_definition(self) -> str:
         """FK 정의 SQL"""
-        cols = ", ".join(f"`{c}`" for c in self.columns)
-        ref_cols = ", ".join(f"`{c}`" for c in self.ref_columns)
+        cols = _quote_idents(self.columns)
+        ref_cols = _quote_idents(self.ref_columns)
         return (
-            f"CONSTRAINT `{self.name}` FOREIGN KEY ({cols}) "
-            f"REFERENCES `{self.ref_table}` ({ref_cols}) "
+            f"CONSTRAINT {_quote_ident(self.name)} FOREIGN KEY ({cols}) "
+            f"REFERENCES {_quote_ident(self.ref_table)} ({ref_cols}) "
             f"ON DELETE {self.on_delete} ON UPDATE {self.on_update}"
         )
 
