@@ -164,18 +164,20 @@ class DBConnectionDialog(QDialog):
 
         current_data = self.combo_tunnel.currentData()
         if current_data:
-            # Host와 Port 업데이트
-            if 'host' in current_data and 'port' in current_data:
-                self.input_host.setText(current_data['host'])
-                self.input_port.setValue(current_data['port'])
-            # 저장된 자격 증명 자동 채우기
-            if 'tunnel_id' in current_data:
-                self._fill_saved_credentials(current_data['tunnel_id'])
-                config = getattr(self.tunnel_engine, "tunnel_configs", {}).get(current_data['tunnel_id'], {})
-                self._apply_engine_from_config(config)
-                database = config.get('default_database') or config.get('default_schema')
-                if database:
-                    self.input_database.setText(database or "")
+            self._apply_tunnel_data(current_data)
+
+    def _apply_tunnel_data(self, tunnel_data: dict) -> None:
+        """터널 데이터로 Host/Port, 자격 증명, 엔진, 기본 DB를 채운다."""
+        if 'host' in tunnel_data and 'port' in tunnel_data:
+            self.input_host.setText(tunnel_data['host'])
+            self.input_port.setValue(tunnel_data['port'])
+        if 'tunnel_id' in tunnel_data:
+            self._fill_saved_credentials(tunnel_data['tunnel_id'])
+            config = getattr(self.tunnel_engine, "tunnel_configs", {}).get(tunnel_data['tunnel_id'], {})
+            self._apply_engine_from_config(config)
+            database = config.get('default_database') or config.get('default_schema')
+            if database:
+                self.input_database.setText(database or "")
 
     def _fill_saved_credentials(self, tunnel_id: str):
         """저장된 자격 증명 자동 채우기"""
@@ -197,25 +199,26 @@ class DBConnectionDialog(QDialog):
         self.input_port.setEnabled(not use_tunnel)
 
         if use_tunnel and self.combo_tunnel.currentData():
-            tunnel_data = self.combo_tunnel.currentData()
-            self.input_host.setText(tunnel_data['host'])
-            self.input_port.setValue(tunnel_data['port'])
-            # 저장된 자격 증명 자동 채우기
-            if 'tunnel_id' in tunnel_data:
-                self._fill_saved_credentials(tunnel_data['tunnel_id'])
-                config = getattr(self.tunnel_engine, "tunnel_configs", {}).get(tunnel_data['tunnel_id'], {})
-                self._apply_engine_from_config(config)
-                database = config.get('default_database') or config.get('default_schema')
-                if database:
-                    self.input_database.setText(database or "")
+            self._apply_tunnel_data(self.combo_tunnel.currentData())
 
-    def test_connection(self):
-        """연결 테스트"""
+    def _read_connection_fields(self) -> tuple:
+        """입력 필드에서 연결 정보를 읽는다."""
         host = self.input_host.text()
         port = self.input_port.value()
         user = self.input_user.text()
         password = self.input_password.text()
         database = self.input_database.text().strip() or None
+        return host, port, user, password, database
+
+    def _build_connector_or_raise(self, host, port, user, password, database):
+        """선택된 엔진에 맞는 커넥터를 생성한다."""
+        engine = self._current_engine(host, port)
+        connector = self._create_connector(engine, host, port, user, password, database)
+        return engine, connector
+
+    def test_connection(self):
+        """연결 테스트"""
+        host, port, user, password, database = self._read_connection_fields()
 
         if not user:
             QMessageBox.warning(self, "입력 오류", "사용자명을 입력하세요.")
@@ -224,8 +227,7 @@ class DBConnectionDialog(QDialog):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         try:
-            engine = self._current_engine(host, port)
-            connector = self._create_connector(engine, host, port, user, password, database)
+            engine, connector = self._build_connector_or_raise(host, port, user, password, database)
             success, msg = connector.connect()
             connector.disconnect()
 
@@ -241,11 +243,7 @@ class DBConnectionDialog(QDialog):
 
     def do_connect(self):
         """연결 수행"""
-        host = self.input_host.text()
-        port = self.input_port.value()
-        user = self.input_user.text()
-        password = self.input_password.text()
-        database = self.input_database.text().strip() or None
+        host, port, user, password, database = self._read_connection_fields()
 
         if not user:
             QMessageBox.warning(self, "입력 오류", "사용자명을 입력하세요.")
@@ -254,8 +252,7 @@ class DBConnectionDialog(QDialog):
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
 
         try:
-            engine = self._current_engine(host, port)
-            self.connector = self._create_connector(engine, host, port, user, password, database)
+            _, self.connector = self._build_connector_or_raise(host, port, user, password, database)
             success, msg = self.connector.connect()
 
             QApplication.restoreOverrideCursor()

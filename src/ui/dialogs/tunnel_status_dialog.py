@@ -108,6 +108,7 @@ class TunnelStatusDialog(QDialog):
 
         max_attempts_layout = QHBoxLayout()
         max_attempts_layout.addWidget(QLabel("최대 재연결 시도 횟수:"))
+        # settings.py 전역 기본값과 별개인 monitor 기반 터널별 라이브 오버라이드이다.
         self.max_attempts_spin = QSpinBox()
         self.max_attempts_spin.setRange(1, 20)
         self.max_attempts_spin.setValue(
@@ -214,16 +215,6 @@ class TunnelStatusDialog(QDialog):
 
             # 이벤트 타입
             type_item = QTableWidgetItem(event.event_type)
-            # 이벤트 타입별 색상
-            type_colors = {
-                "connected": "#27ae60",
-                "disconnected": "#888888",
-                "reconnected": "#3498db",
-                "reconnecting": "#f39c12",
-                "error": "#e74c3c"
-            }
-            # color는 향후 행 배경색에 사용 예정
-            _color = type_colors.get(event.event_type, "#000000")  # noqa: F841
             type_item.setForeground(Qt.GlobalColor.darkGreen if event.event_type in ["connected", "reconnected"] else Qt.GlobalColor.black)
             self.event_table.setItem(row, 1, type_item)
 

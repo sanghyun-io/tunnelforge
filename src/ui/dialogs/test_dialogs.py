@@ -1,12 +1,17 @@
 """
 테스트 및 SQL 실행 관련 다이얼로그
 """
+from typing import Any, Optional
+
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                              QPushButton, QTextEdit, QFileDialog, QComboBox,
                              QGroupBox, QProgressBar, QMessageBox)
 from PyQt6.QtCore import Qt
 
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+from src.core.logger import get_logger
+
+logger = get_logger(__name__)
 
 
 class SQLExecutionDialog(QDialog):
@@ -155,6 +160,48 @@ class SQLExecutionDialog(QDialog):
         db_user, _ = self.config_mgr.get_tunnel_credentials(tid)
         self.btn_execute.setEnabled(bool(self.sql_file and db_user))
 
+    def _resolve_connection(self) -> Optional[tuple[str, int, Optional[Any]]]:
+        """현재 설정에서 SQL/스키마 조회용 접속 정보를 해석한다."""
+        tid = self.config.get('id')
+        is_direct = self.config.get('connection_mode') == 'direct'
+
+        if is_direct:
+            return self.config['remote_host'], int(self.config['remote_port']), None
+        if self.engine.is_running(tid):
+            host, port = self.engine.get_connection_info(tid)
+            return host, port, None
+
+        self.output_text.append("🔗 임시 터널 생성 중...")
+        success, temp_server, error = self.engine.create_temp_tunnel(self.config)
+        if not success:
+            self.output_text.append(f"❌ 터널 생성 실패: {error}")
+            return None
+        port = self.engine.get_temp_tunnel_port(temp_server)
+        self.output_text.append(f"✅ 임시 터널 생성됨: localhost:{port}")
+        return '127.0.0.1', port, temp_server
+
+    def _fetch_schemas(self, host, port, db_user, db_password) -> list[str]:
+        """Rust DB Core 커넥터를 통해 스키마 목록을 가져온다."""
+        db_engine = normalize_db_engine(self.config.get('db_engine'), self.config.get('remote_port'))
+        connector = create_rust_db_connector(
+            db_engine,
+            host,
+            port,
+            db_user,
+            db_password,
+            self.config.get('default_database') or (
+                self.config.get('default_schema') if db_engine == 'mysql' else None
+            ),
+        )
+        success, msg = connector.connect()
+        if not success:
+            raise ConnectionError(f"DB 연결 실패: {msg}")
+
+        try:
+            return connector.get_schemas()
+        finally:
+            connector.disconnect()
+
     def refresh_databases(self):
         """데이터베이스 목록 새로고침"""
         tid = self.config.get('id')
@@ -163,52 +210,26 @@ class SQLExecutionDialog(QDialog):
         if not db_user:
             return
 
-        is_direct = self.config.get('connection_mode') == 'direct'
         temp_server = None
 
         try:
             self.output_text.append("📋 데이터베이스 목록 조회 중...")
 
-            # 연결 정보 결정
-            if is_direct:
-                host = self.config['remote_host']
-                port = int(self.config['remote_port'])
-            elif self.engine.is_running(tid):
-                host, port = self.engine.get_connection_info(tid)
-            else:
-                # 임시 터널 생성
-                success, temp_server, error = self.engine.create_temp_tunnel(self.config)
-                if not success:
-                    self.output_text.append(f"❌ 터널 생성 실패: {error}")
-                    return
-                host = '127.0.0.1'
-                port = self.engine.get_temp_tunnel_port(temp_server)
+            resolved = self._resolve_connection()
+            if resolved is None:
+                return
+            host, port, temp_server = resolved
 
-            db_engine = normalize_db_engine(self.config.get('db_engine'), self.config.get('remote_port'))
-            connector = create_rust_db_connector(
-                db_engine,
-                host,
-                port,
-                db_user,
-                db_password,
-                self.config.get('default_database') or (
-                    self.config.get('default_schema') if db_engine == 'mysql' else None
-                ),
-            )
-            success, msg = connector.connect()
+            schemas = self._fetch_schemas(host, port, db_user, db_password)
+            self.db_combo.clear()
+            self.db_combo.addItem("")  # 빈 항목 (선택 안함)
+            self.db_combo.addItems(schemas)
+            self.output_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
 
-            if success:
-                schemas = connector.get_schemas()
-                connector.disconnect()
-
-                self.db_combo.clear()
-                self.db_combo.addItem("")  # 빈 항목 (선택 안함)
-                self.db_combo.addItems(schemas)
-                self.output_text.append(f"✅ {len(schemas)}개 데이터베이스 발견")
-            else:
-                self.output_text.append(f"❌ DB 연결 실패: {msg}")
-
+        except ConnectionError as e:
+            self.output_text.append(f"❌ {str(e)}")
         except Exception as e:
+            logger.exception("데이터베이스 목록 조회 중 오류")
             self.output_text.append(f"❌ 오류: {str(e)}")
         finally:
             if temp_server:
@@ -229,25 +250,12 @@ class SQLExecutionDialog(QDialog):
             QMessageBox.warning(self, "경고", "DB 자격 증명이 설정되지 않았습니다.")
             return
 
-        is_direct = self.config.get('connection_mode') == 'direct'
-
         try:
-            # 연결 정보 결정
-            if is_direct:
-                host = self.config['remote_host']
-                port = int(self.config['remote_port'])
-            elif self.engine.is_running(tid):
-                host, port = self.engine.get_connection_info(tid)
-            else:
-                # 임시 터널 생성
-                self.output_text.append("🔗 임시 터널 생성 중...")
-                success, self.temp_server, error = self.engine.create_temp_tunnel(self.config)
-                if not success:
-                    self.output_text.append(f"❌ 터널 생성 실패: {error}")
-                    return
-                host = '127.0.0.1'
-                port = self.engine.get_temp_tunnel_port(self.temp_server)
-                self.output_text.append(f"✅ 임시 터널 생성됨: localhost:{port}")
+            resolved = self._resolve_connection()
+            if resolved is None:
+                return
+            host, port, temp_server = resolved
+            self.temp_server = temp_server
 
             # 데이터베이스 선택
             database = self.db_combo.currentText().strip() or None
@@ -279,6 +287,7 @@ class SQLExecutionDialog(QDialog):
             self.worker.start()
 
         except Exception as e:
+            logger.exception("SQL 파일 실행 중 오류")
             self.output_text.append(f"❌ 오류: {str(e)}")
             self._cleanup()
 

@@ -8,15 +8,10 @@ from src.core.postgres_connector import PostgresConnector
 from src.ui.dialogs.db_connection_dialog import DBConnectionDialog
 from src.ui.dialogs.db_export_dialog import (
     RustDumpExportDialog,
-    cap_incomplete_export_percent,
-    next_export_percent,
-    export_overall_percent,
-    format_export_row_labels,
-    format_export_table_status,
-    format_export_visible_telemetry,
 )
 from src.ui.dialogs.db_import_dialog import (
     RustDumpImportDialog,
+    # 테스트 하위호환 재노출
     format_import_row_labels,
     import_overall_percent,
     displayed_import_percent,
@@ -26,9 +21,9 @@ from src.ui.dialogs.db_import_dialog import (
 )
 from src.ui.dialogs.db_orphan_dialog import (
     OrphanRecordDialog,
+    # 테스트 하위호환 재노출
     OrphanAnalysisWorker,
     OrphanReportWorker,
-    _build_orphan_queries_sql,
 )
 
 
@@ -95,33 +90,35 @@ class RustDumpWizard:
 
         return connector, connection_info
 
+    def _resolve_connector(self, need_connection_info: bool = False) -> tuple:
+        """Export/Import/고아 레코드 검사에서 사용할 커넥터를 준비한다."""
+        if self.preselected_tunnel:
+            return self._connect_preselected_tunnel()
+
+        conn_dialog = DBConnectionDialog(
+            self.parent,
+            tunnel_engine=self.tunnel_engine,
+            config_manager=self.config_manager
+        )
+
+        if conn_dialog.exec() != QDialog.DialogCode.Accepted:
+            return None, None
+
+        connector = conn_dialog.get_connector()
+        if not connector:
+            return None, None
+
+        connection_info = (
+            conn_dialog.get_connection_identifier()
+            if need_connection_info else None
+        )
+        return connector, connection_info
+
     def start_export(self) -> bool:
         """Export 마법사 시작"""
-        connector = None
-        connection_info = None
-
-        # 미리 선택된 터널이 있으면 바로 연결
-        if self.preselected_tunnel:
-            connector, connection_info = self._connect_preselected_tunnel()
-            if not connector:
-                return False
-        else:
-            # 1단계: DB 연결 다이얼로그
-            conn_dialog = DBConnectionDialog(
-                self.parent,
-                tunnel_engine=self.tunnel_engine,
-                config_manager=self.config_manager
-            )
-
-            if conn_dialog.exec() != QDialog.DialogCode.Accepted:
-                return False
-
-            connector = conn_dialog.get_connector()
-            if not connector:
-                return False
-
-            # 연결 식별자 가져오기
-            connection_info = conn_dialog.get_connection_identifier()
+        connector, connection_info = self._resolve_connector(need_connection_info=True)
+        if not connector:
+            return False
 
         # 2단계: Export
         export_dialog = RustDumpExportDialog(
@@ -136,27 +133,9 @@ class RustDumpWizard:
 
     def start_import(self) -> bool:
         """Import 마법사 시작"""
-        connector = None
-
-        # 미리 선택된 터널이 있으면 바로 연결
-        if self.preselected_tunnel:
-            connector, _ = self._connect_preselected_tunnel()
-            if not connector:
-                return False
-        else:
-            # 1단계: DB 연결 다이얼로그
-            conn_dialog = DBConnectionDialog(
-                self.parent,
-                tunnel_engine=self.tunnel_engine,
-                config_manager=self.config_manager
-            )
-
-            if conn_dialog.exec() != QDialog.DialogCode.Accepted:
-                return False
-
-            connector = conn_dialog.get_connector()
-            if not connector:
-                return False
+        connector, _ = self._resolve_connector()
+        if not connector:
+            return False
 
         # 2단계: Import
         import_dialog = RustDumpImportDialog(
@@ -171,27 +150,9 @@ class RustDumpWizard:
 
     def start_orphan_check(self) -> bool:
         """고아 레코드 검사 마법사 시작"""
-        connector = None
-
-        # 미리 선택된 터널이 있으면 바로 연결
-        if self.preselected_tunnel:
-            connector, _ = self._connect_preselected_tunnel()
-            if not connector:
-                return False
-        else:
-            # 1단계: DB 연결 다이얼로그
-            conn_dialog = DBConnectionDialog(
-                self.parent,
-                tunnel_engine=self.tunnel_engine,
-                config_manager=self.config_manager
-            )
-
-            if conn_dialog.exec() != QDialog.DialogCode.Accepted:
-                return False
-
-            connector = conn_dialog.get_connector()
-            if not connector:
-                return False
+        connector, _ = self._resolve_connector()
+        if not connector:
+            return False
 
         # 2단계: 고아 레코드 검사
         orphan_dialog = OrphanRecordDialog(

@@ -1,6 +1,6 @@
 from unittest.mock import MagicMock
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QDialog
 
 from src.ui.dialogs.db_dialogs import RustDumpWizard
 from src.exporters.rust_dump_exporter import RustDumpConfig
@@ -181,3 +181,59 @@ def test_start_orphan_check_disconnects_connector_after_dialog_exec(monkeypatch)
 
     assert result is True
     assert connector.disconnect_calls == 1
+
+
+def test_resolve_connector_uses_preselected_tunnel_hook(monkeypatch):
+    connector = object()
+    calls = []
+
+    wizard = RustDumpWizard(preselected_tunnel={"id": "t1"})
+    monkeypatch.setattr(
+        wizard,
+        "_connect_preselected_tunnel",
+        lambda: calls.append("called") or (connector, "tunnel_user"),
+    )
+
+    resolved = wizard._resolve_connector(need_connection_info=True)
+
+    assert resolved == (connector, "tunnel_user")
+    assert calls == ["called"]
+
+
+def test_resolve_connector_only_reads_dialog_identifier_when_requested(monkeypatch):
+    connector = object()
+    instances = []
+
+    class FakeDBConnectionDialog:
+        def __init__(self, parent=None, tunnel_engine=None, config_manager=None):
+            self.parent = parent
+            self.tunnel_engine = tunnel_engine
+            self.config_manager = config_manager
+            self.identifier_calls = 0
+            instances.append(self)
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+        def get_connector(self):
+            return connector
+
+        def get_connection_identifier(self):
+            self.identifier_calls += 1
+            return "dialog_conn"
+
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.DBConnectionDialog", FakeDBConnectionDialog)
+
+    parent = object()
+    tunnel_engine = object()
+    config_manager = object()
+    wizard = RustDumpWizard(parent, tunnel_engine, config_manager)
+
+    assert wizard._resolve_connector() == (connector, None)
+    assert instances[-1].identifier_calls == 0
+
+    assert wizard._resolve_connector(need_connection_info=True) == (connector, "dialog_conn")
+    assert instances[-1].identifier_calls == 1
+    assert instances[-1].parent is parent
+    assert instances[-1].tunnel_engine is tunnel_engine
+    assert instances[-1].config_manager is config_manager
