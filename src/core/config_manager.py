@@ -11,6 +11,7 @@ from cryptography.fernet import Fernet
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_MYSQL_PORT
 from src.core.platform_paths import backups_dir, config_file, encryption_key_file, app_support_dir
+from src.core.group_manager import TunnelGroupManager
 
 logger = get_logger('config_manager')
 
@@ -19,6 +20,7 @@ CONFIG_FILE = str(config_file())
 KEY_FILE = str(encryption_key_file())
 BACKUP_DIR = str(backups_dir())
 MAX_BACKUPS = 5
+FILE_ATTRIBUTE_HIDDEN = 0x02  # Win32 SetFileAttributesW 플래그: 숨김 파일 속성
 
 # load_config/save_config를 여러 스레드(스케줄러, UI)가 동시에 호출해도
 # 설정 파일이 중간 상태로 노출되지 않도록 보호하는 프로세스 전역 락.
@@ -63,7 +65,7 @@ class CredentialEncryptor:
             # Windows 숨김 파일 설정
             if os.name == 'nt':
                 import ctypes
-                ctypes.windll.kernel32.SetFileAttributesW(KEY_FILE, 0x02)
+                ctypes.windll.kernel32.SetFileAttributesW(KEY_FILE, FILE_ATTRIBUTE_HIDDEN)
 
         with open(KEY_FILE, 'rb') as f:
             self._fernet = Fernet(f.read())
@@ -87,6 +89,7 @@ class CredentialEncryptor:
 class ConfigManager:
     def __init__(self):
         self._encryptor = None
+        self._group_manager = None
         self._ensure_config_exists()
 
     def _default_config(self) -> dict:
@@ -270,6 +273,20 @@ class ConfigManager:
         """설정 데이터를 파일에 저장합니다."""
         with _CONFIG_LOCK:
             self._save_config_unlocked(data)
+
+    def _mutate_config(self, mutator):
+        """config를 로드 -> mutator로 변경 -> 필요 시에만 저장하는 공통 헬퍼.
+
+        mutator는 config(dict)를 받아 (should_save: bool, result) 튜플을 반환하는
+        콜러블이다. should_save가 False면 save_config를 호출하지 않는다 (조기 실패
+        반환 시 백업 로테이션/리비전 갱신이 일어나지 않던 기존 동작을 보존하기 위함).
+        """
+        with _CONFIG_LOCK:
+            config = self.load_config()
+            should_save, result = mutator(config)
+            if should_save:
+                self.save_config(config)
+            return result
 
     def _create_backup(self, exclude_paths: Optional[set] = None):
         """설정 변경 전 자동 백업.
@@ -572,12 +589,13 @@ class ConfigManager:
 
     def set_app_setting(self, key, value):
         """앱 설정 값 저장 (기존 설정 유지)"""
-        with _CONFIG_LOCK:
-            config = self.load_config()
+        def mutator(config):
             if 'settings' not in config:
                 config['settings'] = {}
             config['settings'][key] = value
-            self.save_config(config)
+            return True, None
+
+        self._mutate_config(mutator)
 
     @property
     def encryptor(self):
@@ -585,6 +603,13 @@ class ConfigManager:
         if self._encryptor is None:
             self._encryptor = CredentialEncryptor()
         return self._encryptor
+
+    @property
+    def group_manager(self) -> TunnelGroupManager:
+        """TunnelGroupManager 인스턴스 (lazy initialization)"""
+        if self._group_manager is None:
+            self._group_manager = TunnelGroupManager(self)
+        return self._group_manager
 
     def get_tunnel_credentials(self, tunnel_id: str) -> tuple:
         """터널의 MySQL 자격 증명 조회 -> (user, password)"""
@@ -599,10 +624,11 @@ class ConfigManager:
 
     def save_active_tunnels(self, tunnel_ids: list):
         """종료 시 활성화된 터널 ID 목록 저장"""
-        with _CONFIG_LOCK:
-            config = self.load_config()
+        def mutator(config):
             config['last_active_tunnels'] = tunnel_ids
-            self.save_config(config)
+            return True, None
+
+        self._mutate_config(mutator)
         logger.info(f"활성 터널 상태 저장: {len(tunnel_ids)}개")
 
     def get_last_active_tunnels(self) -> list:
@@ -615,16 +641,15 @@ class ConfigManager:
     # =========================================================================
 
     def get_groups(self) -> List[dict]:
-        """모든 그룹 목록 반환
+        """모든 그룹 목록 반환 (TunnelGroupManager 위임)
 
         Returns:
             그룹 목록: [{"id", "name", "color", "collapsed", "tunnel_ids"}, ...]
         """
-        config = self.load_config()
-        return config.get('tunnel_groups', [])
+        return self.group_manager.get_groups()
 
     def add_group(self, name: str, color: str = "#3498db") -> Tuple[bool, str, Optional[str]]:
-        """새 그룹 생성
+        """새 그룹 생성 (TunnelGroupManager 위임)
 
         Args:
             name: 그룹 이름
@@ -633,33 +658,10 @@ class ConfigManager:
         Returns:
             (success, message, group_id) 튜플
         """
-        with _CONFIG_LOCK:
-            config = self.load_config()
-
-            if 'tunnel_groups' not in config:
-                config['tunnel_groups'] = []
-
-            # 중복 이름 확인
-            for group in config['tunnel_groups']:
-                if group['name'] == name:
-                    return False, f"이미 존재하는 그룹 이름입니다: {name}", None
-
-            group_id = str(uuid.uuid4())
-            new_group = {
-                "id": group_id,
-                "name": name,
-                "color": color,
-                "collapsed": False,
-                "tunnel_ids": []
-            }
-
-            config['tunnel_groups'].append(new_group)
-            self.save_config(config)
-        logger.info(f"그룹 생성: {name} (ID: {group_id})")
-        return True, f"그룹이 생성되었습니다: {name}", group_id
+        return self.group_manager.add_group(name, color)
 
     def update_group(self, group_id: str, data: dict) -> Tuple[bool, str]:
-        """그룹 정보 수정
+        """그룹 정보 수정 (TunnelGroupManager 위임)
 
         Args:
             group_id: 수정할 그룹 ID
@@ -668,31 +670,10 @@ class ConfigManager:
         Returns:
             (success, message) 튜플
         """
-        with _CONFIG_LOCK:
-            config = self.load_config()
-            groups = config.get('tunnel_groups', [])
-
-            for group in groups:
-                if group['id'] == group_id:
-                    # 이름 변경 시 중복 확인
-                    if 'name' in data and data['name'] != group['name']:
-                        for other in groups:
-                            if other['id'] != group_id and other['name'] == data['name']:
-                                return False, f"이미 존재하는 그룹 이름입니다: {data['name']}"
-
-                    # 허용된 필드만 업데이트
-                    for key in ['name', 'color', 'collapsed']:
-                        if key in data:
-                            group[key] = data[key]
-
-                    self.save_config(config)
-                    logger.info(f"그룹 수정: {group_id}")
-                    return True, "그룹이 수정되었습니다."
-
-            return False, f"그룹을 찾을 수 없습니다: {group_id}"
+        return self.group_manager.update_group(group_id, data)
 
     def delete_group(self, group_id: str) -> Tuple[bool, str]:
-        """그룹 삭제 (터널은 그룹 없음으로 이동)
+        """그룹 삭제 (TunnelGroupManager 위임, 터널은 그룹 없음으로 이동)
 
         Args:
             group_id: 삭제할 그룹 ID
@@ -700,29 +681,10 @@ class ConfigManager:
         Returns:
             (success, message) 튜플
         """
-        with _CONFIG_LOCK:
-            config = self.load_config()
-            groups = config.get('tunnel_groups', [])
-
-            for i, group in enumerate(groups):
-                if group['id'] == group_id:
-                    group_name = group['name']
-
-                    # 그룹에 속한 터널들을 ungrouped_order로 이동
-                    if 'ungrouped_order' not in config:
-                        config['ungrouped_order'] = []
-                    config['ungrouped_order'].extend(group.get('tunnel_ids', []))
-
-                    # 그룹 삭제
-                    groups.pop(i)
-                    self.save_config(config)
-                    logger.info(f"그룹 삭제: {group_name} (ID: {group_id})")
-                    return True, f"그룹이 삭제되었습니다: {group_name}"
-
-            return False, f"그룹을 찾을 수 없습니다: {group_id}"
+        return self.group_manager.delete_group(group_id)
 
     def move_tunnel_to_group(self, tunnel_id: str, group_id: Optional[str]) -> Tuple[bool, str]:
-        """터널을 그룹으로 이동
+        """터널을 그룹으로 이동 (TunnelGroupManager 위임)
 
         Args:
             tunnel_id: 이동할 터널 ID
@@ -731,46 +693,10 @@ class ConfigManager:
         Returns:
             (success, message) 튜플
         """
-        with _CONFIG_LOCK:
-            config = self.load_config()
-
-            # 터널 존재 확인
-            tunnel_exists = any(t['id'] == tunnel_id for t in config.get('tunnels', []))
-            if not tunnel_exists:
-                return False, f"터널을 찾을 수 없습니다: {tunnel_id}"
-
-            # ungrouped_order 초기화
-            if 'ungrouped_order' not in config:
-                config['ungrouped_order'] = []
-
-            # 기존 그룹에서 터널 제거
-            for group in config.get('tunnel_groups', []):
-                if tunnel_id in group.get('tunnel_ids', []):
-                    group['tunnel_ids'].remove(tunnel_id)
-
-            # ungrouped_order에서도 제거
-            if tunnel_id in config['ungrouped_order']:
-                config['ungrouped_order'].remove(tunnel_id)
-
-            # 새 그룹에 추가 또는 ungrouped로 이동
-            if group_id is None:
-                config['ungrouped_order'].append(tunnel_id)
-            else:
-                for group in config.get('tunnel_groups', []):
-                    if group['id'] == group_id:
-                        if 'tunnel_ids' not in group:
-                            group['tunnel_ids'] = []
-                        group['tunnel_ids'].append(tunnel_id)
-                        break
-                else:
-                    return False, f"대상 그룹을 찾을 수 없습니다: {group_id}"
-
-            self.save_config(config)
-        logger.debug(f"터널 이동: {tunnel_id} -> 그룹 {group_id or '(없음)'}")
-        return True, "터널이 이동되었습니다."
+        return self.group_manager.move_tunnel_to_group(tunnel_id, group_id)
 
     def get_tunnel_group(self, tunnel_id: str) -> Optional[str]:
-        """터널이 속한 그룹 ID 반환
+        """터널이 속한 그룹 ID 반환 (TunnelGroupManager 위임)
 
         Args:
             tunnel_id: 터널 ID
@@ -778,16 +704,10 @@ class ConfigManager:
         Returns:
             그룹 ID (그룹 없으면 None)
         """
-        config = self.load_config()
-
-        for group in config.get('tunnel_groups', []):
-            if tunnel_id in group.get('tunnel_ids', []):
-                return group['id']
-
-        return None
+        return self.group_manager.get_tunnel_group(tunnel_id)
 
     def save_group_collapsed_state(self, group_id: str, collapsed: bool) -> bool:
-        """그룹 접기/펼치기 상태 저장
+        """그룹 접기/펼치기 상태 저장 (TunnelGroupManager 위임)
 
         Args:
             group_id: 그룹 ID
@@ -796,13 +716,4 @@ class ConfigManager:
         Returns:
             성공 여부
         """
-        with _CONFIG_LOCK:
-            config = self.load_config()
-
-            for group in config.get('tunnel_groups', []):
-                if group['id'] == group_id:
-                    group['collapsed'] = collapsed
-                    self.save_config(config)
-                    return True
-
-            return False
+        return self.group_manager.save_group_collapsed_state(group_id, collapsed)
