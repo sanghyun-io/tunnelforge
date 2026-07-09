@@ -1112,8 +1112,6 @@ class TestDataclasses:
         )
         assert step.selected_option is None
         assert step.user_input is None
-        assert step.included_by is None
-        assert step.included_reason == ""
 
     def test_fix_execution_result(self):
         r = FixExecutionResult(

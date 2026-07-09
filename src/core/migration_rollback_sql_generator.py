@@ -4,7 +4,11 @@
 from typing import List, Dict, Set, Optional, Tuple, Any
 
 from src.core.db_connector import MySQLConnector
-from src.core.migration_fix_models import FixStrategy, _format_default_sql_clause
+from src.core.migration_fix_models import (
+    FixStrategy,
+    _format_default_sql_clause,
+    get_table_charset,
+)
 
 
 class RollbackSQLGenerator:
@@ -46,30 +50,16 @@ class RollbackSQLGenerator:
         return ' '.join(parts)
 
     def capture_table_charset(self, table: str) -> Dict[str, str]:
-        """테이블의 현재 charset/collation 캡처"""
+        """테이블의 현재 charset/collation 캡처
+
+        공유 read-only 헬퍼(get_table_charset)로 조회한 뒤 자신의 dict 캐시로 래핑한다.
+        """
         cache_key = f"{self.schema}.{table}"
         if cache_key in self._table_charset_cache:
             return self._table_charset_cache[cache_key]
 
-        query = """
-        SELECT
-            TABLE_NAME,
-            TABLE_COLLATION,
-            CCSA.CHARACTER_SET_NAME as TABLE_CHARSET
-        FROM INFORMATION_SCHEMA.TABLES T
-        LEFT JOIN INFORMATION_SCHEMA.COLLATION_CHARACTER_SET_APPLICABILITY CCSA
-            ON T.TABLE_COLLATION = CCSA.COLLATION_NAME
-        WHERE T.TABLE_SCHEMA = %s AND T.TABLE_NAME = %s
-        """
-        result = self.connector.execute(query, (self.schema, table))
-
-        if result:
-            info = {
-                'charset': result[0]['TABLE_CHARSET'] or 'utf8mb3',
-                'collation': result[0]['TABLE_COLLATION'] or 'utf8mb3_general_ci'
-            }
-        else:
-            info = {'charset': 'utf8mb3', 'collation': 'utf8mb3_general_ci'}
+        charset, collation = get_table_charset(self.connector, self.schema, table)
+        info = {'charset': charset, 'collation': collation}
 
         self._table_charset_cache[cache_key] = info
         return info
@@ -206,121 +196,158 @@ class RollbackSQLGenerator:
         if len(location_parts) < 2:
             return ""
 
+        # === 전략별 dispatch ===
+        if strategy in (FixStrategy.DATE_TO_NULL, FixStrategy.DATE_TO_MIN, FixStrategy.DATE_TO_CUSTOM):
+            return self._rollback_date(step)
+
+        if strategy == FixStrategy.COLLATION_SINGLE:
+            return self._rollback_collation_single(step, original_state)
+
+        if strategy in (FixStrategy.COLLATION_FK_CASCADE, FixStrategy.COLLATION_FK_SAFE):
+            return self._rollback_collation_fk(step, original_state, all_pre_states)
+
+        return ""
+
+    def _rollback_date(self, step: 'FixWizardStep') -> str:
+        """날짜 수정 롤백 (원본 값 소실로 경고만 생성)"""
+        location_parts = step.location.split('.')
+        table = location_parts[1]
+        column = location_parts[2] if len(location_parts) > 2 else None
+
+        lines = []
+        lines.append(f"-- ⚠️ 날짜 값 롤백 불가")
+        lines.append(f"-- 원본 값이 0000-00-00이었으므로 복원할 값을 알 수 없습니다.")
+        lines.append(f"-- 테이블: {table}, 컬럼: {column}")
+        lines.append(f"-- 백업 데이터에서 복원하거나 수동으로 처리하세요.")
+        return "\n".join(lines)
+
+    def _rollback_collation_single(
+        self,
+        step: 'FixWizardStep',
+        original_state: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """COLLATION_SINGLE 롤백 (컬럼/테이블 레벨 charset 복원)"""
+        location_parts = step.location.split('.')
         schema = location_parts[0]
         table = location_parts[1]
         column = location_parts[2] if len(location_parts) > 2 else None
 
         lines = []
 
-        # === 날짜 수정 롤백 ===
-        if strategy in (FixStrategy.DATE_TO_NULL, FixStrategy.DATE_TO_MIN, FixStrategy.DATE_TO_CUSTOM):
-            lines.append(f"-- ⚠️ 날짜 값 롤백 불가")
-            lines.append(f"-- 원본 값이 0000-00-00이었으므로 복원할 값을 알 수 없습니다.")
-            lines.append(f"-- 테이블: {table}, 컬럼: {column}")
-            lines.append(f"-- 백업 데이터에서 복원하거나 수동으로 처리하세요.")
-            return "\n".join(lines)
+        if column:
+            # 컬럼 레벨 롤백
+            col_info = original_state or self.capture_column_info(table, column)
+            if col_info:
+                orig_charset = col_info.get('CHARACTER_SET_NAME', 'utf8mb3')
+                orig_collation = col_info.get('COLLATION_NAME', 'utf8mb3_general_ci')
+                col_type = col_info.get('COLUMN_TYPE', 'VARCHAR(255)')
+                nullable = 'NULL' if col_info.get('IS_NULLABLE') == 'YES' else 'NOT NULL'
+                default_clause = self._format_default_clause(col_info)
+                extra_clause = self._format_extra_clause(col_info)
 
-        # === Collation 롤백 ===
-        if strategy == FixStrategy.COLLATION_SINGLE:
-            if column:
-                # 컬럼 레벨 롤백
-                col_info = original_state or self.capture_column_info(table, column)
-                if col_info:
-                    orig_charset = col_info.get('CHARACTER_SET_NAME', 'utf8mb3')
-                    orig_collation = col_info.get('COLLATION_NAME', 'utf8mb3_general_ci')
-                    col_type = col_info.get('COLUMN_TYPE', 'VARCHAR(255)')
-                    nullable = 'NULL' if col_info.get('IS_NULLABLE') == 'YES' else 'NOT NULL'
-                    default_clause = self._format_default_clause(col_info)
-                    extra_clause = self._format_extra_clause(col_info)
+                # 컬럼 정의: type nullable [default] [extra] charset collation
+                col_def_parts = [col_type, nullable]
+                if default_clause:
+                    col_def_parts.append(default_clause)
+                if extra_clause:
+                    col_def_parts.append(extra_clause)
+                col_def_parts.append(
+                    f"CHARACTER SET {orig_charset} COLLATE {orig_collation}"
+                )
 
-                    # 컬럼 정의: type nullable [default] [extra] charset collation
-                    col_def_parts = [col_type, nullable]
-                    if default_clause:
-                        col_def_parts.append(default_clause)
-                    if extra_clause:
-                        col_def_parts.append(extra_clause)
-                    col_def_parts.append(
-                        f"CHARACTER SET {orig_charset} COLLATE {orig_collation}"
-                    )
-
-                    lines.append(f"-- Rollback: {table}.{column} 컬럼 charset 복원")
-                    lines.append(f"-- 원본: {orig_charset} / {orig_collation}")
-                    lines.append(
-                        f"ALTER TABLE `{schema}`.`{table}` "
-                        f"MODIFY COLUMN `{column}` {' '.join(col_def_parts)};"
-                    )
-            else:
-                # 테이블 레벨 롤백
-                tbl_info = original_state or self.capture_table_charset(table)
-                orig_charset = tbl_info.get('charset', 'utf8mb3')
-                orig_collation = tbl_info.get('collation', 'utf8mb3_general_ci')
-
-                lines.append(f"-- Rollback: {table} 테이블 charset 복원")
+                lines.append(f"-- Rollback: {table}.{column} 컬럼 charset 복원")
                 lines.append(f"-- 원본: {orig_charset} / {orig_collation}")
                 lines.append(
                     f"ALTER TABLE `{schema}`.`{table}` "
-                    f"CONVERT TO CHARACTER SET {orig_charset} COLLATE {orig_collation};"
+                    f"MODIFY COLUMN `{column}` {' '.join(col_def_parts)};"
                 )
+        else:
+            # 테이블 레벨 롤백
+            tbl_info = original_state or self.capture_table_charset(table)
+            orig_charset = tbl_info.get('charset', 'utf8mb3')
+            orig_collation = tbl_info.get('collation', 'utf8mb3_general_ci')
 
-        elif strategy in (FixStrategy.COLLATION_FK_CASCADE, FixStrategy.COLLATION_FK_SAFE):
-            # FK 일괄 변경 롤백 - 모든 연관 테이블 복원
-            related_tables = step.selected_option.related_tables or [table]
+            lines.append(f"-- Rollback: {table} 테이블 charset 복원")
+            lines.append(f"-- 원본: {orig_charset} / {orig_collation}")
+            lines.append(
+                f"ALTER TABLE `{schema}`.`{table}` "
+                f"CONVERT TO CHARACTER SET {orig_charset} COLLATE {orig_collation};"
+            )
 
-            lines.append(f"-- Rollback: FK 연관 테이블 일괄 charset 복원")
-            lines.append(f"-- 대상 테이블: {', '.join(related_tables)}")
+        return "\n".join(lines)
+
+    def _rollback_collation_fk(
+        self,
+        step: 'FixWizardStep',
+        original_state: Optional[Dict[str, Any]] = None,
+        all_pre_states: Optional[Dict[str, Dict[str, Any]]] = None
+    ) -> str:
+        """FK 일괄 변경 롤백 (연관 테이블 전체 charset 복원)"""
+        strategy = step.selected_option.strategy
+        location_parts = step.location.split('.')
+        schema = location_parts[0]
+        table = location_parts[1]
+
+        lines = []
+
+        # FK 일괄 변경 롤백 - 모든 연관 테이블 복원
+        related_tables = step.selected_option.related_tables or [table]
+
+        lines.append(f"-- Rollback: FK 연관 테이블 일괄 charset 복원")
+        lines.append(f"-- 대상 테이블: {', '.join(related_tables)}")
+        lines.append("")
+
+        # FK 안전 변경과 동일하게 FK DROP → 변경 → FK 재생성 구조
+        # FK SQL 조회 (concrete SQL 생성)
+        drop_sqls, add_sqls = [], []
+        if strategy == FixStrategy.COLLATION_FK_SAFE:
+            drop_sqls, add_sqls = self._get_fk_sql_for_tables(schema, related_tables)
+
+            lines.append("-- Phase 1: FK 임시 DROP")
+            if drop_sqls:
+                for sql in drop_sqls:
+                    lines.append(sql)
+            else:
+                lines.append("-- (FK 정의 조회 실패 - 원본 실행 로그 참조)")
             lines.append("")
 
-            # FK 안전 변경과 동일하게 FK DROP → 변경 → FK 재생성 구조
-            # FK SQL 조회 (concrete SQL 생성)
-            drop_sqls, add_sqls = [], []
-            if strategy == FixStrategy.COLLATION_FK_SAFE:
-                drop_sqls, add_sqls = self._get_fk_sql_for_tables(schema, related_tables)
-
-                lines.append("-- Phase 1: FK 임시 DROP")
-                if drop_sqls:
-                    for sql in drop_sqls:
-                        lines.append(sql)
+        lines.append("-- Phase 2: Charset 복원")
+        for tbl in related_tables:
+            # pre-state 우선 사용 (변경 전 상태), 없으면 현재 상태 캡처 (fallback)
+            # 테이블 레벨 키(schema.table) 먼저 조회, 없으면 컬럼 레벨 키도 탐색
+            tbl_location = f"{schema}.{tbl}"
+            tbl_info = None
+            if all_pre_states:
+                if tbl_location in all_pre_states:
+                    tbl_info = all_pre_states[tbl_location]
                 else:
-                    lines.append("-- (FK 정의 조회 실패 - 원본 실행 로그 참조)")
-                lines.append("")
-
-            lines.append("-- Phase 2: Charset 복원")
-            for tbl in related_tables:
-                # pre-state 우선 사용 (변경 전 상태), 없으면 현재 상태 캡처 (fallback)
-                # 테이블 레벨 키(schema.table) 먼저 조회, 없으면 컬럼 레벨 키도 탐색
-                tbl_location = f"{schema}.{tbl}"
-                tbl_info = None
-                if all_pre_states:
-                    if tbl_location in all_pre_states:
-                        tbl_info = all_pre_states[tbl_location]
-                    else:
-                        # 컬럼 레벨 키 중 해당 테이블 소속 첫 번째 항목 사용
-                        for key, val in all_pre_states.items():
-                            if key.startswith(f"{tbl_location}."):
-                                tbl_info = val
-                                break
-                if tbl_info is None:
-                    if original_state and tbl == table:
-                        tbl_info = original_state
-                    else:
-                        tbl_info = self.capture_table_charset(tbl)
-                orig_charset = tbl_info.get('charset', 'utf8mb3')
-                orig_collation = tbl_info.get('collation', 'utf8mb3_general_ci')
-
-                lines.append(f"-- {tbl}: {orig_charset} / {orig_collation}")
-                lines.append(
-                    f"ALTER TABLE `{schema}`.`{tbl}` "
-                    f"CONVERT TO CHARACTER SET {orig_charset} COLLATE {orig_collation};"
-                )
-
-            if strategy == FixStrategy.COLLATION_FK_SAFE:
-                lines.append("")
-                lines.append("-- Phase 3: FK 재생성")
-                if add_sqls:
-                    for sql in add_sqls:
-                        lines.append(sql)
+                    # 컬럼 레벨 키 중 해당 테이블 소속 첫 번째 항목 사용
+                    for key, val in all_pre_states.items():
+                        if key.startswith(f"{tbl_location}."):
+                            tbl_info = val
+                            break
+            if tbl_info is None:
+                if original_state and tbl == table:
+                    tbl_info = original_state
                 else:
-                    lines.append("-- (FK 정의 조회 실패 - 원본 실행 로그 참조)")
+                    tbl_info = self.capture_table_charset(tbl)
+            orig_charset = tbl_info.get('charset', 'utf8mb3')
+            orig_collation = tbl_info.get('collation', 'utf8mb3_general_ci')
+
+            lines.append(f"-- {tbl}: {orig_charset} / {orig_collation}")
+            lines.append(
+                f"ALTER TABLE `{schema}`.`{tbl}` "
+                f"CONVERT TO CHARACTER SET {orig_charset} COLLATE {orig_collation};"
+            )
+
+        if strategy == FixStrategy.COLLATION_FK_SAFE:
+            lines.append("")
+            lines.append("-- Phase 3: FK 재생성")
+            if add_sqls:
+                for sql in add_sqls:
+                    lines.append(sql)
+            else:
+                lines.append("-- (FK 정의 조회 실패 - 원본 실행 로그 참조)")
 
         return "\n".join(lines)
 
@@ -366,10 +393,6 @@ class RollbackSQLGenerator:
                 continue
 
             if step.selected_option.strategy == FixStrategy.SKIP:
-                continue
-
-            # 자동 포함된 테이블은 건너뛰기 (원본 step에서 처리)
-            if step.included_by is not None:
                 continue
 
             location = step.location
