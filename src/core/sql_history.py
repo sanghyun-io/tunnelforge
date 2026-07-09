@@ -9,10 +9,29 @@ SQL 쿼리 히스토리 관리
 import os
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import List, Dict, Any, Tuple, Optional
 
+from src.core.logger import get_logger
 from src.core.platform_paths import sql_history_file
+
+logger = get_logger('sql_history')
+
+
+def _matches_history_id(entry: Dict[str, Any], history_id: str) -> bool:
+    """엔트리가 특정 history_id(UUID 또는 timestamp, 하위 호환성)와 일치하는지 확인"""
+    return entry.get('id') == history_id or entry.get('timestamp') == history_id
+
+
+@dataclass
+class HistorySearchFilter:
+    """search_advanced의 다중 필터 조건"""
+    keyword: Optional[str] = None
+    date_from: Optional[datetime] = None
+    date_to: Optional[datetime] = None
+    success_only: Optional[bool] = None
+    favorites_only: bool = False
 
 
 class SQLHistory:
@@ -42,7 +61,8 @@ class SQLHistory:
             with open(self.history_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
                 return data.get('history', [])
-        except (json.JSONDecodeError, IOError):
+        except (json.JSONDecodeError, IOError) as e:
+            logger.warning(f"히스토리 파일 로드 실패: {e}")
             return []
 
     def _save_history(self, history: List[Dict[str, Any]]):
@@ -51,7 +71,7 @@ class SQLHistory:
             with open(self.history_file, 'w', encoding='utf-8') as f:
                 json.dump({'history': history}, f, ensure_ascii=False, indent=2)
         except IOError as e:
-            print(f"히스토리 저장 오류: {e}")
+            logger.error(f"히스토리 저장 오류: {e}")
 
     def add_query(self, query: str, success: bool, result_count: int = 0,
                   execution_time: float = 0.0, status: str = 'completed', error: str = None) -> str:
@@ -105,8 +125,7 @@ class SQLHistory:
         history = self._load_history()
 
         for entry in history:
-            # ID 또는 timestamp로 매칭 (하위 호환성)
-            if entry.get('id') == history_id or entry.get('timestamp') == history_id:
+            if _matches_history_id(entry, history_id):
                 entry['status'] = new_status
                 break
 
@@ -124,12 +143,9 @@ class SQLHistory:
             return
 
         history = self._load_history()
-        ids_set = set(history_ids)
 
         for entry in history:
-            # ID 또는 timestamp로 매칭 (하위 호환성)
-            entry_id = entry.get('id') or entry.get('timestamp')
-            if entry_id in ids_set or entry.get('timestamp') in ids_set:
+            if any(_matches_history_id(entry, hid) for hid in history_ids):
                 entry['status'] = new_status
 
         self._save_history(history)
@@ -227,35 +243,50 @@ class SQLHistory:
             (결과 목록, 전체 결과 수) 튜플
         """
         history = self._load_history()
+        filt = HistorySearchFilter(
+            keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
+            success_only=success_only,
+            favorites_only=favorites_only,
+        )
+        results = self._apply_filters(history, filt)
+
+        total = len(results)
+        return results[offset:offset + limit], total
+
+    def _apply_filters(
+        self, history: List[Dict[str, Any]], filt: HistorySearchFilter
+    ) -> List[Dict[str, Any]]:
+        """HistorySearchFilter 조건에 따라 히스토리 목록을 순차 필터링"""
         results = history
 
         # 키워드 필터
-        if keyword:
-            keyword_lower = keyword.lower()
+        if filt.keyword:
+            keyword_lower = filt.keyword.lower()
             results = [r for r in results
                        if keyword_lower in r.get('query', '').lower()]
 
         # 날짜 범위 필터
-        if date_from:
+        if filt.date_from:
             results = [r for r in results
-                       if self._parse_timestamp(r.get('timestamp', '')) >= date_from]
+                       if self._parse_timestamp(r.get('timestamp', '')) >= filt.date_from]
 
-        if date_to:
+        if filt.date_to:
             # date_to를 하루의 끝으로 설정 (23:59:59)
-            date_to_end = datetime(date_to.year, date_to.month, date_to.day, 23, 59, 59)
+            date_to_end = datetime(filt.date_to.year, filt.date_to.month, filt.date_to.day, 23, 59, 59)
             results = [r for r in results
                        if self._parse_timestamp(r.get('timestamp', '')) <= date_to_end]
 
         # 성공/실패 필터
-        if success_only is not None:
-            results = [r for r in results if r.get('success') == success_only]
+        if filt.success_only is not None:
+            results = [r for r in results if r.get('success') == filt.success_only]
 
         # 즐겨찾기 필터
-        if favorites_only:
+        if filt.favorites_only:
             results = [r for r in results if r.get('is_favorite', False)]
 
-        total = len(results)
-        return results[offset:offset + limit], total
+        return results
 
     def _parse_timestamp(self, timestamp_str: str) -> datetime:
         """타임스탬프 문자열을 datetime으로 변환"""
@@ -277,8 +308,7 @@ class SQLHistory:
         history = self._load_history()
 
         for entry in history:
-            # ID 또는 timestamp로 매칭
-            if entry.get('id') == history_id or entry.get('timestamp') == history_id:
+            if _matches_history_id(entry, history_id):
                 entry['is_favorite'] = not entry.get('is_favorite', False)
                 self._save_history(history)
                 return entry['is_favorite']

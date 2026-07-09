@@ -42,6 +42,10 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
+from src.core.logger import get_logger
+
+logger = get_logger(__name__)
+
 
 class GitHubAppAuth:
     """GitHub App 인증 관리"""
@@ -245,7 +249,7 @@ class GitHubAppAuth:
             return self._cached_token
 
         except Exception as e:
-            print(f"Installation Token 발급 실패: {e}")
+            logger.error(f"Installation Token 발급 실패: {e}")
             return None
 
     def get_headers(self) -> dict:
@@ -319,19 +323,21 @@ class GitHubAppAuth:
             return False, f"예상치 못한 오류: {str(e)}"
 
     # === 난독화 유틸리티 ===
+    #
+    # _obfuscate/generate_embedded_code는 빌드타임 전용 도구라
+    # scripts/github_app_secret_codec.py로 위임한다. _deobfuscate는 런타임에
+    # _EMBEDDED_PRIVATE_KEY를 복호화하는 경로이므로(패키징된 exe에 scripts/가
+    # 포함되지 않음) scripts import 없이 이 클래스 내부 구현을 그대로 유지한다.
 
     @classmethod
     def _obfuscate(cls, plain_text: str) -> str:
-        """문자열 난독화"""
-        import base64
-        key = cls._OBFUSCATION_KEY
-        data = plain_text.encode('utf-8')
-        obfuscated = bytes(d ^ key[i % len(key)] for i, d in enumerate(data))
-        return base64.b64encode(obfuscated).decode('ascii')
+        """문자열 난독화 (빌드타임 전용 — scripts/github_app_secret_codec에 위임)"""
+        from scripts.github_app_secret_codec import obfuscate
+        return obfuscate(plain_text)
 
     @classmethod
     def _deobfuscate(cls, obfuscated: str) -> str:
-        """난독화 해제"""
+        """난독화 해제 (런타임 경로 — _EMBEDDED_PRIVATE_KEY 복호화에 사용)"""
         try:
             import base64
             key = cls._OBFUSCATION_KEY
@@ -344,18 +350,9 @@ class GitHubAppAuth:
     @classmethod
     def generate_embedded_code(cls, app_id: str, private_key: str,
                                 installation_id: str, repo: str) -> str:
-        """빌드 시 삽입할 코드 생성"""
-        obf_app_id = cls._obfuscate(app_id)
-        obf_private_key = cls._obfuscate(private_key)
-        obf_installation_id = cls._obfuscate(installation_id)
-        obf_repo = cls._obfuscate(repo)
-
-        return f'''    # 빌드 시 자동 생성된 GitHub App 인증 정보
-    _EMBEDDED_APP_ID: Optional[str] = "{obf_app_id}"
-    _EMBEDDED_PRIVATE_KEY: Optional[str] = "{obf_private_key}"
-    _EMBEDDED_INSTALLATION_ID: Optional[str] = "{obf_installation_id}"
-    _EMBEDDED_REPO: Optional[str] = "{obf_repo}"
-'''
+        """빌드 시 삽입할 코드 생성 (빌드타임 전용 — scripts/github_app_secret_codec에 위임)"""
+        from scripts.github_app_secret_codec import generate_embedded_code
+        return generate_embedded_code(app_id, private_key, installation_id, repo)
 
 
 def get_github_app_auth() -> Optional[GitHubAppAuth]:

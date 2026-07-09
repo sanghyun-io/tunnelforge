@@ -1,4 +1,6 @@
-from src.core.update_downloader import select_release_asset
+from unittest.mock import MagicMock, patch
+
+from src.core.update_downloader import UpdateDownloader, select_release_asset
 
 
 def test_select_release_asset_prefers_windows_offline_installer():
@@ -54,3 +56,24 @@ def test_select_release_asset_returns_none_when_platform_asset_missing():
     ]
 
     assert select_release_asset(assets, platform_name="Darwin") is None
+
+
+def test_download_installer_uses_configurable_timeout():
+    """download_installer가 하드코딩된 30초 대신 self.timeout을 전달해야 한다 (CC-048 회귀)"""
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 10
+
+    config_manager = MagicMock()
+    config_manager.get_network_timeout_download.return_value = 77
+    downloader._config_manager = config_manager
+
+    mock_response = MagicMock()
+    mock_response.headers = {'content-length': '10'}
+    mock_response.iter_content.return_value = [b'0123456789']
+
+    with patch('src.core.update_downloader.requests.get', return_value=mock_response) as mock_get, \
+         patch('src.core.update_downloader.open', create=True):
+        downloader.download_installer()
+
+    assert mock_get.call_args.kwargs['timeout'] == 77
