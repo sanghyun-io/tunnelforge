@@ -25,8 +25,12 @@ from PyQt6.QtWidgets import (
 )
 
 from src.core.cross_engine_migration import (
+    DEFAULT_POSTGRESQL_SCHEMA,
     DatabaseEngine,
     MigrationDirection,
+    format_plan_summary,
+    format_schema_summary,
+    format_verification_result,
     load_resume_state,
     next_workflow_command,
     make_connection_payload,
@@ -40,6 +44,95 @@ from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
 from src.ui.workers.cross_engine_migration_worker import CrossEngineMigrationWorker
 
 
+WORKER_GRACEFUL_WAIT_MS = 5000
+WORKER_CLOSE_WAIT_MS = 3000
+WORKER_TERMINATE_WAIT_MS = 1000
+# Normal finish gets the longest grace period; close and terminate waits stay shorter for responsive shutdown.
+
+_WIZARD_STYLESHEET = """
+    QDialog {
+        background-color: #f8fafc;
+    }
+    QGroupBox {
+        background-color: #ffffff;
+        border: 1px solid #d0d5dd;
+        border-radius: 6px;
+        margin-top: 10px;
+        padding: 12px;
+    }
+    QGroupBox::title {
+        subcontrol-origin: margin;
+        left: 12px;
+        padding: 0 4px;
+        color: #101828;
+        font-weight: 600;
+    }
+    QLabel#StepHelp {
+        color: #344054;
+        font-weight: 600;
+        padding: 8px 0;
+    }
+    QLabel#MutedHelp {
+        color: #667085;
+    }
+    QPushButton {
+        min-height: 26px;
+        padding: 4px 12px;
+        border: 1px solid #98a2b3;
+        border-radius: 3px;
+        background-color: #ffffff;
+        color: #182230;
+    }
+    QPushButton:hover:enabled {
+        background-color: #f2f4f7;
+    }
+    QPushButton:disabled {
+        background-color: #e4e7ec;
+        color: #98a2b3;
+        border: 1px solid #d0d5dd;
+    }
+    QPushButton#WizardNextButton {
+        background-color: #2563eb;
+        border: 1px solid #1d4ed8;
+        color: #ffffff;
+        font-weight: 600;
+    }
+    QPushButton#WizardNextButton:hover:enabled {
+        background-color: #1d4ed8;
+    }
+    QPushButton#WizardNextButton:disabled {
+        background-color: #e4e7ec;
+        color: #98a2b3;
+        border: 1px solid #d0d5dd;
+        font-weight: 600;
+    }
+    QPushButton#WizardBackButton:disabled {
+        background-color: #f2f4f7;
+        color: #98a2b3;
+        border: 1px solid #e4e7ec;
+    }
+    QPushButton#PrimaryActionButton {
+        background-color: #16a34a;
+        border: 1px solid #15803d;
+        color: #ffffff;
+        font-weight: 600;
+        min-height: 32px;
+    }
+    QPushButton#PrimaryActionButton:hover:enabled {
+        background-color: #15803d;
+    }
+    QPushButton#PrimaryActionButton:disabled {
+        background-color: #dcfce7;
+        color: #86efac;
+        border: 1px solid #bbf7d0;
+    }
+    QLabel#NextHint {
+        color: #475467;
+        font-weight: 600;
+    }
+"""
+
+
 class CrossEngineMigrationDialog(QDialog):
     """Wizard-style dialog for DB engine conversion."""
 
@@ -48,6 +141,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.tunnel_engine = tunnel_engine
         self.config_manager = config_manager
         self.worker: Optional[CrossEngineMigrationWorker] = None
+        self._ui_running = False
         self.last_result: Optional[Dict] = None
         self.unsupported_objects = []
         self._last_checkpoint_path = None
@@ -94,88 +188,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._setup_ui()
 
     def _apply_wizard_style(self):
-        self.setStyleSheet("""
-            QDialog {
-                background-color: #f8fafc;
-            }
-            QGroupBox {
-                background-color: #ffffff;
-                border: 1px solid #d0d5dd;
-                border-radius: 6px;
-                margin-top: 10px;
-                padding: 12px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 12px;
-                padding: 0 4px;
-                color: #101828;
-                font-weight: 600;
-            }
-            QLabel#StepHelp {
-                color: #344054;
-                font-weight: 600;
-                padding: 8px 0;
-            }
-            QLabel#MutedHelp {
-                color: #667085;
-            }
-            QPushButton {
-                min-height: 26px;
-                padding: 4px 12px;
-                border: 1px solid #98a2b3;
-                border-radius: 3px;
-                background-color: #ffffff;
-                color: #182230;
-            }
-            QPushButton:hover:enabled {
-                background-color: #f2f4f7;
-            }
-            QPushButton:disabled {
-                background-color: #e4e7ec;
-                color: #98a2b3;
-                border: 1px solid #d0d5dd;
-            }
-            QPushButton#WizardNextButton {
-                background-color: #2563eb;
-                border: 1px solid #1d4ed8;
-                color: #ffffff;
-                font-weight: 600;
-            }
-            QPushButton#WizardNextButton:hover:enabled {
-                background-color: #1d4ed8;
-            }
-            QPushButton#WizardNextButton:disabled {
-                background-color: #e4e7ec;
-                color: #98a2b3;
-                border: 1px solid #d0d5dd;
-                font-weight: 600;
-            }
-            QPushButton#WizardBackButton:disabled {
-                background-color: #f2f4f7;
-                color: #98a2b3;
-                border: 1px solid #e4e7ec;
-            }
-            QPushButton#PrimaryActionButton {
-                background-color: #16a34a;
-                border: 1px solid #15803d;
-                color: #ffffff;
-                font-weight: 600;
-                min-height: 32px;
-            }
-            QPushButton#PrimaryActionButton:hover:enabled {
-                background-color: #15803d;
-            }
-            QPushButton#PrimaryActionButton:disabled {
-                background-color: #dcfce7;
-                color: #86efac;
-                border: 1px solid #bbf7d0;
-            }
-            QLabel#NextHint {
-                color: #475467;
-                font-weight: 600;
-            }
-        """)
+        self.setStyleSheet(_WIZARD_STYLESHEET)
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -360,7 +373,6 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_inspect = QPushButton("스키마 검사")
         self.btn_guide = QPushButton("상세 가이드")
         self.btn_plan = QPushButton("계획 생성")
-        self.btn_run_plan = self.btn_plan
         self.btn_resume = QPushButton("중단 지점부터 재개")
         self.btn_cleanup_failed = QPushButton("실패한 전환 정리")
         self.btn_verify = QPushButton("검증")
@@ -398,7 +410,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_plan_summary = QLabel("아직 실행 계획을 생성하지 않았습니다.")
         self.lbl_plan_summary.setWordWrap(True)
         plan_layout.addWidget(self.lbl_plan_summary)
-        plan_layout.addWidget(self.btn_run_plan)
+        plan_layout.addWidget(self.btn_plan)
         self.step_page_layouts["plan"].addWidget(self.plan_group)
         self.step_page_layouts["plan"].addWidget(option_group)
 
@@ -434,9 +446,8 @@ class CrossEngineMigrationDialog(QDialog):
         self.txt_verify_result = QPlainTextEdit()
         self.txt_verify_result.setReadOnly(True)
         self.txt_verify_result.setPlaceholderText("검증 실행 후 mismatch 예시와 요약이 표시됩니다.")
-        self.btn_run_verify = self.btn_verify
         verify_action_layout = QHBoxLayout()
-        verify_action_layout.addWidget(self.btn_run_verify)
+        verify_action_layout.addWidget(self.btn_verify)
         verify_action_layout.addWidget(self.btn_save_report)
         verify_action_layout.addStretch()
         verify_layout.addWidget(self.lbl_verify_mode)
@@ -489,31 +500,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.lbl_direction_summary.setText(self._direction_label())
 
     def _schema_summary_text(self, schema: Dict, unsupported_objects: List[str]) -> str:
-        schema_data: Dict[str, Any] = schema if isinstance(schema, dict) else {}
-        raw_tables = schema_data.get("tables")
-        tables: List[Any] = cast(List[Any], raw_tables) if isinstance(raw_tables, list) else []
-        valid_tables: List[Dict[str, Any]] = [table for table in tables if isinstance(table, dict)]
-        table_count = len(valid_tables)
-        column_count = 0
-        index_count = 0
-        foreign_key_count = 0
-        for table in valid_tables:
-            raw_columns = table.get("columns")
-            columns: List[Any] = cast(List[Any], raw_columns) if isinstance(raw_columns, list) else []
-            raw_indexes = table.get("indexes")
-            indexes: List[Any] = cast(List[Any], raw_indexes) if isinstance(raw_indexes, list) else []
-            raw_foreign_keys = table.get("foreign_keys")
-            foreign_keys: List[Any] = (
-                cast(List[Any], raw_foreign_keys) if isinstance(raw_foreign_keys, list) else []
-            )
-            column_count += len(columns)
-            index_count += len(indexes)
-            foreign_key_count += len(foreign_keys)
-        return (
-            f"테이블 {table_count}개, 컬럼 {column_count}개, "
-            f"인덱스 {index_count}개, FK {foreign_key_count}개, "
-            f"지원 제외 {len(unsupported_objects)}개"
-        )
+        return format_schema_summary(schema, unsupported_objects)
 
     def _update_source_summary(self, schema: Dict):
         unsupported = [str(item) for item in self.unsupported_objects]
@@ -542,37 +529,7 @@ class CrossEngineMigrationDialog(QDialog):
         return [mapping for mapping in mappings if isinstance(mapping, dict)]
 
     def _plan_summary_text(self, payload: Dict) -> str:
-        tables = self._plan_tables(payload)
-        mappings = self._plan_type_mappings(payload)
-        estimated_rows = 0
-        for table in tables:
-            raw_rows = table.get("estimated_rows")
-            if not isinstance(raw_rows, int) or isinstance(raw_rows, bool):
-                raw_rows = table.get("rows")
-            if isinstance(raw_rows, int) and not isinstance(raw_rows, bool):
-                estimated_rows += raw_rows
-
-        lines = [
-            f"전환 대상 테이블 {len(tables)}개",
-            f"예상 rows {estimated_rows:,}",
-        ]
-        mapping_summaries: List[str] = []
-        for mapping in mappings:
-            source_type = str(mapping.get("source_type", "")).strip()
-            target_type = str(mapping.get("target_type", "")).strip()
-            if source_type and target_type:
-                mapping_summaries.append(f"{source_type} -> {target_type}")
-        if mapping_summaries:
-            lines.append("타입 변환: " + ", ".join(mapping_summaries[:8]))
-
-        raw_plan = payload.get("plan")
-        plan: Dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
-        raw_ddl_order = plan.get("ddl_order")
-        ddl_order: List[Any] = cast(List[Any], raw_ddl_order) if isinstance(raw_ddl_order, list) else []
-        ddl_order_text = " ".join(str(item).lower() for item in ddl_order)
-        if "foreign" in ddl_order_text or "fk" in ddl_order_text:
-            lines.append("FK/index는 데이터 적재 후 생성")
-        return "\n".join(lines)
+        return format_plan_summary(payload)
 
     def _update_plan_summary(self, payload: Dict):
         self.lbl_plan_summary.setText(self._plan_summary_text(payload))
@@ -591,57 +548,7 @@ class CrossEngineMigrationDialog(QDialog):
         return text[: limit - 3] + "..."
 
     def _verification_result_text(self, payload: Dict) -> str:
-        mismatch_lines: List[str] = []
-        raw_mismatches = payload.get("mismatches")
-        if isinstance(raw_mismatches, list):
-            for mismatch in raw_mismatches[:20]:
-                if not isinstance(mismatch, dict):
-                    continue
-                table = mismatch.get("table", "")
-                key = mismatch.get("key", "")
-                column = mismatch.get("column", "")
-                source_value = mismatch.get("source_value", "")
-                target_value = mismatch.get("target_value", "")
-                difference = mismatch.get("difference", "")
-                lines = [
-                    f"- 테이블: {table}",
-                    f"  Key: {key}",
-                    f"  Column: {column}",
-                    f"  Source: {self._display_value(source_value)}",
-                    f"  Target: {self._display_value(target_value)}",
-                ]
-                if difference:
-                    lines.append(f"  차이 유형: {difference}")
-                mismatch_lines.append("\n".join(lines))
-
-        row_diff_lines: List[str] = []
-        raw_row_diffs = payload.get("row_count_differences")
-        if isinstance(raw_row_diffs, list):
-            for diff in raw_row_diffs:
-                if not isinstance(diff, dict):
-                    continue
-                source_rows = int(diff.get("source_rows", 0) or 0)
-                target_rows = int(diff.get("target_rows", 0) or 0)
-                delta = source_rows - target_rows
-                row_diff_lines.append(
-                    f"- {diff.get('table', '')}: Source {source_rows:,} rows / "
-                    f"Target {target_rows:,} rows / 차이 {delta:+,}"
-                )
-
-        lines: List[str] = []
-        if mismatch_lines:
-            lines.append("Mismatch 예시")
-            lines.extend(mismatch_lines)
-        if row_diff_lines:
-            if lines:
-                lines.append("")
-            lines.append("Row count 차이")
-            lines.extend(row_diff_lines)
-        if not lines and payload.get("success") is True:
-            lines.append("검증 통과: Source와 Target 데이터가 일치합니다.")
-        elif not lines:
-            lines.append("검증 실패: Rust Core가 비교 차이 상세를 반환하지 않았습니다.")
-        return "\n".join(lines)
+        return format_verification_result(payload)
 
     def _update_verification_result(self, payload: Dict):
         mismatches = payload.get("mismatches")
@@ -768,7 +675,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.btn_target_advanced.setText("고급 설정 닫기" if visible else "고급 설정 열기")
 
     def _next_enabled_for_current_step(self) -> bool:
-        if self.worker and self.worker.isRunning():
+        if self._ui_running or (self.worker and self.worker.isRunning()):
             return False
         if self.current_step_id == "connections":
             return self._connection_step_ready()
@@ -785,7 +692,7 @@ class CrossEngineMigrationDialog(QDialog):
         return False
 
     def _can_start_migration_from_execute_step(self) -> bool:
-        running = bool(self.worker and self.worker.isRunning())
+        running = self._ui_running or bool(self.worker and self.worker.isRunning())
         return (not running) and self._execution_unlocked and self._approval_matches_target_schema()
 
     def _next_button_text(self) -> str:
@@ -804,7 +711,7 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _refresh_navigation_state(self):
         if hasattr(self, "btn_previous"):
-            running = bool(self.worker and self.worker.isRunning())
+            running = self._ui_running or bool(self.worker and self.worker.isRunning())
             self.btn_previous.setEnabled(self._current_step_index() > 0 and not running)
         if hasattr(self, "btn_next"):
             self.btn_next.setText(self._next_button_text())
@@ -813,7 +720,7 @@ class CrossEngineMigrationDialog(QDialog):
             self.lbl_next_hint.setText(self._next_hint_text())
 
     def _next_hint_text(self) -> str:
-        if self.worker and self.worker.isRunning():
+        if self._ui_running or (self.worker and self.worker.isRunning()):
             return "현재 작업이 실행 중입니다. 완료될 때까지 기다려 주세요."
         if self.current_step_id == "connections":
             return "Source와 Target 연결을 모두 선택하면 다음 단계로 이동할 수 있습니다."
@@ -841,12 +748,6 @@ class CrossEngineMigrationDialog(QDialog):
         self.current_step_id = step_id
         for page_id, page in self.step_pages.items():
             page.setVisible(page_id == step_id)
-        if hasattr(self, "btn_previous"):
-            running = bool(self.worker and self.worker.isRunning())
-            self.btn_previous.setEnabled(self._current_step_index() > 0 and not running)
-        if hasattr(self, "btn_next"):
-            self.btn_next.setText(self._next_button_text())
-            self.btn_next.setEnabled(self._next_enabled_for_current_step())
         self._refresh_navigation_state()
         self._refresh_direction_summary()
 
@@ -990,7 +891,8 @@ class CrossEngineMigrationDialog(QDialog):
     def _on_result(self, payload: Dict):
         self.last_result = payload
         self.btn_save_report.setEnabled(True)
-        if payload.get("command") == "migrate" and isinstance(payload.get("state"), dict):
+        command = payload.get("command")
+        if command == "migrate" and isinstance(payload.get("state"), dict):
             if self._active_state_key:
                 path = save_resume_state(self._active_state_key, payload["state"])
                 self._append_log(f"재개 상태 저장: {path}")
@@ -1013,37 +915,58 @@ class CrossEngineMigrationDialog(QDialog):
                 self._append_log(
                     f"지원 제외 객체 {len(self.unsupported_objects)}개를 preflight warning 대상으로 저장했습니다."
                 )
-        elif payload.get("command") == "inspect":
+        elif command == "inspect":
             self.unsupported_objects = []
         if schema is not None:
             self._update_source_summary(schema)
-        if payload.get("command") == "readiness":
-            self._append_readiness_summary(payload)
-        if payload.get("command") == "guide":
-            self._append_guide_summary(payload)
-        if payload.get("command") == "plan":
-            self._step_completed["plan"] = bool(payload.get("success"))
-            self._update_plan_summary(payload)
-        if payload.get("command") == "verify":
-            self._verify_result_received = True
-            self._step_completed["verify"] = True
-            self._update_verification_result(payload)
-        if payload.get("command") in ("preflight", "plan"):
-            target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
-            if payload.get("command") == "preflight":
-                self._step_completed["safety"] = bool(payload.get("success")) and not target_blocked
-                self._update_preflight_summary(payload, target_blocked)
-            self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)
-            if self._execution_unlocked:
-                self._append_log("사전 확인이 완료되어 DB 변경 실행이 활성화되었습니다.")
-            else:
-                self._append_log("차단 이슈가 있어 DB 변경 실행은 계속 잠겨 있습니다.")
-        if payload.get("command") == "migrate":
-            self._step_completed["execute"] = bool(payload.get("success"))
-            self._update_migration_result_summary(payload)
-        if payload.get("command") not in ("readiness", "migrate"):
+        handlers = {
+            "readiness": self._handle_readiness_result,
+            "guide": self._handle_guide_result,
+            "plan": self._handle_plan_result,
+            "verify": self._handle_verify_result,
+            "preflight": self._handle_preflight_result,
+            "migrate": self._handle_migrate_result,
+        }
+        handler = handlers.get(command)
+        if handler:
+            handler(payload)
+        if command not in ("readiness", "migrate"):
             self._append_log(json.dumps(payload, ensure_ascii=False, indent=2))
         self._refresh_navigation_state()
+
+    def _handle_readiness_result(self, payload: Dict):
+        self._append_readiness_summary(payload)
+
+    def _handle_guide_result(self, payload: Dict):
+        self._append_guide_summary(payload)
+
+    def _handle_plan_result(self, payload: Dict):
+        self._step_completed["plan"] = bool(payload.get("success"))
+        self._update_plan_summary(payload)
+        self._handle_preflight_or_plan_safety_result(payload)
+
+    def _handle_verify_result(self, payload: Dict):
+        self._verify_result_received = True
+        self._step_completed["verify"] = True
+        self._update_verification_result(payload)
+
+    def _handle_preflight_result(self, payload: Dict):
+        self._handle_preflight_or_plan_safety_result(payload)
+
+    def _handle_preflight_or_plan_safety_result(self, payload: Dict):
+        target_blocked = self._update_target_safety_from_issues(payload.get("issues"))
+        if payload.get("command") == "preflight":
+            self._step_completed["safety"] = bool(payload.get("success")) and not target_blocked
+            self._update_preflight_summary(payload, target_blocked)
+        self._set_execution_unlocked(bool(payload.get("success")) and not target_blocked)
+        if self._execution_unlocked:
+            self._append_log("사전 확인이 완료되어 DB 변경 실행이 활성화되었습니다.")
+        else:
+            self._append_log("차단 이슈가 있어 DB 변경 실행은 계속 잠겨 있습니다.")
+
+    def _handle_migrate_result(self, payload: Dict):
+        self._step_completed["execute"] = bool(payload.get("success"))
+        self._update_migration_result_summary(payload)
 
     def _append_readiness_summary(self, payload: Dict):
         selected = self._selected_direction_result(payload)
@@ -1121,7 +1044,7 @@ class CrossEngineMigrationDialog(QDialog):
         worker = self.worker
         if worker is None or not worker.isRunning():
             return True
-        if worker.wait(5000):
+        if worker.wait(WORKER_GRACEFUL_WAIT_MS):
             return True
         else:
             self._append_log("작업 thread 종료 대기가 시간 초과되었습니다.")
@@ -1196,6 +1119,7 @@ class CrossEngineMigrationDialog(QDialog):
             QMessageBox.critical(self, "저장 실패", str(exc))
 
     def _set_running(self, running: bool):
+        self._ui_running = running
         if self._current_command == "preflight" and running:
             self._start_safety_activity("전환 가능 여부 점검 중")
         for button in (
@@ -1214,10 +1138,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._set_input_controls_enabled(not running)
         self._update_execution_state()
         self.btn_cancel.setEnabled(running)
-        if hasattr(self, "btn_previous"):
-            self.btn_previous.setEnabled((not running) and self._current_step_index() > 0)
-        if hasattr(self, "btn_next"):
-            self.btn_next.setEnabled((not running) and self._next_enabled_for_current_step())
+        self._refresh_navigation_state()
 
     def _set_input_controls_enabled(self, enabled: bool):
         self.source_form.set_inputs_enabled(enabled)
@@ -1250,7 +1171,7 @@ class CrossEngineMigrationDialog(QDialog):
         schema = self.target_form.input_schema.text().strip()
         database = self.target_form.input_database.text().strip()
         if self.target_form.engine() == DatabaseEngine.POSTGRESQL:
-            return schema or "public"
+            return schema or DEFAULT_POSTGRESQL_SCHEMA
         return schema or database
 
     def _approval_matches_target_schema(self) -> bool:
@@ -1493,9 +1414,9 @@ class CrossEngineMigrationDialog(QDialog):
                 a0.ignore()
                 return
             self.worker.cancel()
-            if not self.worker.wait(3000):
+            if not self.worker.wait(WORKER_CLOSE_WAIT_MS):
                 self.worker.terminate()
-                self.worker.wait(1000)
+                self.worker.wait(WORKER_TERMINATE_WAIT_MS)
         a0.accept()
 
 

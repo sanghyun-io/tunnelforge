@@ -6,6 +6,7 @@ import threading
 import pytest
 from PyQt6.QtCore import Qt
 
+from src.core.cross_engine_migration import parse_helper_event
 from src.ui.workers.cross_engine_migration_worker import CrossEngineMigrationWorker
 
 
@@ -71,6 +72,25 @@ def test_worker_run_emits_checkpoint_state():
     worker.run()
 
     assert checkpoints == [state]
+
+
+def test_worker_dispatch_event_emits_checkpoint_state():
+    state = {"tables": [{"table": "users", "completed": False, "rows_copied": 2}]}
+    event = parse_helper_event(
+        '{"event":"table_progress","table":"users","status":"copying",'
+        '"state":{"tables":[{"table":"users","completed":false,"rows_copied":2}]}}'
+    )
+    worker = CrossEngineMigrationWorker("migrate", {}, helper_path="fake-helper")
+
+    table_events = []
+    checkpoints = []
+    worker.table_progress.connect(lambda table, status: table_events.append((table, status)))
+    worker.checkpoint.connect(checkpoints.append)
+
+    assert worker._dispatch_event(event) is False
+    assert table_events == [("users", "copying")]
+    assert checkpoints == [state]
+    assert worker._last_checkpoint == state
 
 
 def test_worker_run_emits_failure_on_error():

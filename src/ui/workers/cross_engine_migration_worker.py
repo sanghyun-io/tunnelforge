@@ -129,27 +129,10 @@ class CrossEngineMigrationWorker(QThread):
                 if event.event == "result":
                     final_payload = event.payload
                     success = bool(event.success)
-                    self.result.emit(event.payload)
                 elif event.event == "error":
                     final_payload = event.payload
                     success = False
-                    self.failed.emit(event.message)
-                elif event.event == "phase":
-                    self.phase_changed.emit(event.phase or "", event.message)
-                elif event.event == "table_progress":
-                    self.table_progress.emit(event.table or "", event.status or "")
-                    if isinstance(event.payload.get("state"), dict):
-                        self._last_checkpoint = event.payload["state"]
-                        self.checkpoint.emit(event.payload["state"])
-                elif event.event == "row_progress":
-                    self.row_progress.emit(event.table or "", int(event.rows or 0), event.total)
-                    if isinstance(event.payload.get("state"), dict):
-                        self._last_checkpoint = event.payload["state"]
-                        self.checkpoint.emit(event.payload["state"])
-                elif event.event == "issue" and event.issue:
-                    self.issue.emit(event.issue)
-                else:
-                    self.log_message.emit(line.rstrip())
+                self._dispatch_event(event)
 
             return_code = self._process.wait()
             self._join_stderr_drain()
@@ -176,3 +159,32 @@ class CrossEngineMigrationWorker(QThread):
                 if self._last_checkpoint:
                     final_payload["state"] = self._last_checkpoint
             self.finished.emit(success, final_payload)
+
+    def _dispatch_event(self, event) -> bool:
+        if event.event == "result":
+            self.result.emit(event.payload)
+            return True
+        if event.event == "error":
+            self.failed.emit(event.message)
+            return True
+        if event.event == "phase":
+            self.phase_changed.emit(event.phase or "", event.message)
+            return False
+        if event.event == "table_progress":
+            self.table_progress.emit(event.table or "", event.status or "")
+            self._emit_checkpoint_if_present(event)
+            return False
+        if event.event == "row_progress":
+            self.row_progress.emit(event.table or "", int(event.rows or 0), event.total)
+            self._emit_checkpoint_if_present(event)
+            return False
+        if event.event == "issue" and event.issue:
+            self.issue.emit(event.issue)
+            return False
+        self.log_message.emit(event.raw_line)
+        return False
+
+    def _emit_checkpoint_if_present(self, event) -> None:
+        if isinstance(event.payload.get("state"), dict):
+            self._last_checkpoint = event.payload["state"]
+            self.checkpoint.emit(event.payload["state"])

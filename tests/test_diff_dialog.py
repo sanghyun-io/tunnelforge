@@ -633,6 +633,20 @@ class TestCloseEventCleanup:
 
         mock_source.disconnect.assert_called_once()
 
+    def test_disconnect_connectors_clears_both_dialog_owned_connectors(self, dialog):
+        """반복 비교/오류/닫기 경로가 같은 커넥터 정리 헬퍼를 사용한다"""
+        mock_source = MagicMock()
+        mock_target = MagicMock()
+        dialog._source_connector = mock_source
+        dialog._target_connector = mock_target
+
+        dialog._disconnect_connectors()
+
+        mock_source.disconnect.assert_called_once()
+        mock_target.disconnect.assert_called_once()
+        assert dialog._source_connector is None
+        assert dialog._target_connector is None
+
     def test_close_waits_for_pending_schema_load_threads(self, dialog):
         """진행 중인 스키마 로드 스레드도 종료를 기다려야 한다"""
         mock_thread = MagicMock()

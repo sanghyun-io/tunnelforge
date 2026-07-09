@@ -40,6 +40,34 @@ class MigrationDirection(str, Enum):
         raise ValueError(f"Unsupported migration direction: {source.value} -> {target.value}")
 
 
+DEFAULT_MYSQL_PORT = 3306
+DEFAULT_POSTGRESQL_PORT = 5432
+DEFAULT_POSTGRESQL_SCHEMA = "public"
+DEFAULT_POSTGRESQL_DATABASE = "postgres"
+
+
+@dataclass
+class ConnectionEndpointInput:
+    engine: DatabaseEngine
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+    schema: str = ""
+
+    def to_payload(self) -> Dict[str, Any]:
+        return {
+            "engine": self.engine.value,
+            "host": self.host,
+            "port": int(self.port),
+            "user": self.user,
+            "password": self.password,
+            "database": self.database,
+            "schema": self.schema,
+        }
+
+
 @dataclass
 class MigrationIssue:
     severity: str
@@ -62,6 +90,7 @@ class MigrationIssue:
 @dataclass
 class HelperEvent:
     event: str
+    raw_line: str = ""
     request_id: Optional[str] = None
     phase: Optional[str] = None
     message: str = ""
@@ -129,6 +158,7 @@ def parse_helper_event(line: str) -> HelperEvent:
 
     return HelperEvent(
         event=event_type,
+        raw_line=line.rstrip(),
         request_id=data.get("request_id"),
         phase=data.get("phase"),
         message=str(data.get("message", "")),
@@ -254,15 +284,149 @@ def make_connection_payload(
     schema: str = "",
 ) -> Dict[str, Any]:
     """Build a serializable endpoint payload for the helper."""
-    return {
-        "engine": engine.value,
-        "host": host,
-        "port": int(port),
-        "user": user,
-        "password": password,
-        "database": database,
-        "schema": schema,
-    }
+    return ConnectionEndpointInput(
+        engine=engine,
+        host=host,
+        port=port,
+        user=user,
+        password=password,
+        database=database,
+        schema=schema,
+    ).to_payload()
+
+
+def format_schema_summary(schema: Dict, unsupported_objects: List[str]) -> str:
+    schema_data: Dict[str, Any] = schema if isinstance(schema, dict) else {}
+    raw_tables = schema_data.get("tables")
+    tables: List[Any] = raw_tables if isinstance(raw_tables, list) else []
+    valid_tables: List[Dict[str, Any]] = [table for table in tables if isinstance(table, dict)]
+    table_count = len(valid_tables)
+    column_count = 0
+    index_count = 0
+    foreign_key_count = 0
+    for table in valid_tables:
+        columns = table.get("columns")
+        indexes = table.get("indexes")
+        foreign_keys = table.get("foreign_keys")
+        column_count += len(columns) if isinstance(columns, list) else 0
+        index_count += len(indexes) if isinstance(indexes, list) else 0
+        foreign_key_count += len(foreign_keys) if isinstance(foreign_keys, list) else 0
+    return (
+        f"테이블 {table_count}개, 컬럼 {column_count}개, "
+        f"인덱스 {index_count}개, FK {foreign_key_count}개, "
+        f"지원 제외 {len(unsupported_objects)}개"
+    )
+
+
+def _plan_tables(payload: Dict) -> List[Dict]:
+    raw_plan = payload.get("plan")
+    plan: Dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+    raw_tables = plan.get("tables")
+    tables: List[Any] = raw_tables if isinstance(raw_tables, list) else []
+    return [table for table in tables if isinstance(table, dict)]
+
+
+def _plan_type_mappings(payload: Dict) -> List[Dict]:
+    raw_plan = payload.get("plan")
+    plan: Dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+    raw_mappings = plan.get("type_mappings")
+    mappings: List[Any] = raw_mappings if isinstance(raw_mappings, list) else []
+    return [mapping for mapping in mappings if isinstance(mapping, dict)]
+
+
+def format_plan_summary(payload: Dict) -> str:
+    tables = _plan_tables(payload)
+    mappings = _plan_type_mappings(payload)
+    estimated_rows = 0
+    for table in tables:
+        raw_rows = table.get("estimated_rows")
+        if not isinstance(raw_rows, int) or isinstance(raw_rows, bool):
+            raw_rows = table.get("rows")
+        if isinstance(raw_rows, int) and not isinstance(raw_rows, bool):
+            estimated_rows += raw_rows
+
+    lines = [
+        f"전환 대상 테이블 {len(tables)}개",
+        f"예상 rows {estimated_rows:,}",
+    ]
+    mapping_summaries: List[str] = []
+    for mapping in mappings:
+        source_type = str(mapping.get("source_type", "")).strip()
+        target_type = str(mapping.get("target_type", "")).strip()
+        if source_type and target_type:
+            mapping_summaries.append(f"{source_type} -> {target_type}")
+    if mapping_summaries:
+        lines.append("타입 변환: " + ", ".join(mapping_summaries[:8]))
+
+    raw_plan = payload.get("plan")
+    plan: Dict[str, Any] = raw_plan if isinstance(raw_plan, dict) else {}
+    raw_ddl_order = plan.get("ddl_order")
+    ddl_order: List[Any] = raw_ddl_order if isinstance(raw_ddl_order, list) else []
+    ddl_order_text = " ".join(str(item).lower() for item in ddl_order)
+    if "foreign" in ddl_order_text or "fk" in ddl_order_text:
+        lines.append("FK/index는 데이터 적재 후 생성")
+    return "\n".join(lines)
+
+
+def _display_value(value: Any, limit: int = 160) -> str:
+    text = str(value)
+    if len(text) <= limit:
+        return text
+    return text[: limit - 3] + "..."
+
+
+def format_verification_result(payload: Dict) -> str:
+    mismatch_lines: List[str] = []
+    raw_mismatches = payload.get("mismatches")
+    if isinstance(raw_mismatches, list):
+        for mismatch in raw_mismatches[:20]:
+            if not isinstance(mismatch, dict):
+                continue
+            table = mismatch.get("table", "")
+            key = mismatch.get("key", "")
+            column = mismatch.get("column", "")
+            source_value = mismatch.get("source_value", "")
+            target_value = mismatch.get("target_value", "")
+            difference = mismatch.get("difference", "")
+            lines = [
+                f"- 테이블: {table}",
+                f"  Key: {key}",
+                f"  Column: {column}",
+                f"  Source: {_display_value(source_value)}",
+                f"  Target: {_display_value(target_value)}",
+            ]
+            if difference:
+                lines.append(f"  차이 유형: {difference}")
+            mismatch_lines.append("\n".join(lines))
+
+    row_diff_lines: List[str] = []
+    raw_row_diffs = payload.get("row_count_differences")
+    if isinstance(raw_row_diffs, list):
+        for diff in raw_row_diffs:
+            if not isinstance(diff, dict):
+                continue
+            source_rows = int(diff.get("source_rows", 0) or 0)
+            target_rows = int(diff.get("target_rows", 0) or 0)
+            delta = source_rows - target_rows
+            row_diff_lines.append(
+                f"- {diff.get('table', '')}: Source {source_rows:,} rows / "
+                f"Target {target_rows:,} rows / 차이 {delta:+,}"
+            )
+
+    lines: List[str] = []
+    if mismatch_lines:
+        lines.append("Mismatch 예시")
+        lines.extend(mismatch_lines)
+    if row_diff_lines:
+        if lines:
+            lines.append("")
+        lines.append("Row count 차이")
+        lines.extend(row_diff_lines)
+    if not lines and payload.get("success") is True:
+        lines.append("검증 통과: Source와 Target 데이터가 일치합니다.")
+    elif not lines:
+        lines.append("검증 실패: Rust Core가 비교 차이 상세를 반환하지 않았습니다.")
+    return "\n".join(lines)
 
 
 def schema_from_inspect_result(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:

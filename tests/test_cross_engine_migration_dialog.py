@@ -537,8 +537,8 @@ def test_verify_step_has_single_visible_verify_trigger_and_save_report_reachable
             if button.text() == "검증" and button.isVisible()
         ]
 
-        assert visible_verify_buttons == [dialog.btn_run_verify]
-        assert dialog.btn_run_verify is dialog.btn_verify
+        assert visible_verify_buttons == [dialog.btn_verify]
+        assert not hasattr(dialog, "btn_run_verify")
         assert dialog.btn_save_report.isVisible()
         assert_widget_reachable(dialog.btn_save_report, dialog)
     finally:
@@ -588,8 +588,8 @@ def test_plan_step_has_single_visible_plan_trigger():
             if button.text() == "계획 생성" and button.isVisible()
         ]
 
-        assert visible_plan_buttons == [dialog.btn_run_plan]
-        assert dialog.btn_plan is dialog.btn_run_plan
+        assert visible_plan_buttons == [dialog.btn_plan]
+        assert not hasattr(dialog, "btn_run_plan")
     finally:
         dialog.close()
 

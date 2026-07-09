@@ -6,6 +6,11 @@ from pathlib import Path
 import pytest
 
 from src.core.cross_engine_migration import (
+    DEFAULT_MYSQL_PORT,
+    DEFAULT_POSTGRESQL_DATABASE,
+    DEFAULT_POSTGRESQL_PORT,
+    DEFAULT_POSTGRESQL_SCHEMA,
+    ConnectionEndpointInput,
     DatabaseEngine,
     HelperProtocolError,
     MigrationDirection,
@@ -13,6 +18,9 @@ from src.core.cross_engine_migration import (
     _db_core_frozen_candidate_dirs,
     build_helper_request,
     db_core_executable,
+    format_plan_summary,
+    format_schema_summary,
+    format_verification_result,
     load_resume_state,
     next_workflow_command,
     parse_helper_event,
@@ -40,6 +48,83 @@ def test_build_helper_request_is_jsonl():
     assert data["command"] == "preflight"
     assert data["request_id"] == "req-1"
     assert data["payload"]["source_engine"] == "mysql"
+
+
+def test_connection_endpoint_input_matches_legacy_payload_shape():
+    endpoint = ConnectionEndpointInput(
+        engine=DatabaseEngine.POSTGRESQL,
+        host="db.example.test",
+        port=DEFAULT_POSTGRESQL_PORT,
+        user="app",
+        password="secret",
+        database=DEFAULT_POSTGRESQL_DATABASE,
+        schema=DEFAULT_POSTGRESQL_SCHEMA,
+    )
+
+    assert endpoint.to_payload() == {
+        "engine": "postgresql",
+        "host": "db.example.test",
+        "port": 5432,
+        "user": "app",
+        "password": "secret",
+        "database": "postgres",
+        "schema": "public",
+    }
+
+
+def test_default_connection_constants_match_ui_defaults():
+    assert DEFAULT_MYSQL_PORT == 3306
+    assert DEFAULT_POSTGRESQL_PORT == 5432
+    assert DEFAULT_POSTGRESQL_SCHEMA == "public"
+    assert DEFAULT_POSTGRESQL_DATABASE == "postgres"
+
+
+def test_format_schema_summary_counts_supported_objects():
+    schema = {
+        "tables": [
+            {
+                "columns": [{}, {}],
+                "indexes": [{}],
+                "foreign_keys": [{}, {}],
+            },
+            {
+                "columns": [{}],
+                "indexes": [],
+                "foreign_keys": [{}],
+            },
+        ]
+    }
+
+    assert format_schema_summary(schema, ["view:active_users"]) == (
+        "테이블 2개, 컬럼 3개, 인덱스 1개, FK 3개, 지원 제외 1개"
+    )
+
+
+def test_format_plan_summary_preserves_existing_korean_copy():
+    text = format_plan_summary({
+        "plan": {
+            "tables": [
+                {"estimated_rows": 1500},
+                {"rows": 2000},
+                {"estimated_rows": True, "rows": 1},
+            ],
+            "type_mappings": [
+                {"source_type": "int unsigned", "target_type": "bigint"},
+            ],
+            "ddl_order": ["create tables", "add foreign keys"],
+        }
+    })
+
+    assert "전환 대상 테이블 3개" in text
+    assert "예상 rows 3,501" in text
+    assert "int unsigned -> bigint" in text
+    assert "FK/index는 데이터 적재 후 생성" in text
+
+
+def test_format_verification_result_preserves_failure_fallback():
+    assert format_verification_result({"success": False}) == (
+        "검증 실패: Rust Core가 비교 차이 상세를 반환하지 않았습니다."
+    )
 
 
 def test_parse_issue_event():

@@ -4,8 +4,6 @@
 - 스키마 비교 결과 표시
 - 동기화 스크립트 생성
 """
-import math
-import random
 from typing import List, Dict, Optional
 
 from PyQt6.QtWidgets import (
@@ -13,14 +11,15 @@ from PyQt6.QtWidgets import (
     QLabel, QComboBox, QPushButton, QGroupBox,
     QTreeWidget, QTreeWidgetItem, QTextEdit, QSplitter,
     QWidget, QProgressBar, QMessageBox, QFileDialog,
-    QHeaderView, QApplication
+    QHeaderView
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont, QColor, QPainter, QPen
 
 from src.core.schema_diff import (
     SchemaExtractor, SchemaComparator, SyncScriptGenerator,
-    TableDiff, DiffType, DiffSeverity, CompareLevel,
+    TableDiff, ColumnDiff, IndexDiff, ForeignKeyDiff,
+    DiffType, DiffSeverity, CompareLevel,
     SeverityClassifier, VersionContext, SeveritySummary
 )
 from src.core.db_connector import MySQLConnector
@@ -334,18 +333,7 @@ class SchemaDiffDialog(QDialog):
         _, target_host, target_port, target_user, target_pw = target_params
 
         # 이전 비교에서 남아있는 커넥터 정리 (반복 비교 시 세션 누수 방지)
-        if self._source_connector:
-            try:
-                self._source_connector.disconnect()
-            except Exception:
-                pass
-            self._source_connector = None
-        if self._target_connector:
-            try:
-                self._target_connector.disconnect()
-            except Exception:
-                pass
-            self._target_connector = None
+        self._disconnect_connectors()
 
         # 비교 시작 시점의 스키마 이름을 캡처 (비교 중 콤보가 바뀌어도 결과와 일치 보장)
         self._compared_source_schema = source_schema
@@ -368,25 +356,12 @@ class SchemaDiffDialog(QDialog):
             success, _ = self._target_connector.connect()
             if not success:
                 # 소스 연결 정리 후 예외 발생
-                if self._source_connector:
-                    self._source_connector.disconnect()
-                    self._source_connector = None
+                self._disconnect_connectors()
                 raise Exception("타겟 연결 실패")
 
         except Exception as e:
             # 연결 정리
-            if self._source_connector:
-                try:
-                    self._source_connector.disconnect()
-                except Exception:
-                    pass
-                self._source_connector = None
-            if self._target_connector:
-                try:
-                    self._target_connector.disconnect()
-                except Exception:
-                    pass
-                self._target_connector = None
+            self._disconnect_connectors()
             QMessageBox.critical(self, "연결 오류", f"DB 연결 실패: {e}")
             return
 
@@ -485,6 +460,17 @@ class SchemaDiffDialog(QDialog):
         }
         return icons.get(severity, "")
 
+    def _disconnect_connectors(self):
+        """Disconnect and clear dialog-owned DB connectors."""
+        for attr_name in ("_source_connector", "_target_connector"):
+            connector = getattr(self, attr_name)
+            if connector:
+                try:
+                    connector.disconnect()
+                except Exception:
+                    pass
+            setattr(self, attr_name, None)
+
     def _on_compare_error(self, error: str):
         """비교 오류"""
         self.compare_btn.setEnabled(True)
@@ -532,65 +518,12 @@ class SchemaDiffDialog(QDialog):
             ])
             item.setData(0, Qt.ItemDataRole.UserRole, diff)
 
-            # 컬럼 차이
-            if diff.column_diffs:
-                for col_diff in diff.column_diffs:
-                    if col_diff.diff_type != DiffType.UNCHANGED:
-                        col_icon = self._get_diff_icon(col_diff.diff_type)
-                        sev_icon = self._get_severity_icon(col_diff.severity)
-                        sev_suffix = f" {sev_icon}" if sev_icon else ""
-                        col_item = QTreeWidgetItem([
-                            f"  {col_icon} {col_diff.column_name}{sev_suffix}",
-                            col_diff.diff_type.value,
-                            ""
-                        ])
-                        col_item.setData(0, Qt.ItemDataRole.UserRole, col_diff)
-                        self._apply_severity_background(col_item, col_diff.severity)
-                        item.addChild(col_item)
-
-            # 인덱스 차이
-            if diff.index_diffs:
-                for idx_diff in diff.index_diffs:
-                    if idx_diff.diff_type != DiffType.UNCHANGED:
-                        idx_icon = self._get_diff_icon(idx_diff.diff_type)
-                        sev_icon = self._get_severity_icon(idx_diff.severity)
-                        sev_suffix = f" {sev_icon}" if sev_icon else ""
-                        # RENAMED: old_name → new_name 표시
-                        if idx_diff.diff_type == DiffType.RENAMED and idx_diff.old_name:
-                            label = (f"  {idx_icon} [IDX] {idx_diff.old_name} "
-                                     f"→ {idx_diff.index_name}{sev_suffix}")
-                        else:
-                            label = f"  {idx_icon} [IDX] {idx_diff.index_name}{sev_suffix}"
-                        idx_item = QTreeWidgetItem([
-                            label,
-                            idx_diff.diff_type.value,
-                            ""
-                        ])
-                        idx_item.setData(0, Qt.ItemDataRole.UserRole, idx_diff)
-                        self._apply_severity_background(idx_item, idx_diff.severity)
-                        item.addChild(idx_item)
-
-            # FK 차이
-            if diff.fk_diffs:
-                for fk_diff in diff.fk_diffs:
-                    if fk_diff.diff_type != DiffType.UNCHANGED:
-                        fk_icon = self._get_diff_icon(fk_diff.diff_type)
-                        sev_icon = self._get_severity_icon(fk_diff.severity)
-                        sev_suffix = f" {sev_icon}" if sev_icon else ""
-                        # RENAMED: old_name → new_name 표시
-                        if fk_diff.diff_type == DiffType.RENAMED and fk_diff.old_name:
-                            label = (f"  {fk_icon} [FK] {fk_diff.old_name} "
-                                     f"→ {fk_diff.fk_name}{sev_suffix}")
-                        else:
-                            label = f"  {fk_icon} [FK] {fk_diff.fk_name}{sev_suffix}"
-                        fk_item = QTreeWidgetItem([
-                            label,
-                            fk_diff.diff_type.value,
-                            ""
-                        ])
-                        fk_item.setData(0, Qt.ItemDataRole.UserRole, fk_diff)
-                        self._apply_severity_background(fk_item, fk_diff.severity)
-                        item.addChild(fk_item)
+            for col_diff in diff.column_diffs or []:
+                self._add_diff_child_item(item, "", col_diff, "column_name")
+            for idx_diff in diff.index_diffs or []:
+                self._add_diff_child_item(item, "[IDX] ", idx_diff, "index_name", show_renamed_old_name=True)
+            for fk_diff in diff.fk_diffs or []:
+                self._add_diff_child_item(item, "[FK] ", fk_diff, "fk_name", show_renamed_old_name=True)
 
             self.diff_tree.addTopLevelItem(item)
 
@@ -603,6 +536,33 @@ class SchemaDiffDialog(QDialog):
             f"총 {len(diffs)}개 테이블: "
             f"🟢 추가 {added}, 🟡 수정 {modified}, 🔴 삭제 {removed}, ⚪ 동일 {unchanged}"
         )
+
+    def _add_diff_child_item(
+        self,
+        parent_item: QTreeWidgetItem,
+        kind_prefix: str,
+        diff,
+        name_attr: str,
+        show_renamed_old_name: bool = False,
+    ):
+        if diff.diff_type == DiffType.UNCHANGED:
+            return
+        diff_icon = self._get_diff_icon(diff.diff_type)
+        sev_icon = self._get_severity_icon(diff.severity)
+        sev_suffix = f" {sev_icon}" if sev_icon else ""
+        name = getattr(diff, name_attr)
+        if show_renamed_old_name and diff.diff_type == DiffType.RENAMED and diff.old_name:
+            label = f"  {diff_icon} {kind_prefix}{diff.old_name} → {name}{sev_suffix}"
+        else:
+            label = f"  {diff_icon} {kind_prefix}{name}{sev_suffix}"
+        child_item = QTreeWidgetItem([
+            label,
+            diff.diff_type.value,
+            ""
+        ])
+        child_item.setData(0, Qt.ItemDataRole.UserRole, diff)
+        self._apply_severity_background(child_item, diff.severity)
+        parent_item.addChild(child_item)
 
     def _apply_severity_background(
         self, item: QTreeWidgetItem, severity: Optional[DiffSeverity]
@@ -678,20 +638,20 @@ class SchemaDiffDialog(QDialog):
         """차이 상세 정보 표시"""
         lines = []
 
-        if hasattr(diff, 'column_name'):
+        if isinstance(diff, ColumnDiff):
             lines.append(f"컬럼: {diff.column_name}")
-        elif hasattr(diff, 'index_name'):
+        elif isinstance(diff, IndexDiff):
             lines.append(f"인덱스: {diff.index_name}")
-        elif hasattr(diff, 'fk_name'):
+        elif isinstance(diff, ForeignKeyDiff):
             lines.append(f"FK: {diff.fk_name}")
 
         lines.append(f"상태: {diff.diff_type.value}")
 
         # RENAMED인 경우 이전 이름 표시
-        if hasattr(diff, 'old_name') and diff.old_name:
+        if isinstance(diff, (IndexDiff, ForeignKeyDiff)) and diff.old_name:
             lines.append(f"이전 이름: {diff.old_name}")
 
-        if hasattr(diff, 'severity') and diff.severity:
+        if diff.severity:
             sev_icon = self._get_severity_icon(diff.severity)
             lines.append(f"심각도: {sev_icon} {diff.severity.value}")
 
@@ -700,10 +660,10 @@ class SchemaDiffDialog(QDialog):
             for d in diff.differences:
                 lines.append(f"  - {d}")
 
-        if hasattr(diff, 'source_info') and diff.source_info:
+        if isinstance(diff, (IndexDiff, ForeignKeyDiff)) and diff.source_info:
             lines.append(f"\n[소스]\n  {diff.source_info}")
 
-        if hasattr(diff, 'target_info') and diff.target_info:
+        if isinstance(diff, (IndexDiff, ForeignKeyDiff)) and diff.target_info:
             lines.append(f"\n[타겟]\n  {diff.target_info}")
 
         self.detail_text.setPlainText("\n".join(lines))
@@ -744,19 +704,7 @@ class SchemaDiffDialog(QDialog):
         self._cancel_schema_load_threads()
 
         # 연결 정리
-        if self._source_connector:
-            try:
-                self._source_connector.disconnect()
-            except Exception:
-                pass
-            self._source_connector = None
-
-        if self._target_connector:
-            try:
-                self._target_connector.disconnect()
-            except Exception:
-                pass
-            self._target_connector = None
+        self._disconnect_connectors()
 
         super().closeEvent(event)
 

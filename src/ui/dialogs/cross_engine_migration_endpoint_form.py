@@ -4,7 +4,15 @@ Cross-Engine 마이그레이션 소스/타겟 엔드포인트 입력 폼
 from typing import Dict, Optional
 from PyQt6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QLineEdit, QSpinBox
 
-from src.core.cross_engine_migration import DatabaseEngine, make_connection_payload
+from src.core.cross_engine_migration import (
+    DEFAULT_MYSQL_PORT,
+    DEFAULT_POSTGRESQL_DATABASE,
+    DEFAULT_POSTGRESQL_PORT,
+    DEFAULT_POSTGRESQL_SCHEMA,
+    ConnectionEndpointInput,
+    DatabaseEngine,
+    make_connection_payload,
+)
 
 
 class EndpointForm(QGroupBox):
@@ -40,7 +48,9 @@ class EndpointForm(QGroupBox):
         self.input_host = QLineEdit("127.0.0.1")
         self.input_port = QSpinBox()
         self.input_port.setRange(1, 65535)
-        self.input_port.setValue(3306 if default_engine == DatabaseEngine.MYSQL else 5432)
+        self.input_port.setValue(
+            DEFAULT_MYSQL_PORT if default_engine == DatabaseEngine.MYSQL else DEFAULT_POSTGRESQL_PORT
+        )
         self.input_user = QLineEdit()
         self.input_password = QLineEdit()
         self.input_password.setEchoMode(QLineEdit.EchoMode.Password)
@@ -164,14 +174,14 @@ class EndpointForm(QGroupBox):
         return "127.0.0.1", int(config.get("local_port", 0) or config.get("remote_port", 0) or 0)
 
     def _on_engine_changed(self):
-        if self.engine() == DatabaseEngine.MYSQL and self.input_port.value() == 5432:
-            self.input_port.setValue(3306)
-        elif self.engine() == DatabaseEngine.POSTGRESQL and self.input_port.value() == 3306:
-            self.input_port.setValue(5432)
+        if self.engine() == DatabaseEngine.MYSQL and self.input_port.value() == DEFAULT_POSTGRESQL_PORT:
+            self.input_port.setValue(DEFAULT_MYSQL_PORT)
+        elif self.engine() == DatabaseEngine.POSTGRESQL and self.input_port.value() == DEFAULT_MYSQL_PORT:
+            self.input_port.setValue(DEFAULT_POSTGRESQL_PORT)
         if self.engine() == DatabaseEngine.MYSQL and not self.input_schema.text().strip():
             self.input_schema.setText(self.input_database.text().strip())
         elif self.engine() == DatabaseEngine.POSTGRESQL and not self.input_schema.text().strip():
-            self.input_schema.setText("public")
+            self.input_schema.setText(DEFAULT_POSTGRESQL_SCHEMA)
 
     def _on_tunnel_selected(self):
         data = self.combo_tunnel.currentData()
@@ -188,26 +198,20 @@ class EndpointForm(QGroupBox):
         if port:
             self.input_port.setValue(int(port))
 
-        engine = self._detect_engine(host, port, config)
+        engine = self._detect_engine(config)
         engine_index = self.combo_engine.findData(engine.value)
         if engine_index >= 0:
             self.combo_engine.setCurrentIndex(engine_index)
 
-        default_schema = config.get("default_schema")
-        default_database = config.get("default_database")
-        if self.engine() == DatabaseEngine.POSTGRESQL and default_database:
-            self.input_database.setText(str(default_database))
-        elif self.engine() == DatabaseEngine.POSTGRESQL:
-            self.input_database.setText("postgres")
-        elif default_schema:
-            self.input_database.setText(str(default_schema))
-        if default_schema:
-            if self.engine() == DatabaseEngine.MYSQL:
-                self.input_schema.setText(str(default_schema))
-            elif self.engine() == DatabaseEngine.POSTGRESQL:
-                self.input_schema.setText(str(default_schema))
-        elif self.engine() == DatabaseEngine.POSTGRESQL and not self.input_schema.text().strip():
-            self.input_schema.setText("public")
+        database, schema = self._resolve_default_database_and_schema(
+            self.engine(),
+            config.get("default_database"),
+            config.get("default_schema"),
+        )
+        if database:
+            self.input_database.setText(database)
+        if schema and (config.get("default_schema") or not self.input_schema.text().strip()):
+            self.input_schema.setText(schema)
 
         if self.config_manager:
             db_user, db_password = self.config_manager.get_tunnel_credentials(data["tunnel_id"])
@@ -216,7 +220,22 @@ class EndpointForm(QGroupBox):
             if db_password:
                 self.input_password.setText(db_password)
 
-    def _detect_engine(self, host, port, config: Dict) -> DatabaseEngine:
+    @staticmethod
+    def _resolve_default_database_and_schema(
+        engine: DatabaseEngine,
+        default_database,
+        default_schema,
+    ) -> tuple[str, str]:
+        if engine == DatabaseEngine.POSTGRESQL:
+            return (
+                str(default_database) if default_database else DEFAULT_POSTGRESQL_DATABASE,
+                str(default_schema) if default_schema else DEFAULT_POSTGRESQL_SCHEMA,
+            )
+        database = str(default_schema) if default_schema else ""
+        schema = str(default_schema) if default_schema else ""
+        return database, schema
+
+    def _detect_engine(self, config: Dict) -> DatabaseEngine:
         configured = config.get("db_engine")
         if configured in ("mysql", "postgresql"):
             return DatabaseEngine(configured)
@@ -284,15 +303,15 @@ class EndpointForm(QGroupBox):
             database = schema or database
             schema = database
         elif not schema:
-            schema = "public"
+            schema = DEFAULT_POSTGRESQL_SCHEMA
             if not database:
-                database = "postgres"
-        return make_connection_payload(
-            self.engine(),
-            self.input_host.text().strip(),
-            self.input_port.value(),
-            self.input_user.text().strip(),
-            self.input_password.text(),
-            database,
-            schema,
-        )
+                database = DEFAULT_POSTGRESQL_DATABASE
+        return ConnectionEndpointInput(
+            engine=self.engine(),
+            host=self.input_host.text().strip(),
+            port=self.input_port.value(),
+            user=self.input_user.text().strip(),
+            password=self.input_password.text(),
+            database=database,
+            schema=schema,
+        ).to_payload()
