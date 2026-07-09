@@ -15,13 +15,19 @@ from datetime import datetime
 import json
 import os
 
+from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
 from src.core.db_connector import MySQLConnector
 from src.core.i18n import translate_text
+from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
-    RustDumpConfig, check_rust_dump
+    build_rust_dump_config, check_rust_dump
 )
+from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
+from src.ui.workers.github_worker import GithubReportingMixin
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
+
+logger = get_logger('db_dialogs')
 
 _REDACTED_KEYS = {"password", "credentials"}
 _REDACTED_PLACEHOLDER = "***REDACTED***"
@@ -156,6 +162,25 @@ def displayed_import_percent(table_rows_done: dict, table_rows_total: dict, even
     return min(max(0, int(event_percent or 0)), 100)
 
 
+def resolve_timezone_sql(engine: str, tz_mode: str) -> Optional[str]:
+    """Return engine-specific timezone SQL for non-auto modes."""
+    normalized_engine = (engine or "mysql").lower()
+    normalized_mode = (tz_mode or "none").lower()
+    if normalized_mode == "kst":
+        return (
+            "SET TIME ZONE '+09:00'"
+            if normalized_engine == "postgresql"
+            else "SET SESSION time_zone = '+09:00'"
+        )
+    if normalized_mode == "utc":
+        return (
+            "SET TIME ZONE '+00:00'"
+            if normalized_engine == "postgresql"
+            else "SET SESSION time_zone = '+00:00'"
+        )
+    return None
+
+
 def format_import_visible_telemetry(event: dict) -> Optional[str]:
     """Convert Rust import telemetry into a concise visible log line."""
     event_type = event.get("event")
@@ -219,7 +244,7 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
 # Rust DB Core 기반 Import 다이얼로그
 # ============================================================
 
-class RustDumpImportDialog(QDialog):
+class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialog):
     """Rust DB Core Import 다이얼로그"""
 
     def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None,
@@ -267,16 +292,13 @@ class RustDumpImportDialog(QDialog):
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # QSplitter로 상하 분할 (설정 영역 / 진행 상황 영역)
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(self.splitter)
 
-        # ========== 상단: 설정 영역 (스크롤 가능) ==========
         config_widget = QWidget()
         config_layout = QVBoxLayout(config_widget)
         config_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 접기/펼치기 버튼 추가
         collapse_layout = QHBoxLayout()
         self.btn_collapse = QPushButton("🔽 설정 접기")
         self.btn_collapse.setStyleSheet("""
@@ -292,12 +314,33 @@ class RustDumpImportDialog(QDialog):
         collapse_layout.addStretch()
         config_layout.addLayout(collapse_layout)
 
-        # 설정 내용을 담을 컨테이너
         self.config_container = QWidget()
         container_layout = QVBoxLayout(self.config_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(self._build_status_group())
+        container_layout.addWidget(self._build_input_dir_group())
+        container_layout.addWidget(self._build_upgrade_check_group())
+        container_layout.addWidget(self._build_schema_group())
+        container_layout.addWidget(self._build_import_options_group())
+        container_layout.addWidget(self._build_timezone_group())
+        container_layout.addWidget(self._build_import_mode_group())
 
-        # --- rust_dump 상태 ---
+        config_layout.addWidget(self.config_container)
+        config_layout.addStretch()
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(config_widget)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.splitter.addWidget(scroll_area)
+        self.splitter.addWidget(self._build_progress_section())
+
+        self.splitter.setStretchFactor(0, 60)
+        self.splitter.setStretchFactor(1, 40)
+
+        layout.addLayout(self._build_button_row())
+
+    def _build_status_group(self):
         status_group = QGroupBox("Rust DB Core 상태")
         status_layout = QVBoxLayout(status_group)
 
@@ -309,9 +352,9 @@ class RustDumpImportDialog(QDialog):
             status_label.setStyleSheet("color: red;")
 
         status_layout.addWidget(status_label)
-        container_layout.addWidget(status_group)
+        return status_group
 
-        # --- 입력 폴더 선택 ---
+    def _build_input_dir_group(self):
         input_group = QGroupBox("Dump 폴더")
         input_layout = QHBoxLayout(input_group)
 
@@ -331,20 +374,18 @@ class RustDumpImportDialog(QDialog):
 
         input_layout.addWidget(self.input_dir)
         input_layout.addWidget(btn_browse)
-        container_layout.addWidget(input_group)
+        return input_group
 
-        # --- MySQL 8.4 호환성 검사 상태 ---
+    def _build_upgrade_check_group(self):
         self.upgrade_check_group = QGroupBox("MySQL 8.4 호환성 검사")
         upgrade_check_layout = QVBoxLayout(self.upgrade_check_group)
 
-        # 상태 표시 레이아웃
         status_line = QHBoxLayout()
         self.lbl_upgrade_status = QLabel("📋 Dump 폴더를 선택하면 자동 검사됩니다.")
         self.lbl_upgrade_status.setStyleSheet("color: #7f8c8d;")
         status_line.addWidget(self.lbl_upgrade_status)
         status_line.addStretch()
 
-        # 상세 보기 버튼
         self.btn_view_issues = QPushButton("📊 상세 보기")
         self.btn_view_issues.setStyleSheet("""
             QPushButton {
@@ -359,12 +400,11 @@ class RustDumpImportDialog(QDialog):
 
         upgrade_check_layout.addLayout(status_line)
 
-        # 호환성 검사 결과 저장
         self._upgrade_issues: List[CompatibilityIssue] = []
 
-        container_layout.addWidget(self.upgrade_check_group)
+        return self.upgrade_check_group
 
-        # --- 대상 스키마 ---
+    def _build_schema_group(self):
         schema_group = QGroupBox("대상 스키마")
         schema_layout = QVBoxLayout(schema_group)
 
@@ -382,9 +422,9 @@ class RustDumpImportDialog(QDialog):
         target_layout.addStretch()
         schema_layout.addLayout(target_layout)
 
-        container_layout.addWidget(schema_group)
+        return schema_group
 
-        # --- Import 옵션 ---
+    def _build_import_options_group(self):
         option_group = QGroupBox("Import 옵션")
         option_layout = QFormLayout(option_group)
 
@@ -393,9 +433,9 @@ class RustDumpImportDialog(QDialog):
         self.spin_threads.setValue(8)
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
-        container_layout.addWidget(option_group)
+        return option_group
 
-        # --- 타임존 설정 ---
+    def _build_timezone_group(self):
         tz_group = QGroupBox("타임존 설정")
         tz_layout = QVBoxLayout(tz_group)
 
@@ -425,9 +465,9 @@ class RustDumpImportDialog(QDialog):
         tz_layout.addWidget(self.radio_tz_utc)
         tz_layout.addWidget(self.radio_tz_none)
 
-        container_layout.addWidget(tz_group)
+        return tz_group
 
-        # --- Import 모드 선택 ---
+    def _build_import_mode_group(self):
         mode_group = QGroupBox("Import 모드 선택")
         mode_layout = QVBoxLayout(mode_group)
 
@@ -468,34 +508,19 @@ class RustDumpImportDialog(QDialog):
         self.btn_import_mode.addButton(self.radio_replace)
         self.btn_import_mode.addButton(self.radio_recreate)
 
-        container_layout.addWidget(mode_group)
+        return mode_group
 
-        # 설정 컨테이너를 config_layout에 추가
-        config_layout.addWidget(self.config_container)
-        config_layout.addStretch()
-
-        # 스크롤 영역으로 감싸기
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(config_widget)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
-        self.splitter.addWidget(scroll_area)
-
-        # ========== 하단: 진행 상황 영역 ==========
+    def _build_progress_section(self):
         progress_widget = QWidget()
         progress_main_layout = QVBoxLayout(progress_widget)
         progress_main_layout.setContentsMargins(0, 0, 0, 0)
-        self.splitter.addWidget(progress_widget)
 
-        # --- 진행 상황 섹션 (확장된 UI) ---
         self.progress_group = QGroupBox("진행 상황")
         self.progress_group.setVisible(False)
         progress_layout = QVBoxLayout(self.progress_group)
 
-        # 상세 진행률 표시 영역
         detail_layout = QHBoxLayout()
 
-        # 왼쪽: 진행률 정보
         left_detail = QVBoxLayout()
         self.label_percent = QLabel("📊 진행률: 0%")
         self.label_percent.setStyleSheet("font-weight: bold; font-size: 12pt;")
@@ -535,14 +560,12 @@ class RustDumpImportDialog(QDialog):
         """)
         progress_layout.addWidget(self.progress_bar)
 
-        # 상태 라벨
         self.label_status = QLabel("준비 중...")
         self.label_status.setStyleSheet("color: #27ae60; font-weight: bold;")
         progress_layout.addWidget(self.label_status)
 
         progress_main_layout.addWidget(self.progress_group)
 
-        # --- 테이블 상태 목록 (GitHub Actions 스타일) ---
         self.table_status_group = QGroupBox("테이블 Import 상태")
         self.table_status_group.setVisible(False)
         table_status_layout = QVBoxLayout(self.table_status_group)
@@ -567,7 +590,6 @@ class RustDumpImportDialog(QDialog):
         """)
         table_status_layout.addWidget(self.table_list)
 
-        # 재시도 버튼 (실패 시에만 표시)
         retry_layout = QHBoxLayout()
         self.btn_retry = QPushButton("🔄 선택한 테이블 재시도")
         self.btn_retry.setVisible(False)
@@ -598,7 +620,6 @@ class RustDumpImportDialog(QDialog):
 
         progress_main_layout.addWidget(self.table_status_group)
 
-        # --- 실행 로그 ---
         self.log_group = QGroupBox("실행 로그")
         self.log_group.setVisible(False)
         log_layout = QVBoxLayout(self.log_group)
@@ -622,12 +643,9 @@ class RustDumpImportDialog(QDialog):
         log_layout.addWidget(self.txt_log)
 
         progress_main_layout.addWidget(self.log_group)
+        return progress_widget
 
-        # Splitter 초기 비율 설정 (설정:진행 = 60:40)
-        self.splitter.setStretchFactor(0, 60)
-        self.splitter.setStretchFactor(1, 40)
-
-        # --- 버튼 ---
+    def _build_button_row(self):
         button_layout = QHBoxLayout()
 
         self.btn_import = QPushButton("📥 Import 시작")
@@ -668,39 +686,7 @@ class RustDumpImportDialog(QDialog):
         button_layout.addStretch()
         button_layout.addWidget(self.btn_import)
         button_layout.addWidget(btn_cancel)
-        layout.addLayout(button_layout)
-
-    def toggle_config_section(self):
-        """설정 섹션 접기/펼치기"""
-        is_visible = self.config_container.isVisible()
-
-        if is_visible:
-            # 접기
-            self.config_container.setVisible(False)
-            self.btn_collapse.setText("🔼 설정 펼치기")
-        else:
-            # 펼치기
-            self.config_container.setVisible(True)
-            self.btn_collapse.setText("🔽 설정 접기")
-
-    def collapse_config_section(self):
-        """설정 섹션을 접음 (Import 시작 시)"""
-        self.config_container.setVisible(False)
-        self.btn_collapse.setText("🔼 설정 펼치기")
-        self.btn_collapse.setVisible(True)
-
-        # Splitter 비율 조정 (설정:진행 = 10:90)
-        total_height = self.splitter.height()
-        self.splitter.setSizes([int(total_height * 0.1), int(total_height * 0.9)])
-
-    def expand_config_section(self):
-        """설정 섹션을 펼침 (Import 완료 시)"""
-        self.config_container.setVisible(True)
-        self.btn_collapse.setText("🔽 설정 접기")
-
-        # Splitter 비율 복원 (설정:진행 = 60:40)
-        total_height = self.splitter.height()
-        self.splitter.setSizes([int(total_height * 0.6), int(total_height * 0.4)])
+        return button_layout
 
     def load_schemas(self):
         self.combo_target_schema.clear()
@@ -910,6 +896,7 @@ class RustDumpImportDialog(QDialog):
             rows = self.connector.execute(query)
             return len(rows) > 0
         except Exception:
+            logger.debug("Timezone support check failed", exc_info=True)
             return False
 
     def _add_log(self, msg: str):
@@ -917,8 +904,8 @@ class RustDumpImportDialog(QDialog):
         timestamp = datetime.now().strftime('%H:%M:%S')
         log_entry = f"[{timestamp}] {msg}"
         self.log_entries.append(log_entry)
-        if len(self.log_entries) > 500:
-            del self.log_entries[:-500]
+        if len(self.log_entries) > MAX_LOG_ENTRIES:
+            del self.log_entries[:-MAX_LOG_ENTRIES]
 
     def _get_dump_schema_name(self, dump_dir: str) -> str:
         """덤프 디렉토리의 @.done.json에서 원본 스키마명 읽기"""
@@ -933,6 +920,7 @@ class RustDumpImportDialog(QDialog):
                 return schema_name
             return ""
         except Exception:
+            logger.debug("Failed to read dump schema name from %s", dump_dir, exc_info=True)
             return ""
 
     def _get_import_mode_text(self) -> str:
@@ -942,6 +930,25 @@ class RustDumpImportDialog(QDialog):
         elif self.radio_recreate.isChecked():
             return "완전 재생성 Import"
         return "증분 Import (병합)"
+
+    def _confirm_production_guard(self, input_dir: str, target_schema: Optional[str]) -> bool:
+        if not self.tunnel_config:
+            return True
+
+        from src.core.production_guard import ProductionGuard
+
+        guard = ProductionGuard(self)
+        if target_schema:
+            schema_name = target_schema
+        else:
+            schema_name = self._get_dump_schema_name(input_dir) or "(원본 스키마)"
+        details = (
+            f"Dump 폴더: {input_dir}<br>"
+            f"Import 모드: {self._get_import_mode_text()}"
+        )
+        return guard.confirm_dangerous_operation(
+            self.tunnel_config, "데이터 Import", schema_name, details
+        )
 
     def do_import(self, retry_tables: list = None):
         """Import 실행 (retry_tables가 주어지면 해당 테이블만 재시도)"""
@@ -964,23 +971,8 @@ class RustDumpImportDialog(QDialog):
                 QMessageBox.warning(self, "오류", "대상 스키마를 선택하세요.")
                 return
 
-        # Production 환경 확인
-        if self.tunnel_config:
-            from src.core.production_guard import ProductionGuard
-            guard = ProductionGuard(self)
-
-            if target_schema:
-                schema_name = target_schema
-            else:
-                # 원본 스키마명 사용 - 덤프에서 실제 스키마명 읽기
-                schema_name = self._get_dump_schema_name(input_dir) or "(원본 스키마)"
-            details = (f"Dump 폴더: {input_dir}<br>"
-                      f"Import 모드: {self._get_import_mode_text()}")
-
-            if not guard.confirm_dangerous_operation(
-                self.tunnel_config, "데이터 Import", schema_name, details
-            ):
-                return  # 사용자가 취소
+        if not self._confirm_production_guard(input_dir, target_schema):
+            return
 
         # 저장 (재시도용)
         self.last_input_dir = input_dir
@@ -1046,18 +1038,11 @@ class RustDumpImportDialog(QDialog):
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Import 준비 중...")
 
-        # Rust DB Core 설정
-        config = RustDumpConfig(
-            host=getattr(self.connector, 'host', "127.0.0.1"),
-            port=self.connector.port if hasattr(self.connector, 'port') else 3306,
-            user=self.connector.user if hasattr(self.connector, 'user') else "root",
-            password=self.connector.password if hasattr(self.connector, 'password') else "",
-            engine=getattr(self.connector, 'engine', "mysql"),
-        )
+        config = build_rust_dump_config(self.connector)
 
         # 타임존 설정 결정
-        timezone_sql = None
         db_engine = config.engine
+        timezone_sql = None
 
         if self.radio_tz_auto.isChecked():
             if db_engine == "mysql":
@@ -1076,19 +1061,11 @@ class RustDumpImportDialog(QDialog):
                 self.txt_log.addItem("ℹ️ PostgreSQL Import는 MySQL 타임존 자동 보정을 건너뜁니다.")
 
         elif self.radio_tz_kst.isChecked():
-            timezone_sql = (
-                "SET TIME ZONE '+09:00'"
-                if db_engine == "postgresql"
-                else "SET SESSION time_zone = '+09:00'"
-            )
+            timezone_sql = resolve_timezone_sql(db_engine, "kst")
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+09:00' (KST)로 설정합니다.")
 
         elif self.radio_tz_utc.isChecked():
-            timezone_sql = (
-                "SET TIME ZONE '+00:00'"
-                if db_engine == "postgresql"
-                else "SET SESSION time_zone = '+00:00'"
-            )
+            timezone_sql = resolve_timezone_sql(db_engine, "utc")
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+00:00' (UTC)로 설정합니다.")
 
         # Import 모드 결정
@@ -1187,25 +1164,25 @@ class RustDumpImportDialog(QDialog):
         self.label_speed.setText(speed_label)
         self.label_status.setText(status_label)
 
-    def on_table_status(self, table_name: str, status: str, message: str):
-        """테이블 상태 업데이트 (메타데이터 정보 포함)"""
-        # 상태별 아이콘 및 스타일
-        status_icons = {
-            'pending': '⏳',
-            'loading': '🔄',
-            'done': '✅',
-            'error': '❌'
-        }
-        status_colors = {
-            'pending': '#95a5a6',
-            'loading': '#3498db',
-            'done': '#27ae60',
-            'error': '#e74c3c'
+    def _format_bytes(self, size_bytes: int) -> str:
+        size_mb = size_bytes / (1024 * 1024)
+        if size_mb < 1024:
+            return f"{size_mb:.1f} MB"
+        return f"{size_mb / 1024:.2f} GB"
+
+    def _table_results(self) -> dict:
+        return {
+            table: result
+            for table, result in self.import_results.items()
+            if table != 'fk_restore' and isinstance(result, dict)
         }
 
-        icon = status_icons.get(status, '❓')
-        # color는 향후 테이블 행 스타일링에 사용 예정
-        _color = status_colors.get(status, '#7f8c8d')  # noqa: F841
+    def _count_by_status(self, results: dict, status: str) -> int:
+        return sum(1 for result in results.values() if result.get('status') == status)
+
+    def on_table_status(self, table_name: str, status: str, message: str):
+        """테이블 상태 업데이트 (메타데이터 정보 포함)"""
+        icon = TABLE_STATUS_ICONS.get(status, '❓')
 
         # 메타데이터에서 테이블 정보 가져오기
         size_info = ""
@@ -1215,12 +1192,7 @@ class RustDumpImportDialog(QDialog):
             chunk_count = self.dump_metadata['chunk_counts'].get(table_name, 1)
 
             if size_bytes > 0:
-                size_mb = size_bytes / (1024 * 1024)
-                if size_mb < 1024:
-                    size_str = f"{size_mb:.1f} MB"
-                else:
-                    size_str = f"{size_mb / 1024:.2f} GB"
-                size_info = f" ({size_str})"
+                size_info = f" ({self._format_bytes(size_bytes)})"
 
                 # chunk 진행률 표시 (loading 상태이고 chunk가 2개 이상인 경우)
                 if status == 'loading' and chunk_count > 1 and table_name in self.table_chunk_progress:
@@ -1270,25 +1242,14 @@ class RustDumpImportDialog(QDialog):
 
             # 현재 상태 확인
             current_status = self.import_results.get(table_name, {}).get('status', 'loading')
-            status_icons = {
-                'pending': '⏳',
-                'loading': '🔄',
-                'done': '✅',
-                'error': '❌'
-            }
-            icon = status_icons.get(current_status, '❓')
+            icon = TABLE_STATUS_ICONS.get(current_status, '❓')
 
             # 크기 정보
             size_info = ""
             if self.dump_metadata and 'table_sizes' in self.dump_metadata:
                 size_bytes = self.dump_metadata['table_sizes'].get(table_name, 0)
                 if size_bytes > 0:
-                    size_mb = size_bytes / (1024 * 1024)
-                    if size_mb < 1024:
-                        size_str = f"{size_mb:.1f} MB"
-                    else:
-                        size_str = f"{size_mb / 1024:.2f} GB"
-                    size_info = f" ({size_str})"
+                    size_info = f" ({self._format_bytes(size_bytes)})"
 
             # chunk 진행률 표시
             chunk_percent = (completed_chunks / total_chunks * 100) if total_chunks > 0 else 0
@@ -1315,8 +1276,8 @@ class RustDumpImportDialog(QDialog):
         원시 JSONL 라인은 자격 증명을 포함할 수 있으므로 화면/로그에 그대로
         남기지 않는다. 표시/저장은 정제된 요약(visible_summary)만 사용한다.
         """
-        # 너무 많은 로그 방지 (최대 500줄)
-        if self.txt_log.count() > 500:
+        # 너무 많은 로그 방지
+        if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
             self.txt_log.takeItem(0)
 
         visible_summary = None
@@ -1363,11 +1324,7 @@ class RustDumpImportDialog(QDialog):
             if large_tables:
                 # 상위 대용량 테이블을 미리 표시 (pending 상태로)
                 for table_name, size_bytes, chunk_count in large_tables[:10]:
-                    size_mb = size_bytes / (1024 * 1024)
-                    if size_mb < 1024:
-                        size_str = f"{size_mb:.1f} MB"
-                    else:
-                        size_str = f"{size_mb / 1024:.2f} GB"
+                    size_str = self._format_bytes(size_bytes)
 
                     display = f"⏳ {table_name} ({size_str}, {chunk_count} chunks)"
                     item = QListWidgetItem(display)
@@ -1379,10 +1336,9 @@ class RustDumpImportDialog(QDialog):
         """Import 완료 처리 (결과 저장 및 재시도 버튼 표시)"""
         self.import_results = results
 
-        # 실패한 테이블이 있는지 확인 (fk_restore는 제외)
         failed_tables = [
-            t for t, r in results.items()
-            if t != 'fk_restore' and isinstance(r, dict) and r.get('status') == 'error'
+            table for table, result in self._table_results().items()
+            if result.get('status') == 'error'
         ]
 
         if failed_tables:
@@ -1396,10 +1352,9 @@ class RustDumpImportDialog(QDialog):
         self.import_end_time = datetime.now()
         self.import_success = success
 
-        # 결과 요약 (fk_restore 제외)
-        table_results = {k: v for k, v in self.import_results.items() if k != 'fk_restore' and isinstance(v, dict)}
-        done_count = sum(1 for r in table_results.values() if r.get('status') == 'done')
-        error_count = sum(1 for r in table_results.values() if r.get('status') == 'error')
+        table_results = self._table_results()
+        done_count = self._count_by_status(table_results, 'done')
+        error_count = self._count_by_status(table_results, 'error')
         total_count = len(table_results)
 
         self._add_log(f"{'='*60}")
@@ -1476,9 +1431,16 @@ class RustDumpImportDialog(QDialog):
         if not self.config_manager:
             return
 
-        # 실패한 테이블 목록
-        failed_tables = [t for t, r in self.import_results.items() if r.get('status') == 'error']
-        failed_messages = [r.get('message', '') for t, r in self.import_results.items() if r.get('status') == 'error']
+        table_results = self._table_results()
+        failed_tables = [
+            table for table, result in table_results.items()
+            if result.get('status') == 'error'
+        ]
+        failed_messages = [
+            result.get('message', '')
+            for result in table_results.values()
+            if result.get('status') == 'error'
+        ]
 
         # 컨텍스트 정보 수집
         target_schema = self.combo_target_schema.currentText() if not self.chk_use_original.isChecked() else "(원본 스키마)"
@@ -1493,30 +1455,11 @@ class RustDumpImportDialog(QDialog):
         if failed_messages:
             combined_error += "\n\n실패한 테이블 오류:\n" + "\n".join(failed_messages[:3])
 
-        from src.ui.workers.github_worker import GitHubReportWorker
-        worker = GitHubReportWorker(
-            self.config_manager, error_type, combined_error, context
-        )
-        self._github_workers.append(worker)
-        worker.finished.connect(
-            lambda success, message, worker=worker: self._on_github_report_finished(success, message, worker)
-        )
-        worker.start()
-
-    def _on_github_report_finished(self, success: bool, message: str, worker=None):
-        """GitHub 이슈 보고 완료 콜백"""
-        if success:
-            self._add_log(f"🐙 GitHub: {message}")
-        else:
-            self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
-        if worker is not None and worker in self._github_workers:
-            self._github_workers.remove(worker)
-        if worker is not None:
-            worker.deleteLater()
+        self._start_github_report_worker(error_type, combined_error, context)
 
     def select_failed_tables(self):
         """실패한 테이블 모두 선택"""
-        for table_name, result in self.import_results.items():
+        for table_name, result in self._table_results().items():
             if result.get('status') == 'error':
                 if table_name in self.table_items:
                     self.table_items[table_name].setSelected(True)
@@ -1587,9 +1530,10 @@ class RustDumpImportDialog(QDialog):
 
         try:
             # 결과 요약
-            done_count = sum(1 for r in self.import_results.values() if r.get('status') == 'done')
-            error_count = sum(1 for r in self.import_results.values() if r.get('status') == 'error')
-            total_count = len(self.import_results)
+            table_results = self._table_results()
+            done_count = self._count_by_status(table_results, 'done')
+            error_count = self._count_by_status(table_results, 'error')
+            total_count = len(table_results)
 
             with open(file_path, 'w', encoding='utf-8') as f:
                 # 헤더 정보
@@ -1619,7 +1563,7 @@ class RustDumpImportDialog(QDialog):
                     f.write("\n" + "-" * 70 + "\n")
                     f.write("실패한 테이블 목록\n")
                     f.write("-" * 70 + "\n")
-                    for table_name, result in self.import_results.items():
+                    for table_name, result in table_results.items():
                         if result.get('status') == 'error':
                             f.write(f"  ❌ {table_name}: {result.get('message', 'Unknown error')}\n")
 

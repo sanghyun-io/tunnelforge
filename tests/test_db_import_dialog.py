@@ -17,6 +17,7 @@ from src.ui.dialogs.db_dialogs import (
     _sanitized_rust_event,
     _sanitize_plain_rust_line,
 )
+from src.ui.dialogs.db_import_dialog import resolve_timezone_sql
 
 def test_format_import_row_labels_separates_rows_chunks_and_strategy():
     labels = format_import_row_labels({
@@ -781,3 +782,31 @@ def test_import_mode_text_uses_single_korean_label_source(monkeypatch):
     assert dialog._get_import_mode_text() == "완전 재생성 Import"
 
     dialog.close()
+
+
+def test_resolve_timezone_sql_preserves_engine_specific_modes():
+    assert resolve_timezone_sql("postgresql", "auto") is None
+    assert resolve_timezone_sql("postgresql", "kst") == "SET TIME ZONE '+09:00'"
+    assert resolve_timezone_sql("postgresql", "utc") == "SET TIME ZONE '+00:00'"
+    assert resolve_timezone_sql("mysql", "kst") == "SET SESSION time_zone = '+09:00'"
+    assert resolve_timezone_sql("mysql", "utc") == "SET SESSION time_zone = '+00:00'"
+    assert resolve_timezone_sql("mysql", "none") is None
+
+
+def test_import_table_result_helpers_ignore_fk_restore_and_non_dict_entries():
+    dialog = type("DummyDialog", (), {})()
+    dialog.import_results = {
+        "users": {"status": "done"},
+        "orders": {"status": "error"},
+        "fk_restore": {"status": "error"},
+        "summary": "ignored",
+    }
+
+    table_results = RustDumpImportDialog._table_results(dialog)
+
+    assert table_results == {
+        "users": {"status": "done"},
+        "orders": {"status": "error"},
+    }
+    assert RustDumpImportDialog._count_by_status(dialog, table_results, "done") == 1
+    assert RustDumpImportDialog._count_by_status(dialog, table_results, "error") == 1

@@ -1,5 +1,5 @@
 """GitHub 이슈 자동 보고 백그라운드 워커"""
-from typing import Optional, Dict
+from typing import Dict, Optional
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -31,3 +31,28 @@ class GitHubReportWorker(QThread):
 
         except Exception as e:
             self.finished.emit(False, str(e))
+
+
+class GithubReportingMixin:
+    """Mixin for dialogs that retain GitHub report workers until completion."""
+
+    def _start_github_report_worker(self, error_type: str, message: str, context: Optional[Dict] = None):
+        worker = GitHubReportWorker(self.config_manager, error_type, message, context)
+        self._github_workers.append(worker)
+        worker.finished.connect(
+            lambda success, report_message, worker=worker: self._on_github_report_finished(
+                success, report_message, worker
+            )
+        )
+        worker.start()
+
+    def _on_github_report_finished(self, success: bool, message: str, worker=None):
+        """GitHub 이슈 보고 완료 콜백"""
+        if success:
+            self._add_log(f"🐙 GitHub: {message}")
+        else:
+            self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
+        if worker is not None and worker in self._github_workers:
+            self._github_workers.remove(worker)
+        if worker is not None:
+            worker.deleteLater()

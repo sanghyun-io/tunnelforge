@@ -13,6 +13,12 @@ from src.core.db_core_service import (
     DbEndpoint,
     normalize_db_engine,
 )
+from src.core.constants import (
+    DEFAULT_DB_ENGINE,
+    DEFAULT_DB_USER,
+    DEFAULT_LOCAL_HOST,
+    DEFAULT_MYSQL_PORT,
+)
 from src.core.foreign_key_resolver import ForeignKeyResolver, OrphanRecordInfo
 from src.core.logger import get_logger
 from src.exporters.dump_progress import DumpEventCallbacks, TableProgressTracker, emit_core_event
@@ -77,6 +83,17 @@ class RustDumpConfig:
 
     def get_masked_uri(self) -> str:
         return f"{self.user}:****@{self.host}:{self.port}"
+
+
+def build_rust_dump_config(connector) -> RustDumpConfig:
+    """Build RustDumpConfig from connector attributes with legacy fallbacks."""
+    return RustDumpConfig(
+        host=getattr(connector, 'host', DEFAULT_LOCAL_HOST),
+        port=connector.port if hasattr(connector, 'port') else DEFAULT_MYSQL_PORT,
+        user=connector.user if hasattr(connector, 'user') else DEFAULT_DB_USER,
+        password=connector.password if hasattr(connector, 'password') else "",
+        engine=getattr(connector, 'engine', DEFAULT_DB_ENGINE),
+    )
 
 
 class RustDumpChecker:

@@ -15,13 +15,17 @@ from datetime import datetime
 import json
 import os
 
+from src.core.constants import MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
 from src.core.db_connector import MySQLConnector
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
+from src.core.path_safety import safe_output_dir
 from src.exporters.rust_dump_exporter import (
-    RustDumpChecker, RustDumpConfig, check_rust_dump,
+    RustDumpChecker, build_rust_dump_config, check_rust_dump,
     DEFAULT_DUMP_COMPRESSION
 )
+from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
+from src.ui.workers.github_worker import GithubReportingMixin
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 logger = get_logger("db_dialogs")
@@ -165,7 +169,7 @@ def format_export_visible_telemetry(event: dict) -> Optional[str]:
 # Rust DB Core 기반 Export 다이얼로그
 # ============================================================
 
-class RustDumpExportDialog(QDialog):
+class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialog):
     """Rust DB Core Export 다이얼로그"""
 
     def __init__(self, parent=None, connector: MySQLConnector = None,
@@ -212,16 +216,13 @@ class RustDumpExportDialog(QDialog):
     def init_ui(self):
         layout = QVBoxLayout(self)
 
-        # QSplitter로 상하 분할 (설정 영역 / 진행 상황 영역)
         self.splitter = QSplitter(Qt.Orientation.Vertical)
         layout.addWidget(self.splitter)
 
-        # ========== 상단: 설정 영역 (스크롤 가능) ==========
         config_widget = QWidget()
         config_layout = QVBoxLayout(config_widget)
         config_layout.setContentsMargins(0, 0, 0, 0)
 
-        # 접기/펼치기 버튼 추가
         collapse_layout = QHBoxLayout()
         self.btn_collapse = QPushButton("🔽 설정 접기")
         self.btn_collapse.setStyleSheet("""
@@ -237,12 +238,33 @@ class RustDumpExportDialog(QDialog):
         collapse_layout.addStretch()
         config_layout.addLayout(collapse_layout)
 
-        # 설정 내용을 담을 컨테이너
         self.config_container = QWidget()
         container_layout = QVBoxLayout(self.config_container)
         container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.addWidget(self._build_status_group())
+        container_layout.addWidget(self._build_export_type_group())
+        container_layout.addWidget(self._build_schema_section())
+        container_layout.addWidget(self._build_output_folder_group())
 
-        # --- rust_dump 상태 표시 ---
+        self._load_naming_settings()
+        self._update_output_dir_preview()
+
+        config_layout.addWidget(self.config_container)
+        config_layout.addStretch()
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidget(config_widget)
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
+        self.splitter.addWidget(scroll_area)
+        self.splitter.addWidget(self._build_progress_section())
+
+        self.splitter.setStretchFactor(0, 60)
+        self.splitter.setStretchFactor(1, 40)
+
+        layout.addLayout(self._build_button_row())
+
+    def _build_status_group(self):
         status_group = QGroupBox("Rust DB Core 상태")
         status_layout = QVBoxLayout(status_group)
 
@@ -265,9 +287,9 @@ class RustDumpExportDialog(QDialog):
             status_layout.addWidget(btn_guide)
 
         status_layout.addWidget(status_label)
-        container_layout.addWidget(status_group)
+        return status_group
 
-        # --- Export 유형 선택 ---
+    def _build_export_type_group(self):
         type_group = QGroupBox("Export 유형")
         type_layout = QVBoxLayout(type_group)
 
@@ -284,9 +306,13 @@ class RustDumpExportDialog(QDialog):
 
         type_layout.addWidget(self.radio_full)
         type_layout.addWidget(self.radio_partial)
-        container_layout.addWidget(type_group)
+        return type_group
 
-        # --- 스키마 선택 ---
+    def _build_schema_section(self):
+        section = QWidget()
+        section_layout = QVBoxLayout(section)
+        section_layout.setContentsMargins(0, 0, 0, 0)
+
         schema_layout = QHBoxLayout()
         schema_layout.addWidget(QLabel("Schema:"))
         self.combo_schema = QComboBox()
@@ -294,9 +320,8 @@ class RustDumpExportDialog(QDialog):
         self.combo_schema.currentTextChanged.connect(self.on_schema_changed)
         schema_layout.addWidget(self.combo_schema)
         schema_layout.addStretch()
-        container_layout.addLayout(schema_layout)
+        section_layout.addLayout(schema_layout)
 
-        # --- 테이블 선택 (일부 테이블 Export 시) ---
         self.table_group = QGroupBox("테이블 선택")
         table_layout = QVBoxLayout(self.table_group)
 
@@ -334,9 +359,8 @@ class RustDumpExportDialog(QDialog):
         table_layout.addWidget(self.chk_include_fk)
 
         self.table_group.setVisible(False)
-        container_layout.addWidget(self.table_group)
+        section_layout.addWidget(self.table_group)
 
-        # --- Export 옵션 ---
         option_group = QGroupBox("Export 옵션")
         option_layout = QFormLayout(option_group)
 
@@ -351,13 +375,13 @@ class RustDumpExportDialog(QDialog):
         self.combo_compression.setToolTip("Rust DB Core dump 압축 방식입니다. zstd는 디스크 사용량을 줄이고 import 시 스트리밍 해제됩니다.")
         option_layout.addRow("압축 방식:", self.combo_compression)
 
-        container_layout.addWidget(option_group)
+        section_layout.addWidget(option_group)
+        return section
 
-        # --- 출력 폴더 설정 ---
+    def _build_output_folder_group(self):
         folder_group = QGroupBox("출력 폴더 설정")
         folder_main_layout = QVBoxLayout(folder_group)
 
-        # 기본 위치
         base_layout = QHBoxLayout()
         base_layout.addWidget(QLabel("기본 위치:"))
         self.input_base_dir = QLineEdit()
@@ -376,17 +400,14 @@ class RustDumpExportDialog(QDialog):
         base_layout.addWidget(btn_browse_base)
         folder_main_layout.addLayout(base_layout)
 
-        # 폴더 이름 옵션
         naming_layout = QHBoxLayout()
         naming_layout.addWidget(QLabel("폴더 이름:"))
 
-        # 자동 지정 라디오
         self.radio_auto_naming = QRadioButton("자동 지정")
         self.radio_auto_naming.setChecked(True)
         self.radio_auto_naming.toggled.connect(self._on_naming_mode_changed)
         naming_layout.addWidget(self.radio_auto_naming)
 
-        # 자동 지정 옵션 체크박스들
         self.chk_name = QCheckBox("name")
         self.chk_name.setChecked(True)
         self.chk_name.setToolTip("연결 정보 (터널명 또는 host_port)")
@@ -419,7 +440,6 @@ class RustDumpExportDialog(QDialog):
         naming_layout.addStretch()
         folder_main_layout.addLayout(naming_layout)
 
-        # 최종 경로 미리보기
         preview_layout = QHBoxLayout()
         preview_layout.addWidget(QLabel("최종 경로:"))
         self.input_output_dir = QLineEdit()
@@ -428,38 +448,19 @@ class RustDumpExportDialog(QDialog):
         preview_layout.addWidget(self.input_output_dir)
         folder_main_layout.addLayout(preview_layout)
 
-        container_layout.addWidget(folder_group)
+        return folder_group
 
-        # 초기 출력 경로 설정
-        self._load_naming_settings()
-        self._update_output_dir_preview()
-
-        # 설정 컨테이너를 config_layout에 추가
-        config_layout.addWidget(self.config_container)
-        config_layout.addStretch()
-
-        # 스크롤 영역으로 감싸기
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(config_widget)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setFrameShape(QScrollArea.Shape.NoFrame)
-        self.splitter.addWidget(scroll_area)
-
-        # ========== 하단: 진행 상황 영역 ==========
+    def _build_progress_section(self):
         progress_widget = QWidget()
         progress_main_layout = QVBoxLayout(progress_widget)
         progress_main_layout.setContentsMargins(0, 0, 0, 0)
-        self.splitter.addWidget(progress_widget)
 
-        # --- 진행 상황 (개선된 UI) ---
         self.progress_group = QGroupBox("진행 상황")
         self.progress_group.setVisible(False)
         progress_layout = QVBoxLayout(self.progress_group)
 
-        # 상세 진행률 표시 영역
         detail_layout = QHBoxLayout()
 
-        # 왼쪽: 진행률 정보
         left_detail = QVBoxLayout()
         self.label_percent = QLabel("📊 진행률: 0%")
         self.label_percent.setStyleSheet("font-weight: bold; font-size: 12pt;")
@@ -477,7 +478,6 @@ class RustDumpExportDialog(QDialog):
         detail_layout.addStretch()
         progress_layout.addLayout(detail_layout)
 
-        # 프로그레스 바 (퍼센트 기준)
         self.progress_bar = QProgressBar()
         self.progress_bar.setTextVisible(True)
         self.progress_bar.setFormat("%p%")
@@ -498,14 +498,12 @@ class RustDumpExportDialog(QDialog):
         """)
         progress_layout.addWidget(self.progress_bar)
 
-        # 상태 라벨
         self.label_status = QLabel("준비 중...")
         self.label_status.setStyleSheet("color: #27ae60; font-weight: bold;")
         progress_layout.addWidget(self.label_status)
 
         progress_main_layout.addWidget(self.progress_group)
 
-        # --- 테이블 상태 목록 (GitHub Actions 스타일) ---
         self.table_status_group = QGroupBox("테이블 Export 상태")
         self.table_status_group.setVisible(False)
         table_status_layout = QVBoxLayout(self.table_status_group)
@@ -527,10 +525,8 @@ class RustDumpExportDialog(QDialog):
         table_status_layout.addWidget(self.table_list)
         progress_main_layout.addWidget(self.table_status_group)
 
-        # 테이블 아이템 매핑 (테이블명 -> QListWidgetItem)
         self.table_items = {}
 
-        # --- 실행 로그 (터미널 스타일) ---
         self.log_group = QGroupBox("실행 로그")
         self.log_group.setVisible(False)
         log_layout = QVBoxLayout(self.log_group)
@@ -553,12 +549,9 @@ class RustDumpExportDialog(QDialog):
         """)
         log_layout.addWidget(self.txt_log)
         progress_main_layout.addWidget(self.log_group)
+        return progress_widget
 
-        # Splitter 초기 비율 설정 (설정:진행 = 60:40)
-        self.splitter.setStretchFactor(0, 60)
-        self.splitter.setStretchFactor(1, 40)
-
-        # --- 버튼 ---
+    def _build_button_row(self):
         button_layout = QHBoxLayout()
 
         self.btn_export = QPushButton("🚀 Export 시작")
@@ -599,39 +592,7 @@ class RustDumpExportDialog(QDialog):
         button_layout.addStretch()
         button_layout.addWidget(self.btn_export)
         button_layout.addWidget(btn_cancel)
-        layout.addLayout(button_layout)
-
-    def toggle_config_section(self):
-        """설정 섹션 접기/펼치기"""
-        is_visible = self.config_container.isVisible()
-
-        if is_visible:
-            # 접기
-            self.config_container.setVisible(False)
-            self.btn_collapse.setText("🔼 설정 펼치기")
-        else:
-            # 펼치기
-            self.config_container.setVisible(True)
-            self.btn_collapse.setText("🔽 설정 접기")
-
-    def collapse_config_section(self):
-        """설정 섹션을 접음 (Export 시작 시)"""
-        self.config_container.setVisible(False)
-        self.btn_collapse.setText("🔼 설정 펼치기")
-        self.btn_collapse.setVisible(True)
-
-        # Splitter 비율 조정 (설정:진행 = 10:90)
-        total_height = self.splitter.height()
-        self.splitter.setSizes([int(total_height * 0.1), int(total_height * 0.9)])
-
-    def expand_config_section(self):
-        """설정 섹션을 펼침 (Export 완료 시)"""
-        self.config_container.setVisible(True)
-        self.btn_collapse.setText("🔽 설정 접기")
-
-        # Splitter 비율 복원 (설정:진행 = 60:40)
-        total_height = self.splitter.height()
-        self.splitter.setSizes([int(total_height * 0.6), int(total_height * 0.4)])
+        return button_layout
 
     def _get_base_output_dir(self) -> str:
         """기본 출력 디렉토리 (부모 폴더)"""
@@ -639,7 +600,6 @@ class RustDumpExportDialog(QDialog):
             saved = self.config_manager.get_app_setting('rust_dump_export_base_dir')
             if saved:
                 return saved
-        import os
         return os.path.join(os.path.expanduser("~"), "Desktop")
 
     def _generate_output_dir(self, schema: str = "") -> str:
@@ -647,52 +607,25 @@ class RustDumpExportDialog(QDialog):
         동적 출력 폴더명 생성
         설정에 따라 name, schema, timestamp 조합
         """
-        import os
-        from datetime import datetime
-        from pathlib import Path
-
         base_dir = self._get_base_output_dir()
-
-        def safe_component(value: str) -> str:
-            safe = value.replace(':', '_').replace('/', '_').replace('\\', '_')
-            safe = safe.replace('*', '_').replace('?', '_').replace('"', '_')
-            safe = safe.replace('<', '_').replace('>', '_').replace('|', '_')
-            safe = safe.strip().strip(".")
-            return safe if safe not in {".", ".."} else ""
-
-        def safe_join(folder_name: str) -> str:
-            fallback = f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-            folder_name = safe_component(folder_name) or fallback
-            base_path = Path(base_dir).expanduser().resolve()
-            output_path = (base_path / folder_name).resolve()
-            try:
-                if not output_path.is_relative_to(base_path):
-                    output_path = (base_path / fallback).resolve()
-            except ValueError:
-                output_path = (base_path / fallback).resolve()
-            return str(output_path)
 
         # 수동 모드일 경우
         if hasattr(self, 'radio_manual_naming') and self.radio_manual_naming.isChecked():
             manual_name = self.input_manual_folder.text().strip()
             if manual_name:
-                return safe_join(manual_name)
-            return safe_join(f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                return safe_output_dir(base_dir, manual_name)
+            return safe_output_dir(base_dir, f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
         # 자동 모드
         parts = []
 
         # name (연결 정보)
         if hasattr(self, 'chk_name') and self.chk_name.isChecked() and self.connection_info:
-            safe_conn = safe_component(self.connection_info)
-            if safe_conn:
-                parts.append(safe_conn)
+            parts.append(self.connection_info)
 
         # schema
         if hasattr(self, 'chk_schema') and self.chk_schema.isChecked() and schema:
-            safe_schema = safe_component(schema)
-            if safe_schema:
-                parts.append(safe_schema)
+            parts.append(schema)
 
         # timestamp
         if hasattr(self, 'chk_timestamp') and self.chk_timestamp.isChecked():
@@ -704,7 +637,7 @@ class RustDumpExportDialog(QDialog):
             parts.append(f"export_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
 
         folder_name = "_".join(parts)
-        return safe_join(folder_name)
+        return safe_output_dir(base_dir, folder_name)
 
     def _get_default_output_dir(self) -> str:
         """기본 출력 디렉토리 (초기값)"""
@@ -888,15 +821,7 @@ class RustDumpExportDialog(QDialog):
                 QMessageBox.warning(self, "오류", "최소 하나의 테이블을 선택하세요.")
                 return
 
-        # 실행 시점 기준으로 출력 폴더를 재생성한다.
-        # 미리보기(_update_output_dir_preview)는 스키마 변경 시 등 이전 시점에
-        # 생성된 값이라 타임스탬프가 오래됐을 수 있어, 같은 세션에서 연속 Export
-        # 시 동일 폴더를 재사용하는 문제가 있었다.
-        output_dir = self.input_output_dir.text()
-        is_auto_mode = not self.radio_manual_naming.isChecked()
-        if is_auto_mode and self.chk_timestamp.isChecked():
-            output_dir = self._generate_output_dir(schema)
-        output_dir = self._unique_output_dir(output_dir)
+        output_dir = self._resolve_output_dir(schema)
 
         if not output_dir:
             QMessageBox.warning(self, "오류", "출력 폴더를 선택하세요.")
@@ -909,27 +834,7 @@ class RustDumpExportDialog(QDialog):
             self.config_manager.set_app_setting('rust_dump_export_dir', output_dir)
             self.config_manager.set_app_setting('rust_dump_last_dump_dir', output_dir)
 
-        # 로그 수집 초기화
-        self.log_entries.clear()
-        self.export_start_time = datetime.now()
-        self.export_end_time = None
-        self.export_success = None
-        self.export_schema = schema
-        self.export_tables = self.get_selected_tables() if self.radio_partial.isChecked() else []
-        self.export_table_totals = {}
-        self.export_table_done = {}
-        self.export_table_status = {}
-        self.export_total_rows = 0
-        self.export_completed_tables = 0
-        self.export_completed_table_names = set()
-        self.export_total_tables = 0
-        self.export_last_percent = 0
-        self.export_telemetry_events = []
-        self.export_table_started_at = {}
-        self.export_table_finished_at = {}
-        self.btn_save_log.setEnabled(False)
-        self._cancel_requested = False
-        self._close_after_cancel = False
+        self._reset_export_state(schema)
 
         # 로그 헤더 추가
         self._add_log(f"{'='*60}")
@@ -969,34 +874,8 @@ class RustDumpExportDialog(QDialog):
         self.label_tables.setText("📋 테이블: 0 / 0 완료")
         self.label_status.setText("Export 준비 중...")
 
-        # Rust DB Core 설정
-        config = RustDumpConfig(
-            host=getattr(self.connector, 'host', "127.0.0.1"),
-            port=self.connector.port if hasattr(self.connector, 'port') else 3306,
-            user=self.connector.user if hasattr(self.connector, 'user') else "root",
-            password=self.connector.password if hasattr(self.connector, 'password') else "",
-            engine=getattr(self.connector, 'engine', "mysql"),
-        )
-
         # 작업 스레드 시작
-        if self.radio_full.isChecked():
-            self.worker = RustDumpWorker(
-                "export_schema", config,
-                schema=schema,
-                output_dir=output_dir,
-                threads=self.spin_threads.value(),
-                compression=self.combo_compression.currentText()
-            )
-        else:
-            self.worker = RustDumpWorker(
-                "export_tables", config,
-                schema=schema,
-                tables=self.get_selected_tables(),
-                output_dir=output_dir,
-                threads=self.spin_threads.value(),
-                compression=self.combo_compression.currentText(),
-                include_fk_parents=self.chk_include_fk.isChecked()
-            )
+        self.worker = self._build_worker(schema, output_dir)
 
         # 시그널 연결
         self.worker.progress.connect(self.on_progress)
@@ -1006,6 +885,59 @@ class RustDumpExportDialog(QDialog):
         self.worker.raw_output.connect(self.on_raw_output)
         self.worker.finished.connect(self.on_finished)
         self.worker.start()
+
+    def _resolve_output_dir(self, schema: str) -> str:
+        # 실행 시점 기준으로 출력 폴더를 재생성한다.
+        # 미리보기(_update_output_dir_preview)는 스키마 변경 시 등 이전 시점에
+        # 생성된 값이라 타임스탬프가 오래됐을 수 있어, 같은 세션에서 연속 Export
+        # 시 동일 폴더를 재사용하는 문제가 있었다.
+        output_dir = self.input_output_dir.text()
+        is_auto_mode = not self.radio_manual_naming.isChecked()
+        if is_auto_mode and self.chk_timestamp.isChecked():
+            output_dir = self._generate_output_dir(schema)
+        return self._unique_output_dir(output_dir)
+
+    def _reset_export_state(self, schema: str):
+        self.log_entries.clear()
+        self.export_start_time = datetime.now()
+        self.export_end_time = None
+        self.export_success = None
+        self.export_schema = schema
+        self.export_tables = self.get_selected_tables() if self.radio_partial.isChecked() else []
+        self.export_table_totals = {}
+        self.export_table_done = {}
+        self.export_table_status = {}
+        self.export_total_rows = 0
+        self.export_completed_tables = 0
+        self.export_completed_table_names = set()
+        self.export_total_tables = 0
+        self.export_last_percent = 0
+        self.export_telemetry_events = []
+        self.export_table_started_at = {}
+        self.export_table_finished_at = {}
+        self.btn_save_log.setEnabled(False)
+        self._cancel_requested = False
+        self._close_after_cancel = False
+
+    def _build_worker(self, schema: str, output_dir: str):
+        config = build_rust_dump_config(self.connector)
+        if self.radio_full.isChecked():
+            return RustDumpWorker(
+                "export_schema", config,
+                schema=schema,
+                output_dir=output_dir,
+                threads=self.spin_threads.value(),
+                compression=self.combo_compression.currentText()
+            )
+        return RustDumpWorker(
+            "export_tables", config,
+            schema=schema,
+            tables=self.get_selected_tables(),
+            output_dir=output_dir,
+            threads=self.spin_threads.value(),
+            compression=self.combo_compression.currentText(),
+            include_fk_parents=self.chk_include_fk.isChecked()
+        )
 
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용)"""
@@ -1183,15 +1115,7 @@ class RustDumpExportDialog(QDialog):
         elif status in ("done", "error"):
             self.export_table_finished_at[table_name] = now
 
-        # 상태별 아이콘 및 스타일
-        status_icons = {
-            'pending': '⏳',
-            'loading': '🔄',
-            'done': '✅',
-            'error': '❌'
-        }
-
-        icon = status_icons.get(status, '❓')
+        icon = TABLE_STATUS_ICONS.get(status, '❓')
 
         # 기존 아이템이 있으면 업데이트, 없으면 새로 생성
         if table_name in self.table_items:
@@ -1235,15 +1159,15 @@ class RustDumpExportDialog(QDialog):
             visible_summary = format_export_visible_telemetry(event)
 
         if visible_summary:
-            # 너무 많은 로그 방지 (최대 500줄)
-            if self.txt_log.count() > 500:
+            # 너무 많은 로그 방지
+            if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
                 self.txt_log.takeItem(0)
             self.txt_log.addItem(visible_summary)
             self.txt_log.scrollToBottom()
             self._add_log(visible_summary)
         elif not is_telemetry_event:
-            # 너무 많은 로그 방지 (최대 500줄)
-            if self.txt_log.count() > 500:
+            # 너무 많은 로그 방지
+            if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
                 self.txt_log.takeItem(0)
             self.txt_log.addItem(line)
             self.txt_log.scrollToBottom()
@@ -1260,26 +1184,7 @@ class RustDumpExportDialog(QDialog):
             'mode': '전체 스키마' if self.radio_full.isChecked() else '선택 테이블'
         }
 
-        from src.ui.workers.github_worker import GitHubReportWorker
-        worker = GitHubReportWorker(
-            self.config_manager, error_type, error_message, context
-        )
-        self._github_workers.append(worker)
-        worker.finished.connect(
-            lambda success, message, worker=worker: self._on_github_report_finished(success, message, worker)
-        )
-        worker.start()
-
-    def _on_github_report_finished(self, success: bool, message: str, worker=None):
-        """GitHub 이슈 보고 완료 콜백"""
-        if success:
-            self._add_log(f"🐙 GitHub: {message}")
-        else:
-            self._add_log(f"⚠️ GitHub 이슈 보고 실패: {message}")
-        if worker is not None and worker in self._github_workers:
-            self._github_workers.remove(worker)
-        if worker is not None:
-            worker.deleteLater()
+        self._start_github_report_worker(error_type, error_message, context)
 
     def _export_table_duration_seconds(self, table_name: str) -> float:
         start = self.export_table_started_at.get(table_name)

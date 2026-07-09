@@ -104,6 +104,35 @@ class TestRustDumpConfig:
 
         assert config.engine == 'postgresql'
 
+    def test_build_config_from_connector_preserves_values(self):
+        from src.exporters.rust_dump_exporter import build_rust_dump_config
+
+        class Connector:
+            host = "db.example.com"
+            port = 5432
+            user = "postgres"
+            password = "secret"
+            engine = "postgresql"
+
+        config = build_rust_dump_config(Connector())
+
+        assert config.host == "db.example.com"
+        assert config.port == 5432
+        assert config.user == "postgres"
+        assert config.password == "secret"
+        assert config.engine == "postgresql"
+
+    def test_build_config_from_connector_uses_legacy_defaults(self):
+        from src.exporters.rust_dump_exporter import build_rust_dump_config
+
+        config = build_rust_dump_config(object())
+
+        assert config.host == "127.0.0.1"
+        assert config.port == 3306
+        assert config.user == "root"
+        assert config.password == ""
+        assert config.engine == "mysql"
+
 
 class TestForeignKeyResolver:
     """ForeignKeyResolver 클래스 테스트"""
