@@ -287,14 +287,25 @@ pub(crate) fn dump_import_row_progress_event(
     event
 }
 
-fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
-    let endpoint = request_endpoint(request)?;
+/// dump.run 요청 payload에서 파싱·검증한 옵션 묶음.
+struct DumpRunOptions {
+    output_dir: String,
+    chunk_size: usize,
+    threads: usize,
+    overwrite: bool,
+    selected_tables: Vec<String>,
+    data_format: String,
+    compression: String,
+}
+
+fn parse_dump_run_options(request: &Request) -> Result<DumpRunOptions, String> {
     let output_dir = request
         .payload
         .get("output_dir")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| "dump.run requires output_dir".to_string())?;
+        .ok_or_else(|| "dump.run requires output_dir".to_string())?
+        .to_string();
     let chunk_size = request
         .payload
         .get("chunk_size")
@@ -333,16 +344,111 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     if !matches!(compression.as_str(), "none" | "zstd") {
         return Err(format!("unsupported dump compression: {compression}"));
     }
+    Ok(DumpRunOptions {
+        output_dir,
+        chunk_size,
+        threads,
+        overwrite,
+        selected_tables,
+        data_format,
+        compression,
+    })
+}
 
-    let output_path = Path::new(output_dir);
-    prepare_dump_output_dir(output_path, overwrite)?;
+/// engine/threads/table_total로 결정되는 덤프 실행 전략.
+enum DumpStrategy {
+    SingleMysqlParallel,
+    GlobalMysql,
+    TableParallel,
+    Sequential,
+}
+
+impl DumpStrategy {
+    fn scheduler_label(&self) -> &'static str {
+        match self {
+            DumpStrategy::GlobalMysql => "global_chunk",
+            _ => "table_parallel",
+        }
+    }
+}
+
+fn select_dump_strategy(engine: &str, threads: usize, table_total: usize) -> DumpStrategy {
+    if engine == "mysql" && threads > 1 && table_total == 1 {
+        DumpStrategy::SingleMysqlParallel
+    } else if engine == "mysql" && threads > 1 && table_total > 1 {
+        DumpStrategy::GlobalMysql
+    } else if threads > 1 && table_total > 1 {
+        DumpStrategy::TableParallel
+    } else {
+        DumpStrategy::Sequential
+    }
+}
+
+/// View 정의 수집(전체 export 시) + DumpManifest 조립 및 파일 기록. (manifest, view 개수)를 반환한다.
+fn finalize_dump_manifest<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    schema: NormalizedSchema,
+    table_manifests: Vec<DumpTableManifest>,
+    options: &DumpRunOptions,
+    output_path: &Path,
+    full_export: bool,
+    request_id: Option<String>,
+    mut emit: F,
+) -> Result<(DumpManifest, usize), String> {
+    // View 정의 수집 (전체 export 시에만). 실패해도 테이블 덤프는 유효하므로 fatal로 보지 않는다.
+    let views = if full_export {
+        match collect_views(endpoint) {
+            Ok(views) => views,
+            Err(err) => {
+                emit(json!({
+                    "event": "phase",
+                    "request_id": request_id,
+                    "phase": "dump",
+                    "message": format!("View 정의 수집 실패 (테이블 덤프는 정상): {err}"),
+                }));
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+    let views_count = views.len();
+    let (snapshot_policy, strict_export, manifest_warnings) =
+        dump_manifest_consistency_metadata(options.threads);
+
+    let manifest = DumpManifest {
+        format: "tunnelforge-dump".to_string(),
+        format_version: if options.data_format == "jsonl" { 1 } else { 2 },
+        data_format: options.data_format.clone(),
+        compression: options.compression.clone(),
+        source_engine: endpoint.engine.clone(),
+        database: endpoint.database.clone(),
+        schema,
+        snapshot_policy,
+        strict_export,
+        manifest_warnings,
+        chunk_size: options.chunk_size,
+        created_unix_seconds: current_unix_seconds(),
+        tables: table_manifests,
+        views,
+    };
+    write_dump_manifest(output_path, &manifest)?;
+    Ok((manifest, views_count))
+}
+
+fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
+    let endpoint = request_endpoint(request)?;
+    let options = parse_dump_run_options(request)?;
+
+    let output_path = Path::new(&options.output_dir);
+    prepare_dump_output_dir(output_path, options.overwrite)?;
 
     // 부분 export(tables 지정) 시에는 View가 참조하는 base table이 빠질 수 있으므로 View를 수집하지 않는다.
-    let full_export = selected_tables.is_empty();
+    let full_export = options.selected_tables.is_empty();
     let inspection = inspect_live(&endpoint)?;
     let mut schema = inspection.schema;
-    if !selected_tables.is_empty() {
-        let selected: BTreeSet<String> = selected_tables.into_iter().collect();
+    if !options.selected_tables.is_empty() {
+        let selected: BTreeSet<String> = options.selected_tables.iter().cloned().collect();
         schema.tables.retain(|table| selected.contains(&table.name));
     }
     schema = dependency_ordered_schema(&schema);
@@ -358,8 +464,9 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     ));
 
     let table_total = schema.tables.len();
-    let parallel_limits = dump_parallel_limits(threads, table_total);
-    let export_tables = if threads > 1 && table_total > 1 {
+    let parallel_limits = dump_parallel_limits(options.threads, table_total);
+    let strategy = select_dump_strategy(&endpoint.engine, options.threads, table_total);
+    let export_tables = if options.threads > 1 && table_total > 1 {
         dump_schedule_order(&schema.tables, &row_counts)
     } else {
         schema.tables.clone()
@@ -369,26 +476,22 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         &export_tables,
         &row_counts,
         parallel_limits,
-        threads,
-        chunk_size,
-        &data_format,
-        &compression,
-        if endpoint.engine == "mysql" && threads > 1 && table_total > 1 {
-            "global_chunk"
-        } else {
-            "table_parallel"
-        },
+        options.threads,
+        options.chunk_size,
+        &options.data_format,
+        &options.compression,
+        strategy.scheduler_label(),
     ));
     let ctx = DumpJobContext {
         endpoint: endpoint.clone(),
         output_path: output_path.to_path_buf(),
-        chunk_size,
-        data_format: data_format.clone(),
-        compression: compression.clone(),
+        chunk_size: options.chunk_size,
+        data_format: options.data_format.clone(),
+        compression: options.compression.clone(),
         request_id: request.request_id.clone(),
     };
-    let (table_manifests, total_rows, total_chunks) =
-        if endpoint.engine == "mysql" && threads > 1 && table_total == 1 {
+    let (table_manifests, total_rows, total_chunks) = match strategy {
+        DumpStrategy::SingleMysqlParallel => {
             match dump_single_mysql_table_parallel(
                 &ctx,
                 &export_tables[0],
@@ -401,66 +504,40 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                     dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
                 }
             }
-        } else if endpoint.engine == "mysql" && threads > 1 && table_total > 1 {
-            dump_tables_global_mysql(&ctx, &export_tables, threads, |event| emit(event))?
-        } else if threads > 1 && table_total > 1 {
-            dump_tables_parallel(
-                &ctx,
-                &export_tables,
-                parallel_limits.table_workers,
-                parallel_limits.range_workers_per_table,
-                |event| emit(event),
-            )?
-        } else {
+        }
+        DumpStrategy::GlobalMysql => {
+            dump_tables_global_mysql(&ctx, &export_tables, options.threads, |event| emit(event))?
+        }
+        DumpStrategy::TableParallel => dump_tables_parallel(
+            &ctx,
+            &export_tables,
+            parallel_limits.table_workers,
+            parallel_limits.range_workers_per_table,
+            |event| emit(event),
+        )?,
+        DumpStrategy::Sequential => {
             let mut adapter = LiveAdapter::connect(&endpoint)?;
             dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
-        };
-
-    // View 정의 수집 (전체 export 시에만). 실패해도 테이블 덤프는 유효하므로 fatal로 보지 않는다.
-    let views = if full_export {
-        match collect_views(&endpoint) {
-            Ok(views) => views,
-            Err(err) => {
-                emit(json!({
-                    "event": "phase",
-                    "request_id": request.request_id,
-                    "phase": "dump",
-                    "message": format!("View 정의 수집 실패 (테이블 덤프는 정상): {err}"),
-                }));
-                Vec::new()
-            }
         }
-    } else {
-        Vec::new()
     };
-    let views_count = views.len();
-    let (snapshot_policy, strict_export, manifest_warnings) =
-        dump_manifest_consistency_metadata(threads);
 
-    let manifest = DumpManifest {
-        format: "tunnelforge-dump".to_string(),
-        format_version: if data_format == "jsonl" { 1 } else { 2 },
-        data_format,
-        compression,
-        source_engine: endpoint.engine.clone(),
-        database: endpoint.database.clone(),
+    let (manifest, views_count) = finalize_dump_manifest(
+        &endpoint,
         schema,
-        snapshot_policy,
-        strict_export,
-        manifest_warnings,
-        chunk_size,
-        created_unix_seconds: current_unix_seconds(),
-        tables: table_manifests,
-        views,
-    };
-    write_dump_manifest(output_path, &manifest)?;
+        table_manifests,
+        &options,
+        output_path,
+        full_export,
+        request.request_id.clone(),
+        |event| emit(event),
+    )?;
 
     Ok(json!({
         "event": "result",
         "request_id": request.request_id,
         "command": "dump.run",
         "success": true,
-        "output_dir": output_dir,
+        "output_dir": options.output_dir,
         "format": manifest.format,
         "format_version": manifest.format_version,
         "compression": manifest.compression,
