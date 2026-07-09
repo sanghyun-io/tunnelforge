@@ -3,9 +3,17 @@
 """
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import List, Dict, Set, Optional, Tuple, Callable, Any
+from typing import List, Dict, Set, Optional, Tuple, Callable, Any, TYPE_CHECKING
 
 from src.core.migration_constants import IssueType
+
+if TYPE_CHECKING:
+    from src.core.db_connector import MySQLConnector
+
+
+# 마이그레이션 자동 수정의 목표 charset/collation (wizard-domain 공유 상수)
+DEFAULT_TARGET_CHARSET = "utf8mb4"
+DEFAULT_TARGET_COLLATION = "utf8mb4_unicode_ci"
 
 
 class FixStrategy(Enum):
@@ -80,11 +88,6 @@ class FixWizardStep:
     selected_option: Optional[FixOption] = None
     user_input: Optional[str] = None                 # 사용자 입력값
 
-    # FK 연관 테이블 일괄 변경으로 인한 자동 포함 정보
-    # (옵션 선택 단계만 생략, 실제 SQL에는 포함됨)
-    included_by: Optional[str] = None                # 포함시킨 원본 테이블명 (예: "companies")
-    included_reason: str = ""                        # 포함 사유 설명
-
 
 @dataclass
 class FixExecutionResult:
@@ -145,6 +148,34 @@ def _format_default_sql_clause(col_info: Dict[str, Any]) -> str:
     # 문자열/기타 → 작은따옴표로 감싸기 (내부 ' 이스케이프)
     escaped = default_val.replace("'", "''")
     return f"DEFAULT '{escaped}'"
+
+
+def get_table_charset(connector: "MySQLConnector", schema: str, table: str) -> Tuple[str, str]:
+    """테이블의 현재 charset/collation 조회 (공유 read-only 헬퍼)
+
+    INFORMATION_SCHEMA.TABLES + COLLATION_CHARACTER_SET_APPLICABILITY join으로
+    테이블 레벨 charset/collation을 조회한다. CharsetFixPlanBuilder와
+    RollbackSQLGenerator가 공유한다 (mutation 경로 아님).
+
+    Returns:
+        (charset, collation) 튜플. 조회 실패 시 ('utf8mb3', 'utf8mb3_general_ci').
+    """
+    query = """
+    SELECT
+        TABLE_COLLATION,
+        CCSA.CHARACTER_SET_NAME as TABLE_CHARSET
+    FROM INFORMATION_SCHEMA.TABLES T
+    LEFT JOIN INFORMATION_SCHEMA.COLLATION_CHARACTER_SET_APPLICABILITY CCSA
+        ON T.TABLE_COLLATION = CCSA.COLLATION_NAME
+    WHERE T.TABLE_SCHEMA = %s AND T.TABLE_NAME = %s
+    """
+    result = connector.execute(query, (schema, table))
+
+    if result:
+        charset = result[0]['TABLE_CHARSET'] or 'utf8mb3'
+        collation = result[0]['TABLE_COLLATION'] or 'utf8mb3_general_ci'
+        return charset, collation
+    return 'utf8mb3', 'utf8mb3_general_ci'
 
 
 @dataclass
