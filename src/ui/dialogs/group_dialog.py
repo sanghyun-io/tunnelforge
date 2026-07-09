@@ -14,6 +14,9 @@ from PyQt6.QtGui import QColor
 from src.ui.styles import ButtonStyles
 
 
+DEFAULT_GROUP_COLOR = '#3498db'
+
+
 class GroupDialog(QDialog):
     """그룹 생성/수정 다이얼로그"""
 
@@ -26,7 +29,7 @@ class GroupDialog(QDialog):
         super().__init__(parent)
         self._group_data = group_data
         self._is_edit_mode = group_data is not None
-        self._selected_color = group_data.get('color', '#3498db') if group_data else '#3498db'
+        self._selected_color = group_data.get('color', DEFAULT_GROUP_COLOR) if group_data else DEFAULT_GROUP_COLOR
 
         self.setWindowTitle("그룹 수정" if self._is_edit_mode else "새 그룹")
         self.setFixedSize(400, 200)

@@ -2,20 +2,17 @@
 import os
 import subprocess
 import sys
-from dataclasses import dataclass
-from typing import Optional
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
-                             QWidget, QTextBrowser, QSizePolicy, QTextEdit,
+                             QWidget, QTextBrowser, QSizePolicy,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
                              QSpinBox, QProgressBar, QApplication)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QDesktopServices, QCursor, QFont
+from PyQt6.QtCore import Qt
+from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
-from src.core.logger import get_log_file_path, get_log_dir, read_log_file, filter_log_by_level, clear_log_file
 from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
 from src.core.platform_integration import (
     StartupRegistrar,
@@ -27,17 +24,26 @@ from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
 from src.ui.styles import ButtonStyles
 from src.ui.dialogs.settings_close_confirm_dialog import CloseConfirmDialog
+from src.ui.dialogs.settings_log_tab import LogViewerTab
 from src.ui.dialogs.settings_update_helpers import (
-    UpdatePackageActionText,
     update_package_action_text,
     UpdateCheckerThread,
 )
 
 
+def _collect_active_tunnel_names(main_window) -> list[str]:
+    if not main_window or not hasattr(main_window, 'engine'):
+        return []
 
+    active_tunnels = main_window.engine.active_tunnels
+    if len(active_tunnels) == 0:
+        return []
 
-
-
+    tunnel_names = []
+    for tid in active_tunnels:
+        config = main_window.engine.tunnel_configs.get(tid, {})
+        tunnel_names.append(config.get('name', tid))
+    return tunnel_names
 
 
 class SettingsDialog(QDialog):
@@ -82,6 +88,20 @@ class SettingsDialog(QDialog):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        layout.addWidget(self._build_language_group())
+        layout.addWidget(self._build_close_behavior_group())
+        layout.addWidget(self._build_theme_group())
+        layout.addWidget(self._build_github_group())
+        self._load_github_settings()
+        layout.addWidget(self._build_backup_group())
+        self._refresh_backup_list()
+        layout.addWidget(self._build_reconnect_group())
+        layout.addWidget(self._build_startup_group())
+        layout.addStretch()
+
+        return tab
+
+    def _build_language_group(self) -> QGroupBox:
         language_group = QGroupBox(tr("settings.language"))
         language_layout = QVBoxLayout(language_group)
         language_row = QHBoxLayout()
@@ -100,9 +120,9 @@ class SettingsDialog(QDialog):
         restart_note.setStyleSheet("color: gray; font-size: 11px;")
         restart_note.setWordWrap(True)
         language_layout.addWidget(restart_note)
-        layout.addWidget(language_group)
+        return language_group
 
-        # 종료 동작 설정 그룹
+    def _build_close_behavior_group(self) -> QGroupBox:
         group_box = QGroupBox(tr("settings.close_behavior"))
         group_layout = QVBoxLayout(group_box)
 
@@ -120,9 +140,6 @@ class SettingsDialog(QDialog):
         self.btn_group.addButton(self.radio_exit)
         group_layout.addWidget(self.radio_exit)
 
-        layout.addWidget(group_box)
-
-        # 현재 설정 로드
         current_action = self.config_mgr.get_app_setting('close_action', 'ask')
         if current_action == 'minimize':
             self.radio_minimize.setChecked(True)
@@ -130,8 +147,9 @@ class SettingsDialog(QDialog):
             self.radio_exit.setChecked(True)
         else:  # 'ask' or default
             self.radio_ask.setChecked(True)
+        return group_box
 
-        # 테마 설정 그룹
+    def _build_theme_group(self) -> QGroupBox:
         theme_group = QGroupBox(tr("settings.theme"))
         theme_layout = QHBoxLayout(theme_group)
 
@@ -158,9 +176,9 @@ class SettingsDialog(QDialog):
 
         theme_layout.addStretch()
 
-        layout.addWidget(theme_group)
+        return theme_group
 
-        # GitHub 이슈 자동 보고 설정 그룹
+    def _build_github_group(self) -> QGroupBox:
         github_group = QGroupBox(tr("settings.github_auto_report"))
         github_layout = QVBoxLayout(github_group)
 
@@ -200,12 +218,9 @@ class SettingsDialog(QDialog):
             desc_label.setWordWrap(True)
             self.chk_auto_report.setEnabled(False)
             github_layout.addWidget(desc_label)
-        layout.addWidget(github_group)
+        return github_group
 
-        # GitHub 설정 로드
-        self._load_github_settings()
-
-        # 설정 백업/복원 그룹
+    def _build_backup_group(self) -> QGroupBox:
         backup_group = QGroupBox(tr("settings.backup_restore"))
         backup_layout = QVBoxLayout(backup_group)
 
@@ -254,12 +269,9 @@ class SettingsDialog(QDialog):
         backup_btn_layout.addStretch()
         backup_layout.addLayout(backup_btn_layout)
 
-        layout.addWidget(backup_group)
+        return backup_group
 
-        # 백업 목록 로드
-        self._refresh_backup_list()
-
-        # 자동 재연결 설정 그룹
+    def _build_reconnect_group(self) -> QGroupBox:
         reconnect_group = QGroupBox(tr("settings.reconnect"))
         reconnect_layout = QVBoxLayout(reconnect_group)
 
@@ -290,9 +302,9 @@ class SettingsDialog(QDialog):
         reconnect_desc.setWordWrap(True)
         reconnect_layout.addWidget(reconnect_desc)
 
-        layout.addWidget(reconnect_group)
+        return reconnect_group
 
-        # 시작 프로그램 설정 그룹
+    def _build_startup_group(self) -> QGroupBox:
         startup_group = QGroupBox(tr("settings.startup"))
         startup_layout = QVBoxLayout(startup_group)
 
@@ -312,9 +324,7 @@ class SettingsDialog(QDialog):
         if not StartupRegistrar().is_supported:
             startup_group.setVisible(False)
 
-        layout.addStretch()
-
-        return tab
+        return startup_group
 
     def _refresh_backup_list(self):
         """백업 목록 새로고침"""
@@ -401,109 +411,8 @@ class SettingsDialog(QDialog):
 
     def _create_log_tab(self) -> QWidget:
         """로그 뷰어 탭 생성"""
-        tab = QWidget()
-        layout = QVBoxLayout(tab)
-
-        # 상단 컨트롤
-        control_layout = QHBoxLayout()
-
-        # 로그 레벨 필터
-        filter_label = QLabel("로그 레벨:")
-        filter_label.setStyleSheet("font-size: 12px;")
-        control_layout.addWidget(filter_label)
-
-        self.log_level_combo = QComboBox()
-        self.log_level_combo.addItems(["ALL", "DEBUG", "INFO", "WARNING", "ERROR"])
-        self.log_level_combo.setCurrentText("ALL")
-        self.log_level_combo.currentTextChanged.connect(self._on_log_filter_changed)
-        self.log_level_combo.setStyleSheet("font-size: 12px; padding: 4px; min-width: 100px;")
-        control_layout.addWidget(self.log_level_combo)
-
-        control_layout.addStretch()
-
-        # 새로고침 버튼
-        btn_refresh_log = QPushButton("새로고침")
-        btn_refresh_log.setStyleSheet(ButtonStyles.INFO_SMALL)
-        btn_refresh_log.clicked.connect(self._refresh_log_viewer)
-        control_layout.addWidget(btn_refresh_log)
-
-        # 로그 폴더 열기 버튼
-        btn_open_log_folder = QPushButton("로그 폴더 열기")
-        btn_open_log_folder.setStyleSheet(ButtonStyles.MUTED_SMALL)
-        btn_open_log_folder.clicked.connect(self._open_log_folder)
-        control_layout.addWidget(btn_open_log_folder)
-
-        # 로그 초기화 버튼
-        btn_clear_log = QPushButton("로그 초기화")
-        btn_clear_log.setStyleSheet(ButtonStyles.DANGER_SMALL)
-        btn_clear_log.clicked.connect(self._clear_log_file)
-        control_layout.addWidget(btn_clear_log)
-
-        layout.addLayout(control_layout)
-
-        # 로그 파일 경로 표시
-        log_path_label = QLabel(f"로그 파일: {get_log_file_path()}")
-        log_path_label.setStyleSheet("font-size: 10px; color: #666; margin: 5px 0;")
-        log_path_label.setWordWrap(True)
-        layout.addWidget(log_path_label)
-
-        # 로그 뷰어 (읽기 전용 텍스트 에디터)
-        self.log_viewer = QTextEdit()
-        self.log_viewer.setReadOnly(True)
-        self.log_viewer.setFont(QFont("Consolas", 9))
-        self.log_viewer.setStyleSheet("""
-            QTextEdit {
-                background-color: #1e1e1e;
-                color: #d4d4d4;
-                border: 1px solid #3c3c3c;
-                border-radius: 4px;
-                padding: 8px;
-            }
-        """)
-        self.log_viewer.setPlaceholderText("로그 파일이 없습니다.")
-        layout.addWidget(self.log_viewer)
-
-        # 최초 로그 로드
-        self._refresh_log_viewer()
-
-        return tab
-
-    def _refresh_log_viewer(self):
-        """로그 뷰어 새로고침"""
-        content = read_log_file(max_lines=500)
-        level = self.log_level_combo.currentText()
-        filtered_content = filter_log_by_level(content, level)
-        self.log_viewer.setPlainText(filtered_content)
-        # 스크롤을 맨 아래로
-        scrollbar = self.log_viewer.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
-
-    def _on_log_filter_changed(self, level: str):
-        """로그 필터 변경 시"""
-        self._refresh_log_viewer()
-
-    def _open_log_folder(self):
-        """로그 폴더를 탐색기에서 열기"""
-        log_dir = get_log_dir()
-        if os.path.exists(log_dir):
-            QDesktopServices.openUrl(QUrl.fromLocalFile(log_dir))
-        else:
-            QMessageBox.information(self, "알림", "로그 폴더가 아직 생성되지 않았습니다.")
-
-    def _clear_log_file(self):
-        """로그 파일 초기화"""
-        reply = QMessageBox.question(
-            self, "로그 초기화",
-            "로그 파일을 초기화하시겠습니까?\n이 작업은 되돌릴 수 없습니다.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            success, msg = clear_log_file()
-            if success:
-                self._refresh_log_viewer()
-                QMessageBox.information(self, "알림", msg)
-            else:
-                QMessageBox.warning(self, "오류", msg)
+        self.log_tab = LogViewerTab(self)
+        return self.log_tab
 
     def _create_about_tab(self) -> QWidget:
         """정보 탭 생성"""
@@ -858,20 +767,15 @@ class SettingsDialog(QDialog):
         action_text = update_package_action_text()
         confirm_msg = f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
 
-        if main_window and hasattr(main_window, 'engine'):
-            active_count = len(main_window.engine.active_tunnels)
-            if active_count > 0:
-                tunnel_names = []
-                for tid in main_window.engine.active_tunnels:
-                    config = main_window.engine.tunnel_configs.get(tid, {})
-                    tunnel_names.append(config.get('name', tid))
-                tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
-                confirm_msg = (
-                    f"{action_text.confirm_question}\n\n"
-                    f"⚠️ 현재 {active_count}개의 활성 터널이 연결 해제됩니다:\n"
-                    f"{tunnel_list}\n\n"
-                    f"{action_text.confirm_body}"
-                )
+        tunnel_names = _collect_active_tunnel_names(main_window)
+        if tunnel_names:
+            tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
+            confirm_msg = (
+                f"{action_text.confirm_question}\n\n"
+                f"⚠️ 현재 {len(tunnel_names)}개의 활성 터널이 연결 해제됩니다:\n"
+                f"{tunnel_list}\n\n"
+                f"{action_text.confirm_body}"
+            )
 
         # 확인 다이얼로그
         reply = QMessageBox.question(

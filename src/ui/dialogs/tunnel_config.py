@@ -8,9 +8,12 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QAction
 import uuid
 
+from src.core.logger import get_logger
 from src.ui.styles import ButtonStyles, LabelStyles
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
+
+logger = get_logger(__name__)
 
 
 class _RunningTestProgressDialog(TestProgressDialog):
@@ -82,12 +85,27 @@ class TunnelConfigDialog(QDialog):
         layout = QVBoxLayout(self)
         form_layout = QFormLayout()
 
-        # --- 1. 기본 정보 ---
+        self._build_basic_info_section(form_layout)
+        self._build_connection_mode_section(form_layout)
+        self._build_bastion_section(form_layout)
+        self._build_target_db_section(form_layout)
+        self._build_environment_section(form_layout)
+        self._build_local_section(form_layout)
+        self._build_auth_section(form_layout)
+
+        layout.addLayout(form_layout)
+
+        # 초기 모드에 따라 UI 상태 설정
+        self.on_mode_changed()
+
+        self._build_footer_section(layout)
+
+    def _build_basic_info_section(self, form_layout: QFormLayout):
         self.input_name = QLineEdit(self.tunnel_data.get('name', ''))
         self.input_name.setPlaceholderText("예: Project A (Master)")
         form_layout.addRow("이름(별칭):", self.input_name)
 
-        # --- 연결 방식 선택 ---
+    def _build_connection_mode_section(self, form_layout: QFormLayout):
         lbl_mode = QLabel("--- 연결 방식 ---")
         lbl_mode.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_mode)
@@ -116,7 +134,7 @@ class TunnelConfigDialog(QDialog):
         self.radio_ssh_tunnel.toggled.connect(self.on_mode_changed)
         self.radio_direct.toggled.connect(self.on_mode_changed)
 
-        # --- 2. Bastion 서버 정보 ---
+    def _build_bastion_section(self, form_layout: QFormLayout):
         self.lbl_bastion = QLabel("--- Bastion Host (중계 서버) ---")
         self.lbl_bastion.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(self.lbl_bastion)
@@ -160,7 +178,7 @@ class TunnelConfigDialog(QDialog):
         self.btn_copy_bastion.setEnabled(bool(self.bastion_templates))
         form_layout.addRow("", self.btn_copy_bastion)
 
-        # --- 3. RDS/Remote 정보 ---
+    def _build_target_db_section(self, form_layout: QFormLayout):
         lbl_remote = QLabel("--- Target DB (목적지) ---")
         lbl_remote.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_remote)
@@ -192,31 +210,26 @@ class TunnelConfigDialog(QDialog):
         self.input_default_schema.setPlaceholderText("(선택사항) MySQL DB명 또는 PostgreSQL schema명")
         form_layout.addRow("기본 스키마:", self.input_default_schema)
 
-        # --- 환경 설정 ---
+    def _build_environment_section(self, form_layout: QFormLayout):
         lbl_env = QLabel("--- 환경 설정 ---")
         lbl_env.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_env)
 
         self.combo_environment = QComboBox()
-        self.combo_environment.addItems([
-            "(미설정)",
-            "🔴 Production",
-            "🟠 Staging",
-            "🟢 Development"
-        ])
+        self.combo_environment.addItem("(미설정)", None)
+        self.combo_environment.addItem("🔴 Production", "production")
+        self.combo_environment.addItem("🟠 Staging", "staging")
+        self.combo_environment.addItem("🟢 Development", "development")
         self.combo_environment.setToolTip(
             "Production: 위험 작업 시 스키마명 직접 입력 필요\n"
             "Staging: 위험 작업 시 확인 다이얼로그 표시\n"
             "Development: 확인 없이 바로 실행"
         )
-        # 기존 데이터에서 환경 값 로드
-        env_index_map = {None: 0, 'production': 1, 'staging': 2, 'development': 3}
-        self.combo_environment.setCurrentIndex(
-            env_index_map.get(self.tunnel_data.get('environment'), 0)
-        )
+        env_index = self.combo_environment.findData(self.tunnel_data.get('environment'))
+        self.combo_environment.setCurrentIndex(env_index if env_index >= 0 else 0)
         form_layout.addRow("환경:", self.combo_environment)
 
-        # --- 4. 로컬 설정 ---
+    def _build_local_section(self, form_layout: QFormLayout):
         self.lbl_local = QLabel("--- Local (내 컴퓨터) ---")
         self.lbl_local.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(self.lbl_local)
@@ -233,7 +246,7 @@ class TunnelConfigDialog(QDialog):
         self.btn_tunnel_test.clicked.connect(self._test_tunnel_only)
         form_layout.addRow("", self.btn_tunnel_test)
 
-        # --- 5. DB 인증 정보 (선택 사항) ---
+    def _build_auth_section(self, form_layout: QFormLayout):
         lbl_mysql = QLabel("--- DB 인증 정보 (선택 사항) ---")
         lbl_mysql.setStyleSheet(LabelStyles.SECTION_HEADER)
         form_layout.addRow(lbl_mysql)
@@ -267,23 +280,14 @@ class TunnelConfigDialog(QDialog):
             if self.tunnel_data.get('db_password_encrypted'):
                 self.input_db_password.setPlaceholderText("(저장됨 - 변경시 새로 입력)")
 
-        layout.addLayout(form_layout)
-
-        # 초기 모드에 따라 UI 상태 설정
-        self.on_mode_changed()
-
-        # --- 하단 버튼 (통합 테스트 & 저장/취소) ---
-
-        # 통합 테스트 버튼 - 중앙화된 스타일 사용
+    def _build_footer_section(self, layout: QVBoxLayout):
         self.btn_integrated_test = QPushButton("🚀 통합 테스트")
         self.btn_integrated_test.setStyleSheet(ButtonStyles.WARNING)
         self.btn_integrated_test.clicked.connect(self._test_integrated)
         layout.addWidget(self.btn_integrated_test)
 
-        # 구분 공백
         layout.addSpacing(10)
 
-        # 기본 버튼 (저장/취소)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         buttons.accepted.connect(self.accept)
         buttons.rejected.connect(self.reject)
@@ -345,6 +349,7 @@ class TunnelConfigDialog(QDialog):
             try:
                 return parent.config_mgr.load_config().get('tunnels', [])
             except Exception:
+                logger.exception("failed to load tunnel list for bastion templates")
                 return []
         return []
 
@@ -370,9 +375,7 @@ class TunnelConfigDialog(QDialog):
 
     def get_data(self):
         """입력된 폼 데이터를 딕셔너리로 반환"""
-        # 환경 설정 매핑
-        env_map = {0: None, 1: 'production', 2: 'staging', 3: 'development'}
-        environment = env_map.get(self.combo_environment.currentIndex())
+        environment = self.combo_environment.currentData()
 
         is_direct = self.radio_direct.isChecked()
         remote_host = self.input_remote_host.text().strip()
@@ -448,11 +451,10 @@ class TunnelConfigDialog(QDialog):
             )
             return
 
-        dialog = self._start_connection_test(
+        self._run_test(
             TestType.TUNNEL_ONLY, temp_config, None,
             f"터널 테스트 - {temp_config.get('name', 'Unknown')}"
         )
-        dialog.exec()
 
     def _test_db_only(self):
         """DB 인증만 테스트 (터널 경유)"""
@@ -478,22 +480,16 @@ class TunnelConfigDialog(QDialog):
             QMessageBox.warning(self, "경고", "DB 비밀번호를 입력해주세요.")
             return
 
-        # 부모 창(main_window)에서 encryptor 가져오기
-        encryptor = None
-        if hasattr(self.parent(), 'config_mgr'):
-            encryptor = self.parent().config_mgr.encryptor
-
         temp_config_mgr = _TempCredentials(
             db_user, db_password,
             self.tunnel_data.get('db_password_encrypted'),
-            encryptor
+            self._get_parent_encryptor()
         )
 
-        dialog = self._start_connection_test(
+        self._run_test(
             TestType.DB_ONLY, temp_config, temp_config_mgr,
             f"DB 인증 테스트 - {temp_config.get('name', 'Unknown')}"
         )
-        dialog.exec()
 
     def _test_integrated(self):
         """통합 테스트 (터널 + DB)"""
@@ -510,20 +506,24 @@ class TunnelConfigDialog(QDialog):
         db_user = self.input_db_user.text() if self.chk_save_credentials.isChecked() else None
         db_password = self.input_db_password.text() if self.chk_save_credentials.isChecked() else None
 
-        encryptor = None
-        if hasattr(self.parent(), 'config_mgr'):
-            encryptor = self.parent().config_mgr.encryptor
-
         temp_config_mgr = _TempCredentials(
             db_user, db_password,
             self.tunnel_data.get('db_password_encrypted') if db_user else None,
-            encryptor
+            self._get_parent_encryptor()
         )
 
-        dialog = self._start_connection_test(
+        self._run_test(
             TestType.INTEGRATED, temp_config, temp_config_mgr,
             f"통합 테스트 - {temp_config.get('name', 'Unknown')}"
         )
+
+    def _get_parent_encryptor(self):
+        if hasattr(self.parent(), 'config_mgr'):
+            return self.parent().config_mgr.encryptor
+        return None
+
+    def _run_test(self, test_type: TestType, temp_config: dict, config_mgr, title: str):
+        dialog = self._start_connection_test(test_type, temp_config, config_mgr, title)
         dialog.exec()
 
     def _start_connection_test(self, test_type: TestType, temp_config: dict,

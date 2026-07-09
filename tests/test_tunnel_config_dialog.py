@@ -108,6 +108,57 @@ def test_db_engine_is_manual_select_field():
         parent.close()
 
 
+def test_environment_combo_uses_item_data_for_persisted_value():
+    parent = ParentWithTunnels()
+    dialog = TunnelConfigDialog(
+        parent,
+        tunnel_data={
+            "id": "current",
+            "name": "Current",
+            "connection_mode": "ssh_tunnel",
+            "db_engine": "mysql",
+            "environment": "staging",
+        },
+    )
+    try:
+        assert dialog.combo_environment.currentData() == "staging"
+
+        production_index = dialog.combo_environment.findData("production")
+        dialog.combo_environment.setCurrentIndex(production_index)
+        assert dialog.get_data()["environment"] == "production"
+
+        unset_index = dialog.combo_environment.findData(None)
+        dialog.combo_environment.setCurrentIndex(unset_index)
+        assert dialog.get_data()["environment"] is None
+    finally:
+        dialog.close()
+        parent.close()
+
+
+def test_available_tunnels_logs_and_returns_empty_list_on_config_failure(monkeypatch):
+    class BrokenConfigManager:
+        def load_config(self):
+            raise RuntimeError("boom")
+
+    parent = QWidget()
+    parent.config_mgr = BrokenConfigManager()
+    exception_calls = []
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.tunnel_config.logger.exception",
+        lambda message: exception_calls.append(message),
+    )
+
+    dialog = TunnelConfigDialog(parent, tunnel_data={"id": "current", "db_engine": "mysql"})
+    try:
+        exception_calls.clear()
+        assert dialog._available_tunnels() == []
+        assert exception_calls == ["failed to load tunnel list for bastion templates"]
+    finally:
+        dialog.close()
+        parent.close()
+
+
 def test_running_test_progress_dialog_blocks_reject_until_allowed():
     """WP-3.9 Finding 1 회귀: 테스트가 실행 중일 때는 ESC 등으로 트리거되는
     reject()가 완전히 무시되어야 한다. accept()는 별도 경로(닫기 버튼)이므로
@@ -202,3 +253,14 @@ def test_test_db_only_and_test_integrated_share_temp_credentials_class():
     for src in (db_only_src, integrated_src):
         assert "class " not in src, "임시 자격증명 클래스가 인라인으로 재정의되면 안 된다"
         assert "_TempCredentials(" in src
+
+
+def test_connection_test_flows_share_run_test_wrapper():
+    for method in (
+        TunnelConfigDialog._test_tunnel_only,
+        TunnelConfigDialog._test_db_only,
+        TunnelConfigDialog._test_integrated,
+    ):
+        source = inspect.getsource(method)
+        assert "_run_test(" in source
+        assert "dialog.exec()" not in source
