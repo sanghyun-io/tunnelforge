@@ -179,11 +179,9 @@ class BatchOptionDialog(QDialog):
 class FixOptionPage(QWizardPage):
     """3단계: 이슈별 수정 옵션 선택 (문자셋 제외)
 
-    개선 사항:
+    기능:
+    - 이슈별 옵션 선택
     - 전체 일괄 옵션 적용
-    - FK 연관 테이블 Tree 시각화
-    - FK 연관테이블 일괄 변경 시 자동 포함 (옵션 선택만 건너뜀)
-    - 자동 포함된 테이블 건너뛰기 네비게이션
 
     참고: 문자셋 이슈는 CharsetFixPage에서 처리됨
     """
@@ -476,9 +474,6 @@ class FixOptionPage(QWizardPage):
 
     def isComplete(self) -> bool:
         """다음 단계 진행 가능 여부"""
-        # 다른 이슈가 없으면 무조건 통과
-        if not self.wizard_dialog.wizard_steps:
-            return True
         return True  # 옵션 선택은 validatePage에서 검증
 
     def nextId(self) -> int:

@@ -24,6 +24,7 @@ class ExecutionPage(QWizardPage):
         self.worker: Optional[FixWizardWorker] = None
         self.executed = False
         self.rollback_sql_path: Optional[str] = None  # 저장된 Rollback SQL 경로
+        self._rollback_sql_content: Optional[str] = None
 
         self.setTitle("SQL 확인")
         self.setSubTitle("Legacy 자동 수정 위저드는 DB 변경을 직접 실행하지 않고 Dry-run 결과와 SQL만 제공합니다.")
@@ -204,28 +205,13 @@ class ExecutionPage(QWizardPage):
             # 결과 요약 표시
             self.grp_result.setVisible(True)
 
-            # CombinedExecutionResult 또는 BatchExecutionResult 처리
-            if hasattr(result, 'charset_tables_count'):
-                # CombinedExecutionResult
-                total_items = result.charset_tables_count
-                if result.other_result:
-                    total_items += result.other_result.total_steps
+            summary = result.summary()
+            self.lbl_total.setText(str(summary.total))
+            self.lbl_success.setText(f"{summary.success}개")
+            self.lbl_fail.setText(f"{summary.fail}개")
+            self.lbl_affected.setText(f"{summary.affected_rows:,}개")
 
-                self.lbl_total.setText(str(total_items))
-                self.lbl_success.setText(f"{result.total_success_count}개")
-                self.lbl_fail.setText(f"{result.total_fail_count}개")
-                self.lbl_affected.setText(f"{result.total_affected_rows:,}개")
-
-                fail_count = result.total_fail_count
-            else:
-                # BatchExecutionResult (하위 호환)
-                self.lbl_total.setText(str(result.total_steps))
-                self.lbl_success.setText(f"{result.success_count}개")
-                self.lbl_fail.setText(f"{result.fail_count}개")
-                self.lbl_affected.setText(f"{result.total_affected_rows:,}개")
-                fail_count = result.fail_count
-
-            if fail_count > 0:
+            if summary.fail > 0:
                 self.lbl_fail.setStyleSheet("color: #e74c3c; font-weight: bold;")
 
             # Rollback SQL 저장 및 표시
@@ -257,8 +243,8 @@ class ExecutionPage(QWizardPage):
             # 파일명 생성
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"rollback_{self.wizard_dialog.schema}_{timestamp}.sql"
-            rollback_dir = self._get_rollback_dir()
-            filepath = os.path.join(rollback_dir, filename)
+            rollback_dir_path = self._get_rollback_dir()
+            filepath = os.path.join(rollback_dir_path, filename)
 
             # 파일 저장
             with open(filepath, 'w', encoding='utf-8') as f:
@@ -304,7 +290,7 @@ class ExecutionPage(QWizardPage):
 
     def copy_rollback_sql(self):
         """Rollback SQL 클립보드 복사"""
-        if hasattr(self, '_rollback_sql_content') and self._rollback_sql_content:
+        if self._rollback_sql_content:
             clipboard = QApplication.clipboard()
             clipboard.setText(self._rollback_sql_content)
             QMessageBox.information(self, "복사 완료", "Rollback SQL이 클립보드에 복사되었습니다.")
@@ -313,7 +299,7 @@ class ExecutionPage(QWizardPage):
 
     def save_rollback_as(self):
         """Rollback SQL 다른 위치에 저장"""
-        if not hasattr(self, '_rollback_sql_content') or not self._rollback_sql_content:
+        if not self._rollback_sql_content:
             QMessageBox.warning(self, "내용 없음", "저장할 Rollback SQL이 없습니다.")
             return
 

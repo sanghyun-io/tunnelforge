@@ -14,12 +14,15 @@ test)의 import 경로를 유지하기 위한 얇은 re-export facade다.
 - RollbackSQLGenerator → migration_rollback_sql_generator
 """
 
+from typing import List, Tuple
+
 from src.core.migration_fix_models import (
     FixStrategy,
     FKDefinition,
     FixOption,
     FixWizardStep,
     FixExecutionResult,
+    ExecutionSummary,
     BatchExecutionResult,
     CharsetTableInfo,
 )
@@ -33,12 +36,33 @@ from src.core.migration_batch_fix_executor import BatchFixExecutor
 from src.core.migration_charset_fix_plan import CharsetFixPlanBuilder
 from src.core.migration_rollback_sql_generator import RollbackSQLGenerator
 
+
+def render_all_steps_sql(steps: List[FixWizardStep]) -> List[Tuple[FixWizardStep, str]]:
+    """선택된 수정 단계의 렌더링된 SQL을 중복 제거해 반환한다."""
+    rendered = []
+    processed_sql: set[str] = set()
+
+    for step in steps:
+        if not step.selected_option or step.selected_option.strategy == FixStrategy.SKIP:
+            continue
+
+        sql = step.rendered_sql()
+        if sql in processed_sql:
+            continue
+
+        processed_sql.add(sql)
+        rendered.append((step, sql))
+
+    return rendered
+
+
 __all__ = [
     "FixStrategy",
     "FKDefinition",
     "FixOption",
     "FixWizardStep",
     "FixExecutionResult",
+    "ExecutionSummary",
     "BatchExecutionResult",
     "CharsetTableInfo",
     "RollbackSQLGenerator",
@@ -48,4 +72,5 @@ __all__ = [
     "BatchFixExecutor",
     "CharsetFixPlanBuilder",
     "create_wizard_steps",
+    "render_all_steps_sql",
 ]

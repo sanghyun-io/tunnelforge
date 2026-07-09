@@ -431,17 +431,7 @@ class SmartFixGenerator:
 
     def generate_sql(self, step: FixWizardStep) -> str:
         """선택된 옵션으로 SQL 생성"""
-        if not step.selected_option:
-            return ""
-
-        sql = step.selected_option.sql_template or ""
-
-        # 사용자 입력값 대체
-        if step.selected_option.requires_input and step.user_input:
-            sql = sql.replace("{custom_date}", step.user_input)
-            sql = sql.replace("{precision}", step.user_input)
-
-        return sql
+        return step.rendered_sql()
 
 
 def create_wizard_steps(

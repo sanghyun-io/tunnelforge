@@ -7,7 +7,7 @@ from PyQt6.QtWidgets import (
 )
 from typing import Optional
 
-from src.core.migration_fix_wizard import FKSafeCharsetChanger, FixStrategy
+from src.core.migration_fix_wizard import FKSafeCharsetChanger, FixStrategy, render_all_steps_sql
 from src.ui.workers.fix_wizard_worker import FixWizardWorker
 
 
@@ -142,27 +142,12 @@ class PreviewPage(QWizardPage):
             lines.append(f"-- 대상 이슈: {other_execute_count}개")
             lines.append("")
 
-            # 이미 출력한 SQL 추적 (FK 일괄 변경 중복 방지)
-            processed_sql_hashes: set = set()
-
-            for step in steps:
-                if step.selected_option and step.selected_option.strategy != FixStrategy.SKIP:
-                    sql = step.selected_option.sql_template or ""
-                    if step.selected_option.requires_input and step.user_input:
-                        sql = sql.replace("{custom_date}", step.user_input)
-                        sql = sql.replace("{precision}", step.user_input)
-
-                    # SQL 중복 체크
-                    sql_hash = hash(sql)
-                    if sql_hash in processed_sql_hashes:
-                        continue
-                    processed_sql_hashes.add(sql_hash)
-
-                    counter += 1
-                    lines.append(f"-- [{counter}] {step.location}")
-                    lines.append(f"-- 전략: {step.selected_option.label}")
-                    lines.append(sql)
-                    lines.append("")
+            for step, sql in render_all_steps_sql(steps):
+                counter += 1
+                lines.append(f"-- [{counter}] {step.location}")
+                lines.append(f"-- 전략: {step.selected_option.label}")
+                lines.append(sql)
+                lines.append("")
 
         if counter == 0:
             lines.append("-- (실행할 SQL이 없습니다)")
@@ -205,18 +190,21 @@ class PreviewPage(QWizardPage):
             self.txt_dryrun.append("=" * 50)
             self.txt_dryrun.append(f"✅ Dry-run 완료")
 
+            summary = result.summary()
+
             # CombinedExecutionResult 또는 BatchExecutionResult 처리
             if hasattr(result, 'charset_tables_count'):
                 # CombinedExecutionResult
                 if result.charset_tables_count > 0:
                     self.txt_dryrun.append(f"  - 문자셋 변경: {result.charset_tables_count}개 테이블, {result.charset_fk_count}개 FK")
                 if result.other_result:
-                    self.txt_dryrun.append(f"  - 기타 이슈: 성공 {result.other_result.success_count}개, 건너뛰기 {result.other_result.skip_count}개")
-                self.txt_dryrun.append(f"  - 총 영향: {result.total_affected_rows:,}개")
+                    other_summary = result.other_result.summary()
+                    self.txt_dryrun.append(f"  - 기타 이슈: 성공 {other_summary.success}개, 건너뛰기 {other_summary.skip}개")
+                self.txt_dryrun.append(f"  - 총 영향: {summary.affected_rows:,}개")
             else:
                 # BatchExecutionResult (하위 호환)
-                self.txt_dryrun.append(f"  - 성공: {result.success_count}개")
-                self.txt_dryrun.append(f"  - 건너뛰기: {result.skip_count}개")
-                self.txt_dryrun.append(f"  - 예상 영향 행: {result.total_affected_rows:,}개")
+                self.txt_dryrun.append(f"  - 성공: {summary.success}개")
+                self.txt_dryrun.append(f"  - 건너뛰기: {summary.skip}개")
+                self.txt_dryrun.append(f"  - 예상 영향 행: {summary.affected_rows:,}개")
         else:
             self.txt_dryrun.append(f"❌ Dry-run 오류: {message}")

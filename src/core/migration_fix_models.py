@@ -88,6 +88,18 @@ class FixWizardStep:
     selected_option: Optional[FixOption] = None
     user_input: Optional[str] = None                 # 사용자 입력값
 
+    def rendered_sql(self) -> str:
+        """선택된 옵션과 사용자 입력으로 렌더링된 SQL 반환"""
+        if not self.selected_option:
+            return ""
+
+        sql = self.selected_option.sql_template or ""
+        if self.selected_option.requires_input and self.user_input:
+            sql = sql.replace("{custom_date}", self.user_input)
+            sql = sql.replace("{precision}", self.user_input)
+
+        return sql
+
 
 @dataclass
 class FixExecutionResult:
@@ -102,6 +114,16 @@ class FixExecutionResult:
 
 
 @dataclass
+class ExecutionSummary:
+    """실행 결과 공통 요약"""
+    total: int
+    success: int
+    fail: int
+    skip: int
+    affected_rows: int
+
+
+@dataclass
 class BatchExecutionResult:
     """배치 실행 결과"""
     total_steps: int
@@ -111,6 +133,16 @@ class BatchExecutionResult:
     results: List[FixExecutionResult]
     total_affected_rows: int = 0
     rollback_sql: str = ""  # Rollback SQL
+
+    def summary(self) -> ExecutionSummary:
+        """UI가 공통으로 소비하는 실행 결과 요약"""
+        return ExecutionSummary(
+            total=self.total_steps,
+            success=self.success_count,
+            fail=self.fail_count,
+            skip=self.skip_count,
+            affected_rows=self.total_affected_rows,
+        )
 
 
 def _format_default_sql_clause(col_info: Dict[str, Any]) -> str:

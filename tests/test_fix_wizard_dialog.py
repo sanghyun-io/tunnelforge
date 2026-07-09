@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from src.ui.dialogs import fix_wizard_dialog
 from src.ui.dialogs import fix_wizard_execution_page
 from src.ui.workers import fix_wizard_worker
+from src.core.migration_fix_models import CharsetTableInfo
 
 
 class _FakeSignal:
@@ -92,7 +93,7 @@ def test_fix_wizard_worker_rejects_legacy_python_mutation_mode():
     QApplication.instance() or QApplication([])
 
     try:
-        fix_wizard_dialog.FixWizardWorker(
+        fix_wizard_worker.FixWizardWorker(
             connector=SimpleNamespace(),
             schema="app",
             steps=[],
@@ -245,7 +246,7 @@ def test_charset_fix_page_resets_state_when_charset_issues_cleared():
     page = dialog.charset_fix_page
 
     # 이전 라운드(문자셋 이슈 선택)에서 남은 상태를 시뮬레이션
-    stale_info = fix_wizard_dialog.CharsetTableInfo(
+    stale_info = CharsetTableInfo(
         table_name="orders",
         current_charset="latin1",
         current_collation="latin1_swedish_ci",

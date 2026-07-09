@@ -10,7 +10,7 @@ from dataclasses import dataclass
 
 from src.core.db_connector import MySQLConnector
 from src.core.migration_fix_wizard import (
-    FixWizardStep, BatchFixExecutor, BatchExecutionResult,
+    FixWizardStep, BatchFixExecutor, BatchExecutionResult, ExecutionSummary,
     FKSafeCharsetChanger
 )
 
@@ -47,6 +47,19 @@ class CombinedExecutionResult:
             rows += self.other_result.total_affected_rows
         return rows
 
+    def summary(self) -> ExecutionSummary:
+        """UI가 공통으로 소비하는 실행 결과 요약"""
+        return ExecutionSummary(
+            total=(
+                self.charset_tables_count
+                + (self.other_result.total_steps if self.other_result else 0)
+            ),
+            success=self.total_success_count,
+            fail=self.total_fail_count,
+            skip=self.other_result.skip_count if self.other_result else 0,
+            affected_rows=self.total_affected_rows,
+        )
+
     @property
     def rollback_sql(self) -> str:
         """통합 롤백 SQL 반환"""
@@ -80,6 +93,7 @@ class FixWizardWorker(QThread):
         charset_tables_to_fix: Optional[Set[str]] = None
     ):
         super().__init__()
+        # dry_run은 Rust Core mutation ownership을 강제하는 의도적 방지 가드다.
         if not dry_run:
             raise RuntimeError(
                 "Legacy Python Auto-Fix Wizard mutation execution is disabled. "

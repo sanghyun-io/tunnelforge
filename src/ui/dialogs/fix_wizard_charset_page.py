@@ -153,6 +153,20 @@ class CharsetFixPage(QWizardPage):
                 widget.deleteLater()
         self.table_checkboxes.clear()
 
+    def _make_tag_label(self, text: str, color: str) -> QLabel:
+        """테이블 상태 태그 라벨 생성"""
+        tag = QLabel(text)
+        tag.setStyleSheet(f"""
+            QLabel {{
+                background-color: {color};
+                color: white;
+                padding: 2px 6px;
+                border-radius: 3px;
+                font-size: 10px;
+            }}
+        """)
+        return tag
+
     def _create_table_widget(self, info: CharsetTableInfo) -> QWidget:
         """테이블 위젯 생성"""
         widget = QFrame()
@@ -185,28 +199,11 @@ class CharsetFixPage(QWizardPage):
         header_layout.addWidget(lbl_name)
 
         # 태그: 원본 이슈 / FK 연관
-        if info.is_original_issue:
-            tag = QLabel("원본 이슈")
-            tag.setStyleSheet("""
-                QLabel {
-                    background-color: #e74c3c;
-                    color: white;
-                    padding: 2px 6px;
-                    border-radius: 3px;
-                    font-size: 10px;
-                }
-            """)
-        else:
-            tag = QLabel("FK 연관")
-            tag.setStyleSheet("""
-                QLabel {
-                    background-color: #3498db;
-                    color: white;
-                    padding: 2px 6px;
-                    border-radius: 3px;
-                    font-size: 10px;
-                }
-            """)
+        tag = (
+            self._make_tag_label("원본 이슈", "#e74c3c")
+            if info.is_original_issue
+            else self._make_tag_label("FK 연관", "#3498db")
+        )
         header_layout.addWidget(tag)
         header_layout.addStretch()
 
@@ -380,19 +377,11 @@ class CharsetFixPage(QWizardPage):
 
         다른 이슈가 없으면 FixOptionPage 건너뛰기
         """
-        # 문자셋 이슈가 없으면 다음 페이지(FixOptionPage)로
-        if not self.wizard_dialog.has_charset_issues():
-            # 다른 이슈도 없으면 PreviewPage로
-            if not self.wizard_dialog.has_other_issues():
-                return self.wizard_dialog.preview_page_id
-            return self.wizard_dialog.option_page_id
-
-        # 다른 이슈가 없으면 PreviewPage로
-        if not self.wizard_dialog.has_other_issues():
-            return self.wizard_dialog.preview_page_id
-
-        # 기본: 다음 페이지 (FixOptionPage)
-        return self.wizard_dialog.option_page_id
+        return (
+            self.wizard_dialog.option_page_id
+            if self.wizard_dialog.has_other_issues()
+            else self.wizard_dialog.preview_page_id
+        )
 
     def validatePage(self) -> bool:
         """페이지 유효성 검사 및 데이터 저장"""
