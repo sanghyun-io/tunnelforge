@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-06-27
+Last reviewed: 2026-07-09
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -56,6 +56,12 @@ session. If only focused tests passed, use `fixed_pending_full_verify`.
 TunnelForge is in a strong build/test state. The active architecture baseline
 is Rust Core ownership of DB operations through `tunnelforge-core`, with
 Python/PyQt responsible for UI, orchestration, signals, and dialogs.
+
+Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
+refactor work packages WP-3.1 through WP-3.8 were integrated as
+behavior-preserving commits. The integrated main tree passed the Rust Core
+regression gate, a whole-tree `MySQLConnector` allowlist scan, Round 3 focused
+tests at 491 passed, and the full Python suite at 1819 passed / 4 warnings.
 
 Open GitHub issue #116 remains external: its remaining unchecked criterion is
 real operator Mac validation evidence. GitHub #142 is fixed: the legacy Python
@@ -365,14 +371,19 @@ confirming the separate legacy Python Auto-Fix Wizard mutation path.
 
 ## Current Baseline Verification
 
-Commands run locally. Full-suite count refreshed on 2026-06-27; some broader
-Rust/macOS evidence rows are preserved from the 2026-06-26 baseline sweep until
-those commands are rerun.
+Commands run locally. Full-suite count refreshed on 2026-07-09 after Clean Code
+Round 3 integration; the earlier `Full-suite count refreshed on 2026-06-27`
+baseline is superseded by this latest status update. Broader Rust/macOS
+evidence rows are preserved from the 2026-06-26 / 2026-06-27 baseline sweeps
+until those commands are rerun.
 
 | Check | Result |
 | --- | --- |
-| `git status --short --branch` | `## main...origin/main`, no local changes before the latest status update |
-| `pytest -q` | PASS, 1876 passed, 5 warnings |
+| `git status --short --branch` | Tracked Round 3 commits integrated on `main`; only status/handoff scratch files remain outside the integration commits before this status update |
+| `pytest -q` | PASS, 1819 passed, 4 warnings |
+| Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
+| `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
+| whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 187 lib tests, JSONL CLI, live roundtrip, and non-ignored stress tests |
 | `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS |
 | `python -m compileall -q main.py src tests scripts` | PASS |
@@ -482,6 +493,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-09 | Clean Code Round 3 UI/dialog/main-window integration | `python -m py_compile` on all Round 3 production Python files; `pytest` focused Round 3 suite; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; custom whole-tree `MySQLConnector` allowlist scan; `git diff --check HEAD~8..HEAD`; `pytest -q` | PASS | Integrated WP-3.1 through WP-3.8 as behavior-preserving commits. Focused Round 3 tests passed at 491 passed / 2 warnings, Rust Core regression gate passed, allowlist scan found 22 product imports with no missing entries, and full Python suite passed at 1819 passed / 4 warnings. |
 | 2026-06-27 | macOS final validation tooling recheck | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_macos_final_validation_tooling_recheck -q`; `bash -n scripts/macos-manual-validation-report.sh scripts/macos-download-validation-artifacts.sh scripts/validate-macos-release.sh scripts/build-macos.sh scripts/package-macos.sh`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL for `--final` only | #116 final validation tooling remains ready from the repository side: shell syntax is valid, macOS focused tests pass at 53, the normal gate passes, and the final gate accepts current-head manual workflow evidence while failing only for missing real-Mac report evidence under `build/`. |
 | 2026-06-27 | Post-#169 next issue re-audit | `git status --short --branch`; `git log --oneline --decorate -8`; `gh issue list --state open --limit 30 --json number,title,state,url,labels,updatedAt`; `gh issue view 116 --comments --json number,title,state,body,labels,comments,updatedAt,url`; `rg -n "TODO\|FIXME\|XXX\|HACK\|NotImplemented\|raise NotImplementedError\|pass\s*$" src tests scripts docs README.md README.ko.md SCHEDULE.md`; `rg -n "not yet supported\|pending\|future\|disabled\|hidden\|preview\|manual\|not implemented\|unsupported\|준비\|미지원\|비활성\|숨김\|수동\|TODO" docs README.md README.ko.md SCHEDULE.md src tests`; `rg -n "pymysql\|psycopg\|mysql\.connector\|mysqldump\|pg_dump\|mysqlpump\|mysqlimport\|\bpsql\b\|mysqlsh\|dump tool\|external dump\|shell export\|shell import" src scripts tests docs README.md README.ko.md BUILD.md SCHEDULE.md`; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_169_next_issue_reaudit -q`; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | EXPECTED FAIL for `--final` only | #116 remains the only open GitHub issue and still requires external real-Mac report evidence. The re-audit found no new repo-side issue; Rust Core-shaped connector calls route through `RustDbConnection`/`RustDbCursor`, and the lone `psql` hit is Docker live evidence seeding rather than an active export/import dump path. |
 | 2026-06-27 | Superseded missing manual workflow Summary cleanup | `gh issue create` created #169; RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_summary_does_not_keep_superseded_missing_manual_workflow_wording -q`; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `python scripts\check-macos-support-gate.py`; `python scripts\check-macos-support-gate.py --final`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | EXPECTED FAIL for `--final` only | GitHub #169 is fixed: Summary no longer presents older missing current-head manual workflow evidence as current state; the current #116 blocker remains missing real-Mac report evidence |
@@ -796,22 +808,28 @@ Status: `watch`
 Severity: Medium
 Area: Maintainability
 
-Largest implementation files:
+Largest implementation files after Clean Code Round 3:
 
-- `migration_core/src/lib.rs` - about 11,600 lines.
-- `src/ui/dialogs/sql_editor_dialog.py` - about 3,209 lines.
-- `src/ui/dialogs/db_dialogs.py` - about 3,078 lines.
-- `src/ui/dialogs/cross_engine_migration_dialog.py` - about 1,630 lines.
+- `migration_core/src/ddl.rs` - about 2,710 lines.
+- `src/ui/dialogs/sql_editor_dialog.py` - about 2,534 lines.
+- `migration_core/src/migrate.rs` - about 2,491 lines.
+- `migration_core/src/oneclick.rs` - about 2,125 lines.
+- `migration_core/src/dump.rs` - about 2,091 lines.
+- `src/ui/dialogs/db_import_dialog.py` - about 1,611 lines.
+- `src/ui/dialogs/cross_engine_migration_dialog.py` - about 1,429 lines.
+- `src/ui/dialogs/db_export_dialog.py` - about 1,368 lines.
 
 Impact:
 
-- Focused fixes are possible, but refactors and behavior changes have a broad
-  blast radius.
+- Round 1 through Round 3 removed the worst legacy god-file hotspots, including
+  the previous `db_dialogs.py` and main-window concentration. Remaining large
+  files still have enough surface area to make broad behavior changes risky.
 
 Next action:
 
-1. Keep recovery fixes narrowly scoped and test-first.
-2. Defer structural splitting until behavior is stabilized.
+1. Keep future fixes narrowly scoped and test-first.
+2. Treat further structural splitting as watch work, not an active blocker,
+   unless a nearby feature touches one of the remaining large files.
 
 ## Lower Priority / Tracking
 
@@ -2119,7 +2137,7 @@ Next action:
 | TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
 | TF-STATUS-004 | High | closed | Rust Core export | Export consistency explicit | Keep metadata coverage aligned with export scheduling changes |
 | TF-STATUS-005 | Medium | closed | Docs/UI flags | Disabled UI features labeled | Reverify docs if feature flags change |
-| TF-STATUS-006 | Medium | watch | Maintainability | Very large files | Keep fixes narrow; split later if behavior stabilizes |
+| TF-STATUS-006 | Medium | watch | Maintainability | Remaining large files after Clean Code Round 3 | Keep future fixes narrow; split further only when nearby work justifies it |
 | TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
 | TF-STATUS-008 | Low | watch | macOS | Final real-Mac validation pending | Require evidence bundle before production-ready claim |
 | TF-STATUS-009 | High | closed | Rust Core import | Merge import post-load DDL policy | Keep merge/recreate policy tests |
@@ -2193,8 +2211,9 @@ Next action:
 ## Recommended Execution Order
 
 1. No repo-side implementation issue is currently open after TF-STATUS-075 /
-   macOS final validation tooling recheck. `main` is aligned with `origin/main`;
-   #116 remains external and is the only open GitHub issue.
+   macOS final validation tooling recheck. Clean Code Round 3 is integrated
+   and verified locally, and no new repo-side implementation issue was created
+   by the Round 3 integration. #116 remains external.
 2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
    operator Mac validation report evidence. Do not hard-code exact current-head
    workflow run IDs or SHAs as durable status summary evidence; use #116
@@ -2207,6 +2226,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-09 | Integrated Clean Code Round 3 WP-3.1 through WP-3.8 into `main`, covering SQL editor, DB dialogs, migration dialogs, Fix Wizard pages, cross-engine/diff dialogs, settings/schedule/tunnel dialogs, main window controllers, and UI workers. | Round 3 UI/core helper files plus `docs/current_status.md` | Round 3 focused pytest 491 passed; full `pytest -q` 1819 passed / 4 warnings; Rust Core regression gate passed; whole-tree `MySQLConnector` allowlist scan passed; `git diff --check` passed |
 | 2026-06-27 | Recorded TF-STATUS-075 after rechecking #116 final validation tooling: shell syntax is valid, focused macOS support tests pass, the normal #116 gate passes, and the final gate fails only for missing external real-Mac report evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: final validation tooling current-status pytest; final: macOS focused pytest, #116 gates, shell syntax |
 | 2026-06-27 | Recorded TF-STATUS-074 after a post-#169 next-issue re-audit found no new repo-side issue: #116 is still the only open GitHub issue, Rust Core boundary scans still route through shims, stale-handoff scans found no new current task, and the remaining blocker is external real-Mac report evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #116 | RED/GREEN: post-#169 current-status pytest; final: current-status pytest, full pytest, #116 gates, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-073 / GitHub #169 by removing superseded missing-manual-workflow current-state wording from the Summary; older verification log rows remain historical, while the Summary now keeps the #116 current blocker to real-Mac report evidence. | `docs/current_status.md`, `tests/test_current_status_docs.py`, GitHub #169 | RED/GREEN: superseded Summary wording current-status pytest; final: `pytest -q`, #116 gates, compileall, `git diff --check` |
