@@ -20,9 +20,47 @@ Logging (stderr):
     exit code 1 + stderr 에러 메시지
 """
 
+from __future__ import annotations
+
 import argparse
 import sys
 from pathlib import Path
+from typing import Callable
+
+
+def _apply_sync(
+    sync_fn: Callable[[Path, str], None],
+    path: Path,
+    new_version: str,
+    label: str,
+    required: bool,
+) -> int | None:
+    """sync_fn(path, new_version)을 실행하고 결과를 stderr로 보고한다.
+
+    write_version/sync_pyproject/sync_installer는 모두 (path, new_version)
+    시그니처를 공유하므로 이 헬퍼 하나로 세 파일의 동기화를 처리한다.
+
+    Args:
+        sync_fn: 실행할 동기화 함수
+        path: 대상 파일 경로
+        new_version: 새 버전 문자열
+        label: 실패 시 ERROR 메시지에 쓸 레이블
+        required: False이고 path가 존재하지 않으면 건너뛴다
+
+    Returns:
+        실패 시 1 (호출자는 즉시 return해야 함), 성공/스킵 시 None
+    """
+    if not required and not path.exists():
+        print(f"[SKIP] {path} 없음, 건너뜁니다.", file=sys.stderr)
+        return None
+
+    try:
+        sync_fn(path, new_version)
+        print(f"[OK] {path} 업데이트 완료", file=sys.stderr)
+        return None
+    except (ValueError, OSError) as e:
+        print(f"ERROR: {label} 쓰기 실패: {e}", file=sys.stderr)
+        return 1
 
 
 def main() -> int:
@@ -119,33 +157,18 @@ def main() -> int:
         print(f"[DRY RUN] 파일 수정 없이 종료합니다.", file=sys.stderr)
     else:
         # 실제 파일 수정
-        try:
-            write_version(version_file, new_version)
-            print(f"[OK] {version_file} 업데이트 완료", file=sys.stderr)
-        except (ValueError, OSError) as e:
-            print(f"ERROR: version 파일 쓰기 실패: {e}", file=sys.stderr)
-            return 1
+        rc = _apply_sync(write_version, version_file, new_version, 'version 파일', required=True)
+        if rc is not None:
+            return rc
 
-        if pyproject_file.exists():
-            try:
-                sync_pyproject(pyproject_file, new_version)
-                print(f"[OK] {pyproject_file} 업데이트 완료", file=sys.stderr)
-            except (ValueError, OSError) as e:
-                print(f"ERROR: pyproject.toml 쓰기 실패: {e}", file=sys.stderr)
-                return 1
-        else:
-            print(f"[SKIP] {pyproject_file} 없음, 건너뜁니다.", file=sys.stderr)
+        rc = _apply_sync(sync_pyproject, pyproject_file, new_version, 'pyproject.toml', required=False)
+        if rc is not None:
+            return rc
 
         # Inno Setup 인스톨러 버전 동기화 (test_release_version_files_are_in_sync 요구사항)
-        if installer_file.exists():
-            try:
-                sync_installer(installer_file, new_version)
-                print(f"[OK] {installer_file} 업데이트 완료", file=sys.stderr)
-            except (ValueError, OSError) as e:
-                print(f"ERROR: installer .iss 쓰기 실패: {e}", file=sys.stderr)
-                return 1
-        else:
-            print(f"[SKIP] {installer_file} 없음, 건너뜁니다.", file=sys.stderr)
+        rc = _apply_sync(sync_installer, installer_file, new_version, 'installer .iss', required=False)
+        if rc is not None:
+            return rc
 
     # $GITHUB_OUTPUT 호환 형식으로 stdout 출력
     print(f"new_version={new_version}")
