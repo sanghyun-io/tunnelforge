@@ -1,5 +1,5 @@
 """마이그레이션 분석 작업 스레드"""
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, fields
 
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -36,9 +36,21 @@ class MigrationAnalyzerWorker(QThread):
         self,
         connector: MySQLConnector,
         schema: str,
-        options: MigrationCheckOptions = MigrationCheckOptions()
+        options: MigrationCheckOptions = None,
+        **legacy_check_options
     ):
         super().__init__()
+        if options is not None and legacy_check_options:
+            raise TypeError("Use either options or legacy check_* keyword arguments, not both")
+        if options is None:
+            option_values = asdict(MigrationCheckOptions())
+            valid_names = {field.name for field in fields(MigrationCheckOptions)}
+            unexpected = sorted(set(legacy_check_options) - valid_names)
+            if unexpected:
+                unexpected_names = ", ".join(unexpected)
+                raise TypeError(f"Unexpected migration check option(s): {unexpected_names}")
+            option_values.update(legacy_check_options)
+            options = MigrationCheckOptions(**option_values)
         self.connector = connector
         self.schema = schema
         self.options = options
@@ -71,8 +83,14 @@ class CleanupWorker(QThread):
         connector: MySQLConnector,
         schema: str,
         actions: list,  # List[CleanupAction]
+        dry_run: bool = True
     ):
         super().__init__()
+        if not dry_run:
+            raise RuntimeError(
+                "Legacy Python cleanup worker actual execution is disabled. "
+                "DB mutations must be owned by Rust Core."
+            )
         self.connector = connector
         self.schema = schema
         self.actions = actions

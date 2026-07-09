@@ -17,12 +17,13 @@ from typing import List, Optional, Set
 from src.core.db_connector import MySQLConnector
 from src.core.migration_analyzer import CompatibilityIssue
 from src.core.migration_constants import IssueType
-from src.core.migration_fix_wizard import FixWizardStep, CharsetFixPlanBuilder
+from src.core.migration_fix_wizard import FixWizardStep, CharsetFixPlanBuilder, CharsetTableInfo
 from src.ui.dialogs.fix_wizard_issue_selection_page import IssueSelectionPage
 from src.ui.dialogs.fix_wizard_charset_page import CharsetFixPage
 from src.ui.dialogs.fix_wizard_option_page import FixOptionPage
 from src.ui.dialogs.fix_wizard_preview_page import PreviewPage
 from src.ui.dialogs.fix_wizard_execution_page import ExecutionPage
+from src.ui.workers.fix_wizard_worker import FixWizardWorker
 
 
 class FixWizardDialog(QWizard):

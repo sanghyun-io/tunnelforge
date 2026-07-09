@@ -32,7 +32,7 @@ def _cleanup_action() -> CleanupAction:
 
 
 def test_cleanup_worker_rejects_legacy_actual_cleanup_mode():
-    with pytest.raises(TypeError, match="dry_run"):
+    with pytest.raises(RuntimeError, match="Rust Core"):
         CleanupWorker(
             connector=FakeMySQLConnector(),
             schema="app",
@@ -89,6 +89,40 @@ def test_migration_analyzer_worker_forwards_options_without_int_display_width(mo
     assert captured["options"]["check_orphans"] is False
     assert captured["options"]["check_timestamp_range"] is True
     assert "check_int_display_width" not in captured["options"]
+
+
+def test_migration_analyzer_worker_accepts_legacy_check_kwargs(monkeypatch):
+    captured = {}
+
+    class _FakeAnalyzer:
+        def __init__(self, connector):
+            captured["connector"] = connector
+
+        def set_progress_callback(self, callback):
+            captured["progress_callback"] = callback
+
+        def analyze_schema(self, schema, **options):
+            captured["schema"] = schema
+            captured["options"] = options
+            return SimpleNamespace()
+
+    monkeypatch.setattr("src.ui.workers.migration_worker.MigrationAnalyzer", _FakeAnalyzer)
+
+    worker = MigrationAnalyzerWorker(
+        FakeMySQLConnector(),
+        "app",
+        check_orphans=False,
+        check_charset=False,
+        check_fk_name_length=False,
+    )
+
+    worker.run()
+
+    assert captured["schema"] == "app"
+    assert captured["options"]["check_orphans"] is False
+    assert captured["options"]["check_charset"] is False
+    assert captured["options"]["check_fk_name_length"] is False
+    assert captured["options"]["check_keywords"] is True
 
 
 def test_fix_wizard_worker_rejects_legacy_actual_execution_mode():

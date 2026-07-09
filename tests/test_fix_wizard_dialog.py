@@ -8,6 +8,11 @@ from src.ui.workers import fix_wizard_worker
 from src.core.migration_fix_models import CharsetTableInfo
 
 
+def test_fix_wizard_dialog_preserves_legacy_module_reexports():
+    assert fix_wizard_dialog.FixWizardWorker is fix_wizard_worker.FixWizardWorker
+    assert fix_wizard_dialog.CharsetTableInfo is CharsetTableInfo
+
+
 class _FakeSignal:
     def connect(self, _callback):
         pass
