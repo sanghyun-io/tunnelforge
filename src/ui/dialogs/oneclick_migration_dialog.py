@@ -12,10 +12,10 @@ from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QStackedWidget,
     QWidget, QLabel, QPushButton, QProgressBar,
     QTextEdit, QGroupBox, QMessageBox, QFileDialog,
-    QCheckBox, QScrollArea, QFrame
+    QCheckBox, QFrame
 )
 from PyQt6.QtCore import QThread, pyqtSignal, Qt
-from PyQt6.QtGui import QFont, QColor
+from PyQt6.QtGui import QFont
 
 from src.core.db_connector import MySQLConnector
 from src.core.migration_preflight import PreflightResult, CheckResult, CheckSeverity

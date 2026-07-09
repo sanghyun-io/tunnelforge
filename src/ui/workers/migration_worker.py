@@ -1,10 +1,29 @@
 """마이그레이션 분석 작업 스레드"""
+from dataclasses import asdict, dataclass
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.core.db_connector import MySQLConnector
-from src.core.migration_analyzer import (
-    MigrationAnalyzer, AnalysisResult, CleanupAction, ActionType
-)
+from src.core.migration_analyzer import MigrationAnalyzer
+
+
+@dataclass(frozen=True)
+class MigrationCheckOptions:
+    """마이그레이션 분석 워커가 core analyze_schema로 전달하는 검사 옵션"""
+    check_orphans: bool = True
+    check_charset: bool = True
+    check_keywords: bool = True
+    check_routines: bool = True
+    check_sql_mode: bool = True
+    check_auth_plugins: bool = True
+    check_zerofill: bool = True
+    check_float_precision: bool = True
+    check_fk_name_length: bool = True
+    check_invalid_dates: bool = True
+    check_year2: bool = True
+    check_deprecated_engines: bool = True
+    check_enum_empty: bool = True
+    check_timestamp_range: bool = True
 
 
 class MigrationAnalyzerWorker(QThread):
@@ -17,42 +36,12 @@ class MigrationAnalyzerWorker(QThread):
         self,
         connector: MySQLConnector,
         schema: str,
-        check_orphans: bool = True,
-        check_charset: bool = True,
-        check_keywords: bool = True,
-        check_routines: bool = True,
-        check_sql_mode: bool = True,
-        # MySQL 8.4 Upgrade Checker 옵션
-        check_auth_plugins: bool = True,
-        check_zerofill: bool = True,
-        check_float_precision: bool = True,
-        check_fk_name_length: bool = True,
-        # 추가 검사 옵션
-        check_invalid_dates: bool = True,
-        check_year2: bool = True,
-        check_deprecated_engines: bool = True,
-        check_enum_empty: bool = True,
-        check_timestamp_range: bool = True
+        options: MigrationCheckOptions = MigrationCheckOptions()
     ):
         super().__init__()
         self.connector = connector
         self.schema = schema
-        self.check_orphans = check_orphans
-        self.check_charset = check_charset
-        self.check_keywords = check_keywords
-        self.check_routines = check_routines
-        self.check_sql_mode = check_sql_mode
-        # MySQL 8.4 Upgrade Checker 옵션
-        self.check_auth_plugins = check_auth_plugins
-        self.check_zerofill = check_zerofill
-        self.check_float_precision = check_float_precision
-        self.check_fk_name_length = check_fk_name_length
-        # 추가 검사 옵션
-        self.check_invalid_dates = check_invalid_dates
-        self.check_year2 = check_year2
-        self.check_deprecated_engines = check_deprecated_engines
-        self.check_enum_empty = check_enum_empty
-        self.check_timestamp_range = check_timestamp_range
+        self.options = options
 
     def run(self):
         try:
@@ -61,22 +50,7 @@ class MigrationAnalyzerWorker(QThread):
 
             result = analyzer.analyze_schema(
                 self.schema,
-                check_orphans=self.check_orphans,
-                check_charset=self.check_charset,
-                check_keywords=self.check_keywords,
-                check_routines=self.check_routines,
-                check_sql_mode=self.check_sql_mode,
-                # MySQL 8.4 Upgrade Checker 옵션
-                check_auth_plugins=self.check_auth_plugins,
-                check_zerofill=self.check_zerofill,
-                check_float_precision=self.check_float_precision,
-                check_fk_name_length=self.check_fk_name_length,
-                # 추가 검사 옵션
-                check_invalid_dates=self.check_invalid_dates,
-                check_year2=self.check_year2,
-                check_deprecated_engines=self.check_deprecated_engines,
-                check_enum_empty=self.check_enum_empty,
-                check_timestamp_range=self.check_timestamp_range
+                **asdict(self.options)
             )
 
             self.analysis_complete.emit(result)
@@ -87,7 +61,7 @@ class MigrationAnalyzerWorker(QThread):
 
 
 class CleanupWorker(QThread):
-    """정리 작업 실행 스레드"""
+    """preview/dry-run 전용 정리 작업 실행 스레드"""
     progress = pyqtSignal(str)  # 진행 메시지
     action_complete = pyqtSignal(str, bool, str, int)  # table, success, message, affected_rows
     finished = pyqtSignal(bool, str, dict)  # success, message, results
@@ -97,15 +71,8 @@ class CleanupWorker(QThread):
         connector: MySQLConnector,
         schema: str,
         actions: list,  # List[CleanupAction]
-        dry_run: bool = True
     ):
         super().__init__()
-        if not dry_run:
-            raise RuntimeError(
-                "Legacy Python cleanup worker actual execution is disabled. "
-                "DB mutations must be owned by Rust Core."
-            )
-
         self.connector = connector
         self.schema = schema
         self.actions = actions

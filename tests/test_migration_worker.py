@@ -9,7 +9,7 @@ from PyQt6.QtWidgets import QApplication, QDialog, QMessageBox
 
 from src.core.migration_analyzer import ActionType, CleanupAction
 from src.ui.dialogs import migration_dialogs
-from src.ui.workers.migration_worker import CleanupWorker
+from src.ui.workers.migration_worker import CleanupWorker, MigrationAnalyzerWorker, MigrationCheckOptions
 from src.ui.workers.fix_wizard_worker import FixWizardWorker
 from tests.conftest import FakeMySQLConnector
 
@@ -32,7 +32,7 @@ def _cleanup_action() -> CleanupAction:
 
 
 def test_cleanup_worker_rejects_legacy_actual_cleanup_mode():
-    with pytest.raises(RuntimeError, match="Rust Core"):
+    with pytest.raises(TypeError, match="dry_run"):
         CleanupWorker(
             connector=FakeMySQLConnector(),
             schema="app",
@@ -46,12 +46,49 @@ def test_cleanup_worker_allows_dry_run_mode():
         connector=FakeMySQLConnector(),
         schema="app",
         actions=[_cleanup_action()],
-        dry_run=True,
     )
 
     assert worker.schema == "app"
     assert worker.actions
     assert not hasattr(worker, "dry_run")
+
+
+def test_migration_analyzer_worker_forwards_options_without_int_display_width(monkeypatch):
+    captured = {}
+
+    class _FakeAnalyzer:
+        def __init__(self, connector):
+            captured["connector"] = connector
+
+        def set_progress_callback(self, callback):
+            captured["progress_callback"] = callback
+
+        def analyze_schema(self, schema, **options):
+            captured["schema"] = schema
+            captured["options"] = options
+            return SimpleNamespace()
+
+    monkeypatch.setattr("src.ui.workers.migration_worker.MigrationAnalyzer", _FakeAnalyzer)
+
+    options = MigrationCheckOptions(
+        check_orphans=False,
+        check_charset=False,
+        check_keywords=False,
+        check_routines=False,
+        check_sql_mode=False,
+        check_auth_plugins=False,
+        check_zerofill=False,
+        check_float_precision=False,
+        check_fk_name_length=False,
+    )
+    worker = MigrationAnalyzerWorker(FakeMySQLConnector(), "app", options=options)
+
+    worker.run()
+
+    assert captured["schema"] == "app"
+    assert captured["options"]["check_orphans"] is False
+    assert captured["options"]["check_timestamp_range"] is True
+    assert "check_int_display_width" not in captured["options"]
 
 
 def test_fix_wizard_worker_rejects_legacy_actual_execution_mode():

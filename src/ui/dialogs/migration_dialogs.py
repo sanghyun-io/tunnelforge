@@ -4,40 +4,42 @@
 - FK 관계 시각화
 - dry-run 정리 영향 분석
 """
-import os
-import json
-import shutil
-import html
-import re
 import threading
+from pathlib import Path
 from PyQt6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
-    QLabel, QLineEdit, QSpinBox, QPushButton, QComboBox,
-    QCheckBox, QListWidget, QListWidgetItem, QGroupBox,
+    QDialog, QVBoxLayout, QHBoxLayout,
+    QLabel, QPushButton, QComboBox,
+    QCheckBox, QGroupBox,
     QMessageBox, QProgressBar, QApplication,
     QRadioButton, QButtonGroup, QWidget, QTabWidget,
-    QTextEdit, QTreeWidget, QTreeWidgetItem, QSplitter,
-    QTableWidget, QTableWidgetItem, QHeaderView, QFrame,
-    QFileDialog, QMenu
+    QTextEdit, QTreeWidget, QTreeWidgetItem,
+    QTableWidget, QTableWidgetItem, QHeaderView,
+    QFileDialog
 )
 from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont, QColor
-from typing import List, Optional, Dict
+from PyQt6.QtGui import QColor
+from typing import Iterator, List, Optional, Dict
 from datetime import datetime
 
 from src.core.db_connector import MySQLConnector
 from src.core.migration_analyzer import (
     MigrationAnalyzer, AnalysisResult, OrphanRecord,
-    CompatibilityIssue, CleanupAction, ActionType, IssueType
+    CompatibilityIssue, ActionType
 )
 from src.core.migration_constants import ISSUE_TYPE_DISPLAY_NAMES, AUTO_FIXABLE_ISSUE_TYPES
-from src.ui.workers.migration_worker import MigrationAnalyzerWorker, CleanupWorker
+from src.ui.workers.migration_worker import (
+    MigrationAnalyzerWorker,
+    MigrationCheckOptions,
+    CleanupWorker,
+)
 from src.core.logger import get_logger
-from src.core.platform_paths import analysis_dir
 from src.ui.dialogs.migration_manual_guide_dialog import ManualGuideDialog
+from src.ui.dialogs.migration_result_store import MigrationResultStore
 
 logger = get_logger('migration_dialogs')
 ONE_CLICK_MIGRATION_FEATURE_ENABLED = True
+ORPHAN_COUNT_CRITICAL_THRESHOLD = 1000
+ORPHAN_COUNT_WARNING_THRESHOLD = 100
 LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP = (
     "실제 정리 실행은 Rust Core 구현 전까지 비활성화되어 있습니다. "
     "현재는 Dry-Run과 SQL 미리보기만 사용할 수 있습니다."
@@ -105,10 +107,47 @@ def _safe_disconnect_all(signal) -> None:
         pass
 
 
-def _format_fk_tree_text(fk_tree: Dict[str, List[str]]) -> str:
-    """FK 트리를 ASCII 텍스트로 변환하는 순수 포맷터 (DB 접근 없이 fk_tree 데이터만 사용)"""
+def _make_action_button(text: str, bg: str, hover: str, disabled: str = '#bdc3c7') -> QPushButton:
+    """굵은 액션 버튼 생성"""
+    button = QPushButton(text)
+    padding = "8px 20px"
+    font_size = "font-size: 14px;"
+    if text in {"🔍 Dry-Run (미리보기)", "⚡ 실행"}:
+        padding = "8px 16px"
+        font_size = ""
+    elif text in {"🔧 자동 수정 위저드", "📖 수동 처리 가이드"}:
+        padding = "6px 16px"
+        font_size = ""
+
+    button.setStyleSheet(f"""
+        QPushButton {{
+            background-color: {bg}; color: white; font-weight: bold;
+            padding: {padding}; border-radius: 4px; border: none;
+            {font_size}
+        }}
+        QPushButton:hover {{ background-color: {hover}; }}
+        QPushButton:disabled {{ background-color: {disabled}; }}
+    """)
+    return button
+
+
+def _make_secondary_button(text: str) -> QPushButton:
+    """보조 버튼 생성"""
+    button = QPushButton(text)
+    button.setStyleSheet("""
+        QPushButton {
+            background-color: #ecf0f1; color: #2c3e50;
+            padding: 8px 20px; border-radius: 4px; border: 1px solid #bdc3c7;
+        }
+        QPushButton:hover { background-color: #d5dbdb; }
+    """)
+    return button
+
+
+def iter_fk_tree(fk_tree: Dict[str, List[str]]) -> Iterator[tuple[str, int, bool, bool]]:
+    """FK 트리를 루트/사이클 처리 규칙에 맞게 순회한다."""
     if not fk_tree:
-        return "FK 관계가 없습니다."
+        return
 
     all_children = set()
     for children in fk_tree.values():
@@ -116,30 +155,62 @@ def _format_fk_tree_text(fk_tree: Dict[str, List[str]]) -> str:
 
     root_tables = sorted(set(fk_tree.keys()) - all_children)
     rendered: set = set()
-    lines = ["FK 관계 트리:"]
 
-    def _walk(table: str, prefix: str, visited: set):
+    def _walk(table: str, depth: int, visited: set) -> Iterator[tuple[str, int, bool, bool]]:
         rendered.add(table)
-        for i, child in enumerate(fk_tree.get(table, [])):
-            is_last = (i == len(fk_tree.get(table, [])) - 1)
-            branch = "└── " if is_last else "├── "
+        children = fk_tree.get(table, [])
+        for index, child in enumerate(children):
+            is_last = index == len(children) - 1
             if child in visited:
-                lines.append(f"{prefix}{branch}🔄 {child} (순환 참조)")
+                yield child, depth + 1, True, is_last
                 continue
-            lines.append(f"{prefix}{branch}{child}")
-            next_prefix = prefix + ("    " if is_last else "│   ")
-            _walk(child, next_prefix, visited | {child})
+            yield child, depth + 1, False, is_last
+            yield from _walk(child, depth + 1, visited | {child})
 
     for root in root_tables:
-        lines.append(f"📁 {root}")
-        _walk(root, "", {root})
+        yield root, 0, False, True
+        yield from _walk(root, 0, {root})
 
-    # 루트에서 도달하지 못한 테이블(사이클 전용)도 최상위 진입점으로 렌더
     for table in sorted(fk_tree.keys()):
         if table in rendered:
             continue
-        lines.append(f"📁 {table}")
-        _walk(table, "", {table})
+        yield table, 0, False, True
+        yield from _walk(table, 0, {table})
+
+
+def build_orphan_select_sql(orphan: OrphanRecord, schema: str) -> str:
+    """고아 레코드 조회 쿼리 생성"""
+    return f"""-- {orphan.child_table}.{orphan.child_column} → {orphan.parent_table}.{orphan.parent_column}
+-- 고아 레코드 수: {orphan.orphan_count:,}개
+SELECT c.*
+FROM `{schema}`.`{orphan.child_table}` c
+LEFT JOIN `{schema}`.`{orphan.parent_table}` p
+    ON c.`{orphan.child_column}` = p.`{orphan.parent_column}`
+WHERE c.`{orphan.child_column}` IS NOT NULL
+  AND p.`{orphan.parent_column}` IS NULL;"""
+
+
+def _format_fk_tree_text(fk_tree: Dict[str, List[str]]) -> str:
+    """FK 트리를 ASCII 텍스트로 변환하는 순수 포맷터 (DB 접근 없이 fk_tree 데이터만 사용)"""
+    if not fk_tree:
+        return "FK 관계가 없습니다."
+
+    lines = ["FK 관계 트리:"]
+    last_at_depth: List[bool] = []
+
+    for table, depth, is_cycle, is_last in iter_fk_tree(fk_tree):
+        if depth == 0:
+            lines.append(f"📁 {table}")
+            last_at_depth = [True]
+            continue
+
+        while len(last_at_depth) <= depth:
+            last_at_depth.append(True)
+        prefix = "".join("    " if last_at_depth[level] else "│   " for level in range(1, depth))
+        branch = "└── " if is_last else "├── "
+        label = f"🔄 {table} (순환 참조)" if is_cycle else table
+        lines.append(f"{prefix}{branch}{label}")
+        last_at_depth[depth] = is_last
 
     return "\n".join(lines)
 
@@ -157,6 +228,7 @@ class MigrationAnalyzerDialog(QDialog):
         self.analysis_result: Optional[AnalysisResult] = None
         self.worker: Optional[MigrationAnalyzerWorker] = None
         self.cleanup_worker: Optional[CleanupWorker] = None
+        self.result_store = MigrationResultStore()
         self._is_closing = False  # 닫기 진행 중 플래그
         self._auto_saved_path: Optional[str] = None  # 자동 저장 경로
         self._disconnect_deferred_to_worker_completion = False  # 커넥터 해제를 Worker 완료로 위임했는지 여부
@@ -228,122 +300,10 @@ class MigrationAnalyzerDialog(QDialog):
         # --- 상단: 스키마 선택 및 분석 옵션 ---
         top_group = QGroupBox("분석 설정")
         top_layout = QVBoxLayout(top_group)
-
-        # 스키마 선택
-        schema_layout = QHBoxLayout()
-        schema_layout.addWidget(QLabel("스키마:"))
-        self.combo_schema = QComboBox()
-        self.combo_schema.setMinimumWidth(200)
-        schema_layout.addWidget(self.combo_schema)
-        schema_layout.addStretch()
-        top_layout.addLayout(schema_layout)
-
-        # 분석 옵션 체크박스들 (행 1: 기존 검사)
-        options_layout = QHBoxLayout()
-
-        self.chk_orphans = QCheckBox("고아 레코드 검사")
-        self.chk_orphans.setChecked(True)
-        self.chk_orphans.setToolTip("FK 관계에서 부모가 없는 자식 레코드 탐지")
-
-        self.chk_charset = QCheckBox("문자셋 이슈")
-        self.chk_charset.setChecked(True)
-        self.chk_charset.setToolTip("utf8mb3 사용 테이블/컬럼 확인")
-
-        self.chk_keywords = QCheckBox("예약어 충돌")
-        self.chk_keywords.setChecked(True)
-        self.chk_keywords.setToolTip("MySQL 8.4 새 예약어와 충돌하는 이름 확인")
-
-        self.chk_routines = QCheckBox("저장 프로시저/함수")
-        self.chk_routines.setChecked(True)
-        self.chk_routines.setToolTip("deprecated 함수 사용 여부 확인")
-
-        self.chk_sql_mode = QCheckBox("SQL 모드")
-        self.chk_sql_mode.setChecked(True)
-        self.chk_sql_mode.setToolTip("deprecated SQL 모드 사용 여부 확인")
-
-        options_layout.addWidget(self.chk_orphans)
-        options_layout.addWidget(self.chk_charset)
-        options_layout.addWidget(self.chk_keywords)
-        options_layout.addWidget(self.chk_routines)
-        options_layout.addWidget(self.chk_sql_mode)
-        options_layout.addStretch()
-
-        top_layout.addLayout(options_layout)
-
-        # 분석 옵션 체크박스들 (행 2: MySQL 8.4 Upgrade Checker)
-        options_layout2 = QHBoxLayout()
-
-        self.chk_auth_plugins = QCheckBox("인증 플러그인")
-        self.chk_auth_plugins.setChecked(True)
-        self.chk_auth_plugins.setToolTip("mysql_native_password, sha256_password 사용자 확인")
-
-        self.chk_zerofill = QCheckBox("ZEROFILL")
-        self.chk_zerofill.setChecked(True)
-        self.chk_zerofill.setToolTip("ZEROFILL 속성 사용 컬럼 확인")
-
-        self.chk_float_precision = QCheckBox("FLOAT(M,D)")
-        self.chk_float_precision.setChecked(True)
-        self.chk_float_precision.setToolTip("FLOAT(M,D), DOUBLE(M,D) deprecated 구문 확인")
-
-        self.chk_fk_name_length = QCheckBox("FK 이름 길이")
-        self.chk_fk_name_length.setChecked(True)
-        self.chk_fk_name_length.setToolTip("FK 이름 64자 초과 확인")
-
-        options_layout2.addWidget(QLabel("🔧 8.4 검사:"))
-        options_layout2.addWidget(self.chk_auth_plugins)
-        options_layout2.addWidget(self.chk_zerofill)
-        options_layout2.addWidget(self.chk_float_precision)
-        options_layout2.addWidget(self.chk_fk_name_length)
-        options_layout2.addStretch()
-
-        top_layout.addLayout(options_layout2)
-
-        # 분석 버튼
-        btn_layout = QHBoxLayout()
-        self.btn_analyze = QPushButton("🔍 분석 시작")
-        self.btn_analyze.setStyleSheet("""
-            QPushButton {
-                background-color: #3498db; color: white; font-weight: bold;
-                padding: 8px 20px; border-radius: 4px; border: none;
-                font-size: 14px;
-            }
-            QPushButton:hover { background-color: #2980b9; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
-        self.btn_analyze.clicked.connect(self.start_analysis)
-        btn_layout.addWidget(self.btn_analyze)
-
-        # One-Click migration button
-        self.btn_oneclick = QPushButton("🚀 One-Click Migration")
-        self.btn_oneclick.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60; color: white; font-weight: bold;
-                padding: 8px 20px; border-radius: 4px; border: none;
-                font-size: 14px;
-            }
-            QPushButton:hover { background-color: #219a52; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
-        self.btn_oneclick.setToolTip(
-            "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 기본 dry-run으로 실행합니다.\n"
-            "백업 확인 후 검증된 MyISAM/deprecated engine 테이블만 InnoDB로 자동 변경할 수 있습니다."
-        )
-        self.btn_oneclick.clicked.connect(self.start_oneclick_migration)
-        self.btn_oneclick.setVisible(ONE_CLICK_MIGRATION_FEATURE_ENABLED)
-        btn_layout.addWidget(self.btn_oneclick)
-
-        # 저장/불러오기 버튼
-        self.btn_save = QPushButton("💾 결과 저장")
-        self.btn_save.setEnabled(False)
-        self.btn_save.clicked.connect(self.save_analysis_result)
-        btn_layout.addWidget(self.btn_save)
-
-        self.btn_load = QPushButton("📂 결과 불러오기")
-        self.btn_load.clicked.connect(self.load_analysis_result)
-        btn_layout.addWidget(self.btn_load)
-
-        btn_layout.addStretch()
-        top_layout.addLayout(btn_layout)
+        top_layout.addLayout(self._build_schema_row())
+        top_layout.addLayout(self._build_basic_check_options())
+        top_layout.addLayout(self._build_upgrade_checker_options())
+        top_layout.addLayout(self._build_action_buttons())
 
         layout.addWidget(top_group)
 
@@ -385,20 +345,108 @@ class MigrationAnalyzerDialog(QDialog):
         # --- 하단 버튼 ---
         bottom_layout = QHBoxLayout()
 
-        self.btn_close = QPushButton("닫기")
-        self.btn_close.setStyleSheet("""
-            QPushButton {
-                background-color: #ecf0f1; color: #2c3e50;
-                padding: 8px 20px; border-radius: 4px; border: 1px solid #bdc3c7;
-            }
-            QPushButton:hover { background-color: #d5dbdb; }
-        """)
+        self.btn_close = _make_secondary_button("닫기")
         self.btn_close.clicked.connect(self.close)
 
         bottom_layout.addStretch()
         bottom_layout.addWidget(self.btn_close)
 
         layout.addLayout(bottom_layout)
+
+    def _build_schema_row(self) -> QHBoxLayout:
+        schema_layout = QHBoxLayout()
+        schema_layout.addWidget(QLabel("스키마:"))
+        self.combo_schema = QComboBox()
+        self.combo_schema.setMinimumWidth(200)
+        schema_layout.addWidget(self.combo_schema)
+        schema_layout.addStretch()
+        return schema_layout
+
+    def _build_basic_check_options(self) -> QHBoxLayout:
+        options_layout = QHBoxLayout()
+
+        self.chk_orphans = QCheckBox("고아 레코드 검사")
+        self.chk_orphans.setChecked(True)
+        self.chk_orphans.setToolTip("FK 관계에서 부모가 없는 자식 레코드 탐지")
+
+        self.chk_charset = QCheckBox("문자셋 이슈")
+        self.chk_charset.setChecked(True)
+        self.chk_charset.setToolTip("utf8mb3 사용 테이블/컬럼 확인")
+
+        self.chk_keywords = QCheckBox("예약어 충돌")
+        self.chk_keywords.setChecked(True)
+        self.chk_keywords.setToolTip("MySQL 8.4 새 예약어와 충돌하는 이름 확인")
+
+        self.chk_routines = QCheckBox("저장 프로시저/함수")
+        self.chk_routines.setChecked(True)
+        self.chk_routines.setToolTip("deprecated 함수 사용 여부 확인")
+
+        self.chk_sql_mode = QCheckBox("SQL 모드")
+        self.chk_sql_mode.setChecked(True)
+        self.chk_sql_mode.setToolTip("deprecated SQL 모드 사용 여부 확인")
+
+        options_layout.addWidget(self.chk_orphans)
+        options_layout.addWidget(self.chk_charset)
+        options_layout.addWidget(self.chk_keywords)
+        options_layout.addWidget(self.chk_routines)
+        options_layout.addWidget(self.chk_sql_mode)
+        options_layout.addStretch()
+        return options_layout
+
+    def _build_upgrade_checker_options(self) -> QHBoxLayout:
+        options_layout = QHBoxLayout()
+
+        self.chk_auth_plugins = QCheckBox("인증 플러그인")
+        self.chk_auth_plugins.setChecked(True)
+        self.chk_auth_plugins.setToolTip("mysql_native_password, sha256_password 사용자 확인")
+
+        self.chk_zerofill = QCheckBox("ZEROFILL")
+        self.chk_zerofill.setChecked(True)
+        self.chk_zerofill.setToolTip("ZEROFILL 속성 사용 컬럼 확인")
+
+        self.chk_float_precision = QCheckBox("FLOAT(M,D)")
+        self.chk_float_precision.setChecked(True)
+        self.chk_float_precision.setToolTip("FLOAT(M,D), DOUBLE(M,D) deprecated 구문 확인")
+
+        self.chk_fk_name_length = QCheckBox("FK 이름 길이")
+        self.chk_fk_name_length.setChecked(True)
+        self.chk_fk_name_length.setToolTip("FK 이름 64자 초과 확인")
+
+        options_layout.addWidget(QLabel("🔧 8.4 검사:"))
+        options_layout.addWidget(self.chk_auth_plugins)
+        options_layout.addWidget(self.chk_zerofill)
+        options_layout.addWidget(self.chk_float_precision)
+        options_layout.addWidget(self.chk_fk_name_length)
+        options_layout.addStretch()
+        return options_layout
+
+    def _build_action_buttons(self) -> QHBoxLayout:
+        btn_layout = QHBoxLayout()
+
+        self.btn_analyze = _make_action_button("🔍 분석 시작", "#3498db", "#2980b9")
+        self.btn_analyze.clicked.connect(self.start_analysis)
+        btn_layout.addWidget(self.btn_analyze)
+
+        self.btn_oneclick = _make_action_button("🚀 One-Click Migration", "#27ae60", "#219a52")
+        self.btn_oneclick.setToolTip(
+            "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 기본 dry-run으로 실행합니다.\n"
+            "백업 확인 후 검증된 MyISAM/deprecated engine 테이블만 InnoDB로 자동 변경할 수 있습니다."
+        )
+        self.btn_oneclick.clicked.connect(self.start_oneclick_migration)
+        self.btn_oneclick.setVisible(ONE_CLICK_MIGRATION_FEATURE_ENABLED)
+        btn_layout.addWidget(self.btn_oneclick)
+
+        self.btn_save = QPushButton("💾 결과 저장")
+        self.btn_save.setEnabled(False)
+        self.btn_save.clicked.connect(self.save_analysis_result)
+        btn_layout.addWidget(self.btn_save)
+
+        self.btn_load = QPushButton("📂 결과 불러오기")
+        self.btn_load.clicked.connect(self.load_analysis_result)
+        btn_layout.addWidget(self.btn_load)
+
+        btn_layout.addStretch()
+        return btn_layout
 
     def init_overview_tab(self):
         """개요 탭 초기화"""
@@ -480,28 +528,12 @@ class MigrationAnalyzerDialog(QDialog):
         # 버튼들
         btn_layout = QHBoxLayout()
 
-        self.btn_dry_run = QPushButton("🔍 Dry-Run (미리보기)")
-        self.btn_dry_run.setStyleSheet("""
-            QPushButton {
-                background-color: #f39c12; color: white; font-weight: bold;
-                padding: 8px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #e67e22; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
+        self.btn_dry_run = _make_action_button("🔍 Dry-Run (미리보기)", "#f39c12", "#e67e22")
         self.btn_dry_run.clicked.connect(lambda: self.execute_cleanup(dry_run=True))
         self.btn_dry_run.setEnabled(False)
 
-        self.btn_execute = QPushButton("⚡ 실행")
+        self.btn_execute = _make_action_button("⚡ 실행", "#e74c3c", "#c0392b")
         self.btn_execute.setToolTip(LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP)
-        self.btn_execute.setStyleSheet("""
-            QPushButton {
-                background-color: #e74c3c; color: white; font-weight: bold;
-                padding: 8px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #c0392b; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
         self.btn_execute.clicked.connect(lambda: self.execute_cleanup(dry_run=False))
         self.btn_execute.setEnabled(False)
 
@@ -555,30 +587,14 @@ class MigrationAnalyzerDialog(QDialog):
         filter_layout.addStretch()
 
         # 자동 수정 위저드 버튼
-        self.btn_auto_fix = QPushButton("🔧 자동 수정 위저드")
-        self.btn_auto_fix.setStyleSheet("""
-            QPushButton {
-                background-color: #9b59b6; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #8e44ad; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
+        self.btn_auto_fix = _make_action_button("🔧 자동 수정 위저드", "#9b59b6", "#8e44ad")
         self.btn_auto_fix.setToolTip("자동 수정 가능한 이슈를 대화형 위저드로 수정합니다.")
         self.btn_auto_fix.setEnabled(False)  # 분석 완료 후 활성화
         self.btn_auto_fix.clicked.connect(self.open_fix_wizard)
         filter_layout.addWidget(self.btn_auto_fix)
 
         # 수동 처리 가이드 버튼
-        self.btn_manual_guide = QPushButton("📖 수동 처리 가이드")
-        self.btn_manual_guide.setStyleSheet("""
-            QPushButton {
-                background-color: #e67e22; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #d35400; }
-            QPushButton:disabled { background-color: #bdc3c7; }
-        """)
+        self.btn_manual_guide = _make_action_button("📖 수동 처리 가이드", "#e67e22", "#d35400")
         self.btn_manual_guide.setToolTip("자동 수정이 불가능한 이슈에 대한 수동 처리 가이드를 제공합니다.")
         self.btn_manual_guide.setEnabled(False)
         self.btn_manual_guide.clicked.connect(self.show_manual_guide)
@@ -656,8 +672,6 @@ class MigrationAnalyzerDialog(QDialog):
 
     def save_log(self):
         """로그 저장"""
-        from PyQt6.QtWidgets import QFileDialog
-
         filename, _ = QFileDialog.getSaveFileName(
             self, "로그 저장", f"migration_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt",
             "Text Files (*.txt)"
@@ -715,22 +729,17 @@ class MigrationAnalyzerDialog(QDialog):
         self.worker = MigrationAnalyzerWorker(
             connector=self.connector,
             schema=schema,
-            check_orphans=self.chk_orphans.isChecked(),
-            check_charset=self.chk_charset.isChecked(),
-            check_keywords=self.chk_keywords.isChecked(),
-            check_routines=self.chk_routines.isChecked(),
-            check_sql_mode=self.chk_sql_mode.isChecked(),
-            # MySQL 8.4 Upgrade Checker 옵션
-            check_auth_plugins=self.chk_auth_plugins.isChecked(),
-            check_zerofill=self.chk_zerofill.isChecked(),
-            check_float_precision=self.chk_float_precision.isChecked(),
-            check_fk_name_length=self.chk_fk_name_length.isChecked(),
-            # 추가 검사 (기본 활성화)
-            check_invalid_dates=True,
-            check_year2=True,
-            check_deprecated_engines=True,
-            check_enum_empty=True,
-            check_timestamp_range=True
+            options=MigrationCheckOptions(
+                check_orphans=self.chk_orphans.isChecked(),
+                check_charset=self.chk_charset.isChecked(),
+                check_keywords=self.chk_keywords.isChecked(),
+                check_routines=self.chk_routines.isChecked(),
+                check_sql_mode=self.chk_sql_mode.isChecked(),
+                check_auth_plugins=self.chk_auth_plugins.isChecked(),
+                check_zerofill=self.chk_zerofill.isChecked(),
+                check_float_precision=self.chk_float_precision.isChecked(),
+                check_fk_name_length=self.chk_fk_name_length.isChecked(),
+            )
         )
 
         self.worker.progress.connect(self.add_log)
@@ -821,9 +830,9 @@ class MigrationAnalyzerDialog(QDialog):
 
             count_item = QTableWidgetItem(f"{orphan.orphan_count:,}")
             count_item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-            if orphan.orphan_count > 1000:
+            if orphan.orphan_count > ORPHAN_COUNT_CRITICAL_THRESHOLD:
                 count_item.setForeground(QColor("#e74c3c"))
-            elif orphan.orphan_count > 100:
+            elif orphan.orphan_count > ORPHAN_COUNT_WARNING_THRESHOLD:
                 count_item.setForeground(QColor("#f39c12"))
             self.table_orphans.setItem(i, 4, count_item)
 
@@ -894,34 +903,22 @@ class MigrationAnalyzerDialog(QDialog):
             self.txt_fk_tree.setText("FK 관계가 없습니다.")
             return
 
-        # 루트 테이블 찾기
-        all_children = set()
-        for children in fk_tree.values():
-            all_children.update(children)
-
-        root_tables = set(fk_tree.keys()) - all_children
-        rendered: set = set()
-
-        def add_tree_items(parent_item, table: str, visited: set):
-            rendered.add(table)
-            for child in fk_tree.get(table, []):
-                # 순환 참조 방지
-                if child in visited:
-                    QTreeWidgetItem(parent_item, [f"🔄 {child} (순환 참조)"])
-                    continue
-                child_item = QTreeWidgetItem(parent_item, [f"└── {child}"])
-                add_tree_items(child_item, child, visited | {child})
-
-        for root in sorted(root_tables):
-            root_item = QTreeWidgetItem(self.tree_fk, [f"📁 {root}"])
-            add_tree_items(root_item, root, {root})
-
-        # 루트에서 도달하지 못한 테이블(사이클 전용)도 최상위 진입점으로 렌더
-        for table in sorted(fk_tree.keys()):
-            if table in rendered:
+        item_stack: List[QTreeWidgetItem] = []
+        for table, depth, is_cycle, _is_last in iter_fk_tree(fk_tree):
+            if depth == 0:
+                root_item = QTreeWidgetItem(self.tree_fk, [f"📁 {table}"])
+                item_stack = [root_item]
                 continue
-            cycle_root_item = QTreeWidgetItem(self.tree_fk, [f"📁 {table}"])
-            add_tree_items(cycle_root_item, table, {table})
+
+            parent_item = item_stack[depth - 1]
+            label = f"🔄 {table} (순환 참조)" if is_cycle else f"└── {table}"
+            child_item = QTreeWidgetItem(parent_item, [label])
+            if not is_cycle:
+                if len(item_stack) <= depth:
+                    item_stack.append(child_item)
+                else:
+                    item_stack[depth] = child_item
+                    del item_stack[depth + 1:]
 
         self.tree_fk.expandAll()
 
@@ -961,14 +958,7 @@ class MigrationAnalyzerDialog(QDialog):
 
     def _generate_orphan_select_query(self, orphan: OrphanRecord, schema: str) -> str:
         """고아 레코드 조회 쿼리 생성"""
-        return f"""-- {orphan.child_table}.{orphan.child_column} → {orphan.parent_table}.{orphan.parent_column}
--- 고아 레코드 수: {orphan.orphan_count:,}개
-SELECT c.*
-FROM `{schema}`.`{orphan.child_table}` c
-LEFT JOIN `{schema}`.`{orphan.parent_table}` p
-    ON c.`{orphan.child_column}` = p.`{orphan.parent_column}`
-WHERE c.`{orphan.child_column}` IS NOT NULL
-  AND p.`{orphan.parent_column}` IS NULL;"""
+        return build_orphan_select_sql(orphan, schema)
 
     def copy_orphan_query(self):
         """선택된 고아 레코드 조회 쿼리 복사"""
@@ -987,7 +977,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             row = row_index.row()
             if row < len(self.analysis_result.orphan_records):
                 orphan = self.analysis_result.orphan_records[row]
-                queries.append(self._generate_orphan_select_query(orphan, schema))
+                queries.append(build_orphan_select_sql(orphan, schema))
 
         clipboard = QApplication.clipboard()
         clipboard.setText("\n\n".join(queries))
@@ -1008,7 +998,6 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
         total_count = sum(o.orphan_count for o in orphans)
 
         # 파일 저장 다이얼로그
-        from datetime import datetime
         default_name = f"orphan_queries_{schema}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.sql"
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1021,19 +1010,12 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             return
 
         try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                f.write(f"-- ═══════════════════════════════════════════════════════════════\n")
-                f.write(f"-- 고아 레코드 조회 쿼리\n")
-                f.write(f"-- 스키마: {schema}\n")
-                f.write(f"-- 생성일시: {datetime.now().isoformat()}\n")
-                f.write(f"-- FK 관계 수: {len(orphans)}개\n")
-                f.write(f"-- 총 고아 레코드: {total_count:,}개\n")
-                f.write(f"-- ═══════════════════════════════════════════════════════════════\n\n")
-
-                for i, orphan in enumerate(orphans, 1):
-                    f.write(f"-- [{i}/{len(orphans)}] {orphan.child_table}.{orphan.child_column}\n")
-                    f.write(self._generate_orphan_select_query(orphan, schema))
-                    f.write("\n\n")
+            self.result_store.export_orphan_queries(
+                schema=schema,
+                orphans=orphans,
+                path=file_path,
+                query_builder=build_orphan_select_sql,
+            )
 
             QMessageBox.information(
                 self, "저장 완료",
@@ -1093,7 +1075,6 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             connector=self.connector,
             schema=schema,
             actions=actions,
-            dry_run=dry_run
         )
 
         self.cleanup_worker.progress.connect(self.add_log)
@@ -1233,21 +1214,14 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
 
     def _get_analysis_dir(self) -> str:
         """분석 결과 저장 디렉토리"""
-        base_dir = str(analysis_dir())
-        os.makedirs(base_dir, exist_ok=True)
-        return base_dir
+        return str(self.result_store.analysis_dir())
 
     def _auto_save_result(self, result: AnalysisResult):
         """분석 결과 자동 저장 (백그라운드, 기록 보관용)"""
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            auto_save_name = f"{result.schema}_{timestamp}.json"
-            auto_save_path = os.path.join(self._get_analysis_dir(), auto_save_name)
+            auto_save_path = self.result_store.auto_save(result)
 
-            with open(auto_save_path, 'w', encoding='utf-8') as f:
-                json.dump(result.to_dict(), f, ensure_ascii=False, indent=2, default=str)
-
-            self._auto_saved_path = auto_save_path
+            self._auto_saved_path = str(auto_save_path)
             self.add_log(f"💾 분석 결과 자동 저장: {auto_save_path}")
             logger.info(f"분석 결과 자동 저장 완료: {auto_save_path}")
 
@@ -1262,12 +1236,12 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             return
 
         # 자동 저장된 파일이 없으면 직접 저장
-        if not self._auto_saved_path or not os.path.exists(self._auto_saved_path):
+        if not self._auto_saved_path or not Path(self._auto_saved_path).exists():
             self._save_result_directly()
             return
 
         # 기본 파일명 생성
-        default_name = os.path.basename(self._auto_saved_path)
+        default_name = Path(self._auto_saved_path).name
 
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1280,7 +1254,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             return
 
         try:
-            shutil.copy2(self._auto_saved_path, file_path)
+            self.result_store.write(self.analysis_result, file_path)
 
             self.add_log(f"💾 분석 결과 복사 완료: {file_path}")
             QMessageBox.information(self, "저장 완료", f"분석 결과가 저장되었습니다.\n\n{file_path}")
@@ -1291,8 +1265,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
 
     def _save_result_directly(self):
         """분석 결과 직접 저장 (자동 저장 실패 시 fallback)"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"{self.analysis_result.schema}_{timestamp}.json"
+        default_name = self.result_store.default_name(self.analysis_result.schema)
 
         file_path, _ = QFileDialog.getSaveFileName(
             self,
@@ -1305,8 +1278,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             return
 
         try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                json.dump(self.analysis_result.to_dict(), f, ensure_ascii=False, indent=2, default=str)
+            self.result_store.write(self.analysis_result, file_path)
 
             self.add_log(f"💾 분석 결과 저장 완료: {file_path}")
             QMessageBox.information(self, "저장 완료", f"분석 결과가 저장되었습니다.\n\n{file_path}")
@@ -1330,10 +1302,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
             return
 
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-
-            result = AnalysisResult.from_dict(data)
+            result = self.result_store.read(file_path)
 
             # UI 업데이트
             self.analysis_result = result
