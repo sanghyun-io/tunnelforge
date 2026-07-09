@@ -4,6 +4,14 @@ use std::io::Write;
 
 use crate::*;
 
+/// MySQL collation/식별자 이름의 최대 길이. MySQL 식별자는 64자를 넘지 못하므로,
+/// 그보다 긴 collation 문자열은 변조된 값으로 보고 fail-closed로 거부한다.
+const MYSQL_IDENTIFIER_MAX_LEN: usize = 64;
+
+/// 검증 대상 컬럼 타입 문자열의 최대 길이. 정상 타입 선언은 이보다 훨씬 짧으므로,
+/// 초과하는 값은 주입 시도로 보고 파싱 전에 fail-closed로 거부한다.
+const MAX_COLUMN_TYPE_LEN: usize = 512;
+
 pub(crate) fn read_engine(payload: &Value, key: &str) -> String {
     payload
         .get(key)
@@ -241,13 +249,11 @@ pub fn select_chunk_sql(
     )
 }
 
-pub fn select_chunk_text_sql(
-    engine: &str,
-    table: &NormalizedTable,
-    key_columns: &[String],
-) -> String {
-    let columns = column_names(table);
-    let projected_columns = table
+/// 청크 SELECT의 텍스트 컬럼 프로젝션 절을 생성한다. 바이너리 컬럼은 hex로 인코딩하고
+/// (postgresql=encode, 그 외=HEX), 나머지는 엔진별로 text/CAST로 정규화하여 JSONL 직렬화가
+/// 안전한 문자열이 되도록 한다. 세 select_chunk_text_* 함수가 동일 프로젝션을 공유한다.
+fn projected_text_columns_sql(engine: &str, table: &NormalizedTable) -> String {
+    table
         .columns
         .iter()
         .map(|column| {
@@ -280,7 +286,16 @@ pub fn select_chunk_text_sql(
             }
         })
         .collect::<Vec<_>>()
-        .join(", ");
+        .join(", ")
+}
+
+pub fn select_chunk_text_sql(
+    engine: &str,
+    table: &NormalizedTable,
+    key_columns: &[String],
+) -> String {
+    let columns = column_names(table);
+    let projected_columns = projected_text_columns_sql(engine, table);
     let order_columns: Vec<String> = if key_columns.is_empty() {
         columns
     } else {
@@ -312,40 +327,7 @@ pub fn select_chunk_text_after_key_sql(
     limit: usize,
 ) -> String {
     let columns = column_names(table);
-    let projected_columns = table
-        .columns
-        .iter()
-        .map(|column| {
-            if is_binary_type(&column.type_name) && engine == "postgresql" {
-                format!(
-                    "encode({}, 'hex') AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            } else if is_binary_type(&column.type_name) {
-                format!(
-                    "HEX({}) AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            } else if engine == "postgresql" {
-                format!(
-                    "{}::text AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            } else if engine == "mysql" {
-                quote_ident(engine, &column.name)
-            } else {
-                format!(
-                    "CAST({} AS CHAR) AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let projected_columns = projected_text_columns_sql(engine, table);
     let order_by = key_columns
         .iter()
         .map(|column| quote_column_ref(engine, &table.name, column))
@@ -387,40 +369,7 @@ pub fn select_chunk_text_range_sql(
     start: i128,
     end: i128,
 ) -> String {
-    let projected_columns = table
-        .columns
-        .iter()
-        .map(|column| {
-            if is_binary_type(&column.type_name) && engine == "postgresql" {
-                format!(
-                    "encode({}, 'hex') AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            } else if is_binary_type(&column.type_name) {
-                format!(
-                    "HEX({}) AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            } else if engine == "postgresql" {
-                format!(
-                    "{}::text AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            } else if engine == "mysql" {
-                quote_ident(engine, &column.name)
-            } else {
-                format!(
-                    "CAST({} AS CHAR) AS {}",
-                    quote_ident(engine, &column.name),
-                    quote_ident(engine, &column.name)
-                )
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
+    let projected_columns = projected_text_columns_sql(engine, table);
     let key_ref = quote_column_ref(engine, &table.name, key_column);
     format!(
         "SELECT {} FROM {} WHERE {} >= {} AND {} <= {} ORDER BY {}",
@@ -485,13 +434,17 @@ pub fn insert_sql(engine: &str, table: &str, columns: &[String]) -> String {
     )
 }
 
-pub fn insert_rows_literal_sql(
+/// `INSERT INTO t (cols) VALUES (...), (...)`를 조립하는 공통 헬퍼.
+/// row가 Object가 아니면 모든 컬럼을 NULL로, Object면 컬럼명으로 값을 조회해
+/// `literal_for(컬럼명, 값)`으로 SQL 리터럴을 만든다. 값이 없으면 Value::Null로 대체한다.
+fn insert_values_sql(
     engine: &str,
     table: &str,
-    columns: &[String],
+    column_names: &[&str],
     rows: &[Value],
+    literal_for: impl Fn(&str, &Value) -> String,
 ) -> String {
-    let column_sql = columns
+    let column_sql = column_names
         .iter()
         .map(|column| quote_ident(engine, column))
         .collect::<Vec<_>>()
@@ -499,11 +452,11 @@ pub fn insert_rows_literal_sql(
     let values_sql = rows
         .iter()
         .map(|row| {
-            let values = columns
+            let values = column_names
                 .iter()
                 .map(|column| match row {
                     Value::Object(object) => {
-                        sql_literal(object.get(column).unwrap_or(&Value::Null))
+                        literal_for(column, object.get(*column).unwrap_or(&Value::Null))
                     }
                     _ => "NULL".to_string(),
                 })
@@ -521,43 +474,33 @@ pub fn insert_rows_literal_sql(
     )
 }
 
+pub fn insert_rows_literal_sql(
+    engine: &str,
+    table: &str,
+    columns: &[String],
+    rows: &[Value],
+) -> String {
+    let column_names: Vec<&str> = columns.iter().map(String::as_str).collect();
+    insert_values_sql(engine, table, &column_names, rows, |_column, value| {
+        sql_literal(value)
+    })
+}
+
 pub fn insert_rows_literal_sql_for_table(
     target_engine: &str,
     table: &NormalizedTable,
     rows: &[Value],
 ) -> String {
-    let columns = column_names(table);
-    let column_sql = columns
+    let column_names: Vec<&str> = table.columns.iter().map(|column| column.name.as_str()).collect();
+    let column_types: BTreeMap<&str, &str> = table
+        .columns
         .iter()
-        .map(|column| quote_ident(target_engine, column))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let values_sql = rows
-        .iter()
-        .map(|row| {
-            let values = table
-                .columns
-                .iter()
-                .map(|column| match row {
-                    Value::Object(object) => sql_literal_for_column(
-                        target_engine,
-                        &column.type_name,
-                        object.get(&column.name).unwrap_or(&Value::Null),
-                    ),
-                    _ => "NULL".to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("({values})")
-        })
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "INSERT INTO {} ({}) VALUES {}",
-        quote_ident(target_engine, &table.name),
-        column_sql,
-        values_sql
-    )
+        .map(|column| (column.name.as_str(), column.type_name.as_str()))
+        .collect();
+    insert_values_sql(target_engine, &table.name, &column_names, rows, |column, value| {
+        let source_type = column_types.get(column).copied().unwrap_or("");
+        sql_literal_for_column(target_engine, source_type, value)
+    })
 }
 
 pub(crate) fn copy_rows_to_postgres(
@@ -709,13 +652,15 @@ pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Va
         if target_engine == "postgresql" {
             return sql_literal(&Value::String(sanitize_postgresql_text(text)));
         }
-        if target_engine == "mysql" && is_json_type(&source_type) {
-            return mysql_json_literal(value);
-        }
-        if target_engine == "mysql" {
-            return mysql_sql_literal(value);
-        }
+        return mysql_or_generic_literal(target_engine, &source_type, value);
     }
+    mysql_or_generic_literal(target_engine, source_type, value)
+}
+
+/// mysql 타겟이면 JSON 타입은 `_utf8mb4'...'` 도입자를 붙이고, 그 외 mysql 값은 mysql
+/// 이스케이프 규칙으로, mysql이 아니면 범용 SQL 리터럴로 변환한다.
+/// sql_literal_for_column의 String/비-String 경로가 공유하던 3분기 로직을 통합한 헬퍼다.
+fn mysql_or_generic_literal(target_engine: &str, source_type: &str, value: &Value) -> String {
     if target_engine == "mysql" && is_json_type(source_type) {
         return mysql_json_literal(value);
     }
@@ -764,7 +709,10 @@ pub fn is_timestamp_type(type_name: &str) -> bool {
     type_name.starts_with("datetime") || type_name.starts_with("timestamp")
 }
 
-pub fn sql_literal(value: &Value) -> String {
+/// Null/Bool/Number의 공통 SQL 리터럴화를 담당하고, 문자열/배열/객체는 주어진 `escape`
+/// 클로저로 이스케이프한다. sql_literal(작은따옴표 doubling)과 mysql_sql_literal(mysql
+/// 이스케이프)이 동일한 Null/Bool/Number arm을 공유하도록 통합한 헬퍼다.
+fn generic_sql_literal(value: &Value, escape: impl Fn(&str) -> String) -> String {
     match value {
         Value::Null => "NULL".to_string(),
         Value::Bool(value) => {
@@ -775,27 +723,17 @@ pub fn sql_literal(value: &Value) -> String {
             }
         }
         Value::Number(value) => value.to_string(),
-        Value::String(value) => format!("'{}'", value.replace('\'', "''")),
-        Value::Array(_) | Value::Object(_) => {
-            format!("'{}'", value.to_string().replace('\'', "''"))
-        }
+        Value::String(value) => escape(value),
+        Value::Array(_) | Value::Object(_) => escape(&value.to_string()),
     }
 }
 
+pub fn sql_literal(value: &Value) -> String {
+    generic_sql_literal(value, |text| format!("'{}'", text.replace('\'', "''")))
+}
+
 fn mysql_sql_literal(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Bool(value) => {
-            if *value {
-                "TRUE".to_string()
-            } else {
-                "FALSE".to_string()
-            }
-        }
-        Value::Number(value) => value.to_string(),
-        Value::String(value) => mysql_string_literal(value),
-        Value::Array(_) | Value::Object(_) => mysql_string_literal(&value.to_string()),
-    }
+    generic_sql_literal(value, mysql_string_literal)
 }
 
 fn mysql_json_literal(value: &Value) -> String {
@@ -929,6 +867,27 @@ pub(crate) fn group_foreign_keys(rows: Vec<(String, String, String, String)>) ->
 }
 
 pub(crate) fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Option<String> {
+    let (mut lines, primary_keys) = column_ddl_lines(table, source, target)?;
+    if !primary_keys.is_empty() {
+        lines.push(format!("  PRIMARY KEY ({})", primary_keys.join(", ")));
+    }
+    let table_suffix = mysql_table_collation_suffix(source, target, table)?;
+    Some(format!(
+        "CREATE TABLE {} (\n{}\n){};",
+        quote_ident(target, &table.name),
+        lines.join(",\n"),
+        table_suffix
+    ))
+}
+
+/// 각 컬럼의 DDL 라인과 primary key 컬럼 목록을 만든다. 최종 DDL에 들어갈 타입 문자열
+/// (mapped_type)을 is_safe_column_type로 검증하고, 위반 시 fail-closed로 None을 반환해
+/// 컬럼 정의 탈출(CTAS/추가 컬럼 주입)을 차단한다.
+fn column_ddl_lines(
+    table: &NormalizedTable,
+    source: &str,
+    target: &str,
+) -> Option<(Vec<String>, Vec<String>)> {
     let mut lines = Vec::new();
     let mut primary_keys = Vec::new();
 
@@ -969,41 +928,40 @@ pub(crate) fn generate_table_ddl(table: &NormalizedTable, source: &str, target: 
         }
     }
 
-    if !primary_keys.is_empty() {
-        lines.push(format!("  PRIMARY KEY ({})", primary_keys.join(", ")));
-    }
+    Some((lines, primary_keys))
+}
 
+/// same-engine(MySQL→MySQL) 일 때만 테이블 레벨 `COLLATE=...` 접미사를 만든다.
+/// cross-engine이나 PostgreSQL 타겟은 빈 문자열을 반환하고, 변조된 collation 값은
+/// fail-closed로 None을 반환한다.
+fn mysql_table_collation_suffix(
+    source: &str,
+    target: &str,
+    table: &NormalizedTable,
+) -> Option<String> {
     // 테이블 레벨 기본 collation 재현은 같은 엔진(MySQL→MySQL)에서만 한다.
     // cross-engine이나 PostgreSQL 타겟에는 테이블 레벨 DEFAULT COLLATE 개념이 없어 붙이면 오류가 난다.
     // COLLATE만 지정해도 MySQL이 해당 collation의 charset을 자동 결정하므로 charset은 별도로 방출하지 않는다.
-    let table_suffix =
-        if source.eq_ignore_ascii_case(target) && target.eq_ignore_ascii_case("mysql") {
-            match table
-                .table_collation
-                .as_deref()
-                .map(str::trim)
-                .filter(|collation| !collation.is_empty())
-            {
-                // dump 매니페스트는 변조 가능한 파일이므로, collation 값을 그대로 DDL에 끼우면
-                // `utf8mb4_bin AS SELECT ...`(CTAS) 나 `utf8mb4_bin ENGINE=MyISAM` 같은
-                // 테이블 옵션/구문 주입이 가능하다(SQL injection). MySQL collation 식별자 형태만
-                // 허용하고, 위반 시 fail-closed로 DDL 생성을 거부한다(import 중단).
-                Some(collation) if is_valid_mysql_collation_ident(collation) => {
-                    format!(" COLLATE={collation}")
-                }
-                Some(_) => return None,
-                None => String::new(),
+    if source.eq_ignore_ascii_case(target) && target.eq_ignore_ascii_case("mysql") {
+        match table
+            .table_collation
+            .as_deref()
+            .map(str::trim)
+            .filter(|collation| !collation.is_empty())
+        {
+            // dump 매니페스트는 변조 가능한 파일이므로, collation 값을 그대로 DDL에 끼우면
+            // `utf8mb4_bin AS SELECT ...`(CTAS) 나 `utf8mb4_bin ENGINE=MyISAM` 같은
+            // 테이블 옵션/구문 주입이 가능하다(SQL injection). MySQL collation 식별자 형태만
+            // 허용하고, 위반 시 fail-closed로 DDL 생성을 거부한다(import 중단).
+            Some(collation) if is_valid_mysql_collation_ident(collation) => {
+                Some(format!(" COLLATE={collation}"))
             }
-        } else {
-            String::new()
-        };
-
-    Some(format!(
-        "CREATE TABLE {} (\n{}\n){};",
-        quote_ident(target, &table.name),
-        lines.join(",\n"),
-        table_suffix
-    ))
+            Some(_) => None,
+            None => Some(String::new()),
+        }
+    } else {
+        Some(String::new())
+    }
 }
 
 /// dump 매니페스트에서 온 collation 문자열이 MySQL collation 식별자로 안전한지 검사한다.
@@ -1011,10 +969,212 @@ pub(crate) fn generate_table_ddl(table: &NormalizedTable, source: &str, target: 
 /// CTAS·table_options SQL 주입을 fail-closed로 차단한다.
 fn is_valid_mysql_collation_ident(value: &str) -> bool {
     !value.is_empty()
-        && value.len() <= 64
+        && value.len() <= MYSQL_IDENTIFIER_MAX_LEN
         && value
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+}
+
+/// base 식별자를 파싱한다: ascii 알파벳으로 시작해 이후 영숫자/밑줄. 성공 시 진행된 index를,
+/// 첫 글자가 알파벳이 아니면 None을 반환한다.
+fn parse_base_ident(bytes: &[u8], mut i: usize) -> Option<usize> {
+    if i >= bytes.len() || !bytes[i].is_ascii_alphabetic() {
+        return None;
+    }
+    i += 1;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    Some(i)
+}
+
+/// enum/set의 따옴표 문자열 리스트를 파싱한다: qstr (',' qstr)*. `i`는 첫 여는 따옴표를 가리켜야 한다.
+/// 백슬래시를 포함한 값과 닫히지 않은 문자열은 fail-closed로 거부한다(어느 MySQL 이스케이프
+/// 모드에서도 validator와 서버의 따옴표 경계가 어긋나지 않도록).
+fn parse_quoted_string_list(bytes: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        if i >= bytes.len() || bytes[i] != b'\'' {
+            return None;
+        }
+        i += 1;
+        loop {
+            if i >= bytes.len() {
+                return None; // 닫히지 않은 문자열
+            }
+            match bytes[i] {
+                b'\\' => return None,
+                b'\'' => {
+                    if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
+                        i += 2; // '' 이스케이프된 따옴표
+                    } else {
+                        i += 1; // 닫는 따옴표
+                        break;
+                    }
+                }
+                _ => i += 1,
+            }
+        }
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    Some(i)
+}
+
+/// 숫자 리스트를 파싱한다: digits (',' digits)*. 숫자가 하나도 없으면 None을 반환한다.
+fn parse_numeric_list(bytes: &[u8], mut i: usize) -> Option<usize> {
+    loop {
+        let numeric_list_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        if i == numeric_list_start {
+            return None;
+        }
+        while i < bytes.len() && bytes[i] == b' ' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b',' {
+            i += 1;
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            continue;
+        }
+        break;
+    }
+    Some(i)
+}
+
+/// 선택적 인자 그룹 '(' ... ')'를 파싱한다. `i`는 여는 괄호를 가리켜야 한다.
+/// 내부는 따옴표 문자열 리스트(enum/set) 또는 숫자 리스트다.
+fn parse_arg_group(bytes: &[u8], i: usize) -> Option<usize> {
+    let mut i = i + 1;
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    i = if i < bytes.len() && bytes[i] == b'\'' {
+        parse_quoted_string_list(bytes, i)?
+    } else {
+        parse_numeric_list(bytes, i)?
+    };
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
+    if i >= bytes.len() || bytes[i] != b')' {
+        return None;
+    }
+    Some(i + 1)
+}
+
+/// 하나의 후행 modifier 단어와 그 인자를 파싱한다. `i`는 단어 첫 글자(비공백)를 가리켜야 한다.
+///   modifier = unsigned | zerofill | precision | varying [ '(' digits ')' ]
+///            | (with|without) time zone | (charset|collate) <ident>
+///            | character set <ident>
+/// 허용되지 않는 단어나 비단어 문자는 None으로 거부한다.
+fn parse_modifier_word(s: &str, bytes: &[u8], i: usize) -> Option<usize> {
+    let modifier_word_start = i;
+    let mut i = i;
+    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+        i += 1;
+    }
+    if i == modifier_word_start {
+        return None; // 비단어 문자(괄호/세미콜론/등호 등) → 거부
+    }
+    let word = s[modifier_word_start..i].to_ascii_lowercase();
+    match word.as_str() {
+        // PostgreSQL 원형 다단어 타입 꼬리 허용: `double precision`, `bit/character varying`,
+        // `timestamp/time with|without time zone`. same-engine PostgreSQL에서는 map_type이
+        // 원문 type_name을 그대로 반환하므로, 이 타입들을 거부하면 정상 import가 깨진다(fidelity).
+        "unsigned" | "zerofill" | "precision" => Some(i),
+        "varying" => {
+            // character varying(255) / bit varying(8) — 선택적 길이 인자를 허용한다.
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            if i < bytes.len() && bytes[i] == b'(' {
+                i += 1;
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let varying_length_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == varying_length_start {
+                    return None;
+                }
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                if i >= bytes.len() || bytes[i] != b')' {
+                    return None;
+                }
+                i += 1;
+            }
+            Some(i)
+        }
+        "with" | "without" => {
+            for expected in ["time", "zone"] {
+                while i < bytes.len() && bytes[i] == b' ' {
+                    i += 1;
+                }
+                let time_zone_word_start = i;
+                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if !s[time_zone_word_start..i].eq_ignore_ascii_case(expected) {
+                    return None;
+                }
+            }
+            Some(i)
+        }
+        "charset" | "collate" => {
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let charset_or_collate_value_start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if i == charset_or_collate_value_start {
+                return None;
+            }
+            Some(i)
+        }
+        "character" => {
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let set_keyword_start = i;
+            while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
+                i += 1;
+            }
+            if !s[set_keyword_start..i].eq_ignore_ascii_case("set") {
+                return None;
+            }
+            while i < bytes.len() && bytes[i] == b' ' {
+                i += 1;
+            }
+            let character_set_name_start = i;
+            while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
+                i += 1;
+            }
+            if i == character_set_name_start {
+                return None;
+            }
+            Some(i)
+        }
+        _ => None,
+    }
 }
 
 /// dump 매니페스트에서 온 MySQL 컬럼 타입 문자열이 안전한 문법인지 검사한다.
@@ -1026,98 +1186,22 @@ fn is_valid_mysql_collation_ident(value: &str) -> bool {
 /// enum/set 값 리스트는 따옴표 문자열이라 단순 식별자 allowlist로는 걸러낼 수 없어 구조적으로 파싱한다.
 fn is_safe_column_type(type_name: &str) -> bool {
     let s = type_name.trim();
-    if s.is_empty() || s.len() > 512 {
+    if s.is_empty() || s.len() > MAX_COLUMN_TYPE_LEN {
         return false;
     }
     let bytes = s.as_bytes();
-    let mut i = 0usize;
 
-    // 1) base 식별자: ascii 알파벳으로 시작, 이후 영숫자/밑줄
-    if !bytes[i].is_ascii_alphabetic() {
+    // 1) base 식별자
+    let Some(mut i) = parse_base_ident(bytes, 0) else {
         return false;
-    }
-    i += 1;
-    while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-        i += 1;
-    }
+    };
 
     // 2) 선택적 인자 그룹 '(' ... ')'
     if i < bytes.len() && bytes[i] == b'(' {
-        i += 1;
-        while i < bytes.len() && bytes[i] == b' ' {
-            i += 1;
+        match parse_arg_group(bytes, i) {
+            Some(next) => i = next,
+            None => return false,
         }
-        if i < bytes.len() && bytes[i] == b'\'' {
-            // 따옴표 문자열 리스트 (enum/set): qstr (',' qstr)*
-            loop {
-                if i >= bytes.len() || bytes[i] != b'\'' {
-                    return false;
-                }
-                i += 1;
-                loop {
-                    if i >= bytes.len() {
-                        return false; // 닫히지 않은 문자열
-                    }
-                    // enum/set 문자열 값에 백슬래시가 있으면 fail-closed로 거부한다.
-                    // 백슬래시를 일반 문자로 취급하면 기본 MySQL 모드(백슬래시=이스케이프)에서 validator와
-                    // 서버의 따옴표 경계가 어긋나 우회되고(예: enum('a\', ') , evil int -- ')), 반대로
-                    // 이스케이프로 취급하면 NO_BACKSLASH_ESCAPES 모드에서 어긋난다. 어느 모드에서도 안전하도록
-                    // 백슬래시를 포함한 값 자체를 거부한다(정상 enum/set 값에 백슬래시는 실사용상 드묾).
-                    match bytes[i] {
-                        b'\\' => return false,
-                        b'\'' => {
-                            if i + 1 < bytes.len() && bytes[i + 1] == b'\'' {
-                                i += 2; // '' 이스케이프된 따옴표
-                            } else {
-                                i += 1; // 닫는 따옴표
-                                break;
-                            }
-                        }
-                        _ => i += 1,
-                    }
-                }
-                while i < bytes.len() && bytes[i] == b' ' {
-                    i += 1;
-                }
-                if i < bytes.len() && bytes[i] == b',' {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] == b' ' {
-                        i += 1;
-                    }
-                    continue;
-                }
-                break;
-            }
-        } else {
-            // 숫자 리스트: digits (',' digits)*
-            loop {
-                let ds = i;
-                while i < bytes.len() && bytes[i].is_ascii_digit() {
-                    i += 1;
-                }
-                if i == ds {
-                    return false;
-                }
-                while i < bytes.len() && bytes[i] == b' ' {
-                    i += 1;
-                }
-                if i < bytes.len() && bytes[i] == b',' {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] == b' ' {
-                        i += 1;
-                    }
-                    continue;
-                }
-                break;
-            }
-        }
-        while i < bytes.len() && bytes[i] == b' ' {
-            i += 1;
-        }
-        if i >= bytes.len() || bytes[i] != b')' {
-            return false;
-        }
-        i += 1;
     }
 
     // 3) 후행 modifier들 (공백 구분)
@@ -1128,95 +1212,9 @@ fn is_safe_column_type(type_name: &str) -> bool {
         if i >= bytes.len() {
             break;
         }
-        let ws = i;
-        while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-            i += 1;
-        }
-        if i == ws {
-            return false; // 비단어 문자(괄호/세미콜론/등호 등) → 거부
-        }
-        let word = s[ws..i].to_ascii_lowercase();
-        match word.as_str() {
-            "unsigned" | "zerofill" => {}
-            // PostgreSQL 원형 다단어 타입 꼬리 허용: `double precision`, `bit/character varying`,
-            // `timestamp/time with|without time zone`. same-engine PostgreSQL에서는 map_type이
-            // 원문 type_name을 그대로 반환하므로, 이 타입들을 거부하면 정상 import가 깨진다(fidelity).
-            "precision" => {}
-            "varying" => {
-                // character varying(255) / bit varying(8) — 선택적 길이 인자를 허용한다.
-                while i < bytes.len() && bytes[i] == b' ' {
-                    i += 1;
-                }
-                if i < bytes.len() && bytes[i] == b'(' {
-                    i += 1;
-                    while i < bytes.len() && bytes[i] == b' ' {
-                        i += 1;
-                    }
-                    let ds = i;
-                    while i < bytes.len() && bytes[i].is_ascii_digit() {
-                        i += 1;
-                    }
-                    if i == ds {
-                        return false;
-                    }
-                    while i < bytes.len() && bytes[i] == b' ' {
-                        i += 1;
-                    }
-                    if i >= bytes.len() || bytes[i] != b')' {
-                        return false;
-                    }
-                    i += 1;
-                }
-            }
-            "with" | "without" => {
-                for expected in ["time", "zone"] {
-                    while i < bytes.len() && bytes[i] == b' ' {
-                        i += 1;
-                    }
-                    let ws2 = i;
-                    while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-                        i += 1;
-                    }
-                    if !s[ws2..i].eq_ignore_ascii_case(expected) {
-                        return false;
-                    }
-                }
-            }
-            "charset" | "collate" => {
-                while i < bytes.len() && bytes[i] == b' ' {
-                    i += 1;
-                }
-                let is2 = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                if i == is2 {
-                    return false;
-                }
-            }
-            "character" => {
-                while i < bytes.len() && bytes[i] == b' ' {
-                    i += 1;
-                }
-                let ss = i;
-                while i < bytes.len() && bytes[i].is_ascii_alphabetic() {
-                    i += 1;
-                }
-                if !s[ss..i].eq_ignore_ascii_case("set") {
-                    return false;
-                }
-                while i < bytes.len() && bytes[i] == b' ' {
-                    i += 1;
-                }
-                let is2 = i;
-                while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
-                    i += 1;
-                }
-                if i == is2 {
-                    return false;
-                }
-            }
-            _ => return false,
+        match parse_modifier_word(s, bytes, i) {
+            Some(next) => i = next,
+            None => return false,
         }
     }
 
@@ -1535,6 +1533,30 @@ mod tests {
     
     
     use crate::adapters::test_support::{RecordingAdapter, schema, single_pk_table_with_collation};
+
+    /// mysql JSON 컬럼 리터럴 테스트가 공유하는 fixture. `ai_phase1_cache.result_json`에
+    /// 유니코드 + 백슬래시 이스케이프가 섞인 JSON을 insert하는 SQL을 만든다.
+    fn ai_phase1_cache_json_insert_sql() -> String {
+        let table = NormalizedTable {
+            name: "ai_phase1_cache".to_string(),
+            columns: vec![NormalizedColumn {
+                name: "result_json".to_string(),
+                type_name: "json".to_string(),
+                default_value: None,
+                nullable: false,
+                primary_key: false,
+                unique: false,
+            }],
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            table_collation: None,
+        };
+        let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
+        insert_rows_literal_sql_for_table("mysql", &table, &[json!({"result_json": json_text})])
+    }
+
+    const AI_PHASE1_CACHE_JSON_INSERT_SQL: &str =
+        r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES (_utf8mb4'{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#;
 
     #[test]
     fn post_load_ddl_policy_applies_for_recreated_targets_only() {
@@ -2263,61 +2285,19 @@ mod tests {
 
     #[test]
     fn mysql_json_literal_insert_preserves_json_escape_backslashes() {
-        let table = NormalizedTable {
-            name: "ai_phase1_cache".to_string(),
-            columns: vec![NormalizedColumn {
-                name: "result_json".to_string(),
-                type_name: "json".to_string(),
-                default_value: None,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-            }],
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            table_collation: None,
-        };
-        let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
-
-        let sql = insert_rows_literal_sql_for_table(
-            "mysql",
-            &table,
-            &[json!({"result_json": json_text})],
-        );
-
+        // JSON 내부 백슬래시 이스케이프가 mysql 리터럴에서 이중 백슬래시로 보존되는지 검증.
         assert_eq!(
-            sql,
-            r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES (_utf8mb4'{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#
+            ai_phase1_cache_json_insert_sql(),
+            AI_PHASE1_CACHE_JSON_INSERT_SQL
         );
     }
 
     #[test]
     fn mysql_json_literal_uses_utf8mb4_introducer_for_unicode_json_text() {
-        let table = NormalizedTable {
-            name: "ai_phase1_cache".to_string(),
-            columns: vec![NormalizedColumn {
-                name: "result_json".to_string(),
-                type_name: "json".to_string(),
-                default_value: None,
-                nullable: false,
-                primary_key: false,
-                unique: false,
-            }],
-            indexes: Vec::new(),
-            foreign_keys: Vec::new(),
-            table_collation: None,
-        };
-        let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
-
-        let sql = insert_rows_literal_sql_for_table(
-            "mysql",
-            &table,
-            &[json!({"result_json": json_text})],
-        );
-
+        // 유니코드 JSON 텍스트에 _utf8mb4 도입자가 붙는지 검증.
         assert_eq!(
-            sql,
-            r#"INSERT INTO `ai_phase1_cache` (`result_json`) VALUES (_utf8mb4'{"facts":[{"content":"문서 제목은 \\"工伤管理表\\"로 표기되어 있다."}]}')"#
+            ai_phase1_cache_json_insert_sql(),
+            AI_PHASE1_CACHE_JSON_INSERT_SQL
         );
     }
 

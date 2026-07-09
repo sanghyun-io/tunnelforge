@@ -9,6 +9,10 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use mysql::prelude::Queryable;
 use crate::*;
 
+/// 이 평균 행 크기(바이트) 이상인 넓은 테이블에서는, 직전 실행에서 학습된 chunk_rows 프로파일이
+/// 바이트 목표 기반 추정보다 실측에 가깝다고 보고 학습값을 신뢰한다.
+const LEARNED_PROFILE_LARGE_ROW_BYTES: u64 = 4_096;
+
 pub fn table_dependency_order(schema: &NormalizedSchema) -> Vec<String> {
     let (ordered, _) = table_dependency_order_indices(schema);
     ordered
@@ -244,7 +248,7 @@ pub(crate) fn learned_mysql_range_chunk_size(
     let Some(profile) = profile else {
         return byte_target_size;
     };
-    if avg_row_bytes >= 4_096 && profile.chunk_rows >= byte_target_size {
+    if avg_row_bytes >= LEARNED_PROFILE_LARGE_ROW_BYTES && profile.chunk_rows >= byte_target_size {
         return profile.chunk_rows.max(1).min(fallback_chunk_size.max(1));
     }
     byte_target_size
