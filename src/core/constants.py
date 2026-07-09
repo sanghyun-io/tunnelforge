@@ -15,4 +15,5 @@ SYSTEM_SCHEMAS = frozenset({
     'mysql',
     'performance_schema',
     'sys',
+    'ndbinfo',
 })
