@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mysql::prelude::Queryable;
 use crate::*;
+use crate::schema::error_event;
 
 pub(crate) fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(phase_event(
@@ -53,11 +54,7 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
     let state = match oneclick_preflight_state(request) {
         Ok(state) => state,
         Err(err) => {
-            emit(json!({
-                "event": "error",
-                "request_id": request.request_id,
-                "message": err
-            }));
+            emit(error_event(request, err));
             return;
         }
     };
@@ -130,70 +127,12 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "steps": recommendations
     });
     let apply_plan = oneclick_apply_actions(&plan_payload);
-    let (
-        success_count,
-        fail_count,
-        skip_count,
-        disallowed_fix_attempts,
-        applied_fixes,
-        execution_log,
-    ) = if dry_run {
-        (
-            0usize,
-            0usize,
-            apply_plan.actions.len() + apply_plan.skipped,
-            apply_plan.disallowed,
-            Vec::new(),
-            vec!["DRY-RUN: no database changes were executed.".to_string()],
-        )
-    } else if !apply_plan.disallowed.is_empty() {
-        (
-            0,
-            apply_plan.disallowed.len(),
-            apply_plan.skipped,
-            apply_plan.disallowed,
-            Vec::new(),
-            vec!["Disallowed One-Click automatic fix attempt blocked.".to_string()],
-        )
-    } else if apply_plan.actions.is_empty() {
-        (
-            0,
-            0,
-            apply_plan.skipped,
-            Vec::new(),
-            Vec::new(),
-            vec!["No automatic Rust Core fixes are currently required.".to_string()],
-        )
-    } else {
-        match LiveAdapter::connect(&state.endpoint) {
-            Ok(mut adapter) => {
-                let outcome = oneclick_execute_apply_plan(&apply_plan, &mut adapter);
-                (
-                    outcome.success_count,
-                    outcome.fail_count,
-                    apply_plan.skipped,
-                    Vec::new(),
-                    outcome.applied_fixes,
-                    outcome.log,
-                )
-            }
-            Err(err) => (
-                0,
-                apply_plan.actions.len(),
-                apply_plan.skipped,
-                Vec::new(),
-                Vec::new(),
-                vec![format!(
-                    "FAILED: unable to connect for One-Click fixes: {err}"
-                )],
-            ),
-        }
-    };
-    let execution_success = fail_count == 0 && disallowed_fix_attempts.is_empty();
-    let report_execution_log = execution_log.clone();
-    let report_fail_count = fail_count;
-    let report_disallowed_count = disallowed_fix_attempts.len();
-    let report_applied_count = applied_fixes.len();
+    let outcome = oneclick_execute_stage(&state, &apply_plan, dry_run);
+    let execution_success = outcome.fail_count == 0 && outcome.disallowed_fix_attempts.is_empty();
+    let report_execution_log = outcome.log.clone();
+    let report_fail_count = outcome.fail_count;
+    let report_disallowed_count = outcome.disallowed_fix_attempts.len();
+    let report_applied_count = outcome.applied_fixes.len();
     let execution_message = if dry_run {
         "Execution completed"
     } else if execution_success {
@@ -205,12 +144,12 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "event": "execution",
         "request_id": request.request_id,
         "dry_run": dry_run,
-        "success_count": success_count,
-        "fail_count": fail_count,
-        "skip_count": skip_count,
-        "disallowed_fix_attempts": disallowed_fix_attempts,
-        "applied_fixes": applied_fixes,
-        "log": execution_log
+        "success_count": outcome.success_count,
+        "fail_count": outcome.fail_count,
+        "skip_count": outcome.skip_count,
+        "disallowed_fix_attempts": outcome.disallowed_fix_attempts,
+        "applied_fixes": outcome.applied_fixes,
+        "log": outcome.log
     }));
     emit(oneclick_progress_event(request, 80, execution_message));
 
@@ -219,19 +158,7 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "validation",
         "one-click validation started",
     ));
-    let validation_issues = match inspect_live(&state.endpoint) {
-        Ok(inspection) => oneclick_issues_from_inspection(&inspection),
-        Err(err) => vec![MigrationIssue {
-            issue_type: None,
-            severity: "error".to_string(),
-            location: "validation".to_string(),
-            message: err,
-            suggestion: "Check the database connection and rerun validation.".to_string(),
-            blocking: true,
-            table_name: None,
-            column_name: None,
-        }],
-    };
+    let validation_issues = issues_from_inspect_result(inspect_live(&state.endpoint));
     let validation_success = validation_issues.is_empty()
         && execution_success
         && report_fail_count == 0
@@ -277,11 +204,7 @@ pub(crate) fn oneclick_preflight(request: &Request) -> Vec<Value> {
                 "issues": state.issues
             }));
         }
-        Err(err) => events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": err
-        })),
+        Err(err) => events.push(error_event(request, err)),
     }
     events
 }
@@ -305,11 +228,7 @@ pub(crate) fn oneclick_analyze(request: &Request) -> Vec<Value> {
                 "issues": state.issues
             }));
         }
-        Err(err) => events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": err
-        })),
+        Err(err) => events.push(error_event(request, err)),
     }
     events
 }
@@ -385,11 +304,7 @@ pub(crate) fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value>
                 }
             }
             Err(err) => {
-                events.push(json!({
-                    "event": "error",
-                    "request_id": request.request_id,
-                    "message": err
-                }));
+                events.push(error_event(request, err));
                 return events;
             }
         }
@@ -487,30 +402,21 @@ pub(crate) fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
     let (endpoint, _) = match oneclick_endpoint(request) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            events.push(json!({
-                "event": "error",
-                "request_id": request.request_id,
-                "message": err
-            }));
+            events.push(error_event(request, err));
             return events;
         }
     };
     if endpoint.engine != "mysql" {
-        events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": "oneclick.apply_fixes currently supports MySQL engine fixes only"
-        }));
+        events.push(error_event(
+            request,
+            "oneclick.apply_fixes currently supports MySQL engine fixes only",
+        ));
         return events;
     }
     let mut adapter = match LiveAdapter::connect(&endpoint) {
         Ok(adapter) => adapter,
         Err(err) => {
-            events.push(json!({
-                "event": "error",
-                "request_id": request.request_id,
-                "message": err
-            }));
+            events.push(error_event(request, err));
             return events;
         }
     };
@@ -539,19 +445,7 @@ pub(crate) fn oneclick_validate(request: &Request) -> Vec<Value> {
     )];
     match oneclick_endpoint(request) {
         Ok((endpoint, schema_name)) => {
-            let issues = match inspect_live(&endpoint) {
-                Ok(inspection) => oneclick_issues_from_inspection(&inspection),
-                Err(err) => vec![MigrationIssue {
-                    issue_type: None,
-                    severity: "error".to_string(),
-                    location: "validation".to_string(),
-                    message: err,
-                    suggestion: "Check the database connection and rerun validation.".to_string(),
-                    blocking: true,
-                    table_name: None,
-                    column_name: None,
-                }],
-            };
+            let issues = issues_from_inspect_result(inspect_live(&endpoint));
             events.push(json!({
                 "event": "result",
                 "request_id": request.request_id,
@@ -562,11 +456,7 @@ pub(crate) fn oneclick_validate(request: &Request) -> Vec<Value> {
                 "all_fixed": issues.is_empty()
             }));
         }
-        Err(err) => events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": err
-        })),
+        Err(err) => events.push(error_event(request, err)),
     }
     events
 }
@@ -768,6 +658,25 @@ fn oneclick_issues_from_inspection(inspection: &InspectionResult) -> Vec<Migrati
             column_name: None,
         })
         .collect()
+}
+
+/// inspect 결과(성공/실패)를 검증용 MigrationIssue 목록으로 변환한다.
+/// Ok → oneclick_issues_from_inspection, Err → 단일 validation-error MigrationIssue.
+/// oneclick_run_streaming 과 oneclick_validate 에 중복돼 있던 fallback 블록을 하나로 통합한다.
+fn issues_from_inspect_result(result: Result<InspectionResult, String>) -> Vec<MigrationIssue> {
+    match result {
+        Ok(inspection) => oneclick_issues_from_inspection(&inspection),
+        Err(err) => vec![MigrationIssue {
+            issue_type: None,
+            severity: "error".to_string(),
+            location: "validation".to_string(),
+            message: err,
+            suggestion: "Check the database connection and rerun validation.".to_string(),
+            blocking: true,
+            table_name: None,
+            column_name: None,
+        }],
+    }
 }
 
 fn oneclick_deprecated_engine_marker(object: &str) -> Option<(String, String)> {
@@ -1349,6 +1258,8 @@ struct OneClickApplyPlan {
 struct OneClickApplyOutcome {
     success_count: usize,
     fail_count: usize,
+    skip_count: usize,
+    disallowed_fix_attempts: Vec<String>,
     log: Vec<String>,
     applied_fixes: Vec<Value>,
 }
@@ -1358,6 +1269,51 @@ struct OneClickDryRunPreview {
     planned_fixes: Vec<Value>,
     skipped: usize,
     disallowed: Vec<String>,
+}
+
+/// One-Click step 의 공통 분류 결과.
+/// apply(real) 와 dry-run preview 가 공유하는 per-step 판정만 담는다.
+/// real-apply 전용인 sql_template 불일치 검사는 여기 포함하지 않고
+/// oneclick_apply_actions 후처리에 남긴다(preview 출력 불변 보존).
+enum OneClickStepClassification {
+    Skip,
+    Disallowed(String),
+    Charset(Value),
+    Engine { table: String, sql: String },
+}
+
+fn classify_oneclick_step(step: &Value, schema: &str) -> OneClickStepClassification {
+    let issue_type = step
+        .get("issue_type")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let selected = step.get("selected_option").unwrap_or(&Value::Null);
+    let strategy = selected
+        .get("strategy")
+        .and_then(Value::as_str)
+        .unwrap_or("manual");
+
+    if strategy == "manual" || strategy == "skip" {
+        return OneClickStepClassification::Skip;
+    }
+    if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
+        return match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
+            Ok(option) => OneClickStepClassification::Charset(option),
+            Err(_) => OneClickStepClassification::Disallowed(format!("{issue_type}:{strategy}")),
+        };
+    }
+    if issue_type == "deprecated_engine" && strategy == "engine_innodb" {
+        let Some(table) = oneclick_apply_step_table(step, schema) else {
+            return OneClickStepClassification::Skip;
+        };
+        let sql = format!(
+            "ALTER TABLE {}.{} ENGINE=InnoDB;",
+            quote_ident("mysql", schema),
+            quote_ident("mysql", &table),
+        );
+        return OneClickStepClassification::Engine { table, sql };
+    }
+    OneClickStepClassification::Disallowed(format!("{issue_type}:{strategy}"))
 }
 
 fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
@@ -1376,94 +1332,68 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
         .into_iter()
         .flatten()
     {
-        let issue_type = step
-            .get("issue_type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let selected = step.get("selected_option").unwrap_or(&Value::Null);
-        let strategy = selected
-            .get("strategy")
-            .and_then(Value::as_str)
-            .unwrap_or("manual");
-
-        if strategy == "manual" || strategy == "skip" {
-            skipped += 1;
-            continue;
-        }
-        if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
-            match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
-                Ok(option) => {
-                    let tables = oneclick_required_string_list(option.get("tables"), "tables")
+        match classify_oneclick_step(step, schema) {
+            OneClickStepClassification::Skip => skipped += 1,
+            OneClickStepClassification::Disallowed(reason) => disallowed.push(reason),
+            OneClickStepClassification::Charset(option) => {
+                let tables = oneclick_required_string_list(option.get("tables"), "tables")
+                    .unwrap_or_default();
+                let fk_order = oneclick_required_string_list(option.get("fk_order"), "fk_order")
+                    .unwrap_or_default();
+                let sql_statements =
+                    oneclick_required_string_list(option.get("sql"), "sql").unwrap_or_default();
+                let rollback_sql =
+                    oneclick_required_string_list(option.get("rollback_sql"), "rollback_sql")
                         .unwrap_or_default();
-                    let fk_order =
-                        oneclick_required_string_list(option.get("fk_order"), "fk_order")
-                            .unwrap_or_default();
-                    let sql_statements =
-                        oneclick_required_string_list(option.get("sql"), "sql").unwrap_or_default();
-                    let rollback_sql =
-                        oneclick_required_string_list(option.get("rollback_sql"), "rollback_sql")
-                            .unwrap_or_default();
-                    actions.push(OneClickApplyAction {
-                        issue_type: issue_type.to_string(),
-                        strategy: strategy.to_string(),
-                        schema: schema.to_string(),
-                        table: tables.first().cloned().unwrap_or_default(),
-                        sql: sql_statements.first().cloned().unwrap_or_default(),
-                        tables,
-                        fk_order,
-                        sql_statements,
-                        rollback_sql,
-                        target_charset: option
-                            .get("target_charset")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string),
-                        target_collation: option
-                            .get("target_collation")
-                            .and_then(Value::as_str)
-                            .map(ToString::to_string),
-                    });
-                }
-                Err(_) => disallowed.push(format!("{issue_type}:{strategy}")),
+                actions.push(OneClickApplyAction {
+                    issue_type: "charset_issue".to_string(),
+                    strategy: "charset_collation_fk_safe".to_string(),
+                    schema: schema.to_string(),
+                    table: tables.first().cloned().unwrap_or_default(),
+                    sql: sql_statements.first().cloned().unwrap_or_default(),
+                    tables,
+                    fk_order,
+                    sql_statements,
+                    rollback_sql,
+                    target_charset: option
+                        .get("target_charset")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                    target_collation: option
+                        .get("target_collation")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
+                });
             }
-            continue;
+            OneClickStepClassification::Engine { table, sql } => {
+                // real-apply 전용: 클라이언트가 보낸 sql_template 이 서버 산출 SQL 과
+                // 불일치하면 disallowed 로 거부한다(preview 경로에는 적용하지 않음).
+                let selected = step.get("selected_option").unwrap_or(&Value::Null);
+                if selected
+                    .get("sql_template")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|template| !template.is_empty() && *template != sql)
+                    .is_some()
+                {
+                    disallowed.push("deprecated_engine:engine_innodb:sql_mismatch".to_string());
+                    continue;
+                }
+                actions.push(OneClickApplyAction {
+                    issue_type: "deprecated_engine".to_string(),
+                    strategy: "engine_innodb".to_string(),
+                    schema: schema.to_string(),
+                    table: table.clone(),
+                    sql: sql.clone(),
+                    tables: vec![table],
+                    fk_order: Vec::new(),
+                    sql_statements: vec![sql],
+                    rollback_sql: Vec::new(),
+                    target_charset: None,
+                    target_collation: None,
+                });
+            }
         }
-        if issue_type != "deprecated_engine" || strategy != "engine_innodb" {
-            disallowed.push(format!("{issue_type}:{strategy}"));
-            continue;
-        }
-
-        let Some(table) = oneclick_apply_step_table(step, schema) else {
-            skipped += 1;
-            continue;
-        };
-        let sql = format!(
-            "ALTER TABLE {}.{} ENGINE=InnoDB;",
-            quote_ident("mysql", schema),
-            quote_ident("mysql", &table),
-        );
-        if selected
-            .get("sql_template")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|template| !template.is_empty() && *template != sql)
-            .is_some()
-        {
-            disallowed.push(format!("{issue_type}:{strategy}:sql_mismatch"));
-            continue;
-        }
-        actions.push(OneClickApplyAction {
-            issue_type: issue_type.to_string(),
-            strategy: strategy.to_string(),
-            schema: schema.to_string(),
-            table: table.clone(),
-            sql: sql.clone(),
-            tables: vec![table],
-            fk_order: Vec::new(),
-            sql_statements: vec![sql],
-            rollback_sql: Vec::new(),
-            target_charset: None,
-            target_collation: None,
-        });
     }
 
     OneClickApplyPlan {
@@ -1489,56 +1419,30 @@ fn oneclick_dry_run_preview_fixes(payload: &Value) -> OneClickDryRunPreview {
         .into_iter()
         .flatten()
     {
-        let issue_type = step
-            .get("issue_type")
-            .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let selected = step.get("selected_option").unwrap_or(&Value::Null);
-        let strategy = selected
-            .get("strategy")
-            .and_then(Value::as_str)
-            .unwrap_or("manual");
-
-        if strategy == "manual" || strategy == "skip" {
-            skipped += 1;
-            continue;
-        }
-        if issue_type == "charset_issue" && strategy == "charset_collation_fk_safe" {
-            match oneclick_charset_fk_safe_option_from_payload(selected, schema) {
-                Ok(mut plan) => {
-                    if let Some(object) = plan.as_object_mut() {
-                        object.insert("issue_type".to_string(), json!("charset_issue"));
-                        object.insert("schema".to_string(), json!(schema));
-                        object.insert("dry_run".to_string(), json!(true));
-                        object.insert("success".to_string(), json!(false));
-                    }
-                    planned_fixes.push(plan);
+        match classify_oneclick_step(step, schema) {
+            OneClickStepClassification::Skip => skipped += 1,
+            OneClickStepClassification::Disallowed(reason) => disallowed.push(reason),
+            OneClickStepClassification::Charset(mut plan) => {
+                if let Some(object) = plan.as_object_mut() {
+                    object.insert("issue_type".to_string(), json!("charset_issue"));
+                    object.insert("schema".to_string(), json!(schema));
+                    object.insert("dry_run".to_string(), json!(true));
+                    object.insert("success".to_string(), json!(false));
                 }
-                Err(_) => disallowed.push(format!("{issue_type}:{strategy}")),
+                planned_fixes.push(plan);
             }
-            continue;
+            OneClickStepClassification::Engine { table, sql } => {
+                planned_fixes.push(json!({
+                    "issue_type": "deprecated_engine",
+                    "strategy": "engine_innodb",
+                    "schema": schema,
+                    "table": table,
+                    "sql": sql,
+                    "dry_run": true,
+                    "success": false
+                }));
+            }
         }
-        if issue_type == "deprecated_engine" && strategy == "engine_innodb" {
-            let Some(table) = oneclick_apply_step_table(step, schema) else {
-                skipped += 1;
-                continue;
-            };
-            planned_fixes.push(json!({
-                "issue_type": "deprecated_engine",
-                "strategy": "engine_innodb",
-                "schema": schema,
-                "table": table,
-                "sql": format!(
-                    "ALTER TABLE {}.{} ENGINE=InnoDB;",
-                    quote_ident("mysql", schema),
-                    quote_ident("mysql", &table),
-                ),
-                "dry_run": true,
-                "success": false
-            }));
-            continue;
-        }
-        disallowed.push(format!("{issue_type}:{strategy}"));
     }
 
     OneClickDryRunPreview {
@@ -1584,8 +1488,75 @@ fn oneclick_execute_apply_plan<A: MigrationAdapter>(
     OneClickApplyOutcome {
         success_count,
         fail_count,
+        skip_count: plan.skipped,
+        disallowed_fix_attempts: Vec::new(),
         log,
         applied_fixes,
+    }
+}
+
+/// One-Click 실행 단계: dry-run / disallowed / no-action / live-apply 4분기를 처리해
+/// 타입드 OneClickApplyOutcome 로 반환한다. 기존 익명 6-tuple 을 대체한다(동작 보존).
+fn oneclick_execute_stage(
+    state: &OneClickState,
+    apply_plan: &OneClickApplyPlan,
+    dry_run: bool,
+) -> OneClickApplyOutcome {
+    if dry_run {
+        OneClickApplyOutcome {
+            success_count: 0,
+            fail_count: 0,
+            skip_count: apply_plan.actions.len() + apply_plan.skipped,
+            disallowed_fix_attempts: apply_plan.disallowed.clone(),
+            log: vec!["DRY-RUN: no database changes were executed.".to_string()],
+            applied_fixes: Vec::new(),
+        }
+    } else if !apply_plan.disallowed.is_empty() {
+        OneClickApplyOutcome {
+            success_count: 0,
+            fail_count: apply_plan.disallowed.len(),
+            skip_count: apply_plan.skipped,
+            disallowed_fix_attempts: apply_plan.disallowed.clone(),
+            log: vec!["Disallowed One-Click automatic fix attempt blocked.".to_string()],
+            applied_fixes: Vec::new(),
+        }
+    } else if apply_plan.actions.is_empty() {
+        OneClickApplyOutcome {
+            success_count: 0,
+            fail_count: 0,
+            skip_count: apply_plan.skipped,
+            disallowed_fix_attempts: Vec::new(),
+            log: vec!["No automatic Rust Core fixes are currently required.".to_string()],
+            applied_fixes: Vec::new(),
+        }
+    } else {
+        match LiveAdapter::connect(&state.endpoint) {
+            Ok(mut adapter) => oneclick_execute_apply_plan(apply_plan, &mut adapter),
+            Err(err) => OneClickApplyOutcome {
+                success_count: 0,
+                fail_count: apply_plan.actions.len(),
+                skip_count: apply_plan.skipped,
+                disallowed_fix_attempts: Vec::new(),
+                log: vec![format!(
+                    "FAILED: unable to connect for One-Click fixes: {err}"
+                )],
+                applied_fixes: Vec::new(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneClickPayloadShape {
+    CharsetCollationFkSafe,
+    SingleTable,
+}
+
+fn classify_oneclick_payload_shape(action: &OneClickApplyAction) -> OneClickPayloadShape {
+    if action.issue_type == "charset_issue" && action.strategy == "charset_collation_fk_safe" {
+        OneClickPayloadShape::CharsetCollationFkSafe
+    } else {
+        OneClickPayloadShape::SingleTable
     }
 }
 
@@ -1594,8 +1565,8 @@ fn oneclick_applied_fix_payload(
     success: bool,
     error: Option<&str>,
 ) -> Value {
-    if action.issue_type == "charset_issue" && action.strategy == "charset_collation_fk_safe" {
-        let mut payload = json!({
+    let mut payload = match classify_oneclick_payload_shape(action) {
+        OneClickPayloadShape::CharsetCollationFkSafe => json!({
             "issue_type": action.issue_type,
             "strategy": action.strategy,
             "schema": action.schema,
@@ -1606,22 +1577,17 @@ fn oneclick_applied_fix_payload(
             "rollback_sql": action.rollback_sql,
             "fk_order": action.fk_order,
             "success": success
-        });
-        if let Some(error) = error {
-            payload["error"] = json!(error);
-        }
-        return payload;
-    }
-
-    let mut payload = json!({
-        "issue_type": action.issue_type,
-        "strategy": action.strategy,
-        "schema": action.schema,
-        "table": action.table,
-        "sql": action.sql,
-        "success": success,
-        "rows_affected": 0
-    });
+        }),
+        OneClickPayloadShape::SingleTable => json!({
+            "issue_type": action.issue_type,
+            "strategy": action.strategy,
+            "schema": action.schema,
+            "table": action.table,
+            "sql": action.sql,
+            "success": success,
+            "rows_affected": 0
+        }),
+    };
     if let Some(error) = error {
         payload["error"] = json!(error);
     }
