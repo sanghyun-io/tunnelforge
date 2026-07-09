@@ -5,6 +5,7 @@ import time
 
 import pytest
 
+import src.core.db_core_dbapi_shim as db_core_dbapi_shim
 import src.core.db_core_service as db_core_service
 from src.core.db_core_service import (
     DbCoreFacade,
@@ -239,10 +240,10 @@ def test_rust_connector_get_db_version_returns_legacy_tuple():
         def open_connection(self, endpoint):
             return "conn-1"
 
-        def execute_on_connection(self, connection_id, query, params=None):
+        def execute_on_connection_result(self, connection_id, query, params=None):
             assert connection_id == "conn-1"
             assert "VERSION()" in query
-            return [{"version": "8.4.7"}]
+            return {"rows": [{"version": "8.4.7"}], "columns": ["version"], "rows_affected": 0}
 
     connector = RustDbConnector(
         "mysql",
@@ -323,14 +324,8 @@ def test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml():
     assert cursor.fetchall() == []
 
 
-def test_rust_db_cursor_rowcount_uses_call_local_rows_affected():
+def test_rust_db_cursor_calls_execute_on_connection_result_unconditionally():
     class FakeFacade:
-        last_rows_affected = 999
-
-        def execute_on_connection(self, connection_id, query, params=None):
-            assert connection_id == "conn-1"
-            return []
-
         def execute_on_connection_result(self, connection_id, query, params=None):
             assert connection_id == "conn-1"
             return {"rows": [], "rows_affected": 7}
@@ -533,6 +528,31 @@ def test_bind_sql_params_and_sql_literal_helpers_are_removed():
     assert not hasattr(db_core_service, "sql_literal")
 
 
+def test_db_core_service_reexports_all_public_names_after_module_split():
+    """db_core_service는 db_core_client/db_core_facade/db_core_dbapi_shim 분할 후에도
+    순수 재수출 모듈로서 기존 공개 이름을 전부 제공해야 한다 (import 경로 호환성 보장)."""
+    expected_names = [
+        "DbCoreServiceError",
+        "_format_error_event",
+        "SUPPORTED_DB_ENGINES",
+        "parse_db_version_tuple",
+        "normalize_db_engine",
+        "default_database_for_engine",
+        "DbEndpoint",
+        "DbCoreServiceClient",
+        "DbCoreFacade",
+        "get_shared_db_core_facade",
+        "shutdown_shared_db_core_facade",
+        "RustDbConnector",
+        "create_rust_db_connector",
+        "RustDbConnection",
+        "RustDbCursor",
+        "quote_mysql_ident",
+    ]
+    for name in expected_names:
+        assert hasattr(db_core_service, name), f"db_core_service.{name} must remain re-exported"
+
+
 def test_stderr_is_drained_in_background_and_available_as_tail():
     process = FakeProcess(
         ['{"event":"result","command":"service.hello","success":true}'],
@@ -675,7 +695,7 @@ def test_shutdown_and_concurrent_request_are_serialized_by_lock():
 def test_rust_connector_uses_shared_facade_by_default(monkeypatch):
     """facade 미지정 시 앱 공유 facade를 사용해야 한다 (커넥터별 전용 프로세스 금지)."""
     sentinel = object()
-    monkeypatch.setattr(db_core_service, "get_shared_db_core_facade", lambda: sentinel)
+    monkeypatch.setattr(db_core_dbapi_shim, "get_shared_db_core_facade", lambda: sentinel)
 
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app")
 
@@ -686,7 +706,7 @@ def test_rust_connector_uses_injected_facade_without_shared_lookup(monkeypatch):
     """facade가 주입되면 공유 facade 조회를 건너뛴다."""
     called = []
     monkeypatch.setattr(
-        db_core_service, "get_shared_db_core_facade",
+        db_core_dbapi_shim, "get_shared_db_core_facade",
         lambda: called.append(True) or object(),
     )
     sentinel = object()
@@ -699,7 +719,7 @@ def test_rust_connector_uses_injected_facade_without_shared_lookup(monkeypatch):
 
 def test_rust_connector_uses_constants_for_system_schema_filtering(monkeypatch):
     """MySQL 스키마 필터링은 하드코딩이 아닌 SYSTEM_SCHEMAS 상수를 사용해야 한다."""
-    monkeypatch.setattr(db_core_service, "SYSTEM_SCHEMAS", frozenset({"mysql", "ndbinfo"}))
+    monkeypatch.setattr(db_core_dbapi_shim, "SYSTEM_SCHEMAS", frozenset({"mysql", "ndbinfo"}))
 
     class FakeCursor:
         def __enter__(self):
