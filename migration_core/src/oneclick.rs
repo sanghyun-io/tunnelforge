@@ -1556,13 +1556,27 @@ fn oneclick_execute_apply_plan<A: MigrationAdapter>(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneClickPayloadShape {
+    CharsetCollationFkSafe,
+    SingleTable,
+}
+
+fn classify_oneclick_payload_shape(action: &OneClickApplyAction) -> OneClickPayloadShape {
+    if action.issue_type == "charset_issue" && action.strategy == "charset_collation_fk_safe" {
+        OneClickPayloadShape::CharsetCollationFkSafe
+    } else {
+        OneClickPayloadShape::SingleTable
+    }
+}
+
 fn oneclick_applied_fix_payload(
     action: &OneClickApplyAction,
     success: bool,
     error: Option<&str>,
 ) -> Value {
-    if action.issue_type == "charset_issue" && action.strategy == "charset_collation_fk_safe" {
-        let mut payload = json!({
+    let mut payload = match classify_oneclick_payload_shape(action) {
+        OneClickPayloadShape::CharsetCollationFkSafe => json!({
             "issue_type": action.issue_type,
             "strategy": action.strategy,
             "schema": action.schema,
@@ -1573,22 +1587,17 @@ fn oneclick_applied_fix_payload(
             "rollback_sql": action.rollback_sql,
             "fk_order": action.fk_order,
             "success": success
-        });
-        if let Some(error) = error {
-            payload["error"] = json!(error);
-        }
-        return payload;
-    }
-
-    let mut payload = json!({
-        "issue_type": action.issue_type,
-        "strategy": action.strategy,
-        "schema": action.schema,
-        "table": action.table,
-        "sql": action.sql,
-        "success": success,
-        "rows_affected": 0
-    });
+        }),
+        OneClickPayloadShape::SingleTable => json!({
+            "issue_type": action.issue_type,
+            "strategy": action.strategy,
+            "schema": action.schema,
+            "table": action.table,
+            "sql": action.sql,
+            "success": success,
+            "rows_affected": 0
+        }),
+    };
     if let Some(error) = error {
         payload["error"] = json!(error);
     }
