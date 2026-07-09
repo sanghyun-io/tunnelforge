@@ -23,6 +23,9 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 from urllib.error import HTTPError, URLError
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from versioning import read_version, write_version, sync_pyproject, sync_installer, bump_version, compare_versions
+
 
 class Colors:
     """ANSI color codes for terminal output."""
@@ -56,29 +59,6 @@ def run_command(cmd: list[str], capture: bool = True) -> tuple[int, str, str]:
         return 1, "", str(e)
 
 
-def compare_versions(v1: str, v2: str) -> int:
-    """Compare two semantic versions. Returns: 1 if v1>v2, -1 if v1<v2, 0 if equal."""
-    def parse(v: str) -> list[int]:
-        return [int(x) for x in v.lstrip('v').split('.')]
-
-    p1, p2 = parse(v1), parse(v2)
-    for a, b in zip(p1, p2):
-        if a > b:
-            return 1
-        if a < b:
-            return -1
-    return 0
-
-
-def get_local_version(version_file: Path) -> tuple[str, str]:
-    """Read version from version.py. Returns (version, file_content)."""
-    content = version_file.read_text(encoding='utf-8')
-    match = re.search(r'__version__\s*=\s*[\'"]([^\'"]+)[\'"]', content)
-    if not match:
-        raise ValueError(f"Cannot extract version from {version_file}")
-    return match.group(1), content
-
-
 def get_github_info() -> tuple[str, str]:
     """Extract owner and repo from git remote URL."""
     code, stdout, _ = run_command(['git', 'remote', 'get-url', 'origin'])
@@ -110,28 +90,6 @@ def get_remote_version(owner: str, repo: str) -> str:
         raise RuntimeError(f"Network error: {e.reason}")
 
 
-def bump_version(version: str, bump_type: str) -> str:
-    """Increment version based on bump type."""
-    parts = [int(x) for x in version.split('.')]
-
-    if bump_type == 'major':
-        return f"{parts[0] + 1}.0.0"
-    elif bump_type == 'minor':
-        return f"{parts[0]}.{parts[1] + 1}.0"
-    else:  # patch
-        return f"{parts[0]}.{parts[1]}.{parts[2] + 1}"
-
-
-def update_version_file(version_file: Path, content: str, new_version: str) -> None:
-    """Update version in version.py."""
-    new_content = re.sub(
-        r'__version__\s*=\s*[\'"][^\'"]+[\'"]',
-        f'__version__ = "{new_version}"',
-        content
-    )
-    version_file.write_text(new_content, encoding='utf-8')
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description='TunnelForge - Smart Release',
@@ -157,6 +115,8 @@ def main() -> int:
     os.chdir(project_root)
 
     version_file = Path('src/version.py')
+    pyproject_file = Path('pyproject.toml')
+    installer_file = Path('installer/TunnelForge.iss')
 
     print_color("========================================", Colors.CYAN)
     print_color(" TunnelForge - Smart Release", Colors.CYAN)
@@ -171,7 +131,7 @@ def main() -> int:
         return 1
 
     try:
-        local_version, version_content = get_local_version(version_file)
+        local_version = read_version(version_file)
         print_color(f"  로컬 버전: {local_version}", Colors.WHITE)
     except ValueError as e:
         print_color(f"  [X] {e}", Colors.RED)
@@ -222,10 +182,9 @@ def main() -> int:
         print_color("버전을 어떻게 올리시겠습니까?", Colors.CYAN)
         print()
 
-        parts = [int(x) for x in local_version.split('.')]
-        patch_ver = f"{parts[0]}.{parts[1]}.{parts[2] + 1}"
-        minor_ver = f"{parts[0]}.{parts[1] + 1}.0"
-        major_ver = f"{parts[0] + 1}.0.0"
+        patch_ver = bump_version(local_version, 'patch')
+        minor_ver = bump_version(local_version, 'minor')
+        major_ver = bump_version(local_version, 'major')
 
         print_color(f"  [1] patch  ({local_version} -> {patch_ver})  - 버그 수정", Colors.WHITE)
         print_color(f"  [2] minor  ({local_version} -> {minor_ver})  - 기능 추가", Colors.WHITE)
@@ -300,6 +259,10 @@ def main() -> int:
             print()
             print_color("업데이트될 파일:", Colors.CYAN)
             print_color(f"  - {version_file}", Colors.GRAY)
+            if pyproject_file.exists():
+                print_color(f"  - {pyproject_file}", Colors.GRAY)
+            if installer_file.exists():
+                print_color(f"  - {installer_file}", Colors.GRAY)
         else:
             print_color(f"  버전 변경 없음 (현재: {new_version})", Colors.WHITE)
 
@@ -320,8 +283,17 @@ def main() -> int:
     if needs_bump:
         print_color("[5/6] 버전 업데이트 중...", Colors.YELLOW)
 
-        update_version_file(version_file, version_content, new_version)
+        write_version(version_file, new_version)
         print_color(f"  [OK] {version_file} 업데이트 완료", Colors.GREEN)
+
+        if pyproject_file.exists():
+            sync_pyproject(pyproject_file, new_version)
+            print_color(f"  [OK] {pyproject_file} 업데이트 완료", Colors.GREEN)
+
+        if installer_file.exists():
+            sync_installer(installer_file, new_version)
+            print_color(f"  [OK] {installer_file} 업데이트 완료", Colors.GREEN)
+
         print()
 
         # Show git diff
@@ -339,7 +311,13 @@ def main() -> int:
     if needs_bump:
         print_color("  [릴리스 1/3] 변경사항 커밋...", Colors.CYAN)
 
-        run_command(['git', 'add', str(version_file)])
+        files_to_commit = [str(version_file)]
+        if pyproject_file.exists():
+            files_to_commit.append(str(pyproject_file))
+        if installer_file.exists():
+            files_to_commit.append(str(installer_file))
+
+        run_command(['git', 'add', *files_to_commit])
         code, _, stderr = run_command(['git', 'commit', '-m', f'Bump version to {new_version}'])
 
         if code != 0:
