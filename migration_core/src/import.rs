@@ -124,30 +124,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
 
     set_mysql_import_session_tuning(&mut adapter, false)?;
 
-    // replace/recreate는 대상 테이블을 통째로 재생성한다. 두 가지 사전 조치가 필요하다:
-    //
-    // (1) Surviving-FK preflight (MySQL 전용, abort): import set 밖의 타겟 테이블이
-    //     대상 테이블을 참조하는 FK를 갖고 있으면, 부모 재생성 시 그 살아있는 자식 FK가
-    //     새 부모와 (charset/collation) 호환되지 않아 ERROR 3780이 난다. 타겟을 손대지
-    //     않고 명확한 에러로 차단한다.
-    //
-    // (2) Drop-all-then-create-all 순서: import set 내부의 모든 대상 테이블을 자식 우선
-    //     (역의존성) 순서로 먼저 DROP한 뒤 루프에서 생성한다. 이렇게 하지 않고 테이블별로
-    //     즉시 DROP→CREATE 하면, 부모를 재생성하는 시점에 아직 DROP되지 않은 자식의 FK가
-    //     살아 있어 동일한 ERROR 3780을 유발한다.
-    if matches!(mode, "replace" | "recreate") {
-        let import_set: BTreeSet<String> = tables.iter().map(|table| table.name.clone()).collect();
-        let target_schema = endpoint_schema(&endpoint);
-        preflight_surviving_referencing_fks(&mut adapter, &target_schema, &import_set)?;
-
-        // tables는 parent-first(dependency order)이므로 rev()는 child-first가 된다.
-        // foreign_key_checks=0이 이미 켜져 있어 역순 DROP은 안전하다.
-        for table_manifest in tables.iter().rev() {
-            adapter
-                .execute_sql(&drop_table_sql(adapter.engine(), &table_manifest.name))
-                .map_err(|err| dump_import_ddl_error("drop_table", &table_manifest.name, &err))?;
-        }
-    }
+    let target_schema = endpoint_schema(&endpoint);
+    prepare_import_target(mode, &tables, &mut adapter, &target_schema)?;
 
     let import_result = (|| -> Result<(), String> {
         for (index, table_manifest) in tables.iter().enumerate() {
@@ -165,8 +143,6 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 "current": index + 1,
                 "total": table_total
             }));
-            let table_rows_before = rows_imported;
-
             // replace/recreate의 DROP은 루프 진입 전에 일괄(자식 우선)로 끝냈다.
             // 여기서는 생성과 적재만 수행한다.
             let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
@@ -175,70 +151,23 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 .create_table(table, &ddl)
                 .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
 
-            if data_format == "tsv" && !has_binary_columns(table) {
-                if let LiveAdapter::MySql(conn) = &mut adapter {
-                    let (rows, chunks) = import_mysql_tsv_table(
-                        &endpoint,
-                        conn,
-                        input_path,
-                        table,
-                        table_manifest,
-                        &compression,
-                        threads,
-                        request.request_id.clone(),
-                        rows_imported,
-                        overall_rows_total,
-                        |event| emit(event),
-                    )?;
-                    rows_imported += rows;
-                    chunks_imported += chunks;
-                    imported_rows_by_table.insert(table.name.clone(), rows);
-                    emit(json!({
-                        "event": "table_progress",
-                        "request_id": request.request_id,
-                        "table": table.name,
-                        "status": "completed",
-                        "current": index + 1,
-                        "total": table_total
-                    }));
-                    continue;
-                }
-            }
-
-            for chunk_index in 1..=table_manifest.chunks {
-                let chunk_path = dump_manifest_chunk_path(
-                    input_path,
-                    &table_manifest.path,
-                    chunk_index,
-                    &data_format,
-                    &compression,
-                )?;
-                let rows = read_dump_rows(&chunk_path, table, &data_format, &compression)?;
-                let row_count = rows.len();
-                adapter.insert_rows(table, rows)?;
-                rows_imported += row_count as u64;
-                chunks_imported += 1;
-                let table_rows_done = rows_imported.saturating_sub(table_rows_before);
-                emit(dump_import_row_progress_event(
-                    request.request_id.clone(),
-                    &table.name,
-                    table_rows_done,
-                    table_manifest.rows,
-                    table_rows_before,
-                    overall_rows_total,
-                    row_count as u64,
-                    ChunkProgress {
-                        chunks_done: Some(chunk_index),
-                        chunks_total: Some(table_manifest.chunks),
-                        chunk_index: Some(chunk_index),
-                        load_ms: None,
-                    },
-                    "insert_rows",
-                ));
-            }
-
-            let table_rows_imported = rows_imported.saturating_sub(table_rows_before);
-            imported_rows_by_table.insert(table.name.clone(), table_rows_imported);
+            let (table_rows, table_chunks) = import_table_rows(
+                &endpoint,
+                &mut adapter,
+                input_path,
+                table,
+                table_manifest,
+                &data_format,
+                &compression,
+                threads,
+                request.request_id.clone(),
+                rows_imported,
+                overall_rows_total,
+                |event| emit(event),
+            )?;
+            rows_imported += table_rows;
+            chunks_imported += table_chunks;
+            imported_rows_by_table.insert(table.name.clone(), table_rows);
             emit(json!({
                 "event": "table_progress",
                 "request_id": request.request_id,
@@ -260,20 +189,166 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     import_result?;
     restore_result?;
     local_infile_restore_result?;
+
+    finalize_dump_import(
+        &mut adapter,
+        &manifest,
+        &tables,
+        &imported_rows_by_table,
+        input_dir,
+        request.request_id.clone(),
+        mode,
+        &selected,
+        strict_manifest,
+        &manifest_warnings,
+        rows_imported,
+        chunks_imported,
+        table_total,
+        emit,
+    )
+}
+
+/// replace/recreate 모드일 때 import 전에 대상 테이블을 재생성 가능한 상태로 만든다.
+///
+/// (1) Surviving-FK preflight (MySQL 전용, abort): import set 밖의 타겟 테이블이
+///     대상 테이블을 참조하는 FK를 갖고 있으면, 부모 재생성 시 그 살아있는 자식 FK가
+///     새 부모와 (charset/collation) 호환되지 않아 ERROR 3780이 난다. 타겟을 손대지
+///     않고 명확한 에러로 차단한다.
+///
+/// (2) Drop-all-then-create-all 순서: import set 내부의 모든 대상 테이블을 자식 우선
+///     (역의존성) 순서로 먼저 DROP한 뒤 루프에서 생성한다. 이렇게 하지 않고 테이블별로
+///     즉시 DROP→CREATE 하면, 부모를 재생성하는 시점에 아직 DROP되지 않은 자식의 FK가
+///     살아 있어 동일한 ERROR 3780을 유발한다.
+///
+/// merge 모드에서는 아무것도 하지 않는다.
+fn prepare_import_target(
+    mode: &str,
+    tables: &[DumpTableManifest],
+    adapter: &mut LiveAdapter,
+    target_schema: &str,
+) -> Result<(), String> {
+    if !matches!(mode, "replace" | "recreate") {
+        return Ok(());
+    }
+    let import_set: BTreeSet<String> = tables.iter().map(|table| table.name.clone()).collect();
+    preflight_surviving_referencing_fks(adapter, target_schema, &import_set)?;
+
+    // tables는 parent-first(dependency order)이므로 rev()는 child-first가 된다.
+    // foreign_key_checks=0이 이미 켜져 있어 역순 DROP은 안전하다.
+    for table_manifest in tables.iter().rev() {
+        adapter
+            .execute_sql(&drop_table_sql(adapter.engine(), &table_manifest.name))
+            .map_err(|err| dump_import_ddl_error("drop_table", &table_manifest.name, &err))?;
+    }
+    Ok(())
+}
+
+/// 단일 테이블의 데이터를 적재한다. MySQL TSV fast-path(LOAD DATA / 병렬 / fallback)와
+/// 엔진 무관 generic 청크 INSERT 경로를 분기하고, 이 테이블에 적재한 (rows, chunks)를 반환한다.
+/// 테이블 생성(DDL)과 진행률 table_progress 이벤트는 호출자가 담당한다.
+fn import_table_rows<F: FnMut(Value)>(
+    endpoint: &Endpoint,
+    adapter: &mut LiveAdapter,
+    input_path: &Path,
+    table: &NormalizedTable,
+    table_manifest: &DumpTableManifest,
+    data_format: &str,
+    compression: &str,
+    threads: usize,
+    request_id: Option<String>,
+    overall_rows_before: u64,
+    overall_rows_total: u64,
+    mut emit: F,
+) -> Result<(u64, u64), String> {
+    if data_format == "tsv" && !has_binary_columns(table) {
+        if let LiveAdapter::MySql(conn) = adapter {
+            let chunk_ctx = MysqlImportChunkContext {
+                table,
+                table_manifest,
+                compression,
+                request_id: request_id.clone(),
+                overall_rows_before,
+                overall_rows_total,
+            };
+            return import_mysql_tsv_table(
+                endpoint,
+                conn,
+                input_path,
+                threads,
+                &chunk_ctx,
+                |event| emit(event),
+            );
+        }
+    }
+
+    let mut table_rows = 0_u64;
+    let mut table_chunks = 0_u64;
+    for chunk_index in 1..=table_manifest.chunks {
+        let chunk_path = dump_manifest_chunk_path(
+            input_path,
+            &table_manifest.path,
+            chunk_index,
+            data_format,
+            compression,
+        )?;
+        let rows = read_dump_rows(&chunk_path, table, data_format, compression)?;
+        let row_count = rows.len() as u64;
+        adapter.insert_rows(table, rows)?;
+        table_rows += row_count;
+        table_chunks += 1;
+        emit(dump_import_row_progress_event(
+            request_id.clone(),
+            &table.name,
+            table_rows,
+            table_manifest.rows,
+            overall_rows_before,
+            overall_rows_total,
+            row_count,
+            ChunkProgress {
+                chunks_done: Some(chunk_index),
+                chunks_total: Some(table_manifest.chunks),
+                chunk_index: Some(chunk_index),
+                load_ms: None,
+            },
+            "insert_rows",
+        ));
+    }
+    Ok((table_rows, table_chunks))
+}
+
+/// import 데이터 적재 완료 후의 마무리 단계: post-load DDL(인덱스/FK) 적용,
+/// 적재 행수 검증, View 생성(best-effort), 리포트 기록 후 최종 result JSON을 만든다.
+fn finalize_dump_import<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    manifest: &DumpManifest,
+    tables: &[DumpTableManifest],
+    imported_rows_by_table: &BTreeMap<String, u64>,
+    input_dir: &str,
+    request_id: Option<String>,
+    mode: &str,
+    selected: &BTreeSet<String>,
+    strict_manifest: bool,
+    manifest_warnings: &[String],
+    rows_imported: u64,
+    chunks_imported: u64,
+    table_total: usize,
+    mut emit: F,
+) -> Result<Value, String> {
+    let input_path = Path::new(input_dir);
     let target_engine = adapter.engine().to_string();
     if should_apply_post_load_ddl(mode) {
         emit(json!({
             "event": "phase",
-            "request_id": request.request_id,
+            "request_id": request_id,
             "phase": "dump_import_post_load",
             "message": "현재 단계: 인덱스/FK 생성 중 - 데이터 Import는 완료, 후처리 진행 중",
             "strategy": "post_load_ddl"
         }));
-        apply_post_load_ddl(&mut adapter, &manifest.schema, &target_engine)?;
+        apply_post_load_ddl(adapter, &manifest.schema, &target_engine)?;
     } else {
         emit(json!({
             "event": "phase",
-            "request_id": request.request_id,
+            "request_id": request_id,
             "phase": "dump_import_post_load",
             "message": post_load_ddl_skip_message(mode),
             "strategy": "existing_schema"
@@ -284,17 +359,17 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     // 살아있는 DB면 import 동안 외부 write(예: login_attempts에 새 로그인 시도)로
     // row 수가 정상적으로 달라질 수 있어, 정확 일치를 요구하면 오탐으로 실패한다.
     // (foreign_key_checks=0/unique_checks=0으로 관용 적재하는 정책과도 일관.)
-    verify_imported_row_counts(&tables, &imported_rows_by_table)?;
+    verify_imported_row_counts(tables, imported_rows_by_table)?;
 
     // View 생성 (best-effort). 데이터는 이미 커밋되었으므로 View 실패가 전체 import를 무효화하지 않는다.
     // 전체 import(테이블 부분 선택 없음)일 때만 시도한다 — 부분 import면 View가 참조하는 base table이 없을 수 있다.
     let view_outcome = if selected.is_empty() && !manifest.views.is_empty() {
         import_views(
-            &mut adapter,
-            &manifest,
+            adapter,
+            manifest,
             &target_engine,
             mode,
-            request.request_id.clone(),
+            request_id.clone(),
             &mut emit,
         )
     } else {
@@ -321,7 +396,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
 
     Ok(json!({
         "event": "result",
-        "request_id": request.request_id,
+        "request_id": request_id,
         "command": "dump.import",
         "success": true,
         "input_dir": input_dir,
@@ -471,76 +546,54 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
     outcome
 }
 
+/// MySQL TSV import 경로(fast-path / parallel / insert fallback)가 공통으로
+/// 전달받던 6개 인자 클러스터를 묶는다. 테이블 정의·매니페스트·압축·요청 ID·
+/// 전체 진행률 기준선을 한 번에 관통시켜 시그니처 부풀림을 줄인다.
+#[derive(Clone)]
+struct MysqlImportChunkContext<'a> {
+    table: &'a NormalizedTable,
+    table_manifest: &'a DumpTableManifest,
+    compression: &'a str,
+    request_id: Option<String>,
+    overall_rows_before: u64,
+    overall_rows_total: u64,
+}
+
 fn import_mysql_tsv_table<F: FnMut(Value)>(
     endpoint: &Endpoint,
     conn: &mut mysql::PooledConn,
     input_path: &Path,
-    table: &NormalizedTable,
-    table_manifest: &DumpTableManifest,
-    compression: &str,
     threads: usize,
-    request_id: Option<String>,
-    overall_rows_before: u64,
-    overall_rows_total: u64,
+    ctx: &MysqlImportChunkContext,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
     if !mysql_local_infile_enabled(conn) {
         emit(json!({
             "event": "phase",
-            "request_id": request_id,
+            "request_id": ctx.request_id,
             "phase": "dump_import",
             "message": "MySQL local_infile is disabled; using safe Rust INSERT fallback",
             "strategy": "insert_fallback",
             "performance": "safe_fallback"
         }));
-        return import_mysql_tsv_table_insert_fallback(
-            conn,
-            input_path,
-            table,
-            table_manifest,
-            compression,
-            request_id,
-            overall_rows_before,
-            overall_rows_total,
-            emit,
-        );
+        return import_mysql_tsv_table_insert_fallback(conn, input_path, ctx, emit);
     }
 
-    if threads > 1 && table_manifest.chunks > 1 {
-        let result = import_mysql_tsv_table_parallel(
-            endpoint,
-            input_path,
-            table,
-            table_manifest,
-            compression,
-            threads,
-            request_id.clone(),
-            overall_rows_before,
-            overall_rows_total,
-            |event| emit(event),
-        );
+    if threads > 1 && ctx.table_manifest.chunks > 1 {
+        let result =
+            import_mysql_tsv_table_parallel(endpoint, input_path, threads, ctx, |event| emit(event));
         return match result {
             Ok(result) => Ok(result),
             Err(err) if is_mysql_local_infile_disabled_error(&err) => {
                 emit(json!({
                     "event": "phase",
-                    "request_id": request_id,
+                    "request_id": ctx.request_id,
                     "phase": "dump_import",
                     "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
                     "strategy": "insert_fallback",
                     "performance": "safe_fallback"
                 }));
-                import_mysql_tsv_table_insert_fallback(
-                    conn,
-                    input_path,
-                    table,
-                    table_manifest,
-                    compression,
-                    request_id,
-                    overall_rows_before,
-                    overall_rows_total,
-                    emit,
-                )
+                import_mysql_tsv_table_insert_fallback(conn, input_path, ctx, emit)
             }
             Err(err) => Err(err),
         };
@@ -558,43 +611,33 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
         let mut chunks_imported = 0_u64;
         let mut retryable_table_error: Option<String> = None;
 
-        for chunk_index in 1..=table_manifest.chunks {
+        for chunk_index in 1..=ctx.table_manifest.chunks {
             let chunk_path = dump_manifest_chunk_path(
                 input_path,
-                &table_manifest.path,
+                &ctx.table_manifest.path,
                 chunk_index,
                 "tsv",
-                compression,
+                ctx.compression,
             )?;
             let started = Instant::now();
             let rows = match load_chunk_with_reconnect(
                 endpoint,
                 conn,
-                table,
+                ctx.table,
                 &chunk_path,
-                compression,
+                ctx.compression,
             ) {
                 Ok(rows) => rows,
                 Err(err) if is_mysql_local_infile_disabled_error(&err) => {
                     emit(json!({
                         "event": "phase",
-                        "request_id": request_id,
+                        "request_id": ctx.request_id,
                         "phase": "dump_import",
                         "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
                         "strategy": "insert_fallback",
                         "performance": "safe_fallback"
                     }));
-                    return import_mysql_tsv_table_insert_fallback(
-                        conn,
-                        input_path,
-                        table,
-                        table_manifest,
-                        compression,
-                        request_id,
-                        overall_rows_before,
-                        overall_rows_total,
-                        emit,
-                    );
+                    return import_mysql_tsv_table_insert_fallback(conn, input_path, ctx, emit);
                 }
                 Err(err) if is_transient_disconnect_error(&err) => {
                     // 청크 재접속 재시도로도 복구 안 된 지속적 끊김.
@@ -606,16 +649,16 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             rows_imported += rows;
             chunks_imported += 1;
             emit(dump_import_row_progress_event(
-                request_id.clone(),
-                &table.name,
+                ctx.request_id.clone(),
+                &ctx.table.name,
                 rows_imported,
-                table_manifest.rows,
-                overall_rows_before,
-                overall_rows_total,
+                ctx.table_manifest.rows,
+                ctx.overall_rows_before,
+                ctx.overall_rows_total,
                 rows,
                 ChunkProgress {
                     chunks_done: Some(chunks_imported),
-                    chunks_total: Some(table_manifest.chunks),
+                    chunks_total: Some(ctx.table_manifest.chunks),
                     chunk_index: Some(chunk_index),
                     load_ms: Some(started.elapsed().as_millis() as u64),
                 },
@@ -631,11 +674,11 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                 }
                 emit(json!({
                     "event": "phase",
-                    "request_id": request_id,
+                    "request_id": ctx.request_id,
                     "phase": "dump_import",
                     "message": format!(
                         "연결 끊김으로 테이블 [{}] 재시작 (TRUNCATE 후 재적재)",
-                        table.name
+                        ctx.table.name
                     ),
                     "strategy": "table_restart"
                 }));
@@ -643,7 +686,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                 *conn = connect_tuned_mysql_import_conn(endpoint)?;
                 conn.query_drop(format!(
                     "TRUNCATE TABLE {}",
-                    quote_ident("mysql", &table.name)
+                    quote_ident("mysql", &ctx.table.name)
                 ))
                 .map_err(|truncate_err| {
                     format!("mysql table restart truncate error: {truncate_err}")
@@ -942,45 +985,40 @@ fn is_transient_disconnect_error(message: &str) -> bool {
 fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
     conn: &mut mysql::PooledConn,
     input_path: &Path,
-    table: &NormalizedTable,
-    table_manifest: &DumpTableManifest,
-    compression: &str,
-    request_id: Option<String>,
-    overall_rows_before: u64,
-    overall_rows_total: u64,
+    ctx: &MysqlImportChunkContext,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
-    for chunk_index in 1..=table_manifest.chunks {
+    for chunk_index in 1..=ctx.table_manifest.chunks {
         let chunk_path = dump_manifest_chunk_path(
             input_path,
-            &table_manifest.path,
+            &ctx.table_manifest.path,
             chunk_index,
             "tsv",
-            compression,
+            ctx.compression,
         )?;
         let started = Instant::now();
-        let rows = insert_mysql_tsv_chunk_with_batches(conn, table, &chunk_path, compression)
+        let rows = insert_mysql_tsv_chunk_with_batches(conn, ctx.table, &chunk_path, ctx.compression)
             .map_err(|err| {
                 format!(
                     "mysql insert fallback error for table {} chunk {}: {err}",
-                    table.name, chunk_index
+                    ctx.table.name, chunk_index
                 )
             })?;
         rows_imported += rows;
         chunks_imported += 1;
         emit(dump_import_row_progress_event(
-            request_id.clone(),
-            &table.name,
+            ctx.request_id.clone(),
+            &ctx.table.name,
             rows_imported,
-            table_manifest.rows,
-            overall_rows_before,
-            overall_rows_total,
+            ctx.table_manifest.rows,
+            ctx.overall_rows_before,
+            ctx.overall_rows_total,
             rows,
             ChunkProgress {
                 chunks_done: Some(chunks_imported),
-                chunks_total: Some(table_manifest.chunks),
+                chunks_total: Some(ctx.table_manifest.chunks),
                 chunk_index: Some(chunk_index),
                 load_ms: Some(started.elapsed().as_millis() as u64),
             },
@@ -1012,17 +1050,13 @@ fn insert_mysql_tsv_chunk_with_batches(
 fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     endpoint: &Endpoint,
     input_path: &Path,
-    table: &NormalizedTable,
-    table_manifest: &DumpTableManifest,
-    compression: &str,
     threads: usize,
-    request_id: Option<String>,
-    overall_rows_before: u64,
-    overall_rows_total: u64,
+    ctx: &MysqlImportChunkContext,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
-    let max_threads = threads.max(1).min(table_manifest.chunks as usize);
-    let mut pending = adaptive_import_chunk_order(input_path, table_manifest, "tsv", compression);
+    let max_threads = threads.max(1).min(ctx.table_manifest.chunks as usize);
+    let mut pending =
+        adaptive_import_chunk_order(input_path, ctx.table_manifest, "tsv", ctx.compression);
     let mut active = 0_usize;
     let mut completed = 0_u64;
     let mut rows_imported = 0_u64;
@@ -1035,10 +1069,10 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
             handles.push(spawn_mysql_import_chunk_worker(
                 endpoint.clone(),
                 input_path.to_path_buf(),
-                table.clone(),
-                table_manifest.path.clone(),
+                ctx.table.clone(),
+                ctx.table_manifest.path.clone(),
                 chunk_index,
-                compression.to_string(),
+                ctx.compression.to_string(),
                 sender.clone(),
             ));
             active += 1;
@@ -1047,7 +1081,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
         }
     }
 
-    while completed < table_manifest.chunks && active > 0 {
+    while completed < ctx.table_manifest.chunks && active > 0 {
         match receiver.recv() {
             Ok(ImportChunkEvent::Done {
                 chunk_index,
@@ -1058,16 +1092,16 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                 completed += 1;
                 active = active.saturating_sub(1);
                 emit(dump_import_row_progress_event(
-                    request_id.clone(),
-                    &table.name,
+                    ctx.request_id.clone(),
+                    &ctx.table.name,
                     rows_imported,
-                    table_manifest.rows,
-                    overall_rows_before,
-                    overall_rows_total,
+                    ctx.table_manifest.rows,
+                    ctx.overall_rows_before,
+                    ctx.overall_rows_total,
                     rows,
                     ChunkProgress {
                         chunks_done: Some(completed),
-                        chunks_total: Some(table_manifest.chunks),
+                        chunks_total: Some(ctx.table_manifest.chunks),
                         chunk_index: Some(chunk_index),
                         load_ms: Some(load_ms),
                     },
@@ -1077,10 +1111,10 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                     handles.push(spawn_mysql_import_chunk_worker(
                         endpoint.clone(),
                         input_path.to_path_buf(),
-                        table.clone(),
-                        table_manifest.path.clone(),
+                        ctx.table.clone(),
+                        ctx.table_manifest.path.clone(),
                         next_chunk,
-                        compression.to_string(),
+                        ctx.compression.to_string(),
                         sender.clone(),
                     ));
                     active += 1;
