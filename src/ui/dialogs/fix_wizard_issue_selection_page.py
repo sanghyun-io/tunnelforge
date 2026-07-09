@@ -9,7 +9,11 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor
 from typing import List
 
-from src.core.migration_constants import IssueType
+from src.core.migration_constants import (
+    IssueType,
+    ISSUE_TYPE_DISPLAY_NAMES,
+    AUTO_FIXABLE_ISSUE_TYPES,
+)
 from src.core.migration_fix_wizard import CharsetFixPlanBuilder, create_wizard_steps
 
 
@@ -89,29 +93,8 @@ class IssueSelectionPage(QWizardPage):
         self.table.setRowCount(len(issues))
         self.checkboxes.clear()
 
-        # 자동 수정 가능한 이슈 타입
-        auto_fixable_types = {
-            IssueType.INVALID_DATE,
-            IssueType.CHARSET_ISSUE,
-            IssueType.ZEROFILL_USAGE,
-            IssueType.FLOAT_PRECISION,
-            IssueType.INT_DISPLAY_WIDTH,
-            IssueType.DEPRECATED_ENGINE,
-            IssueType.ENUM_EMPTY_VALUE,
-        }
-
-        type_names = {
-            IssueType.INVALID_DATE: "잘못된 날짜",
-            IssueType.CHARSET_ISSUE: "문자셋",
-            IssueType.ZEROFILL_USAGE: "ZEROFILL",
-            IssueType.FLOAT_PRECISION: "FLOAT 정밀도",
-            IssueType.INT_DISPLAY_WIDTH: "INT 표시 너비",
-            IssueType.DEPRECATED_ENGINE: "deprecated 엔진",
-            IssueType.ENUM_EMPTY_VALUE: "ENUM 빈 값",
-            IssueType.AUTH_PLUGIN_ISSUE: "인증 플러그인",
-            IssueType.RESERVED_KEYWORD: "예약어",
-            IssueType.FK_NAME_LENGTH: "FK 이름 길이",
-        }
+        # 자동 수정 가능한 이슈 타입 (공유 단일 소스 참조)
+        auto_fixable_types = AUTO_FIXABLE_ISSUE_TYPES
 
         for i, issue in enumerate(issues):
             # 체크박스
@@ -136,7 +119,7 @@ class IssueSelectionPage(QWizardPage):
             self.table.setItem(i, 1, severity_item)
 
             # 유형
-            type_name = type_names.get(issue.issue_type, str(issue.issue_type.value))
+            type_name = ISSUE_TYPE_DISPLAY_NAMES.get(issue.issue_type, str(issue.issue_type.value))
             type_item = QTableWidgetItem(type_name)
 
             # 자동 수정 가능 표시

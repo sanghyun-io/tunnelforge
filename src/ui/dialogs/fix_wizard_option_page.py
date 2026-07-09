@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 )
 from typing import Dict, List, Optional
 
-from src.core.migration_constants import IssueType
+from src.core.migration_constants import IssueType, ISSUE_TYPE_DISPLAY_NAMES
 from src.core.migration_fix_wizard import FixOption, FixStrategy, FixWizardStep
 
 
@@ -56,19 +56,8 @@ class BatchOptionDialog(QDialog):
             type_counts[step.issue_type] += 1
             type_steps[step.issue_type].append(step)
 
-        type_names = {
-            IssueType.INVALID_DATE: "잘못된 날짜",
-            IssueType.CHARSET_ISSUE: "문자셋 이슈",
-            IssueType.ZEROFILL_USAGE: "ZEROFILL 속성",
-            IssueType.FLOAT_PRECISION: "FLOAT 정밀도",
-            IssueType.INT_DISPLAY_WIDTH: "INT 표시 너비",
-            IssueType.DEPRECATED_ENGINE: "deprecated 엔진",
-            IssueType.ENUM_EMPTY_VALUE: "ENUM 빈 값",
-            IssueType.AUTH_PLUGIN_ISSUE: "인증 플러그인",
-        }
-
         for issue_type, count in type_counts.items():
-            type_name = type_names.get(issue_type, str(issue_type.value))
+            type_name = ISSUE_TYPE_DISPLAY_NAMES.get(issue_type, str(issue_type.value))
             group = QGroupBox(f"{type_name} ({count}개)")
             group_layout = QVBoxLayout(group)
 
@@ -359,17 +348,7 @@ class FixOptionPage(QWizardPage):
         self.update_progress_display()
 
         # 이슈 정보 업데이트
-        type_names = {
-            IssueType.INVALID_DATE: "잘못된 날짜 (0000-00-00)",
-            IssueType.CHARSET_ISSUE: "문자셋 이슈",
-            IssueType.ZEROFILL_USAGE: "ZEROFILL 속성",
-            IssueType.FLOAT_PRECISION: "FLOAT 정밀도 구문",
-            IssueType.INT_DISPLAY_WIDTH: "INT 표시 너비",
-            IssueType.DEPRECATED_ENGINE: "deprecated 스토리지 엔진",
-            IssueType.ENUM_EMPTY_VALUE: "ENUM 빈 문자열",
-        }
-
-        self.lbl_type.setText(type_names.get(step.issue_type, str(step.issue_type.value)))
+        self.lbl_type.setText(ISSUE_TYPE_DISPLAY_NAMES.get(step.issue_type, str(step.issue_type.value)))
         self.lbl_location.setText(step.location)
         self.lbl_description.setText(step.description)
 

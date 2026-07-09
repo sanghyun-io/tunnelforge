@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from src.core.migration_constants import (
+    ALL_RESERVED_KEYWORDS,
     IssueType,
     CompatibilityIssue,
     INVALID_DATE_PATTERN,
@@ -137,7 +138,6 @@ class DumpFileAnalyzer:
         Returns:
             발견된 이슈 목록
         """
-        from src.core.migration_analyzer import MigrationAnalyzer
         issues = []
 
         try:
@@ -255,7 +255,7 @@ class DumpFileAnalyzer:
                 re.IGNORECASE
             )
 
-            keywords_upper = set(k.upper() for k in MigrationAnalyzer.NEW_RESERVED_KEYWORDS)
+            keywords_upper = set(k.upper() for k in ALL_RESERVED_KEYWORDS)
 
             for match in table_pattern.finditer(content):
                 table_name = match.group(1)

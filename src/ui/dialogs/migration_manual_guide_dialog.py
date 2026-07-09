@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt
 
 from src.core.migration_analyzer import IssueType
+from src.core.migration_constants import ISSUE_TYPE_DISPLAY_NAMES
 
 
 class ManualGuideDialog(QDialog):
@@ -196,18 +197,10 @@ class ManualGuideDialog(QDialog):
 
     def populate_issues(self):
         """이슈 목록 채우기"""
-        type_names = {
-            IssueType.AUTH_PLUGIN_ISSUE: "인증 플러그인",
-            IssueType.RESERVED_KEYWORD: "예약어 충돌",
-            IssueType.FK_NAME_LENGTH: "FK 이름 길이",
-            IssueType.PARTITION_ISSUE: "파티션 이슈",
-            IssueType.INDEX_ISSUE: "인덱스 이슈",
-        }
-
         self.issue_list.setRowCount(len(self.issues))
 
         for i, issue in enumerate(self.issues):
-            type_name = type_names.get(issue.issue_type, str(issue.issue_type.value))
+            type_name = ISSUE_TYPE_DISPLAY_NAMES.get(issue.issue_type, str(issue.issue_type.value))
             self.issue_list.setItem(i, 0, QTableWidgetItem(type_name))
             self.issue_list.setItem(i, 1, QTableWidgetItem(issue.location))
 

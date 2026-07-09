@@ -30,6 +30,7 @@ from src.core.migration_analyzer import (
     MigrationAnalyzer, AnalysisResult, OrphanRecord,
     CompatibilityIssue, CleanupAction, ActionType, IssueType
 )
+from src.core.migration_constants import ISSUE_TYPE_DISPLAY_NAMES, AUTO_FIXABLE_ISSUE_TYPES
 from src.ui.workers.migration_worker import MigrationAnalyzerWorker, CleanupWorker
 from src.core.logger import get_logger
 from src.core.platform_paths import analysis_dir
@@ -868,26 +869,6 @@ class MigrationAnalyzerDialog(QDialog):
             "info": "ℹ️"
         }
 
-        type_names = {
-            # 기존 이슈 타입
-            IssueType.ORPHAN_ROW: "고아 레코드",
-            IssueType.DEPRECATED_FUNCTION: "deprecated 함수",
-            IssueType.CHARSET_ISSUE: "문자셋",
-            IssueType.RESERVED_KEYWORD: "예약어",
-            IssueType.SQL_MODE_ISSUE: "SQL 모드",
-            # MySQL 8.4 Upgrade Checker 이슈 타입 (신규)
-            IssueType.REMOVED_SYS_VAR: "제거된 시스템 변수",
-            IssueType.AUTH_PLUGIN_ISSUE: "인증 플러그인",
-            IssueType.INVALID_DATE: "잘못된 날짜",
-            IssueType.ZEROFILL_USAGE: "ZEROFILL 속성",
-            IssueType.FLOAT_PRECISION: "FLOAT 정밀도",
-            IssueType.INT_DISPLAY_WIDTH: "INT 표시 너비",
-            IssueType.FK_NAME_LENGTH: "FK 이름 길이",
-            IssueType.FTS_TABLE_PREFIX: "FTS_ 테이블명",
-            IssueType.SUPER_PRIVILEGE: "SUPER 권한",
-            IssueType.DEFAULT_VALUE_CHANGE: "기본값 변경",
-        }
-
         for i, issue in enumerate(filtered):
             severity_item = QTableWidgetItem(f"{severity_icons.get(issue.severity, '')} {issue.severity.upper()}")
             if issue.severity == "error":
@@ -896,7 +877,7 @@ class MigrationAnalyzerDialog(QDialog):
                 severity_item.setForeground(QColor("#f39c12"))
 
             self.table_issues.setItem(i, 0, severity_item)
-            self.table_issues.setItem(i, 1, QTableWidgetItem(type_names.get(issue.issue_type, str(issue.issue_type))))
+            self.table_issues.setItem(i, 1, QTableWidgetItem(ISSUE_TYPE_DISPLAY_NAMES.get(issue.issue_type, str(issue.issue_type))))
             self.table_issues.setItem(i, 2, QTableWidgetItem(issue.location))
             self.table_issues.setItem(i, 3, QTableWidgetItem(issue.description))
             self.table_issues.setItem(i, 4, QTableWidgetItem(issue.suggestion))
@@ -1155,16 +1136,8 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
     # 자동 수정 위저드 / 수동 처리 가이드
     # =========================================================================
 
-    # 자동 수정 가능한 이슈 타입
-    AUTO_FIXABLE_TYPES = {
-        IssueType.INVALID_DATE,
-        IssueType.CHARSET_ISSUE,
-        IssueType.ZEROFILL_USAGE,
-        IssueType.FLOAT_PRECISION,
-        IssueType.INT_DISPLAY_WIDTH,
-        IssueType.DEPRECATED_ENGINE,
-        IssueType.ENUM_EMPTY_VALUE,
-    }
+    # 자동 수정 가능한 이슈 타입 (공유 단일 소스 참조)
+    AUTO_FIXABLE_TYPES = AUTO_FIXABLE_ISSUE_TYPES
 
     def _update_fix_buttons(self, issues: list):
         """자동 수정 / 수동 가이드 버튼 활성화 상태 업데이트"""
