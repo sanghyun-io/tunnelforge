@@ -217,12 +217,15 @@ class HistoryDialog(QDialog):
 
     def load_history(self):
         """히스토리 초기 로드"""
+        self._reset_list_state(is_searching=False)
+        self._load_chunk()
+        self._update_fav_count()
+
+    def _reset_list_state(self, is_searching: bool):
         self.list_widget.clear()
         self._history_items.clear()
         self.current_offset = 0
-        self._is_searching = False
-        self._load_chunk()
-        self._update_fav_count()
+        self._is_searching = is_searching
 
     def _load_chunk(self):
         """히스토리 청크 로드"""
@@ -335,10 +338,7 @@ class HistoryDialog(QDialog):
 
     def _do_search(self):
         """검색 실행"""
-        self.list_widget.clear()
-        self._history_items.clear()
-        self.current_offset = 0
-        self._is_searching = True
+        self._reset_list_state(is_searching=True)
         self._load_chunk()
 
     def _reset_search(self):

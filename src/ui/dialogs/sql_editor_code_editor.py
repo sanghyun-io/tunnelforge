@@ -402,12 +402,7 @@ class SQLEditorTab(QWidget):
 
     def set_content(self, text: str):
         """내용 설정 (수정 플래그 초기화)"""
-        self._set_large_document_mode_for_text(text)
-        self.editor.blockSignals(True)
-        self.editor.setPlainText(text)
-        self.editor.blockSignals(False)
-        self.is_modified = False
-        self.title_changed.emit(self.get_title())
+        self._apply_text(text)
 
     def get_content(self) -> str:
         """내용 반환"""
@@ -418,16 +413,19 @@ class SQLEditorTab(QWidget):
         try:
             with open(file_path, 'r', encoding='utf-8') as f:
                 content = f.read()
-            self._set_large_document_mode_for_text(content)
-            self.editor.blockSignals(True)
-            self.editor.setPlainText(content)
-            self.editor.blockSignals(False)
             self.file_path = file_path
-            self.is_modified = False
-            self.title_changed.emit(self.get_title())
+            self._apply_text(content)
             return True
         except Exception:
             return False
+
+    def _apply_text(self, text):
+        self._set_large_document_mode_for_text(text)
+        self.editor.blockSignals(True)
+        self.editor.setPlainText(text)
+        self.editor.blockSignals(False)
+        self.is_modified = False
+        self.title_changed.emit(self.get_title())
 
     def _set_large_document_mode_for_text(self, text: str):
         byte_size = len(text.encode("utf-8", errors="ignore"))

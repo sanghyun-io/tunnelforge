@@ -45,13 +45,147 @@ from src.ui.dialogs.sql_editor_code_editor import (
     LARGE_SQL_RENDER_LIMIT_BYTES,
 )
 from src.ui.dialogs.sql_editor_history_dialog import HistoryDialog
+from src.ui.dialogs.sql_editor_editability import (
+    analyze_query_editability,
+    build_primary_key_query,
+    quote_editor_identifier,
+)
 from src.ui.dialogs.sql_editor_workers import (
     SQLQueryWorker,
     SQLTransactionExecutionWorker,
     create_sql_editor_connector,
+    truncate_sql_preview,
 )
 
 logger = logging.getLogger(__name__)
+
+DANGER_CONFIRM_PREVIEW_LEN = 200
+TX_QUERY_PREVIEW_LEN = 60
+PENDING_PREVIEW_LEN = 50
+MAX_AUTO_COLUMN_WIDTH_PX = 400
+RESULT_ROW_HEIGHT_PX = 28
+ELAPSED_TIMER_INTERVAL_MS = 100
+
+PRIMARY_BUTTON_QSS = """
+    QPushButton {
+        background-color: #27ae60; color: white; font-weight: bold;
+        padding: 6px 16px; border-radius: 4px; border: none;
+    }
+    QPushButton:hover { background-color: #229954; }
+    QPushButton:disabled { background-color: #95a5a6; }
+"""
+
+SECONDARY_BUTTON_QSS = """
+    QPushButton {
+        background-color: #17a2b8; color: white; font-weight: bold;
+        padding: 6px 16px; border-radius: 4px; border: none;
+    }
+    QPushButton:hover { background-color: #138496; }
+    QPushButton:disabled { background-color: #95a5a6; }
+"""
+
+SCHEMA_TREE_QSS = """
+    QTreeWidget {
+        border: 1px solid #d8e0e8;
+        border-radius: 4px;
+        background-color: #fafafa;
+    }
+    QTreeWidget::item {
+        padding: 3px 4px;
+    }
+"""
+
+MESSAGE_TOGGLE_QSS = """
+    QPushButton {
+        text-align: left;
+        background-color: #34495e;
+        color: #ecf0f1;
+        border: none;
+        border-radius: 4px;
+        padding: 6px 10px;
+        font-weight: bold;
+    }
+    QPushButton:hover {
+        background-color: #3f5870;
+    }
+"""
+
+MESSAGE_SUMMARY_QSS = """
+    QLabel {
+        background-color: #f4f7fa;
+        color: #2c3e50;
+        border: 1px solid #d8e0e8;
+        border-radius: 4px;
+        padding: 6px 10px;
+        font-size: 12px;
+    }
+"""
+
+MESSAGE_TEXT_QSS = """
+    QTextEdit {
+        background-color: #2c3e50;
+        color: #ecf0f1;
+        font-family: 'Consolas', monospace;
+        font-size: 12px;
+    }
+"""
+
+TX_STATUS_FRAME_QSS = """
+    QFrame {
+        background-color: #E8F4FD;
+        border: 1px solid #B8DAFF;
+        border-radius: 4px;
+    }
+"""
+
+TX_TOGGLE_QSS = """
+    QPushButton {
+        background: transparent; border: none; color: #666;
+        padding: 4px 8px; font-size: 11px;
+    }
+    QPushButton:hover { color: #333; }
+"""
+
+COMMIT_BUTTON_QSS = """
+    QPushButton {
+        background-color: #28A745; color: white; font-weight: bold;
+        padding: 6px 16px; border-radius: 4px; border: none;
+    }
+    QPushButton:hover { background-color: #218838; }
+    QPushButton:disabled { background-color: #94D3A2; }
+"""
+
+ROLLBACK_BUTTON_QSS = """
+    QPushButton {
+        background-color: #6C757D; color: white; font-weight: bold;
+        padding: 6px 16px; border-radius: 4px; border: none;
+    }
+    QPushButton:hover { background-color: #5A6268; }
+    QPushButton:disabled { background-color: #ADB5BD; }
+"""
+
+PENDING_LIST_QSS = """
+    QListWidget {
+        background-color: #FFFBEA;
+        border: 1px solid #FFC107;
+        border-radius: 4px;
+        font-family: 'Consolas', monospace;
+        font-size: 11px;
+    }
+    QListWidget::item {
+        padding: 4px 8px;
+        border-bottom: 1px solid #FFE082;
+    }
+    QListWidget::item:selected {
+        background-color: #FFE082;
+        color: #333;
+    }
+"""
+
+PROGRESS_BAR_QSS = """
+    QProgressBar { border: none; background-color: #ecf0f1; }
+    QProgressBar::chunk { background-color: #3498db; }
+"""
 
 
 def format_metadata_db_version(db_version) -> str:
@@ -67,56 +201,6 @@ def format_metadata_db_version(db_version) -> str:
     if match:
         return f"{match.group(1)}.{match.group(2) or 0}"
     return text
-
-
-# =====================================================================
-# SQL 구문 하이라이터
-# =====================================================================
-
-
-# =====================================================================
-# SQL 검증 하이라이터 (밑줄 표시)
-# =====================================================================
-
-
-# =====================================================================
-# 자동완성 팝업
-# =====================================================================
-
-
-# =====================================================================
-# 줄 번호 위젯
-# =====================================================================
-
-
-# =====================================================================
-# 코드 에디터 (줄 번호 + 하이라이팅)
-# =====================================================================
-
-
-# =====================================================================
-# 검증 기능이 있는 코드 에디터
-# =====================================================================
-
-
-# =====================================================================
-# SQL 쿼리 실행 워커 (자동 커밋 모드)
-# =====================================================================
-
-
-# =====================================================================
-# SQL 트랜잭션 실행 워커 (지속 연결 모드 - 커밋/롤백은 다이얼로그가 소유)
-# =====================================================================
-
-
-# =====================================================================
-# 히스토리 다이얼로그
-# =====================================================================
-
-
-# =====================================================================
-# SQL 에디터 탭 (개별 탭 위젯)
-# =====================================================================
 
 
 # =====================================================================
@@ -234,7 +318,12 @@ class SQLEditorDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(8)
 
-        # --- 연결 정보 바 ---
+        layout.addLayout(self._build_connection_bar())
+        layout.addLayout(self._build_toolbar())
+        layout.addWidget(self._build_editor_panel())
+        self._build_status_bar(layout)
+
+    def _build_connection_bar(self):
         conn_bar = QHBoxLayout()
 
         tid = self.config.get('id')
@@ -266,35 +355,19 @@ class SQLEditorDialog(QDialog):
         conn_bar.addWidget(btn_refresh_db)
 
         conn_bar.addStretch()
-        layout.addLayout(conn_bar)
+        return conn_bar
 
-        # --- 툴바 ---
+    def _build_toolbar(self):
         toolbar = QHBoxLayout()
 
-        # 현재 쿼리 실행 (커서 위치)
         self.btn_execute_current = QPushButton("▷ 실행")
-        self.btn_execute_current.setStyleSheet("""
-            QPushButton {
-                background-color: #27ae60; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #229954; }
-            QPushButton:disabled { background-color: #95a5a6; }
-        """)
+        self.btn_execute_current.setStyleSheet(PRIMARY_BUTTON_QSS)
         self.btn_execute_current.setToolTip("현재 쿼리 실행 (Ctrl+Enter)\n커서 위치의 쿼리만 실행")
         self.btn_execute_current.clicked.connect(self.execute_current_query)
         toolbar.addWidget(self.btn_execute_current)
 
-        # 전체 실행
         self.btn_execute_all = QPushButton("▶ 전체")
-        self.btn_execute_all.setStyleSheet("""
-            QPushButton {
-                background-color: #17a2b8; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #138496; }
-            QPushButton:disabled { background-color: #95a5a6; }
-        """)
+        self.btn_execute_all.setStyleSheet(SECONDARY_BUTTON_QSS)
         self.btn_execute_all.setToolTip("전체 쿼리 실행 (F5)\n에디터의 모든 쿼리 실행")
         self.btn_execute_all.clicked.connect(self.execute_all_queries)
         toolbar.addWidget(self.btn_execute_all)
@@ -341,9 +414,9 @@ class SQLEditorDialog(QDialog):
         self.limit_combo.setMinimumWidth(100)
         toolbar.addWidget(self.limit_combo)
 
-        layout.addLayout(toolbar)
+        return toolbar
 
-        # --- 메인 스플리터 (스키마 트리 + 에디터/결과) ---
+    def _build_editor_panel(self):
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
 
         schema_group = QGroupBox("스키마 / 테이블")
@@ -353,16 +426,7 @@ class SQLEditorDialog(QDialog):
         self.schema_tree = QTreeWidget()
         self.schema_tree.setHeaderLabels(["이름"])
         self.schema_tree.setMinimumWidth(180)
-        self.schema_tree.setStyleSheet("""
-            QTreeWidget {
-                border: 1px solid #d8e0e8;
-                border-radius: 4px;
-                background-color: #fafafa;
-            }
-            QTreeWidget::item {
-                padding: 3px 4px;
-            }
-        """)
+        self.schema_tree.setStyleSheet(SCHEMA_TREE_QSS)
         self.schema_tree.itemClicked.connect(self._on_schema_tree_item_clicked)
         schema_layout.addWidget(self.schema_tree)
         main_splitter.addWidget(schema_group)
@@ -407,55 +471,31 @@ class SQLEditorDialog(QDialog):
         editor_layout.addWidget(self.editor_tabs)
 
         splitter.addWidget(editor_group)
+        splitter.addWidget(self._build_result_panel())
 
-        # 결과 영역
+        splitter.setSizes([350, 300])
+        main_splitter.addWidget(splitter)
+        main_splitter.setSizes([220, 780])
+        return main_splitter
+
+    def _build_result_panel(self):
         result_group = QGroupBox("결과")
         result_layout = QVBoxLayout(result_group)
         result_layout.setContentsMargins(4, 8, 4, 4)
 
-        # 메시지 영역 (접힘 상태에서는 한 줄 요약만 노출)
         self.btn_toggle_message = QPushButton("실행 로그 펼치기")
         self.btn_toggle_message.setToolTip("실행 로그 상세 보기")
-        self.btn_toggle_message.setStyleSheet("""
-            QPushButton {
-                text-align: left;
-                background-color: #34495e;
-                color: #ecf0f1;
-                border: none;
-                border-radius: 4px;
-                padding: 6px 10px;
-                font-weight: bold;
-            }
-            QPushButton:hover {
-                background-color: #3f5870;
-            }
-        """)
+        self.btn_toggle_message.setStyleSheet(MESSAGE_TOGGLE_QSS)
         self.btn_toggle_message.clicked.connect(self._toggle_message_panel)
         result_layout.addWidget(self.btn_toggle_message)
 
         self.message_summary = QLabel("실행 대기 중")
-        self.message_summary.setStyleSheet("""
-            QLabel {
-                background-color: #f4f7fa;
-                color: #2c3e50;
-                border: 1px solid #d8e0e8;
-                border-radius: 4px;
-                padding: 6px 10px;
-                font-size: 12px;
-            }
-        """)
+        self.message_summary.setStyleSheet(MESSAGE_SUMMARY_QSS)
         result_layout.addWidget(self.message_summary)
 
         self.message_text = QTextEdit()
         self.message_text.setReadOnly(True)
-        self.message_text.setStyleSheet("""
-            QTextEdit {
-                background-color: #2c3e50;
-                color: #ecf0f1;
-                font-family: 'Consolas', monospace;
-                font-size: 12px;
-            }
-        """)
+        self.message_text.setStyleSheet(MESSAGE_TEXT_QSS)
         result_layout.addWidget(self.message_text)
         self._set_message_panel_collapsed(True)
 
@@ -469,22 +509,17 @@ class SQLEditorDialog(QDialog):
         result_tab_bar.customContextMenuRequested.connect(self._show_result_tab_context_menu)
 
         result_layout.addWidget(self.result_tabs)
+        result_layout.addWidget(self._build_transaction_panel())
+        return result_group
 
-        # 트랜잭션 상태 패널
+    def _build_transaction_panel(self):
         self.tx_panel = QWidget()
         tx_panel_layout = QVBoxLayout(self.tx_panel)
         tx_panel_layout.setContentsMargins(0, 0, 0, 0)
         tx_panel_layout.setSpacing(4)
 
-        # 상태 바 (헤더)
         self.tx_status_frame = QFrame()
-        self.tx_status_frame.setStyleSheet("""
-            QFrame {
-                background-color: #E8F4FD;
-                border: 1px solid #B8DAFF;
-                border-radius: 4px;
-            }
-        """)
+        self.tx_status_frame.setStyleSheet(TX_STATUS_FRAME_QSS)
         tx_header_layout = QHBoxLayout(self.tx_status_frame)
         tx_header_layout.setContentsMargins(12, 6, 12, 6)
 
@@ -496,15 +531,8 @@ class SQLEditorDialog(QDialog):
         self.tx_info_label.setStyleSheet("color: #004085; background: transparent; border: none;")
         tx_header_layout.addWidget(self.tx_info_label)
 
-        # 펼치기/접기 버튼
         self.btn_toggle_pending = QPushButton("▼ 상세")
-        self.btn_toggle_pending.setStyleSheet("""
-            QPushButton {
-                background: transparent; border: none; color: #666;
-                padding: 4px 8px; font-size: 11px;
-            }
-            QPushButton:hover { color: #333; }
-        """)
+        self.btn_toggle_pending.setStyleSheet(TX_TOGGLE_QSS)
         self.btn_toggle_pending.clicked.connect(self._toggle_pending_list)
         self.btn_toggle_pending.setVisible(False)
         tx_header_layout.addWidget(self.btn_toggle_pending)
@@ -512,77 +540,35 @@ class SQLEditorDialog(QDialog):
         tx_header_layout.addStretch()
 
         self.btn_commit = QPushButton("✅ 커밋")
-        self.btn_commit.setStyleSheet("""
-            QPushButton {
-                background-color: #28A745; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #218838; }
-            QPushButton:disabled { background-color: #94D3A2; }
-        """)
+        self.btn_commit.setStyleSheet(COMMIT_BUTTON_QSS)
         self.btn_commit.clicked.connect(self._do_commit)
         self.btn_commit.setEnabled(False)
         tx_header_layout.addWidget(self.btn_commit)
 
         self.btn_rollback = QPushButton("↩️ 롤백")
-        self.btn_rollback.setStyleSheet("""
-            QPushButton {
-                background-color: #6C757D; color: white; font-weight: bold;
-                padding: 6px 16px; border-radius: 4px; border: none;
-            }
-            QPushButton:hover { background-color: #5A6268; }
-            QPushButton:disabled { background-color: #ADB5BD; }
-        """)
+        self.btn_rollback.setStyleSheet(ROLLBACK_BUTTON_QSS)
         self.btn_rollback.clicked.connect(self._do_rollback)
         self.btn_rollback.setEnabled(False)
         tx_header_layout.addWidget(self.btn_rollback)
 
         tx_panel_layout.addWidget(self.tx_status_frame)
 
-        # 미커밋 쿼리 목록 (접혀있는 상태로 시작)
         self.pending_list_widget = QListWidget()
-        self.pending_list_widget.setStyleSheet("""
-            QListWidget {
-                background-color: #FFFBEA;
-                border: 1px solid #FFC107;
-                border-radius: 4px;
-                font-family: 'Consolas', monospace;
-                font-size: 11px;
-            }
-            QListWidget::item {
-                padding: 4px 8px;
-                border-bottom: 1px solid #FFE082;
-            }
-            QListWidget::item:selected {
-                background-color: #FFE082;
-                color: #333;
-            }
-        """)
+        self.pending_list_widget.setStyleSheet(PENDING_LIST_QSS)
         self.pending_list_widget.setMaximumHeight(120)
         self.pending_list_widget.setVisible(False)
         tx_panel_layout.addWidget(self.pending_list_widget)
 
-        result_layout.addWidget(self.tx_panel)
+        return self.tx_panel
 
-        splitter.addWidget(result_group)
-
-        splitter.setSizes([350, 300])
-        main_splitter.addWidget(splitter)
-        main_splitter.setSizes([220, 780])
-        layout.addWidget(main_splitter)
-
-        # --- 프로그레스 바 ---
+    def _build_status_bar(self, layout):
         self.progress_bar = QProgressBar()
         self.progress_bar.setMaximumHeight(3)
         self.progress_bar.setTextVisible(False)
         self.progress_bar.setVisible(False)
-        self.progress_bar.setStyleSheet("""
-            QProgressBar { border: none; background-color: #ecf0f1; }
-            QProgressBar::chunk { background-color: #3498db; }
-        """)
+        self.progress_bar.setStyleSheet(PROGRESS_BAR_QSS)
         layout.addWidget(self.progress_bar)
 
-        # --- 상태바 ---
         self.status_bar = QStatusBar()
         self.status_bar.showMessage("준비됨")
         layout.addWidget(self.status_bar)
@@ -989,7 +975,7 @@ class SQLEditorDialog(QDialog):
         is_dangerous, keyword = guard.is_dangerous_query(sql_text)
         if is_dangerous:
             schema_name = self.db_combo.currentText() or "(미선택)"
-            preview = sql_text[:200] + "..." if len(sql_text) > 200 else sql_text
+            preview = truncate_sql_preview(sql_text, DANGER_CONFIRM_PREVIEW_LEN)
             # HTML 특수문자 이스케이프
             preview = preview.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 
@@ -1062,7 +1048,7 @@ class SQLEditorDialog(QDialog):
 
     def _on_transaction_query_result(self, idx, query, returns_rows, columns, rows, error, affected, exec_time):
         """트랜잭션 워커에서 쿼리 1건 실행 결과 수신"""
-        preview = query[:60] + "..." if len(query) > 60 else query
+        preview = truncate_sql_preview(query, TX_QUERY_PREVIEW_LEN)
         preview = preview.replace('\n', ' ')
 
         if error:
@@ -1210,14 +1196,14 @@ class SQLEditorDialog(QDialog):
         table.resizeColumnsToContents()
         # 초기 렌더링 시 400px 초과 컬럼 제한 (이후 자유 조정 가능)
         for col in range(len(columns)):
-            if header.sectionSize(col) > 400:
-                header.resizeSection(col, 400)
+            if header.sectionSize(col) > MAX_AUTO_COLUMN_WIDTH_PX:
+                header.resizeSection(col, MAX_AUTO_COLUMN_WIDTH_PX)
         table.setAlternatingRowColors(True)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
         table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
 
         # 행 높이 확보 (편집 시 텍스트 잘림 방지)
-        table.verticalHeader().setDefaultSectionSize(28)
+        table.verticalHeader().setDefaultSectionSize(RESULT_ROW_HEIGHT_PX)
 
         # 셀 편집기(QLineEdit) 스타일 — 셀 경계 내에 정확히 맞도록
         table.setStyleSheet("""
@@ -1380,7 +1366,7 @@ class SQLEditorDialog(QDialog):
             # 미커밋 쿼리 목록 업데이트 (DML만 — 셀 편집은 노랑 배경/*N으로 별도 표시)
             self.pending_list_widget.clear()
             for pq in self.pending_queries:
-                preview = pq['query'][:50] + "..." if len(pq['query']) > 50 else pq['query']
+                preview = truncate_sql_preview(pq['query'], PENDING_PREVIEW_LEN)
                 preview = preview.replace('\n', ' ')
                 item_text = f"[{pq['timestamp']}] {pq['type']} ({pq['affected']}행) - {preview}"
                 self.pending_list_widget.addItem(item_text)
@@ -1505,6 +1491,96 @@ class SQLEditorDialog(QDialog):
         self._cleanup()
         self.status_bar.showMessage(f"✅ {msg} ({total_elapsed:.1f}초)")
 
+    def _describe_pending_changes(self, pending_count, cell_edit_count) -> str:
+        parts = []
+        if pending_count > 0:
+            parts.append(f"쿼리 {pending_count}건")
+        if cell_edit_count > 0:
+            parts.append(f"셀 편집 {cell_edit_count}건")
+        return ', '.join(parts)
+
+    def _confirm_cell_edit_commit(self, table_edits) -> bool:
+        """Run the existing production guard confirmation for pending cell edits."""
+        if not table_edits:
+            return True
+
+        from src.core.production_guard import ProductionGuard
+        guard = ProductionGuard(self)
+
+        schemas_with_tables = {}
+        for tbl_widget, ctx in table_edits:
+            schema_key = ctx['schema'] or (self.db_combo.currentText() or '')
+            schemas_with_tables.setdefault(schema_key, []).append(
+                (ctx['table'], len(ctx['pending_edits']))
+            )
+
+        for schema, tables_info in schemas_with_tables.items():
+            details = '<br>'.join(
+                f'• <code>{t}</code>: {n}개 셀 변경'
+                for t, n in tables_info
+            )
+            if not guard.confirm_dangerous_operation(
+                self.config,
+                "셀 편집 커밋 (UPDATE)",
+                schema or '(기본 스키마)',
+                f"대상 테이블:<br>{details}"
+            ):
+                return False
+        return True
+
+    def _apply_commit(self, table_edits):
+        """Apply pending cell edits and commit the dialog-owned transaction."""
+        pending_count = len(self.pending_queries)
+        cell_edit_count = sum(len(ctx['pending_edits']) for _, ctx in table_edits)
+
+        try:
+            if table_edits:
+                with self.db_connection.cursor() as cursor:
+                    failed = self._execute_cell_edits_in_txn(cursor, table_edits)
+                if failed:
+                    self.db_connection.rollback()
+                    msg = '\n'.join(
+                        f'행 {r + 1}: {err}' for _, r, err in failed[:10]
+                    )
+                    extra = f"\n... (총 {len(failed)}건 실패)" if len(failed) > 10 else ""
+                    QMessageBox.critical(
+                        self, "커밋 실패",
+                        f"셀 편집 적용 실패 — 전체 롤백되었습니다"
+                        f"{'  (미커밋 쿼리 ' + str(pending_count) + '건 포함)' if pending_count else ''}:\n\n{msg}{extra}"
+                    )
+                    history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
+                    if history_ids:
+                        self.history_manager.update_status_batch(history_ids, 'rolled_back')
+                    self.pending_queries.clear()
+                    self._update_tx_status()
+                    return
+
+            self.db_connection.commit()
+
+            history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
+            if history_ids:
+                self.history_manager.update_status_batch(history_ids, 'committed')
+
+            self._finalize_cell_edits(table_edits)
+            summary = self._describe_pending_changes(pending_count, cell_edit_count)
+            self.message_text.append(f"\n✅ 커밋 완료! ({summary} 적용됨)")
+            self.status_bar.showMessage("커밋 완료")
+
+            self.pending_queries.clear()
+            self._update_tx_status()
+        except Exception as e:
+            try:
+                self.db_connection.rollback()
+            except Exception:
+                pass
+            history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
+            if history_ids:
+                self.history_manager.update_status_batch(history_ids, 'rolled_back')
+            self.pending_queries.clear()
+            self._update_tx_status()
+            self.message_text.append(f"❌ 커밋 실패: {str(e)}")
+            QMessageBox.critical(self, "커밋 오류", f"커밋에 실패했습니다:\n{str(e)}")
+
     def _do_commit(self):
         """트랜잭션 커밋 — DML pending_queries + 모든 탭의 셀 편집을 동일 트랜잭션에서 처리"""
         if self._query_executing:
@@ -1523,90 +1599,10 @@ class SQLEditorDialog(QDialog):
         if pending_count == 0 and cell_edit_count == 0:
             return
 
-        # Production 환경 가드 (셀 편집에 한함 — pending_queries는 실행 시점에 이미 통과)
-        if table_edits:
-            from src.core.production_guard import ProductionGuard
-            guard = ProductionGuard(self)
+        if not self._confirm_cell_edit_commit(table_edits):
+            return
 
-            # 관여 스키마별로 그룹화
-            schemas_with_tables = {}
-            for tbl_widget, ctx in table_edits:
-                schema_key = ctx['schema'] or (self.db_combo.currentText() or '')
-                schemas_with_tables.setdefault(schema_key, []).append(
-                    (ctx['table'], len(ctx['pending_edits']))
-                )
-
-            for schema, tables_info in schemas_with_tables.items():
-                details = '<br>'.join(
-                    f'• <code>{t}</code>: {n}개 셀 변경'
-                    for t, n in tables_info
-                )
-                if not guard.confirm_dangerous_operation(
-                    self.config,
-                    "셀 편집 커밋 (UPDATE)",
-                    schema or '(기본 스키마)',
-                    f"대상 테이블:<br>{details}"
-                ):
-                    return  # 사용자 취소 — 커밋 중단
-
-        try:
-            # 셀 편집이 있으면 같은 트랜잭션에서 UPDATE 실행
-            if table_edits:
-                with self.db_connection.cursor() as cursor:
-                    failed = self._execute_cell_edits_in_txn(cursor, table_edits)
-                if failed:
-                    self.db_connection.rollback()
-                    msg = '\n'.join(
-                        f'행 {r + 1}: {err}' for _, r, err in failed[:10]
-                    )
-                    extra = f"\n... (총 {len(failed)}건 실패)" if len(failed) > 10 else ""
-                    QMessageBox.critical(
-                        self, "커밋 실패",
-                        f"셀 편집 적용 실패 — 전체 롤백되었습니다"
-                        f"{'  (미커밋 쿼리 ' + str(pending_count) + '건 포함)' if pending_count else ''}:\n\n{msg}{extra}"
-                    )
-                    # 롤백 후 상태 정리
-                    history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
-                    if history_ids:
-                        self.history_manager.update_status_batch(history_ids, 'rolled_back')
-                    self.pending_queries.clear()
-                    self._update_tx_status()
-                    return
-
-            # 최종 커밋 (DML + 셀 편집 UPDATE 모두 포함)
-            self.db_connection.commit()
-
-            # 히스토리 상태 업데이트
-            history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
-            if history_ids:
-                self.history_manager.update_status_batch(history_ids, 'committed')
-
-            # 셀 편집 UI 후처리 (UserRole 갱신 + 시각 초기화)
-            self._finalize_cell_edits(table_edits)
-
-            # 완료 메시지
-            parts = []
-            if pending_count > 0:
-                parts.append(f"쿼리 {pending_count}건")
-            if cell_edit_count > 0:
-                parts.append(f"셀 편집 {cell_edit_count}건")
-            self.message_text.append(f"\n✅ 커밋 완료! ({', '.join(parts)} 적용됨)")
-            self.status_bar.showMessage("커밋 완료")
-
-            self.pending_queries.clear()
-            self._update_tx_status()
-        except Exception as e:
-            try:
-                self.db_connection.rollback()
-            except Exception:
-                pass
-            history_ids = [pq['history_id'] for pq in self.pending_queries if pq.get('history_id')]
-            if history_ids:
-                self.history_manager.update_status_batch(history_ids, 'rolled_back')
-            self.pending_queries.clear()
-            self._update_tx_status()
-            self.message_text.append(f"❌ 커밋 실패: {str(e)}")
-            QMessageBox.critical(self, "커밋 오류", f"커밋에 실패했습니다:\n{str(e)}")
+        self._apply_commit(table_edits)
 
     def _do_rollback(self):
         """트랜잭션 롤백 — DML + 셀 편집 모두 원복"""
@@ -1623,12 +1619,7 @@ class SQLEditorDialog(QDialog):
         if pending_count == 0 and cell_edit_count == 0:
             return
 
-        parts = []
-        if pending_count > 0:
-            parts.append(f"쿼리 {pending_count}건")
-        if cell_edit_count > 0:
-            parts.append(f"셀 편집 {cell_edit_count}건")
-        summary = ', '.join(parts)
+        summary = self._describe_pending_changes(pending_count, cell_edit_count)
 
         reply = QMessageBox.question(
             self, "롤백 확인",
@@ -1713,7 +1704,7 @@ class SQLEditorDialog(QDialog):
             self._exec_query_progress = None  # 다중 쿼리 진행률 (예: "2/5")
             self._exec_timer = QTimer()
             self._exec_timer.timeout.connect(self._update_elapsed_time)
-            self._exec_timer.start(100)
+            self._exec_timer.start(ELAPSED_TIMER_INTERVAL_MS)
             self.status_bar.showMessage("⏳ 쿼리 실행 중...")
         else:
             self._query_executing = False
@@ -1835,57 +1826,7 @@ class SQLEditorDialog(QDialog):
 
         반환: {'schema': str|None, 'table': str} 또는 None
         """
-        if not query:
-            return None
-
-        # 주석 제거
-        q = re.sub(r'/\*.*?\*/', ' ', query, flags=re.DOTALL)
-        q = re.sub(r'--[^\n]*', ' ', q)
-        q_norm = q.strip().rstrip(';').strip()
-        if not q_norm:
-            return None
-
-        q_upper = q_norm.upper()
-        if not q_upper.startswith('SELECT'):
-            return None
-
-        # 복잡 구조 거부 (JOIN / UNION / GROUP BY / HAVING / DISTINCT / 집계)
-        forbidden_patterns = [
-            r'\bJOIN\b', r'\bUNION\b', r'\bGROUP\s+BY\b',
-            r'\bHAVING\b', r'\bDISTINCT\b',
-        ]
-        for pat in forbidden_patterns:
-            if re.search(pat, q_upper):
-                return None
-        if re.search(r'\b(COUNT|SUM|AVG|MIN|MAX|GROUP_CONCAT)\s*\(', q_upper):
-            return None
-
-        # FROM 절 테이블 이름 추출: `schema`.`table` 또는 schema.table 또는 table
-        m = re.search(
-            r'\bFROM\s+(`[^`]+`|"[^"]+"|[\w$]+)(\s*\.\s*(`[^`]+`|"[^"]+"|[\w$]+))?',
-            q_norm, re.IGNORECASE
-        )
-        if not m:
-            return None
-
-        # FROM 뒤에 서브쿼리 괄호가 붙는 경우 거부
-        after_from = q_norm[m.start():]
-        from_kw_end = re.search(r'\bFROM\s+', after_from, re.IGNORECASE).end()
-        if after_from[from_kw_end:].lstrip().startswith('('):
-            return None
-
-        part1 = m.group(1).strip().strip('`"')
-        part2 = m.group(3).strip().strip('`"') if m.group(3) else None
-        schema, table = (part1, part2) if part2 else (None, part1)
-
-        # 여러 테이블(콤마 결합) 거부 - FROM 뒤 WHERE 이전 구간에 쉼표 있으면 탈락
-        rest = q_norm[m.end():]
-        stop = re.search(r'\b(WHERE|ORDER|LIMIT|GROUP|HAVING|FOR)\b', rest, re.IGNORECASE)
-        rest_check = rest[:stop.start()] if stop else rest
-        if ',' in rest_check:
-            return None
-
-        return {'schema': schema, 'table': table}
+        return analyze_query_editability(query)
 
     def _fetch_primary_keys(self, schema, table):
         """PK 컬럼명 조회 (엔진별 분기).
@@ -1901,30 +1842,17 @@ class SQLEditorDialog(QDialog):
                 if db_engine == 'postgresql':
                     pg_schema = schema or self.db_combo.currentText().strip() or "public"
                     cursor.execute(
-                        "SELECT kcu.column_name "
-                        "FROM information_schema.table_constraints tc "
-                        "JOIN information_schema.key_column_usage kcu "
-                        "  ON tc.constraint_name = kcu.constraint_name "
-                        " AND tc.table_schema = kcu.table_schema "
-                        " AND tc.table_name = kcu.table_name "
-                        "WHERE tc.constraint_type = 'PRIMARY KEY' "
-                        "  AND tc.table_schema = %s "
-                        "  AND tc.table_name = %s "
-                        "ORDER BY kcu.ordinal_position",
+                        build_primary_key_query(db_engine, has_schema=True),
                         (pg_schema, table)
                     )
                 elif schema:
                     cursor.execute(
-                        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-                        "WHERE TABLE_SCHEMA=%s AND TABLE_NAME=%s AND COLUMN_KEY='PRI' "
-                        "ORDER BY ORDINAL_POSITION",
+                        build_primary_key_query(db_engine, has_schema=True),
                         (schema, table)
                     )
                 else:
                     cursor.execute(
-                        "SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s AND COLUMN_KEY='PRI' "
-                        "ORDER BY ORDINAL_POSITION",
+                        build_primary_key_query(db_engine, has_schema=False),
                         (table,)
                     )
                 rows = cursor.fetchall()
@@ -2450,9 +2378,7 @@ class SQLEditorDialog(QDialog):
         self.editor.insertPlainText(f"{self._quote_editor_identifier(payload.get('name') or '')} ")
 
     def _quote_editor_identifier(self, name: str) -> str:
-        if self._db_engine() == "postgresql":
-            return f'"{name.replace(chr(34), chr(34) + chr(34))}"'
-        return f"`{name.replace('`', '``')}`"
+        return quote_editor_identifier(self._db_engine(), name)
 
     def _on_metadata_error(self, error: str):
         """메타데이터 로드 오류"""

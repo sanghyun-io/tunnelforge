@@ -1,6 +1,7 @@
 """
 SQL 에디터 쿼리 실행 백그라운드 워커 (자동커밋 모드 / 명시적 트랜잭션 모드)
 """
+from dataclasses import dataclass
 import logging
 import time
 from PyQt6.QtCore import QThread, pyqtSignal
@@ -9,6 +10,24 @@ from src.core.db_core_service import create_rust_db_connector, normalize_db_engi
 from src.core.sql_query_classifier import classify_sql_statement, statement_returns_rows
 
 logger = logging.getLogger(__name__)
+
+WORKER_PROGRESS_PREVIEW_LEN = 100
+
+
+@dataclass
+class ConnectionParams:
+    engine: str
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str = None
+    schema: str = None
+
+
+def truncate_sql_preview(text, length=60) -> str:
+    text = text or ""
+    return text[:length] + ("..." if len(text) > length else "")
 
 
 def create_sql_editor_connector(engine, host, port, user, password, database=None, schema=None):
@@ -22,6 +41,30 @@ def create_sql_editor_connector(engine, host, port, user, password, database=Non
         database,
         schema=(schema or "") if db_engine == "postgresql" else "",
     )
+
+
+def connector_from_params(params: ConnectionParams):
+    return create_sql_editor_connector(
+        params.engine,
+        params.host,
+        params.port,
+        params.user,
+        params.password,
+        params.database,
+        params.schema,
+    )
+
+
+def _rows_from_cursor(cursor) -> tuple[list, list]:
+    columns = [desc[0] for desc in cursor.description]
+    rows = cursor.fetchall()
+    row_list = []
+    for row in rows:
+        if isinstance(row, dict):
+            row_list.append([row.get(col) for col in columns])
+        else:
+            row_list.append(list(row))
+    return columns, row_list
 
 
 class SQLQueryWorker(QThread):
@@ -39,20 +82,21 @@ class SQLQueryWorker(QThread):
         self.password = password
         self.database = database
         self.schema = schema
+        self.params = ConnectionParams(
+            self.engine,
+            self.host,
+            self.port,
+            self.user,
+            self.password,
+            self.database,
+            self.schema,
+        )
         self.queries = queries  # List of query strings
 
     def run(self):
         connector = None
         try:
-            connector = create_sql_editor_connector(
-                self.engine,
-                self.host,
-                self.port,
-                self.user,
-                self.password,
-                self.database,
-                self.schema,
-            )
+            connector = connector_from_params(self.params)
             success, msg = connector.connect()
 
             if not success:
@@ -105,15 +149,7 @@ class SQLQueryWorker(QThread):
                         # 행을 반환하는 statement인지 확인 (None만 비행-statement)
                         if cursor.description is not None:
                             # SELECT 결과 (0행이어도 columns == [] 로 반환됨)
-                            columns = [desc[0] for desc in cursor.description]
-                            rows = cursor.fetchall()
-                            # Dict to list 변환
-                            row_list = []
-                            for row in rows:
-                                if isinstance(row, dict):
-                                    row_list.append([row.get(col) for col in columns])
-                                else:
-                                    row_list.append(list(row))
+                            columns, row_list = _rows_from_cursor(cursor)
 
                             execution_time = time.time() - start_time
                             self.query_result.emit(idx, True, columns, row_list, "", len(row_list), execution_time)
@@ -180,7 +216,7 @@ class SQLTransactionExecutionWorker(QThread):
 
             classification = classify_sql_statement(query)
             query_type = (classification.leading_keyword or "other").upper()
-            preview = query[:100] + ("..." if len(query) > 100 else "")
+            preview = truncate_sql_preview(query, WORKER_PROGRESS_PREVIEW_LEN)
             self.progress.emit(idx, total, query_type, preview)
 
             start_time = time.time()
@@ -189,14 +225,7 @@ class SQLTransactionExecutionWorker(QThread):
                     cursor.execute(query)
 
                     if cursor.description is not None:
-                        columns = [desc[0] for desc in cursor.description]
-                        rows = cursor.fetchall()
-                        row_list = []
-                        for row in rows:
-                            if isinstance(row, dict):
-                                row_list.append([row.get(col) for col in columns])
-                            else:
-                                row_list.append(list(row))
+                        columns, row_list = _rows_from_cursor(cursor)
                         execution_time = time.time() - start_time
                         self.query_result.emit(idx, query, True, columns, row_list, "", len(row_list), execution_time)
                     else:
