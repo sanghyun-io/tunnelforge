@@ -96,34 +96,29 @@ def db_core_executable() -> str:
     return resolve_db_core_executable()
 
 
-def QApplication():
-    from PyQt6.QtWidgets import QApplication as q_application
-
-    return q_application
-
-
-def QIcon():
-    from PyQt6.QtGui import QIcon as q_icon
-
-    return q_icon
+def _lazy_class(module_path: str, name: str):
+    module = __import__(module_path, fromlist=[name])
+    return getattr(module, name)
 
 
-def ConfigManager():
-    from src.core import ConfigManager as config_manager
-
-    return config_manager
+def _load_qapplication_class():
+    return _lazy_class("PyQt6.QtWidgets", "QApplication")
 
 
-def TunnelEngine():
-    from src.core import TunnelEngine as tunnel_engine
-
-    return tunnel_engine
+def _load_qicon_class():
+    return _lazy_class("PyQt6.QtGui", "QIcon")
 
 
-def TunnelManagerUI():
-    from src.ui.main_window import TunnelManagerUI as tunnel_manager_ui
+def _load_config_manager_class():
+    return _lazy_class("src.core", "ConfigManager")
 
-    return tunnel_manager_ui
+
+def _load_tunnel_engine_class():
+    return _lazy_class("src.core", "TunnelEngine")
+
+
+def _load_tunnel_manager_ui_class():
+    return _lazy_class("src.ui.main_window", "TunnelManagerUI")
 
 
 def should_run_self_check(argv=None) -> bool:
@@ -192,11 +187,11 @@ def run_ui_smoke_check() -> dict:
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
     self_check = run_self_check()
 
-    app_cls = QApplication()
-    icon_cls = QIcon()
-    config_cls = ConfigManager()
-    engine_cls = TunnelEngine()
-    window_cls = TunnelManagerUI()
+    app_cls = _load_qapplication_class()
+    icon_cls = _load_qicon_class()
+    config_cls = _load_config_manager_class()
+    engine_cls = _load_tunnel_engine_class()
+    window_cls = _load_tunnel_manager_ui_class()
     config_mgr = config_cls()
     from src.core.i18n import configure_language, install_qt_i18n
 
@@ -248,11 +243,11 @@ def main():
     # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
     set_app_user_model_id('tunnelforge.1.0')
 
-    app_cls = QApplication()
-    icon_cls = QIcon()
-    config_cls = ConfigManager()
-    engine_cls = TunnelEngine()
-    window_cls = TunnelManagerUI()
+    app_cls = _load_qapplication_class()
+    icon_cls = _load_qicon_class()
+    config_cls = _load_config_manager_class()
+    engine_cls = _load_tunnel_engine_class()
+    window_cls = _load_tunnel_manager_ui_class()
 
     app = app_cls(sys.argv)
     app.setWindowIcon(icon_cls(str(app_icon_path())))

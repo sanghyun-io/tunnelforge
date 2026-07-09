@@ -35,6 +35,7 @@ class TunnelTreeWidget(QTreeWidget):
     group_edit_requested = pyqtSignal(str)       # 그룹 수정 요청
     group_delete_requested = pyqtSignal(str)     # 그룹 삭제 요청
     tunnel_moved_to_group = pyqtSignal(str, str) # (tunnel_id, group_id 또는 None)
+    group_collapsed_changed = pyqtSignal(str, bool)  # group_id, collapsed
 
     # 아이템 타입 상수
     ITEM_TYPE_GROUP = 1
@@ -308,61 +309,61 @@ class TunnelTreeWidget(QTreeWidget):
         item_type = item_data.get('type')
 
         if item_type == self.ITEM_TYPE_GROUP:
-            # 그룹 컨텍스트 메뉴
-            group_id = item_data.get('id')
-
-            action_connect = menu.addAction("🔗 " + tr("tree.connect_all"))
-            action_connect.triggered.connect(lambda: self.group_connect_all.emit(group_id))
-
-            action_disconnect = menu.addAction("⛔ " + tr("tree.disconnect_all"))
-            action_disconnect.triggered.connect(lambda: self.group_disconnect_all.emit(group_id))
-
-            menu.addSeparator()
-
-            action_edit = menu.addAction("✏️ " + tr("tree.edit_group"))
-            action_edit.triggered.connect(lambda: self.group_edit_requested.emit(group_id))
-
-            action_delete = menu.addAction("🗑️ " + tr("tree.delete_group"))
-            action_delete.triggered.connect(lambda: self.group_delete_requested.emit(group_id))
+            self._build_group_context_menu(menu, item_data.get('id'))
 
         elif item_type == self.ITEM_TYPE_TUNNEL:
-            # 터널 컨텍스트 메뉴
-            tunnel_data = item_data.get('data', {})
-
-            action_duplicate = menu.addAction("📋 " + tr("tree.duplicate"))
-            action_duplicate.triggered.connect(lambda: self.tunnel_duplicate.emit(tunnel_data))
-
-            action_edit = menu.addAction("✏️ " + tr("common.edit"))
-            action_edit.triggered.connect(lambda: self.tunnel_edit_requested.emit(tunnel_data))
-
-            action_test = menu.addAction("🔍 " + tr("tree.test_connection"))
-            action_test.triggered.connect(lambda: self.tunnel_test.emit(tunnel_data))
-
-            menu.addSeparator()
-
-            action_db = menu.addAction("🔌 " + tr("tree.db_connect"))
-            action_db.triggered.connect(lambda: self.tunnel_db_connect.emit(tunnel_data))
-
-            action_sql = menu.addAction("📝 " + tr("tree.sql_editor"))
-            action_sql.triggered.connect(lambda: self.tunnel_sql_editor.emit(tunnel_data))
-
-            menu.addSeparator()
-
-            action_export = menu.addAction("📤 Export")
-            action_export.triggered.connect(lambda: self.tunnel_export.emit(tunnel_data))
-
-            action_import = menu.addAction("📥 Import")
-            action_import.triggered.connect(lambda: self.tunnel_import.emit(tunnel_data))
-
-            action_orphan = menu.addAction("🔍 고아 레코드 분석")
-            action_orphan.triggered.connect(lambda: self.tunnel_orphan_check.emit(tunnel_data))
-
-            menu.addSeparator()
-
-            action_delete = menu.addAction("🗑️ " + tr("common.delete"))
-            action_delete.triggered.connect(lambda: self.tunnel_delete_requested.emit(tunnel_data))
+            self._build_tunnel_context_menu(menu, item_data.get('data', {}))
 
         menu.exec(self.mapToGlobal(pos))
+
+    def _build_group_context_menu(self, menu, group_id):
+        action_connect = menu.addAction("🔗 " + tr("tree.connect_all"))
+        action_connect.triggered.connect(lambda: self.group_connect_all.emit(group_id))
+
+        action_disconnect = menu.addAction("⛔ " + tr("tree.disconnect_all"))
+        action_disconnect.triggered.connect(lambda: self.group_disconnect_all.emit(group_id))
+
+        menu.addSeparator()
+
+        action_edit = menu.addAction("✏️ " + tr("tree.edit_group"))
+        action_edit.triggered.connect(lambda: self.group_edit_requested.emit(group_id))
+
+        action_delete = menu.addAction("🗑️ " + tr("tree.delete_group"))
+        action_delete.triggered.connect(lambda: self.group_delete_requested.emit(group_id))
+
+    def _build_tunnel_context_menu(self, menu, tunnel_data):
+        action_duplicate = menu.addAction("📋 " + tr("tree.duplicate"))
+        action_duplicate.triggered.connect(lambda: self.tunnel_duplicate.emit(tunnel_data))
+
+        action_edit = menu.addAction("✏️ " + tr("common.edit"))
+        action_edit.triggered.connect(lambda: self.tunnel_edit_requested.emit(tunnel_data))
+
+        action_test = menu.addAction("🔍 " + tr("tree.test_connection"))
+        action_test.triggered.connect(lambda: self.tunnel_test.emit(tunnel_data))
+
+        menu.addSeparator()
+
+        action_db = menu.addAction("🔌 " + tr("tree.db_connect"))
+        action_db.triggered.connect(lambda: self.tunnel_db_connect.emit(tunnel_data))
+
+        action_sql = menu.addAction("📝 " + tr("tree.sql_editor"))
+        action_sql.triggered.connect(lambda: self.tunnel_sql_editor.emit(tunnel_data))
+
+        menu.addSeparator()
+
+        action_export = menu.addAction("📤 Export")
+        action_export.triggered.connect(lambda: self.tunnel_export.emit(tunnel_data))
+
+        action_import = menu.addAction("📥 Import")
+        action_import.triggered.connect(lambda: self.tunnel_import.emit(tunnel_data))
+
+        action_orphan = menu.addAction("🔍 고아 레코드 분석")
+        action_orphan.triggered.connect(lambda: self.tunnel_orphan_check.emit(tunnel_data))
+
+        menu.addSeparator()
+
+        action_delete = menu.addAction("🗑️ " + tr("common.delete"))
+        action_delete.triggered.connect(lambda: self.tunnel_delete_requested.emit(tunnel_data))
 
     def _on_item_double_clicked(self, item, column):
         """더블클릭 이벤트"""
@@ -391,7 +392,7 @@ class TunnelTreeWidget(QTreeWidget):
         if item_data and item_data.get('type') == self.ITEM_TYPE_GROUP:
             group_id = item_data.get('id')
             # collapsed 상태 저장 (False)
-            self._save_collapsed_state(group_id, False)
+            self.group_collapsed_changed.emit(group_id, False)
 
     def _on_item_collapsed(self, item):
         """아이템 축소됨"""
@@ -399,17 +400,7 @@ class TunnelTreeWidget(QTreeWidget):
         if item_data and item_data.get('type') == self.ITEM_TYPE_GROUP:
             group_id = item_data.get('id')
             # collapsed 상태 저장 (True)
-            self._save_collapsed_state(group_id, True)
-
-    def _save_collapsed_state(self, group_id: str, collapsed: bool):
-        """접힘 상태 저장 (config_manager 연동)"""
-        # 부모 윈도우에서 config_manager 접근
-        parent = self.parent()
-        while parent:
-            if hasattr(parent, 'config_mgr'):
-                parent.config_mgr.save_group_collapsed_state(group_id, collapsed)
-                break
-            parent = parent.parent()
+            self.group_collapsed_changed.emit(group_id, True)
 
     def dropEvent(self, event):
         """드롭 이벤트 처리"""

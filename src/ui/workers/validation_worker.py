@@ -3,11 +3,13 @@ SQL 검증 워커
 - QThread 기반 비동기 검증
 - 취소 지원
 """
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import pyqtSignal
 from typing import List, Optional
 
+from src.ui.workers.cancellable_worker import CancellableWorker
 
-class ValidationWorker(QThread):
+
+class ValidationWorker(CancellableWorker):
     """SQL 검증 비동기 워커
 
     Signals:
@@ -28,7 +30,6 @@ class ValidationWorker(QThread):
         self.validator = validator
         self.sql = sql
         self.schema = schema
-        self._cancelled = False
 
     def run(self):
         """검증 실행 (비동기)"""
@@ -45,12 +46,8 @@ class ValidationWorker(QThread):
             if not self._cancelled:
                 self.error_occurred.emit(str(e))
 
-    def cancel(self):
-        """검증 취소"""
-        self._cancelled = True
 
-
-class MetadataLoadWorker(QThread):
+class MetadataLoadWorker(CancellableWorker):
     """스키마 메타데이터 로드 워커
 
     DB 연결 후 테이블/컬럼 정보를 백그라운드에서 로드
@@ -73,7 +70,6 @@ class MetadataLoadWorker(QThread):
         super().__init__()
         self.connector = connector
         self.schema = schema
-        self._cancelled = False
 
     def run(self):
         """메타데이터 로드 실행"""
@@ -115,12 +111,8 @@ class MetadataLoadWorker(QThread):
             if not self._cancelled:
                 self.error_occurred.emit(str(e))
 
-    def cancel(self):
-        """로드 취소"""
-        self._cancelled = True
 
-
-class AutoCompleteWorker(QThread):
+class AutoCompleteWorker(CancellableWorker):
     """자동완성 목록 조회 워커
 
     Signals:
@@ -143,7 +135,6 @@ class AutoCompleteWorker(QThread):
         self.sql = sql
         self.cursor_pos = cursor_pos
         self.schema = schema
-        self._cancelled = False
 
     def run(self):
         """자동완성 목록 조회"""
@@ -161,7 +152,3 @@ class AutoCompleteWorker(QThread):
         except Exception as e:
             if not self._cancelled:
                 self.error_occurred.emit(str(e))
-
-    def cancel(self):
-        """조회 취소"""
-        self._cancelled = True

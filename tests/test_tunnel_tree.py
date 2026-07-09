@@ -61,9 +61,26 @@ def test_context_menu_wires_orphan_check_action():
     # 소스 레벨로 검증(오프스크린에서 실제 메뉴를 띄우지 않음).
     import inspect
 
-    source = inspect.getsource(TunnelTreeWidget._show_context_menu)
+    source = inspect.getsource(TunnelTreeWidget._build_tunnel_context_menu)
     assert "고아 레코드 분석" in source
     assert "self.tunnel_orphan_check.emit" in source
+
+
+def test_group_expand_collapse_emits_collapsed_state():
+    tree = TunnelTreeWidget()
+    try:
+        group = {"id": "group-1", "name": "Group", "color": "#3498db", "tunnel_ids": []}
+        tree.load_data([], [group], [])
+        item = tree._group_items["group-1"]
+        emitted = []
+        tree.group_collapsed_changed.connect(lambda group_id, collapsed: emitted.append((group_id, collapsed)))
+
+        tree._on_item_collapsed(item)
+        tree._on_item_expanded(item)
+
+        assert emitted == [("group-1", True), ("group-1", False)]
+    finally:
+        tree.close()
 
 
 def test_update_tunnel_status_toggles_icon_without_reload():

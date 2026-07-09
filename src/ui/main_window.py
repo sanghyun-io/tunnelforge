@@ -1,6 +1,7 @@
 """메인 UI 윈도우"""
 import sys
 import os
+from typing import Optional
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QMessageBox, QSystemTrayIcon,
                              QMenu, QApplication, QDialog)
@@ -14,6 +15,7 @@ from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
+from src.ui.controllers import TrayController, TunnelActionsController, WizardLauncher
 from src.core.logger import get_logger
 from src.core.platform_integration import restore_window_to_front
 from src.core.resources import app_icon_path, resource_path
@@ -28,11 +30,7 @@ def get_resource_path(relative_path):
     return str(resource_path(relative_path))
 
 
-from src.ui.dialogs.tunnel_config import TunnelConfigDialog
 from src.ui.dialogs.settings import CloseConfirmDialog, SettingsDialog
-from src.ui.dialogs.db_dialogs import RustDumpWizard
-from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationWizard
-from src.ui.dialogs.migration_dialogs import MigrationWizard
 from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
 from src.ui.dialogs.tunnel_status_dialog import TunnelStatusDialog
 from src.ui.dialogs.diff_dialog import SchemaDiffDialog
@@ -77,6 +75,10 @@ class TunnelManagerUI(QMainWindow):
 
         # MySQL 로그인 경로 매니저 초기화
         self._login_path_mgr = MysqlLoginPathManager()
+
+        self._wizard_launcher = WizardLauncher(self)
+        self._tray_controller = TrayController(self, SCHEDULE_FEATURE_ENABLED)
+        self._tunnel_actions_controller = TunnelActionsController(self)
 
         # ThemeManager 초기화
         self._init_theme_manager()
@@ -238,42 +240,7 @@ class TunnelManagerUI(QMainWindow):
 
     def init_tray(self):
         """시스템 트레이 아이콘 설정"""
-        self.tray_icon = QSystemTrayIcon(self)
-        # 커스텀 아이콘 사용 (PyInstaller 빌드 환경 지원)
-        icon_path = str(app_icon_path())
-        if os.path.exists(icon_path):
-            self.tray_icon.setIcon(QIcon(icon_path))
-
-        tray_menu = QMenu()
-        show_action = QAction("열기", self)
-        show_action.triggered.connect(self.show)
-
-        if SCHEDULE_FEATURE_ENABLED:
-            # 스케줄 백업 서브메뉴
-            self.schedule_menu = tray_menu.addMenu("")
-            self.schedule_manage_action = QAction(self)
-            self.schedule_manage_action.triggered.connect(self._open_schedule_dialog)
-            self.schedule_menu.addAction(self.schedule_manage_action)
-
-            self.schedule_menu.addSeparator()
-
-            # 스케줄 즉시 실행 서브메뉴
-            self._schedule_run_menu = self.schedule_menu.addMenu("")
-            self._update_schedule_run_menu()
-
-            tray_menu.addSeparator()
-
-        self.show_action = show_action
-        self.quit_action = QAction(self)
-        self.quit_action.triggered.connect(self.close_app)
-
-        tray_menu.addAction(self.show_action)
-        tray_menu.addAction(self.quit_action)
-        self._apply_language()
-
-        self.tray_icon.setContextMenu(tray_menu)
-        self.tray_icon.activated.connect(self._on_tray_activated)
-        self.tray_icon.show()
+        self._tray_controller.init_tray()
 
     def bring_to_front(self):
         """숨김/최소화 상태의 메인 창을 전면으로 복원합니다."""
@@ -300,8 +267,7 @@ class TunnelManagerUI(QMainWindow):
 
     def _on_tray_activated(self, reason):
         """트레이 아이콘 클릭 시"""
-        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
-            self.bring_to_front()
+        self._tray_controller._on_tray_activated(reason)
 
     def _connect_tree_signals(self):
         """트리 위젯 시그널 연결"""
@@ -321,6 +287,9 @@ class TunnelManagerUI(QMainWindow):
         self.tunnel_tree.group_edit_requested.connect(self._edit_group_dialog)
         self.tunnel_tree.group_delete_requested.connect(self._delete_group)
         self.tunnel_tree.tunnel_moved_to_group.connect(self._on_tunnel_moved)
+        self.tunnel_tree.group_collapsed_changed.connect(
+            lambda gid, collapsed: self.config_mgr.save_group_collapsed_state(gid, collapsed)
+        )
         self.tunnel_tree.header().sectionResized.connect(self._on_column_resized)
 
     def _build_power_button(self, tunnel: dict, is_active: bool) -> QPushButton:
@@ -333,6 +302,24 @@ class TunnelManagerUI(QMainWindow):
             btn_power.setStyleSheet(ButtonStyles.SUCCESS)
             btn_power.clicked.connect(lambda checked, t=tunnel: self.start_tunnel(t))
         return btn_power
+
+    def _build_manage_buttons(self, tunnel: dict) -> QWidget:
+        container = QWidget()
+        h_box = QHBoxLayout(container)
+        h_box.setContentsMargins(2, 2, 2, 2)
+        h_box.setSpacing(3)
+
+        btn_edit = QPushButton(tr("common.edit"))
+        btn_edit.setStyleSheet(ButtonStyles.EDIT)
+        btn_edit.clicked.connect(lambda checked, t=tunnel: self.edit_tunnel_dialog(t))
+        h_box.addWidget(btn_edit)
+
+        btn_del = QPushButton(tr("common.delete"))
+        btn_del.setStyleSheet(ButtonStyles.DELETE)
+        btn_del.clicked.connect(lambda checked, t=tunnel: self.delete_tunnel(t))
+        h_box.addWidget(btn_del)
+
+        return container
 
     def refresh_table(self):
         """설정 데이터와 현재 터널 상태를 기반으로 트리를 갱신합니다."""
@@ -358,35 +345,14 @@ class TunnelManagerUI(QMainWindow):
             self.tunnel_tree.set_power_button(tid, self._build_power_button(tunnel, is_active))
 
             # 관리 버튼 그룹 생성
-            container = QWidget()
-            h_box = QHBoxLayout(container)
-            h_box.setContentsMargins(2, 2, 2, 2)
-            h_box.setSpacing(3)
-
-            btn_edit = QPushButton(tr("common.edit"))
-            btn_edit.setStyleSheet(ButtonStyles.EDIT)
-            btn_edit.clicked.connect(lambda checked, t=tunnel: self.edit_tunnel_dialog(t))
-            h_box.addWidget(btn_edit)
-
-            btn_del = QPushButton(tr("common.delete"))
-            btn_del.setStyleSheet(ButtonStyles.DELETE)
-            btn_del.clicked.connect(lambda checked, t=tunnel: self.delete_tunnel(t))
-            h_box.addWidget(btn_del)
-
-            self.tunnel_tree.set_tunnel_buttons(tid, container)
+            self.tunnel_tree.set_tunnel_buttons(tid, self._build_manage_buttons(tunnel))
 
         self._schedule_repaint()
 
     # --- 트리 위젯 시그널 핸들러 ---
     def _on_tree_db_connect(self, tunnel):
         """트리에서 DB 연결 요청 - DB 연결 다이얼로그 열기"""
-        # 자격 증명 확인
-        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
-        if not user:
-            QMessageBox.warning(
-                self, "경고",
-                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
-            )
+        if self._require_db_credentials(tunnel) is None:
             return
 
         # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
@@ -449,13 +415,7 @@ class TunnelManagerUI(QMainWindow):
         """직접 연결 모드 테스트"""
         tunnel_name = tunnel.get('name', '알 수 없음')
 
-        # 자격 증명 확인
-        user, password = self.config_mgr.get_tunnel_credentials(tunnel['id'])
-        if not user:
-            QMessageBox.warning(
-                self, "경고",
-                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
-            )
+        if self._require_db_credentials(tunnel) is None:
             return
 
         engine = tunnel.get('db_engine') or 'mysql'
@@ -578,97 +538,27 @@ class TunnelManagerUI(QMainWindow):
     # --- 기능 로직 ---
     def add_tunnel_dialog(self):
         """연결 추가 팝업"""
-        # 수정됨: self.engine 전달
-        dialog = TunnelConfigDialog(self, tunnel_engine=self.engine)
-        if dialog.exec():
-            new_data = dialog.get_data()
-            new_data = self._process_credentials(new_data)
-            self.tunnels.append(new_data)
-            self.save_and_refresh()
+        self._tunnel_actions_controller.add_tunnel_dialog()
 
     def edit_tunnel_dialog(self, tunnel):
         """연결 수정 팝업"""
-        if self.engine.is_running(tunnel['id']):
-            QMessageBox.warning(self, "수정 불가", "실행 중인 터널은 수정할 수 없습니다.\n먼저 연결을 중지해주세요.")
-            return
-
-        # 수정됨: self.engine 전달
-        dialog = TunnelConfigDialog(self, tunnel_data=tunnel, tunnel_engine=self.engine)
-        if dialog.exec():
-            updated_data = dialog.get_data()
-            updated_data = self._process_credentials(updated_data)
-            for i, t in enumerate(self.tunnels):
-                if t['id'] == updated_data['id']:
-                    self.tunnels[i] = updated_data
-                    break
-            self.save_and_refresh()
+        self._tunnel_actions_controller.edit_tunnel_dialog(tunnel)
 
     def duplicate_tunnel(self, tunnel):
         """연결 설정 복사하여 새로 만들기"""
-        import copy
-        import uuid
-
-        # 기존 설정 복사
-        new_data = copy.deepcopy(tunnel)
-
-        # 새 ID 생성
-        new_data['id'] = str(uuid.uuid4())
-
-        # 이름에 (복사) 추가
-        original_name = tunnel.get('name', 'Unknown')
-        new_data['name'] = f"{original_name} (복사)"
-
-        # 다이얼로그에서 수정할 수 있도록 열기
-        dialog = TunnelConfigDialog(self, tunnel_data=new_data, tunnel_engine=self.engine)
-        dialog.setWindowTitle("연결 복사 - 새 연결 만들기")
-
-        if dialog.exec():
-            copied_data = dialog.get_data()
-            # ID가 변경되었을 수 있으므로 새 ID 유지
-            copied_data['id'] = new_data['id']
-            copied_data = self._process_credentials(copied_data)
-            self.tunnels.append(copied_data)
-            self.save_and_refresh()
-            self.statusBar().showMessage(f"✅ '{copied_data['name']}' 연결이 생성되었습니다.", 3000)
+        self._tunnel_actions_controller.duplicate_tunnel(tunnel)
 
     def delete_tunnel(self, tunnel):
         """연결 삭제"""
-        if self.engine.is_running(tunnel['id']):
-            QMessageBox.warning(self, "삭제 불가", "실행 중인 터널은 삭제할 수 없습니다.")
-            return
-
-        confirm = QMessageBox.question(self, "삭제 확인", f"'{tunnel['name']}' 연결 설정을 삭제하시겠습니까?",
-                                       QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
-
-        if confirm == QMessageBox.StandardButton.Yes:
-            # ID로 찾아서 삭제
-            self.tunnels = [t for t in self.tunnels if t['id'] != tunnel['id']]
-            self.save_and_refresh()
+        self._tunnel_actions_controller.delete_tunnel(tunnel)
 
     def _process_credentials(self, tunnel_data: dict) -> dict:
         """비밀번호 암호화 처리"""
-        result = tunnel_data.copy()
-
-        # 평문 비밀번호가 있으면 암호화
-        if '_db_password_plain' in result:
-            plain_password = result.pop('_db_password_plain')
-            if plain_password:
-                result['db_password_encrypted'] = self.config_mgr.encryptor.encrypt(plain_password)
-
-        # db_user가 없으면 관련 필드 모두 제거
-        if not result.get('db_user'):
-            result.pop('db_user', None)
-            result.pop('db_password_encrypted', None)
-
-        return result
+        return self._tunnel_actions_controller._process_credentials(tunnel_data)
 
     def save_and_refresh(self):
         """변경사항을 JSON 파일에 저장하고 테이블 새로고침 (기존 설정 보존)"""
-        config = self.config_mgr.load_config()
-        config['tunnels'] = self.tunnels
-        self.config_mgr.save_config(config)
-        self.refresh_table()
-        self.statusBar().showMessage("설정이 저장되었습니다.", 2000)
+        self._tunnel_actions_controller.save_and_refresh()
 
     def open_settings_dialog(self):
         """설정 다이얼로그 열기"""
@@ -679,37 +569,19 @@ class TunnelManagerUI(QMainWindow):
 
     def open_rust_dump_export(self):
         """Rust DB Core Export 마법사 열기 (병렬 처리)"""
-        wizard = RustDumpWizard(
-            parent=self,
-            tunnel_engine=self.engine,
-            config_manager=self.config_mgr
-        )
-        wizard.start_export()
+        self._wizard_launcher.open_rust_dump_export()
 
     def open_rust_dump_import(self):
         """Rust DB Core Import 마법사 열기"""
-        wizard = RustDumpWizard(
-            parent=self,
-            tunnel_engine=self.engine,
-            config_manager=self.config_mgr
-        )
-        wizard.start_import()
+        self._wizard_launcher.open_rust_dump_import()
 
     def open_migration_analyzer(self):
         """마이그레이션 분석기 열기"""
-        MigrationWizard.start(
-            parent=self,
-            tunnel_engine=self.engine,
-            config_manager=self.config_mgr
-        )
+        self._wizard_launcher.open_migration_analyzer()
 
     def open_cross_engine_migration(self):
         """DB 전환 마법사 열기"""
-        CrossEngineMigrationWizard.start(
-            parent=self,
-            tunnel_engine=self.engine,
-            config_manager=self.config_mgr
-        )
+        self._wizard_launcher.open_cross_engine_migration()
 
     # --- 기존 터널링 로직 ---
     def _ensure_tunnel_running(self, tunnel: dict, *, prompt: bool = False) -> bool:
@@ -909,53 +781,11 @@ class TunnelManagerUI(QMainWindow):
 
     def _update_schedule_run_menu(self):
         """즉시 실행 메뉴 업데이트"""
-        if not hasattr(self, '_schedule_run_menu') or not self.scheduler:
-            return
-
-        self._schedule_run_menu.clear()
-
-        schedules = self.scheduler.get_schedules()
-        if not schedules:
-            no_schedule_action = QAction("(스케줄 없음)", self)
-            no_schedule_action.setEnabled(False)
-            self._schedule_run_menu.addAction(no_schedule_action)
-            return
-
-        for schedule in schedules:
-            action = QAction(schedule.name, self)
-            action.setData(schedule.id)
-            action.triggered.connect(
-                lambda checked, sid=schedule.id: self._run_schedule_now(sid)
-            )
-            self._schedule_run_menu.addAction(action)
+        self._tray_controller._update_schedule_run_menu()
 
     def _run_schedule_now(self, schedule_id: str):
         """스케줄 즉시 실행"""
-        if not self.scheduler:
-            return
-
-        schedule = self.scheduler.get_schedule(schedule_id)
-        if not schedule:
-            return
-
-        # 백그라운드에서 실행
-        success, message = self.scheduler.run_now(schedule_id)
-
-        # 트레이 알림
-        if success:
-            self.tray_icon.showMessage(
-                "백업 완료",
-                f"{schedule.name} 백업이 완료되었습니다.",
-                QSystemTrayIcon.MessageIcon.Information,
-                3000
-            )
-        else:
-            self.tray_icon.showMessage(
-                "백업 실패",
-                f"{schedule.name}: {message}",
-                QSystemTrayIcon.MessageIcon.Warning,
-                5000
-            )
+        self._tray_controller._run_schedule_now(schedule_id)
 
     def _on_backup_complete(self, schedule_name: str, success: bool, message: str):
         """백업 완료 콜백 (스케줄러 스레드에서 호출될 수 있어 UI 스레드로 마샬링)"""
@@ -971,20 +801,13 @@ class TunnelManagerUI(QMainWindow):
     @pyqtSlot(str, bool, str)
     def _show_backup_complete_notification(self, schedule_name: str, success: bool, message: str):
         """UI 스레드에서 백업 완료/실패 트레이 알림을 표시한다."""
-        if success:
-            self.tray_icon.showMessage(
-                "스케줄 백업 완료",
-                f"{schedule_name} 백업이 완료되었습니다.",
-                QSystemTrayIcon.MessageIcon.Information,
-                3000
-            )
-        else:
-            self.tray_icon.showMessage(
-                "스케줄 백업 실패",
-                f"{schedule_name}: {message}",
-                QSystemTrayIcon.MessageIcon.Warning,
-                5000
-            )
+        self._tray_controller._notify_backup_result(
+            schedule_name,
+            success,
+            message,
+            success_title="스케줄 백업 완료",
+            failure_title="스케줄 백업 실패",
+        )
 
     # =========================================================================
     # 터널 모니터링 관련 메서드
@@ -1062,7 +885,7 @@ class TunnelManagerUI(QMainWindow):
     def _load_column_ratios(self):
         """저장된 열 비율 로드 (없으면 기본값)"""
         ratios = self.config_mgr.get_app_setting('ui_column_ratios')
-        if ratios and len(ratios) == 7:
+        if ratios and len(ratios) == len(self._default_column_ratios):
             return ratios
         return self._default_column_ratios.copy()
 
@@ -1193,15 +1016,19 @@ class TunnelManagerUI(QMainWindow):
             5000  # 5초 동안 표시
         )
 
-    def open_sql_editor(self, tunnel):
-        """SQL 에디터 다이얼로그 열기"""
-        # 자격 증명 확인
-        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+    def _require_db_credentials(self, tunnel) -> Optional[tuple[str, str]]:
+        user, password = self.config_mgr.get_tunnel_credentials(tunnel['id'])
         if not user:
             QMessageBox.warning(
                 self, "경고",
                 "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
             )
+            return None
+        return user, password
+
+    def open_sql_editor(self, tunnel):
+        """SQL 에디터 다이얼로그 열기"""
+        if self._require_db_credentials(tunnel) is None:
             return
 
         # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
@@ -1213,69 +1040,33 @@ class TunnelManagerUI(QMainWindow):
 
     def _context_rust_core_export(self, tunnel):
         """특정 터널용 Rust DB Core Export - 인증정보 자동 사용"""
-        # 자격 증명 확인
-        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
-        if not user:
-            QMessageBox.warning(
-                self, "경고",
-                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
-            )
+        if self._require_db_credentials(tunnel) is None:
             return
 
         # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
         if not self._ensure_tunnel_running(tunnel, prompt=False):
             return
 
-        wizard = RustDumpWizard(
-            parent=self,
-            tunnel_engine=self.engine,
-            config_manager=self.config_mgr,
-            preselected_tunnel=tunnel
-        )
-        wizard.start_export()
+        self._wizard_launcher._launch_rust_dump_wizard("start_export", tunnel)
 
     def _context_rust_core_import(self, tunnel):
         """특정 터널용 Rust DB Core Import - 인증정보 자동 사용"""
-        # 자격 증명 확인
-        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
-        if not user:
-            QMessageBox.warning(
-                self, "경고",
-                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
-            )
+        if self._require_db_credentials(tunnel) is None:
             return
 
         # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
         if not self._ensure_tunnel_running(tunnel, prompt=False):
             return
 
-        wizard = RustDumpWizard(
-            parent=self,
-            tunnel_engine=self.engine,
-            config_manager=self.config_mgr,
-            preselected_tunnel=tunnel
-        )
-        wizard.start_import()
+        self._wizard_launcher._launch_rust_dump_wizard("start_import", tunnel)
 
     def _context_orphan_check(self, tunnel):
         """특정 터널용 고아 레코드 분석 - 인증정보 자동 사용"""
-        # 자격 증명 확인
-        user, _ = self.config_mgr.get_tunnel_credentials(tunnel['id'])
-        if not user:
-            QMessageBox.warning(
-                self, "경고",
-                "DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
-            )
+        if self._require_db_credentials(tunnel) is None:
             return
 
         # 터널 비활성화시 자동 활성화 (직접 연결 모드 제외)
         if not self._ensure_tunnel_running(tunnel, prompt=False):
             return
 
-        wizard = RustDumpWizard(
-            parent=self,
-            tunnel_engine=self.engine,
-            config_manager=self.config_mgr,
-            preselected_tunnel=tunnel
-        )
-        wizard.start_orphan_check()
+        self._wizard_launcher._launch_rust_dump_wizard("start_orphan_check", tunnel)

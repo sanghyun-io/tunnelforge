@@ -8,6 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtWidgets import QApplication
 
 from src.ui import main_window
+from src.ui.controllers.tray_controller import TrayController
 from src.ui.main_window import TunnelManagerUI
 
 
@@ -207,7 +208,7 @@ def test_on_backup_complete_marshals_to_ui_thread():
 
 
 def test_show_backup_complete_notification_shows_tray_message():
-    source = inspect.getsource(TunnelManagerUI._show_backup_complete_notification)
+    source = inspect.getsource(TrayController._notify_backup_result)
     assert "tray_icon.showMessage" in source
 
 

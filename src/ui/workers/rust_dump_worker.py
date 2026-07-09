@@ -55,111 +55,35 @@ class RustDumpWorker(QThread):
             return False, CANCELLED_MESSAGE
         return success, msg
 
+    def _on_progress(self, msg):
+        self.progress.emit(msg)
+
+    def _on_table_progress(self, current, total, table_name):
+        self.table_progress.emit(current, total, table_name)
+
+    def _on_detail(self, info: dict):
+        self.detail_progress.emit(info)
+
+    def _on_table_status(self, table_name: str, status: str, message: str = ""):
+        self.table_status.emit(table_name, status, message)
+
+    def _on_raw_output(self, line: str):
+        self.raw_output.emit(line)
+
+    def _on_metadata(self, metadata: dict):
+        self.metadata_analyzed.emit(metadata)
+
+    def _on_table_chunk_progress(self, table_name: str, completed_chunks: int, total_chunks: int):
+        self.table_chunk_progress.emit(table_name, completed_chunks, total_chunks)
+
     def run(self):
-        def callback(msg):
-            self.progress.emit(msg)
-
-        def table_callback(current, total, table_name):
-            self.table_progress.emit(current, total, table_name)
-
         try:
             if self.task_type == "export_schema":
-                exporter = RustDumpExporter(self.config)
-                self._active_runner = exporter
-
-                # 상세 콜백 함수들
-                def detail_callback(info: dict):
-                    self.detail_progress.emit(info)
-
-                def table_status_callback(table_name: str, status: str, message: str = ""):
-                    self.table_status.emit(table_name, status, message)
-
-                def raw_output_callback(line: str):
-                    self.raw_output.emit(line)
-
-                success, msg = exporter.export_full_schema(
-                    self.kwargs['schema'],
-                    self.kwargs['output_dir'],
-                    self.kwargs.get('threads', 8),
-                    self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
-                    callback,
-                    table_callback,
-                    detail_callback,
-                    table_status_callback,
-                    raw_output_callback
-                )
-                success, msg = self._is_cancelled_message(success, msg)
-                self.finished.emit(success, msg)
-
+                self._run_export_schema()
             elif self.task_type == "export_tables":
-                exporter = RustDumpExporter(self.config)
-                self._active_runner = exporter
-
-                # 상세 콜백 함수들
-                def detail_callback(info: dict):
-                    self.detail_progress.emit(info)
-
-                def table_status_callback(table_name: str, status: str, message: str = ""):
-                    self.table_status.emit(table_name, status, message)
-
-                def raw_output_callback(line: str):
-                    self.raw_output.emit(line)
-
-                success, msg, tables = exporter.export_tables(
-                    self.kwargs['schema'],
-                    self.kwargs['tables'],
-                    self.kwargs['output_dir'],
-                    self.kwargs.get('threads', 8),
-                    self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
-                    self.kwargs.get('include_fk_parents', True),
-                    callback,
-                    table_callback,
-                    detail_callback,
-                    table_status_callback,
-                    raw_output_callback
-                )
-                success, msg = self._is_cancelled_message(success, msg)
-                self.finished.emit(success, msg)
-
+                self._run_export_tables()
             elif self.task_type == "import":
-                importer = RustDumpImporter(self.config)
-                self._active_runner = importer
-
-                # 상세 콜백 함수들
-                def detail_callback(info: dict):
-                    self.detail_progress.emit(info)
-
-                def table_status_callback(table_name: str, status: str, message: str = ""):
-                    self.table_status.emit(table_name, status, message)
-
-                def raw_output_callback(line: str):
-                    self.raw_output.emit(line)
-
-                def metadata_callback(metadata: dict):
-                    self.metadata_analyzed.emit(metadata)
-
-                def table_chunk_progress_callback(table_name: str, completed_chunks: int, total_chunks: int):
-                    self.table_chunk_progress.emit(table_name, completed_chunks, total_chunks)
-
-                success, msg, results = importer.import_dump(
-                    self.kwargs['input_dir'],
-                    self.kwargs.get('target_schema'),
-                    self.kwargs.get('threads', 8),
-                    self.kwargs.get('import_mode', 'replace'),
-                    self.kwargs.get('timezone_sql'),
-                    callback,
-                    table_callback,
-                    detail_callback,
-                    table_status_callback,
-                    raw_output_callback,
-                    self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
-                    metadata_callback,
-                    table_chunk_progress_callback,
-                )
-                success, msg = self._is_cancelled_message(success, msg)
-                self.import_finished.emit(success, msg, results)
-                self.finished.emit(success, msg)
-
+                self._run_import()
         except Exception as e:
             if self._cancel_requested:
                 message = CANCELLED_MESSAGE
@@ -170,3 +94,64 @@ class RustDumpWorker(QThread):
                 self.finished.emit(False, str(e))
         finally:
             self._active_runner = None
+
+    def _run_export_schema(self):
+        exporter = RustDumpExporter(self.config)
+        self._active_runner = exporter
+
+        success, msg = exporter.export_full_schema(
+            self.kwargs['schema'],
+            self.kwargs['output_dir'],
+            self.kwargs.get('threads', 8),
+            self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
+            self._on_progress,
+            self._on_table_progress,
+            self._on_detail,
+            self._on_table_status,
+            self._on_raw_output,
+        )
+        success, msg = self._is_cancelled_message(success, msg)
+        self.finished.emit(success, msg)
+
+    def _run_export_tables(self):
+        exporter = RustDumpExporter(self.config)
+        self._active_runner = exporter
+
+        success, msg, tables = exporter.export_tables(
+            self.kwargs['schema'],
+            self.kwargs['tables'],
+            self.kwargs['output_dir'],
+            self.kwargs.get('threads', 8),
+            self.kwargs.get('compression', DEFAULT_DUMP_COMPRESSION),
+            self.kwargs.get('include_fk_parents', True),
+            self._on_progress,
+            self._on_table_progress,
+            self._on_detail,
+            self._on_table_status,
+            self._on_raw_output,
+        )
+        success, msg = self._is_cancelled_message(success, msg)
+        self.finished.emit(success, msg)
+
+    def _run_import(self):
+        importer = RustDumpImporter(self.config)
+        self._active_runner = importer
+
+        success, msg, results = importer.import_dump(
+            self.kwargs['input_dir'],
+            self.kwargs.get('target_schema'),
+            self.kwargs.get('threads', 8),
+            self.kwargs.get('import_mode', 'replace'),
+            self.kwargs.get('timezone_sql'),
+            self._on_progress,
+            self._on_table_progress,
+            self._on_detail,
+            self._on_table_status,
+            self._on_raw_output,
+            self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
+            self._on_metadata,
+            self._on_table_chunk_progress,
+        )
+        success, msg = self._is_cancelled_message(success, msg)
+        self.import_finished.emit(success, msg, results)
+        self.finished.emit(success, msg)

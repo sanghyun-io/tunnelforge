@@ -114,3 +114,104 @@ def test_connection_test_worker_does_not_shadow_builtin_finished_signal():
     assert thread_finished_calls == [True]
     # 내장 finished()는 인자를 받지 않는다 (test_finished와 시그니처가 다름을 재확인)
     assert test_finished_calls == [(True, "ok")]
+
+
+def test_resolve_connection_uses_running_tunnel_without_temp_tunnel():
+    class FakeEngine:
+        def __init__(self):
+            self.temp_created = False
+
+        def is_running(self, tunnel_id):
+            return tunnel_id == "t1"
+
+        def get_connection_info(self, tunnel_id):
+            return "127.0.0.1", 3307
+
+        def create_temp_tunnel(self, config):
+            self.temp_created = True
+            return True, object(), None
+
+    engine = FakeEngine()
+    worker = ConnectionTestWorker(
+        TestType.DB_ONLY,
+        {"id": "t1", "db_engine": "mysql", "connection_mode": "ssh_tunnel"},
+        tunnel_engine=engine,
+        config_manager=None,
+    )
+    progress = []
+    worker.progress.connect(progress.append)
+
+    resolved, failure = worker._resolve_connection(announce_connection=True)
+
+    assert failure is None
+    assert resolved.host == "127.0.0.1"
+    assert resolved.port == 3307
+    assert resolved.temp_server is None
+    assert engine.temp_created is False
+    assert progress == ["🔗 활성 터널 사용: localhost:3307"]
+
+
+def test_resolve_connection_creates_temp_tunnel_after_bastion_probe():
+    class FakeEngine:
+        def __init__(self):
+            self.created_with = None
+
+        def is_running(self, tunnel_id):
+            return False
+
+        def test_target_reachable_from_bastion(self, config):
+            return True, "reachable"
+
+        def create_temp_tunnel(self, config):
+            self.created_with = config
+            return True, "temp-server", None
+
+        def get_temp_tunnel_port(self, temp_server):
+            return 45432
+
+    config = {"id": "t1", "db_engine": "postgresql", "connection_mode": "ssh_tunnel"}
+    engine = FakeEngine()
+    worker = ConnectionTestWorker(
+        TestType.DB_ONLY,
+        config,
+        tunnel_engine=engine,
+        config_manager=None,
+    )
+    progress = []
+    worker.progress.connect(progress.append)
+
+    resolved, failure = worker._resolve_connection(announce_connection=True)
+
+    assert failure is None
+    assert resolved.host == "127.0.0.1"
+    assert resolved.port == 45432
+    assert resolved.temp_server == "temp-server"
+    assert engine.created_with is config
+    assert progress == [
+        "🔎 Bastion → Target DB 포트 도달성 확인 중...",
+        "✅ reachable",
+        "🔗 임시 SSH 터널 생성 중...",
+        "✅ 임시 터널 생성됨: localhost:45432",
+    ]
+
+
+def test_resolve_connection_reports_bastion_reachability_failure():
+    class FakeEngine:
+        def is_running(self, tunnel_id):
+            return False
+
+        def test_target_reachable_from_bastion(self, config):
+            return False, "blocked"
+
+    worker = ConnectionTestWorker(
+        TestType.DB_ONLY,
+        {"id": "t1", "db_engine": "mysql", "connection_mode": "ssh_tunnel"},
+        tunnel_engine=FakeEngine(),
+        config_manager=None,
+    )
+
+    resolved, failure = worker._resolve_connection(announce_connection=False)
+
+    assert resolved is None
+    assert failure.kind == "target_unreachable"
+    assert failure.message == "blocked"

@@ -107,11 +107,11 @@ def test_run_ui_smoke_check_builds_window_without_background(monkeypatch):
         def dispose_for_smoke_check(self):
             created["disposed"] = True
 
-    monkeypatch.setattr(main, "QApplication", lambda: FakeApp)
-    monkeypatch.setattr(main, "QIcon", lambda: FakeIcon)
-    monkeypatch.setattr(main, "ConfigManager", lambda: FakeConfigManager)
-    monkeypatch.setattr(main, "TunnelEngine", lambda: FakeTunnelEngine)
-    monkeypatch.setattr(main, "TunnelManagerUI", lambda: FakeWindow)
+    monkeypatch.setattr(main, "_load_qapplication_class", lambda: FakeApp)
+    monkeypatch.setattr(main, "_load_qicon_class", lambda: FakeIcon)
+    monkeypatch.setattr(main, "_load_config_manager_class", lambda: FakeConfigManager)
+    monkeypatch.setattr(main, "_load_tunnel_engine_class", lambda: FakeTunnelEngine)
+    monkeypatch.setattr(main, "_load_tunnel_manager_ui_class", lambda: FakeWindow)
     monkeypatch.setattr(main, "app_icon_path", lambda: "icon")
     monkeypatch.setattr(main, "run_self_check", lambda: {"success": True})
 

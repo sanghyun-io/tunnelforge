@@ -64,7 +64,7 @@ def test_sql_execution_worker_uses_rust_core_connector(monkeypatch, tmp_path):
         )
         return connector
 
-    monkeypatch.setattr("src.ui.workers.test_worker.create_rust_db_connector", fake_create)
+    monkeypatch.setattr("src.ui.workers.sql_execution_worker.create_rust_db_connector", fake_create)
 
     outputs = []
     finished = []

@@ -1,11 +1,10 @@
 """
 연결 테스트 및 SQL 실행 Worker 클래스
 """
-import os
+from dataclasses import dataclass
 from enum import Enum
+from typing import Optional, Tuple
 from PyQt6.QtCore import QThread, pyqtSignal
-from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
-from src.core.sql_statement_parser import parse_sql_statements, read_dollar_quote
 
 
 class TestType(Enum):
@@ -13,6 +12,19 @@ class TestType(Enum):
     TUNNEL_ONLY = "tunnel"      # SSH 터널만 테스트
     DB_ONLY = "db"              # DB 인증만 테스트 (터널 경유)
     INTEGRATED = "integrated"   # 터널 + DB 통합 테스트
+
+
+@dataclass
+class _ResolvedConnection:
+    host: str
+    port: int
+    temp_server: object = None
+
+
+@dataclass
+class _ConnectionFailure:
+    kind: str
+    message: str
 
 
 class ConnectionTestWorker(QThread):
@@ -52,8 +64,7 @@ class ConnectionTestWorker(QThread):
     def _test_db(self):
         """DB 인증 테스트 (터널 경유)"""
         tid = self.config.get('id')
-        is_direct = self.config.get('connection_mode') == 'direct'
-        temp_server = None
+        resolved = None
         connector = None
         result_success = False
         result_msg = ""
@@ -66,41 +77,19 @@ class ConnectionTestWorker(QThread):
                 result_msg = "❌ DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
                 return
 
-            # 연결 정보 결정
-            if is_direct:
-                # 직접 연결 모드
-                host = self.config.get('remote_host') or '127.0.0.1'
-                port = int(self.config['remote_port'])
-                self.progress.emit(f"🔗 직접 연결 모드: {host}:{port}")
-            elif self.engine.is_running(tid):
-                # 이미 활성화된 터널 사용
-                host, port = self.engine.get_connection_info(tid)
-                self.progress.emit(f"🔗 활성 터널 사용: localhost:{port}")
-            else:
-                self.progress.emit("🔎 Bastion → Target DB 포트 도달성 확인 중...")
-                reachable, reach_msg = self.engine.test_target_reachable_from_bastion(self.config)
-                if not reachable:
-                    result_success = False
-                    result_msg = f"❌ Target DB 포트 도달 실패\n\n{reach_msg}\n\n{self._aws_reachability_hint()}"
-                    return
-                self.progress.emit(f"✅ {reach_msg}")
+            resolved, failure = self._resolve_connection(announce_connection=True)
+            if failure:
+                result_success = False
+                if failure.kind == "target_unreachable":
+                    result_msg = f"❌ Target DB 포트 도달 실패\n\n{failure.message}\n\n{self._aws_reachability_hint()}"
+                else:
+                    result_msg = f"❌ SSH 터널 생성 실패\n{failure.message}"
+                return
 
-                # 임시 터널 생성
-                self.progress.emit("🔗 임시 SSH 터널 생성 중...")
-                success, temp_server, error = self.engine.create_temp_tunnel(self.config)
-                if not success:
-                    result_success = False
-                    result_msg = f"❌ SSH 터널 생성 실패\n{error}"
-                    return
-
-                host = '127.0.0.1'
-                port = self.engine.get_temp_tunnel_port(temp_server)
-                self.progress.emit(f"✅ 임시 터널 생성됨: localhost:{port}")
-
-            engine = self._resolve_db_engine(host, port)
-            connector = self._create_connector(engine, host, port, db_user, db_password)
+            engine = self._resolve_db_engine(resolved.host, resolved.port)
+            connector = self._create_connector(engine, resolved.host, resolved.port, db_user, db_password)
             engine_label = self._engine_label(engine)
-            self.progress.emit(f"🔐 {engine_label} 인증 테스트 중... ({db_user}@{host}:{port})")
+            self.progress.emit(f"🔐 {engine_label} 인증 테스트 중... ({db_user}@{resolved.host}:{resolved.port})")
             success, msg = connector.connect()
 
             if success:
@@ -112,12 +101,12 @@ class ConnectionTestWorker(QThread):
                     if not schema_exists:
                         connector.disconnect()
                         result_success = False
-                        result_msg = f"⚠️ DB 인증 성공, 스키마 없음\n\n스키마 '{default_schema}'가 존재하지 않습니다.\n\n사용자: {db_user}\n호스트: {host}:{port}"
+                        result_msg = f"⚠️ DB 인증 성공, 스키마 없음\n\n스키마 '{default_schema}'가 존재하지 않습니다.\n\n사용자: {db_user}\n호스트: {resolved.host}:{resolved.port}"
                         return
 
                 connector.disconnect()
                 result_success = True
-                result_msg = f"✅ DB 인증 성공!\n\n사용자: {db_user}\n호스트: {host}:{port}"
+                result_msg = f"✅ DB 인증 성공!\n\n사용자: {db_user}\n호스트: {resolved.host}:{resolved.port}"
                 result_msg += f"\n엔진: {engine_label}"
                 if default_schema:
                     result_msg += f"\n스키마: {default_schema}"
@@ -134,8 +123,8 @@ class ConnectionTestWorker(QThread):
                     pass
 
             # 임시 터널 정리 (finished 전에 실행)
-            if temp_server:
-                self.engine.close_temp_tunnel(temp_server)
+            if resolved and resolved.temp_server:
+                self.engine.close_temp_tunnel(resolved.temp_server)
 
             # 모든 정리 후 결과 전달
             self.test_finished.emit(result_success, result_msg)
@@ -144,7 +133,7 @@ class ConnectionTestWorker(QThread):
         """통합 테스트 (터널 + DB)"""
         tid = self.config.get('id')
         is_direct = self.config.get('connection_mode') == 'direct'
-        temp_server = None
+        resolved = None
         connector = None
         results = []
         result_success = False
@@ -175,38 +164,23 @@ class ConnectionTestWorker(QThread):
                 result_msg = "\n".join(results) + "\n\n💡 DB 테스트를 위해 터널 설정에서 자격 증명을 저장해주세요."
                 return
 
-            # 연결 정보 결정
-            if is_direct:
-                host = self.config.get('remote_host') or '127.0.0.1'
-                port = int(self.config['remote_port'])
-            elif self.engine.is_running(tid):
-                host, port = self.engine.get_connection_info(tid)
-            else:
-                self.progress.emit("🔎 Bastion → Target DB 포트 도달성 확인 중...")
-                reachable, reach_msg = self.engine.test_target_reachable_from_bastion(self.config)
-                if not reachable:
-                    results.append(f"❌ 2. Target DB 포트 도달 실패: {reach_msg}")
-                    result_success = False
+            resolved, failure = self._resolve_connection(announce_connection=False)
+            if failure:
+                result_success = False
+                if failure.kind == "target_unreachable":
+                    results.append(f"❌ 2. Target DB 포트 도달 실패: {failure.message}")
                     result_msg = "\n".join(results) + f"\n\n{self._aws_reachability_hint()}"
-                    return
-                self.progress.emit(f"✅ {reach_msg}")
-
-                # 임시 터널 생성
-                success, temp_server, error = self.engine.create_temp_tunnel(self.config)
-                if not success:
-                    results.append(f"❌ 2. DB 테스트 실패 (터널 생성 오류: {error})")
-                    result_success = False
+                else:
+                    results.append(f"❌ 2. DB 테스트 실패 (터널 생성 오류: {failure.message})")
                     result_msg = "\n".join(results)
-                    return
-                host = '127.0.0.1'
-                port = self.engine.get_temp_tunnel_port(temp_server)
+                return
 
-            engine = self._resolve_db_engine(host, port)
-            connector = self._create_connector(engine, host, port, db_user, db_password)
+            engine = self._resolve_db_engine(resolved.host, resolved.port)
+            connector = self._create_connector(engine, resolved.host, resolved.port, db_user, db_password)
             success, msg = connector.connect()
 
             if success:
-                results.append(f"✅ 2. {self._engine_label(engine)} DB 인증 성공 ({db_user}@{host}:{port})")
+                results.append(f"✅ 2. {self._engine_label(engine)} DB 인증 성공 ({db_user}@{resolved.host}:{resolved.port})")
                 result_success = True
                 result_msg = "\n".join(results) + "\n\n🎉 모든 테스트 통과!"
             else:
@@ -223,11 +197,47 @@ class ConnectionTestWorker(QThread):
                     pass
 
             # 임시 터널 정리 (finished 전에 실행)
-            if temp_server:
-                self.engine.close_temp_tunnel(temp_server)
+            if resolved and resolved.temp_server:
+                self.engine.close_temp_tunnel(resolved.temp_server)
 
             # 모든 정리 후 결과 전달
             self.test_finished.emit(result_success, result_msg)
+
+    def _resolve_connection(
+        self, *, announce_connection: bool
+    ) -> Tuple[Optional[_ResolvedConnection], Optional[_ConnectionFailure]]:
+        tid = self.config.get('id')
+        is_direct = self.config.get('connection_mode') == 'direct'
+
+        if is_direct:
+            host = self.config.get('remote_host') or '127.0.0.1'
+            port = int(self.config['remote_port'])
+            if announce_connection:
+                self.progress.emit(f"🔗 직접 연결 모드: {host}:{port}")
+            return _ResolvedConnection(host, port), None
+
+        if self.engine.is_running(tid):
+            host, port = self.engine.get_connection_info(tid)
+            if announce_connection:
+                self.progress.emit(f"🔗 활성 터널 사용: localhost:{port}")
+            return _ResolvedConnection(host, port), None
+
+        self.progress.emit("🔎 Bastion → Target DB 포트 도달성 확인 중...")
+        reachable, reach_msg = self.engine.test_target_reachable_from_bastion(self.config)
+        if not reachable:
+            return None, _ConnectionFailure("target_unreachable", reach_msg)
+        self.progress.emit(f"✅ {reach_msg}")
+
+        if announce_connection:
+            self.progress.emit("🔗 임시 SSH 터널 생성 중...")
+        success, temp_server, error = self.engine.create_temp_tunnel(self.config)
+        if not success:
+            return None, _ConnectionFailure("temp_tunnel_failed", error)
+
+        port = self.engine.get_temp_tunnel_port(temp_server)
+        if announce_connection:
+            self.progress.emit(f"✅ 임시 터널 생성됨: localhost:{port}")
+        return _ResolvedConnection('127.0.0.1', port, temp_server), None
 
     def _resolve_db_engine(self, host: str, port: int) -> str:
         engine = self.config.get('db_engine')
@@ -258,98 +268,4 @@ class ConnectionTestWorker(QThread):
             "- RDS 엔드포인트와 포트, 기본 DB 이름이 맞는지 확인"
         )
 
-
-class SQLExecutionWorker(QThread):
-    """SQL 파일 실행 Worker backed by Rust DB Core."""
-    progress = pyqtSignal(str)          # 진행 메시지
-    output = pyqtSignal(str)            # SQL 실행 출력
-    finished = pyqtSignal(bool, str)    # (성공여부, 결과메시지)
-
-    def __init__(self, sql_file: str, host: str, port: int,
-                 user: str, password: str, database: str = None,
-                 db_engine: str = "mysql", schema: str = "", parent=None):
-        super().__init__(parent)
-        self.sql_file = sql_file
-        self.host = host
-        self.port = port
-        self.user = user
-        self.password = password
-        self.database = database
-        self.db_engine = normalize_db_engine(db_engine, port)
-        self.schema = schema
-
-    def run(self):
-        connector = None
-        try:
-            self.progress.emit("🔌 Rust DB Core 연결 중...")
-            connector = create_rust_db_connector(
-                self.db_engine,
-                self.host,
-                int(self.port),
-                self.user,
-                self.password,
-                self.database,
-                schema=self.schema if self.db_engine == "postgresql" else "",
-            )
-
-            success, message = connector.connect()
-            if not success:
-                self.finished.emit(False, f"❌ DB 연결 실패: {message}")
-                return
-
-            self.progress.emit(f"🚀 SQL 실행 중: {os.path.basename(self.sql_file)}")
-            with open(self.sql_file, 'r', encoding='utf-8') as f:
-                sql_content = f.read()
-
-            statements = self._parse_sql_statements(sql_content)
-            if not statements:
-                self.finished.emit(False, "❌ 실행할 SQL 문이 없습니다.")
-                return
-
-            total_rows = 0
-            with connector.connection.cursor() as cursor:
-                for index, statement in enumerate(statements, 1):
-                    preview = " ".join(statement.split())
-                    if len(preview) > 120:
-                        preview = preview[:117] + "..."
-                    self.progress.emit(f"  [{index}/{len(statements)}] {preview}")
-
-                    cursor.execute(statement)
-                    rows = cursor.fetchall()
-                    if rows:
-                        total_rows += len(rows)
-                        self.output.emit(self._format_rows(rows))
-
-            self.finished.emit(
-                True,
-                f"✅ SQL 실행 완료: {len(statements)}개 문장"
-                + (f", 결과 {total_rows}행" if total_rows else "")
-            )
-        except Exception as e:
-            self.finished.emit(False, f"❌ SQL 실행 중 오류: {str(e)}")
-        finally:
-            if connector:
-                try:
-                    connector.disconnect()
-                except Exception:
-                    pass
-
-    @staticmethod
-    def _parse_sql_statements(sql_text: str) -> list:
-        return parse_sql_statements(sql_text)
-
-    @staticmethod
-    def _read_dollar_quote(sql_text: str, start: int) -> str:
-        return read_dollar_quote(sql_text, start)
-
-    @staticmethod
-    def _format_rows(rows: list) -> str:
-        if not rows:
-            return ""
-        columns = list(rows[0].keys()) if isinstance(rows[0], dict) else []
-        if not columns:
-            return "\n".join(str(row) for row in rows)
-        lines = ["\t".join(columns)]
-        for row in rows:
-            lines.append("\t".join("" if row.get(col) is None else str(row.get(col)) for col in columns))
-        return "\n".join(lines)
+from src.ui.workers.sql_execution_worker import SQLExecutionWorker
