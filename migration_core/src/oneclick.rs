@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use mysql::prelude::Queryable;
 use crate::*;
+use crate::schema::error_event;
 
 pub(crate) fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(phase_event(
@@ -53,11 +54,7 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
     let state = match oneclick_preflight_state(request) {
         Ok(state) => state,
         Err(err) => {
-            emit(json!({
-                "event": "error",
-                "request_id": request.request_id,
-                "message": err
-            }));
+            emit(error_event(request, err));
             return;
         }
     };
@@ -277,11 +274,7 @@ pub(crate) fn oneclick_preflight(request: &Request) -> Vec<Value> {
                 "issues": state.issues
             }));
         }
-        Err(err) => events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": err
-        })),
+        Err(err) => events.push(error_event(request, err)),
     }
     events
 }
@@ -305,11 +298,7 @@ pub(crate) fn oneclick_analyze(request: &Request) -> Vec<Value> {
                 "issues": state.issues
             }));
         }
-        Err(err) => events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": err
-        })),
+        Err(err) => events.push(error_event(request, err)),
     }
     events
 }
@@ -385,11 +374,7 @@ pub(crate) fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value>
                 }
             }
             Err(err) => {
-                events.push(json!({
-                    "event": "error",
-                    "request_id": request.request_id,
-                    "message": err
-                }));
+                events.push(error_event(request, err));
                 return events;
             }
         }
@@ -487,30 +472,21 @@ pub(crate) fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
     let (endpoint, _) = match oneclick_endpoint(request) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            events.push(json!({
-                "event": "error",
-                "request_id": request.request_id,
-                "message": err
-            }));
+            events.push(error_event(request, err));
             return events;
         }
     };
     if endpoint.engine != "mysql" {
-        events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": "oneclick.apply_fixes currently supports MySQL engine fixes only"
-        }));
+        events.push(error_event(
+            request,
+            "oneclick.apply_fixes currently supports MySQL engine fixes only",
+        ));
         return events;
     }
     let mut adapter = match LiveAdapter::connect(&endpoint) {
         Ok(adapter) => adapter,
         Err(err) => {
-            events.push(json!({
-                "event": "error",
-                "request_id": request.request_id,
-                "message": err
-            }));
+            events.push(error_event(request, err));
             return events;
         }
     };
@@ -562,11 +538,7 @@ pub(crate) fn oneclick_validate(request: &Request) -> Vec<Value> {
                 "all_fixed": issues.is_empty()
             }));
         }
-        Err(err) => events.push(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": err
-        })),
+        Err(err) => events.push(error_event(request, err)),
     }
     events
 }

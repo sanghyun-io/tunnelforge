@@ -114,6 +114,17 @@ pub(crate) fn normalized_schema_diff(source: &NormalizedSchema, target: &Normali
     differences
 }
 
+/// 스트리밍/배치 응답에서 공통으로 쓰이는 `error` 이벤트 리터럴을 생성한다.
+/// `json!({"event":"error","request_id":request.request_id,"message":message})` 와
+/// 바이트 단위로 동일한 payload 를 반환한다.
+pub(crate) fn error_event(request: &Request, message: impl Into<String>) -> Value {
+    json!({
+        "event": "error",
+        "request_id": request.request_id,
+        "message": message.into()
+    })
+}
+
 pub(crate) fn inspect(request: &Request) -> Vec<Value> {
     if let Some(endpoint) = request
         .payload
@@ -130,11 +141,7 @@ pub(crate) fn inspect(request: &Request) -> Vec<Value> {
                 "schema": result.schema,
                 "unsupported_objects": result.unsupported_objects
             })),
-            Err(err) => events.push(json!({
-                "event": "error",
-                "request_id": request.request_id,
-                "message": err
-            })),
+            Err(err) => events.push(error_event(request, err)),
         }
         return events;
     }
