@@ -1,253 +1,19 @@
-"""Small runtime i18n layer for user-facing app chrome."""
-import locale
-import os
+"""Legacy auto-translation of hardcoded Korean UI strings to English.
+
+Best-effort substitution layer (exact dictionary, regex, phrase, and word
+tables plus Korean particle stripping) for Korean literals that predate the
+structured ``tr()`` catalog in :mod:`src.core.i18n.keys`. ``translate_text``
+passes values through unchanged when the active language is the default
+(Korean) or the value contains no Hangul.
+"""
 import re
-from pathlib import Path
-from typing import Iterable, Optional
 
-from src.core.platform_paths import app_support_dir
+from src.core.i18n.keys import DEFAULT_LANGUAGE, current_language
 
-
-DEFAULT_LANGUAGE = "ko"
-SUPPORTED_LANGUAGES = {
-    "ko": "한국어",
-    "en": "English",
-}
-INSTALLER_LANGUAGE_HINT_FILE = "installer-language.txt"
-
-_current_language = DEFAULT_LANGUAGE
-_qt_i18n_installed = False
-
-_TRANSLATIONS = {
-    "ko": {
-        "app.ready": "준비됨",
-        "common.cancel": "취소",
-        "common.close": "닫기",
-        "common.delete": "삭제",
-        "common.edit": "수정",
-        "common.ok": "확인",
-        "common.save": "저장",
-        "common.start": "시작",
-        "common.stop": "중지",
-        "common.unknown": "알 수 없음",
-        "main.add_group": "그룹 추가",
-        "main.add_tunnel": "연결 추가",
-        "main.db_transition": "DB 전환",
-        "main.manage": "관리",
-        "main.migration": "마이그레이션",
-        "main.name": "이름",
-        "main.open": "열기",
-        "main.power": "전원",
-        "main.quit": "종료",
-        "main.schedule": "스케줄",
-        "main.schedule_backup": "스케줄 백업",
-        "main.schedule_manage": "스케줄 관리...",
-        "main.run_now": "즉시 실행",
-        "main.schema_diff": "스키마 비교",
-        "main.settings": "설정",
-        "main.status": "상태",
-        "main.target_host": "타겟 호스트",
-        "main.default_schema": "기본 스키마",
-        "main.title": "터널링 연결 목록",
-        "main.local_port": "로컬 포트",
-        "tree.connect_all": "모두 연결",
-        "tree.db_connect": "DB 연결",
-        "tree.delete_group": "그룹 삭제",
-        "tree.disconnect_all": "모두 해제",
-        "tree.duplicate": "복사하여 새로 만들기",
-        "tree.edit_group": "그룹 수정",
-        "tree.sql_editor": "SQL 에디터",
-        "tree.test_connection": "연결 테스트",
-        "tree.ungrouped": "그룹 없음",
-        "settings.about": "정보",
-        "settings.always_exit": "항상 프로그램 종료",
-        "settings.always_minimize": "항상 시스템 트레이로 최소화",
-        "settings.ask_every_time": "매번 묻기",
-        "settings.auto_reconnect": "연결 끊김 시 자동 재연결",
-        "settings.backup_restore": "설정 백업/복원",
-        "settings.close_behavior": "창 닫기(X) 버튼 동작",
-        "settings.dark_mode": "다크 모드",
-        "settings.general": "일반",
-        "settings.github_auto_report": "GitHub 이슈 자동 보고",
-        "settings.language": "언어",
-        "settings.light_mode": "라이트 모드",
-        "settings.logs": "로그",
-        "settings.max_reconnect_attempts": "최대 재연결 시도 횟수:",
-        "settings.reconnect": "터널 자동 재연결",
-        "settings.reconnect_description": "연결이 끊어지면 점진적 백오프(1초→60초)를 적용하여 자동으로 재연결을 시도합니다.",
-        "settings.restart_note": "일부 화면의 언어는 새 창을 열거나 앱을 재시작하면 완전히 반영됩니다.",
-        "settings.startup": "시작 프로그램",
-        "settings.startup_auto": "시스템 시작 시 자동 실행",
-        "settings.startup_description": "로그인 시 시스템 트레이에 최소화된 상태로 자동 시작됩니다.",
-        "settings.system_theme": "시스템 설정 따르기",
-        "settings.theme": "테마",
-        "settings.theme_label": "화면 테마:",
-        "settings.title": "설정",
-    },
-    "en": {
-        "app.ready": "Ready",
-        "common.cancel": "Cancel",
-        "common.close": "Close",
-        "common.delete": "Delete",
-        "common.edit": "Edit",
-        "common.ok": "OK",
-        "common.save": "Save",
-        "common.start": "Start",
-        "common.stop": "Stop",
-        "common.unknown": "Unknown",
-        "main.add_group": "Add Group",
-        "main.add_tunnel": "Add Connection",
-        "main.db_transition": "DB Transition",
-        "main.manage": "Manage",
-        "main.migration": "Migration",
-        "main.name": "Name",
-        "main.open": "Open",
-        "main.power": "Power",
-        "main.quit": "Quit",
-        "main.schedule": "Schedule",
-        "main.schedule_backup": "Scheduled Backups",
-        "main.schedule_manage": "Manage Schedules...",
-        "main.run_now": "Run Now",
-        "main.schema_diff": "Schema Diff",
-        "main.settings": "Settings",
-        "main.status": "Status",
-        "main.target_host": "Target Host",
-        "main.default_schema": "Default Schema",
-        "main.title": "Tunnel Connections",
-        "main.local_port": "Local Port",
-        "tree.connect_all": "Connect All",
-        "tree.db_connect": "DB Connect",
-        "tree.delete_group": "Delete Group",
-        "tree.disconnect_all": "Disconnect All",
-        "tree.duplicate": "Duplicate as New",
-        "tree.edit_group": "Edit Group",
-        "tree.sql_editor": "SQL Editor",
-        "tree.test_connection": "Test Connection",
-        "tree.ungrouped": "Ungrouped",
-        "settings.about": "About",
-        "settings.always_exit": "Always exit the app",
-        "settings.always_minimize": "Always minimize to system tray",
-        "settings.ask_every_time": "Ask every time",
-        "settings.auto_reconnect": "Automatically reconnect when disconnected",
-        "settings.backup_restore": "Settings Backup/Restore",
-        "settings.close_behavior": "Close (X) Button Behavior",
-        "settings.dark_mode": "Dark Mode",
-        "settings.general": "General",
-        "settings.github_auto_report": "Automatic GitHub Issue Reporting",
-        "settings.language": "Language",
-        "settings.light_mode": "Light Mode",
-        "settings.logs": "Logs",
-        "settings.max_reconnect_attempts": "Max reconnect attempts:",
-        "settings.reconnect": "Tunnel Auto-Reconnect",
-        "settings.reconnect_description": "When a connection drops, TunnelForge retries with incremental backoff from 1 to 60 seconds.",
-        "settings.restart_note": "Some screens fully apply the language after opening a new window or restarting the app.",
-        "settings.startup": "Startup",
-        "settings.startup_auto": "Launch automatically at system startup",
-        "settings.startup_description": "Start minimized to the system tray when you log in.",
-        "settings.system_theme": "Follow system setting",
-        "settings.theme": "Theme",
-        "settings.theme_label": "Display theme:",
-        "settings.title": "Settings",
-    },
-}
-
-
-def normalize_language(value: Optional[str]) -> str:
-    """Return a supported language code, falling back to Korean."""
-    text = (value or "").strip().lower().replace("_", "-")
-    if text.startswith("ko"):
-        return "ko"
-    if text.startswith("en"):
-        return "en"
-    return DEFAULT_LANGUAGE
-
-
-def detect_system_language() -> str:
-    language, _ = locale.getlocale()
-    return normalize_language(language)
-
-
-def installer_language_hint_path() -> Path:
-    return app_support_dir() / INSTALLER_LANGUAGE_HINT_FILE
-
-
-def read_installer_language_hint() -> Optional[str]:
-    path = installer_language_hint_path()
-    try:
-        if not path.exists():
-            return None
-        return normalize_language(path.read_text(encoding="utf-8").strip())
-    except OSError:
-        return None
-
-
-def consume_installer_language_hint() -> Optional[str]:
-    language = read_installer_language_hint()
-    if language:
-        try:
-            installer_language_hint_path().unlink()
-        except OSError:
-            pass
-    return language
-
-
-def language_from_args(args: Optional[Iterable[str]]) -> Optional[str]:
-    if not args:
-        return None
-    prefixes = ("--language=", "--lang=")
-    for arg in args:
-        for prefix in prefixes:
-            if arg.startswith(prefix):
-                return normalize_language(arg[len(prefix):])
-    env_value = os.environ.get("TUNNELFORGE_LANGUAGE")
-    return normalize_language(env_value) if env_value else None
-
-
-def current_language() -> str:
-    return _current_language
-
-
-def set_language(language: Optional[str]) -> str:
-    global _current_language
-    _current_language = normalize_language(language)
-    return _current_language
-
-
-def configure_language(config_manager=None, args: Optional[Iterable[str]] = None) -> str:
-    """Load the active language from args, installer hint, settings, then OS locale."""
-    explicit = language_from_args(args)
-    if explicit:
-        language = explicit
-    else:
-        language = None
-        if config_manager is not None:
-            get_setting = getattr(config_manager, "get_app_setting", None)
-            saved = get_setting("language", None) if get_setting else None
-            if saved:
-                language = normalize_language(saved)
-            else:
-                language = consume_installer_language_hint()
-        if not language:
-            language = detect_system_language()
-
-    language = set_language(language)
-    if config_manager is not None:
-        get_setting = getattr(config_manager, "get_app_setting", None)
-        set_setting = getattr(config_manager, "set_app_setting", None)
-        if get_setting and set_setting and normalize_language(get_setting("language", None)) != language:
-            set_setting("language", language)
-    return language
-
-
-def tr(key: str) -> str:
-    return _TRANSLATIONS.get(_current_language, {}).get(
-        key,
-        _TRANSLATIONS[DEFAULT_LANGUAGE].get(key, key),
-    )
-
-
-def language_label(language: str) -> str:
-    return SUPPORTED_LANGUAGES[normalize_language(language)]
+# Hangul Syllables Unicode block boundaries (가~힣).
+_HANGUL_SYLLABLES_START = "가"
+_HANGUL_SYLLABLES_END = "힣"
+_HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
@@ -1345,7 +1111,44 @@ _EN_WORD_TRANSLATIONS = {
 
 
 def _has_hangul(value: str) -> bool:
-    return any("\uac00" <= char <= "\ud7a3" for char in value)
+    return any(_HANGUL_SYLLABLES_START <= char <= _HANGUL_SYLLABLES_END for char in value)
+
+
+_SORTED_PHRASE_TRANSLATIONS = tuple(
+    sorted(_EN_PHRASE_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True)
+)
+_SORTED_WORD_TRANSLATIONS = tuple(
+    sorted(_EN_WORD_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True)
+)
+
+
+def _apply_regex_pairs(value):
+    for pattern, replacement in _EN_REGEX_TRANSLATIONS:
+        value = re.sub(pattern, replacement, value, flags=re.DOTALL)
+    return value
+
+
+def _apply_phrase_substitutions(value):
+    for korean, english in _SORTED_PHRASE_TRANSLATIONS:
+        value = value.replace(korean, english)
+    return value
+
+
+def _apply_word_substitutions(value):
+    for korean, english in _SORTED_WORD_TRANSLATIONS:
+        value = re.sub(
+            rf"(?<!{_HANGUL_CHAR_CLASS}){re.escape(korean)}(?!{_HANGUL_CHAR_CLASS})",
+            english,
+            value,
+        )
+    return value
+
+
+def _strip_korean_particles(translated):
+    translated = re.sub(r"(?<=[A-Za-z0-9)}'\"`])(?:은|는|이|가|을|를|와|과|의|에|에서|부터|까지|도|로|으로)(?=[\s,.:;!?)]|$)", "", translated)
+    translated = re.sub(r"(?<=[A-Za-z0-9)}'\"`])하시겠습니까", "?", translated)
+    translated = re.sub(r"(?<=[A-Za-z0-9)}'\"`])하세요", ".", translated)
+    return translated
 
 
 def translate_text(value):
@@ -1364,264 +1167,12 @@ def translate_text(value):
     if stripped in _EN_TEXT_TRANSLATIONS:
         return value.replace(stripped, _EN_TEXT_TRANSLATIONS[stripped], 1)
 
-    translated = value
-    for pattern, replacement in _EN_REGEX_TRANSLATIONS:
-        translated = re.sub(pattern, replacement, translated, flags=re.DOTALL)
-
-    for korean, english in sorted(_EN_PHRASE_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True):
-        translated = translated.replace(korean, english)
-
-    for korean, english in sorted(_EN_WORD_TRANSLATIONS.items(), key=lambda item: len(item[0]), reverse=True):
-        translated = re.sub(
-            rf"(?<![\uac00-\ud7a3]){re.escape(korean)}(?![\uac00-\ud7a3])",
-            english,
-            translated,
-        )
-
-    translated = re.sub(r"(?<=[A-Za-z0-9)}'\"`])(?:은|는|이|가|을|를|와|과|의|에|에서|부터|까지|도|로|으로)(?=[\s,.:;!?)]|$)", "", translated)
-    translated = re.sub(r"(?<=[A-Za-z0-9)}'\"`])하시겠습니까", "?", translated)
-    translated = re.sub(r"(?<=[A-Za-z0-9)}'\"`])하세요", ".", translated)
-
+    translated = _apply_regex_pairs(value)
+    translated = _apply_phrase_substitutions(translated)
+    translated = _apply_word_substitutions(translated)
+    translated = _strip_korean_particles(translated)
     return translated
 
 
 def _translate_sequence(values):
     return [translate_text(value) for value in values]
-
-
-def install_qt_i18n() -> bool:
-    """Install broad PyQt text translation hooks for legacy hardcoded UI strings."""
-    global _qt_i18n_installed
-    if _qt_i18n_installed:
-        return False
-
-    try:
-        from PyQt6.QtGui import QAction
-        from PyQt6.QtWidgets import (
-            QAbstractButton,
-            QCheckBox,
-            QComboBox,
-            QDialog,
-            QFileDialog,
-            QFormLayout,
-            QGroupBox,
-            QLabel,
-            QLineEdit,
-            QMenu,
-            QMessageBox,
-            QPlainTextEdit,
-            QProgressBar,
-            QPushButton,
-            QRadioButton,
-            QStatusBar,
-            QSystemTrayIcon,
-            QTabWidget,
-            QTableWidget,
-            QTextEdit,
-            QToolTip,
-            QTreeWidget,
-            QWidget,
-            QWizard,
-            QWizardPage,
-        )
-    except Exception:
-        return False
-
-    def translate_qt_arg(value):
-        if isinstance(value, str):
-            return translate_text(value)
-        if isinstance(value, list):
-            return [translate_qt_arg(item) for item in value]
-        if isinstance(value, tuple):
-            return tuple(translate_qt_arg(item) for item in value)
-        return value
-
-    def patch_init(cls, text_index=0):
-        original = cls.__init__
-        if getattr(original, "_tf_i18n_wrapped", False):
-            return
-
-        def wrapped(self, *args, **kwargs):
-            args = list(args)
-            if text_index is None:
-                args = [translate_qt_arg(arg) for arg in args]
-            elif len(args) > text_index:
-                args[text_index] = translate_qt_arg(args[text_index])
-            original(self, *args, **kwargs)
-
-        wrapped._tf_i18n_wrapped = True
-        cls.__init__ = wrapped
-
-    def patch_method(cls, name, text_indexes):
-        original = getattr(cls, name, None)
-        if original is None or getattr(original, "_tf_i18n_wrapped", False):
-            return
-
-        def wrapped(self, *args, **kwargs):
-            args = list(args)
-            for index in text_indexes:
-                if len(args) > index:
-                    args[index] = translate_qt_arg(args[index])
-            return original(self, *args, **kwargs)
-
-        wrapped._tf_i18n_wrapped = True
-        setattr(cls, name, wrapped)
-
-    def patch_all_string_args_method(cls, name):
-        original = getattr(cls, name, None)
-        if original is None or getattr(original, "_tf_i18n_wrapped", False):
-            return
-
-        def wrapped(self, *args, **kwargs):
-            args = [translate_qt_arg(arg) for arg in args]
-            return original(self, *args, **kwargs)
-
-        wrapped._tf_i18n_wrapped = True
-        setattr(cls, name, wrapped)
-
-    for cls in (QLabel, QAbstractButton, QPushButton, QCheckBox, QRadioButton, QGroupBox, QAction, QMenu):
-        patch_init(cls, None)
-        patch_method(cls, "setText", [0])
-
-    patch_init(QMessageBox, None)
-    patch_method(QWidget, "setWindowTitle", [0])
-    patch_method(QWidget, "setToolTip", [0])
-    patch_method(QWidget, "setStatusTip", [0])
-    patch_method(QWidget, "setWhatsThis", [0])
-    patch_method(QDialog, "setWindowTitle", [0])
-    patch_method(QGroupBox, "setTitle", [0])
-    patch_method(QMenu, "setTitle", [0])
-    patch_method(QAction, "setToolTip", [0])
-    patch_method(QAction, "setStatusTip", [0])
-    patch_method(QStatusBar, "showMessage", [0])
-    patch_method(QSystemTrayIcon, "showMessage", [0, 1])
-    patch_method(QProgressBar, "setFormat", [0])
-    patch_method(QWizard, "setButtonText", [1])
-    patch_method(QWizardPage, "setTitle", [0])
-    patch_method(QWizardPage, "setSubTitle", [0])
-
-    for cls in (QLineEdit, QTextEdit, QPlainTextEdit):
-        patch_method(cls, "setPlaceholderText", [0])
-    patch_method(QTextEdit, "append", [0])
-    patch_method(QTextEdit, "setHtml", [0])
-    patch_method(QPlainTextEdit, "appendPlainText", [0])
-
-    patch_method(QComboBox, "setPlaceholderText", [0])
-    # Combo inserted items can be schema/database identifiers; preserve them exactly.
-    patch_method(QComboBox, "setItemText", [1])
-
-    patch_all_string_args_method(QTabWidget, "addTab")
-    patch_method(QTabWidget, "setTabText", [1])
-    patch_all_string_args_method(QFormLayout, "addRow")
-
-    original_tree_headers = QTreeWidget.setHeaderLabels
-    if not getattr(original_tree_headers, "_tf_i18n_wrapped", False):
-        def tree_headers(self, labels):
-            return original_tree_headers(self, _translate_sequence(list(labels)))
-
-        tree_headers._tf_i18n_wrapped = True
-        QTreeWidget.setHeaderLabels = tree_headers
-
-    original_table_headers = QTableWidget.setHorizontalHeaderLabels
-    if not getattr(original_table_headers, "_tf_i18n_wrapped", False):
-        def table_headers(self, labels):
-            return original_table_headers(self, _translate_sequence(list(labels)))
-
-        table_headers._tf_i18n_wrapped = True
-        QTableWidget.setHorizontalHeaderLabels = table_headers
-
-    original_vertical_table_headers = QTableWidget.setVerticalHeaderLabels
-    if not getattr(original_vertical_table_headers, "_tf_i18n_wrapped", False):
-        def vertical_table_headers(self, labels):
-            return original_vertical_table_headers(self, _translate_sequence(list(labels)))
-
-        vertical_table_headers._tf_i18n_wrapped = True
-        QTableWidget.setVerticalHeaderLabels = vertical_table_headers
-
-    original_tooltip_show_text = QToolTip.showText
-    if not getattr(original_tooltip_show_text, "_tf_i18n_wrapped", False):
-        def tooltip_show_text(*args, **kwargs):
-            args = list(args)
-            if len(args) > 1 and isinstance(args[1], str):
-                args[1] = translate_text(args[1])
-            return original_tooltip_show_text(*args, **kwargs)
-
-        tooltip_show_text._tf_i18n_wrapped = True
-        QToolTip.showText = tooltip_show_text
-
-    original_menu_add_action = QMenu.addAction
-    if not getattr(original_menu_add_action, "_tf_i18n_wrapped", False):
-        def menu_add_action(self, *args, **kwargs):
-            args = list(args)
-            if args and isinstance(args[0], str):
-                args[0] = translate_text(args[0])
-            elif len(args) > 1 and isinstance(args[1], str):
-                args[1] = translate_text(args[1])
-            return original_menu_add_action(self, *args, **kwargs)
-
-        menu_add_action._tf_i18n_wrapped = True
-        QMenu.addAction = menu_add_action
-
-    original_menu_add_menu = QMenu.addMenu
-    if not getattr(original_menu_add_menu, "_tf_i18n_wrapped", False):
-        def menu_add_menu(self, *args, **kwargs):
-            args = list(args)
-            if args and isinstance(args[0], str):
-                args[0] = translate_text(args[0])
-            elif len(args) > 1 and isinstance(args[1], str):
-                args[1] = translate_text(args[1])
-            return original_menu_add_menu(self, *args, **kwargs)
-
-        menu_add_menu._tf_i18n_wrapped = True
-        QMenu.addMenu = menu_add_menu
-
-    for name in ("information", "warning", "critical", "question"):
-        original = getattr(QMessageBox, name)
-        if getattr(original, "_tf_i18n_wrapped", False):
-            continue
-
-        def make_message_wrapper(fn):
-            def wrapped(*args, **kwargs):
-                args = list(args)
-                for index in (1, 2):
-                    if len(args) > index and isinstance(args[index], str):
-                        args[index] = translate_text(args[index])
-                if isinstance(kwargs.get("title"), str):
-                    kwargs["title"] = translate_text(kwargs["title"])
-                if isinstance(kwargs.get("text"), str):
-                    kwargs["text"] = translate_text(kwargs["text"])
-                return fn(*args, **kwargs)
-
-            wrapped._tf_i18n_wrapped = True
-            return wrapped
-
-        setattr(QMessageBox, name, make_message_wrapper(original))
-
-    patch_method(QMessageBox, "setText", [0])
-    patch_method(QMessageBox, "setInformativeText", [0])
-    patch_method(QMessageBox, "setDetailedText", [0])
-
-    for name in ("getOpenFileName", "getSaveFileName", "getExistingDirectory"):
-        original = getattr(QFileDialog, name)
-        if getattr(original, "_tf_i18n_wrapped", False):
-            continue
-
-        def make_file_dialog_wrapper(fn):
-            def wrapped(*args, **kwargs):
-                args = list(args)
-                for index in (1, 3):
-                    if len(args) > index and isinstance(args[index], str):
-                        args[index] = translate_text(args[index])
-                if isinstance(kwargs.get("caption"), str):
-                    kwargs["caption"] = translate_text(kwargs["caption"])
-                if isinstance(kwargs.get("filter"), str):
-                    kwargs["filter"] = translate_text(kwargs["filter"])
-                return fn(*args, **kwargs)
-
-            wrapped._tf_i18n_wrapped = True
-            return wrapped
-
-        setattr(QFileDialog, name, make_file_dialog_wrapper(original))
-
-    _qt_i18n_installed = True
-    return True

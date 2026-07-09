@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 from src.core import i18n
+from src.core.i18n import keys as i18n_keys
 
 
 @pytest.fixture(autouse=True)
@@ -47,8 +48,10 @@ def test_configure_language_prefers_cli_arg_and_persists():
 def test_configure_language_uses_installer_hint_before_system_locale(monkeypatch, tmp_path):
     hint_path = tmp_path / i18n.INSTALLER_LANGUAGE_HINT_FILE
     hint_path.write_text("en", encoding="utf-8")
-    monkeypatch.setattr(i18n, "installer_language_hint_path", lambda: hint_path)
-    monkeypatch.setattr(i18n, "detect_system_language", lambda: "ko")
+    # configure_language resolves these helpers inside the keys module namespace,
+    # so the package-level attribute must be patched on src.core.i18n.keys.
+    monkeypatch.setattr(i18n_keys, "installer_language_hint_path", lambda: hint_path)
+    monkeypatch.setattr(i18n_keys, "detect_system_language", lambda: "ko")
     config = FakeConfig()
 
     result = i18n.configure_language(config, ["TunnelForge"])
@@ -177,9 +180,10 @@ def test_qcombobox_inserted_identity_text_is_not_translated(monkeypatch):
 
 def test_en_phrase_translations_have_no_duplicate_source_keys():
     project_root = Path(__file__).resolve().parents[1]
-    source_path = project_root / "src" / "core" / "i18n.py"
+    source_path = project_root / "src" / "core" / "i18n" / "legacy_translate.py"
     tree = ast.parse(source_path.read_text(encoding="utf-8"))
 
+    found = False
     duplicates = []
     for node in ast.walk(tree):
         if not isinstance(node, ast.Assign):
@@ -187,6 +191,7 @@ def test_en_phrase_translations_have_no_duplicate_source_keys():
         if not any(isinstance(target, ast.Name) and target.id == "_EN_PHRASE_TRANSLATIONS" for target in node.targets):
             continue
 
+        found = True
         seen = {}
         for key_node in node.value.keys:
             if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
@@ -197,6 +202,7 @@ def test_en_phrase_translations_have_no_duplicate_source_keys():
             else:
                 seen[key] = key_node.lineno
 
+    assert found, "_EN_PHRASE_TRANSLATIONS assignment not found in legacy_translate.py"
     assert duplicates == []
 
 
