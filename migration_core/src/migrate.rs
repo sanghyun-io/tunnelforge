@@ -453,6 +453,17 @@ fn plan_table_summaries(request: &Request, schema: &NormalizedSchema) -> Vec<Val
         .collect()
 }
 
+/// payload에서 필수 endpoint(`source`/`target`)를 해석한다. 키가 없으면 패닉 대신 Err를
+/// 반환하고, endpoint_from_value의 파싱 오류도 그대로 Err로 전달한다. 호출부(migrate/verify)는
+/// 반환된 Err를 각자의 error 이벤트 방식(emit vs events.push)으로 처리한다.
+fn required_endpoint(payload: &Value, key: &str) -> Result<Endpoint, String> {
+    match payload.get(key).map(endpoint_from_value).transpose() {
+        Ok(Some(endpoint)) => Ok(endpoint),
+        Ok(None) => Err(format!("{key} endpoint is missing")),
+        Err(err) => Err(err),
+    }
+}
+
 pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(phase_event(request, "migrate", "migration started"));
     if request.payload.get("source").is_some() && request.payload.get("target").is_some() {
@@ -464,27 +475,15 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             .payload
             .get("state")
             .and_then(|value| serde_json::from_value::<ResumeState>(value.clone()).ok());
-        let source_endpoint = match request
-            .payload
-            .get("source")
-            .map(endpoint_from_value)
-            .transpose()
-        {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => unreachable!(),
+        let source_endpoint = match required_endpoint(&request.payload, "source") {
+            Ok(endpoint) => endpoint,
             Err(err) => {
                 emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
                 return;
             }
         };
-        let target_endpoint = match request
-            .payload
-            .get("target")
-            .map(endpoint_from_value)
-            .transpose()
-        {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => unreachable!(),
+        let target_endpoint = match required_endpoint(&request.payload, "target") {
+            Ok(endpoint) => endpoint,
             Err(err) => {
                 emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
                 return;
@@ -618,14 +617,8 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
     let mut events = vec![phase_event(request, "verify", "verification started")];
     if request.payload.get("source").is_some() && request.payload.get("target").is_some() {
         let schema = parse_schema(&request.payload["schema"]).unwrap_or_default();
-        let source_endpoint = match request
-            .payload
-            .get("source")
-            .map(endpoint_from_value)
-            .transpose()
-        {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => unreachable!(),
+        let source_endpoint = match required_endpoint(&request.payload, "source") {
+            Ok(endpoint) => endpoint,
             Err(err) => {
                 events.push(
                     json!({"event": "error", "request_id": request.request_id, "message": err}),
@@ -633,14 +626,8 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
                 return events;
             }
         };
-        let target_endpoint = match request
-            .payload
-            .get("target")
-            .map(endpoint_from_value)
-            .transpose()
-        {
-            Ok(Some(endpoint)) => endpoint,
-            Ok(None) => unreachable!(),
+        let target_endpoint = match required_endpoint(&request.payload, "target") {
+            Ok(endpoint) => endpoint,
             Err(err) => {
                 events.push(
                     json!({"event": "error", "request_id": request.request_id, "message": err}),
@@ -1066,18 +1053,12 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
         match generate_schema_ddl(&ordered_schema, source_engine, target_engine) {
             Ok(ddl) => ddl,
             Err(err) => {
-                let table = ordered_schema
+                let location = ordered_schema
                     .tables
                     .first()
-                    .cloned()
-                    .unwrap_or(NormalizedTable {
-                        name: "schema_ddl".to_string(),
-                        columns: Vec::new(),
-                        indexes: Vec::new(),
-                        foreign_keys: Vec::new(),
-                        table_collation: None,
-                    });
-                return migration_error_result(state, rows_copied, chunks_copied, &table, err);
+                    .map(|table| table.name.as_str())
+                    .unwrap_or("schema_ddl");
+                return migration_error_result(state, rows_copied, chunks_copied, location, err);
             }
         }
     };
@@ -1095,77 +1076,30 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
         }
 
         let table_ddl = ddl.get(table_index).map(String::as_str).unwrap_or("");
-        if let Err(err) = target.create_table(table, table_ddl) {
-            return migration_error_result(state, rows_copied, chunks_copied, table, err);
-        }
-        let total_rows = source.row_count(&table.name).ok();
-        let key_columns = key_columns(table);
-        let use_keyset = !key_columns.is_empty();
-        let mut offset = if use_keyset {
-            0
-        } else {
-            state.tables[state_index].rows_copied as usize
-        };
-        let mut last_key = if use_keyset {
-            state.tables[state_index].last_key.clone()
-        } else {
-            None
-        };
-        loop {
-            let rows = match if use_keyset {
-                source.read_rows_after_key(table, &key_columns, last_key.as_deref(), chunk_size)
-            } else {
-                source.read_rows(table, offset, chunk_size)
-            } {
-                Ok(rows) => rows,
-                Err(err) => {
-                    return migration_error_result(state, rows_copied, chunks_copied, table, err)
-                }
-            };
-            if rows.is_empty() {
-                state.tables[state_index].completed = true;
-                state.tables[state_index].last_key = None;
-                on_event(json!({
-                    "event": "table_progress",
-                    "table": table.name,
-                    "status": "completed",
-                    "state": &state
-                }));
-                break;
+        match copy_table_rows(
+            table,
+            table_ddl,
+            &mut state,
+            state_index,
+            source,
+            target,
+            options,
+            chunk_size,
+            &mut rows_copied,
+            &mut chunks_copied,
+            on_event,
+        ) {
+            Ok(()) => {}
+            Err(TableCopyControl::Error(err)) => {
+                return migration_error_result(
+                    state,
+                    rows_copied,
+                    chunks_copied,
+                    &table.name,
+                    err,
+                );
             }
-
-            let copied_now = rows.len();
-            let next_key = if use_keyset {
-                rows.last().and_then(|row| row_key_token(row, &key_columns))
-            } else {
-                None
-            };
-            if let Err(err) = target.insert_rows(table, rows) {
-                return migration_error_result(state, rows_copied, chunks_copied, table, err);
-            }
-            if use_keyset {
-                state.tables[state_index].rows_copied += copied_now as u64;
-                state.tables[state_index].last_key = next_key.clone();
-                last_key = next_key;
-            } else {
-                offset += copied_now;
-                state.tables[state_index].rows_copied = offset as u64;
-                state.tables[state_index].last_key = Some(offset.to_string());
-            }
-            rows_copied += copied_now as u64;
-            chunks_copied += 1;
-            on_event(json!({
-                "event": "row_progress",
-                "table": table.name,
-                "rows": state.tables[state_index].rows_copied,
-                "total": total_rows,
-                "state": &state
-            }));
-
-            if options
-                .cancel_after_chunks
-                .is_some_and(|limit| chunks_copied >= limit)
-            {
+            Err(TableCopyControl::Cancelled) => {
                 return MigrationResult {
                     success: false,
                     rows_copied,
@@ -1179,18 +1113,12 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
 
     state.current_phase = "completed".to_string();
     if let Err(err) = apply_post_load_ddl(target, &ordered_schema, target_engine) {
-        let table = ordered_schema
+        let location = ordered_schema
             .tables
             .first()
-            .cloned()
-            .unwrap_or(NormalizedTable {
-                name: "post_data_ddl".to_string(),
-                columns: Vec::new(),
-                indexes: Vec::new(),
-                foreign_keys: Vec::new(),
-                table_collation: None,
-            });
-        return migration_error_result(state, rows_copied, chunks_copied, &table, err);
+            .map(|table| table.name.as_str())
+            .unwrap_or("post_data_ddl");
+        return migration_error_result(state, rows_copied, chunks_copied, location, err);
     }
     MigrationResult {
         success: true,
@@ -1201,11 +1129,111 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
     }
 }
 
+/// 한 테이블의 복사 흐름을 나타내는 내부 제어 신호. create/read/insert 오류(Error)나
+/// cancel_after_chunks 도달(Cancelled) 시 상위 함수가 최종 MigrationResult를 조립하도록 위임한다.
+/// (state를 소유한 상위에서 결과를 만들어야 하므로 여기서는 MigrationResult를 직접 반환하지 않는다.)
+enum TableCopyControl {
+    Error(String),
+    Cancelled,
+}
+
+/// create_table 후 keyset/offset 페이지네이션으로 한 테이블의 행을 청크 단위로 복사하고
+/// state와 rows_copied/chunks_copied를 갱신하며 progress 이벤트를 emit한다. 정상 완료 시 Ok(()),
+/// 오류/취소 시 상위가 처리하도록 Err(TableCopyControl)을 반환한다.
+#[allow(clippy::too_many_arguments)]
+fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+    table: &NormalizedTable,
+    table_ddl: &str,
+    state: &mut ResumeState,
+    state_index: usize,
+    source: &mut S,
+    target: &mut T,
+    options: &MigrationOptions,
+    chunk_size: usize,
+    rows_copied: &mut u64,
+    chunks_copied: &mut usize,
+    on_event: &mut F,
+) -> Result<(), TableCopyControl> {
+    if let Err(err) = target.create_table(table, table_ddl) {
+        return Err(TableCopyControl::Error(err));
+    }
+    let total_rows = source.row_count(&table.name).ok();
+    let key_columns = key_columns(table);
+    let use_keyset = !key_columns.is_empty();
+    let mut offset = if use_keyset {
+        0
+    } else {
+        state.tables[state_index].rows_copied as usize
+    };
+    let mut last_key = if use_keyset {
+        state.tables[state_index].last_key.clone()
+    } else {
+        None
+    };
+    loop {
+        let rows = match if use_keyset {
+            source.read_rows_after_key(table, &key_columns, last_key.as_deref(), chunk_size)
+        } else {
+            source.read_rows(table, offset, chunk_size)
+        } {
+            Ok(rows) => rows,
+            Err(err) => return Err(TableCopyControl::Error(err)),
+        };
+        if rows.is_empty() {
+            state.tables[state_index].completed = true;
+            state.tables[state_index].last_key = None;
+            on_event(json!({
+                "event": "table_progress",
+                "table": table.name,
+                "status": "completed",
+                "state": &state
+            }));
+            break;
+        }
+
+        let copied_now = rows.len();
+        let next_key = if use_keyset {
+            rows.last().and_then(|row| row_key_token(row, &key_columns))
+        } else {
+            None
+        };
+        if let Err(err) = target.insert_rows(table, rows) {
+            return Err(TableCopyControl::Error(err));
+        }
+        if use_keyset {
+            state.tables[state_index].rows_copied += copied_now as u64;
+            state.tables[state_index].last_key = next_key.clone();
+            last_key = next_key;
+        } else {
+            offset += copied_now;
+            state.tables[state_index].rows_copied = offset as u64;
+            state.tables[state_index].last_key = Some(offset.to_string());
+        }
+        *rows_copied += copied_now as u64;
+        *chunks_copied += 1;
+        on_event(json!({
+            "event": "row_progress",
+            "table": table.name,
+            "rows": state.tables[state_index].rows_copied,
+            "total": total_rows,
+            "state": &state
+        }));
+
+        if options
+            .cancel_after_chunks
+            .is_some_and(|limit| *chunks_copied >= limit)
+        {
+            return Err(TableCopyControl::Cancelled);
+        }
+    }
+    Ok(())
+}
+
 fn migration_error_result(
     state: ResumeState,
     rows_copied: u64,
     chunks_copied: usize,
-    table: &NormalizedTable,
+    location: &str,
     err: String,
 ) -> MigrationResult {
     MigrationResult {
@@ -1216,7 +1244,7 @@ fn migration_error_result(
         issues: vec![MigrationIssue {
             issue_type: None,
             severity: "error".to_string(),
-            location: table.name.clone(),
+            location: location.to_string(),
             message: err,
             suggestion: "Resolve the database error and resume the migration.".to_string(),
             blocking: true,
@@ -1340,11 +1368,10 @@ fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: F
             }
         };
         let total_rows = source_count.max(target_count);
-        let mut verified_rows = 0usize;
         emit(json!({
             "event": "row_progress",
             "table": table.name,
-            "rows": verified_rows,
+            "rows": 0,
             "total": total_rows
         }));
         if source_count != target_count {
@@ -1357,116 +1384,157 @@ fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: F
         }
 
         let key_columns = key_columns(table);
-        if key_columns.is_empty() {
-            let source_counts = match digest_counts_for_adapter(source, table, chunk_size) {
-                Ok(counts) => counts,
-                Err(err) => {
-                    mismatches.push(json!({
-                        "table": table.name,
-                        "kind": "error",
-                        "side": "source",
-                        "message": err
-                    }));
-                    continue;
-                }
-            };
-            let target_counts = match digest_counts_for_adapter(target, table, chunk_size) {
-                Ok(counts) => counts,
-                Err(err) => {
-                    mismatches.push(json!({
-                        "table": table.name,
-                        "kind": "error",
-                        "side": "target",
-                        "message": err
-                    }));
-                    continue;
-                }
-            };
-            for mismatch in compare_digest_counts(&source_counts, &target_counts) {
-                mismatches.push(with_table(&table.name, mismatch));
-            }
-            verified_rows = total_rows;
-            emit(json!({
-                "event": "row_progress",
-                "table": table.name,
-                "rows": verified_rows,
-                "total": total_rows
-            }));
-            emit(json!({
-                "event": "table_progress",
-                "table": table.name,
-                "status": "completed"
-            }));
-            continue;
-        }
-
-        let mut last_key: Option<String> = None;
-        loop {
-            let source_rows = match source.read_rows_after_key(
+        let table_mismatches = if key_columns.is_empty() {
+            verify_table_by_digest(source, target, table, chunk_size, total_rows, emit)
+        } else {
+            verify_table_by_keyset(
+                source,
+                target,
                 table,
                 &key_columns,
-                last_key.as_deref(),
                 chunk_size,
-            ) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    mismatches.push(json!({
-                        "table": table.name,
-                        "kind": "error",
-                        "side": "source",
-                        "message": err
-                    }));
-                    break;
-                }
-            };
-            let target_rows = match target.read_rows_after_key(
-                table,
-                &key_columns,
-                last_key.as_deref(),
-                chunk_size,
-            ) {
-                Ok(rows) => rows,
-                Err(err) => {
-                    mismatches.push(json!({
-                        "table": table.name,
-                        "kind": "error",
-                        "side": "target",
-                        "message": err
-                    }));
-                    break;
-                }
-            };
-            if source_rows.is_empty() && target_rows.is_empty() {
-                break;
-            }
-            mismatches.extend(compare_typed_keyed_rows(
-                table,
-                &key_columns,
-                &source_rows,
-                &target_rows,
-            ));
-            verified_rows += source_rows.len().max(target_rows.len());
-            emit(json!({
-                "event": "row_progress",
-                "table": table.name,
-                "rows": verified_rows.min(total_rows),
-                "total": total_rows
-            }));
-            let next_key = source_rows
-                .last()
-                .or_else(|| target_rows.last())
-                .and_then(|row| row_key_token(row, &key_columns));
-            if next_key.is_none() || next_key == last_key {
-                break;
-            }
-            last_key = next_key;
-        }
-        emit(json!({
-            "event": "table_progress",
-            "table": table.name,
-            "status": "completed"
-        }));
+                total_rows,
+                emit,
+            )
+        };
+        mismatches.extend(table_mismatches);
     }
+    mismatches
+}
+
+/// key column이 없는 테이블을 digest 카운트 비교로 검증한다. source/target의 행 다이제스트
+/// 빈도를 비교해 불일치를 만들고, 완료 시 row_progress(total) + table_progress(completed)를 emit한다.
+/// 카운트 수집 오류가 나면 그 오류만 담아 반환하고 완료 이벤트는 emit하지 않는다.
+fn verify_table_by_digest<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+    source: &mut S,
+    target: &mut T,
+    table: &NormalizedTable,
+    chunk_size: usize,
+    total_rows: usize,
+    emit: &mut F,
+) -> Vec<Value> {
+    let mut mismatches = Vec::new();
+    let source_counts = match digest_counts_for_adapter(source, table, chunk_size) {
+        Ok(counts) => counts,
+        Err(err) => {
+            mismatches.push(json!({
+                "table": table.name,
+                "kind": "error",
+                "side": "source",
+                "message": err
+            }));
+            return mismatches;
+        }
+    };
+    let target_counts = match digest_counts_for_adapter(target, table, chunk_size) {
+        Ok(counts) => counts,
+        Err(err) => {
+            mismatches.push(json!({
+                "table": table.name,
+                "kind": "error",
+                "side": "target",
+                "message": err
+            }));
+            return mismatches;
+        }
+    };
+    for mismatch in compare_digest_counts(&source_counts, &target_counts) {
+        mismatches.push(with_table(&table.name, mismatch));
+    }
+    emit(json!({
+        "event": "row_progress",
+        "table": table.name,
+        "rows": total_rows,
+        "total": total_rows
+    }));
+    emit(json!({
+        "event": "table_progress",
+        "table": table.name,
+        "status": "completed"
+    }));
+    mismatches
+}
+
+/// key column이 있는 테이블을 keyset 페이지네이션으로 행 단위 비교한다. 청크마다 양측을
+/// 읽어 typed 비교하고 row_progress를 emit하며, 마지막에 table_progress(completed)를 emit한다.
+/// 읽기 오류가 나면 그 오류를 담고 루프를 종료한다(완료 이벤트는 그대로 emit).
+fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+    source: &mut S,
+    target: &mut T,
+    table: &NormalizedTable,
+    key_columns: &[String],
+    chunk_size: usize,
+    total_rows: usize,
+    emit: &mut F,
+) -> Vec<Value> {
+    let mut mismatches = Vec::new();
+    let mut verified_rows = 0usize;
+    let mut last_key: Option<String> = None;
+    loop {
+        let source_rows = match source.read_rows_after_key(
+            table,
+            key_columns,
+            last_key.as_deref(),
+            chunk_size,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                mismatches.push(json!({
+                    "table": table.name,
+                    "kind": "error",
+                    "side": "source",
+                    "message": err
+                }));
+                break;
+            }
+        };
+        let target_rows = match target.read_rows_after_key(
+            table,
+            key_columns,
+            last_key.as_deref(),
+            chunk_size,
+        ) {
+            Ok(rows) => rows,
+            Err(err) => {
+                mismatches.push(json!({
+                    "table": table.name,
+                    "kind": "error",
+                    "side": "target",
+                    "message": err
+                }));
+                break;
+            }
+        };
+        if source_rows.is_empty() && target_rows.is_empty() {
+            break;
+        }
+        mismatches.extend(compare_typed_keyed_rows(
+            table,
+            key_columns,
+            &source_rows,
+            &target_rows,
+        ));
+        verified_rows += source_rows.len().max(target_rows.len());
+        emit(json!({
+            "event": "row_progress",
+            "table": table.name,
+            "rows": verified_rows.min(total_rows),
+            "total": total_rows
+        }));
+        let next_key = source_rows
+            .last()
+            .or_else(|| target_rows.last())
+            .and_then(|row| row_key_token(row, key_columns));
+        if next_key.is_none() || next_key == last_key {
+            break;
+        }
+        last_key = next_key;
+    }
+    emit(json!({
+        "event": "table_progress",
+        "table": table.name,
+        "status": "completed"
+    }));
     mismatches
 }
 
