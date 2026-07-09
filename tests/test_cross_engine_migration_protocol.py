@@ -331,10 +331,22 @@ def test_db_core_frozen_candidate_dirs_include_macos_app_bundle_locations():
     assert executable.parent.parent / "Resources" in candidates
 
 
-def test_db_core_frozen_candidate_dirs_prefer_macos_bundle_before_cwd():
+def test_db_core_frozen_candidate_dirs_exclude_cwd():
     executable = Path("/Applications/TunnelForge.app/Contents/MacOS/TunnelForge")
 
     candidates = _db_core_frozen_candidate_dirs(executable)
 
-    assert candidates.index(executable.parent.parent / "Frameworks") < candidates.index(Path.cwd())
-    assert candidates.index(executable.parent.parent / "Resources") < candidates.index(Path.cwd())
+    assert Path.cwd() not in candidates
+
+
+def test_db_core_executable_does_not_use_path_lookup_without_dev_flag(monkeypatch, tmp_path):
+    exe_name = "tunnelforge-core.exe" if os.name == "nt" else "tunnelforge-core"
+    malicious = tmp_path / exe_name
+    malicious.write_text("", encoding="utf-8")
+
+    monkeypatch.setattr("src.core.cross_engine_migration.project_root", lambda: tmp_path / "repo")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.delenv("TUNNELFORGE_ALLOW_DB_CORE_PATH_LOOKUP", raising=False)
+    monkeypatch.setattr(sys, "frozen", False, raising=False)
+
+    assert db_core_executable() != str(malicious)

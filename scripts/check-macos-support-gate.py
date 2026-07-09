@@ -30,6 +30,7 @@ MANUAL_MACOS_WORKFLOW = "macOS App Validation"
 MANUAL_MACOS_WORKFLOW_EVENT = "workflow_dispatch"
 MANUAL_MACOS_VERIFY_STEP = "Verify signed and notarized artifacts"
 MANUAL_MACOS_REQUIRED_ARCHES = ("arm64", "x86_64")
+BASH_BIN = shutil.which("bash")
 
 
 def run(command: list[str], *, check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -97,9 +98,10 @@ def resolve_path_arg(values: list[str] | None, label: str) -> tuple[Path | None,
 def bash_path(path: Path) -> str:
     if sys.platform == "win32" and path.is_absolute():
         resolved = path.resolve()
-        drive = resolved.drive.rstrip(":").lower()
-        rest = resolved.as_posix()[2:]
-        return f"/mnt/{drive}{rest}"
+        try:
+            return resolved.relative_to(ROOT).as_posix()
+        except ValueError:
+            return resolved.as_posix()
     return path.as_posix()
 
 
@@ -118,13 +120,13 @@ def resolve_report_relative(path_value: str) -> Path:
 
 
 def check_manual_report(report: Path) -> bool:
-    if shutil.which("bash") is None:
+    if BASH_BIN is None:
         fail("bash is required to run scripts/macos-manual-validation-report.sh --check-complete")
         return False
 
     result = run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             bash_path(report),

@@ -24,6 +24,12 @@ def _analysis_result() -> AnalysisResult:
     )
 
 
+def _analysis_result_for_schema(schema: str) -> AnalysisResult:
+    result = _analysis_result()
+    result.schema = schema
+    return result
+
+
 def test_migration_result_store_writes_and_reads_analysis_result(tmp_path):
     store = MigrationResultStore(base_dir=tmp_path)
     path = tmp_path / "analysis.json"
@@ -45,6 +51,18 @@ def test_migration_result_store_auto_save_uses_analysis_directory(tmp_path):
     assert path.parent == tmp_path
     assert path.name.startswith("app_")
     assert store.read(path).schema == "app"
+
+
+def test_migration_result_store_auto_save_sanitizes_schema_path_components(tmp_path):
+    store = MigrationResultStore(base_dir=tmp_path)
+
+    path = store.auto_save(_analysis_result_for_schema("../outside\\schema:name"))
+
+    assert path.parent == tmp_path
+    assert path.resolve().is_relative_to(tmp_path.resolve())
+    assert ".." not in path.name
+    assert "/" not in path.name
+    assert "\\" not in path.name
 
 
 def test_migration_result_store_exports_orphan_queries(tmp_path):

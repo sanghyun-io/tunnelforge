@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
 from typing import Optional
 
 from src.core.migration_fix_wizard import FixStrategy
+from src.core.path_safety import safe_child_file, safe_filename_component
 from src.core.platform_paths import rollback_dir
 from src.ui.workers.fix_wizard_worker import FixWizardWorker
 
@@ -242,9 +243,10 @@ class ExecutionPage(QWizardPage):
         try:
             # 파일명 생성
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"rollback_{self.wizard_dialog.schema}_{timestamp}.sql"
+            safe_schema = safe_filename_component(self.wizard_dialog.schema, "schema")
+            filename = f"rollback_{safe_schema}_{timestamp}.sql"
             rollback_dir_path = self._get_rollback_dir()
-            filepath = os.path.join(rollback_dir_path, filename)
+            filepath = str(safe_child_file(rollback_dir_path, filename, f"rollback_{timestamp}.sql"))
 
             # 파일 저장
             with open(filepath, 'w', encoding='utf-8') as f:
@@ -304,7 +306,8 @@ class ExecutionPage(QWizardPage):
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        default_name = f"rollback_{self.wizard_dialog.schema}_{timestamp}.sql"
+        safe_schema = safe_filename_component(self.wizard_dialog.schema, "schema")
+        default_name = f"rollback_{safe_schema}_{timestamp}.sql"
 
         filepath, _ = QFileDialog.getSaveFileName(
             self,

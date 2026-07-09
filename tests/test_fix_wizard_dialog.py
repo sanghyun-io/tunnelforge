@@ -1,9 +1,11 @@
 from types import SimpleNamespace
+from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from src.ui.dialogs import fix_wizard_dialog
 from src.ui.dialogs import fix_wizard_execution_page
+from src.ui.dialogs import fix_wizard_option_page
 from src.ui.workers import fix_wizard_worker
 from src.core.migration_fix_models import CharsetTableInfo
 
@@ -11,6 +13,29 @@ from src.core.migration_fix_models import CharsetTableInfo
 def test_fix_wizard_dialog_preserves_legacy_module_reexports():
     assert fix_wizard_dialog.FixWizardWorker is fix_wizard_worker.FixWizardWorker
     assert fix_wizard_dialog.CharsetTableInfo is CharsetTableInfo
+    assert fix_wizard_dialog.BatchOptionDialog is fix_wizard_option_page.BatchOptionDialog
+
+
+def test_execution_page_auto_saved_rollback_stays_inside_rollback_dir(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(fix_wizard_execution_page, "rollback_dir", lambda: tmp_path)
+
+    dialog = fix_wizard_dialog.FixWizardDialog(
+        None,
+        connector=SimpleNamespace(),
+        issues=[],
+        schema="../outside\\schema:name",
+    )
+
+    dialog.execution_page._save_and_show_rollback("ROLLBACK SQL;")
+
+    rollback_path = Path(dialog.execution_page.rollback_sql_path)
+    assert rollback_path.parent == tmp_path
+    assert rollback_path.resolve().is_relative_to(tmp_path.resolve())
+    assert ".." not in rollback_path.name
+    assert "/" not in rollback_path.name
+    assert "\\" not in rollback_path.name
+    dialog.close()
 
 
 class _FakeSignal:

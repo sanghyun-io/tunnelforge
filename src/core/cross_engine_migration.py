@@ -196,8 +196,15 @@ def _db_core_frozen_candidate_dirs(executable_path: Path) -> List[Path]:
             contents_dir / "Resources",
         ])
 
-    candidate_dirs.append(Path.cwd())
     return candidate_dirs
+
+
+def _allow_db_core_path_lookup() -> bool:
+    return os.environ.get("TUNNELFORGE_ALLOW_DB_CORE_PATH_LOOKUP", "").lower() in {
+        "1",
+        "true",
+        "yes",
+    }
 
 
 def db_core_executable() -> str:
@@ -223,10 +230,11 @@ def db_core_executable() -> str:
             if candidate.exists():
                 return str(candidate)
 
-    for exe_name in exe_names:
-        from_path = shutil.which(exe_name)
-        if from_path:
-            return from_path
+    if not getattr(sys, "frozen", False) and _allow_db_core_path_lookup():
+        for exe_name in exe_names:
+            from_path = shutil.which(exe_name)
+            if from_path:
+                return from_path
 
     return str(root / "migration_core" / "target" / "release" / exe_names[0])
 

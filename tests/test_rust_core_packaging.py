@@ -14,6 +14,7 @@ import yaml
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+BASH_BIN = shutil.which("bash")
 SUCCESSFUL_MACOS_SMOKE_LOG = (
     "macOS /Applications install smoke checks passed.\n"
     "macOS release package smoke checks passed.\n"
@@ -524,7 +525,7 @@ exit 1
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "-c",
             "EXPECTED_HEAD="
             + shlex.quote(current_head)
@@ -592,7 +593,7 @@ exit 1
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "-c",
             "GH="
             + fake_gh_arg
@@ -667,7 +668,7 @@ exit 1
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "-c",
             "GH="
             + fake_gh_arg
@@ -704,7 +705,7 @@ def test_macos_validation_artifact_download_script_verifies_flat_downloaded_chec
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-download-validation-artifacts.sh",
             "--verify-only",
             artifact_dir.as_posix(),
@@ -755,7 +756,7 @@ def test_macos_manual_validation_report_check_complete_accepts_completed_report(
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -795,7 +796,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_smoke_log
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -837,7 +838,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -880,7 +881,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_required_
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -913,7 +914,7 @@ def test_macos_manual_validation_report_check_complete_rejects_deleted_export_re
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -948,7 +949,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_interacti
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -985,7 +986,7 @@ def test_macos_manual_validation_report_check_complete_rejects_placeholder_evide
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -1022,7 +1023,7 @@ def test_macos_manual_validation_report_check_complete_accepts_concrete_evidence
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -1052,7 +1053,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_applicati
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -1088,7 +1089,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_real_maco
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -1129,7 +1130,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_artifact_
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -1175,7 +1176,7 @@ def test_macos_manual_validation_report_check_complete_rejects_missing_applicati
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--check-complete",
             report_arg,
@@ -1208,7 +1209,7 @@ def test_macos_manual_validation_report_bundle_evidence_creates_zip(tmp_path):
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--bundle-evidence",
             report_arg,
@@ -1259,7 +1260,7 @@ def test_macos_manual_validation_report_bundle_evidence_includes_system_evidence
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--bundle-evidence",
             report_arg,
@@ -1304,7 +1305,7 @@ def test_macos_manual_validation_report_finalize_creates_zip_and_runs_local_gate
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "scripts/macos-manual-validation-report.sh",
             "--finalize",
             report_arg,
@@ -1388,7 +1389,7 @@ test -s "$body_file"
 
     result = subprocess.run(
         [
-            "bash",
+            BASH_BIN,
             "-c",
             f"GH={shlex.quote(fake_gh.relative_to(PROJECT_ROOT).as_posix())} bash scripts/macos-manual-validation-report.sh"
             f" --finalize {shlex.quote(report_arg)}"

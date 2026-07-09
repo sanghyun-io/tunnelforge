@@ -10,6 +10,18 @@ WORKFLOW_NAME="macOS App Validation"
 WORKFLOW_EVENT="workflow_dispatch"
 GH_BIN="${GH:-gh}"
 
+ensure_git_bash_hash_tools() {
+  if command -v shasum >/dev/null 2>&1; then
+    return
+  fi
+
+  if [[ -x /usr/bin/core_perl/shasum ]]; then
+    export PATH="/usr/bin/core_perl:${PATH}"
+  fi
+}
+
+ensure_git_bash_hash_tools
+
 usage() {
   cat <<'EOF'
 Usage:

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Callable, Iterable, Optional, Union
 
 from src.core.migration_analyzer import AnalysisResult, OrphanRecord
+from src.core.path_safety import safe_child_file, safe_filename_component
 from src.core.platform_paths import analysis_dir
 
 PathLike = Union[str, Path]
@@ -24,10 +25,12 @@ class MigrationResultStore:
     @staticmethod
     def default_name(schema: str) -> str:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        return f"{schema}_{timestamp}.json"
+        safe_schema = safe_filename_component(schema, "schema")
+        return f"{safe_schema}_{timestamp}.json"
 
     def auto_save(self, result: AnalysisResult) -> Path:
-        path = self.analysis_dir() / self.default_name(result.schema)
+        base_dir = self.analysis_dir()
+        path = safe_child_file(base_dir, self.default_name(result.schema), "schema_analysis.json")
         self.write(result, path)
         return path
 
