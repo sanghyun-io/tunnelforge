@@ -489,6 +489,7 @@ class _MinimalDownloadDialog(settings.SettingsDialog):
         self._theme_saved = True
         self._download_generation = 0
         self._download_signal_relays = {}
+        self._download_retired = False
 
 
 def test_settings_ignores_queued_success_from_cancelled_generation(
@@ -678,6 +679,49 @@ def test_settings_reject_invalidates_queued_success_before_dialog_closes(
     app.processEvents()
 
     assert dialog.result() == QDialog.DialogCode.Rejected
+    assert dialog._download_generation == 2
+    assert dialog._download_worker is None
+    assert not worker.isRunning()
+    assert dialog._downloaded_installer_path is None
+    assert dialog._downloaded_installer_sha256 is None
+    assert dialog._downloaded_installer_size == 0
+    worker.downloader.discard_downloaded_installer.assert_called_once_with(
+        str(installer)
+    )
+
+
+def test_settings_accept_invalidates_queued_success_before_dialog_closes(
+    monkeypatch, tmp_path
+):
+    app = QApplication.instance() or QApplication([])
+    installer = tmp_path / "accepted-late-installer.exe"
+    installer.write_bytes(b"late")
+
+    class LateSuccessWorker(UpdateDownloadWorker):
+        def __init__(self, config_manager=None):
+            super().__init__(config_manager=config_manager)
+            self.downloader = MagicMock()
+
+        def run(self):
+            self.verification_ready.emit("a" * 64, 4)
+            self.info_fetched.emit("2.0.7", 4)
+            self.progress.emit(4, 4)
+            self.finished.emit(True, str(installer))
+
+    import src.ui.workers as worker_package
+
+    monkeypatch.setattr(worker_package, "UpdateDownloadWorker", LateSuccessWorker)
+    dialog = _MinimalDownloadDialog()
+
+    dialog._start_download()
+    worker = dialog._download_worker
+    assert worker.wait(5000)
+
+    dialog.accept()
+    dialog.accept()
+    app.processEvents()
+
+    assert dialog.result() == QDialog.DialogCode.Accepted
     assert dialog._download_generation == 2
     assert dialog._download_worker is None
     assert not worker.isRunning()

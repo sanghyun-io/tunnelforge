@@ -534,7 +534,7 @@ class SettingsDialog(QDialog):
         self._downloaded_installer_owner = None
         self._download_generation = 0
         self._download_signal_relays = {}
-        self._download_close_invalidated = False
+        self._download_retired = False
         self._latest_version = None
 
         layout.addWidget(update_group)
@@ -613,6 +613,11 @@ class SettingsDialog(QDialog):
 
         self.accept()
 
+    def accept(self):
+        """Retire downloads before accepting and closing the dialog."""
+        self._retire_active_update_download()
+        super().accept()
+
     def _restore_original_theme_if_unsaved(self):
         """테마가 저장되지 않은 채 다이얼로그가 닫히면 미리보기 이전 테마로 복원"""
         if not getattr(self, "_theme_saved", False):
@@ -620,13 +625,13 @@ class SettingsDialog(QDialog):
 
     def reject(self):
         """취소(또는 창 닫기) 시 미리보기 중이던 테마를 원래 상태로 복원"""
-        self._invalidate_download_for_close()
+        self._retire_active_update_download()
         self._restore_original_theme_if_unsaved()
         super().reject()
 
     def closeEvent(self, event):
         """Invalidate downloads before the dialog is closed."""
-        self._invalidate_download_for_close()
+        self._retire_active_update_download()
         self._restore_original_theme_if_unsaved()
         super().closeEvent(event)
 
@@ -698,10 +703,9 @@ class SettingsDialog(QDialog):
         """업데이트 다운로드 시작"""
         from src.ui.workers import UpdateDownloadWorker
 
-        previous_worker = self._retire_download_worker()
-        if previous_worker:
-            previous_worker.cancel()
-            previous_worker.wait()
+        self._download_retired = False
+        self._retire_active_update_download(wait=True)
+        self._download_retired = False
         generation = self._download_generation
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
@@ -753,23 +757,21 @@ class SettingsDialog(QDialog):
         worker.finished.connect(finished_relay)
         worker.start()
 
-    def _retire_download_worker(self):
-        """Invalidate the active download generation and detach its worker."""
+    def _retire_active_update_download(self, *, wait=False):
+        """Invalidate, detach, and cancel the active update worker once."""
+        if self._download_retired:
+            return None
+        self._download_retired = True
         retired_generation = self._download_generation
         self._download_generation += 1
         worker = self._download_worker
         self._download_worker = None
         self._download_signal_relays.pop(retired_generation, None)
-        return worker
-
-    def _invalidate_download_for_close(self):
-        """Retire and cancel the active worker without blocking the UI thread."""
-        if getattr(self, "_download_close_invalidated", False):
-            return
-        self._download_close_invalidated = True
-        worker = self._retire_download_worker()
         if worker:
             worker.cancel()
+            if wait:
+                worker.wait()
+        return worker
 
     def _is_current_download_worker(self, generation, worker) -> bool:
         return (
@@ -874,10 +876,7 @@ class SettingsDialog(QDialog):
 
     def _cancel_download(self):
         """다운로드 취소"""
-        worker = self._retire_download_worker()
-        if worker:
-            worker.cancel()
-            worker.wait()
+        self._retire_active_update_download(wait=True)
 
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
