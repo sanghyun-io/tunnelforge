@@ -400,6 +400,63 @@ def test_bootstrapper_discard_rejects_unowned_sibling(
     ("module", "downloader_class"),
     DOWNLOADER_IMPLEMENTATIONS,
 )
+def test_bootstrapper_publish_preserves_preexisting_final(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    final_path = download_dir / OFFLINE_NAME
+    final_path.write_bytes(b"victim")
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError):
+        downloader.download_installer()
+
+    assert final_path.read_bytes() == b"victim"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_publish_preserves_final_injected_before_rename(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    final_path = download_dir / OFFLINE_NAME
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    def inject_final(_part_path, _published_path):
+        final_path.write_bytes(b"victim")
+        raise FileExistsError("final already exists")
+
+    monkeypatch.setattr(
+        update_integrity, "_publish_windows_no_clobber", inject_final, raising=False
+    )
+
+    with pytest.raises(module.DownloadError):
+        downloader.download_installer()
+
+    assert final_path.read_bytes() == b"victim"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
 def test_bootstrapper_discard_rejects_replaced_owned_parent(
     monkeypatch, tmp_path, module, downloader_class
 ):

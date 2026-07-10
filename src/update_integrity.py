@@ -508,6 +508,26 @@ class OwnedTempDirectory:
     ) -> bool:
         """Retain the parent and record a registered Windows child identity."""
         if os.name != "nt":
+            if final_path is not None:
+                candidate = _absolute_path(final_path)
+                if not self.owns_direct_child(candidate):
+                    return False
+                try:
+                    child_stat = os.stat(
+                        os.path.basename(candidate),
+                        dir_fd=self._descriptor,
+                        follow_symlinks=False,
+                    )
+                except OSError:
+                    return False
+                child_identity = (child_stat.st_dev, child_stat.st_ino)
+                if (
+                    not stat.S_ISREG(child_stat.st_mode)
+                    or expected_child_identity is not None
+                    and child_identity != expected_child_identity
+                ):
+                    return False
+                self._child_identities[os.path.basename(candidate)] = child_identity
             return self.identity_matches()
         handle = None
         try:
@@ -632,6 +652,60 @@ class OwnedTempDirectory:
 
     def __del__(self):
         self.close()
+
+
+def _publish_windows_no_clobber(part_path: str, final_path: str) -> None:
+    # Windows rename preserves an existing destination instead of replacing it.
+    os.rename(part_path, final_path)
+
+
+def _publish_posix_no_clobber(
+    part_path: str,
+    final_path: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    # link(2) atomically requires a missing destination. Leave the part link in
+    # place after success because standard POSIX has no conditional unlink.
+    os.link(part_path, final_path, follow_symlinks=False)
+    part_stat = os.stat(part_path, follow_symlinks=False)
+    final_stat = os.stat(final_path, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(part_stat.st_mode)
+        or not stat.S_ISREG(final_stat.st_mode)
+        or (part_stat.st_dev, part_stat.st_ino) != expected_identity
+        or (final_stat.st_dev, final_stat.st_ino) != expected_identity
+    ):
+        raise IntegrityError("temporary download publish identity changed")
+
+
+def publish_owned_temp_file(
+    owner: OwnedTempDirectory,
+    part_path: str | os.PathLike[str],
+    final_path: str | os.PathLike[str],
+) -> str:
+    """Atomically publish a registered part without replacing a destination.
+
+    POSIX intentionally retains the `.part` hard link after publication because
+    standard APIs cannot conditionally unlink it by recorded identity.
+    """
+    part = _absolute_path(part_path)
+    final = _absolute_path(final_path)
+    expected_identity = owner.child_identity(part)
+    if expected_identity is None or not owner.release_parent_handle():
+        raise IntegrityError("temporary download publish identity changed")
+    try:
+        if os.name == "nt":
+            _publish_windows_no_clobber(part, final)
+        else:
+            _publish_posix_no_clobber(part, final, expected_identity)
+    except OSError as exc:
+        raise IntegrityError(f"temporary download publish failed: {exc}") from exc
+
+    if not owner.retain(final, expected_identity):
+        raise IntegrityError("temporary download publish identity changed")
+    if os.name == "nt":
+        owner.forget_child_identity(part)
+    return final
 
 
 def verify_file_integrity(

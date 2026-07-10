@@ -221,11 +221,12 @@ def test_download_installer_cleans_final_file_when_cancelled_after_replace(
     response = MagicMock()
     response.headers = {"content-length": "4"}
     response.iter_content.return_value = [b"safe"]
-    real_replace = os.replace
+    real_publish = update_integrity.publish_owned_temp_file
 
-    def replace_then_cancel(source, destination):
-        real_replace(source, destination)
+    def publish_then_cancel(owner, source, destination):
+        result = real_publish(owner, source, destination)
         downloader.cancel()
+        return result
 
     monkeypatch.setattr(
         "src.core.update_downloader.tempfile.mkdtemp",
@@ -235,12 +236,17 @@ def test_download_installer_cleans_final_file_when_cancelled_after_replace(
         "src.core.update_downloader.requests.get",
         lambda *args, **kwargs: response,
     )
-    monkeypatch.setattr("src.core.update_downloader.os.replace", replace_then_cancel)
+    monkeypatch.setattr(
+        "src.core.update_downloader.publish_owned_temp_file", publish_then_cancel
+    )
 
     with pytest.raises(DownloadError, match="취소"):
         downloader.download_installer()
 
-    assert not update_dir.exists()
+    if os.name == "nt":
+        assert not update_dir.exists()
+    else:
+        assert update_dir.exists()
 
 
 def test_download_installer_removes_partial_file_on_unexpected_exception(
@@ -550,6 +556,67 @@ def test_windows_discard_rejects_swapped_registered_child(monkeypatch, tmp_path)
 
     assert downloader.discard_downloaded_installer(installer_path) is False
     assert Path(installer_path).read_bytes() == b"victim"
+
+
+def test_download_publish_preserves_preexisting_final(monkeypatch, tmp_path):
+    update_dir = tmp_path / "tunnelforge-update-existing-final"
+    update_dir.mkdir()
+    final_path = update_dir / "TunnelForge-Setup-2.0.5.exe"
+    final_path.write_bytes(b"victim")
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    with pytest.raises(DownloadError):
+        downloader.download_installer()
+
+    assert final_path.read_bytes() == b"victim"
+
+
+def test_download_publish_preserves_final_injected_before_rename(monkeypatch, tmp_path):
+    update_dir = tmp_path / "tunnelforge-update-injected-final"
+    update_dir.mkdir()
+    final_path = update_dir / "TunnelForge-Setup-2.0.5.exe"
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    def inject_final(_part_path, _published_path):
+        final_path.write_bytes(b"victim")
+        raise FileExistsError("final already exists")
+
+    monkeypatch.setattr(
+        update_integrity, "_publish_windows_no_clobber", inject_final, raising=False
+    )
+
+    with pytest.raises(DownloadError):
+        downloader.download_installer()
+
+    assert final_path.read_bytes() == b"victim"
 
 
 def test_discard_downloaded_installer_rejects_unowned_sibling(

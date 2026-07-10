@@ -21,6 +21,7 @@ from src.update_integrity import (
     MAX_INSTALLER_SIZE,
     OwnedTempDirectory,
     VerifiedLaunchFile,
+    publish_owned_temp_file,
     parse_content_length,
     parse_sha256_digest,
     verify_file_integrity,
@@ -251,13 +252,7 @@ class InstallerDownloader:
             self._raise_if_cancelled()
             self.verify_downloaded_installer(part_path)
             self._raise_if_cancelled()
-            part_identity = owner.child_identity(part_path)
-            if part_identity is None or not owner.release_parent_handle():
-                raise DownloadError("temporary download part identity changed")
-            os.replace(part_path, file_path)
-            if not owner.retain(file_path, part_identity):
-                raise DownloadError("temporary download directory identity changed")
-            owner.forget_child_identity(part_path)
+            publish_owned_temp_file(owner, part_path, file_path)
             self._raise_if_cancelled()
             return file_path
 
