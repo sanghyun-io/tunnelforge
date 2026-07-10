@@ -13,6 +13,7 @@ from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
+from src.update_integrity import IntegrityError, verify_file_integrity
 from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
 from src.core.platform_integration import (
     StartupRegistrar,
@@ -526,6 +527,8 @@ class SettingsDialog(QDialog):
         # 다운로드 관련 상태 변수 초기화
         self._download_worker = None
         self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
         self._latest_version = None
 
         layout.addWidget(update_group)
@@ -682,6 +685,10 @@ class SettingsDialog(QDialog):
         """업데이트 다운로드 시작"""
         from src.ui.workers import UpdateDownloadWorker
 
+        self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
+
         # UI 상태 변경
         self.btn_check_update.setEnabled(False)
         self.btn_download.setEnabled(False)
@@ -694,6 +701,9 @@ class SettingsDialog(QDialog):
 
         # Worker 시작
         self._download_worker = UpdateDownloadWorker(config_manager=self.config_mgr)
+        self._download_worker.verification_ready.connect(
+            self._on_download_verification_ready
+        )
         self._download_worker.info_fetched.connect(self._on_download_info_fetched)
         self._download_worker.progress.connect(self._on_download_progress)
         self._download_worker.finished.connect(self._on_download_finished)
@@ -704,6 +714,11 @@ class SettingsDialog(QDialog):
         self.btn_download.setText("다운로드 중...")
         size_str = format_size(file_size)
         self.download_detail_label.setText(f"파일 크기: {size_str}")
+
+    def _on_download_verification_ready(self, sha256: str, file_size: int):
+        """Store immutable release metadata for launch-time verification."""
+        self._downloaded_installer_sha256 = sha256
+        self._downloaded_installer_size = file_size
 
     def _on_download_progress(self, downloaded: int, total: int):
         """다운로드 진행률 업데이트"""
@@ -730,6 +745,9 @@ class SettingsDialog(QDialog):
             self.btn_download.clicked.connect(self._launch_installer)
             self.download_detail_label.setText(action_text.done_message)
         else:
+            self._downloaded_installer_path = None
+            self._downloaded_installer_sha256 = None
+            self._downloaded_installer_size = 0
             self.download_progress.hide()
             self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
             self.btn_download.setEnabled(True)
@@ -743,6 +761,10 @@ class SettingsDialog(QDialog):
             self._download_worker.cancel()
             self._download_worker.wait()
             self._download_worker = None
+
+        self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
 
         # UI 상태 복원
         self.btn_cancel_download.hide()
@@ -760,6 +782,9 @@ class SettingsDialog(QDialog):
                 "설치 오류",
                 "설치 파일을 찾을 수 없습니다.\n다시 다운로드해 주세요."
             )
+            return
+
+        if not SettingsDialog._verify_installer_before_launch(self):
             return
 
         # 확인 메시지 구성 (활성 터널 경고 포함)
@@ -787,6 +812,9 @@ class SettingsDialog(QDialog):
         )
 
         if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        if not SettingsDialog._verify_installer_before_launch(self):
             return
 
         try:
@@ -817,6 +845,57 @@ class SettingsDialog(QDialog):
                 "실행 오류",
                 f"설치 프로그램 실행에 실패했습니다:\n{str(e)}"
             )
+
+    def _verify_installer_before_launch(self) -> bool:
+        try:
+            if not self._downloaded_installer_sha256:
+                raise IntegrityError(
+                    "release asset SHA-256 digest is missing or invalid"
+                )
+            verify_file_integrity(
+                self._downloaded_installer_path,
+                self._downloaded_installer_sha256,
+                self._downloaded_installer_size,
+            )
+            return True
+        except (IntegrityError, OSError) as exc:
+            SettingsDialog._discard_invalid_installer(self, str(exc))
+            return False
+
+    def _discard_invalid_installer(self, error_message: str) -> None:
+        installer_path = self._downloaded_installer_path
+        if installer_path:
+            try:
+                os.remove(installer_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                pass
+
+        self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
+        self.download_progress.hide()
+        self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
+        self.btn_download.setEnabled(True)
+        self.btn_download.setStyleSheet(ButtonStyles.SUCCESS_MD)
+        self.btn_check_update.setEnabled(True)
+        self.download_detail_label.setText(
+            translate_text("❌ 설치 파일 무결성 검증에 실패했습니다.")
+        )
+        self.download_detail_label.setStyleSheet(
+            "font-size: 11px; color: #e74c3c;"
+        )
+        self.btn_download.clicked.disconnect()
+        self.btn_download.clicked.connect(self._start_download)
+        QMessageBox.critical(
+            self,
+            translate_text("설치 파일 무결성 오류"),
+            translate_text(
+                "다운로드한 설치 파일이 릴리스 정보와 일치하지 않아 삭제했습니다.\n"
+                f"다시 다운로드해 주세요.\n\n{error_message}"
+            ),
+        )
 
     def _adjust_update_label_height(self):
         """업데이트 상태 라벨 높이를 내용에 맞게 조정"""

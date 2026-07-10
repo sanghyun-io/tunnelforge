@@ -13,10 +13,12 @@ class UpdateDownloadWorker(QThread):
 
     Signals:
         info_fetched: 설치 프로그램 정보 조회 완료 (version, file_size)
+        verification_ready: 무결성 메타데이터 준비 완료 (sha256, file_size)
         progress: 다운로드 진행률 (downloaded_bytes, total_bytes)
         finished: 다운로드 완료 (success, file_path_or_error_message)
     """
     info_fetched = pyqtSignal(str, int)   # version, file_size
+    verification_ready = pyqtSignal(str, int)  # sha256, file_size
     progress = pyqtSignal(int, int)        # downloaded, total
     finished = pyqtSignal(bool, str)       # success, file_path or error
 
@@ -37,6 +39,9 @@ class UpdateDownloadWorker(QThread):
             if self._cancelled:
                 return
 
+            self.verification_ready.emit(
+                self.downloader.expected_sha256, file_size
+            )
             self.info_fetched.emit(version, file_size)
 
             # 2. 다운로드 실행

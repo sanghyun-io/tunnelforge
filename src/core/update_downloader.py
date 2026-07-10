@@ -6,9 +6,16 @@ bootstrapper/downloader.py의 로직을 메인 앱용으로 추출한 모듈입�
 import os
 import platform
 import tempfile
+from dataclasses import dataclass
 import requests
 from typing import Optional, Callable, Tuple, Sequence, Mapping, Any
+from urllib.parse import urlparse
 
+from src.update_integrity import (
+    IntegrityError,
+    parse_sha256_digest,
+    verify_file_integrity,
+)
 from src.version import GITHUB_OWNER, GITHUB_REPO
 
 
@@ -26,46 +33,82 @@ class DownloadError(Exception):
     pass
 
 
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    size: int
+    sha256: str
+
+
 def select_release_asset(
     assets: Sequence[Mapping[str, Any]],
+    release_version: str,
     platform_name: Optional[str] = None,
     arch_name: Optional[str] = None,
-) -> Optional[Tuple[str, int]]:
-    """Return the download URL and size for the current platform's release asset."""
+) -> Optional[ReleaseAsset]:
+    """Return the version-bound release asset for the current platform."""
     system = platform_name or platform.system()
     arch = arch_name or platform.machine()
     candidates = []
 
     for asset in assets:
         asset_name = str(asset.get('name', ''))
-        url = asset.get('browser_download_url')
-        if not url:
+        if system == "Windows":
+            expected_name = f"{WINDOWS_INSTALLER_FILENAME_PREFIX}{release_version}.exe"
+            if asset_name != expected_name:
+                continue
+            rank = 0
+        elif system == "Darwin":
+            expected_prefix = f"{MACOS_PACKAGE_FILENAME_PREFIX}{release_version}"
+            suffix = asset_name[len(expected_prefix):] if asset_name.startswith(expected_prefix) else ""
+            valid_suffixes = {
+                ".dmg",
+                ".zip",
+                "-arm64.dmg",
+                "-arm64.zip",
+                "-x86_64.dmg",
+                "-x86_64.zip",
+                "-universal.dmg",
+                "-universal.zip",
+                "-universal2.dmg",
+                "-universal2.zip",
+            }
+            if suffix not in valid_suffixes:
+                continue
+
+            arch_rank = _macos_arch_rank(asset_name, arch)
+            if arch_rank is None:
+                continue
+            rank = arch_rank if asset_name.endswith('.dmg') else arch_rank + 1
+        else:
             continue
 
-        if system == "Windows":
-            if (
-                asset_name.startswith(WINDOWS_INSTALLER_FILENAME_PREFIX)
-                and asset_name.endswith('.exe')
-                and 'WebSetup' not in asset_name
-            ):
-                candidates.append((str(url), int(asset.get('size', 0)), 0))
-        elif system == "Darwin":
-            if asset_name.startswith(MACOS_PACKAGE_FILENAME_PREFIX):
-                arch_rank = _macos_arch_rank(asset_name, arch)
-                if arch_rank is None:
-                    continue
+        url = asset.get('browser_download_url')
+        if not url:
+            raise DownloadError("release asset download URL is missing")
 
-                if asset_name.endswith('.dmg'):
-                    candidates.append((str(url), int(asset.get('size', 0)), arch_rank))
-                elif asset_name.endswith('.zip'):
-                    candidates.append((str(url), int(asset.get('size', 0)), arch_rank + 1))
+        try:
+            size = int(asset.get('size', 0))
+        except (TypeError, ValueError) as exc:
+            raise DownloadError("release asset size must be positive") from exc
+        if size <= 0:
+            raise DownloadError("release asset size must be positive")
+
+        try:
+            sha256 = parse_sha256_digest(asset.get('digest'))
+        except IntegrityError as exc:
+            raise DownloadError(str(exc)) from exc
+
+        candidates.append(
+            (rank, ReleaseAsset(asset_name, str(url), size, sha256))
+        )
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda item: item[2])
-    url, size, _ = candidates[0]
-    return url, size
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def _macos_arch_rank(asset_name: str, arch_name: str) -> Optional[int]:
@@ -103,6 +146,8 @@ class UpdateDownloader:
         self.latest_version: Optional[str] = None
         self.download_url: Optional[str] = None
         self.file_size: int = 0
+        self.expected_sha256: Optional[str] = None
+        self.installer_filename: Optional[str] = None
         self._cancelled = False
         self._config_manager = config_manager
 
@@ -136,6 +181,12 @@ class UpdateDownloader:
         Raises:
             DownloadError: API 호출 실패 또는 설치 파일을 찾을 수 없는 경우
         """
+        self.latest_version = None
+        self.download_url = None
+        self.file_size = 0
+        self.expected_sha256 = None
+        self.installer_filename = None
+
         try:
             response = requests.get(
                 RELEASES_API_URL,
@@ -151,9 +202,12 @@ class UpdateDownloader:
                 raise DownloadError("버전 정보를 찾을 수 없습니다")
 
             assets = release_data.get('assets', [])
-            selected = select_release_asset(assets)
+            selected = select_release_asset(assets, self.latest_version)
             if selected:
-                self.download_url, self.file_size = selected
+                self.installer_filename = selected.name
+                self.download_url = selected.url
+                self.file_size = selected.size
+                self.expected_sha256 = selected.sha256
 
             if not self.download_url:
                 raise DownloadError(
@@ -200,13 +254,17 @@ class UpdateDownloader:
         """
         if not self.download_url:
             raise DownloadError("먼저 get_installer_info()를 호출해야 합니다")
+        if not self.expected_sha256 or self.file_size <= 0:
+            raise DownloadError("release asset integrity metadata is missing or invalid")
 
         self._cancelled = False
 
-        # 임시 파일 경로 생성
-        temp_dir = tempfile.gettempdir()
-        filename = os.path.basename(self.download_url) or "TunnelForge-Update"
+        temp_dir = tempfile.mkdtemp(prefix="tunnelforge-update-")
+        filename = self.installer_filename or os.path.basename(
+            urlparse(self.download_url).path
+        ) or "TunnelForge-Update"
         file_path = os.path.join(temp_dir, filename)
+        part_path = f"{file_path}.part"
 
         try:
             response = requests.get(
@@ -220,12 +278,9 @@ class UpdateDownloader:
             total_size = int(response.headers.get('content-length', self.file_size))
 
             downloaded = 0
-            with open(file_path, 'wb') as f:
+            with open(part_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
                     if self._cancelled:
-                        f.close()
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
                         raise DownloadError("다운로드가 취소되었습니다")
 
                     if chunk:
@@ -235,14 +290,39 @@ class UpdateDownloader:
                         if progress_callback and total_size > 0:
                             progress_callback(downloaded, total_size)
 
+            self.verify_downloaded_installer(part_path)
+            os.replace(part_path, file_path)
             return file_path
 
+        except DownloadError:
+            self._remove_download_outputs(part_path, file_path)
+            raise
         except requests.exceptions.RequestException as e:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            self._remove_download_outputs(part_path, file_path)
             raise DownloadError(f"다운로드 실패: {str(e)}")
-        except IOError as e:
+        except OSError as e:
+            self._remove_download_outputs(part_path, file_path)
             raise DownloadError(f"파일 저장 실패: {str(e)}")
+        except Exception as e:
+            self._remove_download_outputs(part_path, file_path)
+            raise DownloadError(f"다운로드 실패: {str(e)}") from e
+
+    def verify_downloaded_installer(self, path: str) -> None:
+        """Verify a downloaded package against the selected release metadata."""
+        if not self.expected_sha256:
+            raise DownloadError("release asset SHA-256 digest is missing or invalid")
+        try:
+            verify_file_integrity(path, self.expected_sha256, self.file_size)
+        except (IntegrityError, OSError) as exc:
+            raise DownloadError(str(exc)) from exc
+
+    @staticmethod
+    def _remove_download_outputs(*paths: str) -> None:
+        for path in paths:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
 
 
 def format_size(size_bytes: int) -> str:

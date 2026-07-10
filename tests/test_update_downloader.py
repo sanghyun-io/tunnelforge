@@ -1,68 +1,135 @@
+import hashlib
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from src.core.update_downloader import UpdateDownloader, select_release_asset
+import pytest
+
+from src.core.update_downloader import DownloadError, UpdateDownloader, select_release_asset
+from src.ui.workers.update_worker import UpdateDownloadWorker
+
+
+VALID_DIGEST = "sha256:" + "a" * 64
+
+
+def _asset(name, url, size, digest=VALID_DIGEST):
+    return {
+        "name": name,
+        "browser_download_url": url,
+        "size": size,
+        "digest": digest,
+    }
 
 
 def test_select_release_asset_prefers_windows_offline_installer():
     assets = [
-        {"name": "TunnelForge-WebSetup.exe", "browser_download_url": "web", "size": 1},
-        {"name": "TunnelForge-Setup-2.0.5.exe", "browser_download_url": "setup", "size": 2},
-        {"name": "TunnelForge-macOS-2.0.5.dmg", "browser_download_url": "dmg", "size": 3},
+        _asset("TunnelForge-WebSetup-2.0.5.exe", "web", 1),
+        _asset("TunnelForge-Setup-2.0.5.exe", "setup", 2),
+        _asset("TunnelForge-macOS-2.0.5.dmg", "dmg", 3),
     ]
 
-    asset = select_release_asset(assets, platform_name="Windows")
+    asset = select_release_asset(assets, "2.0.5", platform_name="Windows")
 
-    assert asset == ("setup", 2)
+    assert asset.name == "TunnelForge-Setup-2.0.5.exe"
+    assert asset.url == "setup"
+    assert asset.size == 2
 
 
 def test_select_release_asset_prefers_macos_dmg():
     assets = [
-        {"name": "TunnelForge-macOS-2.0.5.zip", "browser_download_url": "zip", "size": 2},
-        {"name": "TunnelForge-macOS-2.0.5.dmg", "browser_download_url": "dmg", "size": 3},
-        {"name": "TunnelForge-Setup-2.0.5.exe", "browser_download_url": "setup", "size": 4},
+        _asset("TunnelForge-macOS-2.0.5.zip", "zip", 2),
+        _asset("TunnelForge-macOS-2.0.5.dmg", "dmg", 3),
+        _asset("TunnelForge-Setup-2.0.5.exe", "setup", 4),
     ]
 
-    asset = select_release_asset(assets, platform_name="Darwin")
+    asset = select_release_asset(assets, "2.0.5", platform_name="Darwin")
 
-    assert asset == ("dmg", 3)
+    assert asset.url == "dmg"
+    assert asset.size == 3
 
 
 def test_select_release_asset_prefers_matching_macos_architecture():
     assets = [
-        {"name": "TunnelForge-macOS-2.0.5-x86_64.dmg", "browser_download_url": "intel", "size": 2},
-        {"name": "TunnelForge-macOS-2.0.5-arm64.zip", "browser_download_url": "arm-zip", "size": 3},
-        {"name": "TunnelForge-macOS-2.0.5-arm64.dmg", "browser_download_url": "arm-dmg", "size": 4},
+        _asset("TunnelForge-macOS-2.0.5-x86_64.dmg", "intel", 2),
+        _asset("TunnelForge-macOS-2.0.5-arm64.zip", "arm-zip", 3),
+        _asset("TunnelForge-macOS-2.0.5-arm64.dmg", "arm-dmg", 4),
     ]
 
-    asset = select_release_asset(assets, platform_name="Darwin", arch_name="arm64")
+    asset = select_release_asset(
+        assets, "2.0.5", platform_name="Darwin", arch_name="arm64"
+    )
 
-    assert asset == ("arm-dmg", 4)
+    assert asset.url == "arm-dmg"
+    assert asset.size == 4
 
 
 def test_select_release_asset_ignores_other_macos_architecture():
     assets = [
-        {"name": "TunnelForge-macOS-2.0.5-x86_64.dmg", "browser_download_url": "intel", "size": 2},
-        {"name": "TunnelForge-macOS-2.0.5-arm64.zip", "browser_download_url": "arm-zip", "size": 3},
+        _asset("TunnelForge-macOS-2.0.5-x86_64.dmg", "intel", 2),
+        _asset("TunnelForge-macOS-2.0.5-arm64.zip", "arm-zip", 3),
     ]
 
-    asset = select_release_asset(assets, platform_name="Darwin", arch_name="arm64")
+    asset = select_release_asset(
+        assets, "2.0.5", platform_name="Darwin", arch_name="arm64"
+    )
 
-    assert asset == ("arm-zip", 3)
+    assert asset.url == "arm-zip"
+    assert asset.size == 3
 
 
 def test_select_release_asset_returns_none_when_platform_asset_missing():
     assets = [
-        {"name": "TunnelForge-Setup-2.0.5.exe", "browser_download_url": "setup", "size": 4},
+        _asset("TunnelForge-Setup-2.0.5.exe", "setup", 4),
     ]
 
-    assert select_release_asset(assets, platform_name="Darwin") is None
+    assert select_release_asset(assets, "2.0.5", platform_name="Darwin") is None
 
 
-def test_download_installer_uses_configurable_timeout():
+def test_select_release_asset_requires_exact_release_version():
+    assets = [
+        _asset("TunnelForge-Setup-2.0.4.exe", "old", 4),
+        _asset("TunnelForge-Setup-2.0.5.exe", "current", 5),
+    ]
+
+    asset = select_release_asset(assets, "2.0.5", platform_name="Windows")
+
+    assert asset.url == "current"
+
+
+def test_select_release_asset_requires_valid_sha256_digest():
+    digest = "0123456789abcdef" * 4
+    assets = [
+        _asset("TunnelForge-Setup-2.0.5.exe", "setup", 4, f"sha256:{digest.upper()}"),
+    ]
+
+    asset = select_release_asset(assets, "2.0.5", platform_name="Windows")
+
+    assert asset.sha256 == digest
+
+
+@pytest.mark.parametrize(
+    "digest",
+    [
+        None,
+        "sha512:" + "a" * 64,
+        "sha256:" + "a" * 63,
+        "sha256:" + "g" * 64,
+    ],
+)
+def test_select_release_asset_rejects_missing_or_malformed_digest(digest):
+    assets = [
+        _asset("TunnelForge-Setup-2.0.5.exe", "setup", 4, digest),
+    ]
+
+    with pytest.raises(DownloadError, match="SHA-256"):
+        select_release_asset(assets, "2.0.5", platform_name="Windows")
+
+
+def test_download_installer_uses_configurable_timeout(monkeypatch, tmp_path):
     """download_installer가 하드코딩된 30초 대신 self.timeout을 전달해야 한다 (CC-048 회귀)"""
     downloader = UpdateDownloader()
     downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
     downloader.file_size = 10
+    downloader.expected_sha256 = hashlib.sha256(b"0123456789").hexdigest()
 
     config_manager = MagicMock()
     config_manager.get_network_timeout_download.return_value = 77
@@ -71,9 +138,108 @@ def test_download_installer_uses_configurable_timeout():
     mock_response = MagicMock()
     mock_response.headers = {'content-length': '10'}
     mock_response.iter_content.return_value = [b'0123456789']
+    monkeypatch.setattr("src.core.update_downloader.tempfile.mkdtemp", lambda **_kwargs: str(tmp_path))
 
-    with patch('src.core.update_downloader.requests.get', return_value=mock_response) as mock_get, \
-         patch('src.core.update_downloader.open', create=True):
+    with patch('src.core.update_downloader.requests.get', return_value=mock_response) as mock_get:
         downloader.download_installer()
 
     assert mock_get.call_args.kwargs['timeout'] == 77
+
+
+def test_download_installer_rejects_digest_mismatch_and_removes_partial_file(
+    monkeypatch, tmp_path
+):
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"evil").hexdigest()
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr("src.core.update_downloader.tempfile.mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr("src.core.update_downloader.requests.get", lambda *args, **kwargs: response)
+
+    with pytest.raises(DownloadError, match="SHA-256"):
+        downloader.download_installer()
+
+    final_path = tmp_path / "TunnelForge-Setup-2.0.5.exe"
+    assert not final_path.exists()
+    assert not Path(f"{final_path}.part").exists()
+
+
+def test_download_installer_removes_partial_file_on_unexpected_exception(
+    monkeypatch, tmp_path
+):
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(tmp_path),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *args, **kwargs: response,
+    )
+
+    def fail_progress(*_args):
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(DownloadError, match="callback failed"):
+        downloader.download_installer(progress_callback=fail_progress)
+
+    final_path = tmp_path / "TunnelForge-Setup-2.0.5.exe"
+    assert not final_path.exists()
+    assert not Path(f"{final_path}.part").exists()
+
+
+def test_get_installer_info_does_not_reuse_stale_asset_metadata(monkeypatch):
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/stale.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = "a" * 64
+
+    response = MagicMock()
+    response.json.return_value = {"tag_name": "v2.0.5", "assets": []}
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *args, **kwargs: response,
+    )
+
+    with pytest.raises(DownloadError, match="설치 파일을 찾을 수 없습니다"):
+        downloader.get_installer_info()
+
+    assert downloader.download_url is None
+    assert downloader.expected_sha256 is None
+
+
+def test_update_worker_emits_verification_metadata_before_download():
+    worker = UpdateDownloadWorker()
+    worker.downloader = MagicMock()
+    worker.downloader.get_installer_info.return_value = (
+        "2.0.5",
+        "https://example.com/TunnelForge-Setup-2.0.5.exe",
+        4,
+    )
+    worker.downloader.expected_sha256 = "a" * 64
+    worker.downloader.download_installer.return_value = "installer.exe"
+    events = []
+    worker.verification_ready.connect(
+        lambda sha256, size: events.append(("verification", sha256, size))
+    )
+    worker.info_fetched.connect(
+        lambda version, size: events.append(("info", version, size))
+    )
+
+    worker.run()
+
+    assert events[:2] == [
+        ("verification", "a" * 64, 4),
+        ("info", "2.0.5", 4),
+    ]
