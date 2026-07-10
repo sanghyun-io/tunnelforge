@@ -135,6 +135,18 @@ def test_environment_combo_uses_item_data_for_persisted_value():
         parent.close()
 
 
+def test_unset_environment_copy_warns_that_dangerous_operations_need_confirmation():
+    parent = ParentWithTunnels()
+    dialog = TunnelConfigDialog(parent, tunnel_data={"id": "current"})
+    try:
+        assert dialog.combo_environment.itemText(0) == "(미설정)"
+        assert "(미설정)" in dialog.combo_environment.toolTip()
+        assert "위험 작업 시 확인 필요" in dialog.combo_environment.toolTip()
+    finally:
+        dialog.close()
+        parent.close()
+
+
 def test_available_tunnels_logs_and_returns_empty_list_on_config_failure(monkeypatch):
     class BrokenConfigManager:
         def load_config(self):
