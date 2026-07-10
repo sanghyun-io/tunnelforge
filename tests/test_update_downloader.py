@@ -605,13 +605,22 @@ def test_download_publish_preserves_final_injected_before_rename(monkeypatch, tm
         lambda *_args, **_kwargs: response,
     )
 
-    def inject_final(_part_path, _published_path):
-        final_path.write_bytes(b"victim")
-        raise FileExistsError("final already exists")
+    if os.name == "nt":
+        publish = update_integrity._publish_windows_no_clobber
 
-    monkeypatch.setattr(
-        update_integrity, "_publish_windows_no_clobber", inject_final, raising=False
-    )
+        def inject_final(part_path, published_path):
+            final_path.write_bytes(b"victim")
+            publish(part_path, published_path)
+
+        monkeypatch.setattr(update_integrity, "_publish_windows_no_clobber", inject_final)
+    else:
+        publish = update_integrity._publish_posix_no_clobber
+
+        def inject_final(part_path, published_path, expected_identity):
+            final_path.write_bytes(b"victim")
+            publish(part_path, published_path, expected_identity)
+
+        monkeypatch.setattr(update_integrity, "_publish_posix_no_clobber", inject_final)
 
     with pytest.raises(DownloadError):
         downloader.download_installer()
