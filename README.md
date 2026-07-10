@@ -66,7 +66,8 @@
 |:-:|---------|-------------|
 | ⚡ | **Parallel Export/Import** | Blazing-fast schema and data transfers powered by Rust DB Core's parallel processing. |
 | 🧩 | **Orphan Record Analysis** | Detect rows left behind by broken foreign-key relationships and export the findings as a report. |
-| ⏰ | **Scheduled Backups & Queries** | Cron-based automation for recurring exports and SQL jobs. |
+
+Scheduled Backups & Queries are disabled in the default UI and cannot be used pending intentional reactivation and verification. See [SCHEDULE.md](SCHEDULE.md) for the current status.
 
 ### General
 
@@ -154,7 +155,6 @@ Create separate tunnel configs for each environment (Dev, Staging, Production) w
 - Use **schema-only export** for structure backups
 - Use **table selection** to export only what you need
 - Exports run in parallel for faster completion
-- Set up a **scheduled backup** for recurring exports you don't want to run by hand
 
 </details>
 
