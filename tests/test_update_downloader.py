@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -174,6 +175,73 @@ def test_download_installer_rejects_digest_mismatch_and_removes_partial_file(
     assert not update_dir.exists()
 
 
+def test_download_installer_cleans_temp_dir_when_cancelled_after_last_chunk(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-cancelled"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    def chunks():
+        yield b"safe"
+        downloader.cancel()
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = chunks()
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *args, **kwargs: response,
+    )
+
+    with pytest.raises(DownloadError, match="취소"):
+        downloader.download_installer()
+
+    assert not update_dir.exists()
+
+
+def test_download_installer_cleans_final_file_when_cancelled_after_replace(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-replaced"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    real_replace = os.replace
+
+    def replace_then_cancel(source, destination):
+        real_replace(source, destination)
+        downloader.cancel()
+
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *args, **kwargs: response,
+    )
+    monkeypatch.setattr("src.core.update_downloader.os.replace", replace_then_cancel)
+
+    with pytest.raises(DownloadError, match="취소"):
+        downloader.download_installer()
+
+    assert not update_dir.exists()
+
+
 def test_download_installer_removes_partial_file_on_unexpected_exception(
     monkeypatch, tmp_path
 ):
@@ -249,3 +317,74 @@ def test_update_worker_emits_verification_metadata_before_download():
         ("verification", "a" * 64, 4),
         ("info", "2.0.5", 4),
     ]
+
+
+def test_update_worker_discards_returned_installer_when_cancelled_before_success():
+    worker = UpdateDownloadWorker()
+    worker.downloader = MagicMock()
+    worker.downloader.get_installer_info.return_value = (
+        "2.0.5",
+        "https://example.com/TunnelForge-Setup-2.0.5.exe",
+        4,
+    )
+    worker.downloader.expected_sha256 = "a" * 64
+
+    def cancel_before_return(**_kwargs):
+        worker.cancel()
+        return "installer.exe"
+
+    worker.downloader.download_installer.side_effect = cancel_before_return
+    finished = []
+    worker.finished.connect(lambda success, result: finished.append((success, result)))
+
+    worker.run()
+
+    worker.downloader.discard_downloaded_installer.assert_called_once_with(
+        "installer.exe"
+    )
+    assert finished == []
+
+
+def test_discard_downloaded_installer_ignores_unowned_path(tmp_path):
+    downloader = UpdateDownloader()
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / "installer.exe"
+    outside_file.write_bytes(b"outside")
+
+    downloader.discard_downloaded_installer(str(outside_file))
+
+    assert outside_file.exists()
+    assert outside_dir.exists()
+
+
+def test_discard_downloaded_installer_removes_owned_success_path(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-success"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *args, **kwargs: response,
+    )
+
+    installer_path = downloader.download_installer()
+
+    assert Path(installer_path).exists()
+    assert update_dir.exists()
+
+    downloader.discard_downloaded_installer(installer_path)
+
+    assert not update_dir.exists()

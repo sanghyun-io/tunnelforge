@@ -150,6 +150,7 @@ class UpdateDownloader:
         self.installer_filename: Optional[str] = None
         self._cancelled = False
         self._config_manager = config_manager
+        self._owned_temp_dirs = set()
 
     @property
     def timeout(self) -> int:
@@ -257,9 +258,8 @@ class UpdateDownloader:
         if not self.expected_sha256 or self.file_size <= 0:
             raise DownloadError("release asset integrity metadata is missing or invalid")
 
-        self._cancelled = False
-
         temp_dir = tempfile.mkdtemp(prefix="tunnelforge-update-")
+        self._owned_temp_dirs.add(os.path.realpath(temp_dir))
         filename = self.installer_filename or os.path.basename(
             urlparse(self.download_url).path
         ) or "TunnelForge-Update"
@@ -267,6 +267,7 @@ class UpdateDownloader:
         part_path = f"{file_path}.part"
 
         try:
+            self._raise_if_cancelled()
             response = requests.get(
                 self.download_url,
                 stream=True,
@@ -280,8 +281,7 @@ class UpdateDownloader:
             downloaded = 0
             with open(part_path, 'wb') as f:
                 for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
-                    if self._cancelled:
-                        raise DownloadError("다운로드가 취소되었습니다")
+                    self._raise_if_cancelled()
 
                     if chunk:
                         f.write(chunk)
@@ -290,8 +290,11 @@ class UpdateDownloader:
                         if progress_callback and total_size > 0:
                             progress_callback(downloaded, total_size)
 
+            self._raise_if_cancelled()
             self.verify_downloaded_installer(part_path)
+            self._raise_if_cancelled()
             os.replace(part_path, file_path)
+            self._raise_if_cancelled()
             return file_path
 
         except DownloadError:
@@ -316,8 +319,23 @@ class UpdateDownloader:
         except (IntegrityError, OSError) as exc:
             raise DownloadError(str(exc)) from exc
 
-    @staticmethod
-    def _cleanup_failed_download(temp_dir: str, *paths: str) -> None:
+    def discard_downloaded_installer(self, path: str) -> None:
+        """Remove a returned installer only when its parent is task-owned."""
+        installer_path = os.path.realpath(path)
+        temp_dir = os.path.dirname(installer_path)
+        if temp_dir not in self._owned_temp_dirs:
+            return
+        self._cleanup_failed_download(
+            temp_dir,
+            f"{installer_path}.part",
+            installer_path,
+        )
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled:
+            raise DownloadError("다운로드가 취소되었습니다")
+
+    def _cleanup_failed_download(self, temp_dir: str, *paths: str) -> None:
         for path in paths:
             try:
                 os.remove(path)
@@ -327,6 +345,7 @@ class UpdateDownloader:
             os.rmdir(temp_dir)
         except OSError:
             pass
+        self._owned_temp_dirs.discard(os.path.realpath(temp_dir))
 
 
 def format_size(size_bytes: int) -> str:

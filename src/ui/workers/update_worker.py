@@ -3,6 +3,8 @@
 - QThread 기반 비동기 다운로드
 - 취소 지원
 """
+import threading
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.core.update_downloader import UpdateDownloader, DownloadError
@@ -26,17 +28,18 @@ class UpdateDownloadWorker(QThread):
         super().__init__()
         self.downloader = UpdateDownloader(config_manager=config_manager)
         self._cancelled = False
+        self._state_lock = threading.RLock()
 
     def run(self):
         """다운로드 실행 (비동기)"""
-        if self._cancelled:
+        if self._is_cancelled():
             return
 
         try:
             # 1. 설치 프로그램 정보 조회
             version, url, file_size = self.downloader.get_installer_info()
 
-            if self._cancelled:
+            if self._is_cancelled():
                 return
 
             self.verification_ready.emit(
@@ -49,22 +52,30 @@ class UpdateDownloadWorker(QThread):
                 progress_callback=self._on_progress
             )
 
-            if not self._cancelled:
-                self.finished.emit(True, file_path)
+            with self._state_lock:
+                if self._cancelled:
+                    self.downloader.discard_downloaded_installer(file_path)
+                else:
+                    self.finished.emit(True, file_path)
 
         except DownloadError as e:
-            if not self._cancelled:
+            if not self._is_cancelled():
                 self.finished.emit(False, str(e))
         except Exception as e:
-            if not self._cancelled:
+            if not self._is_cancelled():
                 self.finished.emit(False, f"예기치 않은 오류: {str(e)}")
 
     def _on_progress(self, downloaded: int, total: int):
         """진행률 콜백"""
-        if not self._cancelled:
+        if not self._is_cancelled():
             self.progress.emit(downloaded, total)
+
+    def _is_cancelled(self) -> bool:
+        with self._state_lock:
+            return self._cancelled
 
     def cancel(self):
         """다운로드 취소"""
-        self._cancelled = True
-        self.downloader.cancel()
+        with self._state_lock:
+            self._cancelled = True
+            self.downloader.cancel()
