@@ -239,6 +239,7 @@ git commit -m "fix(security): 부트스트래퍼 다운로드 검증"
 - Modify: `tests/test_production_guard.py`
 - Modify: `tests/test_db_import_dialog.py`
 - Modify: `tests/test_tunnel_config_dialog.py`
+- Modify: `tests/test_sql_editor_dialog.py`
 
 **Interfaces:**
 - `Environment.DEVELOPMENT` is the only permissive fallback.
@@ -289,6 +290,11 @@ values.
 Update the tunnel environment tooltip/copy so `(미설정)` states that dangerous
 operations require confirmation.
 
+Update the shared SQL Editor test fixture to declare
+`{"environment": "development"}` explicitly. Those tests exercise worker and
+query behavior rather than environment confirmation; leaving the field absent
+would correctly open the new UNKNOWN default-No modal and block offscreen tests.
+
 - [ ] **Step 5: Run focused, SQL Editor, and full tests**
 
 Run:
@@ -304,7 +310,7 @@ Expected: all pass; explicit development fixtures remain permissive.
 - [ ] **Step 6: Commit and report**
 
 ```powershell
-git add src/core/production_guard.py src/ui/dialogs/db_import_dialog.py src/ui/dialogs/tunnel_config.py tests/test_production_guard.py tests/test_db_import_dialog.py tests/test_tunnel_config_dialog.py
+git add src/core/production_guard.py src/ui/dialogs/db_import_dialog.py src/ui/dialogs/tunnel_config.py tests/test_production_guard.py tests/test_db_import_dialog.py tests/test_tunnel_config_dialog.py tests/test_sql_editor_dialog.py
 git commit -m "fix(security): 미분류 환경 위험 작업 확인"
 ```
 
