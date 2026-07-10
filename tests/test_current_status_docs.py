@@ -850,3 +850,29 @@ def test_current_status_current_baseline_has_no_duplicate_check_rows():
     commands = _check_row_commands(baseline)
 
     assert len(commands) == len(set(commands))
+
+
+def test_current_status_distinguishes_open_170_from_remaining_implementation_work():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-078" in tracker
+    assert "GitHub #170 remains open for issue hygiene only" in summary
+    assert "PR #171" in summary
+    assert "a4c7a06" in summary
+    assert "close #170 after confirming the merged fix" in order
+
+
+def test_current_status_records_post_round3_reconciliation_full_suite():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    baseline = _section(doc, "Current Baseline Verification")
+    verification = _section(doc, "Verification Log")
+    sessions = _section(doc, "Session Log")
+
+    assert "post-reconciliation full Python suite at 1826 passed / 6 warnings" in summary
+    assert "| `pytest -q` | PASS, 1826 passed, 6 warnings |" in baseline
+    assert "full Python suite passed at 1826 passed / 6 warnings" in verification
+    assert "full pytest 1826 passed / 6 warnings" in sessions

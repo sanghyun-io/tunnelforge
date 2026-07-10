@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-07-09
+Last reviewed: 2026-07-10
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -66,8 +66,15 @@ fail-closed behavior, and Fix Wizard dialog module re-exports including
 `cwd`/implicit `PATH` lookup and hardened schema-derived auto-save filenames
 for analysis and rollback files. The integrated main tree passed the Rust Core
 regression gate, a whole-tree `MySQLConnector` allowlist scan, Round 3 focused
-tests at 491 passed, and the post-SECURE/APPROVE full Python suite at 1824
-passed / 4 warnings.
+tests at 491 passed, and the post-reconciliation full Python suite at 1826
+passed / 6 warnings.
+
+GitHub #170 remains open for issue hygiene only: its reported MySQL ERROR 3780
+import path was fixed by PR #171 / commit `a4c7a06`, that fix is contained in
+current `main`, and release tags `v2.1.8` through `v2.3.0` contain it. Confirm
+the merged fix with the reporter and close the issue unless the failure can be
+reproduced on a containing release; it is not remaining Clean Code Round 3
+implementation work.
 
 Open GitHub issue #116 remains external: its remaining unchecked criterion is
 real operator Mac validation evidence. GitHub #142 is fixed: the legacy Python
@@ -377,8 +384,8 @@ confirming the separate legacy Python Auto-Fix Wizard mutation path.
 
 ## Current Baseline Verification
 
-Commands run locally. Full-suite count refreshed on 2026-07-09 after Clean Code
-Round 3 integration; the earlier `Full-suite count refreshed on 2026-06-27`
+Commands run locally. Full-suite count refreshed on 2026-07-10 after the Round 3
+status reconciliation; the earlier `Full-suite count refreshed on 2026-06-27`
 baseline is superseded by this latest status update. Broader Rust/macOS
 evidence rows are preserved from the 2026-06-26 / 2026-06-27 baseline sweeps
 until those commands are rerun.
@@ -386,7 +393,7 @@ until those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | Tracked Round 3 commits integrated on `main`; only status/handoff scratch files remain outside the integration commits before this status update |
-| `pytest -q` | PASS, 1821 passed, 4 warnings |
+| `pytest -q` | PASS, 1826 passed, 6 warnings |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
 | `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
@@ -499,6 +506,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-10 | Round 3 completion and open-issue reconciliation | `git status --short --branch`; `git rev-list --left-right --count origin/main...main`; `gh issue list --state open --limit 30 --json number,title,updatedAt,url`; `gh issue view 170 --json ...`; `git branch --contains a4c7a06`; `git merge-base --is-ancestor a4c7a06 HEAD`; `gh pr view 171 --json ...`; `git tag --contains a4c7a06`; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `git diff --check` | PASS | Round 3 remains complete and pushed at `09ab060`. GitHub #170 is still open, but PR #171 fixed its ERROR 3780 path, the fix is in current `main`, and release tags from `v2.1.8` through `v2.3.0` contain it. Remaining #170 work is issue confirmation/closure, not implementation. Current-status tests passed at 55 passed; full Python suite passed at 1826 passed / 6 warnings. |
 | 2026-07-09 | Clean Code Round 3 UI/dialog/main-window integration | `python -m py_compile` on all Round 3 production Python files; `pytest` focused Round 3 suite; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; custom whole-tree `MySQLConnector` allowlist scan; `git diff --check HEAD~8..HEAD`; `pytest -q` | PASS | Integrated WP-3.1 through WP-3.8 as behavior-preserving commits. Focused Round 3 tests passed at 491 passed / 2 warnings, Rust Core regression gate passed, allowlist scan found 22 product imports with no missing entries, and full Python suite passed at 1819 passed / 4 warnings. |
 | 2026-07-09 | Clean Code Round 3 red-review follow-up | RED/GREEN: migration worker constructor compatibility and cleanup dry-run rejection tests; Fix Wizard dialog re-export regression test; `python -m py_compile src/ui/workers/migration_worker.py src/ui/dialogs/fix_wizard_dialog.py tests/test_migration_worker.py tests/test_fix_wizard_dialog.py`; `pytest tests/test_migration_worker.py tests/test_fix_wizard_dialog.py tests/test_migration_fix_wizard.py tests/test_fix_wizard_sql_helpers.py -q`; `pytest -q` | PASS | Red-review found behavior-preserving compatibility regressions in `MigrationAnalyzerWorker` legacy `check_*` kwargs, `CleanupWorker(dry_run=False)` fail-closed semantics, and `fix_wizard_dialog` module re-exports. All three were restored; focused tests passed at 118 passed and full Python suite passed at 1821 passed / 4 warnings. |
 | 2026-07-09 | Clean Code Round 3 SECURE/APPROVE follow-up | RED/GREEN: `pytest tests\test_cross_engine_migration_protocol.py::test_db_core_frozen_candidate_dirs_exclude_cwd tests\test_cross_engine_migration_protocol.py::test_db_core_executable_does_not_use_path_lookup_without_dev_flag tests\test_migration_result_store.py::test_migration_result_store_auto_save_sanitizes_schema_path_components tests\test_fix_wizard_dialog.py::test_execution_page_auto_saved_rollback_stays_inside_rollback_dir -q`; focused: `pytest tests\test_cross_engine_migration_protocol.py tests\test_migration_result_store.py tests\test_fix_wizard_dialog.py tests\test_rust_core_packaging.py tests\test_path_safety.py -q`; focused review/security suite: `pytest tests\test_migration_worker.py tests\test_migration_fix_wizard.py tests\test_fix_wizard_sql_helpers.py tests\test_rust_dump_exporter.py tests\test_db_import_dialog.py tests\test_cross_engine_migration_worker.py tests\test_sql_editor_editability.py tests\test_sql_execution_worker.py -q`; `python -m py_compile` on touched Python files; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; custom product-import `MySQLConnector` allowlist scan; `git diff --check` | PASS | SECURE review found two medium issues: frozen/helper lookup could fall through to untrusted locations and schema-derived auto-save names could escape intended directories. Both are fixed with focused regression coverage. Post-fix APPROVE also restored the missing `BatchOptionDialog` legacy re-export. macOS packaging bash tests now use the discovered Git Bash path and pass at 51 passed. Full Python suite passed at 1824 passed / 4 warnings; allowlist scan found 22 product imports with no missing entries. |
@@ -2217,24 +2225,30 @@ Next action:
 | TF-STATUS-075 | Low | closed | Status documentation / macOS release validation | macOS final validation tooling recheck | Keep #116 final validation tooling evidence fresh while external real-Mac report evidence remains pending |
 | TF-STATUS-076 | Medium | closed | Security / Rust Core helper resolution | Frozen-runtime core helper lookup trusted boundary | Keep packaged runtime helper resolution limited to app-owned locations; allow PATH lookup only with explicit development opt-in |
 | TF-STATUS-077 | Medium | closed | Security / auto-save paths | Schema-derived analysis and rollback filenames | Keep schema-derived filenames sanitized and resolved under their intended base directories |
+| TF-STATUS-078 | Low | open | GitHub issue hygiene / Rust Core import | GitHub #170 remains open after merged ERROR 3780 fix | Confirm the PR #171 fix with the reporter and close #170 unless it reproduces on a containing release |
 
 ## Recommended Execution Order
 
 1. No repo-side implementation issue is currently open after TF-STATUS-077.
    Clean Code Round 3 is integrated, red-review compatibility fixes are in,
-   SECURE follow-up fixes are in, and #116 remains external.
-2. Keep TF-STATUS-008 / GitHub #116 tracked separately because it requires real
-   operator Mac validation report evidence. Do not hard-code exact current-head
-   workflow run IDs or SHAs as durable status summary evidence; use #116
+   and SECURE follow-up fixes are in.
+2. Confirm and close #170 after confirming the merged fix from PR #171 / commit
+   `a4c7a06`; reopen implementation work only if it reproduces on a release that
+   contains the fix.
+3. Keep TF-STATUS-008 / GitHub #116 tracked separately because #116 remains
+   external and requires real operator Mac validation report evidence. Do not
+   hard-code exact current-head workflow run IDs or SHAs as durable status
+   summary evidence; use #116
    comments and `scripts\check-macos-support-gate.py --final` for the latest
    current-head manual workflow proof.
-3. Track additional One-Click automatic fix classes as separate GitHub issues
+4. Track additional One-Click automatic fix classes as separate GitHub issues
    before implementation.
 
 ## Session Log
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-10 | Reconciled Round 3 completion against current Git and GitHub state. Round 3 remains complete and synchronized; #170 is open only because the already merged/released ERROR 3780 fix was not linked for automatic closure. | `docs/current_status.md`, `tests/test_current_status_docs.py` | `git` ancestry/sync checks; GitHub open-issue, #170, and PR #171 inspection; release-tag containment check; current-status pytest 55 passed; full pytest 1826 passed / 6 warnings |
 | 2026-07-09 | Integrated Clean Code Round 3 WP-3.1 through WP-3.8 into `main`, covering SQL editor, DB dialogs, migration dialogs, Fix Wizard pages, cross-engine/diff dialogs, settings/schedule/tunnel dialogs, main window controllers, and UI workers. | Round 3 UI/core helper files plus `docs/current_status.md` | Round 3 focused pytest 491 passed; full `pytest -q` 1819 passed / 4 warnings; Rust Core regression gate passed; whole-tree `MySQLConnector` allowlist scan passed; `git diff --check` passed |
 | 2026-07-09 | Addressed Clean Code Round 3 red-review findings by restoring migration worker legacy constructor compatibility, cleanup worker `dry_run=False` RuntimeError behavior, and Fix Wizard dialog re-export compatibility. | `src/ui/workers/migration_worker.py`, `src/ui/dialogs/fix_wizard_dialog.py`, `tests/test_migration_worker.py`, `tests/test_fix_wizard_dialog.py`, `docs/current_status.md` | RED/GREEN compatibility tests; focused migration/Fix Wizard suite 118 passed; full `pytest -q` 1821 passed / 4 warnings |
 | 2026-07-09 | Addressed SECURE/APPROVE follow-up findings by restoring `BatchOptionDialog` legacy re-export, limiting core helper lookup trust boundaries, hardening schema-derived auto-save paths, and stabilizing Windows Git Bash packaging tests. | `src/core/cross_engine_migration.py`, `src/core/path_safety.py`, `src/ui/dialogs/migration_result_store.py`, `src/ui/dialogs/fix_wizard_execution_page.py`, `src/ui/dialogs/fix_wizard_dialog.py`, `scripts/check-macos-support-gate.py`, `scripts/macos-download-validation-artifacts.sh`, tests, `docs/current_status.md` | Security regression tests passed; focused review/security suites passed; macOS packaging pytest 51 passed; full `pytest -q` 1824 passed / 4 warnings; Rust Core regression gate passed; allowlist scan passed; `git diff --check` passed |
