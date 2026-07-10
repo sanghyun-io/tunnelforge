@@ -12,7 +12,7 @@ from src.update_integrity import (
     IntegrityError,
     MAX_INSTALLER_SIZE,
     OwnedTempDirectory,
-    VerifiedLaunchFile,
+    VerifiedFileLease,
     publish_owned_temp_file,
     parse_content_length,
     parse_sha256_digest,
@@ -245,11 +245,11 @@ class InstallerDownloader:
         except (IntegrityError, OSError) as exc:
             raise DownloadError(str(exc)) from exc
 
-    def open_verified_installer(self, path: str) -> VerifiedLaunchFile:
+    def open_verified_installer(self, path: str) -> VerifiedFileLease:
         """Return a verified file lease that can guard process dispatch."""
         if not self.expected_sha256:
             raise DownloadError("release asset SHA-256 digest is missing or invalid")
-        return VerifiedLaunchFile(path, self.expected_sha256, self.file_size)
+        return VerifiedFileLease(path, self.expected_sha256, self.file_size)
 
     def discard_downloaded_installer(self, path: str) -> bool:
         """Remove an installer only when its recorded parent identity matches."""

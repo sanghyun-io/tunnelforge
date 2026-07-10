@@ -20,7 +20,7 @@ from src.update_integrity import (
     IntegrityError,
     MAX_INSTALLER_SIZE,
     OwnedTempDirectory,
-    VerifiedLaunchFile,
+    VerifiedFileLease,
     publish_owned_temp_file,
     parse_content_length,
     parse_sha256_digest,
@@ -278,11 +278,11 @@ class InstallerDownloader:
         except (IntegrityError, OSError) as exc:
             raise DownloadError(str(exc)) from exc
 
-    def open_verified_installer(self, path: str) -> VerifiedLaunchFile:
+    def open_verified_installer(self, path: str) -> VerifiedFileLease:
         """Return a verified file lease that can guard process dispatch."""
         if not self.expected_sha256:
             raise DownloadError("release asset SHA-256 digest is missing or invalid")
-        return VerifiedLaunchFile(path, self.expected_sha256, self.file_size)
+        return VerifiedFileLease(path, self.expected_sha256, self.file_size)
 
     def discard_downloaded_installer(self, path: str) -> bool:
         """Remove an installer only when its recorded parent identity matches."""
@@ -534,11 +534,19 @@ class BootstrapperApp:
             expected_size = getattr(self.downloader, "file_size", 0)
             if not expected_sha256 or expected_size <= 0:
                 raise IntegrityError("release asset integrity metadata is missing or invalid")
-            with VerifiedLaunchFile(
-                self.downloaded_file,
-                expected_sha256,
-                expected_size,
-            ) as verified:
+            open_verified = getattr(
+                self.downloader, "open_verified_installer", None
+            )
+            lease = (
+                open_verified(self.downloaded_file)
+                if callable(open_verified)
+                else VerifiedFileLease(
+                    self.downloaded_file,
+                    expected_sha256,
+                    expected_size,
+                )
+            )
+            with lease as verified:
                 verified.dispatch(
                     lambda path: subprocess.Popen(
                         [path],

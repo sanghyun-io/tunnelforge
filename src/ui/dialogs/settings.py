@@ -15,8 +15,7 @@ from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
 from src.update_integrity import (
     IntegrityError,
-    VerifiedLaunchFile,
-    verify_file_integrity,
+    VerifiedFileLease,
 )
 from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
 from src.core.platform_integration import (
@@ -836,79 +835,88 @@ class SettingsDialog(QDialog):
             )
             return
 
-        if not SettingsDialog._verify_installer_before_launch(self):
-            return
-
-        # 확인 메시지 구성 (활성 터널 경고 포함)
         main_window = self.parent()
-        action_text = update_package_action_text()
-        confirm_msg = f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
-
-        tunnel_names = _collect_active_tunnel_names(main_window)
-        if tunnel_names:
-            tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
-            confirm_msg = (
-                f"{action_text.confirm_question}\n\n"
-                f"⚠️ 현재 {len(tunnel_names)}개의 활성 터널이 연결 해제됩니다:\n"
-                f"{tunnel_list}\n\n"
-                f"{action_text.confirm_body}"
-            )
-
-        # 확인 다이얼로그
-        reply = QMessageBox.question(
-            self,
-            action_text.confirm_title,
-            confirm_msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes
-        )
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
-        if not SettingsDialog._verify_installer_before_launch(self):
-            return
-
         try:
-            if sys.platform == 'win32':
-                subprocess.Popen(
-                    [self._downloaded_installer_path],
-                    close_fds=True,
-                )
-            elif update_package_launch_strategy() == "open":
-                if not QDesktopServices.openUrl(QUrl.fromLocalFile(self._downloaded_installer_path)):
-                    raise RuntimeError("다운로드한 패키지를 열 수 없습니다.")
-            else:
-                subprocess.Popen(
-                    [self._downloaded_installer_path],
-                    start_new_session=True,
-                    close_fds=True,
+            with SettingsDialog._open_verified_installer(self) as verified:
+                action_text = update_package_action_text()
+                confirm_msg = (
+                    f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
                 )
 
-            # closeEvent 우회하여 직접 종료 (CloseConfirmDialog 방지)
-            if main_window and hasattr(main_window, 'close_app'):
-                main_window.close_app()
-            else:
-                QApplication.instance().quit()  # fallback
+                tunnel_names = _collect_active_tunnel_names(main_window)
+                if tunnel_names:
+                    tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
+                    confirm_msg = (
+                        f"{action_text.confirm_question}\n\n"
+                        f"⚠️ 현재 {len(tunnel_names)}개의 활성 터널이 연결 해제됩니다:\n"
+                        f"{tunnel_list}\n\n"
+                        f"{action_text.confirm_body}"
+                    )
 
-        except Exception as e:
+                reply = QMessageBox.question(
+                    self,
+                    action_text.confirm_title,
+                    confirm_msg,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+                SettingsDialog._dispatch_verified_installer(self, verified)
+
+        except IntegrityError as exc:
+            SettingsDialog._discard_invalid_installer(self, str(exc))
+            return
+        except Exception as exc:
             QMessageBox.critical(
                 self,
                 "실행 오류",
-                f"설치 프로그램 실행에 실패했습니다:\n{str(e)}"
+                f"설치 프로그램 실행에 실패했습니다:\n{str(exc)}"
+            )
+            return
+
+        # closeEvent 우회하여 직접 종료 (CloseConfirmDialog 방지)
+        if main_window and hasattr(main_window, 'close_app'):
+            main_window.close_app()
+        else:
+            QApplication.instance().quit()  # fallback
+
+    def _open_verified_installer(self) -> VerifiedFileLease:
+        if not self._downloaded_installer_sha256:
+            raise IntegrityError(
+                "release asset SHA-256 digest is missing or invalid"
+            )
+        return VerifiedFileLease(
+            self._downloaded_installer_path,
+            self._downloaded_installer_sha256,
+            self._downloaded_installer_size,
+        )
+
+    def _dispatch_verified_installer(self, verified: VerifiedFileLease) -> None:
+        if sys.platform == 'win32':
+            verified.dispatch(
+                lambda path: subprocess.Popen([path], close_fds=True)
+            )
+        elif update_package_launch_strategy() == "open":
+            def open_package(path):
+                if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
+                    raise RuntimeError("다운로드한 패키지를 열 수 없습니다.")
+
+            verified.dispatch(open_package)
+        else:
+            verified.dispatch(
+                lambda path: subprocess.Popen(
+                    [path],
+                    start_new_session=True,
+                    close_fds=True,
+                )
             )
 
     def _verify_installer_before_launch(self) -> bool:
         try:
-            if not self._downloaded_installer_sha256:
-                raise IntegrityError(
-                    "release asset SHA-256 digest is missing or invalid"
-                )
-            verify_file_integrity(
-                self._downloaded_installer_path,
-                self._downloaded_installer_sha256,
-                self._downloaded_installer_size,
-            )
+            with SettingsDialog._open_verified_installer(self):
+                pass
             return True
         except (IntegrityError, OSError) as exc:
             SettingsDialog._discard_invalid_installer(self, str(exc))

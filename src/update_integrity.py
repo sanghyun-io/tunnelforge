@@ -272,7 +272,7 @@ def _windows_delete_owned_child(
 _DispatchResult = TypeVar("_DispatchResult")
 
 
-class VerifiedLaunchFile:
+class VerifiedFileLease:
     """A verified no-follow file lease retained through launch dispatch."""
 
     def __init__(
@@ -287,7 +287,7 @@ class VerifiedLaunchFile:
         self._source = None
         self._identity = None
 
-    def __enter__(self) -> "VerifiedLaunchFile":
+    def __enter__(self) -> "VerifiedFileLease":
         if self.expected_size <= 0:
             raise IntegrityError("release asset size must be positive")
         try:
@@ -308,14 +308,17 @@ class VerifiedLaunchFile:
             self._source.seek(0)
             return self
         except IntegrityError:
-            self.close()
+            self._close_after_failed_enter()
             raise
         except OSError as exc:
-            self.close()
+            self._close_after_failed_enter()
             raise IntegrityError(f"could not open release file securely: {exc}") from exc
 
     def __exit__(self, _exc_type, _exc, _traceback) -> None:
-        self.close()
+        if _exc_type is None:
+            self.close()
+        else:
+            self._close_after_failed_enter()
 
     def _open_source(self):
         if os.name == "nt":
@@ -360,7 +363,7 @@ class VerifiedLaunchFile:
             if os.name == "nt":
                 current_identity = _windows_path_identity(self.path, directory=False)
             else:
-                current = os.stat(self.path, follow_symlinks=False)
+                current = os.lstat(self.path)
                 if not stat.S_ISREG(current.st_mode):
                     raise IntegrityError("release path is not a regular file")
                 current_identity = (current.st_dev, current.st_ino)
@@ -381,8 +384,19 @@ class VerifiedLaunchFile:
 
     def close(self) -> None:
         if self._source is not None:
-            self._source.close()
+            source = self._source
             self._source = None
+            source.close()
+
+    def _close_after_failed_enter(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
+
+
+# Compatibility for tests and callers introduced during the staged hardening.
+VerifiedLaunchFile = VerifiedFileLease
 
 
 class OwnedTempDirectory:
@@ -711,5 +725,5 @@ def publish_owned_temp_file(
 def verify_file_integrity(
     path: str | os.PathLike[str], expected_sha256: str, expected_size: int
 ) -> None:
-    with VerifiedLaunchFile(path, expected_sha256, expected_size):
+    with VerifiedFileLease(path, expected_sha256, expected_size):
         pass

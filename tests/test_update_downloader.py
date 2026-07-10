@@ -723,6 +723,9 @@ def test_verified_dispatch_rejects_replacement_after_hash(
     )
 
     installer_path = downloader.download_installer()
+    owner = downloader._find_owned_parent(installer_path)
+    assert owner is not None
+    owner.close()
     verified_type = getattr(update_integrity, "VerifiedLaunchFile")
     original_assert = verified_type._assert_dispatch_identity
     replacement_blocked = []
@@ -743,7 +746,9 @@ def test_verified_dispatch_rejects_replacement_after_hash(
     )
     dispatched = []
 
+    source = None
     with downloader.open_verified_installer(installer_path) as verified:
+        source = verified._source
         if os.name == "nt":
             verified.dispatch(lambda path: dispatched.append(Path(path).read_bytes()))
             assert replacement_blocked == [True]
@@ -752,6 +757,12 @@ def test_verified_dispatch_rejects_replacement_after_hash(
             with pytest.raises(update_integrity.IntegrityError, match="identity"):
                 verified.dispatch(lambda path: dispatched.append(path))
             assert dispatched == []
+
+    assert source is not None and source.closed
+    post_context_replacement = update_dir / "post-context-replacement.exe"
+    post_context_replacement.write_bytes(b"after")
+    os.replace(post_context_replacement, installer_path)
+    assert Path(installer_path).read_bytes() == b"after"
 
 
 def test_release_asset_rejects_size_above_shared_installer_limit():

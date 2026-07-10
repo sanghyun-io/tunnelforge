@@ -658,6 +658,29 @@ def test_bootstrapper_unowned_integrity_failure_does_not_delete_path(
     popen.assert_not_called()
 
 
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_downloaders_expose_verified_file_lease(
+    module, downloader_class, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"safe")
+    downloader = downloader_class()
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    downloader.file_size = 4
+    dispatched = []
+
+    with downloader.open_verified_installer(str(installer)) as verified:
+        source = verified._source
+        verified.dispatch(dispatched.append)
+
+    assert isinstance(verified, update_integrity.VerifiedFileLease)
+    assert dispatched == [str(installer)]
+    assert source.closed
+
+
 def test_bootstrapper_verified_launch_closes_replacement_race(
     monkeypatch, tmp_path
 ):
@@ -679,6 +702,9 @@ def test_bootstrapper_verified_launch_closes_replacement_race(
         lambda **_kwargs: str(download_dir),
     )
     installer_path = downloader.download_installer()
+    owner = downloader._find_owned_parent(installer_path)
+    assert owner is not None
+    owner.close()
 
     verified_type = getattr(update_integrity, "VerifiedLaunchFile")
     original_assert = verified_type._assert_dispatch_identity
