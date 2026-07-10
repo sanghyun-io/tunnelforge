@@ -1,6 +1,8 @@
 import hashlib
 import os
 from pathlib import Path
+import subprocess
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
@@ -9,7 +11,6 @@ import pytest
 from bootstrapper import bootstrapper as bundled_bootstrapper
 from bootstrapper import downloader as modular_downloader
 from src import update_integrity
-from src.core.update_downloader import MAX_INSTALLER_SIZE
 
 
 VALID_DIGEST = "sha256:" + "a" * 64
@@ -383,7 +384,7 @@ def test_bootstrapper_rejects_release_above_shared_installer_limit(
 ):
     downloader = downloader_class()
     response = _release_response(
-        [_asset(OFFLINE_NAME, "offline", MAX_INSTALLER_SIZE + 1)]
+        [_asset(OFFLINE_NAME, "offline", update_integrity.MAX_INSTALLER_SIZE + 1)]
     )
     monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
 
@@ -420,7 +421,16 @@ def test_bootstrapper_rejects_valid_content_length_mismatch_before_body(
     [
         (*implementation, content_length)
         for implementation in DOWNLOADER_IMPLEMENTATIONS
-        for content_length in (None, "not-a-number")
+        for content_length in (
+            None,
+            "not-a-number",
+            "+5",
+            "-0",
+            " 5",
+            "5 ",
+            "\u0665",
+            "5x",
+        )
     ],
 )
 def test_bootstrapper_streams_safely_without_valid_content_length(
@@ -453,6 +463,8 @@ def test_bootstrapper_rejects_oversized_chunk_before_write(
 ):
     download_dir = tmp_path / "download"
     download_dir.mkdir()
+    part_path = download_dir / f"{OFFLINE_NAME}.part"
+    part_path.write_bytes(b"")
     downloader = downloader_class()
     _configure_download(downloader, b"safe")
 
@@ -461,12 +473,41 @@ def test_bootstrapper_rejects_oversized_chunk_before_write(
     response.iter_content.return_value = [b"safe!"]
     monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
     monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+    file_handle = MagicMock()
+    file_handle.__enter__.return_value = file_handle
+    open_mock = MagicMock(return_value=file_handle)
+    monkeypatch.setattr(module, "open", open_mock, raising=False)
     progress = MagicMock()
 
     with pytest.raises(module.DownloadError, match="exceeds expected size"):
         downloader.download_installer(progress_callback=progress)
 
     progress.assert_not_called()
+    file_handle.write.assert_not_called()
+    assert not (download_dir / OFFLINE_NAME).exists()
+    assert not part_path.exists()
+    assert not download_dir.exists()
+
+
+def test_bootstrapper_import_does_not_require_update_downloader():
+    command = "\n".join(
+        [
+            "import sys",
+            "import bootstrapper.downloader",
+            "import bootstrapper.bootstrapper",
+            "assert 'src.core.update_downloader' not in sys.modules",
+        ]
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
 
 
 def test_bootstrapper_unowned_integrity_failure_does_not_delete_path(

@@ -6,12 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from src import update_integrity
-from src.core.update_downloader import (
-    MAX_INSTALLER_SIZE,
-    DownloadError,
-    UpdateDownloader,
-    select_release_asset,
-)
+from src.core.update_downloader import DownloadError, UpdateDownloader, select_release_asset
 from src.ui.workers.update_worker import UpdateDownloadWorker
 
 
@@ -497,7 +492,7 @@ def test_release_asset_rejects_size_above_shared_installer_limit():
         _asset(
             "TunnelForge-Setup-2.0.5.exe",
             "setup",
-            MAX_INSTALLER_SIZE + 1,
+            update_integrity.MAX_INSTALLER_SIZE + 1,
         )
     ]
 
@@ -533,11 +528,14 @@ def test_download_rejects_valid_content_length_mismatch_before_body(
     response.iter_content.assert_not_called()
 
 
-@pytest.mark.parametrize("content_length", [None, "not-a-number"])
+@pytest.mark.parametrize(
+    "content_length",
+    [None, "not-a-number", "+5", "-0", " 5", "5 ", "\u0665", "5x"],
+)
 def test_download_streams_safely_without_valid_content_length(
     monkeypatch, tmp_path, content_length
 ):
-    update_dir = tmp_path / f"tunnelforge-update-{content_length or 'missing'}"
+    update_dir = tmp_path / f"tunnelforge-update-{content_length!r}"
     update_dir.mkdir()
     downloader = UpdateDownloader()
     downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
@@ -568,6 +566,8 @@ def test_download_rejects_oversized_chunk_before_write(
 ):
     update_dir = tmp_path / "tunnelforge-update-oversized"
     update_dir.mkdir()
+    part_path = update_dir / "TunnelForge-Setup-2.0.5.exe.part"
+    part_path.write_bytes(b"")
     downloader = UpdateDownloader()
     downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
     downloader.file_size = 4
@@ -584,9 +584,31 @@ def test_download_rejects_oversized_chunk_before_write(
         "src.core.update_downloader.requests.get",
         lambda *_args, **_kwargs: response,
     )
+    file_handle = MagicMock()
+    file_handle.__enter__.return_value = file_handle
+    open_mock = MagicMock(return_value=file_handle)
+    monkeypatch.setattr(
+        "src.core.update_downloader.open",
+        open_mock,
+        raising=False,
+    )
     progress = MagicMock()
 
     with pytest.raises(DownloadError, match="exceeds expected size"):
         downloader.download_installer(progress_callback=progress)
 
     progress.assert_not_called()
+    file_handle.write.assert_not_called()
+    assert not (update_dir / "TunnelForge-Setup-2.0.5.exe").exists()
+    assert not part_path.exists()
+    assert not update_dir.exists()
+
+
+def test_content_length_parser_accepts_ascii_digits_only():
+    parser = getattr(update_integrity, "parse_content_length", None)
+
+    assert callable(parser)
+    assert parser("004") == 4
+    assert parser("0") == 0
+    for raw in (None, "+4", "-0", " 4", "4 ", "\u0664", "4x"):
+        assert parser(raw) is None

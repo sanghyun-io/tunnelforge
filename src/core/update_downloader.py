@@ -13,6 +13,8 @@ from urllib.parse import urlparse
 
 from src.update_integrity import (
     IntegrityError,
+    MAX_INSTALLER_SIZE,
+    parse_content_length,
     parse_sha256_digest,
     verify_file_integrity,
 )
@@ -26,10 +28,6 @@ RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/l
 # 다운로드 대상 파일 패턴 (버전별 파일명 사용)
 WINDOWS_INSTALLER_FILENAME_PREFIX = "TunnelForge-Setup-"
 MACOS_PACKAGE_FILENAME_PREFIX = "TunnelForge-macOS-"
-
-# Release installers are expected to remain well below this 2 GiB safety cap.
-MAX_INSTALLER_SIZE = 2 * 1024 * 1024 * 1024
-
 
 class DownloadError(Exception):
     """다운로드 관련 오류"""
@@ -178,14 +176,6 @@ class UpdateDownloader:
         """다운로드 취소"""
         self._cancelled = True
 
-    @staticmethod
-    def _valid_content_length(headers: Mapping[str, Any]) -> Optional[int]:
-        try:
-            content_length = int(headers.get("content-length"))
-        except (TypeError, ValueError):
-            return None
-        return content_length if content_length >= 0 else None
-
     def get_installer_info(self) -> Tuple[str, str, int]:
         """최신 릴리스 정보 조회
 
@@ -292,7 +282,9 @@ class UpdateDownloader:
             )
             response.raise_for_status()
 
-            content_length = self._valid_content_length(response.headers)
+            content_length = parse_content_length(
+                response.headers.get("content-length")
+            )
             if content_length is not None and content_length != self.file_size:
                 raise DownloadError(
                     "Content-Length size does not match release metadata"

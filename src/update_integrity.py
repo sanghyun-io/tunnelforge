@@ -7,9 +7,13 @@ import hmac
 import os
 from pathlib import Path
 import re
+from typing import Optional
 
 
 SHA256_DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
+
+# Release installers are expected to remain well below this 2 GiB safety cap.
+MAX_INSTALLER_SIZE = 2 * 1024 * 1024 * 1024
 
 
 class IntegrityError(ValueError):
@@ -21,6 +25,13 @@ def parse_sha256_digest(raw: object) -> str:
     if not match:
         raise IntegrityError("release asset SHA-256 digest is missing or invalid")
     return match.group(1).lower()
+
+
+def parse_content_length(raw: object) -> Optional[int]:
+    """Return a canonical Content-Length value, or None for invalid headers."""
+    if not isinstance(raw, str) or not raw or not raw.isascii() or not raw.isdigit():
+        return None
+    return int(raw)
 
 
 def verify_file_integrity(
