@@ -169,6 +169,14 @@ def _windows_close_handle_safely(handle: int) -> bool:
         return False
 
 
+def _close_descriptor_safely(descriptor: int) -> bool:
+    try:
+        os.close(descriptor)
+        return True
+    except OSError:
+        return False
+
+
 def _windows_path_identity(path: str, *, directory: bool) -> tuple[int, int]:
     share_mode = _FILE_SHARE_READ
     if directory:
@@ -328,6 +336,7 @@ class VerifiedFileLease:
                 share_mode=_FILE_SHARE_READ,
                 directory=False,
             )
+            descriptor = None
             try:
                 identity, attributes = _windows_handle_information(handle)
                 if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
@@ -336,8 +345,12 @@ class VerifiedFileLease:
                     raise IntegrityError("release path is not a regular file")
                 descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
                 handle = None
-                return os.fdopen(descriptor, "rb"), identity
+                source = os.fdopen(descriptor, "rb")
+                descriptor = None
+                return source, identity
             finally:
+                if descriptor is not None:
+                    _close_descriptor_safely(descriptor)
                 if handle is not None:
                     _windows_close_handle(handle)
 
@@ -351,10 +364,12 @@ class VerifiedFileLease:
             if not stat.S_ISREG(source_stat.st_mode):
                 raise IntegrityError("release path is not a regular file")
             identity = (source_stat.st_dev, source_stat.st_ino)
-            return os.fdopen(descriptor, "rb"), identity
-        except Exception:
-            os.close(descriptor)
-            raise
+            source = os.fdopen(descriptor, "rb")
+            descriptor = None
+            return source, identity
+        finally:
+            if descriptor is not None:
+                _close_descriptor_safely(descriptor)
 
     def _assert_dispatch_identity(self) -> None:
         if self._source is None or self._identity is None:
@@ -380,7 +395,14 @@ class VerifiedFileLease:
         self, callback: Callable[[str], _DispatchResult]
     ) -> _DispatchResult:
         self._assert_dispatch_identity()
-        return callback(self.path)
+        try:
+            return callback(self.path)
+        finally:
+            self._assert_dispatch_identity()
+
+    @property
+    def closed(self) -> bool:
+        return self._source is None or self._source.closed
 
     def close(self) -> None:
         if self._source is not None:

@@ -418,6 +418,43 @@ def test_posix_owned_temp_directory_never_unlinks_or_removes_root(tmp_path):
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_verified_lease_closes_descriptor_when_fdopen_fails(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / "installer.exe"
+    installer.write_bytes(b"safe")
+    close_descriptor = MagicMock()
+    close_handle = MagicMock()
+    monkeypatch.setattr(
+        update_integrity, "_windows_open_handle", lambda _path, **_kwargs: 71
+    )
+    monkeypatch.setattr(
+        update_integrity,
+        "_windows_handle_information",
+        lambda _handle: ((1, 2), 0),
+    )
+    monkeypatch.setattr(update_integrity.msvcrt, "open_osfhandle", lambda *_args: 72)
+    monkeypatch.setattr(
+        update_integrity.os,
+        "fdopen",
+        MagicMock(side_effect=OSError("fdopen failed")),
+    )
+    monkeypatch.setattr(update_integrity.os, "close", close_descriptor)
+    monkeypatch.setattr(update_integrity, "_windows_close_handle", close_handle)
+
+    lease = update_integrity.VerifiedFileLease(
+        installer,
+        hashlib.sha256(b"safe").hexdigest(),
+        4,
+    )
+    with pytest.raises(OSError, match="fdopen failed"):
+        lease._open_source()
+
+    close_descriptor.assert_called_once_with(72)
+    close_handle.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
 def test_windows_retain_records_registered_final_child_identity(monkeypatch, tmp_path):
     update_dir = tmp_path / "tunnelforge-update-identity"
     update_dir.mkdir()
@@ -700,9 +737,79 @@ def test_discard_downloaded_installer_rejects_replaced_owned_parent(
     assert (moved_dir / replacement.name).read_bytes() == b"safe"
 
 
-def test_verified_dispatch_rejects_replacement_after_hash(
+def test_verified_dispatch_checks_identity_before_and_after_callback(
     monkeypatch, tmp_path
 ):
+    installer = tmp_path / "installer.exe"
+    installer.write_bytes(b"safe")
+    lease = update_integrity.VerifiedFileLease(
+        installer,
+        hashlib.sha256(b"safe").hexdigest(),
+        4,
+    )
+    identity_checks = []
+    callback_states = []
+
+    with lease as verified:
+        original_assert = verified._assert_dispatch_identity
+
+        def record_identity_check():
+            identity_checks.append(verified.closed)
+            return original_assert()
+
+        monkeypatch.setattr(verified, "_assert_dispatch_identity", record_identity_check)
+
+        def callback(path):
+            callback_states.append((path, verified.closed))
+            return "started"
+
+        assert verified.dispatch(callback) == "started"
+
+    assert identity_checks == [False, False]
+    assert callback_states == [(str(installer.resolve()), False)]
+    assert verified.closed is True
+
+
+def test_verified_dispatch_does_not_return_success_after_identity_change(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / "installer.exe"
+    installer.write_bytes(b"safe")
+    lease = update_integrity.VerifiedFileLease(
+        installer,
+        hashlib.sha256(b"safe").hexdigest(),
+        4,
+    )
+    identity_checks = []
+    callback_states = []
+
+    with pytest.raises(update_integrity.IntegrityError, match="identity changed"):
+        with lease as verified:
+            def assert_identity():
+                identity_checks.append(verified.closed)
+                if len(identity_checks) == 2:
+                    raise update_integrity.IntegrityError(
+                        "release file path identity changed after dispatch"
+                    )
+
+            monkeypatch.setattr(
+                verified,
+                "_assert_dispatch_identity",
+                assert_identity,
+            )
+
+            def callback(_path):
+                callback_states.append(verified.closed)
+                return "started"
+
+            verified.dispatch(callback)
+
+    assert identity_checks == [False, False]
+    assert callback_states == [False]
+    assert lease.closed is True
+
+
+def test_verified_dispatch_rejects_replacement_from_callback(monkeypatch, tmp_path):
     update_dir = tmp_path / "tunnelforge-update-dispatch"
     update_dir.mkdir()
     downloader = UpdateDownloader()
@@ -726,39 +833,36 @@ def test_verified_dispatch_rejects_replacement_after_hash(
     owner = downloader._find_owned_parent(installer_path)
     assert owner is not None
     owner.close()
-    verified_type = getattr(update_integrity, "VerifiedLaunchFile")
-    original_assert = verified_type._assert_dispatch_identity
     replacement_blocked = []
-
-    def replace_before_identity_check(verified):
-        replacement = update_dir / "replacement.exe"
-        replacement.write_bytes(b"safe")
-        try:
-            os.replace(replacement, installer_path)
-        except PermissionError:
-            replacement_blocked.append(True)
-        return original_assert(verified)
-
-    monkeypatch.setattr(
-        verified_type,
-        "_assert_dispatch_identity",
-        replace_before_identity_check,
-    )
-    dispatched = []
+    callback_calls = []
 
     source = None
     with downloader.open_verified_installer(installer_path) as verified:
         source = verified._source
+
+        def callback(path):
+            callback_calls.append(path)
+            assert verified.closed is False
+            replacement = update_dir / "replacement.exe"
+            replacement.write_bytes(b"safe")
+            try:
+                os.replace(replacement, installer_path)
+            except PermissionError:
+                replacement_blocked.append(True)
+            return Path(path).read_bytes()
+
         if os.name == "nt":
-            verified.dispatch(lambda path: dispatched.append(Path(path).read_bytes()))
+            assert verified.dispatch(callback) == b"safe"
             assert replacement_blocked == [True]
-            assert dispatched == [b"safe"]
         else:
             with pytest.raises(update_integrity.IntegrityError, match="identity"):
-                verified.dispatch(lambda path: dispatched.append(path))
-            assert dispatched == []
+                verified.dispatch(callback)
+            assert replacement_blocked == []
+
+        assert callback_calls == [str(Path(installer_path).resolve())]
 
     assert source is not None and source.closed
+    assert verified.closed is True
     post_context_replacement = update_dir / "post-context-replacement.exe"
     post_context_replacement.write_bytes(b"after")
     os.replace(post_context_replacement, installer_path)

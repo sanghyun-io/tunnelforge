@@ -4,6 +4,7 @@ from pathlib import Path
 import threading
 from unittest.mock import MagicMock
 
+import pytest
 from PyQt6.QtWidgets import (
     QApplication,
     QDialog,
@@ -23,6 +24,19 @@ def _record_expected_integrity(dialog, package):
     contents = package.read_bytes()
     dialog._downloaded_installer_sha256 = hashlib.sha256(contents).hexdigest()
     dialog._downloaded_installer_size = len(contents)
+
+
+def _capture_settings_leases(monkeypatch):
+    lease_type = settings.VerifiedFileLease
+    leases = []
+
+    def create_lease(*args, **kwargs):
+        lease = lease_type(*args, **kwargs)
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(settings, "VerifiedFileLease", create_lease)
+    return leases
 
 
 def test_windows_update_launches_visible_installer_directly(monkeypatch, tmp_path):
@@ -97,6 +111,7 @@ def test_macos_update_open_failure_keeps_app_running(monkeypatch, tmp_path):
     monkeypatch.setattr(settings.QMessageBox, "question", MagicMock(return_value=QMessageBox.StandardButton.Yes))
     monkeypatch.setattr(settings.QDesktopServices, "openUrl", open_url)
     monkeypatch.setattr(settings.QMessageBox, "critical", critical)
+    leases = _capture_settings_leases(monkeypatch)
 
     settings.SettingsDialog._launch_installer(dialog)
 
@@ -105,6 +120,67 @@ def test_macos_update_open_failure_keeps_app_running(monkeypatch, tmp_path):
     main_window.close_app.assert_not_called()
     owner.discard_downloaded_installer.assert_not_called()
     assert package.exists()
+    assert len(leases) == 1 and leases[0].closed is True
+
+
+def test_macos_open_url_callback_rechecks_identity_before_success(
+    monkeypatch, tmp_path
+):
+    package = tmp_path / "TunnelForge-macOS-2.0.7-arm64.dmg"
+    package.write_bytes(b"safe")
+    main_window = MagicMock()
+    owner = MagicMock()
+    dialog = MagicMock()
+    dialog._downloaded_installer_path = str(package)
+    dialog._downloaded_installer_sha256 = hashlib.sha256(b"safe").hexdigest()
+    dialog._downloaded_installer_size = 4
+    dialog._downloaded_installer_owner = owner
+    dialog._latest_version = "2.0.7"
+    dialog.parent.return_value = main_window
+    leases = _capture_settings_leases(monkeypatch)
+    replacement_blocked = []
+    open_calls = []
+
+    def open_url(url):
+        open_calls.append(Path(url.toLocalFile()))
+        assert leases[0].closed is False
+        replacement = tmp_path / "open-url-replacement.dmg"
+        replacement.write_bytes(b"safe")
+        try:
+            os.replace(replacement, package)
+        except PermissionError:
+            replacement_blocked.append(True)
+        return True
+
+    critical = MagicMock()
+    monkeypatch.setattr(settings.sys, "platform", "darwin")
+    monkeypatch.setattr(
+        settings.QMessageBox,
+        "question",
+        MagicMock(return_value=QMessageBox.StandardButton.Yes),
+    )
+    monkeypatch.setattr(settings.QDesktopServices, "openUrl", open_url)
+    monkeypatch.setattr(settings.QMessageBox, "critical", critical)
+
+    settings.SettingsDialog._launch_installer(dialog)
+
+    assert open_calls == [package]
+    assert len(leases) == 1 and leases[0].closed is True
+    if os.name == "nt":
+        assert replacement_blocked == [True]
+        main_window.close_app.assert_called_once()
+        critical.assert_not_called()
+        owner.discard_downloaded_installer.assert_not_called()
+    else:
+        assert replacement_blocked == []
+        main_window.close_app.assert_not_called()
+        critical.assert_called_once()
+        owner.discard_downloaded_installer.assert_called_once_with(str(package))
+
+    post_context_replacement = tmp_path / "post-open-url.dmg"
+    post_context_replacement.write_bytes(b"after")
+    os.replace(post_context_replacement, package)
+    assert package.read_bytes() == b"after"
 
 
 def test_launch_installer_rechecks_integrity_before_process_start(monkeypatch, tmp_path):
@@ -225,7 +301,7 @@ def test_settings_integrity_cleanup_error_keeps_primary_failure(monkeypatch, tmp
     settings.QMessageBox.critical.assert_called_once()
 
 
-def test_settings_verified_launch_closes_replacement_race(
+def test_settings_popen_callback_holds_lease_and_rechecks_identity(
     monkeypatch, tmp_path
 ):
     installer, downloader = _download_owned_package(
@@ -246,57 +322,133 @@ def test_settings_verified_launch_closes_replacement_race(
     assert owner is not None
     owner.close()
 
-    verified_type = getattr(update_integrity, "VerifiedLaunchFile")
-    original_assert = verified_type._assert_dispatch_identity
+    leases = _capture_settings_leases(monkeypatch)
     replacement_blocked = []
+    popen_calls = []
 
-    def replace_before_identity_check(verified):
+    def popen(args, **kwargs):
+        popen_calls.append((args, kwargs))
+        assert leases[0].closed is False
         replacement = installer.parent / "replacement.exe"
         replacement.write_bytes(b"safe")
         try:
             os.replace(replacement, installer)
         except PermissionError:
             replacement_blocked.append(True)
-        return original_assert(verified)
+        return MagicMock()
 
-    monkeypatch.setattr(
-        verified_type,
-        "_assert_dispatch_identity",
-        replace_before_identity_check,
-    )
-    popen = MagicMock()
     critical = MagicMock()
-    confirmation_replacement_blocked = []
-
-    def confirm_while_lease_is_held(*_args, **_kwargs):
-        replacement = installer.parent / "confirmation-replacement.exe"
-        replacement.write_bytes(b"safe")
-        try:
-            os.replace(replacement, installer)
-        except PermissionError:
-            confirmation_replacement_blocked.append(True)
-        return QMessageBox.StandardButton.Yes
-
     monkeypatch.setattr(settings.sys, "platform", "win32")
     monkeypatch.setattr(
         settings.QMessageBox,
         "question",
-        confirm_while_lease_is_held,
+        MagicMock(return_value=QMessageBox.StandardButton.Yes),
     )
     monkeypatch.setattr(settings.QMessageBox, "critical", critical)
     monkeypatch.setattr(settings.subprocess, "Popen", popen)
 
     settings.SettingsDialog._launch_installer(dialog)
 
+    assert len(popen_calls) == 1
+    assert len(leases) == 1 and leases[0].closed is True
     if os.name == "nt":
-        assert confirmation_replacement_blocked == [True]
         assert replacement_blocked == [True]
-        popen.assert_called_once()
         main_window.close_app.assert_called_once()
+        critical.assert_not_called()
     else:
-        popen.assert_not_called()
+        assert replacement_blocked == []
         main_window.close_app.assert_not_called()
         critical.assert_called_once()
+
+    post_context_replacement = installer.parent / "post-context.exe"
+    post_context_replacement.write_bytes(b"after")
+    os.replace(post_context_replacement, installer)
+    assert installer.read_bytes() == b"after"
+
+
+def test_settings_confirmation_cancel_closes_lease_without_launch_or_discard(
+    monkeypatch, tmp_path
+):
+    installer, downloader = _download_owned_package(
+        monkeypatch,
+        tmp_path,
+        "TunnelForge-Setup-2.0.7.exe",
+        b"safe",
+    )
+    owner = downloader._find_owned_parent(str(installer))
+    assert owner is not None
+    owner.close()
+    discard = MagicMock(wraps=downloader.discard_downloaded_installer)
+    monkeypatch.setattr(downloader, "discard_downloaded_installer", discard)
+    dialog = MagicMock()
+    dialog._downloaded_installer_path = str(installer)
+    dialog._downloaded_installer_sha256 = hashlib.sha256(b"safe").hexdigest()
+    dialog._downloaded_installer_size = 4
+    dialog._downloaded_installer_owner = downloader
+    dialog._latest_version = "2.0.7"
+    main_window = MagicMock()
+    dialog.parent.return_value = main_window
+    leases = _capture_settings_leases(monkeypatch)
+    popen = MagicMock()
+    monkeypatch.setattr(settings.sys, "platform", "win32")
+    monkeypatch.setattr(
+        settings.QMessageBox,
+        "question",
+        MagicMock(return_value=QMessageBox.StandardButton.No),
+    )
+    monkeypatch.setattr(settings.subprocess, "Popen", popen)
+
+    settings.SettingsDialog._launch_installer(dialog)
+
+    assert len(leases) == 1 and leases[0].closed is True
+    popen.assert_not_called()
+    discard.assert_not_called()
+    main_window.close_app.assert_not_called()
+    assert installer.read_bytes() == b"safe"
+
+    replacement = installer.parent / "after-cancel.exe"
+    replacement.write_bytes(b"after")
+    os.replace(replacement, installer)
+    assert installer.read_bytes() == b"after"
+
+
+@pytest.mark.parametrize("platform_name", ["win32", "linux"])
+def test_settings_popen_failure_preserves_verified_installer(
+    monkeypatch, tmp_path, platform_name
+):
+    installer = tmp_path / "TunnelForge-Setup-2.0.7.exe"
+    installer.write_bytes(b"safe")
+    owner = MagicMock()
+    main_window = MagicMock()
+    dialog = MagicMock()
+    dialog._downloaded_installer_path = str(installer)
+    dialog._downloaded_installer_sha256 = hashlib.sha256(b"safe").hexdigest()
+    dialog._downloaded_installer_size = 4
+    dialog._downloaded_installer_owner = owner
+    dialog._latest_version = "2.0.7"
+    dialog.parent.return_value = main_window
+    leases = _capture_settings_leases(monkeypatch)
+    critical = MagicMock()
+    monkeypatch.setattr(settings.sys, "platform", platform_name)
+    monkeypatch.setattr(
+        settings.QMessageBox,
+        "question",
+        MagicMock(return_value=QMessageBox.StandardButton.Yes),
+    )
+    monkeypatch.setattr(
+        settings.subprocess,
+        "Popen",
+        MagicMock(side_effect=OSError("launch failed")),
+    )
+    monkeypatch.setattr(settings.QMessageBox, "critical", critical)
+
+    settings.SettingsDialog._launch_installer(dialog)
+
+    assert len(leases) == 1 and leases[0].closed is True
+    assert installer.read_bytes() == b"safe"
+    owner.discard_downloaded_installer.assert_not_called()
+    main_window.close_app.assert_not_called()
+    critical.assert_called_once()
 
 
 class _MinimalDownloadDialog(settings.SettingsDialog):

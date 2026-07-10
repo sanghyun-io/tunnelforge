@@ -243,10 +243,21 @@ def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tm
         bundled_bootstrapper.BootstrapperApp
     )
     app.downloaded_file = str(installer)
-    app.downloader = SimpleNamespace(
-        expected_sha256=hashlib.sha256(b"expected").hexdigest(),
-        file_size=len(b"expected"),
-    )
+    downloader = bundled_bootstrapper.InstallerDownloader()
+    downloader.expected_sha256 = hashlib.sha256(b"expected").hexdigest()
+    downloader.file_size = len(b"expected")
+    discard = MagicMock()
+    monkeypatch.setattr(downloader, "discard_downloaded_installer", discard)
+    leases = []
+    open_verified = downloader.open_verified_installer
+
+    def capture_lease(path):
+        lease = open_verified(path)
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(downloader, "open_verified_installer", capture_lease)
+    app.downloader = downloader
     errors = []
     app._show_error = errors.append
     monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0)
@@ -260,6 +271,9 @@ def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tm
     app._launch_installer()
 
     assert installer.exists()
+    assert installer.read_bytes() == b"expected"
+    assert len(leases) == 1 and leases[0].closed is True
+    discard.assert_not_called()
     assert len(errors) == 1
     assert errors[0].startswith("설치 프로그램 실행 실패")
 
@@ -706,24 +720,16 @@ def test_bootstrapper_verified_launch_closes_replacement_race(
     assert owner is not None
     owner.close()
 
-    verified_type = getattr(update_integrity, "VerifiedLaunchFile")
-    original_assert = verified_type._assert_dispatch_identity
     replacement_blocked = []
+    leases = []
+    open_verified = downloader.open_verified_installer
 
-    def replace_before_identity_check(verified):
-        replacement = download_dir / "replacement.exe"
-        replacement.write_bytes(b"safe")
-        try:
-            os.replace(replacement, installer_path)
-        except PermissionError:
-            replacement_blocked.append(True)
-        return original_assert(verified)
+    def capture_lease(path):
+        lease = open_verified(path)
+        leases.append(lease)
+        return lease
 
-    monkeypatch.setattr(
-        verified_type,
-        "_assert_dispatch_identity",
-        replace_before_identity_check,
-    )
+    monkeypatch.setattr(downloader, "open_verified_installer", capture_lease)
     app = bundled_bootstrapper.BootstrapperApp.__new__(
         bundled_bootstrapper.BootstrapperApp
     )
@@ -732,17 +738,35 @@ def test_bootstrapper_verified_launch_closes_replacement_race(
     app.root = MagicMock()
     errors = []
     app._show_error = errors.append
-    popen = MagicMock()
+    popen_calls = []
+
+    def popen(args, **kwargs):
+        popen_calls.append((args, kwargs))
+        assert leases[0].closed is False
+        replacement = download_dir / "replacement.exe"
+        replacement.write_bytes(b"safe")
+        try:
+            os.replace(replacement, installer_path)
+        except PermissionError:
+            replacement_blocked.append(True)
+        return MagicMock()
+
     monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0)
     monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
 
     app._launch_installer()
 
+    assert len(popen_calls) == 1
+    assert len(leases) == 1 and leases[0].closed is True
     if os.name == "nt":
         assert replacement_blocked == [True]
-        popen.assert_called_once()
         assert errors == []
     else:
-        popen.assert_not_called()
+        assert replacement_blocked == []
         assert errors and "identity" in errors[0]
+
+    post_context_replacement = download_dir / "post-context.exe"
+    post_context_replacement.write_bytes(b"after")
+    os.replace(post_context_replacement, installer_path)
+    assert Path(installer_path).read_bytes() == b"after"
