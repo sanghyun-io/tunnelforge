@@ -20,6 +20,9 @@ README_CONTRACTS = {
     },
 }
 
+TABLE_ITEM_PATTERN = r"^\s*\|?[^|\n]+(?:\|[^|\n]*)+\|?\s*$"
+LIST_ITEM_PATTERN = r"^\s*(?:[-*+] |\d+\. )"
+
 
 def _extract_h2_section(document, heading):
     match = re.search(
@@ -35,9 +38,37 @@ def _lines_matching_schedule_claims(section, line_pattern):
         line
         for line in section.splitlines()
         if re.match(line_pattern, line) and re.search(
-            r"schedule|예약(?=\s|$|[&*_])", line, re.IGNORECASE
+            r"schedule|예약(?=\s|$|[&*_])|스케줄", line, re.IGNORECASE
         )
     ]
+
+
+def test_schedule_claim_matcher_catches_common_table_and_tip_variants():
+    table_variants = [
+        "| Scheduled Backups | ... |",
+        "Scheduled Backups | ...",
+        "| 예약 백업 | ...",
+        "스케줄 백업 | ... |",
+    ]
+    tip_variants = [
+        "- Use schedules ...",
+        "* 예약 작업 ...",
+        "1. 스케줄 백업 ...",
+    ]
+
+    for line in table_variants:
+        assert _lines_matching_schedule_claims(line, TABLE_ITEM_PATTERN) == [line]
+    for line in tip_variants:
+        assert _lines_matching_schedule_claims(line, LIST_ITEM_PATTERN) == [line]
+
+    assert not _lines_matching_schedule_claims(
+        "Scheduled Backups are disabled in the default UI. See SCHEDULE.md.",
+        TABLE_ITEM_PATTERN,
+    )
+    assert not _lines_matching_schedule_claims(
+        "See [SCHEDULE.md](SCHEDULE.md) for the current status.",
+        LIST_ITEM_PATTERN,
+    )
 
 
 def test_bilingual_readmes_describe_schedule_as_unavailable_until_verified():
@@ -46,8 +77,8 @@ def test_bilingual_readmes_describe_schedule_as_unavailable_until_verified():
         feature_section = _extract_h2_section(doc, contract["features_heading"])
         tips_section = _extract_h2_section(doc, contract["tips_heading"])
 
-        assert not _lines_matching_schedule_claims(feature_section, r"^\s*\|.*\|\s*$")
-        assert not _lines_matching_schedule_claims(tips_section, r"^\s*(?:[-*+] |\d+\. )")
+        assert not _lines_matching_schedule_claims(feature_section, TABLE_ITEM_PATTERN)
+        assert not _lines_matching_schedule_claims(tips_section, LIST_ITEM_PATTERN)
         assert contract["disabled_status"] in doc
         assert contract["reactivation_status"] in doc
         assert "SCHEDULE.md" in doc
