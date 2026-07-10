@@ -13,6 +13,7 @@ from src.update_integrity import (
     parse_sha256_digest,
     verify_file_integrity,
 )
+from src.core.update_downloader import MAX_INSTALLER_SIZE
 
 from .version_info import (
     RELEASES_API_URL,
@@ -43,6 +44,18 @@ class InstallerDownloader:
     def cancel(self):
         """다운로드 취소"""
         self._cancelled = True
+
+    def reset_cancellation(self):
+        """새 다운로드 작업을 시작하기 전에 취소 상태를 초기화한다."""
+        self._cancelled = False
+
+    @staticmethod
+    def _valid_content_length(headers) -> Optional[int]:
+        try:
+            content_length = int(headers.get("content-length"))
+        except (TypeError, ValueError):
+            return None
+        return content_length if content_length >= 0 else None
 
     def get_latest_release(self) -> Tuple[str, str, int]:
         """최신 릴리스 정보 조회
@@ -89,6 +102,10 @@ class InstallerDownloader:
                     raise DownloadError("release asset size must be positive") from exc
                 if file_size <= 0:
                     raise DownloadError("release asset size must be positive")
+                if file_size > MAX_INSTALLER_SIZE:
+                    raise DownloadError(
+                        "release asset size exceeds maximum installer size"
+                    )
                 try:
                     expected_sha256 = parse_sha256_digest(asset.get('digest'))
                 except IntegrityError as exc:
@@ -145,10 +162,13 @@ class InstallerDownloader:
         """
         if not self.download_url:
             raise DownloadError("먼저 get_latest_release()를 호출해야 합니다")
-        if not self.expected_sha256 or self.file_size <= 0 or not self.installer_filename:
+        if (
+            not self.expected_sha256
+            or self.file_size <= 0
+            or self.file_size > MAX_INSTALLER_SIZE
+            or not self.installer_filename
+        ):
             raise DownloadError("release asset integrity metadata is missing or invalid")
-
-        self._cancelled = False
 
         temp_dir = tempfile.mkdtemp(prefix="tunnelforge-bootstrapper-")
         file_path = os.path.join(temp_dir, self.installer_filename)
@@ -163,8 +183,11 @@ class InstallerDownloader:
             )
             response.raise_for_status()
 
-            # Content-Length가 없는 경우 대비
-            total_size = int(response.headers.get('content-length', self.file_size))
+            content_length = self._valid_content_length(response.headers)
+            if content_length is not None and content_length != self.file_size:
+                raise DownloadError(
+                    "Content-Length size does not match release metadata"
+                )
 
             downloaded = 0
             with open(part_path, 'wb') as f:
@@ -172,11 +195,15 @@ class InstallerDownloader:
                     self._raise_if_cancelled()
 
                     if chunk:
+                        if downloaded + len(chunk) > self.file_size:
+                            raise DownloadError(
+                                "downloaded content exceeds expected size"
+                            )
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        if progress_callback and total_size > 0:
-                            progress_callback(downloaded, total_size)
+                        if progress_callback:
+                            progress_callback(downloaded, self.file_size)
 
             self._raise_if_cancelled()
             self.verify_downloaded_installer(part_path)

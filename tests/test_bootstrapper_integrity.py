@@ -1,12 +1,15 @@
 import hashlib
+import os
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from bootstrapper import bootstrapper as bundled_bootstrapper
 from bootstrapper import downloader as modular_downloader
+from src import update_integrity
+from src.core.update_downloader import MAX_INSTALLER_SIZE
 
 
 VALID_DIGEST = "sha256:" + "a" * 64
@@ -228,3 +231,327 @@ def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tm
     assert installer.exists()
     assert len(errors) == 1
     assert errors[0].startswith("설치 프로그램 실행 실패")
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_cancel_after_metadata_is_not_reset_before_download(
+    monkeypatch, module, downloader_class
+):
+    downloader = downloader_class()
+    api_response = _release_response([_asset(OFFLINE_NAME, "offline", 4)])
+    stream_calls = []
+
+    def get(url, **kwargs):
+        if kwargs.get("stream"):
+            stream_calls.append(url)
+            pytest.fail("cancelled task opened the download stream")
+        return api_response
+
+    monkeypatch.setattr(module.requests, "get", get)
+
+    downloader.get_latest_release()
+    downloader.cancel()
+
+    with pytest.raises(module.DownloadError, match="취소"):
+        downloader.download_installer()
+
+    assert stream_calls == []
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_reset_cancellation_starts_a_new_download_task(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    downloader = downloader_class()
+    api_response = _release_response(
+        [
+            _asset(
+                OFFLINE_NAME,
+                "offline",
+                4,
+                "sha256:" + hashlib.sha256(b"safe").hexdigest(),
+            )
+        ]
+    )
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+
+    def get(_url, **kwargs):
+        return response if kwargs.get("stream") else api_response
+
+    monkeypatch.setattr(module.requests, "get", get)
+    downloader.cancel()
+
+    assert callable(getattr(downloader, "reset_cancellation", None))
+    downloader.reset_cancellation()
+    downloader.get_latest_release()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+        installer_path = downloader.download_installer()
+
+    assert Path(installer_path).read_bytes() == b"safe"
+
+
+def test_bootstrapper_controller_resets_cancellation_before_metadata():
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.side_effect = bundled_bootstrapper.DownloadError(
+        "metadata failed"
+    )
+    app._update_status = MagicMock()
+    app._show_error = MagicMock()
+
+    app._download_worker()
+
+    assert app.downloader.method_calls[:2] == [
+        call.reset_cancellation(),
+        call.get_latest_release(),
+    ]
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_discard_ignores_unowned_path(
+    tmp_path, module, downloader_class
+):
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / OFFLINE_NAME
+    outside_file.write_bytes(b"outside")
+    downloader = downloader_class()
+
+    downloader.discard_downloaded_installer(str(outside_file))
+
+    assert outside_file.read_bytes() == b"outside"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_discard_rejects_replaced_owned_parent(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    moved_dir = tmp_path / "moved"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    installer_path = downloader.download_installer()
+
+    try:
+        os.replace(download_dir, moved_dir)
+    except PermissionError:
+        assert Path(installer_path).read_bytes() == b"safe"
+        return
+
+    download_dir.mkdir()
+    replacement = Path(installer_path)
+    replacement.write_bytes(b"victim")
+
+    downloader.discard_downloaded_installer(installer_path)
+
+    assert replacement.read_bytes() == b"victim"
+    assert (moved_dir / OFFLINE_NAME).read_bytes() == b"safe"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_rejects_release_above_shared_installer_limit(
+    monkeypatch, module, downloader_class
+):
+    downloader = downloader_class()
+    response = _release_response(
+        [_asset(OFFLINE_NAME, "offline", MAX_INSTALLER_SIZE + 1)]
+    )
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(module.DownloadError, match="maximum"):
+        downloader.get_latest_release()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_rejects_valid_content_length_mismatch_before_body(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = {"content-length": "5"}
+    response.iter_content.side_effect = AssertionError("response body was read")
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError, match="Content-Length"):
+        downloader.download_installer()
+
+    response.iter_content.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class", "content_length"),
+    [
+        (*implementation, content_length)
+        for implementation in DOWNLOADER_IMPLEMENTATIONS
+        for content_length in (None, "not-a-number")
+    ],
+)
+def test_bootstrapper_streams_safely_without_valid_content_length(
+    monkeypatch, tmp_path, module, downloader_class, content_length
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = (
+        {} if content_length is None else {"content-length": content_length}
+    )
+    response.iter_content.return_value = [b"sa", b"fe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    installer_path = downloader.download_installer()
+
+    assert Path(installer_path).read_bytes() == b"safe"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_rejects_oversized_chunk_before_write(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = {}
+    response.iter_content.return_value = [b"safe!"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+    progress = MagicMock()
+
+    with pytest.raises(module.DownloadError, match="exceeds expected size"):
+        downloader.download_installer(progress_callback=progress)
+
+    progress.assert_not_called()
+
+
+def test_bootstrapper_unowned_integrity_failure_does_not_delete_path(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"tampered")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app.downloader = bundled_bootstrapper.InstallerDownloader()
+    app.downloader.expected_sha256 = hashlib.sha256(b"expected").hexdigest()
+    app.downloader.file_size = len(b"expected")
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    assert installer.read_bytes() == b"tampered"
+    assert errors
+    popen.assert_not_called()
+
+
+def test_bootstrapper_verified_launch_closes_replacement_race(
+    monkeypatch, tmp_path
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = bundled_bootstrapper.InstallerDownloader()
+    _configure_download(downloader, b"safe")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        bundled_bootstrapper.requests,
+        "get",
+        lambda *_args, **_kwargs: response,
+    )
+    monkeypatch.setattr(
+        bundled_bootstrapper.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(download_dir),
+    )
+    installer_path = downloader.download_installer()
+
+    verified_type = getattr(update_integrity, "VerifiedLaunchFile")
+    original_assert = verified_type._assert_dispatch_identity
+    replacement_blocked = []
+
+    def replace_before_identity_check(verified):
+        replacement = download_dir / "replacement.exe"
+        replacement.write_bytes(b"safe")
+        try:
+            os.replace(replacement, installer_path)
+        except PermissionError:
+            replacement_blocked.append(True)
+        return original_assert(verified)
+
+    monkeypatch.setattr(
+        verified_type,
+        "_assert_dispatch_identity",
+        replace_before_identity_check,
+    )
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = installer_path
+    app.downloader = downloader
+    app.root = MagicMock()
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    if os.name == "nt":
+        assert replacement_blocked == [True]
+        popen.assert_called_once()
+        assert errors == []
+    else:
+        popen.assert_not_called()
+        assert errors and "identity" in errors[0]

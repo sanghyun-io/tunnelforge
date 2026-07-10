@@ -5,7 +5,13 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from src.core.update_downloader import DownloadError, UpdateDownloader, select_release_asset
+from src import update_integrity
+from src.core.update_downloader import (
+    MAX_INSTALLER_SIZE,
+    DownloadError,
+    UpdateDownloader,
+    select_release_asset,
+)
 from src.ui.workers.update_worker import UpdateDownloadWorker
 
 
@@ -388,3 +394,199 @@ def test_discard_downloaded_installer_removes_owned_success_path(
     downloader.discard_downloaded_installer(installer_path)
 
     assert not update_dir.exists()
+
+
+def test_discard_downloaded_installer_rejects_replaced_owned_parent(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-owned"
+    moved_dir = tmp_path / "tunnelforge-update-moved"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    installer_path = downloader.download_installer()
+
+    try:
+        os.replace(update_dir, moved_dir)
+    except PermissionError:
+        # Windows may prevent the swap while a secure directory token is open.
+        assert Path(installer_path).read_bytes() == b"safe"
+        return
+
+    update_dir.mkdir()
+    replacement = Path(installer_path)
+    replacement.write_bytes(b"victim")
+
+    downloader.discard_downloaded_installer(installer_path)
+
+    assert replacement.read_bytes() == b"victim"
+    assert (moved_dir / replacement.name).read_bytes() == b"safe"
+
+
+def test_verified_dispatch_rejects_replacement_after_hash(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-dispatch"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    installer_path = downloader.download_installer()
+    verified_type = getattr(update_integrity, "VerifiedLaunchFile")
+    original_assert = verified_type._assert_dispatch_identity
+    replacement_blocked = []
+
+    def replace_before_identity_check(verified):
+        replacement = update_dir / "replacement.exe"
+        replacement.write_bytes(b"safe")
+        try:
+            os.replace(replacement, installer_path)
+        except PermissionError:
+            replacement_blocked.append(True)
+        return original_assert(verified)
+
+    monkeypatch.setattr(
+        verified_type,
+        "_assert_dispatch_identity",
+        replace_before_identity_check,
+    )
+    dispatched = []
+
+    with downloader.open_verified_installer(installer_path) as verified:
+        if os.name == "nt":
+            verified.dispatch(lambda path: dispatched.append(Path(path).read_bytes()))
+            assert replacement_blocked == [True]
+            assert dispatched == [b"safe"]
+        else:
+            with pytest.raises(update_integrity.IntegrityError, match="identity"):
+                verified.dispatch(lambda path: dispatched.append(path))
+            assert dispatched == []
+
+
+def test_release_asset_rejects_size_above_shared_installer_limit():
+    assets = [
+        _asset(
+            "TunnelForge-Setup-2.0.5.exe",
+            "setup",
+            MAX_INSTALLER_SIZE + 1,
+        )
+    ]
+
+    with pytest.raises(DownloadError, match="maximum"):
+        select_release_asset(assets, "2.0.5", platform_name="Windows")
+
+
+def test_download_rejects_valid_content_length_mismatch_before_body(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-length"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = {"content-length": "5"}
+    response.iter_content.side_effect = AssertionError("response body was read")
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    with pytest.raises(DownloadError, match="Content-Length"):
+        downloader.download_installer()
+
+    response.iter_content.assert_not_called()
+
+
+@pytest.mark.parametrize("content_length", [None, "not-a-number"])
+def test_download_streams_safely_without_valid_content_length(
+    monkeypatch, tmp_path, content_length
+):
+    update_dir = tmp_path / f"tunnelforge-update-{content_length or 'missing'}"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = (
+        {} if content_length is None else {"content-length": content_length}
+    )
+    response.iter_content.return_value = [b"sa", b"fe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    installer_path = downloader.download_installer()
+
+    assert Path(installer_path).read_bytes() == b"safe"
+
+
+def test_download_rejects_oversized_chunk_before_write(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-oversized"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+
+    response = MagicMock()
+    response.headers = {}
+    response.iter_content.return_value = [b"safe!"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+    progress = MagicMock()
+
+    with pytest.raises(DownloadError, match="exceeds expected size"):
+        downloader.download_installer(progress_callback=progress)
+
+    progress.assert_not_called()
