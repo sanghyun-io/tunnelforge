@@ -854,10 +854,32 @@ def test_current_status_records_post_round3_reconciliation_full_suite():
     verification = _section(doc, "Verification Log")
     sessions = _section(doc, "Session Log")
 
+    assert "post-strategy-review full Python suite at 1827 passed / 6 warnings" in summary
+    assert "| `pytest -q` | PASS, 1827 passed, 6 warnings |" in baseline
+    assert "full Python suite passed at 1827 passed / 6 warnings" in verification
+    assert "full pytest 1827 passed / 6 warnings" in sessions
+
+
+def test_current_status_records_231_release_candidate_verification_evidence():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    baseline = _section(doc, "Current Baseline Verification")
+    verification = _section(doc, "Verification Log")
+    sessions = _section(doc, "Session Log")
+
     assert "release-candidate full Python suite passed at 1870 passed / 4 warnings" in summary
     assert "| `pytest -q` | PASS, 1870 passed, 4 warnings, 60.08s, exit 0 |" in baseline
-    assert "Full Python: 1870 passed, 4 warnings in 60.08s" in verification
-    assert "full pytest: 1870 passed / 4 warnings in 60.08s" in sessions
+    assert "Rust gate: 1.4s" in verification
+    assert "Cargo test: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored" in verification
+    assert "Rust gate exit 0 in 1.4s" in sessions
+    assert "Cargo test exit 0 in 4.1s" in sessions
+
+
+def test_current_status_session_log_has_one_header_delimiter():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    sessions = _section(doc, "Session Log")
+
+    assert sessions.count("| --- | --- | --- | --- |") == 1
 
 
 def test_current_status_records_strategy_review_findings_and_priority():
