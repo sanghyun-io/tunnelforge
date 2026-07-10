@@ -398,9 +398,8 @@ def test_settings_confirmation_cancel_closes_lease_without_launch_or_discard(
     assert installer.read_bytes() == b"after"
 
 
-@pytest.mark.parametrize("platform_name", ["win32", "linux"])
 def test_settings_popen_failure_preserves_verified_installer(
-    monkeypatch, tmp_path, platform_name
+    monkeypatch, tmp_path
 ):
     installer = tmp_path / "TunnelForge-Setup-2.0.7.exe"
     installer.write_bytes(b"safe")
@@ -415,7 +414,7 @@ def test_settings_popen_failure_preserves_verified_installer(
     dialog.parent.return_value = main_window
     leases = _capture_settings_leases(monkeypatch)
     critical = MagicMock()
-    monkeypatch.setattr(settings.sys, "platform", platform_name)
+    monkeypatch.setattr(settings.sys, "platform", "win32")
     monkeypatch.setattr(
         settings.QMessageBox,
         "question",
@@ -435,6 +434,40 @@ def test_settings_popen_failure_preserves_verified_installer(
     owner.discard_downloaded_installer.assert_not_called()
     main_window.close_app.assert_not_called()
     critical.assert_called_once()
+
+
+def test_non_windows_settings_reveals_parent_without_launch_or_critical(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / "TunnelForge-Setup-2.0.7.exe"
+    installer.write_bytes(b"safe")
+    main_window = MagicMock()
+    dialog = MagicMock()
+    dialog._downloaded_installer_path = str(installer)
+    dialog._downloaded_installer_sha256 = hashlib.sha256(b"safe").hexdigest()
+    dialog._downloaded_installer_size = 4
+    dialog._downloaded_installer_owner = MagicMock()
+    dialog.parent.return_value = main_window
+
+    popen = MagicMock()
+    open_url = MagicMock(return_value=True)
+    information = MagicMock()
+    critical = MagicMock()
+    monkeypatch.setattr(settings.sys, "platform", "linux")
+    monkeypatch.setattr(settings.subprocess, "Popen", popen)
+    monkeypatch.setattr(settings.QDesktopServices, "openUrl", open_url)
+    monkeypatch.setattr(settings.QMessageBox, "information", information)
+    monkeypatch.setattr(settings.QMessageBox, "critical", critical)
+
+    settings.SettingsDialog._launch_installer(dialog)
+
+    popen.assert_not_called()
+    open_url.assert_called_once()
+    assert Path(open_url.call_args.args[0].toLocalFile()) == installer.parent
+    information.assert_called_once()
+    critical.assert_not_called()
+    main_window.close_app.assert_not_called()
+    assert installer.exists()
 
 
 class _MinimalDownloadDialog(settings.SettingsDialog):
