@@ -61,6 +61,49 @@ jobs:
         shell: pwsh
         run: ./scripts/rust-core-regression-gate.ps1
 
+  python-regression:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout PR
+        shell: pwsh
+        run: |
+          git init .
+          git remote add origin "https://github.com/${{ github.repository }}.git"
+          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"
+          git checkout --detach FETCH_HEAD
+          git config --global --add safe.directory "$PWD"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Build tunnelforge-core (Rust)
+        shell: pwsh
+        run: cargo build --manifest-path migration_core/Cargo.toml --release
+
+      - name: Run full Python regression suite
+        shell: pwsh
+        run: pytest -q
+
   macos-app-validation:
     name: macOS App Validation (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
