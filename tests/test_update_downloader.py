@@ -391,6 +391,36 @@ def test_discard_downloaded_installer_removes_owned_success_path(
     assert not update_dir.exists()
 
 
+def test_discard_downloaded_installer_rejects_unowned_sibling(
+    monkeypatch, tmp_path
+):
+    update_dir = tmp_path / "tunnelforge-update-sibling"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.installer_filename = "TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    downloader.download_installer()
+    sibling = update_dir / "unowned.exe"
+    sibling.write_bytes(b"victim")
+
+    assert downloader.discard_downloaded_installer(str(sibling)) is False
+    assert sibling.read_bytes() == b"victim"
+
+
 def test_discard_downloaded_installer_rejects_replaced_owned_parent(
     monkeypatch, tmp_path
 ):

@@ -13,7 +13,11 @@ from PyQt6.QtGui import QDesktopServices, QFont
 from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
-from src.update_integrity import IntegrityError, verify_file_integrity
+from src.update_integrity import (
+    IntegrityError,
+    VerifiedLaunchFile,
+    verify_file_integrity,
+)
 from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
 from src.core.platform_integration import (
     StartupRegistrar,
@@ -529,6 +533,9 @@ class SettingsDialog(QDialog):
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
+        self._download_generation = 0
+        self._download_signal_relays = {}
         self._latest_version = None
 
         layout.addWidget(update_group)
@@ -685,9 +692,12 @@ class SettingsDialog(QDialog):
         """업데이트 다운로드 시작"""
         from src.ui.workers import UpdateDownloadWorker
 
+        self._download_generation += 1
+        generation = self._download_generation
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
 
         # UI 상태 변경
         self.btn_check_update.setEnabled(False)
@@ -700,14 +710,49 @@ class SettingsDialog(QDialog):
         self.download_detail_label.show()
 
         # Worker 시작
-        self._download_worker = UpdateDownloadWorker(config_manager=self.config_mgr)
-        self._download_worker.verification_ready.connect(
-            self._on_download_verification_ready
+        worker = UpdateDownloadWorker(config_manager=self.config_mgr)
+        self._download_worker = worker
+
+        def is_current_generation():
+            return (
+                generation == self._download_generation
+                and worker is self._download_worker
+            )
+
+        def verification_relay(sha256, file_size):
+            if is_current_generation():
+                self._on_download_verification_ready(sha256, file_size)
+
+        def info_relay(version, file_size):
+            if is_current_generation():
+                self._on_download_info_fetched(version, file_size)
+
+        def progress_relay(downloaded, total):
+            if is_current_generation():
+                self._on_download_progress(downloaded, total)
+
+        def finished_relay(success, result):
+            if not is_current_generation():
+                if success and result:
+                    worker.downloader.discard_downloaded_installer(result)
+                self._download_signal_relays.pop(generation, None)
+                return
+            self._on_download_finished(success, result, worker.downloader)
+            self._download_worker = None
+            self._download_signal_relays.pop(generation, None)
+
+        relays = (
+            verification_relay,
+            info_relay,
+            progress_relay,
+            finished_relay,
         )
-        self._download_worker.info_fetched.connect(self._on_download_info_fetched)
-        self._download_worker.progress.connect(self._on_download_progress)
-        self._download_worker.finished.connect(self._on_download_finished)
-        self._download_worker.start()
+        self._download_signal_relays[generation] = relays
+        worker.verification_ready.connect(verification_relay)
+        worker.info_fetched.connect(info_relay)
+        worker.progress.connect(progress_relay)
+        worker.finished.connect(finished_relay)
+        worker.start()
 
     def _on_download_info_fetched(self, version: str, file_size: int):
         """설치 프로그램 정보 수신"""
@@ -729,12 +774,13 @@ class SettingsDialog(QDialog):
             total_str = format_size(total)
             self.download_detail_label.setText(f"{downloaded_str} / {total_str}")
 
-    def _on_download_finished(self, success: bool, result: str):
+    def _on_download_finished(self, success: bool, result: str, owner=None):
         """다운로드 완료 처리"""
         self.btn_cancel_download.hide()
 
         if success:
             self._downloaded_installer_path = result
+            self._downloaded_installer_owner = owner
             action_text = update_package_action_text()
             self.download_progress.setValue(100)
             self.btn_download.setText(action_text.button)
@@ -748,6 +794,7 @@ class SettingsDialog(QDialog):
             self._downloaded_installer_path = None
             self._downloaded_installer_sha256 = None
             self._downloaded_installer_size = 0
+            self._downloaded_installer_owner = None
             self.download_progress.hide()
             self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
             self.btn_download.setEnabled(True)
@@ -757,14 +804,19 @@ class SettingsDialog(QDialog):
 
     def _cancel_download(self):
         """다운로드 취소"""
-        if self._download_worker:
-            self._download_worker.cancel()
-            self._download_worker.wait()
-            self._download_worker = None
+        cancelled_generation = self._download_generation
+        self._download_generation += 1
+        worker = self._download_worker
+        self._download_worker = None
+        if worker:
+            worker.cancel()
+            worker.wait()
+        self._download_signal_relays.pop(cancelled_generation, None)
 
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
 
         # UI 상태 복원
         self.btn_cancel_download.hide()
@@ -864,17 +916,15 @@ class SettingsDialog(QDialog):
 
     def _discard_invalid_installer(self, error_message: str) -> None:
         installer_path = self._downloaded_installer_path
-        if installer_path:
-            try:
-                os.remove(installer_path)
-            except FileNotFoundError:
-                pass
-            except OSError:
-                pass
+        owner = self._downloaded_installer_owner
+        discard = getattr(owner, "discard_downloaded_installer", None)
+        if installer_path and callable(discard):
+            discard(installer_path)
 
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
         self.download_progress.hide()
         self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
         self.btn_download.setEnabled(True)

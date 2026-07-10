@@ -190,9 +190,11 @@ def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
         bundled_bootstrapper.BootstrapperApp
     )
     app.downloaded_file = str(installer)
+    discard = MagicMock(return_value=True)
     app.downloader = SimpleNamespace(
         expected_sha256=hashlib.sha256(b"expected").hexdigest(),
         file_size=len(b"expected"),
+        discard_downloaded_installer=discard,
     )
     errors = []
     app._show_error = errors.append
@@ -201,7 +203,8 @@ def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
 
     app._launch_installer()
 
-    assert not installer.exists()
+    discard.assert_called_once_with(str(installer))
+    assert installer.exists()
     assert errors
     popen.assert_not_called()
 
@@ -336,6 +339,34 @@ def test_bootstrapper_discard_ignores_unowned_path(
     downloader.discard_downloaded_installer(str(outside_file))
 
     assert outside_file.read_bytes() == b"outside"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_discard_rejects_unowned_sibling(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    downloader.download_url = "https://example.com/" + OFFLINE_NAME
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    downloader.installer_filename = OFFLINE_NAME
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    downloader.download_installer()
+    sibling = download_dir / "unowned.exe"
+    sibling.write_bytes(b"victim")
+
+    assert downloader.discard_downloaded_installer(str(sibling)) is False
+    assert sibling.read_bytes() == b"victim"
 
 
 @pytest.mark.parametrize(

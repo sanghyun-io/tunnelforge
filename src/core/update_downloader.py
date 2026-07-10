@@ -14,6 +14,8 @@ from urllib.parse import urlparse
 from src.update_integrity import (
     IntegrityError,
     MAX_INSTALLER_SIZE,
+    OwnedTempDirectory,
+    VerifiedLaunchFile,
     parse_content_length,
     parse_sha256_digest,
     verify_file_integrity,
@@ -153,7 +155,7 @@ class UpdateDownloader:
         self.installer_filename: Optional[str] = None
         self._cancelled = False
         self._config_manager = config_manager
-        self._owned_temp_dirs = set()
+        self._owned_temp_dirs = {}
 
     @property
     def timeout(self) -> int:
@@ -266,12 +268,21 @@ class UpdateDownloader:
             raise DownloadError("release asset integrity metadata is missing or invalid")
 
         temp_dir = tempfile.mkdtemp(prefix="tunnelforge-update-")
-        self._owned_temp_dirs.add(os.path.realpath(temp_dir))
+        try:
+            owner = OwnedTempDirectory(temp_dir)
+        except (IntegrityError, OSError) as exc:
+            raise DownloadError(
+                f"temporary download directory could not be secured: {exc}"
+            ) from exc
+        self._owned_temp_dirs[owner.path] = owner
+        temp_dir = owner.path
         filename = self.installer_filename or os.path.basename(
             urlparse(self.download_url).path
         ) or "TunnelForge-Update"
         file_path = os.path.join(temp_dir, filename)
         part_path = f"{file_path}.part"
+        if not owner.claim_files((file_path, part_path)):
+            raise DownloadError("temporary download child path is not owned")
 
         try:
             self._raise_if_cancelled()
@@ -310,6 +321,8 @@ class UpdateDownloader:
             self.verify_downloaded_installer(part_path)
             self._raise_if_cancelled()
             os.replace(part_path, file_path)
+            if not owner.retain():
+                raise DownloadError("temporary download directory identity changed")
             self._raise_if_cancelled()
             return file_path
 
@@ -335,33 +348,59 @@ class UpdateDownloader:
         except (IntegrityError, OSError) as exc:
             raise DownloadError(str(exc)) from exc
 
-    def discard_downloaded_installer(self, path: str) -> None:
-        """Remove a returned installer only when its parent is task-owned."""
-        installer_path = os.path.realpath(path)
-        temp_dir = os.path.dirname(installer_path)
-        if temp_dir not in self._owned_temp_dirs:
-            return
-        self._cleanup_failed_download(
-            temp_dir,
-            f"{installer_path}.part",
-            installer_path,
-        )
+    def open_verified_installer(self, path: str) -> VerifiedLaunchFile:
+        """Return a verified file lease that can guard process dispatch."""
+        if not self.expected_sha256:
+            raise DownloadError("release asset SHA-256 digest is missing or invalid")
+        return VerifiedLaunchFile(path, self.expected_sha256, self.file_size)
+
+    def discard_downloaded_installer(self, path: str) -> bool:
+        """Remove a returned installer only when its parent identity is owned."""
+        owner = self._find_owned_parent(path)
+        if owner is None:
+            return False
+        removed = owner.discard_files((path, f"{path}.part"))
+        self._finish_owned_cleanup(owner, removed)
+        return removed
 
     def _raise_if_cancelled(self) -> None:
         if self._cancelled:
             raise DownloadError("다운로드가 취소되었습니다")
 
-    def _cleanup_failed_download(self, temp_dir: str, *paths: str) -> None:
-        for path in paths:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        try:
-            os.rmdir(temp_dir)
-        except OSError:
-            pass
-        self._owned_temp_dirs.discard(os.path.realpath(temp_dir))
+    def _find_owned_parent(self, path: str) -> Optional[OwnedTempDirectory]:
+        return next(
+            (
+                owner
+                for owner in self._owned_temp_dirs.values()
+                if owner.owns_direct_child(path)
+            ),
+            None,
+        )
+
+    def _finish_owned_cleanup(
+        self, owner: OwnedTempDirectory, removed: bool
+    ) -> None:
+        if removed and owner.remove_if_empty():
+            self._owned_temp_dirs.pop(owner.path, None)
+        elif not owner.identity_matches():
+            owner.close()
+            self._owned_temp_dirs.pop(owner.path, None)
+
+    def _cleanup_failed_download(self, temp_dir: str, *paths: str) -> bool:
+        owner = next(
+            (
+                candidate
+                for candidate in self._owned_temp_dirs.values()
+                if os.path.normcase(candidate.path)
+                == os.path.normcase(os.path.normpath(os.path.abspath(temp_dir)))
+            ),
+            None,
+        )
+        if owner is None:
+            return False
+        removed = owner.discard_files(paths)
+        self._finish_owned_cleanup(owner, removed)
+        return removed
 
 
 def format_size(size_bytes: int) -> str:

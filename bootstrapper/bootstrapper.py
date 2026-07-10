@@ -19,6 +19,8 @@ import requests
 from src.update_integrity import (
     IntegrityError,
     MAX_INSTALLER_SIZE,
+    OwnedTempDirectory,
+    VerifiedLaunchFile,
     parse_content_length,
     parse_sha256_digest,
     verify_file_integrity,
@@ -74,6 +76,7 @@ class InstallerDownloader:
         self.expected_sha256: Optional[str] = None
         self.installer_filename: Optional[str] = None
         self._cancelled = False
+        self._owned_temp_dirs = {}
 
     def cancel(self):
         """다운로드 취소"""
@@ -197,8 +200,18 @@ class InstallerDownloader:
             raise DownloadError("release asset integrity metadata is missing or invalid")
 
         temp_dir = tempfile.mkdtemp(prefix="tunnelforge-bootstrapper-")
+        try:
+            owner = OwnedTempDirectory(temp_dir)
+        except (IntegrityError, OSError) as exc:
+            raise DownloadError(
+                f"temporary download directory could not be secured: {exc}"
+            ) from exc
+        self._owned_temp_dirs[owner.path] = owner
+        temp_dir = owner.path
         file_path = os.path.join(temp_dir, self.installer_filename)
         part_path = f"{file_path}.part"
+        if not owner.claim_files((file_path, part_path)):
+            raise DownloadError("temporary download child path is not owned")
 
         try:
             self._raise_if_cancelled()
@@ -237,6 +250,8 @@ class InstallerDownloader:
             self.verify_downloaded_installer(part_path)
             self._raise_if_cancelled()
             os.replace(part_path, file_path)
+            if not owner.retain():
+                raise DownloadError("temporary download directory identity changed")
             self._raise_if_cancelled()
             return file_path
 
@@ -262,21 +277,61 @@ class InstallerDownloader:
         except (IntegrityError, OSError) as exc:
             raise DownloadError(str(exc)) from exc
 
+    def open_verified_installer(self, path: str) -> VerifiedLaunchFile:
+        """Return a verified file lease that can guard process dispatch."""
+        if not self.expected_sha256:
+            raise DownloadError("release asset SHA-256 digest is missing or invalid")
+        return VerifiedLaunchFile(path, self.expected_sha256, self.file_size)
+
+    def discard_downloaded_installer(self, path: str) -> bool:
+        """Remove an installer only when its recorded parent identity matches."""
+        owner = self._find_owned_parent(path)
+        if owner is None:
+            return False
+        removed = owner.discard_files((path, f"{path}.part"))
+        self._finish_owned_cleanup(owner, removed)
+        return removed
+
     def _raise_if_cancelled(self) -> None:
         if self._cancelled:
             raise DownloadError("다운로드가 취소되었습니다")
 
-    @staticmethod
-    def _cleanup_failed_download(temp_dir: str, *paths: str) -> None:
-        for path in paths:
-            try:
-                os.remove(path)
-            except OSError:
-                pass
-        try:
-            os.rmdir(temp_dir)
-        except OSError:
-            pass
+    def _find_owned_parent(self, path: str) -> Optional[OwnedTempDirectory]:
+        return next(
+            (
+                owner
+                for owner in self._owned_temp_dirs.values()
+                if owner.owns_direct_child(path)
+            ),
+            None,
+        )
+
+    def _finish_owned_cleanup(
+        self, owner: OwnedTempDirectory, removed: bool
+    ) -> None:
+        if removed and owner.remove_if_empty():
+            self._owned_temp_dirs.pop(owner.path, None)
+        elif not owner.identity_matches():
+            owner.close()
+            self._owned_temp_dirs.pop(owner.path, None)
+
+    def _cleanup_failed_download(self, temp_dir: str, *paths: str) -> bool:
+        normalized_temp_dir = os.path.normcase(
+            os.path.normpath(os.path.abspath(temp_dir))
+        )
+        owner = next(
+            (
+                candidate
+                for candidate in self._owned_temp_dirs.values()
+                if os.path.normcase(candidate.path) == normalized_temp_dir
+            ),
+            None,
+        )
+        if owner is None:
+            return False
+        removed = owner.discard_files(paths)
+        self._finish_owned_cleanup(owner, removed)
+        return removed
 
 
 # ============================================================
@@ -479,33 +534,37 @@ class BootstrapperApp:
             expected_size = getattr(self.downloader, "file_size", 0)
             if not expected_sha256 or expected_size <= 0:
                 raise IntegrityError("release asset integrity metadata is missing or invalid")
-            verify_file_integrity(
+            with VerifiedLaunchFile(
                 self.downloaded_file,
                 expected_sha256,
                 expected_size,
+            ) as verified:
+                verified.dispatch(
+                    lambda path: subprocess.Popen(
+                        [path],
+                        creationflags=(
+                            subprocess.DETACHED_PROCESS
+                            | subprocess.CREATE_NEW_PROCESS_GROUP
+                        ),
+                    )
+                )
+        except IntegrityError as e:
+            discard = getattr(
+                self.downloader, "discard_downloaded_installer", None
             )
-        except (IntegrityError, OSError) as e:
-            try:
-                os.remove(self.downloaded_file)
-            except OSError:
-                pass
+            if callable(discard):
+                discard(self.downloaded_file)
             self._show_error(f"다운로드된 설치 파일 검증 실패: {str(e)}")
             return
-
-        try:
-            # 설치 프로그램 실행 (부트스트래퍼와 별개 프로세스)
-            subprocess.Popen(
-                [self.downloaded_file],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
-            )
-
-            # 부트스트래퍼 종료
-            self.root.after(500, self.root.destroy)
         except Exception as e:
             self._show_error(
                 f"설치 프로그램 실행 실패: {str(e)}\n\n"
                 f"파일 위치: {self.downloaded_file}"
             )
+            return
+
+        # 부트스트래퍼 종료
+        self.root.after(500, self.root.destroy)
 
     def _on_cancel(self):
         """취소 버튼 클릭"""

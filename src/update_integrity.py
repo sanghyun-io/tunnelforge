@@ -1,19 +1,20 @@
-"""Shared release-package integrity verification."""
+"""Shared release-package integrity and ownership primitives."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import os
-from pathlib import Path
 import re
-from typing import Optional
+import stat
+from typing import Callable, Iterable, Optional, TypeVar
 
 
 SHA256_DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 
 # Release installers are expected to remain well below this 2 GiB safety cap.
 MAX_INSTALLER_SIZE = 2 * 1024 * 1024 * 1024
+_REPARSE_POINT_ATTRIBUTE = 0x00000400
 
 
 class IntegrityError(ValueError):
@@ -34,21 +35,503 @@ def parse_content_length(raw: object) -> Optional[int]:
     return int(raw)
 
 
+if os.name == "nt":
+    import ctypes
+    from ctypes import wintypes
+    import msvcrt
+
+    _GENERIC_READ = 0x80000000
+    _DELETE = 0x00010000
+    _FILE_LIST_DIRECTORY = 0x0001
+    _FILE_READ_ATTRIBUTES = 0x0080
+    _FILE_SHARE_READ = 0x00000001
+    _FILE_SHARE_WRITE = 0x00000002
+    _FILE_SHARE_DELETE = 0x00000004
+    _OPEN_EXISTING = 3
+    _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
+    _FILE_ATTRIBUTE_REPARSE_POINT = _REPARSE_POINT_ATTRIBUTE
+    _FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
+    _FILE_FLAG_OPEN_REPARSE_POINT = 0x00200000
+    _FILE_FLAG_BACKUP_SEMANTICS = 0x02000000
+    _FILE_DISPOSITION_INFO_CLASS = 4
+    _INVALID_HANDLE_VALUE = ctypes.c_void_p(-1).value
+
+    class _BY_HANDLE_FILE_INFORMATION(ctypes.Structure):
+        _fields_ = [
+            ("dwFileAttributes", wintypes.DWORD),
+            ("ftCreationTime", wintypes.FILETIME),
+            ("ftLastAccessTime", wintypes.FILETIME),
+            ("ftLastWriteTime", wintypes.FILETIME),
+            ("dwVolumeSerialNumber", wintypes.DWORD),
+            ("nFileSizeHigh", wintypes.DWORD),
+            ("nFileSizeLow", wintypes.DWORD),
+            ("nNumberOfLinks", wintypes.DWORD),
+            ("nFileIndexHigh", wintypes.DWORD),
+            ("nFileIndexLow", wintypes.DWORD),
+        ]
+
+    class _FILE_DISPOSITION_INFO(ctypes.Structure):
+        _fields_ = [("DeleteFile", wintypes.BOOL)]
+
+    _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _CreateFileW = _kernel32.CreateFileW
+    _CreateFileW.argtypes = (
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        wintypes.HANDLE,
+    )
+    _CreateFileW.restype = wintypes.HANDLE
+    _GetFileInformationByHandle = _kernel32.GetFileInformationByHandle
+    _GetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(_BY_HANDLE_FILE_INFORMATION),
+    )
+    _GetFileInformationByHandle.restype = wintypes.BOOL
+    _SetFileInformationByHandle = _kernel32.SetFileInformationByHandle
+    _SetFileInformationByHandle.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_int,
+        wintypes.LPVOID,
+        wintypes.DWORD,
+    )
+    _SetFileInformationByHandle.restype = wintypes.BOOL
+    _CloseHandle = _kernel32.CloseHandle
+    _CloseHandle.argtypes = (wintypes.HANDLE,)
+    _CloseHandle.restype = wintypes.BOOL
+
+
+def _absolute_path(path: str | os.PathLike[str]) -> str:
+    return os.path.normpath(os.path.abspath(os.fspath(path)))
+
+
+def _same_path(left: str, right: str) -> bool:
+    return os.path.normcase(left) == os.path.normcase(right)
+
+
+def _is_safe_directory(entry: os.stat_result) -> bool:
+    return (
+        stat.S_ISDIR(entry.st_mode)
+        and not stat.S_ISLNK(entry.st_mode)
+        and not (
+            getattr(entry, "st_file_attributes", 0) & _REPARSE_POINT_ATTRIBUTE
+        )
+    )
+
+
+def _windows_open_handle(
+    path: str,
+    *,
+    desired_access: int,
+    share_mode: int,
+    directory: bool,
+) -> int:
+    flags = _FILE_FLAG_OPEN_REPARSE_POINT
+    flags |= _FILE_FLAG_BACKUP_SEMANTICS if directory else _FILE_FLAG_SEQUENTIAL_SCAN
+    handle = _CreateFileW(
+        path,
+        desired_access,
+        share_mode,
+        None,
+        _OPEN_EXISTING,
+        flags,
+        None,
+    )
+    if handle == _INVALID_HANDLE_VALUE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    return handle
+
+
+def _windows_handle_information(handle: int) -> tuple[tuple[int, int], int]:
+    information = _BY_HANDLE_FILE_INFORMATION()
+    if not _GetFileInformationByHandle(handle, ctypes.byref(information)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    identity = (
+        information.dwVolumeSerialNumber,
+        (information.nFileIndexHigh << 32) | information.nFileIndexLow,
+    )
+    return identity, information.dwFileAttributes
+
+
+def _windows_close_handle(handle: int) -> None:
+    if not _CloseHandle(handle):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _windows_path_identity(path: str, *, directory: bool) -> tuple[int, int]:
+    share_mode = _FILE_SHARE_READ
+    if directory:
+        # The retained directory token requests DELETE access, so this observer
+        # must share DELETE even though the retained token still denies it.
+        share_mode |= _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
+    handle = _windows_open_handle(
+        path,
+        desired_access=_FILE_READ_ATTRIBUTES,
+        share_mode=share_mode,
+        directory=directory,
+    )
+    try:
+        identity, attributes = _windows_handle_information(handle)
+        if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+            raise IntegrityError("release path is a reparse point")
+        is_directory = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
+        if is_directory != directory:
+            raise IntegrityError("release path type changed")
+        return identity
+    finally:
+        _windows_close_handle(handle)
+
+
+def _windows_mark_directory_for_delete(handle: int) -> bool:
+    disposition = _FILE_DISPOSITION_INFO(True)
+    return bool(
+        _SetFileInformationByHandle(
+            handle,
+            _FILE_DISPOSITION_INFO_CLASS,
+            ctypes.byref(disposition),
+            ctypes.sizeof(disposition),
+        )
+    )
+
+
+_DispatchResult = TypeVar("_DispatchResult")
+
+
+class VerifiedLaunchFile:
+    """A verified no-follow file lease retained through launch dispatch."""
+
+    def __init__(
+        self,
+        path: str | os.PathLike[str],
+        expected_sha256: str,
+        expected_size: int,
+    ):
+        self.path = _absolute_path(path)
+        self.expected_sha256 = expected_sha256
+        self.expected_size = expected_size
+        self._source = None
+        self._identity = None
+
+    def __enter__(self) -> "VerifiedLaunchFile":
+        if self.expected_size <= 0:
+            raise IntegrityError("release asset size must be positive")
+        try:
+            self._source, self._identity = self._open_source()
+            source_stat = os.fstat(self._source.fileno())
+            if source_stat.st_size != self.expected_size:
+                raise IntegrityError(
+                    "downloaded file size does not match release metadata"
+                )
+
+            hasher = hashlib.sha256()
+            for chunk in iter(lambda: self._source.read(1024 * 1024), b""):
+                hasher.update(chunk)
+            if not hmac.compare_digest(hasher.hexdigest(), self.expected_sha256):
+                raise IntegrityError(
+                    "downloaded file SHA-256 does not match release metadata"
+                )
+            self._source.seek(0)
+            return self
+        except IntegrityError:
+            self.close()
+            raise
+        except OSError as exc:
+            self.close()
+            raise IntegrityError(f"could not open release file securely: {exc}") from exc
+
+    def __exit__(self, _exc_type, _exc, _traceback) -> None:
+        self.close()
+
+    def _open_source(self):
+        if os.name == "nt":
+            handle = _windows_open_handle(
+                self.path,
+                desired_access=_GENERIC_READ,
+                share_mode=_FILE_SHARE_READ,
+                directory=False,
+            )
+            try:
+                identity, attributes = _windows_handle_information(handle)
+                if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                    raise IntegrityError("release file is a reparse point")
+                if attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    raise IntegrityError("release path is not a regular file")
+                descriptor = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+                handle = None
+                return os.fdopen(descriptor, "rb"), identity
+            finally:
+                if handle is not None:
+                    _windows_close_handle(handle)
+
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            raise IntegrityError("no-follow file opens are unavailable")
+        flags = os.O_RDONLY | no_follow | getattr(os, "O_CLOEXEC", 0)
+        descriptor = os.open(self.path, flags)
+        try:
+            source_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(source_stat.st_mode):
+                raise IntegrityError("release path is not a regular file")
+            identity = (source_stat.st_dev, source_stat.st_ino)
+            return os.fdopen(descriptor, "rb"), identity
+        except Exception:
+            os.close(descriptor)
+            raise
+
+    def _assert_dispatch_identity(self) -> None:
+        if self._source is None or self._identity is None:
+            raise IntegrityError("verified release file lease is not active")
+        try:
+            if os.name == "nt":
+                current_identity = _windows_path_identity(self.path, directory=False)
+            else:
+                current = os.stat(self.path, follow_symlinks=False)
+                if not stat.S_ISREG(current.st_mode):
+                    raise IntegrityError("release path is not a regular file")
+                current_identity = (current.st_dev, current.st_ino)
+        except IntegrityError:
+            raise
+        except OSError as exc:
+            raise IntegrityError(
+                f"release file path identity is unavailable: {exc}"
+            ) from exc
+        if current_identity != self._identity:
+            raise IntegrityError("release file path identity changed before dispatch")
+
+    def dispatch(
+        self, callback: Callable[[str], _DispatchResult]
+    ) -> _DispatchResult:
+        self._assert_dispatch_identity()
+        return callback(self.path)
+
+    def close(self) -> None:
+        if self._source is not None:
+            self._source.close()
+            self._source = None
+
+
+class OwnedTempDirectory:
+    """Identity token for one downloader-created temporary directory."""
+
+    def __init__(self, path: str | os.PathLike[str]):
+        self.path = _absolute_path(path)
+        self._handle = None
+        self._descriptor = None
+        self._owned_child_names: set[str] = set()
+
+        try:
+            parent_lstat = os.lstat(self.path)
+            if not _is_safe_directory(parent_lstat):
+                raise IntegrityError("temporary parent is not a safe directory")
+            self._path_identity = (parent_lstat.st_dev, parent_lstat.st_ino)
+
+            if os.name == "nt":
+                capture_handle = _windows_open_handle(
+                    self.path,
+                    desired_access=_FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES,
+                    share_mode=(
+                        _FILE_SHARE_READ | _FILE_SHARE_WRITE | _FILE_SHARE_DELETE
+                    ),
+                    directory=True,
+                )
+                try:
+                    self.identity, attributes = _windows_handle_information(
+                        capture_handle
+                    )
+                    if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                        raise IntegrityError("temporary parent is a reparse point")
+                    if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                        raise IntegrityError("temporary parent is not a directory")
+                finally:
+                    _windows_close_handle(capture_handle)
+            else:
+                no_follow = getattr(os, "O_NOFOLLOW", 0)
+                if not no_follow:
+                    raise IntegrityError("no-follow directory opens are unavailable")
+                flags = (
+                    os.O_RDONLY
+                    | no_follow
+                    | getattr(os, "O_DIRECTORY", 0)
+                    | getattr(os, "O_CLOEXEC", 0)
+                )
+                self._descriptor = os.open(self.path, flags)
+                parent_stat = os.fstat(self._descriptor)
+                if not _is_safe_directory(parent_stat):
+                    raise IntegrityError("temporary parent is not a directory")
+                self.identity = (parent_stat.st_dev, parent_stat.st_ino)
+                if self.identity != self._path_identity:
+                    raise IntegrityError("temporary parent identity changed")
+        except Exception:
+            self.close()
+            raise
+
+    def _is_direct_child(self, path: str | os.PathLike[str]) -> bool:
+        candidate = _absolute_path(path)
+        parent, name = os.path.split(candidate)
+        return (
+            _same_path(parent, self.path)
+            and bool(name)
+            and name not in {".", ".."}
+        )
+
+    def claim_files(self, paths: Iterable[str | os.PathLike[str]]) -> bool:
+        """Register the exact direct child names created by this downloader."""
+        candidates = [_absolute_path(path) for path in paths]
+        if not all(self._is_direct_child(candidate) for candidate in candidates):
+            return False
+        self._owned_child_names.update(os.path.basename(path) for path in candidates)
+        return True
+
+    def owns_direct_child(self, path: str | os.PathLike[str]) -> bool:
+        candidate = _absolute_path(path)
+        return (
+            self._is_direct_child(candidate)
+            and os.path.basename(candidate) in self._owned_child_names
+        )
+
+    def identity_matches(self) -> bool:
+        try:
+            current_lstat = os.lstat(self.path)
+            if (
+                not _is_safe_directory(current_lstat)
+                or (current_lstat.st_dev, current_lstat.st_ino)
+                != self._path_identity
+            ):
+                return False
+            if os.name == "nt":
+                if self._handle is None and not self.retain():
+                    return False
+                return _windows_path_identity(
+                    self.path, directory=True
+                ) == self.identity
+            current = os.stat(self.path, follow_symlinks=False)
+            return _is_safe_directory(current) and (
+                current.st_dev,
+                current.st_ino,
+            ) == self.identity
+        except (IntegrityError, OSError):
+            return False
+
+    def retain(self) -> bool:
+        """Retain a Windows deny-delete handle after download finalization."""
+        if os.name != "nt":
+            return self.identity_matches()
+        if self._handle is not None:
+            return True
+        try:
+            handle = _windows_open_handle(
+                self.path,
+                desired_access=(
+                    _DELETE | _FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES
+                ),
+                share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                directory=True,
+            )
+            current_identity, attributes = _windows_handle_information(handle)
+            if (
+                current_identity != self.identity
+                or attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                or not attributes & _FILE_ATTRIBUTE_DIRECTORY
+            ):
+                _windows_close_handle(handle)
+                return False
+            self._handle = handle
+            return True
+        except OSError:
+            return False
+
+    def discard_files(
+        self, paths: Iterable[str | os.PathLike[str]]
+    ) -> bool:
+        candidates = []
+        for path in paths:
+            candidate = _absolute_path(path)
+            if not self.owns_direct_child(candidate):
+                return False
+            candidates.append(candidate)
+
+        if not self.identity_matches():
+            return False
+
+        existing = []
+        for candidate in candidates:
+            try:
+                if os.name == "nt":
+                    child_stat = os.lstat(candidate)
+                else:
+                    child_stat = os.stat(
+                        os.path.basename(candidate),
+                        dir_fd=self._descriptor,
+                        follow_symlinks=False,
+                    )
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return False
+
+            attributes = getattr(child_stat, "st_file_attributes", 0)
+            if (
+                not stat.S_ISREG(child_stat.st_mode)
+                or attributes & _REPARSE_POINT_ATTRIBUTE
+            ):
+                return False
+            existing.append(candidate)
+
+        try:
+            for candidate in existing:
+                if os.name == "nt":
+                    os.remove(candidate)
+                else:
+                    os.unlink(
+                        os.path.basename(candidate),
+                        dir_fd=self._descriptor,
+                    )
+        except OSError:
+            return False
+        return True
+
+    def remove_if_empty(self) -> bool:
+        if not self.identity_matches():
+            return False
+        if os.name == "nt":
+            if self._handle is None or not _windows_mark_directory_for_delete(
+                self._handle
+            ):
+                return False
+            self.close()
+            return True
+        try:
+            os.rmdir(self.path)
+        except OSError:
+            return False
+        self.close()
+        return True
+
+    def close(self) -> None:
+        if self._handle is not None:
+            handle = self._handle
+            self._handle = None
+            try:
+                _windows_close_handle(handle)
+            except OSError:
+                pass
+        if self._descriptor is not None:
+            descriptor = self._descriptor
+            self._descriptor = None
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+    def __del__(self):
+        self.close()
+
+
 def verify_file_integrity(
     path: str | os.PathLike[str], expected_sha256: str, expected_size: int
 ) -> None:
-    path = Path(path)
-    if expected_size <= 0:
-        raise IntegrityError("release asset size must be positive")
-    if path.stat().st_size != expected_size:
-        raise IntegrityError("downloaded file size does not match release metadata")
-
-    hasher = hashlib.sha256()
-    with path.open("rb") as source:
-        for chunk in iter(lambda: source.read(1024 * 1024), b""):
-            hasher.update(chunk)
-
-    if not hmac.compare_digest(hasher.hexdigest(), expected_sha256):
-        raise IntegrityError(
-            "downloaded file SHA-256 does not match release metadata"
-        )
+    with VerifiedLaunchFile(path, expected_sha256, expected_size):
+        pass
