@@ -690,7 +690,10 @@ class SettingsDialog(QDialog):
         """업데이트 다운로드 시작"""
         from src.ui.workers import UpdateDownloadWorker
 
-        self._download_generation += 1
+        previous_worker = self._retire_download_worker()
+        if previous_worker:
+            previous_worker.cancel()
+            previous_worker.wait()
         generation = self._download_generation
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
@@ -711,33 +714,23 @@ class SettingsDialog(QDialog):
         worker = UpdateDownloadWorker(config_manager=self.config_mgr)
         self._download_worker = worker
 
-        def is_current_generation():
-            return (
-                generation == self._download_generation
-                and worker is self._download_worker
+        def verification_relay(sha256, file_size):
+            self._handle_download_verification_ready(
+                generation, worker, sha256, file_size
             )
 
-        def verification_relay(sha256, file_size):
-            if is_current_generation():
-                self._on_download_verification_ready(sha256, file_size)
-
         def info_relay(version, file_size):
-            if is_current_generation():
-                self._on_download_info_fetched(version, file_size)
+            self._handle_download_info_fetched(
+                generation, worker, version, file_size
+            )
 
         def progress_relay(downloaded, total):
-            if is_current_generation():
-                self._on_download_progress(downloaded, total)
+            self._handle_download_progress(
+                generation, worker, downloaded, total
+            )
 
         def finished_relay(success, result):
-            if not is_current_generation():
-                if success and result:
-                    worker.downloader.discard_downloaded_installer(result)
-                self._download_signal_relays.pop(generation, None)
-                return
-            self._on_download_finished(success, result, worker.downloader)
-            self._download_worker = None
-            self._download_signal_relays.pop(generation, None)
+            self._handle_download_finished(generation, worker, success, result)
 
         relays = (
             verification_relay,
@@ -752,16 +745,65 @@ class SettingsDialog(QDialog):
         worker.finished.connect(finished_relay)
         worker.start()
 
+    def _retire_download_worker(self):
+        """Invalidate the active download generation and detach its worker."""
+        retired_generation = self._download_generation
+        self._download_generation += 1
+        worker = self._download_worker
+        self._download_worker = None
+        self._download_signal_relays.pop(retired_generation, None)
+        return worker
+
+    def _is_current_download_worker(self, generation, worker) -> bool:
+        return (
+            generation == self._download_generation
+            and worker is self._download_worker
+        )
+
+    @staticmethod
+    def _discard_stale_downloaded_installer(worker, installer_path: str) -> None:
+        discard = getattr(
+            getattr(worker, "downloader", None),
+            "discard_downloaded_installer",
+            None,
+        )
+        if callable(discard):
+            try:
+                discard(installer_path)
+            except Exception:
+                pass
+
+    def _handle_download_info_fetched(
+        self, generation, worker, version: str, file_size: int
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            return
+        self._on_download_info_fetched(version, file_size)
+
     def _on_download_info_fetched(self, version: str, file_size: int):
         """설치 프로그램 정보 수신"""
         self.btn_download.setText("다운로드 중...")
         size_str = format_size(file_size)
         self.download_detail_label.setText(f"파일 크기: {size_str}")
 
+    def _handle_download_verification_ready(
+        self, generation, worker, sha256: str, file_size: int
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            return
+        self._on_download_verification_ready(sha256, file_size)
+
     def _on_download_verification_ready(self, sha256: str, file_size: int):
         """Store immutable release metadata for launch-time verification."""
         self._downloaded_installer_sha256 = sha256
         self._downloaded_installer_size = file_size
+
+    def _handle_download_progress(
+        self, generation, worker, downloaded: int, total: int
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            return
+        self._on_download_progress(downloaded, total)
 
     def _on_download_progress(self, downloaded: int, total: int):
         """다운로드 진행률 업데이트"""
@@ -771,6 +813,19 @@ class SettingsDialog(QDialog):
             downloaded_str = format_size(downloaded)
             total_str = format_size(total)
             self.download_detail_label.setText(f"{downloaded_str} / {total_str}")
+
+    def _handle_download_finished(
+        self, generation, worker, success: bool, result: str
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            if success and result:
+                self._discard_stale_downloaded_installer(worker, result)
+            self._download_signal_relays.pop(generation, None)
+            return
+
+        self._download_worker = None
+        self._download_signal_relays.pop(generation, None)
+        self._on_download_finished(success, result, worker.downloader)
 
     def _on_download_finished(self, success: bool, result: str, owner=None):
         """다운로드 완료 처리"""
@@ -802,14 +857,10 @@ class SettingsDialog(QDialog):
 
     def _cancel_download(self):
         """다운로드 취소"""
-        cancelled_generation = self._download_generation
-        self._download_generation += 1
-        worker = self._download_worker
-        self._download_worker = None
+        worker = self._retire_download_worker()
         if worker:
             worker.cancel()
             worker.wait()
-        self._download_signal_relays.pop(cancelled_generation, None)
 
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None

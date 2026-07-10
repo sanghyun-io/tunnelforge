@@ -508,6 +508,122 @@ def test_settings_ignores_queued_success_from_cancelled_generation(
             worker_thread_ids.append(threading.get_ident())
             self.verification_ready.emit("a" * 64, 4)
             self.info_fetched.emit("2.0.7", 4)
+            self.progress.emit(4, 4)
+            self.finished.emit(True, str(installer))
+
+    import src.ui.workers as worker_package
+
+    monkeypatch.setattr(worker_package, "UpdateDownloadWorker", LateSuccessWorker)
+    dialog = _MinimalDownloadDialog()
+
+    dialog._start_download()
+    worker = dialog._download_worker
+    assert worker.wait(5000)
+    worker.downloader.discard_downloaded_installer.assert_not_called()
+
+    dialog._cancel_download()
+    worker.downloader.discard_downloaded_installer.assert_not_called()
+    app.processEvents()
+
+    assert worker_thread_ids and worker_thread_ids[0] != main_thread_id
+    assert dialog._download_generation == 2
+    assert dialog._download_worker is None
+    assert dialog._downloaded_installer_path is None
+    assert dialog._downloaded_installer_sha256 is None
+    assert dialog._downloaded_installer_size == 0
+    assert dialog.download_progress.value() == 0
+    assert dialog.btn_download.isEnabled()
+    worker.downloader.discard_downloaded_installer.assert_called_once_with(
+        str(installer)
+    )
+
+
+def test_settings_queued_old_success_cannot_override_restarted_download(
+    monkeypatch, tmp_path
+):
+    app = QApplication.instance() or QApplication([])
+    old_installer = tmp_path / "old-installer.exe"
+    new_installer = tmp_path / "new-installer.exe"
+    old_installer.write_bytes(b"old")
+    new_installer.write_bytes(b"new-file")
+    worker_specs = iter(
+        (
+            ("a" * 64, 3, str(old_installer)),
+            ("b" * 64, 8, str(new_installer)),
+        )
+    )
+
+    class QueuedSuccessWorker(UpdateDownloadWorker):
+        def __init__(self, config_manager=None):
+            super().__init__(config_manager=config_manager)
+            self.sha256, self.file_size, self.installer = next(worker_specs)
+            self.downloader = MagicMock()
+
+        def run(self):
+            self.verification_ready.emit(self.sha256, self.file_size)
+            self.info_fetched.emit("2.0.7", self.file_size)
+            self.progress.emit(self.file_size, self.file_size)
+            self.finished.emit(True, self.installer)
+
+    import src.ui.workers as worker_package
+
+    monkeypatch.setattr(worker_package, "UpdateDownloadWorker", QueuedSuccessWorker)
+    dialog = _MinimalDownloadDialog()
+
+    dialog._start_download()
+    old_worker = dialog._download_worker
+    assert old_worker.wait(5000)
+
+    dialog._start_download()
+    new_worker = dialog._download_worker
+    assert new_worker is not old_worker
+    assert new_worker.wait(5000)
+    old_worker.downloader.discard_downloaded_installer.assert_not_called()
+
+    app.processEvents()
+
+    assert dialog._download_generation == 2
+    assert dialog._downloaded_installer_path == str(new_installer)
+    assert dialog._downloaded_installer_sha256 == "b" * 64
+    assert dialog._downloaded_installer_size == 8
+    assert dialog._downloaded_installer_owner is new_worker.downloader
+    assert dialog.download_progress.value() == 100
+    old_worker.downloader.discard_downloaded_installer.assert_called_once_with(
+        str(old_installer)
+    )
+    new_worker.downloader.discard_downloaded_installer.assert_not_called()
+
+    old_worker.verification_ready.emit("c" * 64, 99)
+    old_worker.info_fetched.emit("2.0.6", 99)
+    old_worker.progress.emit(1, 99)
+    old_worker.finished.emit(True, str(old_installer))
+    app.processEvents()
+
+    assert dialog._downloaded_installer_path == str(new_installer)
+    assert dialog._downloaded_installer_sha256 == "b" * 64
+    assert dialog._downloaded_installer_size == 8
+    assert dialog._downloaded_installer_owner is new_worker.downloader
+    assert dialog.download_progress.value() == 100
+    old_worker.downloader.discard_downloaded_installer.assert_called_with(
+        str(old_installer)
+    )
+    assert old_worker.downloader.discard_downloaded_installer.call_count == 2
+
+
+def test_settings_stale_success_cleanup_is_best_effort(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    installer = tmp_path / "stale-installer.exe"
+    installer.write_bytes(b"stale")
+
+    class LateSuccessWorker(UpdateDownloadWorker):
+        def __init__(self, config_manager=None):
+            super().__init__(config_manager=config_manager)
+            self.downloader = MagicMock()
+            self.downloader.discard_downloaded_installer.side_effect = RuntimeError(
+                "cleanup failed"
+            )
+
+        def run(self):
             self.finished.emit(True, str(installer))
 
     import src.ui.workers as worker_package
@@ -520,11 +636,11 @@ def test_settings_ignores_queued_success_from_cancelled_generation(
     assert worker.wait(5000)
 
     dialog._cancel_download()
-    for _ in range(5):
-        app.processEvents()
+    app.processEvents()
 
-    assert worker_thread_ids and worker_thread_ids[0] != main_thread_id
     assert dialog._downloaded_installer_path is None
     assert dialog._downloaded_installer_sha256 is None
     assert dialog._downloaded_installer_size == 0
-    worker.downloader.discard_downloaded_installer.assert_called_with(str(installer))
+    worker.downloader.discard_downloaded_installer.assert_called_once_with(
+        str(installer)
+    )
