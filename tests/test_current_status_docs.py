@@ -854,10 +854,10 @@ def test_current_status_records_post_round3_reconciliation_full_suite():
     verification = _section(doc, "Verification Log")
     sessions = _section(doc, "Session Log")
 
-    assert "post-strategy-review full Python suite at 1827 passed / 6 warnings" in summary
-    assert "| `pytest -q` | PASS, 1827 passed, 6 warnings |" in baseline
-    assert "full Python suite passed at 1827 passed / 6 warnings" in verification
-    assert "full pytest 1827 passed / 6 warnings" in sessions
+    assert "release-candidate full Python suite passed at 1870 passed / 4 warnings" in summary
+    assert "| `pytest -q` | PASS, 1870 passed, 4 warnings, 60.08s, exit 0 |" in baseline
+    assert "Full Python: 1870 passed, 4 warnings in 60.08s" in verification
+    assert "full pytest: 1870 passed / 4 warnings in 60.08s" in sessions
 
 
 def test_current_status_records_strategy_review_findings_and_priority():
@@ -887,3 +887,44 @@ def test_current_status_records_strategy_review_findings_and_priority():
     ]
     positions = [order.index(issue_id) for issue_id in priorities]
     assert positions == sorted(positions)
+
+
+def test_current_status_records_231_release_candidate_handoff():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    version_source = (PROJECT_ROOT / "src" / "version.py").read_text(encoding="utf-8")
+    source_version = re.search(r'__version__\s*=\s*"([^"]+)"', version_source).group(1)
+    summary = " ".join(_section(doc, "Summary").split())
+    baseline = " ".join(_section(doc, "Current Baseline Verification").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert source_version == "2.3.1"
+    assert f"`{source_version}` release candidate" in summary
+    assert f"Version references are aligned at `{source_version}`" in baseline
+
+    assert "TF-STATUS-079 | High | closed" in tracker
+    assert "TF-STATUS-080 | Medium | closed" in tracker
+    assert "TF-STATUS-082 | Medium | closed" in tracker
+    assert "TF-STATUS-081 | High | fixed_pending_full_verify" in tracker
+    assert "TF-STATUS-083 | Medium | fixed_pending_full_verify" in tracker
+    assert "TF-STATUS-008 | Low | open" in tracker
+    assert "TF-STATUS-078 | Low | open" in tracker
+
+    for phrase in [
+        "GitHub Release asset `digest` verification",
+        "unknown-environment confirmation",
+        "`python-regression`",
+        "bilingual Schedule correction",
+        f"`{source_version}` release candidate",
+    ]:
+        assert phrase in verification
+
+    assert "fixed_pending_full_verify" in order
+    assert "RC merge/tag" in order
+    assert "stable required-check promotion" in order
+    assert "TF-STATUS-008" in order
+    assert "TF-STATUS-078" in order
+    assert "GitHub Release asset `digest` verification" in sessions
+    assert "unknown-environment confirmation" in sessions
