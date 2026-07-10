@@ -43,6 +43,14 @@ def _configure_download(downloader, expected_bytes, expected_size=None):
     downloader.installer_filename = OFFLINE_NAME
 
 
+def _force_bundled_bootstrapper_windows(monkeypatch):
+    monkeypatch.setattr(
+        bundled_bootstrapper,
+        "os",
+        SimpleNamespace(name="nt", path=os.path),
+    )
+
+
 @pytest.mark.parametrize(
     ("module", "downloader_class", "digest"),
     [
@@ -184,6 +192,7 @@ def test_bootstrapper_streaming_cancel_removes_all_owned_download_files(
 
 
 def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
+    _force_bundled_bootstrapper_windows(monkeypatch)
     installer = tmp_path / OFFLINE_NAME
     installer.write_bytes(b"tampered")
     app = bundled_bootstrapper.BootstrapperApp.__new__(
@@ -212,6 +221,7 @@ def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
 def test_bootstrapper_integrity_cleanup_error_does_not_mask_launch_block(
     monkeypatch, tmp_path
 ):
+    _force_bundled_bootstrapper_windows(monkeypatch)
     installer = tmp_path / OFFLINE_NAME
     installer.write_bytes(b"tampered")
     app = bundled_bootstrapper.BootstrapperApp.__new__(
@@ -237,6 +247,7 @@ def test_bootstrapper_integrity_cleanup_error_does_not_mask_launch_block(
 
 
 def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tmp_path):
+    _force_bundled_bootstrapper_windows(monkeypatch)
     installer = tmp_path / OFFLINE_NAME
     installer.write_bytes(b"expected")
     app = bundled_bootstrapper.BootstrapperApp.__new__(
@@ -276,6 +287,36 @@ def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tm
     discard.assert_not_called()
     assert len(errors) == 1
     assert errors[0].startswith("설치 프로그램 실행 실패")
+
+
+def test_bootstrapper_non_windows_never_launches_windows_installer(monkeypatch, tmp_path):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"verified")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper,
+        "os",
+        SimpleNamespace(name="posix", path=os.path),
+    )
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    popen.assert_not_called()
+    assert len(errors) == 1
+    assert "Windows" in errors[0]
+    assert ".exe" in errors[0]
+    app.root.after.assert_not_called()
+    app.root.destroy.assert_not_called()
+    assert app.downloaded_file == str(installer)
 
 
 @pytest.mark.parametrize(
@@ -698,6 +739,7 @@ def test_bootstrapper_downloaders_expose_verified_file_lease(
 def test_bootstrapper_verified_launch_closes_replacement_race(
     monkeypatch, tmp_path
 ):
+    _force_bundled_bootstrapper_windows(monkeypatch)
     download_dir = tmp_path / "download"
     download_dir.mkdir()
     downloader = bundled_bootstrapper.InstallerDownloader()

@@ -525,6 +525,13 @@ class BootstrapperApp:
 
     def _launch_installer(self):
         """설치 프로그램 실행"""
+        if os.name != "nt":
+            self._show_error(
+                "이 설치 프로그램은 Windows용 .exe 파일입니다. "
+                "Windows에서 실행해 주세요."
+            )
+            return
+
         if not self.downloaded_file or not os.path.exists(self.downloaded_file):
             self._show_error("다운로드된 파일을 찾을 수 없습니다.")
             return

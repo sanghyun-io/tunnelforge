@@ -1,5 +1,6 @@
 """설정 관련 다이얼로그"""
 import os
+from pathlib import Path
 import subprocess
 import sys
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
@@ -8,9 +9,8 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QWidget, QTextBrowser, QSizePolicy,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
                              QSpinBox, QProgressBar, QApplication)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices, QFont
-from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
 from src.update_integrity import (
@@ -22,7 +22,6 @@ from src.core.platform_integration import (
     StartupRegistrar,
     detached_process_kwargs,
     no_window_creation_flags,
-    update_package_launch_strategy,
 )
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
@@ -838,6 +837,10 @@ class SettingsDialog(QDialog):
         main_window = self.parent()
         try:
             with SettingsDialog._open_verified_installer(self) as verified:
+                if sys.platform != 'win32':
+                    SettingsDialog._show_non_windows_installer_saved(self)
+                    return
+
                 action_text = update_package_action_text()
                 confirm_msg = (
                     f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
@@ -894,24 +897,23 @@ class SettingsDialog(QDialog):
         )
 
     def _dispatch_verified_installer(self, verified: VerifiedFileLease) -> None:
-        if sys.platform == 'win32':
-            verified.dispatch(
-                lambda path: subprocess.Popen([path], close_fds=True)
-            )
-        elif update_package_launch_strategy() == "open":
-            def open_package(path):
-                if not QDesktopServices.openUrl(QUrl.fromLocalFile(path)):
-                    raise RuntimeError("다운로드한 패키지를 열 수 없습니다.")
+        if sys.platform != 'win32':
+            raise RuntimeError("non-Windows installer auto-launch is disabled")
+        verified.dispatch(
+            lambda path: subprocess.Popen([path], close_fds=True)
+        )
 
-            verified.dispatch(open_package)
-        else:
-            verified.dispatch(
-                lambda path: subprocess.Popen(
-                    [path],
-                    start_new_session=True,
-                    close_fds=True,
-                )
-            )
+    def _show_non_windows_installer_saved(self) -> None:
+        installer_path = Path(self._downloaded_installer_path)
+        QMessageBox.information(
+            self,
+            translate_text("설치 실행 비활성화"),
+            translate_text(
+                "보안을 위해 이 플랫폼에서는 다운로드한 설치 파일을 자동으로 실행하지 않습니다.\n"
+                "검증된 설치 파일이 저장되었습니다:\n"
+            ) + str(installer_path),
+        )
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(installer_path.parent)))
 
     def _verify_installer_before_launch(self) -> bool:
         try:

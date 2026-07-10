@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
 )
 
 from src import update_integrity
+from src.core import i18n
 from src.core.update_downloader import UpdateDownloader
 from src.ui.dialogs import settings
 from src.ui.workers.update_worker import UpdateDownloadWorker
@@ -66,64 +67,58 @@ def test_windows_update_launches_visible_installer_directly(monkeypatch, tmp_pat
     main_window.close_app.assert_called_once()
 
 
-def test_macos_update_opens_package_and_closes_app(monkeypatch, tmp_path):
+def test_macos_update_keeps_verified_package_without_path_dispatch(monkeypatch, tmp_path):
     package = tmp_path / "TunnelForge-macOS-2.0.7-arm64.dmg"
     package.write_text("dmg", encoding="utf-8")
     main_window = MagicMock()
+    owner = MagicMock()
 
     dialog = MagicMock()
     dialog._downloaded_installer_path = str(package)
     dialog._latest_version = "2.0.7"
     dialog.parent.return_value = main_window
+    dialog._downloaded_installer_owner = owner
     _record_expected_integrity(dialog, package)
 
     popen = MagicMock()
     open_url = MagicMock(return_value=True)
+    information = MagicMock()
+    app = MagicMock()
+    leases = _capture_settings_leases(monkeypatch)
     monkeypatch.setattr(settings.sys, "platform", "darwin")
-    monkeypatch.setattr(settings.QMessageBox, "question", MagicMock(return_value=QMessageBox.StandardButton.Yes))
     monkeypatch.setattr(settings.subprocess, "Popen", popen)
     monkeypatch.setattr(settings.QDesktopServices, "openUrl", open_url)
+    monkeypatch.setattr(settings.QMessageBox, "information", information)
+    monkeypatch.setattr(settings.QApplication, "instance", MagicMock(return_value=app))
 
-    settings.SettingsDialog._launch_installer(dialog)
+    i18n.set_language("en")
+    try:
+        settings.SettingsDialog._launch_installer(dialog)
+    finally:
+        i18n.set_language(i18n.DEFAULT_LANGUAGE)
 
     popen.assert_not_called()
+    information.assert_called_once()
+    assert information.call_args.args[1] == "Installer Launch Disabled"
+    assert information.call_args.args[2].startswith(
+        "For security, the downloaded installer is not launched automatically"
+    )
+    assert str(package) in information.call_args.args[2]
     open_url.assert_called_once()
-    assert Path(open_url.call_args.args[0].toLocalFile()) == package
-    main_window.close_app.assert_called_once()
-
-
-def test_macos_update_open_failure_keeps_app_running(monkeypatch, tmp_path):
-    package = tmp_path / "TunnelForge-macOS-2.0.7-arm64.dmg"
-    package.write_text("dmg", encoding="utf-8")
-    main_window = MagicMock()
-
-    dialog = MagicMock()
-    dialog._downloaded_installer_path = str(package)
-    dialog._latest_version = "2.0.7"
-    dialog.parent.return_value = main_window
-    owner = MagicMock()
-    dialog._downloaded_installer_owner = owner
-    _record_expected_integrity(dialog, package)
-
-    open_url = MagicMock(return_value=False)
-    critical = MagicMock()
-    monkeypatch.setattr(settings.sys, "platform", "darwin")
-    monkeypatch.setattr(settings.QMessageBox, "question", MagicMock(return_value=QMessageBox.StandardButton.Yes))
-    monkeypatch.setattr(settings.QDesktopServices, "openUrl", open_url)
-    monkeypatch.setattr(settings.QMessageBox, "critical", critical)
-    leases = _capture_settings_leases(monkeypatch)
-
-    settings.SettingsDialog._launch_installer(dialog)
-
-    open_url.assert_called_once()
-    critical.assert_called_once()
+    opened_path = Path(open_url.call_args.args[0].toLocalFile())
+    assert opened_path == package.parent
+    assert opened_path != package
     main_window.close_app.assert_not_called()
+    app.quit.assert_not_called()
     owner.discard_downloaded_installer.assert_not_called()
     assert package.exists()
     assert len(leases) == 1 and leases[0].closed is True
+    assert dialog._downloaded_installer_path == str(package)
+    assert dialog._downloaded_installer_sha256 == hashlib.sha256(b"dmg").hexdigest()
+    assert dialog._downloaded_installer_size == len(b"dmg")
 
 
-def test_macos_open_url_callback_rechecks_identity_before_success(
+def test_macos_replacement_callback_cannot_launch_anything(
     monkeypatch, tmp_path
 ):
     package = tmp_path / "TunnelForge-macOS-2.0.7-arm64.dmg"
@@ -138,49 +133,43 @@ def test_macos_open_url_callback_rechecks_identity_before_success(
     dialog._latest_version = "2.0.7"
     dialog.parent.return_value = main_window
     leases = _capture_settings_leases(monkeypatch)
-    replacement_blocked = []
-    open_calls = []
+    callback_calls = []
+    popen = MagicMock()
+    open_url = MagicMock(return_value=True)
 
-    def open_url(url):
-        open_calls.append(Path(url.toLocalFile()))
-        assert leases[0].closed is False
+    def dispatch(_dialog, _verified):
+        callback_calls.append(package)
         replacement = tmp_path / "open-url-replacement.dmg"
         replacement.write_bytes(b"safe")
-        try:
-            os.replace(replacement, package)
-        except PermissionError:
-            replacement_blocked.append(True)
+        os.replace(replacement, package)
+        settings.subprocess.Popen([str(package)])
         return True
 
-    critical = MagicMock()
+    information = MagicMock()
+    app = MagicMock()
     monkeypatch.setattr(settings.sys, "platform", "darwin")
     monkeypatch.setattr(
-        settings.QMessageBox,
-        "question",
-        MagicMock(return_value=QMessageBox.StandardButton.Yes),
+        settings.SettingsDialog,
+        "_dispatch_verified_installer",
+        dispatch,
     )
+    monkeypatch.setattr(settings.subprocess, "Popen", popen)
     monkeypatch.setattr(settings.QDesktopServices, "openUrl", open_url)
-    monkeypatch.setattr(settings.QMessageBox, "critical", critical)
+    monkeypatch.setattr(settings.QMessageBox, "information", information)
+    monkeypatch.setattr(settings.QApplication, "instance", MagicMock(return_value=app))
 
     settings.SettingsDialog._launch_installer(dialog)
 
-    assert open_calls == [package]
+    assert callback_calls == []
+    popen.assert_not_called()
     assert len(leases) == 1 and leases[0].closed is True
-    if os.name == "nt":
-        assert replacement_blocked == [True]
-        main_window.close_app.assert_called_once()
-        critical.assert_not_called()
-        owner.discard_downloaded_installer.assert_not_called()
-    else:
-        assert replacement_blocked == []
-        main_window.close_app.assert_not_called()
-        critical.assert_called_once()
-        owner.discard_downloaded_installer.assert_called_once_with(str(package))
-
-    post_context_replacement = tmp_path / "post-open-url.dmg"
-    post_context_replacement.write_bytes(b"after")
-    os.replace(post_context_replacement, package)
-    assert package.read_bytes() == b"after"
+    information.assert_called_once()
+    open_url.assert_called_once()
+    assert Path(open_url.call_args.args[0].toLocalFile()) == package.parent
+    main_window.close_app.assert_not_called()
+    app.quit.assert_not_called()
+    owner.discard_downloaded_installer.assert_not_called()
+    assert package.read_bytes() == b"safe"
 
 
 def test_launch_installer_rechecks_integrity_before_process_start(monkeypatch, tmp_path):
@@ -201,12 +190,10 @@ def test_launch_installer_rechecks_integrity_before_process_start(monkeypatch, t
     installer.write_bytes(b"corrupt installer")
 
     popen = MagicMock()
-    open_url = MagicMock()
     critical = MagicMock()
     app = MagicMock()
     monkeypatch.setattr(settings.sys, "platform", "win32")
     monkeypatch.setattr(settings.subprocess, "Popen", popen)
-    monkeypatch.setattr(settings.QDesktopServices, "openUrl", open_url)
     monkeypatch.setattr(settings.QMessageBox, "critical", critical)
     monkeypatch.setattr(settings.QMessageBox, "question", MagicMock())
     monkeypatch.setattr(settings.QApplication, "instance", MagicMock(return_value=app))
@@ -214,7 +201,6 @@ def test_launch_installer_rechecks_integrity_before_process_start(monkeypatch, t
     settings.SettingsDialog._launch_installer(dialog)
 
     popen.assert_not_called()
-    open_url.assert_not_called()
     main_window.close_app.assert_not_called()
     app.quit.assert_not_called()
     settings.QMessageBox.question.assert_not_called()
