@@ -149,6 +149,8 @@ def test_download_installer_uses_configurable_timeout(monkeypatch, tmp_path):
 def test_download_installer_rejects_digest_mismatch_and_removes_partial_file(
     monkeypatch, tmp_path
 ):
+    update_dir = tmp_path / "tunnelforge-update-test"
+    update_dir.mkdir()
     downloader = UpdateDownloader()
     downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
     downloader.file_size = 4
@@ -157,15 +159,19 @@ def test_download_installer_rejects_digest_mismatch_and_removes_partial_file(
     response = MagicMock()
     response.headers = {"content-length": "4"}
     response.iter_content.return_value = [b"safe"]
-    monkeypatch.setattr("src.core.update_downloader.tempfile.mkdtemp", lambda **_kwargs: str(tmp_path))
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
     monkeypatch.setattr("src.core.update_downloader.requests.get", lambda *args, **kwargs: response)
 
     with pytest.raises(DownloadError, match="SHA-256"):
         downloader.download_installer()
 
-    final_path = tmp_path / "TunnelForge-Setup-2.0.5.exe"
+    final_path = update_dir / "TunnelForge-Setup-2.0.5.exe"
     assert not final_path.exists()
     assert not Path(f"{final_path}.part").exists()
+    assert not update_dir.exists()
 
 
 def test_download_installer_removes_partial_file_on_unexpected_exception(

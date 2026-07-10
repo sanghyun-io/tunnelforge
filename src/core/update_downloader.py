@@ -295,16 +295,16 @@ class UpdateDownloader:
             return file_path
 
         except DownloadError:
-            self._remove_download_outputs(part_path, file_path)
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise
         except requests.exceptions.RequestException as e:
-            self._remove_download_outputs(part_path, file_path)
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"다운로드 실패: {str(e)}")
         except OSError as e:
-            self._remove_download_outputs(part_path, file_path)
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"파일 저장 실패: {str(e)}")
         except Exception as e:
-            self._remove_download_outputs(part_path, file_path)
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"다운로드 실패: {str(e)}") from e
 
     def verify_downloaded_installer(self, path: str) -> None:
@@ -317,12 +317,16 @@ class UpdateDownloader:
             raise DownloadError(str(exc)) from exc
 
     @staticmethod
-    def _remove_download_outputs(*paths: str) -> None:
+    def _cleanup_failed_download(temp_dir: str, *paths: str) -> None:
         for path in paths:
             try:
                 os.remove(path)
-            except FileNotFoundError:
+            except OSError:
                 pass
+        try:
+            os.rmdir(temp_dir)
+        except OSError:
+            pass
 
 
 def format_size(size_bytes: int) -> str:
