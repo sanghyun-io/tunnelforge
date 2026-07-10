@@ -919,7 +919,10 @@ class SettingsDialog(QDialog):
         owner = self._downloaded_installer_owner
         discard = getattr(owner, "discard_downloaded_installer", None)
         if installer_path and callable(discard):
-            discard(installer_path)
+            try:
+                discard(installer_path)
+            except Exception:
+                pass
 
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
@@ -942,7 +945,7 @@ class SettingsDialog(QDialog):
             self,
             translate_text("설치 파일 무결성 오류"),
             translate_text(
-                "다운로드한 설치 파일이 릴리스 정보와 일치하지 않아 삭제했습니다.\n"
+                "다운로드한 설치 파일이 릴리스 정보와 일치하지 않아 실행을 차단했습니다.\n"
                 f"다시 다운로드해 주세요.\n\n{error_message}"
             ),
         )

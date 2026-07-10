@@ -209,6 +209,33 @@ def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
     popen.assert_not_called()
 
 
+def test_bootstrapper_integrity_cleanup_error_does_not_mask_launch_block(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"tampered")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    discard = MagicMock(side_effect=OSError("cleanup failed"))
+    app.downloader = SimpleNamespace(
+        expected_sha256=hashlib.sha256(b"expected").hexdigest(),
+        file_size=len(b"expected"),
+        discard_downloaded_installer=discard,
+    )
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    discard.assert_called_once_with(str(installer))
+    assert errors and errors[0].startswith("다운로드된 설치 파일 검증 실패")
+    popen.assert_not_called()
+
+
 def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tmp_path):
     installer = tmp_path / OFFLINE_NAME
     installer.write_bytes(b"expected")

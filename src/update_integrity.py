@@ -161,6 +161,14 @@ def _windows_close_handle(handle: int) -> None:
         raise ctypes.WinError(ctypes.get_last_error())
 
 
+def _windows_close_handle_safely(handle: int) -> bool:
+    try:
+        _windows_close_handle(handle)
+        return True
+    except OSError:
+        return False
+
+
 def _windows_path_identity(path: str, *, directory: bool) -> tuple[int, int]:
     share_mode = _FILE_SHARE_READ
     if directory:
@@ -173,6 +181,8 @@ def _windows_path_identity(path: str, *, directory: bool) -> tuple[int, int]:
         share_mode=share_mode,
         directory=directory,
     )
+    result = None
+    primary_error = None
     try:
         identity, attributes = _windows_handle_information(handle)
         if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
@@ -180,12 +190,19 @@ def _windows_path_identity(path: str, *, directory: bool) -> tuple[int, int]:
         is_directory = bool(attributes & _FILE_ATTRIBUTE_DIRECTORY)
         if is_directory != directory:
             raise IntegrityError("release path type changed")
-        return identity
+        result = identity
+    except Exception as exc:
+        primary_error = exc
     finally:
-        _windows_close_handle(handle)
+        close_ok = _windows_close_handle_safely(handle)
+    if primary_error is not None:
+        raise primary_error
+    if not close_ok:
+        raise OSError("could not close release path handle")
+    return result
 
 
-def _windows_mark_directory_for_delete(handle: int) -> bool:
+def _windows_mark_for_delete(handle: int) -> bool:
     disposition = _FILE_DISPOSITION_INFO(True)
     return bool(
         _SetFileInformationByHandle(
@@ -195,6 +212,61 @@ def _windows_mark_directory_for_delete(handle: int) -> bool:
             ctypes.sizeof(disposition),
         )
     )
+
+
+def _windows_file_identity(path: str) -> Optional[tuple[int, int]]:
+    handle = None
+    identity = None
+    close_ok = False
+    try:
+        handle = _windows_open_handle(
+            path,
+            desired_access=_FILE_READ_ATTRIBUTES,
+            share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            directory=False,
+        )
+        candidate_identity, attributes = _windows_handle_information(handle)
+        if not (
+            attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            or attributes & _FILE_ATTRIBUTE_DIRECTORY
+        ):
+            identity = candidate_identity
+    except OSError:
+        pass
+    finally:
+        if handle is not None:
+            close_ok = _windows_close_handle_safely(handle)
+    return identity if close_ok else None
+
+
+def _windows_delete_owned_child(
+    path: str, expected_identity: tuple[int, int]
+) -> bool:
+    """Delete one recorded regular file by its own no-follow handle."""
+    handle = None
+    delete_requested = False
+    close_ok = False
+    try:
+        handle = _windows_open_handle(
+            path,
+            desired_access=_DELETE | _FILE_READ_ATTRIBUTES,
+            share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+            directory=False,
+        )
+        identity, attributes = _windows_handle_information(handle)
+        if (
+            identity != expected_identity
+            or attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+            or attributes & _FILE_ATTRIBUTE_DIRECTORY
+        ):
+            return False
+        delete_requested = _windows_mark_for_delete(handle)
+    except OSError:
+        pass
+    finally:
+        if handle is not None:
+            close_ok = _windows_close_handle_safely(handle)
+    return delete_requested and close_ok
 
 
 _DispatchResult = TypeVar("_DispatchResult")
@@ -314,13 +386,20 @@ class VerifiedLaunchFile:
 
 
 class OwnedTempDirectory:
-    """Identity token for one downloader-created temporary directory."""
+    """Identity token for downloader cleanup with platform-specific deletion.
+
+    Windows records each retained final child identity and deletes only through a
+    matching no-follow child handle. POSIX has no standard identity-conditional
+    unlink primitive, so this helper deliberately does not delete files or the
+    temporary root there and returns ``False`` instead.
+    """
 
     def __init__(self, path: str | os.PathLike[str]):
         self.path = _absolute_path(path)
         self._handle = None
         self._descriptor = None
         self._owned_child_names: set[str] = set()
+        self._child_identities: dict[str, tuple[int, int]] = {}
 
         try:
             parent_lstat = os.lstat(self.path)
@@ -337,6 +416,7 @@ class OwnedTempDirectory:
                     ),
                     directory=True,
                 )
+                primary_error = None
                 try:
                     self.identity, attributes = _windows_handle_information(
                         capture_handle
@@ -345,8 +425,14 @@ class OwnedTempDirectory:
                         raise IntegrityError("temporary parent is a reparse point")
                     if not attributes & _FILE_ATTRIBUTE_DIRECTORY:
                         raise IntegrityError("temporary parent is not a directory")
+                except Exception as exc:
+                    primary_error = exc
                 finally:
-                    _windows_close_handle(capture_handle)
+                    close_ok = _windows_close_handle_safely(capture_handle)
+                if primary_error is not None:
+                    raise primary_error
+                if not close_ok:
+                    raise OSError("could not close temporary parent handle")
             else:
                 no_follow = getattr(os, "O_NOFOLLOW", 0)
                 if not no_follow:
@@ -415,37 +501,81 @@ class OwnedTempDirectory:
         except (IntegrityError, OSError):
             return False
 
-    def retain(self) -> bool:
-        """Retain a Windows deny-delete handle after download finalization."""
+    def retain(
+        self,
+        final_path: str | os.PathLike[str] | None = None,
+        expected_child_identity: tuple[int, int] | None = None,
+    ) -> bool:
+        """Retain the parent and record a registered Windows child identity."""
         if os.name != "nt":
             return self.identity_matches()
-        if self._handle is not None:
-            return True
+        handle = None
         try:
-            handle = _windows_open_handle(
-                self.path,
-                desired_access=(
-                    _DELETE | _FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES
-                ),
-                share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
-                directory=True,
-            )
-            current_identity, attributes = _windows_handle_information(handle)
-            if (
-                current_identity != self.identity
-                or attributes & _FILE_ATTRIBUTE_REPARSE_POINT
-                or not attributes & _FILE_ATTRIBUTE_DIRECTORY
-            ):
-                _windows_close_handle(handle)
-                return False
-            self._handle = handle
+            if self._handle is None:
+                handle = _windows_open_handle(
+                    self.path,
+                    desired_access=(
+                        _DELETE | _FILE_LIST_DIRECTORY | _FILE_READ_ATTRIBUTES
+                    ),
+                    share_mode=_FILE_SHARE_READ | _FILE_SHARE_WRITE,
+                    directory=True,
+                )
+                current_identity, attributes = _windows_handle_information(handle)
+                if (
+                    current_identity != self.identity
+                    or attributes & _FILE_ATTRIBUTE_REPARSE_POINT
+                    or not attributes & _FILE_ATTRIBUTE_DIRECTORY
+                ):
+                    return False
+                self._handle = handle
+                handle = None
+            if final_path is not None:
+                candidate = _absolute_path(final_path)
+                if not self.owns_direct_child(candidate):
+                    return False
+                child_identity = _windows_file_identity(candidate)
+                if (
+                    child_identity is None
+                    or expected_child_identity is not None
+                    and child_identity != expected_child_identity
+                ):
+                    return False
+                self._child_identities[os.path.basename(candidate)] = child_identity
             return True
         except OSError:
             return False
+        finally:
+            if handle is not None:
+                _windows_close_handle_safely(handle)
+
+    def release_parent_handle(self) -> bool:
+        """Release the Windows root lease only while renaming a verified part."""
+        if os.name != "nt" or self._handle is None:
+            return True
+        handle = self._handle
+        self._handle = None
+        return _windows_close_handle_safely(handle)
+
+    def child_identity(self, path: str | os.PathLike[str]) -> Optional[tuple[int, int]]:
+        """Return a registered child identity without accepting unowned names."""
+        candidate = _absolute_path(path)
+        if not self.owns_direct_child(candidate):
+            return None
+        return self._child_identities.get(os.path.basename(candidate))
+
+    def forget_child_identity(self, path: str | os.PathLike[str]) -> None:
+        """Drop an identity only after a verified rename consumed that name."""
+        candidate = _absolute_path(path)
+        if self.owns_direct_child(candidate):
+            self._child_identities.pop(os.path.basename(candidate), None)
 
     def discard_files(
         self, paths: Iterable[str | os.PathLike[str]]
     ) -> bool:
+        if os.name != "nt":
+            # `unlinkat` has no identity-conditional standard API. Do not risk
+            # deleting a replacement path merely because a parent fd is held.
+            return False
         candidates = []
         for path in paths:
             candidate = _absolute_path(path)
@@ -456,59 +586,33 @@ class OwnedTempDirectory:
         if not self.identity_matches():
             return False
 
-        existing = []
         for candidate in candidates:
             try:
-                if os.name == "nt":
-                    child_stat = os.lstat(candidate)
-                else:
-                    child_stat = os.stat(
-                        os.path.basename(candidate),
-                        dir_fd=self._descriptor,
-                        follow_symlinks=False,
-                    )
+                os.lstat(candidate)
             except FileNotFoundError:
                 continue
             except OSError:
                 return False
-
-            attributes = getattr(child_stat, "st_file_attributes", 0)
-            if (
-                not stat.S_ISREG(child_stat.st_mode)
-                or attributes & _REPARSE_POINT_ATTRIBUTE
-            ):
+            expected_identity = self._child_identities.get(os.path.basename(candidate))
+            if expected_identity is None:
                 return False
-            existing.append(candidate)
-
-        try:
-            for candidate in existing:
-                if os.name == "nt":
-                    os.remove(candidate)
-                else:
-                    os.unlink(
-                        os.path.basename(candidate),
-                        dir_fd=self._descriptor,
-                    )
-        except OSError:
-            return False
+            if not _windows_delete_owned_child(candidate, expected_identity):
+                return False
         return True
 
     def remove_if_empty(self) -> bool:
-        if not self.identity_matches():
+        """Delete only a retained empty Windows root by its own handle.
+
+        POSIX has no standard identity-conditional unlink/rmdir primitive, so
+        this method deliberately returns ``False`` there without path deletion.
+        """
+        if os.name != "nt" or not self.identity_matches() or self._handle is None:
             return False
-        if os.name == "nt":
-            if self._handle is None or not _windows_mark_directory_for_delete(
-                self._handle
-            ):
-                return False
-            self.close()
-            return True
-        try:
-            os.rmdir(self.path)
-        except OSError:
+        handle = self._handle
+        if not _windows_mark_for_delete(handle):
             return False
-        self.close()
-        return True
+        self._handle = None
+        return _windows_close_handle_safely(handle)
 
     def close(self) -> None:
         if self._handle is not None:

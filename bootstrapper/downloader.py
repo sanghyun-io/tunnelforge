@@ -199,6 +199,8 @@ class InstallerDownloader:
 
             downloaded = 0
             with open(part_path, 'wb') as f:
+                if not owner.retain(part_path):
+                    raise DownloadError("temporary download part identity changed")
                 for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
                     self._raise_if_cancelled()
 
@@ -216,9 +218,13 @@ class InstallerDownloader:
             self._raise_if_cancelled()
             self.verify_downloaded_installer(part_path)
             self._raise_if_cancelled()
+            part_identity = owner.child_identity(part_path)
+            if part_identity is None or not owner.release_parent_handle():
+                raise DownloadError("temporary download part identity changed")
             os.replace(part_path, file_path)
-            if not owner.retain():
+            if not owner.retain(file_path, part_identity):
                 raise DownloadError("temporary download directory identity changed")
+            owner.forget_child_identity(part_path)
             self._raise_if_cancelled()
             return file_path
 
@@ -276,11 +282,10 @@ class InstallerDownloader:
     def _finish_owned_cleanup(
         self, owner: OwnedTempDirectory, removed: bool
     ) -> None:
-        if removed and owner.remove_if_empty():
-            self._owned_temp_dirs.pop(owner.path, None)
-        elif not owner.identity_matches():
-            owner.close()
-            self._owned_temp_dirs.pop(owner.path, None)
+        if removed:
+            owner.remove_if_empty()
+        owner.close()
+        self._owned_temp_dirs.pop(owner.path, None)
 
     def _cleanup_failed_download(self, temp_dir: str, *paths: str) -> bool:
         normalized_temp_dir = os.path.normcase(

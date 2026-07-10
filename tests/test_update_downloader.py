@@ -386,9 +386,170 @@ def test_discard_downloaded_installer_removes_owned_success_path(
     assert Path(installer_path).exists()
     assert update_dir.exists()
 
-    downloader.discard_downloaded_installer(installer_path)
+    removed = downloader.discard_downloaded_installer(installer_path)
 
-    assert not update_dir.exists()
+    if os.name == "nt":
+        assert removed is True
+        assert not Path(installer_path).exists()
+        assert not update_dir.exists()
+    else:
+        assert removed is False
+        assert Path(installer_path).exists()
+        assert update_dir.exists()
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX-only cleanup capability")
+def test_posix_owned_temp_directory_never_unlinks_or_removes_root(tmp_path):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+    installer = tmp_path / "installer.exe"
+    installer.write_bytes(b"safe")
+
+    assert owner.claim_files((installer,)) is True
+    assert owner.discard_files((installer,)) is False
+    assert installer.read_bytes() == b"safe"
+    assert owner.remove_if_empty() is False
+    assert tmp_path.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_retain_records_registered_final_child_identity(monkeypatch, tmp_path):
+    update_dir = tmp_path / "tunnelforge-update-identity"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    installer_path = downloader.download_installer()
+    owner = next(iter(downloader._owned_temp_dirs.values()))
+
+    assert Path(installer_path).name in getattr(owner, "_child_identities", {})
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_delete_owned_child_rejects_identity_mismatch(monkeypatch):
+    delete_child = getattr(update_integrity, "_windows_delete_owned_child", None)
+    assert delete_child is not None
+    mark_for_delete = MagicMock(return_value=True)
+    close_handle = MagicMock()
+    monkeypatch.setattr(
+        update_integrity, "_windows_open_handle", lambda _path, **_kwargs: 41
+    )
+    monkeypatch.setattr(
+        update_integrity,
+        "_windows_handle_information",
+        lambda _handle: ((2, 3), 0),
+    )
+    monkeypatch.setattr(update_integrity, "_windows_mark_for_delete", mark_for_delete)
+    monkeypatch.setattr(update_integrity, "_windows_close_handle", close_handle)
+
+    assert delete_child("C:\\temp\\installer.exe", (1, 3)) is False
+    mark_for_delete.assert_not_called()
+    close_handle.assert_called_once_with(41)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_delete_owned_child_closes_handle_after_disposition_failure(
+    monkeypatch,
+):
+    close_handle = MagicMock()
+    monkeypatch.setattr(
+        update_integrity, "_windows_open_handle", lambda _path, **_kwargs: 42
+    )
+    monkeypatch.setattr(
+        update_integrity,
+        "_windows_handle_information",
+        lambda _handle: ((1, 3), 0),
+    )
+    monkeypatch.setattr(update_integrity, "_windows_mark_for_delete", lambda _handle: False)
+    monkeypatch.setattr(update_integrity, "_windows_close_handle", close_handle)
+
+    assert update_integrity._windows_delete_owned_child(
+        "C:\\temp\\installer.exe", (1, 3)
+    ) is False
+    close_handle.assert_called_once_with(42)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_capture_close_error_does_not_mask_integrity_error(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        update_integrity, "_windows_open_handle", lambda _path, **_kwargs: 51
+    )
+    monkeypatch.setattr(
+        update_integrity,
+        "_windows_handle_information",
+        lambda _handle: ((1, 1), update_integrity._FILE_ATTRIBUTE_REPARSE_POINT),
+    )
+    monkeypatch.setattr(
+        update_integrity,
+        "_windows_close_handle",
+        MagicMock(side_effect=OSError("close failed")),
+    )
+
+    with pytest.raises(update_integrity.IntegrityError, match="reparse"):
+        update_integrity.OwnedTempDirectory(tmp_path)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_retain_closes_probe_handle_after_information_failure(
+    monkeypatch, tmp_path
+):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+    close_handle = MagicMock()
+    monkeypatch.setattr(
+        update_integrity, "_windows_open_handle", lambda _path, **_kwargs: 61
+    )
+    monkeypatch.setattr(
+        update_integrity,
+        "_windows_handle_information",
+        MagicMock(side_effect=OSError("information failed")),
+    )
+    monkeypatch.setattr(update_integrity, "_windows_close_handle", close_handle)
+
+    assert owner.retain(str(tmp_path / "installer.exe")) is False
+    close_handle.assert_called_once_with(61)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_discard_rejects_swapped_registered_child(monkeypatch, tmp_path):
+    update_dir = tmp_path / "tunnelforge-update-child-swap"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    installer_path = downloader.download_installer()
+    owner = next(iter(downloader._owned_temp_dirs.values()))
+    owner.close()
+    replacement = update_dir / "replacement.exe"
+    replacement.write_bytes(b"victim")
+    os.replace(replacement, installer_path)
+
+    assert downloader.discard_downloaded_installer(installer_path) is False
+    assert Path(installer_path).read_bytes() == b"victim"
 
 
 def test_discard_downloaded_installer_rejects_unowned_sibling(
