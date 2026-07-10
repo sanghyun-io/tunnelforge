@@ -534,6 +534,7 @@ class SettingsDialog(QDialog):
         self._downloaded_installer_owner = None
         self._download_generation = 0
         self._download_signal_relays = {}
+        self._download_close_invalidated = False
         self._latest_version = None
 
         layout.addWidget(update_group)
@@ -619,8 +620,15 @@ class SettingsDialog(QDialog):
 
     def reject(self):
         """취소(또는 창 닫기) 시 미리보기 중이던 테마를 원래 상태로 복원"""
+        self._invalidate_download_for_close()
         self._restore_original_theme_if_unsaved()
         super().reject()
+
+    def closeEvent(self, event):
+        """Invalidate downloads before the dialog is closed."""
+        self._invalidate_download_for_close()
+        self._restore_original_theme_if_unsaved()
+        super().closeEvent(event)
 
     def _is_startup_registered(self) -> bool:
         """레지스트리에 시작 프로그램 등록 여부 확인"""
@@ -753,6 +761,15 @@ class SettingsDialog(QDialog):
         self._download_worker = None
         self._download_signal_relays.pop(retired_generation, None)
         return worker
+
+    def _invalidate_download_for_close(self):
+        """Retire and cancel the active worker without blocking the UI thread."""
+        if getattr(self, "_download_close_invalidated", False):
+            return
+        self._download_close_invalidated = True
+        worker = self._retire_download_worker()
+        if worker:
+            worker.cancel()
 
     def _is_current_download_worker(self, generation, worker) -> bool:
         return (
