@@ -11,6 +11,10 @@ from bootstrapper import downloader as modular_downloader
 
 VALID_DIGEST = "sha256:" + "a" * 64
 OFFLINE_NAME = "TunnelForge-Setup-2.3.1.exe"
+DOWNLOADER_IMPLEMENTATIONS = [
+    (modular_downloader, modular_downloader.InstallerDownloader),
+    (bundled_bootstrapper, bundled_bootstrapper.InstallerDownloader),
+]
 
 
 def _asset(name, url, size, digest=VALID_DIGEST):
@@ -28,13 +32,19 @@ def _release_response(assets):
     return response
 
 
+def _configure_download(downloader, expected_bytes, expected_size=None):
+    downloader.download_url = f"https://example.com/{OFFLINE_NAME}"
+    downloader.file_size = expected_size or len(expected_bytes)
+    downloader.expected_sha256 = hashlib.sha256(expected_bytes).hexdigest()
+    downloader.installer_filename = OFFLINE_NAME
+
+
 @pytest.mark.parametrize(
     ("module", "downloader_class", "digest"),
     [
-        (modular_downloader, modular_downloader.InstallerDownloader, None),
-        (bundled_bootstrapper, bundled_bootstrapper.InstallerDownloader, None),
-        (modular_downloader, modular_downloader.InstallerDownloader, "sha256:bad"),
-        (bundled_bootstrapper, bundled_bootstrapper.InstallerDownloader, "sha256:bad"),
+        (*implementation, digest)
+        for implementation in DOWNLOADER_IMPLEMENTATIONS
+        for digest in (None, "sha256:bad")
     ],
 )
 def test_bootstrapper_missing_digest_fails_before_download(
@@ -61,10 +71,7 @@ def test_bootstrapper_missing_digest_fails_before_download(
 
 @pytest.mark.parametrize(
     ("module", "downloader_class"),
-    [
-        (modular_downloader, modular_downloader.InstallerDownloader),
-        (bundled_bootstrapper, bundled_bootstrapper.InstallerDownloader),
-    ],
+    DOWNLOADER_IMPLEMENTATIONS,
 )
 def test_bootstrapper_does_not_select_websetup_as_offline_installer(
     monkeypatch, module, downloader_class
@@ -89,10 +96,7 @@ def test_bootstrapper_does_not_select_websetup_as_offline_installer(
 
 @pytest.mark.parametrize(
     ("module", "downloader_class"),
-    [
-        (modular_downloader, modular_downloader.InstallerDownloader),
-        (bundled_bootstrapper, bundled_bootstrapper.InstallerDownloader),
-    ],
+    DOWNLOADER_IMPLEMENTATIONS,
 )
 def test_bootstrapper_digest_mismatch_removes_partial_output(
     monkeypatch, tmp_path, module, downloader_class
@@ -100,10 +104,7 @@ def test_bootstrapper_digest_mismatch_removes_partial_output(
     download_dir = tmp_path / "download"
     download_dir.mkdir()
     downloader = downloader_class()
-    downloader.download_url = f"https://example.com/{OFFLINE_NAME}"
-    downloader.file_size = 4
-    downloader.expected_sha256 = hashlib.sha256(b"evil").hexdigest()
-    downloader.installer_filename = OFFLINE_NAME
+    _configure_download(downloader, b"evil")
 
     response = MagicMock()
     response.headers = {"content-length": "4"}
@@ -117,6 +118,65 @@ def test_bootstrapper_digest_mismatch_removes_partial_output(
     final_path = download_dir / OFFLINE_NAME
     assert not final_path.exists()
     assert not Path(f"{final_path}.part").exists()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_size_mismatch_removes_all_owned_download_files(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe", expected_size=5)
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError, match="size"):
+        downloader.download_installer()
+
+    final_path = download_dir / OFFLINE_NAME
+    assert not final_path.exists()
+    assert not Path(f"{final_path}.part").exists()
+    assert not download_dir.exists()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_streaming_cancel_removes_all_owned_download_files(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    def chunks():
+        yield b"sa"
+        downloader.cancel()
+        yield b"fe"
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = chunks()
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError, match="취소"):
+        downloader.download_installer()
+
+    final_path = download_dir / OFFLINE_NAME
+    assert not final_path.exists()
+    assert not Path(f"{final_path}.part").exists()
+    assert not download_dir.exists()
 
 
 def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
