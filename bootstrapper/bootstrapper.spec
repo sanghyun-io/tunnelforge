@@ -22,6 +22,7 @@ a = Analysis(
         (os.path.join(project_root, 'assets', 'icon.ico'), 'assets'),
     ],
     hiddenimports=[
+        'src.update_integrity',
         'requests',
         'urllib3',
         'certifi',
