@@ -66,8 +66,17 @@ fail-closed behavior, and Fix Wizard dialog module re-exports including
 `cwd`/implicit `PATH` lookup and hardened schema-derived auto-save filenames
 for analysis and rollback files. The integrated main tree passed the Rust Core
 regression gate, a whole-tree `MySQLConnector` allowlist scan, Round 3 focused
-tests at 491 passed, and the post-reconciliation full Python suite at 1826
+tests at 491 passed, and the post-strategy-review full Python suite at 1827
 passed / 6 warnings.
+
+A role-specialized strategy/security review on 2026-07-10 confirmed that the
+next work is release trust rather than another broad refactor. Downloaded update
+packages are executed without an application-level hash/signature verification
+gate, unset environments allow dangerous SQL without confirmation, current
+`main` contains unreleased post-release commits while still declaring the
+published version, README advertises scheduled backups while the UI feature
+flag is disabled, and branch protection requires only `version-gate`. These
+are tracked as TF-STATUS-079 through TF-STATUS-083.
 
 GitHub #170 remains open for issue hygiene only: its reported MySQL ERROR 3780
 import path was fixed by PR #171 / commit `a4c7a06`, that fix is contained in
@@ -76,8 +85,9 @@ the merged fix with the reporter and close the issue unless the failure can be
 reproduced on a containing release; it is not remaining Clean Code Round 3
 implementation work.
 
-Open GitHub issue #116 remains external: its remaining unchecked criterion is
-real operator Mac validation evidence. GitHub #142 is fixed: the legacy Python
+Open GitHub issue #116 remains external. Its current final gate needs both
+current-HEAD manual workflow evidence and the real-Mac report before closure.
+GitHub #142 is fixed: the legacy Python
 Auto-Fix Wizard mutation path is now fail-closed from the user-visible worker
 path, legacy Python Auto-Fix Wizard mutations are no longer executable from
 that path, and Legacy Auto-Fix Wizard is dry-run/manual SQL only. GitHub issues
@@ -384,8 +394,8 @@ confirming the separate legacy Python Auto-Fix Wizard mutation path.
 
 ## Current Baseline Verification
 
-Commands run locally. Full-suite count refreshed on 2026-07-10 after the Round 3
-status reconciliation; the earlier `Full-suite count refreshed on 2026-06-27`
+Commands run locally. Full-suite count refreshed on 2026-07-10 after the
+role-specialized strategy review; the earlier `Full-suite count refreshed on 2026-06-27`
 baseline is superseded by this latest status update. Broader Rust/macOS
 evidence rows are preserved from the 2026-06-26 / 2026-06-27 baseline sweeps
 until those commands are rerun.
@@ -393,7 +403,7 @@ until those commands are rerun.
 | Check | Result |
 | --- | --- |
 | `git status --short --branch` | Tracked Round 3 commits integrated on `main`; only status/handoff scratch files remain outside the integration commits before this status update |
-| `pytest -q` | PASS, 1826 passed, 6 warnings |
+| `pytest -q` | PASS, 1827 passed, 6 warnings |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
 | `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
@@ -407,8 +417,10 @@ until those commands are rerun.
 | `RUST_CORE_REQUIRE_PERF_EVIDENCE=1; RUST_CORE_REQUIRE_LIVE_UI_EVIDENCE=1; powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS |
 | `python scripts\check-macos-support-gate.py --skip-github` | PASS |
 | `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS, 53 passed |
+| `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL, missing current-HEAD manual workflow evidence and real-Mac report |
+| GitHub required status checks | `version-gate` only |
 
-Version references are aligned at `2.1.8` across:
+Version references are aligned at `2.3.0` across:
 
 - `src/version.py`
 - `pyproject.toml`
@@ -506,6 +518,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-10 | Role-specialized strategy, release, and security review | six role-specific read-only repository reviews plus cross-critique; `python scripts\check-macos-support-gate.py --final`; `git rev-list --left-right --count v2.3.0...HEAD`; `gh api repos/sanghyun-io/tunnelforge/branches/main/protection/required_status_checks`; focused source tracing for updater execution and ProductionGuard; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `git diff --check` | PASS with expected macOS final-gate failure | Confirmed TF-STATUS-079 through TF-STATUS-083 and refreshed TF-STATUS-008. Current-status tests passed at 56 passed; full Python suite passed at 1827 passed / 6 warnings. The final macOS gate fails only for missing current-HEAD manual workflow evidence and the real-Mac report. |
 | 2026-07-10 | Round 3 completion and open-issue reconciliation | `git status --short --branch`; `git rev-list --left-right --count origin/main...main`; `gh issue list --state open --limit 30 --json number,title,updatedAt,url`; `gh issue view 170 --json ...`; `git branch --contains a4c7a06`; `git merge-base --is-ancestor a4c7a06 HEAD`; `gh pr view 171 --json ...`; `git tag --contains a4c7a06`; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `git diff --check` | PASS | Round 3 remains complete and pushed at `09ab060`. GitHub #170 is still open, but PR #171 fixed its ERROR 3780 path, the fix is in current `main`, and release tags from `v2.1.8` through `v2.3.0` contain it. Remaining #170 work is issue confirmation/closure, not implementation. Current-status tests passed at 55 passed; full Python suite passed at 1826 passed / 6 warnings. |
 | 2026-07-09 | Clean Code Round 3 UI/dialog/main-window integration | `python -m py_compile` on all Round 3 production Python files; `pytest` focused Round 3 suite; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; custom whole-tree `MySQLConnector` allowlist scan; `git diff --check HEAD~8..HEAD`; `pytest -q` | PASS | Integrated WP-3.1 through WP-3.8 as behavior-preserving commits. Focused Round 3 tests passed at 491 passed / 2 warnings, Rust Core regression gate passed, allowlist scan found 22 product imports with no missing entries, and full Python suite passed at 1819 passed / 4 warnings. |
 | 2026-07-09 | Clean Code Round 3 red-review follow-up | RED/GREEN: migration worker constructor compatibility and cleanup dry-run rejection tests; Fix Wizard dialog re-export regression test; `python -m py_compile src/ui/workers/migration_worker.py src/ui/dialogs/fix_wizard_dialog.py tests/test_migration_worker.py tests/test_fix_wizard_dialog.py`; `pytest tests/test_migration_worker.py tests/test_fix_wizard_dialog.py tests/test_migration_fix_wizard.py tests/test_fix_wizard_sql_helpers.py -q`; `pytest -q` | PASS | Red-review found behavior-preserving compatibility regressions in `MigrationAnalyzerWorker` legacy `check_*` kwargs, `CleanupWorker(dry_run=False)` fail-closed semantics, and `fix_wizard_dialog` module re-exports. All three were restored; focused tests passed at 118 passed and full Python suite passed at 1821 passed / 4 warnings. |
@@ -869,7 +882,7 @@ Next action:
 
 ### TF-STATUS-008: macOS Support Still Requires Real-Mac Final Validation
 
-Status: `watch`
+Status: `open`
 Severity: Low
 Area: macOS release readiness
 
@@ -898,6 +911,9 @@ Evidence:
   `python scripts\check-macos-support-gate.py --final` fails as expected
   because no macOS manual validation report was found under `build/` and no
   successful manual `macOS App Validation` `workflow_dispatch` run exists for
+  the current merged main HEAD.
+- 2026-07-10 fresh final-gate run at `edd0c75` confirms both conditions remain:
+  no real-Mac report under `build/` and no successful manual workflow run for
   the current merged main HEAD.
 
 Next action:
@@ -2155,7 +2171,7 @@ Next action:
 | TF-STATUS-005 | Medium | closed | Docs/UI flags | Disabled UI features labeled | Reverify docs if feature flags change |
 | TF-STATUS-006 | Medium | watch | Maintainability | Remaining large files after Clean Code Round 3 | Keep future fixes narrow; split further only when nearby work justifies it |
 | TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
-| TF-STATUS-008 | Low | watch | macOS | Final real-Mac validation pending | Require evidence bundle before production-ready claim |
+| TF-STATUS-008 | Low | open | macOS | Current-HEAD workflow and final real-Mac validation pending | Run the manual workflow on the frozen release candidate, collect the real-Mac evidence bundle, and require the final gate to pass before production-ready claims |
 | TF-STATUS-009 | High | closed | Rust Core import | Merge import post-load DDL policy | Keep merge/recreate policy tests |
 | TF-STATUS-010 | High | closed | Rust Core import | Shadow replacement retired; direct replacement documented | Keep UI/docs aligned |
 | TF-STATUS-011 | High | closed | Rust Core schema fidelity | MySQL FK charset/collation fidelity | Keep FK fidelity regression coverage |
@@ -2226,28 +2242,39 @@ Next action:
 | TF-STATUS-076 | Medium | closed | Security / Rust Core helper resolution | Frozen-runtime core helper lookup trusted boundary | Keep packaged runtime helper resolution limited to app-owned locations; allow PATH lookup only with explicit development opt-in |
 | TF-STATUS-077 | Medium | closed | Security / auto-save paths | Schema-derived analysis and rollback filenames | Keep schema-derived filenames sanitized and resolved under their intended base directories |
 | TF-STATUS-078 | Low | open | GitHub issue hygiene / Rust Core import | GitHub #170 remains open after merged ERROR 3780 fix | Confirm the PR #171 fix with the reporter and close #170 unless it reproduces on a containing release |
+| TF-STATUS-079 | High | open | Security / update integrity | Downloaded update packages execute without application-level integrity verification | Require a signed or cryptographically verified release manifest and fail closed before launching any downloaded package |
+| TF-STATUS-080 | Medium | open | Security / ProductionGuard | Unset environments allow dangerous SQL without confirmation | Treat unknown/unset environments as confirmation-required and preserve explicit development ergonomics without silent destructive execution |
+| TF-STATUS-081 | High | open | Release readiness / versioning | Main contains post-release commits while still declaring the published version | Freeze a release candidate, choose the next version, synchronize all version sources, and keep post-RC feature commits out |
+| TF-STATUS-082 | Medium | open | Product documentation / feature flags | README advertises disabled scheduled backups and queries | Remove current-feature claims or reframe them as unavailable until the feature is intentionally re-enabled and verified |
+| TF-STATUS-083 | Medium | open | CI / branch protection | Only `version-gate` is required on protected main | Add full Python regression and Rust Core regression as required checks after measuring stable CI cost and flake behavior |
 
 ## Recommended Execution Order
 
-1. No repo-side implementation issue is currently open after TF-STATUS-077.
-   Clean Code Round 3 is integrated, red-review compatibility fixes are in,
-   and SECURE follow-up fixes are in.
-2. Confirm and close #170 after confirming the merged fix from PR #171 / commit
-   `a4c7a06`; reopen implementation work only if it reproduces on a release that
-   contains the fix.
-3. Keep TF-STATUS-008 / GitHub #116 tracked separately because #116 remains
-   external and requires real operator Mac validation report evidence. Do not
-   hard-code exact current-head workflow run IDs or SHAs as durable status
-   summary evidence; use #116
-   comments and `scripts\check-macos-support-gate.py --final` for the latest
-   current-head manual workflow proof.
-4. Track additional One-Click automatic fix classes as separate GitHub issues
-   before implementation.
+1. Fix TF-STATUS-079 so downloaded update packages cannot execute unless their
+   release identity and integrity are verified.
+2. Fix TF-STATUS-080 so dangerous SQL never bypasses confirmation merely because
+   the tunnel environment is unset.
+3. Resolve TF-STATUS-083 by promoting stable full Python and Rust regression
+   workflows to required checks.
+4. Resolve TF-STATUS-082 so public feature claims match runtime feature flags.
+5. Resolve TF-STATUS-081 by freezing and versioning the next release candidate.
+6. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
+   #116 remains external, with both current-HEAD manual workflow evidence and
+   the real-Mac report. Do not hard-code exact current-head workflow run IDs or
+   SHAs as durable status summary evidence; use #116 comments and the final gate
+   for current proof.
+7. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
+   #171 / commit `a4c7a06`; reopen implementation work only if it reproduces on
+   a release that contains the fix.
+8. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
+   expansion, and Rust Core concurrency redesign until the release-trust work is
+   complete and user/benchmark evidence justifies them.
 
 ## Session Log
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-10 | Convened architecture, product, UX, quality, security, and critical-program-review agents for two rounds of repository-grounded strategy review. Consensus prioritizes update integrity, dangerous-SQL defaults, release truth, public capability accuracy, required regression gates, and real-Mac evidence before new features or broad refactors. | `docs/current_status.md`, `tests/test_current_status_docs.py` | six independent reviews plus cross-critique; direct source and GitHub verification; current-status pytest 56 passed; full pytest 1827 passed / 6 warnings; expected macOS final-gate failure for two missing evidence conditions |
 | 2026-07-10 | Reconciled Round 3 completion against current Git and GitHub state. Round 3 remains complete and synchronized; #170 is open only because the already merged/released ERROR 3780 fix was not linked for automatic closure. | `docs/current_status.md`, `tests/test_current_status_docs.py` | `git` ancestry/sync checks; GitHub open-issue, #170, and PR #171 inspection; release-tag containment check; current-status pytest 55 passed; full pytest 1826 passed / 6 warnings |
 | 2026-07-09 | Integrated Clean Code Round 3 WP-3.1 through WP-3.8 into `main`, covering SQL editor, DB dialogs, migration dialogs, Fix Wizard pages, cross-engine/diff dialogs, settings/schedule/tunnel dialogs, main window controllers, and UI workers. | Round 3 UI/core helper files plus `docs/current_status.md` | Round 3 focused pytest 491 passed; full `pytest -q` 1819 passed / 4 warnings; Rust Core regression gate passed; whole-tree `MySQLConnector` allowlist scan passed; `git diff --check` passed |
 | 2026-07-09 | Addressed Clean Code Round 3 red-review findings by restoring migration worker legacy constructor compatibility, cleanup worker `dry_run=False` RuntimeError behavior, and Fix Wizard dialog re-export compatibility. | `src/ui/workers/migration_worker.py`, `src/ui/dialogs/fix_wizard_dialog.py`, `tests/test_migration_worker.py`, `tests/test_fix_wizard_dialog.py`, `docs/current_status.md` | RED/GREEN compatibility tests; focused migration/Fix Wizard suite 118 passed; full `pytest -q` 1821 passed / 4 warnings |
