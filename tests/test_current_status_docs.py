@@ -867,8 +867,8 @@ def test_current_status_records_231_release_candidate_verification_evidence():
     verification = _section(doc, "Verification Log")
     sessions = _section(doc, "Session Log")
 
-    assert "release-candidate full Python suite passed at 1870 passed / 4 warnings" in summary
-    assert "| `pytest -q` | PASS, 1870 passed, 4 warnings, 60.08s, exit 0 |" in baseline
+    assert "final-review full Python suite passed at 1955 passed / 1 skipped / 4 warnings" in summary
+    assert "| `pytest -q` | PASS, 1955 passed, 1 skipped, 4 warnings, 60.38s, exit 0 |" in baseline
     assert "Rust gate: 1.4s" in verification
     assert "Cargo test: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored" in verification
     assert "Rust gate exit 0 in 1.4s" in sessions
@@ -950,3 +950,32 @@ def test_current_status_records_231_release_candidate_handoff():
     assert "TF-STATUS-078" in order
     assert "GitHub Release asset `digest` verification" in sessions
     assert "unknown-environment confirmation" in sessions
+
+
+def test_current_status_closes_final_review_update_boundary_after_fresh_verification():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    baseline = " ".join(_section(doc, "Current Baseline Verification").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-084 | High | closed" in tracker
+    for finding in [
+        "verification-to-launch lease",
+        "owned cleanup/no-clobber",
+        "cancellation generation",
+        "streaming bound",
+    ]:
+        assert finding in tracker
+
+    assert "RC head `b35dde6`" in baseline
+    assert "feat/trust-release-sprint" in baseline
+    assert "clean worktree after commit" in baseline
+    assert "automatic installer execution is disabled/reveal-only" in summary
+    assert "Mac hardware validation claim" in summary
+    assert "TF-STATUS-084" in verification
+    assert "1955 passed, 1 skipped, 4 warnings in 60.38s" in verification
+    assert "TF-STATUS-084" in order
+    assert "TF-STATUS-084" in sessions

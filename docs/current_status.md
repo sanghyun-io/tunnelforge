@@ -67,9 +67,19 @@ TF-STATUS-080, and TF-STATUS-082 are closed by this release-candidate
 verification. TF-STATUS-081 and TF-STATUS-083 are
 `fixed_pending_full_verify` because RC merge/tag and stable required-check
 promotion are external follow-ups; TF-STATUS-008 and TF-STATUS-078 remain open.
-The release-candidate full Python suite passed at 1870 passed / 4 warnings in
-60.08s with exit 0; the matching Rust Core gate, Cargo test/build, version-sync,
-and diff checks also passed in this session.
+TF-STATUS-079 remains closed with strengthened final-review evidence. The
+final-review full Python suite passed at 1955 passed / 1 skipped / 4 warnings
+in 60.38s with exit 0; the matching Rust Core gate, Cargo test/build, and
+version-sync checks also passed in this session.
+
+TF-STATUS-084 records the final-review update boundary findings: a
+verification-to-launch lease, owned cleanup/no-clobber behavior, cancellation
+generation isolation, and a bounded streaming path. It remains
+`closed` after focused update/security/status/version tests, exactly one full
+Python suite, Rust Core regression, Cargo test/build, and version-sync passed.
+On non-Windows, automatic installer execution is disabled/reveal-only; this
+local work does not make a Mac hardware validation claim. It does not claim
+live Actions, branch protection, a tag or release, or GitHub issue closure.
 
 Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
 refactor work packages WP-3.1 through WP-3.8 were integrated as
@@ -408,23 +418,24 @@ confirming the separate legacy Python Auto-Fix Wizard mutation path.
 
 ## Current Baseline Verification
 
-Commands run locally. The `2.3.1` release candidate verification refreshes the
-current Python, Rust Core, release-build, version-sync, and diff evidence;
+Commands run locally. The `2.3.1` release candidate final-review verification
+refreshes the current Python, Rust Core, release-build, version-sync, and diff evidence;
 the latest status update preserves earlier broad evidence rows where their
 commands were not rerun, including the historical `Full-suite count refreshed on 2026-06-27` baseline.
 
 | Check | Result |
 | --- | --- |
-| `git status --short --branch` | Tracked Round 3 commits integrated on `main`; only status/handoff scratch files remain outside the integration commits before this status update |
-| `pytest -q` | PASS, 1870 passed, 4 warnings, 60.08s, exit 0 |
+| `git status --short --branch` | RC head `b35dde6` on `feat/trust-release-sprint`; clean worktree after commit for the docs/status-only handoff |
+| update/security/status/version focused pytest | PASS, 183 passed, 1 skipped, 1.63s, exit 0 |
+| `pytest -q` | PASS, 1955 passed, 1 skipped, 4 warnings, 60.38s, exit 0 |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
 | `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS, 1.4s, exit 0 |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
-| `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 216 lib, 2 JSONL CLI, 9 live roundtrip, and 2 stress tests passed; 1 stress test ignored, 4.1s, exit 0 |
-| `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS, 36.61s, exit 0 |
-| `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.08s, exit 0 |
+| `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 216 lib, 2 JSONL CLI, 9 live roundtrip, and 2 stress tests passed; 1 stress test ignored, 14.1s overall, exit 0 |
+| `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS, 4.25s, exit 0 |
+| `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.09s, exit 0 |
 | `python -m compileall -q main.py src tests scripts` | PASS |
-| `git diff --check` | PASS, 0.5s, exit 0 |
+| `git diff --check` | PASS, exit 0; final docs/status diff check recorded in this session |
 | `tunnelforge-core service.hello` | PASS, reports `dump.run`, `dump.import`, migration commands, and `oneclick.*` commands |
 | `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip -- --nocapture` | PASS, 6 live container MySQL/PostgreSQL smoke tests |
 | `pytest tests\test_live_ui_migration_capture.py tests\test_live_ui_migration_evidence.py -q` | PASS, capture and validator tests |
@@ -536,6 +547,8 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-10 | TF-STATUS-084 post-close status consistency | RED then GREEN: `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q` | PASS, 60 passed in 0.33s | RED was 1 failed, 59 passed in 0.39s because `test_current_status_records_231_release_candidate_verification_evidence` still expected the superseded current `1870` count. Updated it to assert the fresh `1955` final-review evidence; no full pytest rerun was performed, preserving the required exactly-one full-suite run. |
+| 2026-07-10 | TF-STATUS-084 final-review boundary verification | RED: `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py::test_current_status_tracks_final_review_update_boundary_pending_verification -q`; GREEN: focused update/security/status/version pytest, exactly one `pytest -q`, Rust Core gate, Cargo test/build, version-sync, and final diff check | PASS, all local gates exit 0 | RED was 1 failed in 0.24s before TF-STATUS-084 existed. GREEN focused suite: 183 passed, 1 skipped in 1.63s; full suite: 1955 passed, 1 skipped, 4 warnings in 60.38s; Rust gate: 1.4s; Cargo test: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored in 14.1s; release build: 4.25s; version-sync: 1 passed in 0.09s. TF-STATUS-084 is closed locally without claims about Actions, branch protection, tags/releases, GitHub closure, or Mac hardware. |
 | 2026-07-10 | Task 6 review follow-up: historical-versus-RC status evidence | RED then GREEN: `pytest tests\test_current_status_docs.py tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 60 passed in 0.25s | RED had 2 failures in 0.44s: the Round 3 `1827 passed / 6 warnings` baseline snapshot was no longer asserted/present, and Session Log had two delimiter rows. Restored the historical assertion, split `1870 passed / 4 warnings` plus Rust evidence into a dedicated RC test, preserved both records, and removed the duplicate delimiter. |
 | 2026-07-10 | `2.3.1` release-candidate status and version finalization | RED: `pytest tests\test_current_status_docs.py tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q`; GREEN: same focused command after `.venv\Scripts\python.exe scripts\bump_version.py --bump-type patch`; `$env:PYTHONUTF8='1'; $env:QT_QPA_PLATFORM='offscreen'; pytest -q`; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; version-sync pytest; `git diff --check` | PASS, all exit 0 | RED: 1 failed, 57 passed in 0.43s because source was `2.3.0`; bump emitted `new_version=2.3.1`; GREEN: 58 passed in 0.26s. Full Python: 1870 passed, 4 warnings in 60.08s. Rust gate: 1.4s; Cargo test: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored in 4.1s; release build: 36.61s; version-sync: 1 passed in 0.08s; diff check: 0.5s. The handoff records GitHub Release asset `digest` verification, unknown-environment confirmation, `python-regression`, the bilingual Schedule correction, and the `2.3.1` release candidate. |
 | 2026-07-10 | Role-specialized strategy, release, and security review | six role-specific read-only repository reviews plus cross-critique; `python scripts\check-macos-support-gate.py --final`; `git rev-list --left-right --count v2.3.0...HEAD`; `gh api repos/sanghyun-io/tunnelforge/branches/main/protection/required_status_checks`; focused source tracing for updater execution and ProductionGuard; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `git diff --check` | PASS with expected macOS final-gate failure | Confirmed TF-STATUS-079 through TF-STATUS-083 and refreshed TF-STATUS-008. Current-status tests passed at 56 passed; full Python suite passed at 1827 passed / 6 warnings. The final macOS gate fails only for missing current-HEAD manual workflow evidence and the real-Mac report. |
@@ -2267,29 +2280,34 @@ Next action:
 | TF-STATUS-081 | High | fixed_pending_full_verify | Release readiness / versioning | `2.3.1` release candidate version alignment | Complete the external RC merge/tag process; do not create a tag or GitHub Release from this task |
 | TF-STATUS-082 | Medium | closed | Product documentation / feature flags | Bilingual Schedule correction for disabled features | Keep both language surfaces explicit that Schedule remains disabled until intentional reactivation and verification |
 | TF-STATUS-083 | Medium | fixed_pending_full_verify | CI / branch protection | Full Python regression workflow | Observe stable `python-regression` and Rust Core runs, then complete external required-check promotion |
+| TF-STATUS-084 | High | closed | Update final review / launch boundary | verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, streaming bound | Retain the reviewed bounds; local closure does not claim external Actions, branch protection, tag/release, GitHub closure, or Mac hardware evidence |
 
 ## Recommended Execution Order
 
-1. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
+1. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
+   owned cleanup/no-clobber, cancellation generation, and streaming bound in
+   place. Do not claim external Actions, branch protection, tag/release,
+   GitHub closure, or Mac hardware validation.
+2. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
    verification before every downloaded-package launch.
-2. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
+3. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
    dangerous operations without classified tunnel metadata.
-3. Complete TF-STATUS-083 from `fixed_pending_full_verify` through external
+4. Complete TF-STATUS-083 from `fixed_pending_full_verify` through external
    stable required-check promotion for `python-regression` and the Rust Core
    regression gate.
-4. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
+5. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
    while the feature flag remains disabled.
-5. Complete TF-STATUS-081 from `fixed_pending_full_verify` through the external
+6. Complete TF-STATUS-081 from `fixed_pending_full_verify` through the external
    RC merge/tag process for the `2.3.1` release candidate.
-6. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
+7. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
    #116 remains external, with both current-HEAD manual workflow evidence and
    the real-Mac report. Do not hard-code exact current-head workflow run IDs or
    SHAs as durable status summary evidence; use #116 comments and the final gate
    for current proof.
-7. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
+8. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
    #171 / commit `a4c7a06`; reopen implementation work only if it reproduces on
    a release that contains the fix.
-8. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
+9. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
    expansion, and Rust Core concurrency redesign until the release-trust work is
    complete and user/benchmark evidence justifies them.
 
@@ -2297,6 +2315,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-10 | Closed TF-STATUS-084 after fresh local final-review verification of the verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, and streaming bound. Non-Windows automatic installer execution is disabled/reveal-only; no Mac hardware validation claim is made. TF-STATUS-079 remains closed with strengthened evidence; TF-080/082 remain closed, TF-081/083 remain `fixed_pending_full_verify`, and TF-008/078 remain open. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED: TF-STATUS-084 documentation regression failed as expected (1 failed in 0.24s), then a stale 1870-count assertion failed post-close (1 failed / 59 passed in 0.39s); GREEN status suite 60 passed in 0.33s, focused suite 183 passed / 1 skipped in 1.63s, exactly one full pytest 1955 passed / 1 skipped / 4 warnings in 60.38s; Rust gate, Cargo test/build, version-sync, and diff check exit 0 |
 | 2026-07-10 | Addressed Task 6 review feedback by restoring the Round 3 historical `1827 passed / 6 warnings` assertion, separating current `2.3.1` RC and Rust evidence into a dedicated regression, preserving both records, and removing the duplicate Session Log delimiter. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED: 2 failed / 58 passed in 0.44s; GREEN: 60 passed in 0.25s; final diff check recorded with the fix commit |
 | 2026-07-10 | Finalized the `2.3.1` release candidate status handoff: GitHub Release asset `digest` verification, unknown-environment confirmation, `python-regression`, and the bilingual Schedule correction are reflected in the tracker. TF-STATUS-079/080/082 are closed with fresh focused and full evidence; TF-STATUS-081/083 remain `fixed_pending_full_verify`; TF-STATUS-008/078 remain open. | `src/version.py`, `pyproject.toml`, `installer/TunnelForge.iss`, `docs/current_status.md`, `tests/test_current_status_docs.py` | RED: 1 failed / 57 passed in 0.43s; GREEN: 58 passed in 0.26s; full pytest: 1870 passed / 4 warnings in 60.08s; Rust gate exit 0 in 1.4s; Cargo test exit 0 in 4.1s; release build exit 0 in 36.61s; version sync 1 passed in 0.08s; diff check exit 0 in 0.5s |
 | 2026-07-10 | Convened architecture, product, UX, quality, security, and critical-program-review agents for two rounds of repository-grounded strategy review. Consensus prioritizes update integrity, dangerous-SQL defaults, release truth, public capability accuracy, required regression gates, and real-Mac evidence before new features or broad refactors. | `docs/current_status.md`, `tests/test_current_status_docs.py` | six independent reviews plus cross-critique; direct source and GitHub verification; current-status pytest 56 passed; full pytest 1827 passed / 6 warnings; expected macOS final-gate failure for two missing evidence conditions |
