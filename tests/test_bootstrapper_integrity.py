@@ -578,6 +578,53 @@ def test_bootstrapper_destroyed_root_after_confirmed_cancel_is_not_an_error(
     app._show_error.assert_not_called()
 
 
+def test_bootstrapper_cancelled_download_error_does_not_schedule_on_destroyed_root(
+    monkeypatch
+):
+    download_started = threading.Event()
+    allow_error = threading.Event()
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app._download_state_lock = threading.Lock()
+    app._download_abandoned = False
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
+
+    def fail_after_confirmed_cancel(progress_callback=None):
+        download_started.set()
+        assert allow_error.wait(timeout=2)
+        raise bundled_bootstrapper.DownloadError("download cancelled")
+
+    app.downloader.download_installer.side_effect = fail_after_confirmed_cancel
+    app.root = MagicMock()
+    app.root.after.side_effect = bundled_bootstrapper.tk.TclError(
+        "application has been destroyed"
+    )
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+    app._update_status = MagicMock()
+    app._update_detail = MagicMock()
+    app._update_progress = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=True),
+    )
+
+    worker = threading.Thread(target=app._download_worker)
+    worker.start()
+    assert download_started.wait(timeout=2)
+    app._on_cancel()
+    allow_error.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    app.downloader.cancel.assert_called_once_with()
+
+
 def test_bootstrapper_non_windows_never_launches_windows_installer(monkeypatch, tmp_path):
     installer = tmp_path / OFFLINE_NAME
     installer.write_bytes(b"verified")

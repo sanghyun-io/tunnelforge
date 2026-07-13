@@ -526,7 +526,13 @@ class BootstrapperApp:
                 message + "\n\nGitHub에서 직접 다운로드할 수 있습니다."
             )
 
-        self.root.after(0, show)
+        try:
+            self.root.after(0, show)
+        except (RuntimeError, tk.TclError):
+            with self._get_download_state_lock():
+                if self._download_abandoned:
+                    return
+            raise
 
     def _download_worker(self):
         """백그라운드 다운로드 작업"""
