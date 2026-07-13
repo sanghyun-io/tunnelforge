@@ -929,7 +929,7 @@ def test_current_status_records_231_release_candidate_handoff():
     assert "TF-STATUS-079 | High | closed" in tracker
     assert "TF-STATUS-080 | Medium | closed" in tracker
     assert "TF-STATUS-082 | Medium | closed" in tracker
-    assert "TF-STATUS-081 | High | fixed_pending_full_verify" in tracker
+    assert "TF-STATUS-081 | High | in_progress" in tracker
     assert "TF-STATUS-083 | Medium | closed" in tracker
     assert "TF-STATUS-008 | Low | open" in tracker
     assert "TF-STATUS-078 | Low | open" in tracker
@@ -943,8 +943,9 @@ def test_current_status_records_231_release_candidate_handoff():
     ]:
         assert phrase in verification
 
-    assert "fixed_pending_full_verify" in order
-    assert "RC merge/tag" in order
+    assert "TF-STATUS-081" in order
+    assert "approved release execution" in order
+    assert "PR #240 merge" in order
     assert "strict required checks" in order
     assert "TF-STATUS-008" in order
     assert "TF-STATUS-078" in order
@@ -1064,7 +1065,7 @@ def test_current_status_refresh_preserves_historical_test_snapshots_and_statuses
     for status in [
         "TF-STATUS-079 | High | closed",
         "TF-STATUS-080 | Medium | closed",
-        "TF-STATUS-081 | High | fixed_pending_full_verify",
+        "TF-STATUS-081 | High | in_progress",
         "TF-STATUS-082 | Medium | closed",
         "TF-STATUS-083 | Medium | closed",
         "TF-STATUS-008 | Low | open",
@@ -1087,7 +1088,7 @@ def test_current_status_closes_version_gate_trust_boundary_issue():
     assert "PASS, 65 passed, exit 0; diff check pass" in verification
 
 
-def test_current_status_tracks_release_approval_and_external_release_blockers():
+def test_current_status_tracks_release_approval_and_accepted_unsigned_macos_policy():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     summary = " ".join(_section(doc, "Summary").split())
     tracker = " ".join(_section(doc, "Issue Tracker").split())
@@ -1095,8 +1096,10 @@ def test_current_status_tracks_release_approval_and_external_release_blockers():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
 
     assert "TF-STATUS-089 | High | closed" in tracker
-    assert "TF-STATUS-090 | High | blocked" in tracker
-    assert "TF-STATUS-091 | Medium | blocked" in tracker
+    assert "TF-STATUS-090 | High | watch" in tracker
+    assert "TF-STATUS-091 | Medium | watch" in tracker
+    assert "unsigned macOS artifacts" in summary
+    assert "accepted for this release" in summary
     assert "required reviewer, admin bypass disabled" in summary
     assert "active ruleset prevents `v*` tag update/deletion/non-fast-forward" in summary
     assert "2028 passed, 1 skipped, 4 warnings in 59.79s" in verification
@@ -1106,5 +1109,5 @@ def test_current_status_tracks_release_approval_and_external_release_blockers():
     assert "29229463485" in verification
     assert "PR #240 is `CLEAN`/mergeable" in verification
     assert "Security re-review: SECURE / APPROVE" in doc
-    assert order.index("TF-STATUS-090") < order.index("TF-STATUS-089")
-    assert order.index("TF-STATUS-089") < order.index("TF-STATUS-091")
+    assert order.index("TF-STATUS-089") < order.index("TF-STATUS-090")
+    assert order.index("TF-STATUS-090") < order.index("TF-STATUS-091")

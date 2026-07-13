@@ -247,7 +247,12 @@ def test_release_publication_requires_approval_and_creates_draft():
     assert release_step["with"]["tag_name"] == "${{ needs.release-preflight.outputs.tag }}"
     assert "draft: true" in workflow_text
     assert "prerelease: false" in workflow_text
-    assert "Apple signing certificate secret is required" in workflow_text
+    assert "unsigned macOS artifacts will be built" in workflow_text
+    assert "scripts/apple_release_credentials.py" in workflow_text
+    assert 'APPLE_RELEASE_MODE="$(python scripts/apple_release_credentials.py)"' in workflow_text
+    assert "enabled=false" in workflow_text
+    assert "enabled=true" in workflow_text
+    assert "APPLE_CODESIGN_CERTIFICATE_PASSWORD is required" in workflow_text
     assert "APPLE_ID is required for release notarization" in workflow_text
     assert "APPLE_TEAM_ID is required for release notarization" in workflow_text
     assert "APPLE_APP_SPECIFIC_PASSWORD is required for release notarization" in workflow_text
@@ -312,9 +317,21 @@ def test_release_workflow_preflight_gates_all_secret_release_work():
 
 def test_release_macos_artifacts_are_validated_before_upload():
     workflow_text = RELEASE_PATH.read_text(encoding="utf-8")
+    workflow = load_workflow(RELEASE_PATH)
+    macos_steps = workflow["jobs"]["build-macos-app"]["steps"]
+    signing_step = next(
+        step for step in macos_steps
+        if step["name"] == "Import Apple Developer ID certificate"
+    )
+    verification_step = next(
+        step for step in macos_steps
+        if step["name"] == "Verify signed and notarized macOS artifacts"
+    )
     verification_index = workflow_text.index("Verify signed and notarized macOS artifacts")
     upload_index = workflow_text.index("Upload macOS release artifacts")
 
+    assert signing_step["id"] == "apple-signing"
+    assert verification_step["if"] == "steps.apple-signing.outputs.enabled == 'true'"
     assert verification_index < upload_index
     verification_text = workflow_text[verification_index:upload_index]
     assert 'codesign --verify --deep --strict --verbose=2 "$APP_PATH"' in verification_text

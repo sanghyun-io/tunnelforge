@@ -118,8 +118,10 @@ TF-STATUS-089 is `closed`: release tags now require a
 manually approved `production-release` deployment, an exact full SHA matching
 current `main`, and synchronized version files. Release publication accepts
 only a separate approved manual dispatch, validates an immutable tag retained
-on `main`, creates a draft for that exact tag, pins every external action, and
-fails closed when macOS signing or notarization credentials are absent. The
+on `main`, creates a draft for that exact tag, and pins every external action.
+The established release policy builds explicitly unsigned macOS artifacts when
+Apple credentials are entirely absent, while partial signing/notarization
+configuration still fails closed. The
 GitHub Environment now has a required reviewer, admin bypass disabled, and
 `main`/`v*` deployment policies. `main` protection is strict, applies to admins,
 requires conversation resolution and five terminal/platform checks, and an
@@ -133,12 +135,15 @@ runs `29229463468` and `29229463485` passed Python regression, Rust Core,
 terminal version gate, and both internal/external macOS arm64/x86_64 checks;
 the PR is mergeable and `CLEAN`.
 
-TF-STATUS-090 is `blocked`: the protected release environment has none of the
-Apple Developer ID signing/notarization secrets required by the fail-closed
-release workflow. TF-STATUS-091 is `blocked`: `sanghyun-io` is the only current
-write/admin collaborator, so enabling self-review prevention or one required PR
-approval would deadlock the repository. A second trusted maintainer is required
-before independent approval can be enforced.
+TF-STATUS-090 is `watch`: the protected release environment has no Apple
+Developer ID signing/notarization secrets, so unsigned macOS artifacts are
+accepted for this release under the project's established release behavior.
+The long-term distribution policy is direct download through GitHub Releases;
+Apple App Store registration is not planned.
+TF-STATUS-091 is `watch`: `sanghyun-io` is the only current write/admin
+collaborator, and single-maintainer self-approval is accepted for this release.
+Adding Apple signing and a second trusted maintainer remain future hardening
+opportunities rather than release blockers.
 
 Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
 refactor work packages WP-3.1 through WP-3.8 were integrated as
@@ -610,6 +615,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | Accepted unsigned macOS release policy | credential matrix and workflow focused tests; standalone full Python suite; Cargo baseline; security re-review; `git diff --check` | PASS | RED produced the expected workflow contract failure and missing credential-classifier import. GREEN: credential/workflow focused 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings in 60.14s; Cargo 216 + 2 JSONL + 9 live + 2 stress passed / 1 ignored. All Apple values absent selects unsigned; any partial configuration fails closed; complete required credentials select signed. Security re-review: SECURE. |
 | 2026-07-13 | TF-STATUS-083/089 live closure | PR #240 checks; runs `29229463468` and `29229463485`; live main protection, `production-release` Environment, and ruleset API reads | PASS | Python regression, Rust Core regression, terminal `version-gate`, macOS tracking, and both macOS arm64/x86_64 validation surfaces passed. PR #240 is `CLEAN`/mergeable. Main protection is strict, admin-enforced, conversation-gated, and requires five stable checks; release Environment approval/admin-bypass/ref restrictions and immutable `v*` update/delete rules are active. |
 | 2026-07-13 | PR #240 hosted regression failure remediation | PR runs `29228401540`, `29228401548`, and `29228414876` failure logs; i18n leak reproduction; focused app/cross-engine/i18n and packaging tests; standalone full Python suite; PyInstaller build; frozen `--ui-smoke-check`; `git diff --check` | LOCAL PASS, replacement hosted run pending | Hosted logs showed English Qt state leaking from UI smoke into later tests and `ModuleNotFoundError: No module named 'src.ui'` in both macOS architectures. RED reproduced the translated dialog and missing spec collection. GREEN: focused 79 + 14 passed, full Python 2028 passed, 1 skipped, 4 warnings in 59.79s, PyInstaller build passed, and frozen smoke returned `success=true` with bundled Rust Core service hello. |
 | 2026-07-13 | TF-STATUS-089 release approval boundary implementation and live controls | release/CI focused suite; GitHub App auth focused suite; standalone full Python suite; Rust regression/Cargo test/release build; GitHub Environment, branch protection, and tag ruleset API reads; `git diff --check` | PASS with external blockers recorded | Workflow: 64 passed in 47.39s. GitHub auth/settings: 114 passed in 7.60s. Final full Python: 2028 passed, 1 skipped, 4 warnings in 61.83s. Rust regression, Cargo 216 + 2 JSONL + 9 live + 2 stress / 1 ignored, and release build passed. `production-release`, strict main protection, and immutable `v*` update/delete rules are live. Apple secrets, an independent maintainer, PR Actions, and real-Mac evidence remain pending. |
@@ -2359,7 +2365,7 @@ Next action:
 | TF-STATUS-078 | Low | open | GitHub issue hygiene / Rust Core import | GitHub #170 remains open after merged ERROR 3780 fix | Confirm the PR #171 fix with the reporter and close #170 unless it reproduces on a containing release |
 | TF-STATUS-079 | High | closed | Security / update integrity | Downloaded update package integrity verification | Keep GitHub Release asset `digest` verification fail-closed before every downloaded-package launch |
 | TF-STATUS-080 | Medium | closed | Security / ProductionGuard | Unknown-environment dangerous-operation confirmation | Keep unknown-environment confirmation default-No for missing, unrecognized, and direct Import contexts |
-| TF-STATUS-081 | High | fixed_pending_full_verify | Release readiness / versioning | `2.3.1` release candidate version alignment | Complete the external RC merge/tag process; do not create a tag or GitHub Release from this task |
+| TF-STATUS-081 | High | in_progress | Release readiness / versioning | `2.3.1` release candidate version alignment | Merge PR #240, create the protected `v2.3.1` tag, run the approved draft release workflow, and verify published assets |
 | TF-STATUS-082 | Medium | closed | Product documentation / feature flags | Bilingual Schedule correction for disabled features | Keep both language surfaces explicit that Schedule remains disabled until intentional reactivation and verification |
 | TF-STATUS-083 | Medium | closed | CI / branch protection | Full Python regression workflow | Keep the terminal version gate plus Rust Core, macOS tracking, and both macOS architecture checks required and strict on current main |
 | TF-STATUS-084 | High | closed | Update final review / launch boundary | verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, streaming bound | Retain the reviewed bounds, Fix E secure child creation/name validation, and bootstrapper cancel-before-entry evidence; local closure does not claim external Actions, branch protection, tag/release, GitHub closure, or Mac hardware evidence |
@@ -2368,8 +2374,8 @@ Next action:
 | TF-STATUS-087 | Medium | closed | Non-Windows update UX / platform policy | Reveal-only action text claimed package open and app exit | Keep non-Windows action wording aligned with folder reveal-only behavior and no app exit |
 | TF-STATUS-088 | High | closed | CI version gate / credentialed action trust | Commit-message bump bypass and mutable App token action tag | Require all three version files to match the trusted expected version and keep the credentialed action pinned by full commit SHA |
 | TF-STATUS-089 | High | closed | Release approval / tag and publication trust | Automatic tag, automatic stable publication, mutable credentialed actions, optional macOS signing | Retain separate approved manual tag/draft workflows, exact tag/version/ancestry checks, pinned actions, protected Environment, and immutable release-tag updates/deletes |
-| TF-STATUS-090 | High | blocked | macOS release signing / notarization | Protected Environment lacks Apple Developer ID and notarization secrets | Add the required Apple certificate, identity, account, team, and app-specific-password secrets to `production-release`, then run the signed hosted macOS release validation |
-| TF-STATUS-091 | Medium | blocked | Release governance / independent approval | Only one write/admin collaborator exists | Add a second trusted maintainer, then enable environment self-review prevention and one required PR approval without deadlocking releases |
+| TF-STATUS-090 | High | watch | macOS release signing / notarization | Protected Environment intentionally has no paid Apple Developer credentials | Publish explicitly unsigned macOS artifacts for this release; revisit signing/notarization when an Apple Developer account is available |
+| TF-STATUS-091 | Medium | watch | Release governance / independent approval | Only one write/admin collaborator exists | Keep single-maintainer approval enabled; revisit independent approval after adding a second trusted maintainer |
 
 ## Recommended Execution Order
 
@@ -2381,13 +2387,14 @@ Next action:
    update wording.
 4. Keep TF-STATUS-088 closed by verifying all version files against trusted
    expected state and pinning credentialed actions by full commit SHA.
-5. Resolve TF-STATUS-090 by adding Apple signing/notarization secrets to the
-   protected environment and running the signed hosted macOS validation.
-6. Keep TF-STATUS-089 closed by retaining the approved manual tag/draft split,
+5. Keep TF-STATUS-089 closed by retaining the approved manual tag/draft split,
    protected Environment, strict branch checks, and immutable release-tag
    updates/deletes.
-7. Resolve TF-STATUS-091 by adding a second trusted maintainer, then require
-   independent environment and PR approval.
+6. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted for
+   this release; add signing/notarization only when paid Apple credentials are
+   available.
+7. Keep TF-STATUS-091 on watch under the accepted single-maintainer approval
+   policy; revisit independent approval after adding another trusted maintainer.
 8. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
    owned cleanup/no-clobber, cancellation generation, and streaming bound in
    place. Do not claim external Actions, branch protection, tag/release,
@@ -2401,8 +2408,8 @@ Next action:
    macOS architectures.
 12. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
    while the feature flag remains disabled.
-13. Complete TF-STATUS-081 from `fixed_pending_full_verify` through the external
-   RC merge/tag process for the `2.3.1` release candidate.
+13. Complete TF-STATUS-081 through PR #240 merge, protected `v2.3.1` tagging,
+   approved release execution, and final asset verification.
 14. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
    #116 remains external, with both current-HEAD manual workflow evidence and
    the real-Mac report. Do not hard-code exact current-head workflow run IDs or
@@ -2419,6 +2426,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Restored the established release behavior for maintainers without paid Apple credentials: build and smoke-test unsigned macOS arm64/x86_64 artifacts only when all Apple values are absent, while failing on every partial signing/notarization configuration. Recorded GitHub Releases direct distribution and no planned Apple App Store registration as durable project policy. The owner accepted unsigned macOS distribution and single-maintainer approval for `2.3.1`; TF-STATUS-090/091 moved from blockers to watch items. | release workflow, Apple credential classifier, workflow/credential/status/macOS documentation tests, `AGENTS.md`, support/status docs | TDD RED/GREEN; focused credential/workflow 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings; Cargo baseline passed; security re-review SECURE; diff check passed. |
 | 2026-07-13 | Closed TF-STATUS-083 and TF-STATUS-089 after replacement PR #240 hosted verification and live GitHub control re-reads. The PR is clean/mergeable; release remains blocked only by separately tracked Apple signing, independent-approval, and real-Mac evidence. | status docs/tests and live GitHub configuration evidence | Runs `29229463468`/`29229463485`: Python, Rust, terminal gate, and all macOS arm64/x86_64 checks passed; main protection, protected Environment, and immutable tag rules confirmed active. |
 | 2026-07-13 | Remediated PR #240 hosted regressions at code baseline `7d49601`: isolated process-wide language state between tests and explicitly bundled lazy-loaded `src.ui` modules. | `tests/conftest.py`, `tunnel-manager.spec`, packaging regression test, status docs/tests | RED hosted Python/macOS runs and local reproductions; GREEN focused 79 + 14, full Python 2028 / 1 skipped / 4 warnings, PyInstaller build and frozen UI smoke success; replacement hosted run pending. |
 | 2026-07-13 | Hardened the pre-release boundary at code baseline `c52f60e`: removed distributable GitHub App private-key embedding, made tag and draft release separate approved manual operations, pinned every action, and added exact tag/ancestor/version plus macOS signature/notarization checks. Applied the protected Environment, strict main checks, and immutable release-tag update/delete rules. | release/tag workflows, GitHub App auth and UI copy, setup docs, focused tests, status docs/tests, live GitHub configuration | Workflow 64 passed; GitHub auth/settings 114 passed; final standalone full Python 2028 passed / 1 skipped / 4 warnings; Rust regression/Cargo test/release build and diff check passed. Security re-review: SECURE / APPROVE. TF-STATUS-090/091 record missing Apple secrets and independent maintainer. |

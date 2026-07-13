@@ -8,6 +8,17 @@ Rust Core migration is the active architecture baseline. Treat `tunnelforge-core
 
 Do not reintroduce direct Python DB driver hot paths, external dump tool paths, or retired helper aliases in `src/`, tests, packaging, or user-facing docs. Packaging should include the single Rust DB core binary `tunnelforge-core(.exe)`.
 
+## Distribution Policy
+TunnelForge is distributed directly through GitHub Releases and is not planned
+for Apple App Store registration. Do not make a paid Apple Developer account,
+Developer ID certificate, or Apple notarization credentials a release
+prerequisite. The default macOS release path builds unsigned arm64 and x86_64
+DMG/ZIP artifacts and protects distribution integrity with SHA-256 checksum
+files, GitHub Release asset digests, protected immutable release tags, and the
+approved release workflow. Keep Apple signing/notarization support optional and
+fail closed on partial Apple credential configuration; use it only if the
+project's distribution policy explicitly changes later.
+
 ## Session Continuity & Status Tracking
 `docs/current_status.md` is the canonical handoff and issue-tracking document. For any non-trivial investigation, implementation, verification, release, or documentation work, read it before deciding next steps. When a session discovers a new issue, changes an existing issue, runs meaningful verification, changes feature status, or resolves work, update `docs/current_status.md` in the same session.
 

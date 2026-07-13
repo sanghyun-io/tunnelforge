@@ -2,6 +2,16 @@
 
 This document tracks the repository-level work required to make TunnelForge usable on macOS while preserving the existing Windows release path.
 
+## Distribution Policy
+
+TunnelForge is distributed directly through GitHub Releases. Apple App Store
+registration is not planned, and paid Apple Developer credentials are not a
+release prerequisite. The default release publishes unsigned arm64 and x86_64
+DMG/ZIP artifacts with SHA-256 checksum files; the protected tag and approved
+release workflow provide artifact provenance, and the updater verifies the
+GitHub Release asset digest before launch. Apple Developer ID signing and
+notarization remain optional only for a future policy change.
+
 GitHub tracking:
 
 - #110 - Compatibility baseline
@@ -71,7 +81,7 @@ These checks require macOS:
 - `bash scripts/macos-manual-validation-report.sh --bundle-evidence <report.md>` to create a `build/macos-manual-validation-evidence-*.zip` bundle containing the completed report, smoke log, system evidence log, and SHA256 manifest for PR or release attachment, plus a sibling `*.zip.sha256` checksum for the bundle itself. Use `--evidence-bundle <zip>` to choose a specific output path.
 - `bash scripts/macos-manual-validation-report.sh --finalize <report.md>` to run the completed-report check, create the evidence zip and checksum, run `scripts/check-macos-support-gate.py --final`, write a GitHub evidence comment Markdown file with the report Git SHA, Artifact workflow run, Artifact head SHA, and Evidence bundle SHA256, and print the exact report/log/system-evidence/comment/zip/checksum attachment paths. Add `--post-github-comment` to post that generated comment to #116 and mirror it to PR #117 after finalization. Use `--skip-github` only for offline local rehearsal.
 - `python scripts/check-macos-support-gate.py --final --report build/macos-manual-validation-report-*.md --bundle build/macos-manual-validation-evidence-*.zip` to verify M0-M5 are closed, #116 is assigned to M6, PR #117 checks are green or already merged, the report Git SHA matches the current PR head before merge, or the current merged main HEAD after PR #117 has merged, the manual workflow_dispatch artifact run follows the same head policy, and the real-Mac report/log/system-evidence/bundle evidence is complete. The Python gate accepts explicit paths or glob patterns and selects the newest match when multiple files exist.
-- Optional local signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`.
+- Optional local signing/notarization with `APPLE_CODESIGN_IDENTITY`, `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`; these paid Apple credentials are not part of the default direct-distribution policy.
 - Optional GitHub Release signing/notarization secrets:
   - `APPLE_CODESIGN_CERTIFICATE_P12_BASE64`: base64-encoded Developer ID Application `.p12` certificate.
   - `APPLE_CODESIGN_CERTIFICATE_PASSWORD`: password for the `.p12` certificate.
@@ -80,7 +90,7 @@ These checks require macOS:
   - `APPLE_ID`, `APPLE_TEAM_ID`, and `APPLE_APP_SPECIFIC_PASSWORD`: Apple notarization credentials passed to `notarytool`.
 - When notarization credentials are present, `scripts/package-macos.sh` submits a temporary app ZIP for notarization, staples the returned ticket to the `.app`, validates the stapled `.app`, then creates the final ZIP distribution from that stapled `.app`. It also notarizes, staples, and validates the DMG distribution.
 - For a pre-release hosted check of the Apple secret path, manually run `.github/workflows/macos-app.yml` with `workflow_dispatch` on the release branch. When the signing certificate and notarization credentials are available, the workflow imports the Developer ID certificate into a temporary keychain, packages signed/notarized artifacts, then verifies the `.app` and DMG with `codesign --verify`, `spctl --assess`, and `xcrun stapler validate`.
-- After that hosted check passes, run `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --download-artifacts --run-smoke` on the validator Mac to download the latest successful signed/notarized artifacts for the current Mac architecture from the PR head before merge, or current merged main HEAD after PR #117 is merged, verify checksums, record artifact provenance, and start the final manual report in one command.
+- After that hosted check passes, run `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --download-artifacts --run-smoke` on the validator Mac to download the latest successful packaged artifacts for the current Mac architecture from the PR head before merge, or current merged main HEAD after PR #117 is merged, verify checksums, record artifact provenance, and start the final manual report in one command. Signed/notarized assessment applies only when optional Apple credentials were configured for that run.
 
 ## Final Manual Validation
 
@@ -88,7 +98,7 @@ Final Manual Validation must happen after all implementation milestones are comp
 
 Run on macOS:
 
-1. Run `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --download-artifacts --run-smoke` to download the latest successful signed/notarized GitHub Actions artifacts for the current Mac architecture from the PR head before merge, or current merged main HEAD after PR #117 is merged, verify DMG/ZIP checksums, generate a report, smoke log, and system evidence log under `build/`, record the artifact provenance in the report, and pre-check the automated smoke/download checklist items that passed.
+1. Run `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --download-artifacts --run-smoke` to download the latest successful packaged GitHub Actions artifacts for the current Mac architecture from the PR head before merge, or current merged main HEAD after PR #117 is merged, verify DMG/ZIP checksums, generate a report, smoke log, and system evidence log under `build/`, record the artifact provenance in the report, and pre-check the automated smoke/download checklist items that passed.
 2. If artifact download was done separately, run `bash scripts/macos-download-validation-artifacts.sh --arch <arm64|x86_64> --write-env build/macos-validation-artifacts.env`, source the generated env file, then run `MACOS_RELEASE_SMOKE_APPLICATIONS=1 bash scripts/macos-manual-validation-report.sh --run-smoke`. Add `--run-id <workflow-run-id>` only when pinning a specific run.
 3. Build Rust Core and app bundle with `bash scripts/build-macos.sh` if validating the build step separately.
 4. Package with `bash scripts/package-macos.sh` if validating packaging separately.

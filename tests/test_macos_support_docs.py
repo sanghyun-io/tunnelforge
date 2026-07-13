@@ -6,7 +6,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 def test_macos_support_plan_documents_scope_and_validation_gates():
     doc = (PROJECT_ROOT / "docs" / "macos_support.md").read_text(encoding="utf-8")
+    agents = (PROJECT_ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    normalized_doc = " ".join(doc.split())
+    normalized_agents = " ".join(agents.split())
 
+    assert "distributed directly through GitHub Releases" in normalized_doc
+    assert "Apple App Store registration is not planned" in normalized_doc
+    assert "paid Apple Developer credentials are not a release prerequisite" in normalized_doc
+    assert "default release publishes unsigned arm64 and x86_64" in normalized_doc
+    assert "## Distribution Policy" in agents
+    assert "not planned for Apple App Store registration" in normalized_agents
+    assert "default macOS release path builds unsigned arm64 and x86_64" in normalized_agents
     assert "macOS 13+" in doc
     assert "Apple Silicon" in doc
     assert "Intel" in doc
