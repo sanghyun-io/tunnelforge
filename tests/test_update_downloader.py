@@ -108,6 +108,28 @@ def test_select_release_asset_rejects_unsafe_version_leaf(
         select_release_asset([], release_version, platform_name=platform_name)
 
 
+@pytest.mark.parametrize(
+    "device_stem",
+    [
+        "COM\u00b9",
+        "com\u00b2",
+        "Com\u00b3",
+        "LPT\u00b9",
+        "lpt\u00b2",
+        "Lpt\u00b3",
+    ],
+)
+def test_select_release_asset_rejects_superscript_reserved_device_stem(
+    monkeypatch, device_stem
+):
+    monkeypatch.setattr(
+        "src.core.update_downloader.WINDOWS_INSTALLER_FILENAME_PREFIX", ""
+    )
+
+    with pytest.raises(DownloadError, match="filename"):
+        select_release_asset([], device_stem, platform_name="Windows")
+
+
 def test_select_release_asset_requires_valid_sha256_digest():
     digest = "0123456789abcdef" * 4
     assets = [
@@ -478,8 +500,14 @@ def test_owned_temp_directory_create_file_requires_exact_basename(tmp_path, name
         "NUL.part",
         "COM1.part",
         "com9.exe",
+        "COM\u00b9.part",
+        "com\u00b2.exe",
+        "Com\u00b3",
         "LPT1.part",
         "lpt9.exe",
+        "LPT\u00b9.part",
+        "lpt\u00b2.exe",
+        "Lpt\u00b3",
     ],
 )
 def test_windows_create_file_rejects_invalid_leaf_before_create(

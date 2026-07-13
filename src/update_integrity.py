@@ -20,6 +20,8 @@ _WINDOWS_RESERVED_DEVICE_STEMS = frozenset(
     {"CON", "PRN", "AUX", "NUL"}
     | {f"COM{number}" for number in range(1, 10)}
     | {f"LPT{number}" for number in range(1, 10)}
+    | {f"COM{number}" for number in ("\u00b9", "\u00b2", "\u00b3")}
+    | {f"LPT{number}" for number in ("\u00b9", "\u00b2", "\u00b3")}
 )
 
 
