@@ -46,10 +46,17 @@ application and the standalone bootstrapper. It parses GitHub digests and
 verifies a file's byte count and SHA-256 digest. It imports only Python standard
 library modules so the bootstrapper PyInstaller build stays small.
 
-Downloads are written into a unique temporary directory using a `.part` suffix.
-After download, the file is verified and atomically renamed to its final name.
-Missing, malformed, size-mismatched, or digest-mismatched metadata fails closed,
-deletes partial output, and never emits a successful download result.
+Downloads are written into an `OwnedTempDirectory` using `create_file()` with a
+no-clobber `.part` name. `VerifiedFileLease` verifies the opened file and keeps
+the verification-to-dispatch identity boundary through launch. After download,
+the file is verified and published without replacing a destination.
+
+Missing, malformed, size-mismatched, or digest-mismatched metadata fails closed
+and never emits a successful download result. Windows cleanup deletes only a
+recorded child through its identity-conditional no-follow handle. POSIX has no
+standard identity-conditional unlink, so failed or abandoned downloads may
+retain `.part`, final, and temporary-directory residue by design; they are never
+reported as successful or launched.
 
 The main Settings dialog stores the expected digest and size from the worker and
 re-verifies immediately before opening or executing the package. This second
@@ -62,6 +69,13 @@ launch. The modular `bootstrapper/downloader.py` and bundled
 `bootstrapper/bootstrapper.py` both use `src/update_integrity.py`; duplicated
 download orchestration remains only where the current single-entry bootstrapper
 build requires it.
+
+Automatic installer execution is Windows-only. On macOS and other non-Windows
+platforms, the app verifies the package and reveals its containing directory;
+it does not dispatch the package path. A completed installer is best-effort
+discarded when Settings or the bootstrapper is abandoned before a successful
+Windows dispatch. The state clear is idempotent, and a successful `Popen` is
+marked dispatched so later close handling does not treat it as abandoned.
 
 This design protects against transfer/cache corruption and package substitution
 that does not also alter authenticated GitHub release metadata. Compromise of the
@@ -113,10 +127,12 @@ the release candidate; no tag or GitHub Release is created in this sprint.
 
 - Release asset digest absent or malformed: report a download-integrity error;
   offer the releases page only as a manual fallback; do not auto-open it.
-- Download byte count or SHA-256 mismatch: delete `.part` and final output,
-  report failure, and keep the current application alive.
-- Launch-time re-verification failure: delete the package, reset install UI,
-  show an error, and do not disconnect tunnels or quit the app.
+- Download byte count or SHA-256 mismatch: report failure and keep the current
+  application alive. Windows removes only identity-matched owned output; POSIX
+  intentionally retains residue when safe conditional deletion is unavailable.
+- Launch-time re-verification failure: best-effort discard the owned package,
+  reset install UI, show an error, and do not disconnect tunnels or quit the
+  app. A generic process-launch failure keeps the verified package available.
 - Unknown environment confirmation rejected: return `False` and do not start
   SQL, cell-edit commit, or Import execution.
 

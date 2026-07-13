@@ -56,7 +56,7 @@
 |:-:|---------|-------------|
 | 🚀 | **One-Click Migration** | Guided, dry-run-first MySQL 8.0 → 8.4 upgrade in a single flow, powered by Rust DB Core. |
 | 🛡️ | **Upgrade Compatibility Analysis** | Detailed checks surface MySQL 8.4 upgrade risks — deprecated functions, reserved words, charset issues, orphaned records, and more. |
-| 🧙 | **Guided Fix Wizard** | Step-by-step wizard to review and apply suggested fixes, with dry-run previews before anything runs. |
+| 🧙 | **Guided Fix Wizard** | Step-by-step wizard that previews fixes and generates manual SQL for review; it does not apply changes automatically. |
 | 🔄 | **Cross-Engine Migration** | Guided MySQL ↔ PostgreSQL migration powered by Rust DB Core. |
 | 📊 | **Migration Report** | Export detailed HTML/JSON reports of compatibility findings. |
 

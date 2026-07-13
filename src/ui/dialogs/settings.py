@@ -532,6 +532,7 @@ class SettingsDialog(QDialog):
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
         self._downloaded_installer_owner = None
+        self._installer_dispatched = False
         self._download_generation = 0
         self._download_signal_relays = {}
         self._download_retired = False
@@ -616,6 +617,7 @@ class SettingsDialog(QDialog):
     def accept(self):
         """Retire downloads before accepting and closing the dialog."""
         self._retire_active_update_download()
+        self._discard_abandoned_downloaded_installer()
         super().accept()
 
     def _restore_original_theme_if_unsaved(self):
@@ -626,12 +628,14 @@ class SettingsDialog(QDialog):
     def reject(self):
         """취소(또는 창 닫기) 시 미리보기 중이던 테마를 원래 상태로 복원"""
         self._retire_active_update_download()
+        self._discard_abandoned_downloaded_installer()
         self._restore_original_theme_if_unsaved()
         super().reject()
 
     def closeEvent(self, event):
         """Invalidate downloads before the dialog is closed."""
         self._retire_active_update_download()
+        self._discard_abandoned_downloaded_installer()
         self._restore_original_theme_if_unsaved()
         super().closeEvent(event)
 
@@ -707,10 +711,12 @@ class SettingsDialog(QDialog):
         self._retire_active_update_download(wait=True)
         self._download_retired = False
         generation = self._download_generation
+        self._discard_abandoned_downloaded_installer()
         self._downloaded_installer_path = None
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
         self._downloaded_installer_owner = None
+        self._installer_dispatched = False
 
         # UI 상태 변경
         self.btn_check_update.setEnabled(False)
@@ -853,6 +859,7 @@ class SettingsDialog(QDialog):
         if success:
             self._downloaded_installer_path = result
             self._downloaded_installer_owner = owner
+            self._installer_dispatched = False
             action_text = update_package_action_text()
             self.download_progress.setValue(100)
             self.btn_download.setText(action_text.button)
@@ -867,6 +874,7 @@ class SettingsDialog(QDialog):
             self._downloaded_installer_sha256 = None
             self._downloaded_installer_size = 0
             self._downloaded_installer_owner = None
+            self._installer_dispatched = False
             self.download_progress.hide()
             self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
             self.btn_download.setEnabled(True)
@@ -878,10 +886,7 @@ class SettingsDialog(QDialog):
         """다운로드 취소"""
         self._retire_active_update_download(wait=True)
 
-        self._downloaded_installer_path = None
-        self._downloaded_installer_sha256 = None
-        self._downloaded_installer_size = 0
-        self._downloaded_installer_owner = None
+        self._discard_abandoned_downloaded_installer()
 
         # UI 상태 복원
         self.btn_cancel_download.hide()
@@ -934,6 +939,7 @@ class SettingsDialog(QDialog):
                     return
 
                 SettingsDialog._dispatch_verified_installer(self, verified)
+                self._installer_dispatched = True
 
         except IntegrityError as exc:
             SettingsDialog._discard_invalid_installer(self, str(exc))
@@ -1005,6 +1011,7 @@ class SettingsDialog(QDialog):
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
         self._downloaded_installer_owner = None
+        self._installer_dispatched = False
         self.download_progress.hide()
         self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
         self.btn_download.setEnabled(True)
@@ -1026,6 +1033,24 @@ class SettingsDialog(QDialog):
                 f"다시 다운로드해 주세요.\n\n{error_message}"
             ),
         )
+
+    def _discard_abandoned_downloaded_installer(self) -> None:
+        """Best-effort release of a completed package that was never dispatched."""
+        installer_path = self._downloaded_installer_path
+        owner = self._downloaded_installer_owner
+        dispatched = self._installer_dispatched
+        self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
+        self._installer_dispatched = False
+
+        discard = getattr(owner, "discard_downloaded_installer", None)
+        if installer_path and not dispatched and callable(discard):
+            try:
+                discard(installer_path)
+            except Exception:
+                pass
 
     def _adjust_update_label_height(self):
         """업데이트 상태 라벨 높이를 내용에 맞게 조정"""

@@ -1,7 +1,7 @@
 import hashlib
 import os
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -11,6 +11,18 @@ from src.ui.workers.update_worker import UpdateDownloadWorker
 
 
 VALID_DIGEST = "sha256:" + "a" * 64
+
+
+def _assert_failed_download_cleanup(temp_dir, final_path, *, part_created=True):
+    part_path = Path(f"{final_path}.part")
+    assert not final_path.exists()
+    if os.name == "nt":
+        assert not part_path.exists()
+        assert not temp_dir.exists()
+    else:
+        assert temp_dir.exists()
+        if part_created:
+            assert part_path.exists()
 
 
 def _asset(name, url, size, digest=VALID_DIGEST):
@@ -204,9 +216,7 @@ def test_download_installer_rejects_digest_mismatch_and_removes_partial_file(
         downloader.download_installer()
 
     final_path = update_dir / "TunnelForge-Setup-2.0.5.exe"
-    assert not final_path.exists()
-    assert not Path(f"{final_path}.part").exists()
-    assert not update_dir.exists()
+    _assert_failed_download_cleanup(update_dir, final_path)
 
 
 def test_download_installer_cleans_temp_dir_when_cancelled_after_last_chunk(
@@ -238,7 +248,10 @@ def test_download_installer_cleans_temp_dir_when_cancelled_after_last_chunk(
     with pytest.raises(DownloadError, match="취소"):
         downloader.download_installer()
 
-    assert not update_dir.exists()
+    _assert_failed_download_cleanup(
+        update_dir,
+        update_dir / "TunnelForge-Setup-2.0.5.exe",
+    )
 
 
 def test_download_installer_cleans_final_file_when_cancelled_after_replace(
@@ -280,6 +293,8 @@ def test_download_installer_cleans_final_file_when_cancelled_after_replace(
         assert not update_dir.exists()
     else:
         assert update_dir.exists()
+        assert (update_dir / "TunnelForge-Setup-2.0.5.exe").exists()
+        assert (update_dir / "TunnelForge-Setup-2.0.5.exe.part").exists()
 
 
 def test_download_installer_removes_partial_file_on_unexpected_exception(
@@ -309,8 +324,7 @@ def test_download_installer_removes_partial_file_on_unexpected_exception(
         downloader.download_installer(progress_callback=fail_progress)
 
     final_path = tmp_path / "TunnelForge-Setup-2.0.5.exe"
-    assert not final_path.exists()
-    assert not Path(f"{final_path}.part").exists()
+    _assert_failed_download_cleanup(tmp_path, final_path)
 
 
 def test_get_installer_info_does_not_reuse_stale_asset_metadata(monkeypatch):
@@ -744,7 +758,7 @@ def test_windows_delete_owned_child_rejects_identity_mismatch(monkeypatch):
 
     assert delete_child("C:\\temp\\installer.exe", (1, 3)) is False
     mark_for_delete.assert_not_called()
-    close_handle.assert_called_once_with(41)
+    assert call(41) in close_handle.call_args_list
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
@@ -766,7 +780,7 @@ def test_windows_delete_owned_child_closes_handle_after_disposition_failure(
     assert update_integrity._windows_delete_owned_child(
         "C:\\temp\\installer.exe", (1, 3)
     ) is False
-    close_handle.assert_called_once_with(42)
+    assert call(42) in close_handle.call_args_list
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
@@ -806,7 +820,7 @@ def test_windows_retain_closes_probe_handle_after_information_failure(
     monkeypatch.setattr(update_integrity, "_windows_close_handle", close_handle)
 
     assert owner.retain(str(tmp_path / "installer.exe")) is False
-    close_handle.assert_called_once_with(61)
+    assert call(61) in close_handle.call_args_list
 
 
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
@@ -1224,9 +1238,11 @@ def test_download_rejects_oversized_chunk_before_write(
 
     progress.assert_not_called()
     file_handle.write.assert_not_called()
-    assert not (update_dir / "TunnelForge-Setup-2.0.5.exe").exists()
-    assert not part_path.exists()
-    assert not update_dir.exists()
+    _assert_failed_download_cleanup(
+        update_dir,
+        update_dir / "TunnelForge-Setup-2.0.5.exe",
+        part_created=False,
+    )
 
 
 def test_content_length_parser_accepts_ascii_digits_only():

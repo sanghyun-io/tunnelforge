@@ -388,6 +388,7 @@ class BootstrapperApp:
         self.downloader = InstallerDownloader()
         self.download_thread: Optional[threading.Thread] = None
         self.downloaded_file: Optional[str] = None
+        self._installer_dispatched = False
 
         self._setup_window()
         self._create_widgets()
@@ -542,6 +543,7 @@ class BootstrapperApp:
                 progress_callback=self._update_progress
             )
             self.downloaded_file = file_path
+            self._installer_dispatched = False
 
             # 3. 다운로드 완료
             self.root.after(0, self._on_download_complete)
@@ -601,6 +603,7 @@ class BootstrapperApp:
                         ),
                     )
                 )
+            self._installer_dispatched = True
         except IntegrityError as e:
             discard = getattr(
                 self.downloader, "discard_downloaded_installer", None
@@ -624,6 +627,7 @@ class BootstrapperApp:
 
     def _on_cancel(self):
         """취소 버튼 클릭"""
+        self._discard_undispatched_installer()
         if self.cancel_button.cget('text') == '닫기':
             self.root.destroy()
             return
@@ -638,6 +642,20 @@ class BootstrapperApp:
     def _on_close(self):
         """윈도우 닫기"""
         self._on_cancel()
+
+    def _discard_undispatched_installer(self) -> None:
+        """Best-effort release of a completed installer that was not launched."""
+        downloaded_file = self.downloaded_file
+        dispatched = getattr(self, "_installer_dispatched", False)
+        self.downloaded_file = None
+        self._installer_dispatched = False
+
+        discard = getattr(self.downloader, "discard_downloaded_installer", None)
+        if downloaded_file and not dispatched and callable(discard):
+            try:
+                discard(downloaded_file)
+            except Exception:
+                pass
 
     def _open_github(self):
         """GitHub 릴리스 페이지 열기"""

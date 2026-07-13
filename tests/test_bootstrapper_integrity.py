@@ -22,6 +22,18 @@ DOWNLOADER_IMPLEMENTATIONS = [
 SELF_CHECK_MARKER = "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK"
 
 
+def _assert_failed_download_cleanup(download_dir, final_path, *, part_created=True):
+    part_path = Path(f"{final_path}.part")
+    assert not final_path.exists()
+    if os.name == "nt":
+        assert not part_path.exists()
+        assert not download_dir.exists()
+    else:
+        assert download_dir.exists()
+        if part_created:
+            assert part_path.exists()
+
+
 def test_bootstrapper_source_self_check_runs_without_gui_or_network():
     result = subprocess.run(
         [sys.executable, "bootstrapper/bootstrapper.py", "--self-check"],
@@ -189,8 +201,7 @@ def test_bootstrapper_digest_mismatch_removes_partial_output(
         downloader.download_installer()
 
     final_path = download_dir / OFFLINE_NAME
-    assert not final_path.exists()
-    assert not Path(f"{final_path}.part").exists()
+    _assert_failed_download_cleanup(download_dir, final_path)
 
 
 @pytest.mark.parametrize(
@@ -215,9 +226,7 @@ def test_bootstrapper_size_mismatch_removes_all_owned_download_files(
         downloader.download_installer()
 
     final_path = download_dir / OFFLINE_NAME
-    assert not final_path.exists()
-    assert not Path(f"{final_path}.part").exists()
-    assert not download_dir.exists()
+    _assert_failed_download_cleanup(download_dir, final_path)
 
 
 @pytest.mark.parametrize(
@@ -247,9 +256,7 @@ def test_bootstrapper_streaming_cancel_removes_all_owned_download_files(
         downloader.download_installer()
 
     final_path = download_dir / OFFLINE_NAME
-    assert not final_path.exists()
-    assert not Path(f"{final_path}.part").exists()
-    assert not download_dir.exists()
+    _assert_failed_download_cleanup(download_dir, final_path)
 
 
 def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
@@ -348,6 +355,48 @@ def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tm
     discard.assert_not_called()
     assert len(errors) == 1
     assert errors[0].startswith("설치 프로그램 실행 실패")
+
+
+@pytest.mark.parametrize("action", ("_on_cancel", "_on_close"))
+def test_bootstrapper_abandonment_discards_completed_undispatched_installer_once(
+    action, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app._installer_dispatched = False
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "닫기"
+
+    getattr(app, action)()
+    getattr(app, action)()
+
+    app.downloader.discard_downloaded_installer.assert_called_once_with(str(installer))
+    assert app.downloaded_file is None
+
+
+def test_bootstrapper_abandonment_keeps_successfully_dispatched_installer(tmp_path):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app._installer_dispatched = True
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "닫기"
+
+    app._on_cancel()
+
+    app.downloader.discard_downloaded_installer.assert_not_called()
+    assert app.downloaded_file is None
 
 
 def test_bootstrapper_non_windows_never_launches_windows_installer(monkeypatch, tmp_path):
@@ -786,9 +835,11 @@ def test_bootstrapper_rejects_oversized_chunk_before_write(
 
     progress.assert_not_called()
     file_handle.write.assert_not_called()
-    assert not (download_dir / OFFLINE_NAME).exists()
-    assert not part_path.exists()
-    assert not download_dir.exists()
+    _assert_failed_download_cleanup(
+        download_dir,
+        download_dir / OFFLINE_NAME,
+        part_created=False,
+    )
 
 
 def test_bootstrapper_import_does_not_require_update_downloader():
@@ -927,6 +978,7 @@ def test_bootstrapper_verified_launch_closes_replacement_race(
     if os.name == "nt":
         assert replacement_blocked == [True]
         assert errors == []
+        assert app._installer_dispatched is True
     else:
         assert replacement_blocked == []
         assert errors and "identity" in errors[0]

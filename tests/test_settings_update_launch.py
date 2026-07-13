@@ -64,6 +64,7 @@ def test_windows_update_launches_visible_installer_directly(monkeypatch, tmp_pat
     assert "cmd.exe" not in args[0]
     assert "/SILENT" not in args[0]
     assert kwargs["close_fds"] is True
+    assert dialog._installer_dispatched is True
     main_window.close_app.assert_called_once()
 
 
@@ -78,6 +79,7 @@ def test_macos_update_keeps_verified_package_without_path_dispatch(monkeypatch, 
     dialog._latest_version = "2.0.7"
     dialog.parent.return_value = main_window
     dialog._downloaded_installer_owner = owner
+    dialog._installer_dispatched = False
     _record_expected_integrity(dialog, package)
 
     popen = MagicMock()
@@ -485,6 +487,7 @@ class _MinimalDownloadDialog(settings.SettingsDialog):
         self._downloaded_installer_sha256 = None
         self._downloaded_installer_size = 0
         self._downloaded_installer_owner = None
+        self._installer_dispatched = False
         self._latest_version = "2.0.7"
         self._theme_saved = True
         self._download_generation = 0
@@ -779,3 +782,51 @@ def test_settings_close_cancels_inflight_worker_without_waiting_in_ui_thread(
     assert dialog._downloaded_installer_path is None
     assert dialog._downloaded_installer_sha256 is None
     assert dialog._downloaded_installer_size == 0
+
+
+@pytest.mark.parametrize("action", ("accept", "reject", "close"))
+def test_settings_abandonment_discards_completed_undispatched_installer_once(
+    action, tmp_path
+):
+    app = QApplication.instance() or QApplication([])
+    installer = tmp_path / "abandoned-installer.exe"
+    installer.write_bytes(b"safe")
+    owner = MagicMock()
+    dialog = _MinimalDownloadDialog()
+    dialog._downloaded_installer_path = str(installer)
+    dialog._downloaded_installer_sha256 = hashlib.sha256(b"safe").hexdigest()
+    dialog._downloaded_installer_size = len(b"safe")
+    dialog._downloaded_installer_owner = owner
+
+    getattr(dialog, action)()
+    getattr(dialog, action)()
+    app.processEvents()
+
+    owner.discard_downloaded_installer.assert_called_once_with(str(installer))
+    assert dialog._downloaded_installer_path is None
+    assert dialog._downloaded_installer_sha256 is None
+    assert dialog._downloaded_installer_size == 0
+    assert dialog._downloaded_installer_owner is None
+
+
+def test_settings_abandonment_does_not_discard_successfully_dispatched_installer(
+    tmp_path,
+):
+    app = QApplication.instance() or QApplication([])
+    installer = tmp_path / "dispatched-installer.exe"
+    installer.write_bytes(b"safe")
+    owner = MagicMock()
+    dialog = _MinimalDownloadDialog()
+    dialog._downloaded_installer_path = str(installer)
+    dialog._downloaded_installer_sha256 = hashlib.sha256(b"safe").hexdigest()
+    dialog._downloaded_installer_size = len(b"safe")
+    dialog._downloaded_installer_owner = owner
+    dialog._installer_dispatched = True
+
+    dialog.reject()
+
+    app.processEvents()
+
+    owner.discard_downloaded_installer.assert_not_called()
+    assert dialog._downloaded_installer_path is None
+    assert dialog._downloaded_installer_owner is None

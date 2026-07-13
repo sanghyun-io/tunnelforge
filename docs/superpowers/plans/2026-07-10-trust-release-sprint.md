@@ -1,6 +1,8 @@
-# Trust & Release Sprint Implementation Plan
+# Trust & Release Sprint Historical Implementation Plan
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+> **Historical/superseded:** The task steps and unchecked boxes below record the
+> original implementation sequence. They are not executable current guidance.
+> The final contract is the superseding record immediately below.
 
 **Goal:** Produce a reviewed `2.3.1` release-candidate branch that fails closed on unverified update packages and unknown dangerous-operation environments, exposes stable Python/Rust PR gates, and accurately documents supported features.
 
@@ -20,6 +22,25 @@
 - Preserve unrelated `.claude/` files and the existing `feat/table-collation-dump-import` worktree.
 - Use TDD: record the focused RED command and expected failure before production changes, then GREEN evidence.
 - Each implementer runs focused tests while iterating and the full Python suite once before committing.
+
+## Final Superseding Contract
+
+- `VerifiedFileLease` guards verification-to-dispatch identity, and
+  `OwnedTempDirectory.create_file()` plus no-clobber publish owns temporary
+  file creation.
+- Windows cleanup deletes only identity-matched owned children. POSIX must not
+  claim equivalent deletion: `.part`, final, and temporary-directory residue
+  may remain because standard POSIX lacks identity-conditional unlink.
+- Failure and abandonment always prevent download success or launch on every
+  platform. macOS/non-Windows automatic package dispatch is disabled; the app
+  only reveals the verified package directory.
+- Settings and the bootstrapper best-effort discard a completed package before
+  dispatch on accept, reject, close, or cancel. The state clear is idempotent;
+  a successful Windows `Popen` marks the package dispatched and is not treated
+  as abandonment. Generic launch failures do not delete a verified package.
+- F1 CI aggregation and bootstrapper self-check are completed historical
+  release-trust gates; retain them as regression coverage rather than treating
+  the original task steps as current work.
 
 ---
 
