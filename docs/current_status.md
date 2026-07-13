@@ -123,7 +123,12 @@ GitHub Environment now has a required reviewer, admin bypass disabled, and
 `main`/`v*` deployment policies. `main` protection is strict, applies to admins,
 requires conversation resolution and five terminal/platform checks, and an
 active ruleset prevents `v*` tag update/deletion/non-fast-forward changes.
-Local workflow/full-suite verification passed; PR Actions remain pending.
+Initial PR #240 Actions exposed process-wide i18n leakage in the Windows Python
+job and a missing `src.ui` bundle caused by the string-based lazy import in the
+macOS package. Code baseline `7d49601` resets language state around every test
+and collects `src.ui` submodules for PyInstaller. The full suite, real
+PyInstaller build, and frozen UI smoke check pass locally; the replacement PR
+Actions run remains pending.
 
 TF-STATUS-090 is `blocked`: the protected release environment has none of the
 Apple Developer ID signing/notarization secrets required by the fail-closed
@@ -477,9 +482,9 @@ preserves earlier broad evidence rows, including the historical Full-suite count
 
 | Check | Result |
 | --- | --- |
-| `git status --short --branch` | verified RC code baseline `c52f60e` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
+| `git status --short --branch` | verified RC code baseline `7d49601` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
 | update/security/status/version focused pytest | PASS, 319 passed, 1 skipped in 48.27s, exit 0 |
-| `pytest -q` | PASS, 2028 passed, 1 skipped, 4 warnings, 61.83s, exit 0 |
+| `pytest -q` | PASS, 2028 passed, 1 skipped, 4 warnings, 59.79s, exit 0 |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
 | `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS, Rust regression gate pass, exit 0 |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
@@ -602,6 +607,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | PR #240 hosted regression failure remediation | PR runs `29228401540`, `29228401548`, and `29228414876` failure logs; i18n leak reproduction; focused app/cross-engine/i18n and packaging tests; standalone full Python suite; PyInstaller build; frozen `--ui-smoke-check`; `git diff --check` | LOCAL PASS, replacement hosted run pending | Hosted logs showed English Qt state leaking from UI smoke into later tests and `ModuleNotFoundError: No module named 'src.ui'` in both macOS architectures. RED reproduced the translated dialog and missing spec collection. GREEN: focused 79 + 14 passed, full Python 2028 passed, 1 skipped, 4 warnings in 59.79s, PyInstaller build passed, and frozen smoke returned `success=true` with bundled Rust Core service hello. |
 | 2026-07-13 | TF-STATUS-089 release approval boundary implementation and live controls | release/CI focused suite; GitHub App auth focused suite; standalone full Python suite; Rust regression/Cargo test/release build; GitHub Environment, branch protection, and tag ruleset API reads; `git diff --check` | PASS with external blockers recorded | Workflow: 64 passed in 47.39s. GitHub auth/settings: 114 passed in 7.60s. Final full Python: 2028 passed, 1 skipped, 4 warnings in 61.83s. Rust regression, Cargo 216 + 2 JSONL + 9 live + 2 stress / 1 ignored, and release build passed. `production-release`, strict main protection, and immutable `v*` update/delete rules are live. Apple secrets, an independent maintainer, PR Actions, and real-Mac evidence remain pending. |
 | 2026-07-13 | TF-STATUS-088 final status-document verification | `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q`; `git diff --check` | PASS, 65 passed, exit 0; diff check pass | Confirms the CI trust-boundary issue lifecycle and code baseline `9088aab`. |
 | 2026-07-13 | TF-STATUS-088 version-gate trust-boundary closure | CI workflow focused suite; update/security/status/version focused suite; standalone full Python suite; `git diff --check` | PASS | CI workflow: 9 passed. Focused: 319 passed, 1 skipped in 48.27s. Full Python: 2031 passed, 1 skipped, 4 warnings in 60.28s. Commit-message bypass is removed, three real version files are checked against the trusted expected value, and the App token action is commit-pinned. |
@@ -2408,6 +2414,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Remediated PR #240 hosted regressions at code baseline `7d49601`: isolated process-wide language state between tests and explicitly bundled lazy-loaded `src.ui` modules. | `tests/conftest.py`, `tunnel-manager.spec`, packaging regression test, status docs/tests | RED hosted Python/macOS runs and local reproductions; GREEN focused 79 + 14, full Python 2028 / 1 skipped / 4 warnings, PyInstaller build and frozen UI smoke success; replacement hosted run pending. |
 | 2026-07-13 | Hardened the pre-release boundary at code baseline `c52f60e`: removed distributable GitHub App private-key embedding, made tag and draft release separate approved manual operations, pinned every action, and added exact tag/ancestor/version plus macOS signature/notarization checks. Applied the protected Environment, strict main checks, and immutable release-tag update/delete rules. | release/tag workflows, GitHub App auth and UI copy, setup docs, focused tests, status docs/tests, live GitHub configuration | Workflow 64 passed; GitHub auth/settings 114 passed; final standalone full Python 2028 passed / 1 skipped / 4 warnings; Rust regression/Cargo test/release build and diff check passed. Security re-review: SECURE / APPROVE. TF-STATUS-090/091 record missing Apple secrets and independent maintainer. |
 | 2026-07-13 | Closed TF-STATUS-088 after the final CI security audit: removed commit-message-only bump completion, made trusted expected-version comparison cover all three version files, and pinned the releaser App token action to a full commit SHA. | `.github/workflows/version-gate.yml`, `tests/test_ci_workflows.py`, status docs/tests | CI workflow 9 passed; focused 319 passed / 1 skipped; standalone full Python 2031 passed / 1 skipped / 4 warnings; diff check passed. |
 | 2026-07-13 | Closed the cancelled-DownloadError destroyed-root edge by applying the synchronized abandonment retirement rule to error UI scheduling as well as completion scheduling. | `bootstrapper/bootstrapper.py`, `tests/test_bootstrapper_integrity.py`, status docs/tests | Bootstrapper 74 passed; focused 318 passed / 1 skipped; standalone full Python 2030 passed / 1 skipped / 4 warnings; rebuilt frozen self-check and diff check passed. |
