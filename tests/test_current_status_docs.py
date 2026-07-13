@@ -929,7 +929,7 @@ def test_current_status_records_231_release_candidate_handoff():
     assert "TF-STATUS-079 | High | closed" in tracker
     assert "TF-STATUS-080 | Medium | closed" in tracker
     assert "TF-STATUS-082 | Medium | closed" in tracker
-    assert "TF-STATUS-081 | High | in_progress" in tracker
+    assert "TF-STATUS-081 | High | closed" in tracker
     assert "TF-STATUS-083 | Medium | closed" in tracker
     assert "TF-STATUS-008 | Low | open" in tracker
     assert "TF-STATUS-078 | Low | open" in tracker
@@ -943,9 +943,8 @@ def test_current_status_records_231_release_candidate_handoff():
     ]:
         assert phrase in verification
 
-    assert "TF-STATUS-081" in order
-    assert "approved release execution" in order
-    assert "PR #240 merge" in order
+    assert "Keep TF-STATUS-081 closed" in order
+    assert "v2.3.1" in order
     assert "strict required checks" in order
     assert "TF-STATUS-008" in order
     assert "TF-STATUS-078" in order
@@ -1065,7 +1064,7 @@ def test_current_status_refresh_preserves_historical_test_snapshots_and_statuses
     for status in [
         "TF-STATUS-079 | High | closed",
         "TF-STATUS-080 | Medium | closed",
-        "TF-STATUS-081 | High | in_progress",
+        "TF-STATUS-081 | High | closed",
         "TF-STATUS-082 | Medium | closed",
         "TF-STATUS-083 | Medium | closed",
         "TF-STATUS-008 | Low | open",
@@ -1111,3 +1110,20 @@ def test_current_status_tracks_release_approval_and_accepted_unsigned_macos_poli
     assert "Security re-review: SECURE / APPROVE" in doc
     assert order.index("TF-STATUS-089") < order.index("TF-STATUS-090")
     assert order.index("TF-STATUS-090") < order.index("TF-STATUS-091")
+
+
+def test_current_status_records_published_231_release_evidence():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "`v2.3.1` is published as the latest stable GitHub Release" in summary
+    assert "TF-STATUS-081 | High | closed" in tracker
+    assert "29233663954" in verification
+    assert "29233708190" in verification
+    assert "10 release assets" in verification
+    assert "all GitHub SHA-256 digests present" in verification
+    assert "b80e15c6148ba19a357a84b4e9e6cee8ae0b4727" in sessions
+    assert "https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1" in sessions
