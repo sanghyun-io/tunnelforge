@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import yaml
@@ -24,6 +25,20 @@ def version_gate_job_text(job_name):
     while next_job != -1 and workflow_text[next_job + 3:next_job + 4] == " ":
         next_job = workflow_text.find("\n  ", next_job + 1)
     return workflow_text[job_start:] if next_job == -1 else workflow_text[job_start:next_job]
+
+
+def load_workflow(path):
+    workflow = yaml.safe_load(path.read_text(encoding="utf-8"))
+    if True in workflow and "on" not in workflow:
+        workflow["on"] = workflow.pop(True)
+    return workflow
+
+
+def assert_external_actions_are_sha_pinned(workflow_text):
+    external_uses = re.findall(r"^\s*uses:\s*([^\s]+)", workflow_text, re.MULTILINE)
+
+    assert external_uses
+    assert all(re.fullmatch(r"[^@\s]+@[0-9a-f]{40}", action) for action in external_uses)
 
 
 def test_version_gate_exposes_required_regression_jobs():
@@ -173,38 +188,141 @@ def test_version_bump_requires_real_version_files_and_pins_token_action():
 
 def test_release_tag_creation_is_manual_approved_and_sha_bound():
     workflow_text = CREATE_RELEASE_TAG_PATH.read_text(encoding="utf-8")
-    workflow = yaml.safe_load(workflow_text)
-    if True in workflow and "on" not in workflow:
-        workflow["on"] = workflow.pop(True)
+    workflow = load_workflow(CREATE_RELEASE_TAG_PATH)
     job = workflow["jobs"]["create-tag"]
 
     assert set(workflow["on"]) == {"workflow_dispatch"}
     assert "target_sha" in workflow["on"]["workflow_dispatch"]["inputs"]
+    assert "version" in workflow["on"]["workflow_dispatch"]["inputs"]
     assert "confirm" in workflow["on"]["workflow_dispatch"]["inputs"]
+    assert workflow["permissions"] == {"contents": "read"}
     assert job["environment"] == "production-release"
+    assert job["permissions"] == {"contents": "write"}
+    validate_step = next(step for step in job["steps"] if step["name"] == "Validate target and create tag")
+    assert validate_step["env"] == {
+        "TARGET_SHA": "${{ inputs.target_sha }}",
+        "VERSION": "${{ inputs.version }}",
+        "CONFIRM": "${{ inputs.confirm }}",
+        "GITHUB_TOKEN": "${{ github.token }}",
+    }
     assert "github.event.pull_request" not in workflow_text
     assert "git rev-parse origin/main" in workflow_text
     assert 'TARGET_SHA" != "$MAIN_SHA' in workflow_text
+    assert 'TAG="v${VERSION}"' in workflow_text
+    assert '"$PYTHON_VERSION" != "$VERSION"' in workflow_text
+    assert '"$PROJECT_VERSION" != "$VERSION"' in workflow_text
+    assert '"$INSTALLER_VERSION" != "$VERSION"' in workflow_text
     assert "src/version.py" in workflow_text
     assert "pyproject.toml" in workflow_text
     assert "installer/TunnelForge.iss" in workflow_text
-    assert "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1" in workflow_text
+    assert "actions/create-github-app-token" not in workflow_text
+    assert "RELEASER_" not in workflow_text
+    assert "private-key:" not in workflow_text
+    assert "GITHUB_TOKEN: ${{ github.token }}" in workflow_text
     assert "actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd" in workflow_text
+    assert "persist-credentials: false" in workflow_text
+    assert "persist-credentials: true" not in workflow_text
+    assert_external_actions_are_sha_pinned(workflow_text)
 
 
 def test_release_publication_requires_approval_and_creates_draft():
     workflow_text = RELEASE_PATH.read_text(encoding="utf-8")
-    workflow = yaml.safe_load(workflow_text)
+    workflow = load_workflow(RELEASE_PATH)
     release_job = workflow["jobs"]["create-release"]
 
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    dispatch_inputs = workflow["on"]["workflow_dispatch"]["inputs"]
+    assert {"tag", "version", "confirm"} <= set(dispatch_inputs)
+    assert all(dispatch_inputs[name]["required"] is True for name in ("tag", "version", "confirm"))
+    assert "push:" not in workflow_text
+    assert "RELEASE_DRAFT" in workflow_text
+    assert workflow["permissions"] == {"contents": "read"}
     assert release_job["environment"] == "production-release"
-    assert "softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d" in workflow_text
+    assert release_job["permissions"] == {"contents": "write"}
+    assert "softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b" in workflow_text
+    release_step = next(
+        step for step in release_job["steps"]
+        if step.get("uses", "").startswith("softprops/action-gh-release@")
+    )
+    assert release_step["with"]["tag_name"] == "${{ needs.release-preflight.outputs.tag }}"
     assert "draft: true" in workflow_text
     assert "prerelease: false" in workflow_text
     assert "Apple signing certificate secret is required" in workflow_text
     assert "APPLE_ID is required for release notarization" in workflow_text
     assert "APPLE_TEAM_ID is required for release notarization" in workflow_text
     assert "APPLE_APP_SPECIFIC_PASSWORD is required for release notarization" in workflow_text
+
+
+def test_release_workflow_preflight_gates_all_secret_release_work():
+    workflow_text = RELEASE_PATH.read_text(encoding="utf-8")
+    workflow = load_workflow(RELEASE_PATH)
+    jobs = workflow["jobs"]
+    preflight = jobs["release-preflight"]
+
+    assert set(jobs) == {"release-preflight", "build-windows-installer", "build-macos-app", "create-release"}
+    assert preflight["permissions"] == {"contents": "read"}
+    assert preflight["runs-on"] == "ubuntu-24.04"
+    preflight_checkout = next(
+        step for step in preflight["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    assert preflight_checkout["with"] == {
+        "ref": "refs/tags/${{ inputs.tag }}",
+        "fetch-depth": 0,
+        "persist-credentials": False,
+    }
+    validate_step = next(step for step in preflight["steps"] if step["name"] == "Validate release target")
+    assert validate_step["env"] == {
+        "TAG": "${{ inputs.tag }}",
+        "VERSION": "${{ inputs.version }}",
+        "CONFIRM": "${{ inputs.confirm }}",
+    }
+    assert "^[0-9a-f]{40}$" in workflow_text
+    assert "^v(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)$" in workflow_text
+    assert 'git rev-parse "${TAG}^{commit}"' in workflow_text
+    assert "git rev-parse origin/main^{commit}" in workflow_text
+    assert 'git merge-base --is-ancestor "$TAG_SHA" "$MAIN_SHA"' in workflow_text
+    assert 'if [ "$CONFIRM" != "RELEASE_DRAFT" ]; then' in workflow_text
+    assert 'if [ "$TAG" != "v${VERSION}" ]; then' in workflow_text
+    assert "src/version.py" in workflow_text
+    assert "pyproject.toml" in workflow_text
+    assert "installer/TunnelForge.iss" in workflow_text
+    assert "GH_APP_PRIVATE_KEY" not in workflow_text
+    assert "embed_github_credentials.py" not in workflow_text
+    assert "RELEASER_" not in workflow_text
+
+    for job_name, job in jobs.items():
+        if job_name == "release-preflight":
+            continue
+        needs = job["needs"]
+        needs = [needs] if isinstance(needs, str) else needs
+        assert "release-preflight" in needs
+        for step in job["steps"]:
+            if step.get("uses", "").startswith("actions/checkout@"):
+                assert step["with"]["persist-credentials"] is False
+                assert step["with"]["ref"] == "refs/tags/${{ needs.release-preflight.outputs.tag }}"
+
+        job_text = yaml.safe_dump(job, sort_keys=False)
+        assert "needs.release-preflight.outputs.version" in job_text
+
+    assert jobs["build-windows-installer"]["environment"] == "production-release"
+    assert jobs["build-macos-app"]["environment"] == "production-release"
+    assert_external_actions_are_sha_pinned(workflow_text)
+
+
+def test_release_macos_artifacts_are_validated_before_upload():
+    workflow_text = RELEASE_PATH.read_text(encoding="utf-8")
+    verification_index = workflow_text.index("Verify signed and notarized macOS artifacts")
+    upload_index = workflow_text.index("Upload macOS release artifacts")
+
+    assert verification_index < upload_index
+    verification_text = workflow_text[verification_index:upload_index]
+    assert 'codesign --verify --deep --strict --verbose=2 "$APP_PATH"' in verification_text
+    assert 'spctl --assess --type execute --verbose "$APP_PATH"' in verification_text
+    assert 'xcrun stapler validate "$APP_PATH"' in verification_text
+    assert 'codesign --verify --strict --verbose=2 "$DMG_PATH"' in verification_text
+    assert 'spctl --assess --type open --context context:primary-signature --verbose "$DMG_PATH"' in verification_text
+    assert 'xcrun stapler validate "$DMG_PATH"' in verification_text
 
 
 def test_required_version_gate_is_terminal_and_aggregates_all_results():

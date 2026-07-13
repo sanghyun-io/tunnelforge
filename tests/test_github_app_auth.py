@@ -305,51 +305,18 @@ class TestTestConnection:
 
 
 # ============================================================
-# 난독화 유틸리티
+# 환경변수 설정
 # ============================================================
 
-class TestObfuscation:
-    """난독화/해독 왕복 검증"""
-
-    def test_roundtrip(self):
-        from src.core.github_app_auth import GitHubAppAuth
-        original = "test-secret-value-12345"
-        obfuscated = GitHubAppAuth._obfuscate(original)
-        assert obfuscated != original
-        deobfuscated = GitHubAppAuth._deobfuscate(obfuscated)
-        assert deobfuscated == original
-
-    def test_deobfuscate_invalid_returns_empty(self):
-        from src.core.github_app_auth import GitHubAppAuth
-        result = GitHubAppAuth._deobfuscate("not-valid-base64!!!")
-        assert result == ""
-
-    def test_roundtrip_with_special_chars(self):
-        from src.core.github_app_auth import GitHubAppAuth
-        original = "-----BEGIN RSA PRIVATE KEY-----\nMIIE...\n-----END RSA PRIVATE KEY-----"
-        obfuscated = GitHubAppAuth._obfuscate(original)
-        deobfuscated = GitHubAppAuth._deobfuscate(obfuscated)
-        assert deobfuscated == original
-
-
-# ============================================================
-# from_env_or_embedded
-# ============================================================
-
-class TestFromEnvOrEmbedded:
-    """환경변수/내장 값으로부터 인스턴스 생성"""
+class TestFromEnv:
+    """환경변수 또는 .env에서만 인증 정보를 읽는지 검증"""
 
     def test_returns_none_when_no_config(self):
         from src.core.github_app_auth import GitHubAppAuth
-        # 환경변수와 내장 값 모두 없는 경우
         GitHubAppAuth._env_loaded = False
         with patch.dict('os.environ', {}, clear=True), \
-             patch.object(GitHubAppAuth, '_EMBEDDED_APP_ID', None), \
-             patch.object(GitHubAppAuth, '_EMBEDDED_PRIVATE_KEY', None), \
-             patch.object(GitHubAppAuth, '_EMBEDDED_INSTALLATION_ID', None), \
-             patch.object(GitHubAppAuth, '_EMBEDDED_REPO', None), \
              patch('src.core.github_app_auth.HAS_DOTENV', False):
-            result = GitHubAppAuth.from_env_or_embedded()
+            result = GitHubAppAuth.from_env()
 
         assert result is None
 
@@ -366,11 +333,33 @@ class TestFromEnvOrEmbedded:
 
         with patch.dict('os.environ', env, clear=True), \
              patch('src.core.github_app_auth.HAS_DOTENV', False):
-            result = GitHubAppAuth.from_env_or_embedded()
+            result = GitHubAppAuth.from_env()
 
         assert result is not None
         assert result.app_id == '111'
         assert result.repo == 'test/repo'
+
+    def test_legacy_embedded_and_codec_apis_are_removed(self):
+        from pathlib import Path
+        from src.core.github_app_auth import GitHubAppAuth
+
+        assert not any(
+            hasattr(GitHubAppAuth, name)
+            for name in (
+                '_EMBEDDED_APP_ID',
+                '_EMBEDDED_PRIVATE_KEY',
+                '_EMBEDDED_INSTALLATION_ID',
+                '_EMBEDDED_REPO',
+                '_OBFUSCATION_KEY',
+                '_obfuscate',
+                '_deobfuscate',
+                'generate_embedded_code',
+                'from_env_or_embedded',
+            )
+        )
+        repo_root = Path(__file__).resolve().parents[1]
+        assert not (repo_root / 'scripts' / 'embed_github_credentials.py').exists()
+        assert not (repo_root / 'scripts' / 'github_app_secret_codec.py').exists()
 
 
 # ============================================================
@@ -381,7 +370,7 @@ class TestConvenienceFunctions:
 
     def test_get_github_app_auth_returns_instance_or_none(self):
         from src.core.github_app_auth import get_github_app_auth
-        with patch('src.core.github_app_auth.GitHubAppAuth.from_env_or_embedded', return_value=None):
+        with patch('src.core.github_app_auth.GitHubAppAuth.from_env', return_value=None):
             result = get_github_app_auth()
         assert result is None
 

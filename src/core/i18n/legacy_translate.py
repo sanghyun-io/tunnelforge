@@ -200,7 +200,7 @@ _EN_PHRASE_TRANSLATIONS = {
     "GitHub App이 설정되어 있습니다.": "GitHub App is configured.",
     "GitHub App이 설정되지 않았습니다.": "GitHub App is not configured.",
     "오류 발생 시 자동으로 이슈를 생성하거나, 유사한 이슈가 있으면 코멘트를 추가합니다.": "When errors occur, TunnelForge creates an issue or comments on a similar existing issue.",
-    "환경변수 또는 내장 설정이 필요합니다.": "Environment variables or embedded settings are required.",
+    "환경변수 또는 로컬 .env 설정이 필요합니다.": "Environment variables or a local .env file are required.",
     "백업 목록": "Backup List",
     "최근 5개": "latest 5",
     "설정 백업/복원": "Settings Backup/Restore",

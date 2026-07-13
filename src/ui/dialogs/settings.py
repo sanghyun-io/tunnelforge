@@ -215,7 +215,7 @@ class SettingsDialog(QDialog):
         else:
             desc_label = QLabel(
                 "⚠️ GitHub App이 설정되지 않았습니다.\n"
-                "환경변수 또는 내장 설정이 필요합니다. (GITHUB_APP_SETUP.md 참조)"
+                "환경변수 또는 로컬 .env 설정이 필요합니다. (GITHUB_APP_SETUP.md 참조)"
             )
             desc_label.setStyleSheet("color: #e74c3c; font-size: 11px; margin-left: 20px; margin-top: 5px;")
             desc_label.setWordWrap(True)

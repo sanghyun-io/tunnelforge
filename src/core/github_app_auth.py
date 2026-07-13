@@ -61,15 +61,6 @@ class GitHubAppAuth:
     # .env 파일 로드 여부
     _env_loaded = False
 
-    # 내장 값 (빌드 시 설정)
-    _EMBEDDED_APP_ID: Optional[str] = None
-    _EMBEDDED_PRIVATE_KEY: Optional[str] = None  # 난독화된 PEM
-    _EMBEDDED_INSTALLATION_ID: Optional[str] = None
-    _EMBEDDED_REPO: Optional[str] = None
-
-    # 난독화 키
-    _OBFUSCATION_KEY = b"TunnelForgeGitHubApp2024"
-
     # 캐시된 Installation Token
     _cached_token: Optional[str] = None
     _token_expires_at: Optional[datetime] = None
@@ -120,16 +111,15 @@ class GitHubAppAuth:
         cls._env_loaded = True
 
     @classmethod
-    def from_env_or_embedded(cls) -> Optional['GitHubAppAuth']:
-        """환경변수 또는 내장 값에서 인스턴스 생성"""
+    def from_env(cls) -> Optional['GitHubAppAuth']:
+        """환경변수 또는 .env 파일에서 인스턴스 생성"""
         # .env 파일 로드
         cls._load_env_file()
 
-        # 환경변수 우선
-        app_id = os.environ.get(cls.ENV_APP_ID) or cls._get_embedded_value('app_id')
+        app_id = os.environ.get(cls.ENV_APP_ID)
         private_key = cls._get_private_key()
-        installation_id = os.environ.get(cls.ENV_INSTALLATION_ID) or cls._get_embedded_value('installation_id')
-        repo = os.environ.get(cls.ENV_REPO) or cls._get_embedded_value('repo')
+        installation_id = os.environ.get(cls.ENV_INSTALLATION_ID)
+        repo = os.environ.get(cls.ENV_REPO)
 
         if all([app_id, private_key, installation_id, repo]):
             return cls(app_id, private_key, installation_id, repo)
@@ -137,7 +127,7 @@ class GitHubAppAuth:
 
     @classmethod
     def _get_private_key(cls) -> Optional[str]:
-        """Private Key 조회 (환경변수 또는 내장)"""
+        """환경변수에서 Private Key 조회"""
         env_key = os.environ.get(cls.ENV_PRIVATE_KEY)
 
         if env_key:
@@ -160,29 +150,12 @@ class GitHubAppAuth:
             except Exception:
                 pass
 
-        # 내장 키 사용
-        if cls._EMBEDDED_PRIVATE_KEY:
-            return cls._deobfuscate(cls._EMBEDDED_PRIVATE_KEY)
-
-        return None
-
-    @classmethod
-    def _get_embedded_value(cls, key: str) -> Optional[str]:
-        """내장 값 조회 (난독화 해제)"""
-        embedded_map = {
-            'app_id': cls._EMBEDDED_APP_ID,
-            'installation_id': cls._EMBEDDED_INSTALLATION_ID,
-            'repo': cls._EMBEDDED_REPO
-        }
-        value = embedded_map.get(key)
-        if value:
-            return cls._deobfuscate(value)
         return None
 
     @classmethod
     def is_configured(cls) -> bool:
         """GitHub App 설정 여부 확인"""
-        return cls.from_env_or_embedded() is not None
+        return cls.from_env() is not None
 
     def _generate_jwt(self) -> str:
         """JWT 생성 (App 인증용)"""
@@ -322,42 +295,9 @@ class GitHubAppAuth:
         except Exception as e:
             return False, f"예상치 못한 오류: {str(e)}"
 
-    # === 난독화 유틸리티 ===
-    #
-    # _obfuscate/generate_embedded_code는 빌드타임 전용 도구라
-    # scripts/github_app_secret_codec.py로 위임한다. _deobfuscate는 런타임에
-    # _EMBEDDED_PRIVATE_KEY를 복호화하는 경로이므로(패키징된 exe에 scripts/가
-    # 포함되지 않음) scripts import 없이 이 클래스 내부 구현을 그대로 유지한다.
-
-    @classmethod
-    def _obfuscate(cls, plain_text: str) -> str:
-        """문자열 난독화 (빌드타임 전용 — scripts/github_app_secret_codec에 위임)"""
-        from scripts.github_app_secret_codec import obfuscate
-        return obfuscate(plain_text)
-
-    @classmethod
-    def _deobfuscate(cls, obfuscated: str) -> str:
-        """난독화 해제 (런타임 경로 — _EMBEDDED_PRIVATE_KEY 복호화에 사용)"""
-        try:
-            import base64
-            key = cls._OBFUSCATION_KEY
-            data = base64.b64decode(obfuscated.encode('ascii'))
-            plain = bytes(d ^ key[i % len(key)] for i, d in enumerate(data))
-            return plain.decode('utf-8')
-        except Exception:
-            return ""
-
-    @classmethod
-    def generate_embedded_code(cls, app_id: str, private_key: str,
-                                installation_id: str, repo: str) -> str:
-        """빌드 시 삽입할 코드 생성 (빌드타임 전용 — scripts/github_app_secret_codec에 위임)"""
-        from scripts.github_app_secret_codec import generate_embedded_code
-        return generate_embedded_code(app_id, private_key, installation_id, repo)
-
-
 def get_github_app_auth() -> Optional[GitHubAppAuth]:
     """GitHub App 인증 인스턴스 반환 (편의 함수)"""
-    return GitHubAppAuth.from_env_or_embedded()
+    return GitHubAppAuth.from_env()
 
 
 def is_github_app_configured() -> bool:

@@ -155,28 +155,14 @@ setx GITHUB_REPO "your-org/your-repo"
 
 ---
 
-## .exe 빌드 시 내장 설정
+## 배포 빌드 보안 정책
 
-배포용 `.exe` 파일에 인증 정보를 내장하려면:
+GitHub App private key는 `.exe`, `.app`, 설치 파일 또는 소스 코드에 내장하지
+않습니다. 난독화는 비밀키 보호가 아니며 배포물에서 복구될 수 있습니다.
 
-```python
-from src.core.github_app_auth import GitHubAppAuth
-
-# Private Key 내용 읽기
-with open('private-key.pem', 'r') as f:
-    private_key = f.read()
-
-# 난독화된 코드 생성
-code = GitHubAppAuth.generate_embedded_code(
-    app_id="123456",
-    private_key=private_key,
-    installation_id="12345678",
-    repo="your-org/your-repo"
-)
-print(code)
-```
-
-출력된 코드를 `src/core/github_app_auth.py`의 해당 변수에 삽입합니다.
+GitHub 이슈 자동 보고가 필요한 운영 환경에서만 위 환경변수 또는 로컬 `.env`
+파일로 자격증명을 주입하세요. 일반 배포 빌드는 자격증명이 없는 상태로
+생성되며, 이 경우 자동 보고 기능은 안전하게 비활성화됩니다.
 
 ---
 

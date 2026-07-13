@@ -1894,12 +1894,16 @@ def test_release_workflow_creates_release_after_all_platform_artifacts():
     macos_job_text = workflow_text.split("  build-macos-app:", 1)[1].split("\n  create-release:", 1)[0]
 
     assert "create-release" in jobs
-    assert jobs["create-release"]["needs"] == ["build-windows-installer", "build-macos-app"]
+    assert jobs["create-release"]["needs"] == [
+        "release-preflight",
+        "build-windows-installer",
+        "build-macos-app",
+    ]
     assert "actions/download-artifact" in workflow_text
     assert "merge-multiple: true" in workflow_text
     assert "Normalize release artifacts" in workflow_text
     assert "find release-artifacts -type f" in workflow_text
-    assert "softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d" in workflow_text
+    assert "softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b" in workflow_text
     assert "Create GitHub Release" in workflow_text
     assert "release-upload/TunnelForge-Setup-*.exe" in workflow_text
     assert "release-upload/TunnelForge-WebSetup.exe" in workflow_text
@@ -1907,8 +1911,8 @@ def test_release_workflow_creates_release_after_all_platform_artifacts():
     assert "release-upload/TunnelForge-macOS-*.zip" in workflow_text
     assert "release-upload/TunnelForge-macOS-*.dmg.sha256" in workflow_text
     assert "release-upload/TunnelForge-macOS-*.zip.sha256" in workflow_text
-    assert "actions/upload-artifact@v4" in windows_job_text
-    assert "actions/upload-artifact@v4" in macos_job_text
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in windows_job_text
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in macos_job_text
     assert "softprops/action-gh-release@" not in windows_job_text
     assert "softprops/action-gh-release@" not in macos_job_text
 
@@ -2047,7 +2051,7 @@ def test_release_workflow_builds_core_before_pyinstaller():
     pyinstaller_index = workflow.index("Build with PyInstaller")
 
     assert core_build_index < pyinstaller_index
-    assert "uses: dtolnay/rust-toolchain@stable" in workflow
+    assert "uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30" in workflow
     assert "cargo build --manifest-path migration_core\\Cargo.toml --release" in workflow
     assert "migration_core\\target\\release\\tunnelforge-core.exe" in workflow
 
