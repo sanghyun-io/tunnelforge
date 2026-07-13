@@ -930,7 +930,7 @@ def test_current_status_records_231_release_candidate_handoff():
     assert "TF-STATUS-080 | Medium | closed" in tracker
     assert "TF-STATUS-082 | Medium | closed" in tracker
     assert "TF-STATUS-081 | High | fixed_pending_full_verify" in tracker
-    assert "TF-STATUS-083 | Medium | fixed_pending_full_verify" in tracker
+    assert "TF-STATUS-083 | Medium | closed" in tracker
     assert "TF-STATUS-008 | Low | open" in tracker
     assert "TF-STATUS-078 | Low | open" in tracker
 
@@ -945,7 +945,7 @@ def test_current_status_records_231_release_candidate_handoff():
 
     assert "fixed_pending_full_verify" in order
     assert "RC merge/tag" in order
-    assert "stable required-check promotion" in order
+    assert "strict required checks" in order
     assert "TF-STATUS-008" in order
     assert "TF-STATUS-078" in order
     assert "GitHub Release asset `digest` verification" in sessions
@@ -979,9 +979,8 @@ def test_current_status_closes_final_review_update_boundary_after_fresh_verifica
     assert "b35dde6" not in baseline
     assert "automatic installer execution is disabled/reveal-only" in summary
     external_non_completion = (
-        "This local verification does not claim completion of live Actions, "
-        "branch protection promotion, tag/release, GitHub issue closure, or "
-        "Mac hardware validation."
+        "This local verification does not claim completion of tag/release, "
+        "GitHub issue closure, Apple-signed artifact validation, or Mac hardware validation."
     )
     assert external_non_completion in summary
     assert "TF-STATUS-084" in verification
@@ -1067,7 +1066,7 @@ def test_current_status_refresh_preserves_historical_test_snapshots_and_statuses
         "TF-STATUS-080 | Medium | closed",
         "TF-STATUS-081 | High | fixed_pending_full_verify",
         "TF-STATUS-082 | Medium | closed",
-        "TF-STATUS-083 | Medium | fixed_pending_full_verify",
+        "TF-STATUS-083 | Medium | closed",
         "TF-STATUS-008 | Low | open",
         "TF-STATUS-078 | Low | open",
     ]:
@@ -1095,7 +1094,7 @@ def test_current_status_tracks_release_approval_and_external_release_blockers():
     verification = " ".join(_section(doc, "Verification Log").split())
     order = " ".join(_section(doc, "Recommended Execution Order").split())
 
-    assert "TF-STATUS-089 | High | fixed_pending_full_verify" in tracker
+    assert "TF-STATUS-089 | High | closed" in tracker
     assert "TF-STATUS-090 | High | blocked" in tracker
     assert "TF-STATUS-091 | Medium | blocked" in tracker
     assert "required reviewer, admin bypass disabled" in summary
@@ -1103,6 +1102,9 @@ def test_current_status_tracks_release_approval_and_external_release_blockers():
     assert "2028 passed, 1 skipped, 4 warnings in 59.79s" in verification
     assert "ModuleNotFoundError: No module named 'src.ui'" in verification
     assert "frozen smoke returned `success=true`" in verification
+    assert "29229463468" in verification
+    assert "29229463485" in verification
+    assert "PR #240 is `CLEAN`/mergeable" in verification
     assert "Security re-review: SECURE / APPROVE" in doc
     assert order.index("TF-STATUS-090") < order.index("TF-STATUS-089")
     assert order.index("TF-STATUS-089") < order.index("TF-STATUS-091")
