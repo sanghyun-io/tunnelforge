@@ -1,3 +1,4 @@
+import gc
 import hashlib
 import os
 from pathlib import Path
@@ -680,6 +681,7 @@ def test_windows_create_file_uses_exclusive_no_follow_handle_and_closes_fd(
 def test_windows_verified_lease_closes_descriptor_when_fdopen_fails(
     monkeypatch, tmp_path
 ):
+    gc.collect()
     installer = tmp_path / "installer.exe"
     installer.write_bytes(b"safe")
     close_descriptor = MagicMock()
