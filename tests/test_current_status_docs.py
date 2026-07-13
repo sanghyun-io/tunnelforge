@@ -1006,14 +1006,20 @@ def test_current_status_closes_final_review_update_boundary_after_fresh_verifica
 
 def test_current_status_closes_cross_platform_update_cleanup_after_broad_verification():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    baseline = " ".join(_section(doc, "Current Baseline Verification").split())
     tracker = " ".join(_section(doc, "Issue Tracker").split())
     verification = " ".join(_section(doc, "Verification Log").split())
     order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
 
     assert "TF-STATUS-085 | High | closed" in tracker
+    assert "verified RC code baseline `87d9021`" in baseline
     assert "verified code baseline `87d9021`" in verification
     assert "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK" in verification
+    assert "PASS, 62 passed, exit 0; diff check pass" in verification
     assert "Keep TF-STATUS-085 closed" in order
+    assert "Closed TF-STATUS-085" in sessions
+    assert "final status suite 62 passed" in sessions
 
 
 def test_current_status_refresh_preserves_historical_test_snapshots_and_statuses():
