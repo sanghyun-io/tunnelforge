@@ -1899,7 +1899,7 @@ def test_release_workflow_creates_release_after_all_platform_artifacts():
     assert "merge-multiple: true" in workflow_text
     assert "Normalize release artifacts" in workflow_text
     assert "find release-artifacts -type f" in workflow_text
-    assert "softprops/action-gh-release@v3" in workflow_text
+    assert "softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d" in workflow_text
     assert "Create GitHub Release" in workflow_text
     assert "release-upload/TunnelForge-Setup-*.exe" in workflow_text
     assert "release-upload/TunnelForge-WebSetup.exe" in workflow_text
@@ -1909,8 +1909,8 @@ def test_release_workflow_creates_release_after_all_platform_artifacts():
     assert "release-upload/TunnelForge-macOS-*.zip.sha256" in workflow_text
     assert "actions/upload-artifact@v4" in windows_job_text
     assert "actions/upload-artifact@v4" in macos_job_text
-    assert "softprops/action-gh-release@v3" not in windows_job_text
-    assert "softprops/action-gh-release@v3" not in macos_job_text
+    assert "softprops/action-gh-release@" not in windows_job_text
+    assert "softprops/action-gh-release@" not in macos_job_text
 
 
 def test_macos_validation_workflow_builds_pr_artifacts():

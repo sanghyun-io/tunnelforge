@@ -5,6 +5,8 @@ import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VERSION_GATE_PATH = PROJECT_ROOT / ".github" / "workflows" / "version-gate.yml"
+CREATE_RELEASE_TAG_PATH = PROJECT_ROOT / ".github" / "workflows" / "create-release-tag.yml"
+RELEASE_PATH = PROJECT_ROOT / ".github" / "workflows" / "release.yml"
 
 
 def load_version_gate():
@@ -167,6 +169,42 @@ def test_version_bump_requires_real_version_files_and_pins_token_action():
         "uses: actions/create-github-app-token@"
         "bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3"
     ) in bump_text
+
+
+def test_release_tag_creation_is_manual_approved_and_sha_bound():
+    workflow_text = CREATE_RELEASE_TAG_PATH.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    if True in workflow and "on" not in workflow:
+        workflow["on"] = workflow.pop(True)
+    job = workflow["jobs"]["create-tag"]
+
+    assert set(workflow["on"]) == {"workflow_dispatch"}
+    assert "target_sha" in workflow["on"]["workflow_dispatch"]["inputs"]
+    assert "confirm" in workflow["on"]["workflow_dispatch"]["inputs"]
+    assert job["environment"] == "production-release"
+    assert "github.event.pull_request" not in workflow_text
+    assert "git rev-parse origin/main" in workflow_text
+    assert 'TARGET_SHA" != "$MAIN_SHA' in workflow_text
+    assert "src/version.py" in workflow_text
+    assert "pyproject.toml" in workflow_text
+    assert "installer/TunnelForge.iss" in workflow_text
+    assert "actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1" in workflow_text
+    assert "actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd" in workflow_text
+
+
+def test_release_publication_requires_approval_and_creates_draft():
+    workflow_text = RELEASE_PATH.read_text(encoding="utf-8")
+    workflow = yaml.safe_load(workflow_text)
+    release_job = workflow["jobs"]["create-release"]
+
+    assert release_job["environment"] == "production-release"
+    assert "softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d" in workflow_text
+    assert "draft: true" in workflow_text
+    assert "prerelease: false" in workflow_text
+    assert "Apple signing certificate secret is required" in workflow_text
+    assert "APPLE_ID is required for release notarization" in workflow_text
+    assert "APPLE_TEAM_ID is required for release notarization" in workflow_text
+    assert "APPLE_APP_SPECIFIC_PASSWORD is required for release notarization" in workflow_text
 
 
 def test_required_version_gate_is_terminal_and_aggregates_all_results():

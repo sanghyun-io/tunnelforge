@@ -311,14 +311,29 @@ jobs:
           APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
           APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
           APPLE_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_CODESIGN_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
           if [[ -z "${APPLE_CODESIGN_CERTIFICATE_P12_BASE64:-}" ]]; then
-            echo "Apple signing certificate secret is not set; unsigned macOS artifacts will be built."
-            exit 0
+            echo "Apple signing certificate secret is required for a release." >&2
+            exit 1
           fi
 
           if [[ -z "${APPLE_CODESIGN_CERTIFICATE_PASSWORD:-}" ]]; then
             echo "APPLE_CODESIGN_CERTIFICATE_PASSWORD is required when APPLE_CODESIGN_CERTIFICATE_P12_BASE64 is set." >&2
+            exit 1
+          fi
+          if [[ -z "${APPLE_ID:-}" ]]; then
+            echo "APPLE_ID is required for release notarization." >&2
+            exit 1
+          fi
+          if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
+            echo "APPLE_TEAM_ID is required for release notarization." >&2
+            exit 1
+          fi
+          if [[ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+            echo "APPLE_APP_SPECIFIC_PASSWORD is required for release notarization." >&2
             exit 1
           fi
 
@@ -495,6 +510,7 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    environment: production-release
     needs:
       - build-windows-installer
       - build-macos-app
@@ -711,7 +727,7 @@ jobs:
           echo "============================================="
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@7c4723f7a335432393329f8f1c564994ce50185d # v3
         with:
           name: v${{ steps.get_version.outputs.version }}
           body_path: release_notes.md
@@ -722,7 +738,7 @@ jobs:
             release-upload/TunnelForge-macOS-*.zip
             release-upload/TunnelForge-macOS-*.dmg.sha256
             release-upload/TunnelForge-macOS-*.zip.sha256
-          draft: false
+          draft: true
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
