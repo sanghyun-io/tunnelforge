@@ -339,7 +339,6 @@ jobs:
       pull-requests: write
     outputs:
       bump_type: ${{ steps.check.outputs.bump_type }}
-      needs_rebump: ${{ steps.check.outputs.needs_rebump }}
 
     steps:
       - name: Checkout trusted base
@@ -391,41 +390,9 @@ jobs:
           BUMP_TYPE=$(echo "$VERSION_LABELS" | head -1 | sed 's/version://')
           echo "감지된 bump_type: $BUMP_TYPE"
 
-          # === Step 2: 기존 bump 커밋 확인 (라벨 정합성 포함) ===
-          # bump 커밋 메시지에 [patch]/[minor]/[major] 트레일러로 타입 검증.
-          # 트레일러 없는 레거시 bump 커밋도 호환 처리.
-
-          # HEAD 체크 (synchronize 재귀 방지)
-          HEAD_MSG=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}" \
-            --jq .commit.message 2>/dev/null || true)
-          if echo "$HEAD_MSG" | grep -q "^chore: bump version"; then
-            if echo "$HEAD_MSG" | grep -q "\[$BUMP_TYPE\]" || \
-               ! echo "$HEAD_MSG" | grep -qE "\[(patch|minor|major)\]"; then
-              echo "HEAD가 bump 커밋 (타입 일치 또는 레거시). 체크 통과."
-              echo "bump_type=" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "HEAD가 다른 타입의 bump 커밋. 재bump 필요."
-            echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          # PR 커밋 히스토리 체크 (페이지네이션 적용, 최신 bump만 검증)
-          BUMP_MSGS=$(gh api --paginate \
-            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits" \
-            --jq '.[].commit.message' | grep "^chore: bump version" || true)
-          if [ -n "$BUMP_MSGS" ]; then
-            # 최신 bump 커밋만 확인 (API는 시간순 반환, tail -1 = 가장 최근)
-            LATEST_BUMP=$(echo "$BUMP_MSGS" | tail -1)
-            if echo "$LATEST_BUMP" | grep -q "\[$BUMP_TYPE\]" || \
-               ! echo "$LATEST_BUMP" | grep -qE "\[(patch|minor|major)\]"; then
-              echo "PR의 최신 bump 커밋이 현재 라벨과 일치 (또는 레거시). 체크 통과."
-              echo "bump_type=" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "최신 bump 커밋이 현재 라벨과 불일치. 재bump 필요."
-            echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
-          fi
-
+          # Commit messages are not evidence of a completed bump. The trusted
+          # version-bump job verifies all three version files against the
+          # expected version calculated from the trusted base.
           echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
 
   version-bump:
@@ -454,42 +421,39 @@ jobs:
         id: bump
         env:
           BUMP_TYPE: ${{ needs.version-validation.outputs.bump_type }}
-          NEEDS_REBUMP: ${{ needs.version-validation.outputs.needs_rebump }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
           git fetch --no-tags --depth=1 origin "$HEAD_SHA"
-          BASE_VERSION=$(grep '__version__' src/version.py | cut -d'"' -f2)
-          CURRENT=$(git show "$HEAD_SHA:src/version.py" | grep '__version__' | cut -d'"' -f2)
-          echo "base version: $BASE_VERSION / PR version: $CURRENT"
+          mkdir -p .version-bump-input/src .version-bump-input/installer
+          cp src/version.py .version-bump-input/src/version.py
+          cp pyproject.toml .version-bump-input/pyproject.toml
+          cp installer/TunnelForge.iss .version-bump-input/installer/TunnelForge.iss
+          python scripts/bump_version.py \
+            --bump-type "$BUMP_TYPE" \
+            --version-file .version-bump-input/src/version.py \
+            --pyproject-file .version-bump-input/pyproject.toml \
+            --installer-file .version-bump-input/installer/TunnelForge.iss \
+            > /tmp/bump.txt
+          EXPECTED=$(grep 'new_version=' /tmp/bump.txt | cut -d= -f2)
+          CURRENT_PY=$(git show "$HEAD_SHA:src/version.py" | grep '__version__' | cut -d'"' -f2)
+          CURRENT_PROJECT=$(git show "$HEAD_SHA:pyproject.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)
+          CURRENT_INSTALLER=$(git show "$HEAD_SHA:installer/TunnelForge.iss" | sed -n 's/^#define MyAppVersion "\([^"]*\)"/\1/p' | head -1)
+          echo "expected=$EXPECTED python=$CURRENT_PY project=$CURRENT_PROJECT installer=$CURRENT_INSTALLER"
 
-          if [ -z "$BASE_VERSION" ] || [ -z "$CURRENT" ]; then
-            echo "ERROR: version parse failed (base='$BASE_VERSION', current='$CURRENT')"
+          if [ -z "$EXPECTED" ] || [ -z "$CURRENT_PY" ] || \
+             [ -z "$CURRENT_PROJECT" ] || [ -z "$CURRENT_INSTALLER" ]; then
+            echo "ERROR: version parse failed"
             exit 1
           fi
 
-          if [ "$BASE_VERSION" != "$CURRENT" ] && [ "$NEEDS_REBUMP" != "true" ]; then
-            echo "PR version is already changed. Skipping."
+          if [ "$CURRENT_PY" = "$EXPECTED" ] && \
+             [ "$CURRENT_PROJECT" = "$EXPECTED" ] && \
+             [ "$CURRENT_INSTALLER" = "$EXPECTED" ]; then
+            echo "All PR version files match the trusted expected version. Skipping."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            mkdir -p .version-bump-input/src .version-bump-input/installer
-            git show "$HEAD_SHA:src/version.py" > .version-bump-input/src/version.py
-            git show "$HEAD_SHA:pyproject.toml" > .version-bump-input/pyproject.toml
-            git show "$HEAD_SHA:installer/TunnelForge.iss" > .version-bump-input/installer/TunnelForge.iss
-            if [ "$NEEDS_REBUMP" = "true" ]; then
-              cp src/version.py .version-bump-input/src/version.py
-              cp pyproject.toml .version-bump-input/pyproject.toml
-              cp installer/TunnelForge.iss .version-bump-input/installer/TunnelForge.iss
-            fi
-            python scripts/bump_version.py \
-              --bump-type "$BUMP_TYPE" \
-              --version-file .version-bump-input/src/version.py \
-              --pyproject-file .version-bump-input/pyproject.toml \
-              --installer-file .version-bump-input/installer/TunnelForge.iss \
-              > /tmp/bump.txt
-            EXPECTED=$(grep 'new_version=' /tmp/bump.txt | cut -d= -f2)
-            echo "expected bump version: $EXPECTED"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "new_version=$EXPECTED" >> "$GITHUB_OUTPUT"
           fi
@@ -497,7 +461,7 @@ jobs:
       - name: Generate GitHub App Token
         if: steps.bump.outputs.skip != 'true'
         id: app-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ secrets.RELEASER_APP_ID }}
           private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}

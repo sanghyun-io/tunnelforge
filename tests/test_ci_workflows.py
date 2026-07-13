@@ -150,6 +150,25 @@ def test_write_capable_jobs_checkout_and_execute_only_trusted_base_code():
     assert "needs.version-validation.outputs.bump_type" in bump_text
 
 
+def test_version_bump_requires_real_version_files_and_pins_token_action():
+    validation_text = version_gate_job_text("version-validation")
+    bump_text = version_gate_job_text("version-bump")
+
+    assert "Commit messages are not evidence" in validation_text
+    assert 'grep -q "^chore: bump version"' not in validation_text
+    assert "pulls/${PR_NUMBER}/commits" not in validation_text
+    assert 'CURRENT_PY=$(git show "$HEAD_SHA:src/version.py"' in bump_text
+    assert 'CURRENT_PROJECT=$(git show "$HEAD_SHA:pyproject.toml"' in bump_text
+    assert 'CURRENT_INSTALLER=$(git show "$HEAD_SHA:installer/TunnelForge.iss"' in bump_text
+    assert '[ "$CURRENT_PY" = "$EXPECTED" ]' in bump_text
+    assert '[ "$CURRENT_PROJECT" = "$EXPECTED" ]' in bump_text
+    assert '[ "$CURRENT_INSTALLER" = "$EXPECTED" ]' in bump_text
+    assert (
+        "uses: actions/create-github-app-token@"
+        "bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3"
+    ) in bump_text
+
+
 def test_required_version_gate_is_terminal_and_aggregates_all_results():
     jobs = load_version_gate()["jobs"]
     job = load_version_gate()["jobs"]["version-gate"]
