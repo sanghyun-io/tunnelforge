@@ -970,12 +970,21 @@ def test_current_status_closes_final_review_update_boundary_after_fresh_verifica
     ]:
         assert finding in tracker
 
-    assert "RC head `b35dde6`" in baseline
-    assert "feat/trust-release-sprint" in baseline
-    assert "clean worktree after commit" in baseline
+    assert (
+        "verified RC code baseline `b35dde6` on `feat/trust-release-sprint`; "
+        "status-only documentation lineage starts at `7810ea3` and does not "
+        "alter the verified code baseline"
+    ) in baseline
+    assert "current HEAD `b35dde6`" not in baseline
     assert "automatic installer execution is disabled/reveal-only" in summary
-    assert "Mac hardware validation claim" in summary
+    external_non_completion = (
+        "This local verification does not claim completion of live Actions, "
+        "branch protection promotion, tag/release, GitHub issue closure, or "
+        "Mac hardware validation."
+    )
+    assert external_non_completion in summary
     assert "TF-STATUS-084" in verification
     assert "1955 passed, 1 skipped, 4 warnings in 60.38s" in verification
+    assert "PASS, 60 passed in 0.21s" in verification
     assert "TF-STATUS-084" in order
-    assert "TF-STATUS-084" in sessions
+    assert "GREEN status suite 60 passed in 0.21s" in sessions
