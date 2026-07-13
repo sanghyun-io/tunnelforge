@@ -389,6 +389,8 @@ class BootstrapperApp:
         self.download_thread: Optional[threading.Thread] = None
         self.downloaded_file: Optional[str] = None
         self._installer_dispatched = False
+        self._download_state_lock = threading.Lock()
+        self._download_abandoned = False
 
         self._setup_window()
         self._create_widgets()
@@ -542,8 +544,17 @@ class BootstrapperApp:
             file_path = self.downloader.download_installer(
                 progress_callback=self._update_progress
             )
-            self.downloaded_file = file_path
-            self._installer_dispatched = False
+            with self._get_download_state_lock():
+                if self._download_abandoned:
+                    discard_late_result = True
+                else:
+                    self.downloaded_file = file_path
+                    self._installer_dispatched = False
+                    discard_late_result = False
+
+            if discard_late_result:
+                self._discard_installer_path(file_path)
+                return
 
             # 3. 다운로드 완료
             self.root.after(0, self._on_download_complete)
@@ -628,6 +639,7 @@ class BootstrapperApp:
     def _on_cancel(self):
         """취소 버튼 클릭"""
         if self.cancel_button.cget('text') == '닫기':
+            self._mark_download_abandoned()
             self._discard_undispatched_installer()
             self.root.destroy()
             return
@@ -636,6 +648,7 @@ class BootstrapperApp:
             "다운로드 취소",
             "설치를 취소하시겠습니까?"
         ):
+            self._mark_download_abandoned()
             self.downloader.cancel()
             self._discard_undispatched_installer()
             self.root.destroy()
@@ -646,13 +659,32 @@ class BootstrapperApp:
 
     def _discard_undispatched_installer(self) -> None:
         """Best-effort release of a completed installer that was not launched."""
-        downloaded_file = self.downloaded_file
-        dispatched = getattr(self, "_installer_dispatched", False)
-        self.downloaded_file = None
-        self._installer_dispatched = False
+        with self._get_download_state_lock():
+            downloaded_file = self.downloaded_file
+            dispatched = getattr(self, "_installer_dispatched", False)
+            self.downloaded_file = None
+            self._installer_dispatched = False
 
+        if downloaded_file and not dispatched:
+            self._discard_installer_path(downloaded_file)
+
+    def _get_download_state_lock(self):
+        lock = getattr(self, "_download_state_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._download_state_lock = lock
+            self._download_abandoned = getattr(
+                self, "_download_abandoned", False
+            )
+        return lock
+
+    def _mark_download_abandoned(self) -> None:
+        with self._get_download_state_lock():
+            self._download_abandoned = True
+
+    def _discard_installer_path(self, downloaded_file: str) -> None:
         discard = getattr(self.downloader, "discard_downloaded_installer", None)
-        if downloaded_file and not dispatched and callable(discard):
+        if callable(discard):
             try:
                 discard(downloaded_file)
             except Exception:

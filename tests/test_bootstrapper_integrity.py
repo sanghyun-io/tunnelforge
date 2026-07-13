@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -432,6 +433,57 @@ def test_bootstrapper_declined_cancel_preserves_race_completed_installer(
     app.downloader.cancel.assert_not_called()
     app.downloader.discard_downloaded_installer.assert_not_called()
     app.root.destroy.assert_not_called()
+
+
+def test_bootstrapper_confirmed_cancel_discards_late_download_result(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    download_started = threading.Event()
+    allow_return = threading.Event()
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
+
+    def return_after_confirmed_cancel(progress_callback=None):
+        download_started.set()
+        assert allow_return.wait(timeout=2)
+        return str(installer)
+
+    app.downloader.download_installer.side_effect = return_after_confirmed_cancel
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+    app._update_status = MagicMock()
+    app._update_detail = MagicMock()
+    app._update_progress = MagicMock()
+    app._show_error = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=True),
+    )
+
+    worker = threading.Thread(target=app._download_worker)
+    worker.start()
+    assert download_started.wait(timeout=2)
+    app._on_cancel()
+    allow_return.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    app.downloader.cancel.assert_called_once_with()
+    app.downloader.discard_downloaded_installer.assert_called_once_with(str(installer))
+    assert app.downloaded_file is None
+    assert not any(
+        call.args and call.args[-1] == app._on_download_complete
+        for call in app.root.after.call_args_list
+    )
 
 
 def test_bootstrapper_non_windows_never_launches_windows_installer(monkeypatch, tmp_path):
