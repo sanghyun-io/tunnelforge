@@ -88,12 +88,13 @@ local work does not make a Mac hardware validation claim. This local
 verification does not claim completion of live Actions, branch protection
 promotion, tag/release, GitHub issue closure, or Mac hardware validation.
 
-TF-STATUS-085 is `fixed_pending_full_verify`: Final Fix F2 aligns the update
+TF-STATUS-085 is `closed`: Final Fix F2 aligns the update
 cleanup contract across Windows and POSIX, makes Settings/bootstrapper
 abandonment idempotent before dispatch, retains verified packages after generic
 launch failures, and corrects the Fix Wizard public claim to dry-run/manual SQL
-generation. Focused update, settings, bootstrapper, i18n, and status checks are
-recorded below; a broader verification session is still required for closure.
+generation. Focused and full Python verification, Rust Core regression and
+release builds, frozen WebSetup self-check, version sync, and diff checks are
+recorded below against code baseline `87d9021`.
 
 Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
 refactor work packages WP-3.1 through WP-3.8 were integrated as
@@ -440,15 +441,17 @@ preserves earlier broad evidence rows, including the historical Full-suite count
 
 | Check | Result |
 | --- | --- |
-| `git status --short --branch` | verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
-| update/security/status/version focused pytest | PASS, 291 passed, 1 skipped in 46.01s, exit 0 |
-| `pytest -q` | PASS, 2006 passed, 1 skipped, 4 warnings, 58.07s, exit 0 |
+| `git status --short --branch` | verified RC code baseline `87d9021` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
+| update/security/status/version focused pytest | PASS, 311 passed, 1 skipped in 55.41s, exit 0 |
+| `pytest -q` | PASS, 2023 passed, 1 skipped, 4 warnings, 58.64s, exit 0 |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
 | `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS, Rust regression gate pass, exit 0 |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
 | `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 216 lib, 2 JSONL CLI, 9 live, 2 stress tests passed; 1 stress test ignored, exit 0 |
-| `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS, 2.82s, exit 0 |
-| `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.08s, exit 0 |
+| `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS, 0.30s, exit 0 |
+| `.venv\Scripts\python.exe -m PyInstaller --noconfirm bootstrapper\bootstrapper.spec` | PASS, frozen `TunnelForge-WebSetup.exe` built, exit 0 |
+| `dist\TunnelForge-WebSetup.exe --self-check` | PASS, `TUNNELFORGE_WEBSETUP_SELF_CHECK_OK`, exit 0 |
+| `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.09s, exit 0 |
 | `python -m compileall -q main.py src tests scripts` | PASS |
 | `git diff --check` | PASS, exit 0; final docs/status diff check recorded in this session |
 | `tunnelforge-core service.hello` | PASS, reports `dump.run`, `dump.import`, migration commands, and `oneclick.*` commands |
@@ -563,6 +566,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | TF-STATUS-085 final broad verification | verified code baseline `87d9021`; focused and full Python suites; Rust Core regression gate; Cargo test/release build; PyInstaller frozen WebSetup build and self-check; version-sync; `git diff --check` | PASS | Focused: 311 passed, 1 skipped in 55.41s. Full Python: 2023 passed, 1 skipped, 4 warnings in 58.64s. Cargo: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored. Release build: 0.30s. Frozen self-check emitted `TUNNELFORGE_WEBSETUP_SELF_CHECK_OK`. Version sync: 1 passed in 0.09s. TF-STATUS-085 is closed locally without claims about live Actions, branch protection, tag/release, GitHub closure, or Mac hardware. |
 | 2026-07-13 | TF-STATUS-085 Final Fix F2 focused verification | `python -m py_compile src/ui/dialogs/settings.py bootstrapper/bootstrapper.py tests/test_update_downloader.py tests/test_bootstrapper_integrity.py tests/test_settings_update_launch.py`; `$env:QT_QPA_PLATFORM='offscreen'; pytest tests/test_update_downloader.py tests/test_bootstrapper_integrity.py tests/test_settings_update_launch.py tests/test_i18n.py tests/test_current_status_docs.py -q`; `git diff --check` | PASS | 253 passed, 1 skipped, 2 warnings in 2.79s. Covers Windows identity-conditional cleanup, POSIX residue retention assertions, deterministic macOS reveal-only behavior, pre-dispatch abandonment cleanup, generic launch-failure retention, docs, i18n, and status. |
 | 2026-07-13 | TF-STATUS-079/084 final security and release baseline refresh | verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd`; focused security/status/version command; full Python suite; Rust Core regression gate; Cargo test; release build; version-sync; `git diff --check` | PASS | Focused: 291 passed, 1 skipped in 46.01s. Full Python: 2006 passed, 1 skipped, 4 warnings in 58.07s. Cargo: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored. Release build: 2.82s. Version sync: 1 passed in 0.08s. Fix E secure child creation/name validation and bootstrapper cancel-before-entry evidence support TF-STATUS-084 closed; TF-STATUS-079 remains closed and other statuses are unchanged. |
 | 2026-07-13 | Final current-status documentation verification | .venv\\Scripts\\python.exe -m pytest tests\\test_current_status_docs.py -q; git diff --check | PASS, 61 passed in 0.36s; diff check pass | Fresh current-status tests and the final diff check passed after preserving historical 1827, 1870, and 1955 snapshots. |
@@ -2302,13 +2306,12 @@ Next action:
 | TF-STATUS-082 | Medium | closed | Product documentation / feature flags | Bilingual Schedule correction for disabled features | Keep both language surfaces explicit that Schedule remains disabled until intentional reactivation and verification |
 | TF-STATUS-083 | Medium | fixed_pending_full_verify | CI / branch protection | Full Python regression workflow | Observe stable `python-regression` and Rust Core runs, then complete external required-check promotion |
 | TF-STATUS-084 | High | closed | Update final review / launch boundary | verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, streaming bound | Retain the reviewed bounds, Fix E secure child creation/name validation, and bootstrapper cancel-before-entry evidence; local closure does not claim external Actions, branch protection, tag/release, GitHub closure, or Mac hardware evidence |
-| TF-STATUS-085 | High | fixed_pending_full_verify | Update cross-platform cleanup / documentation | POSIX residue policy, pre-dispatch abandonment, Fix Wizard capability wording | Run focused update/settings/bootstrapper/docs/status checks and a broader verification session before closure |
+| TF-STATUS-085 | High | closed | Update cross-platform cleanup / documentation | POSIX residue policy, pre-dispatch abandonment, Fix Wizard capability wording | Retain the verified POSIX residue policy, pre-dispatch abandonment cleanup, and manual-SQL Fix Wizard wording |
 
 ## Recommended Execution Order
 
-1. Complete TF-STATUS-085 with broader verification, retaining the POSIX
-   residue policy, pre-dispatch abandonment cleanup, and manual-SQL Fix Wizard
-   wording.
+1. Keep TF-STATUS-085 closed by retaining the POSIX residue policy,
+   pre-dispatch abandonment cleanup, and manual-SQL Fix Wizard wording.
 2. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
    owned cleanup/no-clobber, cancellation generation, and streaming bound in
    place. Do not claim external Actions, branch protection, tag/release,
@@ -2340,6 +2343,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Closed TF-STATUS-085 after fresh broad verification of cross-platform update cleanup, pre-dispatch abandonment, generic launch-failure retention, documentation accuracy, and the frozen WebSetup import boundary on code baseline `87d9021`. | `docs/current_status.md`, `tests/test_current_status_docs.py` | Focused Python 311 passed / 1 skipped; full Python 2023 passed / 1 skipped / 4 warnings; Rust gate and Cargo test/release build passed; frozen WebSetup build/self-check passed; version sync and diff check passed. |
 | 2026-07-13 | Final Fix F2 aligned update cleanup/docs contracts: POSIX retains identity-unsafe cleanup residue by policy, Windows alone deletes identity-matched children, non-Windows auto-launch remains disabled, and Settings/bootstrapper discard completed undispatched packages idempotently. README Fix Wizard wording now states dry-run/manual SQL generation only. | `src/ui/dialogs/settings.py`, `bootstrapper/bootstrapper.py`, focused update/bootstrapper/settings tests, README/design/plan/status docs | `py_compile`; focused update/bootstrapper/settings/i18n/current-status suite: 253 passed / 1 skipped / 2 warnings in 2.79s; `git diff --check` passed. |
 | 2026-07-13 | Refreshed the final release/security status against RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd`; TF-STATUS-084 remains closed with Fix E secure child creation/name validation and bootstrapper cancel-before-entry evidence. TF-STATUS-079 remains closed; TF-STATUS-080/082 remain closed, TF-STATUS-081/083 remain `fixed_pending_full_verify`, and TF-STATUS-008/078 remain open. Historical status-only rows, including the prior `b35dde6` baseline, remain historical. | `docs/current_status.md`, `tests/test_current_status_docs.py` | Focused security/status/version: 291 passed / 1 skipped in 46.01s; full Python: 2006 passed / 1 skipped / 4 warnings in 58.07s; Rust regression gate pass; Cargo 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored; release build 2.82s; version sync 1 passed in 0.08s; diff check pass; fresh current-status tests and diff check appended above. |
 | 2026-07-13 | Corrected TF-STATUS-084 baseline lineage wording: `b35dde6` is the verified RC code baseline, while status-only documentation lineage starts at `7810ea3` and does not alter that code baseline. The external boundary explicitly does not claim completion of live Actions, branch protection promotion, tag/release, GitHub issue closure, or Mac hardware validation. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED: focused TF-STATUS-084 wording regression failed because the baseline/lineage sentence was absent; GREEN focused current-status tests and diff check recorded in this session. Canonical final status suite: 60 passed in 0.21s; separate historical post-close run: 60 passed in 0.33s. |

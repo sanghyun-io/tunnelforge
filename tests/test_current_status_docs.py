@@ -971,7 +971,7 @@ def test_current_status_closes_final_review_update_boundary_after_fresh_verifica
         assert finding in tracker
 
     assert (
-        "verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd` "
+        "verified RC code baseline `87d9021` "
         "on `feat/trust-release-sprint`; status-only history remains historical "
         "and does not alter the verified code baseline"
     ) in baseline
@@ -987,21 +987,33 @@ def test_current_status_closes_final_review_update_boundary_after_fresh_verifica
     assert "TF-STATUS-084" in verification
     assert "Fix E secure child creation/name validation" in verification
     assert "bootstrapper cancel-before-entry" in verification
-    assert "291 passed, 1 skipped in 46.01s" in verification
-    assert "2006 passed, 1 skipped, 4 warnings in 58.07s" in verification
+    assert "311 passed, 1 skipped in 55.41s" in verification
+    assert "2023 passed, 1 skipped, 4 warnings in 58.64s" in verification
     assert "Rust Core regression gate pass" in verification
     assert "216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored" in verification
-    assert "Release build: 2.82s" in verification
-    assert "Version sync: 1 passed in 0.08s" in verification
+    assert "Release build: 0.30s" in verification
+    assert "Version sync: 1 passed in 0.09s" in verification
     assert "final diff check passed" in verification
-    assert "| `git status --short --branch` | verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd`" in baseline
-    assert "| update/security/status/version focused pytest | PASS, 291 passed, 1 skipped in 46.01s, exit 0 |" in baseline
-    assert "| `pytest -q` | PASS, 2006 passed, 1 skipped, 4 warnings, 58.07s, exit 0 |" in baseline
-    assert "| `cargo build --manifest-path migration_core\\Cargo.toml --release` | PASS, 2.82s, exit 0 |" in baseline
-    assert "| `pytest tests\\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.08s, exit 0 |" in baseline
+    assert "| `git status --short --branch` | verified RC code baseline `87d9021`" in baseline
+    assert "| update/security/status/version focused pytest | PASS, 311 passed, 1 skipped in 55.41s, exit 0 |" in baseline
+    assert "| `pytest -q` | PASS, 2023 passed, 1 skipped, 4 warnings, 58.64s, exit 0 |" in baseline
+    assert "| `cargo build --manifest-path migration_core\\Cargo.toml --release` | PASS, 0.30s, exit 0 |" in baseline
+    assert "| `pytest tests\\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.09s, exit 0 |" in baseline
     assert "TF-STATUS-084" in order
-    assert "Focused security/status/version: 291 passed / 1 skipped in 46.01s" in sessions
-    assert "full Python: 2006 passed / 1 skipped / 4 warnings in 58.07s" in sessions
+    assert "Focused Python 311 passed / 1 skipped" in sessions
+    assert "full Python 2023 passed / 1 skipped / 4 warnings" in sessions
+
+
+def test_current_status_closes_cross_platform_update_cleanup_after_broad_verification():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-085 | High | closed" in tracker
+    assert "verified code baseline `87d9021`" in verification
+    assert "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK" in verification
+    assert "Keep TF-STATUS-085 closed" in order
 
 
 def test_current_status_refresh_preserves_historical_test_snapshots_and_statuses():
