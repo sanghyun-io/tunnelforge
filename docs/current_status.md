@@ -107,6 +107,12 @@ TF-STATUS-087 is `closed`: non-Windows update UI text now matches reveal-only
 behavior. It says "저장 위치 보기", explains that only the containing folder
 is shown, and no longer claims that the package opens or the app exits.
 
+TF-STATUS-088 is `closed`: version-gate no longer trusts bump commit messages.
+The trusted base calculates the expected version and the PR head may skip only
+when all three version files match it. The GitHub App token action that receives
+the releaser private key is pinned to reviewed commit
+`bcd2ba49218906704ab6c1aa796996da409d3eb1`.
+
 Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
 refactor work packages WP-3.1 through WP-3.8 were integrated as
 behavior-preserving commits. A red-review follow-up restored compatibility for
@@ -452,9 +458,9 @@ preserves earlier broad evidence rows, including the historical Full-suite count
 
 | Check | Result |
 | --- | --- |
-| `git status --short --branch` | verified RC code baseline `77b0d31` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
-| update/security/status/version focused pytest | PASS, 318 passed, 1 skipped in 50.65s, exit 0 |
-| `pytest -q` | PASS, 2030 passed, 1 skipped, 4 warnings, 62.49s, exit 0 |
+| `git status --short --branch` | verified RC code baseline `9088aab` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
+| update/security/status/version focused pytest | PASS, 319 passed, 1 skipped in 48.27s, exit 0 |
+| `pytest -q` | PASS, 2031 passed, 1 skipped, 4 warnings, 60.28s, exit 0 |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
 | `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS, Rust regression gate pass, exit 0 |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
@@ -577,6 +583,8 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | TF-STATUS-088 final status-document verification | `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q`; `git diff --check` | PASS, 65 passed, exit 0; diff check pass | Confirms the CI trust-boundary issue lifecycle and code baseline `9088aab`. |
+| 2026-07-13 | TF-STATUS-088 version-gate trust-boundary closure | CI workflow focused suite; update/security/status/version focused suite; standalone full Python suite; `git diff --check` | PASS | CI workflow: 9 passed. Focused: 319 passed, 1 skipped in 48.27s. Full Python: 2031 passed, 1 skipped, 4 warnings in 60.28s. Commit-message bypass is removed, three real version files are checked against the trusted expected value, and the App token action is commit-pinned. |
 | 2026-07-13 | TF-STATUS-086 cancelled-error scheduling follow-up | cancelled-DownloadError RED/GREEN regression; bootstrapper suite; update/security/status/version focused suite; standalone full Python suite; rebuilt frozen WebSetup self-check; `git diff --check` | PASS | Bootstrapper: 74 passed. Focused: 318 passed, 1 skipped in 50.65s. Full Python: 2030 passed, 1 skipped, 4 warnings in 62.49s. Frozen self-check emitted `TUNNELFORGE_WEBSETUP_SELF_CHECK_OK`. Error UI scheduling rejected by a destroyed root retires only after confirmed cancellation; non-cancellation errors remain visible. |
 | 2026-07-13 | TF-STATUS-086 destroyed-root scheduling follow-up | destroyed-root RED/GREEN regression; bootstrapper suite; update/security/status/version focused suite; standalone full Python suite; rebuilt frozen WebSetup self-check; `git diff --check` | PASS | Bootstrapper: 73 passed. Focused: 317 passed, 1 skipped in 50.81s. Full Python: 2029 passed, 1 skipped, 4 warnings in 62.51s. Frozen self-check emitted `TUNNELFORGE_WEBSETUP_SELF_CHECK_OK`. A destroyed Tk root after confirmed cancellation is treated as normal retirement without recursive UI error scheduling. |
 | 2026-07-13 | TF-STATUS-086 lock-inversion and TF-STATUS-087 Linux follow-up | focused bootstrapper/settings/platform suite; standalone full Python suite; rebuilt frozen WebSetup self-check; `git diff --check` | PASS | Focused: 107 passed in 3.22s. Full Python: 2028 passed, 1 skipped, 4 warnings in 64.28s. Frozen self-check emitted `TUNNELFORGE_WEBSETUP_SELF_CHECK_OK`. Tk scheduling occurs outside the state lock, queued callbacks retire when abandoned, and all non-Windows platforms use reveal-only UI wording. |
@@ -2328,6 +2336,7 @@ Next action:
 | TF-STATUS-085 | High | closed | Update cross-platform cleanup / documentation | POSIX residue policy, pre-dispatch abandonment, Fix Wizard capability wording | Retain the verified POSIX residue policy, pre-dispatch abandonment cleanup, and manual-SQL Fix Wizard wording |
 | TF-STATUS-086 | High | closed | Bootstrapper cancellation / result publication | Confirmed cancellation before completed-path publication | Keep abandonment and result publication synchronized; discard late completed results and never schedule completion after confirmed cancellation |
 | TF-STATUS-087 | Medium | closed | Non-Windows update UX / platform policy | Reveal-only action text claimed package open and app exit | Keep non-Windows action wording aligned with folder reveal-only behavior and no app exit |
+| TF-STATUS-088 | High | closed | CI version gate / credentialed action trust | Commit-message bump bypass and mutable App token action tag | Require all three version files to match the trusted expected version and keep the credentialed action pinned by full commit SHA |
 
 ## Recommended Execution Order
 
@@ -2337,30 +2346,32 @@ Next action:
    publication and late-result discard behavior.
 3. Keep TF-STATUS-087 closed by preserving reveal-only/no-exit non-Windows
    update wording.
-4. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
+4. Keep TF-STATUS-088 closed by verifying all version files against trusted
+   expected state and pinning credentialed actions by full commit SHA.
+5. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
    owned cleanup/no-clobber, cancellation generation, and streaming bound in
    place. Do not claim external Actions, branch protection, tag/release,
    GitHub closure, or Mac hardware validation.
-5. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
+6. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
    verification before every downloaded-package launch.
-6. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
+7. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
    dangerous operations without classified tunnel metadata.
-7. Complete TF-STATUS-083 from `fixed_pending_full_verify` through external
+8. Complete TF-STATUS-083 from `fixed_pending_full_verify` through external
    stable required-check promotion for `python-regression` and the Rust Core
    regression gate.
-8. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
+9. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
    while the feature flag remains disabled.
-9. Complete TF-STATUS-081 from `fixed_pending_full_verify` through the external
+10. Complete TF-STATUS-081 from `fixed_pending_full_verify` through the external
    RC merge/tag process for the `2.3.1` release candidate.
-10. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
+11. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
    #116 remains external, with both current-HEAD manual workflow evidence and
    the real-Mac report. Do not hard-code exact current-head workflow run IDs or
    SHAs as durable status summary evidence; use #116 comments and the final gate
    for current proof.
-11. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
+12. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
    #171 / commit `a4c7a06`; reopen implementation work only if it reproduces on
    a release that contains the fix.
-12. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
+13. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
    expansion, and Rust Core concurrency redesign until the release-trust work is
    complete and user/benchmark evidence justifies them.
 
@@ -2368,6 +2379,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Closed TF-STATUS-088 after the final CI security audit: removed commit-message-only bump completion, made trusted expected-version comparison cover all three version files, and pinned the releaser App token action to a full commit SHA. | `.github/workflows/version-gate.yml`, `tests/test_ci_workflows.py`, status docs/tests | CI workflow 9 passed; focused 319 passed / 1 skipped; standalone full Python 2031 passed / 1 skipped / 4 warnings; diff check passed. |
 | 2026-07-13 | Closed the cancelled-DownloadError destroyed-root edge by applying the synchronized abandonment retirement rule to error UI scheduling as well as completion scheduling. | `bootstrapper/bootstrapper.py`, `tests/test_bootstrapper_integrity.py`, status docs/tests | Bootstrapper 74 passed; focused 318 passed / 1 skipped; standalone full Python 2030 passed / 1 skipped / 4 warnings; rebuilt frozen self-check and diff check passed. |
 | 2026-07-13 | Closed the destroyed-root scheduling edge after confirmed cancellation: completion scheduling now silently retires only when Tk rejects the call and the synchronized state is already abandoned; non-cancellation Tk errors still propagate. | `bootstrapper/bootstrapper.py`, `tests/test_bootstrapper_integrity.py`, status docs/tests | Bootstrapper 73 passed; focused 317 passed / 1 skipped; standalone full Python 2029 passed / 1 skipped / 4 warnings; rebuilt frozen self-check and diff check passed. |
 | 2026-07-13 | Removed the final lock-inversion risk by moving Tk scheduling outside the bootstrapper state lock while retaining abandoned-callback retirement, and extended reveal-only action strategy from macOS to every non-Windows platform. | `bootstrapper/bootstrapper.py`, `src/core/platform_integration.py`, focused bootstrapper/platform tests, status docs/tests | Focused 107 passed; standalone full Python 2028 passed / 1 skipped / 4 warnings; rebuilt frozen self-check and diff check passed. |
