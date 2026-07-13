@@ -556,7 +556,7 @@ class BootstrapperApp:
                 self._discard_installer_path(file_path)
                 return
 
-            self.root.after(0, self._on_download_complete)
+            self._schedule_download_complete()
 
         except DownloadError as e:
             self._show_error(str(e))
@@ -576,6 +576,15 @@ class BootstrapperApp:
 
         # 약간의 지연 후 설치 프로그램 실행
         self.root.after(500, self._launch_installer)
+
+    def _schedule_download_complete(self) -> None:
+        try:
+            self.root.after(0, self._on_download_complete)
+        except (RuntimeError, tk.TclError):
+            with self._get_download_state_lock():
+                if self._download_abandoned:
+                    return
+            raise
 
     def _launch_installer(self):
         """설치 프로그램 실행"""
