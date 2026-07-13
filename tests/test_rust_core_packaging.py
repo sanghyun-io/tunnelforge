@@ -210,6 +210,7 @@ def load_macos_support_gate_module():
 def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
     spec = (PROJECT_ROOT / "tunnel-manager.spec").read_text(encoding="utf-8")
 
+    assert "collect_submodules('src.ui')" in spec
     assert "core_suffix = '.exe' if os.name == 'nt' else ''" in spec
     assert "tunnelforge-core{core_suffix}" in spec
     assert "binaries=binaries" in spec
@@ -1894,12 +1895,16 @@ def test_release_workflow_creates_release_after_all_platform_artifacts():
     macos_job_text = workflow_text.split("  build-macos-app:", 1)[1].split("\n  create-release:", 1)[0]
 
     assert "create-release" in jobs
-    assert jobs["create-release"]["needs"] == ["build-windows-installer", "build-macos-app"]
+    assert jobs["create-release"]["needs"] == [
+        "release-preflight",
+        "build-windows-installer",
+        "build-macos-app",
+    ]
     assert "actions/download-artifact" in workflow_text
     assert "merge-multiple: true" in workflow_text
     assert "Normalize release artifacts" in workflow_text
     assert "find release-artifacts -type f" in workflow_text
-    assert "softprops/action-gh-release@v3" in workflow_text
+    assert "softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b" in workflow_text
     assert "Create GitHub Release" in workflow_text
     assert "release-upload/TunnelForge-Setup-*.exe" in workflow_text
     assert "release-upload/TunnelForge-WebSetup.exe" in workflow_text
@@ -1907,10 +1912,10 @@ def test_release_workflow_creates_release_after_all_platform_artifacts():
     assert "release-upload/TunnelForge-macOS-*.zip" in workflow_text
     assert "release-upload/TunnelForge-macOS-*.dmg.sha256" in workflow_text
     assert "release-upload/TunnelForge-macOS-*.zip.sha256" in workflow_text
-    assert "actions/upload-artifact@v4" in windows_job_text
-    assert "actions/upload-artifact@v4" in macos_job_text
-    assert "softprops/action-gh-release@v3" not in windows_job_text
-    assert "softprops/action-gh-release@v3" not in macos_job_text
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in windows_job_text
+    assert "actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02" in macos_job_text
+    assert "softprops/action-gh-release@" not in windows_job_text
+    assert "softprops/action-gh-release@" not in macos_job_text
 
 
 def test_macos_validation_workflow_builds_pr_artifacts():
@@ -1995,15 +2000,25 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "issues: read" in workflow
     assert "checks: read" in workflow
     assert jobs["macos-app-validation"]["strategy"]["fail-fast"] is False
-    assert jobs["version-bump"]["needs"] == "version-gate"
+    assert jobs["version-bump"]["needs"] == "version-validation"
+    assert jobs["version-gate"]["needs"] == [
+        "macos-support-tracking-gate",
+        "rust-core-regression-gate",
+        "python-regression",
+        "macos-app-validation",
+        "version-validation",
+        "version-bump",
+    ]
     assert "Check macOS support GitHub tracking gate" in workflow
     assert "python scripts/check-macos-support-gate.py" in workflow
     assert "--skip-pr-checks" in workflow
     version_gate_text = workflow.split("  version-gate:", 1)[1].split("\n  version-bump:", 1)[0]
     assert "actions/create-github-app-token" not in version_gate_text
-    assert "git fetch --depth=1 origin" in workflow
-    assert "git checkout --detach FETCH_HEAD" in workflow
-    assert "token: ${{ steps.app-token.outputs.token }}" in workflow
+    assert "uses: actions/checkout@v5" in workflow
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in workflow
+    assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "token: ${{ steps.app-token.outputs.token }}" not in workflow
     assert "macos-14" in workflow
     assert "macos-15-intel" in workflow
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow
@@ -2037,7 +2052,7 @@ def test_release_workflow_builds_core_before_pyinstaller():
     pyinstaller_index = workflow.index("Build with PyInstaller")
 
     assert core_build_index < pyinstaller_index
-    assert "uses: dtolnay/rust-toolchain@stable" in workflow
+    assert "uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30" in workflow
     assert "cargo build --manifest-path migration_core\\Cargo.toml --release" in workflow
     assert "migration_core\\target\\release\\tunnelforge-core.exe" in workflow
 

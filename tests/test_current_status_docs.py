@@ -860,6 +860,28 @@ def test_current_status_records_post_round3_reconciliation_full_suite():
     assert "full pytest 1827 passed / 6 warnings" in sessions
 
 
+def test_current_status_records_231_release_candidate_verification_evidence():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    baseline = _section(doc, "Current Baseline Verification")
+    verification = _section(doc, "Verification Log")
+    sessions = _section(doc, "Session Log")
+
+    assert "historical 1955-pass release-review snapshot is preserved" in summary
+    assert "| `pytest -q` | PASS, 1955 passed, 1 skipped, 4 warnings, 60.38s, exit 0 |" in baseline
+    assert "Rust gate: 1.4s" in verification
+    assert "Cargo test: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored" in verification
+    assert "Rust gate exit 0 in 1.4s" in sessions
+    assert "Cargo test exit 0 in 4.1s" in sessions
+
+
+def test_current_status_session_log_has_one_header_delimiter():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    sessions = _section(doc, "Session Log")
+
+    assert sessions.count("| --- | --- | --- | --- |") == 1
+
+
 def test_current_status_records_strategy_review_findings_and_priority():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     summary = " ".join(_section(doc, "Summary").split())
@@ -887,3 +909,205 @@ def test_current_status_records_strategy_review_findings_and_priority():
     ]
     positions = [order.index(issue_id) for issue_id in priorities]
     assert positions == sorted(positions)
+
+
+def test_current_status_records_231_release_candidate_handoff():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    version_source = (PROJECT_ROOT / "src" / "version.py").read_text(encoding="utf-8")
+    source_version = re.search(r'__version__\s*=\s*"([^"]+)"', version_source).group(1)
+    summary = " ".join(_section(doc, "Summary").split())
+    baseline = " ".join(_section(doc, "Current Baseline Verification").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert source_version == "2.3.1"
+    assert f"`{source_version}` release candidate" in summary
+    assert f"Version references are aligned at `{source_version}`" in baseline
+
+    assert "TF-STATUS-079 | High | closed" in tracker
+    assert "TF-STATUS-080 | Medium | closed" in tracker
+    assert "TF-STATUS-082 | Medium | closed" in tracker
+    assert "TF-STATUS-081 | High | in_progress" in tracker
+    assert "TF-STATUS-083 | Medium | closed" in tracker
+    assert "TF-STATUS-008 | Low | open" in tracker
+    assert "TF-STATUS-078 | Low | open" in tracker
+
+    for phrase in [
+        "GitHub Release asset `digest` verification",
+        "unknown-environment confirmation",
+        "`python-regression`",
+        "bilingual Schedule correction",
+        f"`{source_version}` release candidate",
+    ]:
+        assert phrase in verification
+
+    assert "TF-STATUS-081" in order
+    assert "approved release execution" in order
+    assert "PR #240 merge" in order
+    assert "strict required checks" in order
+    assert "TF-STATUS-008" in order
+    assert "TF-STATUS-078" in order
+    assert "GitHub Release asset `digest` verification" in sessions
+    assert "unknown-environment confirmation" in sessions
+
+
+def test_current_status_closes_final_review_update_boundary_after_fresh_verification():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    baseline = " ".join(_section(doc, "Current Baseline Verification").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-084 | High | closed" in tracker
+    for finding in [
+        "verification-to-launch lease",
+        "owned cleanup/no-clobber",
+        "cancellation generation",
+        "streaming bound",
+    ]:
+        assert finding in tracker
+
+    assert (
+        "verified RC code baseline `7d49601` "
+        "on `feat/trust-release-sprint`; status-only history remains historical "
+        "and does not alter the verified code baseline"
+    ) in baseline
+    assert "current HEAD `b35dde6`" not in baseline
+    assert "b35dde6" not in baseline
+    assert "automatic installer execution is disabled/reveal-only" in summary
+    external_non_completion = (
+        "This local verification does not claim completion of tag/release, "
+        "GitHub issue closure, Apple-signed artifact validation, or Mac hardware validation."
+    )
+    assert external_non_completion in summary
+    assert "TF-STATUS-084" in verification
+    assert "Fix E secure child creation/name validation" in verification
+    assert "bootstrapper cancel-before-entry" in verification
+    assert "319 passed, 1 skipped in 48.27s" in verification
+    assert "2028 passed, 1 skipped, 4 warnings in 59.79s" in verification
+    assert "Rust Core regression gate pass" in verification
+    assert "216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored" in verification
+    assert "Release build: 0.30s" in verification
+    assert "Version sync: 1 passed in 0.09s" in verification
+    assert "final diff check passed" in verification
+    assert "| `git status --short --branch` | verified RC code baseline `7d49601`" in baseline
+    assert "| update/security/status/version focused pytest | PASS, 319 passed, 1 skipped in 48.27s, exit 0 |" in baseline
+    assert "| `pytest -q` | PASS, 2028 passed, 1 skipped, 4 warnings, 59.79s, exit 0 |" in baseline
+    assert "| `cargo build --manifest-path migration_core\\Cargo.toml --release` | PASS, 0.30s, exit 0 |" in baseline
+    assert "| `pytest tests\\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.09s, exit 0 |" in baseline
+    assert "TF-STATUS-084" in order
+    assert "focused 319 passed / 1 skipped" in sessions
+    assert "standalone full Python 2028 passed / 1 skipped / 4 warnings" in sessions
+
+
+def test_current_status_closes_bootstrapper_cancel_publication_race():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-086 is `closed`" in summary
+    assert "TF-STATUS-086 | High | closed" in tracker
+    assert "RED reproduced zero discard calls" in verification
+    assert "PASS, 63 passed, exit 0; diff check pass" in verification
+    assert "Keep TF-STATUS-086 closed" in order
+    assert "synchronized bootstrapper abandonment/result publication" in sessions
+    assert "final status suite 63 passed" in sessions
+
+
+def test_current_status_closes_non_windows_reveal_only_wording_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-087 is `closed`" in summary
+    assert "TF-STATUS-087 | Medium | closed" in tracker
+    assert "Keep TF-STATUS-087 closed" in order
+    assert "PASS, 64 passed, exit 0; diff check pass" in doc
+
+
+def test_current_status_closes_cross_platform_update_cleanup_after_broad_verification():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    baseline = " ".join(_section(doc, "Current Baseline Verification").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-085 | High | closed" in tracker
+    assert "verified RC code baseline `7d49601`" in baseline
+    assert "verified code baseline `87d9021`" in verification
+    assert "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK" in verification
+    assert "PASS, 62 passed, exit 0; diff check pass" in verification
+    assert "Keep TF-STATUS-085 closed" in order
+    assert "Closed TF-STATUS-085" in sessions
+    assert "final status suite 62 passed" in sessions
+
+
+def test_current_status_refresh_preserves_historical_test_snapshots_and_statuses():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+
+    for snapshot in [
+        "1827 passed, 6 warnings",
+        "1870 passed, 4 warnings",
+        "1955 passed, 1 skipped, 4 warnings",
+    ]:
+        assert snapshot in doc
+
+    for status in [
+        "TF-STATUS-079 | High | closed",
+        "TF-STATUS-080 | Medium | closed",
+        "TF-STATUS-081 | High | in_progress",
+        "TF-STATUS-082 | Medium | closed",
+        "TF-STATUS-083 | Medium | closed",
+        "TF-STATUS-008 | Low | open",
+        "TF-STATUS-078 | Low | open",
+    ]:
+        assert status in tracker
+
+
+def test_current_status_closes_version_gate_trust_boundary_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-088 is `closed`" in summary
+    assert "TF-STATUS-088 | High | closed" in tracker
+    assert "Commit-message bypass is removed" in verification
+    assert "Keep TF-STATUS-088 closed" in order
+    assert "PASS, 65 passed, exit 0; diff check pass" in verification
+
+
+def test_current_status_tracks_release_approval_and_accepted_unsigned_macos_policy():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+
+    assert "TF-STATUS-089 | High | closed" in tracker
+    assert "TF-STATUS-090 | High | watch" in tracker
+    assert "TF-STATUS-091 | Medium | watch" in tracker
+    assert "unsigned macOS artifacts" in summary
+    assert "accepted for this release" in summary
+    assert "required reviewer, admin bypass disabled" in summary
+    assert "active ruleset prevents `v*` tag update/deletion/non-fast-forward" in summary
+    assert "2028 passed, 1 skipped, 4 warnings in 59.79s" in verification
+    assert "ModuleNotFoundError: No module named 'src.ui'" in verification
+    assert "frozen smoke returned `success=true`" in verification
+    assert "29229463468" in verification
+    assert "29229463485" in verification
+    assert "PR #240 is `CLEAN`/mergeable" in verification
+    assert "Security re-review: SECURE / APPROVE" in doc
+    assert order.index("TF-STATUS-089") < order.index("TF-STATUS-090")
+    assert order.index("TF-STATUS-090") < order.index("TF-STATUS-091")

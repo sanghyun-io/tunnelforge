@@ -6,14 +6,14 @@ from src.ui.dialogs.settings import SettingsDialog, update_package_action_text
 from src.ui.themes import ThemeType
 
 
-def test_update_package_action_text_uses_open_wording_for_macos_packages():
+def test_update_package_action_text_uses_reveal_wording_for_macos_packages():
     text = update_package_action_text("open")
 
-    assert text.button == "📂 패키지 열기"
-    assert "패키지 열기" in text.done_message
+    assert text.button == "📂 저장 위치 보기"
+    assert "저장 위치 보기" in text.done_message
     assert "설치 시작" not in text.button
     assert "설치 시작" not in text.done_message
-    assert "다운로드한 패키지를 열면 현재 앱이 종료됩니다." in text.confirm_body
+    assert "현재 앱은 종료되지 않습니다." in text.confirm_body
 
 
 def test_update_package_action_text_keeps_installer_wording_for_windows():

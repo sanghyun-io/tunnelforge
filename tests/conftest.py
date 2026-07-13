@@ -8,6 +8,16 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 
+@pytest.fixture(autouse=True)
+def reset_process_language():
+    """Keep process-wide Qt translation state from leaking between tests."""
+    from src.core import i18n
+
+    i18n.set_language(i18n.DEFAULT_LANGUAGE)
+    yield
+    i18n.set_language(i18n.DEFAULT_LANGUAGE)
+
+
 @pytest.fixture
 def canonical_constants():
     """mysql-upgrade-checker canonical 상수 기준값 로드"""

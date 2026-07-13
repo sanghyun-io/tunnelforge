@@ -932,9 +932,6 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         return "증분 Import (병합)"
 
     def _confirm_production_guard(self, input_dir: str, target_schema: Optional[str]) -> bool:
-        if not self.tunnel_config:
-            return True
-
         from src.core.production_guard import ProductionGuard
 
         guard = ProductionGuard(self)
@@ -947,7 +944,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             f"Import 모드: {self._get_import_mode_text()}"
         )
         return guard.confirm_dangerous_operation(
-            self.tunnel_config, "데이터 Import", schema_name, details
+            self.tunnel_config or {}, "데이터 Import", schema_name, details
         )
 
     def do_import(self, retry_tables: list = None):

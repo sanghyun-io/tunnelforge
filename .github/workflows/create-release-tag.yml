@@ -1,50 +1,90 @@
 name: Create Release Tag
 
-# version:* 라벨이 있는 PR 머지 시 태그 생성 → release.yml 트리거
-
 on:
-  pull_request:
-    types: [closed]
+  workflow_dispatch:
+    inputs:
+      target_sha:
+        description: Exact merged main commit to tag
+        required: true
+        type: string
+      version:
+        description: Release version without the v prefix
+        required: true
+        type: string
+      confirm:
+        description: Type CREATE_RELEASE_TAG to confirm
+        required: true
+        type: string
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   create-tag:
-    if: >
-      github.event.pull_request.merged == true &&
-      contains(toJSON(github.event.pull_request.labels.*.name), 'version:')
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    environment: production-release
+    permissions:
+      contents: write
 
     steps:
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v3
+      - name: Checkout approved target
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
-          app-id: ${{ secrets.RELEASER_APP_ID }}
-          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
-
-      - name: Checkout main
-        uses: actions/checkout@v5
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          ref: main
+          ref: ${{ inputs.target_sha }}
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Read version and create tag
+      - name: Validate target and create tag
+        env:
+          TARGET_SHA: ${{ inputs.target_sha }}
+          VERSION: ${{ inputs.version }}
+          CONFIRM: ${{ inputs.confirm }}
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          set -euo pipefail
 
-          VERSION=$(grep '__version__' src/version.py | cut -d'"' -f2)
-          TAG="v${VERSION}"
-
-          if git ls-remote --tags origin "$TAG" | grep -q "$TAG"; then
-            echo "태그 $TAG 이미 존재. 건너뜁니다."
-            exit 0
+          if [ "$CONFIRM" != "CREATE_RELEASE_TAG" ]; then
+            echo "Confirmation must be CREATE_RELEASE_TAG." >&2
+            exit 1
+          fi
+          if ! echo "$TARGET_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "target_sha must be a full 40-character commit SHA." >&2
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "version must be a canonical SemVer value without the v prefix." >&2
+            exit 1
           fi
 
-          git tag -a "$TAG" -m "Release ${TAG}"
-          git push origin "$TAG"
-          echo "태그 ${TAG} 생성 완료 → release.yml 트리거됨"
+          git fetch --no-tags origin main
+          MAIN_SHA=$(git rev-parse origin/main)
+          CHECKED_OUT_SHA=$(git rev-parse HEAD)
+          if [ "$TARGET_SHA" != "$MAIN_SHA" ] || [ "$TARGET_SHA" != "$CHECKED_OUT_SHA" ]; then
+            echo "Approved target must equal the current main HEAD." >&2
+            echo "target=$TARGET_SHA main=$MAIN_SHA checkout=$CHECKED_OUT_SHA" >&2
+            exit 1
+          fi
+
+          PYTHON_VERSION=$(grep '__version__' src/version.py | cut -d'"' -f2)
+          PROJECT_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml | head -1)
+          INSTALLER_VERSION=$(sed -n 's/^#define MyAppVersion "\([^"]*\)"/\1/p' installer/TunnelForge.iss | head -1)
+          if [ -z "$PYTHON_VERSION" ] || [ "$PYTHON_VERSION" != "$VERSION" ] || \
+             [ "$PROJECT_VERSION" != "$VERSION" ] || [ "$INSTALLER_VERSION" != "$VERSION" ]; then
+            echo "Version input does not match all release version files." >&2
+            echo "input=$VERSION python=$PYTHON_VERSION project=$PROJECT_VERSION installer=$INSTALLER_VERSION" >&2
+            exit 1
+          fi
+
+          TAG="v${VERSION}"
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists; refusing to retarget it." >&2
+            exit 1
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" "$TARGET_SHA" -m "Release $TAG"
+          git remote set-url origin "https://x-access-token:${GITHUB_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          git push origin "refs/tags/$TAG"
+          echo "Created $TAG at $TARGET_SHA. Dispatch Build and Release separately to create the approved draft."

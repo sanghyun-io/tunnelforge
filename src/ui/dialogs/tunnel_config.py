@@ -9,6 +9,7 @@ from PyQt6.QtGui import QAction
 import uuid
 
 from src.core.logger import get_logger
+from src.core.i18n import translate_text
 from src.ui.styles import ButtonStyles, LabelStyles
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
@@ -221,9 +222,12 @@ class TunnelConfigDialog(QDialog):
         self.combo_environment.addItem("🟠 Staging", "staging")
         self.combo_environment.addItem("🟢 Development", "development")
         self.combo_environment.setToolTip(
-            "Production: 위험 작업 시 스키마명 직접 입력 필요\n"
-            "Staging: 위험 작업 시 확인 다이얼로그 표시\n"
-            "Development: 확인 없이 바로 실행"
+            translate_text(
+                "(미설정): 위험 작업 시 확인 필요 (기본값 No)\n"
+                "Production: 위험 작업 시 스키마명 직접 입력 필요\n"
+                "Staging: 위험 작업 시 확인 다이얼로그 표시\n"
+                "Development: 확인 없이 바로 실행"
+            )
         )
         env_index = self.combo_environment.findData(self.tunnel_data.get('environment'))
         self.combo_environment.setCurrentIndex(env_index if env_index >= 0 else 0)

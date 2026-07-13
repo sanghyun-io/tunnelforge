@@ -1,6 +1,65 @@
+import pytest
+
 from PyQt6.QtWidgets import QMessageBox
 
 from src.core.production_guard import ProductionGuard
+
+
+@pytest.mark.parametrize(
+    "tunnel_config",
+    [{}, {"environment": None}, {"environment": "invalid"}],
+)
+def test_unknown_environment_requires_default_no_confirmation(monkeypatch, tunnel_config):
+    captured = {}
+
+    def fake_warning(parent, title, text, buttons, default_button):
+        captured.update(
+            parent=parent,
+            title=title,
+            text=text,
+            buttons=buttons,
+            default_button=default_button,
+        )
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr("src.core.production_guard.QMessageBox.warning", fake_warning)
+
+    result = ProductionGuard(parent=None).confirm_dangerous_operation(
+        tunnel_config,
+        "데이터 Import",
+        "target_schema",
+        "Import 상세 정보",
+    )
+
+    assert result is False
+    assert captured["default_button"] == QMessageBox.StandardButton.No
+    assert captured["buttons"] == (
+        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+    )
+    assert "데이터 Import" in captured["text"]
+    assert "target_schema" in captured["text"]
+    assert "Import 상세 정보" in captured["text"]
+    assert "미분류" in captured["title"]
+
+
+def test_explicit_development_environment_remains_permissive(monkeypatch):
+    message_box_calls = []
+
+    def record_message_box(*args, **kwargs):
+        message_box_calls.append((args, kwargs))
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr("src.core.production_guard.QMessageBox.warning", record_message_box)
+    monkeypatch.setattr("src.core.production_guard.QMessageBox.question", record_message_box)
+
+    result = ProductionGuard(parent=None).confirm_dangerous_operation(
+        {"environment": "development"},
+        "데이터 Import",
+        "dev_schema",
+    )
+
+    assert result is True
+    assert message_box_calls == []
 
 
 def test_staging_confirmation_includes_operation_and_schema_when_details_empty(monkeypatch):

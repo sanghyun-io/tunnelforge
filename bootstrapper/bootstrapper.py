@@ -10,11 +10,27 @@ import subprocess
 import threading
 import webbrowser
 import tempfile
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional, Callable, Tuple
 
+if __package__ in {None, ""} and not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import certifi
 import requests
+
+from src.update_integrity import (
+    IntegrityError,
+    MAX_INSTALLER_SIZE,
+    OwnedTempDirectory,
+    VerifiedFileLease,
+    publish_owned_temp_file,
+    parse_content_length,
+    parse_sha256_digest,
+    validate_child_basename,
+)
 
 # ============================================================
 # Version Info (from version_info.py)
@@ -33,6 +49,42 @@ RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/l
 
 # 다운로드 대상 파일 패턴
 INSTALLER_FILENAME_PATTERN = "TunnelForge-Setup-latest.exe"
+SELF_CHECK_MARKER = "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK"
+
+
+def run_self_check() -> str:
+    """Validate frozen bootstrapper dependencies without starting UI or I/O."""
+    required_import_api = (
+        tk.Tk,
+        ttk.Frame,
+        messagebox.showerror,
+        requests.get,
+        requests.certs.where,
+        certifi.where,
+    )
+    if not all(callable(symbol) for symbol in required_import_api):
+        raise RuntimeError("required import API contract is incomplete")
+
+    required_symbols = (
+        IntegrityError,
+        OwnedTempDirectory,
+        VerifiedFileLease,
+        publish_owned_temp_file,
+        parse_content_length,
+        parse_sha256_digest,
+        validate_child_basename,
+    )
+    if not all(callable(symbol) for symbol in required_symbols):
+        raise RuntimeError("shared integrity API contract is incomplete")
+    if not isinstance(MAX_INSTALLER_SIZE, int) or MAX_INSTALLER_SIZE <= 0:
+        raise RuntimeError("shared integrity size contract is invalid")
+
+    cert_paths = {Path(certifi.where()), Path(requests.certs.where())}
+    if not cert_paths or any(
+        not path.is_file() or path.stat().st_size <= 0 for path in cert_paths
+    ):
+        raise RuntimeError("embedded CA certificate lookup failed")
+    return SELF_CHECK_MARKER
 
 
 # ============================================================
@@ -63,11 +115,18 @@ class InstallerDownloader:
         self.latest_version: Optional[str] = None
         self.download_url: Optional[str] = None
         self.file_size: int = 0
+        self.expected_sha256: Optional[str] = None
+        self.installer_filename: Optional[str] = None
         self._cancelled = False
+        self._owned_temp_dirs = {}
 
     def cancel(self):
         """다운로드 취소"""
         self._cancelled = True
+
+    def reset_cancellation(self):
+        """새 다운로드 작업을 시작하기 전에 취소 상태를 초기화한다."""
+        self._cancelled = False
 
     def get_latest_release(self) -> Tuple[str, str, int]:
         """최신 릴리스 정보 조회
@@ -78,6 +137,12 @@ class InstallerDownloader:
         Raises:
             DownloadError: API 호출 실패 또는 설치 파일을 찾을 수 없는 경우
         """
+        self.latest_version = None
+        self.download_url = None
+        self.file_size = 0
+        self.expected_sha256 = None
+        self.installer_filename = None
+
         try:
             response = requests.get(
                 RELEASES_API_URL,
@@ -92,23 +157,40 @@ class InstallerDownloader:
             if not self.latest_version:
                 raise DownloadError("버전 정보를 찾을 수 없습니다")
 
-            # assets에서 설치 프로그램 찾기
+            expected_name = f"TunnelForge-Setup-{self.latest_version}.exe"
+            try:
+                validate_child_basename(expected_name, windows=True)
+            except IntegrityError as exc:
+                raise DownloadError(f"release asset filename is unsafe: {exc}") from exc
             assets = release_data.get('assets', [])
             for asset in assets:
                 asset_name = asset.get('name', '')
-                if INSTALLER_FILENAME_PATTERN in asset_name or asset_name == INSTALLER_FILENAME_PATTERN:
-                    self.download_url = asset.get('browser_download_url')
-                    self.file_size = asset.get('size', 0)
-                    break
+                if asset_name != expected_name:
+                    continue
 
-            # Setup-latest.exe를 못 찾으면 Setup-{version}.exe 시도
-            if not self.download_url:
-                for asset in assets:
-                    asset_name = asset.get('name', '')
-                    if 'TunnelForge-Setup' in asset_name and asset_name.endswith('.exe'):
-                        self.download_url = asset.get('browser_download_url')
-                        self.file_size = asset.get('size', 0)
-                        break
+                download_url = asset.get('browser_download_url')
+                if not download_url:
+                    raise DownloadError("release asset download URL is missing")
+                try:
+                    file_size = int(asset.get('size', 0))
+                except (TypeError, ValueError) as exc:
+                    raise DownloadError("release asset size must be positive") from exc
+                if file_size <= 0:
+                    raise DownloadError("release asset size must be positive")
+                if file_size > MAX_INSTALLER_SIZE:
+                    raise DownloadError(
+                        "release asset size exceeds maximum installer size"
+                    )
+                try:
+                    expected_sha256 = parse_sha256_digest(asset.get('digest'))
+                except IntegrityError as exc:
+                    raise DownloadError(str(exc)) from exc
+
+                self.download_url = str(download_url)
+                self.file_size = file_size
+                self.expected_sha256 = expected_sha256
+                self.installer_filename = expected_name
+                break
 
             if not self.download_url:
                 raise DownloadError(
@@ -155,15 +237,30 @@ class InstallerDownloader:
         """
         if not self.download_url:
             raise DownloadError("먼저 get_latest_release()를 호출해야 합니다")
+        if (
+            not self.expected_sha256
+            or self.file_size <= 0
+            or self.file_size > MAX_INSTALLER_SIZE
+            or not self.installer_filename
+        ):
+            raise DownloadError("release asset integrity metadata is missing or invalid")
 
-        self._cancelled = False
-
-        # 임시 파일 경로 생성
-        temp_dir = tempfile.gettempdir()
-        filename = os.path.basename(self.download_url) or "TunnelForge-Setup.exe"
-        file_path = os.path.join(temp_dir, filename)
+        temp_dir = tempfile.mkdtemp(prefix="tunnelforge-bootstrapper-")
+        try:
+            owner = OwnedTempDirectory(temp_dir)
+        except (IntegrityError, OSError) as exc:
+            raise DownloadError(
+                f"temporary download directory could not be secured: {exc}"
+            ) from exc
+        self._owned_temp_dirs[owner.path] = owner
+        temp_dir = owner.path
+        file_path = os.path.join(temp_dir, self.installer_filename)
+        part_path = f"{file_path}.part"
+        if not owner.claim_files((file_path, part_path)):
+            raise DownloadError("temporary download child path is not owned")
 
         try:
+            self._raise_if_cancelled()
             response = requests.get(
                 self.download_url,
                 stream=True,
@@ -171,33 +268,108 @@ class InstallerDownloader:
             )
             response.raise_for_status()
 
-            # Content-Length가 없는 경우 대비
-            total_size = int(response.headers.get('content-length', self.file_size))
+            content_length = parse_content_length(
+                response.headers.get("content-length")
+            )
+            if content_length is not None and content_length != self.file_size:
+                raise DownloadError(
+                    "Content-Length size does not match release metadata"
+                )
 
             downloaded = 0
-            with open(file_path, 'wb') as f:
+            with owner.create_file(os.path.basename(part_path)) as f:
                 for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
-                    if self._cancelled:
-                        f.close()
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                        raise DownloadError("다운로드가 취소되었습니다")
+                    self._raise_if_cancelled()
 
                     if chunk:
+                        if downloaded + len(chunk) > self.file_size:
+                            raise DownloadError(
+                                "downloaded content exceeds expected size"
+                            )
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        if progress_callback and total_size > 0:
-                            progress_callback(downloaded, total_size)
+                        if progress_callback:
+                            progress_callback(downloaded, self.file_size)
 
+            self._raise_if_cancelled()
+            try:
+                with self.open_verified_installer(part_path):
+                    pass
+            except (IntegrityError, OSError) as exc:
+                raise DownloadError(str(exc)) from exc
+            self._raise_if_cancelled()
+            publish_owned_temp_file(owner, part_path, file_path)
+            self._raise_if_cancelled()
             return file_path
 
+        except DownloadError:
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
+            raise
         except requests.exceptions.RequestException as e:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"다운로드 실패: {str(e)}")
-        except IOError as e:
+        except OSError as e:
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"파일 저장 실패: {str(e)}")
+        except Exception as e:
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
+            raise DownloadError(f"다운로드 실패: {str(e)}") from e
+
+    def open_verified_installer(self, path: str) -> VerifiedFileLease:
+        """Return a verified file lease that can guard process dispatch."""
+        if not self.expected_sha256:
+            raise DownloadError("release asset SHA-256 digest is missing or invalid")
+        return VerifiedFileLease(path, self.expected_sha256, self.file_size)
+
+    def discard_downloaded_installer(self, path: str) -> bool:
+        """Remove an installer only when its recorded parent identity matches."""
+        owner = self._find_owned_parent(path)
+        if owner is None:
+            return False
+        removed = owner.discard_files((path, f"{path}.part"))
+        self._finish_owned_cleanup(owner, removed)
+        return removed
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled:
+            raise DownloadError("다운로드가 취소되었습니다")
+
+    def _find_owned_parent(self, path: str) -> Optional[OwnedTempDirectory]:
+        return next(
+            (
+                owner
+                for owner in self._owned_temp_dirs.values()
+                if owner.owns_direct_child(path)
+            ),
+            None,
+        )
+
+    def _finish_owned_cleanup(
+        self, owner: OwnedTempDirectory, removed: bool
+    ) -> None:
+        if removed:
+            owner.remove_if_empty()
+        owner.close()
+        self._owned_temp_dirs.pop(owner.path, None)
+
+    def _cleanup_failed_download(self, temp_dir: str, *paths: str) -> bool:
+        normalized_temp_dir = os.path.normcase(
+            os.path.normpath(os.path.abspath(temp_dir))
+        )
+        owner = next(
+            (
+                candidate
+                for candidate in self._owned_temp_dirs.values()
+                if os.path.normcase(candidate.path) == normalized_temp_dir
+            ),
+            None,
+        )
+        if owner is None:
+            return False
+        removed = owner.discard_files(paths)
+        self._finish_owned_cleanup(owner, removed)
+        return removed
 
 
 # ============================================================
@@ -216,6 +388,9 @@ class BootstrapperApp:
         self.downloader = InstallerDownloader()
         self.download_thread: Optional[threading.Thread] = None
         self.downloaded_file: Optional[str] = None
+        self._installer_dispatched = False
+        self._download_state_lock = threading.Lock()
+        self._download_abandoned = False
 
         self._setup_window()
         self._create_widgets()
@@ -351,12 +526,19 @@ class BootstrapperApp:
                 message + "\n\nGitHub에서 직접 다운로드할 수 있습니다."
             )
 
-        self.root.after(0, show)
+        try:
+            self.root.after(0, show)
+        except (RuntimeError, tk.TclError):
+            with self._get_download_state_lock():
+                if self._download_abandoned:
+                    return
+            raise
 
     def _download_worker(self):
         """백그라운드 다운로드 작업"""
         try:
             # 1. 최신 릴리스 정보 조회
+            self.downloader._raise_if_cancelled()
             self._update_status("최신 버전 확인 중...")
             version, url, size = self.downloader.get_latest_release()
 
@@ -368,10 +550,19 @@ class BootstrapperApp:
             file_path = self.downloader.download_installer(
                 progress_callback=self._update_progress
             )
-            self.downloaded_file = file_path
+            with self._get_download_state_lock():
+                if self._download_abandoned:
+                    discard_late_result = True
+                else:
+                    self.downloaded_file = file_path
+                    self._installer_dispatched = False
+                    discard_late_result = False
 
-            # 3. 다운로드 완료
-            self.root.after(0, self._on_download_complete)
+            if discard_late_result:
+                self._discard_installer_path(file_path)
+                return
+
+            self._schedule_download_complete()
 
         except DownloadError as e:
             self._show_error(str(e))
@@ -380,6 +571,10 @@ class BootstrapperApp:
 
     def _on_download_complete(self):
         """다운로드 완료 처리"""
+        with self._get_download_state_lock():
+            if self._download_abandoned:
+                return
+
         self.progress_bar.config(value=100)
         self.status_label.config(text="다운로드 완료! 설치 프로그램 실행 중...")
         self.detail_label.config(text="")
@@ -388,31 +583,82 @@ class BootstrapperApp:
         # 약간의 지연 후 설치 프로그램 실행
         self.root.after(500, self._launch_installer)
 
+    def _schedule_download_complete(self) -> None:
+        try:
+            self.root.after(0, self._on_download_complete)
+        except (RuntimeError, tk.TclError):
+            with self._get_download_state_lock():
+                if self._download_abandoned:
+                    return
+            raise
+
     def _launch_installer(self):
         """설치 프로그램 실행"""
+        if os.name != "nt":
+            self._show_error(
+                "이 설치 프로그램은 Windows용 .exe 파일입니다. "
+                "Windows에서 실행해 주세요."
+            )
+            return
+
         if not self.downloaded_file or not os.path.exists(self.downloaded_file):
             self._show_error("다운로드된 파일을 찾을 수 없습니다.")
             return
 
         try:
-            # 설치 프로그램 실행 (부트스트래퍼와 별개 프로세스)
-            subprocess.Popen(
-                [self.downloaded_file],
-                creationflags=subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            expected_sha256 = getattr(self.downloader, "expected_sha256", None)
+            expected_size = getattr(self.downloader, "file_size", 0)
+            if not expected_sha256 or expected_size <= 0:
+                raise IntegrityError("release asset integrity metadata is missing or invalid")
+            open_verified = getattr(
+                self.downloader, "open_verified_installer", None
             )
-
-            # 부트스트래퍼 종료
-            self.root.after(500, self.root.destroy)
-
+            lease = (
+                open_verified(self.downloaded_file)
+                if callable(open_verified)
+                else VerifiedFileLease(
+                    self.downloaded_file,
+                    expected_sha256,
+                    expected_size,
+                )
+            )
+            with lease as verified:
+                verified.dispatch(
+                    lambda path: subprocess.Popen(
+                        [path],
+                        creationflags=(
+                            subprocess.DETACHED_PROCESS
+                            | subprocess.CREATE_NEW_PROCESS_GROUP
+                        ),
+                    )
+                )
+            self._installer_dispatched = True
+        except IntegrityError as e:
+            discard = getattr(
+                self.downloader, "discard_downloaded_installer", None
+            )
+            if callable(discard):
+                try:
+                    discard(self.downloaded_file)
+                except Exception:
+                    pass
+            self._show_error(f"다운로드된 설치 파일 검증 실패: {str(e)}")
+            return
         except Exception as e:
             self._show_error(
                 f"설치 프로그램 실행 실패: {str(e)}\n\n"
                 f"파일 위치: {self.downloaded_file}"
             )
+            return
+
+        # 부트스트래퍼 종료
+        self.root.after(500, self.root.destroy)
 
     def _on_cancel(self):
         """취소 버튼 클릭"""
         if self.cancel_button.cget('text') == '닫기':
+            self._mark_download_abandoned()
+            self._discard_undispatched_installer()
             self.root.destroy()
             return
 
@@ -420,12 +666,47 @@ class BootstrapperApp:
             "다운로드 취소",
             "설치를 취소하시겠습니까?"
         ):
+            self._mark_download_abandoned()
             self.downloader.cancel()
+            self._discard_undispatched_installer()
             self.root.destroy()
 
     def _on_close(self):
         """윈도우 닫기"""
         self._on_cancel()
+
+    def _discard_undispatched_installer(self) -> None:
+        """Best-effort release of a completed installer that was not launched."""
+        with self._get_download_state_lock():
+            downloaded_file = self.downloaded_file
+            dispatched = getattr(self, "_installer_dispatched", False)
+            self.downloaded_file = None
+            self._installer_dispatched = False
+
+        if downloaded_file and not dispatched:
+            self._discard_installer_path(downloaded_file)
+
+    def _get_download_state_lock(self):
+        lock = getattr(self, "_download_state_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self._download_state_lock = lock
+            self._download_abandoned = getattr(
+                self, "_download_abandoned", False
+            )
+        return lock
+
+    def _mark_download_abandoned(self) -> None:
+        with self._get_download_state_lock():
+            self._download_abandoned = True
+
+    def _discard_installer_path(self, downloaded_file: str) -> None:
+        discard = getattr(self.downloader, "discard_downloaded_installer", None)
+        if callable(discard):
+            try:
+                discard(downloaded_file)
+            except Exception:
+                pass
 
     def _open_github(self):
         """GitHub 릴리스 페이지 열기"""
@@ -438,6 +719,7 @@ class BootstrapperApp:
 
     def _start_download(self):
         """백그라운드 다운로드 시작"""
+        self.downloader.reset_cancellation()
         self.download_thread = threading.Thread(
             target=self._download_worker,
             daemon=True
@@ -450,11 +732,16 @@ class BootstrapperApp:
         self.root.mainloop()
 
 
-def main():
+def main(argv=None):
     """엔트리 포인트"""
+    arguments = sys.argv[1:] if argv is None else argv
+    if "--self-check" in arguments:
+        print(run_self_check())
+        return 0
     app = BootstrapperApp()
     app.run()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())

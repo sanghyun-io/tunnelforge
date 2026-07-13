@@ -1,5 +1,6 @@
 """설정 관련 다이얼로그"""
 import os
+from pathlib import Path
 import subprocess
 import sys
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
@@ -8,17 +9,19 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QWidget, QTextBrowser, QSizePolicy,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
                              QSpinBox, QProgressBar, QApplication)
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices, QFont
-from PyQt6.QtCore import QUrl
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
+from src.update_integrity import (
+    IntegrityError,
+    VerifiedFileLease,
+)
 from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
 from src.core.platform_integration import (
     StartupRegistrar,
     detached_process_kwargs,
     no_window_creation_flags,
-    update_package_launch_strategy,
 )
 from src.ui.themes import ThemeType
 from src.ui.theme_manager import ThemeManager
@@ -212,7 +215,7 @@ class SettingsDialog(QDialog):
         else:
             desc_label = QLabel(
                 "⚠️ GitHub App이 설정되지 않았습니다.\n"
-                "환경변수 또는 내장 설정이 필요합니다. (GITHUB_APP_SETUP.md 참조)"
+                "환경변수 또는 로컬 .env 설정이 필요합니다. (GITHUB_APP_SETUP.md 참조)"
             )
             desc_label.setStyleSheet("color: #e74c3c; font-size: 11px; margin-left: 20px; margin-top: 5px;")
             desc_label.setWordWrap(True)
@@ -526,6 +529,13 @@ class SettingsDialog(QDialog):
         # 다운로드 관련 상태 변수 초기화
         self._download_worker = None
         self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
+        self._installer_dispatched = False
+        self._download_generation = 0
+        self._download_signal_relays = {}
+        self._download_retired = False
         self._latest_version = None
 
         layout.addWidget(update_group)
@@ -604,6 +614,12 @@ class SettingsDialog(QDialog):
 
         self.accept()
 
+    def accept(self):
+        """Retire downloads before accepting and closing the dialog."""
+        self._retire_active_update_download()
+        self._discard_abandoned_downloaded_installer()
+        super().accept()
+
     def _restore_original_theme_if_unsaved(self):
         """테마가 저장되지 않은 채 다이얼로그가 닫히면 미리보기 이전 테마로 복원"""
         if not getattr(self, "_theme_saved", False):
@@ -611,8 +627,17 @@ class SettingsDialog(QDialog):
 
     def reject(self):
         """취소(또는 창 닫기) 시 미리보기 중이던 테마를 원래 상태로 복원"""
+        self._retire_active_update_download()
+        self._discard_abandoned_downloaded_installer()
         self._restore_original_theme_if_unsaved()
         super().reject()
+
+    def closeEvent(self, event):
+        """Invalidate downloads before the dialog is closed."""
+        self._retire_active_update_download()
+        self._discard_abandoned_downloaded_installer()
+        self._restore_original_theme_if_unsaved()
+        super().closeEvent(event)
 
     def _is_startup_registered(self) -> bool:
         """레지스트리에 시작 프로그램 등록 여부 확인"""
@@ -682,6 +707,17 @@ class SettingsDialog(QDialog):
         """업데이트 다운로드 시작"""
         from src.ui.workers import UpdateDownloadWorker
 
+        self._download_retired = False
+        self._retire_active_update_download(wait=True)
+        self._download_retired = False
+        generation = self._download_generation
+        self._discard_abandoned_downloaded_installer()
+        self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
+        self._installer_dispatched = False
+
         # UI 상태 변경
         self.btn_check_update.setEnabled(False)
         self.btn_download.setEnabled(False)
@@ -693,17 +729,106 @@ class SettingsDialog(QDialog):
         self.download_detail_label.show()
 
         # Worker 시작
-        self._download_worker = UpdateDownloadWorker(config_manager=self.config_mgr)
-        self._download_worker.info_fetched.connect(self._on_download_info_fetched)
-        self._download_worker.progress.connect(self._on_download_progress)
-        self._download_worker.finished.connect(self._on_download_finished)
-        self._download_worker.start()
+        worker = UpdateDownloadWorker(config_manager=self.config_mgr)
+        self._download_worker = worker
+
+        def verification_relay(sha256, file_size):
+            self._handle_download_verification_ready(
+                generation, worker, sha256, file_size
+            )
+
+        def info_relay(version, file_size):
+            self._handle_download_info_fetched(
+                generation, worker, version, file_size
+            )
+
+        def progress_relay(downloaded, total):
+            self._handle_download_progress(
+                generation, worker, downloaded, total
+            )
+
+        def finished_relay(success, result):
+            self._handle_download_finished(generation, worker, success, result)
+
+        relays = (
+            verification_relay,
+            info_relay,
+            progress_relay,
+            finished_relay,
+        )
+        self._download_signal_relays[generation] = relays
+        worker.verification_ready.connect(verification_relay)
+        worker.info_fetched.connect(info_relay)
+        worker.progress.connect(progress_relay)
+        worker.finished.connect(finished_relay)
+        worker.start()
+
+    def _retire_active_update_download(self, *, wait=False):
+        """Invalidate, detach, and cancel the active update worker once."""
+        if self._download_retired:
+            return None
+        self._download_retired = True
+        retired_generation = self._download_generation
+        self._download_generation += 1
+        worker = self._download_worker
+        self._download_worker = None
+        self._download_signal_relays.pop(retired_generation, None)
+        if worker:
+            worker.cancel()
+            if wait:
+                worker.wait()
+        return worker
+
+    def _is_current_download_worker(self, generation, worker) -> bool:
+        return (
+            generation == self._download_generation
+            and worker is self._download_worker
+        )
+
+    @staticmethod
+    def _discard_stale_downloaded_installer(worker, installer_path: str) -> None:
+        discard = getattr(
+            getattr(worker, "downloader", None),
+            "discard_downloaded_installer",
+            None,
+        )
+        if callable(discard):
+            try:
+                discard(installer_path)
+            except Exception:
+                pass
+
+    def _handle_download_info_fetched(
+        self, generation, worker, version: str, file_size: int
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            return
+        self._on_download_info_fetched(version, file_size)
 
     def _on_download_info_fetched(self, version: str, file_size: int):
         """설치 프로그램 정보 수신"""
         self.btn_download.setText("다운로드 중...")
         size_str = format_size(file_size)
         self.download_detail_label.setText(f"파일 크기: {size_str}")
+
+    def _handle_download_verification_ready(
+        self, generation, worker, sha256: str, file_size: int
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            return
+        self._on_download_verification_ready(sha256, file_size)
+
+    def _on_download_verification_ready(self, sha256: str, file_size: int):
+        """Store immutable release metadata for launch-time verification."""
+        self._downloaded_installer_sha256 = sha256
+        self._downloaded_installer_size = file_size
+
+    def _handle_download_progress(
+        self, generation, worker, downloaded: int, total: int
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            return
+        self._on_download_progress(downloaded, total)
 
     def _on_download_progress(self, downloaded: int, total: int):
         """다운로드 진행률 업데이트"""
@@ -714,12 +839,27 @@ class SettingsDialog(QDialog):
             total_str = format_size(total)
             self.download_detail_label.setText(f"{downloaded_str} / {total_str}")
 
-    def _on_download_finished(self, success: bool, result: str):
+    def _handle_download_finished(
+        self, generation, worker, success: bool, result: str
+    ):
+        if not self._is_current_download_worker(generation, worker):
+            if success and result:
+                self._discard_stale_downloaded_installer(worker, result)
+            self._download_signal_relays.pop(generation, None)
+            return
+
+        self._download_worker = None
+        self._download_signal_relays.pop(generation, None)
+        self._on_download_finished(success, result, worker.downloader)
+
+    def _on_download_finished(self, success: bool, result: str, owner=None):
         """다운로드 완료 처리"""
         self.btn_cancel_download.hide()
 
         if success:
             self._downloaded_installer_path = result
+            self._downloaded_installer_owner = owner
+            self._installer_dispatched = False
             action_text = update_package_action_text()
             self.download_progress.setValue(100)
             self.btn_download.setText(action_text.button)
@@ -730,6 +870,11 @@ class SettingsDialog(QDialog):
             self.btn_download.clicked.connect(self._launch_installer)
             self.download_detail_label.setText(action_text.done_message)
         else:
+            self._downloaded_installer_path = None
+            self._downloaded_installer_sha256 = None
+            self._downloaded_installer_size = 0
+            self._downloaded_installer_owner = None
+            self._installer_dispatched = False
             self.download_progress.hide()
             self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
             self.btn_download.setEnabled(True)
@@ -739,10 +884,9 @@ class SettingsDialog(QDialog):
 
     def _cancel_download(self):
         """다운로드 취소"""
-        if self._download_worker:
-            self._download_worker.cancel()
-            self._download_worker.wait()
-            self._download_worker = None
+        self._retire_active_update_download(wait=True)
+
+        self._discard_abandoned_downloaded_installer()
 
         # UI 상태 복원
         self.btn_cancel_download.hide()
@@ -762,61 +906,151 @@ class SettingsDialog(QDialog):
             )
             return
 
-        # 확인 메시지 구성 (활성 터널 경고 포함)
         main_window = self.parent()
-        action_text = update_package_action_text()
-        confirm_msg = f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
-
-        tunnel_names = _collect_active_tunnel_names(main_window)
-        if tunnel_names:
-            tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
-            confirm_msg = (
-                f"{action_text.confirm_question}\n\n"
-                f"⚠️ 현재 {len(tunnel_names)}개의 활성 터널이 연결 해제됩니다:\n"
-                f"{tunnel_list}\n\n"
-                f"{action_text.confirm_body}"
-            )
-
-        # 확인 다이얼로그
-        reply = QMessageBox.question(
-            self,
-            action_text.confirm_title,
-            confirm_msg,
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.Yes
-        )
-
-        if reply != QMessageBox.StandardButton.Yes:
-            return
-
         try:
-            if sys.platform == 'win32':
-                subprocess.Popen(
-                    [self._downloaded_installer_path],
-                    close_fds=True,
-                )
-            elif update_package_launch_strategy() == "open":
-                if not QDesktopServices.openUrl(QUrl.fromLocalFile(self._downloaded_installer_path)):
-                    raise RuntimeError("다운로드한 패키지를 열 수 없습니다.")
-            else:
-                subprocess.Popen(
-                    [self._downloaded_installer_path],
-                    start_new_session=True,
-                    close_fds=True,
+            with SettingsDialog._open_verified_installer(self) as verified:
+                if sys.platform != 'win32':
+                    SettingsDialog._show_non_windows_installer_saved(self)
+                    return
+
+                action_text = update_package_action_text()
+                confirm_msg = (
+                    f"{action_text.confirm_question}\n\n{action_text.confirm_body}"
                 )
 
-            # closeEvent 우회하여 직접 종료 (CloseConfirmDialog 방지)
-            if main_window and hasattr(main_window, 'close_app'):
-                main_window.close_app()
-            else:
-                QApplication.instance().quit()  # fallback
+                tunnel_names = _collect_active_tunnel_names(main_window)
+                if tunnel_names:
+                    tunnel_list = "\n".join(f"  • {name}" for name in tunnel_names)
+                    confirm_msg = (
+                        f"{action_text.confirm_question}\n\n"
+                        f"⚠️ 현재 {len(tunnel_names)}개의 활성 터널이 연결 해제됩니다:\n"
+                        f"{tunnel_list}\n\n"
+                        f"{action_text.confirm_body}"
+                    )
 
-        except Exception as e:
+                reply = QMessageBox.question(
+                    self,
+                    action_text.confirm_title,
+                    confirm_msg,
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if reply != QMessageBox.StandardButton.Yes:
+                    return
+
+                SettingsDialog._dispatch_verified_installer(self, verified)
+                self._installer_dispatched = True
+
+        except IntegrityError as exc:
+            SettingsDialog._discard_invalid_installer(self, str(exc))
+            return
+        except Exception as exc:
             QMessageBox.critical(
                 self,
                 "실행 오류",
-                f"설치 프로그램 실행에 실패했습니다:\n{str(e)}"
+                f"설치 프로그램 실행에 실패했습니다:\n{str(exc)}"
             )
+            return
+
+        # closeEvent 우회하여 직접 종료 (CloseConfirmDialog 방지)
+        if main_window and hasattr(main_window, 'close_app'):
+            main_window.close_app()
+        else:
+            QApplication.instance().quit()  # fallback
+
+    def _open_verified_installer(self) -> VerifiedFileLease:
+        if not self._downloaded_installer_sha256:
+            raise IntegrityError(
+                "release asset SHA-256 digest is missing or invalid"
+            )
+        return VerifiedFileLease(
+            self._downloaded_installer_path,
+            self._downloaded_installer_sha256,
+            self._downloaded_installer_size,
+        )
+
+    def _dispatch_verified_installer(self, verified: VerifiedFileLease) -> None:
+        if sys.platform != 'win32':
+            raise RuntimeError("non-Windows installer auto-launch is disabled")
+        verified.dispatch(
+            lambda path: subprocess.Popen([path], close_fds=True)
+        )
+
+    def _show_non_windows_installer_saved(self) -> None:
+        installer_path = Path(self._downloaded_installer_path)
+        QMessageBox.information(
+            self,
+            translate_text("설치 실행 비활성화"),
+            translate_text(
+                "보안을 위해 이 플랫폼에서는 다운로드한 설치 파일을 자동으로 실행하지 않습니다.\n"
+                "검증된 설치 파일이 저장되었습니다:\n"
+            ) + str(installer_path),
+        )
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(installer_path.parent)))
+
+    def _verify_installer_before_launch(self) -> bool:
+        try:
+            with SettingsDialog._open_verified_installer(self):
+                pass
+            return True
+        except (IntegrityError, OSError) as exc:
+            SettingsDialog._discard_invalid_installer(self, str(exc))
+            return False
+
+    def _discard_invalid_installer(self, error_message: str) -> None:
+        installer_path = self._downloaded_installer_path
+        owner = self._downloaded_installer_owner
+        discard = getattr(owner, "discard_downloaded_installer", None)
+        if installer_path and callable(discard):
+            try:
+                discard(installer_path)
+            except Exception:
+                pass
+
+        self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
+        self._installer_dispatched = False
+        self.download_progress.hide()
+        self.btn_download.setText(f"🔽 v{self._latest_version} 다운로드")
+        self.btn_download.setEnabled(True)
+        self.btn_download.setStyleSheet(ButtonStyles.SUCCESS_MD)
+        self.btn_check_update.setEnabled(True)
+        self.download_detail_label.setText(
+            translate_text("❌ 설치 파일 무결성 검증에 실패했습니다.")
+        )
+        self.download_detail_label.setStyleSheet(
+            "font-size: 11px; color: #e74c3c;"
+        )
+        self.btn_download.clicked.disconnect()
+        self.btn_download.clicked.connect(self._start_download)
+        QMessageBox.critical(
+            self,
+            translate_text("설치 파일 무결성 오류"),
+            translate_text(
+                "다운로드한 설치 파일이 릴리스 정보와 일치하지 않아 실행을 차단했습니다.\n"
+                f"다시 다운로드해 주세요.\n\n{error_message}"
+            ),
+        )
+
+    def _discard_abandoned_downloaded_installer(self) -> None:
+        """Best-effort release of a completed package that was never dispatched."""
+        installer_path = self._downloaded_installer_path
+        owner = self._downloaded_installer_owner
+        dispatched = self._installer_dispatched
+        self._downloaded_installer_path = None
+        self._downloaded_installer_sha256 = None
+        self._downloaded_installer_size = 0
+        self._downloaded_installer_owner = None
+        self._installer_dispatched = False
+
+        discard = getattr(owner, "discard_downloaded_installer", None)
+        if installer_path and not dispatched and callable(discard):
+            try:
+                discard(installer_path)
+            except Exception:
+                pass
 
     def _adjust_update_label_height(self):
         """업데이트 상태 라벨 높이를 내용에 맞게 조정"""

@@ -162,6 +162,7 @@ def make_dialog(monkeypatch):
             "id": "test-tunnel",
             "name": "테스트 터널",
             "connection_mode": "direct",
+            "environment": "development",
             "remote_host": "127.0.0.1",
             "remote_port": 3306,
         },

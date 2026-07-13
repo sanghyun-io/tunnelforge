@@ -6,9 +6,21 @@ bootstrapper/downloader.py의 로직을 메인 앱용으로 추출한 모듈입�
 import os
 import platform
 import tempfile
+from dataclasses import dataclass
 import requests
 from typing import Optional, Callable, Tuple, Sequence, Mapping, Any
+from urllib.parse import urlparse
 
+from src.update_integrity import (
+    IntegrityError,
+    MAX_INSTALLER_SIZE,
+    OwnedTempDirectory,
+    VerifiedFileLease,
+    publish_owned_temp_file,
+    parse_content_length,
+    parse_sha256_digest,
+    validate_child_basename,
+)
 from src.version import GITHUB_OWNER, GITHUB_REPO
 
 
@@ -20,52 +32,106 @@ RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/l
 WINDOWS_INSTALLER_FILENAME_PREFIX = "TunnelForge-Setup-"
 MACOS_PACKAGE_FILENAME_PREFIX = "TunnelForge-macOS-"
 
-
 class DownloadError(Exception):
     """다운로드 관련 오류"""
     pass
 
 
+@dataclass(frozen=True)
+class ReleaseAsset:
+    name: str
+    url: str
+    size: int
+    sha256: str
+
+
 def select_release_asset(
     assets: Sequence[Mapping[str, Any]],
+    release_version: str,
     platform_name: Optional[str] = None,
     arch_name: Optional[str] = None,
-) -> Optional[Tuple[str, int]]:
-    """Return the download URL and size for the current platform's release asset."""
+) -> Optional[ReleaseAsset]:
+    """Return the version-bound release asset for the current platform."""
     system = platform_name or platform.system()
     arch = arch_name or platform.machine()
     candidates = []
 
+    try:
+        if system == "Windows":
+            expected_windows_name = (
+                f"{WINDOWS_INSTALLER_FILENAME_PREFIX}{release_version}.exe"
+            )
+            validate_child_basename(expected_windows_name, windows=True)
+        elif system == "Darwin":
+            validate_child_basename(
+                f"{MACOS_PACKAGE_FILENAME_PREFIX}{release_version}.dmg"
+            )
+    except IntegrityError as exc:
+        raise DownloadError(f"release asset filename is unsafe: {exc}") from exc
+
     for asset in assets:
         asset_name = str(asset.get('name', ''))
-        url = asset.get('browser_download_url')
-        if not url:
+        if system == "Windows":
+            if asset_name != expected_windows_name:
+                continue
+            rank = 0
+        elif system == "Darwin":
+            expected_prefix = f"{MACOS_PACKAGE_FILENAME_PREFIX}{release_version}"
+            suffix = asset_name[len(expected_prefix):] if asset_name.startswith(expected_prefix) else ""
+            valid_suffixes = {
+                ".dmg",
+                ".zip",
+                "-arm64.dmg",
+                "-arm64.zip",
+                "-x86_64.dmg",
+                "-x86_64.zip",
+                "-universal.dmg",
+                "-universal.zip",
+                "-universal2.dmg",
+                "-universal2.zip",
+            }
+            if suffix not in valid_suffixes:
+                continue
+
+            arch_rank = _macos_arch_rank(asset_name, arch)
+            if arch_rank is None:
+                continue
+            rank = arch_rank if asset_name.endswith('.dmg') else arch_rank + 1
+        else:
             continue
 
-        if system == "Windows":
-            if (
-                asset_name.startswith(WINDOWS_INSTALLER_FILENAME_PREFIX)
-                and asset_name.endswith('.exe')
-                and 'WebSetup' not in asset_name
-            ):
-                candidates.append((str(url), int(asset.get('size', 0)), 0))
-        elif system == "Darwin":
-            if asset_name.startswith(MACOS_PACKAGE_FILENAME_PREFIX):
-                arch_rank = _macos_arch_rank(asset_name, arch)
-                if arch_rank is None:
-                    continue
+        try:
+            validate_child_basename(asset_name, windows=system == "Windows")
+        except IntegrityError as exc:
+            raise DownloadError(f"release asset filename is unsafe: {exc}") from exc
 
-                if asset_name.endswith('.dmg'):
-                    candidates.append((str(url), int(asset.get('size', 0)), arch_rank))
-                elif asset_name.endswith('.zip'):
-                    candidates.append((str(url), int(asset.get('size', 0)), arch_rank + 1))
+        url = asset.get('browser_download_url')
+        if not url:
+            raise DownloadError("release asset download URL is missing")
+
+        try:
+            size = int(asset.get('size', 0))
+        except (TypeError, ValueError) as exc:
+            raise DownloadError("release asset size must be positive") from exc
+        if size <= 0:
+            raise DownloadError("release asset size must be positive")
+        if size > MAX_INSTALLER_SIZE:
+            raise DownloadError("release asset size exceeds maximum installer size")
+
+        try:
+            sha256 = parse_sha256_digest(asset.get('digest'))
+        except IntegrityError as exc:
+            raise DownloadError(str(exc)) from exc
+
+        candidates.append(
+            (rank, ReleaseAsset(asset_name, str(url), size, sha256))
+        )
 
     if not candidates:
         return None
 
-    candidates.sort(key=lambda item: item[2])
-    url, size, _ = candidates[0]
-    return url, size
+    candidates.sort(key=lambda item: item[0])
+    return candidates[0][1]
 
 
 def _macos_arch_rank(asset_name: str, arch_name: str) -> Optional[int]:
@@ -103,8 +169,11 @@ class UpdateDownloader:
         self.latest_version: Optional[str] = None
         self.download_url: Optional[str] = None
         self.file_size: int = 0
+        self.expected_sha256: Optional[str] = None
+        self.installer_filename: Optional[str] = None
         self._cancelled = False
         self._config_manager = config_manager
+        self._owned_temp_dirs = {}
 
     @property
     def timeout(self) -> int:
@@ -136,6 +205,12 @@ class UpdateDownloader:
         Raises:
             DownloadError: API 호출 실패 또는 설치 파일을 찾을 수 없는 경우
         """
+        self.latest_version = None
+        self.download_url = None
+        self.file_size = 0
+        self.expected_sha256 = None
+        self.installer_filename = None
+
         try:
             response = requests.get(
                 RELEASES_API_URL,
@@ -151,9 +226,12 @@ class UpdateDownloader:
                 raise DownloadError("버전 정보를 찾을 수 없습니다")
 
             assets = release_data.get('assets', [])
-            selected = select_release_asset(assets)
+            selected = select_release_asset(assets, self.latest_version)
             if selected:
-                self.download_url, self.file_size = selected
+                self.installer_filename = selected.name
+                self.download_url = selected.url
+                self.file_size = selected.size
+                self.expected_sha256 = selected.sha256
 
             if not self.download_url:
                 raise DownloadError(
@@ -200,15 +278,32 @@ class UpdateDownloader:
         """
         if not self.download_url:
             raise DownloadError("먼저 get_installer_info()를 호출해야 합니다")
+        if (
+            not self.expected_sha256
+            or self.file_size <= 0
+            or self.file_size > MAX_INSTALLER_SIZE
+        ):
+            raise DownloadError("release asset integrity metadata is missing or invalid")
 
-        self._cancelled = False
-
-        # 임시 파일 경로 생성
-        temp_dir = tempfile.gettempdir()
-        filename = os.path.basename(self.download_url) or "TunnelForge-Update"
+        temp_dir = tempfile.mkdtemp(prefix="tunnelforge-update-")
+        try:
+            owner = OwnedTempDirectory(temp_dir)
+        except (IntegrityError, OSError) as exc:
+            raise DownloadError(
+                f"temporary download directory could not be secured: {exc}"
+            ) from exc
+        self._owned_temp_dirs[owner.path] = owner
+        temp_dir = owner.path
+        filename = self.installer_filename or os.path.basename(
+            urlparse(self.download_url).path
+        ) or "TunnelForge-Update"
         file_path = os.path.join(temp_dir, filename)
+        part_path = f"{file_path}.part"
+        if not owner.claim_files((file_path, part_path)):
+            raise DownloadError("temporary download child path is not owned")
 
         try:
+            self._raise_if_cancelled()
             response = requests.get(
                 self.download_url,
                 stream=True,
@@ -216,33 +311,106 @@ class UpdateDownloader:
             )
             response.raise_for_status()
 
-            # Content-Length가 없는 경우 대비
-            total_size = int(response.headers.get('content-length', self.file_size))
+            content_length = parse_content_length(
+                response.headers.get("content-length")
+            )
+            if content_length is not None and content_length != self.file_size:
+                raise DownloadError(
+                    "Content-Length size does not match release metadata"
+                )
 
             downloaded = 0
-            with open(file_path, 'wb') as f:
+            with owner.create_file(os.path.basename(part_path)) as f:
                 for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
-                    if self._cancelled:
-                        f.close()
-                        if os.path.exists(file_path):
-                            os.remove(file_path)
-                        raise DownloadError("다운로드가 취소되었습니다")
+                    self._raise_if_cancelled()
 
                     if chunk:
+                        if downloaded + len(chunk) > self.file_size:
+                            raise DownloadError(
+                                "downloaded content exceeds expected size"
+                            )
                         f.write(chunk)
                         downloaded += len(chunk)
 
-                        if progress_callback and total_size > 0:
-                            progress_callback(downloaded, total_size)
+                        if progress_callback:
+                            progress_callback(downloaded, self.file_size)
 
+            self._raise_if_cancelled()
+            try:
+                with self.open_verified_installer(part_path):
+                    pass
+            except (IntegrityError, OSError) as exc:
+                raise DownloadError(str(exc)) from exc
+            self._raise_if_cancelled()
+            publish_owned_temp_file(owner, part_path, file_path)
+            self._raise_if_cancelled()
             return file_path
 
+        except DownloadError:
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
+            raise
         except requests.exceptions.RequestException as e:
-            if os.path.exists(file_path):
-                os.remove(file_path)
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"다운로드 실패: {str(e)}")
-        except IOError as e:
+        except OSError as e:
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"파일 저장 실패: {str(e)}")
+        except Exception as e:
+            self._cleanup_failed_download(temp_dir, part_path, file_path)
+            raise DownloadError(f"다운로드 실패: {str(e)}") from e
+
+    def open_verified_installer(self, path: str) -> VerifiedFileLease:
+        """Return a verified file lease that can guard process dispatch."""
+        if not self.expected_sha256:
+            raise DownloadError("release asset SHA-256 digest is missing or invalid")
+        return VerifiedFileLease(path, self.expected_sha256, self.file_size)
+
+    def discard_downloaded_installer(self, path: str) -> bool:
+        """Remove a returned installer only when its parent identity is owned."""
+        owner = self._find_owned_parent(path)
+        if owner is None:
+            return False
+        removed = owner.discard_files((path, f"{path}.part"))
+        self._finish_owned_cleanup(owner, removed)
+        return removed
+
+    def _raise_if_cancelled(self) -> None:
+        if self._cancelled:
+            raise DownloadError("다운로드가 취소되었습니다")
+
+    def _find_owned_parent(self, path: str) -> Optional[OwnedTempDirectory]:
+        return next(
+            (
+                owner
+                for owner in self._owned_temp_dirs.values()
+                if owner.owns_direct_child(path)
+            ),
+            None,
+        )
+
+    def _finish_owned_cleanup(
+        self, owner: OwnedTempDirectory, removed: bool
+    ) -> None:
+        if removed:
+            owner.remove_if_empty()
+        owner.close()
+        self._owned_temp_dirs.pop(owner.path, None)
+
+    def _cleanup_failed_download(self, temp_dir: str, *paths: str) -> bool:
+        owner = next(
+            (
+                candidate
+                for candidate in self._owned_temp_dirs.values()
+                if os.path.normcase(candidate.path)
+                == os.path.normcase(os.path.normpath(os.path.abspath(temp_dir)))
+            ),
+            None,
+        )
+        if owner is None:
+            return False
+        removed = owner.discard_files(paths)
+        self._finish_owned_cleanup(owner, removed)
+        return removed
 
 
 def format_size(size_bytes: int) -> str:

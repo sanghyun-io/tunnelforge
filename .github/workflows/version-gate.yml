@@ -14,24 +14,23 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: write
-  issues: read
-  pull-requests: write
-  checks: read
+  contents: read
 
 jobs:
   macos-support-tracking-gate:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: read
+      checks: read
 
     steps:
-      - name: Checkout PR
-        run: |
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout --detach FETCH_HEAD
-          git config --global --add safe.directory "$PWD"
+      - name: Checkout trusted base
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
 
       - name: Check macOS support GitHub tracking gate
         env:
@@ -44,15 +43,15 @@ jobs:
   rust-core-regression-gate:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
 
     steps:
       - name: Checkout PR
-        run: |
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout --detach FETCH_HEAD
-          git config --global --add safe.directory "$PWD"
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
       - name: Install ripgrep
         run: sudo apt-get update && sudo apt-get install -y ripgrep
@@ -61,10 +60,73 @@ jobs:
         shell: pwsh
         run: ./scripts/rust-core-regression-gate.ps1
 
+      - name: Run Rust Core tests
+        run: cargo test --manifest-path migration_core/Cargo.toml
+
+  python-regression:
+    runs-on: windows-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      QT_QPA_PLATFORM: offscreen
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Set up Rust
+        shell: pwsh
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Install dependencies
+        shell: pwsh
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Build tunnelforge-core (Rust)
+        shell: pwsh
+        run: cargo build --manifest-path migration_core/Cargo.toml --release
+
+      - name: Run full Python regression suite
+        shell: pwsh
+        run: pytest -q
+
+      - name: Build and self-check frozen WebSetup
+        shell: pwsh
+        run: |
+          pyinstaller bootstrapper/bootstrapper.spec
+          $executable = "dist\TunnelForge-WebSetup.exe"
+          if (-not (Test-Path -LiteralPath $executable -PathType Leaf)) {
+            throw "missing frozen WebSetup artifact: $executable"
+          }
+          $output = (& .\dist\TunnelForge-WebSetup.exe --self-check | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) {
+            throw "frozen WebSetup self-check exited with $LASTEXITCODE"
+          }
+          if ($output -ne "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK") {
+            throw "unexpected frozen WebSetup self-check output: '$output'"
+          }
+
   macos-app-validation:
     name: macOS App Validation (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -76,12 +138,10 @@ jobs:
 
     steps:
       - name: Checkout PR
-        run: |
-          git init .
-          git remote add origin "https://github.com/${{ github.repository }}.git"
-          git fetch --depth=1 origin "${{ github.event.pull_request.head.sha }}"
-          git checkout --detach FETCH_HEAD
-          git config --global --add safe.directory "$PWD"
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
@@ -271,14 +331,22 @@ jobs:
             dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256
           if-no-files-found: error
 
-  version-gate:
+  version-validation:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    permissions:
+      contents: read
+      pull-requests: write
     outputs:
       bump_type: ${{ steps.check.outputs.bump_type }}
-      needs_rebump: ${{ steps.check.outputs.needs_rebump }}
 
     steps:
+      - name: Checkout trusted base
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
       - name: Check version labels
         id: check
         env:
@@ -322,114 +390,155 @@ jobs:
           BUMP_TYPE=$(echo "$VERSION_LABELS" | head -1 | sed 's/version://')
           echo "감지된 bump_type: $BUMP_TYPE"
 
-          # === Step 2: 기존 bump 커밋 확인 (라벨 정합성 포함) ===
-          # bump 커밋 메시지에 [patch]/[minor]/[major] 트레일러로 타입 검증.
-          # 트레일러 없는 레거시 bump 커밋도 호환 처리.
-
-          # HEAD 체크 (synchronize 재귀 방지)
-          HEAD_MSG=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}" \
-            --jq .commit.message 2>/dev/null || true)
-          if echo "$HEAD_MSG" | grep -q "^chore: bump version"; then
-            if echo "$HEAD_MSG" | grep -q "\[$BUMP_TYPE\]" || \
-               ! echo "$HEAD_MSG" | grep -qE "\[(patch|minor|major)\]"; then
-              echo "HEAD가 bump 커밋 (타입 일치 또는 레거시). 체크 통과."
-              echo "bump_type=" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "HEAD가 다른 타입의 bump 커밋. 재bump 필요."
-            echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
-          fi
-
-          # PR 커밋 히스토리 체크 (페이지네이션 적용, 최신 bump만 검증)
-          BUMP_MSGS=$(gh api --paginate \
-            "repos/${{ github.repository }}/pulls/${PR_NUMBER}/commits" \
-            --jq '.[].commit.message' | grep "^chore: bump version" || true)
-          if [ -n "$BUMP_MSGS" ]; then
-            # 최신 bump 커밋만 확인 (API는 시간순 반환, tail -1 = 가장 최근)
-            LATEST_BUMP=$(echo "$BUMP_MSGS" | tail -1)
-            if echo "$LATEST_BUMP" | grep -q "\[$BUMP_TYPE\]" || \
-               ! echo "$LATEST_BUMP" | grep -qE "\[(patch|minor|major)\]"; then
-              echo "PR의 최신 bump 커밋이 현재 라벨과 일치 (또는 레거시). 체크 통과."
-              echo "bump_type=" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            echo "최신 bump 커밋이 현재 라벨과 불일치. 재bump 필요."
-            echo "needs_rebump=true" >> "$GITHUB_OUTPUT"
-          fi
-
+          # Commit messages are not evidence of a completed bump. The trusted
+          # version-bump job verifies all three version files against the
+          # expected version calculated from the trusted base.
           echo "bump_type=$BUMP_TYPE" >> "$GITHUB_OUTPUT"
 
   version-bump:
     runs-on: ubuntu-24.04
-    needs: version-gate
-    if: needs.version-gate.outputs.bump_type != ''
+    needs: version-validation
+    if: needs.version-validation.result == 'success' && needs.version-validation.outputs.bump_type != ''
     timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
 
     steps:
-      - name: Generate GitHub App Token
-        id: app-token
-        uses: actions/create-github-app-token@v3
-        with:
-          app-id: ${{ secrets.RELEASER_APP_ID }}
-          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
-
-      - name: Checkout PR branch
+      - name: Checkout trusted base
         uses: actions/checkout@v5
         with:
-          token: ${{ steps.app-token.outputs.token }}
-          ref: ${{ github.event.pull_request.head.ref }}
+          ref: ${{ github.event.pull_request.base.sha }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
         uses: actions/setup-python@v6
         with:
           python-version: '3.x'
 
-      - name: Check if already bumped & bump version (idempotent)
+      - name: Prepare trusted version bump from PR data
         id: bump
         env:
-          BUMP_TYPE: ${{ needs.version-gate.outputs.bump_type }}
-          NEEDS_REBUMP: ${{ needs.version-gate.outputs.needs_rebump }}
-          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          BUMP_TYPE: ${{ needs.version-validation.outputs.bump_type }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
 
-          # base 브랜치 버전 조회 (동적 — hardcoded origin/main 제거)
-          BASE_VERSION=$(git show "origin/${BASE_REF}:src/version.py" | grep '__version__' | cut -d'"' -f2)
-          CURRENT=$(grep '__version__' src/version.py | cut -d'"' -f2)
-          echo "base 버전(${BASE_REF}): $BASE_VERSION / 현재 버전: $CURRENT"
+          git fetch --no-tags --depth=1 origin "$HEAD_SHA"
+          mkdir -p .version-bump-input/src .version-bump-input/installer
+          cp src/version.py .version-bump-input/src/version.py
+          cp pyproject.toml .version-bump-input/pyproject.toml
+          cp installer/TunnelForge.iss .version-bump-input/installer/TunnelForge.iss
+          python scripts/bump_version.py \
+            --bump-type "$BUMP_TYPE" \
+            --version-file .version-bump-input/src/version.py \
+            --pyproject-file .version-bump-input/pyproject.toml \
+            --installer-file .version-bump-input/installer/TunnelForge.iss \
+            > /tmp/bump.txt
+          EXPECTED=$(grep 'new_version=' /tmp/bump.txt | cut -d= -f2)
+          CURRENT_PY=$(git show "$HEAD_SHA:src/version.py" | grep '__version__' | cut -d'"' -f2)
+          CURRENT_PROJECT=$(git show "$HEAD_SHA:pyproject.toml" | sed -n 's/^version = "\([^"]*\)"/\1/p' | head -1)
+          CURRENT_INSTALLER=$(git show "$HEAD_SHA:installer/TunnelForge.iss" | sed -n 's/^#define MyAppVersion "\([^"]*\)"/\1/p' | head -1)
+          echo "expected=$EXPECTED python=$CURRENT_PY project=$CURRENT_PROJECT installer=$CURRENT_INSTALLER"
 
-          # 빈 값 검증 (파싱 실패 시 즉시 실패)
-          if [ -z "$BASE_VERSION" ] || [ -z "$CURRENT" ]; then
-            echo "ERROR: 버전 파싱 실패 (base='$BASE_VERSION', current='$CURRENT')"
+          if [ -z "$EXPECTED" ] || [ -z "$CURRENT_PY" ] || \
+             [ -z "$CURRENT_PROJECT" ] || [ -z "$CURRENT_INSTALLER" ]; then
+            echo "ERROR: version parse failed"
             exit 1
           fi
 
-          if [ "$BASE_VERSION" != "$CURRENT" ] && [ "$NEEDS_REBUMP" != "true" ]; then
-            echo "버전이 이미 변경됨 ($BASE_VERSION → $CURRENT). 건너뜁니다."
+          if [ "$CURRENT_PY" = "$EXPECTED" ] && \
+             [ "$CURRENT_PROJECT" = "$EXPECTED" ] && \
+             [ "$CURRENT_INSTALLER" = "$EXPECTED" ]; then
+            echo "All PR version files match the trusted expected version. Skipping."
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
-            if [ "$NEEDS_REBUMP" = "true" ]; then
-              echo "라벨 변경으로 인한 재bump. base 버전으로 복원 후 재bump."
-              git checkout "origin/${BASE_REF}" -- src/version.py pyproject.toml installer/TunnelForge.iss
-            fi
-            python scripts/bump_version.py --bump-type "$BUMP_TYPE" --dry-run > /tmp/bump_dry.txt
-            EXPECTED=$(grep 'new_version=' /tmp/bump_dry.txt | cut -d= -f2)
-            echo "예상 bump 버전: $EXPECTED"
             echo "skip=false" >> "$GITHUB_OUTPUT"
             echo "new_version=$EXPECTED" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Commit and push bump to PR branch
+      - name: Generate GitHub App Token
+        if: steps.bump.outputs.skip != 'true'
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
+        with:
+          app-id: ${{ secrets.RELEASER_APP_ID }}
+          private-key: ${{ secrets.RELEASER_APP_PRIVATE_KEY }}
+
+      - name: Commit trusted bump tree and push
         if: steps.bump.outputs.skip != 'true'
         env:
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           NEW_VERSION: ${{ steps.bump.outputs.new_version }}
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          export GIT_INDEX_FILE="$RUNNER_TEMP/version-bump-index"
+          git read-tree "$HEAD_SHA"
+          for path in src/version.py pyproject.toml installer/TunnelForge.iss; do
+            mode=$(git ls-tree "$HEAD_SHA" -- "$path" | awk '{print $1}')
+            blob=$(git hash-object -w ".version-bump-input/$path")
+            git update-index --add --cacheinfo "$mode,$blob,$path"
+          done
+          tree=$(git write-tree)
+          commit=$(printf '%s\n' \
+            "chore: bump version to v${NEW_VERSION} [${{ needs.version-validation.outputs.bump_type }}]" \
+            | git commit-tree "$tree" -p "$HEAD_SHA")
+          git push \
+            "https://x-access-token:${APP_TOKEN}@github.com/${{ github.repository }}.git" \
+            "$commit:refs/heads/$HEAD_REF"
+          echo "version bump completed: v${NEW_VERSION}"
 
-          python scripts/bump_version.py --bump-type "${{ needs.version-gate.outputs.bump_type }}"
-          git add src/version.py pyproject.toml installer/TunnelForge.iss
-          git commit -m "chore: bump version to v${NEW_VERSION} [${{ needs.version-gate.outputs.bump_type }}]"
-          git push origin "${{ github.event.pull_request.head.ref }}"
-          echo "버전 bump 완료: v${NEW_VERSION}"
+  version-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs:
+      - macos-support-tracking-gate
+      - rust-core-regression-gate
+      - python-regression
+      - macos-app-validation
+      - version-validation
+      - version-bump
+    if: always()
+    permissions: {}
+
+    steps:
+      - name: Require successful terminal gate state
+        env:
+          MACOS_TRACKING_RESULT: ${{ needs.macos-support-tracking-gate.result }}
+          RUST_RESULT: ${{ needs.rust-core-regression-gate.result }}
+          PYTHON_RESULT: ${{ needs.python-regression.result }}
+          MACOS_APP_RESULT: ${{ needs.macos-app-validation.result }}
+          VERSION_VALIDATION_RESULT: ${{ needs.version-validation.result }}
+          VERSION_BUMP_RESULT: ${{ needs.version-bump.result }}
+          BUMP_TYPE: ${{ needs.version-validation.outputs.bump_type }}
+        run: |
+          set -euo pipefail
+
+          for result in \
+            "$MACOS_TRACKING_RESULT" \
+            "$RUST_RESULT" \
+            "$PYTHON_RESULT" \
+            "$MACOS_APP_RESULT" \
+            "$VERSION_VALIDATION_RESULT"; do
+            if [ "$result" != "success" ]; then
+              echo "ERROR: required job result is '$result'"
+              exit 1
+            fi
+          done
+
+          if [ -z "$BUMP_TYPE" ]; then
+            if [ "$VERSION_BUMP_RESULT" != "skipped" ]; then
+              echo "ERROR: version-bump must be skipped when no bump is required"
+              exit 1
+            fi
+          else
+            if [ "$VERSION_BUMP_RESULT" != "success" ]; then
+              echo "ERROR: version-bump result is '$VERSION_BUMP_RESULT'"
+              exit 1
+            fi
+          fi

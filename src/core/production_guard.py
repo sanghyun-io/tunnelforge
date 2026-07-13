@@ -7,6 +7,7 @@ Production 환경에서 위험 작업 실행 시 추가 확인 절차를 통해
 - PRODUCTION: 스키마명 직접 입력 필요
 - STAGING: Yes/No 확인 다이얼로그
 - DEVELOPMENT: 확인 없이 바로 실행
+- UNKNOWN: 미분류 환경으로 기본 No 확인
 """
 from enum import Enum
 from typing import Optional, Tuple
@@ -18,13 +19,15 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt
 
+from src.core.i18n import translate_text
+
 
 class Environment(Enum):
     """환경 타입 Enum"""
     PRODUCTION = "production"    # 🔴 스키마명 직접 입력 필요
     STAGING = "staging"          # 🟠 Yes/No 확인 다이얼로그
     DEVELOPMENT = "development"  # 🟢 확인 없이 바로 실행
-    UNKNOWN = None               # 미설정 (Development와 동일)
+    UNKNOWN = None               # 미설정 (기본 No 확인)
 
     @classmethod
     def from_string(cls, value: Optional[str]) -> 'Environment':
@@ -321,7 +324,8 @@ class ProductionGuard:
         환경에 따라 다른 확인 방식을 사용합니다:
         - Production: 스키마명 직접 입력 확인
         - Staging: Yes/No 확인 (기본값 No)
-        - Development/미설정: 바로 진행 (True 반환)
+        - Unknown: 미분류 환경 경고 (기본값 No)
+        - Development: 확인 없이 바로 진행 (True 반환)
 
         Args:
             tunnel_config: 터널 설정 딕셔너리
@@ -363,8 +367,27 @@ class ProductionGuard:
             )
             return reply == QMessageBox.StandardButton.Yes
 
-        # Development/미설정: 바로 진행
-        return True
+        elif environment == Environment.UNKNOWN:
+            # 환경 metadata가 없거나 분류할 수 없으면 fail-closed로 확인합니다.
+            message = (
+                f"<b>{operation}</b> 작업을 실행하시겠습니까?<br><br>"
+                "환경: <b>미분류 (UNKNOWN)</b><br>"
+                f"스키마: <b>{schema_name}</b><br><br>"
+            )
+            if details:
+                message += details
+
+            reply = QMessageBox.warning(
+                self.parent,
+                translate_text(f"⚪ 미분류 환경 - {operation}"),
+                translate_text(message),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            return reply == QMessageBox.StandardButton.Yes
+
+        # 명시적으로 Development인 경우에만 확인 없이 진행합니다.
+        return environment == Environment.DEVELOPMENT
 
     def confirm_dangerous_query(
         self,

@@ -1,29 +1,121 @@
 name: Build and Release
 
 on:
-  push:
-    tags:
-      - 'v*'  # v1.0.0, v1.0.1 등의 태그 push 시 자동 실행
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing approved release tag, including the v prefix
+        required: true
+        type: string
+      version:
+        description: Release version without the v prefix
+        required: true
+        type: string
+      confirm:
+        description: Type RELEASE_DRAFT to confirm
+        required: true
+        type: string
 
 permissions:
-  contents: write  # Required for creating releases and uploading assets
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
+  release-preflight:
+    name: Validate Approved Release Tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.validate.outputs.tag }}
+      version: ${{ steps.validate.outputs.version }}
+
+    steps:
+      - name: Checkout requested release tag
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release target
+        id: validate
+        shell: bash
+        env:
+          TAG: ${{ inputs.tag }}
+          VERSION: ${{ inputs.version }}
+          CONFIRM: ${{ inputs.confirm }}
+        run: |
+          set -euo pipefail
+
+          if [ "$CONFIRM" != "RELEASE_DRAFT" ]; then
+            echo "Confirmation must be RELEASE_DRAFT." >&2
+            exit 1
+          fi
+          if ! echo "$GITHUB_SHA" | grep -Eq '^[0-9a-f]{40}$'; then
+            echo "github.sha must be a full 40-character commit SHA." >&2
+            exit 1
+          fi
+          if ! echo "$VERSION" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "version must be a canonical SemVer value without the v prefix." >&2
+            exit 1
+          fi
+          if ! echo "$TAG" | grep -Eq '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$'; then
+            echo "tag must be a canonical vSemVer value." >&2
+            exit 1
+          fi
+          if [ "$TAG" != "v${VERSION}" ]; then
+            echo "tag and version input must match exactly." >&2
+            exit 1
+          fi
+
+          git fetch --no-tags origin main
+          HEAD_SHA=$(git rev-parse HEAD^{commit})
+          TAG_SHA=$(git rev-parse "${TAG}^{commit}")
+          MAIN_SHA=$(git rev-parse origin/main^{commit})
+          if [ "$HEAD_SHA" != "$TAG_SHA" ]; then
+            echo "Checkout HEAD and peeled tag commit must match exactly." >&2
+            echo "head=$HEAD_SHA tag=$TAG_SHA" >&2
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "$TAG_SHA" "$MAIN_SHA"; then
+            echo "Approved release tag must point to a commit retained on main." >&2
+            echo "tag=$TAG_SHA main=$MAIN_SHA" >&2
+            exit 1
+          fi
+
+          PYTHON_VERSION=$(grep '__version__' src/version.py | cut -d'"' -f2)
+          PROJECT_VERSION=$(sed -n 's/^version = "\([^"]*\)"/\1/p' pyproject.toml | head -1)
+          INSTALLER_VERSION=$(sed -n 's/^#define MyAppVersion "\([^"]*\)"/\1/p' installer/TunnelForge.iss | head -1)
+          if [ -z "$PYTHON_VERSION" ] || [ "$PYTHON_VERSION" != "$VERSION" ] || \
+             [ "$PROJECT_VERSION" != "$VERSION" ] || [ "$INSTALLER_VERSION" != "$VERSION" ]; then
+            echo "Version input does not match all release version files." >&2
+            echo "input=$VERSION python=$PYTHON_VERSION project=$PROJECT_VERSION installer=$INSTALLER_VERSION" >&2
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
   build-windows-installer:
     name: Build Windows Installer
     runs-on: windows-2025
+    needs: release-preflight
+    environment: production-release
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: refs/tags/${{ needs.release-preflight.outputs.tag }}
           fetch-depth: 0  # 전체 히스토리 (릴리스 노트 생성용)
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -32,7 +124,7 @@ jobs:
         id: get_version
         shell: bash
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION="${{ needs.release-preflight.outputs.version }}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
@@ -58,10 +150,10 @@ jobs:
           pip install -e ".[dev]"
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
 
       - name: Cache cargo registry and target
-        uses: actions/cache@v4
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
         with:
           path: |
             ~/.cargo/registry
@@ -81,34 +173,6 @@ jobs:
           }
           $coreSize = (Get-Item "migration_core\target\release\tunnelforge-core.exe").Length / 1MB
           Write-Host "tunnelforge-core.exe built: $($coreSize.ToString('0.0')) MB"
-
-      - name: Setup GitHub App credentials
-        if: ${{ vars.GH_APP_ID != '' }}
-        shell: bash
-        env:
-          APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
-        run: |
-          # .env 파일 생성 (GitHub App 자동 이슈 리포팅용)
-          echo "GITHUB_APP_ID=${{ vars.GH_APP_ID }}" >> .env
-          echo "GITHUB_APP_INSTALLATION_ID=${{ vars.GH_APP_INSTALLATION_ID }}" >> .env
-          echo "GITHUB_REPO=${{ vars.GH_ISSUE_REPO || github.repository }}" >> .env
-
-          # Private Key 파일 생성
-          mkdir -p secrets
-          echo "$APP_PRIVATE_KEY" > secrets/github-app.pem
-          echo "GITHUB_APP_PRIVATE_KEY=secrets/github-app.pem" >> .env
-
-          echo "✅ GitHub App credentials configured"
-
-      - name: Embed GitHub App credentials
-        if: ${{ vars.GH_APP_ID != '' }}
-        env:
-          GITHUB_APP_ID: ${{ vars.GH_APP_ID }}
-          GITHUB_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
-          GITHUB_APP_PRIVATE_KEY: secrets/github-app.pem
-          GITHUB_REPO: ${{ vars.GH_ISSUE_REPO || github.repository }}
-        run: |
-          python scripts/embed_github_credentials.py
 
       - name: Build with PyInstaller
         run: |
@@ -172,7 +236,7 @@ jobs:
           echo "installer_name=$($installerFile.Name)" >> $env:GITHUB_OUTPUT
 
       - name: Upload Windows release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: TunnelForge-Windows-${{ steps.get_version.outputs.version }}
           path: |
@@ -183,6 +247,8 @@ jobs:
   build-macos-app:
     name: Build macOS App (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
+    needs: release-preflight
+    environment: production-release
     strategy:
       fail-fast: false
       matrix:
@@ -194,12 +260,14 @@ jobs:
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: refs/tags/${{ needs.release-preflight.outputs.tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -213,7 +281,7 @@ jobs:
         id: get_version
         shell: bash
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION="${{ needs.release-preflight.outputs.version }}"
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
@@ -231,29 +299,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[dev]"
-
-      - name: Setup GitHub App credentials
-        if: ${{ vars.GH_APP_ID != '' }}
-        shell: bash
-        env:
-          APP_PRIVATE_KEY: ${{ secrets.GH_APP_PRIVATE_KEY }}
-        run: |
-          echo "GITHUB_APP_ID=${{ vars.GH_APP_ID }}" >> .env
-          echo "GITHUB_APP_INSTALLATION_ID=${{ vars.GH_APP_INSTALLATION_ID }}" >> .env
-          echo "GITHUB_REPO=${{ vars.GH_ISSUE_REPO || github.repository }}" >> .env
-          mkdir -p secrets
-          echo "$APP_PRIVATE_KEY" > secrets/github-app.pem
-          echo "GITHUB_APP_PRIVATE_KEY=secrets/github-app.pem" >> .env
-
-      - name: Embed GitHub App credentials
-        if: ${{ vars.GH_APP_ID != '' }}
-        env:
-          GITHUB_APP_ID: ${{ vars.GH_APP_ID }}
-          GITHUB_APP_INSTALLATION_ID: ${{ vars.GH_APP_INSTALLATION_ID }}
-          GITHUB_APP_PRIVATE_KEY: secrets/github-app.pem
-          GITHUB_REPO: ${{ vars.GH_ISSUE_REPO || github.repository }}
-        run: |
-          python scripts/embed_github_credentials.py
 
       - name: Run tests
         run: |
@@ -305,20 +350,38 @@ jobs:
           PY
 
       - name: Import Apple Developer ID certificate
+        id: apple-signing
         shell: bash
         env:
           APPLE_CODESIGN_CERTIFICATE_P12_BASE64: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_P12_BASE64 }}
           APPLE_CODESIGN_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CODESIGN_CERTIFICATE_PASSWORD }}
           APPLE_CODESIGN_IDENTITY: ${{ secrets.APPLE_CODESIGN_IDENTITY }}
           APPLE_CODESIGN_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_CODESIGN_KEYCHAIN_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
         run: |
-          if [[ -z "${APPLE_CODESIGN_CERTIFICATE_P12_BASE64:-}" ]]; then
+          APPLE_RELEASE_MODE="$(python scripts/apple_release_credentials.py)"
+          if [[ "$APPLE_RELEASE_MODE" == "unsigned" ]]; then
             echo "Apple signing certificate secret is not set; unsigned macOS artifacts will be built."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           if [[ -z "${APPLE_CODESIGN_CERTIFICATE_PASSWORD:-}" ]]; then
             echo "APPLE_CODESIGN_CERTIFICATE_PASSWORD is required when APPLE_CODESIGN_CERTIFICATE_P12_BASE64 is set." >&2
+            exit 1
+          fi
+          if [[ -z "${APPLE_ID:-}" ]]; then
+            echo "APPLE_ID is required for release notarization." >&2
+            exit 1
+          fi
+          if [[ -z "${APPLE_TEAM_ID:-}" ]]; then
+            echo "APPLE_TEAM_ID is required for release notarization." >&2
+            exit 1
+          fi
+          if [[ -z "${APPLE_APP_SPECIFIC_PASSWORD:-}" ]]; then
+            echo "APPLE_APP_SPECIFIC_PASSWORD is required for release notarization." >&2
             exit 1
           fi
 
@@ -366,6 +429,7 @@ jobs:
             echo "APPLE_CODESIGN_IDENTITY=$APPLE_CODESIGN_IDENTITY"
             echo "APPLE_CODESIGN_KEYCHAIN_PATH=$KEYCHAIN_PATH"
           } >> "$GITHUB_ENV"
+          echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Package macOS app
         env:
@@ -472,8 +536,23 @@ jobs:
           assert data["core_hello"]["service"] == "tunnelforge-core"
           PY
 
+      - name: Verify signed and notarized macOS artifacts
+        if: steps.apple-signing.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          APP_PATH="dist/TunnelForge.app"
+          DMG_PATH="dist/TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}.dmg"
+          test -d "$APP_PATH"
+          test -f "$DMG_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+          spctl --assess --type execute --verbose "$APP_PATH"
+          xcrun stapler validate "$APP_PATH"
+          codesign --verify --strict --verbose=2 "$DMG_PATH"
+          spctl --assess --type open --context context:primary-signature --verbose "$DMG_PATH"
+          xcrun stapler validate "$DMG_PATH"
+
       - name: Upload macOS release artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: TunnelForge-macOS-${{ steps.get_version.outputs.version }}-${{ matrix.arch }}
           path: |
@@ -495,21 +574,27 @@ jobs:
   create-release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
+    environment: production-release
+    permissions:
+      contents: write
     needs:
+      - release-preflight
       - build-windows-installer
       - build-macos-app
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v5
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
         with:
+          ref: refs/tags/${{ needs.release-preflight.outputs.tag }}
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Extract version from tag
         id: get_version
         shell: bash
         run: |
-          VERSION=${GITHUB_REF#refs/tags/v}
+          VERSION="${{ needs.release-preflight.outputs.version }}"
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "Version: $VERSION"
 
@@ -524,7 +609,7 @@ jobs:
           fi
 
       - name: Download release artifacts
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6
         with:
           path: release-artifacts
           merge-multiple: true
@@ -711,8 +796,9 @@ jobs:
           echo "============================================="
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3
         with:
+          tag_name: ${{ needs.release-preflight.outputs.tag }}
           name: v${{ steps.get_version.outputs.version }}
           body_path: release_notes.md
           files: |
@@ -722,7 +808,7 @@ jobs:
             release-upload/TunnelForge-macOS-*.zip
             release-upload/TunnelForge-macOS-*.dmg.sha256
             release-upload/TunnelForge-macOS-*.zip.sha256
-          draft: false
+          draft: true
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

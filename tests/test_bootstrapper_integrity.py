@@ -1,0 +1,1215 @@
+import hashlib
+import os
+from pathlib import Path
+import subprocess
+import sys
+import threading
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+from bootstrapper import bootstrapper as bundled_bootstrapper
+from bootstrapper import downloader as modular_downloader
+from src import update_integrity
+
+
+VALID_DIGEST = "sha256:" + "a" * 64
+OFFLINE_NAME = "TunnelForge-Setup-2.3.1.exe"
+DOWNLOADER_IMPLEMENTATIONS = [
+    (modular_downloader, modular_downloader.InstallerDownloader),
+    (bundled_bootstrapper, bundled_bootstrapper.InstallerDownloader),
+]
+SELF_CHECK_MARKER = "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK"
+
+
+def _assert_failed_download_cleanup(download_dir, final_path, *, part_created=True):
+    part_path = Path(f"{final_path}.part")
+    assert not final_path.exists()
+    if os.name == "nt":
+        assert not part_path.exists()
+        assert not download_dir.exists()
+    else:
+        assert download_dir.exists()
+        if part_created:
+            assert part_path.exists()
+
+
+def test_bootstrapper_source_self_check_runs_without_gui_or_network():
+    result = subprocess.run(
+        [sys.executable, "bootstrapper/bootstrapper.py", "--self-check"],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == SELF_CHECK_MARKER
+
+
+def test_bootstrapper_self_check_validates_shared_integrity_and_cert_contract(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        bundled_bootstrapper.tk,
+        "Tk",
+        lambda: pytest.fail("self-check constructed Tk"),
+    )
+    monkeypatch.setattr(
+        bundled_bootstrapper.requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("self-check used the network"),
+    )
+
+    assert bundled_bootstrapper.run_self_check() == SELF_CHECK_MARKER
+
+
+def test_bootstrapper_self_check_rejects_missing_required_import_contract(monkeypatch):
+    monkeypatch.setattr(bundled_bootstrapper.requests, "get", None)
+
+    with pytest.raises(RuntimeError, match="required import"):
+        bundled_bootstrapper.run_self_check()
+
+
+def _asset(name, url, size, digest=VALID_DIGEST):
+    return {
+        "name": name,
+        "browser_download_url": url,
+        "size": size,
+        "digest": digest,
+    }
+
+
+def _release_response(assets):
+    response = MagicMock()
+    response.json.return_value = {"tag_name": "v2.3.1", "assets": assets}
+    return response
+
+
+def _configure_download(downloader, expected_bytes, expected_size=None):
+    downloader.download_url = f"https://example.com/{OFFLINE_NAME}"
+    downloader.file_size = expected_size or len(expected_bytes)
+    downloader.expected_sha256 = hashlib.sha256(expected_bytes).hexdigest()
+    downloader.installer_filename = OFFLINE_NAME
+
+
+def _force_bundled_bootstrapper_windows(monkeypatch):
+    monkeypatch.setattr(
+        bundled_bootstrapper,
+        "os",
+        SimpleNamespace(name="nt", path=os.path),
+    )
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class", "digest"),
+    [
+        (*implementation, digest)
+        for implementation in DOWNLOADER_IMPLEMENTATIONS
+        for digest in (None, "sha256:bad")
+    ],
+)
+def test_bootstrapper_missing_digest_fails_before_download(
+    monkeypatch, module, downloader_class, digest
+):
+    downloader = downloader_class()
+    api_response = _release_response([_asset(OFFLINE_NAME, "offline", 4, digest)])
+    calls = []
+
+    def get(url, **kwargs):
+        calls.append((url, kwargs))
+        if kwargs.get("stream"):
+            pytest.fail("download stream opened without valid digest metadata")
+        return api_response
+
+    monkeypatch.setattr(module.requests, "get", get)
+
+    with pytest.raises(module.DownloadError, match="SHA-256"):
+        downloader.get_latest_release()
+
+    assert len(calls) == 1
+    assert downloader.download_url is None
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_rejects_unsafe_release_version_filename(
+    monkeypatch, module, downloader_class
+):
+    unsafe_name = "TunnelForge-Setup-2.3:1.exe"
+    response = MagicMock()
+    response.json.return_value = {
+        "tag_name": "v2.3:1",
+        "assets": [_asset(unsafe_name, "offline", 4)],
+    }
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    downloader = downloader_class()
+
+    with pytest.raises(module.DownloadError, match="filename"):
+        downloader.get_latest_release()
+
+    assert downloader.download_url is None
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_does_not_select_websetup_as_offline_installer(
+    monkeypatch, module, downloader_class
+):
+    downloader = downloader_class()
+    response = _release_response(
+        [
+            _asset("TunnelForge-WebSetup.exe", "web", 1),
+            _asset(OFFLINE_NAME, "offline", 4),
+        ]
+    )
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+
+    version, url, size = downloader.get_latest_release()
+
+    assert version == "2.3.1"
+    assert url == "offline"
+    assert size == 4
+    assert downloader.download_url == "offline"
+    assert downloader.expected_sha256 == "a" * 64
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_digest_mismatch_removes_partial_output(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"evil")
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError, match="SHA-256"):
+        downloader.download_installer()
+
+    final_path = download_dir / OFFLINE_NAME
+    _assert_failed_download_cleanup(download_dir, final_path)
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_size_mismatch_removes_all_owned_download_files(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe", expected_size=5)
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError, match="size"):
+        downloader.download_installer()
+
+    final_path = download_dir / OFFLINE_NAME
+    _assert_failed_download_cleanup(download_dir, final_path)
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_streaming_cancel_removes_all_owned_download_files(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    def chunks():
+        yield b"sa"
+        downloader.cancel()
+        yield b"fe"
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = chunks()
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError, match="취소"):
+        downloader.download_installer()
+
+    final_path = download_dir / OFFLINE_NAME
+    _assert_failed_download_cleanup(download_dir, final_path)
+
+
+def test_bootstrapper_launch_rejects_tampered_installer(monkeypatch, tmp_path):
+    _force_bundled_bootstrapper_windows(monkeypatch)
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"tampered")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    discard = MagicMock(return_value=True)
+    app.downloader = SimpleNamespace(
+        expected_sha256=hashlib.sha256(b"expected").hexdigest(),
+        file_size=len(b"expected"),
+        discard_downloaded_installer=discard,
+    )
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    discard.assert_called_once_with(str(installer))
+    assert installer.exists()
+    assert errors
+    popen.assert_not_called()
+
+
+def test_bootstrapper_integrity_cleanup_error_does_not_mask_launch_block(
+    monkeypatch, tmp_path
+):
+    _force_bundled_bootstrapper_windows(monkeypatch)
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"tampered")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    discard = MagicMock(side_effect=OSError("cleanup failed"))
+    app.downloader = SimpleNamespace(
+        expected_sha256=hashlib.sha256(b"expected").hexdigest(),
+        file_size=len(b"expected"),
+        discard_downloaded_installer=discard,
+    )
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    discard.assert_called_once_with(str(installer))
+    assert errors and errors[0].startswith("다운로드된 설치 파일 검증 실패")
+    popen.assert_not_called()
+
+
+def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tmp_path):
+    _force_bundled_bootstrapper_windows(monkeypatch)
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    downloader = bundled_bootstrapper.InstallerDownloader()
+    downloader.expected_sha256 = hashlib.sha256(b"expected").hexdigest()
+    downloader.file_size = len(b"expected")
+    discard = MagicMock()
+    monkeypatch.setattr(downloader, "discard_downloaded_installer", discard)
+    leases = []
+    open_verified = downloader.open_verified_installer
+
+    def capture_lease(path):
+        lease = open_verified(path)
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(downloader, "open_verified_installer", capture_lease)
+    app.downloader = downloader
+    errors = []
+    app._show_error = errors.append
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    monkeypatch.setattr(
+        bundled_bootstrapper.subprocess,
+        "Popen",
+        MagicMock(side_effect=OSError("launch failed")),
+    )
+
+    app._launch_installer()
+
+    assert installer.exists()
+    assert installer.read_bytes() == b"expected"
+    assert len(leases) == 1 and leases[0].closed is True
+    discard.assert_not_called()
+    assert len(errors) == 1
+    assert errors[0].startswith("설치 프로그램 실행 실패")
+
+
+@pytest.mark.parametrize("action", ("_on_cancel", "_on_close"))
+def test_bootstrapper_abandonment_discards_completed_undispatched_installer_once(
+    action, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app._installer_dispatched = False
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "닫기"
+
+    getattr(app, action)()
+    getattr(app, action)()
+
+    app.downloader.discard_downloaded_installer.assert_called_once_with(str(installer))
+    assert app.downloaded_file is None
+
+
+def test_bootstrapper_abandonment_keeps_successfully_dispatched_installer(tmp_path):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app._installer_dispatched = True
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "닫기"
+
+    app._on_cancel()
+
+    app.downloader.discard_downloaded_installer.assert_not_called()
+    assert app.downloaded_file is None
+
+
+def test_bootstrapper_declined_cancel_preserves_race_completed_installer(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+
+    def worker_sets_completed_path_before_callback():
+        app.downloaded_file = str(installer)
+
+    worker_sets_completed_path_before_callback()
+
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=False),
+    )
+
+    app._on_cancel()
+
+    assert app.downloaded_file == str(installer)
+    assert app._installer_dispatched is False
+    app.downloader.cancel.assert_not_called()
+    app.downloader.discard_downloaded_installer.assert_not_called()
+    app.root.destroy.assert_not_called()
+
+
+def test_bootstrapper_confirmed_cancel_discards_late_download_result(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    download_started = threading.Event()
+    allow_return = threading.Event()
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
+
+    def return_after_confirmed_cancel(progress_callback=None):
+        download_started.set()
+        assert allow_return.wait(timeout=2)
+        return str(installer)
+
+    app.downloader.download_installer.side_effect = return_after_confirmed_cancel
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+    app._update_status = MagicMock()
+    app._update_detail = MagicMock()
+    app._update_progress = MagicMock()
+    app._show_error = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=True),
+    )
+
+    worker = threading.Thread(target=app._download_worker)
+    worker.start()
+    assert download_started.wait(timeout=2)
+    app._on_cancel()
+    allow_return.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    app.downloader.cancel.assert_called_once_with()
+    app.downloader.discard_downloaded_installer.assert_called_once_with(str(installer))
+    assert app.downloaded_file is None
+    assert not any(
+        call.args and call.args[-1] == app._on_download_complete
+        for call in app.root.after.call_args_list
+    )
+
+
+def test_bootstrapper_confirmed_cancel_retires_already_queued_completion(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    callbacks = []
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app._download_state_lock = threading.Lock()
+    app._download_abandoned = False
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
+    app.downloader.download_installer.return_value = str(installer)
+    app.root = MagicMock()
+
+    def queue_without_holding_state_lock(_delay, callback):
+        assert app._download_state_lock.acquire(blocking=False)
+        app._download_state_lock.release()
+        callbacks.append(callback)
+
+    app.root.after.side_effect = queue_without_holding_state_lock
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+    app.progress_bar = MagicMock()
+    app.status_label = MagicMock()
+    app.detail_label = MagicMock()
+    app._update_status = MagicMock()
+    app._update_detail = MagicMock()
+    app._update_progress = MagicMock()
+    app._show_error = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=True),
+    )
+
+    app._download_worker()
+    assert callbacks == [app._on_download_complete]
+
+    app._on_cancel()
+    callbacks[0]()
+
+    app.downloader.discard_downloaded_installer.assert_called_once_with(str(installer))
+    app.progress_bar.config.assert_not_called()
+    app.status_label.config.assert_not_called()
+    assert callbacks == [app._on_download_complete]
+
+
+def test_bootstrapper_destroyed_root_after_confirmed_cancel_is_not_an_error(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app._download_state_lock = threading.Lock()
+    app._download_abandoned = False
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
+    app.downloader.download_installer.return_value = str(installer)
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+    app._update_status = MagicMock()
+    app._update_detail = MagicMock()
+    app._update_progress = MagicMock()
+    app._show_error = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=True),
+    )
+
+    def cancel_then_reject_schedule(_delay, _callback):
+        app._on_cancel()
+        raise bundled_bootstrapper.tk.TclError("application has been destroyed")
+
+    app.root.after.side_effect = cancel_then_reject_schedule
+
+    app._download_worker()
+
+    app.downloader.discard_downloaded_installer.assert_called_once_with(str(installer))
+    assert app.downloaded_file is None
+    app._show_error.assert_not_called()
+
+
+def test_bootstrapper_cancelled_download_error_does_not_schedule_on_destroyed_root(
+    monkeypatch
+):
+    download_started = threading.Event()
+    allow_error = threading.Event()
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app._download_state_lock = threading.Lock()
+    app._download_abandoned = False
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
+
+    def fail_after_confirmed_cancel(progress_callback=None):
+        download_started.set()
+        assert allow_error.wait(timeout=2)
+        raise bundled_bootstrapper.DownloadError("download cancelled")
+
+    app.downloader.download_installer.side_effect = fail_after_confirmed_cancel
+    app.root = MagicMock()
+    app.root.after.side_effect = bundled_bootstrapper.tk.TclError(
+        "application has been destroyed"
+    )
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+    app._update_status = MagicMock()
+    app._update_detail = MagicMock()
+    app._update_progress = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=True),
+    )
+
+    worker = threading.Thread(target=app._download_worker)
+    worker.start()
+    assert download_started.wait(timeout=2)
+    app._on_cancel()
+    allow_error.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    app.downloader.cancel.assert_called_once_with()
+
+
+def test_bootstrapper_non_windows_never_launches_windows_installer(monkeypatch, tmp_path):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"verified")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper,
+        "os",
+        SimpleNamespace(name="posix", path=os.path),
+    )
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    popen.assert_not_called()
+    assert len(errors) == 1
+    assert "Windows" in errors[0]
+    assert ".exe" in errors[0]
+    app.root.after.assert_not_called()
+    app.root.destroy.assert_not_called()
+    assert app.downloaded_file == str(installer)
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_cancel_after_metadata_is_not_reset_before_download(
+    monkeypatch, module, downloader_class
+):
+    downloader = downloader_class()
+    api_response = _release_response([_asset(OFFLINE_NAME, "offline", 4)])
+    stream_calls = []
+
+    def get(url, **kwargs):
+        if kwargs.get("stream"):
+            stream_calls.append(url)
+            pytest.fail("cancelled task opened the download stream")
+        return api_response
+
+    monkeypatch.setattr(module.requests, "get", get)
+
+    downloader.get_latest_release()
+    downloader.cancel()
+
+    with pytest.raises(module.DownloadError, match="취소"):
+        downloader.download_installer()
+
+    assert stream_calls == []
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_reset_cancellation_starts_a_new_download_task(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    downloader = downloader_class()
+    api_response = _release_response(
+        [
+            _asset(
+                OFFLINE_NAME,
+                "offline",
+                4,
+                "sha256:" + hashlib.sha256(b"safe").hexdigest(),
+            )
+        ]
+    )
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+
+    def get(_url, **kwargs):
+        return response if kwargs.get("stream") else api_response
+
+    monkeypatch.setattr(module.requests, "get", get)
+    downloader.cancel()
+
+    assert callable(getattr(downloader, "reset_cancellation", None))
+    downloader.reset_cancellation()
+    downloader.get_latest_release()
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(tmp_path))
+        installer_path = downloader.download_installer()
+
+    assert Path(installer_path).read_bytes() == b"safe"
+
+
+def test_bootstrapper_controller_resets_cancellation_before_thread_object(monkeypatch):
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloader = MagicMock()
+    events = []
+    app.downloader.reset_cancellation.side_effect = lambda: events.append("reset")
+
+    class RecordingThread:
+        def __init__(self, *, target, daemon):
+            events.append("thread")
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            events.append("start")
+
+    monkeypatch.setattr(bundled_bootstrapper.threading, "Thread", RecordingThread)
+
+    app._start_download()
+
+    assert events == ["reset", "thread", "start"]
+
+
+def test_bundled_controller_preserves_cancel_after_thread_start(monkeypatch):
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloader = bundled_bootstrapper.InstallerDownloader()
+    app._update_status = MagicMock()
+    app._show_error = MagicMock()
+    metadata = MagicMock()
+    body = MagicMock()
+    monkeypatch.setattr(app.downloader, "get_latest_release", metadata)
+    monkeypatch.setattr(app.downloader, "download_installer", body)
+
+    class BarrierThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            app.downloader.cancel()
+            self.target()
+
+    monkeypatch.setattr(bundled_bootstrapper.threading, "Thread", BarrierThread)
+
+    app._start_download()
+
+    metadata.assert_not_called()
+    body.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_downloaders_preserve_preexisting_part_file(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+    victim = download_dir / f"{OFFLINE_NAME}.part"
+    victim.write_bytes(b"victim")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError):
+        downloader.download_installer()
+
+    assert victim.read_bytes() == b"victim"
+    response.iter_content.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_discard_ignores_unowned_path(
+    tmp_path, module, downloader_class
+):
+    outside_dir = tmp_path / "outside"
+    outside_dir.mkdir()
+    outside_file = outside_dir / OFFLINE_NAME
+    outside_file.write_bytes(b"outside")
+    downloader = downloader_class()
+
+    downloader.discard_downloaded_installer(str(outside_file))
+
+    assert outside_file.read_bytes() == b"outside"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_discard_rejects_unowned_sibling(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    downloader.download_url = "https://example.com/" + OFFLINE_NAME
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    downloader.installer_filename = OFFLINE_NAME
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    downloader.download_installer()
+    sibling = download_dir / "unowned.exe"
+    sibling.write_bytes(b"victim")
+
+    assert downloader.discard_downloaded_installer(str(sibling)) is False
+    assert sibling.read_bytes() == b"victim"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_publish_preserves_preexisting_final(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    final_path = download_dir / OFFLINE_NAME
+    final_path.write_bytes(b"victim")
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError):
+        downloader.download_installer()
+
+    assert final_path.read_bytes() == b"victim"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_publish_preserves_final_injected_before_rename(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    final_path = download_dir / OFFLINE_NAME
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    if os.name == "nt":
+        publish = update_integrity._publish_windows_no_clobber
+
+        def inject_final(part_path, published_path):
+            final_path.write_bytes(b"victim")
+            publish(part_path, published_path)
+
+        monkeypatch.setattr(update_integrity, "_publish_windows_no_clobber", inject_final)
+    else:
+        publish = update_integrity._publish_posix_no_clobber
+
+        def inject_final(part_path, published_path, expected_identity):
+            final_path.write_bytes(b"victim")
+            publish(part_path, published_path, expected_identity)
+
+        monkeypatch.setattr(update_integrity, "_publish_posix_no_clobber", inject_final)
+
+    with pytest.raises(module.DownloadError):
+        downloader.download_installer()
+
+    assert final_path.read_bytes() == b"victim"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_discard_rejects_replaced_owned_parent(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    moved_dir = tmp_path / "moved"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    installer_path = downloader.download_installer()
+
+    try:
+        os.replace(download_dir, moved_dir)
+    except PermissionError:
+        assert Path(installer_path).read_bytes() == b"safe"
+        return
+
+    download_dir.mkdir()
+    replacement = Path(installer_path)
+    replacement.write_bytes(b"victim")
+
+    downloader.discard_downloaded_installer(installer_path)
+
+    assert replacement.read_bytes() == b"victim"
+    assert (moved_dir / OFFLINE_NAME).read_bytes() == b"safe"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_rejects_release_above_shared_installer_limit(
+    monkeypatch, module, downloader_class
+):
+    downloader = downloader_class()
+    response = _release_response(
+        [_asset(OFFLINE_NAME, "offline", update_integrity.MAX_INSTALLER_SIZE + 1)]
+    )
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+
+    with pytest.raises(module.DownloadError, match="maximum"):
+        downloader.get_latest_release()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_rejects_valid_content_length_mismatch_before_body(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = {"content-length": "5"}
+    response.iter_content.side_effect = AssertionError("response body was read")
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError, match="Content-Length"):
+        downloader.download_installer()
+
+    response.iter_content.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class", "content_length"),
+    [
+        (*implementation, content_length)
+        for implementation in DOWNLOADER_IMPLEMENTATIONS
+        for content_length in (
+            None,
+            "not-a-number",
+            "+5",
+            "-0",
+            " 5",
+            "5 ",
+            "\u0665",
+            "5x",
+        )
+    ],
+)
+def test_bootstrapper_streams_safely_without_valid_content_length(
+    monkeypatch, tmp_path, module, downloader_class, content_length
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = (
+        {} if content_length is None else {"content-length": content_length}
+    )
+    response.iter_content.return_value = [b"sa", b"fe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    installer_path = downloader.download_installer()
+
+    assert Path(installer_path).read_bytes() == b"safe"
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_rejects_oversized_chunk_before_write(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    part_path = download_dir / f"{OFFLINE_NAME}.part"
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+
+    response = MagicMock()
+    response.headers = {}
+    response.iter_content.return_value = [b"safe!"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+    file_handle = MagicMock()
+    file_handle.__enter__.return_value = file_handle
+    monkeypatch.setattr(
+        update_integrity.OwnedTempDirectory,
+        "create_file",
+        MagicMock(return_value=file_handle),
+    )
+    progress = MagicMock()
+
+    with pytest.raises(module.DownloadError, match="exceeds expected size"):
+        downloader.download_installer(progress_callback=progress)
+
+    progress.assert_not_called()
+    file_handle.write.assert_not_called()
+    _assert_failed_download_cleanup(
+        download_dir,
+        download_dir / OFFLINE_NAME,
+        part_created=False,
+    )
+
+
+def test_bootstrapper_import_does_not_require_update_downloader():
+    command = "\n".join(
+        [
+            "import sys",
+            "import bootstrapper.downloader",
+            "import bootstrapper.bootstrapper",
+            "assert 'src.core.update_downloader' not in sys.modules",
+        ]
+    )
+
+    result = subprocess.run(
+        [sys.executable, "-c", command],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+
+
+def test_bootstrapper_unowned_integrity_failure_does_not_delete_path(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"tampered")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = str(installer)
+    app.downloader = bundled_bootstrapper.InstallerDownloader()
+    app.downloader.expected_sha256 = hashlib.sha256(b"expected").hexdigest()
+    app.downloader.file_size = len(b"expected")
+    errors = []
+    app._show_error = errors.append
+    popen = MagicMock()
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    assert installer.read_bytes() == b"tampered"
+    assert errors
+    popen.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_downloaders_expose_verified_file_lease(
+    module, downloader_class, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"safe")
+    downloader = downloader_class()
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    downloader.file_size = 4
+    dispatched = []
+
+    with downloader.open_verified_installer(str(installer)) as verified:
+        source = verified._source
+        verified.dispatch(dispatched.append)
+
+    assert isinstance(verified, update_integrity.VerifiedFileLease)
+    assert dispatched == [str(installer)]
+    assert source.closed
+
+
+def test_bootstrapper_verified_launch_closes_replacement_race(
+    monkeypatch, tmp_path
+):
+    _force_bundled_bootstrapper_windows(monkeypatch)
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = bundled_bootstrapper.InstallerDownloader()
+    _configure_download(downloader, b"safe")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        bundled_bootstrapper.requests,
+        "get",
+        lambda *_args, **_kwargs: response,
+    )
+    monkeypatch.setattr(
+        bundled_bootstrapper.tempfile,
+        "mkdtemp",
+        lambda **_kwargs: str(download_dir),
+    )
+    installer_path = downloader.download_installer()
+    owner = downloader._find_owned_parent(installer_path)
+    assert owner is not None
+    owner.close()
+
+    replacement_blocked = []
+    leases = []
+    open_verified = downloader.open_verified_installer
+
+    def capture_lease(path):
+        lease = open_verified(path)
+        leases.append(lease)
+        return lease
+
+    monkeypatch.setattr(downloader, "open_verified_installer", capture_lease)
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = installer_path
+    app.downloader = downloader
+    app.root = MagicMock()
+    errors = []
+    app._show_error = errors.append
+    popen_calls = []
+
+    def popen(args, **kwargs):
+        popen_calls.append((args, kwargs))
+        assert leases[0].closed is False
+        replacement = download_dir / "replacement.exe"
+        replacement.write_bytes(b"safe")
+        try:
+            os.replace(replacement, installer_path)
+        except PermissionError:
+            replacement_blocked.append(True)
+        return MagicMock()
+
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
+
+    app._launch_installer()
+
+    assert len(popen_calls) == 1
+    assert len(leases) == 1 and leases[0].closed is True
+    if os.name == "nt":
+        assert replacement_blocked == [True]
+        assert errors == []
+        assert app._installer_dispatched is True
+    else:
+        assert replacement_blocked == []
+        assert errors and "identity" in errors[0]
+
+    post_context_replacement = download_dir / "post-context.exe"
+    post_context_replacement.write_bytes(b"after")
+    os.replace(post_context_replacement, installer_path)
+    assert Path(installer_path).read_bytes() == b"after"

@@ -19,6 +19,38 @@ from src.ui.dialogs.db_dialogs import (
 )
 from src.ui.dialogs.db_import_dialog import resolve_timezone_sql
 
+
+def test_import_without_tunnel_config_uses_unknown_environment_guard(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    calls = []
+
+    def fake_confirm(self, tunnel_config, operation, schema_name, details):
+        calls.append((tunnel_config, operation, schema_name, details))
+        return False
+
+    monkeypatch.setattr(
+        "src.core.production_guard.ProductionGuard.confirm_dangerous_operation",
+        fake_confirm,
+    )
+
+    dialog = RustDumpImportDialog()
+    try:
+        assert dialog._confirm_production_guard("C:/dumps/app", "app") is False
+    finally:
+        dialog.close()
+
+    assert len(calls) == 1
+    tunnel_config, operation, schema_name, details = calls[0]
+    assert tunnel_config == {}
+    assert operation == "데이터 Import"
+    assert schema_name == "app"
+    assert "C:/dumps/app" in details
+    assert "Import 모드" in details
+
 def test_format_import_row_labels_separates_rows_chunks_and_strategy():
     labels = format_import_row_labels({
         "table": "df_subs",
@@ -291,7 +323,10 @@ def test_import_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
 
-    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog = RustDumpImportDialog(
+        connector=FakeConnector(),
+        tunnel_config={"environment": "development"},
+    )
     dialog.input_dir.setText(str(dump_dir))
     dialog.radio_tz_none.setChecked(True)
 
@@ -356,7 +391,10 @@ def test_postgresql_import_auto_timezone_skips_mysql_detection(monkeypatch, tmp_
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
 
-    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog = RustDumpImportDialog(
+        connector=FakeConnector(),
+        tunnel_config={"environment": "development"},
+    )
     dialog.input_dir.setText(str(dump_dir))
     dialog.check_timezone_support = MagicMock(
         side_effect=AssertionError("PostgreSQL import must not query MySQL timezone tables")
@@ -421,7 +459,10 @@ def test_postgresql_import_forced_kst_uses_postgresql_timezone_sql(monkeypatch, 
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
 
-    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog = RustDumpImportDialog(
+        connector=FakeConnector(),
+        tunnel_config={"environment": "development"},
+    )
     dialog.input_dir.setText(str(dump_dir))
     dialog.radio_tz_kst.setChecked(True)
 
@@ -609,7 +650,10 @@ def test_import_fresh_run_clears_stale_progress_state(monkeypatch, tmp_path):
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
 
-    dialog = RustDumpImportDialog(connector=FakeConnector())
+    dialog = RustDumpImportDialog(
+        connector=FakeConnector(),
+        tunnel_config={"environment": "development"},
+    )
     dialog.input_dir.setText(str(dump_dir))
     dialog.radio_tz_none.setChecked(True)
 

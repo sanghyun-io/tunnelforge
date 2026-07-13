@@ -47,6 +47,10 @@ hiddenimports = [
     'dotenv',
 ]
 
+# main.py loads the UI root through _lazy_class(), so PyInstaller cannot infer
+# these modules from the string-based import path.
+hiddenimports.extend(collect_submodules('src.ui'))
+
 # 제외할 모듈 (불필요한 대용량 라이브러리 제외로 크기 최적화)
 excludes = [
     'matplotlib',

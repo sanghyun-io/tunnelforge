@@ -104,6 +104,7 @@ def test_restore_window_to_front_is_noop_on_macos():
     assert platform_integration.restore_window_to_front(1234, platform_name="Darwin") is False
 
 
-def test_update_package_launch_strategy_opens_macos_packages():
+def test_update_package_launch_strategy_reveals_non_windows_packages():
     assert platform_integration.update_package_launch_strategy("Darwin") == "open"
+    assert platform_integration.update_package_launch_strategy("Linux") == "open"
     assert platform_integration.update_package_launch_strategy("Windows") == "execute"
