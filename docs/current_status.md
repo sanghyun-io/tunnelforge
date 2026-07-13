@@ -113,6 +113,25 @@ when all three version files match it. The GitHub App token action that receives
 the releaser private key is pinned to reviewed commit
 `bcd2ba49218906704ab6c1aa796996da409d3eb1`.
 
+TF-STATUS-089 is `fixed_pending_full_verify`: release tags now require a
+manually approved `production-release` deployment, an exact full SHA matching
+current `main`, and synchronized version files. Release publication accepts
+only a separate approved manual dispatch, validates an immutable tag retained
+on `main`, creates a draft for that exact tag, pins every external action, and
+fails closed when macOS signing or notarization credentials are absent. The
+GitHub Environment now has a required reviewer, admin bypass disabled, and
+`main`/`v*` deployment policies. `main` protection is strict, applies to admins,
+requires conversation resolution and five terminal/platform checks, and an
+active ruleset prevents `v*` tag update/deletion/non-fast-forward changes.
+Local workflow/full-suite verification passed; PR Actions remain pending.
+
+TF-STATUS-090 is `blocked`: the protected release environment has none of the
+Apple Developer ID signing/notarization secrets required by the fail-closed
+release workflow. TF-STATUS-091 is `blocked`: `sanghyun-io` is the only current
+write/admin collaborator, so enabling self-review prevention or one required PR
+approval would deadlock the repository. A second trusted maintainer is required
+before independent approval can be enforced.
+
 Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
 refactor work packages WP-3.1 through WP-3.8 were integrated as
 behavior-preserving commits. A red-review follow-up restored compatibility for
@@ -458,9 +477,9 @@ preserves earlier broad evidence rows, including the historical Full-suite count
 
 | Check | Result |
 | --- | --- |
-| `git status --short --branch` | verified RC code baseline `9088aab` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
+| `git status --short --branch` | verified RC code baseline `c52f60e` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
 | update/security/status/version focused pytest | PASS, 319 passed, 1 skipped in 48.27s, exit 0 |
-| `pytest -q` | PASS, 2031 passed, 1 skipped, 4 warnings, 60.28s, exit 0 |
+| `pytest -q` | PASS, 2028 passed, 1 skipped, 4 warnings, 61.83s, exit 0 |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
 | `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS, Rust regression gate pass, exit 0 |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
@@ -583,6 +602,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | TF-STATUS-089 release approval boundary implementation and live controls | release/CI focused suite; GitHub App auth focused suite; standalone full Python suite; Rust regression/Cargo test/release build; GitHub Environment, branch protection, and tag ruleset API reads; `git diff --check` | PASS with external blockers recorded | Workflow: 64 passed in 47.39s. GitHub auth/settings: 114 passed in 7.60s. Final full Python: 2028 passed, 1 skipped, 4 warnings in 61.83s. Rust regression, Cargo 216 + 2 JSONL + 9 live + 2 stress / 1 ignored, and release build passed. `production-release`, strict main protection, and immutable `v*` update/delete rules are live. Apple secrets, an independent maintainer, PR Actions, and real-Mac evidence remain pending. |
 | 2026-07-13 | TF-STATUS-088 final status-document verification | `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q`; `git diff --check` | PASS, 65 passed, exit 0; diff check pass | Confirms the CI trust-boundary issue lifecycle and code baseline `9088aab`. |
 | 2026-07-13 | TF-STATUS-088 version-gate trust-boundary closure | CI workflow focused suite; update/security/status/version focused suite; standalone full Python suite; `git diff --check` | PASS | CI workflow: 9 passed. Focused: 319 passed, 1 skipped in 48.27s. Full Python: 2031 passed, 1 skipped, 4 warnings in 60.28s. Commit-message bypass is removed, three real version files are checked against the trusted expected value, and the App token action is commit-pinned. |
 | 2026-07-13 | TF-STATUS-086 cancelled-error scheduling follow-up | cancelled-DownloadError RED/GREEN regression; bootstrapper suite; update/security/status/version focused suite; standalone full Python suite; rebuilt frozen WebSetup self-check; `git diff --check` | PASS | Bootstrapper: 74 passed. Focused: 318 passed, 1 skipped in 50.65s. Full Python: 2030 passed, 1 skipped, 4 warnings in 62.49s. Frozen self-check emitted `TUNNELFORGE_WEBSETUP_SELF_CHECK_OK`. Error UI scheduling rejected by a destroyed root retires only after confirmed cancellation; non-cancellation errors remain visible. |
@@ -2337,6 +2357,9 @@ Next action:
 | TF-STATUS-086 | High | closed | Bootstrapper cancellation / result publication | Confirmed cancellation before completed-path publication | Keep abandonment and result publication synchronized; discard late completed results and never schedule completion after confirmed cancellation |
 | TF-STATUS-087 | Medium | closed | Non-Windows update UX / platform policy | Reveal-only action text claimed package open and app exit | Keep non-Windows action wording aligned with folder reveal-only behavior and no app exit |
 | TF-STATUS-088 | High | closed | CI version gate / credentialed action trust | Commit-message bump bypass and mutable App token action tag | Require all three version files to match the trusted expected version and keep the credentialed action pinned by full commit SHA |
+| TF-STATUS-089 | High | fixed_pending_full_verify | Release approval / tag and publication trust | Automatic tag, automatic stable publication, mutable credentialed actions, optional macOS signing | Apply the production-release Environment and strengthened branch protection, then verify the PR and hosted macOS runs before closure |
+| TF-STATUS-090 | High | blocked | macOS release signing / notarization | Protected Environment lacks Apple Developer ID and notarization secrets | Add the required Apple certificate, identity, account, team, and app-specific-password secrets to `production-release`, then run the signed hosted macOS release validation |
+| TF-STATUS-091 | Medium | blocked | Release governance / independent approval | Only one write/admin collaborator exists | Add a second trusted maintainer, then enable environment self-review prevention and one required PR approval without deadlocking releases |
 
 ## Recommended Execution Order
 
@@ -2348,30 +2371,36 @@ Next action:
    update wording.
 4. Keep TF-STATUS-088 closed by verifying all version files against trusted
    expected state and pinning credentialed actions by full commit SHA.
-5. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
+5. Resolve TF-STATUS-090 by adding Apple signing/notarization secrets to the
+   protected environment and running the signed hosted macOS validation.
+6. Complete TF-STATUS-089 with live PR Actions evidence; the Environment,
+   branch protection, and immutable release-tag update/delete rules are active.
+7. Resolve TF-STATUS-091 by adding a second trusted maintainer, then require
+   independent environment and PR approval.
+8. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
    owned cleanup/no-clobber, cancellation generation, and streaming bound in
    place. Do not claim external Actions, branch protection, tag/release,
    GitHub closure, or Mac hardware validation.
-6. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
+9. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
    verification before every downloaded-package launch.
-7. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
+10. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
    dangerous operations without classified tunnel metadata.
-8. Complete TF-STATUS-083 from `fixed_pending_full_verify` through external
+11. Complete TF-STATUS-083 from `fixed_pending_full_verify` through external
    stable required-check promotion for `python-regression` and the Rust Core
    regression gate.
-9. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
+12. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
    while the feature flag remains disabled.
-10. Complete TF-STATUS-081 from `fixed_pending_full_verify` through the external
+13. Complete TF-STATUS-081 from `fixed_pending_full_verify` through the external
    RC merge/tag process for the `2.3.1` release candidate.
-11. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
+14. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
    #116 remains external, with both current-HEAD manual workflow evidence and
    the real-Mac report. Do not hard-code exact current-head workflow run IDs or
    SHAs as durable status summary evidence; use #116 comments and the final gate
    for current proof.
-12. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
+15. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
    #171 / commit `a4c7a06`; reopen implementation work only if it reproduces on
    a release that contains the fix.
-13. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
+16. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
    expansion, and Rust Core concurrency redesign until the release-trust work is
    complete and user/benchmark evidence justifies them.
 
@@ -2379,6 +2408,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Hardened the pre-release boundary at code baseline `c52f60e`: removed distributable GitHub App private-key embedding, made tag and draft release separate approved manual operations, pinned every action, and added exact tag/ancestor/version plus macOS signature/notarization checks. Applied the protected Environment, strict main checks, and immutable release-tag update/delete rules. | release/tag workflows, GitHub App auth and UI copy, setup docs, focused tests, status docs/tests, live GitHub configuration | Workflow 64 passed; GitHub auth/settings 114 passed; final standalone full Python 2028 passed / 1 skipped / 4 warnings; Rust regression/Cargo test/release build and diff check passed. Security re-review: SECURE / APPROVE. TF-STATUS-090/091 record missing Apple secrets and independent maintainer. |
 | 2026-07-13 | Closed TF-STATUS-088 after the final CI security audit: removed commit-message-only bump completion, made trusted expected-version comparison cover all three version files, and pinned the releaser App token action to a full commit SHA. | `.github/workflows/version-gate.yml`, `tests/test_ci_workflows.py`, status docs/tests | CI workflow 9 passed; focused 319 passed / 1 skipped; standalone full Python 2031 passed / 1 skipped / 4 warnings; diff check passed. |
 | 2026-07-13 | Closed the cancelled-DownloadError destroyed-root edge by applying the synchronized abandonment retirement rule to error UI scheduling as well as completion scheduling. | `bootstrapper/bootstrapper.py`, `tests/test_bootstrapper_integrity.py`, status docs/tests | Bootstrapper 74 passed; focused 318 passed / 1 skipped; standalone full Python 2030 passed / 1 skipped / 4 warnings; rebuilt frozen self-check and diff check passed. |
 | 2026-07-13 | Closed the destroyed-root scheduling edge after confirmed cancellation: completion scheduling now silently retires only when Tk rejects the call and the synchronized state is already abandoned; non-cancellation Tk errors still propagate. | `bootstrapper/bootstrapper.py`, `tests/test_bootstrapper_integrity.py`, status docs/tests | Bootstrapper 73 passed; focused 317 passed / 1 skipped; standalone full Python 2029 passed / 1 skipped / 4 warnings; rebuilt frozen self-check and diff check passed. |
