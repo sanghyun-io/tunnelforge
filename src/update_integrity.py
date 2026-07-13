@@ -41,6 +41,7 @@ if os.name == "nt":
     import msvcrt
 
     _GENERIC_READ = 0x80000000
+    _GENERIC_WRITE = 0x40000000
     _DELETE = 0x00010000
     _FILE_LIST_DIRECTORY = 0x0001
     _FILE_READ_ATTRIBUTES = 0x0080
@@ -48,6 +49,7 @@ if os.name == "nt":
     _FILE_SHARE_WRITE = 0x00000002
     _FILE_SHARE_DELETE = 0x00000004
     _OPEN_EXISTING = 3
+    _CREATE_NEW = 1
     _FILE_ATTRIBUTE_DIRECTORY = 0x00000010
     _FILE_ATTRIBUTE_REPARSE_POINT = _REPARSE_POINT_ATTRIBUTE
     _FILE_FLAG_SEQUENTIAL_SCAN = 0x08000000
@@ -417,10 +419,6 @@ class VerifiedFileLease:
             pass
 
 
-# Compatibility for tests and callers introduced during the staged hardening.
-VerifiedLaunchFile = VerifiedFileLease
-
-
 class OwnedTempDirectory:
     """Identity token for downloader cleanup with platform-specific deletion.
 
@@ -506,6 +504,86 @@ class OwnedTempDirectory:
             return False
         self._owned_child_names.update(os.path.basename(path) for path in candidates)
         return True
+
+    def create_file(self, name: str | os.PathLike[str]):
+        """Create and retain one new regular file directly under this directory."""
+        child_name = os.fspath(name)
+        if (
+            not isinstance(child_name, str)
+            or not child_name
+            or child_name in {".", ".."}
+            or os.path.basename(child_name) != child_name
+            or os.path.dirname(child_name)
+        ):
+            raise IntegrityError("temporary download child must be an exact basename")
+
+        if not self.identity_matches():
+            raise IntegrityError("temporary parent identity changed")
+
+        if os.name == "nt":
+            child_path = os.path.join(self.path, child_name)
+            handle = _CreateFileW(
+                child_path,
+                _GENERIC_READ | _GENERIC_WRITE,
+                _FILE_SHARE_READ,
+                None,
+                _CREATE_NEW,
+                _FILE_FLAG_OPEN_REPARSE_POINT,
+                None,
+            )
+            if handle == _INVALID_HANDLE_VALUE:
+                raise ctypes.WinError(ctypes.get_last_error())
+
+            descriptor = None
+            try:
+                identity, attributes = _windows_handle_information(handle)
+                if attributes & _FILE_ATTRIBUTE_REPARSE_POINT:
+                    raise IntegrityError("temporary download child is a reparse point")
+                if attributes & _FILE_ATTRIBUTE_DIRECTORY:
+                    raise IntegrityError("temporary download child is not a regular file")
+                self._owned_child_names.add(child_name)
+                self._child_identities[child_name] = identity
+                descriptor = msvcrt.open_osfhandle(
+                    handle, os.O_RDWR | os.O_BINARY
+                )
+                handle = None
+                stream = os.fdopen(descriptor, "w+b")
+                descriptor = None
+                return stream
+            finally:
+                if descriptor is not None:
+                    _close_descriptor_safely(descriptor)
+                if handle is not None:
+                    _windows_close_handle_safely(handle)
+
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        if not no_follow:
+            raise IntegrityError("no-follow file opens are unavailable")
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | no_follow
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        descriptor = os.open(child_name, flags, 0o600, dir_fd=self._descriptor)
+        try:
+            child_stat = os.fstat(descriptor)
+            if not stat.S_ISREG(child_stat.st_mode):
+                raise IntegrityError("temporary download child is not a regular file")
+            self._owned_child_names.add(child_name)
+            self._child_identities[child_name] = (
+                child_stat.st_dev,
+                child_stat.st_ino,
+            )
+            if not self.identity_matches():
+                raise IntegrityError("temporary parent identity changed")
+            stream = os.fdopen(descriptor, "wb")
+            descriptor = None
+            return stream
+        finally:
+            if descriptor is not None:
+                _close_descriptor_safely(descriptor)
 
     def owns_direct_child(self, path: str | os.PathLike[str]) -> bool:
         candidate = _absolute_path(path)
@@ -742,10 +820,3 @@ def publish_owned_temp_file(
     if os.name == "nt":
         owner.forget_child_identity(part)
     return final
-
-
-def verify_file_integrity(
-    path: str | os.PathLike[str], expected_sha256: str, expected_size: int
-) -> None:
-    with VerifiedFileLease(path, expected_sha256, expected_size):
-        pass

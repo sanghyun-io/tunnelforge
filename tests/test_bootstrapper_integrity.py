@@ -4,7 +4,7 @@ from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -386,23 +386,83 @@ def test_bootstrapper_reset_cancellation_starts_a_new_download_task(
     assert Path(installer_path).read_bytes() == b"safe"
 
 
-def test_bootstrapper_controller_resets_cancellation_before_metadata():
+def test_bootstrapper_controller_resets_cancellation_before_thread_object(monkeypatch):
     app = bundled_bootstrapper.BootstrapperApp.__new__(
         bundled_bootstrapper.BootstrapperApp
     )
     app.downloader = MagicMock()
-    app.downloader.get_latest_release.side_effect = bundled_bootstrapper.DownloadError(
-        "metadata failed"
+    events = []
+    app.downloader.reset_cancellation.side_effect = lambda: events.append("reset")
+
+    class RecordingThread:
+        def __init__(self, *, target, daemon):
+            events.append("thread")
+            self.target = target
+            self.daemon = daemon
+
+        def start(self):
+            events.append("start")
+
+    monkeypatch.setattr(bundled_bootstrapper.threading, "Thread", RecordingThread)
+
+    app._start_download()
+
+    assert events == ["reset", "thread", "start"]
+
+
+def test_bundled_controller_preserves_cancel_after_thread_start(monkeypatch):
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
     )
+    app.downloader = bundled_bootstrapper.InstallerDownloader()
     app._update_status = MagicMock()
     app._show_error = MagicMock()
+    metadata = MagicMock()
+    body = MagicMock()
+    monkeypatch.setattr(app.downloader, "get_latest_release", metadata)
+    monkeypatch.setattr(app.downloader, "download_installer", body)
 
-    app._download_worker()
+    class BarrierThread:
+        def __init__(self, *, target, daemon):
+            self.target = target
+            self.daemon = daemon
 
-    assert app.downloader.method_calls[:2] == [
-        call.reset_cancellation(),
-        call.get_latest_release(),
-    ]
+        def start(self):
+            app.downloader.cancel()
+            self.target()
+
+    monkeypatch.setattr(bundled_bootstrapper.threading, "Thread", BarrierThread)
+
+    app._start_download()
+
+    metadata.assert_not_called()
+    body.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
+def test_bootstrapper_downloaders_preserve_preexisting_part_file(
+    monkeypatch, tmp_path, module, downloader_class
+):
+    download_dir = tmp_path / "download"
+    download_dir.mkdir()
+    downloader = downloader_class()
+    _configure_download(downloader, b"safe")
+    victim = download_dir / f"{OFFLINE_NAME}.part"
+    victim.write_bytes(b"victim")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
+
+    with pytest.raises(module.DownloadError):
+        downloader.download_installer()
+
+    assert victim.read_bytes() == b"victim"
+    response.iter_content.assert_not_called()
 
 
 @pytest.mark.parametrize(
@@ -643,7 +703,6 @@ def test_bootstrapper_rejects_oversized_chunk_before_write(
     download_dir = tmp_path / "download"
     download_dir.mkdir()
     part_path = download_dir / f"{OFFLINE_NAME}.part"
-    part_path.write_bytes(b"")
     downloader = downloader_class()
     _configure_download(downloader, b"safe")
 
@@ -654,8 +713,11 @@ def test_bootstrapper_rejects_oversized_chunk_before_write(
     monkeypatch.setattr(module.tempfile, "mkdtemp", lambda **_kwargs: str(download_dir))
     file_handle = MagicMock()
     file_handle.__enter__.return_value = file_handle
-    open_mock = MagicMock(return_value=file_handle)
-    monkeypatch.setattr(module, "open", open_mock, raising=False)
+    monkeypatch.setattr(
+        update_integrity.OwnedTempDirectory,
+        "create_file",
+        MagicMock(return_value=file_handle),
+    )
     progress = MagicMock()
 
     with pytest.raises(module.DownloadError, match="exceeds expected size"):

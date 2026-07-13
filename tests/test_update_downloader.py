@@ -417,6 +417,137 @@ def test_posix_owned_temp_directory_never_unlinks_or_removes_root(tmp_path):
     assert tmp_path.exists()
 
 
+def test_owned_temp_directory_create_file_preserves_existing_child(tmp_path):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+    victim = tmp_path / "installer.exe.part"
+    victim.write_bytes(b"victim")
+
+    with pytest.raises(OSError):
+        owner.create_file(victim.name)
+
+    assert victim.read_bytes() == b"victim"
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "nested/file.part"])
+def test_owned_temp_directory_create_file_requires_exact_basename(tmp_path, name):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+
+    with pytest.raises(update_integrity.IntegrityError, match="basename"):
+        owner.create_file(name)
+
+
+def test_owned_temp_directory_create_file_rejects_replaced_parent(tmp_path):
+    parent = tmp_path / "download"
+    moved = tmp_path / "moved"
+    parent.mkdir()
+    owner = update_integrity.OwnedTempDirectory(parent)
+    os.rename(parent, moved)
+    parent.mkdir()
+    victim = parent / "installer.exe.part"
+    victim.write_bytes(b"victim")
+
+    with pytest.raises(update_integrity.IntegrityError, match="parent identity"):
+        owner.create_file(victim.name)
+
+    assert victim.read_bytes() == b"victim"
+
+
+def test_update_downloader_preserves_preexisting_part_file(monkeypatch, tmp_path):
+    update_dir = tmp_path / "download"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/installer.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    downloader.installer_filename = "installer.exe"
+    victim = update_dir / "installer.exe.part"
+    victim.write_bytes(b"victim")
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr(
+        "src.core.update_downloader.requests.get",
+        lambda *_args, **_kwargs: response,
+    )
+
+    with pytest.raises(DownloadError):
+        downloader.download_installer()
+
+    assert victim.read_bytes() == b"victim"
+    response.iter_content.assert_not_called()
+
+
+def test_update_downloader_preserves_race_created_part_file(monkeypatch, tmp_path):
+    update_dir = tmp_path / "download"
+    update_dir.mkdir()
+    downloader = UpdateDownloader()
+    downloader.download_url = "https://example.com/installer.exe"
+    downloader.file_size = 4
+    downloader.expected_sha256 = hashlib.sha256(b"safe").hexdigest()
+    downloader.installer_filename = "installer.exe"
+    victim = update_dir / "installer.exe.part"
+    response = MagicMock()
+    response.headers = {"content-length": "4"}
+    response.iter_content.return_value = [b"safe"]
+
+    def race_create(*_args, **_kwargs):
+        victim.write_bytes(b"victim")
+        return response
+
+    monkeypatch.setattr(
+        "src.core.update_downloader.tempfile.mkdtemp",
+        lambda **_kwargs: str(update_dir),
+    )
+    monkeypatch.setattr("src.core.update_downloader.requests.get", race_create)
+
+    with pytest.raises(DownloadError):
+        downloader.download_installer()
+
+    assert victim.read_bytes() == b"victim"
+    response.iter_content.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
+def test_windows_create_file_uses_exclusive_no_follow_handle_and_closes_fd(
+    monkeypatch, tmp_path
+):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+    assert owner.retain() is True
+    create_file = MagicMock(return_value=71)
+    close_descriptor = MagicMock()
+    close_handle = MagicMock()
+    monkeypatch.setattr(owner, "identity_matches", lambda: True)
+    monkeypatch.setattr(update_integrity, "_CreateFileW", create_file)
+    monkeypatch.setattr(
+        update_integrity,
+        "_windows_handle_information",
+        lambda _handle: ((1, 2), 0),
+    )
+    monkeypatch.setattr(update_integrity.msvcrt, "open_osfhandle", lambda *_args: 72)
+    monkeypatch.setattr(
+        update_integrity.os,
+        "fdopen",
+        MagicMock(side_effect=OSError("fdopen failed")),
+    )
+    monkeypatch.setattr(update_integrity.os, "close", close_descriptor)
+    monkeypatch.setattr(update_integrity, "_windows_close_handle_safely", close_handle)
+
+    with pytest.raises(OSError, match="fdopen failed"):
+        owner.create_file("installer.exe.part")
+
+    args = create_file.call_args.args
+    assert args[1] == update_integrity._GENERIC_READ | update_integrity._GENERIC_WRITE
+    assert args[2] == update_integrity._FILE_SHARE_READ
+    assert args[4] == update_integrity._CREATE_NEW
+    assert args[5] == update_integrity._FILE_FLAG_OPEN_REPARSE_POINT
+    close_descriptor.assert_called_once_with(72)
+    close_handle.assert_not_called()
+
+
 @pytest.mark.skipif(os.name != "nt", reason="Windows handle behavior")
 def test_windows_verified_lease_closes_descriptor_when_fdopen_fails(
     monkeypatch, tmp_path
@@ -949,7 +1080,6 @@ def test_download_rejects_oversized_chunk_before_write(
     update_dir = tmp_path / "tunnelforge-update-oversized"
     update_dir.mkdir()
     part_path = update_dir / "TunnelForge-Setup-2.0.5.exe.part"
-    part_path.write_bytes(b"")
     downloader = UpdateDownloader()
     downloader.download_url = "https://example.com/TunnelForge-Setup-2.0.5.exe"
     downloader.file_size = 4
@@ -968,11 +1098,10 @@ def test_download_rejects_oversized_chunk_before_write(
     )
     file_handle = MagicMock()
     file_handle.__enter__.return_value = file_handle
-    open_mock = MagicMock(return_value=file_handle)
     monkeypatch.setattr(
-        "src.core.update_downloader.open",
-        open_mock,
-        raising=False,
+        update_integrity.OwnedTempDirectory,
+        "create_file",
+        MagicMock(return_value=file_handle),
     )
     progress = MagicMock()
 

@@ -24,7 +24,6 @@ from src.update_integrity import (
     publish_owned_temp_file,
     parse_content_length,
     parse_sha256_digest,
-    verify_file_integrity,
 )
 
 # ============================================================
@@ -232,9 +231,7 @@ class InstallerDownloader:
                 )
 
             downloaded = 0
-            with open(part_path, 'wb') as f:
-                if not owner.retain(part_path):
-                    raise DownloadError("temporary download part identity changed")
+            with owner.create_file(os.path.basename(part_path)) as f:
                 for chunk in response.iter_content(chunk_size=self.CHUNK_SIZE):
                     self._raise_if_cancelled()
 
@@ -250,7 +247,11 @@ class InstallerDownloader:
                             progress_callback(downloaded, self.file_size)
 
             self._raise_if_cancelled()
-            self.verify_downloaded_installer(part_path)
+            try:
+                with self.open_verified_installer(part_path):
+                    pass
+            except (IntegrityError, OSError) as exc:
+                raise DownloadError(str(exc)) from exc
             self._raise_if_cancelled()
             publish_owned_temp_file(owner, part_path, file_path)
             self._raise_if_cancelled()
@@ -268,15 +269,6 @@ class InstallerDownloader:
         except Exception as e:
             self._cleanup_failed_download(temp_dir, part_path, file_path)
             raise DownloadError(f"다운로드 실패: {str(e)}") from e
-
-    def verify_downloaded_installer(self, path: str) -> None:
-        """Verify a package against the selected GitHub release metadata."""
-        if not self.expected_sha256:
-            raise DownloadError("release asset SHA-256 digest is missing or invalid")
-        try:
-            verify_file_integrity(path, self.expected_sha256, self.file_size)
-        except (IntegrityError, OSError) as exc:
-            raise DownloadError(str(exc)) from exc
 
     def open_verified_installer(self, path: str) -> VerifiedFileLease:
         """Return a verified file lease that can guard process dispatch."""
@@ -491,7 +483,7 @@ class BootstrapperApp:
         """백그라운드 다운로드 작업"""
         try:
             # 1. 최신 릴리스 정보 조회
-            self.downloader.reset_cancellation()
+            self.downloader._raise_if_cancelled()
             self._update_status("최신 버전 확인 중...")
             version, url, size = self.downloader.get_latest_release()
 
@@ -612,6 +604,7 @@ class BootstrapperApp:
 
     def _start_download(self):
         """백그라운드 다운로드 시작"""
+        self.downloader.reset_cancellation()
         self.download_thread = threading.Thread(
             target=self._download_worker,
             daemon=True
