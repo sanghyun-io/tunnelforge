@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-07-10
+Last reviewed: 2026-07-13
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -67,16 +67,22 @@ TF-STATUS-080, and TF-STATUS-082 are closed by this release-candidate
 verification. TF-STATUS-081 and TF-STATUS-083 are
 `fixed_pending_full_verify` because RC merge/tag and stable required-check
 promotion are external follow-ups; TF-STATUS-008 and TF-STATUS-078 remain open.
-TF-STATUS-079 remains closed with strengthened final-review evidence. The
-final-review full Python suite passed at 1955 passed / 1 skipped / 4 warnings
-in 60.38s with exit 0; the matching Rust Core gate, Cargo test/build, and
-version-sync checks also passed in this session.
+TF-STATUS-079 remains closed with strengthened final-review evidence. Fresh
+2026-07-13 verification on RC code baseline
+`e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd` passed the focused
+security/status/version command at 291 passed / 1 skipped in 46.01s and the
+full Python suite at 2006 passed / 1 skipped / 4 warnings in 58.07s; the
+matching Rust regression gate, Cargo test, release build, version-sync, and
+diff checks also passed. The historical 1955-pass release-review snapshot is
+preserved in the verification rows below.
 
 TF-STATUS-084 records the final-review update boundary findings: a
 verification-to-launch lease, owned cleanup/no-clobber behavior, cancellation
-generation isolation, and a bounded streaming path. It remains
-`closed` after focused update/security/status/version tests, exactly one full
-Python suite, Rust Core regression, Cargo test/build, and version-sync passed.
+generation isolation, and a bounded streaming path. It remains `closed` with
+fresh Fix E secure child creation/name validation and bootstrapper
+cancel-before-entry evidence, plus focused update/security/status/version
+tests, the full Python suite, Rust Core regression, Cargo test/build, release
+build, version-sync, and diff checks.
 On non-Windows, automatic installer execution is disabled/reveal-only; this
 local work does not make a Mac hardware validation claim. This local
 verification does not claim completion of live Actions, branch protection
@@ -419,22 +425,23 @@ confirming the separate legacy Python Auto-Fix Wizard mutation path.
 
 ## Current Baseline Verification
 
-Commands run locally. The `2.3.1` release candidate final-review verification
-refreshes the current Python, Rust Core, release-build, version-sync, and diff evidence;
-the latest status update preserves earlier broad evidence rows where their
-commands were not rerun, including the historical `Full-suite count refreshed on 2026-06-27` baseline.
+Commands run locally. The 2026-07-13 release-candidate verification refreshes
+the current Python, Rust Core, release-build, version-sync, and diff evidence
+on the verified RC code baseline; status-only history remains historical and
+does not call the prior status-only baseline current. This latest status update
+preserves earlier broad evidence rows, including the historical Full-suite count refreshed on 2026-06-27 baseline.
 
 | Check | Result |
 | --- | --- |
-| `git status --short --branch` | verified RC code baseline `b35dde6` on `feat/trust-release-sprint`; status-only documentation lineage starts at `7810ea3` and does not alter the verified code baseline |
-| update/security/status/version focused pytest | PASS, 183 passed, 1 skipped, 1.63s, exit 0 |
-| `pytest -q` | PASS, 1955 passed, 1 skipped, 4 warnings, 60.38s, exit 0 |
+| `git status --short --branch` | verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd` on `feat/trust-release-sprint`; status-only history remains historical and does not alter the verified code baseline |
+| update/security/status/version focused pytest | PASS, 291 passed, 1 skipped in 46.01s, exit 0 |
+| `pytest -q` | PASS, 2006 passed, 1 skipped, 4 warnings, 58.07s, exit 0 |
 | Round 3 focused pytest suite | PASS, 491 passed, 2 warnings |
-| `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS, 1.4s, exit 0 |
+| `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` | PASS, Rust regression gate pass, exit 0 |
 | whole-tree `MySQLConnector` allowlist scan | PASS, 22 product imports and no missing allowlist entries |
-| `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 216 lib, 2 JSONL CLI, 9 live roundtrip, and 2 stress tests passed; 1 stress test ignored, 14.1s overall, exit 0 |
-| `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS, 4.25s, exit 0 |
-| `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.09s, exit 0 |
+| `cargo test --manifest-path migration_core\Cargo.toml` | PASS, 216 lib, 2 JSONL CLI, 9 live, 2 stress tests passed; 1 stress test ignored, exit 0 |
+| `cargo build --manifest-path migration_core\Cargo.toml --release` | PASS, 2.82s, exit 0 |
+| `pytest tests\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.08s, exit 0 |
 | `python -m compileall -q main.py src tests scripts` | PASS |
 | `git diff --check` | PASS, exit 0; final docs/status diff check recorded in this session |
 | `tunnelforge-core service.hello` | PASS, reports `dump.run`, `dump.import`, migration commands, and `oneclick.*` commands |
@@ -446,9 +453,10 @@ commands were not rerun, including the historical `Full-suite count refreshed on
 | `python scripts\check-macos-support-gate.py --final` | EXPECTED FAIL, missing current-HEAD manual workflow evidence and real-Mac report |
 | GitHub required status checks | `version-gate` only |
 
-Historical Round 3 baseline snapshot (preserved for audit):
+Historical release-review snapshots (preserved for audit):
 
     | `pytest -q` | PASS, 1827 passed, 6 warnings |
+    | `pytest -q` | PASS, 1955 passed, 1 skipped, 4 warnings, 60.38s, exit 0 |
 
 Version references are aligned at `2.3.1` across:
 
@@ -548,6 +556,8 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | TF-STATUS-079/084 final security and release baseline refresh | verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd`; focused security/status/version command; full Python suite; Rust Core regression gate; Cargo test; release build; version-sync; `git diff --check` | PASS | Focused: 291 passed, 1 skipped in 46.01s. Full Python: 2006 passed, 1 skipped, 4 warnings in 58.07s. Cargo: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored. Release build: 2.82s. Version sync: 1 passed in 0.08s. Fix E secure child creation/name validation and bootstrapper cancel-before-entry evidence support TF-STATUS-084 closed; TF-STATUS-079 remains closed and other statuses are unchanged. |
+| 2026-07-13 | Final current-status documentation verification | .venv\\Scripts\\python.exe -m pytest tests\\test_current_status_docs.py -q; git diff --check | PASS, 61 passed in 0.36s; diff check pass | Fresh current-status tests and the final diff check passed after preserving historical 1827, 1870, and 1955 snapshots. |
 | 2026-07-13 | TF-STATUS-084 final status-suite record | `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q` | PASS, 60 passed in 0.21s | Canonical final status-suite result. The earlier `60 passed in 0.33s` row records a separate post-close run and remains preserved in chronological order. |
 | 2026-07-10 | TF-STATUS-084 post-close status consistency | RED then GREEN: `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q` | PASS, 60 passed in 0.33s | RED was 1 failed, 59 passed in 0.39s because `test_current_status_records_231_release_candidate_verification_evidence` still expected the superseded current `1870` count. Updated it to assert the fresh `1955` final-review evidence; no full pytest rerun was performed, preserving the required exactly-one full-suite run. |
 | 2026-07-10 | TF-STATUS-084 final-review boundary verification | RED: `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py::test_current_status_tracks_final_review_update_boundary_pending_verification -q`; GREEN: focused update/security/status/version pytest, exactly one `pytest -q`, Rust Core gate, Cargo test/build, version-sync, and final diff check | PASS, all local gates exit 0 | RED was 1 failed in 0.24s before TF-STATUS-084 existed. GREEN focused suite: 183 passed, 1 skipped in 1.63s; full suite: 1955 passed, 1 skipped, 4 warnings in 60.38s; Rust gate: 1.4s; Cargo test: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored in 14.1s; release build: 4.25s; version-sync: 1 passed in 0.09s. TF-STATUS-084 is closed locally without claims about Actions, branch protection, tags/releases, GitHub closure, or Mac hardware. |
@@ -2282,7 +2292,7 @@ Next action:
 | TF-STATUS-081 | High | fixed_pending_full_verify | Release readiness / versioning | `2.3.1` release candidate version alignment | Complete the external RC merge/tag process; do not create a tag or GitHub Release from this task |
 | TF-STATUS-082 | Medium | closed | Product documentation / feature flags | Bilingual Schedule correction for disabled features | Keep both language surfaces explicit that Schedule remains disabled until intentional reactivation and verification |
 | TF-STATUS-083 | Medium | fixed_pending_full_verify | CI / branch protection | Full Python regression workflow | Observe stable `python-regression` and Rust Core runs, then complete external required-check promotion |
-| TF-STATUS-084 | High | closed | Update final review / launch boundary | verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, streaming bound | Retain the reviewed bounds; local closure does not claim external Actions, branch protection, tag/release, GitHub closure, or Mac hardware evidence |
+| TF-STATUS-084 | High | closed | Update final review / launch boundary | verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, streaming bound | Retain the reviewed bounds, Fix E secure child creation/name validation, and bootstrapper cancel-before-entry evidence; local closure does not claim external Actions, branch protection, tag/release, GitHub closure, or Mac hardware evidence |
 
 ## Recommended Execution Order
 
@@ -2317,6 +2327,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Refreshed the final release/security status against RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd`; TF-STATUS-084 remains closed with Fix E secure child creation/name validation and bootstrapper cancel-before-entry evidence. TF-STATUS-079 remains closed; TF-STATUS-080/082 remain closed, TF-STATUS-081/083 remain `fixed_pending_full_verify`, and TF-STATUS-008/078 remain open. Historical status-only rows, including the prior `b35dde6` baseline, remain historical. | `docs/current_status.md`, `tests/test_current_status_docs.py` | Focused security/status/version: 291 passed / 1 skipped in 46.01s; full Python: 2006 passed / 1 skipped / 4 warnings in 58.07s; Rust regression gate pass; Cargo 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored; release build 2.82s; version sync 1 passed in 0.08s; diff check pass; fresh current-status tests and diff check appended above. |
 | 2026-07-13 | Corrected TF-STATUS-084 baseline lineage wording: `b35dde6` is the verified RC code baseline, while status-only documentation lineage starts at `7810ea3` and does not alter that code baseline. The external boundary explicitly does not claim completion of live Actions, branch protection promotion, tag/release, GitHub issue closure, or Mac hardware validation. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED: focused TF-STATUS-084 wording regression failed because the baseline/lineage sentence was absent; GREEN focused current-status tests and diff check recorded in this session. Canonical final status suite: 60 passed in 0.21s; separate historical post-close run: 60 passed in 0.33s. |
 | 2026-07-10 | Closed TF-STATUS-084 after fresh local final-review verification of the verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, and streaming bound. Non-Windows automatic installer execution is disabled/reveal-only; no Mac hardware validation claim is made. TF-STATUS-079 remains closed with strengthened evidence; TF-080/082 remain closed, TF-081/083 remain `fixed_pending_full_verify`, and TF-008/078 remain open. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED: TF-STATUS-084 documentation regression failed as expected (1 failed in 0.24s), then a stale 1870-count assertion failed post-close (1 failed / 59 passed in 0.39s); GREEN status suite 60 passed in 0.21s (separate prior post-close run: 60 passed in 0.33s), focused suite 183 passed / 1 skipped in 1.63s, exactly one full pytest 1955 passed / 1 skipped / 4 warnings in 60.38s; Rust gate, Cargo test/build, version-sync, and diff check exit 0 |
 | 2026-07-10 | Addressed Task 6 review feedback by restoring the Round 3 historical `1827 passed / 6 warnings` assertion, separating current `2.3.1` RC and Rust evidence into a dedicated regression, preserving both records, and removing the duplicate Session Log delimiter. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED: 2 failed / 58 passed in 0.44s; GREEN: 60 passed in 0.25s; final diff check recorded with the fix commit |

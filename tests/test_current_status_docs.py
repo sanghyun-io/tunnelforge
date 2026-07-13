@@ -867,7 +867,7 @@ def test_current_status_records_231_release_candidate_verification_evidence():
     verification = _section(doc, "Verification Log")
     sessions = _section(doc, "Session Log")
 
-    assert "final-review full Python suite passed at 1955 passed / 1 skipped / 4 warnings" in summary
+    assert "historical 1955-pass release-review snapshot is preserved" in summary
     assert "| `pytest -q` | PASS, 1955 passed, 1 skipped, 4 warnings, 60.38s, exit 0 |" in baseline
     assert "Rust gate: 1.4s" in verification
     assert "Cargo test: 216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored" in verification
@@ -971,11 +971,12 @@ def test_current_status_closes_final_review_update_boundary_after_fresh_verifica
         assert finding in tracker
 
     assert (
-        "verified RC code baseline `b35dde6` on `feat/trust-release-sprint`; "
-        "status-only documentation lineage starts at `7810ea3` and does not "
-        "alter the verified code baseline"
+        "verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd` "
+        "on `feat/trust-release-sprint`; status-only history remains historical "
+        "and does not alter the verified code baseline"
     ) in baseline
     assert "current HEAD `b35dde6`" not in baseline
+    assert "b35dde6" not in baseline
     assert "automatic installer execution is disabled/reveal-only" in summary
     external_non_completion = (
         "This local verification does not claim completion of live Actions, "
@@ -984,7 +985,43 @@ def test_current_status_closes_final_review_update_boundary_after_fresh_verifica
     )
     assert external_non_completion in summary
     assert "TF-STATUS-084" in verification
-    assert "1955 passed, 1 skipped, 4 warnings in 60.38s" in verification
-    assert "PASS, 60 passed in 0.21s" in verification
+    assert "Fix E secure child creation/name validation" in verification
+    assert "bootstrapper cancel-before-entry" in verification
+    assert "291 passed, 1 skipped in 46.01s" in verification
+    assert "2006 passed, 1 skipped, 4 warnings in 58.07s" in verification
+    assert "Rust Core regression gate pass" in verification
+    assert "216 lib, 2 JSONL CLI, 9 live, 2 stress passed / 1 ignored" in verification
+    assert "Release build: 2.82s" in verification
+    assert "Version sync: 1 passed in 0.08s" in verification
+    assert "final diff check passed" in verification
+    assert "| `git status --short --branch` | verified RC code baseline `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd`" in baseline
+    assert "| update/security/status/version focused pytest | PASS, 291 passed, 1 skipped in 46.01s, exit 0 |" in baseline
+    assert "| `pytest -q` | PASS, 2006 passed, 1 skipped, 4 warnings, 58.07s, exit 0 |" in baseline
+    assert "| `cargo build --manifest-path migration_core\\Cargo.toml --release` | PASS, 2.82s, exit 0 |" in baseline
+    assert "| `pytest tests\\test_rust_core_packaging.py::test_release_version_files_are_in_sync -q` | PASS, 1 passed in 0.08s, exit 0 |" in baseline
     assert "TF-STATUS-084" in order
-    assert "GREEN status suite 60 passed in 0.21s" in sessions
+    assert "Focused security/status/version: 291 passed / 1 skipped in 46.01s" in sessions
+    assert "full Python: 2006 passed / 1 skipped / 4 warnings in 58.07s" in sessions
+
+
+def test_current_status_refresh_preserves_historical_test_snapshots_and_statuses():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+
+    for snapshot in [
+        "1827 passed, 6 warnings",
+        "1870 passed, 4 warnings",
+        "1955 passed, 1 skipped, 4 warnings",
+    ]:
+        assert snapshot in doc
+
+    for status in [
+        "TF-STATUS-079 | High | closed",
+        "TF-STATUS-080 | Medium | closed",
+        "TF-STATUS-081 | High | fixed_pending_full_verify",
+        "TF-STATUS-082 | Medium | closed",
+        "TF-STATUS-083 | Medium | fixed_pending_full_verify",
+        "TF-STATUS-008 | Low | open",
+        "TF-STATUS-078 | Low | open",
+    ]:
+        assert status in tracker
