@@ -1127,3 +1127,20 @@ def test_current_status_records_published_231_release_evidence():
     assert "all GitHub SHA-256 digests present" in verification
     assert "b80e15c6148ba19a357a84b4e9e6cee8ae0b4727" in sessions
     assert "https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1" in sessions
+
+
+def test_current_status_tracks_embedded_github_app_key_rotation_scope():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-092 is `open`" in summary
+    assert "TF-STATUS-092 | High | open" in tracker
+    assert "42 published releases" in verification
+    assert "`v1.13.4` through `v2.3.0`" in verification
+    assert "App ID `2735888`" in sessions
+    assert "RELEASER_APP_PRIVATE_KEY" in sessions
+    assert order.index("TF-STATUS-092") < order.index("TF-STATUS-090")

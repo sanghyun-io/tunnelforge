@@ -146,6 +146,16 @@ collaborator, and single-maintainer self-approval is accepted for this release.
 Adding Apple signing and a second trusted maintainer remain future hardening
 opportunities rather than release blockers.
 
+TF-STATUS-092 is `open`: the legacy issue-reporter GitHub App private key for
+App ID `2735888` was embedded by the release path used from `v1.13.4` through
+`v2.3.0`. The current `v2.3.1` release does not embed the key or consume
+`GH_APP_PRIVATE_KEY` in its release build. Revoking the old key will disable
+automatic issue reporting in affected legacy builds without affecting tunnel,
+database, migration, or Rust Core operations. Rotate the exposed key only after
+inventorying external consumers by App ID and key fingerprint. Treat the current CI-only
+`RELEASER_APP_PRIVATE_KEY` as a separate credential until its App ID and
+fingerprint prove that the two lanes share the same key.
+
 Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
 refactor work packages WP-3.1 through WP-3.8 were integrated as
 behavior-preserving commits. A red-review follow-up restored compatibility for
@@ -616,6 +626,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | TF-STATUS-092 legacy GitHub App private-key rotation scope | Current and `v2.3.0` source/workflow scan; release-tag matrix scan; `v2.1.5` Actions log inspection; GitHub Actions secret-name inventory across 46 accessible `sanghyun-io` repositories; `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q`; `git diff --check` | HIGH exposure confirmed; rotation not yet performed; status suite 68 passed; diff check passed | App ID `2735888` release automation embedded the issue-reporter key in `v1.13.4` through `v2.3.0`: 43 affected tags and 42 published releases, with `v2.1.4` being the only affected tag without a published release. The `v2.1.5` build log directly confirms private-key embedding; the full release range is a high-confidence inference from the identical embedding workflow and successful release records, not individual reverse engineering of all 42 binaries. `v2.3.1` has no embedded-key support and its release workflows do not read `GH_APP_PRIVATE_KEY`. Exact GitHub App/Releaser secret names were found only in `sanghyun-io/tunnelforge`; external secret stores, local PEM copies, installation scope, and differently named copies remain unresolved. |
 | 2026-07-13 | `v2.3.1` protected release publication / TF-STATUS-081 closure | PR #240 checks and merge; tag workflow `29233663954`; Build and Release workflow `29233708190`; annotated tag API read; `gh release view v2.3.1`; release asset/digest assertion | PASS | PR #240 merged at `b80e15c6148ba19a357a84b4e9e6cee8ae0b4727`. The approved tag workflow created immutable annotated `v2.3.1` at that commit. Release preflight, Windows build, unsigned macOS arm64/x86_64 build/package/smoke, artifact normalization, and draft creation passed. The published latest stable release has 10 release assets, all GitHub SHA-256 digests present, at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1`. |
 | 2026-07-13 | Accepted unsigned macOS release policy | credential matrix and workflow focused tests; standalone full Python suite; Cargo baseline; security re-review; `git diff --check` | PASS | RED produced the expected workflow contract failure and missing credential-classifier import. GREEN: credential/workflow focused 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings in 60.14s; Cargo 216 + 2 JSONL + 9 live + 2 stress passed / 1 ignored. All Apple values absent selects unsigned; any partial configuration fails closed; complete required credentials select signed. Security re-review: SECURE. |
 | 2026-07-13 | TF-STATUS-083/089 live closure | PR #240 checks; runs `29229463468` and `29229463485`; live main protection, `production-release` Environment, and ruleset API reads | PASS | Python regression, Rust Core regression, terminal `version-gate`, macOS tracking, and both macOS arm64/x86_64 validation surfaces passed. PR #240 is `CLEAN`/mergeable. Main protection is strict, admin-enforced, conversation-gated, and requires five stable checks; release Environment approval/admin-bypass/ref restrictions and immutable `v*` update/delete rules are active. |
@@ -2378,6 +2389,7 @@ Next action:
 | TF-STATUS-089 | High | closed | Release approval / tag and publication trust | Automatic tag, automatic stable publication, mutable credentialed actions, optional macOS signing | Retain separate approved manual tag/draft workflows, exact tag/version/ancestry checks, pinned actions, protected Environment, and immutable release-tag updates/deletes |
 | TF-STATUS-090 | High | watch | macOS release signing / notarization | Protected Environment intentionally has no paid Apple Developer credentials | Publish explicitly unsigned macOS artifacts for this release; revisit signing/notarization when an Apple Developer account is available |
 | TF-STATUS-091 | Medium | watch | Release governance / independent approval | Only one write/admin collaborator exists | Keep single-maintainer approval enabled; revisit independent approval after adding a second trusted maintainer |
+| TF-STATUS-092 | High | open | Security / GitHub App credentials | Legacy issue-reporter App private key was embedded in public releases | Inventory App ID `2735888` consumers and the exposed key fingerprint; generate an overlapping replacement, migrate and test legitimate server consumers, revoke the embedded old key, and remove the unused `GH_APP_PRIVATE_KEY` repository secret. Rotate the Releaser App separately unless identity is proven shared |
 
 ## Recommended Execution Order
 
@@ -2392,35 +2404,44 @@ Next action:
 5. Keep TF-STATUS-089 closed by retaining the approved manual tag/draft split,
    protected Environment, strict branch checks, and immutable release-tag
    updates/deletes.
-6. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted for
+6. Resolve TF-STATUS-092 before optional release hardening: identify App ID
+   `2735888` and the exposed key fingerprint, inventory all legitimate
+   consumers, generate an overlapping replacement, migrate and test those
+   consumers, then revoke the old embedded key and remove the unused
+   `GH_APP_PRIVATE_KEY` repository secret. Do not distribute the replacement in
+   TunnelForge clients. After revocation, treat already issued installation
+   tokens as potentially valid until their one-hour lifetime expires. Rotate
+   `RELEASER_APP_PRIVATE_KEY` separately unless its App ID and key fingerprint
+   prove that the credentials are coupled.
+7. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted for
    this release; add signing/notarization only when paid Apple credentials are
    available.
-7. Keep TF-STATUS-091 on watch under the accepted single-maintainer approval
+8. Keep TF-STATUS-091 on watch under the accepted single-maintainer approval
    policy; revisit independent approval after adding another trusted maintainer.
-8. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
+9. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
    owned cleanup/no-clobber, cancellation generation, and streaming bound in
    place. Do not claim external Actions, branch protection, tag/release,
    GitHub closure, or Mac hardware validation.
-9. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
+10. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
    verification before every downloaded-package launch.
-10. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
+11. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
    dangerous operations without classified tunnel metadata.
-11. Keep TF-STATUS-083 closed by retaining strict required checks and the
+12. Keep TF-STATUS-083 closed by retaining strict required checks and the
    terminal gate that aggregates Python, Rust Core, macOS tracking, and both
    macOS architectures.
-12. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
+13. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
    while the feature flag remains disabled.
-13. Keep TF-STATUS-081 closed by retaining the protected `v2.3.1` tag, approved
+14. Keep TF-STATUS-081 closed by retaining the protected `v2.3.1` tag, approved
    release execution evidence, and all expected asset digest metadata.
-14. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
+15. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
    #116 remains external, with both current-HEAD manual workflow evidence and
    the real-Mac report. Do not hard-code exact current-head workflow run IDs or
    SHAs as durable status summary evidence; use #116 comments and the final gate
    for current proof.
-15. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
+16. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
    #171 / commit `a4c7a06`; reopen implementation work only if it reproduces on
    a release that contains the fix.
-16. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
+17. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
    expansion, and Rust Core concurrency redesign until the release-trust work is
    complete and user/benchmark evidence justifies them.
 
@@ -2428,6 +2449,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Opened TF-STATUS-092 after mapping the GitHub App private-key rotation blast radius. App ID `2735888` powered the legacy issue reporter and its key was embedded in the public release path through `v2.3.0`; current `v2.3.1` is outside that path. The repository's `RELEASER_APP_PRIVATE_KEY` remains a separate CI credential unless Developer Settings App ID and key-fingerprint evidence proves otherwise. No key was generated, replaced, deleted, or revoked in this session. | release history, release workflows, GitHub App authentication history, Actions logs/secrets inventory, `docs/current_status.md`, status documentation test | Confirmed 43 affected tags and 42 published releases; direct embedding evidence in the `v2.1.5` build log; no current embedded support or release secret read; exact secret-name inventory across 46 accessible account repositories. Status suite 68 passed and `git diff --check` passed. External consumers and installation scope still require fingerprint-based inventory before rotation. |
 | 2026-07-13 | Published TunnelForge `v2.3.1` through the protected release path and closed TF-STATUS-081. PR #240 merged at `b80e15c6148ba19a357a84b4e9e6cee8ae0b4727`; the approved annotated tag, multi-platform release build, draft asset verification, direct-distribution security notice, and stable/latest publication all completed. | live PR/tag/Actions/Release state; final status docs/tests | Tag run `29233663954` and release run `29233708190` passed. Windows installer/WebSetup and unsigned macOS arm64/x86_64 DMG/ZIP assets passed hosted build/package/smoke checks. The published release contains all 10 expected assets with GitHub SHA-256 digests: `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1`. |
 | 2026-07-13 | Restored the established release behavior for maintainers without paid Apple credentials: build and smoke-test unsigned macOS arm64/x86_64 artifacts only when all Apple values are absent, while failing on every partial signing/notarization configuration. Recorded GitHub Releases direct distribution and no planned Apple App Store registration as durable project policy. The owner accepted unsigned macOS distribution and single-maintainer approval for `2.3.1`; TF-STATUS-090/091 moved from blockers to watch items. | release workflow, Apple credential classifier, workflow/credential/status/macOS documentation tests, `AGENTS.md`, support/status docs | TDD RED/GREEN; focused credential/workflow 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings; Cargo baseline passed; security re-review SECURE; diff check passed. |
 | 2026-07-13 | Closed TF-STATUS-083 and TF-STATUS-089 after replacement PR #240 hosted verification and live GitHub control re-reads. The PR is clean/mergeable; release remains blocked only by separately tracked Apple signing, independent-approval, and real-Mac evidence. | status docs/tests and live GitHub configuration evidence | Runs `29229463468`/`29229463485`: Python, Rust, terminal gate, and all macOS arm64/x86_64 checks passed; main protection, protected Environment, and immutable tag rules confirmed active. |
