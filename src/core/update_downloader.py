@@ -19,6 +19,7 @@ from src.update_integrity import (
     publish_owned_temp_file,
     parse_content_length,
     parse_sha256_digest,
+    validate_child_basename,
 )
 from src.version import GITHUB_OWNER, GITHUB_REPO
 
@@ -55,11 +56,23 @@ def select_release_asset(
     arch = arch_name or platform.machine()
     candidates = []
 
+    try:
+        if system == "Windows":
+            expected_windows_name = (
+                f"{WINDOWS_INSTALLER_FILENAME_PREFIX}{release_version}.exe"
+            )
+            validate_child_basename(expected_windows_name, windows=True)
+        elif system == "Darwin":
+            validate_child_basename(
+                f"{MACOS_PACKAGE_FILENAME_PREFIX}{release_version}.dmg"
+            )
+    except IntegrityError as exc:
+        raise DownloadError(f"release asset filename is unsafe: {exc}") from exc
+
     for asset in assets:
         asset_name = str(asset.get('name', ''))
         if system == "Windows":
-            expected_name = f"{WINDOWS_INSTALLER_FILENAME_PREFIX}{release_version}.exe"
-            if asset_name != expected_name:
+            if asset_name != expected_windows_name:
                 continue
             rank = 0
         elif system == "Darwin":
@@ -86,6 +99,11 @@ def select_release_asset(
             rank = arch_rank if asset_name.endswith('.dmg') else arch_rank + 1
         else:
             continue
+
+        try:
+            validate_child_basename(asset_name, windows=system == "Windows")
+        except IntegrityError as exc:
+            raise DownloadError(f"release asset filename is unsafe: {exc}") from exc
 
         url = asset.get('browser_download_url')
         if not url:

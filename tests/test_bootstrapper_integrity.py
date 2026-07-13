@@ -85,6 +85,28 @@ def test_bootstrapper_missing_digest_fails_before_download(
     ("module", "downloader_class"),
     DOWNLOADER_IMPLEMENTATIONS,
 )
+def test_bootstrapper_rejects_unsafe_release_version_filename(
+    monkeypatch, module, downloader_class
+):
+    unsafe_name = "TunnelForge-Setup-2.3:1.exe"
+    response = MagicMock()
+    response.json.return_value = {
+        "tag_name": "v2.3:1",
+        "assets": [_asset(unsafe_name, "offline", 4)],
+    }
+    monkeypatch.setattr(module.requests, "get", lambda *_args, **_kwargs: response)
+    downloader = downloader_class()
+
+    with pytest.raises(module.DownloadError, match="filename"):
+        downloader.get_latest_release()
+
+    assert downloader.download_url is None
+
+
+@pytest.mark.parametrize(
+    ("module", "downloader_class"),
+    DOWNLOADER_IMPLEMENTATIONS,
+)
 def test_bootstrapper_does_not_select_websetup_as_offline_installer(
     monkeypatch, module, downloader_class
 ):

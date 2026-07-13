@@ -15,10 +15,50 @@ SHA256_DIGEST_RE = re.compile(r"^sha256:([0-9a-fA-F]{64})$")
 # Release installers are expected to remain well below this 2 GiB safety cap.
 MAX_INSTALLER_SIZE = 2 * 1024 * 1024 * 1024
 _REPARSE_POINT_ATTRIBUTE = 0x00000400
+_WINDOWS_INVALID_FILENAME_CHARS = frozenset('<>:"/\\|?*')
+_WINDOWS_RESERVED_DEVICE_STEMS = frozenset(
+    {"CON", "PRN", "AUX", "NUL"}
+    | {f"COM{number}" for number in range(1, 10)}
+    | {f"LPT{number}" for number in range(1, 10)}
+)
 
 
 class IntegrityError(ValueError):
     pass
+
+
+def validate_child_basename(
+    name: str | os.PathLike[str], *, windows: bool = False
+) -> str:
+    """Return one safe direct-child basename or raise ``IntegrityError``."""
+    child_name = os.fspath(name)
+    if (
+        not isinstance(child_name, str)
+        or not child_name
+        or child_name in {".", ".."}
+        or "/" in child_name
+        or "\\" in child_name
+        or any(
+            ord(character) < 32 or 127 <= ord(character) <= 159
+            for character in child_name
+        )
+    ):
+        raise IntegrityError("temporary download child must be an exact basename")
+
+    if windows:
+        device_stem = child_name.split(".", 1)[0].rstrip(" .").upper()
+        if (
+            any(
+                character in _WINDOWS_INVALID_FILENAME_CHARS
+                for character in child_name
+            )
+            or child_name.endswith((".", " "))
+            or device_stem in _WINDOWS_RESERVED_DEVICE_STEMS
+        ):
+            raise IntegrityError(
+                "temporary download child must be a safe Windows basename"
+            )
+    return child_name
 
 
 def parse_sha256_digest(raw: object) -> str:
@@ -507,15 +547,7 @@ class OwnedTempDirectory:
 
     def create_file(self, name: str | os.PathLike[str]):
         """Create and retain one new regular file directly under this directory."""
-        child_name = os.fspath(name)
-        if (
-            not isinstance(child_name, str)
-            or not child_name
-            or child_name in {".", ".."}
-            or os.path.basename(child_name) != child_name
-            or os.path.dirname(child_name)
-        ):
-            raise IntegrityError("temporary download child must be an exact basename")
+        child_name = validate_child_basename(name, windows=os.name == "nt")
 
         if not self.identity_matches():
             raise IntegrityError("temporary parent identity changed")

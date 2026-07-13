@@ -24,6 +24,7 @@ from src.update_integrity import (
     publish_owned_temp_file,
     parse_content_length,
     parse_sha256_digest,
+    validate_child_basename,
 )
 
 # ============================================================
@@ -116,6 +117,10 @@ class InstallerDownloader:
                 raise DownloadError("버전 정보를 찾을 수 없습니다")
 
             expected_name = f"TunnelForge-Setup-{self.latest_version}.exe"
+            try:
+                validate_child_basename(expected_name, windows=True)
+            except IntegrityError as exc:
+                raise DownloadError(f"release asset filename is unsafe: {exc}") from exc
             assets = release_data.get('assets', [])
             for asset in assets:
                 asset_name = asset.get('name', '')

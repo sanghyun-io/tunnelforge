@@ -97,6 +97,17 @@ def test_select_release_asset_requires_exact_release_version():
     assert asset.url == "current"
 
 
+@pytest.mark.parametrize(
+    ("platform_name", "release_version"),
+    [("Windows", "2.0:5"), ("Darwin", "2.0/5")],
+)
+def test_select_release_asset_rejects_unsafe_version_leaf(
+    platform_name, release_version
+):
+    with pytest.raises(DownloadError, match="filename"):
+        select_release_asset([], release_version, platform_name=platform_name)
+
+
 def test_select_release_asset_requires_valid_sha256_digest():
     digest = "0123456789abcdef" * 4
     assets = [
@@ -428,12 +439,87 @@ def test_owned_temp_directory_create_file_preserves_existing_child(tmp_path):
     assert victim.read_bytes() == b"victim"
 
 
-@pytest.mark.parametrize("name", ["", ".", "..", "nested/file.part"])
+@pytest.mark.parametrize(
+    "name",
+    [
+        "",
+        ".",
+        "..",
+        "nested/file.part",
+        "nested\\file.part",
+        "bad\x00.part",
+        "bad\x1f.part",
+    ],
+)
 def test_owned_temp_directory_create_file_requires_exact_basename(tmp_path, name):
     owner = update_integrity.OwnedTempDirectory(tmp_path)
 
     with pytest.raises(update_integrity.IntegrityError, match="basename"):
         owner.create_file(name)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows filename behavior")
+@pytest.mark.parametrize(
+    "name",
+    [
+        "bad:name.part",
+        "bad<name.part",
+        "bad>name.part",
+        'bad"name.part',
+        "bad|name.part",
+        "bad?name.part",
+        "bad*name.part",
+        "trailing.part.",
+        "trailing.part ",
+        "CON",
+        "con.txt",
+        "PRN.part",
+        "AUX.exe",
+        "NUL.part",
+        "COM1.part",
+        "com9.exe",
+        "LPT1.part",
+        "lpt9.exe",
+    ],
+)
+def test_windows_create_file_rejects_invalid_leaf_before_create(
+    monkeypatch, tmp_path, name
+):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+    identity_matches = MagicMock(side_effect=AssertionError("validated too late"))
+    monkeypatch.setattr(owner, "identity_matches", identity_matches)
+    create_file = MagicMock()
+    monkeypatch.setattr(update_integrity, "_CreateFileW", create_file)
+
+    with pytest.raises(update_integrity.IntegrityError, match="basename"):
+        owner.create_file(name)
+
+    identity_matches.assert_not_called()
+    create_file.assert_not_called()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows alternate data streams")
+def test_windows_create_file_rejects_ads_without_touching_victim(tmp_path):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+    victim = tmp_path / "victim"
+    stream = tmp_path / "victim:existing"
+    victim.write_bytes(b"victim-content")
+    stream.write_bytes(b"victim-stream")
+
+    with pytest.raises(update_integrity.IntegrityError, match="basename"):
+        owner.create_file("victim:installer.part")
+
+    assert victim.read_bytes() == b"victim-content"
+    assert stream.read_bytes() == b"victim-stream"
+
+
+def test_owned_temp_directory_create_file_accepts_release_filename(tmp_path):
+    owner = update_integrity.OwnedTempDirectory(tmp_path)
+
+    with owner.create_file("TunnelForge-Setup-2.3.1.exe.part") as destination:
+        destination.write(b"safe")
+
+    assert (tmp_path / "TunnelForge-Setup-2.3.1.exe.part").read_bytes() == b"safe"
 
 
 def test_owned_temp_directory_create_file_rejects_replaced_parent(tmp_path):
