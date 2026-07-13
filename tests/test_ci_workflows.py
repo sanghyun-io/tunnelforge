@@ -31,6 +31,100 @@ def test_version_gate_exposes_required_regression_jobs():
     assert "python-regression" in jobs
 
 
+def test_version_gate_defaults_to_read_only_contents_permission():
+    workflow = load_version_gate()
+
+    assert workflow["permissions"] == {"contents": "read"}
+
+
+def test_pr_head_regression_jobs_use_read_only_checkout_without_credentials():
+    jobs = load_version_gate()["jobs"]
+    pr_head_jobs = {
+        "macos-support-tracking-gate": {
+            "contents": "read",
+            "issues": "read",
+            "checks": "read",
+        },
+        "rust-core-regression-gate": {"contents": "read"},
+        "python-regression": {"contents": "read"},
+        "macos-app-validation": {"contents": "read"},
+    }
+
+    for job_name, expected_permissions in pr_head_jobs.items():
+        job = jobs[job_name]
+        job_text = version_gate_job_text(job_name)
+        checkout = next(
+            step for step in job["steps"]
+            if step.get("uses", "").startswith("actions/checkout@")
+        )
+        assert job["permissions"] == expected_permissions
+        assert checkout["with"] == {
+            "ref": "${{ github.event.pull_request.head.sha }}",
+            "persist-credentials": False,
+        }
+        assert "contents: write" not in job_text
+        assert "pull-requests: write" not in job_text
+        assert "actions/create-github-app-token" not in job_text
+        assert "token:" not in job_text
+
+
+def test_write_capable_jobs_checkout_and_execute_only_trusted_base_code():
+    jobs = load_version_gate()["jobs"]
+
+    version_gate = jobs["version-gate"]
+    assert version_gate["permissions"] == {
+        "contents": "read",
+        "pull-requests": "write",
+    }
+    assert version_gate["if"] == "always()"
+    gate_checkout = next(
+        step for step in version_gate["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    assert gate_checkout["with"] == {
+        "ref": "${{ github.event.pull_request.base.sha }}",
+        "persist-credentials": False,
+    }
+
+    version_bump = jobs["version-bump"]
+    bump_text = version_gate_job_text("version-bump")
+    assert version_bump["permissions"] == {
+        "contents": "write",
+        "pull-requests": "write",
+    }
+    bump_checkout = next(
+        step for step in version_bump["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    )
+    assert bump_checkout["with"] == {
+        "ref": "${{ github.event.pull_request.base.sha }}",
+        "fetch-depth": 0,
+        "persist-credentials": False,
+    }
+    assert "git checkout" not in bump_text
+    assert "git switch" not in bump_text
+    assert "scripts/bump_version.py" in bump_text
+    assert "git read-tree \"$HEAD_SHA\"" in bump_text
+    assert "git push" in bump_text
+
+
+def test_required_version_gate_aggregates_regressions_before_version_logic():
+    job = load_version_gate()["jobs"]["version-gate"]
+    job_text = version_gate_job_text("version-gate")
+    expected_needs = [
+        "macos-support-tracking-gate",
+        "rust-core-regression-gate",
+        "python-regression",
+        "macos-app-validation",
+    ]
+
+    assert job["needs"] == expected_needs
+    assert job["if"] == "always()"
+    for needed_job in expected_needs:
+        assert f"needs.{needed_job}.result" in job_text
+    assert "exit 1" in job_text
+
+
 def test_rust_core_regression_gate_contract_is_preserved():
     job = load_version_gate()["jobs"]["rust-core-regression-gate"]
     job_text = version_gate_job_text("rust-core-regression-gate")
@@ -38,6 +132,7 @@ def test_rust_core_regression_gate_contract_is_preserved():
     assert job["runs-on"] == "ubuntu-24.04"
     assert job["timeout-minutes"] == 5
     assert "./scripts/rust-core-regression-gate.ps1" in job_text
+    assert "cargo test --manifest-path migration_core/Cargo.toml" in job_text
 
 
 def test_python_regression_runs_full_suite_with_built_core():
@@ -56,3 +151,6 @@ def test_python_regression_runs_full_suite_with_built_core():
     assert 'pip install -e ".[dev]"' in job_text
     assert "cargo build --manifest-path migration_core/Cargo.toml --release" in job_text
     assert "pytest -q" in job_text
+    assert "pyinstaller bootstrapper/bootstrapper.spec" in job_text
+    assert "dist\\TunnelForge-WebSetup.exe --self-check" in job_text
+    assert "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK" in job_text

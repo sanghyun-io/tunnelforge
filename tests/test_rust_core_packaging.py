@@ -2001,9 +2001,11 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "--skip-pr-checks" in workflow
     version_gate_text = workflow.split("  version-gate:", 1)[1].split("\n  version-bump:", 1)[0]
     assert "actions/create-github-app-token" not in version_gate_text
-    assert "git fetch --depth=1 origin" in workflow
-    assert "git checkout --detach FETCH_HEAD" in workflow
-    assert "token: ${{ steps.app-token.outputs.token }}" in workflow
+    assert "uses: actions/checkout@v5" in workflow
+    assert "ref: ${{ github.event.pull_request.head.sha }}" in workflow
+    assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
+    assert "persist-credentials: false" in workflow
+    assert "token: ${{ steps.app-token.outputs.token }}" not in workflow
     assert "macos-14" in workflow
     assert "macos-15-intel" in workflow
     assert "MACOS_PACKAGE_ARCH: ${{ matrix.arch }}" in workflow

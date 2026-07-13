@@ -19,6 +19,45 @@ DOWNLOADER_IMPLEMENTATIONS = [
     (modular_downloader, modular_downloader.InstallerDownloader),
     (bundled_bootstrapper, bundled_bootstrapper.InstallerDownloader),
 ]
+SELF_CHECK_MARKER = "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK"
+
+
+def test_bootstrapper_source_self_check_runs_without_gui_or_network():
+    result = subprocess.run(
+        [sys.executable, "bootstrapper/bootstrapper.py", "--self-check"],
+        cwd=Path(__file__).resolve().parents[1],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == SELF_CHECK_MARKER
+
+
+def test_bootstrapper_self_check_validates_shared_integrity_and_cert_contract(
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        bundled_bootstrapper.tk,
+        "Tk",
+        lambda: pytest.fail("self-check constructed Tk"),
+    )
+    monkeypatch.setattr(
+        bundled_bootstrapper.requests,
+        "get",
+        lambda *_args, **_kwargs: pytest.fail("self-check used the network"),
+    )
+
+    assert bundled_bootstrapper.run_self_check() == SELF_CHECK_MARKER
+
+
+def test_bootstrapper_self_check_rejects_missing_required_import_contract(monkeypatch):
+    monkeypatch.setattr(bundled_bootstrapper.requests, "get", None)
+
+    with pytest.raises(RuntimeError, match="required import"):
+        bundled_bootstrapper.run_self_check()
 
 
 def _asset(name, url, size, digest=VALID_DIGEST):

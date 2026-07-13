@@ -10,10 +10,15 @@ import subprocess
 import threading
 import webbrowser
 import tempfile
+from pathlib import Path
 import tkinter as tk
 from tkinter import ttk, messagebox
 from typing import Optional, Callable, Tuple
 
+if __package__ in {None, ""} and not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+import certifi
 import requests
 
 from src.update_integrity import (
@@ -44,6 +49,42 @@ RELEASES_PAGE_URL = f"https://github.com/{GITHUB_OWNER}/{GITHUB_REPO}/releases/l
 
 # 다운로드 대상 파일 패턴
 INSTALLER_FILENAME_PATTERN = "TunnelForge-Setup-latest.exe"
+SELF_CHECK_MARKER = "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK"
+
+
+def run_self_check() -> str:
+    """Validate frozen bootstrapper dependencies without starting UI or I/O."""
+    required_import_api = (
+        tk.Tk,
+        ttk.Frame,
+        messagebox.showerror,
+        requests.get,
+        requests.certs.where,
+        certifi.where,
+    )
+    if not all(callable(symbol) for symbol in required_import_api):
+        raise RuntimeError("required import API contract is incomplete")
+
+    required_symbols = (
+        IntegrityError,
+        OwnedTempDirectory,
+        VerifiedFileLease,
+        publish_owned_temp_file,
+        parse_content_length,
+        parse_sha256_digest,
+        validate_child_basename,
+    )
+    if not all(callable(symbol) for symbol in required_symbols):
+        raise RuntimeError("shared integrity API contract is incomplete")
+    if not isinstance(MAX_INSTALLER_SIZE, int) or MAX_INSTALLER_SIZE <= 0:
+        raise RuntimeError("shared integrity size contract is invalid")
+
+    cert_paths = {Path(certifi.where()), Path(requests.certs.where())}
+    if not cert_paths or any(
+        not path.is_file() or path.stat().st_size <= 0 for path in cert_paths
+    ):
+        raise RuntimeError("embedded CA certificate lookup failed")
+    return SELF_CHECK_MARKER
 
 
 # ============================================================
@@ -622,11 +663,16 @@ class BootstrapperApp:
         self.root.mainloop()
 
 
-def main():
+def main(argv=None):
     """엔트리 포인트"""
+    arguments = sys.argv[1:] if argv is None else argv
+    if "--self-check" in arguments:
+        print(run_self_check())
+        return 0
     app = BootstrapperApp()
     app.run()
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
