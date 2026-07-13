@@ -1238,7 +1238,7 @@ Evidence:
   machine state rather than durable repo, CI, release, or handoff evidence.
 - 2026-06-26 update: the four required JSONL files are archived under
   `reports\rust_core_performance`, with `README.md` documenting refresh and
-validation.
+  validation.
 
 - `scripts\validate-rust-core-performance-evidence.py` validates that all four
   files exist, contain successful Rust Core `result` events, prove the required

@@ -399,6 +399,41 @@ def test_bootstrapper_abandonment_keeps_successfully_dispatched_installer(tmp_pa
     assert app.downloaded_file is None
 
 
+def test_bootstrapper_declined_cancel_preserves_race_completed_installer(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app.downloader = MagicMock()
+    app.root = MagicMock()
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+
+    def worker_sets_completed_path_before_callback():
+        app.downloaded_file = str(installer)
+
+    worker_sets_completed_path_before_callback()
+
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=False),
+    )
+
+    app._on_cancel()
+
+    assert app.downloaded_file == str(installer)
+    assert app._installer_dispatched is False
+    app.downloader.cancel.assert_not_called()
+    app.downloader.discard_downloaded_installer.assert_not_called()
+    app.root.destroy.assert_not_called()
+
+
 def test_bootstrapper_non_windows_never_launches_windows_installer(monkeypatch, tmp_path):
     installer = tmp_path / OFFLINE_NAME
     installer.write_bytes(b"verified")

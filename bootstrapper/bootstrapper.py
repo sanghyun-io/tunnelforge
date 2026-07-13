@@ -627,8 +627,8 @@ class BootstrapperApp:
 
     def _on_cancel(self):
         """취소 버튼 클릭"""
-        self._discard_undispatched_installer()
         if self.cancel_button.cget('text') == '닫기':
+            self._discard_undispatched_installer()
             self.root.destroy()
             return
 
@@ -637,6 +637,7 @@ class BootstrapperApp:
             "설치를 취소하시겠습니까?"
         ):
             self.downloader.cancel()
+            self._discard_undispatched_installer()
             self.root.destroy()
 
     def _on_close(self):
