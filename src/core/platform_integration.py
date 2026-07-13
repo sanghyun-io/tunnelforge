@@ -73,7 +73,7 @@ def restore_window_to_front(window_id: int, platform_name: Optional[str] = None)
 
 def update_package_launch_strategy(platform_name: Optional[str] = None) -> str:
     """Return how an update package should be launched for the platform."""
-    return "open" if is_macos(platform_name) else "execute"
+    return "execute" if is_windows(platform_name) else "open"
 
 
 def show_crash_recovery_message(error_message: str, app_dir: str) -> None:

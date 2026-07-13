@@ -551,11 +551,12 @@ class BootstrapperApp:
                     self.downloaded_file = file_path
                     self._installer_dispatched = False
                     discard_late_result = False
-                    self.root.after(0, self._on_download_complete)
 
             if discard_late_result:
                 self._discard_installer_path(file_path)
                 return
+
+            self.root.after(0, self._on_download_complete)
 
         except DownloadError as e:
             self._show_error(str(e))

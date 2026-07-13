@@ -503,7 +503,13 @@ def test_bootstrapper_confirmed_cancel_retires_already_queued_completion(
     app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
     app.downloader.download_installer.return_value = str(installer)
     app.root = MagicMock()
-    app.root.after.side_effect = lambda _delay, callback: callbacks.append(callback)
+
+    def queue_without_holding_state_lock(_delay, callback):
+        assert app._download_state_lock.acquire(blocking=False)
+        app._download_state_lock.release()
+        callbacks.append(callback)
+
+    app.root.after.side_effect = queue_without_holding_state_lock
     app.cancel_button = MagicMock()
     app.cancel_button.cget.return_value = "취소"
     app.progress_bar = MagicMock()
