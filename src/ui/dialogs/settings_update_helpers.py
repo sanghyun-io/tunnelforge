@@ -21,11 +21,11 @@ def update_package_action_text(strategy: Optional[str] = None) -> UpdatePackageA
     launch_strategy = strategy or update_package_launch_strategy()
     if launch_strategy == "open":
         return UpdatePackageActionText(
-            button="📂 패키지 열기",
-            done_message="✅ 다운로드 완료! '패키지 열기' 버튼을 클릭하세요.",
-            confirm_title="패키지 열기 확인",
-            confirm_question="다운로드한 TunnelForge 패키지를 여시겠습니까?",
-            confirm_body="다운로드한 패키지를 열면 현재 앱이 종료됩니다.",
+            button="📂 저장 위치 보기",
+            done_message="✅ 다운로드 완료! '저장 위치 보기' 버튼을 클릭하세요.",
+            confirm_title="저장 위치 확인",
+            confirm_question="다운로드한 TunnelForge 패키지의 저장 위치를 여시겠습니까?",
+            confirm_body="파일 관리자에서 저장 폴더만 표시하며 현재 앱은 종료되지 않습니다.",
         )
 
     return UpdatePackageActionText(
