@@ -39,24 +39,24 @@ def test_version_gate_defaults_to_read_only_contents_permission():
 
 def test_pr_head_regression_jobs_use_read_only_checkout_without_credentials():
     jobs = load_version_gate()["jobs"]
-    pr_head_jobs = {
-        "macos-support-tracking-gate": {
-            "contents": "read",
-            "issues": "read",
-            "checks": "read",
-        },
+    expected_pr_head_jobs = {
         "rust-core-regression-gate": {"contents": "read"},
         "python-regression": {"contents": "read"},
         "macos-app-validation": {"contents": "read"},
     }
+    pr_head_jobs = {}
 
-    for job_name, expected_permissions in pr_head_jobs.items():
-        job = jobs[job_name]
+    for job_name, job in jobs.items():
+        for step in job.get("steps", []):
+            if not step.get("uses", "").startswith("actions/checkout@"):
+                continue
+            if step.get("with", {}).get("ref") == "${{ github.event.pull_request.head.sha }}":
+                pr_head_jobs[job_name] = (job, step)
+
+    assert set(pr_head_jobs) == set(expected_pr_head_jobs)
+    for job_name, (job, checkout) in pr_head_jobs.items():
+        expected_permissions = expected_pr_head_jobs[job_name]
         job_text = version_gate_job_text(job_name)
-        checkout = next(
-            step for step in job["steps"]
-            if step.get("uses", "").startswith("actions/checkout@")
-        )
         assert job["permissions"] == expected_permissions
         assert checkout["with"] == {
             "ref": "${{ github.event.pull_request.head.sha }}",
@@ -66,22 +66,59 @@ def test_pr_head_regression_jobs_use_read_only_checkout_without_credentials():
         assert "pull-requests: write" not in job_text
         assert "actions/create-github-app-token" not in job_text
         assert "token:" not in job_text
+        assert "GH_TOKEN" not in job_text
+        assert "secrets." not in job_text
+        assert "github.token" not in job_text
+        for step in job["steps"]:
+            assert not any("TOKEN" in key.upper() for key in step.get("env", {}))
+            assert "token" not in step.get("with", {})
+
+
+def test_macos_support_gate_executes_only_trusted_base_code_with_read_token():
+    job = load_version_gate()["jobs"]["macos-support-tracking-gate"]
+    job_text = version_gate_job_text("macos-support-tracking-gate")
+    checkouts = [
+        step for step in job["steps"]
+        if step.get("uses", "").startswith("actions/checkout@")
+    ]
+
+    assert len(checkouts) == 1
+    checkout = checkouts[0]
+    assert job["permissions"] == {
+        "contents": "read",
+        "issues": "read",
+        "checks": "read",
+    }
+    assert checkout["with"] == {
+        "ref": "${{ github.event.pull_request.base.sha }}",
+        "persist-credentials": False,
+    }
+    assert "${{ github.event.pull_request.head.sha }}" not in job_text
+    assert "git checkout" not in job_text
+    assert "git switch" not in job_text
+    assert "python scripts/check-macos-support-gate.py" in job_text
+    assert "GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}" in job_text
 
 
 def test_write_capable_jobs_checkout_and_execute_only_trusted_base_code():
     jobs = load_version_gate()["jobs"]
+    write_jobs = {
+        job_name for job_name, job in jobs.items()
+        if "write" in job.get("permissions", {}).values()
+    }
 
-    version_gate = jobs["version-gate"]
-    assert version_gate["permissions"] == {
+    assert write_jobs == {"version-validation", "version-bump"}
+
+    version_validation = jobs["version-validation"]
+    assert version_validation["permissions"] == {
         "contents": "read",
         "pull-requests": "write",
     }
-    assert version_gate["if"] == "always()"
-    gate_checkout = next(
-        step for step in version_gate["steps"]
+    validation_checkout = next(
+        step for step in version_validation["steps"]
         if step.get("uses", "").startswith("actions/checkout@")
     )
-    assert gate_checkout["with"] == {
+    assert validation_checkout["with"] == {
         "ref": "${{ github.event.pull_request.base.sha }}",
         "persist-credentials": False,
     }
@@ -101,14 +138,20 @@ def test_write_capable_jobs_checkout_and_execute_only_trusted_base_code():
         "fetch-depth": 0,
         "persist-credentials": False,
     }
+    assert version_bump["needs"] == "version-validation"
     assert "git checkout" not in bump_text
     assert "git switch" not in bump_text
+    assert "git reset" not in bump_text
+    assert "git restore" not in bump_text
+    assert "git read-tree -u" not in bump_text
     assert "scripts/bump_version.py" in bump_text
     assert "git read-tree \"$HEAD_SHA\"" in bump_text
     assert "git push" in bump_text
+    assert "needs.version-validation.outputs.bump_type" in bump_text
 
 
-def test_required_version_gate_aggregates_regressions_before_version_logic():
+def test_required_version_gate_is_terminal_and_aggregates_all_results():
+    jobs = load_version_gate()["jobs"]
     job = load_version_gate()["jobs"]["version-gate"]
     job_text = version_gate_job_text("version-gate")
     expected_needs = [
@@ -116,13 +159,30 @@ def test_required_version_gate_aggregates_regressions_before_version_logic():
         "rust-core-regression-gate",
         "python-regression",
         "macos-app-validation",
+        "version-validation",
+        "version-bump",
     ]
 
     assert job["needs"] == expected_needs
     assert job["if"] == "always()"
+    assert job["permissions"] == {}
+    assert not any(
+        step.get("uses", "").startswith("actions/checkout@")
+        for step in job["steps"]
+    )
     for needed_job in expected_needs:
         assert f"needs.{needed_job}.result" in job_text
+    assert "needs.version-validation.outputs.bump_type" in job_text
+    assert 'if [ -z "$BUMP_TYPE" ]; then' in job_text
+    assert 'if [ "$VERSION_BUMP_RESULT" != "skipped" ]; then' in job_text
+    assert 'if [ "$VERSION_BUMP_RESULT" != "success" ]; then' in job_text
     assert "exit 1" in job_text
+    for job_name, candidate in jobs.items():
+        if job_name == "version-gate":
+            continue
+        needs = candidate.get("needs", [])
+        needs = [needs] if isinstance(needs, str) else needs
+        assert "version-gate" not in needs
 
 
 def test_rust_core_regression_gate_contract_is_preserved():

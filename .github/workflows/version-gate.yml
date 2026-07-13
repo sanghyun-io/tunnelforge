@@ -26,10 +26,10 @@ jobs:
       checks: read
 
     steps:
-      - name: Checkout PR
+      - name: Checkout trusted base
         uses: actions/checkout@v5
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ github.event.pull_request.base.sha }}
           persist-credentials: false
 
       - name: Check macOS support GitHub tracking gate
@@ -331,15 +331,9 @@ jobs:
             dist/TunnelForge-macOS-${{ steps.version.outputs.version }}-${{ matrix.arch }}.zip.sha256
           if-no-files-found: error
 
-  version-gate:
+  version-validation:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    needs:
-      - macos-support-tracking-gate
-      - rust-core-regression-gate
-      - python-regression
-      - macos-app-validation
-    if: always()
     permissions:
       contents: read
       pull-requests: write
@@ -348,24 +342,6 @@ jobs:
       needs_rebump: ${{ steps.check.outputs.needs_rebump }}
 
     steps:
-      - name: Require successful regression jobs
-        env:
-          MACOS_TRACKING_RESULT: ${{ needs.macos-support-tracking-gate.result }}
-          RUST_RESULT: ${{ needs.rust-core-regression-gate.result }}
-          PYTHON_RESULT: ${{ needs.python-regression.result }}
-          MACOS_APP_RESULT: ${{ needs.macos-app-validation.result }}
-        run: |
-          for result in \
-            "$MACOS_TRACKING_RESULT" \
-            "$RUST_RESULT" \
-            "$PYTHON_RESULT" \
-            "$MACOS_APP_RESULT"; do
-            if [ "$result" != "success" ]; then
-              echo "ERROR: required regression job result is '$result'"
-              exit 1
-            fi
-          done
-
       - name: Checkout trusted base
         uses: actions/checkout@v5
         with:
@@ -454,8 +430,8 @@ jobs:
 
   version-bump:
     runs-on: ubuntu-24.04
-    needs: version-gate
-    if: needs.version-gate.outputs.bump_type != ''
+    needs: version-validation
+    if: needs.version-validation.result == 'success' && needs.version-validation.outputs.bump_type != ''
     timeout-minutes: 10
     permissions:
       contents: write
@@ -477,8 +453,8 @@ jobs:
       - name: Prepare trusted version bump from PR data
         id: bump
         env:
-          BUMP_TYPE: ${{ needs.version-gate.outputs.bump_type }}
-          NEEDS_REBUMP: ${{ needs.version-gate.outputs.needs_rebump }}
+          BUMP_TYPE: ${{ needs.version-validation.outputs.bump_type }}
+          NEEDS_REBUMP: ${{ needs.version-validation.outputs.needs_rebump }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
@@ -546,9 +522,59 @@ jobs:
           done
           tree=$(git write-tree)
           commit=$(printf '%s\n' \
-            "chore: bump version to v${NEW_VERSION} [${{ needs.version-gate.outputs.bump_type }}]" \
+            "chore: bump version to v${NEW_VERSION} [${{ needs.version-validation.outputs.bump_type }}]" \
             | git commit-tree "$tree" -p "$HEAD_SHA")
           git push \
             "https://x-access-token:${APP_TOKEN}@github.com/${{ github.repository }}.git" \
             "$commit:refs/heads/$HEAD_REF"
           echo "version bump completed: v${NEW_VERSION}"
+
+  version-gate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    needs:
+      - macos-support-tracking-gate
+      - rust-core-regression-gate
+      - python-regression
+      - macos-app-validation
+      - version-validation
+      - version-bump
+    if: always()
+    permissions: {}
+
+    steps:
+      - name: Require successful terminal gate state
+        env:
+          MACOS_TRACKING_RESULT: ${{ needs.macos-support-tracking-gate.result }}
+          RUST_RESULT: ${{ needs.rust-core-regression-gate.result }}
+          PYTHON_RESULT: ${{ needs.python-regression.result }}
+          MACOS_APP_RESULT: ${{ needs.macos-app-validation.result }}
+          VERSION_VALIDATION_RESULT: ${{ needs.version-validation.result }}
+          VERSION_BUMP_RESULT: ${{ needs.version-bump.result }}
+          BUMP_TYPE: ${{ needs.version-validation.outputs.bump_type }}
+        run: |
+          set -euo pipefail
+
+          for result in \
+            "$MACOS_TRACKING_RESULT" \
+            "$RUST_RESULT" \
+            "$PYTHON_RESULT" \
+            "$MACOS_APP_RESULT" \
+            "$VERSION_VALIDATION_RESULT"; do
+            if [ "$result" != "success" ]; then
+              echo "ERROR: required job result is '$result'"
+              exit 1
+            fi
+          done
+
+          if [ -z "$BUMP_TYPE" ]; then
+            if [ "$VERSION_BUMP_RESULT" != "skipped" ]; then
+              echo "ERROR: version-bump must be skipped when no bump is required"
+              exit 1
+            fi
+          else
+            if [ "$VERSION_BUMP_RESULT" != "success" ]; then
+              echo "ERROR: version-bump result is '$VERSION_BUMP_RESULT'"
+              exit 1
+            fi
+          fi

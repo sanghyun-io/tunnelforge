@@ -4,6 +4,9 @@ Status: DONE
 
 Commit subject: `ci: PR 보안 게이트와 WebSetup self-check 강화`
 
+Critical/Important follow-up subject:
+`ci: F1 보안 게이트 terminal DAG 수정`
+
 Base: `e0e9c7a8f79932f1cb0bf47c0341c50b73651d41`
 
 ## Scope
@@ -15,9 +18,14 @@ Base: `e0e9c7a8f79932f1cb0bf47c0341c50b73651d41`
   base SHA; `version-bump` reads the PR head with `git show`/an alternate index,
   runs only the base-owned bump script, creates a commit tree without checking
   out PR code, and mints the App token only immediately before push.
-- Preserved required context `version-gate`, added `needs` for macOS tracking,
-  Rust regression, Python regression, and macOS app validation, and made its
-  `if: always()` precondition fail unless every dependency result is `success`.
+- Renamed pre-bump label logic to `version-validation`; `version-bump` now
+  depends on that internal job.
+- Made required context `version-gate` terminal. It uses `if: always()`, waits
+  for all regression jobs, validation, and `version-bump`, and accepts a skipped
+  bump only when validation explicitly reports an empty bump type.
+- Changed the macOS support tracking job to checkout and execute only the
+  trusted PR base. PR-head regression jobs retain no credentials and expose no
+  token, secret, or `GH_TOKEN` environment.
 - Added `cargo test --manifest-path migration_core/Cargo.toml` after the static
   Rust Core regression script.
 - Kept the Windows Rust build and full `pytest -q`, then added PyInstaller
@@ -40,6 +48,12 @@ Base: `e0e9c7a8f79932f1cb0bf47c0341c50b73651d41`
 - Final focused GREEN:
   `pytest -q tests/test_ci_workflows.py tests/test_bootstrapper_integrity.py tests/test_rust_core_packaging.py`
   reported `124 passed in 45.47s`.
+- Critical/Important follow-up RED: `3 failed, 5 passed`; failures reproduced
+  PR-head macOS gate execution, missing `version-validation`, and a non-terminal
+  required context.
+- Critical/Important follow-up GREEN:
+  `pytest -q tests/test_ci_workflows.py tests/test_rust_core_packaging.py`
+  reported `59 passed in 47.88s`.
 
 ## Verification Evidence
 
@@ -51,6 +65,9 @@ Base: `e0e9c7a8f79932f1cb0bf47c0341c50b73651d41`
   `TUNNELFORGE_WEBSETUP_SELF_CHECK_OK` captured from PowerShell.
 - Focused Python compile check for the changed Python/test files: exit 0.
 - `git diff --check`: pass.
+- Follow-up workflow tests dynamically enumerate every PR-head checkout and
+  reject token/secret exposure; terminal DAG and bump skip/success disposition
+  are asserted explicitly.
 - Full suite was not run, per assignment.
 
 ## Result

@@ -1995,7 +1995,15 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "issues: read" in workflow
     assert "checks: read" in workflow
     assert jobs["macos-app-validation"]["strategy"]["fail-fast"] is False
-    assert jobs["version-bump"]["needs"] == "version-gate"
+    assert jobs["version-bump"]["needs"] == "version-validation"
+    assert jobs["version-gate"]["needs"] == [
+        "macos-support-tracking-gate",
+        "rust-core-regression-gate",
+        "python-regression",
+        "macos-app-validation",
+        "version-validation",
+        "version-bump",
+    ]
     assert "Check macOS support GitHub tracking gate" in workflow
     assert "python scripts/check-macos-support-gate.py" in workflow
     assert "--skip-pr-checks" in workflow
