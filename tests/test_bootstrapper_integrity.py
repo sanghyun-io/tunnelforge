@@ -486,6 +486,51 @@ def test_bootstrapper_confirmed_cancel_discards_late_download_result(
     )
 
 
+def test_bootstrapper_confirmed_cancel_retires_already_queued_completion(
+    monkeypatch, tmp_path
+):
+    installer = tmp_path / OFFLINE_NAME
+    installer.write_bytes(b"expected")
+    callbacks = []
+    app = bundled_bootstrapper.BootstrapperApp.__new__(
+        bundled_bootstrapper.BootstrapperApp
+    )
+    app.downloaded_file = None
+    app._installer_dispatched = False
+    app._download_state_lock = threading.Lock()
+    app._download_abandoned = False
+    app.downloader = MagicMock()
+    app.downloader.get_latest_release.return_value = ("2.3.1", "url", 8)
+    app.downloader.download_installer.return_value = str(installer)
+    app.root = MagicMock()
+    app.root.after.side_effect = lambda _delay, callback: callbacks.append(callback)
+    app.cancel_button = MagicMock()
+    app.cancel_button.cget.return_value = "취소"
+    app.progress_bar = MagicMock()
+    app.status_label = MagicMock()
+    app.detail_label = MagicMock()
+    app._update_status = MagicMock()
+    app._update_detail = MagicMock()
+    app._update_progress = MagicMock()
+    app._show_error = MagicMock()
+    monkeypatch.setattr(
+        bundled_bootstrapper.messagebox,
+        "askyesno",
+        MagicMock(return_value=True),
+    )
+
+    app._download_worker()
+    assert callbacks == [app._on_download_complete]
+
+    app._on_cancel()
+    callbacks[0]()
+
+    app.downloader.discard_downloaded_installer.assert_called_once_with(str(installer))
+    app.progress_bar.config.assert_not_called()
+    app.status_label.config.assert_not_called()
+    assert callbacks == [app._on_download_complete]
+
+
 def test_bootstrapper_non_windows_never_launches_windows_installer(monkeypatch, tmp_path):
     installer = tmp_path / OFFLINE_NAME
     installer.write_bytes(b"verified")

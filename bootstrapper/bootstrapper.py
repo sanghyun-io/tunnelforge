@@ -551,13 +551,11 @@ class BootstrapperApp:
                     self.downloaded_file = file_path
                     self._installer_dispatched = False
                     discard_late_result = False
+                    self.root.after(0, self._on_download_complete)
 
             if discard_late_result:
                 self._discard_installer_path(file_path)
                 return
-
-            # 3. 다운로드 완료
-            self.root.after(0, self._on_download_complete)
 
         except DownloadError as e:
             self._show_error(str(e))
@@ -566,6 +564,10 @@ class BootstrapperApp:
 
     def _on_download_complete(self):
         """다운로드 완료 처리"""
+        with self._get_download_state_lock():
+            if self._download_abandoned:
+                return
+
         self.progress_bar.config(value=100)
         self.status_label.config(text="다운로드 완료! 설치 프로그램 실행 중...")
         self.detail_label.config(text="")
