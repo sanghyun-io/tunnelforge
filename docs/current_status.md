@@ -66,8 +66,9 @@ states that scheduled backups and queries remain disabled. TF-STATUS-079,
 TF-STATUS-080, and TF-STATUS-082 are closed by this release-candidate
 verification. TF-STATUS-083 is closed after live required-check promotion and
 successful PR #240 Python/Rust/macOS runs. TF-STATUS-081 remains
-`fixed_pending_full_verify` because RC merge/tag is still external;
-TF-STATUS-008 and TF-STATUS-078 remain open.
+closed after the protected merge/tag/build/publication sequence. `v2.3.1` is
+published as the latest stable GitHub Release with all 10 expected assets and
+GitHub SHA-256 digest metadata. TF-STATUS-008 and TF-STATUS-078 remain open.
 TF-STATUS-079 remains closed with strengthened final-review evidence. Fresh
 2026-07-13 verification on RC code baseline
 `e37f57adfd5053b6a5c8343d9ff7c36f8f4425bd` passed the focused
@@ -615,6 +616,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-13 | `v2.3.1` protected release publication / TF-STATUS-081 closure | PR #240 checks and merge; tag workflow `29233663954`; Build and Release workflow `29233708190`; annotated tag API read; `gh release view v2.3.1`; release asset/digest assertion | PASS | PR #240 merged at `b80e15c6148ba19a357a84b4e9e6cee8ae0b4727`. The approved tag workflow created immutable annotated `v2.3.1` at that commit. Release preflight, Windows build, unsigned macOS arm64/x86_64 build/package/smoke, artifact normalization, and draft creation passed. The published latest stable release has 10 release assets, all GitHub SHA-256 digests present, at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1`. |
 | 2026-07-13 | Accepted unsigned macOS release policy | credential matrix and workflow focused tests; standalone full Python suite; Cargo baseline; security re-review; `git diff --check` | PASS | RED produced the expected workflow contract failure and missing credential-classifier import. GREEN: credential/workflow focused 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings in 60.14s; Cargo 216 + 2 JSONL + 9 live + 2 stress passed / 1 ignored. All Apple values absent selects unsigned; any partial configuration fails closed; complete required credentials select signed. Security re-review: SECURE. |
 | 2026-07-13 | TF-STATUS-083/089 live closure | PR #240 checks; runs `29229463468` and `29229463485`; live main protection, `production-release` Environment, and ruleset API reads | PASS | Python regression, Rust Core regression, terminal `version-gate`, macOS tracking, and both macOS arm64/x86_64 validation surfaces passed. PR #240 is `CLEAN`/mergeable. Main protection is strict, admin-enforced, conversation-gated, and requires five stable checks; release Environment approval/admin-bypass/ref restrictions and immutable `v*` update/delete rules are active. |
 | 2026-07-13 | PR #240 hosted regression failure remediation | PR runs `29228401540`, `29228401548`, and `29228414876` failure logs; i18n leak reproduction; focused app/cross-engine/i18n and packaging tests; standalone full Python suite; PyInstaller build; frozen `--ui-smoke-check`; `git diff --check` | LOCAL PASS, replacement hosted run pending | Hosted logs showed English Qt state leaking from UI smoke into later tests and `ModuleNotFoundError: No module named 'src.ui'` in both macOS architectures. RED reproduced the translated dialog and missing spec collection. GREEN: focused 79 + 14 passed, full Python 2028 passed, 1 skipped, 4 warnings in 59.79s, PyInstaller build passed, and frozen smoke returned `success=true` with bundled Rust Core service hello. |
@@ -2365,7 +2367,7 @@ Next action:
 | TF-STATUS-078 | Low | open | GitHub issue hygiene / Rust Core import | GitHub #170 remains open after merged ERROR 3780 fix | Confirm the PR #171 fix with the reporter and close #170 unless it reproduces on a containing release |
 | TF-STATUS-079 | High | closed | Security / update integrity | Downloaded update package integrity verification | Keep GitHub Release asset `digest` verification fail-closed before every downloaded-package launch |
 | TF-STATUS-080 | Medium | closed | Security / ProductionGuard | Unknown-environment dangerous-operation confirmation | Keep unknown-environment confirmation default-No for missing, unrecognized, and direct Import contexts |
-| TF-STATUS-081 | High | in_progress | Release readiness / versioning | `2.3.1` release candidate version alignment | Merge PR #240, create the protected `v2.3.1` tag, run the approved draft release workflow, and verify published assets |
+| TF-STATUS-081 | High | closed | Release readiness / versioning | `2.3.1` release candidate version alignment | Keep `v2.3.1` immutable and retain the approved tag/build/publication evidence and asset digests |
 | TF-STATUS-082 | Medium | closed | Product documentation / feature flags | Bilingual Schedule correction for disabled features | Keep both language surfaces explicit that Schedule remains disabled until intentional reactivation and verification |
 | TF-STATUS-083 | Medium | closed | CI / branch protection | Full Python regression workflow | Keep the terminal version gate plus Rust Core, macOS tracking, and both macOS architecture checks required and strict on current main |
 | TF-STATUS-084 | High | closed | Update final review / launch boundary | verification-to-launch lease, owned cleanup/no-clobber, cancellation generation, streaming bound | Retain the reviewed bounds, Fix E secure child creation/name validation, and bootstrapper cancel-before-entry evidence; local closure does not claim external Actions, branch protection, tag/release, GitHub closure, or Mac hardware evidence |
@@ -2408,8 +2410,8 @@ Next action:
    macOS architectures.
 12. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
    while the feature flag remains disabled.
-13. Complete TF-STATUS-081 through PR #240 merge, protected `v2.3.1` tagging,
-   approved release execution, and final asset verification.
+13. Keep TF-STATUS-081 closed by retaining the protected `v2.3.1` tag, approved
+   release execution evidence, and all expected asset digest metadata.
 14. Complete TF-STATUS-008 / GitHub #116 on the frozen release candidate because
    #116 remains external, with both current-HEAD manual workflow evidence and
    the real-Mac report. Do not hard-code exact current-head workflow run IDs or
@@ -2426,6 +2428,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-13 | Published TunnelForge `v2.3.1` through the protected release path and closed TF-STATUS-081. PR #240 merged at `b80e15c6148ba19a357a84b4e9e6cee8ae0b4727`; the approved annotated tag, multi-platform release build, draft asset verification, direct-distribution security notice, and stable/latest publication all completed. | live PR/tag/Actions/Release state; final status docs/tests | Tag run `29233663954` and release run `29233708190` passed. Windows installer/WebSetup and unsigned macOS arm64/x86_64 DMG/ZIP assets passed hosted build/package/smoke checks. The published release contains all 10 expected assets with GitHub SHA-256 digests: `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1`. |
 | 2026-07-13 | Restored the established release behavior for maintainers without paid Apple credentials: build and smoke-test unsigned macOS arm64/x86_64 artifacts only when all Apple values are absent, while failing on every partial signing/notarization configuration. Recorded GitHub Releases direct distribution and no planned Apple App Store registration as durable project policy. The owner accepted unsigned macOS distribution and single-maintainer approval for `2.3.1`; TF-STATUS-090/091 moved from blockers to watch items. | release workflow, Apple credential classifier, workflow/credential/status/macOS documentation tests, `AGENTS.md`, support/status docs | TDD RED/GREEN; focused credential/workflow 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings; Cargo baseline passed; security re-review SECURE; diff check passed. |
 | 2026-07-13 | Closed TF-STATUS-083 and TF-STATUS-089 after replacement PR #240 hosted verification and live GitHub control re-reads. The PR is clean/mergeable; release remains blocked only by separately tracked Apple signing, independent-approval, and real-Mac evidence. | status docs/tests and live GitHub configuration evidence | Runs `29229463468`/`29229463485`: Python, Rust, terminal gate, and all macOS arm64/x86_64 checks passed; main protection, protected Environment, and immutable tag rules confirmed active. |
 | 2026-07-13 | Remediated PR #240 hosted regressions at code baseline `7d49601`: isolated process-wide language state between tests and explicitly bundled lazy-loaded `src.ui` modules. | `tests/conftest.py`, `tunnel-manager.spec`, packaging regression test, status docs/tests | RED hosted Python/macOS runs and local reproductions; GREEN focused 79 + 14, full Python 2028 / 1 skipped / 4 warnings, PyInstaller build and frozen UI smoke success; replacement hosted run pending. |
