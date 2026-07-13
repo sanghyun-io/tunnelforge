@@ -210,6 +210,7 @@ def load_macos_support_gate_module():
 def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
     spec = (PROJECT_ROOT / "tunnel-manager.spec").read_text(encoding="utf-8")
 
+    assert "collect_submodules('src.ui')" in spec
     assert "core_suffix = '.exe' if os.name == 'nt' else ''" in spec
     assert "tunnelforge-core{core_suffix}" in spec
     assert "binaries=binaries" in spec
