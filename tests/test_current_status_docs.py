@@ -1208,6 +1208,8 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "local Tasks 1-11 approved" in verification
     assert "full Python 2695 passed / 1 skipped" in verification
     assert "final Worker 314 passed" in verification
+    assert "GitHub Push Protection" in verification
+    assert "feat/anonymous-error-reporting-relay" in verification
     assert "2026-07-14-anonymous-error-reporting.md" in order
     assert "Continue owner-mediated credential containment from Task 12" in order
     assert "Implementation has not yet changed runtime code" in sessions
@@ -1219,3 +1221,4 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "Completed and independently approved TF-STATUS-092 Task 10" in sessions
     assert "Completed and independently approved TF-STATUS-092 Task 11" in sessions
     assert "Completed the final local Tasks 1-11 review" in sessions
+    assert "Published the reviewed local Tasks 1-11 branch" in sessions
