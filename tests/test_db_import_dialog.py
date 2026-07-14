@@ -1,8 +1,10 @@
 import json
+import logging
 import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
 from PyQt6.QtWidgets import QApplication, QLabel, QMessageBox
 
 from src.exporters.rust_dump_exporter import OrphanRecordInfo, RustDumpConfig
@@ -486,11 +488,455 @@ def test_sanitized_rust_event_redacts_password_and_credentials_recursively():
     flattened = json.dumps(sanitized)
     assert "s3cr3t" not in flattened
 
-def test_sanitize_plain_rust_line_masks_password_assignment():
+@pytest.mark.parametrize(
+    ("line", "secret"),
+    [
+        ("table orders failed password=s3cr3t", "s3cr3t"),
+        ("table orders failed token=short-token", "short-token"),
+        (
+            "postgresql://alice:uri-secret@db.internal/customer failed",
+            "uri-secret",
+        ),
+        (
+            "-----BEGIN PRIVATE KEY-----\nprivate-material\n"
+            "-----END PRIVATE KEY----- table orders failed",
+            "private-material",
+        ),
+    ],
+)
+def test_sanitize_plain_rust_line_masks_local_diagnostic_secrets(line, secret):
     from src.ui.dialogs.db_dialogs import _sanitize_plain_rust_line
 
-    sanitized = _sanitize_plain_rust_line("connecting with password=s3cr3t to host")
-    assert "s3cr3t" not in sanitized
+    sanitized = _sanitize_plain_rust_line(line)
+
+    assert secret not in sanitized
+    assert "REDACTED" in sanitized
+
+
+def test_sanitize_plain_rust_line_preserves_diagnostics_but_escapes_log_controls():
+    sanitized = _sanitize_plain_rust_line(
+        "normal diagnostic\n[FORGED] second entry\x1b[31m\u202ereversed"
+    )
+
+    assert sanitized == r"normal diagnostic\n[FORGED] second entry\x1b[31m\u202ereversed"
+
+
+def test_import_raw_output_falls_back_when_recursive_sanitization_fails(monkeypatch):
+    from src.core.error_report_sanitizer import sanitize_local_diagnostic
+
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+    raw_line = (
+        '{"event":"error","message":"table orders failed '
+        'password=fallback-secret\\n[FORGED]"}'
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog._sanitized_rust_event",
+        lambda _event: (_ for _ in ()).throw(RecursionError()),
+    )
+
+    RustDumpImportDialog.on_raw_output(dialog, raw_line)
+
+    expected = sanitize_local_diagnostic(raw_line)
+    assert dialog.txt_log.items == [expected]
+    assert dialog.log_entries == [expected]
+    assert "fallback-secret" not in "\n".join(dialog.log_entries)
+
+
+def test_import_unknown_json_event_is_structurally_sanitized_for_display_and_log():
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+    raw_line = json.dumps({
+        "password": "hunter2",
+        "nested": {
+            r"AW\x53_SECRET_ACCESS_KEY": "escaped-aws-secret",
+            "request_id": "Q7mP2vK9xR4tN8cL5sW1yB6dF3hJ0aZq",
+        },
+    })
+
+    RustDumpImportDialog.on_raw_output(dialog, raw_line)
+
+    rendered = "\n".join(dialog.txt_log.items + dialog.log_entries)
+    assert dialog.txt_log.items
+    assert "hunter2" not in rendered
+    assert "escaped-aws-secret" not in rendered
+    assert "Q7mP2vK9xR4tN8cL5sW1yB6dF3hJ0aZq" in rendered
+    assert "REDACTED" in rendered
+
+
+@pytest.mark.parametrize(
+    ("value", "expected", "forbidden"),
+    [
+        (
+            [
+                "table customer_orders failed",
+                {
+                    "AWS_SESSION_TOKEN": (
+                        "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCD"
+                    )
+                },
+            ],
+            "customer_orders",
+            "AbCdEfGhIjKlMnOpQrStUvWxYz0123456789ABCD",
+        ),
+        (
+            "request failed with ASIAABCDEFGHIJKLMNOP",
+            "REDACTED",
+            "ASIAABCDEFGHIJKLMNOP",
+        ),
+    ],
+)
+def test_import_valid_json_arrays_and_scalars_preserve_sanitized_diagnostics(
+    value, expected, forbidden
+):
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+
+    RustDumpImportDialog.on_raw_output(dialog, json.dumps(value))
+
+    rendered = "\n".join(dialog.txt_log.items + dialog.log_entries)
+    assert dialog.txt_log.items
+    assert expected in rendered
+    assert forbidden not in rendered
+    assert "REDACTED" in rendered
+
+
+def test_import_scalar_json_preserves_unprefixed_opaque_request_id():
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    request_id = "Q7mP2vK9xR4tN8cL5sW1yB6dF3hJ0aZq"
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+
+    RustDumpImportDialog.on_raw_output(
+        dialog, json.dumps(f"request id {request_id} failed")
+    )
+
+    assert request_id in "\n".join(dialog.txt_log.items + dialog.log_entries)
+
+
+def test_import_recursive_malformed_telemetry_falls_back_without_raising(monkeypatch):
+    import src.ui.dialogs.db_import_dialog as import_module
+    from src.core.error_report_sanitizer import sanitize_local_diagnostic
+
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    recursive = []
+    recursive.append(recursive)
+    malformed_event = {
+        "event": "row_progress",
+        "table": "customer_orders",
+        "rows": {"not": "numeric"},
+        "nested": recursive,
+    }
+    raw_line = '{"event":"row_progress","token":"short-token"}'
+    monkeypatch.setattr(import_module.json, "loads", lambda _line: malformed_event)
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+
+    import_module.RustDumpImportDialog.on_raw_output(dialog, raw_line)
+
+    assert len(dialog.txt_log.items) == 1
+    assert dialog.log_entries == dialog.txt_log.items
+    assert "customer_orders" in dialog.txt_log.items[0]
+    assert "short-token" not in dialog.txt_log.items[0]
+
+
+def test_import_malformed_parsed_telemetry_structurally_redacts_nested_credentials():
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+    raw_line = json.dumps({
+        "event": "row_progress",
+        "table": "customer_orders",
+        "rows": {"not": "numeric"},
+        "password": {"primary": "hunter2", "backup": "backup-secret"},
+    })
+
+    RustDumpImportDialog.on_raw_output(dialog, raw_line)
+
+    rendered = "\n".join(dialog.txt_log.items + dialog.log_entries)
+    assert "customer_orders" in rendered
+    assert "hunter2" not in rendered
+    assert "backup-secret" not in rendered
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "event": "table_progress",
+            "table": "customer_orders",
+            "status": "completed",
+            "current": -1,
+            "total": -1,
+        },
+        {
+            "event": "row_progress",
+            "table": "customer_orders",
+            "rows": -1,
+            "total": -1,
+            "chunk_rows": -1,
+        },
+    ],
+)
+def test_import_negative_numeric_telemetry_uses_plain_fallback(event):
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+
+    RustDumpImportDialog.on_raw_output(dialog, json.dumps(event))
+
+    rendered = "\n".join(dialog.txt_log.items + dialog.log_entries)
+    assert "customer_orders" in rendered
+    assert "(-1/-1)" not in rendered
+    assert "-1/-1 rows" not in rendered
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {
+            "event": "table_progress",
+            "table": "customer_orders",
+            "status": "completed",
+            "current": 2,
+            "total": 1,
+        },
+        {
+            "event": "row_progress",
+            "table": "customer_orders",
+            "rows": 100,
+            "total": 1,
+            "chunks_done": 5,
+            "chunks_total": 1,
+        },
+    ],
+)
+def test_import_impossible_progress_relationships_use_plain_fallback(event):
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+
+    RustDumpImportDialog.on_raw_output(dialog, json.dumps(event))
+
+    rendered = "\n".join(dialog.txt_log.items + dialog.log_entries)
+    assert "customer_orders" in rendered
+    assert "(2/1)" not in rendered
+    assert "5/1 chunks" not in rendered
+    assert "100/1 rows" not in rendered
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        {"event": "row_progress", "rows": 1, "total": 2},
+        {
+            "event": "table_progress",
+            "table": "customer_orders",
+            "status": "unexpected",
+            "current": 1,
+            "total": 2,
+        },
+    ],
+)
+def test_import_invalid_required_telemetry_text_uses_plain_fallback(event):
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+
+    RustDumpImportDialog.on_raw_output(dialog, json.dumps(event))
+
+    assert dialog.txt_log.items
+    assert dialog.log_entries == dialog.txt_log.items
+    assert '"event"' in dialog.txt_log.items[0]
+
+
+def test_import_progress_escapes_controls_before_display_and_log():
+    class FakeValue:
+        def __init__(self):
+            self.value = None
+
+        def setText(self, value):
+            self.value = value
+
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.label_status = FakeValue()
+    dialog.label_fk_status = FakeValue()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+
+    RustDumpImportDialog.on_progress(dialog, "phase\n[FORGED]\u202ereversed")
+
+    expected = r"phase\n[FORGED]\u202ereversed"
+    assert dialog.txt_log.items == [expected]
+    assert dialog.label_status.value == expected
+    assert dialog.log_entries == [expected]
 
 def test_import_raw_output_redacts_password_and_credentials_from_saved_log():
     class FakeLogList:
@@ -524,6 +970,53 @@ def test_import_raw_output_redacts_password_and_credentials_from_saved_log():
 
     combined = "\n".join(dialog.log_entries)
     assert "s3cr3t-pw" not in combined
+
+
+def test_import_raw_output_sanitizes_all_local_secret_classes_before_logging(caplog):
+    class FakeLogList:
+        def __init__(self):
+            self.items = []
+
+        def count(self):
+            return len(self.items)
+
+        def takeItem(self, index):
+            self.items.pop(index)
+
+        def addItem(self, item):
+            self.items.append(item)
+
+        def scrollToBottom(self):
+            pass
+
+    dialog = type("DummyDialog", (), {})()
+    dialog.txt_log = FakeLogList()
+    dialog.log_entries = []
+    dialog._add_log = dialog.log_entries.append
+    private_key = (
+        "-----BEGIN PRIVATE KEY-----\nprivate-material\n"
+        "-----END PRIVATE KEY-----"
+    )
+    raw_line = json.dumps({
+        "event": "error",
+        "message": (
+            "table customer_orders at C:\\dumps\\customer failed "
+            "password=pw-secret; token=token-secret; "
+            "postgresql://alice:uri-secret@db.internal/customer; "
+            f"{private_key}\n[FORGED]\u202ereversed"
+        ),
+    })
+    caplog.set_level(logging.DEBUG, logger="tunnelforge.db_dialogs")
+
+    RustDumpImportDialog.on_raw_output(dialog, raw_line)
+
+    rendered = "\n".join(dialog.txt_log.items + dialog.log_entries)
+    assert "customer_orders" in rendered
+    assert r"C:\dumps\customer" in rendered
+    assert r"\n[FORGED]\u202ereversed" in rendered
+    for secret in ("pw-secret", "token-secret", "uri-secret", "private-material"):
+        assert secret not in rendered
+    assert raw_line not in caplog.text
 
 def test_import_log_entries_are_capped(monkeypatch):
     app = QApplication.instance() or QApplication([])
@@ -664,6 +1157,7 @@ def test_import_fresh_run_clears_stale_progress_state(monkeypatch, tmp_path):
 
     dialog.do_import()
 
+    assert dialog._error_report_operation_generation == 1
     assert dialog.import_table_rows_done == {}
     assert dialog.import_table_rows_total == {}
     assert dialog.table_chunk_progress == {}
@@ -763,49 +1257,209 @@ def test_import_close_running_requests_cancel_and_keeps_dialog_until_finished(mo
     assert dialog._cancel_requested
     assert dialog._close_after_cancel
 
-def test_import_github_workers_are_retained_until_finished(monkeypatch):
+def test_import_error_report_workers_are_retained_without_table_context(monkeypatch):
     app = QApplication.instance() or QApplication([])
 
-    class FakeGithubSignal:
+    class FakeReportSignal:
         def __init__(self):
             self._slot = None
 
-        def connect(self, slot):
+        def connect(self, slot, *_args):
             self._slot = slot
 
         def emit(self, *args):
             self._slot(*args)
 
-    class FakeGithubWorker:
-        def __init__(self, config_manager, error_type, error_message, context):
-            self.finished = FakeGithubSignal()
+    created = []
+
+    class FakeReportWorker:
+        def __init__(self, config_manager, **kwargs):
+            self.report_finished = FakeReportSignal()
+            self.finished = FakeReportSignal()
+            self.kwargs = kwargs
+            self.running = False
+            created.append(self)
 
         def start(self):
-            pass
+            self.running = True
+
+        def isRunning(self):
+            return self.running
 
         def deleteLater(self):
             pass
 
     monkeypatch.setattr(
-        "src.ui.workers.github_worker.GitHubReportWorker", FakeGithubWorker
+        "src.ui.workers.error_reporting_worker.ErrorReportingWorker",
+        FakeReportWorker,
     )
     monkeypatch.setattr(
         "src.ui.dialogs.db_import_dialog.check_rust_dump",
         lambda: (True, "Rust DB Core OK"),
     )
 
-    dialog = RustDumpImportDialog(config_manager=MagicMock())
-    dialog.import_results = {}
+    class FakeConnector:
+        engine = "postgresql"
 
-    dialog._report_error_to_github("import", "error 1")
-    dialog._report_error_to_github("import", "error 2")
+        def get_schemas(self):
+            return []
 
-    assert len(dialog._github_workers) == 2
-    worker1, worker2 = dialog._github_workers
+        def disconnect(self):
+            pass
 
-    worker1.finished.emit(True, "ok")
+    config_manager = MagicMock()
+    config_manager.get_app_setting.side_effect = (
+        lambda key, default=None: (
+            "550e8400-e29b-41d4-a716-446655440000"
+            if key == "error_reporting_installation_id"
+            else default
+        )
+    )
+    dialog = RustDumpImportDialog(
+        connector=FakeConnector(), config_manager=config_manager
+    )
+    dialog.import_results = {
+        "failed_table_secret": {
+            "status": "error",
+            "message": "per-table-message-secret",
+        }
+    }
+    dialog.combo_target_schema.addItem("target_schema_secret")
+    dialog.chk_use_original.setChecked(False)
 
-    assert dialog._github_workers == [worker2]
+    engine_error = (
+        'dump.import failed for schema "target_schema_secret", '
+        'table `failed_table_secret`: per-table-message-secret'
+    )
+    dialog._report_error_anonymously()
+    dialog._report_error_anonymously()
+
+    assert len(dialog._error_report_workers) == 2
+    worker1, worker2 = dialog._error_report_workers
+    assert worker1.kwargs == {
+        "operation_kind": "import",
+        "db_engine": "postgresql",
+        "phase": "dump.import",
+    }
+    from src.core.error_report_builder import build_error_report
+
+    payload = build_error_report(
+        config_manager,
+        **worker1.kwargs,
+        error_message="Rust DB Core import operation failed.",
+    )
+    serialized = json.dumps(payload, sort_keys=True)
+    assert "failed_table_secret" not in serialized
+    assert "per-table-message-secret" not in serialized
+    assert "target_schema_secret" not in serialized
+
+    worker1.report_finished.emit(True, "remote-secret", "https://github.com/issues/1")
+
+    assert dialog._error_report_workers == [worker1, worker2]
+
+    worker1.running = False
+    worker1.finished.emit()
+
+    assert dialog._error_report_workers == [worker2]
+    worker2.running = False
+    worker2.finished.emit()
+
+    assert dialog._error_report_workers == []
+    from src.ui.workers import error_reporting_worker as worker_module
+
+    assert worker1 not in worker_module._ACTIVE_ERROR_REPORT_WORKERS
+    assert worker2 not in worker_module._ACTIVE_ERROR_REPORT_WORKERS
+    dialog.close()
+
+
+def test_import_retry_confirmation_sanitizes_rust_table_names(monkeypatch):
+    class SelectedItem:
+        @staticmethod
+        def isSelected():
+            return True
+
+    captured = {}
+    malicious_table = "customer_orders\n[FORGED]\u202ereversed"
+    dialog = type("DummyDialog", (), {})()
+    dialog.table_items = {malicious_table: SelectedItem()}
+
+    def capture_question(_parent, _title, message, _buttons):
+        captured["message"] = message
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog.QMessageBox.question",
+        capture_question,
+    )
+
+    RustDumpImportDialog.do_retry(dialog)
+
+    message = captured["message"]
+    assert "\n[FORGED]" not in message
+    assert "\u202e" not in message
+    assert r"\n[FORGED]\u202e" in message
+    assert "customer_orders" in message
+
+
+def test_import_save_log_escapes_result_controls(tmp_path, monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    output_path = tmp_path / "import-log.txt"
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog.QFileDialog.getSaveFileName",
+        lambda *_args: (str(output_path), ""),
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog.QMessageBox.information",
+        lambda *_args: None,
+    )
+    dialog = RustDumpImportDialog()
+    dialog.log_entries = ["[00:00:00] started"]
+    dialog.last_input_dir = "C:\\dump\\customer\n[FORGED]\u202ereversed"
+    dialog.last_target_schema = "schema\n[FORGED]\u202ereversed"
+    dialog.import_results = {
+        "table\n[FORGED]\u202ereversed": {
+            "status": "error",
+            "message": (
+                "failure Q7mP2vK9xR4tN8cL5sW1yB6dF3hJ0aZq "
+                "; mysql://alice:dsn@secret@db.internal/customer;\n"
+                "[FORGED]\u202ereversed"
+            ),
+        }
+    }
+
+    dialog.save_log()
+
+    saved = output_path.read_text(encoding="utf-8")
+    assert r"C:\dump\customer\n[FORGED]\u202ereversed" in saved
+    assert r"schema\n[FORGED]\u202ereversed" in saved
+    assert r"table\n[FORGED]\u202ereversed" in saved
+    assert r"failure" in saved
+    assert r"\n[FORGED]\u202ereversed" in saved
+    assert "Q7mP2vK9xR4tN8cL5sW1yB6dF3hJ0aZq" in saved
+    assert "alice" not in saved
+    assert "dsn@secret" not in saved
+    assert "db.internal/customer" in saved
+    dialog.close()
+
+
+def test_import_cancellation_does_not_start_error_reporting(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog()
+    dialog._cancel_requested = True
+    dialog._report_error_anonymously = MagicMock()
+
+    dialog.on_finished(False, "cancelled by user")
+
+    dialog._report_error_anonymously.assert_not_called()
+    assert dialog.import_success is False
     dialog.close()
 
 def test_import_mode_text_uses_single_korean_label_source(monkeypatch):

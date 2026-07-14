@@ -284,6 +284,7 @@ def main():
     # 3. UI 실행
     start_minimized = '--minimized' in sys.argv
     window = window_cls(config_mgr, tunnel_engine)
+    app.aboutToQuit.connect(window.prepare_for_shutdown)
     single_instance_guard.activation_requested.connect(window.bring_to_front)
     if not start_minimized:
         window.show()

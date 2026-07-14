@@ -1,0 +1,1106 @@
+{
+  "schema_version": 1,
+  "cases": [
+    {
+      "name": "payload must be an object",
+      "expected_rejection": "type",
+      "expected_path": "root",
+      "payload": []
+    },
+    {
+      "name": "unknown top-level field",
+      "expected_rejection": "unknown_field",
+      "expected_path": "root",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        },
+        "context": {
+          "arbitrary": "forbidden"
+        }
+      }
+    },
+    {
+      "name": "missing top-level group",
+      "expected_rejection": "required_field",
+      "expected_path": "root",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unknown nested field",
+      "expected_rejection": "unknown_field",
+      "expected_path": "operation",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run",
+          "schema_name": "synthetic_schema"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unsupported schema version",
+      "expected_rejection": "version",
+      "expected_path": "report.report_schema_version",
+      "payload": {
+        "report": {
+          "report_schema_version": 2,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "schema version wrong type",
+      "expected_rejection": "type",
+      "expected_path": "report.report_schema_version",
+      "payload": {
+        "report": {
+          "report_schema_version": "1",
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "installation id is not UUIDv4",
+      "expected_rejection": "format",
+      "expected_path": "report.anonymous_installation_id",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "6ba7b810-9dad-11d1-80b4-00c04fd430c8",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "fingerprint is not lowercase hexadecimal",
+      "expected_rejection": "format",
+      "expected_path": "report.error_fingerprint",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unknown package kind",
+      "expected_rejection": "enum",
+      "expected_path": "app.package_kind",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "portable",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unknown OS family",
+      "expected_rejection": "enum",
+      "expected_path": "system.os_family",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "freebsd",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unknown architecture",
+      "expected_rejection": "enum",
+      "expected_path": "system.architecture",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "UTC offset exceeds upper bound",
+      "expected_rejection": "bounds",
+      "expected_path": "system.utc_offset_minutes",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 841
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "UTC offset boolean is not an integer",
+      "expected_rejection": "type",
+      "expected_path": "system.utc_offset_minutes",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": true
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "runtime version is not numeric dotted",
+      "expected_rejection": "format",
+      "expected_path": "runtime.python_version",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12rc1",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unknown operation kind",
+      "expected_rejection": "enum",
+      "expected_path": "operation.kind",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "migrate",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unknown database engine",
+      "expected_rejection": "enum",
+      "expected_path": "operation.db_engine",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "sqlite",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "unknown operation phase",
+      "expected_rejection": "enum",
+      "expected_path": "operation.phase",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "connect"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "database version includes forbidden patch component",
+      "expected_rejection": "format",
+      "expected_path": "operation.db_server_version",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run",
+          "db_server_version": "8.0.36"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "sanitized message exceeds maximum length",
+      "expected_rejection": "bounds",
+      "expected_path": "error.sanitized_message",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "application frame count exceeds maximum",
+      "expected_rejection": "bounds",
+      "expected_path": "error.app_frames",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": [
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            },
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "unknown application frame field",
+      "expected_rejection": "unknown_field",
+      "expected_path": "error.app_frames[0]",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": [
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 1,
+              "absolute_path": "C:/synthetic.py"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "missing required nested field",
+      "expected_rejection": "required_field",
+      "expected_path": "operation",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "application frame line below lower bound",
+      "expected_rejection": "bounds",
+      "expected_path": "error.app_frames[0].line",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": [
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": 0
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "application frame line wrong type",
+      "expected_rejection": "type",
+      "expected_path": "error.app_frames[0].line",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": [
+            {
+              "module": "src.core.worker",
+              "function": "run",
+              "line": true
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "nested group must be an object",
+      "expected_rejection": "type",
+      "expected_path": "operation",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "2.3.1",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": [],
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    },
+    {
+      "name": "application version exceeds maximum length",
+      "expected_rejection": "bounds",
+      "expected_path": "app.version",
+      "payload": {
+        "report": {
+          "report_schema_version": 1,
+          "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+          "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        },
+        "app": {
+          "version": "1.1111111111111111111111111111111111111111",
+          "package_kind": "source",
+          "ui_language": "en"
+        },
+        "system": {
+          "os_family": "linux",
+          "os_version": "6.8.0",
+          "architecture": "x86_64",
+          "locale": "en_US",
+          "utc_offset_minutes": 0
+        },
+        "runtime": {
+          "python_version": "3.12.4",
+          "qt_version": "6.7.2",
+          "rust_core_version": "2.3.1"
+        },
+        "operation": {
+          "kind": "export",
+          "db_engine": "mysql",
+          "phase": "dump.run"
+        },
+        "error": {
+          "exception_class": "RuntimeError",
+          "sanitized_message": "Export failed.",
+          "app_frames": []
+        }
+      }
+    }
+  ]
+}

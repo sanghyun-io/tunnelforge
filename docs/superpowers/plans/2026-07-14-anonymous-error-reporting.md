@@ -254,12 +254,14 @@ Commit: `feat: add anonymous reporting consent prompt`.
 **Interfaces:**
 - Produces `RelayResult(success, message, issue_url, status_code)`.
 - Produces `ErrorReportTransport.submit(payload) -> RelayResult` and `health() -> RelayResult`.
-- `ErrorReportingWorker.finished` emits `(success: bool, message: str, issue_url: str)`.
-- `ErrorReportingMixin._start_error_report_worker(...)` accepts only allowlisted operation arguments.
+- `ErrorReportingWorker.report_finished` emits `(success: bool, message: str, issue_url: str)`; inherited `QThread.finished` remains the lifecycle signal.
+- `ErrorReportingMixin._start_error_report_worker(...)` accepts only allowlisted operation arguments and never accepts an arbitrary error message.
+- `GET /health` succeeds only for HTTP 200 with exactly `{"service":"issue-relay","schema":1,"mode":"off|shadow|canary|active"}`.
+- `POST /v1/reports` succeeds only for one exact response: HTTP 202 `accepted` with a canonical UUIDv4 `receipt`; HTTP 201 `created` with a canonical TunnelForge issue URL; or HTTP 200 `updated`/`duplicate` with that URL. Success responses contain no display message. Duplicate JSON members are invalid even when their values match.
 
 - [ ] **Step 1: Write RED transport and integration tests**
 
-Test HTTPS-only URL validation, `(3.05, 8.0)` connect/read timeout, default TLS verification, environment proxy behavior, bounded response parsing, one retry only for network/502/503/504, no immediate 429 retry, no 4xx retry, no payload logging, worker retention, shutdown, and no schema/table/failed-table context from Export/Import.
+Test HTTPS-only URL validation including C0/whitespace rejection, Requests `(3.05, 8.0)` connect/read timeout, explicit `verify=True` overriding an injected `Session.verify=False` while preserving `REQUESTS_CA_BUNDLE`, environment proxy behavior, fixed-length/chunked/gzip/connection-close response framing, bounded response parsing, exactly one retry only for `RequestException` or HTTP 502/503/504, no 429 or other 4xx retry, no payload logging, pre-permit revoke/disable-reenable races, post-permit nonblocking disable before Python enters `Session.post`, worker retention through inherited lifecycle completion, stale Export/Import result isolation, C++-deleted receivers, and no schema/table/failed-table context from Export/Import.
 
 - [ ] **Step 2: Run RED**
 
@@ -267,11 +269,13 @@ Run focused transport, worker, export, and import tests offscreen.
 
 - [ ] **Step 3: Implement best-effort transport**
 
-Use `requests.Session.post(..., json=payload, timeout=(3.05, 8.0))` without a `verify=False` option. Require a bounded JSON response with only `status`, `message`, and optional HTTPS `issue_url`.
+Use `requests.Session.post(..., json=payload, timeout=(3.05, 8.0), verify=True)` and the equivalent explicit verification argument for health checks. This overrides an injected Session's insecure default while Requests still resolves `REQUESTS_CA_BUNDLE` through normal environment merging. This is a bounded connect timeout plus a bounded socket-read inactivity timeout, not an absolute request wall-clock deadline. Do not traverse or mutate private Requests/urllib3 socket internals. Bound decoded response bytes and require the exact endpoint-specific wire objects above; convert them to fixed local `RelayResult.message` strings and never display or log remote strings. Retry exactly once after `RequestException` or HTTP 502/503/504, and do not retry 429, any other 4xx, or any other HTTP status.
 
 - [ ] **Step 4: Replace the worker and dialog calls**
 
-Remove arbitrary context construction. Export passes `operation_kind="export"`, connector engine, and `phase="dump.run"`. Import passes `operation_kind="import"`, connector engine, and `phase="dump.import"`. Message strings pass through the builder; object names do not.
+Remove arbitrary context and error-message construction. Export passes `operation_kind="export"`, connector engine, and `phase="dump.run"`; Import passes `operation_kind="import"`, connector engine, and `phase="dump.import"`. The worker derives the fixed safe builder message from that allowlisted operation/phase pair. Increment an operation-log generation whenever Export/Import begins or resets, capture it when starting the report worker, and write the report completion log only if that generation remains current. Always perform worker lifecycle cleanup, including for stale operation results. Export/Import retain the full escaped local diagnostic for their own UI while relay input contains no object name or raw Rust output. Before local credential matching, safely recognize Unicode-escaped sensitive key spellings and escaped quotes. Redact bounded known provider-token prefixes such as `ghp_`, `github_pat_`, `glpat-`, `sk-`, and `xox[baprs]-`, but preserve ordinary identifiers such as `customer_orders_archive_partition_2024`. Escape C0, format controls, and Unicode line/paragraph separators at every Rust-derived display and saved-log boundary so malformed local diagnostics cannot forge entries.
+
+Consent token validation and every consent mutation share one process-local linearization lease. `authorize_submission()` is the linearization and dispatch-commit point. Revocation, including disable then re-enable, that linearizes before the permit prevents commit. After a true permit, the report is no longer pending and later revocation does not recall the committed dispatch, even if Python has not entered `Session.post`. Never hold the lease across blocking `Session.post`; this keeps the Settings disable path nonblocking.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -430,7 +434,7 @@ Use Web Crypto HMAC-SHA256 with `INSTALLATION_ID_HMAC_KEY`. Start edge controls 
 
 - [ ] **Step 4: Implement health and report routing**
 
-`GET /health` returns service/schema/mode only. Stable 4xx/429/5xx responses never echo payload. `shadow` returns a random receipt and stores nothing. Invocation logs/traces are disabled in Wrangler configuration, and code never passes bodies, headers, exception objects, IPs, UUIDs, or HMACs to `console.*`.
+`GET /health` returns exactly `{"service":"issue-relay","schema":1,"mode":"off|shadow|canary|active"}`. Stable 4xx/429/5xx responses never echo payload. `shadow` returns HTTP 202 with exactly `{"status":"accepted","receipt":"<random canonical UUIDv4>"}` and stores nothing. A concurrent pending lease uses the same 202 `accepted` receipt contract. Invocation logs/traces are disabled in Wrangler configuration, and code never passes bodies, headers, exception objects, IPs, UUIDs, or HMACs to `console.*`.
 
 - [ ] **Step 5: Run GREEN and commit**
 
@@ -470,6 +474,8 @@ Title and body use validated enums/scalars and fixed templates. Labels are fixed
 - [ ] **Step 4: Bind D1 reservation to GitHub action**
 
 Atomically acquire a fingerprint lease before create, return 202 for concurrent leases, and update the route after success. A definite pre-send failure may release the lease; a timeout or ambiguous upstream result transitions to `unknown` and blocks automatic create retry until reconciliation. Never create when duplicate lookup or route state is ambiguous.
+
+Map upsert outcomes exactly: `created` -> HTTP 201 `{status:"created",issue_url}`; `commented` -> HTTP 200 `{status:"updated",issue_url}`; and a recurrence requiring no mutation -> HTTP 200 `{status:"duplicate",issue_url}`. Pending lease responses remain HTTP 202 `accepted` with a canonical UUIDv4 receipt. No successful response contains a remote display message.
 
 - [ ] **Step 5: Run GREEN, dry-run bundle, and commit**
 

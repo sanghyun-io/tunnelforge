@@ -482,6 +482,7 @@ def test_oneclick_dialog_close_event_detaches_worker_instead_of_blocking(monkeyp
     monkeypatch.setattr(worker, "isRunning", lambda: True)
     dialog.worker = worker
     worker.migration_finished.connect(dialog._on_finished)
+    assert oneclick_migration_dialog.has_active_detached_oneclick_workers() is False
 
     monkeypatch.setattr(
         QMessageBox,
@@ -506,12 +507,127 @@ def test_oneclick_dialog_close_event_detaches_worker_instead_of_blocking(monkeyp
     assert event.accepted
     assert not event.ignored
     assert dialog.worker is None
-    assert worker in oneclick_migration_dialog._DETACHED_ONECLICK_WORKERS
+    assert oneclick_migration_dialog.has_active_detached_oneclick_workers() is True
 
     # 워커의 상속받은 finished가 발생하면 detach 정리 콜백이 스스로 제거해야 한다.
     worker.finished.emit()
-    assert worker not in oneclick_migration_dialog._DETACHED_ONECLICK_WORKERS
+    assert oneclick_migration_dialog.has_active_detached_oneclick_workers() is False
     dialog.close()
+
+
+class _DetachSignal:
+    def __init__(self):
+        self.slots = []
+
+    def connect(self, slot):
+        self.slots.append(slot)
+
+    def emit(self):
+        for slot in list(self.slots):
+            slot()
+
+
+class _DetachedOneClickWorker:
+    def __init__(self, running):
+        self.running = running
+        self.finished = _DetachSignal()
+        self.delete_later_calls = 0
+
+    def isRunning(self):
+        return self.running
+
+    def deleteLater(self):
+        self.delete_later_calls += 1
+
+
+def test_detached_oneclick_helper_prunes_non_running_worker(monkeypatch):
+    worker = _DetachedOneClickWorker(running=False)
+    registry = {worker}
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        '_DETACHED_ONECLICK_WORKERS',
+        registry,
+    )
+
+    assert oneclick_migration_dialog.has_active_detached_oneclick_workers() is False
+    assert registry == set()
+
+
+def test_detached_oneclick_helper_retains_running_worker(monkeypatch):
+    worker = _DetachedOneClickWorker(running=True)
+    registry = {worker}
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        '_DETACHED_ONECLICK_WORKERS',
+        registry,
+    )
+
+    assert oneclick_migration_dialog.has_active_detached_oneclick_workers() is True
+    assert registry == {worker}
+
+
+def test_detached_oneclick_helper_prunes_deleted_worker(monkeypatch):
+    class _DeletedWorker:
+        def isRunning(self):
+            raise RuntimeError('wrapped C/C++ object has been deleted')
+
+    worker = _DeletedWorker()
+    registry = {worker}
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        '_DETACHED_ONECLICK_WORKERS',
+        registry,
+    )
+
+    assert oneclick_migration_dialog.has_active_detached_oneclick_workers() is False
+    assert registry == set()
+
+
+def test_oneclick_detach_connects_cleanup_before_registry_visibility(monkeypatch):
+    worker = _DetachedOneClickWorker(running=True)
+    registry = set()
+    observed_membership = []
+    original_connect = worker.finished.connect
+
+    def connect(slot):
+        observed_membership.append(worker in registry)
+        original_connect(slot)
+
+    worker.finished.connect = connect
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        '_DETACHED_ONECLICK_WORKERS',
+        registry,
+    )
+    dialog = SimpleNamespace(
+        worker=worker,
+        _disconnect_worker_ui_signals=lambda value: None,
+    )
+
+    OneClickMigrationDialog._detach_running_worker(dialog)
+
+    assert observed_membership == [False]
+    assert registry == {worker}
+
+
+def test_oneclick_detach_prunes_worker_completed_before_cleanup_connect(monkeypatch):
+    worker = _DetachedOneClickWorker(running=False)
+    registry = set()
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        '_DETACHED_ONECLICK_WORKERS',
+        registry,
+    )
+    dialog = SimpleNamespace(
+        worker=worker,
+        _disconnect_worker_ui_signals=lambda value: None,
+    )
+
+    OneClickMigrationDialog._detach_running_worker(dialog)
+
+    assert dialog.worker is None
+    assert registry == set()
+    assert oneclick_migration_dialog.has_active_detached_oneclick_workers() is False
 
 
 def test_oneclick_dialog_close_event_ignores_close_when_user_declines(monkeypatch):

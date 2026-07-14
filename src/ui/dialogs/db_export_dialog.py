@@ -15,8 +15,12 @@ from datetime import datetime
 import json
 import os
 
-from src.core.constants import MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
+from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
 from src.core.db_connector import MySQLConnector
+from src.core.error_report_sanitizer import (
+    sanitize_local_diagnostic,
+    sanitize_local_diagnostic_data,
+)
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.core.path_safety import safe_output_dir
@@ -25,10 +29,135 @@ from src.exporters.rust_dump_exporter import (
     DEFAULT_DUMP_COMPRESSION
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
-from src.ui.workers.github_worker import GithubReportingMixin
+from src.ui.workers.error_reporting_worker import ErrorReportingMixin
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 logger = get_logger("db_dialogs")
+
+
+def _escape_local_diagnostic_text(value: object) -> str:
+    return sanitize_local_diagnostic(value)
+
+
+def _structured_local_diagnostic_text(value: object) -> str:
+    try:
+        serialized = json.dumps(
+            sanitize_local_diagnostic_data(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except BaseException:
+        serialized = "REDACTED"
+    return sanitize_local_diagnostic(serialized)
+
+
+_EXPORT_TELEMETRY_TYPES = {
+    "dump_plan",
+    "dump_schedule",
+    "row_progress",
+    "table_progress",
+}
+_EXPORT_TELEMETRY_NUMERIC_FIELDS = {
+    "dump_plan": ("tables_total", "rows_total"),
+    "dump_schedule": (
+        "threads",
+        "table_workers",
+        "range_workers_per_table",
+        "chunk_size",
+    ),
+    "row_progress": (
+        "rows",
+        "total",
+        "chunk_rows",
+        "chunks_done",
+        "chunks_total",
+        "chunk_index",
+        "stream_ms",
+        "read_ms",
+        "write_ms",
+        "load_ms",
+    ),
+    "table_progress": ("current", "total"),
+}
+_EXPORT_TELEMETRY_TEXT_FIELDS = {
+    "dump_schedule": ("data_format", "compression", "scheduler"),
+    "row_progress": ("table", "strategy"),
+    "table_progress": ("table", "status", "strategy"),
+}
+
+
+def _normalized_export_telemetry(event: object) -> Optional[dict]:
+    """Return an allowlisted, bounded telemetry event or reject it."""
+    if type(event) is not dict:
+        return None
+    event_type = event.get("event")
+    if type(event_type) is not str or event_type not in _EXPORT_TELEMETRY_TYPES:
+        return None
+    normalized = {"event": event_type}
+    for key in _EXPORT_TELEMETRY_NUMERIC_FIELDS[event_type]:
+        value = event.get(key, 0)
+        if value is None:
+            value = 0
+        if type(value) is not int or value < 0 or value > (2**64 - 1):
+            return None
+        normalized[key] = value
+    for key in _EXPORT_TELEMETRY_TEXT_FIELDS.get(event_type, ()):
+        value = event.get(key, "")
+        if value is None:
+            value = ""
+        if type(value) is not str or len(value) > 2_000:
+            return None
+        normalized[key] = sanitize_local_diagnostic(value, max_length=2_000)
+
+    if event_type in {"table_progress", "row_progress"} and not normalized["table"]:
+        return None
+    if event_type == "table_progress":
+        if normalized["status"] not in {"dumping", "completed"}:
+            return None
+        if normalized["total"] and normalized["current"] > normalized["total"]:
+            return None
+    elif event_type == "row_progress":
+        if normalized["total"] and normalized["rows"] > normalized["total"]:
+            return None
+        if (
+            normalized["chunks_total"]
+            and normalized["chunks_done"] > normalized["chunks_total"]
+        ):
+            return None
+        if (
+            normalized["chunks_total"]
+            and normalized["chunk_index"] > normalized["chunks_total"]
+        ):
+            return None
+
+    collection_key = "tables" if event_type == "dump_plan" else "scheduled_tables"
+    if event_type in {"dump_plan", "dump_schedule"}:
+        collection = event.get(collection_key, [])
+        if type(collection) is not list or len(collection) > 64:
+            return None
+        normalized_items = []
+        for item in collection:
+            if type(item) is not dict:
+                return None
+            name = item.get("name", "")
+            rows = item.get("rows", 0)
+            if type(name) is not str or len(name) > 2_000:
+                return None
+            if type(rows) is not int or rows < 0 or rows > (2**64 - 1):
+                return None
+            normalized_item = {
+                "name": sanitize_local_diagnostic(name, max_length=2_000),
+                "rows": rows,
+            }
+            if event_type == "dump_schedule":
+                chunks = item.get("estimated_chunks", 0)
+                if type(chunks) is not int or chunks < 0 or chunks > (2**64 - 1):
+                    return None
+                normalized_item["estimated_chunks"] = chunks
+            normalized_items.append(normalized_item)
+        normalized[collection_key] = normalized_items
+    return normalized
 
 
 def cap_incomplete_export_percent(percent: int, completed_tables: int, total_tables: int) -> int:
@@ -169,7 +298,7 @@ def format_export_visible_telemetry(event: dict) -> Optional[str]:
 # Rust DB Core 기반 Export 다이얼로그
 # ============================================================
 
-class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialog):
+class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog):
     """Rust DB Core Export 다이얼로그"""
 
     def __init__(self, parent=None, connector: MySQLConnector = None,
@@ -183,8 +312,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         self.connection_info = connection_info  # 터널명 또는 host_port
         self.worker: Optional[RustDumpWorker] = None
 
-        # GitHub 이슈 보고 워커 목록 (완료 전까지 참조 유지)
-        self._github_workers: List[object] = []
+        # 익명 오류 보고 워커 목록 (완료 전까지 참조 유지)
+        self._error_report_workers: List[object] = []
         self._cancel_requested = False
         self._close_after_cancel = False
 
@@ -898,6 +1027,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         return self._unique_output_dir(output_dir)
 
     def _reset_export_state(self, schema: str):
+        self._begin_error_report_operation()
         self.log_entries.clear()
         self.export_start_time = datetime.now()
         self.export_end_time = None
@@ -942,12 +1072,15 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용)"""
         timestamp = datetime.now().strftime('%H:%M:%S')
-        log_entry = f"[{timestamp}] {msg}"
+        log_entry = f"[{timestamp}] {_escape_local_diagnostic_text(msg)}"
         self.log_entries.append(log_entry)
+        if len(self.log_entries) > MAX_LOG_ENTRIES:
+            del self.log_entries[:-MAX_LOG_ENTRIES]
         if hasattr(self, "btn_save_log"):
             self.btn_save_log.setEnabled(True)
 
     def on_progress(self, msg: str):
+        msg = _escape_local_diagnostic_text(msg)
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
         self._add_log(msg)
@@ -964,11 +1097,13 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         self.label_tables.setText(
             f"📋 테이블: {self.export_completed_tables} / {self.export_total_tables} 완료"
         )
+        display_table = _escape_local_diagnostic_text(table_name)
         self._add_log(
-            f"테이블 완료: {table_name} ({self.export_completed_tables}/{self.export_total_tables})"
+            f"테이블 완료: {display_table} ({self.export_completed_tables}/{self.export_total_tables})"
         )
 
     def on_finished(self, success: bool, message: str):
+        message = _escape_local_diagnostic_text(message)
         # 로그 기록
         self.export_end_time = datetime.now()
         self.export_success = success
@@ -1031,8 +1166,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             else:
                 QMessageBox.warning(self, "Export 실패", f"❌ {message}")
 
-                # GitHub 이슈 자동 보고
-                self._report_error_to_github("export", message)
+                self._report_error_anonymously()
 
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
@@ -1093,13 +1227,16 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         data_label, estimate_label = format_export_row_labels(overall_done, self.export_total_rows)
         self.label_data.setText(data_label)
         self.label_estimated_rows.setText(estimate_label)
-        self.label_speed.setText(f"⚡ 속도: {info.get('speed', 'Rust DB Core')}")
+        display_speed = _escape_local_diagnostic_text(
+            info.get('speed', 'Rust DB Core')
+        )
+        self.label_speed.setText(f"⚡ 속도: {display_speed}")
 
         if table:
             table_total = self.export_table_totals.get(table) or int(info.get("rows_total") or 0)
             self.label_status.setText(
                 format_export_table_status(
-                    table,
+                    _escape_local_diagnostic_text(table),
                     self.export_table_done.get(table, 0),
                     table_total,
                 )
@@ -1107,11 +1244,13 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
 
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트"""
+        display_table = _escape_local_diagnostic_text(table_name)
+        display_message = _escape_local_diagnostic_text(message)
         now = datetime.now()
         self.export_table_status[table_name] = status
         if status == "loading":
             self.export_table_started_at.setdefault(table_name, now)
-            self.label_status.setText(f"🔄 {table_name}")
+            self.label_status.setText(f"🔄 {display_table}")
         elif status in ("done", "error"):
             self.export_table_finished_at[table_name] = now
 
@@ -1120,23 +1259,23 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         # 기존 아이템이 있으면 업데이트, 없으면 새로 생성
         if table_name in self.table_items:
             item = self.table_items[table_name]
-            display_text = f"{icon} {table_name}"
+            display_text = f"{icon} {display_table}"
             if status == 'error' and message:
-                display_text += f" - {message[:50]}..."
+                display_text += f" - {display_message[:50]}..."
             item.setText(display_text)
         else:
             # 새 아이템 생성
-            display_text = f"{icon} {table_name}"
+            display_text = f"{icon} {display_table}"
             if status == 'error' and message:
-                display_text += f" - {message[:50]}..."
+                display_text += f" - {display_message[:50]}..."
             item = QListWidgetItem(display_text)
             self.table_list.addItem(item)
             self.table_items[table_name] = item
 
         # 로그에 테이블 상태 변경 기록 (done/error만)
         if status in ('done', 'error'):
-            status_text = '완료' if status == 'done' else f'오류: {message}'
-            self._add_log(f"테이블 [{table_name}] {status_text}")
+            status_text = '완료' if status == 'done' else f'오류: {display_message}'
+            self._add_log(f"테이블 [{display_table}] {status_text}")
 
     def on_raw_output(self, line: str):
         """rust_dump 실시간 출력 처리 (로그에 추가)"""
@@ -1146,19 +1285,16 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             event = json.loads(line)
         except Exception:
             event = None
-        if isinstance(event, dict) and event.get("event") in {
-            "dump_plan",
-            "dump_schedule",
-            "row_progress",
-            "table_progress",
-        }:
+        normalized_event = _normalized_export_telemetry(event)
+        if normalized_event is not None:
             is_telemetry_event = True
-            for key in ("password", "credentials"):
-                event.pop(key, None)
-            self.export_telemetry_events.append(event)
-            visible_summary = format_export_visible_telemetry(event)
+            self.export_telemetry_events.append(normalized_event)
+            if len(self.export_telemetry_events) > MAX_LOG_ENTRIES:
+                del self.export_telemetry_events[:-MAX_LOG_ENTRIES]
+            visible_summary = format_export_visible_telemetry(normalized_event)
 
         if visible_summary:
+            visible_summary = _escape_local_diagnostic_text(visible_summary)
             # 너무 많은 로그 방지
             if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
                 self.txt_log.takeItem(0)
@@ -1166,25 +1302,26 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             self.txt_log.scrollToBottom()
             self._add_log(visible_summary)
         elif not is_telemetry_event:
+            visible_line = (
+                _structured_local_diagnostic_text(event)
+                if type(event) in {dict, list}
+                else _escape_local_diagnostic_text(line)
+            )
             # 너무 많은 로그 방지
             if self.txt_log.count() > MAX_VISIBLE_LOG_LINES:
                 self.txt_log.takeItem(0)
-            self.txt_log.addItem(line)
+            self.txt_log.addItem(visible_line)
             self.txt_log.scrollToBottom()
-        logger.debug("[rust_dump] %s", line)
 
-    def _report_error_to_github(self, error_type: str, error_message: str):
-        """GitHub 이슈 자동 보고 (백그라운드)"""
+    def _report_error_anonymously(self):
+        """Submit a privacy-allowlisted report in the background."""
         if not self.config_manager:
             return
-
-        context = {
-            'schema': self.export_schema,
-            'tables': self.export_tables,
-            'mode': '전체 스키마' if self.radio_full.isChecked() else '선택 테이블'
-        }
-
-        self._start_github_report_worker(error_type, error_message, context)
+        self._start_error_report_worker(
+            operation_kind="export",
+            db_engine=getattr(self.connector, "engine", ""),
+            phase="dump.run",
+        )
 
     def _export_table_duration_seconds(self, table_name: str) -> float:
         start = self.export_table_started_at.get(table_name)
@@ -1259,18 +1396,22 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             return
 
         try:
+            safe = _escape_local_diagnostic_text
             with open(file_path, 'w', encoding='utf-8') as f:
                 # 헤더 정보
                 f.write("=" * 70 + "\n")
                 f.write("Rust DB Core Export Log\n")
                 f.write("=" * 70 + "\n\n")
 
-                f.write(f"스키마: {self.export_schema}\n")
+                f.write(f"스키마: {safe(self.export_schema)}\n")
                 f.write(f"Export 유형: {'전체 스키마' if self.radio_full.isChecked() else '선택 테이블'}\n")
                 if self.export_tables:
-                    f.write(f"선택 테이블: {', '.join(self.export_tables)}\n")
-                f.write(f"출력 폴더: {self.input_output_dir.text()}\n")
-                f.write(f"연결 정보: {self.connection_info}\n")
+                    f.write(
+                        f"선택 테이블: "
+                        f"{', '.join(safe(table) for table in self.export_tables)}\n"
+                    )
+                f.write(f"출력 폴더: {safe(self.input_output_dir.text())}\n")
+                f.write(f"연결 정보: {safe(self.connection_info)}\n")
                 if self.export_success is None:
                     result_label = "진행 중"
                 else:
@@ -1295,31 +1436,31 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                 if schedule:
                     f.write("\nAdaptive Schedule\n")
                     f.write(
-                        f"- format={schedule.get('data_format')}, "
-                        f"compression={schedule.get('compression')}, "
-                        f"threads={schedule.get('threads')}, "
-                        f"table_workers={schedule.get('table_workers')}, "
-                        f"range_workers/table={schedule.get('range_workers_per_table')}, "
-                        f"chunk_size={schedule.get('chunk_size')}\n"
+                        f"- format={safe(schedule.get('data_format'))}, "
+                        f"compression={safe(schedule.get('compression'))}, "
+                        f"threads={safe(schedule.get('threads'))}, "
+                        f"table_workers={safe(schedule.get('table_workers'))}, "
+                        f"range_workers/table={safe(schedule.get('range_workers_per_table'))}, "
+                        f"chunk_size={safe(schedule.get('chunk_size'))}\n"
                     )
                     for item in (schedule.get("scheduled_tables") or [])[:8]:
                         f.write(
-                            f"  - {item.get('name')}: {int(item.get('rows') or 0):,} rows, "
+                            f"  - {safe(item.get('name'))}: {int(item.get('rows') or 0):,} rows, "
                             f"{int(item.get('estimated_chunks') or 0):,} chunks\n"
                         )
                 f.write("\n느린 테이블 Top 10\n")
                 for item in self._export_slow_table_summaries()[:10]:
                     f.write(
-                        f"- {item['table']}: {item['duration_sec']:.1f}s, "
+                        f"- {safe(item['table'])}: {item['duration_sec']:.1f}s, "
                         f"{item['done']:,}/{item['rows']:,} rows\n"
                     )
                 f.write("\n느린 Chunk Top 10\n")
                 for item in self._export_slow_chunk_summaries()[:10]:
                     chunk = item["chunk_index"] if item["chunk_index"] is not None else "-"
                     f.write(
-                        f"- {item['table']} chunk {chunk}: "
+                        f"- {safe(item['table'])} chunk {safe(chunk)}: "
                         f"{item['elapsed_ms']}ms, {item['chunk_rows']:,} rows, "
-                        f"{item['strategy'] or 'default'}\n"
+                        f"{safe(item['strategy'] or 'default')}\n"
                     )
 
                 f.write("\n" + "=" * 70 + "\n")
@@ -1327,7 +1468,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                 f.write("=" * 70 + "\n\n")
 
                 for entry in self.log_entries:
-                    f.write(entry + "\n")
+                    f.write(safe(entry) + "\n")
 
             QMessageBox.information(
                 self, "저장 완료",

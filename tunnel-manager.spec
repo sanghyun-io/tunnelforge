@@ -43,8 +43,6 @@ hiddenimports = [
 
     # 기타 의존성
     'requests',
-    'jwt',
-    'dotenv',
 ]
 
 # main.py loads the UI root through _lazy_class(), so PyInstaller cannot infer

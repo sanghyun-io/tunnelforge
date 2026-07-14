@@ -76,7 +76,7 @@ Scheduled Backups & Queries are disabled in the default UI and cannot be used pe
 | 🌐 | **Bilingual UI** | Switch the app's language between Korean and English from Settings. |
 | 🌓 | **Light / Dark Theme** | Pick the theme that suits your setup. |
 | 🔄 | **Auto Update** | Checks for new versions on startup so you never miss an update. |
-| 🐛 | **Optional Issue Reporter** | GitHub App-based error reporting when explicitly configured. |
+| 🛡️ | **Anonymous Error Reporting** | Explicit opt-in sends a strict allowlisted report through a relay; no client GitHub credential is required. See [error reporting](docs/error_reporting.md). |
 
 ---
 

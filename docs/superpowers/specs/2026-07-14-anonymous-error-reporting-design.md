@@ -189,9 +189,20 @@ automatically.
 
 The Worker exposes:
 
-- `GET /health`: reports service version and `off`, `shadow`, `canary`, or
-  `active` mode without checking GitHub credentials.
+- `GET /health`: HTTP 200 with exactly
+  `{"service":"issue-relay","schema":1,"mode":"off|shadow|canary|active"}`
+  without checking GitHub credentials.
 - `POST /v1/reports`: accepts schema v1 reports.
+
+Successful report responses have no server-provided display message. The exact
+contracts are HTTP 202 `{"status":"accepted","receipt":"<canonical UUIDv4>"}`
+for shadow mode or a concurrent pending lease; HTTP 201
+`{"status":"created","issue_url":"https://github.com/sanghyun-io/tunnelforge/issues/<positive decimal>"}`;
+and HTTP 200 with the same canonical issue URL plus status `updated` after a
+comment or `duplicate` when recurrence needs no mutation. Any key, status, URL,
+receipt, or HTTP-code mismatch is invalid. The desktop maps valid contracts to
+fixed local text; remote response values never enter UI logs. Duplicate JSON
+members are rejected, including duplicates whose names and values match.
 
 The endpoint accepts only HTTPS POST with `application/json`. CORS is not used
 as an authentication control. Payload size, parse depth, arrays, strings, and
@@ -222,8 +233,18 @@ uses one outbound HTTPS/443 path to the configured relay. The client opens no
 listening socket and requires no firewall exception.
 
 Corporate policy may still block the relay domain, DNS, proxy authentication,
-or TLS chain. The transport honors normal proxy configuration, always verifies
-TLS, uses short connect/read timeouts, and makes at most one in-memory retry.
+or TLS chain. Before URL parsing, the transport rejects every C0 control and
+whitespace character. It honors normal proxy and `REQUESTS_CA_BUNDLE`
+configuration, passes `verify=True` at each Requests call site even when an
+injected Session has `verify=False`, and uses Requests `timeout=(3.05, 8.0)`.
+It makes exactly one retry after a Requests exception from request initiation
+or response-body iteration, or HTTP 502, 503, or 504. It does not retry HTTP
+429, any other 4xx response, or any other HTTP status.
+The timeout is a 3.05-second connect bound and an 8-second socket-read
+inactivity bound, not an absolute wall-clock deadline. Client code does not
+traverse or mutate private Requests/urllib3 sockets. Every response is closed,
+and decoded bytes remain bounded for Content-Length, chunked, gzip, and
+close-delimited bodies.
 It does not persist a report queue to disk. Offline, timeout, certificate,
 proxy, 429, 4xx, and 5xx failures are recorded as bounded local status without
 interrupting the source operation.
@@ -240,6 +261,27 @@ interrupting the source operation.
 Mode changes are server-side and require no client release. Secrets and mode
 changes use versioned Worker deployment so a prior Worker version can be
 restored.
+
+Consent submission uses a process-local linearization lease shared by every
+consent mutation and `authorize_submission()`. That method is the dispatch
+permit and commit point. Revocation, including disable then re-enable, that
+linearizes before the permit prevents dispatch. Once the permit returns true,
+the report is no longer pending: later revocation does not recall the committed
+dispatch, even when Python has not entered `Session.post`. The lease is never
+held across blocking network I/O, so Settings disable remains responsive.
+
+The client retains each reporting QThread until inherited `QThread.finished`
+is delivered and `isRunning()` is false; report results use a separate signal
+and cleanup tolerates Python- or C++-deleted receivers. Each Export/Import start
+increments a dialog operation-log generation. A report worker captures that
+generation, and its completion writes a local status only while the generation
+is still current; lifecycle cleanup always runs for stale workers. Rust-derived
+local diagnostics remain visible, but C0, Unicode format controls, and
+line/paragraph separators are escaped before any UI or saved-log boundary to
+prevent control and log forging. Local credential matching first recognizes
+Unicode-escaped sensitive key spellings and escaped quotes. Known provider
+token prefixes are redacted with bounded patterns; ordinary long database and
+table identifiers are preserved.
 
 ## Rolling Strategy
 
@@ -281,7 +323,7 @@ to stop. This lane does not wait for the replacement feature.
 - Oversized, malformed, unknown-version, or forbidden server payload: return a
   stable 4xx code without echoing the payload.
 - Rate limited: return 429 with bounded retry guidance; the desktop does not
-  retry more than once.
+  retry it.
 - GitHub authentication failure: refresh an installation token once; then fail
   closed without logging JWT, token, PEM, or request body.
 - GitHub permission/repository mismatch: fail closed and surface an operator

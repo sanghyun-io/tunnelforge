@@ -1154,7 +1154,7 @@ def test_current_status_records_anonymous_error_reporting_design():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "Last reviewed: 2026-07-14" in doc
+    assert "Last reviewed: 2026-07-15" in doc
     assert "dedicated reporter GitHub App" in summary
     assert "Cloudflare Worker" in summary
     assert "TF-STATUS-092 | High | in_progress" in tracker
@@ -1179,5 +1179,43 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "13 TDD tasks" in verification
     assert "D1 global mutation budgets" in verification
     assert "GitHub timeout" in verification
+    assert "final 76 passed" in verification
+    assert "Task 1 quality approved" in verification
+    assert "Task 2 quality approved" in verification
+    assert "final 171 passed" in verification
+    assert "Task 3 quality approved" in verification
+    assert "final 93 passed" in verification
+    assert "Task 4 quality approved" in verification
+    assert "final 188 passed" in verification
+    assert "Task 5 quality approved" in verification
+    assert "full 2729 passed" in verification
+    assert "Task 6 quality approved" in verification
+    assert "full 2748 passed" in verification
+    assert "Task 7 quality approved" in verification
+    assert "full 2672 passed" in verification
+    assert "Task 8 quality approved" in verification
+    assert "final 198 passed" in verification
+    assert "fail-closed free-text boundary" in verification
+    assert "Task 9 quality approved" in verification
+    assert "final 259 passed" in verification
+    assert "100-row cleanup bound" in verification
+    assert "Task 10 quality approved" in verification
+    assert "final 306 passed" in verification
+    assert "GitHub App JWT" in verification
+    assert "Task 11 quality approved" in verification
+    assert "final 311 passed" in verification
+    assert "packaging 47 passed" in verification
+    assert "local Tasks 1-11 approved" in verification
+    assert "full Python 2695 passed / 1 skipped" in verification
+    assert "final Worker 314 passed" in verification
     assert "2026-07-14-anonymous-error-reporting.md" in order
+    assert "Continue owner-mediated credential containment from Task 12" in order
     assert "Implementation has not yet changed runtime code" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 5" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 6" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 7" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 8" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 9" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 10" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 11" in sessions
+    assert "Completed the final local Tasks 1-11 review" in sessions

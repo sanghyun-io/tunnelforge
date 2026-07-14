@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tunnelforge-issue-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-08",
+  "vars": {
+    "RELAY_MODE": "off"
+  },
+  "triggers": {
+    "crons": ["*/15 * * * *"]
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "tunnelforge-issue-relay",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "observability": {
+    "enabled": false,
+    "logs": {
+      "enabled": false
+    },
+    "traces": {
+      "enabled": false
+    }
+  }
+}

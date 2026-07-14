@@ -49,6 +49,25 @@ LEGACY_CLEANUP_EXECUTION_DISABLED_TOOLTIP = (
 _DETACHED_MIGRATION_WORKERS = set()
 
 
+def _worker_is_running(worker) -> bool:
+    try:
+        is_running = getattr(worker, "isRunning")
+        return bool(is_running()) if callable(is_running) else False
+    except (AttributeError, RuntimeError, TypeError):
+        return False
+
+
+def has_active_detached_migration_workers() -> bool:
+    """Return whether a detached migration DB worker is still running."""
+    active = False
+    for worker in list(_DETACHED_MIGRATION_WORKERS):
+        if _worker_is_running(worker):
+            active = True
+        else:
+            _DETACHED_MIGRATION_WORKERS.discard(worker)
+    return active
+
+
 def _disconnect_connector_in_background(connector) -> None:
     """DB 커넥터 연결 해제를 백그라운드 스레드에서 수행 (UI 스레드 블로킹 방지)"""
     if not connector:
@@ -74,27 +93,39 @@ def _detach_workers_until_finished(workers, connector) -> None:
         _disconnect_connector_in_background(connector)
         return
 
-    for worker in remaining.values():
-        _DETACHED_MIGRATION_WORKERS.add(worker)
+    remaining_lock = threading.Lock()
+    disconnect_started = False
 
     def _make_on_finished(worker):
         def _on_finished(*_args):
-            _DETACHED_MIGRATION_WORKERS.discard(worker)
-            remaining.pop(id(worker), None)
-            if not remaining:
+            nonlocal disconnect_started
+            should_disconnect = False
+            with remaining_lock:
+                _DETACHED_MIGRATION_WORKERS.discard(worker)
+                was_pending = remaining.pop(id(worker), None) is not None
+                if was_pending and not remaining and not disconnect_started:
+                    disconnect_started = True
+                    should_disconnect = True
+            if should_disconnect:
                 _disconnect_connector_in_background(connector)
         return _on_finished
 
     for worker in list(remaining.values()):
+        on_finished = _make_on_finished(worker)
         try:
-            worker.finished.connect(_make_on_finished(worker))
+            worker.finished.connect(on_finished)
         except Exception as e:
             logger.error(f"디태치 Worker 완료 신호 연결 오류: {e}", exc_info=True)
-            remaining.pop(id(worker), None)
-            _DETACHED_MIGRATION_WORKERS.discard(worker)
+            on_finished()
+            continue
 
-    if not remaining:
-        _disconnect_connector_in_background(connector)
+        if not _worker_is_running(worker):
+            on_finished()
+            continue
+
+        _DETACHED_MIGRATION_WORKERS.add(worker)
+        if not _worker_is_running(worker):
+            on_finished()
 
 
 def _safe_disconnect_all(signal) -> None:
