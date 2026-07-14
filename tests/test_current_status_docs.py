@@ -1144,3 +1144,22 @@ def test_current_status_tracks_embedded_github_app_key_rotation_scope():
     assert "App ID `2735888`" in sessions
     assert "RELEASER_APP_PRIVATE_KEY" in sessions
     assert order.index("TF-STATUS-092") < order.index("TF-STATUS-090")
+
+
+def test_current_status_records_anonymous_error_reporting_design():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "Last reviewed: 2026-07-14" in doc
+    assert "dedicated reporter GitHub App" in summary
+    assert "Cloudflare Worker" in summary
+    assert "TF-STATUS-092 | High | open" in tracker
+    assert "2026-07-14-anonymous-error-reporting-design.md" in verification
+    assert "30 days" in verification
+    assert "at most twice" in verification
+    assert "2026-07-14-anonymous-error-reporting-design.md" in order
+    assert "No key or deployed service changed" in sessions

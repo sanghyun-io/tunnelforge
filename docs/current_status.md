@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-07-13
+Last reviewed: 2026-07-14
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -155,6 +155,12 @@ database, migration, or Rust Core operations. Rotate the exposed key only after
 inventorying external consumers by App ID and key fingerprint. Treat the current CI-only
 `RELEASER_APP_PRIVATE_KEY` as a separate credential until its App ID and
 fingerprint prove that the two lanes share the same key.
+The accepted replacement architecture uses a dedicated reporter GitHub App,
+installed only on TunnelForge with Metadata read and Issues read/write, behind
+a Cloudflare Worker. The desktop client contains no GitHub credential and sends
+only an affirmative-consent, versioned allowlist report. Credential containment
+does not wait for replacement feature delivery: the exposed key is revoked as
+soon as the Releaser coupling gate is resolved.
 
 Clean Code Round 3 completed on 2026-07-09: the remaining UI/dialog/main-window
 refactor work packages WP-3.1 through WP-3.8 were integrated as
@@ -626,6 +632,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-14 | TF-STATUS-092 anonymous error-reporting and rolling-rotation design | Chat design review; `docs/superpowers/specs/2026-07-14-anonymous-error-reporting-design.md` placeholder/heading scan; `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q`; `git diff --check` | DESIGN ACCEPTED; implementation not started; status suite 69 passed; placeholder/diff scans passed | Fixes the client/credential boundary around a dedicated reporter App and Cloudflare Worker, strict client/server allowlists, D1 HMAC idempotency without raw payload retention, local-only collection, best-effort HTTPS transport, and off/shadow/canary/active modes. Consent is affirmative; the prompt appears initially and, after defer, once more after 30 days, at most twice total. No key, secret, Worker, GitHub App, or live service was changed. |
 | 2026-07-13 | TF-STATUS-092 legacy GitHub App private-key rotation scope | Current and `v2.3.0` source/workflow scan; release-tag matrix scan; `v2.1.5` Actions log inspection; GitHub Actions secret-name inventory across 46 accessible `sanghyun-io` repositories; `.venv\Scripts\python.exe -m pytest tests\test_current_status_docs.py -q`; `git diff --check` | HIGH exposure confirmed; rotation not yet performed; status suite 68 passed; diff check passed | App ID `2735888` release automation embedded the issue-reporter key in `v1.13.4` through `v2.3.0`: 43 affected tags and 42 published releases, with `v2.1.4` being the only affected tag without a published release. The `v2.1.5` build log directly confirms private-key embedding; the full release range is a high-confidence inference from the identical embedding workflow and successful release records, not individual reverse engineering of all 42 binaries. `v2.3.1` has no embedded-key support and its release workflows do not read `GH_APP_PRIVATE_KEY`. Exact GitHub App/Releaser secret names were found only in `sanghyun-io/tunnelforge`; external secret stores, local PEM copies, installation scope, and differently named copies remain unresolved. |
 | 2026-07-13 | `v2.3.1` protected release publication / TF-STATUS-081 closure | PR #240 checks and merge; tag workflow `29233663954`; Build and Release workflow `29233708190`; annotated tag API read; `gh release view v2.3.1`; release asset/digest assertion | PASS | PR #240 merged at `b80e15c6148ba19a357a84b4e9e6cee8ae0b4727`. The approved tag workflow created immutable annotated `v2.3.1` at that commit. Release preflight, Windows build, unsigned macOS arm64/x86_64 build/package/smoke, artifact normalization, and draft creation passed. The published latest stable release has 10 release assets, all GitHub SHA-256 digests present, at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1`. |
 | 2026-07-13 | Accepted unsigned macOS release policy | credential matrix and workflow focused tests; standalone full Python suite; Cargo baseline; security re-review; `git diff --check` | PASS | RED produced the expected workflow contract failure and missing credential-classifier import. GREEN: credential/workflow focused 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings in 60.14s; Cargo 216 + 2 JSONL + 9 live + 2 stress passed / 1 ignored. All Apple values absent selects unsigned; any partial configuration fails closed; complete required credentials select signed. Security re-review: SECURE. |
@@ -2389,7 +2396,7 @@ Next action:
 | TF-STATUS-089 | High | closed | Release approval / tag and publication trust | Automatic tag, automatic stable publication, mutable credentialed actions, optional macOS signing | Retain separate approved manual tag/draft workflows, exact tag/version/ancestry checks, pinned actions, protected Environment, and immutable release-tag updates/deletes |
 | TF-STATUS-090 | High | watch | macOS release signing / notarization | Protected Environment intentionally has no paid Apple Developer credentials | Publish explicitly unsigned macOS artifacts for this release; revisit signing/notarization when an Apple Developer account is available |
 | TF-STATUS-091 | Medium | watch | Release governance / independent approval | Only one write/admin collaborator exists | Keep single-maintainer approval enabled; revisit independent approval after adding a second trusted maintainer |
-| TF-STATUS-092 | High | open | Security / GitHub App credentials | Legacy issue-reporter App private key was embedded in public releases | Inventory App ID `2735888` consumers and the exposed key fingerprint; generate an overlapping replacement, migrate and test legitimate server consumers, revoke the embedded old key, and remove the unused `GH_APP_PRIVATE_KEY` repository secret. Rotate the Releaser App separately unless identity is proven shared |
+| TF-STATUS-092 | High | open | Security / GitHub App credentials | Legacy issue-reporter App private key was embedded in public releases | Resolve the Releaser coupling gate and revoke the exposed key without waiting for feature delivery; then implement and roll out the dedicated reporter App, Cloudflare relay, strict allowlists, affirmative consent, and emergency off switch from the accepted design |
 
 ## Recommended Execution Order
 
@@ -2406,13 +2413,13 @@ Next action:
    updates/deletes.
 6. Resolve TF-STATUS-092 before optional release hardening: identify App ID
    `2735888` and the exposed key fingerprint, inventory all legitimate
-   consumers, generate an overlapping replacement, migrate and test those
-   consumers, then revoke the old embedded key and remove the unused
-   `GH_APP_PRIVATE_KEY` repository secret. Do not distribute the replacement in
-   TunnelForge clients. After revocation, treat already issued installation
-   tokens as potentially valid until their one-hour lifetime expires. Rotate
-   `RELEASER_APP_PRIVATE_KEY` separately unless its App ID and key fingerprint
-   prove that the credentials are coupled.
+   consumers, resolve any Releaser coupling, then revoke the old embedded key
+   and remove the unused `GH_APP_PRIVATE_KEY` repository secret. Do not wait for
+   replacement feature delivery and treat already issued installation tokens as
+   potentially valid until their one-hour lifetime expires. Implement the new
+   client and relay through
+   `docs/superpowers/specs/2026-07-14-anonymous-error-reporting-design.md`;
+   never distribute the replacement private key in TunnelForge clients.
 7. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted for
    this release; add signing/notarization only when paid Apple credentials are
    available.
@@ -2449,6 +2456,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-14 | Accepted the TF-STATUS-092 replacement design: a dedicated repository-scoped reporter GitHub App, Cloudflare Worker relay, client/server allowlists, affirmative consent prompt shown at most twice with a 30-day defer, and an independent exposed-key containment lane. No key or deployed service changed in this design session. | anonymous error-reporting design, canonical status, status documentation contract test | Design self-review found no placeholders; storage was fixed to D1 HMAC idempotency, Cloudflare network processing was distinguished from application retention, and DB version collection was constrained to already-known metadata. Focused status test began RED; final status suite passed 69 tests and placeholder/diff scans passed. |
 | 2026-07-13 | Opened TF-STATUS-092 after mapping the GitHub App private-key rotation blast radius. App ID `2735888` powered the legacy issue reporter and its key was embedded in the public release path through `v2.3.0`; current `v2.3.1` is outside that path. The repository's `RELEASER_APP_PRIVATE_KEY` remains a separate CI credential unless Developer Settings App ID and key-fingerprint evidence proves otherwise. No key was generated, replaced, deleted, or revoked in this session. | release history, release workflows, GitHub App authentication history, Actions logs/secrets inventory, `docs/current_status.md`, status documentation test | Confirmed 43 affected tags and 42 published releases; direct embedding evidence in the `v2.1.5` build log; no current embedded support or release secret read; exact secret-name inventory across 46 accessible account repositories. Status suite 68 passed and `git diff --check` passed. External consumers and installation scope still require fingerprint-based inventory before rotation. |
 | 2026-07-13 | Published TunnelForge `v2.3.1` through the protected release path and closed TF-STATUS-081. PR #240 merged at `b80e15c6148ba19a357a84b4e9e6cee8ae0b4727`; the approved annotated tag, multi-platform release build, draft asset verification, direct-distribution security notice, and stable/latest publication all completed. | live PR/tag/Actions/Release state; final status docs/tests | Tag run `29233663954` and release run `29233708190` passed. Windows installer/WebSetup and unsigned macOS arm64/x86_64 DMG/ZIP assets passed hosted build/package/smoke checks. The published release contains all 10 expected assets with GitHub SHA-256 digests: `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.3.1`. |
 | 2026-07-13 | Restored the established release behavior for maintainers without paid Apple credentials: build and smoke-test unsigned macOS arm64/x86_64 artifacts only when all Apple values are absent, while failing on every partial signing/notarization configuration. Recorded GitHub Releases direct distribution and no planned Apple App Store registration as durable project policy. The owner accepted unsigned macOS distribution and single-maintainer approval for `2.3.1`; TF-STATUS-090/091 moved from blockers to watch items. | release workflow, Apple credential classifier, workflow/credential/status/macOS documentation tests, `AGENTS.md`, support/status docs | TDD RED/GREEN; focused credential/workflow 23 passed; final full Python 2038 passed / 1 skipped / 4 warnings; Cargo baseline passed; security re-review SECURE; diff check passed. |
