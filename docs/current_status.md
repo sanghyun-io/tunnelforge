@@ -2545,14 +2545,16 @@ Next action:
    by preflight and normal forwarding.
 2. Fix TF-STATUS-096 so Import Auto preserves server/session defaults and emits
    no implicit timezone-changing SQL.
-3. Disable One-Click non-dry-run immediately while its exact-plan approval
-   boundary is absent; preserve dry-run and explain the temporary restriction.
+3. Disable One-Click non-dry-run for TF-STATUS-097 immediately while its
+   exact-plan approval boundary is absent; preserve dry-run and explain the
+   temporary restriction.
 4. Write TF-STATUS-098 executable contracts for deadline, mismatched IDs,
    process death/restart, protocol compatibility, typed indeterminate outcomes,
    and mutation non-retry; implement only the smallest passing process behavior.
-5. Re-enable One-Click non-dry-run only after TF-STATUS-098 is complete and
-   plan/apply binds a secret-free current-target identity, ordered actions,
-   snapshot hash, and plan hash to explicit default-No approval.
+5. Re-enable One-Click non-dry-run for TF-STATUS-097 only after TF-STATUS-098
+   is complete and plan/apply binds a secret-free current-target identity,
+   ordered actions, snapshot hash, and plan hash to explicit default-No
+   approval.
 6. Write TF-STATUS-099 reproducers for complete endpoint identity, plan
    fingerprint, atomic resume storage, stale-state rejection, and exactly one
    terminal cancellation/result state before changing resume architecture.
