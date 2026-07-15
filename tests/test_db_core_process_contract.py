@@ -2989,7 +2989,7 @@ def test_cancel_owner_cleanup_uses_full_deadline_and_reports_handoff_timeout(
         assert len(pending_tasks) == 1
         assert "db-core-reap-generation-1" in pending_tasks[0]
         assert owner_deadlines == [pytest.approx(started + 0.6, abs=0.03)]
-        assert handoff_blocked.is_set()
+        assert handoff_blocked.wait(timeout=0.2)
         assert client.generation_state is DbCoreGenerationState.REAPING
     finally:
         monkeypatch.setattr(
