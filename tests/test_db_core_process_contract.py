@@ -1058,6 +1058,10 @@ def _task3_hello(request_id, **overrides):
         "process_version": 1,
         "process_capabilities": sorted(REQUIRED_PROCESS_CAPABILITIES),
         "max_jsonl_frame_bytes": MAX_JSONL_FRAME_BYTES,
+        "max_assembled_event_bytes": db_core_client.MAX_ASSEMBLED_EVENT_BYTES,
+        "max_assembled_event_chunks": db_core_client.MAX_ASSEMBLED_EVENT_CHUNKS,
+        "max_assembled_event_nodes": db_core_client.MAX_ASSEMBLED_EVENT_NODES,
+        "max_assembled_event_depth": db_core_client.MAX_ASSEMBLED_EVENT_DEPTH,
         "capabilities": ["service.shutdown"],
     }
     event.update(overrides)
@@ -1144,6 +1148,7 @@ class _Task3Process:
         self,
         *,
         hello_overrides=None,
+        hello_remove=(),
         responder=None,
         stall_hello=False,
         stall_drain=False,
@@ -1153,6 +1158,7 @@ class _Task3Process:
     ):
         self.returncode = None
         self.hello_overrides = dict(hello_overrides or {})
+        self.hello_remove = tuple(hello_remove)
         self.responder = responder
         self.stall_hello = stall_hello
         self.stall_drain = stall_drain
@@ -1179,9 +1185,10 @@ class _Task3Process:
     def respond(self, request):
         if request["command"] == "service.hello":
             if not self.stall_hello:
-                self.stdout.feed_event(
-                    _task3_hello(request["request_id"], **self.hello_overrides)
-                )
+                event = _task3_hello(request["request_id"], **self.hello_overrides)
+                for field in self.hello_remove:
+                    event.pop(field, None)
+                self.stdout.feed_event(event)
             return
         if self.responder is not None:
             self.responder(self, request)
@@ -1370,6 +1377,10 @@ def test_spawn_hello_exact_capabilities_and_generation_state_correlation():
         ({"protocol_version": 2}, "db_core_capability_missing"),
         ({"process_version": 2}, "db_core_capability_missing"),
         ({"max_jsonl_frame_bytes": MAX_JSONL_FRAME_BYTES - 1}, "db_core_capability_missing"),
+        ({"max_assembled_event_bytes": db_core_client.MAX_ASSEMBLED_EVENT_BYTES - 1}, "db_core_capability_missing"),
+        ({"max_assembled_event_chunks": db_core_client.MAX_ASSEMBLED_EVENT_CHUNKS - 1}, "db_core_capability_missing"),
+        ({"max_assembled_event_nodes": db_core_client.MAX_ASSEMBLED_EVENT_NODES - 1}, "db_core_capability_missing"),
+        ({"max_assembled_event_depth": db_core_client.MAX_ASSEMBLED_EVENT_DEPTH - 1}, "db_core_capability_missing"),
         ({"process_capabilities": ["request.deadline"]}, "db_core_capability_missing"),
         ({"process_capabilities": sorted(REQUIRED_PROCESS_CAPABILITIES) + ["extra"]}, "db_core_capability_missing"),
         ({"process_capabilities": [*sorted(REQUIRED_PROCESS_CAPABILITIES)[:-1], 7]}, "db_core_capability_missing"),
@@ -1402,6 +1413,35 @@ def test_hello_capability_negotiation_is_exact_and_reaps(hello_overrides, expect
         (DbCoreGenerationState.REAPING, 1),
         (DbCoreGenerationState.CLOSED, 1),
     ]
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_assembled_event_bytes",
+        "max_assembled_event_chunks",
+        "max_assembled_event_nodes",
+        "max_assembled_event_depth",
+    ],
+)
+def test_hello_missing_aggregate_limit_reaps(field):
+    process = _Task3Process(hello_remove=(field,))
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id=f"missing-{field}",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_capability_missing"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert process.terminate_calls == 1
 
 
 @pytest.mark.parametrize("response_id", [None, "wrong-request"])
@@ -1991,6 +2031,94 @@ def test_stderr_cancellation_resistance_is_deadline_bounded_and_not_closed():
     client.shutdown(timeout_seconds=1.0)
 
 
+def test_external_reap_cancellation_retains_process_and_stderr_for_retry():
+    process = _Task3Process(responder=lambda proc, req: _task3_result(proc, req))
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    client.request_result(
+        "schema.list",
+        request_id="activate-external-reap-cancel",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        timeout_seconds=1.0,
+    )
+
+    async def exercise():
+        old_task = client._stderr_task
+        assert old_task is not None
+        old_task.cancel()
+        await asyncio.gather(old_task, return_exceptions=True)
+        release = asyncio.Event()
+
+        async def cancellation_resistant():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        resistant = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        client._stderr_task = resistant
+        reap = asyncio.create_task(
+            client._terminate_process_on_owner(time.monotonic() + 1.0)
+        )
+        await asyncio.sleep(0.02)
+        reap.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await reap
+        retained = (
+            client.generation_state,
+            client._process is process,
+            client._stderr_task is resistant,
+        )
+        release.set()
+        await resistant
+        return retained
+
+    retained = client._submit_owner(
+        exercise(), DbCoreRequestKind.READ_ONLY, "external-reap-cancel"
+    ).result(timeout=1.0)
+
+    assert retained == (DbCoreGenerationState.REAPING, True, True)
+    client.shutdown(timeout_seconds=1.0)
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+@pytest.mark.parametrize("cleanup_exception", [RuntimeError("cleanup runtime"), asyncio.CancelledError()])
+def test_cleanup_base_exception_preserves_mutation_indeterminate(cleanup_exception):
+    def respond(process, request):
+        process.stdout.feed_event({
+            "event": "result",
+            "request_id": request["request_id"],
+            "command": "wrong.command",
+            "success": True,
+        })
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    original_reap = client._poison_and_reap_on_owner
+
+    async def failing_reap(_deadline_at):
+        raise cleanup_exception
+
+    client._poison_and_reap_on_owner = failing_reap
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "dump.import",
+                request_id="base-exception-cleanup",
+                request_kind=DbCoreRequestKind.MUTATION,
+                timeout_seconds=1.0,
+            )
+    finally:
+        client._poison_and_reap_on_owner = original_reap
+        client.shutdown(timeout_seconds=1.0)
+
+    assert raised.value.code == "db_core_protocol_mismatch"
+    assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+    assert raised.value.cleanup_error.code == "db_core_cleanup_failed"
+    assert raised.value.payload["cleanup_error"]["code"] == "db_core_cleanup_failed"
+    assert [request["command"] for request in process.writes].count("dump.import") == 1
+
+
 def test_reap_failure_preserves_post_write_mutation_uncertainty_without_retry():
     def respond(process, request):
         process.stdout.feed_event({
@@ -2024,10 +2152,25 @@ def test_reap_failure_preserves_post_write_mutation_uncertainty_without_retry():
 
 
 def test_real_rust_cli_chunks_reassemble_in_python():
+    repository = Path(__file__).parents[1]
+    manifest = repository / "migration_core" / "Cargo.toml"
+    subprocess.run(
+        ["cargo", "build", "--manifest-path", str(manifest), "--bin", "tunnelforge-core"],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    metadata = subprocess.run(
+        ["cargo", "metadata", "--manifest-path", str(manifest), "--format-version", "1", "--no-deps"],
+        cwd=repository,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
     binary_name = "tunnelforge-core.exe" if sys.platform == "win32" else "tunnelforge-core"
-    binary = Path(__file__).parents[1] / "migration_core" / "target" / "debug" / binary_name
-    if not binary.exists():
-        pytest.skip("Rust debug CLI is not built")
+    binary = Path(json.loads(metadata.stdout)["target_directory"]) / "debug" / binary_name
+    assert binary.is_file()
     request_id = "rust-python-chunk-compat"
     column_name = "열" * 220_000
     request = {
@@ -2072,6 +2215,13 @@ def test_real_rust_cli_chunks_reassemble_in_python():
     assert logical["request_id"] == request_id
     assert logical["command"] == "plan"
     assert logical["success"] is True
+    expected_ddl = (
+        'CREATE TABLE "large_names" (\n'
+        f'  "{column_name}" INTEGER GENERATED BY DEFAULT AS IDENTITY NOT NULL,\n'
+        f'  PRIMARY KEY ("{column_name}")\n'
+        ');'
+    )
+    assert logical["plan"]["ddl"] == [expected_ddl]
 
 
 def test_stale_required_generation_is_rejected_before_fresh_process_spawn():

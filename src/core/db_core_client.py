@@ -1094,6 +1094,22 @@ class DbCoreServiceClient:
                 payload.get("max_jsonl_frame_bytes"),
                 MAX_JSONL_FRAME_BYTES,
             )
+            and exact_integer(
+                payload.get("max_assembled_event_bytes"),
+                MAX_ASSEMBLED_EVENT_BYTES,
+            )
+            and exact_integer(
+                payload.get("max_assembled_event_chunks"),
+                MAX_ASSEMBLED_EVENT_CHUNKS,
+            )
+            and exact_integer(
+                payload.get("max_assembled_event_nodes"),
+                MAX_ASSEMBLED_EVENT_NODES,
+            )
+            and exact_integer(
+                payload.get("max_assembled_event_depth"),
+                MAX_ASSEMBLED_EVENT_DEPTH,
+            )
             and exact_capabilities
         ):
             raise DbCoreServiceError(
@@ -1268,6 +1284,18 @@ class DbCoreServiceClient:
             error.__cause__ = exc
             await self._poison_and_reap_preserving_on_owner(error, deadline_at)
             raise error
+        except BaseException as exc:
+            error = DbCoreServiceError(
+                f"DB Core request write failed: {type(exc).__name__}: {exc}",
+                code="db_core_write_failed",
+                request_kind=request_kind,
+                outcome=self._transport_outcome(request_kind),
+                request_id=request_id,
+                process_generation=self._process_generation,
+            )
+            error.__cause__ = exc
+            await self._poison_and_reap_preserving_on_owner(error, deadline_at)
+            raise error
 
         assembler = _PayloadAssembler(request_id)
         while True:
@@ -1325,6 +1353,18 @@ class DbCoreServiceClient:
                 error = DbCoreServiceError(
                     f"DB Core emitted a malformed protocol event: {exc}",
                     code="db_core_protocol_mismatch",
+                    request_kind=request_kind,
+                    outcome=self._transport_outcome(request_kind),
+                    request_id=request_id,
+                    process_generation=self._process_generation,
+                )
+                error.__cause__ = exc
+                await self._poison_and_reap_preserving_on_owner(error, deadline_at)
+                raise error
+            except BaseException as exc:
+                error = DbCoreServiceError(
+                    f"DB Core request transport failed: {type(exc).__name__}: {exc}",
+                    code="db_core_transport_failed",
                     request_kind=request_kind,
                     outcome=self._transport_outcome(request_kind),
                     request_id=request_id,
@@ -1721,7 +1761,18 @@ class DbCoreServiceClient:
     ) -> None:
         try:
             await self._poison_and_reap_on_owner(deadline_at)
-        except DbCoreServiceError as cleanup_error:
+        except BaseException as cleanup_exception:
+            if isinstance(cleanup_exception, DbCoreServiceError):
+                cleanup_error = cleanup_exception
+            else:
+                cleanup_error = DbCoreServiceError(
+                    f"DB Core cleanup failed: {type(cleanup_exception).__name__}: "
+                    f"{cleanup_exception}",
+                    code="db_core_cleanup_failed",
+                    outcome=DbCoreOutcome.FAILED,
+                    process_generation=self._process_generation,
+                )
+                cleanup_error.__cause__ = cleanup_exception
             self._attach_cleanup_error(primary_error, cleanup_error)
 
     async def _poison_and_reap_on_owner(self, deadline_at: float) -> None:
@@ -1803,8 +1854,6 @@ class DbCoreServiceClient:
         if stderr_task is not None and not stderr_task.done():
             try:
                 await self._await_before(asyncio.shield(stderr_task), deadline_at)
-            except asyncio.CancelledError:
-                pass
             except asyncio.TimeoutError as exc:
                 raise DbCoreServiceError(
                     "DB Core stderr task resisted bounded cancellation",

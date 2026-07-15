@@ -112,6 +112,10 @@ fn helper_binary_negotiates_process_contract() {
         ])
     );
     assert_eq!(result["max_jsonl_frame_bytes"], 1_048_576);
+    assert_eq!(result["max_assembled_event_bytes"], 64 * 1024 * 1024);
+    assert_eq!(result["max_assembled_event_chunks"], 4_096);
+    assert_eq!(result["max_assembled_event_nodes"], 65_536);
+    assert_eq!(result["max_assembled_event_depth"], 128);
 }
 
 #[test]
@@ -132,7 +136,7 @@ fn helper_binary_emits_structured_invalid_json_error() {
     let events = run_helper_lines("{\n");
 
     assert_eq!(events.len(), 1);
-    assert_protocol_error(&events[0], Value::Null);
+    assert_protocol_error(&events[0], json!("protocol-invalid-request-id"));
     assert_eq!(events[0]["command"], Value::Null);
 }
 
@@ -233,4 +237,20 @@ fn helper_binary_rejects_unterminated_jsonl_frame() {
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["code"], "jsonl_frame_missing_newline");
     assert_eq!(events[0]["command"], Value::Null);
+}
+
+#[test]
+fn helper_binary_rejects_invalid_request_ids_without_null_envelopes() {
+    for input in [
+        "{\"command\":\"service.hello\",\"payload\":{}}\n",
+        "{\"command\":\"service.hello\",\"request_id\":null,\"payload\":{}}\n",
+        "{\"command\":\"service.hello\",\"request_id\":7,\"payload\":{}}\n",
+        "{\"command\":\"service.hello\",\"request_id\":\"\",\"payload\":{}}\n",
+    ] {
+        let events = run_helper_lines(input);
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0]["event"], "error");
+        assert!(matches!(events[0]["request_id"].as_str(), Some(value) if !value.is_empty()));
+        assert_ne!(events[0]["request_id"], Value::Null);
+    }
 }

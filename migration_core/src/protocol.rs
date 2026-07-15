@@ -10,6 +10,12 @@ use crate::*;
 pub const PROTOCOL_VERSION: u32 = 1;
 pub const PROCESS_VERSION: u32 = 1;
 pub const MAX_JSONL_FRAME_BYTES: usize = 1_048_576;
+pub const MAX_ASSEMBLED_EVENT_BYTES: usize = 64 * 1024 * 1024;
+pub const MAX_ASSEMBLED_EVENT_CHUNKS: usize = 4_096;
+pub const MAX_ASSEMBLED_EVENT_NODES: usize = 65_536;
+pub const MAX_ASSEMBLED_EVENT_DEPTH: usize = 128;
+const MAX_REFERENCE_PAGE_ITEMS: usize = 64;
+const PROTOCOL_ERROR_REQUEST_ID: &str = "protocol-invalid-request-id";
 
 pub const PROCESS_CAPABILITIES: &[&str] = &[
     "request.deadline",
@@ -48,6 +54,7 @@ pub const PUBLIC_COMMANDS: &[&str] = &[
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtocolEmitError {
+    code: &'static str,
     message: String,
     side_effect_started: bool,
 }
@@ -55,9 +62,22 @@ pub struct ProtocolEmitError {
 impl ProtocolEmitError {
     pub fn io(message: impl Into<String>) -> Self {
         Self {
+            code: "protocol_emit_failed",
             message: message.into(),
             side_effect_started: false,
         }
+    }
+
+    fn aggregate(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            side_effect_started: false,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        self.code
     }
 
     pub fn after_side_effect(mut self) -> Self {
@@ -105,6 +125,7 @@ struct ProtocolEncodingMetrics {
     peak_buffered_frames: usize,
     peak_buffered_bytes: usize,
     visited_nodes: usize,
+    peak_reference_page_items: usize,
 }
 
 #[cfg(test)]
@@ -115,6 +136,7 @@ thread_local! {
     static PEAK_BUFFERED_FRAMES: Cell<usize> = const { Cell::new(0) };
     static PEAK_BUFFERED_BYTES: Cell<usize> = const { Cell::new(0) };
     static VISITED_NODES: Cell<usize> = const { Cell::new(0) };
+    static PEAK_REFERENCE_PAGE_ITEMS: Cell<usize> = const { Cell::new(0) };
 }
 
 fn record_frame_serialization(bytes: usize) {
@@ -153,6 +175,13 @@ fn record_node_visited() {
     VISITED_NODES.set(VISITED_NODES.get() + 1);
 }
 
+fn record_reference_page_items(items: usize) {
+    #[cfg(test)]
+    PEAK_REFERENCE_PAGE_ITEMS.set(PEAK_REFERENCE_PAGE_ITEMS.get().max(items));
+    #[cfg(not(test))]
+    let _ = items;
+}
+
 #[cfg(test)]
 fn reset_protocol_encoding_metrics() {
     SERIALIZED_FRAMES.set(0);
@@ -161,6 +190,7 @@ fn reset_protocol_encoding_metrics() {
     PEAK_BUFFERED_FRAMES.set(0);
     PEAK_BUFFERED_BYTES.set(0);
     VISITED_NODES.set(0);
+    PEAK_REFERENCE_PAGE_ITEMS.set(0);
 }
 
 #[cfg(test)]
@@ -172,6 +202,7 @@ fn protocol_encoding_metrics() -> ProtocolEncodingMetrics {
         peak_buffered_frames: PEAK_BUFFERED_FRAMES.get(),
         peak_buffered_bytes: PEAK_BUFFERED_BYTES.get(),
         visited_nodes: VISITED_NODES.get(),
+        peak_reference_page_items: PEAK_REFERENCE_PAGE_ITEMS.get(),
     }
 }
 
@@ -220,10 +251,18 @@ struct ProtocolChunkEncoder {
     logical_event: String,
     next_node_id: u64,
     max_frame_bytes: usize,
+    aggregate_bytes: usize,
+    chunk_count: usize,
+    node_count: usize,
+    track_metrics: bool,
 }
 
 impl ProtocolChunkEncoder {
-    fn new(event: &Value, max_frame_bytes: usize) -> Result<Self, ProtocolEmitError> {
+    fn new(
+        event: &Value,
+        max_frame_bytes: usize,
+        track_metrics: bool,
+    ) -> Result<Self, ProtocolEmitError> {
         let fields = event
             .as_object()
             .ok_or_else(|| ProtocolEmitError::io("protocol event must be an object"))?;
@@ -239,6 +278,10 @@ impl ProtocolChunkEncoder {
             logical_event,
             next_node_id: 0,
             max_frame_bytes,
+            aggregate_bytes: 0,
+            chunk_count: 0,
+            node_count: 0,
+            track_metrics,
         })
     }
 
@@ -247,61 +290,108 @@ impl ProtocolChunkEncoder {
         value: &Value,
         parent_node_id: Option<u64>,
         slot_index: Option<usize>,
+        depth: usize,
         emit: &mut F,
     ) -> Result<u64, ProtocolEmitError>
     where
         F: FnMut(&[u8]) -> ProtocolEmitResult,
     {
-        record_node_visited();
+        if depth > MAX_ASSEMBLED_EVENT_DEPTH {
+            return Err(ProtocolEmitError::aggregate(
+                "protocol_aggregate_depth_exceeded",
+                "protocol event exceeds aggregate reconstruction depth limit",
+            ));
+        }
+        if self.node_count >= MAX_ASSEMBLED_EVENT_NODES {
+            return Err(ProtocolEmitError::aggregate(
+                "protocol_aggregate_nodes_exceeded",
+                "protocol event exceeds aggregate node count limit",
+            ));
+        }
+        self.node_count += 1;
+        if self.track_metrics {
+            record_node_visited();
+        }
         let node_id = self.next_node_id;
         self.next_node_id += 1;
         match value {
             Value::Object(fields) => {
-                let mut items = Vec::with_capacity(fields.len());
-                for (index, (key, child)) in fields.iter().enumerate() {
-                    let key_value = Value::String(key.clone());
-                    let key_node_id = self.visit_and_emit(
-                        &key_value,
-                        Some(node_id),
-                        Some(index),
-                        emit,
-                    )?;
-                    let value_node_id = self.visit_and_emit(
-                        child,
-                        Some(node_id),
-                        Some(index),
-                        emit,
-                    )?;
-                    items.push(json!({
-                        "key_node_id": key_node_id,
-                        "value_node_id": value_node_id
-                    }));
-                }
                 let node = ProtocolChunkNode {
                     node_id,
                     parent_node_id,
                     slot_index,
                     value_kind: "object",
                 };
-                self.item_frames(&node, items, emit)?;
-            }
-            Value::Array(values) => {
-                let mut items = Vec::with_capacity(values.len());
-                for (index, child) in values.iter().enumerate() {
-                    items.push(Value::from(self.visit_and_emit(
+                let mut items = Vec::with_capacity(fields.len().min(MAX_REFERENCE_PAGE_ITEMS));
+                let mut sequence = 0usize;
+                for (index, (key, child)) in fields.iter().enumerate() {
+                    let key_value = Value::String(key.clone());
+                    let key_node_id = self.visit_and_emit(
+                        &key_value,
+                        Some(node_id),
+                        Some(index),
+                        depth + 1,
+                        emit,
+                    )?;
+                    let value_node_id = self.visit_and_emit(
                         child,
                         Some(node_id),
                         Some(index),
+                        depth + 1,
                         emit,
-                    )?));
+                    )?;
+                    items.push(json!({
+                        "key_node_id": key_node_id,
+                        "value_node_id": value_node_id
+                    }));
+                    if items.len() == MAX_REFERENCE_PAGE_ITEMS {
+                        if self.track_metrics {
+                            record_reference_page_items(items.len());
+                        }
+                        let final_page = index + 1 == fields.len();
+                        self.item_page(&node, &mut sequence, items, final_page, emit)?;
+                        items = Vec::with_capacity(MAX_REFERENCE_PAGE_ITEMS);
+                    }
                 }
+                if !items.is_empty() || fields.is_empty() {
+                    if self.track_metrics {
+                        record_reference_page_items(items.len());
+                    }
+                    self.item_page(&node, &mut sequence, items, true, emit)?;
+                }
+            }
+            Value::Array(values) => {
                 let node = ProtocolChunkNode {
                     node_id,
                     parent_node_id,
                     slot_index,
                     value_kind: "list",
                 };
-                self.item_frames(&node, items, emit)?;
+                let mut items = Vec::with_capacity(values.len().min(MAX_REFERENCE_PAGE_ITEMS));
+                let mut sequence = 0usize;
+                for (index, child) in values.iter().enumerate() {
+                    items.push(Value::from(self.visit_and_emit(
+                        child,
+                        Some(node_id),
+                        Some(index),
+                        depth + 1,
+                        emit,
+                    )?));
+                    if items.len() == MAX_REFERENCE_PAGE_ITEMS {
+                        if self.track_metrics {
+                            record_reference_page_items(items.len());
+                        }
+                        let final_page = index + 1 == values.len();
+                        self.item_page(&node, &mut sequence, items, final_page, emit)?;
+                        items = Vec::with_capacity(MAX_REFERENCE_PAGE_ITEMS);
+                    }
+                }
+                if !items.is_empty() || values.is_empty() {
+                    if self.track_metrics {
+                        record_reference_page_items(items.len());
+                    }
+                    self.item_page(&node, &mut sequence, items, true, emit)?;
+                }
             }
             Value::String(text) => {
                 let node = ProtocolChunkNode {
@@ -319,7 +409,8 @@ impl ProtocolChunkEncoder {
                     slot_index,
                     value_kind: "atomic",
                 };
-                self.item_frames(&node, vec![value.clone()], emit)?;
+                let mut sequence = 0;
+                self.item_page(&node, &mut sequence, vec![value.clone()], true, emit)?;
             }
         }
         Ok(node_id)
@@ -344,7 +435,9 @@ impl ProtocolChunkEncoder {
         let mut bytes = serde_json::to_vec(frame)
             .map_err(|err| ProtocolEmitError::io(format!("protocol frame encode failed: {err}")))?;
         bytes.push(b'\n');
-        record_frame_serialization(bytes.len());
+        if self.track_metrics {
+            record_frame_serialization(bytes.len());
+        }
         if bytes.len() > self.max_frame_bytes {
             return Err(ProtocolEmitError::io(
                 "protocol frame exceeds MAX_JSONL_FRAME_BYTES",
@@ -353,20 +446,44 @@ impl ProtocolChunkEncoder {
         Ok(bytes)
     }
 
-    fn emit_frame<F>(&self, frame: &Value, emit: &mut F) -> ProtocolEmitResult
+    fn emit_frame<F>(&mut self, frame: &Value, emit: &mut F) -> ProtocolEmitResult
     where
         F: FnMut(&[u8]) -> ProtocolEmitResult,
     {
         let bytes = self.serialize_frame(frame)?;
+        if self.chunk_count >= MAX_ASSEMBLED_EVENT_CHUNKS {
+            return Err(ProtocolEmitError::aggregate(
+                "protocol_aggregate_chunks_exceeded",
+                "protocol event exceeds aggregate chunk count limit",
+            ));
+        }
+        let aggregate_bytes = self.aggregate_bytes.checked_add(bytes.len()).ok_or_else(|| {
+            ProtocolEmitError::aggregate(
+                "protocol_aggregate_bytes_exceeded",
+                "protocol event exceeds aggregate byte limit",
+            )
+        })?;
+        if aggregate_bytes > MAX_ASSEMBLED_EVENT_BYTES {
+            return Err(ProtocolEmitError::aggregate(
+                "protocol_aggregate_bytes_exceeded",
+                "protocol event exceeds aggregate byte limit",
+            ));
+        }
+        self.chunk_count += 1;
+        self.aggregate_bytes = aggregate_bytes;
         emit(&bytes)?;
-        record_frame_emitted();
+        if self.track_metrics {
+            record_frame_emitted();
+        }
         Ok(())
     }
 
-    fn item_frames<F>(
-        &self,
+    fn item_page<F>(
+        &mut self,
         node: &ProtocolChunkNode,
+        sequence: &mut usize,
         items: Vec<Value>,
+        final_page: bool,
         emit: &mut F,
     ) -> ProtocolEmitResult
     where
@@ -386,25 +503,31 @@ impl ProtocolChunkEncoder {
         let true_base_len = self.serialize_frame(&empty_true)?.len();
 
         if items.is_empty() {
+            if !final_page {
+                return Ok(());
+            }
+            empty_true["sequence"] = Value::from(*sequence);
+            *sequence += 1;
             return self.emit_frame(&empty_true, emit);
         }
 
         let item_count = items.len();
         let mut current = Vec::new();
         let mut current_serialized_bytes = 0usize;
-        let mut sequence = 0usize;
         for (index, item) in items.into_iter().enumerate() {
             let item_bytes = serde_json::to_vec(&item).map_err(|err| {
                 ProtocolEmitError::io(format!("protocol collection item encode failed: {err}"))
             })?;
-            record_value_serialization(item_bytes.len());
+            if self.track_metrics {
+                record_value_serialization(item_bytes.len());
+            }
             let separator_bytes = usize::from(!current.is_empty());
-            let is_last_item = index + 1 == item_count;
-            let candidate_base = if is_last_item {
+            let is_final_item = final_page && index + 1 == item_count;
+            let candidate_base = if is_final_item {
                 true_base_len
             } else {
                 false_base_len
-            } + Self::sequence_width_extra(sequence);
+            } + Self::sequence_width_extra(*sequence);
             let candidate_len = candidate_base
                 + current_serialized_bytes
                 + separator_bytes
@@ -415,19 +538,19 @@ impl ProtocolChunkEncoder {
                         "protocol collection item cannot fit in one frame",
                     ));
                 }
-                let mut frame = self.base_frame(node, sequence, false);
+                let mut frame = self.base_frame(node, *sequence, false);
                 frame
                     .as_object_mut()
                     .expect("chunk frame object")
                     .insert("items".to_string(), Value::Array(std::mem::take(&mut current)));
                 self.emit_frame(&frame, emit)?;
-                sequence += 1;
+                *sequence += 1;
                 current_serialized_bytes = 0;
-                let standalone_base = if is_last_item {
+                let standalone_base = if is_final_item {
                     true_base_len
                 } else {
                     false_base_len
-                } + Self::sequence_width_extra(sequence);
+                } + Self::sequence_width_extra(*sequence);
                 if standalone_base + item_bytes.len() > self.max_frame_bytes {
                     return Err(ProtocolEmitError::io(
                         "protocol collection item cannot fit in one frame",
@@ -438,11 +561,12 @@ impl ProtocolChunkEncoder {
             current.push(item);
         }
 
-        let mut frame = self.base_frame(node, sequence, true);
+        let mut frame = self.base_frame(node, *sequence, final_page);
         frame
             .as_object_mut()
             .expect("chunk frame object")
             .insert("items".to_string(), Value::Array(current));
+        *sequence += 1;
         self.emit_frame(&frame, emit)
     }
 
@@ -465,7 +589,7 @@ impl ProtocolChunkEncoder {
     }
 
     fn string_frames<F>(
-        &self,
+        &mut self,
         node: &ProtocolChunkNode,
         text: &str,
         emit: &mut F,
@@ -551,7 +675,7 @@ impl ProtocolChunkEncoder {
     where
         F: FnMut(&[u8]) -> ProtocolEmitResult,
     {
-        let root = self.visit_and_emit(event, None, None, emit)?;
+        let root = self.visit_and_emit(event, None, None, 1, emit)?;
         if root != 0 {
             return Err(ProtocolEmitError::io("protocol root node id is invalid"));
         }
@@ -566,6 +690,46 @@ where
     encode_protocol_frames_with_limit(event, MAX_JSONL_FRAME_BYTES, &mut emit)
 }
 
+fn discard_protocol_frame(_frame: &[u8]) -> ProtocolEmitResult {
+    Ok(())
+}
+
+fn count_aggregate_node(depth: usize, nodes: &mut usize) -> ProtocolEmitResult {
+    if depth > MAX_ASSEMBLED_EVENT_DEPTH {
+        return Err(ProtocolEmitError::aggregate(
+            "protocol_aggregate_depth_exceeded",
+            "protocol event exceeds aggregate reconstruction depth limit",
+        ));
+    }
+    if *nodes >= MAX_ASSEMBLED_EVENT_NODES {
+        return Err(ProtocolEmitError::aggregate(
+            "protocol_aggregate_nodes_exceeded",
+            "protocol event exceeds aggregate node count limit",
+        ));
+    }
+    *nodes += 1;
+    Ok(())
+}
+
+fn validate_aggregate_shape(value: &Value, depth: usize, nodes: &mut usize) -> ProtocolEmitResult {
+    count_aggregate_node(depth, nodes)?;
+    match value {
+        Value::Object(fields) => {
+            for child in fields.values() {
+                count_aggregate_node(depth + 1, nodes)?;
+                validate_aggregate_shape(child, depth + 1, nodes)?;
+            }
+        }
+        Value::Array(values) => {
+            for child in values {
+                validate_aggregate_shape(child, depth + 1, nodes)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn encode_protocol_frames_with_limit<F>(
     event: &Value,
     max_frame_bytes: usize,
@@ -574,6 +738,8 @@ fn encode_protocol_frames_with_limit<F>(
 where
     F: FnMut(&[u8]) -> ProtocolEmitResult,
 {
+    let mut structural_nodes = 0;
+    validate_aggregate_shape(event, 1, &mut structural_nodes)?;
     let json_limit = max_frame_bytes.checked_sub(1).ok_or_else(|| {
         ProtocolEmitError::io("MAX_JSONL_FRAME_BYTES cannot fit a JSONL newline")
     })?;
@@ -596,7 +762,10 @@ where
     record_value_serialization(direct.bytes.len());
     record_buffered_bytes(direct.bytes.len());
     drop(direct);
-    ProtocolChunkEncoder::new(event, max_frame_bytes)?.finish(event, emit)
+    let mut count_only = discard_protocol_frame;
+    ProtocolChunkEncoder::new(event, max_frame_bytes, false)?
+        .finish(event, &mut count_only)?;
+    ProtocolChunkEncoder::new(event, max_frame_bytes, true)?.finish(event, emit)
 }
 
 pub struct CoreService {
@@ -902,6 +1071,9 @@ pub fn protocol_error_event(
     code: impl AsRef<str>,
     message: impl AsRef<str>,
 ) -> Value {
+    let request_id = request_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| PROTOCOL_ERROR_REQUEST_ID.to_string());
     json!({
         "event": "error",
         "request_id": request_id,
@@ -1013,6 +1185,10 @@ fn service_hello(request: &Request) -> Vec<Value> {
         "process_version": PROCESS_VERSION,
         "process_capabilities": PROCESS_CAPABILITIES,
         "max_jsonl_frame_bytes": MAX_JSONL_FRAME_BYTES,
+        "max_assembled_event_bytes": MAX_ASSEMBLED_EVENT_BYTES,
+        "max_assembled_event_chunks": MAX_ASSEMBLED_EVENT_CHUNKS,
+        "max_assembled_event_nodes": MAX_ASSEMBLED_EVENT_NODES,
+        "max_assembled_event_depth": MAX_ASSEMBLED_EVENT_DEPTH,
         "capabilities": PUBLIC_COMMANDS
     })]
 }
@@ -1486,6 +1662,22 @@ mod tests {
     }
 
     #[test]
+    fn service_hello_advertises_exact_aggregate_limits() {
+        let result = handle_request(Request {
+            command: "service.hello".to_string(),
+            request_id: Some("hello-aggregate-1".to_string()),
+            payload: json!({}),
+        })
+        .pop()
+        .unwrap();
+
+        assert_eq!(result["max_assembled_event_bytes"], 64 * 1024 * 1024);
+        assert_eq!(result["max_assembled_event_chunks"], 4_096);
+        assert_eq!(result["max_assembled_event_nodes"], 65_536);
+        assert_eq!(result["max_assembled_event_depth"], 128);
+    }
+
+    #[test]
     fn public_command_capabilities_include_migration_cleanup() {
         let events = handle_request(Request {
             command: "migration.cleanup".to_string(),
@@ -1529,11 +1721,17 @@ mod tests {
         });
         assert_protocol_error_envelope(&stateful_events, json!("outer-request-1"));
 
-        assert_protocol_error_envelope(&handle_line("{"), Value::Null);
+        assert_protocol_error_envelope(
+            &handle_line("{"),
+            json!("protocol-invalid-request-id"),
+        );
 
         let mut line_streaming_events = Vec::new();
         let _ = handle_line_streaming("{", |event| line_streaming_events.push(event));
-        assert_protocol_error_envelope(&line_streaming_events, Value::Null);
+        assert_protocol_error_envelope(
+            &line_streaming_events,
+            json!("protocol-invalid-request-id"),
+        );
     }
 
     #[test]
@@ -2248,7 +2446,7 @@ mod tests {
             "request_id": "stream-failure-1",
             "command": "query.execute",
             "success": true,
-            "rows": (0..40_000).map(|index| json!({"id": index, "value": "x".repeat(32)})).collect::<Vec<_>>()
+            "rows": (0..500).map(|index| json!({"id": index, "value": "x".repeat(32)})).collect::<Vec<_>>()
         });
         reset_protocol_encoding_metrics();
         let mut emitted = 0;
@@ -2282,8 +2480,8 @@ mod tests {
             protocol_encoding_metrics()
         }
 
-        let small = measure(5_000);
-        let large = measure(10_000);
+        let small = measure(250);
+        let large = measure(500);
 
         assert!(small.emitted_frames > 1);
         assert!(large.emitted_frames > small.emitted_frames);
@@ -2291,6 +2489,115 @@ mod tests {
         assert!(large.serialized_frames <= small.serialized_frames * 3);
         assert!(large.peak_buffered_frames <= 1);
         assert!(large.peak_buffered_bytes <= 4_096);
+    }
+
+    #[test]
+    fn chunk_encoder_bounds_reference_pages_for_high_cardinality_lists() {
+        let event = json!({
+            "event": "result",
+            "request_id": "bounded-ref-pages",
+            "command": "query.execute",
+            "success": true,
+            "values": (0..1_000).map(|index| format!("value-{index:04}"))
+                .collect::<Vec<_>>()
+        });
+        reset_protocol_encoding_metrics();
+
+        encode_protocol_frames_with_limit(&event, 4_096, &mut |_frame| Ok(())).unwrap();
+        let metrics = protocol_encoding_metrics();
+
+        assert!(metrics.emitted_frames > 1);
+        assert_eq!(metrics.peak_reference_page_items, MAX_REFERENCE_PAGE_ITEMS);
+    }
+
+    #[test]
+    fn chunk_encoder_rejects_aggregate_node_overflow_before_emitting() {
+        let event = json!({
+            "event": "result",
+            "request_id": "aggregate-node-limit",
+            "command": "query.execute",
+            "success": true,
+            "values": vec![0; MAX_ASSEMBLED_EVENT_NODES]
+        });
+        let mut emitted = 0;
+
+        let error = encode_protocol_frames_with_limit(&event, 4_096, &mut |_frame| {
+            emitted += 1;
+            Ok(())
+        })
+        .expect_err("aggregate node overflow must fail preflight");
+
+        assert_eq!(error.code(), "protocol_aggregate_nodes_exceeded");
+        assert_eq!(emitted, 0);
+    }
+
+    #[test]
+    fn chunk_encoder_rejects_aggregate_chunk_overflow_before_emitting() {
+        let event = json!({
+            "event": "result",
+            "request_id": "aggregate-chunk-limit",
+            "command": "query.execute",
+            "success": true,
+            "values": (0..MAX_ASSEMBLED_EVENT_CHUNKS)
+                .map(|index| format!("value-{index:04}"))
+                .collect::<Vec<_>>()
+        });
+        let mut emitted = 0;
+
+        let error = encode_protocol_frames_with_limit(&event, 4_096, &mut |_frame| {
+            emitted += 1;
+            Ok(())
+        })
+        .expect_err("aggregate chunk overflow must fail preflight");
+
+        assert_eq!(error.code(), "protocol_aggregate_chunks_exceeded");
+        assert_eq!(emitted, 0);
+    }
+
+    #[test]
+    fn chunk_encoder_rejects_aggregate_depth_overflow_before_emitting() {
+        let mut nested = json!(0);
+        for _ in 0..MAX_ASSEMBLED_EVENT_DEPTH {
+            nested = json!([nested]);
+        }
+        let event = json!({
+            "event": "result",
+            "request_id": "aggregate-depth-limit",
+            "command": "query.execute",
+            "success": true,
+            "value": nested
+        });
+        let mut emitted = 0;
+
+        let error = encode_protocol_frames_with_limit(&event, 4_096, &mut |_frame| {
+            emitted += 1;
+            Ok(())
+        })
+        .expect_err("aggregate depth overflow must fail preflight");
+
+        assert_eq!(error.code(), "protocol_aggregate_depth_exceeded");
+        assert_eq!(emitted, 0);
+    }
+
+    #[test]
+    fn chunk_encoder_rejects_aggregate_byte_overflow_before_emitting() {
+        let event = json!({
+            "event": "result",
+            "request_id": "aggregate-byte-limit",
+            "command": "query.execute",
+            "success": true,
+            "value": "x".repeat(MAX_ASSEMBLED_EVENT_BYTES)
+        });
+        let mut emitted = 0;
+
+        let error = encode_protocol_frames(&event, |_frame| {
+            emitted += 1;
+            Ok(())
+        })
+        .expect_err("aggregate byte overflow must fail preflight");
+
+        assert_eq!(error.code(), "protocol_aggregate_bytes_exceeded");
+        assert_eq!(emitted, 0);
     }
 
     #[test]

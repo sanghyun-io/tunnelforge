@@ -1,6 +1,6 @@
 use crate::*;
 
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
 
@@ -22,13 +22,39 @@ pub(crate) const MYSQL_PK_RANGE_MAX_SPAN_TO_ROW_RATIO: u128 = 8;
 pub(crate) const MYSQL_DUMP_ZSTD_LEVEL: i32 = 1;
 pub(crate) const DUMP_DIR_MARKER: &str = ".tunnelforge_dump_dir";
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug)]
 pub struct Request {
     pub command: String,
-    #[serde(default)]
     pub request_id: Option<String>,
-    #[serde(default)]
     pub payload: Value,
+}
+
+impl<'de> Deserialize<'de> for Request {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireRequest {
+            command: String,
+            #[serde(default)]
+            request_id: Value,
+            #[serde(default)]
+            payload: Value,
+        }
+
+        let wire = WireRequest::deserialize(deserializer)?;
+        let request_id = wire
+            .request_id
+            .as_str()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| de::Error::custom("request_id must be a non-empty string"))?;
+        Ok(Self {
+            command: wire.command,
+            request_id: Some(request_id.to_string()),
+            payload: wire.payload,
+        })
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1106,5 +1132,27 @@ mod tests {
         let json = serde_json::to_string(&manifest).expect("serialize");
         // skip_serializing_if 로 빈 views는 직렬화되지 않아 기존 dump와 바이트 호환.
         assert!(!json.contains("\"views\""));
+    }
+
+    #[test]
+    fn wire_request_requires_nonempty_string_request_id() {
+        for input in [
+            r#"{"command":"service.hello","payload":{}}"#,
+            r#"{"command":"service.hello","request_id":null,"payload":{}}"#,
+            r#"{"command":"service.hello","request_id":7,"payload":{}}"#,
+            r#"{"command":"service.hello","request_id":"","payload":{}}"#,
+        ] {
+            assert!(serde_json::from_str::<Request>(input).is_err(), "{input}");
+        }
+    }
+
+    #[test]
+    fn wire_request_preserves_valid_request_id() {
+        let request = serde_json::from_str::<Request>(
+            r#"{"command":"service.hello","request_id":"strict-1","payload":{}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.request_id.as_deref(), Some("strict-1"));
     }
 }

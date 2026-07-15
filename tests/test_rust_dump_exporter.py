@@ -96,6 +96,10 @@ class TestRustDumpChecker:
                             ],
                             "capabilities": ["dump.run", "dump.import"],
                             "max_jsonl_frame_bytes": 1_048_576,
+                            "max_assembled_event_bytes": 64 * 1024 * 1024,
+                            "max_assembled_event_chunks": 4_096,
+                            "max_assembled_event_nodes": 65_536,
+                            "max_assembled_event_depth": 128,
                         }) + "\n")
                         return super().write(data)
 

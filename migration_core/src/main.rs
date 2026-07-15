@@ -18,7 +18,7 @@ fn main() -> ProtocolEmitResult {
         handle_request_streaming(
             Request {
                 command,
-                request_id: None,
+                request_id: Some("cli-compat".to_string()),
                 payload: json!({}),
             },
             emit_one,
@@ -224,7 +224,7 @@ mod tests {
 
         assert!(handled);
         assert_eq!(events.len(), 1);
-        assert_protocol_error(&events[0], Value::Null);
+        assert_protocol_error(&events[0], json!("protocol-invalid-request-id"));
     }
 
     #[test]
