@@ -2419,6 +2419,31 @@ class DbCoreServiceClient:
             raise settlement_error
         return True
 
+    async def _retry_failed_reap_cleanup_on_owner(self, deadline_at: float) -> bool:
+        await self._terminate_process_on_owner(deadline_at)
+        retained_tasks = [
+            task
+            for task in (
+                self._spawn_task,
+                self._process_wait_task,
+                self._stdout_drain_task,
+                self._stderr_task,
+                self._stdin_close_task,
+            )
+            if task is not None
+        ]
+        if (
+            self._generation_state is not DbCoreGenerationState.CLOSED
+            or self._process is not None
+            or retained_tasks
+        ):
+            raise self._residual_process_error(
+                "cleanup_retry",
+                "DB Core failed reap cleanup returned without full settlement",
+                pending_tasks=[self._task_diagnostic(task) for task in retained_tasks],
+            )
+        return True
+
     def _ensure_owner_reap_task_on_owner(
         self,
         deadline_at: float,
@@ -2426,22 +2451,32 @@ class DbCoreServiceClient:
         retry_failed: bool = False,
     ) -> asyncio.Task:
         task = self._owner_reap_task
+        retry_cleanup = False
         if task is not None:
             if not retry_failed or not task.done():
                 return task
             try:
                 task.result()
             except BaseException:
-                pass
+                retry_cleanup = True
             else:
                 if self._owner_reap_task is task:
                     self._owner_reap_task = None
                     self._owner_reap_generation = None
                 return self._ensure_owner_reap_task_on_owner(deadline_at)
 
-        generation = self._process_generation
+        generation = (
+            self._owner_reap_generation
+            if retry_cleanup and self._owner_reap_generation is not None
+            else self._process_generation
+        )
+        reap = (
+            self._retry_failed_reap_cleanup_on_owner(deadline_at)
+            if retry_cleanup
+            else self._cancel_active_on_owner(deadline_at)
+        )
         task = asyncio.create_task(
-            self._cancel_active_on_owner(deadline_at),
+            reap,
             name=f"db-core-reap-generation-{generation}",
         )
         self._owner_reap_task = task

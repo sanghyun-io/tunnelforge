@@ -3396,6 +3396,137 @@ def test_failed_reap_barrier_blocks_followup_without_generation_increment(monkey
     assert client._owner_reap_task is None
 
 
+def test_cancel_retry_does_not_clear_failed_reap_without_cleanup(monkeypatch):
+    factory = _Task3Factory([])
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+    original_cancel = client._cancel_active_on_owner
+    original_terminate = client._terminate_process_on_owner
+    original_error = None
+    cleanup_deadlines = []
+    retained_process = _Task4Process(pid=4343)
+
+    async def fail_reap_once(deadline_at):
+        nonlocal original_error
+        if original_error is not None:
+            return await original_cancel(deadline_at)
+        original_error = client._residual_process_error(
+            "spawn_identity",
+            "Native DB Core spawn cancellation returned no process identity",
+            pending_tasks=["native_spawn:cancelled_without_identity"],
+            extra={"diagnostic": "original-spawn-residual"},
+        )
+        client._spawn_residual = dict(original_error.payload)
+        raise original_error
+
+    async def recording_terminate(deadline_at):
+        cleanup_deadlines.append(deadline_at)
+        return await original_terminate(deadline_at)
+
+    monkeypatch.setattr(client, "_cancel_active_on_owner", fail_reap_once)
+    monkeypatch.setattr(client, "_terminate_process_on_owner", recording_terminate)
+
+    async def install_failed_reap_barrier():
+        client._process_generation = 1
+        client._transition_generation(DbCoreGenerationState.CREATING)
+        client._transition_generation(DbCoreGenerationState.POISONED)
+        client._transition_generation(DbCoreGenerationState.REAPING)
+        task = client._ensure_owner_reap_task_on_owner(time.monotonic() + 1.0)
+        with pytest.raises(DbCoreServiceError):
+            await asyncio.shield(task)
+        await asyncio.sleep(0)
+        return task
+
+    failed_reap = client._submit_owner(
+        install_failed_reap_barrier(),
+        DbCoreRequestKind.MUTATION,
+        "install-retryable-failed-reap-barrier",
+    ).result(timeout=1.0)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as cancel_raised:
+            client.cancel_active_request(timeout_seconds=0.5)
+
+        assert cancel_raised.value.code == "db_core_residual_process"
+        assert cancel_raised.value.payload["stage"] == "spawn_identity"
+        assert cancel_raised.value.payload["pending_tasks"] == [
+            "native_spawn:cancelled_without_identity"
+        ]
+        assert cancel_raised.value.payload["diagnostic"] == "original-spawn-residual"
+        assert len(cleanup_deadlines) == 1
+        retry_reap = client._owner_reap_task
+        assert retry_reap is not None
+        assert retry_reap is not failed_reap
+        assert retry_reap.done()
+        assert client._owner_reap_generation == 1
+        assert client.process_generation == 1
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert factory.calls == []
+
+        with pytest.raises(DbCoreServiceError) as request_raised:
+            client.request_result(
+                "schema.list",
+                request_id="still-blocked-by-failed-reap-retry",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.5,
+            )
+
+        assert request_raised.value.code == "db_core_residual_process"
+        assert request_raised.value.payload["stage"] == "spawn_identity"
+        assert request_raised.value.payload["pending_tasks"] == [
+            "native_spawn:cancelled_without_identity"
+        ]
+        assert request_raised.value.payload["diagnostic"] == (
+            "original-spawn-residual"
+        )
+        assert client._owner_reap_task is retry_reap
+        assert client._owner_reap_generation == 1
+        assert client.process_generation == 1
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert factory.calls == []
+
+        async def make_cleanup_recoverable():
+            client._spawn_residual = None
+            client._process = retained_process
+
+        client._submit_owner(
+            make_cleanup_recoverable(),
+            DbCoreRequestKind.MUTATION,
+            "make-failed-reap-cleanup-recoverable",
+        ).result(timeout=1.0)
+
+        assert client.cancel_active_request(timeout_seconds=0.5) is True
+        client._submit_owner(
+            asyncio.sleep(0),
+            DbCoreRequestKind.MUTATION,
+            "observe-cleared-failed-reap-barrier",
+        ).result(timeout=1.0)
+        assert len(cleanup_deadlines) == 2
+        assert client._owner_reap_task is None
+        assert client._owner_reap_generation is None
+        assert client.process_generation == 1
+        assert client.generation_state is DbCoreGenerationState.CLOSED
+        assert client._process is None
+        assert retained_process.terminate_calls == 1
+        assert retained_process.wait_calls == 1
+        assert retained_process.stdin.close_calls == 1
+        assert retained_process.stdin.wait_closed_calls == 1
+        assert retained_process.raw_writes == []
+        assert factory.calls == []
+    finally:
+        if client.owner_thread.is_alive():
+            async def clear_injected_spawn_residual():
+                client._spawn_residual = None
+
+            client._submit_owner(
+                clear_injected_spawn_residual(),
+                DbCoreRequestKind.MUTATION,
+                "clear-injected-failed-reap-residual",
+            ).result(timeout=1.0)
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client.shutdown_complete is True
+
+
 def test_cancel_owner_uses_exact_minimum_deadline_without_handoff_subtraction(
     monkeypatch,
 ):
