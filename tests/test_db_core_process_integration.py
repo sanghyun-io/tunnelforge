@@ -193,6 +193,18 @@ def _shutdown_and_assert_zero_residual(
         current_process is not process for process in tracked_processes
     ):
         tracked_processes.append(current_process)
+    failures = []
+
+    try:
+        client.shutdown(timeout_seconds=2.0)
+    except BaseException as exc:
+        failures.append(exc)
+
+    current_process = client._process
+    if current_process is not None and all(
+        current_process is not process for process in tracked_processes
+    ):
+        tracked_processes.append(current_process)
     tracked_pids = list(dict.fromkeys([
         *pids,
         *(
@@ -201,28 +213,31 @@ def _shutdown_and_assert_zero_residual(
             if getattr(process, "pid", None) is not None
         ),
     ]))
-    failures = []
 
-    try:
-        client.shutdown(timeout_seconds=2.0)
-    except BaseException as exc:
-        failures.append(exc)
+    for process in tracked_processes:
+        if getattr(process, "returncode", None) is not None:
+            continue
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+        except BaseException as exc:
+            failures.append(exc)
+        try:
+            if isinstance(process, subprocess.Popen):
+                process.wait(timeout=2.0)
+            else:
+                pid = getattr(process, "pid", None)
+                if pid is not None:
+                    _assert_pid_terminal(pid)
+        except BaseException as exc:
+            failures.append(exc)
 
-    if owner.is_alive() or client._process is not None:
-        for process in tracked_processes:
-            if getattr(process, "returncode", None) is not None:
-                continue
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            except BaseException as exc:
-                failures.append(exc)
-        if owner.is_alive():
-            try:
-                client.shutdown(timeout_seconds=2.0)
-            except BaseException as exc:
-                failures.append(exc)
+    if owner.is_alive():
+        try:
+            client.shutdown(timeout_seconds=2.0)
+        except BaseException as exc:
+            failures.append(exc)
 
     if owner.is_alive():
         try:
@@ -274,6 +289,43 @@ def _finalize_real_child_runner(
     except BaseException:
         if not preserve_primary_failure:
             raise
+
+
+def test_finalizer_reaps_tracked_child_with_cleared_client_and_stopped_owner():
+    client = DbCoreServiceClient(
+        executable="unused-core",
+        process_factory=lambda *args, **kwargs: None,
+    )
+    client.shutdown(timeout_seconds=1.0)
+    assert client._process is None
+    assert not client.owner_thread.is_alive()
+    child = subprocess.Popen(
+        [HELPER_PYTHON, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    assert child.poll() is None
+    cleanup_error = None
+    alive_after_finalizer = True
+    try:
+        try:
+            _shutdown_and_assert_zero_residual(
+                client,
+                [child.pid],
+                processes=[child],
+            )
+        except BaseException as exc:
+            cleanup_error = exc
+        alive_after_finalizer = _pid_is_alive(child.pid)
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=5.0)
+
+    assert cleanup_error is None
+    assert not alive_after_finalizer
 
 
 def _assert_cancel_transitions(transitions, generation):

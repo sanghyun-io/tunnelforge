@@ -2855,7 +2855,7 @@ def test_cancel_during_shutdown(monkeypatch):
     "active_timeout, cancel_timeout, expected_deadline",
     [
         (1.0, 30.0, 101.0),
-        (30.0, 1.0, 101.0),
+        (30.0, 1.0, 100.8),
         (30.0, 30.0, 100.0 + DEFAULT_SHUTDOWN_TIMEOUT_SECONDS),
     ],
 )
@@ -2893,6 +2893,75 @@ def test_cancel_cleanup_deadline_is_earliest_active_cancel_or_cleanup_cap(
     assert cleanup
     assert cleanup == [pytest.approx(expected_deadline)]
     assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_cancel_owner_cleanup_reserves_caller_handoff_and_preserves_diagnostics(
+    monkeypatch,
+):
+    process = _Task4Process(
+        pid=9877,
+        stall_terminate_wait=True,
+        stall_final_wait=True,
+    )
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+    process.before_write.clear()
+    process.read_entered.clear()
+    request_thread, errors = _task4_start_request(
+        client,
+        request_id="cancel-reserved-handoff",
+        timeout_seconds=2.0,
+    )
+    assert process.before_write.wait(timeout=0.5)
+    assert process.read_entered.wait(timeout=0.5)
+    owner_deadlines = []
+    original_terminate = client._terminate_process_on_owner
+
+    async def delay_residual_handoff(deadline_at):
+        owner_deadlines.append(deadline_at)
+        try:
+            return await original_terminate(deadline_at)
+        except DbCoreServiceError:
+            await asyncio.sleep(0.03)
+            raise
+
+    monkeypatch.setattr(
+        client,
+        "_terminate_process_on_owner",
+        delay_residual_handoff,
+    )
+    started = client._monotonic()
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.cancel_active_request(timeout_seconds=0.6)
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload.get("stage") == "final_wait"
+        assert raised.value.payload.get("pid") == 9877
+        assert raised.value.payload.get("generation_state") == "reaping"
+        assert raised.value.payload.get("pending_tasks") == []
+        assert owner_deadlines == [pytest.approx(started + 0.48, abs=0.03)]
+        assert client.generation_state is DbCoreGenerationState.REAPING
+    finally:
+        monkeypatch.setattr(
+            client,
+            "_terminate_process_on_owner",
+            original_terminate,
+        )
+        process.stall_final_wait = False
+        process.returncode = -9
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+        request_thread.join(timeout=1.0)
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert not request_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], DbCoreServiceError)
 
 
 def test_cancel_active_at_exhausted_deadline_settles_task_and_reaps_process():
@@ -2940,6 +3009,35 @@ def test_cancel_active_at_exhausted_deadline_settles_task_and_reaps_process():
 
     assert task_settled.is_set()
     assert process.terminate_calls == 1
+    assert client._process is None
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_native_like_process_wait_settles_once_at_exhausted_deadline():
+    clock = FakeClock()
+    process = _Task4Process()
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+        monotonic=clock.monotonic,
+    )
+    client.start()
+
+    future = client._submit_owner(
+        client._terminate_process_on_owner(clock.monotonic()),
+        DbCoreRequestKind.MUTATION,
+        "native-wait-at-exhausted-deadline",
+    )
+    try:
+        future.result(timeout=1.0)
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert process.wait_entered.is_set()
+    assert process.terminate_calls == 1
+    assert process.wait_calls == 1
+    assert process.kill_calls == 0
     assert client._process is None
     assert client.generation_state is DbCoreGenerationState.CLOSED
 

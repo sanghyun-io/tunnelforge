@@ -745,6 +745,19 @@ class DbCoreServiceClient:
             timeout=self._remaining(cutoff_at),
         )
 
+    async def _settle_process_wait_before(self, awaitable, cutoff_at: float):
+        wait_task = asyncio.ensure_future(awaitable)
+        if not wait_task.done():
+            await asyncio.sleep(0)
+        if wait_task.done():
+            return wait_task.result()
+        remaining = self._remaining(cutoff_at)
+        if remaining <= 0.0:
+            wait_task.cancel()
+            await asyncio.sleep(0)
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(wait_task, timeout=remaining)
+
     def _cleanup_deadline_on_owner(self, *deadlines: float) -> float:
         return min(
             *deadlines,
@@ -2008,7 +2021,10 @@ class DbCoreServiceClient:
                         graceful_wait_cutoff = self._monotonic() + (
                             self._remaining(deadline_at) / 2.0
                         )
-                        await self._await_before(pending_wait, graceful_wait_cutoff)
+                        await self._settle_process_wait_before(
+                            pending_wait,
+                            graceful_wait_cutoff,
+                        )
                 except asyncio.TimeoutError:
                     needs_kill = True
             if needs_kill:
@@ -2030,7 +2046,10 @@ class DbCoreServiceClient:
                 try:
                     pending_wait = wait()
                     if inspect.isawaitable(pending_wait):
-                        await self._await_before(pending_wait, deadline_at)
+                        await self._settle_process_wait_before(
+                            pending_wait,
+                            deadline_at,
+                        )
                 except asyncio.TimeoutError as exc:
                     raise self._residual_process_error(
                         "final_wait",
@@ -2117,6 +2136,7 @@ class DbCoreServiceClient:
     ) -> bool:
         timeout = self._validated_timeout(timeout_seconds, DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
         deadline_at = self._monotonic() + timeout
+        owner_deadline_at = self._cleanup_start(deadline_at, timeout)
         remaining = self._remaining(deadline_at)
         if remaining <= 0.0 or not self._admission_lock.acquire(timeout=remaining):
             raise DbCoreServiceError(
@@ -2129,7 +2149,7 @@ class DbCoreServiceClient:
             if self._shutdown_started:
                 return False
             future = self._submit_owner(
-                self._cancel_active_on_owner(deadline_at),
+                self._cancel_active_on_owner(owner_deadline_at),
                 DbCoreRequestKind.MUTATION,
                 "cancel-active",
             )
