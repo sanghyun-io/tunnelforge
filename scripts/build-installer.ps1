@@ -1,30 +1,29 @@
-<#
+﻿<#
 #############################################################################
-# ⚠️  DO NOT DELETE - GitHub Actions 전용 스크립트
+# ⚠️  DO NOT DELETE - GitHub Actions 및 로컬 검증 스크립트
 #
 # 이 파일은 .github/workflows/release.yml에서 사용됩니다.
 # Windows Installer 빌드를 위해 반드시 필요합니다.
 #
-# 로컬에서 릴리스하려면 대신 다음 스크립트를 사용하세요:
-#   python scripts/smart_release.py
-#   ./scripts/smart-release.sh
+# 실제 태그와 릴리스는 보호된 수동 GitHub Actions 워크플로를 사용합니다.
 #############################################################################
 
 .SYNOPSIS
-    TunnelForge Windows Installer를 빌드합니다. (GitHub Actions 전용)
+    TunnelForge Windows Installer를 빌드하고 로컬 릴리스 후보를 검증합니다.
 
 .DESCRIPTION
     이 스크립트는 PyInstaller와 Inno Setup을 사용하여 Windows 설치 프로그램을 생성합니다.
 
     빌드 프로세스:
-    1. src/version.py에서 버전 읽기
+    1. 세 릴리스 버전 파일의 일치 검증
     2. Rust tunnelforge-core DB service 빌드
     3. PyInstaller로 실행 파일(.exe) 빌드
-    4. 버전을 installer/TunnelForge.iss에 동기화
+    4. WebSetup bootstrapper 빌드 및 frozen self-check
     5. Inno Setup으로 Windows Installer(.exe) 생성
 
     출력 파일:
     - dist\TunnelForge\TunnelForge.exe (실행 파일)
+    - dist\TunnelForge-WebSetup.exe (온라인 설치 및 복구 프로그램)
     - output\TunnelForge-Setup-{version}.exe (설치 프로그램)
 
 .PARAMETER Clean
@@ -32,8 +31,7 @@
     깨끗한 상태에서 빌드를 시작하려면 이 옵션을 사용하세요.
 
 .PARAMETER SkipPyInstaller
-    PyInstaller 빌드를 건너뛰고 기존 EXE로 Installer만 생성합니다.
-    EXE가 이미 빌드되어 있고 Installer만 다시 만들 때 유용합니다.
+    PyInstaller 빌드를 건너뛰고 기존 본체 EXE와 WebSetup으로 Installer만 생성합니다.
 
 .EXAMPLE
     .\scripts\build-installer.ps1
@@ -49,12 +47,7 @@
     .\scripts\build-installer.ps1 -SkipPyInstaller
 
     PyInstaller 빌드를 건너뛰고 기존 EXE로 Installer만 생성합니다.
-    EXE가 이미 dist\TunnelForge\TunnelForge.exe에 있어야 합니다.
-
-.EXAMPLE
-    .\scripts\build-installer.ps1 -Clean -SkipPyInstaller
-
-    이전 output 디렉토리를 삭제하고 기존 EXE로 Installer만 생성합니다.
+    본체 EXE와 dist\TunnelForge-WebSetup.exe가 이미 있어야 합니다.
 
 .NOTES
     파일명: build-installer.ps1
@@ -65,8 +58,8 @@
     - Inno Setup 6 (https://jrsoftware.org/isinfo.php)
 
     참고:
-    - GitHub Actions는 자동으로 빌드를 수행하므로 로컬 테스트용으로만 사용하세요.
-    - 릴리스는 bump-version.ps1 -AutoRelease로 자동화할 수 있습니다.
+    - 이 명령은 로컬 릴리스 후보 검증에도 사용합니다.
+    - 태그 생성과 draft 릴리스는 보호된 수동 GitHub Actions 워크플로에서 수행합니다.
 
 .LINK
     https://github.com/sanghyun-io/tunnelforge
@@ -99,13 +92,15 @@ if ($Help) {
     Write-Host "  -Help, -h        이 도움말 출력" -ForegroundColor White
     Write-Host ""
     Write-Host "빌드 프로세스:" -ForegroundColor Yellow
-    Write-Host "  1. src/version.py에서 버전 읽기" -ForegroundColor Gray
+    Write-Host "  1. 세 릴리스 버전 파일 일치 검증" -ForegroundColor Gray
     Write-Host "  2. Rust tunnelforge-core DB service 빌드" -ForegroundColor Gray
     Write-Host "  3. PyInstaller로 EXE 빌드" -ForegroundColor Gray
-    Write-Host "  4. Inno Setup으로 Windows Installer 생성" -ForegroundColor Gray
+    Write-Host "  4. WebSetup bootstrapper 빌드 및 frozen self-check" -ForegroundColor Gray
+    Write-Host "  5. Inno Setup으로 Windows Installer 생성" -ForegroundColor Gray
     Write-Host ""
     Write-Host "출력:" -ForegroundColor Yellow
     Write-Host "  - dist\TunnelForge\TunnelForge.exe                    (실행 파일)" -ForegroundColor Gray
+    Write-Host "  - dist\TunnelForge-WebSetup.exe                       (온라인 설치 및 복구)" -ForegroundColor Gray
     Write-Host "  - output\TunnelForge-Setup-{version}.exe  (설치 프로그램)" -ForegroundColor Gray
     Write-Host ""
     Write-Host "예제:" -ForegroundColor Yellow
@@ -137,7 +132,7 @@ Write-Host ""
 
 # Clean 옵션: 빌드 디렉토리 삭제
 if ($Clean) {
-    Write-Host "[1/5] 이전 빌드 파일 정리 중..." -ForegroundColor Yellow
+    Write-Host "[1/7] 이전 빌드 파일 정리 중..." -ForegroundColor Yellow
 
     if (Test-Path "build") {
         Remove-Item -Path "build" -Recurse -Force
@@ -159,7 +154,7 @@ if ($Clean) {
 
 # Rust helper 빌드
 if (-not $SkipPyInstaller) {
-    Write-Host "[2/6] Rust tunnelforge-core DB service 빌드 중..." -ForegroundColor Yellow
+    Write-Host "[2/7] Rust tunnelforge-core DB service 빌드 중..." -ForegroundColor Yellow
 
     $cargoCheck = cargo --version 2>&1
     if ($LASTEXITCODE -ne 0) {
@@ -184,7 +179,7 @@ if (-not $SkipPyInstaller) {
     Write-Host "  ✅ tunnelforge-core DB service 빌드 완료" -ForegroundColor Green
     Write-Host ""
 
-    Write-Host "[3/6] PyInstaller로 실행 파일 빌드 중..." -ForegroundColor Yellow
+    Write-Host "[3/7] PyInstaller로 실행 파일 빌드 중..." -ForegroundColor Yellow
 
     # PyInstaller 설치 확인
     $pyinstallerCheck = python -m PyInstaller --version 2>&1
@@ -213,8 +208,16 @@ if (-not $SkipPyInstaller) {
     $exeSize = (Get-Item "dist\TunnelForge\TunnelForge.exe").Length / 1MB
     Write-Host "  ✅ EXE 빌드 완료: dist\TunnelForge\TunnelForge.exe ($($exeSize.ToString('0.0')) MB)" -ForegroundColor Green
     Write-Host ""
+
+    Write-Host "[4/7] 온라인 설치 bootstrapper 빌드 중..." -ForegroundColor Yellow
+    & "$PSScriptRoot\build-bootstrapper.ps1"
+
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "  ❌ TunnelForge-WebSetup.exe 빌드 실패" -ForegroundColor Red
+        exit 1
+    }
 } else {
-    Write-Host "[2/6] Rust helper/PyInstaller 빌드 건너뛰기 (-SkipPyInstaller)" -ForegroundColor Gray
+    Write-Host "[2-4/7] Rust helper/PyInstaller/bootstrapper 빌드 건너뛰기 (-SkipPyInstaller)" -ForegroundColor Gray
 
     # EXE 파일 존재 확인
     if (-not (Test-Path "dist\TunnelForge\TunnelForge.exe")) {
@@ -227,8 +230,23 @@ if (-not $SkipPyInstaller) {
     Write-Host ""
 }
 
+$webSetupPath = "dist\TunnelForge-WebSetup.exe"
+if (-not (Test-Path $webSetupPath)) {
+    Write-Host "  ❌ $webSetupPath 파일을 찾을 수 없습니다." -ForegroundColor Red
+    Write-Host "  먼저 전체 빌드를 실행하거나 -SkipPyInstaller 옵션을 제거하세요." -ForegroundColor Yellow
+    exit 1
+}
+
+$webSetupSelfCheck = (& ".\$webSetupPath" --self-check 2>&1 | Out-String).Trim()
+if ($LASTEXITCODE -ne 0 -or $webSetupSelfCheck -ne "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK") {
+    Write-Host "  ❌ TunnelForge-WebSetup.exe self-check 실패" -ForegroundColor Red
+    exit 1
+}
+Write-Host "  ✅ TunnelForge-WebSetup.exe self-check 통과" -ForegroundColor Green
+Write-Host ""
+
 # Inno Setup 경로 찾기
-Write-Host "[4/6] Inno Setup 확인 중..." -ForegroundColor Yellow
+Write-Host "[5/7] Inno Setup 확인 중..." -ForegroundColor Yellow
 
 $InnoSetupPaths = @(
     "C:\Program Files (x86)\Inno Setup 6\ISCC.exe",
@@ -264,8 +282,8 @@ Write-Host "  ✅ Inno Setup 발견: $ISCC" -ForegroundColor Green
 Write-Host "  버전: $innoVersion" -ForegroundColor Gray
 Write-Host ""
 
-# version.py에서 버전 추출 및 동기화
-Write-Host "[5/6] 버전 정보 동기화 중..." -ForegroundColor Yellow
+# 세 릴리스 버전 파일 일치 검증
+Write-Host "[6/7] 버전 정보 검증 중..." -ForegroundColor Yellow
 
 # version.py에서 버전 추출
 $versionPy = "src\version.py"
@@ -283,22 +301,39 @@ if ($versionContent -match '__version__\s*=\s*[''"]([^''"]+)[''"]') {
     exit 1
 }
 
-# TunnelForge.iss 파일 업데이트
-$issFile = "installer\TunnelForge.iss"
-if (-not (Test-Path $issFile)) {
-    Write-Host "  ❌ $issFile 파일을 찾을 수 없습니다." -ForegroundColor Red
+$projectContent = Get-Content "pyproject.toml" -Raw
+if ($projectContent -match '(?m)^version\s*=\s*"([^"]+)"\s*$') {
+    $projectVersion = $matches[1]
+} else {
+    Write-Host "  ❌ pyproject.toml 에서 project version을 추출할 수 없습니다." -ForegroundColor Red
     exit 1
 }
 
-$issContent = Get-Content $issFile -Raw
-$issContent = $issContent -replace '#define MyAppVersion ".*"', "#define MyAppVersion `"$version`""
-Set-Content -Path $issFile -Value $issContent -NoNewline
+# TunnelForge.iss 버전 검증
+if (-not (Test-Path "installer\TunnelForge.iss")) {
+    Write-Host "  ❌ installer\TunnelForge.iss 파일을 찾을 수 없습니다." -ForegroundColor Red
+    exit 1
+}
 
-Write-Host "  ✅ $issFile 버전 업데이트 완료: $version" -ForegroundColor Green
+$issContent = Get-Content "installer\TunnelForge.iss" -Raw
+if ($issContent -match '#define\s+MyAppVersion\s+"([^"]+)"') {
+    $installerVersion = $matches[1]
+} else {
+    Write-Host "  ❌ installer\TunnelForge.iss 에서 MyAppVersion을 추출할 수 없습니다." -ForegroundColor Red
+    exit 1
+}
+
+if ($projectVersion -ne $version -or $installerVersion -ne $version) {
+    Write-Host "  ❌ 릴리스 버전 불일치: version.py=$version pyproject=$projectVersion installer=$installerVersion" -ForegroundColor Red
+    Write-Host "  scripts\bump_version.py로 세 버전 파일을 먼저 동기화하세요." -ForegroundColor Yellow
+    exit 1
+}
+
+Write-Host "  ✅ 릴리스 버전 일치: $version" -ForegroundColor Green
 Write-Host ""
 
 # Inno Setup으로 Installer 컴파일
-Write-Host "[6/6] Windows Installer 생성 중..." -ForegroundColor Yellow
+Write-Host "[7/7] Windows Installer 생성 중..." -ForegroundColor Yellow
 
 $crashLog = "dist\TunnelForge\crash.log"
 if (Test-Path $crashLog) {

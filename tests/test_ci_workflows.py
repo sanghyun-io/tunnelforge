@@ -43,6 +43,7 @@ def assert_external_actions_are_sha_pinned(workflow_text):
 
 def test_version_gate_exposes_required_regression_jobs():
     jobs = load_version_gate()["jobs"]
+    assert_external_actions_are_sha_pinned(VERSION_GATE_PATH.read_text(encoding="utf-8"))
 
     assert "rust-core-regression-gate" in jobs
     assert "python-regression" in jobs
@@ -125,6 +126,8 @@ def test_write_capable_jobs_checkout_and_execute_only_trusted_base_code():
     }
 
     assert write_jobs == {"version-validation", "version-bump"}
+    for job_name in write_jobs:
+        assert_external_actions_are_sha_pinned(version_gate_job_text(job_name))
 
     version_validation = jobs["version-validation"]
     assert version_validation["permissions"] == {
@@ -396,7 +399,7 @@ def test_python_regression_runs_full_suite_with_built_core():
     assert job["env"]["QT_QPA_PLATFORM"] == "offscreen"
     assert str(job["env"]["PYTHONUTF8"]) == "1"
     assert "${{ github.event.pull_request.head.sha }}" in job_text
-    assert "actions/setup-python@v6" in job_text
+    assert "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1" in job_text
     assert 'python-version: "3.12"' in job_text
     assert "rustc --version" in job_text
     assert "cargo --version" in job_text
