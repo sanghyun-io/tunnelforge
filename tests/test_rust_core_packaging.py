@@ -229,12 +229,27 @@ def test_pyinstaller_spec_includes_core_service_binaries_cross_platform():
 
 
 def test_windows_installer_builds_and_checks_core_service_binaries():
-    script = (PROJECT_ROOT / "scripts" / "build-installer.ps1").read_text(encoding="utf-8")
+    script_path = PROJECT_ROOT / "scripts" / "build-installer.ps1"
+    assert script_path.read_bytes().startswith(b"\xef\xbb\xbf")
+    script = script_path.read_text(encoding="utf-8-sig")
 
     assert "cargo build --manifest-path migration_core\\Cargo.toml --release" in script
     assert "migration_core\\target\\release\\tunnelforge-core.exe" in script
     assert "tunnelforge-core DB service 빌드 완료" in script
     assert "dist\\TunnelForge\\TunnelForge.exe" in script
+    assert '& "$PSScriptRoot\\build-bootstrapper.ps1"' in script
+    assert "dist\\TunnelForge-WebSetup.exe" in script
+    assert "--self-check" in script
+    assert ".\\scripts\\build-installer.ps1 -Clean -SkipPyInstaller" not in script
+    assert "세 릴리스 버전 파일 일치 검증" in script
+    assert "WebSetup bootstrapper 빌드 및 frozen self-check" in script
+    assert "Set-Content -Path $issFile" not in script
+    assert 'Get-Content "pyproject.toml" -Raw' in script
+    assert "$projectVersion -ne $version" in script
+    assert "$installerVersion -ne $version" in script
+    assert script.index('& "$PSScriptRoot\\build-bootstrapper.ps1"') < script.index(
+        '& $ISCC "installer\\TunnelForge.iss"'
+    )
 
 
 def test_dev_dependencies_include_yaml_parser_for_workflow_tests():
@@ -2014,7 +2029,7 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert "--skip-pr-checks" in workflow
     version_gate_text = workflow.split("  version-gate:", 1)[1].split("\n  version-bump:", 1)[0]
     assert "actions/create-github-app-token" not in version_gate_text
-    assert "uses: actions/checkout@v5" in workflow
+    assert "uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd" in workflow
     assert "ref: ${{ github.event.pull_request.head.sha }}" in workflow
     assert "ref: ${{ github.event.pull_request.base.sha }}" in workflow
     assert "persist-credentials: false" in workflow
