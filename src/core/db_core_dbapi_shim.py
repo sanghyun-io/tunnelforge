@@ -4,16 +4,55 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.core.constants import SYSTEM_SCHEMAS
 from src.core.db_core_client import (
+    DbCoreOutcome,
+    DbCoreRequestKind,
     DbCoreServiceError,
     default_database_for_engine,
     normalize_db_engine,
     parse_db_version_tuple,
 )
-from src.core.db_core_facade import DbCoreFacade, DbEndpoint, get_shared_db_core_facade
+from src.core.db_core_facade import (
+    DbCoreConnectionHandle,
+    DbCoreFacade,
+    DbEndpoint,
+    get_shared_db_core_facade,
+)
 from src.core.logger import get_logger
 from src.core.sql_query_classifier import statement_returns_rows
 
 logger = get_logger("db_core_service")
+
+
+def _require_connection_handle(
+    connection_handle: DbCoreConnectionHandle,
+) -> DbCoreConnectionHandle:
+    if isinstance(connection_handle, DbCoreConnectionHandle):
+        return connection_handle
+    raise DbCoreServiceError(
+        "DB Core connection handle is missing its process generation",
+        code="db_core_stale_connection",
+        request_kind=DbCoreRequestKind.MUTATION,
+        outcome=DbCoreOutcome.NOT_STARTED,
+        request_id="",
+        process_generation=0,
+        rust_code=None,
+        payload={"wire_writes": 0},
+    )
+
+
+def _closed_connection_error(
+    connection_handle: DbCoreConnectionHandle,
+) -> DbCoreServiceError:
+    return DbCoreServiceError(
+        "connection is closed",
+        code="db_core_business_failure",
+        request_kind=DbCoreRequestKind.MUTATION,
+        outcome=DbCoreOutcome.NOT_STARTED,
+        request_id="",
+        process_generation=connection_handle.process_generation,
+        rust_code=None,
+        payload={"connection_id": connection_handle.connection_id, "wire_writes": 0},
+    )
 
 
 class RustDbConnector:
@@ -42,7 +81,7 @@ class RustDbConnector:
             schema=schema,
         )
         self.facade = facade if facade is not None else get_shared_db_core_facade()
-        self.connection_id: Optional[str] = None
+        self.connection_id: Optional[DbCoreConnectionHandle] = None
         self.connection: Optional["RustDbConnection"] = None
 
     def _log_metadata_error(self, operation: str, exc: Exception) -> None:
@@ -214,10 +253,16 @@ def create_rust_db_connector(
 class RustDbConnection:
     """Minimal DB-API-like connection backed by a Rust service connection."""
 
-    def __init__(self, endpoint: DbEndpoint, facade: DbCoreFacade, connection_id: str):
+    def __init__(
+        self,
+        endpoint: DbEndpoint,
+        facade: DbCoreFacade,
+        connection_handle: DbCoreConnectionHandle,
+    ):
         self.endpoint = endpoint
         self.facade = facade
-        self.connection_id = connection_id
+        self.connection_handle = _require_connection_handle(connection_handle)
+        self.connection_id = self.connection_handle
         self.open = True
         self._autocommit = True
         self._in_transaction = False
@@ -229,28 +274,28 @@ class RustDbConnection:
         # `reconnect` is accepted for DB-API shim compatibility only; the Rust core owns
         # connection lifecycle and Python does not implement reconnect.
         if not self.open:
-            raise DbCoreServiceError("connection is closed")
+            raise _closed_connection_error(self.connection_handle)
         try:
-            self.facade.execute_on_connection(self.connection_id, "SELECT 1")
+            self.facade.execute_on_connection(self.connection_handle, "SELECT 1")
         except Exception:
             self.open = False
             raise
 
     def close(self) -> None:
         if self.open:
-            self.facade.close_connection(self.connection_id)
+            self.facade.close_connection(self.connection_handle)
             self.open = False
 
     def commit(self) -> None:
         if self.open:
-            self.facade.execute_on_connection(self.connection_id, "COMMIT")
+            self.facade.execute_on_connection(self.connection_handle, "COMMIT")
             self._in_transaction = False
             if not self._autocommit:
                 self._begin_transaction()
 
     def rollback(self) -> None:
         if self.open:
-            self.facade.execute_on_connection(self.connection_id, "ROLLBACK")
+            self.facade.execute_on_connection(self.connection_handle, "ROLLBACK")
             self._in_transaction = False
             if not self._autocommit:
                 self._begin_transaction()
@@ -261,26 +306,29 @@ class RustDbConnection:
             return
         if self.endpoint.engine == "mysql":
             self.facade.execute_on_connection(
-                self.connection_id,
+                self.connection_handle,
                 "SET autocommit = 1" if enabled else "SET autocommit = 0",
             )
             self._in_transaction = not enabled
         elif enabled:
             if self._in_transaction:
-                self.facade.execute_on_connection(self.connection_id, "COMMIT")
+                self.facade.execute_on_connection(self.connection_handle, "COMMIT")
             self._in_transaction = False
         else:
             self._begin_transaction()
 
     def _begin_transaction(self) -> None:
         if self.open and not self._in_transaction:
-            self.facade.execute_on_connection(self.connection_id, "BEGIN")
+            self.facade.execute_on_connection(self.connection_handle, "BEGIN")
             self._in_transaction = True
 
     def select_db(self, database: str) -> None:
         self.endpoint = replace(self.endpoint, database=database)
         if self.endpoint.engine == "mysql":
-            self.facade.execute_on_connection(self.connection_id, f"USE {quote_mysql_ident(database)}")
+            self.facade.execute_on_connection(
+                self.connection_handle,
+                f"USE {quote_mysql_ident(database)}",
+            )
 
 
 class RustDbCursor:
@@ -288,6 +336,7 @@ class RustDbCursor:
 
     def __init__(self, connection: RustDbConnection):
         self.connection = connection
+        self.connection_handle = connection.connection_handle
         self._rows: List[Dict[str, Any]] = []
         self.rowcount = 0
         self.description = None
@@ -300,7 +349,7 @@ class RustDbCursor:
 
     def execute(self, query: str, params: Optional[Sequence[Any]] = None) -> int:
         result = self.connection.facade.execute_on_connection_result(
-            self.connection.connection_id,
+            self.connection_handle,
             query,
             params=params,
         )

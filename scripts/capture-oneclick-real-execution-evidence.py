@@ -175,6 +175,8 @@ def _table_engine(tables: List[Dict[str, Any]], schema: str, table: str) -> str:
 
 
 def _engine_rows(facade: DbCoreFacade, endpoint: DbEndpoint, schema: str, table: str) -> List[Dict[str, Any]]:
+    from src.core.db_core_service import DbCoreRequestKind
+
     result = facade.client.request(
         "query.execute",
         {
@@ -186,6 +188,7 @@ def _engine_rows(facade: DbCoreFacade, endpoint: DbEndpoint, schema: str, table:
             ),
             "params": [schema, table],
         },
+        request_kind=DbCoreRequestKind.MUTATION,
     )
     rows = result.get("rows")
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []

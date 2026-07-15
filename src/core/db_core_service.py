@@ -35,6 +35,7 @@ from src.core.db_core_dbapi_shim import (
     quote_mysql_ident,
 )
 from src.core.db_core_facade import (
+    DbCoreConnectionHandle,
     DbCoreFacade,
     DbEndpoint,
     get_shared_db_core_facade,
@@ -65,6 +66,7 @@ __all__ = [
     "has_bootstrap_residual_db_core_clients",
     "retry_bootstrap_residual_db_core_clients",
     "DbEndpoint",
+    "DbCoreConnectionHandle",
     "DbCoreServiceClient",
     "DbCoreFacade",
     "get_shared_db_core_facade",

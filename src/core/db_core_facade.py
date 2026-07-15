@@ -39,6 +39,37 @@ class DbEndpoint:
         }
 
 
+@dataclass(frozen=True)
+class DbCoreConnectionHandle:
+    connection_id: str
+    process_generation: int
+
+
+def _client_process_generation(client: Any) -> int:
+    try:
+        return int(getattr(client, "process_generation", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _residual_process_error(
+    message: str,
+    *,
+    process_generation: int = 0,
+    payload: Optional[Dict[str, Any]] = None,
+) -> DbCoreServiceError:
+    return DbCoreServiceError(
+        message,
+        code="db_core_residual_process",
+        request_kind=DbCoreRequestKind.MUTATION,
+        outcome=DbCoreOutcome.FAILED,
+        request_id="",
+        process_generation=process_generation,
+        rust_code=None,
+        payload=payload or {},
+    )
+
+
 class DbCoreFacade:
     """High-level DB operations exposed to UI/workers."""
 
@@ -59,7 +90,7 @@ class DbCoreFacade:
         )
         return bool(result.get("success")), str(result.get("message", ""))
 
-    def open_connection(self, endpoint: DbEndpoint) -> str:
+    def open_connection(self, endpoint: DbEndpoint) -> DbCoreConnectionHandle:
         request_result = self.client.request_result(
             "connection.open",
             {"connection": endpoint.to_payload()},
@@ -73,15 +104,38 @@ class DbCoreFacade:
                 outcome=DbCoreOutcome.DEFINITE,
                 request_id=request_result.request_id,
                 process_generation=request_result.process_generation,
+                rust_code=request_result.rust_code,
                 payload=request_result.payload,
             )
-        return str(request_result.payload.get("connection_id", ""))
+        return DbCoreConnectionHandle(
+            connection_id=str(request_result.payload.get("connection_id", "")),
+            process_generation=request_result.process_generation,
+        )
 
-    def close_connection(self, connection_id: str) -> bool:
+    def _require_connection_handle(
+        self,
+        connection_handle: DbCoreConnectionHandle,
+    ) -> DbCoreConnectionHandle:
+        if isinstance(connection_handle, DbCoreConnectionHandle):
+            return connection_handle
+        raise DbCoreServiceError(
+            "DB Core connection handle is missing its process generation",
+            code="db_core_stale_connection",
+            request_kind=DbCoreRequestKind.MUTATION,
+            outcome=DbCoreOutcome.NOT_STARTED,
+            request_id="",
+            process_generation=_client_process_generation(self.client),
+            rust_code=None,
+            payload={"wire_writes": 0},
+        )
+
+    def close_connection(self, connection_handle: DbCoreConnectionHandle) -> bool:
+        handle = self._require_connection_handle(connection_handle)
         result = self.client.request_payload(
             "connection.close",
-            {"connection_id": connection_id},
+            {"connection_id": handle.connection_id},
             request_kind=DbCoreRequestKind.MUTATION,
+            required_generation=handle.process_generation,
         )
         return bool(result.get("success"))
 
@@ -141,23 +195,29 @@ class DbCoreFacade:
 
     def execute_on_connection(
         self,
-        connection_id: str,
+        connection_handle: DbCoreConnectionHandle,
         sql: str,
         params: Optional[Sequence[Any]] = None,
     ) -> List[Dict[str, Any]]:
-        result = self.execute_on_connection_result(connection_id, sql, params=params)
+        result = self.execute_on_connection_result(connection_handle, sql, params=params)
         return result["rows"]
 
     def execute_on_connection_result(
         self,
-        connection_id: str,
+        connection_handle: DbCoreConnectionHandle,
         sql: str,
         params: Optional[Sequence[Any]] = None,
     ) -> Dict[str, Any]:
+        handle = self._require_connection_handle(connection_handle)
         result = self.client.request_payload(
             "query.execute",
-            {"connection_id": connection_id, "sql": sql, "params": list(params or [])},
+            {
+                "connection_id": handle.connection_id,
+                "sql": sql,
+                "params": list(params or []),
+            },
             request_kind=DbCoreRequestKind.MUTATION,
+            required_generation=handle.process_generation,
         )
         rows = result.get("rows")
         columns = result.get("columns")
@@ -169,7 +229,7 @@ class DbCoreFacade:
 
     def execute_on_connection_streaming(
         self,
-        connection_id: str,
+        connection_handle: DbCoreConnectionHandle,
         sql: str,
         params: Optional[Sequence[Any]] = None,
         row_batch_size: int = 500,
@@ -183,10 +243,11 @@ class DbCoreFacade:
             if isinstance(rows, list):
                 on_batch([row for row in rows if isinstance(row, dict)])
 
+        handle = self._require_connection_handle(connection_handle)
         return self.client.request_payload(
             "query.execute",
             {
-                "connection_id": connection_id,
+                "connection_id": handle.connection_id,
                 "sql": sql,
                 "params": list(params or []),
                 "stream_rows": True,
@@ -194,6 +255,7 @@ class DbCoreFacade:
             },
             request_kind=DbCoreRequestKind.MUTATION,
             on_event=handle_event,
+            required_generation=handle.process_generation,
         )
 
     def run_migration(
@@ -314,10 +376,9 @@ def retry_retained_db_core_facades(
     deadline_at = time.monotonic() + timeout
     remaining = max(0.0, deadline_at - time.monotonic())
     if remaining <= 0.0 or not _retained_facade_lock.acquire(timeout=remaining):
-        raise DbCoreServiceError(
+        raise _residual_process_error(
             "DB Core retained facade registry lock exceeded its deadline",
-            code="db_core_residual_process",
-            outcome=DbCoreOutcome.FAILED,
+            payload={"stage": "retained_registry_lock"},
         )
     try:
         retained = list(_retained_facades)
@@ -328,11 +389,13 @@ def retry_retained_db_core_facades(
     for facade in retained:
         remaining = max(0.0, deadline_at - time.monotonic())
         if remaining <= 0.0:
-            errors.append(DbCoreServiceError(
-                "DB Core retained facade retry exceeded its deadline",
-                code="db_core_residual_process",
-                outcome=DbCoreOutcome.FAILED,
-            ))
+            errors.append(
+                _residual_process_error(
+                    "DB Core retained facade retry exceeded its deadline",
+                    process_generation=_client_process_generation(facade.client),
+                    payload={"stage": "retained_facade_retry"},
+                )
+            )
             break
         try:
             facade.client.shutdown(timeout_seconds=remaining)
@@ -347,19 +410,19 @@ def retry_retained_db_core_facades(
         except BaseException as exc:
             errors.append(exc)
     elif has_bootstrap_residual_db_core_clients():
-        errors.append(DbCoreServiceError(
-            "DB Core bootstrap owner retry exceeded its deadline",
-            code="db_core_residual_process",
-            outcome=DbCoreOutcome.FAILED,
-        ))
+        errors.append(
+            _residual_process_error(
+                "DB Core bootstrap owner retry exceeded its deadline",
+                payload={"stage": "bootstrap_owner_retry"},
+            )
+        )
     if errors:
         error = errors[0]
         if isinstance(error, DbCoreServiceError):
             raise error
-        raise DbCoreServiceError(
+        raise _residual_process_error(
             f"DB Core retained facade retry failed: {type(error).__name__}: {error}",
-            code="db_core_residual_process",
-            outcome=DbCoreOutcome.FAILED,
+            payload={"stage": "retained_facade_retry"},
         ) from error
 
 
@@ -384,10 +447,9 @@ def shutdown_shared_db_core_facade(
     deadline_at = time.monotonic() + timeout
     remaining = max(0.0, deadline_at - time.monotonic())
     if remaining <= 0.0 or not _shared_facade_lock.acquire(timeout=remaining):
-        raise DbCoreServiceError(
+        raise _residual_process_error(
             "DB Core shared facade shutdown lock exceeded its deadline",
-            code="db_core_residual_process",
-            outcome=DbCoreOutcome.FAILED,
+            payload={"stage": "shared_facade_lock"},
         )
     shared_error: Optional[BaseException] = None
     try:
@@ -395,10 +457,10 @@ def shutdown_shared_db_core_facade(
         if facade is not None:
             remaining = max(0.0, deadline_at - time.monotonic())
             if remaining <= 0.0:
-                raise DbCoreServiceError(
+                raise _residual_process_error(
                     "DB Core shared facade shutdown exceeded its deadline",
-                    code="db_core_residual_process",
-                    outcome=DbCoreOutcome.FAILED,
+                    process_generation=_client_process_generation(facade.client),
+                    payload={"stage": "shared_facade_shutdown"},
                 )
             try:
                 facade.client.shutdown(timeout_seconds=remaining)
@@ -421,19 +483,17 @@ def shutdown_shared_db_core_facade(
         with _retained_facade_lock:
             retained_pending = bool(_retained_facades)
         if retained_pending or has_bootstrap_residual_db_core_clients():
-            retry_error = DbCoreServiceError(
+            retry_error = _residual_process_error(
                 "DB Core retained ownership remained after the shutdown deadline",
-                code="db_core_residual_process",
-                outcome=DbCoreOutcome.FAILED,
+                payload={"stage": "retained_ownership"},
             )
     error = shared_error or retry_error
     if error is not None:
         if isinstance(error, DbCoreServiceError):
             raise error
-        raise DbCoreServiceError(
+        raise _residual_process_error(
             f"DB Core shared shutdown failed: {type(error).__name__}: {error}",
-            code="db_core_residual_process",
-            outcome=DbCoreOutcome.FAILED,
+            payload={"stage": "shared_facade_shutdown"},
         ) from error
 
 

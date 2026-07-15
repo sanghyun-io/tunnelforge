@@ -34,6 +34,13 @@ DEFAULT_DUMP_COMPRESSION = "zstd"
 DEFAULT_DUMP_THREADS = 8
 
 
+def _facade_process_generation(facade: DbCoreFacade) -> int:
+    try:
+        return int(getattr(facade.client, "process_generation", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def _safe_dump_child_dir(dump_dir: str, table_path: str) -> Optional[Path]:
     base_path = Path(dump_dir).resolve()
     table_path_obj = Path(table_path)
@@ -80,6 +87,10 @@ def _shutdown_owned_facade(facade: DbCoreFacade, owns_facade: bool) -> None:
             code="db_core_residual_process",
             request_kind=DbCoreRequestKind.MUTATION,
             outcome=DbCoreOutcome.FAILED,
+            request_id="",
+            process_generation=_facade_process_generation(facade),
+            rust_code=None,
+            payload={"stage": "owned_facade_shutdown"},
         ) from exc
     else:
         release_db_core_facade_retry(facade)

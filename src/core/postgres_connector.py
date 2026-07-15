@@ -34,8 +34,8 @@ class PostgresConnector:
                 password=self.password,
                 database=self.database,
             )
-            connection_id = self.facade.open_connection(endpoint)
-            self.connection = RustDbConnection(endpoint, self.facade, connection_id)
+            connection_handle = self.facade.open_connection(endpoint)
+            self.connection = RustDbConnection(endpoint, self.facade, connection_handle)
             return True, "연결 성공"
         except Exception as exc:
             return False, f"PostgreSQL 오류: {exc}"
