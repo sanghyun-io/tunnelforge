@@ -1,6 +1,8 @@
 """High-level facade over the Rust TunnelForge DB core service."""
 import atexit
+import math
 import threading
+import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -10,6 +12,8 @@ from src.core.db_core_client import (
     DbCoreRequestKind,
     DbCoreServiceClient,
     DbCoreServiceError,
+    has_bootstrap_residual_db_core_clients,
+    retry_bootstrap_residual_db_core_clients,
 )
 
 
@@ -274,6 +278,89 @@ class DbCoreFacade:
 
 _shared_facade_lock = threading.Lock()
 _shared_facade: Optional[DbCoreFacade] = None
+_retained_facade_lock = threading.Lock()
+_retained_facades: List[DbCoreFacade] = []
+
+
+def retain_db_core_facade_for_retry(facade: DbCoreFacade) -> None:
+    """Keep strong ownership of a facade whose bounded shutdown was residual."""
+    with _retained_facade_lock:
+        if not any(retained is facade for retained in _retained_facades):
+            _retained_facades.append(facade)
+    setattr(facade, "_db_core_shutdown_retry_pending", True)
+
+
+def release_db_core_facade_retry(facade: DbCoreFacade) -> None:
+    with _retained_facade_lock:
+        _retained_facades[:] = [
+            retained for retained in _retained_facades if retained is not facade
+        ]
+    setattr(facade, "_db_core_shutdown_retry_pending", False)
+
+
+def is_db_core_facade_retained(facade: DbCoreFacade) -> bool:
+    with _retained_facade_lock:
+        return any(retained is facade for retained in _retained_facades)
+
+
+def retry_retained_db_core_facades(
+    *,
+    timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+) -> None:
+    """Retry retained dedicated facade shutdowns within one absolute deadline."""
+    timeout = float(timeout_seconds)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("timeout_seconds must be finite and greater than zero")
+    deadline_at = time.monotonic() + timeout
+    remaining = max(0.0, deadline_at - time.monotonic())
+    if remaining <= 0.0 or not _retained_facade_lock.acquire(timeout=remaining):
+        raise DbCoreServiceError(
+            "DB Core retained facade registry lock exceeded its deadline",
+            code="db_core_residual_process",
+            outcome=DbCoreOutcome.FAILED,
+        )
+    try:
+        retained = list(_retained_facades)
+    finally:
+        _retained_facade_lock.release()
+
+    errors = []
+    for facade in retained:
+        remaining = max(0.0, deadline_at - time.monotonic())
+        if remaining <= 0.0:
+            errors.append(DbCoreServiceError(
+                "DB Core retained facade retry exceeded its deadline",
+                code="db_core_residual_process",
+                outcome=DbCoreOutcome.FAILED,
+            ))
+            break
+        try:
+            facade.client.shutdown(timeout_seconds=remaining)
+        except BaseException as exc:
+            errors.append(exc)
+        else:
+            release_db_core_facade_retry(facade)
+    remaining = max(0.0, deadline_at - time.monotonic())
+    if remaining > 0.0:
+        try:
+            retry_bootstrap_residual_db_core_clients(timeout_seconds=remaining)
+        except BaseException as exc:
+            errors.append(exc)
+    elif has_bootstrap_residual_db_core_clients():
+        errors.append(DbCoreServiceError(
+            "DB Core bootstrap owner retry exceeded its deadline",
+            code="db_core_residual_process",
+            outcome=DbCoreOutcome.FAILED,
+        ))
+    if errors:
+        error = errors[0]
+        if isinstance(error, DbCoreServiceError):
+            raise error
+        raise DbCoreServiceError(
+            f"DB Core retained facade retry failed: {type(error).__name__}: {error}",
+            code="db_core_residual_process",
+            outcome=DbCoreOutcome.FAILED,
+        ) from error
 
 
 def get_shared_db_core_facade() -> DbCoreFacade:
@@ -291,13 +378,63 @@ def shutdown_shared_db_core_facade(
 ) -> None:
     """Shutdown the app-wide Rust DB core process if it was started."""
     global _shared_facade
-    with _shared_facade_lock:
+    timeout = float(timeout_seconds)
+    if not math.isfinite(timeout) or timeout <= 0.0:
+        raise ValueError("timeout_seconds must be finite and greater than zero")
+    deadline_at = time.monotonic() + timeout
+    remaining = max(0.0, deadline_at - time.monotonic())
+    if remaining <= 0.0 or not _shared_facade_lock.acquire(timeout=remaining):
+        raise DbCoreServiceError(
+            "DB Core shared facade shutdown lock exceeded its deadline",
+            code="db_core_residual_process",
+            outcome=DbCoreOutcome.FAILED,
+        )
+    shared_error: Optional[BaseException] = None
+    try:
         facade = _shared_facade
-        if facade is None:
-            return
-        facade.client.shutdown(timeout_seconds=timeout_seconds)
-        if _shared_facade is facade:
-            _shared_facade = None
+        if facade is not None:
+            remaining = max(0.0, deadline_at - time.monotonic())
+            if remaining <= 0.0:
+                raise DbCoreServiceError(
+                    "DB Core shared facade shutdown exceeded its deadline",
+                    code="db_core_residual_process",
+                    outcome=DbCoreOutcome.FAILED,
+                )
+            try:
+                facade.client.shutdown(timeout_seconds=remaining)
+            except BaseException as exc:
+                shared_error = exc
+            else:
+                if _shared_facade is facade:
+                    _shared_facade = None
+    finally:
+        _shared_facade_lock.release()
+
+    retry_error: Optional[BaseException] = None
+    remaining = max(0.0, deadline_at - time.monotonic())
+    if remaining > 0.0:
+        try:
+            retry_retained_db_core_facades(timeout_seconds=remaining)
+        except BaseException as exc:
+            retry_error = exc
+    else:
+        with _retained_facade_lock:
+            retained_pending = bool(_retained_facades)
+        if retained_pending or has_bootstrap_residual_db_core_clients():
+            retry_error = DbCoreServiceError(
+                "DB Core retained ownership remained after the shutdown deadline",
+                code="db_core_residual_process",
+                outcome=DbCoreOutcome.FAILED,
+            )
+    error = shared_error or retry_error
+    if error is not None:
+        if isinstance(error, DbCoreServiceError):
+            raise error
+        raise DbCoreServiceError(
+            f"DB Core shared shutdown failed: {type(error).__name__}: {error}",
+            code="db_core_residual_process",
+            outcome=DbCoreOutcome.FAILED,
+        ) from error
 
 
 atexit.register(shutdown_shared_db_core_facade)

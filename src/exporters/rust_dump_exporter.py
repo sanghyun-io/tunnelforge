@@ -15,6 +15,8 @@ from src.core.db_core_service import (
     DbCoreServiceError,
     DbEndpoint,
     normalize_db_engine,
+    release_db_core_facade_retry,
+    retain_db_core_facade_for_retry,
 )
 from src.core.constants import (
     DEFAULT_DB_ENGINE,
@@ -69,14 +71,18 @@ def _shutdown_owned_facade(facade: DbCoreFacade, owns_facade: bool) -> None:
             timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
         )
     except DbCoreServiceError:
+        retain_db_core_facade_for_retry(facade)
         raise
     except Exception as exc:
+        retain_db_core_facade_for_retry(facade)
         raise DbCoreServiceError(
             f"Rust DB Core dedicated facade shutdown failed: {type(exc).__name__}: {exc}",
             code="db_core_residual_process",
             request_kind=DbCoreRequestKind.MUTATION,
             outcome=DbCoreOutcome.FAILED,
         ) from exc
+    else:
+        release_db_core_facade_retry(facade)
 
 
 @dataclass

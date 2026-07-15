@@ -28,16 +28,43 @@ from src.core.sql_query_classifier import (
 
 class FakeProcess:
     def __init__(self, stdout_lines, stderr_text=""):
-        self.stdin = io.StringIO()
-        self.stdout = io.StringIO("\n".join(stdout_lines) + "\n")
-        self.stderr = io.StringIO(stderr_text)
-        self.terminated = False
-
-    def poll(self):
-        return None if not self.terminated else 0
+        self.stdin = _AsyncTextWriter()
+        self.stdout = _AsyncTextReader("\n".join(stdout_lines) + "\n")
+        self.stderr = _AsyncTextReader(stderr_text)
+        self.returncode = None
 
     def terminate(self):
-        self.terminated = True
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = 0
+
+    async def wait(self):
+        return self.returncode
+
+
+class _AsyncTextWriter:
+    def __init__(self):
+        self._buffer = io.StringIO()
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        return self._buffer.write(data)
+
+    async def drain(self):
+        return None
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+class _AsyncTextReader:
+    def __init__(self, text):
+        self._buffer = io.StringIO(text)
+
+    async def readline(self):
+        return self._buffer.readline()
 
 
 def test_client_sends_jsonl_and_returns_result():
@@ -610,7 +637,7 @@ def test_stderr_is_drained_in_background_and_available_as_tail():
 
 def test_request_eof_error_does_not_call_stderr_read():
     class ExplodingStderr:
-        def readline(self):
+        async def readline(self):
             return ""
 
         def read(self):
@@ -618,16 +645,19 @@ def test_request_eof_error_does_not_call_stderr_read():
 
     class EOFProcess:
         def __init__(self):
-            self.stdin = io.StringIO()
-            self.stdout = io.StringIO("")
+            self.stdin = _AsyncTextWriter()
+            self.stdout = _AsyncTextReader("")
             self.stderr = ExplodingStderr()
-            self.terminated = False
-
-        def poll(self):
-            return None
+            self.returncode = None
 
         def terminate(self):
-            self.terminated = True
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = 0
+
+        async def wait(self):
+            return self.returncode
 
     process = EOFProcess()
     client = DbCoreServiceClient(

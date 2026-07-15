@@ -1,7 +1,12 @@
 """Rust DB Core 작업 스레드"""
 from PyQt6.QtCore import QThread, pyqtSignal
 
-from src.core.db_core_service import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+from src.core.db_core_service import (
+    DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    is_db_core_facade_retained,
+    release_db_core_facade_retry,
+    retain_db_core_facade_for_retry,
+)
 from src.exporters.rust_dump_exporter import (
     DEFAULT_DUMP_COMPRESSION, RustDumpConfig, RustDumpExporter, RustDumpImporter
 )
@@ -48,6 +53,28 @@ class RustDumpWorker(QThread):
                 )
         return True
 
+    def retry_owned_shutdown(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> bool:
+        """Retry cleanup for a worker-owned runner retained after residual shutdown."""
+        runner = self._active_runner
+        if runner is None or not getattr(runner, "_owns_facade", False):
+            return False
+        facade = getattr(runner, "facade", None)
+        if facade is None:
+            return False
+        try:
+            facade.client.shutdown(timeout_seconds=timeout_seconds)
+        except BaseException:
+            retain_db_core_facade_for_retry(facade)
+            raise
+        release_db_core_facade_retry(facade)
+        if self._active_runner is runner:
+            self._active_runner = None
+        return True
+
     def _is_cancelled_message(self, success: bool, msg: str):
         if self._cancel_requested:
             return False, CANCELLED_MESSAGE
@@ -91,7 +118,10 @@ class RustDumpWorker(QThread):
             else:
                 self.finished.emit(False, str(e))
         finally:
-            self._active_runner = None
+            runner = self._active_runner
+            facade = getattr(runner, "facade", None) if runner is not None else None
+            if facade is None or not is_db_core_facade_retained(facade):
+                self._active_runner = None
 
     def _run_export_schema(self):
         exporter = RustDumpExporter(self.config)

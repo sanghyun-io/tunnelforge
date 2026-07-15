@@ -1,6 +1,7 @@
 import inspect
 from unittest.mock import MagicMock
 
+import pytest
 from PyQt6.QtWidgets import QApplication, QDialog
 
 from src.ui.dialogs.db_dialogs import RustDumpWizard
@@ -156,6 +157,35 @@ def test_rust_dump_worker_cancel_has_no_private_process_access():
     assert "_process" not in source
     assert ".poll(" not in source
     assert ".terminate(" not in source
+
+
+def test_rust_dump_worker_retains_failed_runner_until_explicit_retry():
+    from src.core.db_core_service import (
+        DbCoreOutcome,
+        DbCoreServiceError,
+        retain_db_core_facade_for_retry,
+    )
+
+    residual = DbCoreServiceError(
+        "owner still alive",
+        code="db_core_residual_process",
+        outcome=DbCoreOutcome.FAILED,
+    )
+    worker, client = _make_worker_with_fake_runner(owns_facade=True)
+    worker.task_type = "noop"
+    runner = worker._active_runner
+    retain_db_core_facade_for_retry(runner.facade)
+    client.shutdown = MagicMock(side_effect=[residual, None])
+
+    worker.run()
+    assert worker._active_runner is runner
+
+    with pytest.raises(DbCoreServiceError):
+        worker.retry_owned_shutdown(timeout_seconds=0.05)
+    assert worker._active_runner is runner
+
+    assert worker.retry_owned_shutdown(timeout_seconds=0.05) is True
+    assert worker._active_runner is None
 
 def test_start_orphan_check_disconnects_connector_after_dialog_exec(monkeypatch):
     app = QApplication.instance() or QApplication([])

@@ -510,6 +510,8 @@ class TestRustDumpExporter:
             DbCoreOutcome,
             DbCoreRequestKind,
             DbCoreServiceError,
+            is_db_core_facade_retained,
+            release_db_core_facade_retry,
         )
         from src.exporters import rust_dump_exporter
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
@@ -538,6 +540,35 @@ class TestRustDumpExporter:
             exporter.export_full_schema('app', str(tmp_path / 'dump'))
 
         assert raised.value is residual
+        assert is_db_core_facade_retained(exporter.facade) is True
+        release_db_core_facade_retry(exporter.facade)
+
+    def test_dedicated_residual_facade_is_retained_until_retry_succeeds(self):
+        from src.core.db_core_facade import (
+            is_db_core_facade_retained,
+            retry_retained_db_core_facades,
+        )
+        from src.core.db_core_service import DbCoreOutcome, DbCoreServiceError
+        from src.exporters.rust_dump_exporter import _shutdown_owned_facade
+
+        residual = DbCoreServiceError(
+            "owner still alive",
+            code="db_core_residual_process",
+            outcome=DbCoreOutcome.FAILED,
+        )
+        facade = MagicMock()
+        facade.client.shutdown.side_effect = [residual, None]
+
+        with pytest.raises(DbCoreServiceError) as raised:
+            _shutdown_owned_facade(facade, True)
+
+        assert raised.value is residual
+        assert is_db_core_facade_retained(facade) is True
+
+        retry_retained_db_core_facades(timeout_seconds=0.5)
+
+        assert facade.client.shutdown.call_count == 2
+        assert is_db_core_facade_retained(facade) is False
 
 
 def test_export_schema_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):

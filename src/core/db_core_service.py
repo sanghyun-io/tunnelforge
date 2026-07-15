@@ -22,8 +22,10 @@ from src.core.db_core_client import (
     SUPPORTED_DB_ENGINES,
     _format_error_event,
     default_database_for_engine,
+    has_bootstrap_residual_db_core_clients,
     normalize_db_engine,
     parse_db_version_tuple,
+    retry_bootstrap_residual_db_core_clients,
 )
 from src.core.db_core_dbapi_shim import (
     RustDbConnection,
@@ -36,6 +38,10 @@ from src.core.db_core_facade import (
     DbCoreFacade,
     DbEndpoint,
     get_shared_db_core_facade,
+    is_db_core_facade_retained,
+    release_db_core_facade_retry,
+    retain_db_core_facade_for_retry,
+    retry_retained_db_core_facades,
     shutdown_shared_db_core_facade,
 )
 
@@ -56,10 +62,16 @@ __all__ = [
     "parse_db_version_tuple",
     "normalize_db_engine",
     "default_database_for_engine",
+    "has_bootstrap_residual_db_core_clients",
+    "retry_bootstrap_residual_db_core_clients",
     "DbEndpoint",
     "DbCoreServiceClient",
     "DbCoreFacade",
     "get_shared_db_core_facade",
+    "retain_db_core_facade_for_retry",
+    "release_db_core_facade_retry",
+    "is_db_core_facade_retained",
+    "retry_retained_db_core_facades",
     "shutdown_shared_db_core_facade",
     "RustDbConnector",
     "create_rust_db_connector",

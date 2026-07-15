@@ -1,6 +1,8 @@
 import asyncio
 import concurrent.futures
 import io
+import inspect
+import json
 import math
 import sys
 import threading
@@ -25,16 +27,43 @@ from src.core.db_core_service import (
 
 class _Process:
     def __init__(self, lines):
-        self.stdin = io.StringIO()
-        self.stdout = io.StringIO("\n".join(lines) + "\n")
-        self.stderr = io.StringIO()
-        self.terminated = False
-
-    def poll(self):
-        return 0 if self.terminated else None
+        self.stdin = _AsyncTextWriter()
+        self.stdout = _AsyncTextReader("\n".join(lines) + "\n")
+        self.stderr = _AsyncTextReader("")
+        self.returncode = None
 
     def terminate(self):
-        self.terminated = True
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = 0
+
+    async def wait(self):
+        return self.returncode
+
+
+class _AsyncTextWriter:
+    def __init__(self):
+        self._buffer = io.StringIO()
+
+    def write(self, data):
+        if isinstance(data, bytes):
+            data = data.decode("utf-8")
+        return self._buffer.write(data)
+
+    async def drain(self):
+        return None
+
+    def getvalue(self):
+        return self._buffer.getvalue()
+
+
+class _AsyncTextReader:
+    def __init__(self, text):
+        self._buffer = io.StringIO(text)
+
+    async def readline(self):
+        return self._buffer.readline()
 
 
 def _client_for_lines(lines):
@@ -193,7 +222,7 @@ def test_progress_callback_ack_precedes_unblocked_terminal_read():
         def __init__(self):
             self._reads = 0
 
-        def readline(self):
+        async def readline(self):
             self._reads += 1
             if self._reads == 1:
                 return '{"event":"phase","phase":"inspect","message":"started"}\n'
@@ -229,7 +258,7 @@ def test_progress_callback_error_prevents_terminal_read():
         def __init__(self):
             self._reads = 0
 
-        def readline(self):
+        async def readline(self):
             self._reads += 1
             if self._reads == 1:
                 return '{"event":"phase","phase":"inspect","message":"started"}\n'
@@ -418,9 +447,10 @@ def test_shutdown_cancels_inflight_request_with_typed_bounded_error():
     shutdown_errors = []
 
     class _BlockingStdout:
-        def readline(self):
+        async def readline(self):
             read_entered.set()
-            release_read.wait(timeout=2.0)
+            while not release_read.is_set():
+                await asyncio.sleep(0.005)
             return ""
 
     class _CancelableProcess(_Process):
@@ -480,7 +510,7 @@ def test_start_future_cancelled_by_shutdown_is_typed(monkeypatch):
     )
     original_submit = client._submit_admitted
 
-    def cancelled_submit(coroutine, request_kind, request_id):
+    def cancelled_submit(coroutine, request_kind, request_id, deadline_at):
         coroutine.close()
         future = concurrent.futures.Future()
         future.cancel()
@@ -532,9 +562,10 @@ def test_public_cancel_active_request_terminates_only_on_owner_thread():
     terminate_thread_ids = []
 
     class _BlockingStdout:
-        def readline(self):
+        async def readline(self):
             read_entered.set()
-            release_read.wait(timeout=2.0)
+            while not release_read.is_set():
+                await asyncio.sleep(0.005)
             return ""
 
     class _CancelableProcess(_Process):
@@ -624,3 +655,316 @@ def test_shared_shutdown_retains_facade_when_owner_reports_residual(monkeypatch)
     assert raised.value is error
     assert db_core_facade._shared_facade is facade
     db_core_facade._shared_facade = None
+
+
+class _AsyncQueueReader:
+    def __init__(self):
+        self._queue = asyncio.Queue()
+
+    async def readline(self):
+        return await self._queue.get()
+
+    def feed_line(self, payload):
+        self._queue.put_nowait((json.dumps(payload) + "\n").encode("utf-8"))
+
+    def feed_eof(self):
+        self._queue.put_nowait(b"")
+
+
+class _EmptyAsyncReader:
+    async def readline(self):
+        return b""
+
+
+class _ControlledAsyncWriter:
+    def __init__(self, process, release_first):
+        self._process = process
+        self._release_first = release_first
+        self._pending = None
+
+    def write(self, data):
+        self._process.handle_thread_ids.append(threading.get_ident())
+        self._pending = json.loads(data.decode("utf-8"))
+
+    async def drain(self):
+        request = self._pending
+        request_id = request["request_id"]
+        self._process.write_order.append(request_id)
+        if len(self._process.write_order) == 1:
+            self._process.first_write.set()
+            while not self._release_first.is_set():
+                await asyncio.sleep(0.005)
+        self._process.stdout.feed_line({
+            "event": "result",
+            "command": request["command"],
+            "request_id": request_id,
+            "success": True,
+            "value": request_id,
+        })
+
+
+class _ControlledAsyncProcess:
+    def __init__(self, release_first):
+        self.returncode = None
+        self.stdout = _AsyncQueueReader()
+        self.stderr = _EmptyAsyncReader()
+        self.first_write = threading.Event()
+        self.write_order = []
+        self.handle_thread_ids = []
+        self.terminate_calls = 0
+        self.stdin = _ControlledAsyncWriter(self, release_first)
+
+    def terminate(self):
+        self.handle_thread_ids.append(threading.get_ident())
+        self.terminate_calls += 1
+        self.returncode = 0
+        self.stdout.feed_eof()
+
+    def kill(self):
+        self.terminate()
+
+    async def wait(self):
+        while self.returncode is None:
+            await asyncio.sleep(0.005)
+        return self.returncode
+
+
+def test_owner_serializes_concurrent_request_ids_and_stream_order():
+    release_first = threading.Event()
+    process = _ControlledAsyncProcess(release_first)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: process,
+    )
+    results = {}
+    errors = []
+
+    def request(request_id):
+        try:
+            results[request_id] = client.request(
+                "service.hello",
+                request_id=request_id,
+                timeout_seconds=1.0,
+            )["value"]
+        except BaseException as exc:
+            errors.append(exc)
+
+    first = threading.Thread(target=request, args=("req-1",))
+    second = threading.Thread(target=request, args=("req-2",))
+    first.start()
+    first_started = process.first_write.wait(timeout=0.5)
+    if first_started:
+        second.start()
+        time.sleep(0.05)
+        serialized_before_release = process.write_order == ["req-1"]
+    else:
+        serialized_before_release = False
+    release_first.set()
+    first.join(timeout=1.0)
+    if second.ident is not None:
+        second.join(timeout=1.0)
+
+    assert first_started is True
+    assert serialized_before_release is True
+    assert errors == []
+    assert results == {"req-1": "req-1", "req-2": "req-2"}
+    assert process.write_order == ["req-1", "req-2"]
+    assert set(process.handle_thread_ids) == {client.owner_thread.ident}
+
+
+def test_queued_request_timeout_does_not_cancel_or_terminate_active_request():
+    release_first = threading.Event()
+    process = _ControlledAsyncProcess(release_first)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: process,
+    )
+    first_results = []
+
+    first = threading.Thread(
+        target=lambda: first_results.append(client.request(
+            "service.hello",
+            request_id="active",
+            timeout_seconds=1.0,
+        )),
+    )
+    first.start()
+    first_started = process.first_write.wait(timeout=0.5)
+    if first_started:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request(
+                "service.hello",
+                request_id="queued",
+                timeout_seconds=0.05,
+            )
+    release_first.set()
+    first.join(timeout=1.0)
+
+    assert first_started is True
+    assert raised.value.code == "db_core_timeout"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert process.terminate_calls == 0
+    assert process.write_order == ["active"]
+
+    assert len(first_results) == 1
+    assert first_results[0]["value"] == "active"
+
+
+def test_client_shutdown_lock_wait_consumes_same_absolute_deadline():
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: None,
+    )
+    client._shutdown_lock.acquire()
+    errors = []
+
+    def shutdown():
+        try:
+            client.shutdown(timeout_seconds=0.05)
+        except BaseException as exc:
+            errors.append(exc)
+
+    started = time.monotonic()
+    thread = threading.Thread(target=shutdown)
+    try:
+        thread.start()
+        thread.join(timeout=0.2)
+        bounded = not thread.is_alive()
+    finally:
+        client._shutdown_lock.release()
+        thread.join(timeout=0.5)
+    elapsed = time.monotonic() - started
+
+    assert bounded is True
+    assert elapsed < 0.2
+    assert len(errors) == 1
+    assert isinstance(errors[0], DbCoreServiceError)
+    assert errors[0].code == "db_core_residual_process"
+    client.shutdown(timeout_seconds=0.5)
+
+
+def test_shared_shutdown_lock_wait_consumes_same_absolute_deadline(monkeypatch):
+    class FakeClient:
+        def shutdown(self, *, timeout_seconds):
+            raise AssertionError("client shutdown must not start after lock deadline")
+
+    monkeypatch.setattr(db_core_facade, "_shared_facade", type("Facade", (), {"client": FakeClient()})())
+    db_core_facade._shared_facade_lock.acquire()
+    errors = []
+
+    def shutdown():
+        try:
+            db_core_facade.shutdown_shared_db_core_facade(timeout_seconds=0.05)
+        except BaseException as exc:
+            errors.append(exc)
+
+    started = time.monotonic()
+    thread = threading.Thread(target=shutdown)
+    try:
+        thread.start()
+        thread.join(timeout=0.2)
+        bounded = not thread.is_alive()
+    finally:
+        db_core_facade._shared_facade_lock.release()
+        thread.join(timeout=0.5)
+        db_core_facade._shared_facade = None
+    elapsed = time.monotonic() - started
+
+    assert bounded is True
+    assert elapsed < 0.2
+    assert len(errors) == 1
+    assert isinstance(errors[0], DbCoreServiceError)
+    assert errors[0].code == "db_core_residual_process"
+
+
+def test_bootstrap_timeout_stops_and_joins_started_owner_without_leak():
+    release_factory = threading.Event()
+    timer = threading.Timer(0.03, release_factory.set)
+    before = set(threading.enumerate())
+
+    def delayed_loop_factory():
+        release_factory.wait(timeout=0.2)
+        return asyncio.SelectorEventLoop()
+
+    timer.start()
+    try:
+        with pytest.raises(DbCoreServiceError):
+            DbCoreServiceClient(
+                executable="fake-core",
+                process_factory=lambda *args, **kwargs: None,
+                loop_factory=delayed_loop_factory,
+                bootstrap_timeout_seconds=0.05,
+            )
+    finally:
+        release_factory.set()
+        timer.join(timeout=0.2)
+
+    leaked = [
+        thread for thread in threading.enumerate()
+        if thread not in before and thread.name.startswith("TunnelForgeDbCoreOwner-")
+    ]
+    assert leaked == []
+
+
+def test_bootstrap_loop_factory_failure_joins_started_owner_without_leak():
+    before = set(threading.enumerate())
+
+    def failing_loop_factory():
+        raise RuntimeError("loop factory failed")
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        DbCoreServiceClient(
+            executable="fake-core",
+            process_factory=lambda *args, **kwargs: None,
+            loop_factory=failing_loop_factory,
+            bootstrap_timeout_seconds=0.1,
+        )
+
+    leaked = [
+        thread for thread in threading.enumerate()
+        if thread not in before and thread.name.startswith("TunnelForgeDbCoreOwner-")
+    ]
+    assert raised.value.code == "db_core_start_failed"
+    assert leaked == []
+
+
+def test_shared_shutdown_retries_retained_facades_even_when_shared_is_residual(monkeypatch):
+    shared_residual = DbCoreServiceError(
+        "shared owner still alive",
+        code="db_core_residual_process",
+        outcome=DbCoreOutcome.FAILED,
+    )
+
+    class Client:
+        def __init__(self, error=None):
+            self.error = error
+            self.calls = 0
+
+        def shutdown(self, *, timeout_seconds):
+            self.calls += 1
+            if self.error is not None:
+                raise self.error
+
+    shared = type("Facade", (), {"client": Client(shared_residual)})()
+    retained = type("Facade", (), {"client": Client()})()
+    db_core_facade.retain_db_core_facade_for_retry(retained)
+    monkeypatch.setattr(db_core_facade, "_shared_facade", shared)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            db_core_facade.shutdown_shared_db_core_facade(timeout_seconds=0.5)
+    finally:
+        db_core_facade._shared_facade = None
+
+    assert raised.value is shared_residual
+    assert retained.client.calls == 1
+    assert db_core_facade.is_db_core_facade_retained(retained) is False
+
+
+def test_transport_uses_only_owner_asyncio_process_handles():
+    source = inspect.getsource(DbCoreServiceClient)
+
+    assert "asyncio.create_subprocess_exec" in source
+    assert "run_in_executor" not in source
+    assert "subprocess.Popen" not in source
+    assert "_stderr_thread" not in source
