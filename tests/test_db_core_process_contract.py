@@ -2541,6 +2541,7 @@ class _Task4Process(_Task3Process):
         fail_close=False,
         fail_wait_closed=False,
         fail_terminate=False,
+        stall_read=False,
         stall_terminate_wait=False,
         fail_kill=False,
         stall_final_wait=False,
@@ -2554,9 +2555,14 @@ class _Task4Process(_Task3Process):
             fail_wait_closed=fail_wait_closed,
         )
         self.fail_terminate_task4 = fail_terminate
+        self.stall_read = stall_read
         self.stall_terminate_wait = stall_terminate_wait
         self.fail_kill = fail_kill
         self.stall_final_wait = stall_final_wait
+
+    def respond(self, request):
+        if request["command"] == "service.hello" or not self.stall_read:
+            super().respond(request)
 
     def terminate(self):
         self.handle_thread_ids.append(threading.get_ident())
@@ -3525,6 +3531,124 @@ def test_cancel_retry_does_not_clear_failed_reap_without_cleanup(monkeypatch):
             client.shutdown(timeout_seconds=1.0)
 
     assert client.shutdown_complete is True
+
+
+def test_cancel_retry_naturally_cleans_retained_process_before_new_generation():
+    retained_process = _Task4Process(
+        stall_read=True,
+        stall_terminate_wait=True,
+        fail_kill=True,
+    )
+    next_process = _Task4Process(
+        responder=lambda process, request: _task3_result(
+            process,
+            request,
+            value="generation-2",
+        )
+    )
+    factory = _Task3Factory([retained_process, next_process])
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+    client.start()
+    retained_process.before_write.clear()
+    retained_process.read_entered.clear()
+    request_thread, request_errors = _task4_start_request(
+        client,
+        request_id="natural-retained-process",
+    )
+    assert retained_process.before_write.wait(timeout=0.5)
+    assert retained_process.read_entered.wait(timeout=0.5)
+    generation_one_writes = len(retained_process.raw_writes)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as first_cancel:
+            client.cancel_active_request(timeout_seconds=0.5)
+
+        request_thread.join(timeout=1.0)
+        assert not request_thread.is_alive()
+        assert len(request_errors) == 1
+        assert isinstance(request_errors[0], DbCoreServiceError)
+        assert first_cancel.value.code == "db_core_residual_process"
+        assert first_cancel.value.payload["stage"] == "kill"
+        assert first_cancel.value.payload["pid"] == retained_process.pid
+        assert first_cancel.value.payload["process_generation"] == 1
+        assert first_cancel.value.payload["generation_state"] == "reaping"
+        assert first_cancel.value.payload["pending_tasks"]
+        assert isinstance(first_cancel.value.__cause__, OSError)
+        assert str(first_cancel.value.__cause__) == "simulated kill failure"
+
+        failed_reap = client._owner_reap_task
+        retained_wait_task = client._process_wait_task
+        retained_stderr_task = client._stderr_task
+        retained_stdin_task = client._stdin_close_task
+        assert failed_reap is not None and failed_reap.done()
+        assert isinstance(failed_reap.exception(), DbCoreServiceError)
+        assert client._owner_reap_generation == 1
+        assert client._process is retained_process
+        assert client.process_generation == 1
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert retained_wait_task is not None and not retained_wait_task.done()
+        assert retained_stderr_task is not None and not retained_stderr_task.done()
+        assert retained_stdin_task is not None and retained_stdin_task.done()
+        assert retained_process.terminate_calls == 1
+        assert retained_process.kill_calls == 1
+        assert retained_process.wait_calls == 1
+        assert retained_process.stdin.close_calls == 1
+        assert retained_process.stdin.wait_closed_calls == 1
+        assert len(retained_process.raw_writes) == generation_one_writes
+        assert len(factory.calls) == 1
+        assert next_process.raw_writes == []
+
+        retained_process.fail_kill = False
+
+        assert client.cancel_active_request(timeout_seconds=0.5) is True
+        barrier_deadline = time.monotonic() + 0.5
+        while client._owner_reap_task is not None and time.monotonic() < barrier_deadline:
+            time.sleep(0.001)
+
+        assert client._owner_reap_task is None
+        assert client._owner_reap_generation is None
+        assert client._process is None
+        assert client._process_wait_task is None
+        assert client._stdout_drain_task is None
+        assert client._stderr_task is None
+        assert client._stdin_close_task is None
+        assert client.process_generation == 1
+        assert client.generation_state is DbCoreGenerationState.CLOSED
+        assert retained_wait_task.done()
+        assert retained_stderr_task.done()
+        assert retained_stdin_task.done()
+        assert retained_process.terminate_calls == 2
+        assert retained_process.kill_calls == 2
+        assert retained_process.wait_calls == 1
+        assert retained_process.stdin.close_calls == 2
+        assert retained_process.stdin.wait_closed_calls == 1
+        assert retained_process.stdout.queue.empty()
+        assert retained_process.stderr.queue.empty()
+        assert len(retained_process.raw_writes) == generation_one_writes
+        assert len(factory.calls) == 1
+        assert next_process.raw_writes == []
+
+        recovered = client.request_result(
+            "schema.list",
+            request_id="after-natural-retained-cleanup",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=0.5,
+        )
+
+        assert recovered.process_generation == 2
+        assert recovered.payload["value"] == "generation-2"
+        assert client.process_generation == 2
+        assert client.generation_state is DbCoreGenerationState.ACTIVE
+        assert client._process is next_process
+        assert len(factory.calls) == 2
+    finally:
+        request_thread.join(timeout=1.0)
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client.shutdown_complete is True
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert client._process is None
 
 
 def test_cancel_owner_uses_exact_minimum_deadline_without_handoff_subtraction(
