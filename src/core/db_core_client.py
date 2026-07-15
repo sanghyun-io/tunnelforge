@@ -69,6 +69,14 @@ class DbCoreRequestResult:
     payload: Mapping[str, Any]
 
 
+@dataclass
+class _CallbackDelivery:
+    payload: Dict[str, Any]
+    is_terminal: bool
+    ack: Optional[threading.Event] = None
+    callback_error: Optional[BaseException] = None
+
+
 class DbCoreServiceError(RuntimeError):
     """Raised when the Rust DB core service cannot complete a request."""
 
@@ -203,8 +211,11 @@ class DbCoreServiceClient:
         self._stderr_tail: Deque[str] = deque(maxlen=200)
         self._stderr_lock = threading.Lock()
         self._stderr_thread: Optional[threading.Thread] = None
+        self._admission_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
+        self._shutdown_started = False
         self._shutdown_complete = False
+        self._active_request_task: Optional[asyncio.Task] = None
         self._owner_ready = threading.Event()
         self._owner_loop: Optional[asyncio.AbstractEventLoop] = None
         self._owner_error: Optional[BaseException] = None
@@ -277,9 +288,14 @@ class DbCoreServiceClient:
         request_kind: DbCoreRequestKind,
         request_id: str,
     ) -> DbCoreServiceError:
+        shutdown_started = self._shutdown_started
         return DbCoreServiceError(
-            "DB Core owner is already shut down",
-            code="db_core_start_failed",
+            (
+                "DB Core shutdown has started; new requests are not admitted"
+                if shutdown_started
+                else "DB Core owner is unavailable"
+            ),
+            code=("db_core_cleanup_failed" if shutdown_started else "db_core_start_failed"),
             request_kind=request_kind,
             outcome=DbCoreOutcome.NOT_STARTED,
             request_id=request_id,
@@ -300,13 +316,20 @@ class DbCoreServiceClient:
             coroutine.close()
             raise self._owner_unavailable_error(request_kind, request_id) from exc
 
+    def _submit_admitted(self, coroutine, request_kind: DbCoreRequestKind, request_id: str):
+        with self._admission_lock:
+            if self._shutdown_started:
+                coroutine.close()
+                raise self._owner_unavailable_error(request_kind, request_id)
+            return self._submit_owner(coroutine, request_kind, request_id)
+
     def _remaining(self, deadline_at: float) -> float:
         return max(0.0, deadline_at - self._monotonic())
 
     def start(self) -> None:
         request_id = f"py-{uuid.uuid4().hex}"
         deadline_at = self._monotonic() + DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
-        future = self._submit_owner(
+        future = self._submit_admitted(
             self._start_on_owner(DbCoreRequestKind.MUTATION, request_id),
             DbCoreRequestKind.MUTATION,
             request_id,
@@ -318,6 +341,15 @@ class DbCoreServiceClient:
             raise DbCoreServiceError(
                 "DB Core process start exceeded its deadline",
                 code="db_core_timeout",
+                request_kind=DbCoreRequestKind.MUTATION,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+            ) from exc
+        except concurrent.futures.CancelledError as exc:
+            raise DbCoreServiceError(
+                "DB Core process start was cancelled by client shutdown",
+                code="db_core_cleanup_failed",
                 request_kind=DbCoreRequestKind.MUTATION,
                 outcome=DbCoreOutcome.NOT_STARTED,
                 request_id=request_id,
@@ -411,14 +443,17 @@ class DbCoreServiceClient:
             return DbCoreOutcome.OUTCOME_INDETERMINATE
         return DbCoreOutcome.FAILED
 
-    def _send_on_owner(
+    async def _send_on_owner(
         self,
         command: str,
         payload: Optional[Dict[str, Any]],
         request_id: str,
         request_kind: DbCoreRequestKind,
-        event_queue: "queue.Queue[Tuple[Dict[str, Any], bool]]",
+        event_queue: "queue.Queue[_CallbackDelivery]",
         required_generation: Optional[int],
+        deadline_at: float,
+        requires_callback_ack: bool,
+        write_started: threading.Event,
     ) -> DbCoreRequestResult:
         body = {
             "command": command,
@@ -450,6 +485,7 @@ class DbCoreServiceClient:
             )
 
         try:
+            write_started.set()
             stdin.write(json.dumps(body, ensure_ascii=False) + "\n")
             stdin.flush()
         except Exception as exc:
@@ -463,7 +499,30 @@ class DbCoreServiceClient:
             ) from exc
 
         while True:
-            line = stdout.readline()
+            remaining = self._remaining(deadline_at)
+            if remaining <= 0.0:
+                raise DbCoreServiceError(
+                    "DB Core request exceeded its absolute deadline",
+                    code="db_core_timeout",
+                    request_kind=request_kind,
+                    outcome=self._transport_outcome(request_kind),
+                    request_id=request_id,
+                    process_generation=self._process_generation,
+                )
+            try:
+                line = await asyncio.wait_for(
+                    self.owner_loop.run_in_executor(None, stdout.readline),
+                    timeout=remaining,
+                )
+            except asyncio.TimeoutError as exc:
+                raise DbCoreServiceError(
+                    "DB Core request exceeded its absolute deadline",
+                    code="db_core_timeout",
+                    request_kind=request_kind,
+                    outcome=self._transport_outcome(request_kind),
+                    request_id=request_id,
+                    process_generation=self._process_generation,
+                ) from exc
             if line == "":
                 raise DbCoreServiceError(
                     self._stderr_tail_text() or "DB core service stopped before a result",
@@ -496,7 +555,36 @@ class DbCoreServiceClient:
                     payload=event.payload,
                 )
             is_terminal = event.event in ("result", "error")
-            event_queue.put((event.payload, is_terminal))
+            delivery = _CallbackDelivery(
+                payload=event.payload,
+                is_terminal=is_terminal,
+                ack=(threading.Event() if requires_callback_ack and not is_terminal else None),
+            )
+            event_queue.put(delivery)
+            if delivery.ack is not None:
+                while not delivery.ack.is_set():
+                    remaining = self._remaining(deadline_at)
+                    if remaining <= 0.0:
+                        await self._terminate_process_on_owner(deadline_at)
+                        raise DbCoreServiceError(
+                            "DB Core progress callback exceeded the request deadline",
+                            code="db_core_callback_failed",
+                            request_kind=request_kind,
+                            outcome=self._transport_outcome(request_kind),
+                            request_id=request_id,
+                            process_generation=self._process_generation,
+                        )
+                    await asyncio.sleep(min(0.01, remaining))
+                if delivery.callback_error is not None:
+                    await self._terminate_process_on_owner(deadline_at)
+                    raise DbCoreServiceError(
+                        f"DB Core progress callback failed: {delivery.callback_error}",
+                        code="db_core_callback_failed",
+                        request_kind=request_kind,
+                        outcome=self._transport_outcome(request_kind),
+                        request_id=request_id,
+                        process_generation=self._process_generation,
+                    )
             if event.event == "result":
                 return DbCoreRequestResult(
                     request_kind=request_kind,
@@ -536,17 +624,29 @@ class DbCoreServiceClient:
         payload: Optional[Dict[str, Any]],
         request_id: str,
         request_kind: DbCoreRequestKind,
-        event_queue: "queue.Queue[Tuple[Dict[str, Any], bool]]",
+        event_queue: "queue.Queue[_CallbackDelivery]",
         required_generation: Optional[int],
+        deadline_at: float,
+        requires_callback_ack: bool,
+        write_started: threading.Event,
     ) -> DbCoreRequestResult:
-        return self._send_on_owner(
-            command,
-            payload,
-            request_id,
-            request_kind,
-            event_queue,
-            required_generation,
-        )
+        current = asyncio.current_task()
+        self._active_request_task = current
+        try:
+            return await self._send_on_owner(
+                command,
+                payload,
+                request_id,
+                request_kind,
+                event_queue,
+                required_generation,
+                deadline_at,
+                requires_callback_ack,
+                write_started,
+            )
+        finally:
+            if self._active_request_task is current:
+                self._active_request_task = None
 
     @staticmethod
     def _infer_request_kind(command: str) -> DbCoreRequestKind:
@@ -604,8 +704,9 @@ class DbCoreServiceClient:
         timeout = self._validated_timeout(timeout_seconds, DEFAULT_REQUEST_TIMEOUT_SECONDS)
         deadline_at = self._monotonic() + timeout
         request_id = request_id or f"py-{uuid.uuid4().hex}"
-        events: "queue.Queue[Tuple[Dict[str, Any], bool]]" = queue.Queue()
-        future = self._submit_owner(
+        events: "queue.Queue[_CallbackDelivery]" = queue.Queue()
+        write_started = threading.Event()
+        future = self._submit_admitted(
             self._request_on_owner(
                 command,
                 payload,
@@ -613,13 +714,16 @@ class DbCoreServiceClient:
                 request_kind,
                 events,
                 required_generation,
+                deadline_at,
+                on_event is not None,
+                write_started,
             ),
             request_kind,
             request_id,
         )
         result: Optional[DbCoreRequestResult] = None
         request_error: Optional[DbCoreServiceError] = None
-        deferred_events: List[Dict[str, Any]] = []
+        deferred_events: List[_CallbackDelivery] = []
         timed_out = False
         if on_event is not None:
             while not future.done():
@@ -628,25 +732,34 @@ class DbCoreServiceClient:
                     timed_out = True
                     break
                 try:
-                    event_payload, is_terminal = events.get(
+                    delivery = events.get(
                         timeout=min(0.05, remaining),
                     )
                 except queue.Empty:
                     continue
-                if is_terminal:
-                    deferred_events.append(event_payload)
+                if delivery.is_terminal:
+                    deferred_events.append(delivery)
                 else:
                     try:
                         self._invoke_callback(
-                            event_payload,
+                            delivery.payload,
                             on_event,
                             request_kind,
                             None,
                             None,
                         )
-                    except DbCoreCallbackError:
-                        future.cancel()
+                    except DbCoreCallbackError as callback_error:
+                        delivery.callback_error = callback_error.cause
+                        if delivery.ack is not None:
+                            delivery.ack.set()
+                        try:
+                            future.result(timeout=self._remaining(deadline_at))
+                        except BaseException:
+                            pass
                         raise
+                    else:
+                        if delivery.ack is not None:
+                            delivery.ack.set()
 
         try:
             if timed_out:
@@ -663,19 +776,33 @@ class DbCoreServiceClient:
                 process_generation=self._process_generation,
             )
             request_error.__cause__ = exc
+        except concurrent.futures.CancelledError as exc:
+            request_error = DbCoreServiceError(
+                "DB Core request was cancelled by client shutdown",
+                code="db_core_cleanup_failed",
+                request_kind=request_kind,
+                outcome=(
+                    self._transport_outcome(request_kind)
+                    if write_started.is_set()
+                    else DbCoreOutcome.NOT_STARTED
+                ),
+                request_id=request_id,
+                process_generation=self._process_generation,
+            )
+            request_error.__cause__ = exc
         except DbCoreServiceError as exc:
             request_error = exc
 
         if on_event is not None:
             while True:
                 try:
-                    event_payload, _ = events.get_nowait()
+                    delivery = events.get_nowait()
                 except queue.Empty:
                     break
-                deferred_events.append(event_payload)
-            for event_payload in deferred_events:
+                deferred_events.append(delivery)
+            for delivery in deferred_events:
                 self._invoke_callback(
-                    event_payload,
+                    delivery.payload,
                     on_event,
                     request_kind,
                     result,
@@ -729,7 +856,127 @@ class DbCoreServiceClient:
             required_generation=required_generation,
         )
 
+    async def _terminate_process_on_owner(self, deadline_at: float) -> None:
+        process = self._process
+        if process is None:
+            return
+        if process.poll() is None:
+            try:
+                process.terminate()
+            except Exception as exc:
+                raise DbCoreServiceError(
+                    f"DB Core process termination failed: {type(exc).__name__}: {exc}",
+                    code="db_core_residual_process",
+                    outcome=DbCoreOutcome.FAILED,
+                    process_generation=self._process_generation,
+                ) from exc
+
+            wait = getattr(process, "wait", None)
+            if callable(wait):
+                remaining = self._remaining(deadline_at)
+                try:
+                    await asyncio.wait_for(
+                        self.owner_loop.run_in_executor(
+                            None,
+                            lambda: wait(timeout=remaining),
+                        ),
+                        timeout=remaining,
+                    )
+                except (asyncio.TimeoutError, subprocess.TimeoutExpired) as exc:
+                    kill = getattr(process, "kill", None)
+                    if not callable(kill):
+                        raise DbCoreServiceError(
+                            "DB Core process did not exit before shutdown deadline",
+                            code="db_core_residual_process",
+                            outcome=DbCoreOutcome.FAILED,
+                            process_generation=self._process_generation,
+                        ) from exc
+                    try:
+                        kill()
+                    except Exception as kill_exc:
+                        raise DbCoreServiceError(
+                            f"DB Core process kill failed: {type(kill_exc).__name__}: {kill_exc}",
+                            code="db_core_residual_process",
+                            outcome=DbCoreOutcome.FAILED,
+                            process_generation=self._process_generation,
+                        ) from kill_exc
+                    remaining = self._remaining(deadline_at)
+                    try:
+                        await asyncio.wait_for(
+                            self.owner_loop.run_in_executor(
+                                None,
+                                lambda: wait(timeout=remaining),
+                            ),
+                            timeout=remaining,
+                        )
+                    except (asyncio.TimeoutError, subprocess.TimeoutExpired) as final_exc:
+                        raise DbCoreServiceError(
+                            "DB Core process remained alive after bounded kill",
+                            code="db_core_residual_process",
+                            outcome=DbCoreOutcome.FAILED,
+                            process_generation=self._process_generation,
+                        ) from final_exc
+        self._process = None
+
+    async def _cancel_active_on_owner(self, deadline_at: float) -> bool:
+        task = self._active_request_task
+        if task is None or task.done():
+            return False
+
+        await self._terminate_process_on_owner(deadline_at)
+        if not task.done():
+            task.cancel()
+        try:
+            await asyncio.wait_for(
+                asyncio.shield(task),
+                timeout=self._remaining(deadline_at),
+            )
+        except (asyncio.CancelledError, DbCoreServiceError):
+            pass
+        except asyncio.TimeoutError as exc:
+            raise DbCoreServiceError(
+                "DB Core active request did not cancel before the deadline",
+                code="db_core_residual_process",
+                outcome=DbCoreOutcome.FAILED,
+                process_generation=self._process_generation,
+            ) from exc
+        return True
+
+    def cancel_active_request(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    ) -> bool:
+        timeout = self._validated_timeout(timeout_seconds, DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
+        deadline_at = self._monotonic() + timeout
+        with self._admission_lock:
+            if self._shutdown_started:
+                return False
+            future = self._submit_owner(
+                self._cancel_active_on_owner(deadline_at),
+                DbCoreRequestKind.MUTATION,
+                "cancel-active",
+            )
+        try:
+            return bool(future.result(timeout=self._remaining(deadline_at)))
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise DbCoreServiceError(
+                "DB Core active request cancellation exceeded its deadline",
+                code="db_core_residual_process",
+                outcome=DbCoreOutcome.FAILED,
+                process_generation=self._process_generation,
+            ) from exc
+        except concurrent.futures.CancelledError as exc:
+            raise DbCoreServiceError(
+                "DB Core active request cancellation was interrupted by shutdown",
+                code="db_core_residual_process",
+                outcome=DbCoreOutcome.FAILED,
+                process_generation=self._process_generation,
+            ) from exc
+
     async def _shutdown_on_owner(self, deadline_at: float) -> None:
+        await self._terminate_process_on_owner(deadline_at)
         current = asyncio.current_task()
         pending = [
             task
@@ -752,44 +999,6 @@ class DbCoreServiceClient:
                     payload={"pending_tasks": len(still_pending)},
                 )
 
-        process = self._process
-        if process is None:
-            return
-        if process.poll() is None:
-            try:
-                process.terminate()
-            except Exception as exc:
-                raise DbCoreServiceError(
-                    f"DB Core process termination failed: {type(exc).__name__}: {exc}",
-                    code="db_core_residual_process",
-                    outcome=DbCoreOutcome.FAILED,
-                    process_generation=self._process_generation,
-                ) from exc
-            wait = getattr(process, "wait", None)
-            if callable(wait):
-                try:
-                    wait(timeout=self._remaining(deadline_at))
-                except subprocess.TimeoutExpired as exc:
-                    kill = getattr(process, "kill", None)
-                    if not callable(kill):
-                        raise DbCoreServiceError(
-                            "DB Core process did not exit before shutdown deadline",
-                            code="db_core_residual_process",
-                            outcome=DbCoreOutcome.FAILED,
-                            process_generation=self._process_generation,
-                        ) from exc
-                    kill()
-                    try:
-                        wait(timeout=self._remaining(deadline_at))
-                    except subprocess.TimeoutExpired as final_exc:
-                        raise DbCoreServiceError(
-                            "DB Core process remained alive after bounded kill",
-                            code="db_core_residual_process",
-                            outcome=DbCoreOutcome.FAILED,
-                            process_generation=self._process_generation,
-                        ) from final_exc
-        self._process = None
-
     def shutdown(
         self,
         *,
@@ -800,6 +1009,8 @@ class DbCoreServiceClient:
         with self._shutdown_lock:
             if self._shutdown_complete:
                 return
+            with self._admission_lock:
+                self._shutdown_started = True
             try:
                 future = self._submit_owner(
                     self._shutdown_on_owner(deadline_at),
@@ -811,6 +1022,13 @@ class DbCoreServiceClient:
                 future.cancel()
                 raise DbCoreServiceError(
                     "DB Core owner shutdown exceeded its deadline",
+                    code="db_core_residual_process",
+                    outcome=DbCoreOutcome.FAILED,
+                    process_generation=self._process_generation,
+                ) from exc
+            except concurrent.futures.CancelledError as exc:
+                raise DbCoreServiceError(
+                    "DB Core owner shutdown task was cancelled",
                     code="db_core_residual_process",
                     outcome=DbCoreOutcome.FAILED,
                     process_generation=self._process_generation,

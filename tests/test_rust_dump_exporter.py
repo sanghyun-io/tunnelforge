@@ -1,6 +1,7 @@
 """
 RustDumpExporter 테스트
 """
+import io
 import json
 import pytest
 from unittest.mock import patch, MagicMock
@@ -47,6 +48,60 @@ class TestRustDumpChecker:
 
         assert installed is False
         assert '시간 초과' in msg
+
+    def test_check_installation_always_boundedly_shuts_down_dedicated_facade(self):
+        from src.core.db_core_service import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+        from src.exporters.rust_dump_exporter import RustDumpChecker
+
+        with patch('src.exporters.rust_dump_exporter.DbCoreFacade') as facade_class:
+            facade = facade_class.return_value
+            facade.hello.return_value = {
+                "service": "tunnelforge-core",
+                "protocol_version": "1",
+                "capabilities": ["dump.run", "dump.import"],
+            }
+
+            installed, _msg, _version = RustDumpChecker.check_installation()
+
+        assert installed is True
+        facade.client.shutdown.assert_called_once_with(
+            timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+
+    def test_check_installation_leaves_no_live_real_owner(self, monkeypatch):
+        from src.core.db_core_service import DbCoreFacade, DbCoreServiceClient
+        from src.exporters import rust_dump_exporter
+        from src.exporters.rust_dump_exporter import RustDumpChecker
+
+        class _Process:
+            def __init__(self):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(
+                    '{"event":"result","command":"service.hello","success":true,'
+                    '"service":"tunnelforge-core","protocol_version":1,'
+                    '"capabilities":["dump.run","dump.import"]}\n'
+                )
+                self.stderr = io.StringIO()
+                self.terminated = False
+
+            def poll(self):
+                return 0 if self.terminated else None
+
+            def terminate(self):
+                self.terminated = True
+
+        client = DbCoreServiceClient(
+            executable="fake-core",
+            process_factory=lambda *args, **kwargs: _Process(),
+        )
+        facade = DbCoreFacade(client)
+        owner = client.owner_thread
+        monkeypatch.setattr(rust_dump_exporter, "DbCoreFacade", lambda: facade)
+
+        installed, _msg, _version = RustDumpChecker.check_installation()
+
+        assert installed is True
+        assert not owner.is_alive()
 
     def test_get_install_guide(self):
         """설치 가이드 반환 테스트"""
@@ -449,6 +504,40 @@ class TestRustDumpExporter:
 
         assert success is True
         facade.client.shutdown.assert_not_called()
+
+    def test_exporter_dedicated_residual_shutdown_is_not_swallowed(self, tmp_path, monkeypatch):
+        from src.core.db_core_service import (
+            DbCoreOutcome,
+            DbCoreRequestKind,
+            DbCoreServiceError,
+        )
+        from src.exporters import rust_dump_exporter
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        residual = DbCoreServiceError(
+            "owner still alive",
+            code="db_core_residual_process",
+            request_kind=DbCoreRequestKind.MUTATION,
+            outcome=DbCoreOutcome.FAILED,
+        )
+
+        class FakeDedicatedFacade:
+            def __init__(self):
+                self.client = MagicMock()
+                self.client.shutdown.side_effect = residual
+
+            def run_dump(self, payload, on_event=None):
+                return {"success": True, "tables": 1, "rows_dumped": 1}
+
+        monkeypatch.setattr(rust_dump_exporter, "DbCoreFacade", FakeDedicatedFacade)
+        exporter = RustDumpExporter(
+            RustDumpConfig('localhost', 3306, 'root', 'password')
+        )
+
+        with pytest.raises(DbCoreServiceError) as raised:
+            exporter.export_full_schema('app', str(tmp_path / 'dump'))
+
+        assert raised.value is residual
 
 
 def test_export_schema_wrapper_preserves_postgresql_engine(monkeypatch, tmp_path):

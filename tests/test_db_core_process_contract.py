@@ -1,4 +1,5 @@
 import asyncio
+import concurrent.futures
 import io
 import math
 import sys
@@ -184,12 +185,11 @@ def test_callback_runs_on_caller_while_process_work_stays_on_owner_thread():
     assert callback_thread_ids == [caller_thread_id, caller_thread_id]
 
 
-def test_progress_callback_runs_before_terminal_result_is_released():
-    callback_seen = threading.Event()
-    release_terminal = threading.Event()
-    callback_was_live = []
+def test_progress_callback_ack_precedes_unblocked_terminal_read():
+    callback_finished = threading.Event()
+    terminal_read_before_callback_finished = []
 
-    class _BlockingStdout:
+    class _RaceStdout:
         def __init__(self):
             self._reads = 0
 
@@ -197,31 +197,62 @@ def test_progress_callback_runs_before_terminal_result_is_released():
             self._reads += 1
             if self._reads == 1:
                 return '{"event":"phase","phase":"inspect","message":"started"}\n'
-            release_terminal.wait(timeout=2.0)
+            terminal_read_before_callback_finished.append(not callback_finished.is_set())
             return '{"event":"result","command":"service.hello","success":true}\n'
 
     process = _Process([])
-    process.stdout = _BlockingStdout()
+    process.stdout = _RaceStdout()
     client = DbCoreServiceClient(
         executable="fake-core",
         process_factory=lambda *args, **kwargs: process,
     )
 
-    def release_after_callback():
-        callback_was_live.append(callback_seen.wait(timeout=0.5))
-        release_terminal.set()
+    def on_event(event):
+        if event.get("event") == "phase":
+            time.sleep(0.05)
+            callback_finished.set()
 
-    releaser = threading.Thread(target=release_after_callback)
-    releaser.start()
     result = client.request_result(
         "service.hello",
         request_kind=DbCoreRequestKind.READ_ONLY,
-        on_event=lambda event: callback_seen.set(),
+        on_event=on_event,
     )
-    releaser.join(timeout=1.0)
 
     assert result.outcome is DbCoreOutcome.DEFINITE
-    assert callback_was_live == [True]
+    assert terminal_read_before_callback_finished == [False]
+
+
+def test_progress_callback_error_prevents_terminal_read():
+    terminal_reads = []
+
+    class _RaceStdout:
+        def __init__(self):
+            self._reads = 0
+
+        def readline(self):
+            self._reads += 1
+            if self._reads == 1:
+                return '{"event":"phase","phase":"inspect","message":"started"}\n'
+            terminal_reads.append(True)
+            return '{"event":"result","command":"service.hello","success":true}\n'
+
+    process = _Process([])
+    process.stdout = _RaceStdout()
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: process,
+    )
+
+    with pytest.raises(DbCoreCallbackError) as raised:
+        client.request_result(
+            "service.hello",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            on_event=lambda event: (_ for _ in ()).throw(LookupError("callback failed")),
+        )
+
+    assert isinstance(raised.value.cause, LookupError)
+    assert raised.value.outcome is DbCoreOutcome.FAILED
+    assert terminal_reads == []
 
 
 def test_callback_error_exposes_typed_context():
@@ -336,6 +367,212 @@ def test_shutdown_stops_loop_and_joins_non_daemon_owner_boundedly():
     assert owner.daemon is False
     assert not owner.is_alive()
     assert client.owner_loop.is_closed()
+
+
+def test_shutdown_start_atomically_rejects_new_request_without_default_deadline_wait(monkeypatch):
+    shutdown_entered = threading.Event()
+    release_shutdown = threading.Event()
+    shutdown_errors = []
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: None,
+    )
+
+    async def blocked_shutdown(deadline_at):
+        shutdown_entered.set()
+        while not release_shutdown.is_set():
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(client, "_shutdown_on_owner", blocked_shutdown)
+
+    def run_shutdown():
+        try:
+            client.shutdown(timeout_seconds=1.0)
+        except Exception as exc:
+            shutdown_errors.append(exc)
+
+    shutdown_thread = threading.Thread(target=run_shutdown)
+    shutdown_thread.start()
+    assert shutdown_entered.wait(timeout=0.5)
+
+    started = time.monotonic()
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request("service.hello", timeout_seconds=3600.0)
+        elapsed = time.monotonic() - started
+    finally:
+        release_shutdown.set()
+        shutdown_thread.join(timeout=1.0)
+
+    assert elapsed < 0.2
+    assert raised.value.code == "db_core_cleanup_failed"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert shutdown_errors == []
+    assert not shutdown_thread.is_alive()
+
+
+def test_shutdown_cancels_inflight_request_with_typed_bounded_error():
+    read_entered = threading.Event()
+    release_read = threading.Event()
+    request_errors = []
+    shutdown_errors = []
+
+    class _BlockingStdout:
+        def readline(self):
+            read_entered.set()
+            release_read.wait(timeout=2.0)
+            return ""
+
+    class _CancelableProcess(_Process):
+        def __init__(self):
+            super().__init__([])
+            self.stdout = _BlockingStdout()
+
+        def terminate(self):
+            super().terminate()
+            release_read.set()
+
+    process = _CancelableProcess()
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: process,
+    )
+
+    def run_request():
+        try:
+            client.request("service.hello", timeout_seconds=3600.0)
+        except BaseException as exc:
+            request_errors.append(exc)
+
+    request_thread = threading.Thread(target=run_request)
+    request_thread.start()
+    assert read_entered.wait(timeout=0.5)
+
+    def run_shutdown():
+        try:
+            client.shutdown(timeout_seconds=0.5)
+        except BaseException as exc:
+            shutdown_errors.append(exc)
+
+    shutdown_thread = threading.Thread(target=run_shutdown)
+    started = time.monotonic()
+    shutdown_thread.start()
+    shutdown_thread.join(timeout=1.0)
+    if shutdown_thread.is_alive() or request_thread.is_alive():
+        release_read.set()
+    shutdown_thread.join(timeout=1.0)
+    request_thread.join(timeout=1.0)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0
+    assert shutdown_errors == []
+    assert len(request_errors) == 1
+    assert isinstance(request_errors[0], DbCoreServiceError)
+    assert not isinstance(request_errors[0], concurrent.futures.CancelledError)
+    assert not request_thread.is_alive()
+    assert not shutdown_thread.is_alive()
+
+
+def test_start_future_cancelled_by_shutdown_is_typed(monkeypatch):
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: None,
+    )
+    original_submit = client._submit_admitted
+
+    def cancelled_submit(coroutine, request_kind, request_id):
+        coroutine.close()
+        future = concurrent.futures.Future()
+        future.cancel()
+        return future
+
+    monkeypatch.setattr(client, "_submit_admitted", cancelled_submit)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.start()
+    finally:
+        monkeypatch.setattr(client, "_submit_admitted", original_submit)
+        client.shutdown()
+
+    assert raised.value.code == "db_core_cleanup_failed"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+
+
+def test_cancel_active_future_cancelled_by_shutdown_is_typed(monkeypatch):
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: None,
+    )
+    original_submit = client._submit_owner
+
+    def cancelled_submit(coroutine, request_kind, request_id):
+        coroutine.close()
+        future = concurrent.futures.Future()
+        future.cancel()
+        return future
+
+    monkeypatch.setattr(client, "_submit_owner", cancelled_submit)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.cancel_active_request(timeout_seconds=0.5)
+    finally:
+        monkeypatch.setattr(client, "_submit_owner", original_submit)
+        client.shutdown()
+
+    assert raised.value.code == "db_core_residual_process"
+    assert raised.value.outcome is DbCoreOutcome.FAILED
+
+
+def test_public_cancel_active_request_terminates_only_on_owner_thread():
+    read_entered = threading.Event()
+    release_read = threading.Event()
+    request_errors = []
+    terminate_thread_ids = []
+
+    class _BlockingStdout:
+        def readline(self):
+            read_entered.set()
+            release_read.wait(timeout=2.0)
+            return ""
+
+    class _CancelableProcess(_Process):
+        def __init__(self):
+            super().__init__([])
+            self.stdout = _BlockingStdout()
+
+        def terminate(self):
+            terminate_thread_ids.append(threading.get_ident())
+            super().terminate()
+            release_read.set()
+
+    process = _CancelableProcess()
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: process,
+    )
+
+    def run_request():
+        try:
+            client.request("service.hello", timeout_seconds=5.0)
+        except BaseException as exc:
+            request_errors.append(exc)
+
+    request_thread = threading.Thread(target=run_request)
+    request_thread.start()
+    assert read_entered.wait(timeout=0.5)
+
+    try:
+        assert client.cancel_active_request(timeout_seconds=0.5) is True
+    finally:
+        release_read.set()
+        request_thread.join(timeout=1.0)
+
+    assert terminate_thread_ids == [client.owner_thread.ident]
+    assert len(request_errors) == 1
+    assert isinstance(request_errors[0], DbCoreServiceError)
+    assert not request_thread.is_alive()
 
 
 def test_client_fixture_teardown_joins_every_owner(tracked_db_core_clients):

@@ -8,7 +8,10 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.db_connector import MySQLConnector
 from src.core.db_core_service import (
+    DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
     DbCoreFacade,
+    DbCoreOutcome,
+    DbCoreRequestKind,
     DbCoreServiceError,
     DbEndpoint,
     normalize_db_engine,
@@ -62,9 +65,18 @@ def _shutdown_owned_facade(facade: DbCoreFacade, owns_facade: bool) -> None:
     if not owns_facade:
         return
     try:
-        facade.client.shutdown()
+        facade.client.shutdown(
+            timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+        )
+    except DbCoreServiceError:
+        raise
     except Exception as exc:
-        logger.warning("Rust DB Core dedicated facade shutdown failed: %s", exc)
+        raise DbCoreServiceError(
+            f"Rust DB Core dedicated facade shutdown failed: {type(exc).__name__}: {exc}",
+            code="db_core_residual_process",
+            request_kind=DbCoreRequestKind.MUTATION,
+            outcome=DbCoreOutcome.FAILED,
+        ) from exc
 
 
 @dataclass
@@ -101,8 +113,9 @@ class RustDumpChecker:
 
     @staticmethod
     def check_installation() -> Tuple[bool, str, Optional[str]]:
+        facade = DbCoreFacade()
         try:
-            result = DbCoreFacade().hello()
+            result = facade.hello()
             service = str(result.get("service", "tunnelforge-core"))
             protocol = str(result.get("protocol_version", ""))
             capabilities = result.get("capabilities", [])
@@ -116,6 +129,8 @@ class RustDumpChecker:
             return False, "Rust DB Core 확인 시간 초과", None
         except Exception as exc:
             return False, f"오류: {exc}", None
+        finally:
+            _shutdown_owned_facade(facade, True)
 
     @staticmethod
     def get_install_guide() -> str:
