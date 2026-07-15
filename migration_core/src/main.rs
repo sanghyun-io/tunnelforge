@@ -1,38 +1,11 @@
-use migration_core::{handle_request_streaming, CoreService, Request};
+use migration_core::{handle_request_streaming, protocol_error_event, CoreService, Request};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
 fn main() {
     let stdin = io::stdin();
-    let mut handled = false;
     let mut service = CoreService::new();
-
-    for line in stdin.lock().lines() {
-        match line {
-            Ok(line) => {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                handled = true;
-                match serde_json::from_str::<Request>(&line) {
-                    Ok(request) => {
-                        let should_shutdown = request.command == "service.shutdown";
-                        service.handle_request_streaming(request, emit_one);
-                        if should_shutdown {
-                            break;
-                        }
-                    }
-                    Err(err) => emit_one(json!({
-                        "event": "error",
-                        "message": format!("invalid request JSON: {err}")
-                    })),
-                }
-            }
-            Err(err) => {
-                emit_one(json!({"event": "error", "message": format!("stdin read failed: {err}")}));
-            }
-        }
-    }
+    let handled = process_jsonl_reader(stdin.lock(), &mut service, emit_one);
 
     if !handled {
         let command = std::env::args()
@@ -49,8 +22,110 @@ fn main() {
     }
 }
 
+fn process_jsonl_reader<R: BufRead, F: FnMut(Value)>(
+    reader: R,
+    service: &mut CoreService,
+    mut emit: F,
+) -> bool {
+    let mut handled = false;
+
+    for line in reader.lines() {
+        match line {
+            Ok(line) => {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                handled = true;
+                match serde_json::from_str::<Request>(&line) {
+                    Ok(request) => {
+                        let should_shutdown = request.command == "service.shutdown";
+                        service.handle_request_streaming(request, &mut emit);
+                        if should_shutdown {
+                            break;
+                        }
+                    }
+                    Err(err) => emit(protocol_error_event(
+                        None,
+                        "invalid_request_json",
+                        format!("invalid request JSON: {err}"),
+                    )),
+                }
+            }
+            Err(err) => {
+                handled = true;
+                emit(protocol_error_event(
+                    None,
+                    "stdin_read_failed",
+                    format!("stdin read failed: {err}"),
+                ));
+                break;
+            }
+        }
+    }
+
+    handled
+}
+
 fn emit_one(event: Value) {
     let mut stdout = io::stdout().lock();
     let _ = writeln!(stdout, "{event}");
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::{self, BufRead, Read};
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+            Err(io::Error::other("simulated stdin failure"))
+        }
+    }
+
+    impl BufRead for FailingReader {
+        fn fill_buf(&mut self) -> io::Result<&[u8]> {
+            Err(io::Error::other("simulated stdin failure"))
+        }
+
+        fn consume(&mut self, _amount: usize) {}
+    }
+
+    fn assert_protocol_error(event: &Value, request_id: Value) {
+        assert_eq!(event["event"], "error");
+        assert_eq!(event["request_id"], request_id);
+        assert!(matches!(event["code"].as_str(), Some(value) if !value.is_empty()));
+        assert!(matches!(event["message"].as_str(), Some(value) if !value.is_empty()));
+    }
+
+    #[test]
+    fn stdin_read_failure_uses_protocol_error_envelope() {
+        let mut events = Vec::new();
+        let mut service = CoreService::new();
+
+        let handled = process_jsonl_reader(FailingReader, &mut service, |event| events.push(event));
+
+        assert!(handled);
+        assert_eq!(events.len(), 1);
+        assert_protocol_error(&events[0], Value::Null);
+    }
+
+    #[test]
+    fn parsed_lines_dispatch_through_stateful_core_service() {
+        let mut events = Vec::new();
+        let mut service = CoreService::new();
+        let input = b"{\"command\":\"query.execute\",\"request_id\":\"stateful-1\",\"payload\":{\"connection_id\":\"missing\",\"sql\":\"SELECT 1\"}}\n";
+
+        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event));
+
+        assert!(handled);
+        assert_eq!(events.len(), 1);
+        assert_protocol_error(&events[0], json!("stateful-1"));
+        assert!(events[0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unknown connection_id: missing"));
+    }
 }

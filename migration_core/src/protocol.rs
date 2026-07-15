@@ -3,6 +3,45 @@ use std::collections::BTreeMap;
 
 use crate::*;
 
+pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROCESS_VERSION: u32 = 1;
+pub const MAX_JSONL_FRAME_BYTES: usize = 1_048_576;
+
+pub const PROCESS_CAPABILITIES: &[&str] = &[
+    "jsonl",
+    "request_id",
+    "structured_errors",
+    "stateful_service",
+];
+
+pub const PUBLIC_COMMANDS: &[&str] = &[
+    "connection.open",
+    "connection.close",
+    "connection.test",
+    "schema.list",
+    "schema.inspect",
+    "schema.diff",
+    "query.execute",
+    "query.cancel",
+    "dump.run",
+    "dump.import",
+    "migration.plan",
+    "migration.run",
+    "migration.verify",
+    "migration.resume",
+    "migration.cleanup",
+    "oneclick.run",
+    "oneclick.preflight",
+    "oneclick.analyze",
+    "oneclick.recommend",
+    "oneclick.derive_charset_contracts",
+    "oneclick.apply_fixes",
+    "oneclick.validate",
+    "oneclick.report",
+    "job.cancel",
+    "service.shutdown",
+];
+
 pub struct CoreService {
     connections: BTreeMap<String, LiveAdapter>,
     next_connection_sequence: u64,
@@ -16,7 +55,14 @@ impl CoreService {
         }
     }
 
-    pub fn handle_request_streaming<F: FnMut(Value)>(&mut self, request: Request, emit: F) {
+    pub fn handle_request_streaming<F: FnMut(Value)>(&mut self, request: Request, mut emit: F) {
+        let request_id = request.request_id.clone();
+        self.handle_request_streaming_unchecked(request, |event| {
+            emit(normalize_protocol_event(event, &request_id));
+        });
+    }
+
+    fn handle_request_streaming_unchecked<F: FnMut(Value)>(&mut self, request: Request, emit: F) {
         match request.command.as_str() {
             "connection.open" => emit_all_events(self.connection_open(&request), emit),
             "connection.close" => emit_all_events(self.connection_close(&request), emit),
@@ -25,7 +71,7 @@ impl CoreService {
                 self.connections.clear();
                 emit_all_events(service_shutdown(&request), emit);
             }
-            _ => handle_request_streaming(request, emit),
+            _ => handle_request_streaming_unchecked(request, emit),
         }
     }
 
@@ -128,20 +174,22 @@ impl Default for CoreService {
 pub fn handle_line(line: &str) -> Vec<Value> {
     match serde_json::from_str::<Request>(line) {
         Ok(request) => handle_request(request),
-        Err(err) => vec![json!({
-            "event": "error",
-            "message": format!("invalid request JSON: {err}")
-        })],
+        Err(err) => vec![protocol_error_event(
+            None,
+            "invalid_request_json",
+            format!("invalid request JSON: {err}"),
+        )],
     }
 }
 
 pub fn handle_line_streaming<F: FnMut(Value)>(line: &str, mut emit: F) {
     match serde_json::from_str::<Request>(line) {
         Ok(request) => handle_request_streaming(request, emit),
-        Err(err) => emit(json!({
-            "event": "error",
-            "message": format!("invalid request JSON: {err}")
-        })),
+        Err(err) => emit(protocol_error_event(
+            None,
+            "invalid_request_json",
+            format!("invalid request JSON: {err}"),
+        )),
     }
 }
 
@@ -152,6 +200,13 @@ pub fn handle_request(request: Request) -> Vec<Value> {
 }
 
 pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) {
+    let request_id = request.request_id.clone();
+    handle_request_streaming_unchecked(request, |event| {
+        emit(normalize_protocol_event(event, &request_id));
+    });
+}
+
+fn handle_request_streaming_unchecked<F: FnMut(Value)>(request: Request, mut emit: F) {
     match request.command.as_str() {
         "service.hello" => emit_all_events(service_hello(&request), emit),
         "service.shutdown" => emit_all_events(service_shutdown(&request), emit),
@@ -218,6 +273,58 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
     }
 }
 
+pub fn protocol_error_event(
+    request_id: Option<String>,
+    code: impl AsRef<str>,
+    message: impl AsRef<str>,
+) -> Value {
+    json!({
+        "event": "error",
+        "request_id": request_id,
+        "code": nonempty_or_default(code.as_ref(), "protocol_error"),
+        "message": nonempty_or_default(message.as_ref(), "unknown protocol error")
+    })
+}
+
+fn normalize_protocol_event(event: Value, request_id: &Option<String>) -> Value {
+    let Value::Object(mut fields) = event else {
+        return protocol_error_event(
+            request_id.clone(),
+            "invalid_protocol_event",
+            "protocol handler emitted a non-object event",
+        );
+    };
+
+    if fields.get("event") != Some(&Value::String("error".to_string())) {
+        return Value::Object(fields);
+    }
+
+    let code = fields
+        .get("code")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("protocol_error")
+        .to_string();
+    let message = fields
+        .get("message")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("unknown protocol error")
+        .to_string();
+    fields.insert("request_id".to_string(), json!(request_id));
+    fields.insert("code".to_string(), Value::String(code));
+    fields.insert("message".to_string(), Value::String(message));
+    Value::Object(fields)
+}
+
+fn nonempty_or_default(value: &str, default: &str) -> String {
+    if value.trim().is_empty() {
+        default.to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn emit_all_events<F: FnMut(Value)>(events: Vec<Value>, mut emit: F) {
     for event in events {
         emit(event);
@@ -252,33 +359,11 @@ fn service_hello(request: &Request) -> Vec<Value> {
         "command": "service.hello",
         "success": true,
         "service": "tunnelforge-core",
-        "protocol_version": 1,
-        "capabilities": [
-            "connection.open",
-            "connection.close",
-            "connection.test",
-            "schema.list",
-            "schema.inspect",
-            "schema.diff",
-            "query.execute",
-            "query.cancel",
-            "dump.run",
-            "dump.import",
-            "migration.plan",
-            "migration.run",
-            "migration.verify",
-            "migration.resume",
-            "oneclick.run",
-            "oneclick.preflight",
-            "oneclick.analyze",
-            "oneclick.recommend",
-            "oneclick.derive_charset_contracts",
-            "oneclick.apply_fixes",
-            "oneclick.validate",
-            "oneclick.report",
-            "job.cancel",
-            "service.shutdown"
-        ]
+        "protocol_version": PROTOCOL_VERSION,
+        "process_version": PROCESS_VERSION,
+        "process_capabilities": PROCESS_CAPABILITIES,
+        "max_jsonl_frame_bytes": MAX_JSONL_FRAME_BYTES,
+        "capabilities": PUBLIC_COMMANDS
     })]
 }
 
@@ -618,29 +703,28 @@ fn job_cancel(request: &Request) -> Vec<Value> {
     })]
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
+
     use serde_json::{json, Value};
-    
-    
-    
-    
-    
-    
-    
-    
-    
-    use crate::adapters::test_support::{schema};
+
+    use crate::adapters::test_support::schema;
 
     fn assert_error_code(events: &[Value], expected: &str) {
         assert_eq!(events.len(), 1, "mutation gate must be the first event");
         assert_eq!(events[0]["event"], "error");
         assert_eq!(events[0]["code"], expected);
         assert!(events[0]["message"].as_str().is_some());
+    }
+
+    fn assert_protocol_error_envelope(events: &[Value], request_id: Value) {
+        assert_eq!(events.len(), 1, "outer paths must emit one error event");
+        let event = &events[0];
+        assert_eq!(event["event"], "error");
+        assert_eq!(event["request_id"], request_id);
+        assert!(matches!(event["code"].as_str(), Some(value) if !value.is_empty()));
+        assert!(matches!(event["message"].as_str(), Some(value) if !value.is_empty()));
     }
 
     #[test]
@@ -677,6 +761,139 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("oneclick.derive_charset_contracts")));
+    }
+
+    #[test]
+    fn service_hello_advertises_exact_process_contract() {
+        let result = handle_request(Request {
+            command: "service.hello".to_string(),
+            request_id: Some("hello-process-1".to_string()),
+            payload: json!({}),
+        })
+        .into_iter()
+        .next()
+        .unwrap();
+
+        assert_eq!(result["protocol_version"], 1);
+        assert_eq!(result["process_version"], 1);
+        assert_eq!(
+            result["process_capabilities"],
+            json!([
+                "jsonl",
+                "request_id",
+                "structured_errors",
+                "stateful_service"
+            ])
+        );
+        assert_eq!(
+            result["capabilities"],
+            json!([
+                "connection.open",
+                "connection.close",
+                "connection.test",
+                "schema.list",
+                "schema.inspect",
+                "schema.diff",
+                "query.execute",
+                "query.cancel",
+                "dump.run",
+                "dump.import",
+                "migration.plan",
+                "migration.run",
+                "migration.verify",
+                "migration.resume",
+                "migration.cleanup",
+                "oneclick.run",
+                "oneclick.preflight",
+                "oneclick.analyze",
+                "oneclick.recommend",
+                "oneclick.derive_charset_contracts",
+                "oneclick.apply_fixes",
+                "oneclick.validate",
+                "oneclick.report",
+                "job.cancel",
+                "service.shutdown"
+            ])
+        );
+        assert!(result["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("migration.cleanup")));
+    }
+
+    #[test]
+    fn service_hello_advertises_exact_max_jsonl_frame_bytes() {
+        let result = handle_request(Request {
+            command: "service.hello".to_string(),
+            request_id: Some("hello-frame-1".to_string()),
+            payload: json!({}),
+        })
+        .into_iter()
+        .next()
+        .unwrap();
+
+        assert_eq!(result["max_jsonl_frame_bytes"], 1_048_576);
+    }
+
+    #[test]
+    fn public_command_capabilities_include_migration_cleanup() {
+        let events = handle_request(Request {
+            command: "migration.cleanup".to_string(),
+            request_id: Some("cleanup-capability-1".to_string()),
+            payload: json!({
+                "target_engine": "postgresql",
+                "schema": {"tables": []}
+            }),
+        });
+
+        let result = events
+            .iter()
+            .find(|event| event["event"] == "result")
+            .unwrap();
+        assert_eq!(result["command"], "migration.cleanup");
+    }
+
+    #[test]
+    fn outer_error_paths_preserve_request_id_and_use_protocol_envelope() {
+        let unknown_request = || Request {
+            command: "unknown.command".to_string(),
+            request_id: Some("outer-request-1".to_string()),
+            payload: json!({}),
+        };
+
+        assert_protocol_error_envelope(
+            &handle_request(unknown_request()),
+            json!("outer-request-1"),
+        );
+
+        let mut streaming_events = Vec::new();
+        handle_request_streaming(unknown_request(), |event| streaming_events.push(event));
+        assert_protocol_error_envelope(&streaming_events, json!("outer-request-1"));
+
+        let mut service = CoreService::new();
+        let mut stateful_events = Vec::new();
+        service.handle_request_streaming(unknown_request(), |event| stateful_events.push(event));
+        assert_protocol_error_envelope(&stateful_events, json!("outer-request-1"));
+
+        assert_protocol_error_envelope(&handle_line("{"), Value::Null);
+
+        let mut line_streaming_events = Vec::new();
+        handle_line_streaming("{", |event| line_streaming_events.push(event));
+        assert_protocol_error_envelope(&line_streaming_events, Value::Null);
+    }
+
+    #[test]
+    fn protocol_error_normalization_replaces_missing_empty_and_non_string_fields() {
+        for event in [
+            json!({"event": "error"}),
+            json!({"event": "error", "code": "", "message": ""}),
+            json!({"event": "error", "code": 7, "message": false}),
+        ] {
+            let event = normalize_protocol_event(event, &Some("normalized-1".to_string()));
+            assert_eq!(event["request_id"], "normalized-1");
+            assert!(matches!(event["code"].as_str(), Some(value) if !value.is_empty()));
+            assert!(matches!(event["message"].as_str(), Some(value) if !value.is_empty()));
+        }
     }
 
     #[test]
@@ -926,7 +1143,8 @@ mod tests {
                 .iter()
                 .find(|event| event.get("event") == Some(&json!("error")))
                 .expect("dry-run should reach existing endpoint validation");
-            assert!(error.get("code").is_none());
+            assert!(matches!(error["code"].as_str(), Some(value) if !value.is_empty()));
+            assert_eq!(error["request_id"], request_id);
             assert!(error["message"]
                 .as_str()
                 .unwrap()
