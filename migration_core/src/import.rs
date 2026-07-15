@@ -2,12 +2,14 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self};
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use mysql::{prelude::Queryable, LocalInfileHandler};
 use crate::*;
+use mysql::{prelude::Queryable, LocalInfileHandler};
 
 /// MySQL `LOAD DATA LOCAL`이 비활성화됐을 때 반환되는 에러 코드(ERROR 3948) 매칭 토큰.
 const MYSQL_ERR_LOCAL_INFILE_DISABLED: &str = "3948";
@@ -16,25 +18,85 @@ const MYSQL_IMPORT_NET_TIMEOUT_SECS: u32 = 600;
 /// import 세션 튜닝에서 상향하는 wait_timeout(초).
 const MYSQL_IMPORT_WAIT_TIMEOUT_SECS: u32 = 28800;
 
-pub(crate) fn dump_import_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
-    emit(json!({
+#[derive(Debug)]
+enum DumpImportError {
+    Domain(String),
+    Emit(ProtocolEmitError),
+}
+
+impl From<String> for DumpImportError {
+    fn from(value: String) -> Self {
+        Self::Domain(value)
+    }
+}
+
+impl From<ProtocolEmitError> for DumpImportError {
+    fn from(value: ProtocolEmitError) -> Self {
+        Self::Emit(value)
+    }
+}
+
+type DumpImportResult<T> = Result<T, DumpImportError>;
+
+fn emit_import_event<F, R>(
+    emit: &mut F,
+    event: Value,
+    side_effect_started: bool,
+) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    emit(event).into_protocol_emit_result().map_err(|error| {
+        if side_effect_started {
+            error.after_side_effect()
+        } else {
+            error
+        }
+    })
+}
+
+pub(crate) fn dump_import_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    let mut side_effect_started = false;
+    emit_import_event(
+        &mut emit,
+        json!({
         "event": "phase",
         "request_id": request.request_id,
         "phase": "dump_import",
         "message": "dump import started"
-    }));
+        }),
+        side_effect_started,
+    )?;
 
-    match dump_import(request, |event| emit(event)) {
-        Ok(result) => emit(result),
-        Err(err) => emit(json!({
+    match dump_import(request, &mut emit, &mut side_effect_started) {
+        Ok(result) => emit_import_event(&mut emit, result, side_effect_started),
+        Err(DumpImportError::Emit(error)) => Err(error),
+        Err(DumpImportError::Domain(err)) => emit_import_event(
+            &mut emit,
+            json!({
             "event": "error",
             "request_id": request.request_id,
             "message": err
-        })),
+            }),
+            side_effect_started,
+        ),
     }
 }
 
-fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
+fn dump_import<F, R>(
+    request: &Request,
+    emit: &mut F,
+    side_effect_started: &mut bool,
+) -> DumpImportResult<Value>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let endpoint = request_endpoint(request)?;
     let input_dir = request
         .payload
@@ -49,21 +111,21 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .and_then(Value::as_str)
         .unwrap_or("replace");
     if !matches!(mode, "replace" | "merge" | "recreate") {
-        return Err(format!("unsupported dump import mode: {mode}"));
+        return Err(format!("unsupported dump import mode: {mode}").into());
     }
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
     if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2) {
-        return Err("unsupported dump manifest format".to_string());
+        return Err("unsupported dump manifest format".to_string().into());
     }
     let data_format = manifest.data_format.to_ascii_lowercase();
     if !matches!(data_format.as_str(), "jsonl" | "tsv") {
-        return Err(format!("unsupported dump data_format: {data_format}"));
+        return Err(format!("unsupported dump data_format: {data_format}").into());
     }
     let compression = manifest.compression.to_ascii_lowercase();
     if !matches!(compression.as_str(), "none" | "zstd") {
-        return Err(format!("unsupported dump compression: {compression}"));
+        return Err(format!("unsupported dump compression: {compression}").into());
     }
 
     let selected_tables = string_list(request.payload.get("tables"));
@@ -85,7 +147,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         .cloned()
         .collect();
     if tables.is_empty() {
-        return Err("dump.import found no tables to import".to_string());
+        return Err("dump.import found no tables to import".to_string().into());
     }
 
     let strict_manifest = request
@@ -97,16 +159,21 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let tables = dependency_ordered_dump_tables(&manifest.schema, tables);
     validate_dump_manifest_chunks(input_path, &tables, &data_format, &compression)?;
     for warning in &manifest_warnings {
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "warning",
             "request_id": request.request_id,
             "phase": "dump_import_manifest",
             "classification": "legacy_dump",
             "message": warning
-        }));
+            }),
+            *side_effect_started,
+        )?;
     }
     let mut adapter = LiveAdapter::connect(&endpoint)?;
     if let Some(sql) = timezone_sql.as_deref() {
+        *side_effect_started = true;
         adapter.execute_sql(sql)?;
     }
     let local_infile_restore = prepare_mysql_local_infile_policy(
@@ -114,7 +181,8 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         &endpoint,
         mysql_local_infile_policy,
         request.request_id.clone(),
-        &mut emit,
+        emit,
+        side_effect_started,
     )?;
     let table_total = tables.len();
     let overall_rows_total = tables.iter().map(|table| table.rows).sum::<u64>();
@@ -122,12 +190,19 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     let mut chunks_imported = 0_u64;
     let mut imported_rows_by_table: BTreeMap<String, u64> = BTreeMap::new();
 
+    *side_effect_started = true;
     set_mysql_import_session_tuning(&mut adapter, false)?;
 
     let target_schema = endpoint_schema(&endpoint);
-    prepare_import_target(mode, &tables, &mut adapter, &target_schema)?;
+    prepare_import_target(
+        mode,
+        &tables,
+        &mut adapter,
+        &target_schema,
+        side_effect_started,
+    )?;
 
-    let import_result = (|| -> Result<(), String> {
+    let import_result = (|| -> DumpImportResult<()> {
         for (index, table_manifest) in tables.iter().enumerate() {
             let table = manifest
                 .schema
@@ -135,18 +210,23 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 .iter()
                 .find(|table| table.name == table_manifest.name)
                 .ok_or_else(|| format!("manifest schema missing table {}", table_manifest.name))?;
-            emit(json!({
+            emit_import_event(
+                emit,
+                json!({
                 "event": "table_progress",
                 "request_id": request.request_id,
                 "table": table.name,
                 "status": "importing",
                 "current": index + 1,
                 "total": table_total
-            }));
+                }),
+                *side_effect_started,
+            )?;
             // replace/recreate의 DROP은 루프 진입 전에 일괄(자식 우선)로 끝냈다.
             // 여기서는 생성과 적재만 수행한다.
             let ddl = generate_table_ddl(table, &manifest.source_engine, adapter.engine())
                 .ok_or_else(|| format!("cannot generate DDL for table {}", table.name))?;
+            *side_effect_started = true;
             adapter
                 .create_table(table, &ddl)
                 .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
@@ -163,32 +243,49 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
                 request.request_id.clone(),
                 rows_imported,
                 overall_rows_total,
-                |event| emit(event),
+                emit,
+                side_effect_started,
             )?;
             rows_imported += table_rows;
             chunks_imported += table_chunks;
             imported_rows_by_table.insert(table.name.clone(), table_rows);
-            emit(json!({
+            emit_import_event(
+                emit,
+                json!({
                 "event": "table_progress",
                 "request_id": request.request_id,
                 "table": table.name,
                 "status": "completed",
                 "current": index + 1,
                 "total": table_total
-            }));
+                }),
+                *side_effect_started,
+            )?;
         }
         Ok(())
     })();
-    let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
-    let local_infile_restore_result = restore_mysql_local_infile_policy(
-        &mut adapter,
-        local_infile_restore,
-        request.request_id.clone(),
-        &mut emit,
-    );
-    import_result?;
-    restore_result?;
-    local_infile_restore_result?;
+    match import_result {
+        Err(DumpImportError::Emit(error)) => {
+            *side_effect_started = true;
+            let _ = set_mysql_import_session_tuning(&mut adapter, true);
+            let _ = restore_mysql_local_infile_value(&mut adapter, local_infile_restore);
+            return Err(DumpImportError::Emit(error));
+        }
+        import_result => {
+            *side_effect_started = true;
+            let restore_result = set_mysql_import_session_tuning(&mut adapter, true);
+            let local_infile_restore_result = restore_mysql_local_infile_policy(
+                &mut adapter,
+                local_infile_restore,
+                request.request_id.clone(),
+                emit,
+                side_effect_started,
+            );
+            restore_result?;
+            local_infile_restore_result?;
+            import_result?;
+        }
+    }
 
     finalize_dump_import(
         &mut adapter,
@@ -205,6 +302,7 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
         chunks_imported,
         table_total,
         emit,
+        side_effect_started,
     )
 }
 
@@ -226,7 +324,8 @@ fn prepare_import_target(
     tables: &[DumpTableManifest],
     adapter: &mut LiveAdapter,
     target_schema: &str,
-) -> Result<(), String> {
+    side_effect_started: &mut bool,
+) -> DumpImportResult<()> {
     if !matches!(mode, "replace" | "recreate") {
         return Ok(());
     }
@@ -236,6 +335,7 @@ fn prepare_import_target(
     // tables는 parent-first(dependency order)이므로 rev()는 child-first가 된다.
     // foreign_key_checks=0이 이미 켜져 있어 역순 DROP은 안전하다.
     for table_manifest in tables.iter().rev() {
+        *side_effect_started = true;
         adapter
             .execute_sql(&drop_table_sql(adapter.engine(), &table_manifest.name))
             .map_err(|err| dump_import_ddl_error("drop_table", &table_manifest.name, &err))?;
@@ -246,7 +346,7 @@ fn prepare_import_target(
 /// 단일 테이블의 데이터를 적재한다. MySQL TSV fast-path(LOAD DATA / 병렬 / fallback)와
 /// 엔진 무관 generic 청크 INSERT 경로를 분기하고, 이 테이블에 적재한 (rows, chunks)를 반환한다.
 /// 테이블 생성(DDL)과 진행률 table_progress 이벤트는 호출자가 담당한다.
-fn import_table_rows<F: FnMut(Value)>(
+fn import_table_rows<F, R>(
     endpoint: &Endpoint,
     adapter: &mut LiveAdapter,
     input_path: &Path,
@@ -258,8 +358,13 @@ fn import_table_rows<F: FnMut(Value)>(
     request_id: Option<String>,
     overall_rows_before: u64,
     overall_rows_total: u64,
-    mut emit: F,
-) -> Result<(u64, u64), String> {
+    emit: &mut F,
+    side_effect_started: &mut bool,
+) -> DumpImportResult<(u64, u64)>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     if data_format == "tsv" && !has_binary_columns(table) {
         if let LiveAdapter::MySql(conn) = adapter {
             let chunk_ctx = MysqlImportChunkContext {
@@ -276,7 +381,8 @@ fn import_table_rows<F: FnMut(Value)>(
                 input_path,
                 threads,
                 &chunk_ctx,
-                |event| emit(event),
+                emit,
+                side_effect_started,
             );
         }
     }
@@ -293,10 +399,13 @@ fn import_table_rows<F: FnMut(Value)>(
         )?;
         let rows = read_dump_rows(&chunk_path, table, data_format, compression)?;
         let row_count = rows.len() as u64;
+        *side_effect_started = true;
         adapter.insert_rows(table, rows)?;
         table_rows += row_count;
         table_chunks += 1;
-        emit(dump_import_row_progress_event(
+        emit_import_event(
+            emit,
+            dump_import_row_progress_event(
             request_id.clone(),
             &table.name,
             table_rows,
@@ -311,14 +420,16 @@ fn import_table_rows<F: FnMut(Value)>(
                 load_ms: None,
             },
             "insert_rows",
-        ));
+            ),
+            *side_effect_started,
+        )?;
     }
     Ok((table_rows, table_chunks))
 }
 
 /// import 데이터 적재 완료 후의 마무리 단계: post-load DDL(인덱스/FK) 적용,
 /// 적재 행수 검증, View 생성(best-effort), 리포트 기록 후 최종 result JSON을 만든다.
-fn finalize_dump_import<F: FnMut(Value)>(
+fn finalize_dump_import<F, R>(
     adapter: &mut LiveAdapter,
     manifest: &DumpManifest,
     tables: &[DumpTableManifest],
@@ -332,27 +443,41 @@ fn finalize_dump_import<F: FnMut(Value)>(
     rows_imported: u64,
     chunks_imported: u64,
     table_total: usize,
-    mut emit: F,
-) -> Result<Value, String> {
+    emit: &mut F,
+    side_effect_started: &mut bool,
+) -> DumpImportResult<Value>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let input_path = Path::new(input_dir);
     let target_engine = adapter.engine().to_string();
     if should_apply_post_load_ddl(mode) {
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import_post_load",
             "message": "현재 단계: 인덱스/FK 생성 중 - 데이터 Import는 완료, 후처리 진행 중",
             "strategy": "post_load_ddl"
-        }));
+            }),
+            *side_effect_started,
+        )?;
+        *side_effect_started = true;
         apply_post_load_ddl(adapter, &manifest.schema, &target_engine)?;
     } else {
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import_post_load",
             "message": post_load_ddl_skip_message(mode),
             "strategy": "existing_schema"
-        }));
+            }),
+            *side_effect_started,
+        )?;
     }
     // import가 실제로 적재한 행 수가 덤프와 일치하는지만 검증한다(적재 정확성).
     // 타겟 DB를 다시 세는 검증(verify_target_row_counts)은 하지 않는다 — 타겟이
@@ -370,8 +495,9 @@ fn finalize_dump_import<F: FnMut(Value)>(
             &target_engine,
             mode,
             request_id.clone(),
-            &mut emit,
-        )
+            emit,
+            side_effect_started,
+        )?
     } else {
         ViewImportOutcome::default()
     };
@@ -391,6 +517,7 @@ fn finalize_dump_import<F: FnMut(Value)>(
         "views_failed": view_outcome.failed,
         "views_skipped_cross_engine": view_outcome.skipped_cross_engine
     });
+    *side_effect_started = true;
     write_dump_import_report(input_path, &import_report)?;
     let import_report_path = dump_import_report_path(input_path)?;
 
@@ -423,19 +550,26 @@ struct ViewImportOutcome {
 /// - source/target 엔진이 다르면 정의 SQL이 호환되지 않으므로 전부 skip.
 /// - View 간 의존성 순서 문제를 fixpoint 재시도 루프로 해결한다.
 /// - 각 View 실패는 non-fatal: 결과에 모아 보고만 한다.
-fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
+fn import_views<A: MigrationAdapter, F, R>(
     adapter: &mut A,
     manifest: &DumpManifest,
     target_engine: &str,
     mode: &str,
     request_id: Option<String>,
-    mut emit: F,
-) -> ViewImportOutcome {
+    emit: &mut F,
+    side_effect_started: &mut bool,
+) -> DumpImportResult<ViewImportOutcome>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let mut outcome = ViewImportOutcome::default();
 
     if manifest.source_engine != target_engine {
         outcome.skipped_cross_engine = manifest.views.iter().map(|v| v.name.clone()).collect();
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
@@ -445,8 +579,10 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
                 manifest.source_engine,
                 target_engine
             ),
-        }));
-        return outcome;
+            }),
+            *side_effect_started,
+        )?;
+        return Ok(outcome);
     }
 
     // 정화 + 단일 CREATE VIEW 문 검증. 검증 실패한 정의는 실행하지 않고 즉시 failed로 보고한다.
@@ -473,12 +609,16 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
                 outcome
                     .failed
                     .push(json!({ "name": view.name, "error": format!("rejected: {reason}") }));
-                emit(json!({
+                emit_import_event(
+                    emit,
+                    json!({
                     "event": "phase",
                     "request_id": request_id,
                     "phase": "dump_import",
                     "message": format!("View '{}' 거부됨 (안전하지 않은 정의): {reason}", view.name),
-                }));
+                    }),
+                    *side_effect_started,
+                )?;
             }
         }
     }
@@ -487,6 +627,7 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
     // 검증을 통과한 View만 DROP 대상으로 삼는다.
     if matches!(mode, "replace" | "recreate") {
         for name in &validated_names {
+            *side_effect_started = true;
             let _ = adapter.execute_sql(&drop_view_sql(target_engine, name));
         }
     }
@@ -497,18 +638,23 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
         let mut progressed = false;
         let mut still_pending: Vec<(String, String)> = Vec::new();
         for (name, sql) in pending.drain(..) {
+            *side_effect_started = true;
             match adapter.execute_sql(&sql) {
                 Ok(()) => {
                     progressed = true;
                     last_errors.remove(&name);
                     outcome.imported.push(name.clone());
-                    emit(json!({
+                    emit_import_event(
+                        emit,
+                        json!({
                         "event": "table_progress",
                         "request_id": request_id,
                         "table": name,
                         "status": "completed",
                         "kind": "view"
-                    }));
+                        }),
+                        *side_effect_started,
+                    )?;
                 }
                 Err(err) => {
                     last_errors.insert(name.clone(), err);
@@ -531,7 +677,9 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
     }
 
     if !outcome.failed.is_empty() {
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
@@ -540,10 +688,12 @@ fn import_views<A: MigrationAdapter, F: FnMut(Value)>(
                 outcome.imported.len(),
                 outcome.failed.len()
             ),
-        }));
+            }),
+            *side_effect_started,
+        )?;
     }
 
-    outcome
+    Ok(outcome)
 }
 
 /// MySQL TSV import 경로(fast-path / parallel / insert fallback)가 공통으로
@@ -559,41 +709,72 @@ struct MysqlImportChunkContext<'a> {
     overall_rows_total: u64,
 }
 
-fn import_mysql_tsv_table<F: FnMut(Value)>(
+fn import_mysql_tsv_table<F, R>(
     endpoint: &Endpoint,
     conn: &mut mysql::PooledConn,
     input_path: &Path,
     threads: usize,
     ctx: &MysqlImportChunkContext,
-    mut emit: F,
-) -> Result<(u64, u64), String> {
+    emit: &mut F,
+    side_effect_started: &mut bool,
+) -> DumpImportResult<(u64, u64)>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     if !mysql_local_infile_enabled(conn) {
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": ctx.request_id,
             "phase": "dump_import",
             "message": "MySQL local_infile is disabled; using safe Rust INSERT fallback",
             "strategy": "insert_fallback",
             "performance": "safe_fallback"
-        }));
-        return import_mysql_tsv_table_insert_fallback(conn, input_path, ctx, emit);
+            }),
+            *side_effect_started,
+        )?;
+        return import_mysql_tsv_table_insert_fallback(
+            conn,
+            input_path,
+            ctx,
+            emit,
+            side_effect_started,
+        );
     }
 
     if threads > 1 && ctx.table_manifest.chunks > 1 {
-        let result =
-            import_mysql_tsv_table_parallel(endpoint, input_path, threads, ctx, |event| emit(event));
+        let result = import_mysql_tsv_table_parallel(
+            endpoint,
+            input_path,
+            threads,
+            ctx,
+            emit,
+            side_effect_started,
+        );
         return match result {
             Ok(result) => Ok(result),
-            Err(err) if is_mysql_local_infile_disabled_error(&err) => {
-                emit(json!({
+            Err(DumpImportError::Domain(err)) if is_mysql_local_infile_disabled_error(&err) => {
+                emit_import_event(
+                    emit,
+                    json!({
                     "event": "phase",
                     "request_id": ctx.request_id,
                     "phase": "dump_import",
                     "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
                     "strategy": "insert_fallback",
                     "performance": "safe_fallback"
-                }));
-                import_mysql_tsv_table_insert_fallback(conn, input_path, ctx, emit)
+                    }),
+                    *side_effect_started,
+                )?;
+                import_mysql_tsv_table_insert_fallback(
+                    conn,
+                    input_path,
+                    ctx,
+                    emit,
+                    side_effect_started,
+                )
             }
             Err(err) => Err(err),
         };
@@ -620,6 +801,7 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                 ctx.compression,
             )?;
             let started = Instant::now();
+            *side_effect_started = true;
             let rows = match load_chunk_with_reconnect(
                 endpoint,
                 conn,
@@ -629,26 +811,38 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
             ) {
                 Ok(rows) => rows,
                 Err(err) if is_mysql_local_infile_disabled_error(&err) => {
-                    emit(json!({
+                    emit_import_event(
+                        emit,
+                        json!({
                         "event": "phase",
                         "request_id": ctx.request_id,
                         "phase": "dump_import",
                         "message": "MySQL LOAD DATA LOCAL is disabled; using safe Rust INSERT fallback",
                         "strategy": "insert_fallback",
                         "performance": "safe_fallback"
-                    }));
-                    return import_mysql_tsv_table_insert_fallback(conn, input_path, ctx, emit);
+                        }),
+                        *side_effect_started,
+                    )?;
+                    return import_mysql_tsv_table_insert_fallback(
+                        conn,
+                        input_path,
+                        ctx,
+                        emit,
+                        side_effect_started,
+                    );
                 }
                 Err(err) if is_transient_disconnect_error(&err) => {
                     // 청크 재접속 재시도로도 복구 안 된 지속적 끊김.
                     retryable_table_error = Some(err);
                     break;
                 }
-                Err(err) => return Err(err),
+                Err(err) => return Err(err.into()),
             };
             rows_imported += rows;
             chunks_imported += 1;
-            emit(dump_import_row_progress_event(
+            emit_import_event(
+                emit,
+                dump_import_row_progress_event(
                 ctx.request_id.clone(),
                 &ctx.table.name,
                 rows_imported,
@@ -663,16 +857,20 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                     load_ms: Some(started.elapsed().as_millis() as u64),
                 },
                 "load_data_local_infile",
-            ));
+                ),
+                *side_effect_started,
+            )?;
         }
 
         match retryable_table_error {
             None => return Ok((rows_imported, chunks_imported)),
             Some(err) => {
                 if table_attempt >= MAX_TABLE_ATTEMPTS {
-                    return Err(err);
+                    return Err(err.into());
                 }
-                emit(json!({
+                emit_import_event(
+                    emit,
+                    json!({
                     "event": "phase",
                     "request_id": ctx.request_id,
                     "phase": "dump_import",
@@ -681,9 +879,12 @@ fn import_mysql_tsv_table<F: FnMut(Value)>(
                         ctx.table.name
                     ),
                     "strategy": "table_restart"
-                }));
+                    }),
+                    *side_effect_started,
+                )?;
                 // 재접속 후 TRUNCATE. 새 세션은 튜닝이 초기화되므로 튜닝 적용된 커넥션으로 교체.
                 *conn = connect_tuned_mysql_import_conn(endpoint)?;
+                *side_effect_started = true;
                 conn.query_drop(format!(
                     "TRUNCATE TABLE {}",
                     quote_ident("mysql", &ctx.table.name)
@@ -737,13 +938,18 @@ fn mysql_local_infile_policy_from_payload(payload: &Value) -> Result<&str, Strin
     }
 }
 
-fn prepare_mysql_local_infile_policy<F: FnMut(Value)>(
+fn prepare_mysql_local_infile_policy<F, R>(
     adapter: &mut LiveAdapter,
     endpoint: &Endpoint,
     policy: &str,
     request_id: Option<String>,
     emit: &mut F,
-) -> Result<Option<String>, String> {
+    side_effect_started: &mut bool,
+) -> DumpImportResult<Option<String>>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     if policy != "temporary_global" {
         return Ok(None);
     }
@@ -753,35 +959,48 @@ fn prepare_mysql_local_infile_policy<F: FnMut(Value)>(
         };
         let previous = mysql_local_infile_value(conn).unwrap_or_else(|| "ON".to_string());
         if mysql_bool_value_enabled(&previous) {
-            emit(json!({
+            emit_import_event(
+                emit,
+                json!({
                 "event": "phase",
                 "request_id": request_id,
                 "phase": "dump_import",
                 "message": "MySQL local_infile is already enabled; using fast LOAD DATA LOCAL import",
                 "strategy": "load_data_local_infile",
                 "performance": "fast_path"
-            }));
+                }),
+                *side_effect_started,
+            )?;
             return Ok(None);
         }
 
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
             "message": "MySQL local_infile is disabled; trying temporary SET GLOBAL local_infile=ON",
             "strategy": "temporary_local_infile",
             "performance": "fast_path_attempt"
-        }));
+            }),
+            *side_effect_started,
+        )?;
 
+        *side_effect_started = true;
         if let Err(err) = conn.query_drop(mysql_set_global_local_infile_sql(true)) {
-            emit(json!({
+            emit_import_event(
+                emit,
+                json!({
                 "event": "phase",
                 "request_id": request_id,
                 "phase": "dump_import",
                 "message": format!("MySQL local_infile temporary enable failed: {err}; using safe Rust INSERT fallback"),
                 "strategy": "insert_fallback",
                 "performance": "safe_fallback"
-            }));
+                }),
+                *side_effect_started,
+            )?;
             return Ok(None);
         }
         previous
@@ -789,63 +1008,94 @@ fn prepare_mysql_local_infile_policy<F: FnMut(Value)>(
 
     if let Err(err) = LiveAdapter::connect(endpoint).map(|new_adapter| *adapter = new_adapter) {
         if let LiveAdapter::MySql(conn) = adapter {
+            *side_effect_started = true;
             let _ = conn.query_drop(mysql_set_global_local_infile_sql(mysql_bool_value_enabled(
                 &previous,
             )));
         }
-        return Err(err);
+        return Err(err.into());
     }
     let enabled = match adapter {
         LiveAdapter::MySql(conn) => mysql_local_infile_enabled(conn),
         LiveAdapter::PostgreSql(_) => false,
     };
     if enabled {
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
             "message": "MySQL local_infile temporarily enabled; using fast LOAD DATA LOCAL import",
             "strategy": "load_data_local_infile",
             "performance": "fast_path"
-        }));
+            }),
+            *side_effect_started,
+        )?;
     } else {
-        emit(json!({
+        emit_import_event(
+            emit,
+            json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
             "message": "MySQL local_infile temporary enable did not take effect; using safe Rust INSERT fallback",
             "strategy": "insert_fallback",
             "performance": "safe_fallback"
-        }));
+            }),
+            *side_effect_started,
+        )?;
     }
     Ok(Some(previous))
 }
 
-fn restore_mysql_local_infile_policy<F: FnMut(Value)>(
+fn restore_mysql_local_infile_policy<F, R>(
     adapter: &mut LiveAdapter,
     previous: Option<String>,
     request_id: Option<String>,
     emit: &mut F,
-) -> Result<(), String> {
-    let Some(previous) = previous else {
+    side_effect_started: &mut bool,
+) -> DumpImportResult<()>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    if previous.is_some() {
+        *side_effect_started = true;
+    }
+    let Some(previous) = restore_mysql_local_infile_value(adapter, previous)? else {
         return Ok(());
     };
-    let enabled = mysql_bool_value_enabled(&previous);
-    let LiveAdapter::MySql(conn) = adapter else {
-        return Ok(());
-    };
-    conn.query_drop(mysql_set_global_local_infile_sql(enabled))
-        .map_err(|err| {
-            format!("mysql local_infile restore failed; previous value was {previous}: {err}")
-        })?;
-    emit(json!({
+    emit_import_event(
+        emit,
+        json!({
         "event": "phase",
         "request_id": request_id,
         "phase": "dump_import",
         "message": format!("MySQL local_infile restored to {previous}"),
         "strategy": "temporary_local_infile_restore"
-    }));
+        }),
+        *side_effect_started,
+    )?;
     Ok(())
+}
+
+fn restore_mysql_local_infile_value(
+    adapter: &mut LiveAdapter,
+    previous: Option<String>,
+) -> Result<Option<String>, String> {
+    let Some(previous) = previous else {
+        return Ok(None);
+    };
+    let enabled = mysql_bool_value_enabled(&previous);
+    let LiveAdapter::MySql(conn) = adapter else {
+        return Ok(None);
+    };
+    conn.query_drop(mysql_set_global_local_infile_sql(enabled))
+        .map_err(|err| {
+            format!("mysql local_infile restore failed; previous value was {previous}: {err}")
+        })?;
+    Ok(Some(previous))
 }
 
 fn is_mysql_local_infile_disabled_error(message: &str) -> bool {
@@ -982,12 +1232,17 @@ fn is_transient_disconnect_error(message: &str) -> bool {
         || lower.contains("connection refused") // 재접속 시 서버 재기동 대기
 }
 
-fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
+fn import_mysql_tsv_table_insert_fallback<F, R>(
     conn: &mut mysql::PooledConn,
     input_path: &Path,
     ctx: &MysqlImportChunkContext,
-    mut emit: F,
-) -> Result<(u64, u64), String> {
+    emit: &mut F,
+    side_effect_started: &mut bool,
+) -> DumpImportResult<(u64, u64)>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let mut rows_imported = 0_u64;
     let mut chunks_imported = 0_u64;
     for chunk_index in 1..=ctx.table_manifest.chunks {
@@ -999,7 +1254,9 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
             ctx.compression,
         )?;
         let started = Instant::now();
-        let rows = insert_mysql_tsv_chunk_with_batches(conn, ctx.table, &chunk_path, ctx.compression)
+        *side_effect_started = true;
+        let rows =
+            insert_mysql_tsv_chunk_with_batches(conn, ctx.table, &chunk_path, ctx.compression)
             .map_err(|err| {
                 format!(
                     "mysql insert fallback error for table {} chunk {}: {err}",
@@ -1008,7 +1265,9 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
             })?;
         rows_imported += rows;
         chunks_imported += 1;
-        emit(dump_import_row_progress_event(
+        emit_import_event(
+            emit,
+            dump_import_row_progress_event(
             ctx.request_id.clone(),
             &ctx.table.name,
             rows_imported,
@@ -1023,7 +1282,9 @@ fn import_mysql_tsv_table_insert_fallback<F: FnMut(Value)>(
                 load_ms: Some(started.elapsed().as_millis() as u64),
             },
             "insert_fallback",
-        ));
+            ),
+            *side_effect_started,
+        )?;
     }
     Ok((rows_imported, chunks_imported))
 }
@@ -1047,13 +1308,18 @@ fn insert_mysql_tsv_chunk_with_batches(
     )
 }
 
-fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
+fn import_mysql_tsv_table_parallel<F, R>(
     endpoint: &Endpoint,
     input_path: &Path,
     threads: usize,
     ctx: &MysqlImportChunkContext,
-    mut emit: F,
-) -> Result<(u64, u64), String> {
+    emit: &mut F,
+    side_effect_started: &mut bool,
+) -> DumpImportResult<(u64, u64)>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let max_threads = threads.max(1).min(ctx.table_manifest.chunks as usize);
     let mut pending =
         adaptive_import_chunk_order(input_path, ctx.table_manifest, "tsv", ctx.compression);
@@ -1061,11 +1327,14 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     let mut completed = 0_u64;
     let mut rows_imported = 0_u64;
     let mut first_error: Option<String> = None;
+    let mut emit_error: Option<ProtocolEmitError> = None;
     let mut handles = Vec::new();
+    let aborted = Arc::new(AtomicBool::new(false));
     let (sender, receiver) = mpsc::channel::<ImportChunkEvent>();
 
     while active < max_threads {
         if let Some(chunk_index) = pending.pop_front() {
+            *side_effect_started = true;
             handles.push(spawn_mysql_import_chunk_worker(
                 endpoint.clone(),
                 input_path.to_path_buf(),
@@ -1074,6 +1343,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                 chunk_index,
                 ctx.compression.to_string(),
                 sender.clone(),
+                aborted.clone(),
             ));
             active += 1;
         } else {
@@ -1091,7 +1361,9 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                 rows_imported += rows;
                 completed += 1;
                 active = active.saturating_sub(1);
-                emit(dump_import_row_progress_event(
+                if let Err(error) = emit_import_event(
+                    emit,
+                    dump_import_row_progress_event(
                     ctx.request_id.clone(),
                     &ctx.table.name,
                     rows_imported,
@@ -1106,8 +1378,15 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                         load_ms: Some(load_ms),
                     },
                     "parallel_load_data_local_infile",
-                ));
+                    ),
+                    *side_effect_started,
+                ) {
+                    aborted.store(true, Ordering::Release);
+                    emit_error = Some(error);
+                    break;
+                }
                 if let Some(next_chunk) = pending.pop_front() {
+                    *side_effect_started = true;
                     handles.push(spawn_mysql_import_chunk_worker(
                         endpoint.clone(),
                         input_path.to_path_buf(),
@@ -1116,6 +1395,7 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
                         next_chunk,
                         ctx.compression.to_string(),
                         sender.clone(),
+                        aborted.clone(),
                     ));
                     active += 1;
                 }
@@ -1132,8 +1412,11 @@ fn import_mysql_tsv_table_parallel<F: FnMut(Value)>(
     for handle in handles {
         let _ = handle.join();
     }
+    if let Some(error) = emit_error {
+        return Err(DumpImportError::Emit(error));
+    }
     if let Some(err) = first_error {
-        return Err(err);
+        return Err(err.into());
     }
     Ok((rows_imported, completed))
 }
@@ -1180,9 +1463,13 @@ fn spawn_mysql_import_chunk_worker(
     chunk_index: u64,
     compression: String,
     sender: mpsc::Sender<ImportChunkEvent>,
+    aborted: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
+            if aborted.load(Ordering::Acquire) {
+                return Err("parallel import aborted after protocol emitter failure".to_string());
+            }
             // 워커 커넥션에도 세션 튜닝(fk/unique/sql_mode + timeout)을 적용한다.
             // 이전에는 워커가 튜닝 없이 연결해 fk_checks/timeout이 누락돼 있었다.
             let mut conn = connect_tuned_mysql_import_conn(&endpoint)?;
@@ -1193,6 +1480,9 @@ fn spawn_mysql_import_chunk_worker(
                 "tsv",
                 &compression,
             )?;
+            if aborted.load(Ordering::Acquire) {
+                return Err("parallel import aborted after protocol emitter failure".to_string());
+            }
             let started = Instant::now();
             let rows =
                 load_chunk_with_reconnect(&endpoint, &mut conn, &table, &chunk_path, &compression)?;
@@ -1296,23 +1586,15 @@ pub fn load_data_local_infile_sql(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
     
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs::{self};
     
-    
-    
-    
-    
-    
-    
-    use crate::adapters::test_support::{schema};
+    use crate::adapters::test_support::schema;
 
     #[test]
     fn mysql_dump_import_defaults_to_safe_local_infile_policy() {
@@ -1485,5 +1767,36 @@ mod tests {
                 "expected NOT transient: {msg}"
             );
         }
+    }
+
+    #[test]
+    fn import_streaming_emit_failure_stops_before_followup_or_side_effect() {
+        let request = Request {
+            command: "dump.import".to_string(),
+            request_id: Some("import-emit-failure".to_string()),
+            payload: json!({}),
+        };
+        let mut calls = 0;
+
+        let error = dump_import_streaming(&request, |_event| {
+            calls += 1;
+            Err(ProtocolEmitError::io("broken import emitter"))
+        })
+        .expect_err("import emitter failure must propagate");
+
+        assert_eq!(calls, 1);
+        assert!(!error.side_effect_started());
+    }
+
+    #[test]
+    fn import_emit_failure_after_side_effect_is_marked_indeterminate() {
+        let error = emit_import_event(
+            &mut |_event| Err(ProtocolEmitError::io("broken import emitter")),
+            json!({"event": "result"}),
+            true,
+        )
+        .expect_err("post-side-effect failure must propagate");
+
+        assert!(error.side_effect_started());
     }
 }

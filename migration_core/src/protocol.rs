@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::fmt;
 
 use crate::*;
 
@@ -42,6 +43,322 @@ pub const PUBLIC_COMMANDS: &[&str] = &[
     "service.shutdown",
 ];
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolEmitError {
+    message: String,
+    side_effect_started: bool,
+}
+
+impl ProtocolEmitError {
+    pub fn io(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            side_effect_started: false,
+        }
+    }
+
+    pub fn after_side_effect(mut self) -> Self {
+        self.side_effect_started = true;
+        self
+    }
+
+    pub fn side_effect_started(&self) -> bool {
+        self.side_effect_started
+    }
+}
+
+impl fmt::Display for ProtocolEmitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProtocolEmitError {}
+
+pub type ProtocolEmitResult = Result<(), ProtocolEmitError>;
+
+pub trait IntoProtocolEmitResult {
+    fn into_protocol_emit_result(self) -> ProtocolEmitResult;
+}
+
+impl IntoProtocolEmitResult for () {
+    fn into_protocol_emit_result(self) -> ProtocolEmitResult {
+        Ok(())
+    }
+}
+
+impl IntoProtocolEmitResult for ProtocolEmitResult {
+    fn into_protocol_emit_result(self) -> ProtocolEmitResult {
+        self
+    }
+}
+
+#[derive(Debug)]
+struct ProtocolChunkNode {
+    node_id: u64,
+    parent_node_id: Option<u64>,
+    slot_index: Option<usize>,
+    value_kind: &'static str,
+    value: ProtocolChunkValue,
+}
+
+#[derive(Debug)]
+enum ProtocolChunkValue {
+    Object(Vec<(u64, u64)>),
+    List(Vec<u64>),
+    Utf8String(String),
+    Atomic(Value),
+}
+
+struct ProtocolChunkEncoder {
+    request_id: Value,
+    command: Value,
+    logical_event: String,
+    next_node_id: u64,
+    nodes: Vec<ProtocolChunkNode>,
+}
+
+impl ProtocolChunkEncoder {
+    fn new(event: &Value) -> Result<Self, ProtocolEmitError> {
+        let fields = event
+            .as_object()
+            .ok_or_else(|| ProtocolEmitError::io("protocol event must be an object"))?;
+        let logical_event = fields
+            .get("event")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty() && *value != "payload_chunk")
+            .ok_or_else(|| ProtocolEmitError::io("protocol event is missing event type"))?
+            .to_string();
+        Ok(Self {
+            request_id: fields.get("request_id").cloned().unwrap_or(Value::Null),
+            command: fields.get("command").cloned().unwrap_or(Value::Null),
+            logical_event,
+            next_node_id: 0,
+            nodes: Vec::new(),
+        })
+    }
+
+    fn visit(
+        &mut self,
+        value: &Value,
+        parent_node_id: Option<u64>,
+        slot_index: Option<usize>,
+    ) -> u64 {
+        let node_id = self.next_node_id;
+        self.next_node_id += 1;
+        let (value_kind, chunk_value) = match value {
+            Value::Object(fields) => {
+                let items = fields
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (key, value))| {
+                        let key_node_id = self.visit(
+                            &Value::String(key.clone()),
+                            Some(node_id),
+                            Some(index),
+                        );
+                        let value_node_id = self.visit(value, Some(node_id), Some(index));
+                        (key_node_id, value_node_id)
+                    })
+                    .collect();
+                ("object", ProtocolChunkValue::Object(items))
+            }
+            Value::Array(values) => {
+                let items = values
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| self.visit(value, Some(node_id), Some(index)))
+                    .collect();
+                ("list", ProtocolChunkValue::List(items))
+            }
+            Value::String(value) => (
+                "utf8_string",
+                ProtocolChunkValue::Utf8String(value.clone()),
+            ),
+            _ => ("atomic", ProtocolChunkValue::Atomic(value.clone())),
+        };
+        self.nodes.push(ProtocolChunkNode {
+            node_id,
+            parent_node_id,
+            slot_index,
+            value_kind,
+            value: chunk_value,
+        });
+        node_id
+    }
+
+    fn base_frame(&self, node: &ProtocolChunkNode, sequence: usize, final_chunk: bool) -> Value {
+        json!({
+            "event": "payload_chunk",
+            "request_id": self.request_id,
+            "command": self.command,
+            "logical_event": self.logical_event,
+            "node_id": node.node_id,
+            "parent_node_id": node.parent_node_id,
+            "slot_index": node.slot_index,
+            "sequence": sequence,
+            "final": final_chunk,
+            "value_kind": node.value_kind
+        })
+    }
+
+    fn serialize_frame(frame: &Value) -> Result<Vec<u8>, ProtocolEmitError> {
+        let mut bytes = serde_json::to_vec(frame)
+            .map_err(|err| ProtocolEmitError::io(format!("protocol frame encode failed: {err}")))?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_JSONL_FRAME_BYTES {
+            return Err(ProtocolEmitError::io(
+                "protocol frame exceeds MAX_JSONL_FRAME_BYTES",
+            ));
+        }
+        Ok(bytes)
+    }
+
+    fn item_frames(
+        &self,
+        node: &ProtocolChunkNode,
+        items: Vec<Value>,
+    ) -> Result<Vec<Vec<u8>>, ProtocolEmitError> {
+        let mut groups: Vec<Vec<Value>> = Vec::new();
+        let mut current: Vec<Value> = Vec::new();
+        for item in items {
+            let mut candidate = current.clone();
+            candidate.push(item.clone());
+            let mut frame = self.base_frame(node, groups.len(), false);
+            frame
+                .as_object_mut()
+                .expect("chunk frame object")
+                .insert("items".to_string(), Value::Array(candidate.clone()));
+            if Self::serialize_frame(&frame).is_ok() {
+                current = candidate;
+            } else {
+                if current.is_empty() {
+                    return Err(ProtocolEmitError::io(
+                        "protocol collection item cannot fit in one frame",
+                    ));
+                }
+                groups.push(current);
+                current = vec![item];
+            }
+        }
+        if !current.is_empty() || groups.is_empty() {
+            groups.push(current);
+        }
+        let total = groups.len();
+        groups
+            .into_iter()
+            .enumerate()
+            .map(|(sequence, group)| {
+                let mut frame = self.base_frame(node, sequence, sequence + 1 == total);
+                frame
+                    .as_object_mut()
+                    .expect("chunk frame object")
+                    .insert("items".to_string(), Value::Array(group));
+                Self::serialize_frame(&frame)
+            })
+            .collect()
+    }
+
+    fn string_frames(
+        &self,
+        node: &ProtocolChunkNode,
+        text: &str,
+    ) -> Result<Vec<Vec<u8>>, ProtocolEmitError> {
+        if text.is_empty() {
+            let mut frame = self.base_frame(node, 0, true);
+            frame
+                .as_object_mut()
+                .expect("chunk frame object")
+                .insert("text".to_string(), Value::String(String::new()));
+            return Ok(vec![Self::serialize_frame(&frame)?]);
+        }
+        let boundaries = text
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain(std::iter::once(text.len()))
+            .collect::<Vec<_>>();
+        let mut frames = Vec::new();
+        let mut boundary_index = 0;
+        while boundary_index + 1 < boundaries.len() || frames.is_empty() {
+            let start = boundaries[boundary_index];
+            let mut low = boundary_index + 1;
+            let mut high = boundaries.len() - 1;
+            let mut best = None;
+            while low <= high {
+                let middle = low + (high - low) / 2;
+                let mut frame = self.base_frame(node, frames.len(), false);
+                frame.as_object_mut().expect("chunk frame object").insert(
+                    "text".to_string(),
+                    Value::String(text[start..boundaries[middle]].to_string()),
+                );
+                if Self::serialize_frame(&frame).is_ok() {
+                    best = Some(middle);
+                    low = middle + 1;
+                } else if middle == 0 {
+                    break;
+                } else {
+                    high = middle - 1;
+                }
+            }
+            let end_index = best.ok_or_else(|| {
+                ProtocolEmitError::io("one UTF-8 code point cannot fit in a protocol frame")
+            })?;
+            let mut frame = self.base_frame(node, frames.len(), end_index + 1 == boundaries.len());
+            frame.as_object_mut().expect("chunk frame object").insert(
+                "text".to_string(),
+                Value::String(text[start..boundaries[end_index]].to_string()),
+            );
+            frames.push(Self::serialize_frame(&frame)?);
+            boundary_index = end_index;
+            if boundary_index + 1 == boundaries.len() {
+                break;
+            }
+        }
+        Ok(frames)
+    }
+
+    fn finish(mut self, event: &Value) -> Result<Vec<Vec<u8>>, ProtocolEmitError> {
+        let root = self.visit(event, None, None);
+        if root != 0 {
+            return Err(ProtocolEmitError::io("protocol root node id is invalid"));
+        }
+        let mut frames = Vec::new();
+        for node in &self.nodes {
+            let mut node_frames = match &node.value {
+                ProtocolChunkValue::Object(items) => self.item_frames(
+                    node,
+                    items
+                        .iter()
+                        .map(|(key, value)| {
+                            json!({"key_node_id": key, "value_node_id": value})
+                        })
+                        .collect(),
+                )?,
+                ProtocolChunkValue::List(items) => self.item_frames(
+                    node,
+                    items.iter().copied().map(Value::from).collect(),
+                )?,
+                ProtocolChunkValue::Utf8String(text) => self.string_frames(node, text)?,
+                ProtocolChunkValue::Atomic(value) => {
+                    self.item_frames(node, vec![value.clone()])?
+                }
+            };
+            frames.append(&mut node_frames);
+        }
+        Ok(frames)
+    }
+}
+
+pub fn encode_protocol_frames(event: &Value) -> Result<Vec<Vec<u8>>, ProtocolEmitError> {
+    let mut direct = serde_json::to_vec(event)
+        .map_err(|err| ProtocolEmitError::io(format!("protocol event encode failed: {err}")))?;
+    direct.push(b'\n');
+    if direct.len() <= MAX_JSONL_FRAME_BYTES {
+        return Ok(vec![direct]);
+    }
+    ProtocolChunkEncoder::new(event)?.finish(event)
+}
+
 pub struct CoreService {
     connections: BTreeMap<String, LiveAdapter>,
     next_connection_sequence: u64,
@@ -55,80 +372,117 @@ impl CoreService {
         }
     }
 
-    pub fn handle_request_streaming<F: FnMut(Value)>(&mut self, request: Request, mut emit: F) {
+    pub fn handle_request_streaming<F, R>(
+        &mut self,
+        request: Request,
+        mut emit: F,
+    ) -> ProtocolEmitResult
+    where
+        F: FnMut(Value) -> R,
+        R: IntoProtocolEmitResult,
+    {
         let request_id = request.request_id.clone();
+        let mut failed = false;
         self.handle_request_streaming_unchecked(request, |event| {
-            emit(normalize_protocol_event(event, &request_id));
-        });
+            if failed {
+                return Err(ProtocolEmitError::io("protocol emitter is fused"));
+            }
+            let result = emit(normalize_protocol_event(event, &request_id))
+                .into_protocol_emit_result();
+            if result.is_err() {
+                failed = true;
+            }
+            result
+        })
     }
 
-    fn handle_request_streaming_unchecked<F: FnMut(Value)>(&mut self, request: Request, emit: F) {
+    fn handle_request_streaming_unchecked<F, R>(
+        &mut self,
+        request: Request,
+        emit: F,
+    ) -> ProtocolEmitResult
+    where
+        F: FnMut(Value) -> R,
+        R: IntoProtocolEmitResult,
+    {
         match request.command.as_str() {
-            "connection.open" => emit_all_events(self.connection_open(&request), emit),
-            "connection.close" => emit_all_events(self.connection_close(&request), emit),
-            "query.execute" => emit_all_events(self.query_execute(&request), emit),
+            "connection.open" => {
+                let (events, side_effect_started) = self.connection_open(&request);
+                emit_operation_events(events, side_effect_started, emit)
+            }
+            "connection.close" => {
+                let (events, side_effect_started) = self.connection_close(&request);
+                emit_operation_events(events, side_effect_started, emit)
+            }
+            "query.execute" => {
+                let (events, side_effect_started) = self.query_execute(&request);
+                emit_operation_events(events, side_effect_started, emit)
+            }
             "service.shutdown" => {
                 self.connections.clear();
-                emit_all_events(service_shutdown(&request), emit);
+                emit_all_events(service_shutdown(&request), emit)
+                    .map_err(ProtocolEmitError::after_side_effect)
             }
             _ => handle_request_streaming_unchecked(request, emit),
         }
     }
 
-    fn connection_open(&mut self, request: &Request) -> Vec<Value> {
+    fn connection_open(&mut self, request: &Request) -> (Vec<Value>, bool) {
         let endpoint = match request_endpoint(request) {
             Ok(endpoint) => endpoint,
             Err(err) => {
-                return vec![json!({
+                return (vec![json!({
                     "event": "error",
                     "request_id": request.request_id,
                     "message": err
-                })]
+                })], false)
             }
         };
         match LiveAdapter::connect(&endpoint) {
             Ok(adapter) => {
                 let id = unique_connection_id(&endpoint, self.next_connection_sequence);
                 self.next_connection_sequence = self.next_connection_sequence.saturating_add(1);
+                let side_effect_started = true;
                 self.connections.insert(id.clone(), adapter);
-                vec![json!({
+                (vec![json!({
                     "event": "result",
                     "request_id": request.request_id,
                     "command": "connection.open",
                     "success": true,
                     "connection_id": id,
                     "engine": endpoint.engine
-                })]
+                })], side_effect_started)
             }
-            Err(err) => vec![json!({
+            Err(err) => (vec![json!({
                 "event": "result",
                 "request_id": request.request_id,
                 "command": "connection.open",
                 "success": false,
                 "engine": endpoint.engine,
                 "message": redact_endpoint_secret(&err, &endpoint)
-            })],
+            })], false),
         }
     }
 
-    fn connection_close(&mut self, request: &Request) -> Vec<Value> {
+    fn connection_close(&mut self, request: &Request) -> (Vec<Value>, bool) {
         let connection_id = request
             .payload
             .get("connection_id")
             .and_then(Value::as_str)
             .unwrap_or("");
+        let side_effect_started = self.connections.contains_key(connection_id);
         let removed = self.connections.remove(connection_id).is_some();
-        vec![json!({
+        (vec![json!({
             "event": "result",
             "request_id": request.request_id,
             "command": "connection.close",
             "success": true,
             "closed": removed,
             "connection_id": connection_id
-        })]
+        })], side_effect_started)
     }
 
-    fn query_execute(&mut self, request: &Request) -> Vec<Value> {
+    fn query_execute(&mut self, request: &Request) -> (Vec<Value>, bool) {
         if let Some(connection_id) = request.payload.get("connection_id").and_then(Value::as_str) {
             let sql = request
                 .payload
@@ -137,22 +491,23 @@ impl CoreService {
                 .unwrap_or("")
                 .trim();
             if sql.is_empty() {
-                return vec![json!({
+                return (vec![json!({
                     "event": "error",
                     "request_id": request.request_id,
                     "message": "query.execute requires sql"
-                })];
+                })], false);
             }
             let Some(adapter) = self.connections.get_mut(connection_id) else {
-                return vec![json!({
+                return (vec![json!({
                     "event": "error",
                     "request_id": request.request_id,
                     "message": format!("unknown connection_id: {connection_id}")
-                })];
+                })], false);
             };
             let params = query_params(&request.payload);
             let bound_sql = bind_query_params(sql, &params);
-            return match execute_query_adapter(adapter, &bound_sql) {
+            let side_effect_started = true;
+            let events = match execute_query_adapter(adapter, &bound_sql) {
                 Ok(result) => query_result_events(request, result),
                 Err(err) => vec![json!({
                     "event": "error",
@@ -160,8 +515,9 @@ impl CoreService {
                     "message": err
                 })],
             };
+            return (events, side_effect_started);
         }
-        query_execute(request)
+        (query_execute(request), false)
     }
 }
 
@@ -182,31 +538,56 @@ pub fn handle_line(line: &str) -> Vec<Value> {
     }
 }
 
-pub fn handle_line_streaming<F: FnMut(Value)>(line: &str, mut emit: F) {
+pub fn handle_line_streaming<F, R>(line: &str, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     match serde_json::from_str::<Request>(line) {
         Ok(request) => handle_request_streaming(request, emit),
         Err(err) => emit(protocol_error_event(
             None,
             "invalid_request_json",
             format!("invalid request JSON: {err}"),
-        )),
+            ))
+            .into_protocol_emit_result(),
     }
 }
 
 pub fn handle_request(request: Request) -> Vec<Value> {
     let mut events = Vec::new();
-    handle_request_streaming(request, |event| events.push(event));
+    let _ = handle_request_streaming(request, |event| events.push(event));
     events
 }
 
-pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) {
+pub fn handle_request_streaming<F, R>(request: Request, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let request_id = request.request_id.clone();
+    let mut failed = false;
     handle_request_streaming_unchecked(request, |event| {
-        emit(normalize_protocol_event(event, &request_id));
-    });
+        if failed {
+            return Err(ProtocolEmitError::io("protocol emitter is fused"));
+        }
+        let result = emit(normalize_protocol_event(event, &request_id))
+            .into_protocol_emit_result();
+        if result.is_err() {
+            failed = true;
+        }
+        result
+    })
 }
 
-fn handle_request_streaming_unchecked<F: FnMut(Value)>(request: Request, mut emit: F) {
+fn handle_request_streaming_unchecked<F, R>(
+    request: Request,
+    mut emit: F,
+) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     match request.command.as_str() {
         "service.hello" => emit_all_events(service_hello(&request), emit),
         "service.shutdown" => emit_all_events(service_shutdown(&request), emit),
@@ -232,7 +613,7 @@ fn handle_request_streaming_unchecked<F: FnMut(Value)>(request: Request, mut emi
             let command = request.command.clone();
             cleanup_streaming(&alias, |event| {
                 emit(rewrite_result_command(event, &command))
-            });
+            })
         }
         "migration.run" => {
             let alias = Request {
@@ -243,7 +624,7 @@ fn handle_request_streaming_unchecked<F: FnMut(Value)>(request: Request, mut emi
             let command = request.command.clone();
             migrate_streaming(&alias, |event| {
                 emit(rewrite_result_command(event, &command))
-            });
+            })
         }
         "oneclick.run" => oneclick_run_streaming(&request, emit),
         "oneclick.preflight" => emit_all_events(oneclick_preflight(&request), emit),
@@ -269,7 +650,8 @@ fn handle_request_streaming_unchecked<F: FnMut(Value)>(request: Request, mut emi
             "event": "error",
             "request_id": request.request_id,
             "message": format!("unknown command: {other}")
-        })),
+        }))
+        .into_protocol_emit_result(),
     }
 }
 
@@ -325,9 +707,31 @@ fn nonempty_or_default(value: &str, default: &str) -> String {
     }
 }
 
-fn emit_all_events<F: FnMut(Value)>(events: Vec<Value>, mut emit: F) {
+fn emit_all_events<F, R>(events: Vec<Value>, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     for event in events {
-        emit(event);
+        emit(event).into_protocol_emit_result()?;
+    }
+    Ok(())
+}
+
+fn emit_operation_events<F, R>(
+    events: Vec<Value>,
+    side_effect_started: bool,
+    emit: F,
+) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    let result = emit_all_events(events, emit);
+    if side_effect_started {
+        result.map_err(ProtocolEmitError::after_side_effect)
+    } else {
+        result
     }
 }
 
@@ -867,18 +1271,22 @@ mod tests {
         );
 
         let mut streaming_events = Vec::new();
-        handle_request_streaming(unknown_request(), |event| streaming_events.push(event));
+        let _ = handle_request_streaming(unknown_request(), |event| {
+            streaming_events.push(event)
+        });
         assert_protocol_error_envelope(&streaming_events, json!("outer-request-1"));
 
         let mut service = CoreService::new();
         let mut stateful_events = Vec::new();
-        service.handle_request_streaming(unknown_request(), |event| stateful_events.push(event));
+        let _ = service.handle_request_streaming(unknown_request(), |event| {
+            stateful_events.push(event)
+        });
         assert_protocol_error_envelope(&stateful_events, json!("outer-request-1"));
 
         assert_protocol_error_envelope(&handle_line("{"), Value::Null);
 
         let mut line_streaming_events = Vec::new();
-        handle_line_streaming("{", |event| line_streaming_events.push(event));
+        let _ = handle_line_streaming("{", |event| line_streaming_events.push(event));
         assert_protocol_error_envelope(&line_streaming_events, Value::Null);
     }
 
@@ -1434,5 +1842,125 @@ mod tests {
         assert_eq!(result["command"], "cleanup");
         assert_eq!(result["success"], true);
         assert_eq!(result["dropped_tables"], json!(["children", "parents"]));
+    }
+
+    #[test]
+    fn frame_encoder_keeps_direct_jsonl_within_wire_cap() {
+        let event = json!({
+            "event": "result",
+            "request_id": "direct-frame-1",
+            "command": "schema.list",
+            "success": true,
+            "schemas": ["public"]
+        });
+
+        let frames = encode_protocol_frames(&event).expect("encode direct frame");
+
+        assert_eq!(frames.len(), 1);
+        assert!(frames[0].ends_with(b"\n"));
+        assert!(frames[0].len() <= MAX_JSONL_FRAME_BYTES);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&frames[0]).expect("parse direct frame"),
+            event
+        );
+    }
+
+    #[test]
+    fn frame_encoder_chunks_oversized_utf8_at_code_point_boundaries() {
+        let value = "🙂한".repeat(180_000);
+        let event = json!({
+            "event": "result",
+            "request_id": "utf8-frame-1",
+            "command": "query.execute",
+            "success": true,
+            "value": value
+        });
+
+        let frames = encode_protocol_frames(&event).expect("encode chunked frames");
+
+        assert!(frames.len() > 1);
+        let parsed = frames
+            .iter()
+            .map(|frame| {
+                assert!(frame.len() <= MAX_JSONL_FRAME_BYTES);
+                assert!(std::str::from_utf8(frame).is_ok());
+                serde_json::from_slice::<Value>(frame).expect("parse chunk frame")
+            })
+            .collect::<Vec<_>>();
+        assert!(parsed
+            .iter()
+            .all(|frame| frame["event"] == "payload_chunk"));
+
+        let mut strings = BTreeMap::<u64, String>::new();
+        for frame in &parsed {
+            if frame["value_kind"] == "utf8_string" {
+                strings
+                    .entry(frame["node_id"].as_u64().unwrap())
+                    .or_default()
+                    .push_str(frame["text"].as_str().unwrap());
+            }
+        }
+        assert!(strings.values().any(|candidate| candidate == &value));
+    }
+
+    #[test]
+    fn frame_encoder_chunks_nested_large_object_keys_and_values() {
+        let large_key = "키".repeat(400_000);
+        let large_value = "값🙂".repeat(210_000);
+        let mut schema = serde_json::Map::new();
+        schema.insert(large_key.clone(), json!([{"inner": large_value.clone()}]));
+        let event = json!({
+            "event": "result",
+            "request_id": "nested-frame-1",
+            "command": "schema.inspect",
+            "success": true,
+            "schema": Value::Object(schema)
+        });
+
+        let frames = encode_protocol_frames(&event).expect("encode nested frames");
+        let mut strings = BTreeMap::<u64, String>::new();
+        for bytes in &frames {
+            assert!(bytes.len() <= MAX_JSONL_FRAME_BYTES);
+            let frame = serde_json::from_slice::<Value>(bytes).expect("parse nested frame");
+            if frame["value_kind"] == "utf8_string" {
+                strings
+                    .entry(frame["node_id"].as_u64().unwrap())
+                    .or_default()
+                    .push_str(frame["text"].as_str().unwrap());
+            }
+        }
+
+        assert!(strings.values().any(|candidate| candidate == &large_key));
+        assert!(strings.values().any(|candidate| candidate == &large_value));
+    }
+
+    #[test]
+    fn frame_emit_failure_is_fused_and_stops_followup_events() {
+        let request = Request {
+            command: "preflight".to_string(),
+            request_id: Some("emit-failure-1".to_string()),
+            payload: json!({
+                "source_engine": "mysql",
+                "target_engine": "postgresql",
+                "schema": {"tables": []}
+            }),
+        };
+        let mut calls = 0;
+
+        let error = handle_request_streaming(request, |_event| {
+            calls += 1;
+            Err(ProtocolEmitError::io("simulated broken pipe"))
+        })
+        .expect_err("emitter failure must propagate");
+
+        assert_eq!(calls, 1);
+        assert!(!error.side_effect_started());
+    }
+
+    #[test]
+    fn frame_emit_error_can_mark_post_side_effect_indeterminate_boundary() {
+        let error = ProtocolEmitError::io("simulated encode failure").after_side_effect();
+
+        assert!(error.side_effect_started());
     }
 }

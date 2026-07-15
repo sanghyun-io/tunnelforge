@@ -28,10 +28,38 @@ from src.core.sql_query_classifier import (
 
 class FakeProcess:
     def __init__(self, stdout_lines, stderr_text=""):
-        self.stdin = _AsyncTextWriter()
-        self.stdout = _AsyncTextReader("\n".join(stdout_lines) + "\n")
+        self._stdout_lines = list(stdout_lines)
+        self.stdout = _AsyncTextReader("")
+        self.stdin = _AsyncTextWriter(self._handle_request)
         self.stderr = _AsyncTextReader(stderr_text)
         self.returncode = None
+
+    def _handle_request(self, request):
+        request_id = request["request_id"]
+        if request_id.startswith("py-hello-"):
+            self.stdout.append(json.dumps({
+                "event": "result",
+                "request_id": request_id,
+                "command": "service.hello",
+                "success": True,
+                "service": "tunnelforge-core",
+                "protocol_version": 1,
+                "process_version": 1,
+                "process_capabilities": [
+                    "request.deadline",
+                    "request.strict_id",
+                    "process.generation",
+                    "mutation.outcome_indeterminate",
+                ],
+                "max_jsonl_frame_bytes": 1_048_576,
+            }))
+            return
+        while self._stdout_lines:
+            event = json.loads(self._stdout_lines.pop(0))
+            event["request_id"] = request_id
+            self.stdout.append(json.dumps(event))
+            if event.get("event") in ("result", "error"):
+                return
 
     def terminate(self):
         self.returncode = 0
@@ -44,13 +72,23 @@ class FakeProcess:
 
 
 class _AsyncTextWriter:
-    def __init__(self):
+    def __init__(self, on_request=None):
         self._buffer = io.StringIO()
+        self._on_request = on_request
 
     def write(self, data):
         if isinstance(data, bytes):
             data = data.decode("utf-8")
-        return self._buffer.write(data)
+        written = len(data)
+        for line in data.splitlines():
+            if not line.strip():
+                continue
+            request = json.loads(line)
+            if not str(request.get("request_id", "")).startswith("py-hello-"):
+                self._buffer.write(line + "\n")
+            if self._on_request is not None:
+                self._on_request(request)
+        return written
 
     async def drain(self):
         return None
@@ -61,10 +99,15 @@ class _AsyncTextWriter:
 
 class _AsyncTextReader:
     def __init__(self, text):
-        self._buffer = io.StringIO(text)
+        self._lines = text.splitlines(keepends=True)
+
+    def append(self, line):
+        self._lines.append(line.rstrip("\n") + "\n")
 
     async def readline(self):
-        return self._buffer.readline()
+        if not self._lines:
+            return ""
+        return self._lines.pop(0)
 
 
 def test_client_sends_jsonl_and_returns_result():

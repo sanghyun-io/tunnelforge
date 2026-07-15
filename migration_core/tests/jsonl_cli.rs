@@ -23,6 +23,15 @@ fn run_helper(request: Value) -> Vec<Value> {
 }
 
 fn run_helper_lines(input: &str) -> Vec<Value> {
+    let output = run_helper_output(input);
+    String::from_utf8(output)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect()
+}
+
+fn run_helper_output(input: &str) -> Vec<u8> {
     let mut child = Command::new(helper_binary())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -34,11 +43,7 @@ fn run_helper_lines(input: &str) -> Vec<Value> {
     }
     let output = child.wait_with_output().unwrap();
     assert!(output.status.success());
-    String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .map(|line| serde_json::from_str::<Value>(line).unwrap())
-        .collect()
+    output.stdout
 }
 
 #[test]
@@ -159,4 +164,43 @@ fn query_execute_memory_payload_preserves_explicit_columns() {
     assert_eq!(result["success"], true);
     assert_eq!(result["rows"], json!([]));
     assert_eq!(result["columns"], json!(["id", "name"]));
+}
+
+#[test]
+fn helper_binary_frame_chunks_expanded_utf8_plan_under_wire_cap() {
+    let column_name = "열".repeat(220_000);
+    let request = json!({
+        "command": "plan",
+        "request_id": "cli-large-frame-1",
+        "payload": {
+            "source_engine": "mysql",
+            "target_engine": "postgresql",
+            "schema": {
+                "tables": [{
+                    "name": "large_names",
+                    "columns": [{
+                        "name": column_name,
+                        "type": "int(11) auto_increment",
+                        "nullable": false,
+                        "primary_key": true
+                    }]
+                }]
+            }
+        }
+    });
+    let input = format!("{request}\n");
+    assert!(input.as_bytes().len() < 1_048_576);
+
+    let output = run_helper_output(&input);
+    let frames = output
+        .split_inclusive(|byte| *byte == b'\n')
+        .filter(|frame| !frame.is_empty())
+        .collect::<Vec<_>>();
+
+    assert!(frames.len() > 1);
+    assert!(frames.iter().all(|frame| frame.len() <= 1_048_576));
+    assert!(frames.iter().all(|frame| std::str::from_utf8(frame).is_ok()));
+    assert!(frames.iter().any(|frame| {
+        serde_json::from_slice::<Value>(frame).unwrap()["event"] == "payload_chunk"
+    }));
 }

@@ -11,14 +11,13 @@ import threading
 import time
 import uuid
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Mapping, Optional, Set, Tuple
 
 from src.core.cross_engine_migration import (
     HelperProtocolError,
     db_core_executable,
-    parse_helper_event,
 )
 from src.core.logger import get_logger
 from src.core.platform_integration import no_window_creation_flags
@@ -106,6 +105,231 @@ class _CallbackDelivery:
     is_terminal: bool
     ack: Optional[threading.Event] = None
     callback_error: Optional[BaseException] = None
+
+
+@dataclass
+class _PayloadNode:
+    node_id: int
+    parent_node_id: Optional[int]
+    slot_index: Optional[int]
+    value_kind: str
+    next_sequence: int = 0
+    final: bool = False
+    items: List[Any] = field(default_factory=list)
+    text: List[str] = field(default_factory=list)
+
+
+class _PayloadAssembler:
+    """Reassembles internal payload_chunk frames into one public event."""
+
+    _VALUE_KINDS = frozenset({"list", "object", "utf8_string", "atomic"})
+
+    def __init__(self, request_id: str):
+        self._request_id = request_id
+        self._nodes: Dict[int, _PayloadNode] = {}
+        self._root_node_id: Optional[int] = None
+        self._command: Optional[str] = None
+        self._logical_event: Optional[str] = None
+        self._resolved_node_ids: Set[int] = set()
+
+    @staticmethod
+    def _integer(value: Any, field_name: str, *, nullable: bool = False) -> Optional[int]:
+        if nullable and value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise HelperProtocolError(
+                f"payload_chunk {field_name} must be a non-negative integer"
+            )
+        return value
+
+    @staticmethod
+    def _required_keys(payload: Mapping[str, Any], required: Set[str]) -> None:
+        missing = sorted(required.difference(payload))
+        if missing:
+            raise HelperProtocolError(
+                "payload_chunk is missing required fields: " + ", ".join(missing)
+            )
+
+    def consume(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if payload.get("event") != "payload_chunk":
+            if self._nodes:
+                raise HelperProtocolError(
+                    "logical event changed before payload_chunk assembly completed"
+                )
+            return payload
+
+        self._required_keys(payload, {
+            "request_id",
+            "command",
+            "logical_event",
+            "node_id",
+            "parent_node_id",
+            "slot_index",
+            "sequence",
+            "final",
+            "value_kind",
+        })
+        request_id = payload.get("request_id")
+        if not isinstance(request_id, str) or request_id != self._request_id:
+            raise HelperProtocolError("payload_chunk request_id does not match")
+        command = payload.get("command")
+        if command is not None and not isinstance(command, str):
+            raise HelperProtocolError("payload_chunk command must be a string or null")
+        logical_event = payload.get("logical_event")
+        if (
+            not isinstance(logical_event, str)
+            or not logical_event
+            or logical_event == "payload_chunk"
+        ):
+            raise HelperProtocolError("payload_chunk logical_event is invalid")
+        if self._logical_event is None:
+            self._logical_event = logical_event
+            self._command = command
+        elif logical_event != self._logical_event or command != self._command:
+            raise HelperProtocolError("payload_chunk logical metadata conflicts")
+
+        node_id = self._integer(payload.get("node_id"), "node_id")
+        parent_node_id = self._integer(
+            payload.get("parent_node_id"),
+            "parent_node_id",
+            nullable=True,
+        )
+        slot_index = self._integer(
+            payload.get("slot_index"),
+            "slot_index",
+            nullable=True,
+        )
+        sequence = self._integer(payload.get("sequence"), "sequence")
+        final = payload.get("final")
+        if not isinstance(final, bool):
+            raise HelperProtocolError("payload_chunk final must be boolean")
+        value_kind = payload.get("value_kind")
+        if value_kind not in self._VALUE_KINDS:
+            raise HelperProtocolError("payload_chunk value_kind is invalid")
+        if parent_node_id is None:
+            if slot_index is not None:
+                raise HelperProtocolError("payload_chunk root slot_index must be null")
+            if self._root_node_id is None:
+                self._root_node_id = node_id
+            elif self._root_node_id != node_id:
+                raise HelperProtocolError("payload_chunk contains multiple roots")
+        elif slot_index is None or parent_node_id == node_id:
+            raise HelperProtocolError("payload_chunk child relationship is invalid")
+
+        node = self._nodes.get(node_id)
+        if node is None:
+            if sequence != 0:
+                raise HelperProtocolError("payload_chunk node sequence must start at zero")
+            node = _PayloadNode(
+                node_id=node_id,
+                parent_node_id=parent_node_id,
+                slot_index=slot_index,
+                value_kind=value_kind,
+            )
+            self._nodes[node_id] = node
+        elif (
+            node.parent_node_id != parent_node_id
+            or node.slot_index != slot_index
+            or node.value_kind != value_kind
+        ):
+            raise HelperProtocolError("payload_chunk node metadata conflicts")
+        if node.final or sequence != node.next_sequence:
+            raise HelperProtocolError("payload_chunk sequence is duplicate or out of order")
+
+        if value_kind == "utf8_string":
+            text = payload.get("text")
+            if not isinstance(text, str) or "items" in payload:
+                raise HelperProtocolError("payload_chunk utf8_string text is invalid")
+            node.text.append(text)
+        else:
+            items = payload.get("items")
+            if not isinstance(items, list) or "text" in payload:
+                raise HelperProtocolError("payload_chunk items are invalid")
+            if value_kind == "atomic":
+                if sequence != 0 or not final or len(items) != 1:
+                    raise HelperProtocolError("payload_chunk atomic node is invalid")
+            elif value_kind == "list":
+                for child_id in items:
+                    self._integer(child_id, "list child node_id")
+            else:
+                for item in items:
+                    if not isinstance(item, dict) or set(item) != {
+                        "key_node_id",
+                        "value_node_id",
+                    }:
+                        raise HelperProtocolError("payload_chunk object item is invalid")
+                    self._integer(item["key_node_id"], "object key_node_id")
+                    self._integer(item["value_node_id"], "object value_node_id")
+            node.items.extend(items)
+        node.next_sequence += 1
+        node.final = final
+
+        if node_id != self._root_node_id or not final:
+            return None
+        value = self._resolve(node_id, set())
+        if not isinstance(value, dict):
+            raise HelperProtocolError("payload_chunk root must reconstruct an object")
+        if value.get("event") != self._logical_event:
+            raise HelperProtocolError("payload_chunk logical event does not match root")
+        if value.get("request_id") != self._request_id:
+            raise HelperProtocolError("payload_chunk reconstructed request_id does not match")
+        if self._command is not None and value.get("command") != self._command:
+            raise HelperProtocolError("payload_chunk reconstructed command does not match")
+        if len(self._resolved_node_ids) != len(self._nodes):
+            raise HelperProtocolError("payload_chunk contains unreachable nodes")
+        self._nodes.clear()
+        self._root_node_id = None
+        self._command = None
+        self._logical_event = None
+        return value
+
+    def _resolve(self, node_id: int, visiting: Set[int]) -> Any:
+        if not visiting:
+            self._resolved_node_ids = set()
+        if node_id in visiting:
+            raise HelperProtocolError("payload_chunk contains a node cycle")
+        node = self._nodes.get(node_id)
+        if node is None or not node.final:
+            raise HelperProtocolError("payload_chunk references a missing or incomplete node")
+        visiting.add(node_id)
+        if node.value_kind == "utf8_string":
+            value: Any = "".join(node.text)
+        elif node.value_kind == "atomic":
+            value = node.items[0]
+        elif node.value_kind == "list":
+            values = []
+            for index, child_id in enumerate(node.items):
+                child = self._nodes.get(child_id)
+                if (
+                    child is None
+                    or child.parent_node_id != node_id
+                    or child.slot_index != index
+                ):
+                    raise HelperProtocolError("payload_chunk list child relationship conflicts")
+                values.append(self._resolve(child_id, visiting))
+            value = values
+        else:
+            values_dict: Dict[str, Any] = {}
+            for index, item in enumerate(node.items):
+                key_id = item["key_node_id"]
+                value_id = item["value_node_id"]
+                key_node = self._nodes.get(key_id)
+                value_node = self._nodes.get(value_id)
+                if any(
+                    child is None
+                    or child.parent_node_id != node_id
+                    or child.slot_index != index
+                    for child in (key_node, value_node)
+                ):
+                    raise HelperProtocolError("payload_chunk object child relationship conflicts")
+                key = self._resolve(key_id, visiting)
+                if not isinstance(key, str) or key in values_dict:
+                    raise HelperProtocolError("payload_chunk object key is invalid or duplicate")
+                values_dict[key] = self._resolve(value_id, visiting)
+            value = values_dict
+        visiting.remove(node_id)
+        self._resolved_node_ids.add(node_id)
+        return value
 
 
 class DbCoreServiceError(RuntimeError):
@@ -240,6 +464,7 @@ class DbCoreServiceClient:
         self._phase_observer = phase_observer
         self._process: Optional[Any] = None
         self._process_generation = 0
+        self._generation_state = DbCoreGenerationState.CLOSED
         self._stderr_tail: Deque[str] = deque(maxlen=200)
         self._stderr_lock = threading.Lock()
         self._stderr_task: Optional[asyncio.Task] = None
@@ -304,6 +529,39 @@ class DbCoreServiceClient:
     @property
     def shutdown_complete(self) -> bool:
         return self._shutdown_complete
+
+    @property
+    def process_generation(self) -> int:
+        return self._process_generation
+
+    @property
+    def generation_state(self) -> DbCoreGenerationState:
+        return self._generation_state
+
+    def _transition_generation(self, state: DbCoreGenerationState) -> None:
+        if state is self._generation_state:
+            return
+        allowed = {
+            DbCoreGenerationState.CREATING: {
+                DbCoreGenerationState.ACTIVE,
+                DbCoreGenerationState.POISONED,
+            },
+            DbCoreGenerationState.ACTIVE: {
+                DbCoreGenerationState.POISONED,
+                DbCoreGenerationState.REAPING,
+            },
+            DbCoreGenerationState.POISONED: {DbCoreGenerationState.REAPING},
+            DbCoreGenerationState.REAPING: {DbCoreGenerationState.CLOSED},
+            DbCoreGenerationState.CLOSED: {DbCoreGenerationState.CREATING},
+        }
+        if state not in allowed[self._generation_state]:
+            raise RuntimeError(
+                "invalid DB Core generation transition: "
+                f"{self._generation_state.value} -> {state.value}"
+            )
+        self._generation_state = state
+        if self._phase_observer is not None:
+            self._phase_observer(state, self._process_generation)
 
     def _stop_and_join_failed_bootstrap(self, deadline_at: float) -> bool:
         self._owner_stop_requested.set()
@@ -413,11 +671,26 @@ class DbCoreServiceClient:
     def _remaining(self, deadline_at: float) -> float:
         return max(0.0, deadline_at - self._monotonic())
 
+    @staticmethod
+    def _cleanup_start(deadline_at: float, timeout_seconds: float) -> float:
+        cleanup_reserve = min(2.0, timeout_seconds * 0.2)
+        return deadline_at - cleanup_reserve
+
+    async def _await_before(self, awaitable, cutoff_at: float):
+        return await asyncio.wait_for(awaitable, timeout=self._remaining(cutoff_at))
+
     def start(self) -> None:
         request_id = f"py-{uuid.uuid4().hex}"
-        deadline_at = self._monotonic() + DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+        timeout = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+        deadline_at = self._monotonic() + timeout
+        work_cutoff = self._cleanup_start(deadline_at, timeout)
         future = self._submit_admitted(
-            self._start_on_owner(DbCoreRequestKind.MUTATION, request_id, deadline_at),
+            self._start_on_owner(
+                DbCoreRequestKind.MUTATION,
+                request_id,
+                work_cutoff,
+                deadline_at,
+            ),
             DbCoreRequestKind.MUTATION,
             request_id,
             deadline_at,
@@ -448,6 +721,7 @@ class DbCoreServiceClient:
         self,
         request_kind: DbCoreRequestKind,
         request_id: str,
+        work_cutoff: float,
         deadline_at: float,
     ) -> None:
         lock = self._request_lock
@@ -457,7 +731,7 @@ class DbCoreServiceClient:
             try:
                 await asyncio.wait_for(
                     lock.acquire(),
-                    timeout=self._remaining(deadline_at),
+                    timeout=self._remaining(work_cutoff),
                 )
                 acquired = True
             except asyncio.TimeoutError as exc:
@@ -469,7 +743,7 @@ class DbCoreServiceClient:
                     request_id=request_id,
                     process_generation=self._process_generation,
                 ) from exc
-            if self._remaining(deadline_at) <= 0.0:
+            if self._remaining(work_cutoff) <= 0.0:
                 raise DbCoreServiceError(
                     "DB Core process start waited past its absolute deadline",
                     code="db_core_timeout",
@@ -478,7 +752,12 @@ class DbCoreServiceClient:
                     request_id=request_id,
                     process_generation=self._process_generation,
                 )
-            await self._start_process_on_owner(request_kind, request_id, deadline_at)
+            await self._start_process_on_owner(
+                request_kind,
+                request_id,
+                work_cutoff,
+                deadline_at,
+            )
         finally:
             if acquired:
                 lock.release()
@@ -487,11 +766,20 @@ class DbCoreServiceClient:
         self,
         request_kind: DbCoreRequestKind,
         request_id: str,
+        work_cutoff: float,
         deadline_at: float,
     ) -> None:
         """Start the core process on the dedicated owner thread."""
-        if self._process is not None and self._process_is_running_on_owner(self._process):
+        if (
+            self._process is not None
+            and self._generation_state is DbCoreGenerationState.ACTIVE
+            and self._process_is_running_on_owner(self._process)
+        ):
             return
+        if self._process is not None:
+            await self._poison_and_reap_on_owner(deadline_at)
+        self._process_generation += 1
+        self._transition_generation(DbCoreGenerationState.CREATING)
         try:
             if self._process_factory is None:
                 pending_process = asyncio.create_subprocess_exec(
@@ -499,6 +787,7 @@ class DbCoreServiceClient:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    limit=MAX_JSONL_FRAME_BYTES,
                     creationflags=no_window_creation_flags(),
                 )
             else:
@@ -507,16 +796,15 @@ class DbCoreServiceClient:
                     stdin=asyncio.subprocess.PIPE,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.PIPE,
+                    limit=MAX_JSONL_FRAME_BYTES,
                     creationflags=no_window_creation_flags(),
                 )
             if inspect.isawaitable(pending_process):
-                process = await asyncio.wait_for(
-                    pending_process,
-                    timeout=self._remaining(deadline_at),
-                )
+                process = await self._await_before(pending_process, work_cutoff)
             else:
                 process = pending_process
         except FileNotFoundError as exc:
+            await self._poison_and_reap_on_owner(deadline_at)
             raise DbCoreServiceError(
                 "Rust DB Core 실행 파일을 찾을 수 없습니다: "
                 f"{self.executable}\n"
@@ -529,6 +817,7 @@ class DbCoreServiceClient:
                 process_generation=self._process_generation,
             ) from exc
         except asyncio.TimeoutError as exc:
+            await self._poison_and_reap_on_owner(deadline_at)
             raise DbCoreServiceError(
                 "DB Core process creation exceeded the request deadline",
                 code="db_core_timeout",
@@ -538,8 +827,10 @@ class DbCoreServiceClient:
                 process_generation=self._process_generation,
             ) from exc
         except DbCoreServiceError:
+            await self._poison_and_reap_on_owner(deadline_at)
             raise
         except Exception as exc:
+            await self._poison_and_reap_on_owner(deadline_at)
             raise DbCoreServiceError(
                 f"DB Core process failed to start: {type(exc).__name__}: {exc}",
                 code="db_core_start_failed",
@@ -548,11 +839,41 @@ class DbCoreServiceClient:
                 request_id=request_id,
                 process_generation=self._process_generation,
             ) from exc
+        if process is None:
+            await self._poison_and_reap_on_owner(deadline_at)
+            raise DbCoreServiceError(
+                "DB Core process factory returned no process",
+                code="db_core_start_failed",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+            )
         self._process = process
-        self._process_generation += 1
         with self._stderr_lock:
             self._stderr_tail.clear()
         self._stderr_task = asyncio.create_task(self._drain_stderr_on_owner(process))
+        try:
+            await self._negotiate_process_on_owner(
+                process,
+                request_kind,
+                request_id,
+                work_cutoff,
+            )
+        except DbCoreServiceError:
+            await self._poison_and_reap_on_owner(deadline_at)
+            raise
+        except Exception as exc:
+            await self._poison_and_reap_on_owner(deadline_at)
+            raise DbCoreServiceError(
+                f"DB Core hello negotiation failed: {type(exc).__name__}: {exc}",
+                code="db_core_capability_missing",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+            ) from exc
+        self._transition_generation(DbCoreGenerationState.ACTIVE)
 
     def _process_is_running_on_owner(self, process: Any) -> bool:
         if hasattr(process, "returncode"):
@@ -560,26 +881,219 @@ class DbCoreServiceClient:
         poll = getattr(process, "poll", None)
         return bool(callable(poll) and poll() is None)
 
+    @staticmethod
+    def _encode_request_frame(body: Mapping[str, Any]) -> bytes:
+        try:
+            encoded = (
+                json.dumps(body, ensure_ascii=False, separators=(",", ":")) + "\n"
+            ).encode("utf-8")
+        except (TypeError, ValueError, UnicodeError) as exc:
+            raise HelperProtocolError(f"request JSON encoding failed: {exc}") from exc
+        if len(encoded) > MAX_JSONL_FRAME_BYTES:
+            raise HelperProtocolError(
+                "request JSONL frame exceeds the negotiated 1 MiB wire cap"
+            )
+        return encoded
+
+    async def _write_request_frame_on_owner(
+        self,
+        process: Any,
+        body: Mapping[str, Any],
+        cutoff_at: float,
+        *,
+        allowed_state: DbCoreGenerationState,
+        write_started: Optional[threading.Event] = None,
+    ) -> None:
+        if process is not self._process or self._generation_state is not allowed_state:
+            raise HelperProtocolError("DB Core generation changed before transport write")
+        stdin = process.stdin
+        if stdin is None:
+            raise HelperProtocolError("DB Core stdin is unavailable")
+        encoded = self._encode_request_frame(body)
+        if write_started is not None:
+            write_started.set()
+        try:
+            try:
+                stdin.write(encoded)
+            except TypeError:
+                stdin.write(encoded.decode("utf-8"))
+            if process is not self._process or self._generation_state is not allowed_state:
+                raise HelperProtocolError("DB Core generation changed before transport drain")
+            drain = getattr(stdin, "drain", None)
+            if callable(drain):
+                pending_drain = drain()
+                if inspect.isawaitable(pending_drain):
+                    await self._await_before(pending_drain, cutoff_at)
+            else:
+                flush = getattr(stdin, "flush", None)
+                if callable(flush):
+                    flush()
+        except asyncio.TimeoutError:
+            raise
+        except HelperProtocolError:
+            raise
+        except Exception as exc:
+            raise OSError(f"DB Core request write failed: {type(exc).__name__}: {exc}") from exc
+
+    @staticmethod
+    def _strict_event_payload(line: str, request_id: str) -> Dict[str, Any]:
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError as exc:
+            raise HelperProtocolError(f"Invalid helper JSON: {exc}") from exc
+        if not isinstance(payload, dict):
+            raise HelperProtocolError("Helper event must be a JSON object")
+        event_type = payload.get("event")
+        if not isinstance(event_type, str) or not event_type:
+            raise HelperProtocolError("Helper event is missing a string event")
+        response_id = payload.get("request_id")
+        if not isinstance(response_id, str) or response_id != request_id:
+            raise DbCoreServiceError(
+                "DB Core response request_id did not match the active request",
+                code="db_core_request_id_mismatch",
+                request_id=request_id,
+                payload=payload,
+            )
+        return payload
+
+    async def _read_logical_event_on_owner(
+        self,
+        process: Any,
+        request_id: str,
+        assembler: _PayloadAssembler,
+        cutoff_at: float,
+    ) -> Dict[str, Any]:
+        stdout = process.stdout
+        if stdout is None:
+            raise HelperProtocolError("DB Core stdout is unavailable")
+        while True:
+            line = await self._read_stream_line_on_owner(
+                stdout,
+                deadline_at=cutoff_at,
+                enforce_frame_cap=True,
+            )
+            if line == "":
+                raise EOFError(self._stderr_tail_text() or "DB Core process closed stdout")
+            payload = self._strict_event_payload(line, request_id)
+            logical = assembler.consume(payload)
+            if logical is not None:
+                return logical
+
+    async def _negotiate_process_on_owner(
+        self,
+        process: Any,
+        request_kind: DbCoreRequestKind,
+        request_id: str,
+        work_cutoff: float,
+    ) -> None:
+        hello_id = f"py-hello-{self._process_generation}-{uuid.uuid4().hex}"
+        body = {"command": "service.hello", "request_id": hello_id, "payload": {}}
+        try:
+            await self._write_request_frame_on_owner(
+                process,
+                body,
+                work_cutoff,
+                allowed_state=DbCoreGenerationState.CREATING,
+            )
+            payload = await self._read_logical_event_on_owner(
+                process,
+                hello_id,
+                _PayloadAssembler(hello_id),
+                work_cutoff,
+            )
+        except DbCoreServiceError as exc:
+            exc.request_kind = request_kind
+            exc.outcome = DbCoreOutcome.NOT_STARTED
+            exc.request_id = request_id
+            exc.process_generation = self._process_generation
+            raise
+        except asyncio.TimeoutError as exc:
+            raise DbCoreServiceError(
+                "DB Core hello negotiation exceeded the absolute request deadline",
+                code="db_core_timeout",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+            ) from exc
+        except (EOFError, HelperProtocolError, OSError) as exc:
+            raise DbCoreServiceError(
+                f"DB Core hello negotiation failed: {exc}",
+                code="db_core_capability_missing",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+            ) from exc
+
+        capabilities = payload.get("process_capabilities")
+        exact_capabilities = (
+            isinstance(capabilities, list)
+            and all(isinstance(value, str) for value in capabilities)
+            and len(capabilities) == len(REQUIRED_PROCESS_CAPABILITIES)
+            and frozenset(capabilities) == REQUIRED_PROCESS_CAPABILITIES
+        )
+        exact_integer = lambda value, expected: (
+            isinstance(value, int) and not isinstance(value, bool) and value == expected
+        )
+        if not (
+            payload.get("event") == "result"
+            and payload.get("command") == "service.hello"
+            and payload.get("success") is True
+            and payload.get("service") == "tunnelforge-core"
+            and exact_integer(payload.get("protocol_version"), 1)
+            and exact_integer(payload.get("process_version"), 1)
+            and exact_integer(
+                payload.get("max_jsonl_frame_bytes"),
+                MAX_JSONL_FRAME_BYTES,
+            )
+            and exact_capabilities
+        ):
+            raise DbCoreServiceError(
+                "DB Core hello did not advertise the exact required process contract",
+                code="db_core_capability_missing",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+                payload=payload,
+            )
+
     async def _read_stream_line_on_owner(
         self,
         stream: Any,
         *,
         deadline_at: Optional[float] = None,
+        enforce_frame_cap: bool = False,
     ) -> str:
-        pending_line = stream.readline()
-        if inspect.isawaitable(pending_line):
-            if deadline_at is None:
-                line = await pending_line
+        try:
+            pending_line = stream.readline()
+            if inspect.isawaitable(pending_line):
+                if deadline_at is None:
+                    line = await pending_line
+                else:
+                    line = await self._await_before(pending_line, deadline_at)
             else:
-                line = await asyncio.wait_for(
-                    pending_line,
-                    timeout=self._remaining(deadline_at),
-                )
-        else:
-            line = pending_line
+                line = pending_line
+        except (ValueError, asyncio.LimitOverrunError) as exc:
+            raise HelperProtocolError(
+                "DB Core stream exceeded its configured JSONL frame limit"
+            ) from exc
         if isinstance(line, bytes):
-            return line.decode("utf-8", errors="replace")
-        return str(line)
+            encoded = line
+            try:
+                text = line.decode("utf-8", errors="strict")
+            except UnicodeDecodeError as exc:
+                raise HelperProtocolError("DB Core frame is not valid UTF-8") from exc
+        else:
+            text = str(line)
+            try:
+                encoded = text.encode("utf-8", errors="strict")
+            except UnicodeEncodeError as exc:
+                raise HelperProtocolError("DB Core frame is not valid UTF-8") from exc
+        if enforce_frame_cap and len(encoded) > MAX_JSONL_FRAME_BYTES:
+            raise HelperProtocolError("DB Core JSONL frame exceeds the 1 MiB wire cap")
+        return text
 
     async def _drain_stderr_on_owner(self, process: Any) -> None:
         stream = process.stderr
@@ -594,7 +1108,7 @@ class DbCoreServiceClient:
                 if text:
                     with self._stderr_lock:
                         self._stderr_tail.append(text[-4000:])
-        except (asyncio.CancelledError, ValueError, OSError):
+        except (asyncio.CancelledError, HelperProtocolError, ValueError, OSError):
             return
 
     def _stderr_tail_text(self) -> str:
@@ -614,6 +1128,7 @@ class DbCoreServiceClient:
         request_kind: DbCoreRequestKind,
         event_queue: "queue.Queue[_CallbackDelivery]",
         required_generation: Optional[int],
+        work_cutoff: float,
         deadline_at: float,
         requires_callback_ack: bool,
         write_started: threading.Event,
@@ -623,8 +1138,38 @@ class DbCoreServiceClient:
             "request_id": request_id,
             "payload": payload or {},
         }
-        await self._start_process_on_owner(request_kind, request_id, deadline_at)
-        if self._remaining(deadline_at) <= 0.0:
+        try:
+            self._encode_request_frame(body)
+        except HelperProtocolError as exc:
+            raise DbCoreServiceError(
+                f"DB Core request cannot be encoded within the wire cap: {exc}",
+                code="db_core_write_failed",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+            ) from exc
+        if required_generation is not None and not (
+            required_generation == self._process_generation
+            and self._generation_state is DbCoreGenerationState.ACTIVE
+            and self._process is not None
+            and self._process_is_running_on_owner(self._process)
+        ):
+            raise DbCoreServiceError(
+                "DB Core connection belongs to a stale process generation",
+                code="db_core_stale_connection",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id,
+                process_generation=self._process_generation,
+            )
+        await self._start_process_on_owner(
+            request_kind,
+            request_id,
+            work_cutoff,
+            deadline_at,
+        )
+        if self._remaining(work_cutoff) <= 0.0:
             raise DbCoreServiceError(
                 "DB Core request expired before transport write",
                 code="db_core_timeout",
@@ -644,60 +1189,44 @@ class DbCoreServiceClient:
             )
         process = self._process
         assert process is not None
-        stdin = process.stdin
-        stdout = process.stdout
-        if stdin is None or stdout is None:
-            raise DbCoreServiceError(
-                "DB core service pipes are not available",
-                code="db_core_write_failed",
-                request_kind=request_kind,
-                outcome=DbCoreOutcome.NOT_STARTED,
-                request_id=request_id,
-                process_generation=self._process_generation,
-            )
-
         try:
-            write_started.set()
-            encoded_body = (json.dumps(body, ensure_ascii=False) + "\n").encode("utf-8")
-            try:
-                stdin.write(encoded_body)
-            except TypeError:
-                stdin.write(encoded_body.decode("utf-8"))
-            drain = getattr(stdin, "drain", None)
-            if callable(drain):
-                pending_drain = drain()
-                if inspect.isawaitable(pending_drain):
-                    await asyncio.wait_for(
-                        pending_drain,
-                        timeout=self._remaining(deadline_at),
-                    )
-            else:
-                flush = getattr(stdin, "flush", None)
-                if callable(flush):
-                    flush()
+            await self._write_request_frame_on_owner(
+                process,
+                body,
+                work_cutoff,
+                allowed_state=DbCoreGenerationState.ACTIVE,
+                write_started=write_started,
+            )
         except asyncio.TimeoutError as exc:
-            raise DbCoreServiceError(
+            error = DbCoreServiceError(
                 "DB Core request write exceeded its absolute deadline",
                 code="db_core_timeout",
                 request_kind=request_kind,
                 outcome=self._transport_outcome(request_kind),
                 request_id=request_id,
                 process_generation=self._process_generation,
-            ) from exc
-        except Exception as exc:
-            raise DbCoreServiceError(
+            )
+            error.__cause__ = exc
+            await self._poison_and_reap_on_owner(deadline_at)
+            raise error
+        except (HelperProtocolError, OSError) as exc:
+            error = DbCoreServiceError(
                 f"DB Core request write failed: {type(exc).__name__}: {exc}",
                 code="db_core_write_failed",
                 request_kind=request_kind,
                 outcome=self._transport_outcome(request_kind),
                 request_id=request_id,
                 process_generation=self._process_generation,
-            ) from exc
+            )
+            error.__cause__ = exc
+            await self._poison_and_reap_on_owner(deadline_at)
+            raise error
 
+        assembler = _PayloadAssembler(request_id)
         while True:
-            remaining = self._remaining(deadline_at)
+            remaining = self._remaining(work_cutoff)
             if remaining <= 0.0:
-                raise DbCoreServiceError(
+                error = DbCoreServiceError(
                     "DB Core request exceeded its absolute deadline",
                     code="db_core_timeout",
                     request_kind=request_kind,
@@ -705,63 +1234,71 @@ class DbCoreServiceClient:
                     request_id=request_id,
                     process_generation=self._process_generation,
                 )
+                await self._poison_and_reap_on_owner(deadline_at)
+                raise error
             try:
-                line = await self._read_stream_line_on_owner(
-                    stdout,
-                    deadline_at=deadline_at,
+                payload_event = await self._read_logical_event_on_owner(
+                    process,
+                    request_id,
+                    assembler,
+                    work_cutoff,
                 )
             except asyncio.TimeoutError as exc:
-                raise DbCoreServiceError(
+                error = DbCoreServiceError(
                     "DB Core request exceeded its absolute deadline",
                     code="db_core_timeout",
                     request_kind=request_kind,
                     outcome=self._transport_outcome(request_kind),
                     request_id=request_id,
                     process_generation=self._process_generation,
-                ) from exc
-            if line == "":
-                raise DbCoreServiceError(
-                    self._stderr_tail_text() or "DB core service stopped before a result",
+                )
+                error.__cause__ = exc
+                await self._poison_and_reap_on_owner(deadline_at)
+                raise error
+            except EOFError as exc:
+                error = DbCoreServiceError(
+                    str(exc),
                     code="db_core_process_died",
                     request_kind=request_kind,
                     outcome=self._transport_outcome(request_kind),
                     request_id=request_id,
                     process_generation=self._process_generation,
                 )
-
-            try:
-                event = parse_helper_event(line)
+                error.__cause__ = exc
+                await self._poison_and_reap_on_owner(deadline_at)
+                raise error
+            except DbCoreServiceError as exc:
+                exc.request_kind = request_kind
+                exc.outcome = self._transport_outcome(request_kind)
+                exc.request_id = request_id
+                exc.process_generation = self._process_generation
+                await self._poison_and_reap_on_owner(deadline_at)
+                raise
             except HelperProtocolError as exc:
-                raise DbCoreServiceError(
+                error = DbCoreServiceError(
                     f"DB Core emitted a malformed protocol event: {exc}",
                     code="db_core_protocol_mismatch",
                     request_kind=request_kind,
                     outcome=self._transport_outcome(request_kind),
                     request_id=request_id,
                     process_generation=self._process_generation,
-                ) from exc
-            if event.request_id not in (None, request_id):
-                raise DbCoreServiceError(
-                    "DB Core response request_id did not match the active request",
-                    code="db_core_request_id_mismatch",
-                    request_kind=request_kind,
-                    outcome=self._transport_outcome(request_kind),
-                    request_id=request_id,
-                    process_generation=self._process_generation,
-                    payload=event.payload,
                 )
-            is_terminal = event.event in ("result", "error")
+                error.__cause__ = exc
+                await self._poison_and_reap_on_owner(deadline_at)
+                raise error
+            event_type = payload_event["event"]
+            is_terminal = event_type in ("result", "error")
             delivery = _CallbackDelivery(
-                payload=event.payload,
+                payload=payload_event,
                 is_terminal=is_terminal,
                 ack=(threading.Event() if requires_callback_ack and not is_terminal else None),
             )
             event_queue.put(delivery)
             if delivery.ack is not None:
                 while not delivery.ack.is_set():
-                    remaining = self._remaining(deadline_at)
+                    remaining = self._remaining(work_cutoff)
                     if remaining <= 0.0:
-                        await self._terminate_process_on_owner(deadline_at)
+                        await self._poison_and_reap_on_owner(deadline_at)
                         raise DbCoreServiceError(
                             "DB Core progress callback exceeded the request deadline",
                             code="db_core_callback_failed",
@@ -772,7 +1309,7 @@ class DbCoreServiceClient:
                         )
                     await asyncio.sleep(min(0.01, remaining))
                 if delivery.callback_error is not None:
-                    await self._terminate_process_on_owner(deadline_at)
+                    await self._poison_and_reap_on_owner(deadline_at)
                     raise DbCoreServiceError(
                         f"DB Core progress callback failed: {delivery.callback_error}",
                         code="db_core_callback_failed",
@@ -781,37 +1318,51 @@ class DbCoreServiceClient:
                         request_id=request_id,
                         process_generation=self._process_generation,
                     )
-            if event.event == "result":
+            if event_type == "result":
+                if payload_event.get("command") != command:
+                    error = DbCoreServiceError(
+                        "DB Core result command did not match the active request",
+                        code="db_core_protocol_mismatch",
+                        request_kind=request_kind,
+                        outcome=self._transport_outcome(request_kind),
+                        request_id=request_id,
+                        process_generation=self._process_generation,
+                        payload=payload_event,
+                    )
+                    await self._poison_and_reap_on_owner(deadline_at)
+                    raise error
                 return DbCoreRequestResult(
                     request_kind=request_kind,
                     outcome=DbCoreOutcome.DEFINITE,
                     request_id=request_id,
                     process_generation=self._process_generation,
-                    message=str(event.payload.get("message") or ""),
+                    message=str(payload_event.get("message") or ""),
                     rust_code=None,
-                    payload=event.payload,
+                    payload=payload_event,
                 )
-            if event.event == "error":
-                rust_code = event.payload.get("code")
+            if event_type == "error":
+                rust_code = payload_event.get("code")
                 if not isinstance(rust_code, str) or not rust_code.strip():
-                    raise DbCoreServiceError(
+                    error = DbCoreServiceError(
                         "DB Core error event is missing a non-empty string code",
                         code="db_core_protocol_mismatch",
                         request_kind=request_kind,
                         outcome=self._transport_outcome(request_kind),
                         request_id=request_id,
                         process_generation=self._process_generation,
-                        payload=event.payload,
+                        payload=payload_event,
                     )
+                    await self._poison_and_reap_on_owner(deadline_at)
+                    raise error
                 raise DbCoreServiceError(
-                    _format_error_event(event.payload),
+                    _format_error_event(payload_event),
                     code="db_core_business_failure",
                     request_kind=request_kind,
                     outcome=DbCoreOutcome.FAILED,
                     request_id=request_id,
                     process_generation=self._process_generation,
                     rust_code=rust_code,
-                    payload=event.payload,
+                    payload=payload_event,
                 )
 
     async def _request_on_owner(
@@ -822,6 +1373,7 @@ class DbCoreServiceClient:
         request_kind: DbCoreRequestKind,
         event_queue: "queue.Queue[_CallbackDelivery]",
         required_generation: Optional[int],
+        work_cutoff: float,
         deadline_at: float,
         requires_callback_ack: bool,
         write_started: threading.Event,
@@ -834,7 +1386,7 @@ class DbCoreServiceClient:
             try:
                 await asyncio.wait_for(
                     lock.acquire(),
-                    timeout=self._remaining(deadline_at),
+                    timeout=self._remaining(work_cutoff),
                 )
                 acquired = True
             except asyncio.TimeoutError as exc:
@@ -846,7 +1398,7 @@ class DbCoreServiceClient:
                     request_id=request_id,
                     process_generation=self._process_generation,
                 ) from exc
-            if self._remaining(deadline_at) <= 0.0:
+            if self._remaining(work_cutoff) <= 0.0:
                 raise DbCoreServiceError(
                     "DB Core request waited past its absolute deadline",
                     code="db_core_timeout",
@@ -863,6 +1415,7 @@ class DbCoreServiceClient:
                 request_kind,
                 event_queue,
                 required_generation,
+                work_cutoff,
                 deadline_at,
                 requires_callback_ack,
                 write_started,
@@ -928,6 +1481,7 @@ class DbCoreServiceClient:
             request_kind = DbCoreRequestKind(request_kind)
         timeout = self._validated_timeout(timeout_seconds, DEFAULT_REQUEST_TIMEOUT_SECONDS)
         deadline_at = self._monotonic() + timeout
+        work_cutoff = self._cleanup_start(deadline_at, timeout)
         request_id = request_id or f"py-{uuid.uuid4().hex}"
         events: "queue.Queue[_CallbackDelivery]" = queue.Queue()
         write_started = threading.Event()
@@ -939,6 +1493,7 @@ class DbCoreServiceClient:
                 request_kind,
                 events,
                 required_generation,
+                work_cutoff,
                 deadline_at,
                 on_event is not None,
                 write_started,
@@ -1086,9 +1641,27 @@ class DbCoreServiceClient:
             required_generation=required_generation,
         )
 
+    async def _poison_and_reap_on_owner(self, deadline_at: float) -> None:
+        if self._generation_state in (
+            DbCoreGenerationState.CREATING,
+            DbCoreGenerationState.ACTIVE,
+        ):
+            self._transition_generation(DbCoreGenerationState.POISONED)
+        await self._terminate_process_on_owner(deadline_at)
+
     async def _terminate_process_on_owner(self, deadline_at: float) -> None:
         process = self._process
+        if process is None and self._generation_state is DbCoreGenerationState.CLOSED:
+            return
+        if self._generation_state is DbCoreGenerationState.CREATING:
+            self._transition_generation(DbCoreGenerationState.POISONED)
+        if self._generation_state in (
+            DbCoreGenerationState.ACTIVE,
+            DbCoreGenerationState.POISONED,
+        ):
+            self._transition_generation(DbCoreGenerationState.REAPING)
         if process is None:
+            self._transition_generation(DbCoreGenerationState.CLOSED)
             return
         if self._process_is_running_on_owner(process):
             try:
@@ -1101,53 +1674,51 @@ class DbCoreServiceClient:
                     process_generation=self._process_generation,
                 ) from exc
 
-            wait = getattr(process, "wait", None)
-            if callable(wait):
+        wait = getattr(process, "wait", None)
+        if callable(wait):
+            try:
+                pending_wait = wait()
+                if inspect.isawaitable(pending_wait):
+                    graceful_wait_cutoff = self._monotonic() + (
+                        self._remaining(deadline_at) / 2.0
+                    )
+                    await self._await_before(pending_wait, graceful_wait_cutoff)
+            except asyncio.TimeoutError as exc:
+                kill = getattr(process, "kill", None)
+                if not callable(kill):
+                    raise DbCoreServiceError(
+                        "DB Core process did not exit before shutdown deadline",
+                        code="db_core_residual_process",
+                        outcome=DbCoreOutcome.FAILED,
+                        process_generation=self._process_generation,
+                    ) from exc
+                try:
+                    kill()
+                except Exception as kill_exc:
+                    raise DbCoreServiceError(
+                        f"DB Core process kill failed: {type(kill_exc).__name__}: {kill_exc}",
+                        code="db_core_residual_process",
+                        outcome=DbCoreOutcome.FAILED,
+                        process_generation=self._process_generation,
+                    ) from kill_exc
                 try:
                     pending_wait = wait()
                     if inspect.isawaitable(pending_wait):
-                        await asyncio.wait_for(
-                            pending_wait,
-                            timeout=self._remaining(deadline_at),
-                        )
-                except asyncio.TimeoutError as exc:
-                    kill = getattr(process, "kill", None)
-                    if not callable(kill):
-                        raise DbCoreServiceError(
-                            "DB Core process did not exit before shutdown deadline",
-                            code="db_core_residual_process",
-                            outcome=DbCoreOutcome.FAILED,
-                            process_generation=self._process_generation,
-                        ) from exc
-                    try:
-                        kill()
-                    except Exception as kill_exc:
-                        raise DbCoreServiceError(
-                            f"DB Core process kill failed: {type(kill_exc).__name__}: {kill_exc}",
-                            code="db_core_residual_process",
-                            outcome=DbCoreOutcome.FAILED,
-                            process_generation=self._process_generation,
-                        ) from kill_exc
-                    try:
-                        pending_wait = wait()
-                        if inspect.isawaitable(pending_wait):
-                            await asyncio.wait_for(
-                                pending_wait,
-                                timeout=self._remaining(deadline_at),
-                            )
-                    except asyncio.TimeoutError as final_exc:
-                        raise DbCoreServiceError(
-                            "DB Core process remained alive after bounded kill",
-                            code="db_core_residual_process",
-                            outcome=DbCoreOutcome.FAILED,
-                            process_generation=self._process_generation,
-                        ) from final_exc
+                        await self._await_before(pending_wait, deadline_at)
+                except asyncio.TimeoutError as final_exc:
+                    raise DbCoreServiceError(
+                        "DB Core process remained alive after bounded kill",
+                        code="db_core_residual_process",
+                        outcome=DbCoreOutcome.FAILED,
+                        process_generation=self._process_generation,
+                    ) from final_exc
         stderr_task = self._stderr_task
         if stderr_task is not None and not stderr_task.done():
             stderr_task.cancel()
             await asyncio.gather(stderr_task, return_exceptions=True)
         self._stderr_task = None
         self._process = None
+        self._transition_generation(DbCoreGenerationState.CLOSED)
 
     async def _cancel_active_on_owner(self, deadline_at: float) -> bool:
         task = self._active_request_task

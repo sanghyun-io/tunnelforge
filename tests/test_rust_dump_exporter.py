@@ -75,12 +75,32 @@ class TestRustDumpChecker:
 
         class _Process:
             def __init__(self):
-                self.stdin = io.StringIO()
-                self.stdout = io.StringIO(
-                    '{"event":"result","command":"service.hello","success":true,'
-                    '"service":"tunnelforge-core","protocol_version":1,'
-                    '"capabilities":["dump.run","dump.import"]}\n'
-                )
+                process = self
+
+                class _Writer(io.StringIO):
+                    def write(self, data):
+                        request = json.loads(data)
+                        process.stdout = io.StringIO(json.dumps({
+                            "event": "result",
+                            "command": "service.hello",
+                            "request_id": request["request_id"],
+                            "success": True,
+                            "service": "tunnelforge-core",
+                            "protocol_version": 1,
+                            "process_version": 1,
+                            "process_capabilities": [
+                                "request.deadline",
+                                "request.strict_id",
+                                "process.generation",
+                                "mutation.outcome_indeterminate",
+                            ],
+                            "capabilities": ["dump.run", "dump.import"],
+                            "max_jsonl_frame_bytes": 1_048_576,
+                        }) + "\n")
+                        return super().write(data)
+
+                self.stdin = _Writer()
+                self.stdout = io.StringIO()
                 self.stderr = io.StringIO()
                 self.terminated = False
 

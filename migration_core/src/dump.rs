@@ -3,31 +3,125 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
 
-use mysql::prelude::Queryable;
 use crate::*;
+use mysql::prelude::Queryable;
 
 /// dump.run / dump.import 요청에 threads가 명시되지 않았을 때 사용하는 기본 워커 수.
 pub(crate) const DEFAULT_DUMP_THREADS: usize = 8;
 
-pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
-    emit(json!({
+#[derive(Debug)]
+enum DumpStreamError {
+    Domain(String),
+    Emit(ProtocolEmitError),
+}
+
+impl From<String> for DumpStreamError {
+    fn from(error: String) -> Self {
+        Self::Domain(error)
+    }
+}
+
+impl From<ProtocolEmitError> for DumpStreamError {
+    fn from(error: ProtocolEmitError) -> Self {
+        Self::Emit(error)
+    }
+}
+
+impl DumpStreamError {
+    fn message(self) -> String {
+        match self {
+            Self::Domain(message) => message,
+            Self::Emit(error) => error.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Default)]
+struct DumpSideEffectState {
+    started: Arc<AtomicBool>,
+    aborted: Arc<AtomicBool>,
+}
+
+impl DumpSideEffectState {
+    fn mark_started(&self) {
+        self.started.store(true, Ordering::Release);
+    }
+
+    fn started(&self) -> bool {
+        self.started.load(Ordering::Acquire)
+    }
+
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    fn ensure_active(&self) -> Result<(), String> {
+        if self.aborted.load(Ordering::Acquire) {
+            Err("dump aborted after protocol emitter failure".to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn emit_dump_event<F, R>(
+    emit: &mut F,
+    event: Value,
+    side_effect: &DumpSideEffectState,
+) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    side_effect.ensure_active().map_err(ProtocolEmitError::io)?;
+    match emit(event).into_protocol_emit_result() {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            side_effect.abort();
+            Err(if side_effect.started() {
+                error.after_side_effect()
+            } else {
+                error
+            })
+        }
+    }
+}
+
+pub(crate) fn dump_run_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    let side_effect = DumpSideEffectState::default();
+    emit_dump_event(
+        &mut emit,
+        json!({
         "event": "phase",
         "request_id": request.request_id,
         "phase": "dump",
         "message": "dump started"
-    }));
+        }),
+        &side_effect,
+    )?;
 
-    match dump_run(request, |event| emit(event)) {
-        Ok(result) => emit(result),
-        Err(err) => emit(json!({
+    match dump_run(request, &mut emit, &side_effect) {
+        Ok(result) => emit_dump_event(&mut emit, result, &side_effect),
+        Err(DumpStreamError::Emit(error)) => Err(error),
+        Err(DumpStreamError::Domain(error)) => emit_dump_event(
+            &mut emit,
+            json!({
             "event": "error",
             "request_id": request.request_id,
-            "message": err
-        })),
+                "message": error
+            }),
+            &side_effect,
+        ),
     }
 }
 
@@ -95,10 +189,7 @@ fn global_dump_work_plan_for_ranges(
     global_dump_work_plan(tables, &range_counts)
 }
 
-fn dump_table_row_counts(
-    endpoint: &Endpoint,
-    tables: &[NormalizedTable],
-) -> BTreeMap<String, u64> {
+fn dump_table_row_counts(endpoint: &Endpoint, tables: &[NormalizedTable]) -> BTreeMap<String, u64> {
     let mut counts = BTreeMap::new();
     if endpoint.engine != "mysql" || tables.is_empty() {
         return counts;
@@ -385,7 +476,7 @@ fn select_dump_strategy(engine: &str, threads: usize, table_total: usize) -> Dum
 }
 
 /// View 정의 수집(전체 export 시) + DumpManifest 조립 및 파일 기록. (manifest, view 개수)를 반환한다.
-fn finalize_dump_manifest<F: FnMut(Value)>(
+fn finalize_dump_manifest<F, R>(
     endpoint: &Endpoint,
     schema: NormalizedSchema,
     table_manifests: Vec<DumpTableManifest>,
@@ -394,18 +485,27 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     full_export: bool,
     request_id: Option<String>,
     mut emit: F,
-) -> Result<(DumpManifest, usize), String> {
+    side_effect: &DumpSideEffectState,
+) -> Result<(DumpManifest, usize), DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     // View 정의 수집 (전체 export 시에만). 실패해도 테이블 덤프는 유효하므로 fatal로 보지 않는다.
     let views = if full_export {
         match collect_views(endpoint) {
             Ok(views) => views,
             Err(err) => {
-                emit(json!({
+                emit_dump_event(
+                    &mut emit,
+                    json!({
                     "event": "phase",
                     "request_id": request_id,
                     "phase": "dump",
                     "message": format!("View 정의 수집 실패 (테이블 덤프는 정상): {err}"),
-                }));
+                    }),
+                    side_effect,
+                )?;
                 Vec::new()
             }
         }
@@ -432,16 +532,26 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         tables: table_manifests,
         views,
     };
+    side_effect.ensure_active()?;
+    side_effect.mark_started();
     write_dump_manifest(output_path, &manifest)?;
     Ok((manifest, views_count))
 }
 
-fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
+fn dump_run<F, R>(
+    request: &Request,
+    mut emit: F,
+    side_effect: &DumpSideEffectState,
+) -> Result<Value, DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let endpoint = request_endpoint(request)?;
     let options = parse_dump_run_options(request)?;
 
     let output_path = Path::new(&options.output_dir);
-    prepare_dump_output_dir(output_path, options.overwrite)?;
+    prepare_dump_output_dir_with_state(output_path, options.overwrite, side_effect)?;
 
     // 부분 export(tables 지정) 시에는 View가 참조하는 base table이 빠질 수 있으므로 View를 수집하지 않는다.
     let full_export = options.selected_tables.is_empty();
@@ -453,15 +563,15 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     }
     schema = dependency_ordered_schema(&schema);
     if schema.tables.is_empty() {
-        return Err("dump.run found no tables to export".to_string());
+        return Err("dump.run found no tables to export".to_string().into());
     }
 
     let row_counts = dump_table_row_counts(&endpoint, &schema.tables);
-    emit(dump_plan_event(
-        request.request_id.clone(),
-        &schema.tables,
-        &row_counts,
-    ));
+    emit_dump_event(
+        &mut emit,
+        dump_plan_event(request.request_id.clone(), &schema.tables, &row_counts),
+        side_effect,
+    )?;
 
     let table_total = schema.tables.len();
     let parallel_limits = dump_parallel_limits(options.threads, table_total);
@@ -471,17 +581,21 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     } else {
         schema.tables.clone()
     };
-    emit(dump_schedule_event(
-        request.request_id.clone(),
-        &export_tables,
-        &row_counts,
-        parallel_limits,
-        options.threads,
-        options.chunk_size,
-        &options.data_format,
-        &options.compression,
-        strategy.scheduler_label(),
-    ));
+    emit_dump_event(
+        &mut emit,
+        dump_schedule_event(
+            request.request_id.clone(),
+            &export_tables,
+            &row_counts,
+            parallel_limits,
+            options.threads,
+            options.chunk_size,
+            &options.data_format,
+            &options.compression,
+            strategy.scheduler_label(),
+        ),
+        side_effect,
+    )?;
     let ctx = DumpJobContext {
         endpoint: endpoint.clone(),
         output_path: output_path.to_path_buf(),
@@ -496,28 +610,46 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 &ctx,
                 &export_tables[0],
                 parallel_limits.range_workers_per_table,
-                |event| emit(event),
+                |event| emit_dump_event(&mut emit, event, side_effect),
+                side_effect,
             )? {
                 Some(result) => result,
                 None => {
                     let mut adapter = LiveAdapter::connect(&endpoint)?;
-                    dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
+                    dump_tables_sequential(
+                        &mut adapter,
+                        &ctx,
+                        &export_tables,
+                        |event| emit_dump_event(&mut emit, event, side_effect),
+                        side_effect,
+                    )?
                 }
             }
         }
-        DumpStrategy::GlobalMysql => {
-            dump_tables_global_mysql(&ctx, &export_tables, options.threads, |event| emit(event))?
-        }
+        DumpStrategy::GlobalMysql => dump_tables_global_mysql(
+            &ctx,
+            &export_tables,
+            options.threads,
+            |event| emit_dump_event(&mut emit, event, side_effect),
+            side_effect,
+        )?,
         DumpStrategy::TableParallel => dump_tables_parallel(
             &ctx,
             &export_tables,
             parallel_limits.table_workers,
             parallel_limits.range_workers_per_table,
-            |event| emit(event),
+            |event| emit_dump_event(&mut emit, event, side_effect),
+            side_effect,
         )?,
         DumpStrategy::Sequential => {
             let mut adapter = LiveAdapter::connect(&endpoint)?;
-            dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
+            dump_tables_sequential(
+                &mut adapter,
+                &ctx,
+                &export_tables,
+                |event| emit_dump_event(&mut emit, event, side_effect),
+                side_effect,
+            )?
         }
     };
 
@@ -529,7 +661,8 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         output_path,
         full_export,
         request.request_id.clone(),
-        |event| emit(event),
+        |event| emit_dump_event(&mut emit, event, side_effect),
+        side_effect,
     )?;
 
     Ok(json!({
@@ -552,7 +685,16 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     }))
 }
 
+#[cfg(test)]
 fn prepare_dump_output_dir(output_path: &Path, overwrite: bool) -> Result<(), String> {
+    prepare_dump_output_dir_with_state(output_path, overwrite, &DumpSideEffectState::default())
+}
+
+fn prepare_dump_output_dir_with_state(
+    output_path: &Path,
+    overwrite: bool,
+    side_effect: &DumpSideEffectState,
+) -> Result<(), String> {
     if output_path.as_os_str().is_empty() || output_path.parent().is_none() {
         return Err("refusing to use unsafe dump output_dir".to_string());
     }
@@ -569,9 +711,13 @@ fn prepare_dump_output_dir(output_path: &Path, overwrite: bool) -> Result<(), St
                     "refusing to overwrite output_dir without TunnelForge dump marker".to_string(),
                 );
             }
+            side_effect.ensure_active()?;
+            side_effect.mark_started();
             remove_dump_output_dir(output_path)?;
         }
     }
+    side_effect.ensure_active()?;
+    side_effect.mark_started();
     fs::create_dir_all(output_path)
         .map_err(|err| format!("failed to create dump output_dir: {err}"))
 }
@@ -616,20 +762,32 @@ fn has_tunnelforge_dump_marker(output_path: &Path) -> bool {
         == Some("tunnelforge-dump")
 }
 
-fn dump_tables_sequential<F: FnMut(Value)>(
+fn dump_tables_sequential<F, R>(
     adapter: &mut LiveAdapter,
     ctx: &DumpJobContext,
     tables: &[NormalizedTable],
     mut emit: F,
-) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
+    side_effect: &DumpSideEffectState,
+) -> Result<(Vec<DumpTableManifest>, u64, u64), DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let mut manifests = Vec::new();
     let mut total_rows = 0_u64;
     let mut total_chunks = 0_u64;
     let table_total = tables.len();
 
     for (index, table) in tables.iter().enumerate() {
-        let (manifest, rows, chunks) =
-            dump_one_table(adapter, ctx, table, index, table_total, |event| emit(event))?;
+        let (manifest, rows, chunks) = dump_one_table(
+            adapter,
+            ctx,
+            table,
+            index,
+            table_total,
+            |event| emit_dump_event(&mut emit, event, side_effect),
+            side_effect,
+        )?;
         manifests.push(manifest);
         total_rows += rows;
         total_chunks += chunks;
@@ -734,12 +892,13 @@ fn run_bounded_pool<Item, Event>(
     max_workers: usize,
     receiver: &mpsc::Receiver<Event>,
     mut spawn: impl FnMut(Item) -> thread::JoinHandle<()>,
-    mut on_event: impl FnMut(Event) -> PoolAction,
-) {
+    mut on_event: impl FnMut(Event) -> Result<PoolAction, DumpStreamError>,
+) -> Result<(), DumpStreamError> {
     let total = pending.len();
     let mut handles = Vec::new();
     let mut active = 0_usize;
     let mut completed = 0_usize;
+    let mut first_error = None;
 
     while active < max_workers {
         if let Some(item) = pending.pop_front() {
@@ -750,22 +909,25 @@ fn run_bounded_pool<Item, Event>(
         }
     }
 
-    while completed < total && active > 0 {
+    while completed < total && active > 0 && first_error.is_none() {
         match receiver.recv() {
             Ok(event) => match on_event(event) {
-                PoolAction::KeepGoing => {}
-                PoolAction::Advance => {
-                    completed += 1;
-                    active = active.saturating_sub(1);
-                    if let Some(item) = pending.pop_front() {
-                        handles.push(spawn(item));
-                        active += 1;
+                Err(error) => first_error = Some(error),
+                Ok(action) => match action {
+                    PoolAction::KeepGoing => {}
+                    PoolAction::Advance => {
+                        completed += 1;
+                        active = active.saturating_sub(1);
+                        if let Some(item) = pending.pop_front() {
+                            handles.push(spawn(item));
+                            active += 1;
+                        }
                     }
-                }
-                PoolAction::AdvanceNoRefill => {
-                    completed += 1;
-                    active = active.saturating_sub(1);
-                }
+                    PoolAction::AdvanceNoRefill => {
+                        completed += 1;
+                        active = active.saturating_sub(1);
+                    }
+                },
             },
             Err(_) => break,
         }
@@ -774,15 +936,22 @@ fn run_bounded_pool<Item, Event>(
     for handle in handles {
         let _ = handle.join();
     }
+
+    first_error.map_or(Ok(()), Err)
 }
 
-fn dump_tables_parallel<F: FnMut(Value)>(
+fn dump_tables_parallel<F, R>(
     ctx: &DumpJobContext,
     tables: &[NormalizedTable],
     table_threads: usize,
     range_threads: usize,
     mut emit: F,
-) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
+    side_effect: &DumpSideEffectState,
+) -> Result<(Vec<DumpTableManifest>, u64, u64), DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let table_total = tables.len();
     let max_threads = table_threads.max(1).min(table_total);
     let pending = (0..table_total).collect::<VecDeque<_>>();
@@ -804,12 +973,13 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 table_total,
                 range_threads,
                 sender.clone(),
+                side_effect.clone(),
             )
         },
         |event| match event {
             DumpTableEvent::Progress(event) => {
-                emit(event);
-                PoolAction::KeepGoing
+                emit_dump_event(&mut emit, event, side_effect)?;
+                Ok(PoolAction::KeepGoing)
             }
             DumpTableEvent::Done {
                 index,
@@ -820,18 +990,18 @@ fn dump_tables_parallel<F: FnMut(Value)>(
                 manifests[index] = Some(manifest);
                 total_rows += rows;
                 total_chunks += chunks;
-                PoolAction::Advance
+                Ok(PoolAction::Advance)
             }
             // 에러가 나도 나머지 테이블 워커는 계속 리필해 진행한다(기존 동작 보존).
             DumpTableEvent::Error(err) => {
                 first_error.get_or_insert(err);
-                PoolAction::Advance
+                Ok(PoolAction::Advance)
             }
         },
-    );
+    )?;
 
     if let Some(err) = first_error {
-        return Err(err);
+        return Err(err.into());
     }
 
     Ok((
@@ -844,17 +1014,24 @@ fn dump_tables_parallel<F: FnMut(Value)>(
     ))
 }
 
-fn dump_tables_global_mysql<F: FnMut(Value)>(
+fn dump_tables_global_mysql<F, R>(
     ctx: &DumpJobContext,
     tables: &[NormalizedTable],
     threads: usize,
     mut emit: F,
-) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
+    side_effect: &DumpSideEffectState,
+) -> Result<(Vec<DumpTableManifest>, u64, u64), DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let table_total = tables.len();
     let mut conn = match LiveAdapter::connect(&ctx.endpoint)? {
         LiveAdapter::MySql(conn) => conn,
         LiveAdapter::PostgreSql(_) => {
-            return Err("global mysql dump requires mysql endpoint".to_string())
+            return Err("global mysql dump requires mysql endpoint"
+                .to_string()
+                .into())
         }
     };
     let profiles = load_dump_perf_profiles();
@@ -864,6 +1041,8 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
     for (index, table) in tables.iter().enumerate() {
         let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
         let table_dir = ctx.output_path.join(&table_path);
+        side_effect.ensure_active()?;
+        side_effect.mark_started();
         fs::create_dir_all(&table_dir)
             .map_err(|err| format!("failed to create dump table dir: {err}"))?;
         let table_row_count = conn
@@ -873,8 +1052,12 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
         let mut chunks_total = 0_u64;
         let avg_row_bytes = mysql_table_avg_row_length(&mut conn, &ctx.endpoint, &table.name);
         if let Some(pk_column) = single_numeric_primary_key(table) {
-            let profile_key =
-                dump_profile_key(&ctx.endpoint, &table.name, &ctx.data_format, &ctx.compression);
+            let profile_key = dump_profile_key(
+                &ctx.endpoint,
+                &table.name,
+                &ctx.data_format,
+                &ctx.compression,
+            );
             let range_chunk_size = learned_mysql_range_chunk_size(
                 ctx.chunk_size,
                 avg_row_bytes,
@@ -893,7 +1076,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                     let ranges = pk_ranges(min_key, max_key, table_row_count, range_chunk_size);
                     chunks_total = ranges.len() as u64;
                     ranges_by_table.insert(table.name.clone(), ranges);
-                    emit(json!({
+                    emit_dump_event(
+                        &mut emit,
+                        json!({
                         "event": "table_progress",
                         "request_id": ctx.request_id,
                         "table": table.name,
@@ -904,7 +1089,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                         "range_chunk_size": range_chunk_size,
                         "target_bytes_per_chunk": MYSQL_DUMP_TARGET_BYTES_PER_CHUNK,
                         "avg_row_bytes": avg_row_bytes
-                    }));
+                        }),
+                        side_effect,
+                    )?;
                 }
             }
         }
@@ -970,11 +1157,19 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
         pending,
         max_threads,
         &receiver,
-        |work| spawn_dump_global_worker(ctx.clone(), work, table_total, sender.clone()),
+        |work| {
+            spawn_dump_global_worker(
+                ctx.clone(),
+                work,
+                table_total,
+                sender.clone(),
+                side_effect.clone(),
+            )
+        },
         |event| match event {
             DumpGlobalEvent::Progress(event) => {
-                emit(event);
-                PoolAction::KeepGoing
+                emit_dump_event(&mut emit, event, side_effect)?;
+                Ok(PoolAction::KeepGoing)
             }
             DumpGlobalEvent::RangeDone {
                 table_index,
@@ -994,7 +1189,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                     dump_chunk_name(chunk_index, &ctx.data_format, &ctx.compression),
                     checksum,
                 );
-                emit(json!({
+                emit_dump_event(
+                    &mut emit,
+                    json!({
                     "event": "row_progress",
                     "request_id": ctx.request_id,
                     "table": table.name,
@@ -1008,7 +1205,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                     "range_start": range_start,
                     "range_end": range_end,
                     "strategy": "global_pk_range_parallel"
-                }));
+                    }),
+                    side_effect,
+                )?;
                 if state.chunks_done == state.chunks_total {
                     state.manifest = Some(DumpTableManifest {
                         name: table.name.clone(),
@@ -1017,7 +1216,9 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                         chunks: state.chunks_done,
                         chunk_sha256: state.chunk_sha256.clone(),
                     });
-                    emit(json!({
+                    emit_dump_event(
+                        &mut emit,
+                        json!({
                         "event": "table_progress",
                         "request_id": ctx.request_id,
                         "table": table.name,
@@ -1025,9 +1226,11 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                         "current": table_index + 1,
                         "total": table_total,
                         "strategy": "global_pk_range_parallel"
-                    }));
+                        }),
+                        side_effect,
+                    )?;
                 }
-                PoolAction::Advance
+                Ok(PoolAction::Advance)
             }
             DumpGlobalEvent::TableDone {
                 index,
@@ -1042,17 +1245,17 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 state.chunks_total = chunks;
                 state.work_ms = duration_ms.max(1);
                 state.manifest = Some(manifest);
-                PoolAction::Advance
+                Ok(PoolAction::Advance)
             }
             // 글로벌 경로 에러는 리필하지 않고 슬롯만 반환한다(기존 동작 보존).
             DumpGlobalEvent::Error(err) => {
                 first_error.get_or_insert(err);
-                PoolAction::AdvanceNoRefill
+                Ok(PoolAction::AdvanceNoRefill)
             }
         },
-    );
+    )?;
     if let Some(err) = first_error {
-        return Err(err);
+        return Err(err.into());
     }
 
     let mut profiles = profiles;
@@ -1062,7 +1265,12 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
             let duration_ms = state.work_ms.max(1);
             let rows_per_second = state.rows_dumped.saturating_mul(1000) / duration_ms;
             profiles.insert(
-                dump_profile_key(&ctx.endpoint, &table.name, &ctx.data_format, &ctx.compression),
+                dump_profile_key(
+                    &ctx.endpoint,
+                    &table.name,
+                    &ctx.data_format,
+                    &ctx.compression,
+                ),
                 DumpTablePerfProfile {
                     avg_row_bytes: state.avg_row_bytes,
                     chunk_rows: if state.chunks_done > 0 {
@@ -1076,6 +1284,8 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
             );
         }
     }
+    side_effect.ensure_active()?;
+    side_effect.mark_started();
     save_dump_perf_profiles(&profiles);
 
     let manifests = states
@@ -1088,26 +1298,42 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
     Ok((manifests, total_rows, total_chunks))
 }
 
-fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
+fn dump_single_mysql_table_parallel<F, R>(
     ctx: &DumpJobContext,
     table: &NormalizedTable,
     threads: usize,
     mut emit: F,
-) -> Result<Option<(Vec<DumpTableManifest>, u64, u64)>, String> {
-    Ok(
-        dump_mysql_table_parallel_ranges(ctx, table, 0, 1, threads, |event| emit(event))?
-            .map(|(manifest, rows, chunks)| (vec![manifest], rows, chunks)),
-    )
+    side_effect: &DumpSideEffectState,
+) -> Result<Option<(Vec<DumpTableManifest>, u64, u64)>, DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    Ok(dump_mysql_table_parallel_ranges(
+        ctx,
+        table,
+        0,
+        1,
+        threads,
+        |event| emit_dump_event(&mut emit, event, side_effect),
+        side_effect,
+    )?
+    .map(|(manifest, rows, chunks)| (vec![manifest], rows, chunks)))
 }
 
-fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
+fn dump_mysql_table_parallel_ranges<F, R>(
     ctx: &DumpJobContext,
     table: &NormalizedTable,
     index: usize,
     table_total: usize,
     threads: usize,
     mut emit: F,
-) -> Result<Option<(DumpTableManifest, u64, u64)>, String> {
+    side_effect: &DumpSideEffectState,
+) -> Result<Option<(DumpTableManifest, u64, u64)>, DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let Some(pk_column) = single_numeric_primary_key(table) else {
         return Ok(None);
     };
@@ -1138,7 +1364,9 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
         return Ok(None);
     }
 
-    emit(json!({
+    emit_dump_event(
+        &mut emit,
+        json!({
         "event": "table_progress",
         "request_id": ctx.request_id,
         "table": table.name,
@@ -1149,10 +1377,14 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
         "range_chunk_size": range_chunk_size,
         "target_bytes_per_chunk": MYSQL_DUMP_TARGET_BYTES_PER_CHUNK,
         "avg_row_bytes": avg_row_bytes
-    }));
+        }),
+        side_effect,
+    )?;
 
     let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
     let table_dir = ctx.output_path.join(&table_path);
+    side_effect.ensure_active()?;
+    side_effect.mark_started();
     fs::create_dir_all(&table_dir)
         .map_err(|err| format!("failed to create dump table dir: {err}"))?;
     let ranges = pk_ranges(min_key, max_key, table_row_count, range_chunk_size);
@@ -1182,6 +1414,7 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                 ctx.data_format.clone(),
                 ctx.compression.clone(),
                 sender.clone(),
+                side_effect.clone(),
             )
         },
         |event| match event {
@@ -1199,7 +1432,9 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                     dump_chunk_name(chunk_index, &ctx.data_format, &ctx.compression),
                     checksum,
                 );
-                emit(json!({
+                emit_dump_event(
+                    &mut emit,
+                    json!({
                     "event": "row_progress",
                     "request_id": ctx.request_id,
                     "table": table.name,
@@ -1213,22 +1448,26 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
                     "range_start": range_start,
                     "range_end": range_end,
                     "strategy": "pk_range_parallel"
-                }));
-                PoolAction::Advance
+                    }),
+                    side_effect,
+                )?;
+                Ok(PoolAction::Advance)
             }
             // range 워커 에러는 리필하지 않는다(기존 동작 보존). chunks_done는 계속 카운트.
             DumpRangeEvent::Error(err) => {
                 first_error.get_or_insert(err);
                 chunks_done += 1;
-                PoolAction::AdvanceNoRefill
+                Ok(PoolAction::AdvanceNoRefill)
             }
         },
-    );
+    )?;
     if let Some(err) = first_error {
-        return Err(err);
+        return Err(err.into());
     }
 
-    emit(json!({
+    emit_dump_event(
+        &mut emit,
+        json!({
         "event": "table_progress",
         "request_id": ctx.request_id,
         "table": table.name,
@@ -1236,7 +1475,9 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
         "current": index + 1,
         "total": table_total,
         "strategy": "pk_range_parallel"
-    }));
+        }),
+        side_effect,
+    )?;
 
     Ok(Some((
         DumpTableManifest {
@@ -1261,6 +1502,7 @@ fn spawn_mysql_range_worker(
     data_format: String,
     compression: String,
     sender: mpsc::Sender<DumpRangeEvent>,
+    side_effect: DumpSideEffectState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = dump_mysql_range_chunk(
@@ -1272,6 +1514,7 @@ fn spawn_mysql_range_worker(
             &range,
             &data_format,
             &compression,
+            &side_effect,
         );
         match result {
             Ok((rows, stream_ms, checksum)) => {
@@ -1296,6 +1539,7 @@ fn spawn_dump_global_worker(
     work: DumpGlobalWorkItem,
     table_total: usize,
     sender: mpsc::Sender<DumpGlobalEvent>,
+    side_effect: DumpSideEffectState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || match work.kind {
         DumpGlobalWorkKind::MysqlRange {
@@ -1312,6 +1556,7 @@ fn spawn_dump_global_worker(
                 &range,
                 &ctx.data_format,
                 &ctx.compression,
+                &side_effect,
             );
             match result {
                 Ok((rows, stream_ms, checksum)) => {
@@ -1343,6 +1588,7 @@ fn spawn_dump_global_worker(
                     |event| {
                         let _ = sender.send(DumpGlobalEvent::Progress(event));
                     },
+                    &side_effect,
                 )
                 .map(|(manifest, rows, chunks)| {
                     (
@@ -1364,7 +1610,7 @@ fn spawn_dump_global_worker(
                     });
                 }
                 Err(err) => {
-                    let _ = sender.send(DumpGlobalEvent::Error(err));
+                    let _ = sender.send(DumpGlobalEvent::Error(err.message()));
                 }
             }
         }
@@ -1380,6 +1626,7 @@ fn dump_mysql_range_chunk(
     range: &DumpRange,
     data_format: &str,
     compression: &str,
+    side_effect: &DumpSideEffectState,
 ) -> Result<(u64, u64, String), String> {
     let mut conn = match LiveAdapter::connect(endpoint)? {
         LiveAdapter::MySql(conn) => conn,
@@ -1400,6 +1647,8 @@ fn dump_mysql_range_chunk(
         .map_err(|err| format!("mysql range select chunk error: {err}"))?;
     let mut rows = 0_u64;
     {
+        side_effect.ensure_active()?;
+        side_effect.mark_started();
         let mut file = open_dump_writer(&chunk_path, compression)?;
         for row in result {
             let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
@@ -1423,6 +1672,7 @@ fn spawn_dump_table_worker(
     table_total: usize,
     range_threads: usize,
     sender: mpsc::Sender<DumpTableEvent>,
+    side_effect: DumpSideEffectState,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
@@ -1436,6 +1686,7 @@ fn spawn_dump_table_worker(
                     |event| {
                         let _ = sender.send(DumpTableEvent::Progress(event));
                     },
+                    &side_effect,
                 )? {
                     return Ok(result);
                 }
@@ -1450,6 +1701,7 @@ fn spawn_dump_table_worker(
                 |event| {
                     let _ = sender.send(DumpTableEvent::Progress(event));
                 },
+                &side_effect,
             )
         })();
         match result {
@@ -1462,7 +1714,7 @@ fn spawn_dump_table_worker(
                 });
             }
             Err(err) => {
-                let _ = sender.send(DumpTableEvent::Error(err));
+                let _ = sender.send(DumpTableEvent::Error(err.message()));
             }
         }
     })
@@ -1483,30 +1735,41 @@ struct ChunkOutcome {
 /// 클로저는 (다음 청크 번호, 지금까지 누적 rows, table_dir, emit)을 받아 한 청크를
 /// 파일로 기록하고 `ChunkOutcome`을 반환하거나, 더 이상 쓸 데이터가 없으면 `None`을
 /// 반환한다. row_progress 이벤트는 청크 필드가 엔진마다 달라 클로저가 직접 emit한다.
-fn run_table_dump_loop<F: FnMut(Value)>(
+fn run_table_dump_loop<F, R>(
     table: &NormalizedTable,
     index: usize,
     table_total: usize,
     output_path: &Path,
     request_id: Option<String>,
     mut emit: F,
+    side_effect: &DumpSideEffectState,
     mut fetch_next_chunk: impl FnMut(
         u64,
         u64,
         &Path,
-        &mut dyn FnMut(Value),
-    ) -> Result<Option<ChunkOutcome>, String>,
-) -> Result<(DumpTableManifest, u64, u64), String> {
-    emit(json!({
+        &mut dyn FnMut(Value) -> ProtocolEmitResult,
+    ) -> Result<Option<ChunkOutcome>, DumpStreamError>,
+) -> Result<(DumpTableManifest, u64, u64), DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    emit_dump_event(
+        &mut emit,
+        json!({
         "event": "table_progress",
         "request_id": request_id,
         "table": table.name,
         "status": "dumping",
         "current": index + 1,
         "total": table_total
-    }));
+        }),
+        side_effect,
+    )?;
     let table_path = format!("{:04}_{}", index + 1, safe_dump_component(&table.name));
     let table_dir = output_path.join(&table_path);
+    side_effect.ensure_active()?;
+    side_effect.mark_started();
     fs::create_dir_all(&table_dir)
         .map_err(|err| format!("failed to create dump table dir: {err}"))?;
 
@@ -1515,7 +1778,9 @@ fn run_table_dump_loop<F: FnMut(Value)>(
     let mut chunk_sha256 = BTreeMap::new();
 
     loop {
-        match fetch_next_chunk(chunks_dumped + 1, rows_dumped, &table_dir, &mut emit)? {
+        match fetch_next_chunk(chunks_dumped + 1, rows_dumped, &table_dir, &mut |event| {
+            emit_dump_event(&mut emit, event, side_effect)
+        })? {
             Some(outcome) => {
                 chunk_sha256.insert(outcome.chunk_name, outcome.checksum);
                 rows_dumped += outcome.rows;
@@ -1525,14 +1790,18 @@ fn run_table_dump_loop<F: FnMut(Value)>(
         }
     }
 
-    emit(json!({
+    emit_dump_event(
+        &mut emit,
+        json!({
         "event": "table_progress",
         "request_id": request_id,
         "table": table.name,
         "status": "completed",
         "current": index + 1,
         "total": table_total
-    }));
+        }),
+        side_effect,
+    )?;
 
     Ok((
         DumpTableManifest {
@@ -1547,16 +1816,21 @@ fn run_table_dump_loop<F: FnMut(Value)>(
     ))
 }
 
-fn dump_one_table<F: FnMut(Value)>(
+fn dump_one_table<F, R>(
     adapter: &mut LiveAdapter,
     ctx: &DumpJobContext,
     table: &NormalizedTable,
     index: usize,
     table_total: usize,
     emit: F,
-) -> Result<(DumpTableManifest, u64, u64), String> {
+    side_effect: &DumpSideEffectState,
+) -> Result<(DumpTableManifest, u64, u64), DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     if let LiveAdapter::MySql(conn) = adapter {
-        return dump_one_mysql_table(conn, ctx, table, index, table_total, emit);
+        return dump_one_mysql_table(conn, ctx, table, index, table_total, emit, side_effect);
     }
 
     let table_row_count = adapter.row_count(&table.name).unwrap_or(0) as u64;
@@ -1572,11 +1846,12 @@ fn dump_one_table<F: FnMut(Value)>(
         &ctx.output_path,
         ctx.request_id.clone(),
         emit,
+        side_effect,
         |chunk_number: u64,
          rows_dumped_before: u64,
          table_dir: &Path,
-         emit: &mut dyn FnMut(Value)|
-         -> Result<Option<ChunkOutcome>, String> {
+         emit: &mut dyn FnMut(Value) -> ProtocolEmitResult|
+         -> Result<Option<ChunkOutcome>, DumpStreamError> {
             let Some(read_limit) =
                 bounded_dump_chunk_limit(table_row_count, rows_dumped_before, ctx.chunk_size)
             else {
@@ -1594,6 +1869,8 @@ fn dump_one_table<F: FnMut(Value)>(
             }
             let chunk_name = dump_chunk_name(chunk_number, &ctx.data_format, &ctx.compression);
             let write_started = Instant::now();
+            side_effect.ensure_active()?;
+            side_effect.mark_started();
             let checksum = write_dump_rows(
                 &table_dir.join(&chunk_name),
                 table,
@@ -1619,7 +1896,7 @@ fn dump_one_table<F: FnMut(Value)>(
                 "chunk_rows": copied_now,
                 "read_ms": read_ms,
                 "write_ms": write_ms
-            }));
+            }))?;
             Ok(Some(ChunkOutcome {
                 rows: copied_now as u64,
                 chunk_name,
@@ -1629,14 +1906,19 @@ fn dump_one_table<F: FnMut(Value)>(
     )
 }
 
-fn dump_one_mysql_table<F: FnMut(Value)>(
+fn dump_one_mysql_table<F, R>(
     conn: &mut mysql::PooledConn,
     ctx: &DumpJobContext,
     table: &NormalizedTable,
     index: usize,
     table_total: usize,
     emit: F,
-) -> Result<(DumpTableManifest, u64, u64), String> {
+    side_effect: &DumpSideEffectState,
+) -> Result<(DumpTableManifest, u64, u64), DumpStreamError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let table_row_count = conn
         .query_first::<u64, _>(count_sql("mysql", &table.name))
         .map(|count| count.unwrap_or(0))
@@ -1660,11 +1942,12 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
         &ctx.output_path,
         ctx.request_id.clone(),
         emit,
+        side_effect,
         |chunk_number: u64,
          rows_dumped_before: u64,
          table_dir: &Path,
-         emit: &mut dyn FnMut(Value)|
-         -> Result<Option<ChunkOutcome>, String> {
+         emit: &mut dyn FnMut(Value) -> ProtocolEmitResult|
+         -> Result<Option<ChunkOutcome>, DumpStreamError> {
             let Some(read_limit) =
                 bounded_dump_chunk_limit(table_row_count, rows_dumped_before, effective_chunk_size)
             else {
@@ -1703,6 +1986,8 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
             let mut chunk_rows = 0_usize;
             let mut next_key: Option<String> = None;
             {
+                side_effect.ensure_active()?;
+                side_effect.mark_started();
                 let mut file = open_dump_writer(&chunk_path, &ctx.compression)?;
                 for row in result {
                     let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
@@ -1740,7 +2025,7 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
                 "total": table_row_count,
                 "chunk_rows": chunk_rows,
                 "stream_ms": stream_ms
-            }));
+            }))?;
             Ok(Some(ChunkOutcome {
                 rows: chunk_rows as u64,
                 chunk_name,
@@ -1750,21 +2035,14 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
     )
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
-    
     
     use std::collections::BTreeMap;
     use std::fs::{self};
     
     use std::path::Path;
-    
-    
-    
-    
     
     use crate::adapters::test_support::{empty_table, schema};
 
@@ -2087,5 +2365,38 @@ mod tests {
             bounded_dump_chunk_limit(120_000, 100_000, 50_000),
             Some(20_000)
         );
+    }
+
+    #[test]
+    fn dump_streaming_emit_failure_stops_before_followup_or_side_effect() {
+        let request = Request {
+            command: "dump.run".to_string(),
+            request_id: Some("dump-emit-failure".to_string()),
+            payload: json!({}),
+        };
+        let mut calls = 0;
+
+        let error = dump_run_streaming(&request, |_event| {
+            calls += 1;
+            Err(ProtocolEmitError::io("broken dump emitter"))
+        })
+        .expect_err("dump emitter failure must propagate");
+
+        assert_eq!(calls, 1);
+        assert!(!error.side_effect_started());
+    }
+
+    #[test]
+    fn dump_emit_failure_after_side_effect_is_marked_indeterminate() {
+        let side_effect = DumpSideEffectState::default();
+        side_effect.mark_started();
+        let error = emit_dump_event(
+            &mut |_event| Err(ProtocolEmitError::io("broken dump emitter")),
+            json!({"event": "result"}),
+            &side_effect,
+        )
+        .expect_err("post-side-effect failure must propagate");
+
+        assert!(error.side_effect_started());
     }
 }

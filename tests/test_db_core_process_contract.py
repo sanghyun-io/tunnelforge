@@ -15,6 +15,7 @@ from src.core.db_core_service import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
     DbCoreCallbackError,
+    DbCoreGenerationState,
     DbCoreOutcome,
     DbCoreRequestKind,
     DbCoreRequestResult,
@@ -27,13 +28,30 @@ from src.core.db_core_service import (
 
 class _Process:
     def __init__(self, lines):
-        self.stdin = _AsyncTextWriter()
-        self.stdout = _AsyncTextReader("\n".join(lines) + "\n")
+        self._lines = list(lines)
+        self.stdout = _AsyncQueueReader()
         self.stderr = _AsyncTextReader("")
         self.returncode = None
+        self.stdin = _AsyncTextWriter(self)
+
+    def respond(self, request):
+        if request["request_id"].startswith("py-hello-"):
+            if hasattr(self.stdout, "feed_line"):
+                self.stdout.feed_line(_task3_hello(request["request_id"]))
+            return
+        while self._lines:
+            payload = json.loads(self._lines.pop(0))
+            payload.setdefault("request_id", request["request_id"])
+            if payload.get("event") == "result":
+                payload.setdefault("command", request["command"])
+            self.stdout.feed_line(payload)
+            if payload.get("event") in ("result", "error"):
+                break
 
     def terminate(self):
         self.returncode = 0
+        if hasattr(self.stdout, "feed_eof"):
+            self.stdout.feed_eof()
 
     def kill(self):
         self.returncode = 0
@@ -43,15 +61,22 @@ class _Process:
 
 
 class _AsyncTextWriter:
-    def __init__(self):
+    def __init__(self, process=None):
         self._buffer = io.StringIO()
+        self._process = process
+        self.pending = None
 
     def write(self, data):
         if isinstance(data, bytes):
             data = data.decode("utf-8")
-        return self._buffer.write(data)
+        written = self._buffer.write(data)
+        if self._process is not None:
+            self.pending = json.loads(data)
+        return written
 
     async def drain(self):
+        if self._process is not None and self.pending is not None:
+            self._process.respond(self.pending)
         return None
 
     def getvalue(self):
@@ -219,18 +244,33 @@ def test_progress_callback_ack_precedes_unblocked_terminal_read():
     terminal_read_before_callback_finished = []
 
     class _RaceStdout:
-        def __init__(self):
+        def __init__(self, process):
+            self._process = process
             self._reads = 0
 
         async def readline(self):
             self._reads += 1
             if self._reads == 1:
-                return '{"event":"phase","phase":"inspect","message":"started"}\n'
+                request_id = self._process.stdin.pending["request_id"]
+                return json.dumps(_task3_hello(request_id)) + "\n"
+            request_id = self._process.stdin.pending["request_id"]
+            if self._reads == 2:
+                return json.dumps({
+                    "event": "phase",
+                    "request_id": request_id,
+                    "phase": "inspect",
+                    "message": "started",
+                }) + "\n"
             terminal_read_before_callback_finished.append(not callback_finished.is_set())
-            return '{"event":"result","command":"service.hello","success":true}\n'
+            return json.dumps({
+                "event": "result",
+                "request_id": request_id,
+                "command": "service.hello",
+                "success": True,
+            }) + "\n"
 
     process = _Process([])
-    process.stdout = _RaceStdout()
+    process.stdout = _RaceStdout(process)
     client = DbCoreServiceClient(
         executable="fake-core",
         process_factory=lambda *args, **kwargs: process,
@@ -255,18 +295,33 @@ def test_progress_callback_error_prevents_terminal_read():
     terminal_reads = []
 
     class _RaceStdout:
-        def __init__(self):
+        def __init__(self, process):
+            self._process = process
             self._reads = 0
 
         async def readline(self):
             self._reads += 1
             if self._reads == 1:
-                return '{"event":"phase","phase":"inspect","message":"started"}\n'
+                request_id = self._process.stdin.pending["request_id"]
+                return json.dumps(_task3_hello(request_id)) + "\n"
+            request_id = self._process.stdin.pending["request_id"]
+            if self._reads == 2:
+                return json.dumps({
+                    "event": "phase",
+                    "request_id": request_id,
+                    "phase": "inspect",
+                    "message": "started",
+                }) + "\n"
             terminal_reads.append(True)
-            return '{"event":"result","command":"service.hello","success":true}\n'
+            return json.dumps({
+                "event": "result",
+                "request_id": request_id,
+                "command": "service.hello",
+                "success": True,
+            }) + "\n"
 
     process = _Process([])
-    process.stdout = _RaceStdout()
+    process.stdout = _RaceStdout(process)
     client = DbCoreServiceClient(
         executable="fake-core",
         process_factory=lambda *args, **kwargs: process,
@@ -447,7 +502,15 @@ def test_shutdown_cancels_inflight_request_with_typed_bounded_error():
     shutdown_errors = []
 
     class _BlockingStdout:
+        def __init__(self, process):
+            self._process = process
+            self._reads = 0
+
         async def readline(self):
+            self._reads += 1
+            if self._reads == 1:
+                request_id = self._process.stdin.pending["request_id"]
+                return json.dumps(_task3_hello(request_id)) + "\n"
             read_entered.set()
             while not release_read.is_set():
                 await asyncio.sleep(0.005)
@@ -456,7 +519,7 @@ def test_shutdown_cancels_inflight_request_with_typed_bounded_error():
     class _CancelableProcess(_Process):
         def __init__(self):
             super().__init__([])
-            self.stdout = _BlockingStdout()
+            self.stdout = _BlockingStdout(self)
 
         def terminate(self):
             super().terminate()
@@ -562,7 +625,15 @@ def test_public_cancel_active_request_terminates_only_on_owner_thread():
     terminate_thread_ids = []
 
     class _BlockingStdout:
+        def __init__(self, process):
+            self._process = process
+            self._reads = 0
+
         async def readline(self):
+            self._reads += 1
+            if self._reads == 1:
+                request_id = self._process.stdin.pending["request_id"]
+                return json.dumps(_task3_hello(request_id)) + "\n"
             read_entered.set()
             while not release_read.is_set():
                 await asyncio.sleep(0.005)
@@ -571,7 +642,7 @@ def test_public_cancel_active_request_terminates_only_on_owner_thread():
     class _CancelableProcess(_Process):
         def __init__(self):
             super().__init__([])
-            self.stdout = _BlockingStdout()
+            self.stdout = _BlockingStdout(self)
 
         def terminate(self):
             terminate_thread_ids.append(threading.get_ident())
@@ -689,6 +760,9 @@ class _ControlledAsyncWriter:
     async def drain(self):
         request = self._pending
         request_id = request["request_id"]
+        if request_id.startswith("py-hello-"):
+            self._process.stdout.feed_line(_task3_hello(request_id))
+            return
         self._process.write_order.append(request_id)
         if len(self._process.write_order) == 1:
             self._process.first_write.set()
@@ -968,3 +1042,788 @@ def test_transport_uses_only_owner_asyncio_process_handles():
     assert "run_in_executor" not in source
     assert "subprocess.Popen" not in source
     assert "_stderr_thread" not in source
+
+
+def _task3_hello(request_id, **overrides):
+    event = {
+        "event": "result",
+        "request_id": request_id,
+        "command": "service.hello",
+        "success": True,
+        "service": "tunnelforge-core",
+        "protocol_version": 1,
+        "process_version": 1,
+        "process_capabilities": sorted(REQUIRED_PROCESS_CAPABILITIES),
+        "max_jsonl_frame_bytes": MAX_JSONL_FRAME_BYTES,
+        "capabilities": ["service.shutdown"],
+    }
+    event.update(overrides)
+    return event
+
+
+class FakeClock:
+    def __init__(self, now=100.0):
+        self.now = float(now)
+        self.calls = []
+
+    def monotonic(self):
+        self.calls.append((threading.get_ident(), self.now))
+        return self.now
+
+    def advance(self, seconds):
+        self.now += float(seconds)
+
+
+class _Task3QueueReader:
+    def __init__(self, process, name):
+        self.process = process
+        self.name = name
+        self.queue = asyncio.Queue()
+        self.error = None
+
+    async def readline(self):
+        self.process.handle_thread_ids.append(threading.get_ident())
+        if self.name == "stdout":
+            self.process.read_entered.set()
+        else:
+            self.process.stderr_entered.set()
+        if self.error is not None:
+            error = self.error
+            self.error = None
+            raise error
+        return await self.queue.get()
+
+    def feed_event(self, event):
+        self.queue.put_nowait(
+            (json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        )
+
+    def feed_raw(self, data):
+        self.queue.put_nowait(data)
+
+    def feed_eof(self):
+        self.queue.put_nowait(b"")
+
+    def fail(self, error):
+        self.error = error
+
+
+class _Task3Writer:
+    def __init__(self, process):
+        self.process = process
+        self.pending = None
+
+    def write(self, data):
+        self.process.handle_thread_ids.append(threading.get_ident())
+        if isinstance(data, str):
+            data = data.encode("utf-8")
+        self.process.frame_byte_lengths.append(len(data))
+        self.process.raw_writes.append(data)
+        self.pending = json.loads(data.decode("utf-8"))
+        if self.pending["command"] != "service.hello" and self.process.fail_write:
+            raise OSError("simulated transport write failure")
+        self.process.writes.append(self.pending)
+        if self.pending["command"] != "service.hello":
+            self.process.before_write.set()
+
+    async def drain(self):
+        self.process.handle_thread_ids.append(threading.get_ident())
+        request = self.pending
+        assert request is not None
+        self.process.drain_entered.set()
+        if request["command"] != "service.hello" and self.process.stall_drain:
+            await self.process.release_drain.wait()
+        self.process.respond(request)
+
+
+class _Task3Process:
+    def __init__(
+        self,
+        *,
+        hello_overrides=None,
+        responder=None,
+        stall_hello=False,
+        stall_drain=False,
+        stall_wait=False,
+        fail_write=False,
+    ):
+        self.returncode = None
+        self.hello_overrides = dict(hello_overrides or {})
+        self.responder = responder
+        self.stall_hello = stall_hello
+        self.stall_drain = stall_drain
+        self.stall_wait = stall_wait
+        self.fail_write = fail_write
+        self.release_drain = asyncio.Event()
+        self.stdout = _Task3QueueReader(self, "stdout")
+        self.stderr = _Task3QueueReader(self, "stderr")
+        self.stdin = _Task3Writer(self)
+        self.before_write = threading.Event()
+        self.drain_entered = threading.Event()
+        self.read_entered = threading.Event()
+        self.stderr_entered = threading.Event()
+        self.wait_entered = threading.Event()
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_calls = 0
+        self.writes = []
+        self.raw_writes = []
+        self.frame_byte_lengths = []
+        self.handle_thread_ids = []
+
+    def respond(self, request):
+        if request["command"] == "service.hello":
+            if not self.stall_hello:
+                self.stdout.feed_event(
+                    _task3_hello(request["request_id"], **self.hello_overrides)
+                )
+            return
+        if self.responder is not None:
+            self.responder(self, request)
+
+    def terminate(self):
+        self.handle_thread_ids.append(threading.get_ident())
+        self.terminate_calls += 1
+        self.returncode = 0
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+
+    def kill(self):
+        self.handle_thread_ids.append(threading.get_ident())
+        self.kill_calls += 1
+        self.returncode = -9
+        self.stdout.feed_eof()
+        self.stderr.feed_eof()
+
+    async def wait(self):
+        self.handle_thread_ids.append(threading.get_ident())
+        self.wait_calls += 1
+        self.wait_entered.set()
+        if self.stall_wait and self.returncode == 0:
+            await asyncio.Event().wait()
+        while self.returncode is None:
+            await asyncio.sleep(0.001)
+        return self.returncode
+
+
+class _Task3Factory:
+    def __init__(self, processes):
+        self.processes = list(processes)
+        self.calls = []
+        self.thread_ids = []
+
+    def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        self.thread_ids.append(threading.get_ident())
+        return self.processes.pop(0)
+
+
+class _Task3StalledSpawnFactory:
+    def __init__(self):
+        self.entered = threading.Event()
+        self.calls = []
+
+    async def __call__(self, *args, **kwargs):
+        self.calls.append((args, kwargs))
+        self.entered.set()
+        await asyncio.Event().wait()
+
+
+def _task3_result(process, request, **values):
+    process.stdout.feed_event({
+        "event": "result",
+        "request_id": request["request_id"],
+        "command": request["command"],
+        "success": True,
+        **values,
+    })
+
+
+def _task3_chunk_frames(event, *, text_chars=80_000, item_count=2_000):
+    request_id = event["request_id"]
+    command = event.get("command")
+    logical_event = event["event"]
+    frames = []
+    next_node_id = 0
+
+    def add_frame(node_id, parent_id, slot_index, sequence, final, value_kind, **payload):
+        frame = {
+            "event": "payload_chunk",
+            "request_id": request_id,
+            "command": command,
+            "logical_event": logical_event,
+            "node_id": node_id,
+            "parent_node_id": parent_id,
+            "slot_index": slot_index,
+            "sequence": sequence,
+            "final": final,
+            "value_kind": value_kind,
+            **payload,
+        }
+        encoded = (json.dumps(frame, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+        assert len(encoded) <= MAX_JSONL_FRAME_BYTES
+        frames.append(frame)
+
+    def visit(value, parent_id=None, slot_index=None):
+        nonlocal next_node_id
+        node_id = next_node_id
+        next_node_id += 1
+        if isinstance(value, dict):
+            items = []
+            for index, (key, child) in enumerate(value.items()):
+                key_id = visit(key, node_id, index)
+                value_id = visit(child, node_id, index)
+                items.append({"key_node_id": key_id, "value_node_id": value_id})
+            chunks = [items[index:index + item_count] for index in range(0, len(items), item_count)] or [[]]
+            for sequence, chunk in enumerate(chunks):
+                add_frame(
+                    node_id,
+                    parent_id,
+                    slot_index,
+                    sequence,
+                    sequence == len(chunks) - 1,
+                    "object",
+                    items=chunk,
+                )
+        elif isinstance(value, list):
+            child_ids = [visit(child, node_id, index) for index, child in enumerate(value)]
+            chunks = [child_ids[index:index + item_count] for index in range(0, len(child_ids), item_count)] or [[]]
+            for sequence, chunk in enumerate(chunks):
+                add_frame(
+                    node_id,
+                    parent_id,
+                    slot_index,
+                    sequence,
+                    sequence == len(chunks) - 1,
+                    "list",
+                    items=chunk,
+                )
+        elif isinstance(value, str):
+            chunks = [value[index:index + text_chars] for index in range(0, len(value), text_chars)] or [""]
+            for sequence, chunk in enumerate(chunks):
+                add_frame(
+                    node_id,
+                    parent_id,
+                    slot_index,
+                    sequence,
+                    sequence == len(chunks) - 1,
+                    "utf8_string",
+                    text=chunk,
+                )
+        else:
+            add_frame(
+                node_id,
+                parent_id,
+                slot_index,
+                0,
+                True,
+                "atomic",
+                items=[value],
+            )
+        return node_id
+
+    assert visit(event) == 0
+    return frames
+
+
+def test_spawn_hello_exact_capabilities_and_generation_state_correlation():
+    transitions = []
+    process = _Task3Process(responder=lambda proc, req: _task3_result(proc, req, value=7))
+    factory = _Task3Factory([process])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=factory,
+        phase_observer=lambda state, generation: transitions.append((state, generation)),
+    )
+
+    result = client.request_result(
+        "schema.list",
+        request_id="request-1",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        timeout_seconds=1.0,
+    )
+
+    assert result.payload["value"] == 7
+    assert result.process_generation == 1
+    assert client.process_generation == 1
+    assert client.generation_state is DbCoreGenerationState.ACTIVE
+    assert [request["command"] for request in process.writes] == ["service.hello", "schema.list"]
+    assert process.writes[1]["request_id"] == "request-1"
+    assert factory.calls[0][1]["limit"] == MAX_JSONL_FRAME_BYTES
+    assert transitions == [
+        (DbCoreGenerationState.CREATING, 1),
+        (DbCoreGenerationState.ACTIVE, 1),
+    ]
+    assert set(factory.thread_ids + process.handle_thread_ids) == {client.owner_thread.ident}
+
+
+@pytest.mark.parametrize(
+    "hello_overrides, expected_code",
+    [
+        ({"protocol_version": 2}, "db_core_capability_missing"),
+        ({"process_version": 2}, "db_core_capability_missing"),
+        ({"max_jsonl_frame_bytes": MAX_JSONL_FRAME_BYTES - 1}, "db_core_capability_missing"),
+        ({"process_capabilities": ["request.deadline"]}, "db_core_capability_missing"),
+        ({"process_capabilities": sorted(REQUIRED_PROCESS_CAPABILITIES) + ["extra"]}, "db_core_capability_missing"),
+        ({"process_capabilities": [*sorted(REQUIRED_PROCESS_CAPABILITIES)[:-1], 7]}, "db_core_capability_missing"),
+    ],
+)
+def test_hello_capability_negotiation_is_exact_and_reaps(hello_overrides, expected_code):
+    transitions = []
+    process = _Task3Process(hello_overrides=hello_overrides)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+        phase_observer=lambda state, generation: transitions.append((state, generation)),
+    )
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id="capability-request",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == expected_code
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert process.terminate_calls == 1
+    assert process.wait_calls >= 1
+    assert transitions == [
+        (DbCoreGenerationState.CREATING, 1),
+        (DbCoreGenerationState.POISONED, 1),
+        (DbCoreGenerationState.REAPING, 1),
+        (DbCoreGenerationState.CLOSED, 1),
+    ]
+
+
+@pytest.mark.parametrize("response_id", [None, "wrong-request"])
+def test_strict_response_id_mismatch_poison_reaps(response_id):
+    def respond(process, request):
+        process.stdout.feed_event({
+            "event": "result",
+            "request_id": response_id,
+            "command": request["command"],
+            "success": True,
+        })
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id="strict-request",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_request_id_mismatch"
+    assert raised.value.outcome is DbCoreOutcome.FAILED
+    assert process.terminate_calls == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_outbound_frame_over_limit_is_not_written_and_generation_stays_active():
+    process = _Task3Process(responder=lambda proc, req: _task3_result(proc, req))
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    client.request_result(
+        "schema.list",
+        request_id="activate-before-oversized-write",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        timeout_seconds=1.0,
+    )
+    writes_before_oversized_request = list(process.writes)
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "query.execute",
+            {"sql": "x" * MAX_JSONL_FRAME_BYTES},
+            request_id="oversized-write",
+            request_kind=DbCoreRequestKind.MUTATION,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_write_failed"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert process.writes == writes_before_oversized_request
+    assert process.terminate_calls == 0
+    assert client.generation_state is DbCoreGenerationState.ACTIVE
+
+
+def test_malicious_raw_over_limit_frame_poison_reaps():
+    def respond(process, request):
+        process.stdout.feed_raw(b"{" + (b"x" * MAX_JSONL_FRAME_BYTES) + b"}\n")
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id="oversized-read",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_protocol_mismatch"
+    assert raised.value.outcome is DbCoreOutcome.FAILED
+    assert process.terminate_calls == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_stream_reader_limit_error_poison_reaps():
+    def respond(process, _request):
+        process.stdout.fail(ValueError("Separator is found, but chunk is longer than limit"))
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id="stream-limit-read",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_protocol_mismatch"
+    assert raised.value.outcome is DbCoreOutcome.FAILED
+    assert process.terminate_calls == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_oversized_intermediate_utf8_scalar_reassembles_exactly():
+    value = "🙂한" * 180_000
+    logical = {
+        "event": "result",
+        "request_id": "utf8-scalar",
+        "command": "query.execute",
+        "success": True,
+        "value": value,
+    }
+
+    def respond(process, request):
+        for frame in _task3_chunk_frames(logical):
+            process.stdout.feed_event(frame)
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    callbacks = []
+
+    result = client.request_result(
+        "query.execute",
+        request_id="utf8-scalar",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        on_event=callbacks.append,
+        timeout_seconds=2.0,
+    )
+
+    assert result.payload == logical
+    assert result.payload["value"] == value
+    assert callbacks == [logical]
+
+
+def test_nested_large_key_and_multibyte_value_reassemble_exactly():
+    large_key = "키" * 400_000
+    multibyte_value = "값🙂" * 210_000
+    nested = {"outer": [{large_key: {"inner": multibyte_value}}]}
+    logical = {
+        "event": "result",
+        "request_id": "nested-utf8",
+        "command": "schema.inspect",
+        "success": True,
+        "schema": nested,
+    }
+
+    def respond(process, request):
+        for frame in _task3_chunk_frames(logical):
+            process.stdout.feed_event(frame)
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    result = client.request_result(
+        "schema.inspect",
+        request_id="nested-utf8",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        timeout_seconds=3.0,
+    )
+
+    assert result.payload == logical
+    assert result.payload["schema"] == nested
+
+
+@pytest.mark.parametrize(
+    "command,event_name,field",
+    [
+        ("query.execute", "result", "rows"),
+        ("dump.run", "row_progress", "detail"),
+        ("schema.inspect", "result", "schema"),
+        ("migration.plan", "result", "plan"),
+    ],
+)
+def test_near_limit_query_stream_schema_plan_frame_compatibility(command, event_name, field):
+    request_id = "near-limit"
+    event = {
+        "event": event_name,
+        "request_id": request_id,
+        "command": command,
+        field: "x" * (MAX_JSONL_FRAME_BYTES - 2_000),
+    }
+    if event_name == "result":
+        event["success"] = True
+
+    def respond(process, request):
+        process.stdout.feed_event(event)
+        if event_name != "result":
+            _task3_result(process, request, value="done")
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    callbacks = []
+
+    result = client.request_result(
+        command,
+        request_id=request_id,
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        on_event=callbacks.append,
+        timeout_seconds=2.0,
+    )
+
+    assert callbacks[0] == event
+    assert result.outcome is DbCoreOutcome.DEFINITE
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda frames: frames[:1] + [frames[0]] + frames[1:],
+        lambda frames: [dict(frames[0], sequence=1)] + frames[1:],
+        lambda frames: [dict(frames[0], value_kind="list")] + frames[1:],
+    ],
+)
+def test_malformed_node_chunk_poison_reaps(mutate):
+    logical = {
+        "event": "result",
+        "request_id": "malformed-chunk",
+        "command": "schema.inspect",
+        "success": True,
+        "value": "🙂" * 300_000,
+    }
+
+    def respond(process, request):
+        for frame in mutate(_task3_chunk_frames(logical)):
+            process.stdout.feed_event(frame)
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.inspect",
+            request_id="malformed-chunk",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=2.0,
+        )
+
+    assert raised.value.code == "db_core_protocol_mismatch"
+    assert process.terminate_calls == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_mutation_terminal_scalar_encode_failure_after_side_effect_is_indeterminate():
+    def fail_terminal_encode(process, request):
+        process.stdout.feed_eof()
+
+    process = _Task3Process(responder=fail_terminal_encode)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "dump.import",
+            request_id="terminal-scalar-encode-failure",
+            request_kind=DbCoreRequestKind.MUTATION,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+    assert [request["command"] for request in process.writes].count("dump.import") == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_emit_failure_produces_no_followup_frames():
+    def fail_after_progress(process, request):
+        process.stdout.feed_event({
+            "event": "phase",
+            "request_id": request["request_id"],
+            "phase": "mutation",
+            "message": "side effect started",
+        })
+        process.stdout.feed_eof()
+
+    process = _Task3Process(responder=fail_after_progress)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    callbacks = []
+
+    with pytest.raises(DbCoreServiceError):
+        client.request_result(
+            "dump.import",
+            request_id="no-followup",
+            request_kind=DbCoreRequestKind.MUTATION,
+            on_event=callbacks.append,
+            timeout_seconds=1.0,
+        )
+
+    assert [event["event"] for event in callbacks] == ["phase"]
+    assert [request["command"] for request in process.writes].count("dump.import") == 1
+
+
+def test_next_request_after_emit_failure_uses_fresh_generation():
+    def fail_after_side_effect(process, request):
+        process.stdout.feed_eof()
+
+    first = _Task3Process(responder=fail_after_side_effect)
+    second = _Task3Process(responder=lambda proc, req: _task3_result(proc, req, value="fresh"))
+    factory = _Task3Factory([first, second])
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "dump.import",
+            request_id="mutation-emit-failure",
+            request_kind=DbCoreRequestKind.MUTATION,
+            timeout_seconds=1.0,
+        )
+
+    recovered = client.request_result(
+        "schema.list",
+        request_id="fresh-read",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        timeout_seconds=1.0,
+    )
+
+    assert raised.value.code == "db_core_process_died"
+    assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+    assert [request["command"] for request in first.writes].count("dump.import") == 1
+    assert first.terminate_calls <= 1
+    assert first.wait_calls >= 1
+    assert recovered.process_generation == 2
+    assert recovered.payload["value"] == "fresh"
+    assert client.generation_state is DbCoreGenerationState.ACTIVE
+
+
+def test_stale_required_generation_is_rejected_before_fresh_process_spawn():
+    def mismatch_response(process, request):
+        process.stdout.feed_event({
+            "event": "result",
+            "request_id": "wrong-request",
+            "command": request["command"],
+            "success": True,
+        })
+
+    first = _Task3Process(responder=mismatch_response)
+    second = _Task3Process(responder=lambda proc, req: _task3_result(proc, req))
+    factory = _Task3Factory([first, second])
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+
+    with pytest.raises(DbCoreServiceError):
+        client.request_result(
+            "schema.list",
+            request_id="poison-generation-one",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=1.0,
+        )
+
+    assert client.process_generation == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "query.execute",
+            {"sql": "select 1"},
+            request_id="stale-generation-one",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            required_generation=1,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_stale_connection"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert len(factory.calls) == 1
+    assert second.writes == []
+    assert client.process_generation == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_spawn_stall_consumes_same_absolute_deadline_and_closes_generation():
+    factory = _Task3StalledSpawnFactory()
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+
+    started = time.monotonic()
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id="stall-spawn",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=0.15,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.4
+    assert raised.value.code == "db_core_timeout"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert factory.entered.is_set()
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_write_failure_poison_reaps_without_retry():
+    process = _Task3Process(fail_write=True)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "dump.import",
+            request_id="failed-write",
+            request_kind=DbCoreRequestKind.MUTATION,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_write_failed"
+    assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+    assert len([frame for frame in process.raw_writes if b'"command":"dump.import"' in frame]) == 1
+    assert process.terminate_calls == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+@pytest.mark.parametrize("stall", ["hello", "drain", "read", "cleanup"])
+def test_one_absolute_deadline_bounds_hello_write_drain_read_cleanup(stall):
+    process = _Task3Process(
+        stall_hello=stall == "hello",
+        stall_drain=stall == "drain",
+        stall_wait=stall == "cleanup",
+        responder=(
+            None
+            if stall in ("read", "cleanup")
+            else lambda proc, req: _task3_result(proc, req)
+        ),
+    )
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    started = time.monotonic()
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id=f"stall-{stall}",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=0.15,
+        )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.4
+    assert raised.value.code == "db_core_timeout"
+    assert raised.value.outcome in (DbCoreOutcome.NOT_STARTED, DbCoreOutcome.FAILED)
+    assert process.terminate_calls == 1
+    assert process.wait_calls >= 1
+    assert process.kill_calls == (1 if stall == "cleanup" else 0)
+    assert client.generation_state is DbCoreGenerationState.CLOSED

@@ -464,8 +464,17 @@ fn required_endpoint(payload: &Value, key: &str) -> Result<Endpoint, String> {
     }
 }
 
-pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
-    emit(phase_event(request, "migrate", "migration started"));
+pub(crate) fn migrate_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    let mut side_effect_started = false;
+    emit_event(
+        &mut emit,
+        phase_event(request, "migrate", "migration started"),
+        side_effect_started,
+    )?;
     if request.payload.get("source").is_some() && request.payload.get("target").is_some() {
         let schema = dependency_ordered_schema(
             &parse_schema(&request.payload["schema"]).unwrap_or_default(),
@@ -478,15 +487,23 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
         let source_endpoint = match required_endpoint(&request.payload, "source") {
             Ok(endpoint) => endpoint,
             Err(err) => {
-                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
-                return;
+                emit_event(
+                    &mut emit,
+                    json!({"event": "error", "request_id": request.request_id, "message": err}),
+                    side_effect_started,
+                )?;
+                return Ok(());
             }
         };
         let target_endpoint = match required_endpoint(&request.payload, "target") {
             Ok(endpoint) => endpoint,
             Err(err) => {
-                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
-                return;
+                emit_event(
+                    &mut emit,
+                    json!({"event": "error", "request_id": request.request_id, "message": err}),
+                    side_effect_started,
+                )?;
+                return Ok(());
             }
         };
 
@@ -495,11 +512,16 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             LiveAdapter::connect(&target_endpoint),
         ) {
             (Ok(mut source), Ok(mut target)) => {
+                if target_endpoint.engine == "postgresql" {
+                    side_effect_started = true;
+                }
                 if let Err(err) = prepare_target_schema(&mut target, &target_endpoint) {
-                    emit(
+                    emit_event(
+                        &mut emit,
                         json!({"event": "error", "request_id": request.request_id, "message": err}),
-                    );
-                    return;
+                        side_effect_started,
+                    )?;
+                    return Ok(());
                 }
                 if options.cleanup_before_migrate {
                     if let Err(err) = cleanup_target_tables(
@@ -508,11 +530,19 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
                         &target_endpoint.engine,
                         &mut emit,
                         request,
+                        &mut side_effect_started,
                     ) {
-                        emit(
-                            json!({"event": "error", "request_id": request.request_id, "message": err}),
-                        );
-                        return;
+                        match err {
+                            CleanupControlError::Emit(err) => return Err(err),
+                            CleanupControlError::Domain(err) => {
+                                emit_event(
+                                    &mut emit,
+                                    json!({"event": "error", "request_id": request.request_id, "message": err}),
+                                    side_effect_started,
+                                )?;
+                                return Ok(());
+                            }
+                        }
                     }
                 }
                 let mut checkpoint =
@@ -526,8 +556,11 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
                     &source_endpoint.engine,
                     &target_endpoint.engine,
                     &mut checkpoint,
-                );
-                emit(json!({
+                    &mut side_effect_started,
+                )?;
+                emit_event(
+                    &mut emit,
+                    json!({
                     "event": "result",
                     "request_id": request.request_id,
                     "command": "migrate",
@@ -537,22 +570,32 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
                     "chunks_copied": result.chunks_copied,
                     "state": result.state,
                     "issues": result.issues
-                }));
+                    }),
+                    side_effect_started,
+                )?;
             }
             (Err(err), _) | (_, Err(err)) => {
-                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
+                emit_event(
+                    &mut emit,
+                    json!({"event": "error", "request_id": request.request_id, "message": err}),
+                    side_effect_started,
+                )?;
             }
         }
-        return;
+        return Ok(());
     }
 
     if request.payload.get("source_data").is_none() {
-        emit(json!({
+        emit_event(
+            &mut emit,
+            json!({
             "event": "error",
             "request_id": request.request_id,
             "message": "live data streaming is not implemented in this helper build"
-        }));
-        return;
+            }),
+            side_effect_started,
+        )?;
+        return Ok(());
     }
 
     let schema =
@@ -575,18 +618,25 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
         "",
         "",
         &mut checkpoint,
-    );
+        &mut side_effect_started,
+    )?;
 
     for table in &schema.tables {
-        emit(json!({
+        emit_event(
+            &mut emit,
+            json!({
             "event": "table_progress",
             "request_id": request.request_id,
             "table": table.name,
             "status": if result.state.tables.iter().any(|state| state.table == table.name && state.completed) { "completed" } else { "pending" }
-        }));
+            }),
+            side_effect_started,
+        )?;
     }
 
-    emit(json!({
+    emit_event(
+        &mut emit,
+        json!({
         "event": "result",
         "request_id": request.request_id,
         "command": "migrate",
@@ -597,7 +647,24 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
         "state": result.state,
         "issues": result.issues,
         "target_data": target.rows
-    }));
+        }),
+        side_effect_started,
+    )?;
+    Ok(())
+}
+
+fn emit_event<F, R>(emit: &mut F, event: Value, side_effect_started: bool) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    emit(event).into_protocol_emit_result().map_err(|err| {
+        if side_effect_started {
+            err.after_side_effect()
+        } else {
+            err
+        }
+    })
 }
 
 fn add_request_id(mut event: Value, request_id: &Option<String>) -> Value {
@@ -649,7 +716,8 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
                     &mut target,
                     options.chunk_size,
                     &mut emit,
-                );
+                )
+                .expect("infallible verify reporter cannot fail");
                 events.push(json!({
                     "event": "result",
                     "request_id": request.request_id,
@@ -674,7 +742,8 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
         let mut target = MemoryAdapter::from_value(request.payload.get("target_data"));
         let mut emit = |event: Value| events.push(add_request_id(event, &request.request_id));
         let mismatches =
-            verify_with_adapters_reporting(&schema, &mut source, &mut target, 1000, &mut emit);
+            verify_with_adapters_reporting(&schema, &mut source, &mut target, 1000, &mut emit)
+                .expect("infallible verify reporter cannot fail");
         events.push(json!({
             "event": "result",
             "request_id": request.request_id,
@@ -732,12 +801,17 @@ pub(crate) fn resume(request: &Request) -> Vec<Value> {
     ]
 }
 
-pub(crate) fn cleanup_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
-    emit(phase_event(
-        request,
-        "cleanup",
-        "failed migration cleanup started",
-    ));
+pub(crate) fn cleanup_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    let mut side_effect_started = false;
+    emit_event(
+        &mut emit,
+        phase_event(request, "cleanup", "failed migration cleanup started"),
+        side_effect_started,
+    )?;
     let schema =
         dependency_ordered_schema(&parse_schema(&request.payload["schema"]).unwrap_or_default());
     let target_engine = read_engine(&request.payload, "target_engine");
@@ -753,15 +827,23 @@ pub(crate) fn cleanup_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             Ok(Some(endpoint)) => endpoint,
             Ok(None) => unreachable!(),
             Err(err) => {
-                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
-                return;
+                emit_event(
+                    &mut emit,
+                    json!({"event": "error", "request_id": request.request_id, "message": err}),
+                    side_effect_started,
+                )?;
+                return Ok(());
             }
         };
         let mut target = match LiveAdapter::connect(&target_endpoint) {
             Ok(target) => target,
             Err(err) => {
-                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
-                return;
+                emit_event(
+                    &mut emit,
+                    json!({"event": "error", "request_id": request.request_id, "message": err}),
+                    side_effect_started,
+                )?;
+                return Ok(());
             }
         };
         match cleanup_target_tables(
@@ -770,50 +852,84 @@ pub(crate) fn cleanup_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
             &target_endpoint.engine,
             &mut emit,
             request,
+            &mut side_effect_started,
         ) {
             Ok(tables) => dropped_tables.extend(tables),
-            Err(err) => {
-                emit(json!({"event": "error", "request_id": request.request_id, "message": err}));
-                return;
-            }
+            Err(err) => match err {
+                CleanupControlError::Emit(err) => return Err(err),
+                CleanupControlError::Domain(err) => {
+                    emit_event(
+                        &mut emit,
+                        json!({"event": "error", "request_id": request.request_id, "message": err}),
+                        side_effect_started,
+                    )?;
+                    return Ok(());
+                }
+            },
         }
     } else {
         dropped_tables.extend(schema.tables.iter().rev().map(|table| table.name.clone()));
     }
 
-    emit(phase_event(
-        request,
-        "cleanup",
-        "failed migration cleanup completed",
-    ));
-    emit(json!({
+    emit_event(
+        &mut emit,
+        phase_event(request, "cleanup", "failed migration cleanup completed"),
+        side_effect_started,
+    )?;
+    emit_event(
+        &mut emit,
+        json!({
         "event": "result",
         "request_id": request.request_id,
         "command": "cleanup",
         "success": true,
         "target_engine": target_engine,
         "dropped_tables": dropped_tables
-    }));
+        }),
+        side_effect_started,
+    )?;
+    Ok(())
 }
 
-fn cleanup_target_tables<F: FnMut(Value)>(
+enum CleanupControlError {
+    Emit(ProtocolEmitError),
+    Domain(String),
+}
+
+fn cleanup_target_tables<F, R>(
     schema: &NormalizedSchema,
     target: &mut LiveAdapter,
     target_engine: &str,
     emit: &mut F,
     request: &Request,
-) -> Result<Vec<String>, String> {
+    side_effect_started: &mut bool,
+) -> Result<Vec<String>, CleanupControlError>
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let mut dropped_tables = Vec::new();
     for table in schema.tables.iter().rev() {
-        emit(json!({
+        emit_event(
+            emit,
+            json!({
             "event": "table_progress",
             "request_id": request.request_id,
             "table": table.name,
             "status": "dropping"
-        }));
+            }),
+            *side_effect_started,
+        )
+        .map_err(CleanupControlError::Emit)?;
+        *side_effect_started = true;
         target
             .execute_sql(&drop_table_sql(target_engine, &table.name))
-            .map_err(|err| format!("cleanup drop table {} failed: {err}", table.name))?;
+            .map_err(|err| {
+                CleanupControlError::Domain(format!(
+                    "cleanup drop table {} failed: {err}",
+                    table.name
+                ))
+            })?;
         dropped_tables.push(table.name.clone());
     }
     Ok(dropped_tables)
@@ -1007,6 +1123,7 @@ pub fn migrate_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
     source_engine: &str,
     target_engine: &str,
 ) -> MigrationResult {
+    let mut side_effect_started = false;
     migrate_with_adapters_reporting(
         schema,
         options,
@@ -1016,10 +1133,12 @@ pub fn migrate_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
         source_engine,
         target_engine,
         &mut |_| {},
+        &mut side_effect_started,
     )
+    .expect("infallible migration reporter cannot fail")
 }
 
-fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+fn migrate_with_adapters_reporting<S, T, F, R>(
     schema: &NormalizedSchema,
     options: &MigrationOptions,
     resume_state: Option<&ResumeState>,
@@ -1028,16 +1147,23 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
     source_engine: &str,
     target_engine: &str,
     on_event: &mut F,
-) -> MigrationResult {
+    side_effect_started: &mut bool,
+) -> Result<MigrationResult, ProtocolEmitError>
+where
+    S: MigrationAdapter,
+    T: MigrationAdapter,
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let blocking_issues = create_only_issues_with_adapter(schema, options, target);
     if !blocking_issues.is_empty() {
-        return MigrationResult {
+        return Ok(MigrationResult {
             success: false,
             rows_copied: 0,
             chunks_copied: 0,
             state: initial_state(schema),
             issues: blocking_issues,
-        };
+        });
     }
 
     let ordered_schema = dependency_ordered_schema(schema);
@@ -1058,7 +1184,13 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
                     .first()
                     .map(|table| table.name.as_str())
                     .unwrap_or("schema_ddl");
-                return migration_error_result(state, rows_copied, chunks_copied, location, err);
+                return Ok(migration_error_result(
+                    state,
+                    rows_copied,
+                    chunks_copied,
+                    location,
+                    err,
+                ));
             }
         }
     };
@@ -1088,45 +1220,56 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
             &mut rows_copied,
             &mut chunks_copied,
             on_event,
+            side_effect_started,
         ) {
             Ok(()) => {}
             Err(TableCopyControl::Error(err)) => {
-                return migration_error_result(
+                return Ok(migration_error_result(
                     state,
                     rows_copied,
                     chunks_copied,
                     &table.name,
                     err,
-                );
+                ));
             }
             Err(TableCopyControl::Cancelled) => {
-                return MigrationResult {
+                return Ok(MigrationResult {
                     success: false,
                     rows_copied,
                     chunks_copied,
                     state,
                     issues: Vec::new(),
-                };
+                });
             }
+            Err(TableCopyControl::Emit(err)) => return Err(err),
         }
     }
 
     state.current_phase = "completed".to_string();
+    if !target_engine.is_empty() {
+        *side_effect_started = true;
+    }
     if let Err(err) = apply_post_load_ddl(target, &ordered_schema, target_engine) {
         let location = ordered_schema
             .tables
             .first()
             .map(|table| table.name.as_str())
             .unwrap_or("post_data_ddl");
-        return migration_error_result(state, rows_copied, chunks_copied, location, err);
+        return Ok(migration_error_result(
+            state,
+            rows_copied,
+            chunks_copied,
+            location,
+            err,
+        ));
     }
-    MigrationResult {
+    Ok(MigrationResult {
         success: true,
         rows_copied,
         chunks_copied,
         state,
         issues: Vec::new(),
-    }
+    })
 }
 
 /// 한 테이블의 복사 흐름을 나타내는 내부 제어 신호. create/read/insert 오류(Error)나
@@ -1135,13 +1278,14 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
 enum TableCopyControl {
     Error(String),
     Cancelled,
+    Emit(ProtocolEmitError),
 }
 
 /// create_table 후 keyset/offset 페이지네이션으로 한 테이블의 행을 청크 단위로 복사하고
 /// state와 rows_copied/chunks_copied를 갱신하며 progress 이벤트를 emit한다. 정상 완료 시 Ok(()),
 /// 오류/취소 시 상위가 처리하도록 Err(TableCopyControl)을 반환한다.
 #[allow(clippy::too_many_arguments)]
-fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+fn copy_table_rows<S, T, F, R>(
     table: &NormalizedTable,
     table_ddl: &str,
     state: &mut ResumeState,
@@ -1153,7 +1297,15 @@ fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
     rows_copied: &mut u64,
     chunks_copied: &mut usize,
     on_event: &mut F,
-) -> Result<(), TableCopyControl> {
+    side_effect_started: &mut bool,
+) -> Result<(), TableCopyControl>
+where
+    S: MigrationAdapter,
+    T: MigrationAdapter,
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    *side_effect_started = true;
     if let Err(err) = target.create_table(table, table_ddl) {
         return Err(TableCopyControl::Error(err));
     }
@@ -1182,12 +1334,17 @@ fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
         if rows.is_empty() {
             state.tables[state_index].completed = true;
             state.tables[state_index].last_key = None;
-            on_event(json!({
+            emit_event(
+                on_event,
+                json!({
                 "event": "table_progress",
                 "table": table.name,
                 "status": "completed",
                 "state": &state
-            }));
+                }),
+                *side_effect_started,
+            )
+            .map_err(TableCopyControl::Emit)?;
             break;
         }
 
@@ -1197,6 +1354,7 @@ fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
         } else {
             None
         };
+        *side_effect_started = true;
         if let Err(err) = target.insert_rows(table, rows) {
             return Err(TableCopyControl::Error(err));
         }
@@ -1211,13 +1369,18 @@ fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
         }
         *rows_copied += copied_now as u64;
         *chunks_copied += 1;
-        on_event(json!({
+        emit_event(
+            on_event,
+            json!({
             "event": "row_progress",
             "table": table.name,
             "rows": state.tables[state_index].rows_copied,
             "total": total_rows,
             "state": &state
-        }));
+            }),
+            *side_effect_started,
+        )
+        .map_err(TableCopyControl::Emit)?;
 
         if options
             .cancel_after_chunks
@@ -1326,23 +1489,34 @@ pub fn verify_with_adapters<S: MigrationAdapter, T: MigrationAdapter>(
 ) -> Vec<Value> {
     let mut emit = |_event: Value| {};
     verify_with_adapters_reporting(schema, source, target, chunk_size, &mut emit)
+        .expect("infallible verify reporter cannot fail")
 }
 
-fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+fn verify_with_adapters_reporting<S, T, F, R>(
     schema: &NormalizedSchema,
     source: &mut S,
     target: &mut T,
     chunk_size: usize,
     emit: &mut F,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ProtocolEmitError>
+where
+    S: MigrationAdapter,
+    T: MigrationAdapter,
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let mut mismatches = Vec::new();
     let chunk_size = chunk_size.max(1);
     for table in &schema.tables {
-        emit(json!({
+        emit_event(
+            emit,
+            json!({
             "event": "table_progress",
             "table": table.name,
             "status": "verifying"
-        }));
+            }),
+            false,
+        )?;
         let source_count = match source.row_count(&table.name) {
             Ok(count) => count,
             Err(err) => {
@@ -1368,12 +1542,16 @@ fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: F
             }
         };
         let total_rows = source_count.max(target_count);
-        emit(json!({
+        emit_event(
+            emit,
+            json!({
             "event": "row_progress",
             "table": table.name,
             "rows": 0,
             "total": total_rows
-        }));
+            }),
+            false,
+        )?;
         if source_count != target_count {
             mismatches.push(json!({
                 "table": table.name,
@@ -1385,7 +1563,7 @@ fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: F
 
         let key_columns = key_columns(table);
         let table_mismatches = if key_columns.is_empty() {
-            verify_table_by_digest(source, target, table, chunk_size, total_rows, emit)
+            verify_table_by_digest(source, target, table, chunk_size, total_rows, emit)?
         } else {
             verify_table_by_keyset(
                 source,
@@ -1395,24 +1573,30 @@ fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: F
                 chunk_size,
                 total_rows,
                 emit,
-            )
+            )?
         };
         mismatches.extend(table_mismatches);
     }
-    mismatches
+    Ok(mismatches)
 }
 
 /// key column이 없는 테이블을 digest 카운트 비교로 검증한다. source/target의 행 다이제스트
 /// 빈도를 비교해 불일치를 만들고, 완료 시 row_progress(total) + table_progress(completed)를 emit한다.
 /// 카운트 수집 오류가 나면 그 오류만 담아 반환하고 완료 이벤트는 emit하지 않는다.
-fn verify_table_by_digest<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+fn verify_table_by_digest<S, T, F, R>(
     source: &mut S,
     target: &mut T,
     table: &NormalizedTable,
     chunk_size: usize,
     total_rows: usize,
     emit: &mut F,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ProtocolEmitError>
+where
+    S: MigrationAdapter,
+    T: MigrationAdapter,
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let mut mismatches = Vec::new();
     let source_counts = match digest_counts_for_adapter(source, table, chunk_size) {
         Ok(counts) => counts,
@@ -1423,7 +1607,7 @@ fn verify_table_by_digest<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
                 "side": "source",
                 "message": err
             }));
-            return mismatches;
+            return Ok(mismatches);
         }
     };
     let target_counts = match digest_counts_for_adapter(target, table, chunk_size) {
@@ -1435,30 +1619,38 @@ fn verify_table_by_digest<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
                 "side": "target",
                 "message": err
             }));
-            return mismatches;
+            return Ok(mismatches);
         }
     };
     for mismatch in compare_digest_counts(&source_counts, &target_counts) {
         mismatches.push(with_table(&table.name, mismatch));
     }
-    emit(json!({
+    emit_event(
+        emit,
+        json!({
         "event": "row_progress",
         "table": table.name,
         "rows": total_rows,
         "total": total_rows
-    }));
-    emit(json!({
+        }),
+        false,
+    )?;
+    emit_event(
+        emit,
+        json!({
         "event": "table_progress",
         "table": table.name,
         "status": "completed"
-    }));
-    mismatches
+        }),
+        false,
+    )?;
+    Ok(mismatches)
 }
 
 /// key column이 있는 테이블을 keyset 페이지네이션으로 행 단위 비교한다. 청크마다 양측을
 /// 읽어 typed 비교하고 row_progress를 emit하며, 마지막에 table_progress(completed)를 emit한다.
 /// 읽기 오류가 나면 그 오류를 담고 루프를 종료한다(완료 이벤트는 그대로 emit).
-fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
+fn verify_table_by_keyset<S, T, F, R>(
     source: &mut S,
     target: &mut T,
     table: &NormalizedTable,
@@ -1466,7 +1658,13 @@ fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
     chunk_size: usize,
     total_rows: usize,
     emit: &mut F,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, ProtocolEmitError>
+where
+    S: MigrationAdapter,
+    T: MigrationAdapter,
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let mut mismatches = Vec::new();
     let mut verified_rows = 0usize;
     let mut last_key: Option<String> = None;
@@ -1515,12 +1713,16 @@ fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
             &target_rows,
         ));
         verified_rows += source_rows.len().max(target_rows.len());
-        emit(json!({
+        emit_event(
+            emit,
+            json!({
             "event": "row_progress",
             "table": table.name,
             "rows": verified_rows.min(total_rows),
             "total": total_rows
-        }));
+            }),
+            false,
+        )?;
         let next_key = source_rows
             .last()
             .or_else(|| target_rows.last())
@@ -1530,12 +1732,16 @@ fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
         }
         last_key = next_key;
     }
-    emit(json!({
+    emit_event(
+        emit,
+        json!({
         "event": "table_progress",
         "table": table.name,
         "status": "completed"
-    }));
-    mismatches
+        }),
+        false,
+    )?;
+    Ok(mismatches)
 }
 
 fn digest_counts_for_adapter<A: MigrationAdapter>(
@@ -1724,23 +1930,13 @@ pub fn compare_typed_digest_rows(
     compare_digest_rows(&source, &target)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     
-    
     use serde_json::{json, Value};
     
-    
-    
-    
-    
-    
-    
-    
-    
-    use crate::adapters::test_support::{TrackingAdapter, empty_table, fk, schema};
+    use crate::adapters::test_support::{empty_table, fk, schema, TrackingAdapter};
 
     #[test]
     fn migration_plan_alias_preserves_service_command_name() {
@@ -2487,5 +2683,36 @@ mod tests {
             "INSERT INTO \"users\" (\"id\", \"name\") VALUES ('1', 'alpha')"
         );
         assert_eq!(guides[0]["columns"][0]["target_type"], "INTEGER");
+    }
+
+    #[test]
+    fn migrate_streaming_emit_failure_stops_before_followup_or_side_effect() {
+        let request = Request {
+            command: "migrate".to_string(),
+            request_id: Some("migrate-emit-failure".to_string()),
+            payload: json!({}),
+        };
+        let mut calls = 0;
+
+        let error = migrate_streaming(&request, |_event| {
+            calls += 1;
+            Err(ProtocolEmitError::io("broken migrate emitter"))
+        })
+        .expect_err("migrate emitter failure must propagate");
+
+        assert_eq!(calls, 1);
+        assert!(!error.side_effect_started());
+    }
+
+    #[test]
+    fn migrate_emit_failure_after_side_effect_is_marked_indeterminate() {
+        let error = emit_event(
+            &mut |_event| Err(ProtocolEmitError::io("broken migrate emitter")),
+            json!({"event": "result"}),
+            true,
+        )
+        .expect_err("post-side-effect failure must propagate");
+
+        assert!(error.side_effect_started());
     }
 }

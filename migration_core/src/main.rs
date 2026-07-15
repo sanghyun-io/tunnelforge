@@ -1,8 +1,11 @@
-use migration_core::{handle_request_streaming, protocol_error_event, CoreService, Request};
+use migration_core::{
+    encode_protocol_frames, handle_request_streaming, protocol_error_event, CoreService,
+    IntoProtocolEmitResult, ProtocolEmitError, ProtocolEmitResult, Request,
+};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
 
-fn main() {
+fn main() -> ProtocolEmitResult {
     let stdin = io::stdin();
     let mut service = CoreService::new();
     let handled = process_jsonl_reader(stdin.lock(), &mut service, emit_one);
@@ -18,15 +21,21 @@ fn main() {
                 payload: json!({}),
             },
             emit_one,
-        );
+        )?;
     }
+    Ok(())
 }
 
-fn process_jsonl_reader<R: BufRead, F: FnMut(Value)>(
+fn process_jsonl_reader<R, F, O>(
     reader: R,
     service: &mut CoreService,
     mut emit: F,
-) -> bool {
+) -> bool
+where
+    R: BufRead,
+    F: FnMut(Value) -> O,
+    O: IntoProtocolEmitResult,
+{
     let mut handled = false;
 
     for line in reader.lines() {
@@ -39,25 +48,36 @@ fn process_jsonl_reader<R: BufRead, F: FnMut(Value)>(
                 match serde_json::from_str::<Request>(&line) {
                     Ok(request) => {
                         let should_shutdown = request.command == "service.shutdown";
-                        service.handle_request_streaming(request, &mut emit);
-                        if should_shutdown {
+                        if service
+                            .handle_request_streaming(request, &mut emit)
+                            .is_err()
+                            || should_shutdown
+                        {
                             break;
                         }
                     }
-                    Err(err) => emit(protocol_error_event(
-                        None,
-                        "invalid_request_json",
-                        format!("invalid request JSON: {err}"),
-                    )),
+                    Err(err) => {
+                        if emit(protocol_error_event(
+                            None,
+                            "invalid_request_json",
+                            format!("invalid request JSON: {err}"),
+                        ))
+                        .into_protocol_emit_result()
+                        .is_err()
+                        {
+                            break;
+                        }
+                    }
                 }
             }
             Err(err) => {
                 handled = true;
-                emit(protocol_error_event(
+                let _ = emit(protocol_error_event(
                     None,
                     "stdin_read_failed",
                     format!("stdin read failed: {err}"),
-                ));
+                ))
+                .into_protocol_emit_result();
                 break;
             }
         }
@@ -66,10 +86,16 @@ fn process_jsonl_reader<R: BufRead, F: FnMut(Value)>(
     handled
 }
 
-fn emit_one(event: Value) {
+fn emit_one(event: Value) -> ProtocolEmitResult {
     let mut stdout = io::stdout().lock();
-    let _ = writeln!(stdout, "{event}");
-    let _ = stdout.flush();
+    for frame in encode_protocol_frames(&event)? {
+        stdout
+            .write_all(&frame)
+            .map_err(|err| ProtocolEmitError::io(format!("stdout write failed: {err}")))?;
+    }
+    stdout
+        .flush()
+        .map_err(|err| ProtocolEmitError::io(format!("stdout flush failed: {err}")))
 }
 
 #[cfg(test)]
@@ -127,5 +153,21 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("unknown connection_id: missing"));
+    }
+
+    #[test]
+    fn frame_emit_failure_stops_the_request_loop() {
+        let mut service = CoreService::new();
+        let input = b"{\"command\":\"service.hello\",\"request_id\":\"first\",\"payload\":{}}\n\
+                      {\"command\":\"service.hello\",\"request_id\":\"second\",\"payload\":{}}\n";
+        let mut calls = 0;
+
+        let handled = process_jsonl_reader(&input[..], &mut service, |_event| {
+            calls += 1;
+            Err(ProtocolEmitError::io("simulated broken pipe"))
+        });
+
+        assert!(handled);
+        assert_eq!(calls, 1);
     }
 }

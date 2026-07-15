@@ -15,70 +15,92 @@ fn oneclick_apply_disabled_event(request: &Request) -> Value {
     })
 }
 
-pub(crate) fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
+pub(crate) fn preflight_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     emit(phase_event(
         request,
         "preflight",
         "preflight checks started",
-    ));
+    ))
+    .into_protocol_emit_result()?;
     let mut issues = preflight_issues(&request.payload);
     emit(phase_event(
         request,
         "preflight",
         "schema compatibility checks completed",
-    ));
-    emit(phase_event(request, "preflight", "checking target state"));
+    ))
+    .into_protocol_emit_result()?;
+    emit(phase_event(request, "preflight", "checking target state"))
+        .into_protocol_emit_result()?;
     issues.extend(live_preflight_issues(&request.payload));
     emit(phase_event(
         request,
         "preflight",
         "target state checks completed",
-    ));
+    ))
+    .into_protocol_emit_result()?;
 
     for issue in &issues {
         emit(json!({
             "event": "issue",
             "request_id": request.request_id,
             "issue": issue
-        }));
+        }))
+        .into_protocol_emit_result()?;
     }
 
-    emit(phase_event(request, "preflight", "preflight result ready"));
+    emit(phase_event(request, "preflight", "preflight result ready"))
+        .into_protocol_emit_result()?;
     emit(json!({
         "event": "result",
         "request_id": request.request_id,
         "command": "preflight",
         "success": !issues.iter().any(|issue| issue.blocking),
         "issues": issues
-    }));
+    }))
+    .into_protocol_emit_result()?;
+    Ok(())
 }
 
-pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
+pub(crate) fn oneclick_run_streaming<F, R>(
+    request: &Request,
+    mut emit: F,
+) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
     let dry_run = request
         .payload
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(true);
     if !dry_run {
-        emit(oneclick_apply_disabled_event(request));
-        return;
+        emit(oneclick_apply_disabled_event(request)).into_protocol_emit_result()?;
+        return Ok(());
     }
 
     emit(phase_event(
         request,
         "preflight",
         "one-click preflight started",
-    ));
-    emit(oneclick_progress_event(request, 5, "Pre-flight started"));
+    ))
+    .into_protocol_emit_result()?;
+    emit(oneclick_progress_event(request, 5, "Pre-flight started"))
+        .into_protocol_emit_result()?;
     let state = match oneclick_preflight_state(request) {
         Ok(state) => state,
         Err(err) => {
-            emit(error_event(request, err));
-            return;
+            emit(error_event(request, err)).into_protocol_emit_result()?;
+            return Ok(());
         }
     };
-    emit(oneclick_preflight_event(request, &state));
-    emit(oneclick_progress_event(request, 20, "Pre-flight completed"));
+    emit(oneclick_preflight_event(request, &state)).into_protocol_emit_result()?;
+    emit(oneclick_progress_event(request, 20, "Pre-flight completed"))
+        .into_protocol_emit_result()?;
     let mut run_issues = state.issues.clone();
     let payload_issue_offset = run_issues.len();
     run_issues.extend(oneclick_payload_issues(&request.payload));
@@ -90,28 +112,33 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
             &run_issues,
             &run_issues,
             vec!["Pre-flight blocked execution.".to_string()],
-        ));
-        return;
+        ))
+        .into_protocol_emit_result()?;
+        return Ok(());
     }
 
     emit(phase_event(
         request,
         "analysis",
         "one-click analysis started",
-    ));
+    ))
+    .into_protocol_emit_result()?;
     let analysis = oneclick_analysis_summary(&state.inspection, &run_issues);
     emit(json!({
         "event": "analysis",
         "request_id": request.request_id,
         "summary": analysis
-    }));
-    emit(oneclick_progress_event(request, 40, "Analysis completed"));
+    }))
+    .into_protocol_emit_result()?;
+    emit(oneclick_progress_event(request, 40, "Analysis completed"))
+        .into_protocol_emit_result()?;
 
     emit(phase_event(
         request,
         "recommendation",
         "one-click recommendations ready",
-    ));
+    ))
+    .into_protocol_emit_result()?;
     let charset_contracts = oneclick_charset_contracts_by_issue_index_with_offset(
         &request.payload,
         payload_issue_offset,
@@ -124,18 +151,21 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "request_id": request.request_id,
         "steps": recommendations,
         "summary": recommendation_summary
-    }));
+    }))
+    .into_protocol_emit_result()?;
     emit(oneclick_progress_event(
         request,
         55,
         "Recommendations completed",
-    ));
+    ))
+    .into_protocol_emit_result()?;
 
     emit(phase_event(
         request,
         "execution",
         "one-click execution started",
-    ));
+    ))
+    .into_protocol_emit_result()?;
     let plan_payload = json!({
         "schema": state.schema_name,
         "steps": recommendations
@@ -164,14 +194,17 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "disallowed_fix_attempts": outcome.disallowed_fix_attempts,
         "applied_fixes": outcome.applied_fixes,
         "log": outcome.log
-    }));
-    emit(oneclick_progress_event(request, 80, execution_message));
+    }))
+    .into_protocol_emit_result()?;
+    emit(oneclick_progress_event(request, 80, execution_message))
+        .into_protocol_emit_result()?;
 
     emit(phase_event(
         request,
         "validation",
         "one-click validation started",
-    ));
+    ))
+    .into_protocol_emit_result()?;
     let validation_issues = issues_from_inspect_result(inspect_live(&state.endpoint));
     let validation_success = validation_issues.is_empty()
         && execution_success
@@ -183,12 +216,14 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "all_fixed": validation_success,
         "remaining_issues": validation_issues.clone(),
         "applied_fix_count": report_applied_count
-    }));
+    }))
+    .into_protocol_emit_result()?;
     emit(oneclick_progress_event(
         request,
         100,
         "Validation completed",
-    ));
+    ))
+    .into_protocol_emit_result()?;
     emit(oneclick_final_result(
         request,
         &state.schema_name,
@@ -196,7 +231,9 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         &run_issues,
         &validation_issues,
         report_execution_log,
-    ));
+    ))
+    .into_protocol_emit_result()?;
+    Ok(())
 }
 
 pub(crate) fn oneclick_preflight(request: &Request) -> Vec<Value> {
@@ -2139,5 +2176,24 @@ mod tests {
                 .len(),
             2
         );
+    }
+
+    #[test]
+    fn oneclick_streaming_emit_failure_stops_before_followup_or_side_effect() {
+        let request = Request {
+            command: "oneclick.run".to_string(),
+            request_id: Some("oneclick-emit-failure".to_string()),
+            payload: json!({"dry_run": true}),
+        };
+        let mut calls = 0;
+
+        let error = oneclick_run_streaming(&request, |_event| {
+            calls += 1;
+            Err(ProtocolEmitError::io("broken oneclick emitter"))
+        })
+        .expect_err("oneclick emitter failure must propagate");
+
+        assert_eq!(calls, 1);
+        assert!(!error.side_effect_started());
     }
 }
