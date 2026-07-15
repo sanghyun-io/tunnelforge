@@ -8,10 +8,10 @@ pub const PROCESS_VERSION: u32 = 1;
 pub const MAX_JSONL_FRAME_BYTES: usize = 1_048_576;
 
 pub const PROCESS_CAPABILITIES: &[&str] = &[
-    "jsonl",
-    "request_id",
-    "structured_errors",
-    "stateful_service",
+    "request.deadline",
+    "request.strict_id",
+    "process.generation",
+    "mutation.outcome_indeterminate",
 ];
 
 pub const PUBLIC_COMMANDS: &[&str] = &[
@@ -779,10 +779,10 @@ mod tests {
         assert_eq!(
             result["process_capabilities"],
             json!([
-                "jsonl",
-                "request_id",
-                "structured_errors",
-                "stateful_service"
+                "request.deadline",
+                "request.strict_id",
+                "process.generation",
+                "mutation.outcome_indeterminate"
             ])
         );
         assert_eq!(

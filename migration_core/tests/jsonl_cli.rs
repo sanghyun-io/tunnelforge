@@ -99,10 +99,10 @@ fn helper_binary_negotiates_process_contract() {
     assert_eq!(
         result["process_capabilities"],
         json!([
-            "jsonl",
-            "request_id",
-            "structured_errors",
-            "stateful_service"
+            "request.deadline",
+            "request.strict_id",
+            "process.generation",
+            "mutation.outcome_indeterminate"
         ])
     );
     assert_eq!(result["max_jsonl_frame_bytes"], 1_048_576);
