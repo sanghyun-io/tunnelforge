@@ -1192,7 +1192,7 @@ def test_current_status_records_anonymous_error_reporting_design():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "Last reviewed: 2026-07-15" in doc
+    assert "Last reviewed: 2026-07-16" in doc
     assert "dedicated reporter GitHub App" in summary
     assert "Cloudflare Worker" in summary
     assert "TF-STATUS-092 | High | closed" in tracker

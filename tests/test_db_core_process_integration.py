@@ -1,5 +1,6 @@
 import ctypes
 import asyncio
+import gc
 import json
 import os
 from pathlib import Path
@@ -8,11 +9,17 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
+import warnings
 
 import pytest
 
 from src.core.db_core_client import (
     DB_CORE_STDIN_HIGH_WATER_BYTES,
+    MAX_ASSEMBLED_EVENT_BYTES,
+    MAX_ASSEMBLED_EVENT_CHUNKS,
+    MAX_ASSEMBLED_EVENT_DEPTH,
+    MAX_ASSEMBLED_EVENT_NODES,
     MAX_JSONL_FRAME_BYTES,
     DbCoreGenerationState,
     DbCoreOutcome,
@@ -184,16 +191,57 @@ def _is_asyncio_process(process):
     return isinstance(process, asyncio.subprocess.Process)
 
 
+def _asyncio_process_transport_is_settled(process):
+    if process.returncode is None:
+        return False
+    transport = getattr(process, "_transport", None)
+    if transport is None or not getattr(transport, "_finished", False):
+        return False
+    if not transport.is_closing():
+        return False
+    if process.stdout is not None and not process.stdout.at_eof():
+        return False
+    if process.stderr is not None and not process.stderr.at_eof():
+        return False
+    if process.stdin is not None and not process.stdin.is_closing():
+        return False
+    return True
+
+
 async def _settle_tracked_asyncio_process_on_owner(client, process):
+    stdin = process.stdin
+    stdin_close_requested = False
+    if stdin is not None:
+        stdin.close()
+        stdin_close_requested = True
     if process.returncode is None:
         try:
             process.kill()
         except ProcessLookupError:
             pass
-    await process.wait()
-    stderr_task = client._stderr_task
-    if stderr_task is not None and not stderr_task.done():
+    wait_task = asyncio.create_task(process.wait())
+    await asyncio.shield(wait_task)
+    stdout = process.stdout
+    if stdout is not None:
+        await stdout.read()
+    current_process = getattr(client, "_process", None)
+    stderr_task = (
+        client._stderr_task
+        if current_process is None or current_process is process
+        else None
+    )
+    if stderr_task is not None:
         await asyncio.shield(stderr_task)
+    elif process.stderr is not None:
+        await process.stderr.read()
+    if stdin is not None:
+        wait_closed = getattr(stdin, "wait_closed", None)
+        if callable(wait_closed):
+            try:
+                await wait_closed()
+            except (BrokenPipeError, ConnectionResetError):
+                if not stdin_close_requested:
+                    raise
     if client._stderr_task is stderr_task:
         client._stderr_task = None
 
@@ -221,23 +269,24 @@ def _shutdown_and_assert_zero_residual(
 ):
     owner = client.owner_thread
     tracked_processes = [process for process in processes if process is not None]
-    current_process = client._process
-    if current_process is not None and all(
-        current_process is not process for process in tracked_processes
+    current_process_before_shutdown = client._process
+    if current_process_before_shutdown is not None and all(
+        current_process_before_shutdown is not process for process in tracked_processes
     ):
-        tracked_processes.append(current_process)
+        tracked_processes.append(current_process_before_shutdown)
     failures = []
     asyncio_processes = [
         process
         for process in tracked_processes
-        if _is_asyncio_process(process) and process.returncode is None
+        if _is_asyncio_process(process)
+        and process is not current_process_before_shutdown
+        and not _asyncio_process_transport_is_settled(process)
     ]
     if not owner.is_alive() or client.owner_loop.is_closed():
         asyncio_processes.extend(
             process
             for process in simulated_owner_stopped_transports
-            if process.returncode is None
-            and all(process is not tracked for tracked in asyncio_processes)
+            if all(process is not tracked for tracked in asyncio_processes)
         )
     owner_stopped_asyncio_processes = set()
 
@@ -249,6 +298,10 @@ def _shutdown_and_assert_zero_residual(
                         _settle_tracked_asyncio_process_on_owner(client, process),
                         client.owner_loop,
                     ).result(timeout=2.0)
+                    if not _asyncio_process_transport_is_settled(process):
+                        raise AssertionError(
+                            "tracked orphan asyncio process transport did not settle"
+                        )
                 except BaseException as exc:
                     failures.append(exc)
         else:
@@ -280,6 +333,15 @@ def _shutdown_and_assert_zero_residual(
         current_process is not process for process in tracked_processes
     ):
         tracked_processes.append(current_process)
+    for process in tracked_processes:
+        if (
+            _is_asyncio_process(process)
+            and process not in owner_stopped_asyncio_processes
+            and not _asyncio_process_transport_is_settled(process)
+        ):
+            failures.append(AssertionError(
+                "tracked asyncio process transport remained unsettled after shutdown"
+            ))
     tracked_pids = list(dict.fromkeys([
         *pids,
         *(
@@ -429,6 +491,95 @@ def test_finalizer_settles_tracked_asyncio_process_on_owner_loop(tmp_path):
             _finalize_real_child_runner(client, pids, processes=processes)
 
 
+def test_finalizer_leaves_current_asyncio_process_to_client_shutdown(
+    tmp_path,
+    monkeypatch,
+):
+    client, _state_path = _helper_client(tmp_path, "stall")
+    independently_settled = []
+    original_settle = _settle_tracked_asyncio_process_on_owner
+
+    async def record_independent_settlement(owner_client, process):
+        independently_settled.append(process)
+        await original_settle(owner_client, process)
+
+    monkeypatch.setattr(
+        sys.modules[__name__],
+        "_settle_tracked_asyncio_process_on_owner",
+        record_independent_settlement,
+    )
+    client.start()
+    process = client._process
+    assert isinstance(process, asyncio.subprocess.Process)
+
+    _shutdown_and_assert_zero_residual(
+        client,
+        [process.pid],
+        processes=[process],
+    )
+
+    assert independently_settled == []
+    assert process.returncode is not None
+
+
+@pytest.mark.parametrize("terminal_error", [BrokenPipeError, ConnectionResetError])
+def test_finalizer_accepts_terminal_stdin_close_after_close_requested(terminal_error):
+    class _TerminalStdin:
+        def __init__(self):
+            self.close_requested = False
+
+        def close(self):
+            self.close_requested = True
+
+        async def wait_closed(self):
+            assert self.close_requested
+            raise terminal_error("terminal pipe closure")
+
+    class _TerminalProcess:
+        def __init__(self):
+            self.stdin = _TerminalStdin()
+            self.stdout = None
+            self.stderr = None
+            self.returncode = 0
+
+        async def wait(self):
+            return self.returncode
+
+    client = SimpleNamespace(_stderr_task=None)
+    process = _TerminalProcess()
+
+    asyncio.run(_settle_tracked_asyncio_process_on_owner(client, process))
+
+    assert process.stdin.close_requested is True
+
+
+@pytest.mark.parametrize("unrelated_error", [OSError, ResourceWarning])
+def test_finalizer_does_not_suppress_unrelated_stdin_close_errors(unrelated_error):
+    class _FailingStdin:
+        def __init__(self):
+            self.close_requested = False
+
+        def close(self):
+            self.close_requested = True
+
+        async def wait_closed(self):
+            raise unrelated_error("unrelated close failure")
+
+    process = SimpleNamespace(
+        stdin=_FailingStdin(),
+        stdout=None,
+        stderr=None,
+        returncode=0,
+        wait=lambda: asyncio.sleep(0, result=0),
+    )
+    client = SimpleNamespace(_stderr_task=None)
+
+    with pytest.raises(unrelated_error, match="unrelated close failure"):
+        asyncio.run(_settle_tracked_asyncio_process_on_owner(client, process))
+
+    assert process.stdin.close_requested is True
+
+
 def test_finalizer_stopped_owner_reports_transport_unsettled():
     client = DbCoreServiceClient(
         executable="unused-core",
@@ -465,6 +616,173 @@ def test_finalizer_stopped_owner_reports_transport_unsettled():
         if process.poll() is None:
             process.kill()
             process.wait(timeout=5.0)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="requires Windows Proactor subprocess pipes")
+def test_proactor_terminal_child_pipe_settlement_has_no_transport_residual(
+    tmp_path,
+):
+    child_path = tmp_path / "terminal_pipe_child.py"
+    hello_contract = {
+        "event": "result",
+        "command": "service.hello",
+        "success": True,
+        "service": "tunnelforge-core",
+        "protocol_version": 1,
+        "process_version": 1,
+        "process_capabilities": [
+            "mutation.outcome_indeterminate",
+            "process.generation",
+            "request.deadline",
+            "request.strict_id",
+        ],
+        "max_jsonl_frame_bytes": MAX_JSONL_FRAME_BYTES,
+        "max_assembled_event_bytes": MAX_ASSEMBLED_EVENT_BYTES,
+        "max_assembled_event_chunks": MAX_ASSEMBLED_EVENT_CHUNKS,
+        "max_assembled_event_nodes": MAX_ASSEMBLED_EVENT_NODES,
+        "max_assembled_event_depth": MAX_ASSEMBLED_EVENT_DEPTH,
+    }
+    child_path.write_text(
+        "import json\n"
+        "import sys\n"
+        "request = json.loads(sys.stdin.buffer.readline())\n"
+        "response = {!r}\n".format(hello_contract)
+        + "response['request_id'] = request['request_id']\n"
+        "sys.stdout.write(json.dumps(response, separators=(',', ':')) + '\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stdout.write('pending-stdout-before-eof\\n')\n"
+        "sys.stdout.flush()\n"
+        "sys.stderr.write('pending-stderr-before-eof\\n')\n"
+        "sys.stderr.flush()\n",
+        encoding="utf-8",
+    )
+    stderr_gate = threading.Event()
+    stderr_reader_entered = threading.Event()
+    stderr_reader_cancelled = threading.Event()
+    stdin_wait_closed_calls = []
+    stdout_read_calls = []
+    unraisable = []
+    cleanup_errors = []
+    client = DbCoreServiceClient(
+        executable=HELPER_PYTHON,
+        process_argv=[HELPER_PYTHON, str(child_path)],
+    )
+    original_stderr_reader = client._drain_stderr_on_owner
+
+    async def gated_stderr_reader(process):
+        stderr_reader_entered.set()
+        try:
+            while not stderr_gate.is_set():
+                await asyncio.sleep(0.001)
+        except asyncio.CancelledError:
+            stderr_reader_cancelled.set()
+            raise
+        await original_stderr_reader(process)
+
+    client._drain_stderr_on_owner = gated_stderr_reader
+    process = None
+    existing_wait_task = None
+    stderr_task = None
+    previous_unraisable_hook = sys.unraisablehook
+
+    def capture_unraisable(unraisable_hook_args):
+        unraisable.append(unraisable_hook_args)
+
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", ResourceWarning)
+            sys.unraisablehook = capture_unraisable
+            client.start()
+            process = client._process
+            assert isinstance(process, asyncio.subprocess.Process)
+            assert stderr_reader_entered.wait(timeout=0.5)
+            assert _wait_until(lambda: process.returncode is not None)
+            assert process.stdout is not None
+            assert not process.stdout.at_eof()
+            stderr_task = client._stderr_task
+            assert stderr_task is not None
+
+            async def install_settlement_tracking():
+                nonlocal existing_wait_task
+                existing_wait_task = asyncio.create_task(
+                    process.wait(),
+                    name="preexisting-proactor-process-wait",
+                )
+                client._process_wait_task = existing_wait_task
+                stdin = process.stdin
+                assert stdin is not None
+                original_wait_closed = stdin.wait_closed
+                original_stdout_read = process.stdout.read
+
+                async def tracked_wait_closed():
+                    stdin_wait_closed_calls.append(threading.get_ident())
+                    return await original_wait_closed()
+
+                async def tracked_stdout_read(*args, **kwargs):
+                    stdout_read_calls.append(threading.get_ident())
+                    return await original_stdout_read(*args, **kwargs)
+
+                stdin.wait_closed = tracked_wait_closed
+                process.stdout.read = tracked_stdout_read
+                await asyncio.sleep(0)
+
+            client._submit_owner(
+                install_settlement_tracking(),
+                DbCoreRequestKind.MUTATION,
+                "install-proactor-pipe-tracking",
+            ).result(timeout=0.5)
+
+            def shutdown_client():
+                try:
+                    client.shutdown(timeout_seconds=1.0)
+                except BaseException as exc:
+                    cleanup_errors.append(exc)
+
+            cleanup_thread = threading.Thread(target=shutdown_client)
+            cleanup_thread.start()
+            time.sleep(0.05)
+            try:
+                assert cleanup_thread.is_alive()
+                assert not stderr_reader_cancelled.is_set()
+            finally:
+                stderr_gate.set()
+                cleanup_thread.join(timeout=2.0)
+
+            assert not cleanup_thread.is_alive()
+            assert cleanup_errors == []
+            assert stdin_wait_closed_calls == [client.owner_thread.ident]
+            assert stdout_read_calls
+            assert set(stdout_read_calls) == {client.owner_thread.ident}
+            assert process.stdout.at_eof()
+            assert existing_wait_task is not None
+            assert existing_wait_task.done()
+            assert not existing_wait_task.cancelled()
+            assert stderr_task.done()
+            assert not stderr_task.cancelled()
+            assert client._process_wait_task is None
+            assert client._stderr_task is None
+            assert client._process is None
+            assert client._request_tasks == set()
+            assert client.generation_state is DbCoreGenerationState.CLOSED
+            assert not client.owner_thread.is_alive()
+            assert client.owner_thread not in threading.enumerate()
+            _assert_pid_terminal(process.pid)
+            gc.collect()
+            assert unraisable == []
+    finally:
+        sys.unraisablehook = previous_unraisable_hook
+        stderr_gate.set()
+        if process is not None and process.returncode is None:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        if client.owner_thread.is_alive():
+            _finalize_real_child_runner(
+                client,
+                [] if process is None else [process.pid],
+                processes=[] if process is None else [process],
+            )
 
 
 def _assert_cancel_transitions(transitions, generation):
