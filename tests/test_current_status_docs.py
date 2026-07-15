@@ -948,7 +948,7 @@ def test_current_status_records_231_release_candidate_handoff():
     assert "unknown-environment confirmation" in sessions
 
 
-def test_current_status_records_240_release_candidate():
+def test_current_status_records_published_240_release():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     version_source = (PROJECT_ROOT / "src" / "version.py").read_text(encoding="utf-8")
     source_version = re.search(r'__version__\s*=\s*"([^"]+)"', version_source).group(1)
@@ -960,17 +960,30 @@ def test_current_status_records_240_release_candidate():
     sessions = " ".join(_section(doc, "Session Log").split())
 
     assert source_version == "2.4.0"
-    assert "The `2.4.0` release candidate" in summary
+    assert "The latest stable release is now `v2.4.0`" in summary
     assert "anonymous error reporting" in summary
     assert "Version references are aligned at `2.4.0`" in baseline
-    assert "TF-STATUS-093 | High | fixed_pending_full_verify" in tracker
+    assert "TF-STATUS-093 is `closed`" in summary
+    assert "TF-STATUS-093 | High | closed" in tracker
     assert "`2.4.0` release-candidate preparation" in verification
     assert "release-candidate full Python 2697 passed / 1 skipped" in verification
     assert "all external actions in `version-gate.yml` are full-SHA pinned" in verification
     assert "`build-installer.ps1 -Clean` completed end to end" in verification
     assert "Installer source unchanged" in verification
-    assert "Complete TF-STATUS-093 through the protected version PR" in order
+    assert "PR #247" in verification
+    assert "29390539762" in verification
+    assert "29390540655" in verification
+    assert "29390539802" in verification
+    assert "29391247402" in verification
+    assert "29391317995" in verification
+    assert "bfee81613c7f77d96136346fa305858bf62670d7" in verification
+    assert "10 expected assets" in verification
+    assert "all four macOS sidecars match" in verification
+    assert "UpdateChecker" in verification
+    assert "Keep TF-STATUS-093 closed" in order
     assert "Prepared the `2.4.0` release candidate" in sessions
+    assert "Published `v2.4.0` as the stable/latest release" in sessions
+    assert "https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.4.0" in verification
 
 
 def test_current_status_closes_final_review_update_boundary_after_fresh_verification():

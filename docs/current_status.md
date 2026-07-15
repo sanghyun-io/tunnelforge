@@ -57,16 +57,19 @@ TunnelForge is in a strong build/test state. The active architecture baseline
 is Rust Core ownership of DB operations through `tunnelforge-core`, with
 Python/PyQt responsible for UI, orchestration, signals, and dialogs.
 
-The `2.4.0` release candidate packages the completed anonymous error reporting
-work from TF-STATUS-092: affirmative-consent desktop collection, strict local
-sanitization and allowlists, credential-free relay transport, bounded D1 abuse
-controls, and GitHub App issue creation through the active Cloudflare Worker.
-All three release version sources are aligned at `2.4.0`. TF-STATUS-093 is
-`fixed_pending_full_verify` until full local verification, the protected
-version PR and hosted gates, exact-main annotated tag creation, draft artifact
-and digest inspection, and stable publication complete. macOS remains an
-explicitly unsigned direct-download artifact under the accepted project policy;
-this release candidate makes no real-Mac hardware-validation claim.
+The latest stable release is now `v2.4.0`. It packages the completed anonymous
+error reporting work from TF-STATUS-092: affirmative-consent desktop collection,
+strict local sanitization and allowlists, credential-free relay transport,
+bounded D1 abuse controls, and GitHub App issue creation through the active
+Cloudflare Worker. All three release version sources are aligned at `2.4.0`.
+TF-STATUS-093 is `closed` after protected PR #247 and all hosted gates passed,
+annotated tag `v2.4.0` was created on the exact merge commit, the separately
+approved draft produced and verified all 10 expected assets and SHA-256
+digests, and the release was published as stable/latest. The live updater sees
+`2.4.0`, the relay remains schema 1 / `active`, and the repository retains only
+the two separate Releaser secrets. macOS remains an explicitly unsigned and
+unnotarized direct-download artifact under the accepted project policy; this
+release makes no real-Mac hardware-validation claim.
 Fresh release-candidate verification passed the full Python suite at 2697
 passed / 1 skipped / 4 warnings, the Rust Core regression gate and Cargo
 test/release build, Worker 316/typecheck/audit-zero/dry-run, the complete
@@ -717,6 +720,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-15 | `v2.4.0` protected publication closure / TF-STATUS-093 | PR #247 hosted checks and merge; protected `create-release-tag.yml` run `29391247402`; approved `release.yml` run `29391317995`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest API and live `UpdateChecker` checks; post-release relay health and repository-secret inventory | runs `29390539762`, `29390540655`, and `29390539802` passed the required Python, Rust, version, support-tracking, and internal/external macOS arm64/x86_64 gates; PR #247 merged at `2026-07-15T05:21:06Z` as `bfee81613c7f77d96136346fa305858bf62670d7`; tag object `34a111cc90373a485c6dd168d4755f43cfccc768` peels to that exact commit; release run built all platforms and published at `2026-07-15T05:33:59Z`; all 10 expected assets have GitHub SHA-256 digests and all four macOS sidecars match their DMG/ZIP asset digests; `UpdateChecker` returned latest `2.4.0` with no error; relay health returned HTTP 200, schema 1, mode `active`; exactly `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY` remain | `v2.4.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.4.0`. Release notes explicitly identify macOS artifacts as unsigned and unnotarized. TF-STATUS-093 is closed; TF-STATUS-090 and TF-STATUS-091 remain watch items. |
 | 2026-07-15 | `2.4.0` release-candidate preparation / TF-STATUS-093 | RED/GREEN status and version sync; full Python; Rust regression/Cargo test+release; Worker test/typecheck/audit/dry-run; `build-installer.ps1 -Clean`; frozen UI/Rust Core and WebSetup self-checks; workflow pin scan; `git diff --check` | RED proved the source remained `2.3.1`; deterministic minor bump aligned all three sources at `2.4.0`; release-candidate full Python 2697 passed / 1 skipped / 4 warnings; Rust and Worker gates passed; all external actions in `version-gate.yml` are full-SHA pinned; `build-installer.ps1 -Clean` completed end to end and produced the main app, WebSetup, and `TunnelForge-Setup-2.4.0.exe`; Installer source unchanged; frozen checks passed | The initial local installer command exposed stale-output handling, missing bootstrapper creation after clean, tracked Inno-source rewriting, and Windows PowerShell 5.1 UTF-8 parsing problems. TDD added bootstrapper build/self-check, read-only version validation, and a UTF-8 BOM contract. A concurrent clean-build deleted one independent-review test's transient evidence ZIP; two focused reruns and a later standalone full suite passed. Protected version PR, exact-main tag, draft asset/digest inspection, and publication remain. |
 | 2026-07-15 | TF-STATUS-092 protected merge closure | `gh pr checks 245 --watch`; `gh pr ready 245`; `gh pr merge 245 --merge`; post-merge PR/main ancestry, repository-secret inventory, and production health verification | fresh-head runs `29385868513` and `29385868516` passed all required gates; PR #245 merged at `2026-07-15T03:22:13Z` as `6dbcd51c8c60acef3569697fa79a9e6914a7c0e0`; `origin/main` has the expected two-parent merge ancestry; `GH_APP_PRIVATE_KEY` remains absent while exactly the two Releaser secrets remain; relay health returned schema 1 and mode `active` | TF-STATUS-092 is closed. The exposed Reporter key, its possible derived-token lifetime, the unused repository secret, client credential retirement, replacement canary/rollout, frozen package smoke, fresh-head hosted gates, and protected merge are all complete. |
 | 2026-07-15 | TF-STATUS-092 exposed-key deletion, repository-secret containment, and protected PR gate | GitHub Developer Settings exact-fingerprint deletion and post-action key inventory; one-hour containment wait; `gh secret delete GH_APP_PRIVATE_KEY`; repository-secret name inventory; `dist\TunnelForge\TunnelForge.exe --ui-smoke-check`; `git push`; draft PR #245; `gh pr checks 245 --watch` | exposed Reporter fingerprint `SHA256:hLY6...nt+k=` deleted at `2026-07-15T02:06:03Z`; containment completed at `2026-07-15T03:06:03Z`; unused `GH_APP_PRIVATE_KEY` deleted at `2026-07-15T03:06:23Z`; only `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY` remain; replacement `SHA256:6Yki...GYB4=` remains; frozen UI smoke returned `success=true` with bundled Rust Core service hello; commit `9367faa` pushed; PR #245 opened; hosted runs `29382607405` and `29382607434` passed Python, Rust, version, macOS support tracking, and both internal/external macOS arm64/x86_64 gates | The replacement Reporter key and separate Releaser lane were not changed. TF-STATUS-092 remains `fixed_pending_full_verify` until the final status commit, fresh-head CI, and protected PR completion are recorded. |
@@ -2502,7 +2506,7 @@ Next action:
 | TF-STATUS-090 | High | watch | macOS release signing / notarization | Protected Environment intentionally has no paid Apple Developer credentials | Publish explicitly unsigned macOS artifacts for this release; revisit signing/notarization when an Apple Developer account is available |
 | TF-STATUS-091 | Medium | watch | Release governance / independent approval | Only one write/admin collaborator exists | Keep single-maintainer approval enabled; revisit independent approval after adding a second trusted maintainer |
 | TF-STATUS-092 | High | closed | Security / GitHub App credentials | Legacy issue-reporter App private key was embedded in public releases | Keep the exposed key and unused legacy repository secret absent; retain the replacement Reporter key, separate Releaser credentials, D1 global mutation caps, affirmative consent, strict allowlists, fail-closed edge free text, emergency off, and protected hosted gates |
-| TF-STATUS-093 | High | fixed_pending_full_verify | Release readiness / `2.4.0` publication | Anonymous error reporting is merged but not present in the latest stable `v2.3.1` release | Complete the protected version PR, exact-main annotated `v2.4.0` tag, approved draft build, asset/digest inspection, stable publication, updater check, and post-release relay health verification |
+| TF-STATUS-093 | High | closed | Release readiness / `2.4.0` publication | Anonymous error reporting is merged but not present in the latest stable `v2.3.1` release | Keep `v2.4.0` stable/latest with its exact-main annotated tag, 10 verified assets, explicit unsigned macOS notice, updater visibility, active relay health, and separate Releaser credential lane |
 
 ## Recommended Execution Order
 
@@ -2526,10 +2530,10 @@ Next action:
    `docs/superpowers/specs/2026-07-14-anonymous-error-reporting-design.md`;
    never distribute the replacement private key in TunnelForge clients and
    keep the retired credential paths absent.
-7. Complete TF-STATUS-093 through the protected version PR, full hosted gates,
+7. Keep TF-STATUS-093 closed: protected PR #247, full hosted gates, the
    exact-current-main annotated `v2.4.0` tag, separately approved draft build,
-   asset and GitHub SHA-256 digest inspection, stable/latest publication,
-   updater visibility check, and post-release relay health verification.
+   10-asset GitHub SHA-256 and macOS sidecar verification, stable/latest
+   publication, updater visibility, and post-release relay health all passed.
 8. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted for
    this release; add signing/notarization only when paid Apple credentials are
    available.
@@ -2566,6 +2570,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-15 | Published `v2.4.0` as the stable/latest release and closed TF-STATUS-093 after the complete protected PR, exact-main tag, approved draft-build, asset inspection, updater, and production-health sequence. Release notes now explicitly identify the free macOS downloads as unsigned and unnotarized. | PR #247, tag `v2.4.0`, release workflow/metadata, canonical status and status regression contract | Runs `29390539762`, `29390540655`, and `29390539802` passed; merge commit `bfee81613c7f77d96136346fa305858bf62670d7`; tag run `29391247402` and release run `29391317995` passed; 10/10 assets had valid GitHub digests and four macOS sidecars matched; public latest and `UpdateChecker` returned `2.4.0`; relay health was HTTP 200/schema 1/`active`; only the two Releaser repository secrets remain. |
 | 2026-07-15 | Prepared the `2.4.0` release candidate for anonymous error reporting and opened TF-STATUS-093. Hardened the local clean-build path and full-SHA-pinned the version/macOS workflow actions before release. Historical `v2.3.1` publication evidence remains immutable. | version sources, installer/bootstrapper build script and contract, CI workflows/tests, canonical status | Focused RED/GREEN; standalone full Python 2697/1 skipped/4 warnings; Rust and Worker gates passed; corrected `build-installer.ps1 -Clean` completed without source mutation; frozen main/WebSetup checks passed; diff check passed. Protected hosted gates, tag, draft inspection, and publication remain. |
 | 2026-07-15 | Closed TF-STATUS-092 after protected PR #245 merged. The replacement anonymous error-reporting path, credential containment, client retirement, hosted gates, and protected integration are complete. | PR #245, `origin/main`, GitHub repository-secret inventory, production relay health, canonical status | Fresh-head runs `29385868513` and `29385868516` passed; PR #245 merged at `2026-07-15T03:22:13Z` as two-parent merge commit `6dbcd51c8c60acef3569697fa79a9e6914a7c0e0`; the legacy secret remains absent, only the separate Releaser secrets remain, and post-merge relay health is schema 1 / `active`. |
 | 2026-07-15 | Removed the unused `GH_APP_PRIVATE_KEY` repository secret after the full derived-token containment interval. The replacement Reporter credential and independent Releaser credentials remain in their intended lanes. | GitHub repository secret inventory, frozen package smoke, canonical status | Containment completed at `2026-07-15T03:06:03Z`; secret deletion completed at `2026-07-15T03:06:23Z`; the remaining repository secret names are exactly `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY`. `dist\TunnelForge\TunnelForge.exe --ui-smoke-check` returned `success=true`, found the bundled Rust Core, and completed its service hello. Fresh-head hosted checks and protected PR #245 remain. |
