@@ -227,6 +227,8 @@ class TunnelEngine:
             ssh_username=config['bastion_user'],
             ssh_pkey=pkey_obj,  # 경로 대신 키 객체 전달
             ssh_host_key=ssh_host_key,
+            # Keep the approved raw host/port authoritative for authentication.
+            ssh_config_file=None,
             remote_bind_address=(config['remote_host'], int(config['remote_port'])),
             local_bind_address=local_bind_address,
         )

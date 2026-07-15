@@ -490,6 +490,37 @@ def test_forwarder_receives_fresh_trusted_key(sample_tunnel_config):
     assert forwarder.call_args.kwargs["ssh_host_key"] is server_key
 
 
+@pytest.mark.parametrize(
+    "operation",
+    ("start_tunnel", "create_temp_tunnel", "test_connection"),
+)
+def test_all_forwarder_paths_disable_ssh_config_and_pin_raw_endpoint(
+    operation, sample_tunnel_config
+):
+    server_key = _server_key()
+    store = SshHostKeyTrustStore.in_memory()
+    _trust(store, sample_tunnel_config, server_key)
+    engine = _engine_with_probe(server_key, store)
+    engine._load_private_key = MagicMock(return_value=MagicMock())
+    engine.test_target_reachable_from_bastion = MagicMock(
+        return_value=(True, "reachable")
+    )
+
+    with patch("src.core.tunnel_engine.SSHTunnelForwarder") as forwarder:
+        forwarder.return_value = MagicMock()
+        if operation == "start_tunnel":
+            result = engine.start_tunnel(sample_tunnel_config, check_port=False)
+        elif operation == "create_temp_tunnel":
+            result = engine.create_temp_tunnel(sample_tunnel_config)
+        else:
+            result = engine.test_connection(sample_tunnel_config)
+
+    assert result[0] is True
+    assert forwarder.call_count == 1
+    assert forwarder.call_args.kwargs["ssh_config_file"] is None
+    assert forwarder.call_args.kwargs["ssh_host_key"] is server_key
+
+
 def test_target_preflight_uses_reject_policy_and_expected_key(
     sample_tunnel_config
 ):
