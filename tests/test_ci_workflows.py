@@ -60,6 +60,7 @@ def test_pr_head_regression_jobs_use_read_only_checkout_without_credentials():
     expected_pr_head_jobs = {
         "rust-core-regression-gate": {"contents": "read"},
         "python-regression": {"contents": "read"},
+        "python39-db-core-native": {"contents": "read"},
         "macos-app-validation": {"contents": "read"},
     }
     pr_head_jobs = {}
@@ -353,6 +354,7 @@ def test_required_version_gate_is_terminal_and_aggregates_all_results():
         "macos-support-tracking-gate",
         "rust-core-regression-gate",
         "python-regression",
+        "python39-db-core-native",
         "macos-app-validation",
         "version-validation",
         "version-bump",
@@ -409,3 +411,60 @@ def test_python_regression_runs_full_suite_with_built_core():
     assert "pyinstaller bootstrapper/bootstrapper.spec" in job_text
     assert "dist\\TunnelForge-WebSetup.exe --self-check" in job_text
     assert "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK" in job_text
+
+
+def test_python39_db_core_native_builds_release_and_runs_full_integration():
+    workflow = load_version_gate()
+    jobs = workflow["jobs"]
+    ubuntu_job = jobs["python39-db-core-native"]
+    ubuntu_text = version_gate_job_text("python39-db-core-native")
+
+    assert ubuntu_job["runs-on"] == "ubuntu-24.04"
+    assert ubuntu_job["permissions"] == {"contents": "read"}
+    assert ubuntu_job["env"]["PYTHONUTF8"] == "1"
+    assert "${{ github.event.pull_request.head.sha }}" in ubuntu_text
+    assert "actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1" in ubuntu_text
+    assert 'python-version: "3.9"' in ubuntu_text
+    assert 'python -m pip install -e ".[dev]"' in ubuntu_text
+    assert "cargo build --manifest-path migration_core/Cargo.toml --release" in ubuntu_text
+    assert (
+        "python -m compileall -q main.py src/core/db_core_client.py "
+        "src/core/db_core_facade.py src/core/db_core_dbapi_shim.py "
+        "src/core/db_core_service.py tests/test_db_core_process_contract.py"
+    ) in ubuntu_text
+    assert (
+        'python -c "import main; import src.core.db_core_client; '
+        'import src.core.db_core_service"'
+    ) in ubuntu_text
+    assert (
+        'python -m pytest tests/test_db_core_process_contract.py '
+        '-k "owner or deadline or callback or queued or frame" -q'
+    ) in ubuntu_text
+    assert "python -m pytest tests/test_db_core_process_integration.py -q" in ubuntu_text
+
+    for job_name in ("python-regression", "macos-app-validation"):
+        job_text = version_gate_job_text(job_name)
+        assert "pytest tests/test_db_core_process_integration.py -q" in job_text
+        assert job_text.index(
+            "cargo build --manifest-path migration_core/Cargo.toml --release"
+        ) < job_text.index("pytest tests/test_db_core_process_integration.py -q")
+
+    macos_matrix = jobs["macos-app-validation"]["strategy"]["matrix"]["include"]
+    assert {entry["runner"] for entry in macos_matrix} == {"macos-14", "macos-15-intel"}
+
+
+def test_required_version_gate_needs_python39_db_core_native():
+    job = load_version_gate()["jobs"]["version-gate"]
+
+    assert "python39-db-core-native" in job["needs"]
+
+
+def test_required_version_gate_checks_python39_db_core_native_result():
+    job_text = version_gate_job_text("version-gate")
+
+    assert (
+        "PYTHON39_NATIVE_RESULT: "
+        "${{ needs.python39-db-core-native.result }}"
+    ) in job_text
+    assert '"$PYTHON39_NATIVE_RESULT" \\' in job_text
+    assert 'if [ "$result" != "success" ]; then' in job_text
