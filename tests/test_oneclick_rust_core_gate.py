@@ -16,6 +16,10 @@ from src.core.migration_preflight import PreflightResult, CheckResult, CheckSeve
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+TEMPORARY_APPLY_UNAVAILABLE_COPY = (
+    "정확한 실행 계획 승인 보호가 준비될 때까지 실제 변경은 비활성화됩니다. "
+    "Dry-run 미리보기는 계속 사용할 수 있습니다."
+)
 
 
 class FakeEndpoint:
@@ -76,7 +80,7 @@ def test_oneclick_worker_accepts_rust_core_connector_shape():
     worker._ensure_rust_core_connector()
 
 
-def test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope():
+def test_oneclick_dialog_module_copy_matches_temporary_dry_run_only_scope():
     source = (
         PROJECT_ROOT / "src" / "ui" / "dialogs" / "oneclick_migration_dialog.py"
     ).read_text(encoding="utf-8")
@@ -84,44 +88,86 @@ def test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope():
     assert "전체 마이그레이션 프로세스를 자동으로 실행합니다" not in source
     assert "Rust DB Core" in source
     assert "dry-run" in source
-    assert "백업 확인" in source
+    assert "실제 변경은 백업 확인 후 검증된 제한" not in source
+    assert "실제 변경은 비활성화" in source
 
 
-def test_oneclick_worker_rejects_real_execution_without_backup_confirmation():
+@pytest.mark.parametrize("backup_confirmed", [False, True])
+def test_oneclick_worker_rejects_real_execution_while_plan_approval_is_unavailable(
+    monkeypatch,
+    backup_confirmed,
+):
+    class ConnectorAccessProbe:
+        def __init__(self):
+            self.connection_accesses = 0
+
+        @property
+        def connection(self):
+            self.connection_accesses += 1
+            return None
+
+    logger = SimpleNamespace(info=lambda *_: None, exception=lambda *_: None)
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        "create_oneclick_logger",
+        lambda _schema: (logger, ""),
+    )
+    monkeypatch.setattr(oneclick_migration_dialog, "close_oneclick_logger", lambda _logger: None)
+    connector = ConnectorAccessProbe()
+    worker = OneClickMigrationWorker(
+        connector=connector,
+        schema="app",
+        dry_run=False,
+        backup_confirmed=backup_confirmed,
+    )
+    finished = []
+    logs = []
+    worker.migration_finished.connect(lambda success, report: finished.append((success, report)))
+    worker.log_message.connect(lambda message, _style: logs.append(message))
+
+    worker.run()
+
+    assert connector.connection_accesses == 0
+    assert finished == [(False, None)]
+    assert any(TEMPORARY_APPLY_UNAVAILABLE_COPY in message for message in logs)
+
+
+def test_oneclick_worker_keeps_dry_run_usable(monkeypatch):
+    class DryRunFacade:
+        def __init__(self):
+            self.payload = None
+
+        def run_oneclick(self, payload, on_event):
+            self.payload = payload
+            return {"success": True, "report": {"schema": "app", "success": True}}
+
+    logger = SimpleNamespace(info=lambda *_: None, exception=lambda *_: None)
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        "create_oneclick_logger",
+        lambda _schema: (logger, ""),
+    )
+    monkeypatch.setattr(oneclick_migration_dialog, "close_oneclick_logger", lambda _logger: None)
+    facade = DryRunFacade()
     connection = SimpleNamespace(
-        facade=object(),
+        facade=facade,
         connection_id="conn-1",
         endpoint=FakeEndpoint(),
     )
     worker = OneClickMigrationWorker(
         connector=SimpleNamespace(connection=connection),
         schema="app",
-        dry_run=False,
-        backup_confirmed=True,
+        dry_run=True,
+        backup_confirmed=False,
     )
+    finished = []
+    worker.migration_finished.connect(lambda success, report: finished.append((success, report)))
 
-    worker.backup_confirmed = False
-    with pytest.raises(RuntimeError, match="backup"):
-        worker._core_payload(connection)
+    worker.run()
 
-
-def test_oneclick_worker_allows_limited_real_execution_with_backup_confirmation():
-    connection = SimpleNamespace(
-        facade=object(),
-        connection_id="conn-1",
-        endpoint=FakeEndpoint(),
-    )
-    worker = OneClickMigrationWorker(
-        connector=SimpleNamespace(connection=connection),
-        schema="app",
-        dry_run=False,
-        backup_confirmed=True,
-    )
-
-    payload = worker._core_payload(connection)
-
-    assert payload["dry_run"] is False
-    assert payload["backup_confirmed"] is True
+    assert facade.payload["dry_run"] is True
+    assert facade.payload["backup_confirmed"] is False
+    assert finished[0][0] is True
 
 
 def test_oneclick_worker_includes_derived_charset_contracts_when_gate_passes():
@@ -156,7 +202,7 @@ def test_oneclick_worker_includes_derived_charset_contracts_when_gate_passes():
     worker = OneClickMigrationWorker(
         connector=SimpleNamespace(connection=connection),
         schema="tf_oneclick_app",
-        dry_run=False,
+        dry_run=True,
         backup_confirmed=True,
     )
 
@@ -179,7 +225,7 @@ def test_oneclick_worker_omits_charset_contracts_when_derivation_gate_fails():
     worker = OneClickMigrationWorker(
         connector=SimpleNamespace(connection=connection),
         schema="app",
-        dry_run=False,
+        dry_run=True,
         backup_confirmed=True,
     )
 
@@ -189,7 +235,7 @@ def test_oneclick_worker_omits_charset_contracts_when_derivation_gate_fails():
     assert "charset_contracts" not in payload
 
 
-def test_oneclick_dialog_keeps_dry_run_default_but_allows_limited_real_execution():
+def test_oneclick_dialog_keeps_dry_run_checked_and_apply_controls_disabled():
     app = QApplication.instance() or QApplication([])
 
     dialog = OneClickMigrationDialog(
@@ -198,32 +244,67 @@ def test_oneclick_dialog_keeps_dry_run_default_but_allows_limited_real_execution
         schema="app",
     )
 
-    assert dialog.chk_dry_run.isChecked()
-    assert dialog.chk_dry_run.isEnabled()
-    assert "InnoDB" in dialog.chk_dry_run.toolTip()
-    dialog.close()
-
-
-def test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138(monkeypatch):
-    app = QApplication.instance() or QApplication([])
-    monkeypatch.setattr(oneclick_migration_dialog, "ONECLICK_REAL_EXECUTION_ENABLED", False)
-
-    dialog = OneClickMigrationDialog(
-        None,
-        connector=SimpleNamespace(),
-        schema="app",
-    )
-
-    tooltip = dialog.chk_dry_run.toolTip()
+    assert oneclick_migration_dialog.ONECLICK_REAL_EXECUTION_ENABLED is False
     assert dialog.chk_dry_run.isChecked()
     assert not dialog.chk_dry_run.isEnabled()
-    assert "#138" not in tooltip
-    assert "until" not in tooltip.lower()
-    assert "disabled in this build" in tooltip
+    assert not dialog.chk_backup.isEnabled()
+    assert dialog.chk_dry_run.toolTip() == TEMPORARY_APPLY_UNAVAILABLE_COPY
     dialog.close()
 
 
-def test_migration_analyzer_exposes_oneclick_with_limited_real_execution_copy():
+@pytest.mark.parametrize(
+    (
+        "execution_enabled",
+        "dry_run_checked",
+        "expected_checked",
+        "expected_dry_run_enabled",
+        "expected_backup_enabled",
+    ),
+    [
+        (False, True, True, False, False),
+        (False, False, True, False, False),
+        (True, True, True, True, False),
+        (True, False, False, True, True),
+    ],
+)
+def test_oneclick_dialog_syncs_all_execution_gate_states_after_completion(
+    monkeypatch,
+    execution_enabled,
+    dry_run_checked,
+    expected_checked,
+    expected_dry_run_enabled,
+    expected_backup_enabled,
+):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        oneclick_migration_dialog,
+        "ONECLICK_REAL_EXECUTION_ENABLED",
+        execution_enabled,
+    )
+
+    dialog = OneClickMigrationDialog(
+        None,
+        connector=SimpleNamespace(),
+        schema="app",
+    )
+    dialog.chk_dry_run.setChecked(dry_run_checked)
+    dialog._sync_execution_controls()
+
+    assert dialog.chk_dry_run.isChecked() is expected_checked
+    assert dialog.chk_dry_run.isEnabled() is expected_dry_run_enabled
+    assert dialog.chk_backup.isEnabled() is expected_backup_enabled
+
+    dialog.chk_dry_run.setEnabled(False)
+    dialog.chk_backup.setEnabled(False)
+    dialog._on_finished(False, None)
+
+    assert dialog.chk_dry_run.isChecked() is expected_checked
+    assert dialog.chk_dry_run.isEnabled() is expected_dry_run_enabled
+    assert dialog.chk_backup.isEnabled() is expected_backup_enabled
+    dialog.close()
+
+
+def test_migration_analyzer_exposes_oneclick_with_temporary_apply_unavailable_copy():
     app = QApplication.instance() or QApplication([])
 
     dialog = migration_dialogs.MigrationAnalyzerDialog(
@@ -234,10 +315,7 @@ def test_migration_analyzer_exposes_oneclick_with_limited_real_execution_copy():
     assert migration_dialogs.ONE_CLICK_MIGRATION_FEATURE_ENABLED is True
     assert not dialog.btn_oneclick.isHidden()
     assert "One-Click Migration" in dialog.btn_oneclick.text()
-    tooltip = dialog.btn_oneclick.toolTip()
-    assert "dry-run" in tooltip.lower()
-    assert "InnoDB" in tooltip
-    assert "백업" in tooltip
+    assert dialog.btn_oneclick.toolTip() == TEMPORARY_APPLY_UNAVAILABLE_COPY
     dialog.close()
 
 

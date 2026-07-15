@@ -67,6 +67,13 @@ fn result_payload(events: Vec<Value>) -> Value {
         .unwrap_or_else(|| panic!("missing result event"))
 }
 
+fn error_payload(events: Vec<Value>) -> Value {
+    events
+        .into_iter()
+        .find(|event| event.get("event") == Some(&json!("error")))
+        .unwrap_or_else(|| panic!("missing error event"))
+}
+
 fn endpoint_json(endpoint: &Endpoint) -> Value {
     json!({
         "engine": endpoint.engine,
@@ -314,7 +321,7 @@ fn live_readiness_reports_each_direction_when_env_is_configured() {
 }
 
 #[test]
-fn oneclick_run_live_engine_innodb_when_env_is_configured() {
+fn oneclick_run_live_engine_stays_myisam_when_apply_is_disabled() {
     let Some(mysql_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
         eprintln!("skipping oneclick live apply: TF_MYSQL_* is not configured");
         return;
@@ -335,7 +342,7 @@ fn oneclick_run_live_engine_innodb_when_env_is_configured() {
         Some("MyISAM")
     );
 
-    let result = result_payload(handle_request(Request {
+    let error = error_payload(handle_request(Request {
         command: "oneclick.run".to_string(),
         request_id: None,
         payload: json!({
@@ -346,10 +353,10 @@ fn oneclick_run_live_engine_innodb_when_env_is_configured() {
         }),
     }));
 
-    assert_eq!(result["success"], true);
+    assert_eq!(error["code"], "oneclick_apply_disabled");
     assert_eq!(
         mysql_table_engine(&mut mysql, &mysql_endpoint.database, &table).as_deref(),
-        Some("InnoDB")
+        Some("MyISAM")
     );
 
     mysql
@@ -358,7 +365,7 @@ fn oneclick_run_live_engine_innodb_when_env_is_configured() {
 }
 
 #[test]
-fn oneclick_run_live_charset_contract_when_env_is_configured() {
+fn oneclick_run_live_charset_stays_unchanged_when_apply_is_disabled() {
     let Some(base_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
         eprintln!("skipping oneclick charset live apply: TF_MYSQL_* is not configured");
         return;
@@ -399,7 +406,7 @@ fn oneclick_run_live_charset_contract_when_env_is_configured() {
         Some(&(String::from("utf8mb3"), String::from("utf8mb3_general_ci")))
     );
 
-    let result = result_payload(handle_request(Request {
+    let error = error_payload(handle_request(Request {
         command: "oneclick.run".to_string(),
         request_id: None,
         payload: json!({
@@ -430,14 +437,14 @@ fn oneclick_run_live_charset_contract_when_env_is_configured() {
         }),
     }));
 
-    assert_eq!(result["success"], true);
+    assert_eq!(error["code"], "oneclick_apply_disabled");
     assert_eq!(
         mysql_table_charset_collation(&mut mysql, schema, &parent).as_ref(),
-        Some(&(String::from("utf8mb4"), String::from("utf8mb4_0900_ai_ci")))
+        Some(&(String::from("utf8mb3"), String::from("utf8mb3_general_ci")))
     );
     assert_eq!(
         mysql_table_charset_collation(&mut mysql, schema, &child).as_ref(),
-        Some(&(String::from("utf8mb4"), String::from("utf8mb4_0900_ai_ci")))
+        Some(&(String::from("utf8mb3"), String::from("utf8mb3_general_ci")))
     );
 
     admin

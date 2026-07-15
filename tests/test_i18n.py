@@ -298,6 +298,18 @@ def test_neutral_import_auto_strings_have_exact_english_translations():
     )
 
 
+def test_temporary_oneclick_apply_unavailable_copy_has_exact_english_translation():
+    i18n.set_language("en")
+
+    assert i18n.translate_text(
+        "정확한 실행 계획 승인 보호가 준비될 때까지 실제 변경은 비활성화됩니다. "
+        "Dry-run 미리보기는 계속 사용할 수 있습니다."
+    ) == (
+        "Real changes are disabled until exact execution plan approval protection is ready. "
+        "Dry-run preview remains available."
+    )
+
+
 def test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation():
     ui_functions = {
         "QLabel", "QPushButton", "QCheckBox", "QRadioButton", "QGroupBox",

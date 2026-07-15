@@ -2,8 +2,8 @@
 One-Click MySQL 8.0 → 8.4 마이그레이션 다이얼로그
 
 Rust DB Core로 Pre-flight → Analysis → Execution Plan → Validation 흐름을
-실행합니다. 기본값은 dry-run이며, 실제 변경은 백업 확인 후 검증된 제한
-범위에서만 실행됩니다.
+실행합니다. 정확한 실행 계획 승인 보호가 준비될 때까지 실제 변경은
+비활성화되며, dry-run 미리보기만 사용할 수 있습니다.
 """
 from datetime import datetime
 from typing import Optional
@@ -31,7 +31,11 @@ STYLE_WARNING = "color: #f39c12; font-weight: bold;"
 STYLE_INFO = "color: #3498db;"
 STYLE_MUTED = "color: #7f8c8d;"
 
-ONECLICK_REAL_EXECUTION_ENABLED = True
+ONECLICK_REAL_EXECUTION_ENABLED = False
+ONECLICK_APPLY_DISABLED_MESSAGE = (
+    "정확한 실행 계획 승인 보호가 준비될 때까지 실제 변경은 비활성화됩니다. "
+    "Dry-run 미리보기는 계속 사용할 수 있습니다."
+)
 
 
 class OneClickMigrationWorker(QThread):
@@ -70,6 +74,7 @@ class OneClickMigrationWorker(QThread):
         _mig_logger = None
         _log_path = ""
         try:
+            self._require_execution_enabled()
             self._started_at = datetime.now()
             _mig_logger, _log_path = create_oneclick_logger(self.schema)
             _mig_logger.info(f"=== One-Click 마이그레이션 시작: schema={self.schema}, dry_run={self.dry_run} ===")
@@ -217,6 +222,10 @@ class OneClickMigrationWorker(QThread):
                 "Legacy Python DB connections are not supported."
             )
         return connection
+
+    def _require_execution_enabled(self):
+        if not self.dry_run and not ONECLICK_REAL_EXECUTION_ENABLED:
+            raise RuntimeError(ONECLICK_APPLY_DISABLED_MESSAGE)
 
     def _core_payload(self, connection) -> dict:
         if not self.dry_run and not self.backup_confirmed:
@@ -718,22 +727,15 @@ class OneClickMigrationDialog(QDialog):
         options_layout = QHBoxLayout()
 
         self.chk_dry_run = QCheckBox("Dry-run (실제 실행하지 않음)")
-        self.chk_dry_run.setToolTip(
-            "기본값은 dry-run입니다. 해제하면 백업 확인 후 검증된 MyISAM/deprecated engine "
-            "테이블만 InnoDB로 변경할 수 있습니다."
-        )
+        self.chk_dry_run.setToolTip(ONECLICK_APPLY_DISABLED_MESSAGE)
         self.chk_dry_run.setChecked(True)
-        if not ONECLICK_REAL_EXECUTION_ENABLED:
-            self.chk_dry_run.setEnabled(False)
-            self.chk_dry_run.setToolTip(
-                "One-Click real execution is disabled in this build. "
-                "Dry-run remains available for previewing Rust Core recommendations."
-            )
         options_layout.addWidget(self.chk_dry_run)
 
         self.chk_backup = QCheckBox("백업 완료 확인")
         self.chk_backup.setToolTip("체크하면 백업 완료로 간주합니다.")
         options_layout.addWidget(self.chk_backup)
+        self.chk_dry_run.toggled.connect(self._sync_execution_controls)
+        self._sync_execution_controls()
 
         options_layout.addStretch()
         layout.addLayout(options_layout)
@@ -879,6 +881,16 @@ class OneClickMigrationDialog(QDialog):
 
         self.worker.start()
 
+    def _sync_execution_controls(self):
+        if not ONECLICK_REAL_EXECUTION_ENABLED and not self.chk_dry_run.isChecked():
+            self.chk_dry_run.blockSignals(True)
+            self.chk_dry_run.setChecked(True)
+            self.chk_dry_run.blockSignals(False)
+        self.chk_dry_run.setEnabled(ONECLICK_REAL_EXECUTION_ENABLED)
+        self.chk_backup.setEnabled(
+            ONECLICK_REAL_EXECUTION_ENABLED and not self.chk_dry_run.isChecked()
+        )
+
     def _disconnect_worker_ui_signals(self, worker: "OneClickMigrationWorker"):
         """워커의 UI 시그널을 다이얼로그 핸들러에서 분리한다.
 
@@ -1000,8 +1012,7 @@ class OneClickMigrationDialog(QDialog):
     def _on_finished(self, success: bool, report):
         """마이그레이션 결과 완료 핸들러 (스레드 생명주기가 아닌 Rust 실행 결과 처리)"""
         self.btn_start.setEnabled(True)
-        self.chk_dry_run.setEnabled(ONECLICK_REAL_EXECUTION_ENABLED)
-        self.chk_backup.setEnabled(True)
+        self._sync_execution_controls()
         self.worker = None
 
         if report:

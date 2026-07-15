@@ -460,8 +460,8 @@ class MigrationAnalyzerDialog(QDialog):
 
         self.btn_oneclick = _make_action_button("🚀 One-Click Migration", "#27ae60", "#219a52")
         self.btn_oneclick.setToolTip(
-            "Rust Core 기반 One-Click 사전 검사/분석/권장/검증을 기본 dry-run으로 실행합니다.\n"
-            "백업 확인 후 검증된 MyISAM/deprecated engine 테이블만 InnoDB로 자동 변경할 수 있습니다."
+            "정확한 실행 계획 승인 보호가 준비될 때까지 실제 변경은 비활성화됩니다. "
+            "Dry-run 미리보기는 계속 사용할 수 있습니다."
         )
         self.btn_oneclick.clicked.connect(self.start_oneclick_migration)
         self.btn_oneclick.setVisible(ONE_CLICK_MIGRATION_FEATURE_ENABLED)

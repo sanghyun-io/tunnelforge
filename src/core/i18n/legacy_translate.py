@@ -130,6 +130,10 @@ _EN_TEXT_TRANSLATIONS = {
         "Dry-run is the default. If disabled, only verified MyISAM/deprecated "
         "engine tables can be changed to InnoDB after backup confirmation."
     ),
+    "정확한 실행 계획 승인 보호가 준비될 때까지 실제 변경은 비활성화됩니다. Dry-run 미리보기는 계속 사용할 수 있습니다.": (
+        "Real changes are disabled until exact execution plan approval protection is ready. "
+        "Dry-run preview remains available."
+    ),
     "업데이트 사용 가능": "Update Available",
     "연결 복사 - 새 연결 만들기": "Copy Connection - Create New Connection",
     "연결 오류": "Connection Error",

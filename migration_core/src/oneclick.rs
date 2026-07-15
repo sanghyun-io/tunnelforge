@@ -6,6 +6,15 @@ use mysql::prelude::Queryable;
 use crate::*;
 use crate::schema::error_event;
 
+fn oneclick_apply_disabled_event(request: &Request) -> Value {
+    json!({
+        "event": "error",
+        "request_id": request.request_id,
+        "code": "oneclick_apply_disabled",
+        "message": "One-Click apply is disabled until exact plan approval protection is available."
+    })
+}
+
 pub(crate) fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(phase_event(
         request,
@@ -45,6 +54,16 @@ pub(crate) fn preflight_streaming<F: FnMut(Value)>(request: &Request, mut emit: 
 }
 
 pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
+    let dry_run = request
+        .payload
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if !dry_run {
+        emit(oneclick_apply_disabled_event(request));
+        return;
+    }
+
     emit(phase_event(
         request,
         "preflight",
@@ -117,11 +136,6 @@ pub(crate) fn oneclick_run_streaming<F: FnMut(Value)>(request: &Request, mut emi
         "execution",
         "one-click execution started",
     ));
-    let dry_run = request
-        .payload
-        .get("dry_run")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
     let plan_payload = json!({
         "schema": state.schema_name,
         "steps": recommendations
@@ -340,6 +354,10 @@ pub(crate) fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(true);
+    if !dry_run {
+        return vec![oneclick_apply_disabled_event(request)];
+    }
+
     let mut events = vec![phase_event(
         request,
         "execution",

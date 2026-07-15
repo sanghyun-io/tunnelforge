@@ -636,6 +636,13 @@ mod tests {
     
     use crate::adapters::test_support::{schema};
 
+    fn assert_error_code(events: &[Value], expected: &str) {
+        assert_eq!(events.len(), 1, "mutation gate must be the first event");
+        assert_eq!(events[0]["event"], "error");
+        assert_eq!(events[0]["code"], expected);
+        assert!(events[0]["message"].as_str().is_some());
+    }
+
     #[test]
     fn service_hello_advertises_core_protocol() {
         let result = handle_request(Request {
@@ -891,6 +898,43 @@ mod tests {
     }
 
     #[test]
+    fn oneclick_run_non_dry_run_fails_closed_before_endpoint_or_sql() {
+        let events = handle_request(Request {
+            command: "oneclick.run".to_string(),
+            request_id: Some("oneclick-run-disabled-1".to_string()),
+            payload: json!({"dry_run": false, "backup_confirmed": true}),
+        });
+
+        assert_error_code(&events, "oneclick_apply_disabled");
+        assert_eq!(events[0]["request_id"], "oneclick-run-disabled-1");
+    }
+
+    #[test]
+    fn oneclick_run_preserves_explicit_and_default_dry_run_preflight() {
+        for (request_id, payload) in [
+            ("oneclick-run-dry-1", json!({"dry_run": true})),
+            ("oneclick-run-default-dry-1", json!({})),
+        ] {
+            let events = handle_request(Request {
+                command: "oneclick.run".to_string(),
+                request_id: Some(request_id.to_string()),
+                payload,
+            });
+
+            assert_eq!(events[0]["event"], "phase");
+            let error = events
+                .iter()
+                .find(|event| event.get("event") == Some(&json!("error")))
+                .expect("dry-run should reach existing endpoint validation");
+            assert!(error.get("code").is_none());
+            assert!(error["message"]
+                .as_str()
+                .unwrap()
+                .contains("invalid endpoint"));
+        }
+    }
+
+    #[test]
     fn oneclick_apply_fixes_dry_run_previews_charset_plan_without_executing_sql() {
         let events = handle_request(Request {
             command: "oneclick.apply_fixes".to_string(),
@@ -938,49 +982,19 @@ mod tests {
     }
 
     #[test]
-    fn oneclick_apply_fixes_real_charset_requires_endpoint() {
+    fn oneclick_apply_fixes_non_dry_run_fails_closed_before_endpoint_or_sql() {
         let events = handle_request(Request {
             command: "oneclick.apply_fixes".to_string(),
-            request_id: Some("oneclick-apply-charset-real-1".to_string()),
-            payload: json!({
-                "schema": "tf_oneclick_charset",
-                "dry_run": false,
-                "steps": [{
-                    "issue_type": "charset_issue",
-                    "location": "tf_oneclick_charset.tf_oneclick_parent",
-                    "table_name": "tf_oneclick_parent",
-                    "selected_option": {
-                        "strategy": "charset_collation_fk_safe",
-                        "tables": ["tf_oneclick_parent", "tf_oneclick_child"],
-                        "fk_order": ["tf_oneclick_parent", "tf_oneclick_child"],
-                        "target_charset": "utf8mb4",
-                        "target_collation": "utf8mb4_0900_ai_ci",
-                        "sql": [
-                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
-                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
-                        ],
-                        "rollback_sql": [
-                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;",
-                            "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"
-                        ]
-                    }
-                }]
-            }),
+            request_id: Some("oneclick-apply-disabled-1".to_string()),
+            payload: json!({"dry_run": false, "backup_confirmed": true}),
         });
-        let error = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("error")))
-            .unwrap();
 
-        assert_eq!(error["request_id"], "oneclick-apply-charset-real-1");
-        assert!(error["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid endpoint"));
+        assert_error_code(&events, "oneclick_apply_disabled");
+        assert_eq!(events[0]["request_id"], "oneclick-apply-disabled-1");
     }
 
     #[test]
-    fn oneclick_apply_fixes_real_engine_innodb_requires_endpoint() {
+    fn oneclick_apply_fixes_non_dry_run_blocks_actions_before_endpoint() {
         let events = handle_request(Request {
             command: "oneclick.apply_fixes".to_string(),
             request_id: Some("oneclick-apply-real-1".to_string()),
@@ -997,16 +1011,9 @@ mod tests {
                 }]
             }),
         });
-        let error = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("error")))
-            .unwrap();
 
-        assert_eq!(error["request_id"], "oneclick-apply-real-1");
-        assert!(error["message"]
-            .as_str()
-            .unwrap()
-            .contains("invalid endpoint"));
+        assert_error_code(&events, "oneclick_apply_disabled");
+        assert_eq!(events[0]["request_id"], "oneclick-apply-real-1");
     }
 
     #[test]
