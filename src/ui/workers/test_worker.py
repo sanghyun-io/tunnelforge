@@ -9,6 +9,7 @@ from PyQt6.QtCore import QThread, pyqtSignal
 
 class TestType(Enum):
     """테스트 유형"""
+    __test__ = False
     TUNNEL_ONLY = "tunnel"      # SSH 터널만 테스트
     DB_ONLY = "db"              # DB 인증만 테스트 (터널 경유)
     INTEGRATED = "integrated"   # 터널 + DB 통합 테스트
@@ -70,13 +71,6 @@ class ConnectionTestWorker(QThread):
         result_msg = ""
 
         try:
-            # DB 자격 증명 확인
-            db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
-            if not db_user:
-                result_success = False
-                result_msg = "❌ DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
-                return
-
             resolved, failure = self._resolve_connection(announce_connection=True)
             if failure:
                 result_success = False
@@ -84,6 +78,13 @@ class ConnectionTestWorker(QThread):
                     result_msg = f"❌ Target DB 포트 도달 실패\n\n{failure.message}\n\n{self._aws_reachability_hint()}"
                 else:
                     result_msg = f"❌ SSH 터널 생성 실패\n{failure.message}"
+                return
+
+            # SSH 신뢰/연결 확인이 끝난 뒤에만 DB 자격 증명을 읽는다.
+            db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
+            if not db_user:
+                result_success = False
+                result_msg = "❌ DB 자격 증명이 저장되어 있지 않습니다.\n터널 설정에서 DB 사용자/비밀번호를 저장해주세요."
                 return
 
             engine = self._resolve_db_engine(resolved.host, resolved.port)
@@ -157,13 +158,6 @@ class ConnectionTestWorker(QThread):
             # 2. DB 인증 테스트
             self.progress.emit("🔐 [2/2] DB 인증 테스트 중...")
 
-            db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
-            if not db_user:
-                results.append("⚠️ 2. DB 인증 테스트 건너뜀 (자격 증명 없음)")
-                result_success = True
-                result_msg = "\n".join(results) + "\n\n💡 DB 테스트를 위해 터널 설정에서 자격 증명을 저장해주세요."
-                return
-
             resolved, failure = self._resolve_connection(announce_connection=False)
             if failure:
                 result_success = False
@@ -173,6 +167,13 @@ class ConnectionTestWorker(QThread):
                 else:
                     results.append(f"❌ 2. DB 테스트 실패 (터널 생성 오류: {failure.message})")
                     result_msg = "\n".join(results)
+                return
+
+            db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
+            if not db_user:
+                results.append("⚠️ 2. DB 인증 테스트 건너뜀 (자격 증명 없음)")
+                result_success = True
+                result_msg = "\n".join(results) + "\n\n💡 DB 테스트를 위해 터널 설정에서 자격 증명을 저장해주세요."
                 return
 
             engine = self._resolve_db_engine(resolved.host, resolved.port)

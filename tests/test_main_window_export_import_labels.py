@@ -2,12 +2,15 @@ import inspect
 import os
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
 
 from src.ui import main_window
+from src.core.scheduler import BackupScheduler
+from src.core.tunnel_monitor import TunnelMonitor
 from src.ui.controllers.tray_controller import TrayController
 from src.ui.main_window import TunnelManagerUI
 
@@ -136,6 +139,109 @@ def test_connection_tests_are_threaded():
     direct_conn_source = inspect.getsource(TunnelManagerUI._test_direct_connection)
     assert "_run_connection_test" in direct_conn_source
     assert "TestType.DB_ONLY" in direct_conn_source
+
+
+def test_main_window_connection_test_uses_result_signal_and_checks_trust_first(
+    monkeypatch,
+):
+    events = []
+    workers = []
+
+    class FakeSignal:
+        def __init__(self):
+            self.connect = MagicMock()
+
+    class FakeWorker:
+        def __init__(self, *args):
+            events.append("worker")
+            self.progress = FakeSignal()
+            self.test_finished = FakeSignal()
+            self.finished = FakeSignal()
+            self.start = MagicMock(side_effect=lambda: events.append("start"))
+            self.deleteLater = MagicMock()
+            workers.append(self)
+
+    class FakeDialog:
+        def __init__(self, *args):
+            self.update_progress = MagicMock()
+
+        def exec(self):
+            events.append("exec")
+
+    class DummyWindow:
+        def __init__(self):
+            self.engine = object()
+            self.config_mgr = object()
+            self._status_bar = MagicMock()
+
+        def statusBar(self):
+            return self._status_bar
+
+        def _on_connection_test_finished(self, *args):
+            pass
+
+    dummy = DummyWindow()
+    config = {"id": "ssh", "name": "SSH", "connection_mode": "ssh_tunnel"}
+
+    def ensure(parent, engine, checked_config):
+        events.append("trust")
+        assert parent is dummy
+        assert engine is dummy.engine
+        assert checked_config is config
+        return True
+
+    monkeypatch.setattr(main_window, "ConnectionTestWorker", FakeWorker)
+    monkeypatch.setattr(main_window, "TestProgressDialog", FakeDialog)
+    monkeypatch.setattr(
+        main_window, "ensure_ssh_host_trusted", ensure, raising=False
+    )
+
+    TunnelManagerUI._run_connection_test(
+        dummy, config, main_window.TestType.TUNNEL_ONLY, "SSH test"
+    )
+
+    worker = workers[0]
+    assert events == ["trust", "worker", "start", "exec"]
+    assert worker.test_finished.connect.call_count == 1
+    assert worker.finished.connect.call_count == 1
+    assert worker.finished.connect.call_args.args[0] is worker.deleteLater
+
+
+def test_main_window_manual_start_requires_ssh_trust(monkeypatch):
+    class DummyWindow:
+        def __init__(self):
+            self.engine = MagicMock()
+            self.engine.start_tunnel.return_value = (True, "ok")
+            self._status_bar = MagicMock()
+            self.tray_icon = MagicMock()
+            self._register_login_path = MagicMock()
+            self.refresh_table = MagicMock()
+
+        def statusBar(self):
+            return self._status_bar
+
+    dummy = DummyWindow()
+    config = {"id": "ssh", "name": "SSH", "connection_mode": "ssh_tunnel"}
+    ensure = MagicMock(return_value=False)
+    monkeypatch.setattr(
+        main_window, "ensure_ssh_host_trusted", ensure, raising=False
+    )
+
+    assert TunnelManagerUI.start_tunnel(dummy, config) is False
+    ensure.assert_called_once_with(dummy, dummy.engine, config)
+    dummy.engine.start_tunnel.assert_not_called()
+
+
+def test_background_tunnel_paths_remain_noninteractive():
+    methods = (
+        TunnelManagerUI._auto_connect_tunnels,
+        BackupScheduler._resolve_connection,
+        TunnelMonitor._reconnect_after_delay,
+    )
+    for method in methods:
+        source = inspect.getsource(method)
+        assert "ensure_ssh_host_trusted" not in source
+        assert "QMessageBox" not in source
 
 
 # --- 4. 조용한 리로드(_reload_and_refresh) ---

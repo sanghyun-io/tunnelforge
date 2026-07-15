@@ -16,6 +16,7 @@ from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
+from src.ui.dialogs.ssh_host_key_dialog import ensure_ssh_host_trusted
 from src.ui.controllers import TrayController, TunnelActionsController, WizardLauncher
 from src.ui.dialogs.migration_dialogs import has_active_detached_migration_workers
 from src.ui.dialogs.oneclick_migration_dialog import (
@@ -446,13 +447,16 @@ class TunnelManagerUI(QMainWindow):
 
     def _run_connection_test(self, tunnel: dict, test_type: TestType, title: str):
         """연결 테스트를 백그라운드 스레드에서 실행하고 진행 다이얼로그로 결과를 보여준다."""
+        if not ensure_ssh_host_trusted(self, self.engine, tunnel):
+            return
+
         tunnel_name = tunnel.get("name", "알 수 없음")
         self.statusBar().showMessage(f"연결 테스트 중: {tunnel_name}...")
 
         dialog = TestProgressDialog(self, title)
         worker = ConnectionTestWorker(test_type, tunnel, self.engine, self.config_mgr, self)
         worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(
+        worker.test_finished.connect(
             lambda success, message: self._on_connection_test_finished(dialog, tunnel_name, success, message)
         )
         worker.finished.connect(worker.deleteLater)
@@ -622,6 +626,9 @@ class TunnelManagerUI(QMainWindow):
         return bool(self.start_tunnel(tunnel))
 
     def start_tunnel(self, tunnel_config):
+        if not ensure_ssh_host_trusted(self, self.engine, tunnel_config):
+            return False
+
         self.statusBar().showMessage(f"연결 시도 중: {tunnel_config['name']}...")
         success, msg = self.engine.start_tunnel(tunnel_config)
 

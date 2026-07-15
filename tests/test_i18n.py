@@ -143,6 +143,41 @@ def test_translate_text_handles_common_hardcoded_ui_phrases():
     assert i18n.translate_text("사용 중") == "In Use"
 
 
+def test_ssh_host_trust_dialog_strings_have_exact_english_translations():
+    i18n.set_language("en")
+
+    expected = {
+        "SSH 호스트 키 확인": "SSH Host Key Verification",
+        "처음 연결하는 SSH 서버입니다.": "This is the first connection to this SSH server.",
+        "서버:": "Server:",
+        "키 알고리즘:": "Key algorithm:",
+        "SHA256 지문:": "SHA256 fingerprint:",
+        "이 지문을 서버 관리자 또는 신뢰할 수 있는 채널로 확인한 후 계속하세요.": (
+            "Verify this fingerprint with the server administrator or through a trusted channel before continuing."
+        ),
+        "신뢰하고 계속": "Trust and Continue",
+        "SSH 호스트 키 변경 감지": "SSH Host Key Change Detected",
+        "SSH 서버의 호스트 키가 이전에 승인한 키와 다릅니다.": (
+            "The SSH server host key differs from the previously approved key."
+        ),
+        "이전 SHA256 지문:": "Previous SHA256 fingerprint:",
+        "새 SHA256 지문:": "New SHA256 fingerprint:",
+        "보안을 위해 연결을 차단했습니다. 서버 관리자를 통해 변경 사유를 확인하세요.": (
+            "The connection was blocked for security. Confirm the reason for the change with the server administrator."
+        ),
+        "SSH 호스트 키 확인 실패": "SSH Host Key Verification Failed",
+        "SSH 서버의 호스트 키를 안전하게 확인할 수 없어 연결을 중단했습니다.": (
+            "The connection was stopped because the SSH server host key could not be verified safely."
+        ),
+        "SSH 호스트 키 승인이 완료되지 않았습니다.": (
+            "SSH host key approval was not completed."
+        ),
+    }
+
+    for korean, english in expected.items():
+        assert i18n.translate_text(korean) == english
+
+
 def test_qt_i18n_hooks_translate_hardcoded_widget_text(monkeypatch):
     monkeypatch.setenv("QT_QPA_PLATFORM", "offscreen")
     from PyQt6.QtWidgets import (

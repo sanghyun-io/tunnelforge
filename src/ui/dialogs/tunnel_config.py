@@ -13,6 +13,7 @@ from src.core.i18n import translate_text
 from src.ui.styles import ButtonStyles, LabelStyles
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
+from src.ui.dialogs.ssh_host_key_dialog import ensure_ssh_host_trusted
 
 logger = get_logger(__name__)
 
@@ -527,6 +528,8 @@ class TunnelConfigDialog(QDialog):
         return None
 
     def _run_test(self, test_type: TestType, temp_config: dict, config_mgr, title: str):
+        if not ensure_ssh_host_trusted(self, self.engine, temp_config):
+            return
         dialog = self._start_connection_test(test_type, temp_config, config_mgr, title)
         dialog.exec()
 

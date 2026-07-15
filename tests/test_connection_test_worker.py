@@ -1,6 +1,99 @@
+import inspect
+from unittest.mock import MagicMock
+
 import pytest
 
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
+
+
+def test_test_type_enum_is_not_a_pytest_test_class():
+    assert TestType.__test__ is False
+    assert [member.value for member in TestType] == ["tunnel", "db", "integrated"]
+
+
+def test_connection_worker_never_contains_prompting_ui():
+    assert "QMessageBox" not in inspect.getsource(ConnectionTestWorker)
+
+
+def test_connection_worker_emits_unknown_host_failure_without_credentials():
+    engine = MagicMock()
+    engine.test_connection.return_value = (
+        False,
+        "SSH 서버 신뢰 승인이 필요합니다",
+    )
+    config_manager = MagicMock()
+    worker = ConnectionTestWorker(
+        TestType.TUNNEL_ONLY,
+        {"id": "unknown", "connection_mode": "ssh_tunnel"},
+        engine,
+        config_manager,
+    )
+    results = []
+    worker.test_finished.connect(lambda success, message: results.append((success, message)))
+
+    worker.run()
+
+    assert results == [(False, "SSH 서버 신뢰 승인이 필요합니다")]
+    config_manager.get_tunnel_credentials.assert_not_called()
+
+
+def test_db_worker_trust_race_fails_before_loading_db_credentials():
+    engine = MagicMock()
+    engine.is_running.return_value = False
+    engine.test_target_reachable_from_bastion.return_value = (
+        False,
+        "SSH 서버 신뢰 승인이 필요합니다",
+    )
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("db-user", "db-password")
+    worker = ConnectionTestWorker(
+        TestType.DB_ONLY,
+        {
+            "id": "unknown",
+            "connection_mode": "ssh_tunnel",
+            "db_engine": "mysql",
+        },
+        engine,
+        config_manager,
+    )
+    results = []
+    worker.test_finished.connect(lambda success, message: results.append((success, message)))
+
+    worker.run()
+
+    assert results and results[-1][0] is False
+    assert "SSH 서버 신뢰 승인이 필요합니다" in results[-1][1]
+    config_manager.get_tunnel_credentials.assert_not_called()
+
+
+def test_integrated_worker_trust_race_fails_before_loading_db_credentials():
+    engine = MagicMock()
+    engine.test_connection.return_value = (True, "trusted tunnel test")
+    engine.is_running.return_value = False
+    engine.test_target_reachable_from_bastion.return_value = (
+        False,
+        "SSH 서버 신뢰 승인이 필요합니다",
+    )
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("db-user", "db-password")
+    worker = ConnectionTestWorker(
+        TestType.INTEGRATED,
+        {
+            "id": "unknown",
+            "connection_mode": "ssh_tunnel",
+            "db_engine": "mysql",
+        },
+        engine,
+        config_manager,
+    )
+    results = []
+    worker.test_finished.connect(lambda success, message: results.append((success, message)))
+
+    worker.run()
+
+    assert results and results[-1][0] is False
+    assert "SSH 서버 신뢰 승인이 필요합니다" in results[-1][1]
+    config_manager.get_tunnel_credentials.assert_not_called()
 
 
 def test_resolve_db_engine_uses_saved_config():

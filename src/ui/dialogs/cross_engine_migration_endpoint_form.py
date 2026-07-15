@@ -13,6 +13,8 @@ from src.core.cross_engine_migration import (
     DatabaseEngine,
     make_connection_payload,
 )
+from src.core.i18n import translate_text
+from src.ui.dialogs.ssh_host_key_dialog import ensure_ssh_host_trusted
 
 
 class EndpointForm(QGroupBox):
@@ -278,6 +280,10 @@ class EndpointForm(QGroupBox):
         config = data.get("config") or {}
         tid = data.get("tunnel_id")
         if self.tunnel_engine and config and tid and not self.tunnel_engine.is_running(tid):
+            if not ensure_ssh_host_trusted(self, self.tunnel_engine, config):
+                raise ValueError(
+                    translate_text("SSH 호스트 키 승인이 완료되지 않았습니다.")
+                )
             success, message = self.tunnel_engine.start_tunnel(config)
             if not success:
                 raise ValueError(f"{self.title()} 터널 시작 실패: {message}")

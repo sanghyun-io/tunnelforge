@@ -1,11 +1,13 @@
 import inspect
 import os
 import sys
+from unittest.mock import MagicMock
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication, QDialog, QWidget
 
+from src.ui.dialogs import tunnel_config as tunnel_config_module
 from src.ui.dialogs.tunnel_config import (
     TunnelConfigDialog,
     _RunningTestProgressDialog,
@@ -276,3 +278,60 @@ def test_connection_test_flows_share_run_test_wrapper():
         source = inspect.getsource(method)
         assert "_run_test(" in source
         assert "dialog.exec()" not in source
+
+
+def test_connection_test_checks_ssh_trust_before_worker_start(monkeypatch):
+    events = []
+    engine = object()
+    parent = ParentWithTunnels()
+    dialog = TunnelConfigDialog(parent, tunnel_data={"id": "current"}, tunnel_engine=engine)
+    progress_dialog = MagicMock()
+    config = {"id": "current", "connection_mode": "ssh_tunnel"}
+
+    def ensure(parent_widget, checked_engine, checked_config):
+        events.append("trust")
+        assert parent_widget is dialog
+        assert checked_engine is engine
+        assert checked_config is config
+        return True
+
+    def start(*args):
+        events.append("start")
+        return progress_dialog
+
+    progress_dialog.exec.side_effect = lambda: events.append("exec")
+    monkeypatch.setattr(
+        tunnel_config_module, "ensure_ssh_host_trusted", ensure, raising=False
+    )
+    monkeypatch.setattr(dialog, "_start_connection_test", start)
+    try:
+        dialog._run_test(TestType.TUNNEL_ONLY, config, None, "터널 테스트")
+        assert events == ["trust", "start", "exec"]
+    finally:
+        dialog.close()
+        parent.close()
+
+
+def test_connection_test_cancelled_trust_never_starts_worker(monkeypatch):
+    engine = object()
+    parent = ParentWithTunnels()
+    dialog = TunnelConfigDialog(parent, tunnel_data={"id": "current"}, tunnel_engine=engine)
+    start = MagicMock()
+    monkeypatch.setattr(
+        tunnel_config_module,
+        "ensure_ssh_host_trusted",
+        MagicMock(return_value=False),
+        raising=False,
+    )
+    monkeypatch.setattr(dialog, "_start_connection_test", start)
+    try:
+        dialog._run_test(
+            TestType.TUNNEL_ONLY,
+            {"id": "current", "connection_mode": "ssh_tunnel"},
+            None,
+            "터널 테스트",
+        )
+        start.assert_not_called()
+    finally:
+        dialog.close()
+        parent.close()
