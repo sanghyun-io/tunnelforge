@@ -1137,8 +1137,8 @@ def test_current_status_tracks_embedded_github_app_key_rotation_scope():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "TF-STATUS-092 is `in_progress`" in summary
-    assert "TF-STATUS-092 | High | in_progress" in tracker
+    assert "TF-STATUS-092 is `fixed_pending_full_verify`" in summary
+    assert "TF-STATUS-092 | High | fixed_pending_full_verify" in tracker
     assert "42 published releases" in verification
     assert "`v1.13.4` through `v2.3.0`" in verification
     assert "App ID `2735888`" in sessions
@@ -1157,7 +1157,7 @@ def test_current_status_records_anonymous_error_reporting_design():
     assert "Last reviewed: 2026-07-15" in doc
     assert "dedicated reporter GitHub App" in summary
     assert "Cloudflare Worker" in summary
-    assert "TF-STATUS-092 | High | in_progress" in tracker
+    assert "TF-STATUS-092 | High | fixed_pending_full_verify" in tracker
     assert "2026-07-14-anonymous-error-reporting-design.md" in verification
     assert "30 days" in verification
     assert "at most twice" in verification
@@ -1173,8 +1173,8 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "TF-STATUS-092 is `in_progress`" in summary
-    assert "TF-STATUS-092 | High | in_progress" in tracker
+    assert "TF-STATUS-092 is `fixed_pending_full_verify`" in summary
+    assert "TF-STATUS-092 | High | fixed_pending_full_verify" in tracker
     assert "2026-07-14-anonymous-error-reporting.md" in verification
     assert "13 TDD tasks" in verification
     assert "D1 global mutation budgets" in verification
@@ -1218,8 +1218,13 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "9dbed64a-0d60-43bf-b946-24ab96e312f5" in verification
     assert "full Python 2697 passed / 1 skipped" in verification
     assert "61 successful invocations and zero errors" in verification
+    assert "2026-07-15T02:06:03Z" in verification
+    assert "2026-07-15T03:06:23Z" in verification
+    assert "29382607405" in verification
+    assert "29382607434" in verification
+    assert "PR #245" in verification
     assert "2026-07-14-anonymous-error-reporting.md" in order
-    assert "Revoke the old embedded key" in order
+    assert "Complete fresh-head hosted verification and protected PR #245" in order
     assert "Implementation has not yet changed runtime code" in sessions
     assert "Completed and independently approved TF-STATUS-092 Task 5" in sessions
     assert "Completed and independently approved TF-STATUS-092 Task 6" in sessions
@@ -1232,3 +1237,5 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "Published the reviewed local Tasks 1-11 branch" in sessions
     assert "Advanced TF-STATUS-092 Tasks 12-13" in sessions
     assert "Completed the live Task 13 canary and active rollout" in sessions
+    assert "Deleted the exposed Reporter key" in sessions
+    assert "Removed the unused `GH_APP_PRIVATE_KEY` repository secret" in sessions
