@@ -1,4 +1,5 @@
 import ctypes
+import asyncio
 import json
 import os
 from pathlib import Path
@@ -179,12 +180,44 @@ def _assert_signal_or_forced_exit(process, state_path=None):
     )
 
 
+def _is_asyncio_process(process):
+    return isinstance(process, asyncio.subprocess.Process)
+
+
+async def _settle_tracked_asyncio_process_on_owner(client, process):
+    if process.returncode is None:
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
+    await process.wait()
+    stderr_task = client._stderr_task
+    if stderr_task is not None and not stderr_task.done():
+        await asyncio.shield(stderr_task)
+    if client._stderr_task is stderr_task:
+        client._stderr_task = None
+
+
+def _terminate_pid_without_transport(process):
+    pid = process.pid
+    if not _pid_is_alive(pid):
+        if isinstance(process, subprocess.Popen) and process.returncode is None:
+            process.wait(timeout=2.0)
+        return
+    os.kill(pid, signal.SIGTERM)
+    if isinstance(process, subprocess.Popen):
+        process.wait(timeout=2.0)
+    else:
+        _assert_pid_terminal(pid)
+
+
 def _shutdown_and_assert_zero_residual(
     client,
     pids,
     *,
     processes=(),
     request_threads=(),
+    simulated_owner_stopped_transports=(),
 ):
     owner = client.owner_thread
     tracked_processes = [process for process in processes if process is not None]
@@ -194,6 +227,48 @@ def _shutdown_and_assert_zero_residual(
     ):
         tracked_processes.append(current_process)
     failures = []
+    asyncio_processes = [
+        process
+        for process in tracked_processes
+        if _is_asyncio_process(process) and process.returncode is None
+    ]
+    if not owner.is_alive() or client.owner_loop.is_closed():
+        asyncio_processes.extend(
+            process
+            for process in simulated_owner_stopped_transports
+            if process.returncode is None
+            and all(process is not tracked for tracked in asyncio_processes)
+        )
+    owner_stopped_asyncio_processes = set()
+
+    if asyncio_processes:
+        if owner.is_alive() and not client.owner_loop.is_closed():
+            for process in asyncio_processes:
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        _settle_tracked_asyncio_process_on_owner(client, process),
+                        client.owner_loop,
+                    ).result(timeout=2.0)
+                except BaseException as exc:
+                    failures.append(exc)
+        else:
+            for process in asyncio_processes:
+                pid = getattr(process, "pid", None)
+                try:
+                    if pid is not None:
+                        _terminate_pid_without_transport(process)
+                except BaseException as exc:
+                    failures.append(exc)
+                failures.append(DbCoreServiceError(
+                    "DB Core asyncio transport could not be settled after owner stop",
+                    code="db_core_residual_process",
+                    outcome=DbCoreOutcome.FAILED,
+                    payload={
+                        "stage": "transport_unsettled_owner_stopped",
+                        "pid": pid,
+                    },
+                ))
+                owner_stopped_asyncio_processes.add(process)
 
     try:
         client.shutdown(timeout_seconds=2.0)
@@ -215,6 +290,8 @@ def _shutdown_and_assert_zero_residual(
     ]))
 
     for process in tracked_processes:
+        if process in owner_stopped_asyncio_processes:
+            continue
         if getattr(process, "returncode", None) is not None:
             continue
         try:
@@ -326,6 +403,68 @@ def test_finalizer_reaps_tracked_child_with_cleared_client_and_stopped_owner():
 
     assert cleanup_error is None
     assert not alive_after_finalizer
+
+
+def test_finalizer_settles_tracked_asyncio_process_on_owner_loop(tmp_path):
+    client, _state_path = _helper_client(tmp_path, "stall")
+    processes = []
+    pids = []
+    try:
+        client.start()
+        process = client._process
+        assert isinstance(process, asyncio.subprocess.Process)
+        processes.append(process)
+        pids.append(process.pid)
+        client._process = None
+
+        _shutdown_and_assert_zero_residual(
+            client,
+            pids,
+            processes=processes,
+        )
+
+        assert process.returncode is not None
+    finally:
+        if client.owner_thread.is_alive():
+            _finalize_real_child_runner(client, pids, processes=processes)
+
+
+def test_finalizer_stopped_owner_reports_transport_unsettled():
+    client = DbCoreServiceClient(
+        executable="unused-core",
+        process_factory=lambda *args, **kwargs: None,
+    )
+    client.shutdown(timeout_seconds=1.0)
+    process = subprocess.Popen(
+        [HELPER_PYTHON, "-c", "import time; time.sleep(60)"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    try:
+        assert not isinstance(process, asyncio.subprocess.Process)
+        assert process.poll() is None
+        assert not client.owner_thread.is_alive()
+        assert client.owner_loop.is_closed()
+
+        with pytest.raises(DbCoreServiceError) as raised:
+            _shutdown_and_assert_zero_residual(
+                client,
+                [process.pid],
+                processes=[process],
+                simulated_owner_stopped_transports=[process],
+            )
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "transport_unsettled_owner_stopped"
+        assert raised.value.payload["pid"] == process.pid
+        assert process.returncode is not None
+        _assert_pid_terminal(process.pid)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=5.0)
 
 
 def _assert_cancel_transitions(transitions, generation):

@@ -512,12 +512,14 @@ class DbCoreServiceClient:
         self._stderr_tail: Deque[str] = deque(maxlen=200)
         self._stderr_lock = threading.Lock()
         self._stderr_task: Optional[asyncio.Task] = None
+        self._process_wait_task: Optional[asyncio.Task] = None
         self._admission_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
         self._shutdown_complete = False
         self._active_request_task: Optional[asyncio.Task] = None
         self._active_request_deadline_at: Optional[float] = None
+        self._owner_reap_task: Optional[asyncio.Task] = None
         self._request_tasks: Set[asyncio.Task] = set()
         self._spawn_task: Optional[asyncio.Task] = None
         self._spawn_is_native = False
@@ -745,18 +747,19 @@ class DbCoreServiceClient:
             timeout=self._remaining(cutoff_at),
         )
 
-    async def _settle_process_wait_before(self, awaitable, cutoff_at: float):
-        wait_task = asyncio.ensure_future(awaitable)
+    async def _settle_process_wait_before(
+        self,
+        wait_task: asyncio.Task,
+        cutoff_at: float,
+    ):
         if not wait_task.done():
             await asyncio.sleep(0)
         if wait_task.done():
             return wait_task.result()
         remaining = self._remaining(cutoff_at)
         if remaining <= 0.0:
-            wait_task.cancel()
-            await asyncio.sleep(0)
             raise asyncio.TimeoutError
-        return await asyncio.wait_for(wait_task, timeout=remaining)
+        return await asyncio.wait_for(asyncio.shield(wait_task), timeout=remaining)
 
     def _cleanup_deadline_on_owner(self, *deadlines: float) -> float:
         return min(
@@ -1971,6 +1974,14 @@ class DbCoreServiceClient:
         if process is None:
             self._transition_generation(DbCoreGenerationState.CLOSED)
             return
+        process_wait_task = self._process_wait_task
+        wait = getattr(process, "wait", None)
+        if callable(wait) and process_wait_task is None:
+            pending_wait = wait()
+            if inspect.isawaitable(pending_wait):
+                process_wait_task = asyncio.ensure_future(pending_wait)
+                self._process_wait_task = process_wait_task
+                await asyncio.sleep(0)
         stderr_task = self._stderr_task
         if stderr_task is not None and not stderr_task.done():
             stderr_task.cancel()
@@ -2005,7 +2016,6 @@ class DbCoreServiceClient:
             except Exception:
                 needs_kill = True
 
-        wait = getattr(process, "wait", None)
         if not callable(wait):
             if self._process_factory is None or self._process_is_running_on_owner(process):
                 raise self._residual_process_error(
@@ -2013,18 +2023,16 @@ class DbCoreServiceClient:
                     "DB Core process has no wait handle to prove reap",
                     process=process,
                 )
-        else:
+        elif process_wait_task is not None:
             if not needs_kill:
                 try:
-                    pending_wait = wait()
-                    if inspect.isawaitable(pending_wait):
-                        graceful_wait_cutoff = self._monotonic() + (
-                            self._remaining(deadline_at) / 2.0
-                        )
-                        await self._settle_process_wait_before(
-                            pending_wait,
-                            graceful_wait_cutoff,
-                        )
+                    graceful_wait_cutoff = self._monotonic() + (
+                        self._remaining(deadline_at) / 2.0
+                    )
+                    await self._settle_process_wait_before(
+                        process_wait_task,
+                        graceful_wait_cutoff,
+                    )
                 except asyncio.TimeoutError:
                     needs_kill = True
             if needs_kill:
@@ -2035,26 +2043,26 @@ class DbCoreServiceClient:
                         "DB Core process cannot be killed after terminate refusal",
                         process=process,
                     )
+                if self._process_is_running_on_owner(process):
+                    try:
+                        kill()
+                    except Exception as exc:
+                        raise self._residual_process_error(
+                            "kill",
+                            f"DB Core process kill failed: {type(exc).__name__}: {exc}",
+                            process=process,
+                        ) from exc
                 try:
-                    kill()
-                except Exception as exc:
-                    raise self._residual_process_error(
-                        "kill",
-                        f"DB Core process kill failed: {type(exc).__name__}: {exc}",
-                        process=process,
-                    ) from exc
-                try:
-                    pending_wait = wait()
-                    if inspect.isawaitable(pending_wait):
-                        await self._settle_process_wait_before(
-                            pending_wait,
-                            deadline_at,
-                        )
+                    await self._settle_process_wait_before(
+                        process_wait_task,
+                        deadline_at,
+                    )
                 except asyncio.TimeoutError as exc:
                     raise self._residual_process_error(
                         "final_wait",
                         "DB Core process remained alive after bounded kill",
                         process=process,
+                        pending_tasks=[self._task_diagnostic(process_wait_task)],
                     ) from exc
         if stderr_task is not None and not stderr_task.done():
             try:
@@ -2070,6 +2078,7 @@ class DbCoreServiceClient:
                     pending_tasks=[self._task_diagnostic(stderr_task)],
                 ) from exc
         self._stderr_task = None
+        self._process_wait_task = None
         self._process = None
         self._transition_generation(DbCoreGenerationState.CLOSED)
 
@@ -2129,6 +2138,30 @@ class DbCoreServiceClient:
             raise settlement_error
         return True
 
+    def _ensure_owner_reap_task_on_owner(self, deadline_at: float) -> asyncio.Task:
+        task = self._owner_reap_task
+        if task is not None:
+            return task
+
+        task = asyncio.create_task(self._cancel_active_on_owner(deadline_at))
+        self._owner_reap_task = task
+
+        def retrieve_owner_reap_result(completed: asyncio.Task) -> None:
+            try:
+                completed.result()
+            except BaseException:
+                pass
+            finally:
+                if self._owner_reap_task is completed:
+                    self._owner_reap_task = None
+
+        task.add_done_callback(retrieve_owner_reap_result)
+        return task
+
+    async def _await_owner_reap_on_owner(self, deadline_at: float) -> bool:
+        task = self._ensure_owner_reap_task_on_owner(deadline_at)
+        return bool(await asyncio.shield(task))
+
     def cancel_active_request(
         self,
         *,
@@ -2136,7 +2169,6 @@ class DbCoreServiceClient:
     ) -> bool:
         timeout = self._validated_timeout(timeout_seconds, DEFAULT_SHUTDOWN_TIMEOUT_SECONDS)
         deadline_at = self._monotonic() + timeout
-        owner_deadline_at = self._cleanup_start(deadline_at, timeout)
         remaining = self._remaining(deadline_at)
         if remaining <= 0.0 or not self._admission_lock.acquire(timeout=remaining):
             raise DbCoreServiceError(
@@ -2148,8 +2180,13 @@ class DbCoreServiceClient:
         try:
             if self._shutdown_started:
                 return False
+            active_deadline_at = self._active_request_deadline_at or deadline_at
+            owner_deadline_at = self._cleanup_deadline_on_owner(
+                active_deadline_at,
+                self._cleanup_start(deadline_at, timeout),
+            )
             future = self._submit_owner(
-                self._cancel_active_on_owner(owner_deadline_at),
+                self._await_owner_reap_on_owner(owner_deadline_at),
                 DbCoreRequestKind.MUTATION,
                 "cancel-active",
             )
@@ -2158,12 +2195,15 @@ class DbCoreServiceClient:
         try:
             return bool(future.result(timeout=self._remaining(deadline_at)))
         except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            raise DbCoreServiceError(
+            raise self._residual_process_error(
+                "cancel_handoff",
                 "DB Core active request cancellation exceeded its deadline",
-                code="db_core_residual_process",
-                outcome=DbCoreOutcome.FAILED,
-                process_generation=self._process_generation,
+                pending_tasks=(
+                    []
+                    if self._owner_reap_task is None
+                    else [self._task_diagnostic(self._owner_reap_task)]
+                ),
+                extra={"reap_continues": self._owner_reap_task is not None},
             ) from exc
         except concurrent.futures.CancelledError as exc:
             raise DbCoreServiceError(
@@ -2183,7 +2223,7 @@ class DbCoreServiceClient:
         ]
         for task in queued_requests:
             task.cancel()
-        cancelled_active = await self._cancel_active_on_owner(deadline_at)
+        cancelled_active = await self._await_owner_reap_on_owner(deadline_at)
         if not cancelled_active:
             await self._terminate_process_on_owner(deadline_at)
         if queued_requests:

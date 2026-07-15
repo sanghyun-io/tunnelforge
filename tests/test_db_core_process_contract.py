@@ -2486,7 +2486,7 @@ def test_one_absolute_deadline_bounds_hello_write_drain_read_cleanup(stall):
     assert raised.value.outcome in (DbCoreOutcome.NOT_STARTED, DbCoreOutcome.FAILED)
     assert process.terminate_calls == 1
     assert process.wait_calls >= 1
-    assert process.kill_calls == (1 if stall == "cleanup" else 0)
+    assert process.kill_calls == 0
     assert client.generation_state is DbCoreGenerationState.CLOSED
 
 
@@ -2942,7 +2942,9 @@ def test_cancel_owner_cleanup_reserves_caller_handoff_and_preserves_diagnostics(
         assert raised.value.payload.get("stage") == "final_wait"
         assert raised.value.payload.get("pid") == 9877
         assert raised.value.payload.get("generation_state") == "reaping"
-        assert raised.value.payload.get("pending_tasks") == []
+        pending_tasks = raised.value.payload.get("pending_tasks")
+        assert len(pending_tasks) == 1
+        assert "_Task4Process.wait" in pending_tasks[0]
         assert owner_deadlines == [pytest.approx(started + 0.48, abs=0.03)]
         assert client.generation_state is DbCoreGenerationState.REAPING
     finally:
@@ -2955,6 +2957,100 @@ def test_cancel_owner_cleanup_reserves_caller_handoff_and_preserves_diagnostics(
         process.returncode = -9
         process.stdout.feed_eof()
         process.stderr.feed_eof()
+        request_thread.join(timeout=1.0)
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert not request_thread.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], DbCoreServiceError)
+
+
+def test_cancel_caller_timeout_does_not_cancel_owner_reap(monkeypatch):
+    process = _Task4Process(
+        pid=9878,
+        stall_terminate_wait=True,
+        stall_final_wait=True,
+    )
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+    process.before_write.clear()
+    process.read_entered.clear()
+    request_thread, errors = _task4_start_request(
+        client,
+        request_id="cancel-caller-timeout",
+        timeout_seconds=2.0,
+    )
+    assert process.before_write.wait(timeout=0.5)
+    assert process.read_entered.wait(timeout=0.5)
+    owner_deadlines = []
+    original_cancel = client._cancel_active_on_owner
+    original_settle = client._settle_process_wait_before
+    settle_entered = threading.Event()
+    release_settle = threading.Event()
+
+    async def record_cancel_deadline(deadline_at):
+        owner_deadlines.append(deadline_at)
+        return await original_cancel(deadline_at)
+
+    async def block_process_wait_past_caller_deadline(wait_task, cutoff_at):
+        settle_entered.set()
+        while not release_settle.is_set():
+            await asyncio.sleep(0.001)
+        return await original_settle(wait_task, cutoff_at)
+
+    monkeypatch.setattr(client, "_cancel_active_on_owner", record_cancel_deadline)
+    monkeypatch.setattr(
+        client,
+        "_settle_process_wait_before",
+        block_process_wait_past_caller_deadline,
+    )
+    cancel_timeout = 0.05
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.cancel_active_request(timeout_seconds=cancel_timeout)
+        elapsed = time.monotonic() - started
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "cancel_handoff"
+        assert raised.value.payload["reap_continues"] is True
+        assert elapsed < 0.2
+        assert settle_entered.is_set()
+        assert owner_deadlines == [
+            pytest.approx(
+                client._cleanup_start(started + cancel_timeout, cancel_timeout),
+                abs=0.02,
+            )
+        ]
+        reap_task = client._owner_reap_task
+        assert reap_task is not None
+        assert not reap_task.cancelled()
+
+        process.stall_final_wait = False
+        process.returncode = -9
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+        release_settle.set()
+        settled_deadline = time.monotonic() + 1.0
+        while (
+            client.generation_state is not DbCoreGenerationState.CLOSED
+            and time.monotonic() < settled_deadline
+        ):
+            time.sleep(0.01)
+        assert client.generation_state is DbCoreGenerationState.CLOSED
+        assert client._process is None
+        assert client._owner_reap_task is None
+    finally:
+        process.stall_final_wait = False
+        process.returncode = -9
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+        release_settle.set()
         request_thread.join(timeout=1.0)
         if client.owner_thread.is_alive():
             client.shutdown(timeout_seconds=1.0)
@@ -3040,6 +3136,68 @@ def test_native_like_process_wait_settles_once_at_exhausted_deadline():
     assert process.kill_calls == 0
     assert client._process is None
     assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_process_reap_uses_single_wait_task():
+    process = _Task4Process(stall_terminate_wait=True)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+
+    client.shutdown(timeout_seconds=0.2)
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.wait_calls == 1
+    assert client._process is None
+    assert not client.owner_thread.is_alive()
+
+
+def test_process_exit_at_grace_boundary_skips_kill(monkeypatch):
+    process = _Task4Process(stall_terminate_wait=True)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+    original_settle = client._settle_process_wait_before
+    settle_calls = 0
+
+    async def terminal_grace_timeout(wait_handle, cutoff_at):
+        nonlocal settle_calls
+        settle_calls += 1
+        if settle_calls == 1:
+            close = getattr(wait_handle, "close", None)
+            if callable(close):
+                close()
+            process.returncode = 0
+            process.stdout.feed_eof()
+            process.stderr.feed_eof()
+            raise asyncio.TimeoutError
+        return await original_settle(wait_handle, cutoff_at)
+
+    monkeypatch.setattr(
+        client,
+        "_settle_process_wait_before",
+        terminal_grace_timeout,
+    )
+    future = client._submit_owner(
+        client._terminate_process_on_owner(client._monotonic() + 1.0),
+        DbCoreRequestKind.MUTATION,
+        "grace-boundary-terminal",
+    )
+    try:
+        future.result(timeout=1.0)
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert process.wait_calls == 1
+    assert process.kill_calls == 0
+    assert client._process is None
+    assert not client.owner_thread.is_alive()
 
 
 def test_cancel_active_task_residual_still_reaps_process():
@@ -3156,7 +3314,7 @@ def test_cleanup_terminate_wait_timeout_escalates_to_kill():
 
     assert process.terminate_calls == 1
     assert process.kill_calls == 1
-    assert process.wait_calls >= 2
+    assert process.wait_calls == 1
     assert client._process is None
     assert not client.owner_thread.is_alive()
 
