@@ -47,6 +47,10 @@ class DbCoreGenerationState(str, Enum):
 
 MAX_JSONL_FRAME_BYTES = 1_048_576
 DB_CORE_STDIN_HIGH_WATER_BYTES = 65_536
+MAX_ASSEMBLED_EVENT_BYTES = 64 * 1024 * 1024
+MAX_ASSEMBLED_EVENT_CHUNKS = 4_096
+MAX_ASSEMBLED_EVENT_NODES = 65_536
+MAX_ASSEMBLED_EVENT_DEPTH = 128
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 3600.0
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 5.0
 REQUIRED_PROCESS_CAPABILITIES = frozenset({
@@ -124,8 +128,22 @@ class _PayloadAssembler:
 
     _VALUE_KINDS = frozenset({"list", "object", "utf8_string", "atomic"})
 
-    def __init__(self, request_id: str):
+    def __init__(
+        self,
+        request_id: str,
+        *,
+        max_aggregate_bytes: int = MAX_ASSEMBLED_EVENT_BYTES,
+        max_chunks: int = MAX_ASSEMBLED_EVENT_CHUNKS,
+        max_nodes: int = MAX_ASSEMBLED_EVENT_NODES,
+        max_depth: int = MAX_ASSEMBLED_EVENT_DEPTH,
+    ):
         self._request_id = request_id
+        self._max_aggregate_bytes = max_aggregate_bytes
+        self._max_chunks = max_chunks
+        self._max_nodes = max_nodes
+        self._max_depth = max_depth
+        self._aggregate_bytes = 0
+        self._chunk_count = 0
         self._nodes: Dict[int, _PayloadNode] = {}
         self._root_node_id: Optional[int] = None
         self._command: Optional[str] = None
@@ -150,13 +168,32 @@ class _PayloadAssembler:
                 "payload_chunk is missing required fields: " + ", ".join(missing)
             )
 
-    def consume(self, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    def consume(
+        self,
+        payload: Dict[str, Any],
+        *,
+        frame_bytes: Optional[int] = None,
+    ) -> Optional[Dict[str, Any]]:
         if payload.get("event") != "payload_chunk":
             if self._nodes:
                 raise HelperProtocolError(
                     "logical event changed before payload_chunk assembly completed"
                 )
             return payload
+
+        if frame_bytes is None:
+            frame_bytes = len(
+                (json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
+                .encode("utf-8")
+            )
+        if isinstance(frame_bytes, bool) or not isinstance(frame_bytes, int) or frame_bytes < 0:
+            raise HelperProtocolError("payload_chunk frame byte count is invalid")
+        if self._chunk_count >= self._max_chunks:
+            raise HelperProtocolError("payload_chunk exceeds aggregate chunk count limit")
+        if frame_bytes > self._max_aggregate_bytes - self._aggregate_bytes:
+            raise HelperProtocolError("payload_chunk exceeds aggregate byte limit")
+        self._chunk_count += 1
+        self._aggregate_bytes += frame_bytes
 
         self._required_keys(payload, {
             "request_id",
@@ -220,6 +257,8 @@ class _PayloadAssembler:
         if node is None:
             if sequence != 0:
                 raise HelperProtocolError("payload_chunk node sequence must start at zero")
+            if len(self._nodes) >= self._max_nodes:
+                raise HelperProtocolError("payload_chunk exceeds aggregate node count limit")
             node = _PayloadNode(
                 node_id=node_id,
                 parent_node_id=parent_node_id,
@@ -266,7 +305,7 @@ class _PayloadAssembler:
 
         if node_id != self._root_node_id or not final:
             return None
-        value = self._resolve(node_id, set())
+        value = self._resolve(node_id, set(), 1)
         if not isinstance(value, dict):
             raise HelperProtocolError("payload_chunk root must reconstruct an object")
         if value.get("event") != self._logical_event:
@@ -281,9 +320,13 @@ class _PayloadAssembler:
         self._root_node_id = None
         self._command = None
         self._logical_event = None
+        self._aggregate_bytes = 0
+        self._chunk_count = 0
         return value
 
-    def _resolve(self, node_id: int, visiting: Set[int]) -> Any:
+    def _resolve(self, node_id: int, visiting: Set[int], depth: int) -> Any:
+        if depth > self._max_depth:
+            raise HelperProtocolError("payload_chunk exceeds reconstruction depth limit")
         if not visiting:
             self._resolved_node_ids = set()
         if node_id in visiting:
@@ -306,7 +349,7 @@ class _PayloadAssembler:
                     or child.slot_index != index
                 ):
                     raise HelperProtocolError("payload_chunk list child relationship conflicts")
-                values.append(self._resolve(child_id, visiting))
+                values.append(self._resolve(child_id, visiting, depth + 1))
             value = values
         else:
             values_dict: Dict[str, Any] = {}
@@ -322,10 +365,10 @@ class _PayloadAssembler:
                     for child in (key_node, value_node)
                 ):
                     raise HelperProtocolError("payload_chunk object child relationship conflicts")
-                key = self._resolve(key_id, visiting)
+                key = self._resolve(key_id, visiting, depth + 1)
                 if not isinstance(key, str) or key in values_dict:
                     raise HelperProtocolError("payload_chunk object key is invalid or duplicate")
-                values_dict[key] = self._resolve(value_id, visiting)
+                values_dict[key] = self._resolve(value_id, visiting, depth + 1)
             value = values_dict
         visiting.remove(node_id)
         self._resolved_node_ids.add(node_id)
@@ -356,6 +399,7 @@ class DbCoreServiceError(RuntimeError):
         self.process_generation = process_generation
         self.rust_code = rust_code
         self.payload = payload or {}
+        self.cleanup_error: Optional["DbCoreServiceError"] = None
 
 
 class DbCoreCallbackError(RuntimeError):
@@ -826,8 +870,8 @@ class DbCoreServiceClient:
                 request_id=request_id,
                 process_generation=self._process_generation,
             ) from exc
-        except DbCoreServiceError:
-            await self._poison_and_reap_on_owner(deadline_at)
+        except DbCoreServiceError as error:
+            await self._poison_and_reap_preserving_on_owner(error, deadline_at)
             raise
         except Exception as exc:
             await self._poison_and_reap_on_owner(deadline_at)
@@ -860,8 +904,8 @@ class DbCoreServiceClient:
                 request_id,
                 work_cutoff,
             )
-        except DbCoreServiceError:
-            await self._poison_and_reap_on_owner(deadline_at)
+        except DbCoreServiceError as error:
+            await self._poison_and_reap_preserving_on_owner(error, deadline_at)
             raise
         except Exception as exc:
             await self._poison_and_reap_on_owner(deadline_at)
@@ -975,7 +1019,10 @@ class DbCoreServiceClient:
             if line == "":
                 raise EOFError(self._stderr_tail_text() or "DB Core process closed stdout")
             payload = self._strict_event_payload(line, request_id)
-            logical = assembler.consume(payload)
+            logical = assembler.consume(
+                payload,
+                frame_bytes=len(line.encode("utf-8", errors="strict")),
+            )
             if logical is not None:
                 return logical
 
@@ -1207,7 +1254,7 @@ class DbCoreServiceClient:
                 process_generation=self._process_generation,
             )
             error.__cause__ = exc
-            await self._poison_and_reap_on_owner(deadline_at)
+            await self._poison_and_reap_preserving_on_owner(error, deadline_at)
             raise error
         except (HelperProtocolError, OSError) as exc:
             error = DbCoreServiceError(
@@ -1219,7 +1266,7 @@ class DbCoreServiceClient:
                 process_generation=self._process_generation,
             )
             error.__cause__ = exc
-            await self._poison_and_reap_on_owner(deadline_at)
+            await self._poison_and_reap_preserving_on_owner(error, deadline_at)
             raise error
 
         assembler = _PayloadAssembler(request_id)
@@ -1234,7 +1281,7 @@ class DbCoreServiceClient:
                     request_id=request_id,
                     process_generation=self._process_generation,
                 )
-                await self._poison_and_reap_on_owner(deadline_at)
+                await self._poison_and_reap_preserving_on_owner(error, deadline_at)
                 raise error
             try:
                 payload_event = await self._read_logical_event_on_owner(
@@ -1253,7 +1300,7 @@ class DbCoreServiceClient:
                     process_generation=self._process_generation,
                 )
                 error.__cause__ = exc
-                await self._poison_and_reap_on_owner(deadline_at)
+                await self._poison_and_reap_preserving_on_owner(error, deadline_at)
                 raise error
             except EOFError as exc:
                 error = DbCoreServiceError(
@@ -1265,14 +1312,14 @@ class DbCoreServiceClient:
                     process_generation=self._process_generation,
                 )
                 error.__cause__ = exc
-                await self._poison_and_reap_on_owner(deadline_at)
+                await self._poison_and_reap_preserving_on_owner(error, deadline_at)
                 raise error
             except DbCoreServiceError as exc:
                 exc.request_kind = request_kind
                 exc.outcome = self._transport_outcome(request_kind)
                 exc.request_id = request_id
                 exc.process_generation = self._process_generation
-                await self._poison_and_reap_on_owner(deadline_at)
+                await self._poison_and_reap_preserving_on_owner(exc, deadline_at)
                 raise
             except HelperProtocolError as exc:
                 error = DbCoreServiceError(
@@ -1284,53 +1331,62 @@ class DbCoreServiceClient:
                     process_generation=self._process_generation,
                 )
                 error.__cause__ = exc
-                await self._poison_and_reap_on_owner(deadline_at)
+                await self._poison_and_reap_preserving_on_owner(error, deadline_at)
                 raise error
             event_type = payload_event["event"]
             is_terminal = event_type in ("result", "error")
-            delivery = _CallbackDelivery(
-                payload=payload_event,
-                is_terminal=is_terminal,
-                ack=(threading.Event() if requires_callback_ack and not is_terminal else None),
-            )
-            event_queue.put(delivery)
-            if delivery.ack is not None:
-                while not delivery.ack.is_set():
-                    remaining = self._remaining(work_cutoff)
-                    if remaining <= 0.0:
-                        await self._poison_and_reap_on_owner(deadline_at)
-                        raise DbCoreServiceError(
-                            "DB Core progress callback exceeded the request deadline",
+            if is_terminal and payload_event.get("command") != command:
+                error = DbCoreServiceError(
+                    "DB Core terminal command did not match the active request",
+                    code="db_core_protocol_mismatch",
+                    request_kind=request_kind,
+                    outcome=self._transport_outcome(request_kind),
+                    request_id=request_id,
+                    process_generation=self._process_generation,
+                    payload=payload_event,
+                )
+                await self._poison_and_reap_preserving_on_owner(error, deadline_at)
+                raise error
+            if requires_callback_ack:
+                delivery = _CallbackDelivery(
+                    payload=payload_event,
+                    is_terminal=is_terminal,
+                    ack=(threading.Event() if not is_terminal else None),
+                )
+                event_queue.put(delivery)
+                if delivery.ack is not None:
+                    while not delivery.ack.is_set():
+                        remaining = self._remaining(work_cutoff)
+                        if remaining <= 0.0:
+                            error = DbCoreServiceError(
+                                "DB Core progress callback exceeded the request deadline",
+                                code="db_core_callback_failed",
+                                request_kind=request_kind,
+                                outcome=self._transport_outcome(request_kind),
+                                request_id=request_id,
+                                process_generation=self._process_generation,
+                            )
+                            await self._poison_and_reap_preserving_on_owner(
+                                error,
+                                deadline_at,
+                            )
+                            raise error
+                        await asyncio.sleep(min(0.01, remaining))
+                    if delivery.callback_error is not None:
+                        error = DbCoreServiceError(
+                            f"DB Core progress callback failed: {delivery.callback_error}",
                             code="db_core_callback_failed",
                             request_kind=request_kind,
                             outcome=self._transport_outcome(request_kind),
                             request_id=request_id,
                             process_generation=self._process_generation,
                         )
-                    await asyncio.sleep(min(0.01, remaining))
-                if delivery.callback_error is not None:
-                    await self._poison_and_reap_on_owner(deadline_at)
-                    raise DbCoreServiceError(
-                        f"DB Core progress callback failed: {delivery.callback_error}",
-                        code="db_core_callback_failed",
-                        request_kind=request_kind,
-                        outcome=self._transport_outcome(request_kind),
-                        request_id=request_id,
-                        process_generation=self._process_generation,
-                    )
+                        await self._poison_and_reap_preserving_on_owner(
+                            error,
+                            deadline_at,
+                        )
+                        raise error
             if event_type == "result":
-                if payload_event.get("command") != command:
-                    error = DbCoreServiceError(
-                        "DB Core result command did not match the active request",
-                        code="db_core_protocol_mismatch",
-                        request_kind=request_kind,
-                        outcome=self._transport_outcome(request_kind),
-                        request_id=request_id,
-                        process_generation=self._process_generation,
-                        payload=payload_event,
-                    )
-                    await self._poison_and_reap_on_owner(deadline_at)
-                    raise error
                 return DbCoreRequestResult(
                     request_kind=request_kind,
                     outcome=DbCoreOutcome.DEFINITE,
@@ -1352,7 +1408,7 @@ class DbCoreServiceClient:
                         process_generation=self._process_generation,
                         payload=payload_event,
                     )
-                    await self._poison_and_reap_on_owner(deadline_at)
+                    await self._poison_and_reap_preserving_on_owner(error, deadline_at)
                     raise error
                 raise DbCoreServiceError(
                     _format_error_event(payload_event),
@@ -1483,7 +1539,9 @@ class DbCoreServiceClient:
         deadline_at = self._monotonic() + timeout
         work_cutoff = self._cleanup_start(deadline_at, timeout)
         request_id = request_id or f"py-{uuid.uuid4().hex}"
-        events: "queue.Queue[_CallbackDelivery]" = queue.Queue()
+        events: "queue.Queue[_CallbackDelivery]" = queue.Queue(
+            maxsize=(1 if on_event is not None else 0)
+        )
         write_started = threading.Event()
         future = self._submit_admitted(
             self._request_on_owner(
@@ -1641,6 +1699,31 @@ class DbCoreServiceClient:
             required_generation=required_generation,
         )
 
+    @staticmethod
+    def _attach_cleanup_error(
+        primary_error: DbCoreServiceError,
+        cleanup_error: DbCoreServiceError,
+    ) -> None:
+        primary_error.cleanup_error = cleanup_error
+        payload = dict(primary_error.payload)
+        payload["cleanup_error"] = {
+            "code": cleanup_error.code,
+            "message": cleanup_error.message,
+            "outcome": cleanup_error.outcome.value,
+            "process_generation": cleanup_error.process_generation,
+        }
+        primary_error.payload = payload
+
+    async def _poison_and_reap_preserving_on_owner(
+        self,
+        primary_error: DbCoreServiceError,
+        deadline_at: float,
+    ) -> None:
+        try:
+            await self._poison_and_reap_on_owner(deadline_at)
+        except DbCoreServiceError as cleanup_error:
+            self._attach_cleanup_error(primary_error, cleanup_error)
+
     async def _poison_and_reap_on_owner(self, deadline_at: float) -> None:
         if self._generation_state in (
             DbCoreGenerationState.CREATING,
@@ -1663,6 +1746,9 @@ class DbCoreServiceClient:
         if process is None:
             self._transition_generation(DbCoreGenerationState.CLOSED)
             return
+        stderr_task = self._stderr_task
+        if stderr_task is not None and not stderr_task.done():
+            stderr_task.cancel()
         if self._process_is_running_on_owner(process):
             try:
                 process.terminate()
@@ -1712,10 +1798,21 @@ class DbCoreServiceClient:
                         outcome=DbCoreOutcome.FAILED,
                         process_generation=self._process_generation,
                     ) from final_exc
-        stderr_task = self._stderr_task
         if stderr_task is not None and not stderr_task.done():
-            stderr_task.cancel()
-            await asyncio.gather(stderr_task, return_exceptions=True)
+            await asyncio.sleep(0)
+        if stderr_task is not None and not stderr_task.done():
+            try:
+                await self._await_before(asyncio.shield(stderr_task), deadline_at)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError as exc:
+                raise DbCoreServiceError(
+                    "DB Core stderr task resisted bounded cancellation",
+                    code="db_core_residual_process",
+                    outcome=DbCoreOutcome.FAILED,
+                    process_generation=self._process_generation,
+                    payload={"pending_task": "stderr_drain"},
+                ) from exc
         self._stderr_task = None
         self._process = None
         self._transition_generation(DbCoreGenerationState.CLOSED)

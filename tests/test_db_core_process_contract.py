@@ -4,6 +4,8 @@ import io
 import inspect
 import json
 import math
+from pathlib import Path
+import subprocess
 import sys
 import threading
 import time
@@ -11,6 +13,7 @@ import time
 import pytest
 
 import src.core.db_core_facade as db_core_facade
+import src.core.db_core_client as db_core_client
 from src.core.db_core_service import (
     DEFAULT_REQUEST_TIMEOUT_SECONDS,
     DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
@@ -42,7 +45,7 @@ class _Process:
         while self._lines:
             payload = json.loads(self._lines.pop(0))
             payload.setdefault("request_id", request["request_id"])
-            if payload.get("event") == "result":
+            if payload.get("event") in ("result", "error"):
                 payload.setdefault("command", request["command"])
             self.stdout.feed_line(payload)
             if payload.get("event") in ("result", "error"):
@@ -1146,6 +1149,7 @@ class _Task3Process:
         stall_drain=False,
         stall_wait=False,
         fail_write=False,
+        fail_terminate=False,
     ):
         self.returncode = None
         self.hello_overrides = dict(hello_overrides or {})
@@ -1154,6 +1158,7 @@ class _Task3Process:
         self.stall_drain = stall_drain
         self.stall_wait = stall_wait
         self.fail_write = fail_write
+        self.fail_terminate = fail_terminate
         self.release_drain = asyncio.Event()
         self.stdout = _Task3QueueReader(self, "stdout")
         self.stderr = _Task3QueueReader(self, "stderr")
@@ -1184,6 +1189,8 @@ class _Task3Process:
     def terminate(self):
         self.handle_thread_ids.append(threading.get_ident())
         self.terminate_calls += 1
+        if self.fail_terminate:
+            raise OSError("simulated terminate failure")
         self.returncode = 0
         self.stdout.feed_eof()
         self.stderr.feed_eof()
@@ -1422,6 +1429,132 @@ def test_strict_response_id_mismatch_poison_reaps(response_id):
     assert raised.value.outcome is DbCoreOutcome.FAILED
     assert process.terminate_calls == 1
     assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+@pytest.mark.parametrize("response_command", [None, "schema.inspect"])
+def test_terminal_error_command_mismatch_poison_reaps(response_command):
+    def respond(process, request):
+        event = {
+            "event": "error",
+            "request_id": request["request_id"],
+            "code": "planned_failure",
+            "message": "planned failure",
+        }
+        if response_command is not None:
+            event["command"] = response_command
+        process.stdout.feed_event(event)
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "schema.list",
+            request_id="strict-error-command",
+            request_kind=DbCoreRequestKind.READ_ONLY,
+            timeout_seconds=1.0,
+        )
+
+    assert raised.value.code == "db_core_protocol_mismatch"
+    assert raised.value.outcome is DbCoreOutcome.FAILED
+    assert process.terminate_calls == 1
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def _bounded_chunk(**overrides):
+    frame = {
+        "event": "payload_chunk",
+        "request_id": "bounded-assembly",
+        "command": "schema.list",
+        "logical_event": "result",
+        "node_id": 1,
+        "parent_node_id": 0,
+        "slot_index": 0,
+        "sequence": 0,
+        "final": False,
+        "value_kind": "utf8_string",
+        "text": "x",
+    }
+    frame.update(overrides)
+    return frame
+
+
+def test_payload_assembler_aggregate_byte_limit_accepts_exact_boundary_and_rejects_over():
+    exact = db_core_client._PayloadAssembler(
+        "bounded-assembly",
+        max_aggregate_bytes=10,
+    )
+    assert exact.consume(_bounded_chunk(), frame_bytes=10) is None
+
+    over = db_core_client._PayloadAssembler(
+        "bounded-assembly",
+        max_aggregate_bytes=10,
+    )
+    with pytest.raises(db_core_client.HelperProtocolError, match="aggregate byte limit"):
+        over.consume(_bounded_chunk(), frame_bytes=11)
+
+
+def test_payload_assembler_chunk_and_node_limits_accept_exact_boundary_and_reject_over():
+    exact_chunks = db_core_client._PayloadAssembler(
+        "bounded-assembly",
+        max_chunks=2,
+    )
+    assert exact_chunks.consume(_bounded_chunk(), frame_bytes=1) is None
+    assert exact_chunks.consume(
+        _bounded_chunk(sequence=1, text="y"),
+        frame_bytes=1,
+    ) is None
+    with pytest.raises(db_core_client.HelperProtocolError, match="chunk count limit"):
+        exact_chunks.consume(
+            _bounded_chunk(sequence=2, text="z"),
+            frame_bytes=1,
+        )
+
+    exact_nodes = db_core_client._PayloadAssembler(
+        "bounded-assembly",
+        max_nodes=2,
+    )
+    assert exact_nodes.consume(_bounded_chunk(node_id=1), frame_bytes=1) is None
+    assert exact_nodes.consume(
+        _bounded_chunk(node_id=2, slot_index=1),
+        frame_bytes=1,
+    ) is None
+    with pytest.raises(db_core_client.HelperProtocolError, match="node count limit"):
+        exact_nodes.consume(
+            _bounded_chunk(node_id=3, slot_index=2),
+            frame_bytes=1,
+        )
+
+
+def test_payload_assembler_depth_limit_accepts_exact_boundary_and_rejects_over():
+    logical = {
+        "event": "result",
+        "request_id": "bounded-assembly",
+        "command": "schema.list",
+        "success": True,
+        "value": {"outer": [{"inner": "done"}]},
+    }
+
+    def value_depth(value):
+        if isinstance(value, dict):
+            children = [item for pair in value.items() for item in pair]
+            return 1 + max(value_depth(child) for child in children)
+        if isinstance(value, list):
+            return 1 + max(value_depth(child) for child in value)
+        return 1
+
+    frames = _task3_chunk_frames(logical)
+    depth = value_depth(logical)
+    exact = db_core_client._PayloadAssembler("bounded-assembly", max_depth=depth)
+    assembled = None
+    for frame in frames:
+        assembled = exact.consume(frame, frame_bytes=1) or assembled
+    assert assembled == logical
+
+    over = db_core_client._PayloadAssembler("bounded-assembly", max_depth=depth - 1)
+    with pytest.raises(db_core_client.HelperProtocolError, match="depth limit"):
+        for frame in frames:
+            over.consume(frame, frame_bytes=1)
 
 
 def test_outbound_frame_over_limit_is_not_written_and_generation_stays_active():
@@ -1711,6 +1844,234 @@ def test_next_request_after_emit_failure_uses_fresh_generation():
     assert recovered.process_generation == 2
     assert recovered.payload["value"] == "fresh"
     assert client.generation_state is DbCoreGenerationState.ACTIVE
+
+
+def test_no_callback_never_enqueues_long_progress_stream(monkeypatch):
+    original_queue = db_core_client.queue.Queue
+    instances = []
+
+    class RecordingQueue(original_queue):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.put_count = 0
+            self.peak_size = 0
+            instances.append(self)
+
+        def put(self, item, *args, **kwargs):
+            self.put_count += 1
+            result = super().put(item, *args, **kwargs)
+            self.peak_size = max(self.peak_size, self.qsize())
+            return result
+
+    monkeypatch.setattr(db_core_client.queue, "Queue", RecordingQueue)
+
+    def respond(process, request):
+        for index in range(5_000):
+            process.stdout.feed_event({
+                "event": "row_progress",
+                "request_id": request["request_id"],
+                "command": request["command"],
+                "rows": index,
+            })
+        _task3_result(process, request)
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    result = client.request_result(
+        "schema.list",
+        request_id="no-callback-progress",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        timeout_seconds=3.0,
+    )
+
+    assert result.outcome is DbCoreOutcome.DEFINITE
+    assert len(instances) == 1
+    assert instances[0].put_count == 0
+    assert instances[0].qsize() == 0
+
+
+def test_callback_progress_queue_is_single_slot_and_acknowledged(monkeypatch):
+    original_queue = db_core_client.queue.Queue
+    instances = []
+
+    class RecordingQueue(original_queue):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.peak_size = 0
+            instances.append(self)
+
+        def put(self, item, *args, **kwargs):
+            result = super().put(item, *args, **kwargs)
+            self.peak_size = max(self.peak_size, self.qsize())
+            return result
+
+    monkeypatch.setattr(db_core_client.queue, "Queue", RecordingQueue)
+
+    def respond(process, request):
+        for index in range(100):
+            process.stdout.feed_event({
+                "event": "row_progress",
+                "request_id": request["request_id"],
+                "command": request["command"],
+                "rows": index,
+            })
+        _task3_result(process, request)
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    callbacks = []
+
+    result = client.request_result(
+        "schema.list",
+        request_id="callback-progress",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        on_event=callbacks.append,
+        timeout_seconds=3.0,
+    )
+
+    assert result.outcome is DbCoreOutcome.DEFINITE
+    assert len(callbacks) == 101
+    assert len(instances) == 1
+    assert instances[0].maxsize == 1
+    assert instances[0].peak_size <= 1
+
+
+def test_stderr_cancellation_resistance_is_deadline_bounded_and_not_closed():
+    process = _Task3Process(responder=lambda proc, req: _task3_result(proc, req))
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    client.request_result(
+        "schema.list",
+        request_id="activate-stderr-cancel",
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        timeout_seconds=1.0,
+    )
+
+    async def exercise():
+        old_task = client._stderr_task
+        assert old_task is not None
+        old_task.cancel()
+        await asyncio.gather(old_task, return_exceptions=True)
+        release = asyncio.Event()
+
+        async def cancellation_resistant():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        resistant = asyncio.create_task(cancellation_resistant())
+        await asyncio.sleep(0)
+        client._stderr_task = resistant
+        started = time.monotonic()
+        try:
+            await client._terminate_process_on_owner(time.monotonic() + 0.05)
+        except DbCoreServiceError as error:
+            caught = error
+            elapsed = time.monotonic() - started
+            state = client.generation_state
+        else:
+            pytest.fail("cancellation-resistant stderr task must report a residual")
+        finally:
+            release.set()
+            await resistant
+            client._stderr_task = None
+        return caught, elapsed, state
+
+    future = client._submit_owner(
+        exercise(),
+        DbCoreRequestKind.READ_ONLY,
+        "stderr-cancel",
+    )
+    error, elapsed, state = future.result(timeout=1.0)
+
+    assert error.code == "db_core_residual_process"
+    assert elapsed < 0.2
+    assert state is DbCoreGenerationState.REAPING
+    client.shutdown(timeout_seconds=1.0)
+
+
+def test_reap_failure_preserves_post_write_mutation_uncertainty_without_retry():
+    def respond(process, request):
+        process.stdout.feed_event({
+            "event": "result",
+            "request_id": request["request_id"],
+            "command": "wrong.command",
+            "success": True,
+        })
+
+    process = _Task3Process(responder=respond, fail_terminate=True)
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "dump.import",
+                request_id="indeterminate-reap-failure",
+                request_kind=DbCoreRequestKind.MUTATION,
+                timeout_seconds=1.0,
+            )
+    finally:
+        process.fail_terminate = False
+        client.shutdown(timeout_seconds=1.0)
+
+    error = raised.value
+    assert error.code == "db_core_protocol_mismatch"
+    assert error.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+    assert error.cleanup_error.code == "db_core_residual_process"
+    assert error.payload["cleanup_error"]["code"] == "db_core_residual_process"
+    assert [request["command"] for request in process.writes].count("dump.import") == 1
+
+
+def test_real_rust_cli_chunks_reassemble_in_python():
+    binary_name = "tunnelforge-core.exe" if sys.platform == "win32" else "tunnelforge-core"
+    binary = Path(__file__).parents[1] / "migration_core" / "target" / "debug" / binary_name
+    if not binary.exists():
+        pytest.skip("Rust debug CLI is not built")
+    request_id = "rust-python-chunk-compat"
+    column_name = "열" * 220_000
+    request = {
+        "command": "plan",
+        "request_id": request_id,
+        "payload": {
+            "source_engine": "mysql",
+            "target_engine": "postgresql",
+            "schema": {
+                "tables": [{
+                    "name": "large_names",
+                    "columns": [{
+                        "name": column_name,
+                        "type": "int(11) auto_increment",
+                        "nullable": False,
+                        "primary_key": True,
+                    }],
+                }],
+            },
+        },
+    }
+    encoded = (json.dumps(request, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
+    assert len(encoded) < MAX_JSONL_FRAME_BYTES
+
+    completed = subprocess.run(
+        [str(binary)],
+        input=encoded,
+        capture_output=True,
+        check=True,
+        timeout=30,
+    )
+    frames = completed.stdout.splitlines(keepends=True)
+    assert len(frames) > 1
+    assembler = db_core_client._PayloadAssembler(request_id)
+    logical = None
+    for frame in frames:
+        payload = json.loads(frame.decode("utf-8"))
+        logical = assembler.consume(payload, frame_bytes=len(frame)) or logical
+
+    assert logical is not None
+    assert logical["event"] == "result"
+    assert logical["request_id"] == request_id
+    assert logical["command"] == "plan"
+    assert logical["success"] is True
 
 
 def test_stale_required_generation_is_rejected_before_fresh_process_spawn():

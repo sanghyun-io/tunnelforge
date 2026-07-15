@@ -84,6 +84,7 @@ fn helper_binary_accepts_jsonl_and_emits_result() {
 fn assert_protocol_error(event: &Value, request_id: Value) {
     assert_eq!(event["event"], "error");
     assert_eq!(event["request_id"], request_id);
+    assert!(event.get("command").is_some());
     assert!(matches!(event["code"].as_str(), Some(value) if !value.is_empty()));
     assert!(matches!(event["message"].as_str(), Some(value) if !value.is_empty()));
 }
@@ -123,6 +124,7 @@ fn helper_binary_emits_structured_unknown_command_error() {
 
     assert_eq!(events.len(), 1);
     assert_protocol_error(&events[0], json!("cli-unknown-1"));
+    assert_eq!(events[0]["command"], "unknown.command");
 }
 
 #[test]
@@ -131,6 +133,7 @@ fn helper_binary_emits_structured_invalid_json_error() {
 
     assert_eq!(events.len(), 1);
     assert_protocol_error(&events[0], Value::Null);
+    assert_eq!(events[0]["command"], Value::Null);
 }
 
 #[test]
@@ -203,4 +206,31 @@ fn helper_binary_frame_chunks_expanded_utf8_plan_under_wire_cap() {
     assert!(frames.iter().any(|frame| {
         serde_json::from_slice::<Value>(frame).unwrap()["event"] == "payload_chunk"
     }));
+}
+
+#[test]
+fn helper_binary_rejects_oversized_frame_and_processes_next_request() {
+    let mut input = "x".repeat(1_048_576);
+    input.push_str("x\n");
+    input.push_str(
+        "{\"command\":\"service.hello\",\"request_id\":\"after-large\",\"payload\":{}}\n",
+    );
+
+    let events = run_helper_lines(&input);
+
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["code"], "jsonl_frame_too_large");
+    assert_eq!(events[0]["command"], Value::Null);
+    assert_eq!(events[1]["request_id"], "after-large");
+}
+
+#[test]
+fn helper_binary_rejects_unterminated_jsonl_frame() {
+    let events = run_helper_lines(
+        "{\"command\":\"service.hello\",\"request_id\":\"unterminated\",\"payload\":{}}",
+    );
+
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["code"], "jsonl_frame_missing_newline");
+    assert_eq!(events[0]["command"], Value::Null);
 }

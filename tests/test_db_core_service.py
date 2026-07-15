@@ -154,6 +154,7 @@ def test_client_error_includes_database_error_details():
         json.dumps({
             "event": "error",
             "request_id": "req-1",
+            "command": "connection.open",
             "message": "postgresql connection error: db error",
             "code": "3D000",
             "detail": "database public does not exist",
