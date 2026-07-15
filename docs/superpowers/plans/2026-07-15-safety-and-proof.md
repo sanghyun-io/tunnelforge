@@ -52,15 +52,15 @@
 - [ ] GREEN dialog and translation changes
 - [ ] Rust omission contract and focused regression
 
-### Task 4: TF-STATUS-097 One-Click Exact-Plan Approval
+### Task 4: TF-STATUS-097 Disable Unsafe One-Click Apply
 
 **Detailed plan to create before implementation:** `docs/superpowers/plans/2026-07-15-oneclick-plan-approval.md`
 
-**Exit evidence:** A plan-only command returns canonical target identity, actions, and SHA-256 plan hash; apply recomputes and rejects missing/stale approvals before mutation; UI defaults No. If deterministic binding cannot be proven, non-dry-run remains disabled.
+**Exit evidence:** One-Click non-dry-run cannot reach mutation until the bounded process and exact-plan contracts are complete. Dry-run remains available and the UI explains that apply is temporarily unavailable.
 
-- [ ] RED Rust protocol and PyQt sequencing tests
-- [ ] GREEN plan/hash/apply contract
-- [ ] Task review and Rust/Python focused regression
+- [ ] RED UI/service tests proving non-dry-run currently reaches mutation
+- [ ] GREEN fail-closed feature gate while preserving dry-run
+- [ ] Task review and focused regression
 
 ### Task 5: TF-STATUS-098 Bounded DB Core Process Contract
 
@@ -72,7 +72,17 @@
 - [ ] GREEN one-reader bounded lifecycle
 - [ ] Task review and service/protocol regression
 
-### Task 6: TF-STATUS-099 Resume Identity, Atomicity, and Cancellation
+### Task 6: TF-STATUS-097 One-Click Exact-Plan Approval
+
+**Detailed plan:** `docs/superpowers/plans/2026-07-15-oneclick-plan-approval.md`
+
+**Exit evidence:** A plan-only command returns a canonical, secret-free target identity containing engine, route, server UUID, authenticated user, schema, snapshot hash, ordered actions, and SHA-256 plan hash. Apply replans against current state and rejects missing or stale approvals before mutation; UI defaults No. Non-dry-run is re-enabled only after these checks pass through the bounded process contract.
+
+- [ ] RED Rust protocol and PyQt plan/approve/replan sequencing tests
+- [ ] GREEN canonical plan hash and exact-current-plan apply contract
+- [ ] Re-enable non-dry-run, task review, and Rust/Python focused regression
+
+### Task 7: TF-STATUS-099 Resume Identity, Atomicity, and Cancellation
 
 **Detailed plan to create before implementation:** `docs/superpowers/plans/2026-07-15-resume-cancellation-contract.md`
 
@@ -82,7 +92,7 @@
 - [ ] GREEN Python envelope and Rust validation
 - [ ] Task review and migration regression
 
-### Task 7: TF-STATUS-100 Hash-Locked Release Dependencies
+### Task 8: TF-STATUS-100 Hash-Locked Release Dependencies
 
 **Detailed plan to create before implementation:** `docs/superpowers/plans/2026-07-15-release-dependency-lock.md`
 
@@ -92,7 +102,7 @@
 - [ ] GREEN universal lock and release install wiring
 - [ ] Windows and both macOS resolver/install verification
 
-### Task 8: TF-STATUS-101 Typed Analysis Failure
+### Task 9: TF-STATUS-101 Typed Analysis Failure
 
 **Detailed plan to create before implementation:** `docs/superpowers/plans/2026-07-15-analysis-failure-contract.md`
 
@@ -102,9 +112,9 @@
 - [ ] GREEN typed query and analysis outcome
 - [ ] Task review and migration-analysis regression
 
-### Task 9: Safety and Proof Release and Observation Workflow
+### Task 10: Safety and Proof Release and Observation Workflow
 
-**Detailed plan to create after Tasks 1-8:** `docs/superpowers/plans/2026-07-15-safety-release-and-study.md`
+**Detailed plan to create after Tasks 1-9:** `docs/superpowers/plans/2026-07-15-safety-release-and-study.md`
 
 **Exit evidence:** Focused and full Python, Rust, Worker, packaging, clean installer, status, and diff gates pass; TF-STATUS-095 through 101 close with fresh evidence; protected release path publishes verified assets; facilitator workflow contains no credentials and records 3-5 independent session outcomes without treating downloads as users.
 
