@@ -42,3 +42,12 @@ def test_config_file_uses_app_support_dir(tmp_path):
 
     assert result == tmp_path / "Library" / "Application Support" / "TunnelForge" / "config.json"
 
+
+def test_ssh_host_trust_file_uses_app_support_dir(tmp_path):
+    result = platform_paths.ssh_host_trust_file(
+        platform_name="Linux",
+        home=tmp_path,
+        environ={},
+    )
+
+    assert result == tmp_path / ".config" / "tunnelforge" / "ssh_host_trust.json"

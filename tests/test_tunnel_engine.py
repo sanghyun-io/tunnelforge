@@ -1,9 +1,64 @@
 """
 TunnelEngine 테스트
 """
+import json
 import pytest
+import paramiko
 import socket
 from unittest.mock import patch, MagicMock, PropertyMock
+
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
+
+import src.core.tunnel_engine as tunnel_engine_module
+from src.core.ssh_host_trust import SshHostKeyTrustStore
+
+
+def _server_key():
+    public_bytes = (
+        Ed25519PrivateKey.generate()
+        .public_key()
+        .public_bytes(Encoding.Raw, PublicFormat.Raw)
+    )
+    message = paramiko.Message()
+    message.add_string("ssh-ed25519")
+    message.add_string(public_bytes)
+    return paramiko.Ed25519Key(data=message.asbytes())
+
+
+def _trust(store, config, key):
+    check = store.check(
+        config["bastion_host"], int(config["bastion_port"]), key
+    )
+    store.approve(check)
+
+
+def _engine_with_probe(key, store=None):
+    store = store or SshHostKeyTrustStore.in_memory()
+    return tunnel_engine_module.TunnelEngine(
+        trust_store=store,
+        host_key_probe=MagicMock(return_value=key),
+    )
+
+
+def _call_ssh_operation(engine, operation, config):
+    if operation == "start_tunnel":
+        return engine.start_tunnel(config, check_port=False)
+    if operation == "create_temp_tunnel":
+        return engine.create_temp_tunnel(config)
+    if operation == "test_connection":
+        return engine.test_connection(config)
+    if operation == "test_target_reachable_from_bastion":
+        return engine.test_target_reachable_from_bastion(config)
+    raise AssertionError(f"Unknown operation: {operation}")
+
+
+SSH_OPERATIONS = (
+    "start_tunnel",
+    "create_temp_tunnel",
+    "test_connection",
+    "test_target_reachable_from_bastion",
+)
 
 
 class TestTunnelEngine:
@@ -12,8 +67,15 @@ class TestTunnelEngine:
     @pytest.fixture(autouse=True)
     def setup(self):
         """각 테스트 전 TunnelEngine 인스턴스 생성"""
-        from src.core.tunnel_engine import TunnelEngine
-        self.engine = TunnelEngine()
+        self.server_key = _server_key()
+        self.trust_store = SshHostKeyTrustStore.in_memory()
+        self.trust_store.approve(
+            self.trust_store.check("1.2.3.4", 22, self.server_key)
+        )
+        self.engine = tunnel_engine_module.TunnelEngine(
+            trust_store=self.trust_store,
+            host_key_probe=MagicMock(return_value=self.server_key),
+        )
 
     def test_is_port_available_success(self):
         """사용 가능한 포트 확인 테스트"""
@@ -104,6 +166,7 @@ class TestTunnelEngine:
             assert success is False
             # 에러 메시지에 '키' 또는 관련 오류 메시지 포함
             assert any(keyword in msg.lower() for keyword in ['key', '키', 'file', 'not found', '찾을 수 없'])
+            assert sample_tunnel_config['bastion_key'] not in msg
 
     def test_already_running_direct(self, sample_direct_config):
         """이미 실행 중인 직접 연결 시작 시도"""
@@ -205,3 +268,188 @@ class TestTunnelEngine:
 
                 assert success is False
                 assert "시간 초과" in msg
+
+
+def test_probe_ssh_host_key_performs_no_authentication():
+    server_key = _server_key()
+    connected_socket = MagicMock()
+    transport = MagicMock()
+    transport.get_remote_server_key.return_value = server_key
+
+    with patch(
+        "src.core.tunnel_engine.socket.create_connection",
+        return_value=connected_socket,
+    ) as create_connection:
+        with patch(
+            "src.core.tunnel_engine.paramiko.Transport", return_value=transport
+        ) as transport_class:
+            result = tunnel_engine_module.probe_ssh_host_key(
+                "bastion.example", 2222, 7
+            )
+
+    assert result is server_key
+    create_connection.assert_called_once_with(("bastion.example", 2222), timeout=7)
+    transport_class.assert_called_once_with(connected_socket)
+    transport.start_client.assert_called_once_with(timeout=7)
+    transport.get_remote_server_key.assert_called_once_with()
+    transport.auth_none.assert_not_called()
+    transport.auth_password.assert_not_called()
+    transport.auth_publickey.assert_not_called()
+    transport.close.assert_called_once_with()
+    connected_socket.close.assert_called_once_with()
+
+
+def test_probe_ssh_host_key_closes_resources_when_handshake_fails():
+    connected_socket = MagicMock()
+    transport = MagicMock()
+    transport.start_client.side_effect = socket.timeout("timed out")
+
+    with patch(
+        "src.core.tunnel_engine.socket.create_connection",
+        return_value=connected_socket,
+    ):
+        with patch(
+            "src.core.tunnel_engine.paramiko.Transport", return_value=transport
+        ):
+            with pytest.raises(socket.timeout):
+                tunnel_engine_module.probe_ssh_host_key(
+                    "bastion.example", 22, 5
+                )
+
+    transport.close.assert_called_once_with()
+    connected_socket.close.assert_called_once_with()
+
+
+def test_inspect_and_approve_ssh_server_use_public_check(sample_tunnel_config):
+    server_key = _server_key()
+    store = SshHostKeyTrustStore.in_memory()
+    engine = _engine_with_probe(server_key, store)
+
+    check = engine.inspect_ssh_server(sample_tunnel_config)
+
+    assert check.status == "approval_required"
+    assert check.fingerprint_sha256.startswith("SHA256:")
+    assert not hasattr(check, "key")
+    engine.approve_ssh_server(check)
+    assert engine.inspect_ssh_server(sample_tunnel_config).status == "trusted"
+
+
+@pytest.mark.parametrize("operation", SSH_OPERATIONS)
+def test_unknown_host_stops_before_private_key_load(
+    operation, sample_tunnel_config
+):
+    server_key = _server_key()
+    engine = _engine_with_probe(server_key)
+    engine._load_private_key = MagicMock()
+    sample_tunnel_config.update(
+        {
+            "bastion_user": "sensitive-ssh-user",
+            "bastion_key": "C:/sensitive/private-key",
+            "db_user": "sensitive-db-user",
+            "db_password": "sensitive-db-password",
+        }
+    )
+
+    result = _call_ssh_operation(engine, operation, sample_tunnel_config)
+
+    assert result[0] is False
+    message = result[-1]
+    assert "SHA256:" in message
+    assert sample_tunnel_config["bastion_key"] not in message
+    assert sample_tunnel_config["bastion_user"] not in message
+    assert sample_tunnel_config["db_user"] not in message
+    assert sample_tunnel_config["db_password"] not in message
+    engine._load_private_key.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", SSH_OPERATIONS)
+def test_changed_host_stops_before_private_key_load(
+    operation, sample_tunnel_config
+):
+    first_key = _server_key()
+    changed_key = _server_key()
+    store = SshHostKeyTrustStore.in_memory()
+    _trust(store, sample_tunnel_config, first_key)
+    engine = _engine_with_probe(changed_key, store)
+    engine._load_private_key = MagicMock()
+
+    result = _call_ssh_operation(engine, operation, sample_tunnel_config)
+
+    assert result[0] is False
+    assert "SHA256:" in result[-1]
+    assert "변경" in result[-1]
+    engine._load_private_key.assert_not_called()
+
+
+@pytest.mark.parametrize("operation", SSH_OPERATIONS)
+def test_corrupt_trust_store_stops_without_exposing_credentials(
+    operation, sample_tunnel_config, tmp_path
+):
+    path = tmp_path / "ssh_host_trust.json"
+    path.write_text(json.dumps({"version": 99, "hosts": []}), encoding="utf-8")
+    engine = _engine_with_probe(_server_key(), SshHostKeyTrustStore(path))
+    engine._load_private_key = MagicMock()
+    sample_tunnel_config.update(
+        {
+            "bastion_key": "C:/sensitive/private-key",
+            "db_user": "sensitive-db-user",
+            "db_password": "sensitive-db-password",
+        }
+    )
+
+    result = _call_ssh_operation(engine, operation, sample_tunnel_config)
+
+    assert result[0] is False
+    assert "신뢰 저장소" in result[-1]
+    assert sample_tunnel_config["bastion_key"] not in result[-1]
+    assert sample_tunnel_config["db_user"] not in result[-1]
+    assert sample_tunnel_config["db_password"] not in result[-1]
+    engine._load_private_key.assert_not_called()
+
+
+def test_forwarder_receives_fresh_trusted_key(sample_tunnel_config):
+    server_key = _server_key()
+    store = SshHostKeyTrustStore.in_memory()
+    _trust(store, sample_tunnel_config, server_key)
+    engine = _engine_with_probe(server_key, store)
+    engine._load_private_key = MagicMock(return_value=MagicMock())
+
+    with patch("src.core.tunnel_engine.SSHTunnelForwarder") as forwarder:
+        forwarder.return_value = MagicMock()
+        success, _message = engine.start_tunnel(
+            sample_tunnel_config, check_port=False
+        )
+
+    assert success is True
+    assert forwarder.call_args.kwargs["ssh_host_key"] is server_key
+
+
+def test_target_preflight_uses_reject_policy_and_expected_key(
+    sample_tunnel_config
+):
+    sample_tunnel_config["bastion_port"] = 2222
+    server_key = _server_key()
+    store = SshHostKeyTrustStore.in_memory()
+    _trust(store, sample_tunnel_config, server_key)
+    engine = _engine_with_probe(server_key, store)
+    engine._load_private_key = MagicMock(return_value=MagicMock())
+    ssh_client = MagicMock()
+    transport = MagicMock()
+    transport.is_active.return_value = True
+    transport.open_channel.return_value = MagicMock()
+    ssh_client.get_transport.return_value = transport
+
+    with patch(
+        "src.core.tunnel_engine.paramiko.SSHClient", return_value=ssh_client
+    ):
+        success, _message = engine.test_target_reachable_from_bastion(
+            sample_tunnel_config
+        )
+
+    assert success is True
+    ssh_client.get_host_keys.return_value.add.assert_called_once_with(
+        "[1.2.3.4]:2222", "ssh-ed25519", server_key
+    )
+    ssh_client.set_missing_host_key_policy.assert_called_once()
+    policy = ssh_client.set_missing_host_key_policy.call_args.args[0]
+    assert isinstance(policy, paramiko.RejectPolicy)

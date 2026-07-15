@@ -5,14 +5,89 @@ import os
 
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_LOCAL_HOST
+from src.core.ssh_host_trust import (
+    SshHostKeyCheck,
+    SshHostKeyTrustStore,
+    SshHostTrustStoreError,
+)
 
 logger = get_logger('tunnel_engine')
 
 
+class _SshHostTrustRequiredError(Exception):
+    """Internal safe-to-display trust failure."""
+
+
+def probe_ssh_host_key(host: str, port: int, timeout: int):
+    """Read an SSH server key before authentication."""
+    connected_socket = None
+    transport = None
+    try:
+        connected_socket = socket.create_connection(
+            (host, int(port)), timeout=timeout
+        )
+        transport = paramiko.Transport(connected_socket)
+        transport.start_client(timeout=timeout)
+        return transport.get_remote_server_key()
+    finally:
+        if transport is not None:
+            transport.close()
+        if connected_socket is not None:
+            connected_socket.close()
+
+
 class TunnelEngine:
-    def __init__(self):
+    def __init__(self, trust_store=None, host_key_probe=None):
         self.active_tunnels = {}  # { tunnel_id: server_object or None(직접 연결) }
         self.tunnel_configs = {}  # { tunnel_id: config } - 연결 정보 저장용
+        self.trust_store = (
+            trust_store
+            if trust_store is not None
+            else SshHostKeyTrustStore()
+        )
+        self._host_key_probe = (
+            host_key_probe
+            if host_key_probe is not None
+            else probe_ssh_host_key
+        )
+
+    def inspect_ssh_server(
+        self, config: dict, timeout: int = 5
+    ) -> SshHostKeyCheck:
+        host = config.get('bastion_host')
+        port = int(config.get('bastion_port', 22) or 22)
+        server_key = self._host_key_probe(host, port, timeout)
+        return self.trust_store.check(host, port, server_key)
+
+    def approve_ssh_server(self, check: SshHostKeyCheck) -> None:
+        self.trust_store.approve(check)
+
+    def _require_trusted_host_key(self, config: dict, timeout: int = 5):
+        host = config.get('bastion_host')
+        port = int(config.get('bastion_port', 22) or 22)
+        server_key = self._host_key_probe(host, port, timeout)
+        try:
+            check = self.trust_store.check(host, port, server_key)
+        except SshHostTrustStoreError as exc:
+            raise _SshHostTrustRequiredError(
+                "SSH 호스트 신뢰 저장소를 읽을 수 없어 연결을 차단했습니다."
+            ) from exc
+
+        if check.status == "approval_required":
+            raise _SshHostTrustRequiredError(
+                "SSH 서버 신뢰 승인이 필요합니다.\n"
+                f"서버: {check.host}:{check.port}\n"
+                f"키 형식: {check.key_type}\n"
+                f"지문: {check.fingerprint_sha256}"
+            )
+        if check.status == "changed":
+            raise _SshHostTrustRequiredError(
+                "SSH 서버 호스트 키가 변경되어 연결을 차단했습니다.\n"
+                f"서버: {check.host}:{check.port}\n"
+                f"이전 지문: {check.previous_fingerprint_sha256}\n"
+                f"현재 지문: {check.fingerprint_sha256}"
+            )
+        return server_key
 
     def is_port_available(self, port: int) -> bool:
         """포트가 사용 가능한지 확인"""
@@ -34,7 +109,7 @@ class TunnelEngine:
 
         # 1. 키 파일 존재 확인
         if not os.path.exists(key_path):
-            raise FileNotFoundError(f"키 파일을 찾을 수 없습니다: {key_path}")
+            raise FileNotFoundError("키 파일을 찾을 수 없습니다.")
 
         # 모든 시도에 대한 로그 수집
         attempt_logs = []
@@ -61,7 +136,10 @@ class TunnelEngine:
             except paramiko.ssh_exception.PasswordRequiredException:
                 raise Exception("키 파일에 비밀번호(Passphrase)가 걸려있습니다. 현재 버전은 비밀번호를 지원하지 않습니다.")
             except Exception as e:
-                attempt_logs.append(f"  - {key_name}: {type(e).__name__}: {str(e)}")
+                safe_error = str(e).replace(key_path, "[redacted]")
+                attempt_logs.append(
+                    f"  - {key_name}: {type(e).__name__}: {safe_error}"
+                )
                 continue
 
         # 3. 모든 시도가 실패했을 때
@@ -69,18 +147,25 @@ class TunnelEngine:
         error_details = "\n".join(attempt_logs)
         raise Exception(
             f"키 파일을 인식할 수 없습니다.\n"
-            f"키 파일: {key_path}\n"
             f"시도한 키 형식별 에러:\n{error_details}\n\n"
             f"💡 OpenSSH 포맷인 경우 'pip install cryptography' 필요"
         )
 
-    def _build_forwarder(self, config, local_bind_address, pkey_obj, set_keepalive=None):
+    def _build_forwarder(
+        self,
+        config,
+        local_bind_address,
+        pkey_obj,
+        ssh_host_key,
+        set_keepalive=None,
+    ):
         """SSHTunnelForwarder 공통 kwargs 조립 (모듈 전역 SSHTunnelForwarder 참조 필수)
 
         Args:
             config: 터널 설정 (bastion_host/bastion_port/bastion_user/remote_host/remote_port)
             local_bind_address: 로컬 바인드 주소 튜플
             pkey_obj: 이미 로드된 SSH 키 객체
+            ssh_host_key: 현재 연결에서 검증한 SSH 서버 공개 키
             set_keepalive: keepalive 간격(초). None이면 kwarg 자체를 생략(라이브러리 기본값 유지)
 
         Returns:
@@ -89,6 +174,7 @@ class TunnelEngine:
         kwargs = dict(
             ssh_username=config['bastion_user'],
             ssh_pkey=pkey_obj,  # 경로 대신 키 객체 전달
+            ssh_host_key=ssh_host_key,
             remote_bind_address=(config['remote_host'], int(config['remote_port'])),
             local_bind_address=local_bind_address,
         )
@@ -141,11 +227,11 @@ class TunnelEngine:
         connection_logs = []
 
         try:
+            ssh_host_key = self._require_trusted_host_key(config, timeout=5)
             connection_logs.append(f"🚀 터널 시작 시도: {config['name']}")
             connection_logs.append(f"   Bastion: {config['bastion_user']}@{config['bastion_host']}:{config['bastion_port']}")
             connection_logs.append(f"   Target: {config['remote_host']}:{config['remote_port']}")
             connection_logs.append(f"   Local Port: {config['local_port']}")
-            connection_logs.append(f"   SSH Key: {config['bastion_key']}")
 
             for log in connection_logs:
                 logger.debug(log)
@@ -162,6 +248,7 @@ class TunnelEngine:
                 config,
                 local_bind_address=('0.0.0.0', int(config['local_port'])),
                 pkey_obj=pkey_obj,
+                ssh_host_key=ssh_host_key,
                 set_keepalive=30.0,
             )
 
@@ -233,6 +320,7 @@ class TunnelEngine:
             return True, None, ""
 
         try:
+            ssh_host_key = self._require_trusted_host_key(config, timeout=5)
             # SSH 키 로드
             pkey_obj = self._load_private_key(config['bastion_key'])
 
@@ -241,6 +329,7 @@ class TunnelEngine:
                 config,
                 local_bind_address=(DEFAULT_LOCAL_HOST, 0),  # 0 = 자동 할당
                 pkey_obj=pkey_obj,
+                ssh_host_key=ssh_host_key,
             )
 
             temp_server.start()
@@ -280,9 +369,18 @@ class TunnelEngine:
         bastion_user = config.get('bastion_user')
 
         try:
+            ssh_host_key = self._require_trusted_host_key(config, timeout=timeout)
             pkey_obj = self._load_private_key(config['bastion_key'])
             client = paramiko.SSHClient()
-            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+            host_key_name = (
+                bastion_host
+                if bastion_port == 22
+                else f"[{bastion_host}]:{bastion_port}"
+            )
+            client.get_host_keys().add(
+                host_key_name, ssh_host_key.get_name(), ssh_host_key
+            )
+            client.set_missing_host_key_policy(paramiko.RejectPolicy())
             client.connect(
                 hostname=bastion_host,
                 port=bastion_port,
@@ -383,10 +481,10 @@ class TunnelEngine:
         connection_logs = []
 
         try:
+            ssh_host_key = self._require_trusted_host_key(config, timeout=5)
             connection_logs.append("📋 연결 테스트 시작")
             connection_logs.append(f"   Bastion: {config.get('bastion_user', 'N/A')}@{config.get('bastion_host', 'N/A')}:{config.get('bastion_port', 'N/A')}")
             connection_logs.append(f"   Target: {config.get('remote_host', 'N/A')}:{config.get('remote_port', 'N/A')}")
-            connection_logs.append(f"   SSH Key: {config.get('bastion_key', 'N/A')}")
 
             if not config.get('bastion_key'):
                 return False, "❌ SSH 키 파일 경로가 비어있습니다."
@@ -401,6 +499,7 @@ class TunnelEngine:
                 config,
                 local_bind_address=(DEFAULT_LOCAL_HOST, 0),
                 pkey_obj=pkey_obj,
+                ssh_host_key=ssh_host_key,
             )
 
             connection_logs.append("🚀 Bastion Host 연결 시도...")

@@ -109,6 +109,14 @@ def encryption_key_file(
     return app_support_dir(platform_name, home, environ) / ".encryption_key"
 
 
+def ssh_host_trust_file(
+    platform_name: Optional[str] = None,
+    home: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    return app_support_dir(platform_name, home, environ) / "ssh_host_trust.json"
+
+
 def backups_dir(
     platform_name: Optional[str] = None,
     home: Optional[Path] = None,
@@ -131,4 +139,3 @@ def analysis_dir() -> Path:
 
 def rollback_dir() -> Path:
     return app_support_dir() / "rollback"
-
