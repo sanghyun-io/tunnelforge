@@ -512,7 +512,12 @@ class DbCoreServiceClient:
         self._stderr_tail: Deque[str] = deque(maxlen=200)
         self._stderr_lock = threading.Lock()
         self._stderr_task: Optional[asyncio.Task] = None
+        self._stderr_reader_outcome_task: Optional[asyncio.Task] = None
+        self._stderr_reader_outcome: Optional[Dict[str, Any]] = None
+        self._stderr_reader_reported_task: Optional[asyncio.Task] = None
+        self._stderr_expected_cancellations: Set[asyncio.Task] = set()
         self._process_wait_task: Optional[asyncio.Task] = None
+        self._process_wait_reported_task: Optional[asyncio.Task] = None
         self._stdout_drain_task: Optional[asyncio.Task] = None
         self._stdin_close_task: Optional[asyncio.Task] = None
         self._admission_lock = threading.Lock()
@@ -652,6 +657,8 @@ class DbCoreServiceClient:
             if loop is not None:
                 pending = [task for task in asyncio.all_tasks(loop) if not task.done()]
                 for task in pending:
+                    if task is self._stderr_task:
+                        self._stderr_expected_cancellations.add(task)
                     task.cancel()
                 if pending:
                     loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
@@ -1010,7 +1017,7 @@ class DbCoreServiceClient:
         self._process = process
         with self._stderr_lock:
             self._stderr_tail.clear()
-        self._stderr_task = asyncio.create_task(self._drain_stderr_on_owner(process))
+        self._stderr_task = self._start_stderr_reader_on_owner(process)
         try:
             await self._negotiate_process_on_owner(
                 process,
@@ -1276,17 +1283,60 @@ class DbCoreServiceClient:
         stream = process.stderr
         if stream is None:
             return
+        while True:
+            line = await self._read_stream_line_on_owner(stream)
+            if line == "":
+                return
+            text = line.rstrip()
+            if text:
+                with self._stderr_lock:
+                    self._stderr_tail.append(text[-4000:])
+
+    def _consume_stderr_reader_outcome_on_owner(
+        self,
+        task: asyncio.Task,
+    ) -> Dict[str, Any]:
+        if self._stderr_reader_outcome_task is task and self._stderr_reader_outcome is not None:
+            return dict(self._stderr_reader_outcome)
+        cancellation_expected = task in self._stderr_expected_cancellations
+        self._stderr_expected_cancellations.discard(task)
         try:
-            while True:
-                line = await self._read_stream_line_on_owner(stream)
-                if line == "":
-                    return
-                text = line.rstrip()
-                if text:
-                    with self._stderr_lock:
-                        self._stderr_tail.append(text[-4000:])
-        except (asyncio.CancelledError, HelperProtocolError, ValueError, OSError):
-            return
+            task.result()
+        except asyncio.CancelledError as exc:
+            outcome = {
+                "status": "cancelled",
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "cancellation_expected": cancellation_expected,
+            }
+        except BaseException as exc:
+            outcome = {
+                "status": "error",
+                "exception_type": type(exc).__name__,
+                "message": str(exc),
+                "cancellation_expected": False,
+            }
+        else:
+            outcome = {"status": "eof"}
+        if self._stderr_task is task:
+            self._stderr_reader_outcome_task = task
+            self._stderr_reader_outcome = dict(outcome)
+        return outcome
+
+    def _start_stderr_reader_on_owner(self, process: Any) -> asyncio.Task:
+        task = asyncio.create_task(
+            self._drain_stderr_on_owner(process),
+            name=f"db-core-stderr-generation-{self._process_generation}",
+        )
+        self._stderr_reader_outcome_task = None
+        self._stderr_reader_outcome = None
+        self._stderr_reader_reported_task = None
+
+        def consume_reader_outcome(completed: asyncio.Task) -> None:
+            self._consume_stderr_reader_outcome_on_owner(completed)
+
+        task.add_done_callback(consume_reader_outcome)
+        return task
 
     @staticmethod
     async def _drain_stdout_to_eof_on_owner(process: Any) -> None:
@@ -2009,14 +2059,40 @@ class DbCoreServiceClient:
             self._transition_generation(DbCoreGenerationState.CLOSED)
             return
         process_wait_task = self._process_wait_task
+        if (
+            process_wait_task is not None
+            and process_wait_task.done()
+            and self._process_wait_reported_task is process_wait_task
+        ):
+            try:
+                process_wait_task.result()
+            except BaseException:
+                pass
+            self._process_wait_task = None
+            self._process_wait_reported_task = None
+            process_wait_task = None
         wait = getattr(process, "wait", None)
         if callable(wait) and process_wait_task is None:
-            pending_wait = wait()
-            if inspect.isawaitable(pending_wait):
-                process_wait_task = asyncio.ensure_future(pending_wait)
-                self._process_wait_task = process_wait_task
-                await asyncio.sleep(0)
+            async def wait_for_process() -> Any:
+                pending_wait = wait()
+                if inspect.isawaitable(pending_wait):
+                    return await pending_wait
+                return pending_wait
+
+            process_wait_task = asyncio.create_task(
+                wait_for_process(),
+                name=f"db-core-process-wait-generation-{self._process_generation}",
+            )
+            self._process_wait_task = process_wait_task
+            await asyncio.sleep(0)
         stderr_task = self._stderr_task
+        if (
+            stderr_task is not None
+            and stderr_task.done()
+            and self._stderr_reader_reported_task is stderr_task
+        ):
+            stderr_task = self._start_stderr_reader_on_owner(process)
+            self._stderr_task = stderr_task
 
         stdin = getattr(process, "stdin", None)
         stdin_close_diagnostics: List[Dict[str, str]] = []
@@ -2084,6 +2160,25 @@ class DbCoreServiceClient:
                     self._stdin_close_task = stdin_close_task
 
         needs_kill = False
+        process_wait_error: Optional[Dict[str, str]] = None
+
+        def record_process_wait_error(exception: BaseException) -> None:
+            nonlocal process_wait_error
+            process_wait_error = {
+                "exception_type": type(exception).__name__,
+                "message": str(exception),
+            }
+
+        def wait_task_diagnostics() -> List[str]:
+            if process_wait_task is None:
+                return []
+            return [self._task_diagnostic(process_wait_task)]
+
+        def wait_error_extra() -> Dict[str, Any]:
+            if process_wait_error is None:
+                return {}
+            return {"process_wait_error": dict(process_wait_error)}
+
         if self._process_is_running_on_owner(process):
             try:
                 process.terminate()
@@ -2108,32 +2203,62 @@ class DbCoreServiceClient:
                     )
                 except asyncio.TimeoutError:
                     needs_kill = True
+                except asyncio.CancelledError as exc:
+                    if not process_wait_task.cancelled():
+                        raise
+                    record_process_wait_error(exc)
+                    self._process_wait_reported_task = process_wait_task
+                    needs_kill = self._process_is_running_on_owner(process)
+                except BaseException as exc:
+                    record_process_wait_error(exc)
+                    self._process_wait_reported_task = process_wait_task
+                    needs_kill = self._process_is_running_on_owner(process)
             if needs_kill:
-                kill = getattr(process, "kill", None)
-                if not callable(kill):
-                    raise cleanup_residual(
-                        "kill",
-                        "DB Core process cannot be killed after terminate refusal",
-                    )
                 if self._process_is_running_on_owner(process):
+                    kill = getattr(process, "kill", None)
+                    if not callable(kill):
+                        raise cleanup_residual(
+                            "kill",
+                            "DB Core process cannot be killed after terminate refusal",
+                            pending_tasks=wait_task_diagnostics(),
+                            extra=wait_error_extra(),
+                        )
                     try:
                         kill()
                     except Exception as exc:
                         raise cleanup_residual(
                             "kill",
                             f"DB Core process kill failed: {type(exc).__name__}: {exc}",
+                            pending_tasks=wait_task_diagnostics(),
+                            extra=wait_error_extra(),
                         ) from exc
-                try:
-                    await self._settle_process_wait_before(
-                        process_wait_task,
-                        deadline_at,
-                    )
-                except asyncio.TimeoutError as exc:
-                    raise cleanup_residual(
-                        "final_wait",
-                        "DB Core process remained alive after bounded kill",
-                        pending_tasks=[self._task_diagnostic(process_wait_task)],
-                    ) from exc
+                if process_wait_error is None:
+                    try:
+                        await self._settle_process_wait_before(
+                            process_wait_task,
+                            deadline_at,
+                        )
+                    except asyncio.TimeoutError as exc:
+                        raise cleanup_residual(
+                            "final_wait",
+                            "DB Core process remained alive after bounded kill",
+                            pending_tasks=wait_task_diagnostics(),
+                        ) from exc
+                    except asyncio.CancelledError as exc:
+                        if not process_wait_task.cancelled():
+                            raise
+                        record_process_wait_error(exc)
+                        self._process_wait_reported_task = process_wait_task
+                    except BaseException as exc:
+                        record_process_wait_error(exc)
+                        self._process_wait_reported_task = process_wait_task
+            if process_wait_error is not None:
+                raise cleanup_residual(
+                    "process_wait",
+                    "DB Core process wait failed before reap proof completed",
+                    pending_tasks=wait_task_diagnostics(),
+                    extra=wait_error_extra(),
+                )
 
         stdout_drain_task = self._stdout_drain_task
         if stdout_drain_task is None:
@@ -2151,7 +2276,7 @@ class DbCoreServiceClient:
                 pending_tasks=[self._task_diagnostic(stdout_drain_task)],
             ) from exc
         except asyncio.CancelledError as exc:
-            if not stdout_drain_task.done():
+            if not stdout_drain_task.cancelled():
                 raise
             raise cleanup_residual(
                 "stdout_drain",
@@ -2166,16 +2291,29 @@ class DbCoreServiceClient:
             ) from exc
 
         if stderr_task is not None:
+            def stderr_outcome_residual(task: asyncio.Task) -> DbCoreServiceError:
+                outcome = self._consume_stderr_reader_outcome_on_owner(task)
+                self._stderr_reader_reported_task = task
+                stderr_error = {
+                    "exception_type": outcome.get("exception_type", "RuntimeError"),
+                    "message": outcome.get("message", "stderr reader ended without EOF"),
+                    "cancellation_expected": bool(
+                        outcome.get("cancellation_expected", False)
+                    ),
+                }
+                return cleanup_residual(
+                    "stderr_drain",
+                    "DB Core stderr reader ended without EOF proof",
+                    pending_tasks=[self._task_diagnostic(task)],
+                    extra={"stderr_error": stderr_error},
+                )
+
             try:
                 await self._settle_process_wait_before(stderr_task, deadline_at)
             except asyncio.CancelledError as exc:
-                if not stderr_task.done():
+                if not stderr_task.cancelled():
                     raise
-                raise cleanup_residual(
-                    "stderr_drain",
-                    "DB Core stderr reader was cancelled before EOF",
-                    pending_tasks=[self._task_diagnostic(stderr_task)],
-                ) from exc
+                raise stderr_outcome_residual(stderr_task) from exc
             except asyncio.TimeoutError as exc:
                 raise cleanup_residual(
                     "stderr_drain",
@@ -2183,11 +2321,7 @@ class DbCoreServiceClient:
                     pending_tasks=[self._task_diagnostic(stderr_task)],
                 ) from exc
             except BaseException as exc:
-                raise cleanup_residual(
-                    "stderr_drain",
-                    f"DB Core stderr drain failed: {type(exc).__name__}: {exc}",
-                    pending_tasks=[self._task_diagnostic(stderr_task)],
-                ) from exc
+                raise stderr_outcome_residual(stderr_task) from exc
 
         if stdin_close_task is not None:
             try:
@@ -2218,7 +2352,12 @@ class DbCoreServiceClient:
             )
 
         self._stderr_task = None
+        self._stderr_reader_outcome_task = None
+        self._stderr_reader_outcome = None
+        self._stderr_reader_reported_task = None
+        self._stderr_expected_cancellations.discard(stderr_task)
         self._process_wait_task = None
+        self._process_wait_reported_task = None
         self._stdout_drain_task = None
         self._stdin_close_task = None
         self._process = None
@@ -2280,10 +2419,25 @@ class DbCoreServiceClient:
             raise settlement_error
         return True
 
-    def _ensure_owner_reap_task_on_owner(self, deadline_at: float) -> asyncio.Task:
+    def _ensure_owner_reap_task_on_owner(
+        self,
+        deadline_at: float,
+        *,
+        retry_failed: bool = False,
+    ) -> asyncio.Task:
         task = self._owner_reap_task
         if task is not None:
-            return task
+            if not retry_failed or not task.done():
+                return task
+            try:
+                task.result()
+            except BaseException:
+                pass
+            else:
+                if self._owner_reap_task is task:
+                    self._owner_reap_task = None
+                    self._owner_reap_generation = None
+                return self._ensure_owner_reap_task_on_owner(deadline_at)
 
         generation = self._process_generation
         task = asyncio.create_task(
@@ -2294,11 +2448,14 @@ class DbCoreServiceClient:
         self._owner_reap_generation = generation
 
         def retrieve_owner_reap_result(completed: asyncio.Task) -> None:
+            succeeded = False
             try:
                 completed.result()
             except BaseException:
                 pass
-            finally:
+            else:
+                succeeded = True
+            if succeeded:
                 if self._owner_reap_task is completed:
                     self._owner_reap_task = None
                     self._owner_reap_generation = None
@@ -2306,8 +2463,16 @@ class DbCoreServiceClient:
         task.add_done_callback(retrieve_owner_reap_result)
         return task
 
-    async def _await_owner_reap_on_owner(self, deadline_at: float) -> bool:
-        task = self._ensure_owner_reap_task_on_owner(deadline_at)
+    async def _await_owner_reap_on_owner(
+        self,
+        deadline_at: float,
+        *,
+        retry_failed: bool = False,
+    ) -> bool:
+        task = self._ensure_owner_reap_task_on_owner(
+            deadline_at,
+            retry_failed=retry_failed,
+        )
         return bool(await asyncio.shield(task))
 
     async def _await_generation_reap_barrier_on_owner(
@@ -2359,7 +2524,7 @@ class DbCoreServiceClient:
             if self._shutdown_started:
                 return False
             future = self._submit_owner(
-                self._await_owner_reap_on_owner(deadline_at),
+                self._await_owner_reap_on_owner(deadline_at, retry_failed=True),
                 DbCoreRequestKind.MUTATION,
                 "cancel-active",
             )
@@ -2396,7 +2561,10 @@ class DbCoreServiceClient:
         ]
         for task in queued_requests:
             task.cancel()
-        cancelled_active = await self._await_owner_reap_on_owner(deadline_at)
+        cancelled_active = await self._await_owner_reap_on_owner(
+            deadline_at,
+            retry_failed=True,
+        )
         if not cancelled_active:
             await self._terminate_process_on_owner(deadline_at)
         if queued_requests:
@@ -2419,6 +2587,8 @@ class DbCoreServiceClient:
             if task is not current and not task.done()
         ]
         for task in pending:
+            if task is self._stderr_task:
+                self._stderr_expected_cancellations.add(task)
             task.cancel()
         if pending:
             _, still_pending = await asyncio.wait(

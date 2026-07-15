@@ -2170,7 +2170,8 @@ def test_reap_failure_preserves_post_write_mutation_uncertainty_without_retry():
     assert cleanup_payload["pid"] == 4242
     assert cleanup_payload["process_generation"] == 1
     assert cleanup_payload["generation_state"] == "reaping"
-    assert cleanup_payload["pending_tasks"] == []
+    assert len(cleanup_payload["pending_tasks"]) == 1
+    assert "process-wait-generation-1" in cleanup_payload["pending_tasks"][0]
     assert [request["command"] for request in process.writes].count("dump.import") == 1
 
 
@@ -3328,6 +3329,73 @@ def test_request_deadline_during_generation_barrier_has_zero_wire_writes(monkeyp
     assert isinstance(active_errors[0], DbCoreServiceError)
 
 
+def test_failed_reap_barrier_blocks_followup_without_generation_increment(monkeypatch):
+    factory = _Task3Factory([])
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+    original_cancel = client._cancel_active_on_owner
+    original_error = None
+
+    async def fail_reap_once(deadline_at):
+        nonlocal original_error
+        if original_error is not None:
+            return await original_cancel(deadline_at)
+        client._process_generation = 1
+        client._transition_generation(DbCoreGenerationState.CREATING)
+        client._transition_generation(DbCoreGenerationState.POISONED)
+        client._transition_generation(DbCoreGenerationState.REAPING)
+        original_error = client._residual_process_error(
+            "spawn_identity",
+            "Native DB Core spawn cancellation returned no process identity",
+            pending_tasks=["native_spawn:cancelled_without_identity"],
+            extra={"diagnostic": "original-spawn-residual"},
+        )
+        raise original_error
+
+    monkeypatch.setattr(client, "_cancel_active_on_owner", fail_reap_once)
+
+    async def install_failed_reap_barrier():
+        task = client._ensure_owner_reap_task_on_owner(time.monotonic() + 1.0)
+        with pytest.raises(DbCoreServiceError) as raised:
+            await asyncio.shield(task)
+        await asyncio.sleep(0)
+        return raised.value
+
+    failed_reap = client._submit_owner(
+        install_failed_reap_barrier(),
+        DbCoreRequestKind.MUTATION,
+        "install-failed-reap-barrier",
+    ).result(timeout=1.0)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "schema.list",
+                request_id="blocked-by-failed-reap",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.5,
+            )
+
+        assert failed_reap is original_error
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "spawn_identity"
+        assert raised.value.payload["pending_tasks"] == [
+            "native_spawn:cancelled_without_identity"
+        ]
+        assert raised.value.payload["diagnostic"] == "original-spawn-residual"
+        assert client.process_generation == 1
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client._owner_reap_task is not None
+        assert client._owner_reap_task.done()
+        assert factory.calls == []
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client.shutdown_complete is True
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert client._owner_reap_task is None
+
+
 def test_cancel_owner_uses_exact_minimum_deadline_without_handoff_subtraction(
     monkeypatch,
 ):
@@ -3594,6 +3662,151 @@ def test_process_exit_at_grace_boundary_skips_kill(monkeypatch):
     assert process.wait_calls == 1
     assert process.kill_calls == 0
     assert client._process is None
+    assert not client.owner_thread.is_alive()
+
+
+def test_process_wait_oserror_while_live_kills_and_reports_typed_residual():
+    class _WaitOSErrorProcess(_Task4Process):
+        async def wait(self):
+            self.handle_thread_ids.append(threading.get_ident())
+            self.wait_calls += 1
+            self.wait_entered.set()
+            if self.wait_calls == 1:
+                raise OSError("simulated process wait failure")
+            return self.returncode
+
+    process = _WaitOSErrorProcess(pid=8765, stall_terminate_wait=True)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.shutdown(timeout_seconds=0.5)
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "process_wait"
+        assert raised.value.payload["pid"] == 8765
+        assert raised.value.payload["process_generation"] == 1
+        assert raised.value.payload["generation_state"] == "reaping"
+        assert raised.value.payload["pending_tasks"]
+        assert raised.value.payload["process_wait_error"] == {
+            "exception_type": "OSError",
+            "message": "simulated process wait failure",
+        }
+        assert process.terminate_calls == 1
+        assert process.kill_calls == 1
+        assert process.returncode == -9
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client._process is process
+        assert client._process_wait_task is not None
+        assert client._process_wait_task.done()
+    finally:
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert process.wait_calls == 2
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert client._process_wait_task is None
+    assert not client.owner_thread.is_alive()
+
+
+def test_process_wait_raw_error_after_terminal_exit_reports_typed_residual():
+    class _WaitRawErrorProcess(_Task4Process):
+        async def wait(self):
+            self.handle_thread_ids.append(threading.get_ident())
+            self.wait_calls += 1
+            self.wait_entered.set()
+            if self.wait_calls == 1:
+                raise RuntimeError("simulated terminal wait proof failure")
+            return self.returncode
+
+    process = _WaitRawErrorProcess(pid=8766)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+    process.returncode = 0
+    process.stdout.feed_eof()
+    process.stderr.feed_eof()
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.shutdown(timeout_seconds=0.5)
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "process_wait"
+        assert raised.value.payload["pid"] == 8766
+        assert raised.value.payload["pending_tasks"]
+        assert raised.value.payload["process_wait_error"] == {
+            "exception_type": "RuntimeError",
+            "message": "simulated terminal wait proof failure",
+        }
+        assert process.terminate_calls == 0
+        assert process.kill_calls == 0
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client._process is process
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert process.wait_calls == 2
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert not client.owner_thread.is_alive()
+
+
+def test_process_wait_error_kill_failure_keeps_wait_task_diagnostic():
+    class _WaitOSErrorProcess(_Task4Process):
+        async def wait(self):
+            self.handle_thread_ids.append(threading.get_ident())
+            self.wait_calls += 1
+            self.wait_entered.set()
+            if self.wait_calls == 1:
+                raise OSError("simulated wait proof failure before kill")
+            return self.returncode
+
+    process = _WaitOSErrorProcess(
+        pid=8767,
+        stall_terminate_wait=True,
+        fail_kill=True,
+    )
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.shutdown(timeout_seconds=0.5)
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "kill"
+        assert raised.value.payload["pid"] == 8767
+        assert len(raised.value.payload["pending_tasks"]) == 1
+        assert "process-wait-generation-1" in raised.value.payload["pending_tasks"][0]
+        assert raised.value.payload["process_wait_error"] == {
+            "exception_type": "OSError",
+            "message": "simulated wait proof failure before kill",
+        }
+        assert process.kill_calls == 1
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client._process is process
+    finally:
+        process.fail_kill = False
+        process.returncode = -9
+        process.stdout.feed_eof()
+        process.stderr.feed_eof()
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert process.wait_calls == 2
+    assert client.generation_state is DbCoreGenerationState.CLOSED
     assert not client.owner_thread.is_alive()
 
 
@@ -3864,6 +4077,112 @@ def test_cleanup_native_refusal_has_explicit_residual_diagnostics(
         process.stderr.feed_eof()
         if client.owner_thread.is_alive():
             client.shutdown(timeout_seconds=1.0)
+
+
+@pytest.mark.parametrize(
+    "stderr_failure, expected_error",
+    [
+        (
+            lambda process: (
+                process.stderr.fail(OSError("simulated stderr read failure")),
+                process.stderr.feed_raw(b"wake reader\n"),
+            ),
+            ("OSError", "simulated stderr read failure"),
+        ),
+        (
+            lambda process: process.stderr.feed_raw(b"\xff\n"),
+            ("HelperProtocolError", "DB Core frame is not valid UTF-8"),
+        ),
+    ],
+    ids=["oserror", "protocol"],
+)
+def test_cleanup_reports_stderr_reader_error_before_eof(stderr_failure, expected_error):
+    process = _Task4Process(pid=7654)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+    stderr_task = client._stderr_task
+    assert stderr_task is not None
+    stderr_failure(process)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.shutdown(timeout_seconds=0.5)
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "stderr_drain"
+        assert raised.value.payload["pid"] == 7654
+        assert raised.value.payload["process_generation"] == 1
+        assert raised.value.payload["generation_state"] == "reaping"
+        assert raised.value.payload["pending_tasks"]
+        assert raised.value.payload["stderr_error"] == {
+            "exception_type": expected_error[0],
+            "message": expected_error[1],
+            "cancellation_expected": False,
+        }
+        assert stderr_task.done()
+        assert client._stderr_task is stderr_task
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client._process is process
+    finally:
+        process.stderr.feed_eof()
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert client._stderr_task is None
+    assert not client.owner_thread.is_alive()
+
+
+def test_cleanup_reports_stderr_reader_cancelled_before_eof():
+    process = _Task4Process(pid=7655)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+    client.start()
+    stderr_task = client._stderr_task
+    assert stderr_task is not None
+
+    async def cancel_stderr_reader():
+        stderr_task.cancel()
+        await asyncio.gather(stderr_task, return_exceptions=True)
+
+    client._submit_owner(
+        cancel_stderr_reader(),
+        DbCoreRequestKind.MUTATION,
+        "cancel-stderr-before-eof",
+    ).result(timeout=1.0)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.shutdown(timeout_seconds=0.5)
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "stderr_drain"
+        assert raised.value.payload["pid"] == 7655
+        assert raised.value.payload["process_generation"] == 1
+        assert raised.value.payload["generation_state"] == "reaping"
+        assert raised.value.payload["pending_tasks"]
+        assert raised.value.payload["stderr_error"] == {
+            "exception_type": "CancelledError",
+            "message": "",
+            "cancellation_expected": False,
+        }
+        assert stderr_task.cancelled()
+        assert client._stderr_task is stderr_task
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client._process is process
+    finally:
+        process.stderr.feed_eof()
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert client._stderr_task is None
+    assert not client.owner_thread.is_alive()
 
 
 def test_cleanup_stderr_drain_cancellation_is_awaited_without_residual_task():
