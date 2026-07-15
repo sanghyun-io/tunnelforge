@@ -1590,6 +1590,7 @@ def test_resolve_timezone_sql_preserves_engine_specific_modes():
     assert resolve_timezone_sql("postgresql", "auto") is None
     assert resolve_timezone_sql("postgresql", "kst") == "SET TIME ZONE '+09:00'"
     assert resolve_timezone_sql("postgresql", "utc") == "SET TIME ZONE '+00:00'"
+    assert resolve_timezone_sql("postgresql", "none") is None
     assert resolve_timezone_sql("mysql", "kst") == "SET SESSION time_zone = '+09:00'"
     assert resolve_timezone_sql("mysql", "utc") == "SET SESSION time_zone = '+00:00'"
     assert resolve_timezone_sql("mysql", "none") is None
