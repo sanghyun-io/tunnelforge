@@ -6,7 +6,7 @@ import json
 import os
 import re
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -36,6 +36,21 @@ class SshHostKeyCheck:
     key_type: str
     fingerprint_sha256: str
     previous_fingerprint_sha256: Optional[str] = None
+    approval_token: Optional[str] = field(
+        default=None, repr=False, compare=False
+    )
+
+
+def _fsync_parent_directory(parent: Path) -> None:
+    if os.name != "posix":
+        return
+
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_fd = os.open(str(parent), flags)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
 
 
 class SshHostKeyTrustStore:
@@ -84,23 +99,29 @@ class SshHostKeyTrustStore:
             fingerprint_sha256=fingerprint,
         )
 
-    def approve(self, check: SshHostKeyCheck) -> None:
-        if check.status == "changed":
+    def approve(self, check: SshHostKeyCheck, key: paramiko.PKey) -> None:
+        if not isinstance(check, SshHostKeyCheck):
+            raise SshHostTrustStoreError("Invalid SSH host-key check")
+
+        current = self.check(check.host, check.port, key)
+        if check.status == "changed" or current.status == "changed":
             raise SshHostKeyChangedError("Changed SSH host keys cannot be approved")
-        if check.status not in {"approval_required", "trusted"}:
-            raise SshHostTrustStoreError("Invalid SSH host-key check status")
+        if (
+            check.status != "approval_required"
+            or self._check_identity(check) != self._check_identity(current)
+        ):
+            raise SshHostTrustStoreError(
+                "SSH host-key check does not match the supplied key"
+            )
 
         hosts = self._read_hosts()
         endpoint = (check.host, check.port)
         for saved in hosts:
             if (saved["host"], saved["port"]) != endpoint:
                 continue
-            if (
-                saved["key_type"] == check.key_type
-                and saved["fingerprint_sha256"] == check.fingerprint_sha256
-            ):
-                return
-            raise SshHostKeyChangedError("Stored SSH host key changed before approval")
+            raise SshHostKeyChangedError(
+                "Stored SSH host key changed before approval"
+            )
 
         hosts.append(
             {
@@ -111,6 +132,17 @@ class SshHostKeyTrustStore:
             }
         )
         self._write_hosts(hosts)
+
+    @staticmethod
+    def _check_identity(check: SshHostKeyCheck):
+        return (
+            check.status,
+            check.host,
+            check.port,
+            check.key_type,
+            check.fingerprint_sha256,
+            check.previous_fingerprint_sha256,
+        )
 
     @staticmethod
     def _fingerprint_sha256(key: paramiko.PKey) -> str:
@@ -209,6 +241,7 @@ class SshHostKeyTrustStore:
                 os.chmod(temp_path, 0o600)
             os.replace(temp_path, self.path)
             temp_path = None
+            _fsync_parent_directory(self.path.parent)
         except OSError as exc:
             raise SshHostTrustStoreError(
                 "SSH host trust store could not be written"

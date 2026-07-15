@@ -2,6 +2,7 @@
 TunnelEngine 테스트
 """
 import json
+from dataclasses import replace
 import pytest
 import paramiko
 import socket
@@ -11,7 +12,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 
 import src.core.tunnel_engine as tunnel_engine_module
-from src.core.ssh_host_trust import SshHostKeyTrustStore
+from src.core.ssh_host_trust import SshHostKeyTrustStore, SshHostTrustStoreError
 
 
 def _server_key():
@@ -30,7 +31,7 @@ def _trust(store, config, key):
     check = store.check(
         config["bastion_host"], int(config["bastion_port"]), key
     )
-    store.approve(check)
+    store.approve(check, key=key)
 
 
 def _engine_with_probe(key, store=None):
@@ -70,7 +71,8 @@ class TestTunnelEngine:
         self.server_key = _server_key()
         self.trust_store = SshHostKeyTrustStore.in_memory()
         self.trust_store.approve(
-            self.trust_store.check("1.2.3.4", 22, self.server_key)
+            self.trust_store.check("1.2.3.4", 22, self.server_key),
+            key=self.server_key,
         )
         self.engine = tunnel_engine_module.TunnelEngine(
             trust_store=self.trust_store,
@@ -328,10 +330,74 @@ def test_inspect_and_approve_ssh_server_use_public_check(sample_tunnel_config):
     check = engine.inspect_ssh_server(sample_tunnel_config)
 
     assert check.status == "approval_required"
+    assert check.approval_token
+    assert check.approval_token not in repr(check)
     assert check.fingerprint_sha256.startswith("SHA256:")
     assert not hasattr(check, "key")
     engine.approve_ssh_server(check)
     assert engine.inspect_ssh_server(sample_tunnel_config).status == "trusted"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("host", "forged.example"),
+        ("port", 2222),
+        ("key_type", "ssh-rsa"),
+        ("fingerprint_sha256", "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"),
+    ),
+)
+def test_engine_rejects_forged_approval_check_and_consumes_token(
+    sample_tunnel_config, field, value
+):
+    server_key = _server_key()
+    engine = _engine_with_probe(server_key)
+    check = engine.inspect_ssh_server(sample_tunnel_config)
+    forged = replace(check, **{field: value})
+
+    with pytest.raises(SshHostTrustStoreError):
+        engine.approve_ssh_server(forged)
+    with pytest.raises(SshHostTrustStoreError):
+        engine.approve_ssh_server(check)
+
+    assert engine._host_key_probe.call_count == 2
+
+
+def test_server_key_changed_after_inspect_cannot_be_approved(
+    sample_tunnel_config
+):
+    inspected_key = _server_key()
+    changed_key = _server_key()
+    store = SshHostKeyTrustStore.in_memory()
+    probe = MagicMock(side_effect=[inspected_key, changed_key])
+    engine = tunnel_engine_module.TunnelEngine(
+        trust_store=store,
+        host_key_probe=probe,
+    )
+    check = engine.inspect_ssh_server(sample_tunnel_config)
+
+    with pytest.raises(SshHostTrustStoreError):
+        engine.approve_ssh_server(check)
+
+    assert probe.call_count == 2
+    assert store.check(
+        sample_tunnel_config["bastion_host"],
+        sample_tunnel_config["bastion_port"],
+        inspected_key,
+    ).status == "approval_required"
+
+
+def test_approval_token_cannot_be_reused(sample_tunnel_config):
+    server_key = _server_key()
+    store = SshHostKeyTrustStore.in_memory()
+    engine = _engine_with_probe(server_key, store)
+    check = engine.inspect_ssh_server(sample_tunnel_config)
+
+    engine.approve_ssh_server(check)
+    with pytest.raises(SshHostTrustStoreError):
+        engine.approve_ssh_server(check)
+
+    assert engine._host_key_probe.call_count == 2
 
 
 @pytest.mark.parametrize("operation", SSH_OPERATIONS)

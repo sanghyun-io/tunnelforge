@@ -2,6 +2,8 @@ from sshtunnel import SSHTunnelForwarder
 import paramiko
 import socket
 import os
+import secrets
+from dataclasses import replace
 
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_LOCAL_HOST
@@ -50,6 +52,7 @@ class TunnelEngine:
             if host_key_probe is not None
             else probe_ssh_host_key
         )
+        self._pending_ssh_approvals = {}
 
     def inspect_ssh_server(
         self, config: dict, timeout: int = 5
@@ -57,10 +60,59 @@ class TunnelEngine:
         host = config.get('bastion_host')
         port = int(config.get('bastion_port', 22) or 22)
         server_key = self._host_key_probe(host, port, timeout)
-        return self.trust_store.check(host, port, server_key)
+        check = self.trust_store.check(host, port, server_key)
+        self._invalidate_pending_approval(host, port)
+        if check.status != "approval_required":
+            return check
+
+        token = secrets.token_urlsafe(32)
+        while token in self._pending_ssh_approvals:
+            token = secrets.token_urlsafe(32)
+        self._pending_ssh_approvals[token] = check
+        return replace(check, approval_token=token)
 
     def approve_ssh_server(self, check: SshHostKeyCheck) -> None:
-        self.trust_store.approve(check)
+        token = getattr(check, "approval_token", None)
+        issued_check = self._pending_ssh_approvals.pop(token, None)
+        if issued_check is None:
+            raise SshHostTrustStoreError(
+                "SSH host-key approval token is invalid or already used"
+            )
+
+        server_key = self._host_key_probe(
+            issued_check.host, issued_check.port, 5
+        )
+        current = self.trust_store.check(
+            issued_check.host, issued_check.port, server_key
+        )
+        if (
+            self._check_identity(check) != self._check_identity(issued_check)
+            or self._check_identity(current) != self._check_identity(issued_check)
+        ):
+            raise SshHostTrustStoreError(
+                "SSH host key changed or approval check is invalid"
+            )
+        self.trust_store.approve(current, key=server_key)
+
+    @staticmethod
+    def _check_identity(check: SshHostKeyCheck):
+        return (
+            check.status,
+            check.host,
+            check.port,
+            check.key_type,
+            check.fingerprint_sha256,
+            check.previous_fingerprint_sha256,
+        )
+
+    def _invalidate_pending_approval(self, host: str, port: int) -> None:
+        stale_tokens = [
+            token
+            for token, check in self._pending_ssh_approvals.items()
+            if check.host == host and check.port == port
+        ]
+        for token in stale_tokens:
+            del self._pending_ssh_approvals[token]
 
     def _require_trusted_host_key(self, config: dict, timeout: int = 5):
         host = config.get('bastion_host')
