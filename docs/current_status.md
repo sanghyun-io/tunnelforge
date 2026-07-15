@@ -146,7 +146,7 @@ collaborator, and single-maintainer self-approval is accepted for this release.
 Adding Apple signing and a second trusted maintainer remain future hardening
 opportunities rather than release blockers.
 
-TF-STATUS-092 is `fixed_pending_full_verify`: the legacy issue-reporter GitHub App private key for
+TF-STATUS-092 is `closed`: the legacy issue-reporter GitHub App private key for
 App ID `2735888` was embedded by the release path used from `v1.13.4` through
 `v2.3.0`. The current `v2.3.1` release does not embed the key or consume
 `GH_APP_PRIVATE_KEY` in its release build. Revoking the old key will disable
@@ -170,6 +170,11 @@ The containment interval completed at that time. The inventoried-unused
 repository secret `GH_APP_PRIVATE_KEY` was removed at
 `2026-07-15T03:06:23Z`; the only remaining repository secrets are the separate
 `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY` release credentials.
+Fresh-head hosted runs `29385868513` and `29385868516` passed every required
+Python, Rust, version, support-tracking, and macOS architecture gate. Protected
+PR #245 merged at `2026-07-15T03:22:13Z` as merge commit
+`6dbcd51c8c60acef3569697fa79a9e6914a7c0e0`, and the post-merge production
+health probe confirmed the relay remains `active`.
 The accepted replacement architecture uses a dedicated reporter GitHub App,
 installed only on TunnelForge with Metadata read and Issues read/write, behind
 a Cloudflare Worker. The desktop client contains no GitHub credential and sends
@@ -694,6 +699,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-15 | TF-STATUS-092 protected merge closure | `gh pr checks 245 --watch`; `gh pr ready 245`; `gh pr merge 245 --merge`; post-merge PR/main ancestry, repository-secret inventory, and production health verification | fresh-head runs `29385868513` and `29385868516` passed all required gates; PR #245 merged at `2026-07-15T03:22:13Z` as `6dbcd51c8c60acef3569697fa79a9e6914a7c0e0`; `origin/main` has the expected two-parent merge ancestry; `GH_APP_PRIVATE_KEY` remains absent while exactly the two Releaser secrets remain; relay health returned schema 1 and mode `active` | TF-STATUS-092 is closed. The exposed Reporter key, its possible derived-token lifetime, the unused repository secret, client credential retirement, replacement canary/rollout, frozen package smoke, fresh-head hosted gates, and protected merge are all complete. |
 | 2026-07-15 | TF-STATUS-092 exposed-key deletion, repository-secret containment, and protected PR gate | GitHub Developer Settings exact-fingerprint deletion and post-action key inventory; one-hour containment wait; `gh secret delete GH_APP_PRIVATE_KEY`; repository-secret name inventory; `dist\TunnelForge\TunnelForge.exe --ui-smoke-check`; `git push`; draft PR #245; `gh pr checks 245 --watch` | exposed Reporter fingerprint `SHA256:hLY6...nt+k=` deleted at `2026-07-15T02:06:03Z`; containment completed at `2026-07-15T03:06:03Z`; unused `GH_APP_PRIVATE_KEY` deleted at `2026-07-15T03:06:23Z`; only `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY` remain; replacement `SHA256:6Yki...GYB4=` remains; frozen UI smoke returned `success=true` with bundled Rust Core service hello; commit `9367faa` pushed; PR #245 opened; hosted runs `29382607405` and `29382607434` passed Python, Rust, version, macOS support tracking, and both internal/external macOS arm64/x86_64 gates | The replacement Reporter key and separate Releaser lane were not changed. TF-STATUS-092 remains `fixed_pending_full_verify` until the final status commit, fresh-head CI, and protected PR completion are recorded. |
 | 2026-07-15 | TF-STATUS-092 Task 13 canary, emergency off, active, and client binding | authenticated synthetic canary POSTs; GitHub issue/D1 inspection; `gh issue close 244`; Wrangler deploy/health/smoke for off and active; Cloudflare GraphQL `workersInvocationsAdaptive`; full Python/Rust/Worker/package gates | canary created and updated `https://github.com/sanghyun-io/tunnelforge/issues/244` with exact App attribution, fixed labels, one comment, one hidden fingerprint marker, and no forbidden credential/path pattern; emergency-off version `615088ce-96d6-406f-9d5a-d511675c70e6` passed; active version `9dbed64a-0d60-43bf-b946-24ab96e312f5` passed; full Python 2697 passed / 1 skipped; Rust gate, Cargo test/release build, Worker 316, typecheck, audit 0, dry-run, and PyInstaller passed | The first authenticated canary exposed a Workers-runtime incompatibility where `fetch(..., redirect:"error")` threw before GitHub; TDD changed GitHub requests to `redirect:"manual"`, preserving no-follow behavior, and explicit hostile-302 tests prove token and mutation requests stop after one fetch. Same-installation retry correctly returned `duplicate`; a new anonymous installation ID with the same server fingerprint produced the one intended `updated` recurrence. D1 has one complete create and one complete comment. The last-24-hour analytics window reported 61 successful invocations and zero errors; raw grouped `cpuTimeP50/P99` values ranged 213-15189, and the dataset exposed no cold/warm dimension, so no unsupported cold/warm or percentile claim is made. The exact client route is `https://tunnelforge-issue-relay.ppkimsanh.workers.dev/v1/reports`. Old-key deletion, the one-hour derived-token interval, and unused repository-secret deletion are now complete; final fresh-head hosted PR gates remain. |
 | 2026-07-15 | TF-STATUS-092 Task 13 live D1, off, and shadow rollout | OAuth `wrangler whoami`; `wrangler d1 create/list/migrations apply/execute --remote`; Worker test/typecheck/audit/dry-run/deploy; Python/curl health probes; synthetic off/shadow smoke; D1 row-count query | D1 `tunnelforge-issue-relay` created in APAC and migration `0001_init.sql` applied; Worker 314 passed; typecheck passed; 0 vulnerabilities; off version `e837d9df-1043-4298-8864-5eac2246a7ac` and shadow version `e432cb75-97c8-48a1-8e99-6e3bbb088b87` deployed; exact health and both smoke modes passed; all three application tables remained at 0 rows | The live endpoint is `https://tunnelforge-issue-relay.ppkimsanh.workers.dev`. An immediate post-deploy PowerShell probe briefly returned Cloudflare 1042, then PowerShell, Python requests, curl, and Node converged on the exact 200 health response without a code/config change. Shadow uses no GitHub/D1 secrets or persistence. Secret upload, canary, emergency off, active promotion, client binding, and final hosted verification remain pending. |
@@ -2476,7 +2482,7 @@ Next action:
 | TF-STATUS-089 | High | closed | Release approval / tag and publication trust | Automatic tag, automatic stable publication, mutable credentialed actions, optional macOS signing | Retain separate approved manual tag/draft workflows, exact tag/version/ancestry checks, pinned actions, protected Environment, and immutable release-tag updates/deletes |
 | TF-STATUS-090 | High | watch | macOS release signing / notarization | Protected Environment intentionally has no paid Apple Developer credentials | Publish explicitly unsigned macOS artifacts for this release; revisit signing/notarization when an Apple Developer account is available |
 | TF-STATUS-091 | Medium | watch | Release governance / independent approval | Only one write/admin collaborator exists | Keep single-maintainer approval enabled; revisit independent approval after adding a second trusted maintainer |
-| TF-STATUS-092 | High | fixed_pending_full_verify | Security / GitHub App credentials | Legacy issue-reporter App private key was embedded in public releases | Complete fresh-head hosted verification and protected PR #245; retain the replacement Reporter key, separate Releaser credentials, D1 global mutation caps, affirmative consent, strict allowlists, fail-closed edge free text, and emergency off |
+| TF-STATUS-092 | High | closed | Security / GitHub App credentials | Legacy issue-reporter App private key was embedded in public releases | Keep the exposed key and unused legacy repository secret absent; retain the replacement Reporter key, separate Releaser credentials, D1 global mutation caps, affirmative consent, strict allowlists, fail-closed edge free text, emergency off, and protected hosted gates |
 
 ## Recommended Execution Order
 
@@ -2491,17 +2497,15 @@ Next action:
 5. Keep TF-STATUS-089 closed by retaining the approved manual tag/draft split,
    protected Environment, strict branch checks, and immutable release-tag
    updates/deletes.
-6. Resolve TF-STATUS-092 before optional release hardening: the repository-only
-   Reporter and separate Releaser lanes are inventoried; replacement secret,
-   canary create/recurrence, emergency off, active rollout, exact client route,
-   local gates, exposed-key deletion, and initial hosted PR gates now pass.
-   The one-hour containment interval completed and the inventoried-unused
-   `GH_APP_PRIVATE_KEY` repository secret was removed while the separate
-   Releaser credentials remained. Complete fresh-head hosted verification and
-   protected PR #245 through
+6. Keep TF-STATUS-092 closed: the repository-only Reporter and separate
+   Releaser lanes are inventoried; replacement secret, canary
+   create/recurrence, emergency off, active rollout, exact client route, local
+   gates, exposed-key deletion, containment interval, legacy repository-secret
+   deletion, fresh-head hosted gates, and protected PR #245 all completed through
    `docs/superpowers/plans/2026-07-14-anonymous-error-reporting.md`, derived from
    `docs/superpowers/specs/2026-07-14-anonymous-error-reporting-design.md`;
-   never distribute the replacement private key in TunnelForge clients.
+   never distribute the replacement private key in TunnelForge clients and
+   keep the retired credential paths absent.
 7. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted for
    this release; add signing/notarization only when paid Apple credentials are
    available.
@@ -2538,6 +2542,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-15 | Closed TF-STATUS-092 after protected PR #245 merged. The replacement anonymous error-reporting path, credential containment, client retirement, hosted gates, and protected integration are complete. | PR #245, `origin/main`, GitHub repository-secret inventory, production relay health, canonical status | Fresh-head runs `29385868513` and `29385868516` passed; PR #245 merged at `2026-07-15T03:22:13Z` as two-parent merge commit `6dbcd51c8c60acef3569697fa79a9e6914a7c0e0`; the legacy secret remains absent, only the separate Releaser secrets remain, and post-merge relay health is schema 1 / `active`. |
 | 2026-07-15 | Removed the unused `GH_APP_PRIVATE_KEY` repository secret after the full derived-token containment interval. The replacement Reporter credential and independent Releaser credentials remain in their intended lanes. | GitHub repository secret inventory, frozen package smoke, canonical status | Containment completed at `2026-07-15T03:06:03Z`; secret deletion completed at `2026-07-15T03:06:23Z`; the remaining repository secret names are exactly `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY`. `dist\TunnelForge\TunnelForge.exe --ui-smoke-check` returned `success=true`, found the bundled Rust Core, and completed its service hello. Fresh-head hosted checks and protected PR #245 remain. |
 | 2026-07-15 | Deleted the exposed Reporter key after replacement canary approval and opened protected draft PR #245. The exact old fingerprint disappeared, the replacement Reporter fingerprint remained, and the independent Releaser lane was untouched. | GitHub App private-key inventory, remote feature branch, PR #245, canonical status | Deletion recorded at `2026-07-15T02:06:03Z`; commit `9367faa` pushed; runs `29382607405` and `29382607434` passed all Python, Rust, version, support-tracking, and macOS arm64/x86_64 gates. At this checkpoint, the one-hour token containment ended at `2026-07-15T03:06:03Z` and repository secret removal remained; the newer row records its completion. |
 | 2026-07-15 | Completed the live Task 13 canary and active rollout. The replacement GitHub App key authenticated through Cloudflare, one designated issue and one cross-installation recurrence were created by the App and inspected without leaks, the canary issue was closed, emergency off passed, active was restored, and the exact public route was bound into the desktop client. A Workers `redirect:"error"` runtime failure was isolated and fixed with no-follow `manual` handling. | relay GitHub auth/issue tests, Wrangler active D1 config, production endpoint config/transport tests, Settings unconfigured fixture, sanitizer collision regression, canonical status | Canary #244 had one create/comment and correct App/labels; versions `615088ce-...` off and `9dbed64a-...` active passed; analytics showed 61 success/0 errors; focused client 371 passed; full Python 2697/1 skipped, Rust gate/Cargo test+release, Worker 316/typecheck/audit0/dry-run, PyInstaller, and Terra client review passed. Hostile 302 no-follow tests and focused Python 462 passed after review. Old-key and repository-secret deletion plus protected hosted gates remain. |
