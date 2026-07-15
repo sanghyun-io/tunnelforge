@@ -504,10 +504,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         self.btn_tz_group = QButtonGroup(self)
 
-        # 1. 자동 감지 (권장)
-        self.radio_tz_auto = QRadioButton("자동 감지 및 보정 (권장)")
+        # 1. 자동 (권장)
+        self.radio_tz_auto = QRadioButton("자동 (서버/세션 기본값 유지, 권장)")
         self.radio_tz_auto.setChecked(True)
-        self.radio_tz_auto.setToolTip("서버가 지역명 타임존을 지원하지 않으면 자동으로 +09:00(KST)로 보정합니다.")
+        self.radio_tz_auto.setToolTip("서버/세션 타임존을 변경하지 않고 기본값을 유지합니다.")
 
         # 2. 강제 KST
         self.radio_tz_kst = QRadioButton("강제 KST (+09:00)")
@@ -515,18 +515,13 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # 3. 강제 UTC
         self.radio_tz_utc = QRadioButton("강제 UTC (+00:00)")
 
-        # 4. 설정 안 함
-        self.radio_tz_none = QRadioButton("설정 안 함 (서버 기본값)")
-
         self.btn_tz_group.addButton(self.radio_tz_auto)
         self.btn_tz_group.addButton(self.radio_tz_kst)
         self.btn_tz_group.addButton(self.radio_tz_utc)
-        self.btn_tz_group.addButton(self.radio_tz_none)
 
         tz_layout.addWidget(self.radio_tz_auto)
         tz_layout.addWidget(self.radio_tz_kst)
         tz_layout.addWidget(self.radio_tz_utc)
-        tz_layout.addWidget(self.radio_tz_none)
 
         return tz_group
 
@@ -942,25 +937,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.radio_tz_auto.setEnabled(enabled)
         self.radio_tz_kst.setEnabled(enabled)
         self.radio_tz_utc.setEnabled(enabled)
-        self.radio_tz_none.setEnabled(enabled)
         self.btn_import.setEnabled(enabled)
-
-    def check_timezone_support(self) -> bool:
-        """
-        서버가 'Asia/Seoul' 같은 지역명 타임존을 지원하는지 확인
-        """
-        if not self.connector:
-            return False
-
-        try:
-            # mysql.time_zone_name 테이블에서 Asia/Seoul 조회
-            # 단순히 테이블 존재 여부만 보지 않고 실제 데이터가 있는지 확인
-            query = "SELECT 1 FROM mysql.time_zone_name WHERE Name = 'Asia/Seoul' LIMIT 1"
-            rows = self.connector.execute(query)
-            return len(rows) > 0
-        except Exception:
-            logger.debug("Timezone support check failed", exc_info=True)
-            return False
 
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용, 최대 500개 유지)"""
@@ -1106,29 +1083,16 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         db_engine = config.engine
         timezone_sql = None
 
-        if self.radio_tz_auto.isChecked():
-            if db_engine == "mysql":
-                self.txt_log.addItem("🔍 타임존 지원 여부 확인 중...")
-                QApplication.processEvents()
-
-                supports_named_tz = self.check_timezone_support()
-
-                if supports_named_tz:
-                    self.txt_log.addItem("✅ 서버가 지역명 타임존을 지원합니다.")
-                else:
-                    timezone_sql = "SET SESSION time_zone = '+09:00'"
-                    self.txt_log.addItem("⚠️ 서버가 지역명 타임존을 지원하지 않습니다.")
-                    self.txt_log.addItem("ℹ️ 'Asia/Seoul' 에러 방지를 위해 타임존을 '+09:00'으로 자동 보정합니다.")
-            else:
-                self.txt_log.addItem("ℹ️ PostgreSQL Import는 MySQL 타임존 자동 보정을 건너뜁니다.")
-
-        elif self.radio_tz_kst.isChecked():
+        if self.radio_tz_kst.isChecked():
             timezone_sql = resolve_timezone_sql(db_engine, "kst")
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+09:00' (KST)로 설정합니다.")
 
         elif self.radio_tz_utc.isChecked():
             timezone_sql = resolve_timezone_sql(db_engine, "utc")
             self.txt_log.addItem("ℹ️ 타임존을 강제로 '+00:00' (UTC)로 설정합니다.")
+
+        else:
+            self.txt_log.addItem("ℹ️ 서버/세션 기본 타임존을 유지합니다.")
 
         # Import 모드 결정
         import_mode = "merge"  # 기본값

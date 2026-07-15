@@ -284,6 +284,20 @@ def test_en_phrase_translations_have_no_duplicate_source_keys():
     assert duplicates == []
 
 
+def test_neutral_import_auto_strings_have_exact_english_translations():
+    i18n.set_language("en")
+
+    assert i18n.translate_text("자동 (서버/세션 기본값 유지, 권장)") == (
+        "Auto (Preserve server/session defaults, recommended)"
+    )
+    assert i18n.translate_text("서버/세션 타임존을 변경하지 않고 기본값을 유지합니다.") == (
+        "Preserve server/session timezone defaults without changing the session."
+    )
+    assert i18n.translate_text("서버/세션 기본 타임존을 유지합니다.") == (
+        "Preserving the server/session default timezone."
+    )
+
+
 def test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation():
     ui_functions = {
         "QLabel", "QPushButton", "QCheckBox", "QRadioButton", "QGroupBox",

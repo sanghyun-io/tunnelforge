@@ -727,6 +727,40 @@ class TestRustDumpImporter:
         assert facade.payload["timezone_sql"] == "SET SESSION time_zone = '+09:00'"
         assert facade.payload["strict_manifest"] is True
 
+    def test_import_dump_omits_timezone_sql_when_none(self, tmp_path):
+        """Neutral import leaves timezone_sql out of the Rust payload."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        table_dir = dump_dir / '0001_users'
+        table_dir.mkdir(parents=True)
+        (table_dir / 'chunk_000001.jsonl').write_text('{"id":1}\n', encoding='utf-8')
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            '{"format":"tunnelforge-dump","format_version":1,"database":"app",'
+            '"tables":[{"name":"users","path":"0001_users","rows":1,"chunks":1}]}',
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_imported": 1}
+
+        facade = FakeFacade()
+        importer = RustDumpImporter(
+            RustDumpConfig('localhost', 3306, 'root', 'password'),
+            facade=facade,
+        )
+
+        success, _msg, _results = importer.import_dump(
+            str(dump_dir),
+            import_mode='replace',
+            timezone_sql=None,
+        )
+
+        assert success is True
+        assert "timezone_sql" not in facade.payload
+
     def test_import_dump_preserves_classified_core_error(self, tmp_path):
         """Rust classified error code/scope가 Python import 메시지에 보존된다"""
         from src.core.db_core_service import DbCoreServiceError
