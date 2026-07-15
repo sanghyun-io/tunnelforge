@@ -85,6 +85,12 @@ data-semantics, execution, process-contract, resume-state, dependency, and
 analysis-result risks. The governing proposal is
 `docs/product_maturity_proposal_2026-07-15.html`. It separates immediate fixes
 from contract-first investigation and evidence-gated product hypotheses. The
+TF-STATUS-095 SSH host trust Core slice is `fixed_pending_full_verify`: the
+persisted SHA-256 trust store, one-time approval token, approval-time re-probe,
+changed-key rejection, pinned forwarding/preflight, and raw endpoint binding
+are independently approved. The issue remains open until every interactive
+PyQt entry point provides the safe first-use approval UI and background paths
+are verified fail-closed.
 next 90-day sequence is safety fixes and executable contracts, release, then
 3-5 observed sessions through one disposable MySQL-over-SSH workflow. Apple
 App Store distribution, remote product telemetry, broad support tooling, and
@@ -734,6 +740,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-15 | SSH host trust Core slice / TF-STATUS-095 Task 1 | RED/GREEN trust-store and engine tests; `.venv\Scripts\python.exe -m pytest tests\test_ssh_host_trust.py tests\test_platform_paths.py tests\test_tunnel_engine.py tests\test_connection_test_worker.py -q`; related call-path regression; `git diff --check`; three independent TERRA security reviews with two fix loops | PASS: final focused `71 passed, 1 skipped, 1 warning`; related regression `163 passed`; Task 1 security re-review: APPROVE with no Critical or Important findings | Core is `fixed_pending_full_verify`: opaque one-time approval tokens are consumed before approval re-probe, the supplied/current key identities must match, trust writes fsync the file and POSIX parent directory, forwarding pins the fresh key and disables hidden SSH config reinterpretation, and target preflight uses `RejectPolicy`. UI approval paths remain, so TF-STATUS-095 stays open; the existing `TestType` collection warning is carried into Task 2. |
 | 2026-07-15 | Product maturity proposal / TF-STATUS-094-101 | Eight role-specialized reviews and red-team consensus; source/status evidence scan; `.venv\Scripts\python.exe -m pytest tests\test_product_maturity_proposal.py tests\test_current_status_docs.py -q`; Edge headless screenshots at 1440x1100 and 390x844; Chrome DevTools Protocol viewport/overflow/image inspection; `git diff --check` | PASS: focused docs regression 75 passed; desktop and mobile documents reported no horizontal overflow and zero broken images; 13 report sections loaded | Produced `docs/product_maturity_proposal_2026-07-15.html`, corrected stale latest-release wording, closed TF-STATUS-094, and opened TF-STATUS-095 through TF-STATUS-101. Strategy is one Safety and Proof release followed by 3-5 observed disposable MySQL-over-SSH sessions; no implementation or full product test-suite completion is claimed by this documentation session. |
 | 2026-07-15 | `v2.4.0` protected publication closure / TF-STATUS-093 | PR #247 hosted checks and merge; protected `create-release-tag.yml` run `29391247402`; approved `release.yml` run `29391317995`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest API and live `UpdateChecker` checks; post-release relay health and repository-secret inventory | runs `29390539762`, `29390540655`, and `29390539802` passed the required Python, Rust, version, support-tracking, and internal/external macOS arm64/x86_64 gates; PR #247 merged at `2026-07-15T05:21:06Z` as `bfee81613c7f77d96136346fa305858bf62670d7`; tag object `34a111cc90373a485c6dd168d4755f43cfccc768` peels to that exact commit; release run built all platforms and published at `2026-07-15T05:33:59Z`; all 10 expected assets have GitHub SHA-256 digests and all four macOS sidecars match their DMG/ZIP asset digests; `UpdateChecker` returned latest `2.4.0` with no error; relay health returned HTTP 200, schema 1, mode `active`; exactly `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY` remain | `v2.4.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.4.0`. Release notes explicitly identify macOS artifacts as unsigned and unnotarized. TF-STATUS-093 is closed; TF-STATUS-090 and TF-STATUS-091 remain watch items. |
 | 2026-07-15 | `2.4.0` release-candidate preparation / TF-STATUS-093 | RED/GREEN status and version sync; full Python; Rust regression/Cargo test+release; Worker test/typecheck/audit/dry-run; `build-installer.ps1 -Clean`; frozen UI/Rust Core and WebSetup self-checks; workflow pin scan; `git diff --check` | RED proved the source remained `2.3.1`; deterministic minor bump aligned all three sources at `2.4.0`; release-candidate full Python 2697 passed / 1 skipped / 4 warnings; Rust and Worker gates passed; all external actions in `version-gate.yml` are full-SHA pinned; `build-installer.ps1 -Clean` completed end to end and produced the main app, WebSetup, and `TunnelForge-Setup-2.4.0.exe`; Installer source unchanged; frozen checks passed | The initial local installer command exposed stale-output handling, missing bootstrapper creation after clean, tracked Inno-source rewriting, and Windows PowerShell 5.1 UTF-8 parsing problems. TDD added bootstrapper build/self-check, read-only version validation, and a UTF-8 BOM contract. A concurrent clean-build deleted one independent-review test's transient evidence ZIP; two focused reruns and a later standalone full suite passed. Protected version PR, exact-main tag, draft asset/digest inspection, and publication remain. |
@@ -2538,58 +2545,61 @@ Next action:
    by preflight and normal forwarding.
 2. Fix TF-STATUS-096 so Import Auto preserves server/session defaults and emits
    no implicit timezone-changing SQL.
-3. Resolve TF-STATUS-097 with exact-plan approval bound to current target state;
-   disable One-Click non-dry-run if that boundary cannot ship safely.
+3. Disable One-Click non-dry-run immediately while its exact-plan approval
+   boundary is absent; preserve dry-run and explain the temporary restriction.
 4. Write TF-STATUS-098 executable contracts for deadline, mismatched IDs,
    process death/restart, protocol compatibility, typed indeterminate outcomes,
    and mutation non-retry; implement only the smallest passing process behavior.
-5. Write TF-STATUS-099 reproducers for complete endpoint identity, plan
+5. Re-enable One-Click non-dry-run only after TF-STATUS-098 is complete and
+   plan/apply binds a secret-free current-target identity, ordered actions,
+   snapshot hash, and plan hash to explicit default-No approval.
+6. Write TF-STATUS-099 reproducers for complete endpoint identity, plan
    fingerprint, atomic resume storage, stale-state rejection, and exactly one
    terminal cancellation/result state before changing resume architecture.
-6. Complete TF-STATUS-100 with a reviewed release-only hash lock and CI
+7. Complete TF-STATUS-100 with a reviewed release-only hash lock and CI
    verification of the locked artifacts.
-7. Fix TF-STATUS-101 so analysis failure is never rendered as a successful
+8. Fix TF-STATUS-101 so analysis failure is never rendered as a successful
    zero-finding result.
-8. After 1-7 pass focused and full Python/Rust/Worker gates, publish one Safety
+9. After 1-8 pass focused and full Python/Rust/Worker gates, publish one Safety
    and Proof release through the existing free GitHub direct-download channel.
-9. Package and observe 3-5 independent sessions through one disposable
+10. Package and observe 3-5 independent sessions through one disposable
    MySQL-over-SSH workflow before changing positioning, adding telemetry, or
    expanding onboarding and support tooling.
-10. Keep TF-STATUS-085 closed by retaining the POSIX residue policy,
+11. Keep TF-STATUS-085 closed by retaining the POSIX residue policy,
     pre-dispatch abandonment cleanup, and manual-SQL Fix Wizard wording.
-11. Keep TF-STATUS-086 closed by retaining synchronized cancellation/result
+12. Keep TF-STATUS-086 closed by retaining synchronized cancellation/result
     publication and late-result discard behavior.
-12. Keep TF-STATUS-087 closed by preserving reveal-only/no-exit non-Windows
+13. Keep TF-STATUS-087 closed by preserving reveal-only/no-exit non-Windows
     update wording.
-13. Keep TF-STATUS-088 closed by verifying all version files against trusted
+14. Keep TF-STATUS-088 closed by verifying all version files against trusted
     expected state and pinning credentialed actions by full commit SHA.
-14. Keep TF-STATUS-089 closed by retaining the approved manual tag/draft split,
+15. Keep TF-STATUS-089 closed by retaining the approved manual tag/draft split,
     protected Environment, strict branch checks, and immutable release-tag
     updates/deletes.
-15. Keep TF-STATUS-092 closed: preserve the repository-only Reporter and
+16. Keep TF-STATUS-092 closed: preserve the repository-only Reporter and
     separate Releaser lanes defined in
     `docs/superpowers/plans/2026-07-14-anonymous-error-reporting.md` and
     `docs/superpowers/specs/2026-07-14-anonymous-error-reporting-design.md`;
     never distribute the replacement private key in TunnelForge clients.
-16. Keep TF-STATUS-093 closed by retaining the protected PR #247, exact-main
+17. Keep TF-STATUS-093 closed by retaining the protected PR #247, exact-main
     annotated `v2.4.0` tag, approved draft build, asset digests, updater
     visibility, and post-release relay health evidence.
-17. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted; add
+18. Keep TF-STATUS-090 on watch: unsigned macOS distribution is accepted; add
     signing/notarization only when paid Apple credentials become available.
-18. Keep TF-STATUS-091 on watch under the accepted single-maintainer approval
+19. Keep TF-STATUS-091 on watch under the accepted single-maintainer approval
     policy; revisit independent approval after adding another trusted maintainer.
-19. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
+20. Keep TF-STATUS-084 closed by retaining the verification-to-launch lease,
     owned cleanup/no-clobber, cancellation generation, and streaming bound.
-20. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
+21. Keep TF-STATUS-079 closed by retaining GitHub Release asset `digest`
     verification before every downloaded-package launch.
-21. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
+22. Keep TF-STATUS-080 closed by retaining unknown-environment confirmation for
     dangerous operations without classified tunnel metadata.
-22. Keep TF-STATUS-083 closed by retaining strict required checks and the
+23. Keep TF-STATUS-083 closed by retaining strict required checks and the
     terminal gate that aggregates Python, Rust Core, macOS tracking, and both
     macOS architectures.
-23. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
+24. Keep TF-STATUS-082 closed by preserving the bilingual Schedule correction
     while the feature flag remains disabled.
-24. Keep TF-STATUS-081 closed by retaining the protected `v2.3.1` tag, approved
+25. Keep TF-STATUS-081 closed by retaining the protected `v2.3.1` tag, approved
     release evidence, and expected asset digest metadata.
 25. Complete TF-STATUS-008 / GitHub #116 when external real-Mac report evidence
     becomes available. #116 remains external. Do not hard-code exact current-head
@@ -2602,6 +2612,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-15 | Completed the TF-STATUS-095 SSH trust Core slice after two independent security-review fix loops. The Core now persists only public host identity, binds approval to a one-time token and a fresh same-endpoint probe, rejects changed keys, pins forwarding/preflight, and disables implicit `~/.ssh/config` endpoint reinterpretation. The issue remains open because the first-use PyQt approval paths are Task 2. | SSH host trust store/path, tunnel engine, focused Core tests, Safety and Proof plans, canonical status regression | RED/GREEN evidence for forged/stale approvals, directory durability, and SSH config endpoint drift; final focused `71 passed, 1 skipped, 1 warning`; related `163 passed`; final independent Task 1 verdict `APPROVE`; diff check passed. |
 | 2026-07-15 | Convened product, UX, architecture, quality/security/release, market, and operations/analytics roles, followed by a meeting chair and adversarial red-team review. The final proposal separates confirmed defects, contract-first investigations, and evidence-gated hypotheses. It prioritizes a Safety and Proof release before product repositioning, then 3-5 observed disposable MySQL-over-SSH sessions. | `docs/product_maturity_proposal_2026-07-15.html`, `docs/current_status.md`, `tests/test_product_maturity_proposal.py`, `tests/test_current_status_docs.py` | Focused documentation regression passed 75 tests. Edge desktop/mobile screenshots rendered successfully; CDP checks at 1440x1100 and 390x844 found no horizontal overflow and no broken images. Final diff check passed. |
 | 2026-07-15 | Published `v2.4.0` as the stable/latest release and closed TF-STATUS-093 after the complete protected PR, exact-main tag, approved draft-build, asset inspection, updater, and production-health sequence. Release notes now explicitly identify the free macOS downloads as unsigned and unnotarized. | PR #247, tag `v2.4.0`, release workflow/metadata, canonical status and status regression contract | Runs `29390539762`, `29390540655`, and `29390539802` passed; merge commit `bfee81613c7f77d96136346fa305858bf62670d7`; tag run `29391247402` and release run `29391317995` passed; 10/10 assets had valid GitHub digests and four macOS sidecars matched; public latest and `UpdateChecker` returned `2.4.0`; relay health was HTTP 200/schema 1/`active`; only the two Releaser repository secrets remain. |
 | 2026-07-15 | Prepared the `2.4.0` release candidate for anonymous error reporting and opened TF-STATUS-093. Hardened the local clean-build path and full-SHA-pinned the version/macOS workflow actions before release. Historical `v2.3.1` publication evidence remains immutable. | version sources, installer/bootstrapper build script and contract, CI workflows/tests, canonical status | Focused RED/GREEN; standalone full Python 2697/1 skipped/4 warnings; Rust and Worker gates passed; corrected `build-installer.ps1 -Clean` completed without source mutation; frozen main/WebSetup checks passed; diff check passed. Protected hosted gates, tag, draft inspection, and publication remain. |

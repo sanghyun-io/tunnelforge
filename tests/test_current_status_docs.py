@@ -1279,3 +1279,20 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "Deleted the exposed Reporter key" in sessions
     assert "Removed the unused `GH_APP_PRIVATE_KEY` repository secret" in sessions
     assert "Closed TF-STATUS-092 after protected PR #245 merged" in sessions
+
+
+def test_current_status_records_ssh_trust_core_without_closing_ui_work():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-095 | Critical | open" in tracker
+    assert "SSH host trust Core slice" in verification
+    assert "71 passed, 1 skipped, 1 warning" in verification
+    assert "Task 1 security re-review: APPROVE" in verification
+    assert "UI approval paths remain" in verification
+    assert "Completed the TF-STATUS-095 SSH trust Core slice" in sessions
+    assert order.index("Disable One-Click non-dry-run") < order.index("TF-STATUS-098")
+    assert order.index("TF-STATUS-098") < order.index("Re-enable One-Click non-dry-run")
