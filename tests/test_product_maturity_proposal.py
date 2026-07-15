@@ -118,7 +118,7 @@ def test_current_status_tracks_product_maturity_decision_and_latest_release():
     expected_rows = {
         "TF-STATUS-094": "closed",
         "TF-STATUS-095": "closed",
-        "TF-STATUS-096": "open",
+        "TF-STATUS-096": "closed",
         "TF-STATUS-097": "open",
         "TF-STATUS-098": "open",
         "TF-STATUS-099": "open",

@@ -1299,3 +1299,18 @@ def test_current_status_closes_ssh_host_trust_after_core_and_ui_approval():
     assert "Closed TF-STATUS-095 after completing the SSH first-use UI" in sessions
     assert order.index("Disable One-Click non-dry-run") < order.index("TF-STATUS-098")
     assert order.index("TF-STATUS-098") < order.index("Re-enable One-Click non-dry-run")
+
+
+def test_current_status_closes_neutral_import_timezone_issue():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-096 | High | closed" in tracker
+    assert "Neutral Import timezone / TF-STATUS-096" in verification
+    assert "2825 passed, 2 skipped" in verification
+    assert "TF-STATUS-096 final review: APPROVE" in verification
+    assert "Closed TF-STATUS-096" in sessions
+    assert "Keep TF-STATUS-096 closed" in order
