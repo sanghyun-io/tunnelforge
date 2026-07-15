@@ -48,6 +48,10 @@ migration_core/target/
 *.spec
 !tunnel-manager.spec  # PyInstaller 빌드 설정 파일은 커밋
 
+# Private key files (never commit)
+*.pem
+*.key
+
 # Distribution
 *.pyz
 *.pyzw
@@ -58,6 +62,8 @@ output/
 # Environment variables
 .env
 
-# GitHub App Secrets
-secrets/*.pem
-!secrets/*.pem.example
+# Cloudflare Worker local secrets (never commit .dev.vars files)
+services/issue-relay/.dev.vars*
+!services/issue-relay/.dev.vars.example
+services/issue-relay/node_modules/
+services/issue-relay/.wrangler/

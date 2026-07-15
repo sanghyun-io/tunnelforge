@@ -1,0 +1,47 @@
+{
+  "report": {
+    "report_schema_version": 1,
+    "anonymous_installation_id": "6b8f0ee8-68e6-4a31-8d52-2f47d8d56483",
+    "error_fingerprint": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+  },
+  "app": {
+    "version": "2.3.1",
+    "package_kind": "frozen",
+    "ui_language": "ko-KR"
+  },
+  "system": {
+    "os_family": "windows",
+    "os_version": "11.0.26100",
+    "architecture": "x86_64",
+    "locale": "ko_KR",
+    "utc_offset_minutes": 540
+  },
+  "runtime": {
+    "python_version": "3.12.4",
+    "qt_version": "6.7.2",
+    "rust_core_version": "2.3.1"
+  },
+  "operation": {
+    "kind": "import",
+    "db_engine": "postgresql",
+    "db_server_version": "16.3",
+    "phase": "dump.import"
+  },
+  "error": {
+    "exception_class": "src.core.db_core_service.RustCoreError",
+    "error_code": "DUMP_IMPORT_FAILED",
+    "sanitized_message": "Import failed while processing an application request.",
+    "app_frames": [
+      {
+        "module": "src.exporters.rust_dump_exporter",
+        "function": "import_dump",
+        "line": 241
+      },
+      {
+        "module": "src.ui.workers.db_import_worker",
+        "function": "run",
+        "line": 88
+      }
+    ]
+  }
+}

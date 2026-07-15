@@ -1,15 +1,19 @@
 """설정 관련 다이얼로그"""
+from datetime import datetime
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import weakref
+from PyQt6 import sip
 from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QLabel, QPushButton, QRadioButton, QCheckBox,
                              QButtonGroup, QGroupBox, QMessageBox, QTabWidget,
                              QWidget, QTextBrowser, QSizePolicy,
                              QComboBox, QListWidget, QListWidgetItem, QFileDialog,
                              QSpinBox, QProgressBar, QApplication)
-from PyQt6.QtCore import Qt, QUrl
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
@@ -18,6 +22,17 @@ from src.update_integrity import (
     VerifiedFileLease,
 )
 from src.core.i18n import SUPPORTED_LANGUAGES, current_language, set_language, tr, translate_text
+from src.core.error_report_builder import (
+    INSTALLATION_ID_SETTING,
+    build_error_report,
+)
+from src.core.error_report_consent import ConsentPolicy
+from src.core.error_report_transport import (
+    ERROR_REPORT_RELAY_URL,
+    ErrorReportTransport,
+    _is_canonical_issue_url,
+    is_valid_relay_url,
+)
 from src.core.platform_integration import (
     StartupRegistrar,
     detached_process_kwargs,
@@ -32,6 +47,57 @@ from src.ui.dialogs.settings_update_helpers import (
     update_package_action_text,
     UpdateCheckerThread,
 )
+
+
+_ACTIVE_ERROR_REPORT_HEALTH_WORKERS = set()
+_LAST_REPORT_ATTEMPT_STATUS = frozenset({"submitted", "not_sent"})
+
+
+class _PreviewConfigAdapter:
+    """Expose the builder's installation ID read without allowing config writes."""
+
+    def __init__(self, config_manager):
+        self._config_manager = config_manager
+        self._ephemeral_installation_id = None
+
+    def get_app_setting(self, key, default=None):
+        if key != INSTALLATION_ID_SETTING:
+            return default
+        if self._ephemeral_installation_id is not None:
+            return self._ephemeral_installation_id
+        return self._config_manager.get_app_setting(key, default)
+
+    def set_app_setting(self, key, value):
+        if key == INSTALLATION_ID_SETTING:
+            self._ephemeral_installation_id = value
+
+
+def _set_error_reporting_health_button_enabled(dialog, enabled):
+    button = getattr(dialog, "btn_error_reporting_health", None)
+    if button is None:
+        return
+    try:
+        button.setEnabled(enabled)
+    except (RuntimeError, TypeError):
+        pass
+
+
+class ErrorReportingHealthWorker(QThread):
+    """Run the relay health request without interacting with consent state."""
+
+    health_finished = pyqtSignal(bool)
+
+    def __init__(self, config_manager, relay_url):
+        super().__init__()
+        self._config_manager = config_manager
+        self._relay_url = relay_url
+
+    def run(self):
+        try:
+            result = ErrorReportTransport(self._relay_url).health()
+            self.health_finished.emit(result.success is True)
+        except Exception:
+            self.health_finished.emit(False)
 
 
 def _collect_active_tunnel_names(main_window) -> list[str]:
@@ -57,6 +123,7 @@ class SettingsDialog(QDialog):
         self.setWindowTitle(tr("settings.title"))
         self.setMinimumSize(600, 420)
         self._update_checker_thread = None
+        self._error_reporting_health_workers = []
         self._original_theme_type = ThemeManager.instance().current_theme_type
         self._theme_saved = False
         self.init_ui()
@@ -94,8 +161,7 @@ class SettingsDialog(QDialog):
         layout.addWidget(self._build_language_group())
         layout.addWidget(self._build_close_behavior_group())
         layout.addWidget(self._build_theme_group())
-        layout.addWidget(self._build_github_group())
-        self._load_github_settings()
+        layout.addWidget(self._build_error_reporting_group())
         layout.addWidget(self._build_backup_group())
         self._refresh_backup_list()
         layout.addWidget(self._build_reconnect_group())
@@ -181,47 +247,78 @@ class SettingsDialog(QDialog):
 
         return theme_group
 
-    def _build_github_group(self) -> QGroupBox:
-        github_group = QGroupBox(tr("settings.github_auto_report"))
-        github_layout = QVBoxLayout(github_group)
+    def _build_error_reporting_group(self) -> QGroupBox:
+        group = QGroupBox(tr("settings.error_reporting.title"))
+        layout = QVBoxLayout(group)
+        relay_configured = is_valid_relay_url(ERROR_REPORT_RELAY_URL)
 
-        # GitHub App 설정 확인
-        self._github_app_configured = self._check_github_app()
+        self.chk_error_reporting = QCheckBox(
+            tr("settings.error_reporting.enable")
+        )
+        self.chk_error_reporting.setStyleSheet("font-size: 12px;")
+        self._load_error_reporting_settings()
+        self.chk_error_reporting.setEnabled(relay_configured)
+        self.chk_error_reporting.clicked.connect(
+            self._on_error_reporting_checkbox_clicked
+        )
+        layout.addWidget(self.chk_error_reporting)
 
-        # 자동 보고 활성화 체크박스
-        self.chk_auto_report = QCheckBox("Export/Import 오류 시 자동으로 GitHub 이슈 생성")
-        self.chk_auto_report.setStyleSheet("font-size: 12px;")
-        github_layout.addWidget(self.chk_auto_report)
+        disclosure = QLabel(tr("settings.error_reporting.disclosure"))
+        disclosure.setStyleSheet(
+            "color: gray; font-size: 11px; margin-left: 20px;"
+        )
+        disclosure.setWordWrap(True)
+        layout.addWidget(disclosure)
 
-        # GitHub App 설정 상태에 따른 설명
-        if self._github_app_configured:
-            desc_label = QLabel(
-                "✅ GitHub App이 설정되어 있습니다.\n"
-                "오류 발생 시 자동으로 이슈를 생성하거나, 유사한 이슈가 있으면 코멘트를 추가합니다."
-            )
-            desc_label.setStyleSheet("color: #27ae60; font-size: 11px; margin-left: 20px; margin-top: 5px;")
-            desc_label.setWordWrap(True)
-            github_layout.addWidget(desc_label)
+        path = QLabel(tr("settings.error_reporting.settings_path"))
+        path.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
+        layout.addWidget(path)
 
-            # 연결 테스트 버튼
-            test_layout = QHBoxLayout()
-            test_layout.setContentsMargins(20, 5, 0, 0)
-            btn_test = QPushButton("연결 테스트")
-            btn_test.setStyleSheet(ButtonStyles.MUTED_SMALL_TALL)
-            btn_test.clicked.connect(self._test_github_connection)
-            test_layout.addWidget(btn_test)
-            test_layout.addStretch()
-            github_layout.addLayout(test_layout)
-        else:
-            desc_label = QLabel(
-                "⚠️ GitHub App이 설정되지 않았습니다.\n"
-                "환경변수 또는 로컬 .env 설정이 필요합니다. (GITHUB_APP_SETUP.md 참조)"
-            )
-            desc_label.setStyleSheet("color: #e74c3c; font-size: 11px; margin-left: 20px; margin-top: 5px;")
-            desc_label.setWordWrap(True)
-            self.chk_auto_report.setEnabled(False)
-            github_layout.addWidget(desc_label)
-        return github_group
+        actions = QHBoxLayout()
+        actions.setContentsMargins(20, 5, 0, 0)
+        self.btn_error_reporting_preview = QPushButton(
+            tr("settings.error_reporting.preview")
+        )
+        self.btn_error_reporting_preview.setStyleSheet(ButtonStyles.MUTED_SMALL)
+        self.btn_error_reporting_preview.clicked.connect(
+            self._show_error_reporting_preview
+        )
+        actions.addWidget(self.btn_error_reporting_preview)
+
+        self.btn_error_reporting_health = QPushButton(
+            tr("settings.error_reporting.health")
+        )
+        self.btn_error_reporting_health.setStyleSheet(ButtonStyles.MUTED_SMALL)
+        self.btn_error_reporting_health.setEnabled(relay_configured)
+        self.btn_error_reporting_health.clicked.connect(
+            self._start_error_reporting_health_check
+        )
+        actions.addWidget(self.btn_error_reporting_health)
+        actions.addStretch()
+        layout.addLayout(actions)
+
+        self.error_reporting_health_label = QLabel()
+        self.error_reporting_health_label.setStyleSheet(
+            "color: gray; font-size: 11px; margin-left: 20px;"
+        )
+        self.error_reporting_health_label.setWordWrap(True)
+        layout.addWidget(self.error_reporting_health_label)
+
+        self.error_reporting_last_attempt_label = QLabel()
+        self.error_reporting_last_attempt_label.setStyleSheet(
+            "color: gray; font-size: 11px; margin-left: 20px;"
+        )
+        self.error_reporting_last_attempt_label.setWordWrap(True)
+        self.error_reporting_last_attempt_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextBrowserInteraction
+        )
+        self.error_reporting_last_attempt_label.setOpenExternalLinks(False)
+        self.error_reporting_last_attempt_label.linkActivated.connect(
+            self._open_error_reporting_issue_url
+        )
+        self._refresh_error_reporting_last_attempt()
+        layout.addWidget(self.error_reporting_last_attempt_label)
+        return group
 
     def _build_backup_group(self) -> QGroupBox:
         backup_group = QGroupBox(tr("settings.backup_restore"))
@@ -320,8 +417,6 @@ class SettingsDialog(QDialog):
         startup_desc.setStyleSheet("color: gray; font-size: 11px; margin-left: 20px;")
         startup_desc.setWordWrap(True)
         startup_layout.addWidget(startup_desc)
-
-        layout.addWidget(startup_group)
 
         # 자동 시작이 지원되지 않는 플랫폼에서는 숨김
         if not StartupRegistrar().is_supported:
@@ -592,10 +687,6 @@ class SettingsDialog(QDialog):
             self._theme_saved = True
         except ValueError:
             pass
-
-        # GitHub 자동 보고 설정 저장
-        auto_report = self.chk_auto_report.isChecked()
-        self.config_mgr.set_app_setting('github_auto_report', auto_report)
 
         # 자동 업데이트 확인 설정 저장
         auto_update_check = self.chk_auto_update.isChecked()
@@ -1059,67 +1150,164 @@ class SettingsDialog(QDialog):
         new_height = min(max(int(doc_height) + 10, 20), 100)
         self.update_status_label.setFixedHeight(new_height)
 
-    def _check_github_app(self) -> bool:
-        """GitHub App 설정 여부 확인"""
-        try:
-            from src.core.github_app_auth import is_github_app_configured
-            return is_github_app_configured()
-        except ImportError:
-            return False
+    def _load_error_reporting_settings(self):
+        """Load consent state without changing it."""
+        self.chk_error_reporting.setChecked(
+            ConsentPolicy(self.config_mgr).is_enabled()
+        )
 
-    def _load_github_settings(self):
-        """GitHub 설정 로드"""
-        auto_report = self.config_mgr.get_app_setting('github_auto_report', False)
-        # GitHub App이 설정되지 않았으면 자동 보고 비활성화
-        if not self._github_app_configured:
-            auto_report = False
-        self.chk_auto_report.setChecked(auto_report)
+    def _save_error_reporting_choice(self):
+        """Settings save intentionally does not change reporting consent."""
 
-    def _test_github_connection(self):
-        """GitHub API 연결 테스트"""
-        try:
-            from src.core.github_app_auth import get_github_app_auth
+    def _on_error_reporting_checkbox_clicked(self, enabled):
+        """Apply only an explicit checkbox choice to the consent state machine."""
+        ConsentPolicy(self.config_mgr).set_enabled(enabled is True)
 
-            github_app = get_github_app_auth()
-            if not github_app:
-                QMessageBox.warning(
-                    self,
-                    "연결 테스트",
-                    "GitHub App 인스턴스를 생성할 수 없습니다.\n환경변수 설정을 확인하세요."
-                )
+    def _show_error_reporting_preview(self):
+        payload = build_error_report(
+            _PreviewConfigAdapter(self.config_mgr),
+            operation_kind="export",
+            db_engine="mysql",
+            phase="dump.run",
+            error_message="Synthetic settings preview.",
+            exception=RuntimeError("Synthetic settings preview."),
+        )
+        self._show_read_only_error_reporting_preview(
+            json.dumps(payload, ensure_ascii=True, indent=2, sort_keys=True)
+        )
+
+    def _show_read_only_error_reporting_preview(self, preview_text):
+        dialog = QDialog(self)
+        dialog.setWindowTitle(tr("settings.error_reporting.preview_title"))
+        dialog.setMinimumSize(640, 480)
+        layout = QVBoxLayout(dialog)
+        preview = QTextBrowser(dialog)
+        preview.setReadOnly(True)
+        preview.setPlainText(preview_text)
+        layout.addWidget(preview)
+        close_button = QPushButton(tr("common.close"), dialog)
+        close_button.clicked.connect(dialog.accept)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(close_button)
+        layout.addLayout(actions)
+        dialog.exec()
+
+    def _start_error_reporting_health_check(self):
+        if not is_valid_relay_url(ERROR_REPORT_RELAY_URL):
+            return
+        button = getattr(self, "btn_error_reporting_health", None)
+        if button is not None:
+            try:
+                if not button.isEnabled():
+                    return
+            except (RuntimeError, TypeError):
                 return
+        try:
+            worker = ErrorReportingHealthWorker(
+                self.config_mgr, ERROR_REPORT_RELAY_URL
+            )
+        except Exception:
+            return
+        retained_workers = self._error_reporting_health_workers
+        retained_workers.append(worker)
+        _ACTIVE_ERROR_REPORT_HEALTH_WORKERS.add(worker)
+        _set_error_reporting_health_button_enabled(self, False)
+        receiver_ref = weakref.ref(self)
+        cleaned = False
 
-            # 라이브러리 확인
-            available, msg = github_app.check_available()
-            if not available:
-                QMessageBox.warning(self, "연결 테스트", msg)
+        def cleanup():
+            nonlocal cleaned
+            if cleaned:
                 return
-
-            # 연결 테스트 실행
-            success, message = github_app.test_connection()
-
-            if success:
-                QMessageBox.information(
-                    self,
-                    "연결 테스트 성공",
-                    message
-                )
-            else:
-                QMessageBox.warning(
-                    self,
-                    "연결 테스트 실패",
-                    message
-                )
-
-        except ImportError as e:
-            QMessageBox.critical(
-                self,
-                "오류",
-                f"모듈을 불러올 수 없습니다: {str(e)}"
+            cleaned = True
+            while worker in retained_workers:
+                retained_workers.remove(worker)
+            _ACTIVE_ERROR_REPORT_HEALTH_WORKERS.discard(worker)
+            try:
+                non_running = worker.isRunning() is False
+            except (RuntimeError, TypeError):
+                non_running = False
+            if non_running:
+                try:
+                    worker.deleteLater()
+                except (RuntimeError, TypeError):
+                    pass
+            _set_error_reporting_health_button_enabled(
+                self, is_valid_relay_url(ERROR_REPORT_RELAY_URL)
             )
-        except Exception as e:
-            QMessageBox.critical(
-                self,
-                "오류",
-                f"연결 테스트 중 오류 발생:\n{str(e)}"
+
+        def deliver(success):
+            receiver = receiver_ref()
+            if receiver is None:
+                return
+            try:
+                if sip.isdeleted(receiver):
+                    return
+            except (RuntimeError, TypeError):
+                pass
+            receiver._on_error_reporting_health_finished(success)
+
+        def finished():
+            cleanup()
+
+        try:
+            worker.health_finished.connect(deliver)
+            worker.finished.connect(finished, Qt.ConnectionType.QueuedConnection)
+            worker.start()
+        except Exception:
+            cleanup()
+            deliver(False)
+
+    def _on_error_reporting_health_finished(self, success):
+        key = (
+            "settings.error_reporting.health_passed"
+            if success is True
+            else "settings.error_reporting.health_failed"
+        )
+        self.error_reporting_health_label.setText(tr(key))
+
+    def _last_error_reporting_attempt(self):
+        status = self.config_mgr.get_app_setting(
+            "error_reporting_last_attempt_status", None
+        )
+        attempted_at = self.config_mgr.get_app_setting(
+            "error_reporting_last_attempt_at", None
+        )
+        issue_url = self.config_mgr.get_app_setting(
+            "error_reporting_last_attempt_issue_url", ""
+        )
+        if status not in _LAST_REPORT_ATTEMPT_STATUS:
+            return None, None, ""
+        if not _is_utc_attempt_timestamp(attempted_at):
+            return None, None, ""
+        if not _is_canonical_issue_url(issue_url):
+            issue_url = ""
+        return status, attempted_at, issue_url
+
+    def _refresh_error_reporting_last_attempt(self):
+        status, attempted_at, issue_url = self._last_error_reporting_attempt()
+        if status is None:
+            self.error_reporting_last_attempt_label.setText(
+                tr("settings.error_reporting.last_attempt_none")
             )
+            return
+        status_key = f"settings.error_reporting.last_attempt_{status}"
+        text = tr(status_key).format(timestamp=attempted_at)
+        if issue_url:
+            text += " <a href=\"{}\">{}</a>".format(issue_url, issue_url)
+        self.error_reporting_last_attempt_label.setText(text)
+
+    def _open_error_reporting_issue_url(self, issue_url):
+        if _is_canonical_issue_url(issue_url):
+            QDesktopServices.openUrl(QUrl(issue_url))
+
+
+def _is_utc_attempt_timestamp(value):
+    if type(value) is not str or len(value) != 20 or not value.endswith("Z"):
+        return False
+    try:
+        parsed = datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return False
+    return parsed.tzinfo is None

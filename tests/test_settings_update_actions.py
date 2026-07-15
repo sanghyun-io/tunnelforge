@@ -73,6 +73,29 @@ def test_save_settings_persists_selected_theme(monkeypatch):
     dialog.accept.assert_called_once()
 
 
+def test_save_settings_does_not_apply_error_reporting_consent(monkeypatch):
+    dialog = MagicMock()
+    dialog.radio_minimize.isChecked.return_value = False
+    dialog.radio_exit.isChecked.return_value = False
+    dialog.theme_combo.currentData.return_value = ThemeType.DARK.value
+    dialog.language_combo.currentData.return_value = "ko"
+    dialog.chk_auto_reconnect.isChecked.return_value = True
+    dialog.spin_max_reconnect.value.return_value = 5
+    dialog._theme_saved = False
+    policy_factory = MagicMock()
+
+    from src.core.platform_integration import StartupRegistrar
+
+    monkeypatch.setattr(settings, "ConsentPolicy", policy_factory)
+    monkeypatch.setattr(settings.ThemeManager, "instance", staticmethod(MagicMock))
+    monkeypatch.setattr(settings, "set_language", MagicMock())
+    monkeypatch.setattr(StartupRegistrar, "is_supported", property(lambda self: False))
+
+    SettingsDialog.save_settings(dialog)
+
+    policy_factory.assert_not_called()
+
+
 def test_restore_original_theme_if_unsaved_reverts_preview(monkeypatch):
     """미저장 상태에서 취소하면 원래 테마로 save=False 복원해야 한다."""
     dialog = MagicMock()

@@ -3,9 +3,8 @@ import json
 import os
 import threading
 import uuid
-import shutil
 from datetime import datetime
-from typing import List, Tuple, Optional
+from typing import Callable, Dict, List, Mapping, Optional, Tuple, TypeVar
 from cryptography.fernet import Fernet
 
 from src.core.logger import get_logger
@@ -20,6 +19,9 @@ CONFIG_FILE = str(config_file())
 KEY_FILE = str(encryption_key_file())
 BACKUP_DIR = str(backups_dir())
 MAX_BACKUPS = 5
+MAX_IMPORT_CONFIG_BYTES = 1_048_576
+MAX_IMPORT_CONFIG_DEPTH = 64
+MAX_IMPORT_CONFIG_COLLECTION_ITEMS = 500
 FILE_ATTRIBUTE_HIDDEN = 0x02  # Win32 SetFileAttributesW 플래그: 숨김 파일 속성
 
 # load_config/save_config를 여러 스레드(스케줄러, UI)가 동시에 호출해도
@@ -29,6 +31,51 @@ _CONFIG_LOCK = threading.RLock()
 
 # _merge_snapshot_changes에서 "이 키는 원본에 존재하지 않았다"를 None과 구분하기 위한 sentinel
 _MISSING = object()
+_AppSettingsMutationResult = TypeVar('_AppSettingsMutationResult')
+_NON_TRANSFERABLE_REPORTING_SETTINGS = frozenset({'github_auto_report'})
+_NON_TRANSFERABLE_REPORTING_PREFIX = 'error_reporting_'
+
+
+def _is_reporting_privacy_setting(key) -> bool:
+    normalized_key = key.casefold() if isinstance(key, str) else ''
+    return (
+        normalized_key.startswith(_NON_TRANSFERABLE_REPORTING_PREFIX)
+        or normalized_key in _NON_TRANSFERABLE_REPORTING_SETTINGS
+    )
+
+
+def _reporting_privacy_state(config_data: dict) -> dict:
+    settings = config_data.get('settings')
+    if not isinstance(settings, dict):
+        return {}
+    return {
+        key: copy.deepcopy(value)
+        for key, value in settings.items()
+        if _is_reporting_privacy_setting(key)
+    }
+
+
+def _without_reporting_privacy_state(config_data: dict) -> dict:
+    """Return a detached config without destination-local reporting state."""
+    sanitized = copy.deepcopy(config_data)
+    settings = sanitized.get('settings')
+    if not isinstance(settings, dict):
+        return sanitized
+    for key in list(settings):
+        if _is_reporting_privacy_setting(key):
+            del settings[key]
+    return sanitized
+
+
+def _with_local_reporting_privacy_state(
+    incoming_config: dict,
+    local_config: dict,
+) -> dict:
+    merged = _without_reporting_privacy_state(incoming_config)
+    local_privacy_state = _reporting_privacy_state(local_config)
+    if local_privacy_state:
+        merged.setdefault('settings', {}).update(local_privacy_state)
+    return merged
 
 
 class ConfigLoadError(RuntimeError):
@@ -181,6 +228,7 @@ class ConfigManager:
             if not self._is_config_payload_valid(data):
                 continue
 
+            data = _without_reporting_privacy_state(data)
             self._write_config_atomic_unlocked(data)
             logger.warning(f"손상된 설정 파일을 백업에서 복원했습니다: {filename}")
             revision = self._file_revision(CONFIG_FILE)
@@ -311,7 +359,9 @@ class ConfigManager:
             os.makedirs(BACKUP_DIR, exist_ok=True)
             timestamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             backup_path = os.path.join(BACKUP_DIR, f'config.backup.{timestamp}.json')
-            shutil.copy2(CONFIG_FILE, backup_path)
+            backup_data = _without_reporting_privacy_state(current_data)
+            with open(backup_path, 'w', encoding='utf-8') as backup_file:
+                json.dump(backup_data, backup_file, indent=4, ensure_ascii=False)
             logger.debug(f"설정 백업 생성: {backup_path}")
             self._cleanup_old_backups(exclude_paths=exclude_paths)
         except Exception as e:
@@ -414,6 +464,19 @@ class ConfigManager:
                 return False, "백업 파일이 손상되었습니다."
 
             try:
+                try:
+                    current_data = self._read_json_file(CONFIG_FILE)
+                except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+                    current_data = None
+                if self._is_config_payload_valid(current_data):
+                    restore_data = _with_local_reporting_privacy_state(
+                        restore_data,
+                        current_data,
+                    )
+                else:
+                    restore_data = _without_reporting_privacy_state(
+                        restore_data
+                    )
                 # 복원 전 현재 설정을 백업하되, 복원 대상 백업은 회전에서 보호한다.
                 self._create_backup(exclude_paths={backup_path})
                 self._write_config_atomic_unlocked(restore_data)
@@ -448,7 +511,12 @@ class ConfigManager:
             return False, "현재 설정 파일과 동일한 경로로는 내보낼 수 없습니다."
 
         try:
-            shutil.copy2(CONFIG_FILE, normalized_export)
+            with _CONFIG_LOCK:
+                export_data = _without_reporting_privacy_state(
+                    self._read_json_file(CONFIG_FILE)
+                )
+            with open(normalized_export, 'w', encoding='utf-8') as export_file:
+                json.dump(export_data, export_file, indent=4, ensure_ascii=False)
             logger.info(f"설정 내보내기 완료: {normalized_export}")
             return True, f"설정이 내보내기되었습니다: {normalized_export}"
         except Exception as e:
@@ -515,6 +583,23 @@ class ConfigManager:
 
         return True, ""
 
+    def _validate_import_structure(self, import_data) -> Tuple[bool, str]:
+        """Reject deeply nested or oversized collections before copying imports."""
+        pending = [(import_data, 0)]
+        while pending:
+            current, depth = pending.pop()
+            if depth > MAX_IMPORT_CONFIG_DEPTH:
+                return False, "유효하지 않은 설정 파일입니다. (중첩이 너무 깊습니다)"
+            if isinstance(current, dict):
+                if len(current) > MAX_IMPORT_CONFIG_COLLECTION_ITEMS:
+                    return False, "유효하지 않은 설정 파일입니다. (항목이 너무 많습니다)"
+                pending.extend((item, depth + 1) for item in current.values())
+            elif isinstance(current, list):
+                if len(current) > MAX_IMPORT_CONFIG_COLLECTION_ITEMS:
+                    return False, "유효하지 않은 설정 파일입니다. (항목이 너무 많습니다)"
+                pending.extend((item, depth + 1) for item in current)
+        return True, ""
+
     def import_config(self, import_path: str) -> Tuple[bool, str]:
         """외부 파일에서 설정 가져오기
 
@@ -524,29 +609,40 @@ class ConfigManager:
         Returns:
             (success, message) 튜플
         """
-        if not os.path.exists(import_path):
-            return False, f"파일을 찾을 수 없습니다: {import_path}"
-
-        if not os.path.isfile(import_path):
-            return False, f"파일이 아닙니다: {import_path}"
-
         try:
-            # 파일 유효성 검사
-            with open(import_path, 'r', encoding='utf-8') as f:
-                import_data = json.load(f)
+            with open(import_path, 'rb') as f:
+                encoded_config = f.read(MAX_IMPORT_CONFIG_BYTES + 1)
+            if len(encoded_config) > MAX_IMPORT_CONFIG_BYTES:
+                return False, "설정 파일 크기가 허용 한도를 초과했습니다."
+            import_data = json.loads(encoded_config.decode('utf-8'))
 
+            is_valid, validation_msg = self._validate_import_structure(import_data)
+            if not is_valid:
+                return False, validation_msg
             is_valid, validation_msg = self._validate_import_data(import_data)
             if not is_valid:
                 return False, validation_msg
-
             # 현재 설정 백업 + 원자적 교체 (shutil.copy2로 in-place 교체하지 않음)
             with _CONFIG_LOCK:
+                current_data = self.load_config()
+                import_data = _with_local_reporting_privacy_state(
+                    import_data,
+                    current_data,
+                )
                 self._create_backup()
                 self._write_config_atomic_unlocked(import_data)
 
             logger.info(f"설정 가져오기 완료: {import_path}")
             return True, f"설정이 가져오기되었습니다: {import_path}"
 
+        except FileNotFoundError:
+            return False, f"파일을 찾을 수 없습니다: {import_path}"
+        except IsADirectoryError:
+            return False, f"파일이 아닙니다: {import_path}"
+        except PermissionError:
+            if os.path.isdir(import_path):
+                return False, f"파일이 아닙니다: {import_path}"
+            return False, "설정 파일을 읽을 권한이 없습니다."
         except json.JSONDecodeError:
             return False, "유효하지 않은 JSON 파일입니다."
         except UnicodeDecodeError:
@@ -570,6 +666,11 @@ class ConfigManager:
         """앱 설정 값 조회"""
         config = self.load_config()
         return config.get('settings', {}).get(key, default)
+
+    def get_app_settings_snapshot(self) -> dict:
+        """일관된 시점의 앱 설정 복사본을 반환한다."""
+        config = self.load_config()
+        return copy.deepcopy(config.get('settings', {}))
 
     def get_network_timeout_check(self) -> int:
         """업데이트 확인 네트워크 타임아웃 반환 (초)"""
@@ -596,6 +697,39 @@ class ConfigManager:
             return True, None
 
         self._mutate_config(mutator)
+
+    def set_app_settings(self, updates: Mapping[str, object]) -> None:
+        """여러 앱 설정 값을 하나의 원자적 config 변경으로 저장한다."""
+        safe_updates = dict(updates)
+
+        def mutator(settings):
+            settings.update(safe_updates)
+            return True, None
+
+        self.mutate_app_settings(mutator)
+
+    def mutate_app_settings(
+        self,
+        mutator: Callable[
+            [Dict[str, object]],
+            Tuple[bool, _AppSettingsMutationResult],
+        ],
+    ) -> _AppSettingsMutationResult:
+        """앱 설정의 읽기, 판단, 변경, 저장을 한 config 트랜잭션으로 수행한다.
+
+        mutator는 분리된 settings 복사본을 받아 (should_save, result)를 반환한다.
+        should_save가 False면 복사본의 변경은 폐기한다.
+        """
+        def config_mutator(config):
+            settings = copy.deepcopy(config.get('settings', {}))
+            should_save, result = mutator(settings)
+            if type(should_save) is not bool:
+                raise TypeError('should_save must be a bool')
+            if should_save:
+                config['settings'] = copy.deepcopy(settings)
+            return should_save, result
+
+        return self._mutate_config(config_mutator)
 
     @property
     def encryptor(self):

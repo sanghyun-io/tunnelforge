@@ -1,0 +1,151 @@
+{
+  "schema_version": 1,
+  "synthetic_values_only": true,
+  "cases": [
+    {
+      "name": "credential assignments",
+      "category": "credentials",
+      "input": "password=SyntheticPassword123! api_key=synthetic-api-key",
+      "forbidden": [
+        "SyntheticPassword123!",
+        "synthetic-api-key"
+      ]
+    },
+    {
+      "name": "authorization bearer header",
+      "category": "authorization_header",
+      "input": "Authorization: Bearer SYNTHETIC_BEARER_VALUE_123456789",
+      "forbidden": [
+        "SYNTHETIC_BEARER_VALUE_123456789"
+      ]
+    },
+    {
+      "name": "credentialed URL",
+      "category": "url",
+      "input": "https://synthetic-user:synthetic-pass@example.invalid/private?token=synthetic",
+      "forbidden": [
+        "synthetic-user",
+        "synthetic-pass",
+        "token=synthetic"
+      ]
+    },
+    {
+      "name": "database DSN",
+      "category": "dsn",
+      "input": "postgresql://synthetic_user:synthetic_pass@db.example.invalid:5432/synthetic_db",
+      "forbidden": [
+        "synthetic_user",
+        "synthetic_pass",
+        "synthetic_db"
+      ]
+    },
+    {
+      "name": "documentation IPv4 address",
+      "category": "ipv4",
+      "input": "Connection failed at 192.0.2.44:3306",
+      "forbidden": [
+        "192.0.2.44"
+      ]
+    },
+    {
+      "name": "documentation IPv6 address",
+      "category": "ipv6",
+      "input": "Connection failed at [2001:db8::42]:5432",
+      "forbidden": [
+        "2001:db8::42"
+      ]
+    },
+    {
+      "name": "synthetic email address",
+      "category": "email",
+      "input": "Contact reporter@example.invalid for details",
+      "forbidden": [
+        "reporter@example.invalid"
+      ]
+    },
+    {
+      "name": "Windows absolute path",
+      "category": "windows_path",
+      "input": "C:\\Users\\SyntheticUser\\Documents\\dump.sql",
+      "forbidden": [
+        "SyntheticUser",
+        "dump.sql"
+      ]
+    },
+    {
+      "name": "POSIX absolute path",
+      "category": "posix_path",
+      "input": "/home/synthetic-user/private/dump.sql",
+      "forbidden": [
+        "synthetic-user",
+        "dump.sql"
+      ]
+    },
+    {
+      "name": "UNC network path",
+      "category": "unc_path",
+      "input": "\\\\synthetic-server\\private-share\\dump.sql",
+      "forbidden": [
+        "synthetic-server",
+        "private-share",
+        "dump.sql"
+      ]
+    },
+    {
+      "name": "SQL statement",
+      "category": "sql",
+      "input": "SELECT secret_column FROM private_table WHERE id = 42;",
+      "forbidden": [
+        "secret_column",
+        "private_table",
+        "42"
+      ]
+    },
+    {
+      "name": "quoted database identifiers",
+      "category": "quoted_identifier",
+      "input": "Failed for `synthetic_table` and \"SyntheticSchema\".\"private_table\"",
+      "forbidden": [
+        "synthetic_table",
+        "SyntheticSchema",
+        "private_table"
+      ]
+    },
+    {
+      "name": "Markdown controls",
+      "category": "markdown",
+      "input": "# Synthetic heading\n[click](https://example.invalid)\n```sql\nSELECT 1;\n```",
+      "forbidden": [
+        "# Synthetic heading",
+        "[click]",
+        "```"
+      ]
+    },
+    {
+      "name": "Unicode line and paragraph separators",
+      "category": "unicode_separator",
+      "input": "before middle after",
+      "forbidden": [
+        " ",
+        " "
+      ]
+    },
+    {
+      "name": "ASCII control characters",
+      "category": "control_character",
+      "input": "before\u0000middle\u001fafter",
+      "forbidden": [
+        "\u0000",
+        "\u001f"
+      ]
+    },
+    {
+      "name": "high entropy bearer-like value",
+      "category": "high_entropy_token",
+      "input": "token=eyJhbGciOiJIUzI1NiJ9.U1lOVEhFVElDX1BBWUxPQUQ.c3ludGhldGljX3NpZ25hdHVyZQ",
+      "forbidden": [
+        "eyJhbGciOiJIUzI1NiJ9.U1lOVEhFVElDX1BBWUxPQUQ.c3ludGhldGljX3NpZ25hdHVyZQ"
+      ]
+    }
+  ]
+}

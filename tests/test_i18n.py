@@ -66,8 +66,51 @@ def test_translation_falls_back_to_korean():
     assert i18n.tr("common.save") == "Save"
     assert i18n.tr("missing.key") == "missing.key"
 
+
+def test_error_reporting_consent_strings_are_available_in_korean_and_english():
+    i18n.set_language("ko")
+    assert i18n.tr("error_reporting_consent.enable") == "익명 오류 보고 활성화"
+    assert i18n.tr("error_reporting_consent.public_issue") == (
+        "전송되는 정리된 보고서는 공개 GitHub 이슈가 됩니다."
+    )
+    assert i18n.tr("error_reporting_consent.collected_details") == (
+        "앱: 버전, 패키지 종류, UI 언어; 시스템: 운영 체제 종류와 버전, 아키텍처, 로캘, UTC 오프셋; 런타임: Python, Qt, Rust Core 버전; 작업: 종류, 데이터베이스 엔진, 서버 major.minor 버전, 단계; 오류: 예외 클래스, 코드, 정리된 메시지, 최대 20개의 앱 스택 프레임; 익명 설치 UUID; SHA-256 오류 지문"
+    )
+    assert i18n.tr("error_reporting_consent.excluded_details") == (
+        "사용자 이름, 컴퓨터 이름, 이메일 주소; IP 주소, 호스트, 포트; 데이터베이스, 스키마, 테이블, 컬럼 이름; SQL과 데이터; 절대 경로와 UNC 경로; 환경 변수 값; 자격 증명과 토큰; 임의 첨부 파일"
+    )
+
+    i18n.set_language("en")
+    assert i18n.tr("error_reporting_consent.enable") == "Enable anonymous error reporting"
+    assert i18n.tr("error_reporting_consent.public_issue") == (
+        "Sanitized reports become public GitHub issues."
+    )
+    assert i18n.tr("error_reporting_consent.collected_details") == (
+        "Application: version, package kind, and UI language; System: OS family and version, architecture, locale, and UTC offset; Runtime: Python, Qt, and Rust Core versions; Operation: kind, database engine, server major.minor version, and phase; Error: exception class, code, sanitized message, and up to 20 application stack frames; Anonymous installation UUID; SHA-256 error fingerprint"
+    )
+    assert i18n.tr("error_reporting_consent.excluded_details") == (
+        "User, computer, and email names; IP addresses, hosts, and ports; database, schema, table, and column names; SQL and data; absolute and UNC paths; environment variable values; credentials and tokens; arbitrary attachments"
+    )
+    i18n.set_language("ko")
+
     i18n.set_language("unsupported")
     assert i18n.tr("common.save") == "저장"
+
+
+def test_error_reporting_settings_strings_are_available_in_korean_and_english():
+    i18n.set_language("ko")
+    assert i18n.tr("settings.error_reporting.title") == "익명 오류 보고"
+    assert i18n.tr("settings.error_reporting.settings_path") == (
+        "Settings > General > Anonymous Error Reporting"
+    )
+    assert "App" not in i18n.tr("settings.error_reporting.disclosure")
+
+    i18n.set_language("en")
+    assert i18n.tr("settings.error_reporting.title") == "Anonymous Error Reporting"
+    assert i18n.tr("settings.error_reporting.health") == "Test relay connection"
+    assert i18n.tr("settings.error_reporting.settings_path") == (
+        "Settings > General > Anonymous Error Reporting"
+    )
 
 
 def test_translate_text_handles_common_hardcoded_ui_phrases():

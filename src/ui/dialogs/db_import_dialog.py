@@ -17,59 +17,122 @@ import os
 
 from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
 from src.core.db_connector import MySQLConnector
+from src.core.error_report_sanitizer import (
+    sanitize_local_diagnostic,
+    sanitize_local_diagnostic_data,
+)
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
     build_rust_dump_config, check_rust_dump
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
-from src.ui.workers.github_worker import GithubReportingMixin
+from src.ui.workers.error_reporting_worker import ErrorReportingMixin
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
 logger = get_logger('db_dialogs')
 
-_REDACTED_KEYS = {"password", "credentials"}
-_REDACTED_PLACEHOLDER = "***REDACTED***"
+def _escape_local_diagnostic_text(value: object) -> str:
+    return sanitize_local_diagnostic(value)
+
+
+def _structured_local_diagnostic_text(value: object) -> str:
+    try:
+        serialized = json.dumps(
+            sanitize_local_diagnostic_data(value),
+            ensure_ascii=False,
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+    except BaseException:
+        serialized = "REDACTED"
+    return sanitize_local_diagnostic(serialized)
 
 
 def _sanitized_rust_event(event: dict) -> dict:
-    """민감 키(password/credentials)를 재귀적으로 마스킹한 이벤트 복사본을 반환."""
-
-    def _sanitize_value(value):
-        if isinstance(value, dict):
-            return {
-                key: (_REDACTED_PLACEHOLDER if key.lower() in _REDACTED_KEYS else _sanitize_value(val))
-                for key, val in value.items()
-            }
-        if isinstance(value, list):
-            return [_sanitize_value(item) for item in value]
-        return value
-
-    return _sanitize_value(dict(event))
+    """Return a cycle-safe, recursively sanitized Rust event copy."""
+    sanitized = sanitize_local_diagnostic_data(event)
+    return sanitized if type(sanitized) is dict else {}
 
 
 def _sanitize_plain_rust_line(line: str) -> str:
     """JSON으로 파싱되지 않는 원시 출력 라인에서 자격 증명으로 보이는 조각을 마스킹."""
-    import re
+    return sanitize_local_diagnostic(line)
 
-    sanitized = line
-    sanitized = re.sub(
-        r'(?i)("?password"?\s*[:=]\s*)"[^"]*"',
-        lambda m: f'{m.group(1)}"{_REDACTED_PLACEHOLDER}"',
-        sanitized,
-    )
-    sanitized = re.sub(
-        r"(?i)(password\s*=\s*)\S+",
-        lambda m: f"{m.group(1)}{_REDACTED_PLACEHOLDER}",
-        sanitized,
-    )
-    sanitized = re.sub(
-        r'(?i)("?credentials"?\s*[:=]\s*)\{[^}]*\}',
-        lambda m: f'{m.group(1)}{{"{_REDACTED_PLACEHOLDER}": true}}',
-        sanitized,
-    )
-    return sanitized
+
+_IMPORT_TELEMETRY_NUMERIC_FIELDS = {
+    "phase": (),
+    "table_progress": ("current", "total"),
+    "row_progress": (
+        "rows",
+        "total",
+        "overall_rows_done",
+        "overall_rows_total",
+        "chunk_rows",
+        "chunks_done",
+        "chunks_total",
+        "stream_ms",
+        "read_ms",
+        "load_ms",
+    ),
+    "error": (),
+}
+_IMPORT_TELEMETRY_TEXT_FIELDS = {
+    "phase": ("message", "strategy"),
+    "table_progress": ("table", "status", "message"),
+    "row_progress": ("table", "strategy"),
+    "error": ("message",),
+}
+
+
+def _normalized_import_telemetry(event: object) -> Optional[dict]:
+    """Return bounded recognized Import telemetry or reject malformed values."""
+    if type(event) is not dict:
+        return None
+    event_type = event.get("event")
+    if type(event_type) is not str or event_type not in _IMPORT_TELEMETRY_NUMERIC_FIELDS:
+        return None
+    normalized = {"event": event_type}
+    for key in _IMPORT_TELEMETRY_TEXT_FIELDS[event_type]:
+        value = event.get(key, "")
+        if value is None:
+            value = ""
+        if type(value) is not str or len(value) > 2_000:
+            return None
+        normalized[key] = sanitize_local_diagnostic(value, max_length=2_000)
+    for key in _IMPORT_TELEMETRY_NUMERIC_FIELDS[event_type]:
+        value = event.get(key, 0)
+        if value is None:
+            value = 0
+        if type(value) is not int or value < 0 or value > (2**64 - 1):
+            return None
+        normalized[key] = value
+
+    if event_type == "phase" and not normalized["message"]:
+        return None
+    if event_type in {"table_progress", "row_progress"} and not normalized["table"]:
+        return None
+    if event_type == "table_progress":
+        if normalized["status"] not in {"importing", "completed", "error"}:
+            return None
+        if normalized["total"] and normalized["current"] > normalized["total"]:
+            return None
+    elif event_type == "row_progress":
+        if normalized["total"] and normalized["rows"] > normalized["total"]:
+            return None
+        if (
+            normalized["overall_rows_total"]
+            and normalized["overall_rows_done"]
+            > normalized["overall_rows_total"]
+        ):
+            return None
+        if (
+            normalized["chunks_total"]
+            and normalized["chunks_done"] > normalized["chunks_total"]
+        ):
+            return None
+    return normalized
 
 
 def format_import_row_labels(info: dict) -> tuple[str, str, str]:
@@ -244,7 +307,7 @@ def format_import_visible_telemetry(event: dict) -> Optional[str]:
 # Rust DB Core 기반 Import 다이얼로그
 # ============================================================
 
-class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialog):
+class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog):
     """Rust DB Core Import 다이얼로그"""
 
     def __init__(self, parent=None, connector: MySQLConnector = None, config_manager=None,
@@ -258,8 +321,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         self.tunnel_config = tunnel_config  # Production 환경 보호용
         self.worker: Optional[RustDumpWorker] = None
 
-        # GitHub 이슈 보고 워커 목록 (완료 전까지 참조 유지)
-        self._github_workers: List[object] = []
+        # 익명 오류 보고 워커 목록 (완료 전까지 참조 유지)
+        self._error_report_workers: List[object] = []
         self._cancel_requested = False
         self._close_after_cancel = False
 
@@ -902,7 +965,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용, 최대 500개 유지)"""
         timestamp = datetime.now().strftime('%H:%M:%S')
-        log_entry = f"[{timestamp}] {msg}"
+        log_entry = f"[{timestamp}] {_escape_local_diagnostic_text(msg)}"
         self.log_entries.append(log_entry)
         if len(self.log_entries) > MAX_LOG_ENTRIES:
             del self.log_entries[:-MAX_LOG_ENTRIES]
@@ -970,6 +1033,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
 
         if not self._confirm_production_guard(input_dir, target_schema):
             return
+
+        self._begin_error_report_operation()
 
         # 저장 (재시도용)
         self.last_input_dir = input_dir
@@ -1102,6 +1167,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
 
     def on_progress(self, msg: str):
         """일반 진행 메시지 처리"""
+        msg = _escape_local_diagnostic_text(msg)
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
         self.label_status.setText(msg)
@@ -1121,7 +1187,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
         self.label_tables.setText(f"📋 테이블: {current} / {total} 완료")
-        self._add_log(f"테이블 완료: {table_name} ({current}/{total})")
+        display_table = _escape_local_diagnostic_text(table_name)
+        self._add_log(f"테이블 완료: {display_table} ({current}/{total})")
 
     def on_detail_progress(self, info: dict):
         """상세 진행 정보 업데이트"""
@@ -1153,7 +1220,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                 self.import_table_rows_total,
                 int(info.get('percent') or 0),
             )
-        data_label, speed_label, status_label = format_import_row_labels(info)
+        display_info = dict(info)
+        for key in ("table", "current_phase", "strategy"):
+            if key in display_info:
+                display_info[key] = _escape_local_diagnostic_text(
+                    display_info[key]
+                )
+        data_label, speed_label, status_label = format_import_row_labels(
+            display_info
+        )
 
         self.progress_bar.setValue(percent)
         self.label_percent.setText(f"📊 전체 진행률: {percent}%")
@@ -1180,6 +1255,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트 (메타데이터 정보 포함)"""
         icon = TABLE_STATUS_ICONS.get(status, '❓')
+        display_table = _escape_local_diagnostic_text(table_name)
+        display_message = _escape_local_diagnostic_text(message)
 
         # 메타데이터에서 테이블 정보 가져오기
         size_info = ""
@@ -1200,15 +1277,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
         # 기존 아이템이 있으면 업데이트, 없으면 새로 생성
         if table_name in self.table_items:
             item = self.table_items[table_name]
-            display_text = f"{icon} {table_name}{size_info}{chunk_info}"
+            display_text = f"{icon} {display_table}{size_info}{chunk_info}"
             if status == 'error' and message:
-                display_text += f" - {message[:50]}..."
+                display_text += f" - {display_message[:50]}..."
             item.setText(display_text)
             item.setForeground(Qt.GlobalColor.black)
         else:
-            display_text = f"{icon} {table_name}{size_info}{chunk_info}"
+            display_text = f"{icon} {display_table}{size_info}{chunk_info}"
             if status == 'error' and message:
-                display_text += f" - {message[:50]}..."
+                display_text += f" - {display_message[:50]}..."
             item = QListWidgetItem(display_text)
             self.table_list.addItem(item)
             self.table_items[table_name] = item
@@ -1218,8 +1295,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
 
         # 로그에 테이블 상태 변경 기록 (done/error만)
         if status in ('done', 'error'):
-            status_text = '완료' if status == 'done' else f'오류: {message}'
-            self._add_log(f"테이블 [{table_name}] {status_text}")
+            status_text = '완료' if status == 'done' else f'오류: {display_message}'
+            self._add_log(f"테이블 [{display_table}] {status_text}")
 
     def on_table_chunk_progress(self, table_name: str, completed_chunks: int, total_chunks: int):
         """
@@ -1257,13 +1334,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                 # 단일 chunk 테이블: 진행률 표시 안 함
                 chunk_info = ""
 
-            display_text = f"{icon} {table_name}{size_info}{chunk_info}"
+            display_table = _escape_local_diagnostic_text(table_name)
+            display_text = f"{icon} {display_table}{size_info}{chunk_info}"
 
             # error 상태이면 메시지 추가
             if current_status == 'error':
                 message = self.import_results.get(table_name, {}).get('message', '')
                 if message:
-                    display_text += f" - {message[:50]}..."
+                    display_message = _escape_local_diagnostic_text(message)
+                    display_text += f" - {display_message[:50]}..."
 
             item.setText(display_text)
 
@@ -1278,15 +1357,37 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             self.txt_log.takeItem(0)
 
         visible_summary = None
+        sanitized_event = None
         try:
             event = json.loads(line)
             if isinstance(event, dict):
                 sanitized_event = _sanitized_rust_event(event)
-                visible_summary = format_import_visible_telemetry(sanitized_event)
-        except json.JSONDecodeError:
-            visible_summary = _sanitize_plain_rust_line(line)
+                normalized_event = _normalized_import_telemetry(sanitized_event)
+                if normalized_event is None:
+                    visible_summary = _structured_local_diagnostic_text(
+                        sanitized_event
+                    )
+                else:
+                    visible_summary = format_import_visible_telemetry(
+                        normalized_event
+                    )
+            else:
+                visible_summary = _structured_local_diagnostic_text(event)
+        except (
+            json.JSONDecodeError,
+            RecursionError,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ):
+            visible_summary = (
+                _structured_local_diagnostic_text(sanitized_event)
+                if sanitized_event is not None
+                else _sanitize_plain_rust_line(line)
+            )
 
         if visible_summary:
+            visible_summary = _escape_local_diagnostic_text(visible_summary)
             self.txt_log.addItem(visible_summary)
             self.txt_log.scrollToBottom()
             self._add_log(visible_summary)
@@ -1323,7 +1424,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                 for table_name, size_bytes, chunk_count in large_tables[:10]:
                     size_str = self._format_bytes(size_bytes)
 
-                    display = f"⏳ {table_name} ({size_str}, {chunk_count} chunks)"
+                    display_table = _escape_local_diagnostic_text(table_name)
+                    display = f"⏳ {display_table} ({size_str}, {chunk_count} chunks)"
                     item = QListWidgetItem(display)
                     item.setForeground(Qt.GlobalColor.gray)
                     self.table_list.addItem(item)
@@ -1345,6 +1447,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
 
     def on_finished(self, success: bool, message: str):
         """작업 완료 처리"""
+        message = _escape_local_diagnostic_text(message)
         # 로그 기록
         self.import_end_time = datetime.now()
         self.import_success = success
@@ -1417,42 +1520,20 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                 else:
                     QMessageBox.warning(self, "Import 실패", f"❌ {message}")
 
-                # GitHub 이슈 자동 보고
-                self._report_error_to_github("import", message, error_count)
+                self._report_error_anonymously()
 
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 
-    def _report_error_to_github(self, error_type: str, error_message: str, error_count: int = 0):
-        """GitHub 이슈 자동 보고 (백그라운드)"""
+    def _report_error_anonymously(self):
+        """Submit a privacy-allowlisted report in the background."""
         if not self.config_manager:
             return
-
-        table_results = self._table_results()
-        failed_tables = [
-            table for table, result in table_results.items()
-            if result.get('status') == 'error'
-        ]
-        failed_messages = [
-            result.get('message', '')
-            for result in table_results.values()
-            if result.get('status') == 'error'
-        ]
-
-        # 컨텍스트 정보 수집
-        target_schema = self.combo_target_schema.currentText() if not self.chk_use_original.isChecked() else "(원본 스키마)"
-        context = {
-            'schema': target_schema,
-            'failed_tables': failed_tables,
-            'mode': self._get_import_mode_text()
-        }
-
-        # 오류 메시지 조합 (첫 3개 실패 메시지)
-        combined_error = error_message
-        if failed_messages:
-            combined_error += "\n\n실패한 테이블 오류:\n" + "\n".join(failed_messages[:3])
-
-        self._start_github_report_worker(error_type, combined_error, context)
+        self._start_error_report_worker(
+            operation_kind="import",
+            db_engine=getattr(self.connector, "engine", ""),
+            phase="dump.import",
+        )
 
     def select_failed_tables(self):
         """실패한 테이블 모두 선택"""
@@ -1474,10 +1555,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             return
 
         # 확인 대화상자
+        display_tables = [
+            _escape_local_diagnostic_text(table)
+            for table in selected_tables[:5]
+        ]
         reply = QMessageBox.question(
             self, "재시도 확인",
             f"선택한 {len(selected_tables)}개 테이블을 재시도하시겠습니까?\n\n"
-            f"테이블: {', '.join(selected_tables[:5])}{'...' if len(selected_tables) > 5 else ''}",
+            f"테이블: {', '.join(display_tables)}"
+            f"{'...' if len(selected_tables) > 5 else ''}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
         )
 
@@ -1526,6 +1612,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
             return
 
         try:
+            safe = _escape_local_diagnostic_text
             # 결과 요약
             table_results = self._table_results()
             done_count = self._count_by_status(table_results, 'done')
@@ -1538,8 +1625,13 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                 f.write("Rust DB Core Import Log\n")
                 f.write("=" * 70 + "\n\n")
 
-                f.write(f"Dump 폴더: {self.last_input_dir}\n")
-                f.write(f"대상 스키마: {self.last_target_schema if self.last_target_schema else '원본 스키마명 사용'}\n")
+                f.write(f"Dump 폴더: {safe(self.last_input_dir)}\n")
+                target_schema = (
+                    safe(self.last_target_schema)
+                    if self.last_target_schema
+                    else '원본 스키마명 사용'
+                )
+                f.write(f"대상 스키마: {target_schema}\n")
                 if self.import_success is None:
                     result_label = "진행 중"
                 else:
@@ -1562,14 +1654,17 @@ class RustDumpImportDialog(CollapsibleConfigDialog, GithubReportingMixin, QDialo
                     f.write("-" * 70 + "\n")
                     for table_name, result in table_results.items():
                         if result.get('status') == 'error':
-                            f.write(f"  ❌ {table_name}: {result.get('message', 'Unknown error')}\n")
+                            f.write(
+                                f"  ❌ {safe(table_name)}: "
+                                f"{safe(result.get('message', 'Unknown error'))}\n"
+                            )
 
                 f.write("\n" + "=" * 70 + "\n")
                 f.write("상세 로그\n")
                 f.write("=" * 70 + "\n\n")
 
                 for entry in self.log_entries:
-                    f.write(entry + "\n")
+                    f.write(safe(entry) + "\n")
 
             QMessageBox.information(
                 self, "저장 완료",

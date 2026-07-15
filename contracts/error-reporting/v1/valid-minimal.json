@@ -1,0 +1,34 @@
+{
+  "report": {
+    "report_schema_version": 1,
+    "anonymous_installation_id": "550e8400-e29b-41d4-a716-446655440000",
+    "error_fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  },
+  "app": {
+    "version": "2.3.1",
+    "package_kind": "source",
+    "ui_language": "en"
+  },
+  "system": {
+    "os_family": "linux",
+    "os_version": "6.8.0",
+    "architecture": "x86_64",
+    "locale": "en_US",
+    "utc_offset_minutes": 0
+  },
+  "runtime": {
+    "python_version": "3.12.4",
+    "qt_version": "6.7.2",
+    "rust_core_version": "2.3.1"
+  },
+  "operation": {
+    "kind": "export",
+    "db_engine": "mysql",
+    "phase": "dump.run"
+  },
+  "error": {
+    "exception_class": "RuntimeError",
+    "sanitized_message": "Export failed.",
+    "app_frames": []
+  }
+}

@@ -1137,8 +1137,8 @@ def test_current_status_tracks_embedded_github_app_key_rotation_scope():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "TF-STATUS-092 is `in_progress`" in summary
-    assert "TF-STATUS-092 | High | in_progress" in tracker
+    assert "TF-STATUS-092 is `fixed_pending_full_verify`" in summary
+    assert "TF-STATUS-092 | High | fixed_pending_full_verify" in tracker
     assert "42 published releases" in verification
     assert "`v1.13.4` through `v2.3.0`" in verification
     assert "App ID `2735888`" in sessions
@@ -1154,10 +1154,10 @@ def test_current_status_records_anonymous_error_reporting_design():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "Last reviewed: 2026-07-14" in doc
+    assert "Last reviewed: 2026-07-15" in doc
     assert "dedicated reporter GitHub App" in summary
     assert "Cloudflare Worker" in summary
-    assert "TF-STATUS-092 | High | in_progress" in tracker
+    assert "TF-STATUS-092 | High | fixed_pending_full_verify" in tracker
     assert "2026-07-14-anonymous-error-reporting-design.md" in verification
     assert "30 days" in verification
     assert "at most twice" in verification
@@ -1173,11 +1173,69 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "TF-STATUS-092 is `in_progress`" in summary
-    assert "TF-STATUS-092 | High | in_progress" in tracker
+    assert "TF-STATUS-092 is `fixed_pending_full_verify`" in summary
+    assert "TF-STATUS-092 | High | fixed_pending_full_verify" in tracker
     assert "2026-07-14-anonymous-error-reporting.md" in verification
     assert "13 TDD tasks" in verification
     assert "D1 global mutation budgets" in verification
     assert "GitHub timeout" in verification
+    assert "final 76 passed" in verification
+    assert "Task 1 quality approved" in verification
+    assert "Task 2 quality approved" in verification
+    assert "final 171 passed" in verification
+    assert "Task 3 quality approved" in verification
+    assert "final 93 passed" in verification
+    assert "Task 4 quality approved" in verification
+    assert "final 188 passed" in verification
+    assert "Task 5 quality approved" in verification
+    assert "full 2729 passed" in verification
+    assert "Task 6 quality approved" in verification
+    assert "full 2748 passed" in verification
+    assert "Task 7 quality approved" in verification
+    assert "full 2672 passed" in verification
+    assert "Task 8 quality approved" in verification
+    assert "final 198 passed" in verification
+    assert "fail-closed free-text boundary" in verification
+    assert "Task 9 quality approved" in verification
+    assert "final 259 passed" in verification
+    assert "100-row cleanup bound" in verification
+    assert "Task 10 quality approved" in verification
+    assert "final 306 passed" in verification
+    assert "GitHub App JWT" in verification
+    assert "Task 11 quality approved" in verification
+    assert "final 311 passed" in verification
+    assert "packaging 47 passed" in verification
+    assert "local Tasks 1-11 approved" in verification
+    assert "full Python 2695 passed / 1 skipped" in verification
+    assert "final Worker 314 passed" in verification
+    assert "GitHub Push Protection" in verification
+    assert "feat/anonymous-error-reporting-relay" in verification
+    assert "Task 12 GitHub App inventory and overlapping-key creation" in verification
+    assert "Task 13 live D1, off, and shadow rollout" in verification
+    assert "e432cb75-97c8-48a1-8e99-6e3bbb088b87" in verification
+    assert "Task 13 canary, emergency off, active, and client binding" in verification
+    assert "https://github.com/sanghyun-io/tunnelforge/issues/244" in verification
+    assert "9dbed64a-0d60-43bf-b946-24ab96e312f5" in verification
+    assert "full Python 2697 passed / 1 skipped" in verification
+    assert "61 successful invocations and zero errors" in verification
+    assert "2026-07-15T02:06:03Z" in verification
+    assert "2026-07-15T03:06:23Z" in verification
+    assert "29382607405" in verification
+    assert "29382607434" in verification
+    assert "PR #245" in verification
     assert "2026-07-14-anonymous-error-reporting.md" in order
+    assert "Complete fresh-head hosted verification and protected PR #245" in order
     assert "Implementation has not yet changed runtime code" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 5" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 6" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 7" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 8" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 9" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 10" in sessions
+    assert "Completed and independently approved TF-STATUS-092 Task 11" in sessions
+    assert "Completed the final local Tasks 1-11 review" in sessions
+    assert "Published the reviewed local Tasks 1-11 branch" in sessions
+    assert "Advanced TF-STATUS-092 Tasks 12-13" in sessions
+    assert "Completed the live Task 13 canary and active rollout" in sessions
+    assert "Deleted the exposed Reporter key" in sessions
+    assert "Removed the unused `GH_APP_PRIVATE_KEY` repository secret" in sessions

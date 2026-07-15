@@ -208,6 +208,89 @@ class _FakeCloseEvent:
         self.ignored = True
 
 
+class _RegistryWorker:
+    def __init__(self, running):
+        self.running = running
+        self.finished = _FakeSignal()
+
+    def isRunning(self):
+        return self.running
+
+
+def test_detached_migration_helper_prunes_non_running_worker(monkeypatch):
+    worker = _RegistryWorker(running=False)
+    registry = {worker}
+    monkeypatch.setattr(migration_dialogs, '_DETACHED_MIGRATION_WORKERS', registry)
+
+    assert migration_dialogs.has_active_detached_migration_workers() is False
+    assert registry == set()
+
+
+def test_detached_migration_helper_retains_running_worker(monkeypatch):
+    worker = _RegistryWorker(running=True)
+    registry = {worker}
+    monkeypatch.setattr(migration_dialogs, '_DETACHED_MIGRATION_WORKERS', registry)
+
+    assert migration_dialogs.has_active_detached_migration_workers() is True
+    assert registry == {worker}
+
+
+def test_detached_migration_helper_prunes_deleted_worker(monkeypatch):
+    class _DeletedWorker:
+        def isRunning(self):
+            raise RuntimeError('wrapped C/C++ object has been deleted')
+
+    worker = _DeletedWorker()
+    registry = {worker}
+    monkeypatch.setattr(migration_dialogs, '_DETACHED_MIGRATION_WORKERS', registry)
+
+    assert migration_dialogs.has_active_detached_migration_workers() is False
+    assert registry == set()
+
+
+def test_migration_detach_connects_cleanup_before_registry_visibility(monkeypatch):
+    worker = _RegistryWorker(running=True)
+    registry = set()
+    observed_membership = []
+    original_connect = worker.finished.connect
+
+    def connect(slot):
+        observed_membership.append(worker in registry)
+        original_connect(slot)
+
+    worker.finished.connect = connect
+    monkeypatch.setattr(migration_dialogs, '_DETACHED_MIGRATION_WORKERS', registry)
+    monkeypatch.setattr(
+        migration_dialogs,
+        '_disconnect_connector_in_background',
+        lambda connector: None,
+    )
+
+    migration_dialogs._detach_workers_until_finished([worker], object())
+
+    assert observed_membership == [False]
+    assert registry == {worker}
+
+
+def test_migration_detach_prunes_worker_completed_before_cleanup_connect(monkeypatch):
+    worker = _RegistryWorker(running=False)
+    registry = set()
+    connector = object()
+    disconnect_calls = []
+    monkeypatch.setattr(migration_dialogs, '_DETACHED_MIGRATION_WORKERS', registry)
+    monkeypatch.setattr(
+        migration_dialogs,
+        '_disconnect_connector_in_background',
+        lambda value: disconnect_calls.append(value),
+    )
+
+    migration_dialogs._detach_workers_until_finished([worker], connector)
+
+    assert registry == set()
+    assert migration_dialogs.has_active_detached_migration_workers() is False
+    assert disconnect_calls == [connector]
+
+
 def test_close_event_detaches_worker_without_terminate_or_wait(monkeypatch):
     """closeEvent는 실행 중인 Worker를 강제 종료(quit/wait/terminate)하지 않고
     백그라운드로 분리한 뒤, Worker가 스스로 끝나면 커넥터를 정리해야 한다."""
@@ -226,6 +309,8 @@ def test_close_event_detaches_worker_without_terminate_or_wait(monkeypatch):
     fake_worker = _FakeAnalyzerWorker()
     connector = FakeMySQLConnector()
 
+    assert migration_dialogs.has_active_detached_migration_workers() is False
+
     dialog = type("DummyMigrationDialog", (), {})()
     dialog._is_closing = False
     dialog._disconnect_deferred_to_worker_completion = False
@@ -240,11 +325,13 @@ def test_close_event_detaches_worker_without_terminate_or_wait(monkeypatch):
     assert event.ignored is False
     assert dialog._disconnect_deferred_to_worker_completion is True
     assert disconnect_calls == []  # Worker가 아직 끝나지 않았으므로 아직 정리되지 않음
+    assert migration_dialogs.has_active_detached_migration_workers() is True
 
     # Worker가 스스로 끝나면 그제서야 백그라운드 커넥터 정리가 트리거되어야 한다
     fake_worker.finished.emit(True, "분석 완료")
 
     assert disconnect_calls == [connector]
+    assert migration_dialogs.has_active_detached_migration_workers() is False
 
 
 def test_migration_wizard_skips_final_disconnect_when_dialog_deferred(monkeypatch):

@@ -1,0 +1,6 @@
+# Copy this file to .dev.vars for local-only work. Keep every real value out of Git.
+GITHUB_APP_ID=
+GITHUB_APP_INSTALLATION_ID=
+GITHUB_APP_PRIVATE_KEY=
+INSTALLATION_ID_HMAC_KEY=
+CANARY_ADMIN_TOKEN=

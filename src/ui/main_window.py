@@ -1,6 +1,7 @@
 """메인 UI 윈도우"""
 import sys
 import os
+from datetime import datetime, timezone
 from typing import Optional
 from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
                              QPushButton, QLabel, QMessageBox, QSystemTrayIcon,
@@ -16,13 +17,25 @@ from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
 from src.ui.controllers import TrayController, TunnelActionsController, WizardLauncher
+from src.ui.dialogs.migration_dialogs import has_active_detached_migration_workers
+from src.ui.dialogs.oneclick_migration_dialog import (
+    has_active_detached_oneclick_workers,
+)
 from src.core.logger import get_logger
 from src.core.platform_integration import restore_window_to_front
 from src.core.resources import app_icon_path, resource_path
 from src.core.i18n import tr
+from src.core.error_report_consent import ConsentPolicy
+from src.ui.dialogs.error_reporting_consent_dialog import ErrorReportingConsentDialog
 
 logger = get_logger('main_window')
 SCHEDULE_FEATURE_ENABLED = False
+ERROR_REPORTING_INITIAL_DELAY_MS = 500
+ERROR_REPORTING_RETRY_DELAY_MS = 500
+
+
+def _utc_now():
+    return datetime.now(timezone.utc)
 
 
 def get_resource_path(relative_path):
@@ -72,6 +85,8 @@ class TunnelManagerUI(QMainWindow):
         self.tunnels = self.config_data.get('tunnels', [])
 
         self._update_checker_thread = None
+        self._error_reporting_consent_policy = ConsentPolicy(self.config_mgr)
+        self._init_error_reporting_prompt_lifecycle()
 
         # MySQL 로그인 경로 매니저 초기화
         self._login_path_mgr = MysqlLoginPathManager()
@@ -691,6 +706,147 @@ class TunnelManagerUI(QMainWindow):
         super().showEvent(event)
         QTimer.singleShot(50, self._apply_column_ratios)
         self._schedule_repaint()
+        self._schedule_error_reporting_prompt(ERROR_REPORTING_INITIAL_DELAY_MS)
+
+    def _init_error_reporting_prompt_lifecycle(self):
+        self._error_reporting_prompt_scheduled = False
+        self._error_reporting_prompt_running = False
+        self._error_reporting_prompt_shown = False
+        self._error_reporting_prompt_shutdown = False
+        self._error_reporting_prompt_timer = QTimer(self)
+        self._error_reporting_prompt_timer.setSingleShot(True)
+        self._error_reporting_prompt_timer.timeout.connect(
+            self._maybe_show_error_reporting_consent
+        )
+
+    def _schedule_error_reporting_prompt(self, delay_ms):
+        if (
+            self._error_reporting_prompt_shutdown
+            or self._error_reporting_prompt_running
+            or self._error_reporting_prompt_shown
+            or self._error_reporting_prompt_scheduled
+        ):
+            return
+        try:
+            if self._error_reporting_prompt_timer.isActive():
+                self._error_reporting_prompt_scheduled = True
+                return
+            bounded_delay = max(1, min(int(delay_ms), 1000))
+            self._error_reporting_prompt_scheduled = True
+            self._error_reporting_prompt_timer.start(bounded_delay)
+        except (RuntimeError, TypeError, ValueError):
+            self._error_reporting_prompt_scheduled = False
+
+    def prepare_for_shutdown(self):
+        """Stop consent presentation before the application event loop exits."""
+        self._stop_error_reporting_prompt_for_shutdown()
+
+    def _stop_error_reporting_prompt_for_shutdown(self):
+        if self._error_reporting_prompt_shutdown:
+            return
+        self._error_reporting_prompt_shutdown = True
+        self._error_reporting_prompt_scheduled = False
+        try:
+            self._error_reporting_prompt_timer.stop()
+        except (AttributeError, RuntimeError):
+            pass
+
+    def _has_active_database_operation(self):
+        """Avoid prompting over a modal or a detached DB operation."""
+        return (
+            QApplication.activeModalWidget() is not None
+            or has_active_detached_migration_workers()
+            or has_active_detached_oneclick_workers()
+        )
+
+    def _maybe_show_error_reporting_consent(self):
+        """Claim and present the local-only consent dialog once it is safe."""
+        self._error_reporting_prompt_scheduled = False
+        try:
+            if (
+                self._error_reporting_prompt_shutdown
+                or self._error_reporting_prompt_running
+                or self._error_reporting_prompt_shown
+            ):
+                return
+            if (
+                not self.isVisible()
+                or self.isMinimized()
+            ):
+                return
+        except RuntimeError:
+            return
+
+        if self._has_active_database_operation():
+            self._schedule_error_reporting_prompt(ERROR_REPORTING_RETRY_DELAY_MS)
+            return
+
+        self._error_reporting_prompt_running = True
+        try:
+            try:
+                claim_id = self._error_reporting_consent_policy.claim_prompt(
+                    _utc_now()
+                )
+            except Exception:
+                logger.exception("오류 보고 동의 프롬프트 claim 실패")
+                return
+            if claim_id is None:
+                return
+
+            try:
+                dialog = ErrorReportingConsentDialog(self)
+            except Exception:
+                logger.exception("오류 보고 동의 대화상자 생성 실패")
+                self._release_error_reporting_prompt_claim(claim_id)
+                return
+
+            self._error_reporting_prompt_shown = True
+            try:
+                dialog.exec()
+            except Exception:
+                logger.exception("오류 보고 동의 대화상자 실행 실패")
+                self._error_reporting_prompt_shown = False
+                self._release_error_reporting_prompt_claim(claim_id)
+                return
+
+            if self._error_reporting_prompt_shutdown:
+                self._error_reporting_prompt_shown = False
+                self._release_error_reporting_prompt_claim(claim_id)
+                return
+
+            try:
+                outcome, suppress = dialog.get_outcome()
+            except Exception:
+                logger.exception("오류 보고 동의 결과 조회 실패")
+                self._error_reporting_prompt_shown = False
+                self._release_error_reporting_prompt_claim(claim_id)
+                return
+
+            if self._error_reporting_prompt_shutdown:
+                self._error_reporting_prompt_shown = False
+                self._release_error_reporting_prompt_claim(claim_id)
+                return
+
+            try:
+                self._error_reporting_consent_policy.record_outcome(
+                    claim_id,
+                    outcome,
+                    _utc_now(),
+                    suppress=suppress,
+                )
+            except Exception:
+                logger.exception("오류 보고 동의 결과 저장 실패")
+        finally:
+            self._error_reporting_prompt_running = False
+
+    def _release_error_reporting_prompt_claim(self, claim_id):
+        try:
+            self._error_reporting_consent_policy.release_prompt_claim(
+                claim_id,
+                _utc_now(),
+            )
+        except Exception:
+            logger.exception("오류 보고 동의 프롬프트 claim 복원 실패")
 
     def resizeEvent(self, event):
         """창 크기 변경 시 열 비율 유지"""
@@ -732,6 +888,7 @@ class TunnelManagerUI(QMainWindow):
 
     def close_app(self):
         """진짜 종료"""
+        self.prepare_for_shutdown()
         # 현재 활성화된 터널 ID 목록 저장 (다음 시작 시 자동 연결용)
         active_ids = list(self.engine.active_tunnels.keys())
         self.config_mgr.save_active_tunnels(active_ids)
@@ -757,6 +914,7 @@ class TunnelManagerUI(QMainWindow):
 
     def dispose_for_smoke_check(self):
         """Dispose UI objects created by startup smoke checks without user-state writes."""
+        self.prepare_for_shutdown()
         if hasattr(self, 'tray_icon') and self.tray_icon:
             self.tray_icon.hide()
         self.deleteLater()

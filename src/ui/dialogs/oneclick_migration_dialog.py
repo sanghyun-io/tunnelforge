@@ -660,6 +660,25 @@ class ResultWidget(QWidget):
 _DETACHED_ONECLICK_WORKERS: set = set()
 
 
+def _worker_is_running(worker) -> bool:
+    try:
+        is_running = getattr(worker, "isRunning")
+        return bool(is_running()) if callable(is_running) else False
+    except (AttributeError, RuntimeError, TypeError):
+        return False
+
+
+def has_active_detached_oneclick_workers() -> bool:
+    """Return whether a detached One-Click DB worker is still running."""
+    active = False
+    for worker in list(_DETACHED_ONECLICK_WORKERS):
+        if _worker_is_running(worker):
+            active = True
+        else:
+            _DETACHED_ONECLICK_WORKERS.discard(worker)
+    return active
+
+
 class OneClickMigrationDialog(QDialog):
     """One-Click 마이그레이션 다이얼로그"""
 
@@ -891,13 +910,20 @@ class OneClickMigrationDialog(QDialog):
         if worker is None:
             return
         self._disconnect_worker_ui_signals(worker)
-        _DETACHED_ONECLICK_WORKERS.add(worker)
 
         def _cleanup():
             _DETACHED_ONECLICK_WORKERS.discard(worker)
-            worker.deleteLater()
 
-        worker.finished.connect(_cleanup)
+        try:
+            worker.finished.connect(_cleanup)
+        except (AttributeError, RuntimeError, TypeError):
+            self.worker = None
+            return
+
+        if _worker_is_running(worker):
+            _DETACHED_ONECLICK_WORKERS.add(worker)
+            if not _worker_is_running(worker):
+                _cleanup()
         self.worker = None
 
     def closeEvent(self, event):
