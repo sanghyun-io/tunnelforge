@@ -1281,18 +1281,21 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "Closed TF-STATUS-092 after protected PR #245 merged" in sessions
 
 
-def test_current_status_records_ssh_trust_core_without_closing_ui_work():
+def test_current_status_closes_ssh_host_trust_after_core_and_ui_approval():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     tracker = " ".join(_section(doc, "Issue Tracker").split())
     verification = " ".join(_section(doc, "Verification Log").split())
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "TF-STATUS-095 | Critical | open" in tracker
+    assert "TF-STATUS-095 | Critical | closed" in tracker
     assert "SSH host trust Core slice" in verification
     assert "71 passed, 1 skipped, 1 warning" in verification
     assert "Task 1 security re-review: APPROVE" in verification
-    assert "UI approval paths remain" in verification
+    assert "SSH first-use approval UI / TF-STATUS-095 Task 2" in verification
+    assert "2820 passed, 2 skipped" in verification
+    assert "Task 2 final review: APPROVE" in verification
     assert "Completed the TF-STATUS-095 SSH trust Core slice" in sessions
+    assert "Closed TF-STATUS-095 after completing the SSH first-use UI" in sessions
     assert order.index("Disable One-Click non-dry-run") < order.index("TF-STATUS-098")
     assert order.index("TF-STATUS-098") < order.index("Re-enable One-Click non-dry-run")
