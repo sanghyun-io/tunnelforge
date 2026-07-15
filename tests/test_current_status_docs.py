@@ -1153,7 +1153,9 @@ def test_current_status_records_published_231_release_evidence():
     verification = " ".join(_section(doc, "Verification Log").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "`v2.3.1` is published as the latest stable GitHub Release" in summary
+    assert "The latest stable release is now `v2.4.0`" in summary
+    assert "`v2.4.0` supersedes it as stable/latest" in summary
+    assert "`v2.3.1` is published as the latest stable GitHub Release" not in summary
     assert "TF-STATUS-081 | High | closed" in tracker
     assert "29233663954" in verification
     assert "29233708190" in verification

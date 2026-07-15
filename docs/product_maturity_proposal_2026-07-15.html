@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="TunnelForge Safety and Proof 제품 완성도 제안서">
+  <title>TunnelForge Safety and Proof 제안서</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #17202a;
+      --muted: #5b6773;
+      --line: #d9e0e6;
+      --soft: #f4f6f8;
+      --paper: #ffffff;
+      --nav: #101820;
+      --blue: #1769aa;
+      --teal: #087f6f;
+      --red: #b42318;
+      --amber: #9a6700;
+      --green-soft: #eaf7f3;
+      --blue-soft: #eaf3fb;
+      --red-soft: #fdf0ef;
+      --amber-soft: #fff6dc;
+      --shadow: 0 8px 24px rgba(23, 32, 42, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--soft);
+      font-family: Inter, Pretendard, "Noto Sans KR", "Malgun Gothic", Arial, sans-serif;
+      font-size: 16px;
+      line-height: 1.65;
+      letter-spacing: 0;
+    }
+    a { color: var(--blue); text-underline-offset: 3px; }
+    a:hover { color: #0b4f86; }
+    code {
+      padding: 0.1rem 0.32rem;
+      border: 1px solid #dfe5ea;
+      background: #f7f9fa;
+      border-radius: 3px;
+      font-family: Consolas, "SFMono-Regular", monospace;
+      font-size: 0.9em;
+    }
+    button {
+      appearance: none;
+      border: 1px solid #45515d;
+      background: transparent;
+      color: #fff;
+      min-width: 40px;
+      min-height: 40px;
+      padding: 0.45rem 0.7rem;
+      border-radius: 4px;
+      cursor: pointer;
+      font: inherit;
+    }
+    button:hover { background: #263440; }
+    button:focus-visible, a:focus-visible { outline: 3px solid #62b0e8; outline-offset: 2px; }
+
+    .topbar {
+      position: sticky;
+      top: 0;
+      z-index: 20;
+      background: var(--nav);
+      color: #fff;
+      border-bottom: 1px solid #2b3945;
+    }
+    .topbar-inner {
+      width: min(1240px, calc(100% - 32px));
+      min-height: 58px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.65rem;
+      color: #fff;
+      font-weight: 750;
+      text-decoration: none;
+      white-space: nowrap;
+    }
+    .brand img { width: 30px; height: 30px; object-fit: contain; }
+    .topnav {
+      display: flex;
+      align-items: center;
+      gap: 0.9rem;
+      overflow-x: auto;
+      scrollbar-width: thin;
+      flex: 1;
+    }
+    .topnav a {
+      color: #cbd6df;
+      text-decoration: none;
+      font-size: 0.86rem;
+      white-space: nowrap;
+      padding: 0.25rem 0;
+    }
+    .topnav a:hover { color: #fff; }
+
+    .page {
+      width: min(1240px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 34px 0 72px;
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) 280px;
+      gap: 30px;
+      align-items: start;
+    }
+    main { min-width: 0; }
+    section {
+      scroll-margin-top: 76px;
+      margin-bottom: 48px;
+    }
+    .masthead {
+      background: var(--paper);
+      border-top: 5px solid var(--teal);
+      border-bottom: 1px solid var(--line);
+      padding: clamp(24px, 5vw, 54px);
+      box-shadow: var(--shadow);
+    }
+    .kicker {
+      color: var(--teal);
+      font-size: 0.78rem;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    h1, h2, h3 { margin-top: 0; line-height: 1.25; letter-spacing: 0; }
+    h1 { font-size: clamp(2rem, 5vw, 3.5rem); margin: 0.55rem 0 1rem; max-width: 17ch; }
+    h2 { font-size: clamp(1.45rem, 3vw, 2rem); margin-bottom: 0.85rem; }
+    h3 { font-size: 1.06rem; margin-bottom: 0.4rem; }
+    .lede { font-size: 1.14rem; max-width: 66ch; color: #33414d; }
+    .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.6rem 1.3rem;
+      padding-top: 1.2rem;
+      margin-top: 1.4rem;
+      border-top: 1px solid var(--line);
+      color: var(--muted);
+      font-size: 0.88rem;
+    }
+    .decision {
+      margin-top: 1.5rem;
+      padding: 1.1rem 1.25rem;
+      border-left: 5px solid var(--blue);
+      background: var(--blue-soft);
+      font-weight: 680;
+    }
+    .section-head { margin-bottom: 1.25rem; }
+    .section-head p { max-width: 72ch; color: var(--muted); margin: 0; }
+
+    .sidebar {
+      position: sticky;
+      top: 82px;
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 1.1rem;
+      box-shadow: var(--shadow);
+    }
+    .sidebar h2 { font-size: 0.82rem; text-transform: uppercase; color: var(--muted); }
+    .sidebar ol { margin: 0; padding-left: 1.25rem; }
+    .sidebar li { margin: 0.42rem 0; font-size: 0.88rem; }
+    .sidebar a { color: #33414d; text-decoration: none; }
+    .sidebar a:hover { color: var(--blue); }
+
+    .grid-2, .grid-3, .metric-grid {
+      display: grid;
+      gap: 14px;
+    }
+    .grid-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .grid-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    .metric-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+    .panel, .metric, .risk {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      padding: 1rem;
+    }
+    .metric .value { display: block; font-size: 1.55rem; font-weight: 800; line-height: 1.2; }
+    .metric .label { color: var(--muted); font-size: 0.82rem; }
+    .metric .note { margin: 0.6rem 0 0; color: #43505c; font-size: 0.78rem; }
+    .verified { border-top: 4px solid var(--teal); }
+    .inferred { border-top: 4px solid var(--amber); }
+    .missing { border-top: 4px solid var(--red); }
+
+    .legend { display: flex; flex-wrap: wrap; gap: 0.55rem; margin: 1rem 0; }
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.35rem;
+      min-height: 27px;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 760;
+      border: 1px solid;
+    }
+    .tag::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: currentColor; }
+    .tag.verified { color: var(--teal); background: var(--green-soft); border-color: #a8d8cf; }
+    .tag.inferred { color: var(--amber); background: var(--amber-soft); border-color: #ecd382; }
+    .tag.missing { color: var(--red); background: var(--red-soft); border-color: #edb8b2; }
+
+    .scope-matrix { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+    .scope-col { background: var(--paper); border: 1px solid var(--line); border-radius: 6px; overflow: hidden; }
+    .scope-col h3 { margin: 0; padding: 0.8rem 1rem; border-bottom: 1px solid var(--line); }
+    .scope-col ul { margin: 0; padding: 0.9rem 1rem 1rem 2rem; }
+    .scope-col li { margin-bottom: 0.55rem; }
+    .scope-col.now h3 { background: var(--red-soft); color: var(--red); }
+    .scope-col.spec h3 { background: var(--amber-soft); color: var(--amber); }
+    .scope-col.defer h3 { background: var(--blue-soft); color: var(--blue); }
+
+    .table-wrap { overflow-x: auto; border: 1px solid var(--line); border-radius: 6px; background: var(--paper); }
+    table { width: 100%; min-width: 760px; border-collapse: collapse; }
+    th, td { padding: 0.78rem 0.86rem; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { background: #eef2f5; font-size: 0.78rem; color: #394854; text-transform: uppercase; }
+    tbody tr:last-child td { border-bottom: 0; }
+    td { font-size: 0.88rem; }
+    .severity { font-weight: 800; }
+    .sev-critical { color: var(--red); }
+    .sev-high { color: #8d3c13; }
+    .sev-medium { color: var(--amber); }
+
+    .timeline { position: relative; display: grid; gap: 0; border: 1px solid var(--line); background: var(--paper); border-radius: 6px; overflow: hidden; }
+    .phase { display: grid; grid-template-columns: 115px minmax(0, 1fr); min-height: 112px; border-bottom: 1px solid var(--line); }
+    .phase:last-child { border-bottom: 0; }
+    .phase-time { padding: 1rem; font-weight: 800; color: var(--blue); background: #eef5fa; }
+    .phase-body { padding: 1rem 1.1rem; }
+    .phase-body p { margin: 0.3rem 0 0; color: var(--muted); }
+    .gate-list { display: grid; gap: 0.65rem; padding: 0; list-style: none; }
+    .gate-list li { position: relative; padding: 0.75rem 0.85rem 0.75rem 2.25rem; border: 1px solid var(--line); background: var(--paper); border-radius: 4px; }
+    .gate-list li::before { content: "✓"; position: absolute; left: 0.85rem; color: var(--teal); font-weight: 900; }
+    .callout { border-left: 5px solid var(--amber); background: var(--amber-soft); padding: 1rem 1.1rem; margin: 1rem 0; }
+    .callout strong { color: #715000; }
+
+    .allocation { display: grid; gap: 0.75rem; }
+    .allocation-row { display: grid; grid-template-columns: 165px minmax(0, 1fr) 48px; gap: 0.75rem; align-items: center; }
+    .bar { height: 16px; background: #e6ebef; border-radius: 2px; overflow: hidden; }
+    .bar span { display: block; height: 100%; background: var(--blue); }
+    .allocation-row:nth-child(2) .bar span { background: var(--teal); }
+    .allocation-row:nth-child(3) .bar span { background: var(--amber); }
+    .allocation-row:nth-child(4) .bar span { background: #6f7780; }
+
+    .risk { display: grid; grid-template-columns: 150px minmax(0, 1fr); gap: 1rem; }
+    .risk strong { color: var(--red); }
+    .source-list { columns: 2; column-gap: 2rem; padding-left: 1.2rem; }
+    .source-list li { break-inside: avoid; margin-bottom: 0.7rem; }
+    .fineprint { color: var(--muted); font-size: 0.8rem; }
+    footer { border-top: 1px solid var(--line); margin-top: 2.5rem; padding-top: 1rem; color: var(--muted); font-size: 0.8rem; }
+
+    @media (max-width: 980px) {
+      .page { grid-template-columns: 1fr; }
+      .sidebar { display: none; }
+      .metric-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .grid-3, .scope-matrix { grid-template-columns: 1fr; }
+    }
+    @media (max-width: 640px) {
+      .topbar-inner, .page { width: min(100% - 20px, 1240px); }
+      .topnav { display: none; }
+      .topbar-inner { justify-content: space-between; }
+      .page { padding-top: 16px; }
+      .masthead { padding: 22px 18px; }
+      h1 { font-size: 2rem; }
+      .grid-2, .metric-grid { grid-template-columns: 1fr; }
+      .phase { grid-template-columns: 1fr; }
+      .phase-time { padding: 0.6rem 1rem; }
+      .allocation-row { grid-template-columns: 1fr 42px; }
+      .allocation-row .bar { grid-column: 1 / -1; grid-row: 2; }
+      .risk { grid-template-columns: 1fr; gap: 0.25rem; }
+      .source-list { columns: 1; }
+    }
+    @media print {
+      body { background: #fff; color: #000; font-size: 10pt; }
+      .topbar, .sidebar, .print-button { display: none !important; }
+      .page { display: block; width: 100%; padding: 0; }
+      .masthead, .panel, .metric, .scope-col, .table-wrap, .timeline, .risk { box-shadow: none; break-inside: avoid; }
+      section { margin-bottom: 26px; }
+      a { color: #000; text-decoration: none; }
+      a[href^="http"]::after { content: " (" attr(href) ")"; font-size: 8pt; overflow-wrap: anywhere; }
+    }
+  </style>
+</head>
+<body>
+  <header class="topbar">
+    <div class="topbar-inner">
+      <a class="brand" href="#top"><img src="../assets/icon_512.png" alt="TunnelForge 아이콘">TunnelForge</a>
+      <nav class="topnav" aria-label="주요 섹션">
+        <a href="#consensus">합의</a><a href="#evidence">근거</a><a href="#defects">결함</a>
+        <a href="#release">릴리즈</a><a href="#roadmap">90일</a><a href="#study">검증</a><a href="#appendix">부록</a>
+      </nav>
+      <button class="print-button" type="button" title="제안서 인쇄" aria-label="제안서 인쇄" onclick="window.print()">인쇄</button>
+    </div>
+  </header>
+
+  <div class="page" id="top">
+    <main>
+      <section class="masthead" aria-labelledby="report-title">
+        <div class="kicker">Product Maturity Proposal · 2026-07-15</div>
+        <h1 id="report-title">Safety and Proof</h1>
+        <p class="lede">TunnelForge의 다음 단계는 기능 확장이나 포지셔닝 변경이 아니다. 확인된 신뢰·데이터·실행 위험을 제거한 뒤, 하나의 폐기 가능한 DB 워크플로를 실제 사용자에게 관찰해 제품 방향을 증명하는 것이다.</p>
+        <div class="decision">결정: 다음 마일스톤은 범위를 제한한 안전성 릴리즈다. 이 릴리즈의 출구 조건을 모두 통과하기 전에는 새 엔진, 대규모 온보딩, 텔레메트리 인프라를 시작하지 않는다.</div>
+        <div class="meta-row">
+          <span>기준 브랜치 <code>origin/main</code></span>
+          <span>기준 SHA <code>4b37bdb</code></span>
+          <span>최신 안정판 <code>v2.4.0</code></span>
+          <span>검토 방식 8개 역할 + 레드팀 합의</span>
+        </div>
+      </section>
+
+      <section id="consensus">
+        <div class="section-head">
+          <h2>1. 팀 합의</h2>
+          <p>제품, UX, 아키텍처, 품질·보안·릴리즈, 시장, 운영·분석 검토를 레드팀이 반박하고 회의 의장이 최종 범위를 확정했다.</p>
+        </div>
+        <div class="grid-3">
+          <article class="panel verified"><h3>지금 고친다</h3><p>SSH 서버 신원, Import 시간대 기본값, One-Click 승인 경계, DB Core 무기한 대기, 릴리즈 의존성 고정.</p></article>
+          <article class="panel inferred"><h3>계약부터 쓴다</h3><p>resume 식별·원자성, 취소 최종 상태, 프로토콜 호환성, 프로세스 재시작. 재설계 전에 실패 재현 테스트를 만든다.</p></article>
+          <article class="panel missing"><h3>근거 전까지 미룬다</h3><p>브랜드 재포지셔닝, 원격 텔레메트리, 지원 번들, 전면 접근성 개편, 자동 롤백, 추가 DB 엔진.</p></article>
+        </div>
+        <div class="callout"><strong>핵심 원칙:</strong> DB 결과가 불확정인 상황을 자동 재시도, 빈 결과, 낙관적 성공으로 숨기지 않는다. Rust는 DB 연산을 소유하고 Python/PyQt는 UI·오케스트레이션 경계를 유지한다.</div>
+      </section>
+
+      <section id="evidence">
+        <div class="section-head"><h2>2. 근거 기준선</h2><p>사실, 합리적 추론, 아직 없는 근거를 같은 수준으로 취급하지 않는다.</p></div>
+        <div class="legend"><span class="tag verified">코드·명령으로 확인</span><span class="tag inferred">근거 기반 추론</span><span class="tag missing">측정 근거 없음</span></div>
+        <div class="metric-grid">
+          <article class="metric verified"><span class="value">v2.4.0</span><span class="label">현재 안정 릴리즈</span><p class="note">10개 자산, GitHub SHA-256 메타데이터, updater 가시성 확인.</p></article>
+          <article class="metric verified"><span class="value">2,698</span><span class="label">Python 수집 테스트</span><p class="note">폭넓은 회귀 범위다. 아래 특정 안전 계약의 증명과는 별개다.</p></article>
+          <article class="metric verified"><span class="value">101k+</span><span class="label">Python·Rust·Worker 코드/테스트 줄</span><p class="note">기능 규모 대비 핵심 파일 집중도가 높아 변경 경계가 중요하다.</p></article>
+          <article class="metric missing"><span class="value">0</span><span class="label">신뢰 가능한 사용 완료 세션</span><p class="note">릴리즈 다운로드와 clone 수는 사용자·잔존율 지표가 아니다.</p></article>
+        </div>
+        <div class="grid-2" style="margin-top:14px">
+          <article class="panel"><h3>확인된 강점</h3><ul><li>Rust Core 중심 DB 경계가 정착됐다.</li><li>직접 다운로드 릴리즈·무결성 검증·익명 오류 신고 경로가 운영 중이다.</li><li>Python, Rust, Worker, 패키징 회귀 체계가 넓다.</li></ul></article>
+          <article class="panel"><h3>해석 제한</h3><ul><li>최근 릴리즈 자산 다운로드는 대체로 한 자릿수다.</li><li>GitHub clone 트래픽은 CI 영향을 분리할 수 없다.</li><li>별 1개, fork 0개는 방향 결정에 충분한 표본이 아니다.</li></ul></article>
+        </div>
+      </section>
+
+      <section id="scope">
+        <div class="section-head"><h2>3. 범위 결정표</h2><p>확인된 위험, 계약이 필요한 위험, 제품 가설을 분리한다.</p></div>
+        <div class="scope-matrix">
+          <article class="scope-col now"><h3>NOW · 구현</h3><ul><li>SSH TOFU fingerprint 승인과 변경 키 차단</li><li>Import Auto 시간대 중립화</li><li>One-Click exact plan 승인 또는 실행 비활성화</li><li>DB Core 호출 deadline과 불확정 결과</li><li>릴리즈 Python hash lock</li></ul></article>
+          <article class="scope-col spec"><h3>SPECIFY · 재현/계약</h3><ul><li>mismatched JSONL ID와 프로세스 사망</li><li>취소 최종 상태 단일화</li><li>resume target identity와 원자 저장</li><li>프로토콜 min/max 호환성</li><li>분석 쿼리 실패와 “결과 없음” 구분</li></ul></article>
+          <article class="scope-col defer"><h3>DEFER · 관찰 후</h3><ul><li>SSH-first 포지셔닝 전면 변경</li><li>원격 사용 텔레메트리</li><li>지원 번들 인프라</li><li>전면 접근성·온보딩 개편</li><li>자동 updater/migration 롤백</li><li>추가 엔진·golden workflow</li></ul></article>
+        </div>
+      </section>
+
+      <section id="defects">
+        <div class="section-head"><h2>4. 확인된 결함과 출구 조건</h2><p>각 항목은 추적 ID, 코드 근거, 최소 수정, 검증 조건이 연결되어야 한다.</p></div>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>ID / 심각도</th><th>확인된 상태</th><th>최소 대응</th><th>릴리즈 출구 조건</th></tr></thead>
+            <tbody>
+              <tr><td><strong>TF-STATUS-095</strong><br><span class="severity sev-critical">Critical</span></td><td>Paramiko <code>AutoAddPolicy</code>와 forwarding 신뢰 고정 부재.</td><td>첫 접속 SHA-256 fingerprint 승인·저장, 변경 키 fail-closed.</td><td>미등록 키는 명시 승인 전 연결하지 않고, 변경 키는 우회 없이 차단.</td></tr>
+              <tr><td><strong>TF-STATUS-096</strong><br><span class="severity sev-high">High</span></td><td>Import “Auto”가 환경에 따라 <code>+09:00</code>을 주입.</td><td>Auto는 서버/session 기본값을 보존. UTC/KST는 명시 선택.</td><td>기본 import 경로가 시간대 변경 SQL을 생성하지 않음.</td></tr>
+              <tr><td><strong>TF-STATUS-097</strong><br><span class="severity sev-high">High</span></td><td>One-Click 계획과 실행이 한 호출이며 실행 후에야 UI가 계획을 표시.</td><td>target identity와 plan hash에 묶인 승인 후 실행. 불가하면 non-dry-run 비활성화.</td><td>현재 대상의 정확한 계획 승인 없이는 실행이 시작되지 않음.</td></tr>
+              <tr><td><strong>TF-STATUS-098</strong><br><span class="severity sev-high">High</span></td><td>공유 lock 안에서 deadline 없는 <code>stdout.readline()</code>.</td><td>bounded deadline, 프로세스 폐기/reap, typed <code>outcome_indeterminate</code>.</td><td>stalled core가 제한 시간 안에 호출자를 해제하고 mutation을 자동 재시도하지 않음.</td></tr>
+              <tr><td><strong>TF-STATUS-100</strong><br><span class="severity sev-medium">Medium</span></td><td>release Python 의존성이 범위 지정만 되고 hash 고정되지 않음.</td><td>릴리즈 입력 전용 hash-locked resolution과 CI 검증.</td><td>변조된 의존성 artifact 설치가 실패하고 동일 입력이 재현됨.</td></tr>
+              <tr><td><strong>TF-STATUS-101</strong><br><span class="severity sev-medium">Medium</span></td><td>분석 쿼리 예외가 빈 배열로 축약돼 “문제 없음”처럼 보일 수 있음.</td><td>failed / no findings 상태 분리와 사용자 가시 오류.</td><td>권한·연결 실패가 성공적인 0건 분석으로 표시되지 않음.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <section id="contracts">
+        <div class="section-head"><h2>5. 재설계 전 실행 계약</h2><p><code>TF-STATUS-099</code>를 포함한 공유 프로세스·resume·취소 문제는 먼저 작은 실패 재현으로 경계를 고정한다.</p></div>
+        <div class="grid-2">
+          <article class="panel"><h3>Core process</h3><ul><li>stalled response deadline</li><li>mismatched response ID 명시 실패</li><li>프로세스 사망 후 다음 호출 복구</li><li>mutation 자동 재시도 금지</li><li>protocol min/max compatibility</li></ul></article>
+          <article class="panel"><h3>Resume / cancellation</h3><ul><li>source·target host/port/schema identity</li><li>immutable plan fingerprint</li><li>temp write + atomic replace</li><li>stale state 명시 거부</li><li>result/cancel 중 하나의 terminal state</li></ul></article>
+        </div>
+        <p class="fineprint">제약: 각 항목은 하나의 reproducer, 하나의 계약, 그 계약을 통과시키는 가장 작은 구현으로 제한한다. 측정 없이 대규모 동시성 또는 resume 아키텍처 개편으로 확장하지 않는다.</p>
+      </section>
+
+      <section id="release">
+        <div class="section-head"><h2>6. Safety and Proof 릴리즈</h2><p>새 기능 릴리즈가 아니라 위험 제거와 실행 경계 증명 릴리즈다.</p></div>
+        <ul class="gate-list">
+          <li>알 수 없는 SSH 호스트는 SHA-256 fingerprint 승인 전 연결하지 않고, 변경된 키를 차단한다.</li>
+          <li>기본 Import가 시간대 변경 SQL을 생성하지 않는다.</li>
+          <li>One-Click non-dry-run은 exact plan 승인 없이는 실행되지 않거나 완전히 비활성화된다.</li>
+          <li>stalled DB Core 응답은 정의된 deadline 내 typed indeterminate 결과로 종료되고 손상 프로세스는 폐기된다.</li>
+          <li>timeout 또는 process loss 뒤 mutation은 자동 재시도되지 않는다.</li>
+          <li>mismatched ID와 비호환 protocol version은 명시적으로 실패한다.</li>
+          <li>릴리즈 의존성은 hash lock으로 설치되며 변경 artifact는 거부된다.</li>
+          <li>집중 회귀와 기존 Python·Rust·Worker 전체 게이트가 모두 통과한다.</li>
+        </ul>
+      </section>
+
+      <section id="roadmap">
+        <div class="section-head"><h2>7. 90일 실행 순서</h2><p>안전성 증명 후 패키지된 워크플로를 관찰한다. 순서를 뒤집지 않는다.</p></div>
+        <div class="timeline">
+          <article class="phase"><div class="phase-time">Day 0–10</div><div class="phase-body"><h3>계약과 즉시 결함</h3><p>reproducer 작성, SSH trust, 시간대 기본값, One-Click gate, release hash lock.</p></div></article>
+          <article class="phase"><div class="phase-time">Day 11–30</div><div class="phase-body"><h3>최소 Core 동작</h3><p>bounded failure, process recovery, non-retry, protocol/resume/cancel 계약을 통과시키는 최소 구현.</p></div></article>
+          <article class="phase"><div class="phase-time">Day 31–45</div><div class="phase-body"><h3>Safety and Proof 배포</h3><p>기존 GitHub 직접 배포 채널로 빌드·검증·게시. Apple App Store는 범위 밖.</p></div></article>
+          <article class="phase"><div class="phase-time">Day 46–70</div><div class="phase-body"><h3>폐기 가능한 워크플로 패키징</h3><p>MySQL-over-SSH 연결부터 dry-run, 승인, 실행, 결과 검증까지 facilitator script 준비.</p></div></article>
+          <article class="phase"><div class="phase-time">Day 71–90</div><div class="phase-body"><h3>3–5회 관찰</h3><p>비유지보수자 세션의 완료 장애를 기록하고, 가장 빈번하거나 심각한 두 문제만 다음 패치 후보로 선정.</p></div></article>
+        </div>
+      </section>
+
+      <section id="study">
+        <div class="section-head"><h2>8. 폐기 가능한 DB 워크플로 검증</h2><p>원격 텔레메트리를 만들기 전에, 실제 사용자가 핵심 경로를 끝까지 완료하는지 관찰한다.</p></div>
+        <div class="grid-3">
+          <article class="panel"><h3>대상</h3><p>유지보수자가 아닌 3–5명. 개인정보나 실제 운영 DB 대신 폐기 가능한 MySQL/SSH 환경을 사용한다.</p></article>
+          <article class="panel"><h3>시나리오</h3><p>설치 → 연결 → fingerprint 판단 → dry-run → plan 승인 → 실행 → 결과 검증.</p></article>
+          <article class="panel"><h3>산출물</h3><p>단계별 완료 여부, 관찰된 장애, 사용자 발화, 해결/보류 판단. 다운로드 수를 사용자 수로 환산하지 않는다.</p></article>
+        </div>
+        <div class="callout"><strong>의사결정 규칙:</strong> 3명 미만이 핵심 경로를 완료하면 새 분석 인프라나 기능을 추가하지 말고 워크플로를 더 좁히거나 수정한다.</div>
+      </section>
+
+      <section id="six-month">
+        <div class="section-head"><h2>9. 조건부 6개월 로드맵</h2><p>4–6개월차는 관찰 결과가 있을 때만 활성화한다.</p></div>
+        <div class="grid-2">
+          <article class="panel"><h3>증거가 있으면</h3><ul><li>빈도·심각도가 가장 높은 두 완료 장애 수정</li><li>SSH-first 가치가 반복 확인될 때만 포지셔닝 실험</li><li>관찰된 차단점에 한해 첫 연결, 복구, 접근성 개선</li></ul></article>
+          <article class="panel"><h3>계속 보류</h3><ul><li>Apple App Store 등록·유료 인증</li><li>원격 텔레메트리와 별도 metrics endpoint</li><li>지원 번들·SBOM 프로그램</li><li>자동 롤백과 추가 DB 엔진</li></ul></article>
+        </div>
+      </section>
+
+      <section id="resources">
+        <div class="section-head"><h2>10. 자원 배분</h2><p>1인 유지보수 기준으로 릴리즈 위험과 증명 작업에 집중한다.</p></div>
+        <div class="panel allocation">
+          <div class="allocation-row"><span>안전 결함·회귀</span><div class="bar"><span style="width:50%"></span></div><strong>50%</strong></div>
+          <div class="allocation-row"><span>Core·One-Click 계약</span><div class="bar"><span style="width:25%"></span></div><strong>25%</strong></div>
+          <div class="allocation-row"><span>릴리즈 lock·빌드</span><div class="bar"><span style="width:15%"></span></div><strong>15%</strong></div>
+          <div class="allocation-row"><span>사용 세션 준비</span><div class="bar"><span style="width:10%"></span></div><strong>10%</strong></div>
+        </div>
+      </section>
+
+      <section id="risks">
+        <div class="section-head"><h2>11. 위험 관리</h2><p>잘못된 안전 개선이 새로운 데이터 위험을 만들지 않도록 응답 원칙을 고정한다.</p></div>
+        <div class="grid-2">
+          <article class="risk"><strong>Core timeout</strong><span>DB 결과를 불확정으로 보고하고 mutation을 자동 재시도하지 않는다.</span></article>
+          <article class="risk"><strong>SSH TOFU</strong><span>알고리즘과 fingerprint를 명확히 표시하고 변경 키는 우회 없이 거부한다.</span></article>
+          <article class="risk"><strong>Stale plan</strong><span>승인을 target identity와 plan hash에 묶고 관련 변경 시 무효화한다.</span></article>
+          <article class="risk"><strong>범위 팽창</strong><span>reproducer 하나, 계약 하나, 최소 통과 구현으로 제한한다.</span></article>
+          <article class="risk"><strong>Hash lock 부담</strong><span>개발 전체가 아니라 릴리즈 입력만 고정하고 재생성·검증을 자동화한다.</span></article>
+          <article class="risk"><strong>작은 표본</strong><span>3–5회 결과는 방향성 근거로만 쓰고 product-market fit을 주장하지 않는다.</span></article>
+        </div>
+      </section>
+
+      <section id="appendix">
+        <div class="section-head"><h2>12. 출처와 검토 부록</h2><p>로컬 코드 근거와 경쟁 제품의 공식 문서만 사용했다.</p></div>
+        <h3>코드·상태 근거</h3>
+        <ul class="source-list">
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/src/core/tunnel_engine.py">SSH tunnel engine</a></li>
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/src/core/db_core_client.py">DB Core client</a></li>
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/src/ui/dialogs/db_import_dialog.py">Import dialog</a></li>
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/src/ui/dialogs/oneclick_migration_dialog.py">One-Click dialog</a></li>
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/migration_core/src/oneclick.rs">Rust One-Click core</a></li>
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/src/core/cross_engine_migration.py">Resume state</a></li>
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/pyproject.toml">Python dependency ranges</a></li>
+          <li><a href="https://github.com/sanghyun-io/tunnelforge/blob/main/docs/current_status.md">Canonical status</a></li>
+        </ul>
+        <h3>시장 비교 공식 문서</h3>
+        <ul class="source-list">
+          <li><a href="https://docs.tableplus.com/gui-tools/manage-connections">TablePlus connections</a></li>
+          <li><a href="https://docs.tableplus.com/gui-tools/import-and-export">TablePlus import/export</a></li>
+          <li><a href="https://dbeaver.com/docs/dbeaver/SSH-Configuration/">DBeaver SSH</a></li>
+          <li><a href="https://dbeaver.com/docs/dbeaver/Data-transfer/">DBeaver data transfer</a></li>
+          <li><a href="https://dbeaver.com/docs/dbeaver/Schema-compare/">DBeaver schema compare</a></li>
+          <li><a href="https://www.jetbrains.com/help/datagrip/connect-to-a-database-with-ssh.html">DataGrip SSH</a></li>
+          <li><a href="https://www.jetbrains.com/help/datagrip/schema-comparison-and-migration.html">DataGrip schema migration</a></li>
+          <li><a href="https://dev.mysql.com/doc/mysql-shell/8.4/en/mysql-shell-utilities-upgrade.html">MySQL Shell upgrade checker</a></li>
+        </ul>
+        <h3>회의 구성</h3>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>역할</th><th>모델</th><th>책임</th></tr></thead>
+            <tbody>
+              <tr><td>제품 리드</td><td>SOL</td><td>사용자 가치·우선순위</td></tr>
+              <tr><td>UX 리드</td><td>TERRA</td><td>온보딩·실행 안전성·동의 경험</td></tr>
+              <tr><td>아키텍트</td><td>SOL</td><td>Rust/Python 경계·장기 구조</td></tr>
+              <tr><td>품질·보안·릴리즈</td><td>TERRA</td><td>결함·보안·배포 게이트</td></tr>
+              <tr><td>시장 조사</td><td>LUNA</td><td>경쟁 환경·포지셔닝 가설</td></tr>
+              <tr><td>운영·분석</td><td>LUNA</td><td>관찰·지원·측정 방식</td></tr>
+              <tr><td>회의 의장</td><td>SOL</td><td>상충안 조정·최종 합의</td></tr>
+              <tr><td>레드팀</td><td>TERRA</td><td>과대 범위·근거 부족 반박</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <footer>본 제안서는 2026-07-15의 코드와 공개 저장소 상태를 기준으로 한다. 배포 다운로드, clone, 별 수는 사용자 수나 유지율로 해석하지 않는다.</footer>
+      </section>
+    </main>
+
+    <aside class="sidebar" aria-label="문서 목차">
+      <h2>Contents</h2>
+      <ol>
+        <li><a href="#consensus">팀 합의</a></li><li><a href="#evidence">근거 기준선</a></li>
+        <li><a href="#scope">범위 결정표</a></li><li><a href="#defects">확인된 결함</a></li>
+        <li><a href="#contracts">실행 계약</a></li><li><a href="#release">안전 릴리즈</a></li>
+        <li><a href="#roadmap">90일 실행</a></li><li><a href="#study">워크플로 검증</a></li>
+        <li><a href="#six-month">6개월 로드맵</a></li><li><a href="#resources">자원 배분</a></li>
+        <li><a href="#risks">위험 관리</a></li><li><a href="#appendix">출처·부록</a></li>
+      </ol>
+    </aside>
+  </div>
+</body>
+</html>
