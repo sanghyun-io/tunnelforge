@@ -219,7 +219,7 @@ async function githubRequest(
     const response = await fetchWithTimeout(
       options.fetch ?? fetch,
       url,
-      { ...init, headers, redirect: "error" },
+      { ...init, headers, redirect: "manual" },
       timeoutMilliseconds(options.timeoutMs),
       mutation,
     );

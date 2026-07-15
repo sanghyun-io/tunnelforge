@@ -206,7 +206,7 @@ async function requestInstallationToken(
     `${GITHUB_API_ROOT}/app/installations/${env.GITHUB_APP_INSTALLATION_ID}/access_tokens`,
     {
       method: "POST",
-      redirect: "error",
+      redirect: "manual",
       headers: {
         accept: "application/vnd.github+json",
         authorization: `Bearer ${jwt}`,

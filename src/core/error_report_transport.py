@@ -10,12 +10,12 @@ from urllib.parse import urlsplit, urlunsplit
 import requests
 from PyQt6.QtCore import QThread
 
+from src.core.error_reporting_config import ERROR_REPORT_RELAY_URL
 from src.core.logger import get_logger
 
 
 logger = get_logger("error_report_transport")
 
-ERROR_REPORT_RELAY_URL = ""
 REQUEST_TIMEOUT = (3.05, 8.0)
 RETRY_BACKOFF_MS = 200
 MAX_RESPONSE_BYTES = 16 * 1024

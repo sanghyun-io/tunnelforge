@@ -1210,8 +1210,16 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "final Worker 314 passed" in verification
     assert "GitHub Push Protection" in verification
     assert "feat/anonymous-error-reporting-relay" in verification
+    assert "Task 12 GitHub App inventory and overlapping-key creation" in verification
+    assert "Task 13 live D1, off, and shadow rollout" in verification
+    assert "e432cb75-97c8-48a1-8e99-6e3bbb088b87" in verification
+    assert "Task 13 canary, emergency off, active, and client binding" in verification
+    assert "https://github.com/sanghyun-io/tunnelforge/issues/244" in verification
+    assert "9dbed64a-0d60-43bf-b946-24ab96e312f5" in verification
+    assert "full Python 2697 passed / 1 skipped" in verification
+    assert "61 successful invocations and zero errors" in verification
     assert "2026-07-14-anonymous-error-reporting.md" in order
-    assert "Continue owner-mediated credential containment from Task 12" in order
+    assert "Revoke the old embedded key" in order
     assert "Implementation has not yet changed runtime code" in sessions
     assert "Completed and independently approved TF-STATUS-092 Task 5" in sessions
     assert "Completed and independently approved TF-STATUS-092 Task 6" in sessions
@@ -1222,3 +1230,5 @@ def test_current_status_records_anonymous_error_reporting_implementation_plan():
     assert "Completed and independently approved TF-STATUS-092 Task 11" in sessions
     assert "Completed the final local Tasks 1-11 review" in sessions
     assert "Published the reviewed local Tasks 1-11 branch" in sessions
+    assert "Advanced TF-STATUS-092 Tasks 12-13" in sessions
+    assert "Completed the live Task 13 canary and active rollout" in sessions

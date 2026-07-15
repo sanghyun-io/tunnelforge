@@ -15,6 +15,22 @@ REPORT_URL = "https://relay.example.test/v1/reports"
 HEALTH_URL = "https://relay.example.test/health"
 RECEIPT = "11111111-1111-4111-8111-111111111111"
 ISSUE_URL = "https://github.com/sanghyun-io/tunnelforge/issues/12"
+PRODUCTION_RELAY_ORIGIN = "https://tunnelforge-issue-relay.ppkimsanh.workers.dev"
+PRODUCTION_REPORT_URL = f"{PRODUCTION_RELAY_ORIGIN}/v1/reports"
+
+
+def test_transport_binds_only_the_exact_production_relay_endpoint():
+    from src.core.error_reporting_config import (
+        ERROR_REPORT_RELAY_ORIGIN,
+        ERROR_REPORT_RELAY_URL,
+    )
+    from src.core.error_report_transport import (
+        ERROR_REPORT_RELAY_URL as transport_relay_url,
+    )
+
+    assert ERROR_REPORT_RELAY_ORIGIN == PRODUCTION_RELAY_ORIGIN
+    assert ERROR_REPORT_RELAY_URL == PRODUCTION_REPORT_URL
+    assert transport_relay_url == PRODUCTION_REPORT_URL
 
 
 def authorized_transport(*args, **kwargs):

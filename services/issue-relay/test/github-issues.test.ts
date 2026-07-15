@@ -204,7 +204,7 @@ describe("safe GitHub issue operations", () => {
     const fetchMock = vi.fn(async (_input, init) => {
       order.push("fetch");
       expect(init?.method).toBe("POST");
-      expect(init?.redirect).toBe("error");
+      expect(init?.redirect).toBe("manual");
       const payload = JSON.parse(String(init?.body)) as Record<string, unknown>;
       expect(payload.labels).toEqual(["bug", "export", "auto-reported"]);
       expect(String(payload.body)).not.toContain("RAW CLIENT MARKDOWN");
@@ -338,6 +338,27 @@ describe("safe GitHub issue operations", () => {
     });
     expect(getToken).toHaveBeenCalledTimes(1);
     expect(getToken).toHaveBeenCalledWith(expect.anything(), false, expect.anything());
+  });
+
+  it("rejects a mutation redirect without forwarding credentials", async () => {
+    const fetchMock = vi.fn(async (_input, init) => {
+      expect(init?.redirect).toBe("manual");
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://redirect.invalid/credential-target" },
+      });
+    });
+
+    await expect(
+      upsertIssue(makeReport(), FINGERPRINT, {
+        ...issueOptions(fetchMock as unknown as typeof fetch),
+      }),
+    ).rejects.toMatchObject({
+      code: "mutation_ambiguous",
+      status: 302,
+      ambiguous: true,
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("classifies a create timeout or 5xx as unknown after mutation authorization", async () => {

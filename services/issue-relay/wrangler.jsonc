@@ -4,7 +4,7 @@
   "main": "src/index.ts",
   "compatibility_date": "2026-07-08",
   "vars": {
-    "RELAY_MODE": "off"
+    "RELAY_MODE": "active"
   },
   "triggers": {
     "crons": ["*/15 * * * *"]
@@ -13,7 +13,7 @@
     {
       "binding": "DB",
       "database_name": "tunnelforge-issue-relay",
-      "database_id": "00000000-0000-0000-0000-000000000001",
+      "database_id": "0ce1e815-9fd9-4338-a5c4-924e402162c8",
       "migrations_dir": "migrations"
     }
   ],

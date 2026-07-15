@@ -854,7 +854,7 @@ def test_structured_local_diagnostic_keeps_colliding_display_keys_unique():
     }
 
 
-def test_structured_sensitive_key_collisions_consume_the_item_budget():
+def test_structured_truncated_sensitive_key_collisions_consume_the_item_budget():
     from src.core.error_report_sanitizer import sanitize_local_diagnostic_data
 
     class PasswordKey:
@@ -868,13 +868,13 @@ def test_structured_sensitive_key_collisions_consume_the_item_budget():
             return self is other
 
         def __str__(self):
-            return "password"
+            return f"{'!' * 256}password{'!' * self.identity}"
 
     payload = {PasswordKey(index): "secret" for index in range(600)}
 
     sanitized = sanitize_local_diagnostic_data(payload)
 
-    assert len(sanitized) <= 511
+    assert len(sanitized) == 511
     assert set(sanitized.values()) == {"REDACTED"}
 
 

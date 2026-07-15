@@ -119,7 +119,7 @@ describe("GitHub App authentication", () => {
       "https://api.github.com/app/installations/987654/access_tokens",
     );
     expect(init?.method).toBe("POST");
-    expect(init?.redirect).toBe("error");
+    expect(init?.redirect).toBe("manual");
     expect(new Headers(init?.headers).get("x-github-api-version")).toBe(
       GITHUB_API_VERSION,
     );
@@ -130,6 +130,24 @@ describe("GitHub App authentication", () => {
       repositories: ["tunnelforge"],
       permissions: { issues: "write" },
     });
+  });
+
+  it("rejects an installation-token redirect without following it", async () => {
+    const fetchMock = vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+      expect(init?.redirect).toBe("manual");
+      return new Response(null, {
+        status: 302,
+        headers: { location: "https://redirect.invalid/credential-target" },
+      });
+    });
+
+    await expect(
+      getInstallationToken(authEnv("123458"), true, {
+        fetch: fetchMock as unknown as typeof fetch,
+        now: () => FIXED_NOW,
+      }),
+    ).rejects.toMatchObject({ status: 302 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
   it("caches tokens only until five minutes before expiry", async () => {

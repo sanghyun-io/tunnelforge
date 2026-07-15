@@ -122,7 +122,8 @@ def test_local_preview_uses_real_builder_without_config_writes(
         assert uuid.UUID(payload["report"]["anonymous_installation_id"]).version == 4
 
 
-def test_unconfigured_relay_disables_opt_in_and_health_but_keeps_preview():
+def test_unconfigured_relay_disables_opt_in_and_health_but_keeps_preview(monkeypatch):
+    monkeypatch.setattr(settings, "ERROR_REPORT_RELAY_URL", "")
     app = QApplication.instance() or QApplication([])
     dialog = SettingsDialog.__new__(SettingsDialog)
     QDialog.__init__(dialog)
