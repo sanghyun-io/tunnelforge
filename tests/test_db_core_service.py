@@ -1,6 +1,5 @@
 import io
 import json
-import threading
 import time
 
 import pytest
@@ -8,7 +7,9 @@ import pytest
 import src.core.db_core_dbapi_shim as db_core_dbapi_shim
 import src.core.db_core_service as db_core_service
 from src.core.db_core_service import (
+    DbCoreOutcome,
     DbCoreFacade,
+    DbCoreRequestKind,
     DbCoreServiceError,
     DbCoreServiceClient,
     DbEndpoint,
@@ -105,6 +106,25 @@ def test_client_error_includes_database_error_details():
     assert "code=3D000" in message
     assert "database public does not exist" in message
     assert "connection.open" in message
+
+
+def test_facade_open_business_failure_keeps_definite_outcome():
+    process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":false,"message":"refused"}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        facade.open_connection(endpoint)
+
+    assert raised.value.code == "db_core_business_failure"
+    assert raised.value.outcome is DbCoreOutcome.DEFINITE
+    assert raised.value.request_kind is DbCoreRequestKind.MUTATION
 
 
 def test_facade_uses_connection_test_protocol():
@@ -533,6 +553,16 @@ def test_db_core_service_reexports_all_public_names_after_module_split():
     순수 재수출 모듈로서 기존 공개 이름을 전부 제공해야 한다 (import 경로 호환성 보장)."""
     expected_names = [
         "DbCoreServiceError",
+        "DbCoreCallbackError",
+        "DbCoreRequestKind",
+        "DbCoreOutcome",
+        "DbCoreGenerationState",
+        "DbCoreRequestResult",
+        "MAX_JSONL_FRAME_BYTES",
+        "DB_CORE_STDIN_HIGH_WATER_BYTES",
+        "REQUIRED_PROCESS_CAPABILITIES",
+        "DEFAULT_REQUEST_TIMEOUT_SECONDS",
+        "DEFAULT_SHUTDOWN_TIMEOUT_SECONDS",
         "_format_error_event",
         "SUPPORTED_DB_ENGINES",
         "parse_db_version_tuple",
@@ -613,78 +643,23 @@ def test_request_eof_error_does_not_call_stderr_read():
         raise AssertionError("expected DbCoreServiceError on stdout EOF")
 
 
-class _BlockingStdout:
-    """Stdout stub whose readline() blocks until `release_event` is set."""
-
-    def __init__(self, lines, release_event):
-        self._lines = list(lines)
-        self._release_event = release_event
-
-    def readline(self):
-        self._release_event.wait(timeout=5)
-        if self._lines:
-            return self._lines.pop(0)
-        return ""
-
-
-class _BlockingProcess:
-    def __init__(self, lines, release_event):
-        self.stdin = io.StringIO()
-        self.stdout = _BlockingStdout(lines, release_event)
-        self.stderr = io.StringIO()
-        self.terminated = False
-
-    def poll(self):
-        return None if not self.terminated else 0
-
-    def terminate(self):
-        self.terminated = True
-
-
-def test_shutdown_and_concurrent_request_are_serialized_by_lock():
-    release_shutdown_response = threading.Event()
-    shutdown_process = _BlockingProcess(
-        ['{"event":"result","command":"service.shutdown","success":true}\n'],
-        release_shutdown_response,
-    )
-    second_process = FakeProcess([
-        '{"event":"result","command":"service.hello","success":true}',
-    ])
+def test_request_after_shutdown_rejects_stopped_owner_without_restart():
+    process = FakeProcess([])
     popen_calls = []
 
     def popen_factory(*args, **kwargs):
         popen_calls.append(args)
-        return shutdown_process if len(popen_calls) == 1 else second_process
+        return process
 
     client = DbCoreServiceClient(executable="fake-core", popen_factory=popen_factory)
     client.start()
+    client.shutdown(timeout_seconds=0.5)
 
-    shutdown_thread = threading.Thread(target=client.shutdown)
-    shutdown_thread.start()
-    time.sleep(0.05)  # let shutdown() acquire `_lock` and block on the fake stdout
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request("service.hello")
 
-    results = {}
-    errors = []
-
-    def do_request():
-        try:
-            results["value"] = client.request("service.hello")
-        except Exception as exc:
-            errors.append(exc)
-
-    request_thread = threading.Thread(target=do_request)
-    request_thread.start()
-    time.sleep(0.05)
-    assert request_thread.is_alive(), "request() should be waiting behind `_lock`"
-
-    release_shutdown_response.set()
-    shutdown_thread.join(timeout=5)
-    request_thread.join(timeout=5)
-
-    assert not errors
-    assert results["value"]["success"] is True
-    assert client._process is second_process
-    assert len(popen_calls) == 2
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert len(popen_calls) == 1
 
 
 # =====================================================================

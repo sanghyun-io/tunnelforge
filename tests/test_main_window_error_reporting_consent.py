@@ -11,6 +11,7 @@ import pytest
 from PyQt6.QtGui import QShowEvent
 from PyQt6.QtWidgets import QApplication, QMainWindow
 
+from src.core.db_core_service import DbCoreOutcome, DbCoreRequestKind, DbCoreServiceError
 from src.core.error_report_consent import PromptOutcome
 from src.ui.main_window import TunnelManagerUI
 
@@ -505,9 +506,16 @@ class _Signal:
     def connect(self, callback):
         self.callbacks.append(callback)
 
+    def emit(self):
+        for callback in list(self.callbacks):
+            callback()
+
 
 class _App:
     last_instance = None
+    emit_about_to_quit = False
+    exec_error = None
+    exec_result = 0
 
     def __init__(self, argv):
         type(self).last_instance = self
@@ -520,7 +528,11 @@ class _App:
         pass
 
     def exec(self):
-        return 0
+        if self.emit_about_to_quit:
+            self.aboutToQuit.emit()
+        if self.exec_error is not None:
+            raise self.exec_error
+        return self.exec_result
 
 
 class _Config:
@@ -549,6 +561,22 @@ class _Guard:
         pass
 
 
+def _install_main_startup_fakes(monkeypatch, window_class):
+    _App.emit_about_to_quit = False
+    _App.exec_error = None
+    _App.exec_result = 0
+    _Guard.secondary = False
+    monkeypatch.setattr(main, "_load_qapplication_class", lambda: _App)
+    monkeypatch.setattr(main, "_load_qicon_class", lambda: lambda path: path)
+    monkeypatch.setattr(main, "_load_config_manager_class", lambda: _Config)
+    monkeypatch.setattr(main, "_load_tunnel_engine_class", lambda: object)
+    monkeypatch.setattr(main, "_load_tunnel_manager_ui_class", lambda: window_class)
+    monkeypatch.setattr("src.core.single_instance.SingleInstanceGuard", _Guard)
+    monkeypatch.setattr("src.core.i18n.configure_language", lambda *args: "ko")
+    monkeypatch.setattr("src.core.i18n.install_qt_i18n", lambda: None)
+    monkeypatch.setattr(main.sys, "argv", ["TunnelForge"])
+
+
 def test_consent_scheduling_is_reached_only_after_primary_instance_acceptance(monkeypatch):
     constructed = []
 
@@ -565,23 +593,136 @@ def test_consent_scheduling_is_reached_only_after_primary_instance_acceptance(mo
         def prepare_for_shutdown(self):
             pass
 
-    monkeypatch.setattr(main, "_load_qapplication_class", lambda: _App)
-    monkeypatch.setattr(main, "_load_qicon_class", lambda: lambda path: path)
-    monkeypatch.setattr(main, "_load_config_manager_class", lambda: _Config)
-    monkeypatch.setattr(main, "_load_tunnel_engine_class", lambda: object)
-    monkeypatch.setattr(main, "_load_tunnel_manager_ui_class", lambda: _StartupWindow)
-    monkeypatch.setattr("src.core.single_instance.SingleInstanceGuard", _Guard)
-    monkeypatch.setattr("src.core.i18n.configure_language", lambda *args: "ko")
-    monkeypatch.setattr("src.core.i18n.install_qt_i18n", lambda: None)
-    monkeypatch.setattr(main.sys, "argv", ["TunnelForge"])
+    _install_main_startup_fakes(monkeypatch, _StartupWindow)
+    monkeypatch.setattr(main, "_shutdown_shared_db_core_facade", lambda: None)
 
     _Guard.secondary = True
     assert main.main() == 0
     assert constructed == []
 
     _Guard.secondary = False
-    with pytest.raises(SystemExit) as exited:
-        main.main()
-    assert exited.value.code == 0
+    assert main.main() == 0
     assert len(constructed) == 1
     assert constructed[0].prepare_for_shutdown in _App.last_instance.aboutToQuit.callbacks
+
+
+class _LifecycleWindow:
+    def __init__(self, config, engine):
+        self.shutdown_calls = 0
+
+    def show(self):
+        pass
+
+    def bring_to_front(self):
+        pass
+
+    def prepare_for_shutdown(self):
+        self.shutdown_calls += 1
+
+
+def test_main_normal_exit_runs_about_to_quit_and_finally_shutdown(monkeypatch):
+    shutdown_calls = []
+    _install_main_startup_fakes(monkeypatch, _LifecycleWindow)
+    _App.emit_about_to_quit = True
+    _App.exec_result = 17
+    monkeypatch.setattr(
+        main,
+        "_shutdown_shared_db_core_facade",
+        lambda: shutdown_calls.append("shutdown"),
+    )
+
+    assert main.main() == 17
+
+    assert shutdown_calls == ["shutdown", "shutdown"]
+    assert _App.last_instance.aboutToQuit.callbacks.count(
+        main._shutdown_shared_db_core_facade
+    ) == 1
+
+
+def test_main_secondary_instance_return_runs_finally(monkeypatch):
+    shutdown_calls = []
+    _install_main_startup_fakes(monkeypatch, _LifecycleWindow)
+    _Guard.secondary = True
+    monkeypatch.setattr(
+        main,
+        "_shutdown_shared_db_core_facade",
+        lambda: shutdown_calls.append("shutdown"),
+    )
+
+    assert main.main() == 0
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_main_startup_failure_before_qapplication_runs_finally(monkeypatch):
+    shutdown_calls = []
+
+    def fail_qapplication_load():
+        raise RuntimeError("QApplication import failed")
+
+    monkeypatch.setattr(main, "_load_qapplication_class", fail_qapplication_load)
+    monkeypatch.setattr(
+        main,
+        "_shutdown_shared_db_core_facade",
+        lambda: shutdown_calls.append("shutdown"),
+    )
+
+    with pytest.raises(RuntimeError, match="QApplication import failed"):
+        main.main()
+
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_main_window_startup_failure_runs_finally(monkeypatch):
+    shutdown_calls = []
+
+    class _FailingWindow:
+        def __init__(self, config, engine):
+            raise RuntimeError("window failed")
+
+    _install_main_startup_fakes(monkeypatch, _FailingWindow)
+    monkeypatch.setattr(
+        main,
+        "_shutdown_shared_db_core_facade",
+        lambda: shutdown_calls.append("shutdown"),
+    )
+
+    with pytest.raises(RuntimeError, match="window failed"):
+        main.main()
+
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_main_event_loop_exception_runs_finally(monkeypatch):
+    shutdown_calls = []
+    _install_main_startup_fakes(monkeypatch, _LifecycleWindow)
+    _App.exec_error = RuntimeError("event loop failed")
+    monkeypatch.setattr(
+        main,
+        "_shutdown_shared_db_core_facade",
+        lambda: shutdown_calls.append("shutdown"),
+    )
+
+    with pytest.raises(RuntimeError, match="event loop failed"):
+        main.main()
+
+    assert shutdown_calls == ["shutdown"]
+
+
+def test_main_surfaces_residual_owner_join_failure(monkeypatch):
+    residual = DbCoreServiceError(
+        "DB Core owner did not stop",
+        code="db_core_residual_process",
+        request_kind=DbCoreRequestKind.MUTATION,
+        outcome=DbCoreOutcome.FAILED,
+    )
+    _install_main_startup_fakes(monkeypatch, _LifecycleWindow)
+
+    def fail_shutdown():
+        raise residual
+
+    monkeypatch.setattr(main, "_shutdown_shared_db_core_facade", fail_shutdown)
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        main.main()
+
+    assert raised.value is residual

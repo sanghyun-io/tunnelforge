@@ -4,8 +4,68 @@ pytest 공용 fixtures
 import pytest
 import os
 import json
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+
+class _DbCoreClientTracker:
+    def __init__(self):
+        self.clients = []
+
+    def add(self, client):
+        self.clients.append(client)
+
+    def shutdown_all(self):
+        from src.core.db_core_facade import shutdown_shared_db_core_facade
+
+        errors = []
+        try:
+            shutdown_shared_db_core_facade(timeout_seconds=2.0)
+        except Exception as exc:
+            errors.append(exc)
+        for client in reversed(self.clients):
+            try:
+                client.shutdown(timeout_seconds=2.0)
+            except Exception as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
+
+    def live_owner_threads(self):
+        owners = [
+            client.owner_thread
+            for client in self.clients
+            if client.owner_thread is not None and client.owner_thread.is_alive()
+        ]
+        known = set(owners)
+        owners.extend(
+            thread
+            for thread in threading.enumerate()
+            if thread.name.startswith("TunnelForgeDbCoreOwner-") and thread not in known
+        )
+        return owners
+
+
+@pytest.fixture(autouse=True)
+def tracked_db_core_clients(monkeypatch):
+    """Boundedly stop every non-daemon DB Core owner created by a test."""
+    from src.core.db_core_client import DbCoreServiceClient
+
+    tracker = _DbCoreClientTracker()
+    original_init = DbCoreServiceClient.__init__
+
+    def tracked_init(client, *args, **kwargs):
+        try:
+            original_init(client, *args, **kwargs)
+        finally:
+            if hasattr(client, "_owner_thread"):
+                tracker.add(client)
+
+    monkeypatch.setattr(DbCoreServiceClient, "__init__", tracked_init)
+    yield tracker
+    tracker.shutdown_all()
+    assert tracker.live_owner_threads() == []
 
 
 @pytest.fixture(autouse=True)

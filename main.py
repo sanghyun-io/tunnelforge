@@ -121,6 +121,15 @@ def _load_tunnel_manager_ui_class():
     return _lazy_class("src.ui.main_window", "TunnelManagerUI")
 
 
+def _shutdown_shared_db_core_facade():
+    from src.core.db_core_client import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    from src.core.db_core_facade import shutdown_shared_db_core_facade
+
+    shutdown_shared_db_core_facade(
+        timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+
+
 def should_run_self_check(argv=None) -> bool:
     return "--self-check" in (argv if argv is not None else sys.argv)
 
@@ -228,73 +237,78 @@ def run_ui_smoke_check_cli() -> int:
 
 
 def main():
-    if should_run_self_check():
-        return run_self_check_cli()
-    if should_run_ui_smoke_check():
-        return run_ui_smoke_check_cli()
+    shutdown_db_core = _shutdown_shared_db_core_facade
+    try:
+        if should_run_self_check():
+            return run_self_check_cli()
+        if should_run_ui_smoke_check():
+            return run_ui_smoke_check_cli()
 
-    from src.core.logger import get_logger
-    from src.core.platform_integration import set_app_user_model_id
-    from src.core.single_instance import SingleInstanceGuard
+        from src.core.logger import get_logger
+        from src.core.platform_integration import set_app_user_model_id
+        from src.core.single_instance import SingleInstanceGuard
 
-    # 루트 로거 초기화
-    logger = get_logger('main')
+        # 루트 로거 초기화
+        logger = get_logger('main')
 
-    # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
-    set_app_user_model_id('tunnelforge.1.0')
+        # Windows 작업표시줄 아이콘을 위한 AppUserModelID 설정
+        set_app_user_model_id('tunnelforge.1.0')
 
-    app_cls = _load_qapplication_class()
-    icon_cls = _load_qicon_class()
-    config_cls = _load_config_manager_class()
-    engine_cls = _load_tunnel_engine_class()
-    window_cls = _load_tunnel_manager_ui_class()
+        app_cls = _load_qapplication_class()
+        icon_cls = _load_qicon_class()
+        config_cls = _load_config_manager_class()
+        engine_cls = _load_tunnel_engine_class()
+        window_cls = _load_tunnel_manager_ui_class()
 
-    app = app_cls(sys.argv)
-    app.setWindowIcon(icon_cls(str(app_icon_path())))
+        app = app_cls(sys.argv)
+        app.aboutToQuit.connect(shutdown_db_core)
+        app.setWindowIcon(icon_cls(str(app_icon_path())))
 
-    single_instance_guard = SingleInstanceGuard(parent=app)
-    if single_instance_guard.is_secondary:
-        if SingleInstanceGuard.notify_existing_instance():
-            logger.info("이미 실행 중인 TunnelForge 인스턴스에 창 활성화를 요청했습니다.")
+        single_instance_guard = SingleInstanceGuard(parent=app)
+        if single_instance_guard.is_secondary:
+            if SingleInstanceGuard.notify_existing_instance():
+                logger.info("이미 실행 중인 TunnelForge 인스턴스에 창 활성화를 요청했습니다.")
+            else:
+                logger.warning("TunnelForge가 이미 실행 중이지만 창 활성화 요청을 보내지 못했습니다.")
+            return 0
+
+        pending_activation_requests = []
+        single_instance_guard.activation_requested.connect(
+            lambda: pending_activation_requests.append(True)
+        )
+        app.aboutToQuit.connect(single_instance_guard.close)
+
+        # 애플리케이션가 닫혀도 마지막 창이 닫힐 때까지 종료되지 않도록 설정 (트레이 아이콘 때문)
+        app.setQuitOnLastWindowClosed(False)
+
+        # 1. 매니저 초기화
+        config_mgr = config_cls()
+        from src.core.i18n import configure_language, install_qt_i18n
+
+        configure_language(config_mgr, sys.argv)
+        install_qt_i18n()
+        tunnel_engine = engine_cls()
+
+        # 2. 설정 파일 경로 안내 (첫 실행 사용자를 위해)
+        config_path = config_mgr.get_config_path()
+        logger.info(f"설정 파일 위치: {config_path}")
+
+        # 3. UI 실행
+        start_minimized = '--minimized' in sys.argv
+        window = window_cls(config_mgr, tunnel_engine)
+        app.aboutToQuit.connect(window.prepare_for_shutdown)
+        single_instance_guard.activation_requested.connect(window.bring_to_front)
+        if not start_minimized:
+            window.show()
         else:
-            logger.warning("TunnelForge가 이미 실행 중이지만 창 활성화 요청을 보내지 못했습니다.")
-        return 0
+            logger.info("--minimized 모드: 시스템 트레이에서 시작")
+        if pending_activation_requests:
+            window.bring_to_front()
 
-    pending_activation_requests = []
-    single_instance_guard.activation_requested.connect(
-        lambda: pending_activation_requests.append(True)
-    )
-    app.aboutToQuit.connect(single_instance_guard.close)
-
-    # 애플리케이션가 닫혀도 마지막 창이 닫힐 때까지 종료되지 않도록 설정 (트레이 아이콘 때문)
-    app.setQuitOnLastWindowClosed(False)
-
-    # 1. 매니저 초기화
-    config_mgr = config_cls()
-    from src.core.i18n import configure_language, install_qt_i18n
-
-    configure_language(config_mgr, sys.argv)
-    install_qt_i18n()
-    tunnel_engine = engine_cls()
-
-    # 2. 설정 파일 경로 안내 (첫 실행 사용자를 위해)
-    config_path = config_mgr.get_config_path()
-    logger.info(f"설정 파일 위치: {config_path}")
-
-    # 3. UI 실행
-    start_minimized = '--minimized' in sys.argv
-    window = window_cls(config_mgr, tunnel_engine)
-    app.aboutToQuit.connect(window.prepare_for_shutdown)
-    single_instance_guard.activation_requested.connect(window.bring_to_front)
-    if not start_minimized:
-        window.show()
-    else:
-        logger.info("--minimized 모드: 시스템 트레이에서 시작")
-    if pending_activation_requests:
-        window.bring_to_front()
-
-    # 4. 앱 루프 시작
-    sys.exit(app.exec())
+        # 4. 앱 루프 시작
+        return app.exec()
+    finally:
+        shutdown_db_core()
 
 
 if __name__ == "__main__":
