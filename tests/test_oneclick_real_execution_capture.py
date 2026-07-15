@@ -1,5 +1,4 @@
 import importlib.util
-import json
 from pathlib import Path
 
 import pytest
@@ -18,19 +17,6 @@ def _load_capture():
     return module
 
 
-def _load_validator():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "validate-oneclick-real-execution-evidence.py"
-    )
-    spec = importlib.util.spec_from_file_location("validate_oneclick_real_execution_evidence", script)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
 def test_oneclick_real_capture_rejects_unsafe_seed_identifiers():
     capture = _load_capture()
 
@@ -41,63 +27,73 @@ def test_oneclick_real_capture_rejects_unsafe_seed_identifiers():
         capture._require_safe_oneclick_identifier("legacy_engine_table;DROP", "table")
 
 
-def test_oneclick_real_capture_builds_validator_backed_report(tmp_path):
+def test_oneclick_real_capture_fails_closed_before_facade_or_db(monkeypatch):
     capture = _load_capture()
-    validator = _load_validator()
-    service_hello = {"capabilities": list(validator.REQUIRED_CAPABILITIES)}
-    apply_result = {
-        "command": "oneclick.apply_fixes",
-        "dry_run": False,
-        "success": True,
-        "success_count": 1,
-        "fail_count": 0,
-        "skip_count": 0,
-        "disallowed_fix_attempts": [],
-        "applied_fixes": [
-            {
-                "issue_type": "deprecated_engine",
-                "strategy": "engine_innodb",
-                "schema": "tf_oneclick_real_execution",
-                "table": "tf_oneclick_legacy_engine_table",
-                "sql": (
-                    "ALTER TABLE `tf_oneclick_real_execution`."
-                    "`tf_oneclick_legacy_engine_table` ENGINE=InnoDB;"
-                ),
-                "success": True,
-                "rows_affected": 0,
-            }
-        ],
-    }
-    before = [
-        {
-            "schema": "tf_oneclick_real_execution",
-            "table": "tf_oneclick_legacy_engine_table",
-            "engine": "MyISAM",
-        }
-    ]
-    after = [
-        {
-            "schema": "tf_oneclick_real_execution",
-            "table": "tf_oneclick_legacy_engine_table",
-            "engine": "InnoDB",
-        }
-    ]
-
-    report = capture.build_evidence_report(
-        git_sha="abcdef123456",
-        service_hello=service_hello,
-        schema="tf_oneclick_real_execution",
-        table="tf_oneclick_legacy_engine_table",
-        apply_result=apply_result,
-        before_tables=before,
-        after_tables=after,
+    facade_constructions = []
+    expected_message = (
+        "Phase A disables One-Click real-execution evidence capture; exact-plan approval "
+        "and TF-STATUS-098 are required before DB mutation."
+    )
+    monkeypatch.setattr(capture, "ONECLICK_REAL_EXECUTION_ENABLED", True)
+    monkeypatch.setattr(
+        capture,
+        "DbCoreFacade",
+        lambda: facade_constructions.append(True),
     )
 
-    report_path = tmp_path / "oneclick-real-execution-evidence.json"
-    report_path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(capture.OneClickRealExecutionCaptureDisabled) as exc_info:
+        capture.capture_oneclick_real_execution(
+            host="127.0.0.1",
+            port=3406,
+            user="root",
+            password="test",
+            schema="tf_oneclick_real_execution",
+            table="tf_oneclick_legacy_engine_table",
+        )
 
-    assert validator.validate_report(report_path) == {
-        "issue": 138,
-        "schema": "tf_oneclick_real_execution",
-        "applied_fixes": 1,
-    }
+    assert exc_info.value.code == "oneclick_apply_disabled"
+    assert str(exc_info.value) == expected_message
+    assert "exact-plan approval" in str(exc_info.value)
+    assert "TF-STATUS-098" in str(exc_info.value)
+    assert facade_constructions == []
+
+
+def test_oneclick_real_capture_command_fails_before_seed_or_capture(
+    monkeypatch,
+    capsys,
+    tmp_path,
+):
+    capture = _load_capture()
+    calls = []
+    expected_error = (
+        "oneclick_apply_disabled: Phase A disables One-Click real-execution evidence "
+        "capture; exact-plan approval and TF-STATUS-098 are required before DB mutation."
+    )
+    monkeypatch.setattr(
+        capture,
+        "seed_local_mysql_container",
+        lambda **_kwargs: calls.append("seed"),
+    )
+    monkeypatch.setattr(
+        capture,
+        "capture_oneclick_real_execution",
+        lambda **_kwargs: calls.append("capture") or {"must_not_be_used": True},
+    )
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "capture-oneclick-real-execution-evidence.py",
+            "--seed-local-container",
+            "--output",
+            str(tmp_path / "must-not-exist.json"),
+        ],
+    )
+
+    exit_code = capture.main()
+    output = capsys.readouterr()
+
+    assert exit_code == 2
+    assert output.out == ""
+    assert output.err.strip() == expected_error
+    assert calls == []
+    assert not (tmp_path / "must-not-exist.json").exists()

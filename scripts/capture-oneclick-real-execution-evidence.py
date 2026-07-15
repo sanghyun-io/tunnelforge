@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Capture Rust Core-backed One-Click real-execution evidence for GitHub #138."""
+"""Archived One-Click real-execution capture, disabled during Phase A."""
 
 from __future__ import annotations
 
@@ -24,6 +24,23 @@ from src.ui.dialogs.oneclick_migration_dialog import ONECLICK_REAL_EXECUTION_ENA
 DEFAULT_SCHEMA = "tf_oneclick_real_execution"
 DEFAULT_TABLE = "tf_oneclick_legacy_engine_table"
 SAFE_ONECLICK_IDENTIFIER_RE = re.compile(r"^tf_oneclick_[A-Za-z0-9_]+$")
+ONECLICK_REAL_EXECUTION_CAPTURE_ENABLED = False
+ONECLICK_APPLY_DISABLED_CODE = "oneclick_apply_disabled"
+ONECLICK_CAPTURE_DISABLED_MESSAGE = (
+    "Phase A disables One-Click real-execution evidence capture; exact-plan approval "
+    "and TF-STATUS-098 are required before DB mutation."
+)
+
+
+class OneClickRealExecutionCaptureDisabled(RuntimeError):
+    def __init__(self) -> None:
+        self.code = ONECLICK_APPLY_DISABLED_CODE
+        super().__init__(ONECLICK_CAPTURE_DISABLED_MESSAGE)
+
+
+def _require_real_execution_capture_enabled() -> None:
+    if not ONECLICK_REAL_EXECUTION_CAPTURE_ENABLED:
+        raise OneClickRealExecutionCaptureDisabled()
 
 
 def _run_checked(args: List[str]) -> None:
@@ -179,6 +196,7 @@ def capture_oneclick_real_execution(
     schema: str,
     table: str,
 ) -> Dict[str, Any]:
+    _require_real_execution_capture_enabled()
     _require_safe_oneclick_identifier(schema, "schema")
     _require_safe_oneclick_identifier(table, "table")
 
@@ -241,6 +259,12 @@ def main() -> int:
     parser.add_argument("--schema", default=DEFAULT_SCHEMA)
     parser.add_argument("--table", default=DEFAULT_TABLE)
     args = parser.parse_args()
+
+    try:
+        _require_real_execution_capture_enabled()
+    except OneClickRealExecutionCaptureDisabled as exc:
+        print(f"{exc.code}: {exc}", file=sys.stderr)
+        return 2
 
     if args.seed_local_container:
         seed_local_mysql_container(
