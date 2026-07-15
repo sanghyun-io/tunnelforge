@@ -1,6 +1,9 @@
+import ast
 import io
 import json
 import time
+from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
 
@@ -24,6 +27,44 @@ from src.core.sql_query_classifier import (
     is_mysql_implicit_commit_ddl,
     statement_returns_rows,
 )
+
+
+@dataclass(frozen=True)
+class _ExpectedConnectionHandle:
+    connection_id: str
+    process_generation: int
+
+
+def _connection_handle(connection_id="conn-1", process_generation=1):
+    handle_type = getattr(
+        db_core_service,
+        "DbCoreConnectionHandle",
+        _ExpectedConnectionHandle,
+    )
+    return handle_type(connection_id, process_generation)
+
+
+def _service_error(
+    message,
+    *,
+    code="db_core_business_failure",
+    request_kind=DbCoreRequestKind.MUTATION,
+    outcome=DbCoreOutcome.FAILED,
+    request_id="test-request",
+    process_generation=1,
+    rust_code=None,
+    payload=None,
+):
+    return DbCoreServiceError(
+        message,
+        code=code,
+        request_kind=request_kind,
+        outcome=outcome,
+        request_id=request_id,
+        process_generation=process_generation,
+        rust_code=rust_code,
+        payload=payload or {},
+    )
 
 
 class FakeProcess:
@@ -202,6 +243,122 @@ def test_facade_open_business_failure_keeps_definite_outcome():
     assert raised.value.request_kind is DbCoreRequestKind.MUTATION
 
 
+def test_open_connection_returns_generation_handle():
+    process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":true,"connection_id":"conn-1"}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    handle = facade.open_connection(endpoint)
+
+    assert hasattr(db_core_service, "DbCoreConnectionHandle")
+    assert isinstance(handle, db_core_service.DbCoreConnectionHandle)
+    assert handle.connection_id == "conn-1"
+    assert handle.process_generation == client.process_generation == 1
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        lambda facade: facade.close_connection("conn-1"),
+        lambda facade: facade.execute_on_connection("conn-1", "SELECT 1"),
+        lambda facade: facade.execute_on_connection_result("conn-1", "SELECT 1"),
+        lambda facade: facade.execute_on_connection_streaming("conn-1", "SELECT 1"),
+    ],
+)
+def test_raw_connection_ids_are_rejected_before_wire(operation):
+    process = FakeProcess([])
+    process_starts = []
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process_starts.append(True) or process,
+    )
+    facade = DbCoreFacade(client)
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        operation(facade)
+
+    assert raised.value.code == "db_core_stale_connection"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert raised.value.request_kind is DbCoreRequestKind.MUTATION
+    assert process_starts == []
+    assert process.stdin.getvalue() == ""
+
+
+def test_stale_handle_rejected_before_wire():
+    process = FakeProcess([
+        '{"event":"result","command":"service.hello","success":true}',
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    facade = DbCoreFacade(client)
+    facade.hello()
+    stale_handle = _connection_handle(process_generation=client.process_generation + 1)
+    writes_before = process.stdin.getvalue()
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        facade.execute_on_connection(stale_handle, "SELECT 1")
+
+    assert raised.value.code == "db_core_stale_connection"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert raised.value.request_kind is DbCoreRequestKind.MUTATION
+    assert process.stdin.getvalue() == writes_before
+
+
+def _reused_connection_id_fixture():
+    first_process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":true,"connection_id":"reused"}',
+    ])
+    second_process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":true,"connection_id":"reused"}',
+        '{"event":"result","command":"query.execute","success":true,"rows":[{"value":2}],"columns":["value"]}',
+    ])
+    processes = iter([first_process, second_process])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: next(processes),
+    )
+    facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+    old_handle = facade.open_connection(endpoint)
+    old_cursor = RustDbConnection(endpoint, facade, old_handle).cursor()
+    first_process.returncode = 1
+    new_handle = facade.open_connection(endpoint)
+    new_cursor = RustDbConnection(endpoint, facade, new_handle).cursor()
+    return second_process, old_cursor, new_cursor, old_handle, new_handle
+
+
+def test_old_cursor_rejected_when_new_generation_reuses_same_connection_id():
+    process, old_cursor, _new_cursor, old_handle, new_handle = _reused_connection_id_fixture()
+    writes_before = process.stdin.getvalue()
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        old_cursor.execute("SELECT 1 AS value")
+
+    assert old_handle.connection_id == new_handle.connection_id == "reused"
+    assert old_handle.process_generation != new_handle.process_generation
+    assert raised.value.code == "db_core_stale_connection"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert process.stdin.getvalue() == writes_before
+
+
+def test_new_cursor_with_reused_id_succeeds():
+    _process, _old_cursor, new_cursor, _old_handle, new_handle = _reused_connection_id_fixture()
+
+    rowcount = new_cursor.execute("SELECT 2 AS value")
+
+    assert new_handle.connection_id == "reused"
+    assert rowcount == 1
+    assert new_cursor.fetchone() == {"value": 2}
+
+
 def test_facade_uses_connection_test_protocol():
     process = FakeProcess([
         '{"event":"result","command":"connection.test","success":true,"message":"connection successful"}',
@@ -308,11 +465,113 @@ def test_facade_uses_oneclick_derive_charset_contracts_protocol():
     assert events[0]["phase"] == "recommendation"
 
 
+def test_facade_explicitly_classifies_every_request_kind_and_preserves_shapes():
+    calls = []
+
+    class SpyClient:
+        process_generation = 7
+
+        def request_result(self, command, payload=None, **kwargs):
+            calls.append((command, kwargs["request_kind"], kwargs.get("required_generation")))
+            return db_core_service.DbCoreRequestResult(
+                request_kind=kwargs["request_kind"],
+                outcome=DbCoreOutcome.DEFINITE,
+                request_id="open-request",
+                process_generation=self.process_generation,
+                message="",
+                rust_code=None,
+                payload={"success": True, "connection_id": "conn-7"},
+            )
+
+        def request_payload(self, command, payload=None, **kwargs):
+            calls.append((command, kwargs["request_kind"], kwargs.get("required_generation")))
+            if kwargs.get("on_event") is not None:
+                kwargs["on_event"]({"event": "row_batch", "rows": [{"id": 1}]})
+            return {
+                "success": True,
+                "message": "ok",
+                "service": "tunnelforge-core",
+                "schema": {"tables": []},
+                "tables": ["users"],
+                "differences": [{"kind": "added"}],
+                "rows": [{"id": 1}],
+                "columns": ["id"],
+                "rows_affected": 1,
+            }
+
+    facade = DbCoreFacade(SpyClient())
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    assert facade.hello().get("service") == "tunnelforge-core"
+    assert facade.test_connection(endpoint) == (True, "ok")
+    handle = facade.open_connection(endpoint)
+    assert facade.close_connection(handle) is True
+    assert facade.inspect_schema(endpoint)["tables"] == []
+    assert facade.list_tables(endpoint)[0] == "users"
+    assert facade.schema_diff({}, {})[0]["kind"] == "added"
+    assert facade.execute_query(endpoint, "SELECT 1")[0]["id"] == 1
+    assert facade.execute_on_connection(handle, "SELECT 1")[0]["id"] == 1
+    batches = []
+    assert facade.execute_on_connection_streaming(
+        handle,
+        "SELECT 1",
+        on_batch=batches.append,
+    ).get("success") is True
+    assert batches == [[{"id": 1}]]
+    assert facade.run_migration({}).get("success") is True
+    assert facade.verify_migration({}).get("success") is True
+    assert facade.run_dump({}).get("success") is True
+    assert facade.import_dump({}).get("success") is True
+    assert facade.run_oneclick({}).get("success") is True
+    assert facade.derive_oneclick_charset_contracts({}).get("success") is True
+    assert facade.apply_oneclick_fixes({}).get("success") is True
+
+    assert calls == [
+        ("service.hello", DbCoreRequestKind.READ_ONLY, None),
+        ("connection.test", DbCoreRequestKind.READ_ONLY, None),
+        ("connection.open", DbCoreRequestKind.MUTATION, None),
+        ("connection.close", DbCoreRequestKind.MUTATION, 7),
+        ("schema.inspect", DbCoreRequestKind.READ_ONLY, None),
+        ("schema.list", DbCoreRequestKind.READ_ONLY, None),
+        ("schema.diff", DbCoreRequestKind.READ_ONLY, None),
+        ("query.execute", DbCoreRequestKind.MUTATION, None),
+        ("query.execute", DbCoreRequestKind.MUTATION, 7),
+        ("query.execute", DbCoreRequestKind.MUTATION, 7),
+        ("migration.run", DbCoreRequestKind.MUTATION, None),
+        ("migration.verify", DbCoreRequestKind.READ_ONLY, None),
+        ("dump.run", DbCoreRequestKind.MUTATION, None),
+        ("dump.import", DbCoreRequestKind.MUTATION, None),
+        ("oneclick.run", DbCoreRequestKind.MUTATION, None),
+        ("oneclick.derive_charset_contracts", DbCoreRequestKind.READ_ONLY, None),
+        ("oneclick.apply_fixes", DbCoreRequestKind.MUTATION, None),
+    ]
+
+
+def test_owned_request_consumers_explicitly_classify_request_kind():
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        root / "src/core/db_core_facade.py",
+        root / "scripts/capture-oneclick-real-execution-evidence.py",
+    ]
+    missing = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+                continue
+            if node.func.attr not in {"request", "request_payload", "request_result"}:
+                continue
+            if not any(keyword.arg == "request_kind" for keyword in node.keywords):
+                missing.append(f"{path.relative_to(root)}:{node.lineno}")
+
+    assert missing == []
+
+
 def test_rust_connector_masks_success_message_shape():
     class FakeFacade:
         def open_connection(self, endpoint):
             self.endpoint = endpoint
-            return "conn-1"
+            return _connection_handle()
 
     fake = FakeFacade()
     connector = RustDbConnector("postgresql", "db.local", 5432, "user", "pw", "postgres", facade=fake)
@@ -333,10 +592,10 @@ def test_parse_db_version_tuple_handles_rust_core_version_strings():
 def test_rust_connector_get_db_version_returns_legacy_tuple():
     class FakeFacade:
         def open_connection(self, endpoint):
-            return "conn-1"
+            return _connection_handle()
 
-        def execute_on_connection_result(self, connection_id, query, params=None):
-            assert connection_id == "conn-1"
+        def execute_on_connection_result(self, connection_handle, query, params=None):
+            assert connection_handle == _connection_handle()
             assert "VERSION()" in query
             return {"rows": [{"version": "8.4.7"}], "columns": ["version"], "rows_affected": 0}
 
@@ -356,6 +615,7 @@ def test_rust_connector_get_db_version_returns_legacy_tuple():
 
 def test_execute_on_connection_sends_params_to_core_protocol():
     process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":true,"connection_id":"conn-1"}',
         '{"event":"result","command":"query.execute","success":true,"rows":[{"id":1}]}',
     ])
     client = DbCoreServiceClient(
@@ -363,10 +623,12 @@ def test_execute_on_connection_sends_params_to_core_protocol():
         popen_factory=lambda *args, **kwargs: process,
     )
     facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
+    handle = facade.open_connection(endpoint)
 
-    rows = facade.execute_on_connection("conn-1", "SELECT * FROM users WHERE id = %s", params=[1])
+    rows = facade.execute_on_connection(handle, "SELECT * FROM users WHERE id = %s", params=[1])
 
-    sent = json.loads(process.stdin.getvalue().strip())
+    sent = json.loads(process.stdin.getvalue().strip().splitlines()[-1])
     assert rows == [{"id": 1}]
     assert sent["payload"]["connection_id"] == "conn-1"
     assert sent["payload"]["params"] == [1]
@@ -374,6 +636,7 @@ def test_execute_on_connection_sends_params_to_core_protocol():
 
 def test_execute_on_connection_streaming_collects_row_batches():
     process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":true,"connection_id":"conn-1"}',
         '{"event":"row_batch","rows":[{"id":1}],"total":2}',
         '{"event":"row_batch","rows":[{"id":2}],"total":2}',
         '{"event":"result","command":"query.execute","success":true,"rows_streamed":2}',
@@ -384,15 +647,17 @@ def test_execute_on_connection_streaming_collects_row_batches():
     )
     facade = DbCoreFacade(client)
     batches = []
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
+    handle = facade.open_connection(endpoint)
 
     result = facade.execute_on_connection_streaming(
-        "conn-1",
+        handle,
         "SELECT * FROM users",
         row_batch_size=1,
         on_batch=batches.append,
     )
 
-    sent = json.loads(process.stdin.getvalue().strip())
+    sent = json.loads(process.stdin.getvalue().strip().splitlines()[-1])
     assert sent["payload"]["stream_rows"] is True
     assert sent["payload"]["row_batch_size"] == 1
     assert batches == [[{"id": 1}], [{"id": 2}]]
@@ -401,6 +666,7 @@ def test_execute_on_connection_streaming_collects_row_batches():
 
 def test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml():
     process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":true,"connection_id":"conn-1"}',
         '{"event":"result","command":"query.execute","success":true,"rows":[],"rows_affected":7}',
     ])
     client = DbCoreServiceClient(
@@ -409,7 +675,7 @@ def test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml():
     )
     facade = DbCoreFacade(client)
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, facade, "conn-1")
+    connection = RustDbConnection(endpoint, facade, facade.open_connection(endpoint))
 
     with connection.cursor() as cursor:
         rowcount = cursor.execute("UPDATE users SET active = 0")
@@ -421,12 +687,12 @@ def test_rust_db_cursor_rowcount_uses_core_rows_affected_for_dml():
 
 def test_rust_db_cursor_calls_execute_on_connection_result_unconditionally():
     class FakeFacade:
-        def execute_on_connection_result(self, connection_id, query, params=None):
-            assert connection_id == "conn-1"
+        def execute_on_connection_result(self, connection_handle, query, params=None):
+            assert connection_handle == _connection_handle()
             return {"rows": [], "rows_affected": 7}
 
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, FakeFacade(), "conn-1")
+    connection = RustDbConnection(endpoint, FakeFacade(), _connection_handle())
 
     with connection.cursor() as cursor:
         rowcount = cursor.execute("UPDATE users SET active = 0")
@@ -446,7 +712,7 @@ def test_rust_db_cursor_executemany_rejects_python_batch_helper():
 
     facade = FakeFacade()
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, facade, "conn-1")
+    connection = RustDbConnection(endpoint, facade, _connection_handle())
 
     with connection.cursor() as cursor:
         try:
@@ -509,6 +775,7 @@ def test_is_mysql_implicit_commit_ddl_recognizes_single_and_paired_keywords():
 
 def test_execute_on_connection_result_preserves_columns():
     process = FakeProcess([
+        '{"event":"result","command":"connection.open","success":true,"connection_id":"conn-1"}',
         json.dumps({
             "event": "result",
             "command": "query.execute",
@@ -523,8 +790,10 @@ def test_execute_on_connection_result_preserves_columns():
         popen_factory=lambda *args, **kwargs: process,
     )
     facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
+    handle = facade.open_connection(endpoint)
 
-    result = facade.execute_on_connection_result("conn-1", "SELECT id FROM users WHERE 1=0")
+    result = facade.execute_on_connection_result(handle, "SELECT id FROM users WHERE 1=0")
 
     assert result["columns"] == ["id"]
     assert result["rows"] == []
@@ -532,11 +801,11 @@ def test_execute_on_connection_result_preserves_columns():
 
 def test_rust_db_cursor_empty_select_reports_column_metadata():
     class FakeFacade:
-        def execute_on_connection_result(self, connection_id, query, params=None):
+        def execute_on_connection_result(self, connection_handle, query, params=None):
             return {"rows": [], "columns": ["id", "name"], "rows_affected": 0}
 
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, FakeFacade(), "conn-1")
+    connection = RustDbConnection(endpoint, FakeFacade(), _connection_handle())
 
     with connection.cursor() as cursor:
         cursor.execute("-- check\nSELECT id, name FROM users WHERE 1=0")
@@ -547,11 +816,11 @@ def test_rust_db_cursor_empty_select_reports_column_metadata():
 
 def test_rust_db_cursor_comment_prefixed_select_keeps_empty_description_not_none():
     class FakeFacade:
-        def execute_on_connection_result(self, connection_id, query, params=None):
+        def execute_on_connection_result(self, connection_handle, query, params=None):
             return {"rows": [], "columns": [], "rows_affected": 0}
 
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, FakeFacade(), "conn-1")
+    connection = RustDbConnection(endpoint, FakeFacade(), _connection_handle())
 
     with connection.cursor() as cursor:
         cursor.execute("-- comment\nSELECT * FROM users WHERE 1=0")
@@ -561,11 +830,11 @@ def test_rust_db_cursor_comment_prefixed_select_keeps_empty_description_not_none
 
 def test_rust_db_cursor_dml_has_no_description():
     class FakeFacade:
-        def execute_on_connection_result(self, connection_id, query, params=None):
+        def execute_on_connection_result(self, connection_handle, query, params=None):
             return {"rows": [], "columns": [], "rows_affected": 7}
 
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, FakeFacade(), "conn-1")
+    connection = RustDbConnection(endpoint, FakeFacade(), _connection_handle())
 
     with connection.cursor() as cursor:
         rowcount = cursor.execute("UPDATE users SET active = 0")
@@ -580,26 +849,31 @@ def test_rust_db_connection_ping_issues_exactly_select_1():
         def __init__(self):
             self.calls = []
 
-        def execute_on_connection(self, connection_id, query, params=None):
-            self.calls.append((connection_id, query))
+        def execute_on_connection(self, connection_handle, query, params=None):
+            self.calls.append((connection_handle, query))
             return []
 
     facade = FakeFacade()
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, facade, "conn-1")
+    handle = _connection_handle()
+    connection = RustDbConnection(endpoint, facade, handle)
 
     connection.ping()
 
-    assert facade.calls == [("conn-1", "SELECT 1")]
+    assert facade.calls == [(handle, "SELECT 1")]
 
 
 def test_rust_db_connection_ping_closes_on_failure_and_closed_ping_raises():
     class FailingFacade:
-        def execute_on_connection(self, connection_id, query, params=None):
-            raise DbCoreServiceError("connection lost")
+        def execute_on_connection(self, connection_handle, query, params=None):
+            raise _service_error(
+                "connection lost",
+                code="db_core_process_died",
+                outcome=DbCoreOutcome.OUTCOME_INDETERMINATE,
+            )
 
     endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "root", "pw", "app")
-    connection = RustDbConnection(endpoint, FailingFacade(), "conn-1")
+    connection = RustDbConnection(endpoint, FailingFacade(), _connection_handle())
 
     try:
         connection.ping()
@@ -618,6 +892,45 @@ def test_rust_db_connection_ping_closes_on_failure_and_closed_ping_raises():
         raise AssertionError("ping on a closed connection should raise")
 
 
+def test_transport_failure_does_not_retry_or_reopen_connection():
+    class FailingFacade:
+        def __init__(self):
+            self.open_calls = 0
+            self.execute_calls = 0
+
+        def open_connection(self, endpoint):
+            self.open_calls += 1
+            return _connection_handle()
+
+        def execute_on_connection(self, connection_handle, query, params=None):
+            self.execute_calls += 1
+            raise _service_error(
+                "transport lost after write",
+                code="db_core_process_died",
+                outcome=DbCoreOutcome.OUTCOME_INDETERMINATE,
+            )
+
+    facade = FailingFacade()
+    connector = RustDbConnector(
+        "mysql",
+        "127.0.0.1",
+        3306,
+        "root",
+        "pw",
+        "app",
+        facade=facade,
+    )
+    assert connector.connect()[0] is True
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        connector.connection.ping(reconnect=True)
+
+    assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+    assert facade.open_calls == 1
+    assert facade.execute_calls == 1
+    assert connector.connection.open is False
+
+
 def test_bind_sql_params_and_sql_literal_helpers_are_removed():
     assert not hasattr(db_core_service, "bind_sql_params")
     assert not hasattr(db_core_service, "sql_literal")
@@ -633,6 +946,7 @@ def test_db_core_service_reexports_all_public_names_after_module_split():
         "DbCoreOutcome",
         "DbCoreGenerationState",
         "DbCoreRequestResult",
+        "DbCoreConnectionHandle",
         "MAX_JSONL_FRAME_BYTES",
         "DB_CORE_STDIN_HIGH_WATER_BYTES",
         "REQUIRED_PROCESS_CAPABILITIES",
@@ -656,6 +970,54 @@ def test_db_core_service_reexports_all_public_names_after_module_split():
     ]
     for name in expected_names:
         assert hasattr(db_core_service, name), f"db_core_service.{name} must remain re-exported"
+
+
+def test_owned_service_error_construction_requires_full_metadata():
+    root = Path(__file__).resolve().parents[1]
+    paths = [
+        root / "src/core/db_core_facade.py",
+        root / "src/core/db_core_dbapi_shim.py",
+        root / "src/core/postgres_connector.py",
+        root / "src/exporters/rust_dump_exporter.py",
+        root / "src/ui/workers/rust_dump_worker.py",
+        root / "scripts/capture-oneclick-real-execution-evidence.py",
+        root / "tests/test_db_core_service.py",
+        root / "tests/test_db_connector.py",
+        root / "tests/test_db_dialogs.py",
+        root / "tests/test_rust_dump_exporter.py",
+    ]
+    required_keywords = {
+        "code",
+        "request_kind",
+        "outcome",
+        "request_id",
+        "process_generation",
+        "rust_code",
+        "payload",
+    }
+    incomplete = []
+    for path in paths:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            function_name = (
+                node.func.id
+                if isinstance(node.func, ast.Name)
+                else node.func.attr
+                if isinstance(node.func, ast.Attribute)
+                else ""
+            )
+            if function_name != "DbCoreServiceError":
+                continue
+            keywords = {keyword.arg for keyword in node.keywords if keyword.arg}
+            missing = sorted(required_keywords - keywords)
+            if missing:
+                incomplete.append(
+                    f"{path.relative_to(root)}:{node.lineno} missing {','.join(missing)}"
+                )
+
+    assert incomplete == []
 
 
 def test_stderr_is_drained_in_background_and_available_as_tail():
@@ -823,7 +1185,7 @@ class _FailingConnection:
 
 def test_get_schemas_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector.connection = _FailingConnection(_service_error("Access denied"))
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -835,7 +1197,7 @@ def test_get_schemas_propagates_and_logs_db_core_service_error(caplog):
 
 def test_schema_exists_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector.connection = _FailingConnection(_service_error("Access denied"))
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -848,7 +1210,7 @@ def test_schema_exists_propagates_and_logs_db_core_service_error(caplog):
 def test_get_tables_propagates_and_logs_db_core_service_error(caplog):
     class FailingFacade:
         def list_tables(self, endpoint):
-            raise DbCoreServiceError("Access denied")
+            raise _service_error("Access denied")
 
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=FailingFacade())
 
@@ -862,7 +1224,7 @@ def test_get_tables_propagates_and_logs_db_core_service_error(caplog):
 
 def test_get_db_version_string_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector.connection = _FailingConnection(_service_error("Access denied"))
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):
@@ -874,7 +1236,7 @@ def test_get_db_version_string_propagates_and_logs_db_core_service_error(caplog)
 
 def test_get_column_names_propagates_and_logs_db_core_service_error(caplog):
     connector = RustDbConnector("mysql", "127.0.0.1", 3306, "root", "pw", "app", facade=object())
-    connector.connection = _FailingConnection(DbCoreServiceError("Access denied"))
+    connector.connection = _FailingConnection(_service_error("Access denied"))
 
     caplog.set_level("ERROR")
     with pytest.raises(DbCoreServiceError):

@@ -6,6 +6,34 @@ import json
 import pytest
 from unittest.mock import patch, MagicMock
 
+from src.core.db_core_service import (
+    DbCoreOutcome,
+    DbCoreRequestKind,
+    DbCoreServiceError,
+)
+
+
+def _service_error(
+    message,
+    *,
+    code="db_core_business_failure",
+    outcome=DbCoreOutcome.FAILED,
+    request_id="test-request",
+    process_generation=1,
+    rust_code=None,
+    payload=None,
+):
+    return DbCoreServiceError(
+        message,
+        code=code,
+        request_kind=DbCoreRequestKind.MUTATION,
+        outcome=outcome,
+        request_id=request_id,
+        process_generation=process_generation,
+        rust_code=rust_code,
+        payload=payload or {},
+    )
+
 
 class TestRustDumpChecker:
     """RustDumpChecker 클래스 테스트"""
@@ -48,6 +76,45 @@ class TestRustDumpChecker:
 
         assert installed is False
         assert '시간 초과' in msg
+
+    @pytest.mark.parametrize(
+        ("hello_result", "hello_error", "expected_installed"),
+        [
+            (
+                {
+                    "service": "tunnelforge-core",
+                    "protocol_version": "1",
+                    "capabilities": ["dump.run", "dump.import"],
+                },
+                None,
+                True,
+            ),
+            ({"capabilities": []}, None, False),
+            (None, FileNotFoundError("missing"), False),
+            (None, TimeoutError("slow"), False),
+            (None, RuntimeError("broken"), False),
+        ],
+    )
+    def test_check_installation_shuts_down_owned_facade_on_every_exit(
+        self,
+        hello_result,
+        hello_error,
+        expected_installed,
+    ):
+        from src.exporters.rust_dump_exporter import RustDumpChecker
+
+        with patch('src.exporters.rust_dump_exporter.DbCoreFacade') as facade_class:
+            with patch(
+                'src.exporters.rust_dump_exporter._shutdown_owned_facade'
+            ) as shutdown_owned:
+                facade = facade_class.return_value
+                facade.hello.return_value = hello_result
+                facade.hello.side_effect = hello_error
+
+                installed, _message, _version = RustDumpChecker.check_installation()
+
+        assert installed is expected_installed
+        shutdown_owned.assert_called_once_with(facade, True)
 
     def test_check_installation_always_boundedly_shuts_down_dedicated_facade(self):
         from src.core.db_core_service import DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
@@ -540,10 +607,9 @@ class TestRustDumpExporter:
         from src.exporters import rust_dump_exporter
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
 
-        residual = DbCoreServiceError(
+        residual = _service_error(
             "owner still alive",
             code="db_core_residual_process",
-            request_kind=DbCoreRequestKind.MUTATION,
             outcome=DbCoreOutcome.FAILED,
         )
 
@@ -575,7 +641,7 @@ class TestRustDumpExporter:
         from src.core.db_core_service import DbCoreOutcome, DbCoreServiceError
         from src.exporters.rust_dump_exporter import _shutdown_owned_facade
 
-        residual = DbCoreServiceError(
+        residual = _service_error(
             "owner still alive",
             code="db_core_residual_process",
             outcome=DbCoreOutcome.FAILED,
@@ -922,7 +988,7 @@ class TestRustDumpImporter:
 
         class FakeFacade:
             def import_dump(self, payload, on_event=None):
-                raise DbCoreServiceError(
+                raise _service_error(
                     "export_invalid: users: missing chunk_sha256; "
                     "table users has chunks but no chunk_sha256 metadata"
                 )

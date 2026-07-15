@@ -2,8 +2,26 @@
 MySQLConnector 및 MetadataCache 단위 테스트
 """
 import time
+from dataclasses import dataclass
 import pytest
 from unittest.mock import MagicMock, patch, call
+
+import src.core.db_core_service as db_core_service
+
+
+@dataclass(frozen=True)
+class _ExpectedConnectionHandle:
+    connection_id: str
+    process_generation: int
+
+
+def _connection_handle(connection_id="conn-1", process_generation=1):
+    handle_type = getattr(
+        db_core_service,
+        "DbCoreConnectionHandle",
+        _ExpectedConnectionHandle,
+    )
+    return handle_type(connection_id, process_generation)
 
 
 class FakeFacade:
@@ -15,13 +33,13 @@ class FakeFacade:
         if self.fail:
             raise self.fail
         self.endpoint = endpoint
-        return "conn-1"
+        return _connection_handle()
 
-    def close_connection(self, connection_id):
-        self.closed.append(connection_id)
+    def close_connection(self, connection_handle):
+        self.closed.append(connection_handle)
         return True
 
-    def execute_on_connection(self, connection_id, sql):
+    def execute_on_connection(self, connection_handle, sql):
         return []
 
 
@@ -148,6 +166,19 @@ class TestMySQLConnector:
         assert success is True
         assert '성공' in msg
         assert self.connector.connection is not None
+
+    def test_connect_and_disconnect_preserve_generation_handle(self):
+        facade = FakeFacade()
+        self.connector._delegate.facade = facade
+
+        success, _msg = self.connector.connect()
+
+        assert success is True
+        assert self.connector.connection.connection_id == _connection_handle()
+
+        self.connector.disconnect()
+
+        assert facade.closed == [_connection_handle()]
 
     def test_connect_mysql_error(self):
         """MySQL 에러 발생 시 실패 반환"""
@@ -541,3 +572,27 @@ class TestMySQLConnectorFacadeUnification:
             assert connector.facade is sentinel
             _, kwargs = mock_rust_connector.call_args
             assert kwargs['facade'] is sentinel
+
+
+def test_postgres_connector_preserves_generation_handle_compatibility():
+    from src.core.postgres_connector import PostgresConnector
+
+    facade = FakeFacade()
+    connector = PostgresConnector(
+        "db.local",
+        5432,
+        "postgres",
+        "secret",
+        "postgres",
+        facade=facade,
+    )
+
+    success, message = connector.connect()
+
+    assert success is True
+    assert message == "연결 성공"
+    assert connector.connection.connection_id == _connection_handle()
+
+    connector.disconnect()
+
+    assert facade.closed == [_connection_handle()]

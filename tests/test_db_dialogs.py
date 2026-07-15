@@ -4,9 +4,27 @@ from unittest.mock import MagicMock
 import pytest
 from PyQt6.QtWidgets import QApplication, QDialog
 
+from src.core.db_core_service import (
+    DbCoreOutcome,
+    DbCoreRequestKind,
+    DbCoreServiceError,
+)
 from src.ui.dialogs.db_dialogs import RustDumpWizard
 from src.exporters.rust_dump_exporter import RustDumpConfig
 from src.ui.workers.rust_dump_worker import RustDumpWorker
+
+
+def _service_error(message, *, code, outcome):
+    return DbCoreServiceError(
+        message,
+        code=code,
+        request_kind=DbCoreRequestKind.MUTATION,
+        outcome=outcome,
+        request_id="test-request",
+        process_generation=1,
+        rust_code=None,
+        payload={},
+    )
 
 def test_preselected_export_tunnel_passes_mysql_default_database(monkeypatch):
     captured = {}
@@ -129,11 +147,11 @@ def _make_worker_with_fake_runner(owns_facade: bool):
     client = FakeClient()
     runner = FakeRunner(FakeFacade(client), owns_facade)
     worker._active_runner = runner
-    return worker, client
+    return worker, runner, client
 
 
 def test_rust_dump_worker_cancel_terminates_owned_dedicated_process():
-    worker, client = _make_worker_with_fake_runner(owns_facade=True)
+    worker, _runner, client = _make_worker_with_fake_runner(owns_facade=True)
 
     result = worker.cancel()
 
@@ -142,7 +160,7 @@ def test_rust_dump_worker_cancel_terminates_owned_dedicated_process():
     assert client.cancel_calls == [5.0]
 
 def test_rust_dump_worker_cancel_does_not_touch_shared_facade_process():
-    worker, client = _make_worker_with_fake_runner(owns_facade=False)
+    worker, _runner, client = _make_worker_with_fake_runner(owns_facade=False)
 
     result = worker.cancel()
 
@@ -157,6 +175,8 @@ def test_rust_dump_worker_cancel_has_no_private_process_access():
     assert "_process" not in source
     assert ".poll(" not in source
     assert ".terminate(" not in source
+    assert "_owns_facade" in source
+    assert "cancel_active_request" in source
 
 
 def test_rust_dump_worker_retains_failed_runner_until_explicit_retry():
@@ -166,12 +186,12 @@ def test_rust_dump_worker_retains_failed_runner_until_explicit_retry():
         retain_db_core_facade_for_retry,
     )
 
-    residual = DbCoreServiceError(
+    residual = _service_error(
         "owner still alive",
         code="db_core_residual_process",
         outcome=DbCoreOutcome.FAILED,
     )
-    worker, client = _make_worker_with_fake_runner(owns_facade=True)
+    worker, _runner, client = _make_worker_with_fake_runner(owns_facade=True)
     worker.task_type = "noop"
     runner = worker._active_runner
     retain_db_core_facade_for_retry(runner.facade)
