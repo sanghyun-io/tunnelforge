@@ -89,16 +89,31 @@ def test_oneclick_dry_run_evidence_accepts_complete_report(tmp_path):
     assert summary == {"issue": 137, "phase_events": 5, "progress_events": 6}
 
 
-def test_oneclick_dry_run_evidence_allows_current_limited_real_execution_flag(tmp_path):
+@pytest.mark.parametrize("value", [True, "false", 0, None])
+def test_oneclick_dry_run_evidence_requires_real_execution_flag_false(tmp_path, value):
     validator = _load_validator()
     evidence = _valid_evidence()
-    evidence["feature_flags"]["oneclick_real_execution_enabled"] = True
+    evidence["feature_flags"]["oneclick_real_execution_enabled"] = value
     report = tmp_path / "oneclick-evidence.json"
     report.write_text(json.dumps(evidence), encoding="utf-8")
 
-    summary = validator.validate_report(report)
+    with pytest.raises(validator.EvidenceError) as exc_info:
+        validator.validate_report(report)
 
-    assert summary["issue"] == 137
+    assert str(exc_info.value) == "feature_flags.oneclick_real_execution_enabled must be false"
+
+
+def test_oneclick_dry_run_evidence_requires_real_execution_flag_present(tmp_path):
+    validator = _load_validator()
+    evidence = _valid_evidence()
+    del evidence["feature_flags"]["oneclick_real_execution_enabled"]
+    report = tmp_path / "oneclick-evidence.json"
+    report.write_text(json.dumps(evidence), encoding="utf-8")
+
+    with pytest.raises(validator.EvidenceError) as exc_info:
+        validator.validate_report(report)
+
+    assert str(exc_info.value) == "feature_flags.oneclick_real_execution_enabled must be false"
 
 
 def test_oneclick_dry_run_evidence_rejects_real_execution(tmp_path):

@@ -74,11 +74,8 @@ def validate_report(report_path: Path | str) -> Dict[str, Any]:
 
     flags = _require_mapping(report.get("feature_flags"), "feature_flags")
     _require_bool(flags.get("oneclick_ui_enabled"), "feature_flags.oneclick_ui_enabled")
-    if "oneclick_real_execution_enabled" in flags and not isinstance(
-        flags.get("oneclick_real_execution_enabled"),
-        bool,
-    ):
-        raise EvidenceError("feature_flags.oneclick_real_execution_enabled must be boolean")
+    if flags.get("oneclick_real_execution_enabled") is not False:
+        raise EvidenceError("feature_flags.oneclick_real_execution_enabled must be false")
 
     hello = _require_mapping(report.get("service_hello"), "service_hello")
     capabilities = {str(item) for item in hello.get("capabilities") or []}

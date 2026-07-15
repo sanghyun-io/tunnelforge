@@ -16,11 +16,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.db_core_service import DbCoreFacade, DbEndpoint  # noqa: E402
-from src.ui.dialogs.migration_dialogs import ONE_CLICK_MIGRATION_FEATURE_ENABLED  # noqa: E402
-from src.ui.dialogs.oneclick_migration_dialog import ONECLICK_REAL_EXECUTION_ENABLED  # noqa: E402
-
-
 DEFAULT_SCHEMA = "tf_oneclick_real_execution"
 DEFAULT_TABLE = "tf_oneclick_legacy_engine_table"
 SAFE_ONECLICK_IDENTIFIER_RE = re.compile(r"^tf_oneclick_[A-Za-z0-9_]+$")
@@ -41,6 +36,12 @@ class OneClickRealExecutionCaptureDisabled(RuntimeError):
 def _require_real_execution_capture_enabled() -> None:
     if not ONECLICK_REAL_EXECUTION_CAPTURE_ENABLED:
         raise OneClickRealExecutionCaptureDisabled()
+
+
+def _load_db_core_types():
+    from src.core.db_core_service import DbCoreFacade, DbEndpoint
+
+    return DbCoreFacade, DbEndpoint
 
 
 def _run_checked(args: List[str]) -> None:
@@ -109,6 +110,9 @@ def build_evidence_report(
     after_tables: List[Dict[str, Any]],
     source_type: str = "local_mysql_container",
 ) -> Dict[str, Any]:
+    from src.ui.dialogs.migration_dialogs import ONE_CLICK_MIGRATION_FEATURE_ENABLED
+    from src.ui.dialogs.oneclick_migration_dialog import ONECLICK_REAL_EXECUTION_ENABLED
+
     attempted_fix_types = [
         str(item.get("issue_type"))
         for item in apply_result.get("applied_fixes") or []
@@ -197,6 +201,7 @@ def capture_oneclick_real_execution(
     table: str,
 ) -> Dict[str, Any]:
     _require_real_execution_capture_enabled()
+    DbCoreFacade, DbEndpoint = _load_db_core_types()
     _require_safe_oneclick_identifier(schema, "schema")
     _require_safe_oneclick_identifier(table, "table")
 
