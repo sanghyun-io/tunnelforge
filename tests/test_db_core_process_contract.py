@@ -2895,6 +2895,108 @@ def test_cancel_cleanup_deadline_is_earliest_active_cancel_or_cleanup_cap(
     assert client.generation_state is DbCoreGenerationState.CLOSED
 
 
+def test_cancel_active_at_exhausted_deadline_settles_task_and_reaps_process():
+    clock = FakeClock()
+    process = _Task4Process()
+    process.wait = None
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+        monotonic=clock.monotonic,
+    )
+    client.start()
+    task_settled = threading.Event()
+
+    async def exercise():
+        async def active_request():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                task_settled.set()
+
+        task = asyncio.create_task(active_request())
+        await asyncio.sleep(0)
+        client._active_request_task = task
+        client._active_request_deadline_at = clock.monotonic()
+        try:
+            return await client._cancel_active_on_owner(clock.monotonic() + 1.0)
+        finally:
+            client._active_request_task = None
+            client._active_request_deadline_at = None
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    future = client._submit_owner(
+        exercise(),
+        DbCoreRequestKind.MUTATION,
+        "cancel-active-at-exhausted-deadline",
+    )
+    try:
+        assert future.result(timeout=1.0) is True
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert task_settled.is_set()
+    assert process.terminate_calls == 1
+    assert client._process is None
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+
+
+def test_cancel_active_task_residual_still_reaps_process():
+    clock = FakeClock()
+    process = _Task4Process()
+    process.wait = None
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+        monotonic=clock.monotonic,
+    )
+    client.start()
+
+    async def exercise():
+        release = asyncio.Event()
+
+        async def resistant_request():
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+        task = asyncio.create_task(resistant_request())
+        await asyncio.sleep(0)
+        client._active_request_task = task
+        client._active_request_deadline_at = clock.monotonic()
+        try:
+            with pytest.raises(DbCoreServiceError) as raised:
+                await client._cancel_active_on_owner(clock.monotonic() + 1.0)
+            assert process.terminate_calls == 1
+            assert client._process is None
+            assert client.generation_state is DbCoreGenerationState.CLOSED
+            return raised.value
+        finally:
+            release.set()
+            client._active_request_task = None
+            client._active_request_deadline_at = None
+            await asyncio.gather(task, return_exceptions=True)
+
+    future = client._submit_owner(
+        exercise(),
+        DbCoreRequestKind.MUTATION,
+        "cancel-resistant-active-at-exhausted-deadline",
+    )
+    try:
+        error = future.result(timeout=1.0)
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert error.code == "db_core_residual_process"
+    assert error.payload["stage"] == "request_cancel"
+    assert error.payload["pending_tasks"]
+
+
 def test_cleanup_close_stdin_failure_still_reaps_child():
     process = _Task4Process(fail_close=True)
     client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))

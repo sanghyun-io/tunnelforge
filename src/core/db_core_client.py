@@ -730,6 +730,21 @@ class DbCoreServiceClient:
     async def _await_before(self, awaitable, cutoff_at: float):
         return await asyncio.wait_for(awaitable, timeout=self._remaining(cutoff_at))
 
+    async def _settle_cancelled_task_before(
+        self,
+        task: asyncio.Task,
+        cutoff_at: float,
+    ) -> None:
+        if not task.done():
+            await asyncio.sleep(0)
+        if task.done():
+            await asyncio.shield(task)
+            return
+        await asyncio.wait_for(
+            asyncio.shield(task),
+            timeout=self._remaining(cutoff_at),
+        )
+
     def _cleanup_deadline_on_owner(self, *deadlines: float) -> float:
         return min(
             *deadlines,
@@ -2054,20 +2069,45 @@ class DbCoreServiceClient:
         ):
             self._transition_generation(DbCoreGenerationState.POISONED)
         task.cancel()
+        settlement_error: Optional[BaseException] = None
         try:
-            await asyncio.wait_for(
-                asyncio.shield(task),
-                timeout=self._remaining(cleanup_deadline),
-            )
-        except (asyncio.CancelledError, DbCoreServiceError):
+            await self._settle_cancelled_task_before(task, cleanup_deadline)
+        except asyncio.CancelledError as exc:
+            if not task.done():
+                settlement_error = exc
+        except DbCoreServiceError:
             pass
         except asyncio.TimeoutError as exc:
-            raise self._residual_process_error(
+            settlement_error = self._residual_process_error(
                 "request_cancel",
                 "DB Core active request did not cancel before the deadline",
                 pending_tasks=[self._task_diagnostic(task)],
-            ) from exc
-        await self._terminate_process_on_owner(cleanup_deadline)
+            )
+            settlement_error.__cause__ = exc
+        except BaseException as exc:
+            settlement_error = exc
+        try:
+            await self._terminate_process_on_owner(cleanup_deadline)
+        except BaseException as cleanup_exception:
+            if isinstance(settlement_error, DbCoreServiceError):
+                if isinstance(cleanup_exception, DbCoreServiceError):
+                    cleanup_error = cleanup_exception
+                else:
+                    cleanup_error = DbCoreServiceError(
+                        f"DB Core cleanup failed: {type(cleanup_exception).__name__}: "
+                        f"{cleanup_exception}",
+                        code="db_core_cleanup_failed",
+                        outcome=DbCoreOutcome.FAILED,
+                        process_generation=self._process_generation,
+                    )
+                    cleanup_error.__cause__ = cleanup_exception
+                self._attach_cleanup_error(settlement_error, cleanup_error)
+                raise settlement_error
+            if settlement_error is not None:
+                raise cleanup_exception from settlement_error
+            raise
+        if settlement_error is not None:
+            raise settlement_error
         return True
 
     def cancel_active_request(
