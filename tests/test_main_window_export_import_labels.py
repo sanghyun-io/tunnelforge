@@ -4,6 +4,8 @@ import sys
 from pathlib import Path
 from unittest.mock import MagicMock
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtWidgets import QApplication
@@ -29,6 +31,36 @@ AUTO_START_METHODS = (
     "_context_rust_core_import",
     "_context_orphan_check",
 )
+
+
+class _TrustPathConfigManager:
+    def __init__(self, events):
+        self.events = events
+
+    def get_tunnel_credentials(self, tunnel_id):
+        self.events.append("credentials")
+        return "db-user", "db-password"
+
+
+class _TrustPathWindow:
+    def __init__(self, events):
+        self.events = events
+        self.engine = MagicMock()
+        self.config_mgr = _TrustPathConfigManager(events)
+        self._wizard_launcher = MagicMock()
+        for action in ("start_export", "start_import", "start_orphan_check"):
+            self._wizard_launcher._launch_rust_dump_wizard.configure_mock()
+
+    def _require_db_credentials(self, tunnel):
+        return TunnelManagerUI._require_db_credentials(self, tunnel)
+
+    def _ensure_tunnel_running(self, tunnel, *, prompt=False):
+        self.events.append("tunnel")
+        return True
+
+
+def _invoke_interactive_path(window, method_name, tunnel):
+    getattr(TunnelManagerUI, method_name)(window, tunnel)
 
 
 def test_main_window_export_import_labels_match_rust_core_implementation():
@@ -66,6 +98,129 @@ def test_auto_start_paths_route_through_ensure_tunnel_running():
         source = inspect.getsource(getattr(TunnelManagerUI, name))
         assert "_ensure_tunnel_running" in source, f"{name}가 _ensure_tunnel_running을 사용하지 않음"
         assert ".engine.start_tunnel(" not in source, f"{name}가 engine.start_tunnel을 직접 호출함"
+
+
+@pytest.mark.parametrize("method_name", AUTO_START_METHODS)
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("unknown_declined", "changed", "cancelled", "approval_race"),
+)
+def test_main_window_interactive_paths_fail_before_credentials_or_actions(
+    monkeypatch, method_name, failure_mode
+):
+    events = []
+    window = _TrustPathWindow(events)
+    tunnel = {
+        "id": "ssh-1",
+        "name": "SSH",
+        "connection_mode": "ssh_tunnel",
+    }
+
+    def reject_trust(parent, engine, config):
+        events.append(f"trust:{failure_mode}")
+        return False
+
+    class BlockedDialog:
+        def __init__(self, *args, **kwargs):
+            events.append("dialog")
+            self.radio_tunnel = MagicMock()
+            self.combo_tunnel = MagicMock()
+            self.combo_tunnel.count.return_value = 0
+
+        def on_mode_changed(self):
+            pass
+
+        def exec(self):
+            pass
+
+    monkeypatch.setattr(main_window, "ensure_ssh_host_trusted", reject_trust)
+    monkeypatch.setattr("src.ui.dialogs.db_dialogs.DBConnectionDialog", BlockedDialog)
+    monkeypatch.setattr(main_window, "SQLEditorDialog", BlockedDialog)
+    window._wizard_launcher._launch_rust_dump_wizard.side_effect = (
+        lambda *args: events.append("wizard")
+    )
+
+    _invoke_interactive_path(window, method_name, tunnel)
+
+    assert events == [f"trust:{failure_mode}"]
+    window._wizard_launcher._launch_rust_dump_wizard.assert_not_called()
+
+
+@pytest.mark.parametrize("method_name", AUTO_START_METHODS)
+def test_main_window_interactive_paths_approve_before_credentials_and_action(
+    monkeypatch, method_name
+):
+    events = []
+    window = _TrustPathWindow(events)
+    tunnel = {
+        "id": "ssh-1",
+        "name": "SSH",
+        "connection_mode": "ssh_tunnel",
+    }
+
+    monkeypatch.setattr(
+        main_window,
+        "ensure_ssh_host_trusted",
+        lambda *args: events.append("trust") or True,
+    )
+
+    class FakeRadio:
+        def setChecked(self, checked):
+            pass
+
+    class FakeCombo:
+        def count(self):
+            return 0
+
+    class FakeDBConnectionDialog:
+        def __init__(self, *args, **kwargs):
+            self.radio_tunnel = FakeRadio()
+            self.combo_tunnel = FakeCombo()
+            events.append("dialog")
+
+        def on_mode_changed(self):
+            pass
+
+        def exec(self):
+            pass
+
+    class FakeSQLEditorDialog:
+        def __init__(self, *args, **kwargs):
+            events.append("dialog")
+
+        def exec(self):
+            pass
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_dialogs.DBConnectionDialog", FakeDBConnectionDialog
+    )
+    monkeypatch.setattr(main_window, "SQLEditorDialog", FakeSQLEditorDialog)
+    window._wizard_launcher._launch_rust_dump_wizard.side_effect = (
+        lambda *args: events.append("wizard")
+    )
+
+    _invoke_interactive_path(window, method_name, tunnel)
+
+    assert events[:3] == ["trust", "credentials", "tunnel"]
+    assert events[3] in ("dialog", "wizard")
+
+
+def test_main_window_direct_path_bypasses_ssh_probe_and_continues():
+    events = []
+    window = _TrustPathWindow(events)
+    window._wizard_launcher._launch_rust_dump_wizard.side_effect = (
+        lambda *args: events.append("wizard")
+    )
+    tunnel = {
+        "id": "direct-1",
+        "name": "Direct",
+        "connection_mode": "direct",
+    }
+
+    TunnelManagerUI._context_rust_core_export(window, tunnel)
+
+    window.engine.inspect_ssh_server.assert_not_called()
+    assert events == ["credentials", "tunnel", "wizard"]
 
 
 # --- 2. _ensure_tunnel_running이 start_tunnel에 위임하는지 ---

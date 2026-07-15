@@ -1465,6 +1465,116 @@ def test_tunnel_selection_fills_endpoint_fields_from_configured_list():
         dialog.close()
 
 
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("unknown_declined", "changed", "cancelled", "approval_race"),
+)
+def test_cross_engine_selection_fails_before_credentials(monkeypatch, failure_mode):
+    events = []
+    config = {
+        "id": "ssh-source",
+        "name": "SSH Source",
+        "connection_mode": "ssh_tunnel",
+        "remote_host": "db.internal",
+        "remote_port": 3306,
+        "local_port": 3307,
+        "db_engine": "mysql",
+    }
+
+    class Engine:
+        tunnel_configs = {"ssh-source": config}
+
+        def get_active_tunnels(self):
+            return []
+
+        def is_running(self, tunnel_id):
+            return False
+
+        def start_tunnel(self, started_config):
+            raise AssertionError("blocked selection must not start a tunnel")
+
+    class ConfigManager:
+        def load_config(self):
+            return {"tunnels": [config]}
+
+        def get_tunnel_credentials(self, tunnel_id):
+            events.append("credentials")
+            return "should-not-load", "should-not-load"
+
+    monkeypatch.setattr(
+        endpoint_form_module,
+        "ensure_ssh_host_trusted",
+        lambda *args: events.append(f"trust:{failure_mode}") or False,
+    )
+    form = EndpointForm(
+        "Source",
+        DatabaseEngine.MYSQL,
+        tunnel_engine=Engine(),
+        config_manager=ConfigManager(),
+        require_tunnel=True,
+    )
+    try:
+        form.combo_tunnel.setCurrentIndex(1)
+
+        assert events == [f"trust:{failure_mode}"]
+        assert form.input_user.text() == ""
+        assert form.input_password.text() == ""
+    finally:
+        form.close()
+
+
+def test_cross_engine_selection_approves_before_credentials(monkeypatch):
+    events = []
+    config = {
+        "id": "ssh-source",
+        "name": "SSH Source",
+        "connection_mode": "ssh_tunnel",
+        "remote_host": "db.internal",
+        "remote_port": 3306,
+        "local_port": 3307,
+        "db_engine": "mysql",
+    }
+
+    class Engine:
+        tunnel_configs = {"ssh-source": config}
+
+        def get_active_tunnels(self):
+            return []
+
+        def is_running(self, tunnel_id):
+            return False
+
+    class ConfigManager:
+        def load_config(self):
+            return {"tunnels": [config]}
+
+        def get_tunnel_credentials(self, tunnel_id):
+            events.append("credentials")
+            return "db-user", "db-password"
+
+    engine = Engine()
+    monkeypatch.setattr(
+        endpoint_form_module,
+        "ensure_ssh_host_trusted",
+        lambda parent, checked_engine, checked_config: events.append("trust") or True,
+    )
+    form = EndpointForm(
+        "Source",
+        DatabaseEngine.MYSQL,
+        tunnel_engine=engine,
+        config_manager=ConfigManager(),
+        require_tunnel=True,
+    )
+    try:
+        form.combo_tunnel.setCurrentIndex(1)
+
+        assert events == ["trust", "credentials"]
+        assert form.input_user.text() == "db-user"
+        assert form.input_password.text() == "db-password"
+    finally:
+        form.close()
+
+
 def test_cross_engine_endpoint_checks_trust_before_starting_selected_tunnel(
     monkeypatch,
 ):
@@ -1505,6 +1615,7 @@ def test_cross_engine_endpoint_checks_trust_before_starting_selected_tunnel(
             return {"tunnels": [config]}
 
         def get_tunnel_credentials(self, tunnel_id):
+            events.append("credentials")
             return "db-user", "db-password"
 
     engine = Engine()
@@ -1515,8 +1626,6 @@ def test_cross_engine_endpoint_checks_trust_before_starting_selected_tunnel(
         config_manager=ConfigManager(),
         require_tunnel=True,
     )
-    form.combo_tunnel.setCurrentIndex(1)
-
     def ensure(parent, checked_engine, checked_config):
         events.append("trust")
         assert parent is form
@@ -1528,8 +1637,9 @@ def test_cross_engine_endpoint_checks_trust_before_starting_selected_tunnel(
         endpoint_form_module, "ensure_ssh_host_trusted", ensure, raising=False
     )
     try:
+        form.combo_tunnel.setCurrentIndex(1)
         form.payload(prepare_tunnel=True)
-        assert events == ["trust", "start"]
+        assert events == ["trust", "credentials", "trust", "start"]
     finally:
         form.close()
 
@@ -1572,7 +1682,6 @@ def test_cross_engine_endpoint_declined_trust_never_starts_tunnel(monkeypatch):
         config_manager=ConfigManager(),
         require_tunnel=True,
     )
-    form.combo_tunnel.setCurrentIndex(1)
     monkeypatch.setattr(
         endpoint_form_module,
         "ensure_ssh_host_trusted",
@@ -1580,6 +1689,7 @@ def test_cross_engine_endpoint_declined_trust_never_starts_tunnel(monkeypatch):
         raising=False,
     )
     try:
+        form.combo_tunnel.setCurrentIndex(1)
         with pytest.raises(ValueError, match="SSH 호스트 키"):
             form.payload(prepare_tunnel=True)
     finally:

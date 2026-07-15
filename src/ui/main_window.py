@@ -368,6 +368,8 @@ class TunnelManagerUI(QMainWindow):
     # --- 트리 위젯 시그널 핸들러 ---
     def _on_tree_db_connect(self, tunnel):
         """트리에서 DB 연결 요청 - DB 연결 다이얼로그 열기"""
+        if not ensure_ssh_host_trusted(self, self.engine, tunnel):
+            return
         if self._require_db_credentials(tunnel) is None:
             return
 
@@ -1193,6 +1195,8 @@ class TunnelManagerUI(QMainWindow):
 
     def open_sql_editor(self, tunnel):
         """SQL 에디터 다이얼로그 열기"""
+        if not ensure_ssh_host_trusted(self, self.engine, tunnel):
+            return
         if self._require_db_credentials(tunnel) is None:
             return
 
@@ -1205,6 +1209,8 @@ class TunnelManagerUI(QMainWindow):
 
     def _context_rust_core_export(self, tunnel):
         """특정 터널용 Rust DB Core Export - 인증정보 자동 사용"""
+        if not ensure_ssh_host_trusted(self, self.engine, tunnel):
+            return
         if self._require_db_credentials(tunnel) is None:
             return
 
@@ -1216,6 +1222,8 @@ class TunnelManagerUI(QMainWindow):
 
     def _context_rust_core_import(self, tunnel):
         """특정 터널용 Rust DB Core Import - 인증정보 자동 사용"""
+        if not ensure_ssh_host_trusted(self, self.engine, tunnel):
+            return
         if self._require_db_credentials(tunnel) is None:
             return
 
@@ -1227,6 +1235,8 @@ class TunnelManagerUI(QMainWindow):
 
     def _context_orphan_check(self, tunnel):
         """특정 터널용 고아 레코드 분석 - 인증정보 자동 사용"""
+        if not ensure_ssh_host_trusted(self, self.engine, tunnel):
+            return
         if self._require_db_credentials(tunnel) is None:
             return
 

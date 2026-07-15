@@ -189,9 +189,19 @@ class EndpointForm(QGroupBox):
         data = self.combo_tunnel.currentData()
         if not data:
             return
+        if not self._ensure_selected_tunnel_trusted(data):
+            self.input_user.clear()
+            self.input_password.clear()
+            return
         self._apply_tunnel_data(data)
 
-    def _apply_tunnel_data(self, data: Dict):
+    def _ensure_selected_tunnel_trusted(self, data: Dict) -> bool:
+        config = data.get("config") or {}
+        if not config:
+            return False
+        return ensure_ssh_host_trusted(self, self.tunnel_engine, config)
+
+    def _apply_tunnel_data(self, data: Dict, *, load_credentials: bool = True):
         host = data.get("host")
         port = data.get("port")
         config = data.get("config") or {}
@@ -215,7 +225,7 @@ class EndpointForm(QGroupBox):
         if schema and (config.get("default_schema") or not self.input_schema.text().strip()):
             self.input_schema.setText(schema)
 
-        if self.config_manager:
+        if load_credentials and self.config_manager:
             db_user, db_password = self.config_manager.get_tunnel_credentials(data["tunnel_id"])
             if db_user:
                 self.input_user.setText(db_user)
@@ -279,11 +289,18 @@ class EndpointForm(QGroupBox):
 
         config = data.get("config") or {}
         tid = data.get("tunnel_id")
-        if self.tunnel_engine and config and tid and not self.tunnel_engine.is_running(tid):
-            if not ensure_ssh_host_trusted(self, self.tunnel_engine, config):
-                raise ValueError(
-                    translate_text("SSH 호스트 키 승인이 완료되지 않았습니다.")
-                )
+        if not self._ensure_selected_tunnel_trusted(data):
+            raise ValueError(
+                translate_text("SSH 호스트 키 승인이 완료되지 않았습니다.")
+            )
+        is_direct = config.get("connection_mode") == "direct"
+        if (
+            self.tunnel_engine
+            and config
+            and tid
+            and not is_direct
+            and not self.tunnel_engine.is_running(tid)
+        ):
             success, message = self.tunnel_engine.start_tunnel(config)
             if not success:
                 raise ValueError(f"{self.title()} 터널 시작 실패: {message}")
@@ -292,7 +309,7 @@ class EndpointForm(QGroupBox):
                 data["host"] = host
                 data["port"] = int(port)
 
-        self._apply_tunnel_data(data)
+        self._apply_tunnel_data(data, load_credentials=False)
 
     def engine(self) -> DatabaseEngine:
         return DatabaseEngine(self.combo_engine.currentData())

@@ -3,12 +3,15 @@ import os
 import sys
 from unittest.mock import MagicMock
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
 from src.core.sql_validator import SchemaMetadata
+from src.ui.dialogs import sql_editor_dialog as sql_editor_module
 from src.ui.dialogs.sql_editor_dialog import (
     LARGE_SQL_RENDER_LIMIT_BYTES,
     SQLEditorDialog,
@@ -18,6 +21,7 @@ from src.ui.dialogs.sql_editor_dialog import (
 
 
 app = QApplication.instance() or QApplication(sys.argv)
+ORIGINAL_REFRESH_DATABASES = SQLEditorDialog.refresh_databases
 
 
 # =====================================================================
@@ -177,6 +181,148 @@ def close_dialog(dialog):
         if tab:
             tab.is_modified = False
     dialog.close()
+
+
+def _ssh_editor_config():
+    return {
+        "id": "ssh-editor",
+        "name": "SSH Editor",
+        "connection_mode": "ssh_tunnel",
+        "remote_host": "db.internal",
+        "remote_port": 3306,
+        "local_port": 3307,
+        "db_engine": "mysql",
+        "environment": "development",
+    }
+
+
+def _make_ssh_editor(monkeypatch, ensure_result=True):
+    monkeypatch.setattr(
+        sql_editor_module,
+        "ensure_ssh_host_trusted",
+        MagicMock(return_value=ensure_result),
+        raising=False,
+    )
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", lambda self: None)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("db-user", "db-password")
+    engine = MagicMock()
+    engine.is_running.return_value = False
+    dialog = SQLEditorDialog(
+        None, _ssh_editor_config(), config_manager, engine
+    )
+    return dialog, config_manager, engine
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("unknown_declined", "changed", "cancelled", "approval_race"),
+)
+def test_sql_editor_constructor_fails_closed_before_credentials(
+    monkeypatch, failure_mode
+):
+    ensure = MagicMock(return_value=False, name=failure_mode)
+    monkeypatch.setattr(
+        sql_editor_module, "ensure_ssh_host_trusted", ensure, raising=False
+    )
+    refresh = MagicMock()
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", refresh)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.side_effect = AssertionError(
+        "blocked editor must not decrypt credentials"
+    )
+    engine = MagicMock()
+
+    dialog = SQLEditorDialog(
+        None, _ssh_editor_config(), config_manager, engine
+    )
+    try:
+        ensure.assert_called()
+        config_manager.get_tunnel_credentials.assert_not_called()
+        engine.create_temp_tunnel.assert_not_called()
+        refresh.assert_not_called()
+    finally:
+        close_dialog(dialog)
+
+
+def test_sql_editor_constructor_approves_before_credentials(monkeypatch):
+    events = []
+    monkeypatch.setattr(
+        sql_editor_module,
+        "ensure_ssh_host_trusted",
+        lambda *args: events.append("trust") or True,
+        raising=False,
+    )
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", lambda self: None)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.side_effect = (
+        lambda tunnel_id: events.append("credentials") or ("db-user", "db-password")
+    )
+    engine = MagicMock()
+
+    dialog = SQLEditorDialog(
+        None, _ssh_editor_config(), config_manager, engine
+    )
+    try:
+        assert events[:2] == ["trust", "credentials"]
+    finally:
+        close_dialog(dialog)
+
+
+@pytest.mark.parametrize(
+    "method_name",
+    ("refresh_databases", "_ensure_connection", "_execute_with_autocommit", "_load_metadata"),
+)
+def test_sql_editor_actions_fail_before_credentials_temp_tunnel_or_worker(
+    monkeypatch, method_name
+):
+    dialog, config_manager, engine = _make_ssh_editor(monkeypatch, ensure_result=True)
+    try:
+        config_manager.reset_mock()
+        engine.reset_mock()
+        monkeypatch.setattr(
+            sql_editor_module,
+            "ensure_ssh_host_trusted",
+            MagicMock(return_value=False),
+            raising=False,
+        )
+
+        if method_name == "refresh_databases":
+            ORIGINAL_REFRESH_DATABASES(dialog)
+        elif method_name == "_execute_with_autocommit":
+            dialog._execute_with_autocommit(["SELECT 1"], "SELECT 1")
+        elif method_name == "_load_metadata":
+            dialog._load_metadata("testdb")
+        else:
+            dialog._ensure_connection()
+
+        config_manager.get_tunnel_credentials.assert_not_called()
+        engine.create_temp_tunnel.assert_not_called()
+        assert dialog.worker is None
+    finally:
+        close_dialog(dialog)
+
+
+def test_sql_editor_target_resolution_fails_closed_before_temp_tunnel(monkeypatch):
+    dialog, config_manager, engine = _make_ssh_editor(monkeypatch, ensure_result=True)
+    try:
+        monkeypatch.setattr(
+            sql_editor_module,
+            "ensure_ssh_host_trusted",
+            MagicMock(return_value=False),
+            raising=False,
+        )
+        engine.reset_mock()
+
+        host, port, temp_server, error = dialog._resolve_db_target(
+            allow_temp_tunnel=True
+        )
+
+        assert (host, port, temp_server) == (None, None, None)
+        assert error
+        engine.create_temp_tunnel.assert_not_called()
+    finally:
+        close_dialog(dialog)
 
 
 def test_message_panel_is_separate_from_result_tabs(monkeypatch):

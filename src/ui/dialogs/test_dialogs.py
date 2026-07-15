@@ -10,6 +10,7 @@ from PyQt6.QtCore import Qt
 
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 from src.core.logger import get_logger
+from src.ui.dialogs.ssh_host_key_dialog import ensure_ssh_host_trusted
 
 logger = get_logger(__name__)
 
@@ -25,6 +26,7 @@ class SQLExecutionDialog(QDialog):
         self.worker = None
         self.temp_server = None
         self.sql_file = None
+        self._trust_ready = self._ensure_ssh_trusted()
 
         self.setWindowTitle(f"SQL 파일 실행 - {self.config.get('name', 'Unknown')}")
         self.setMinimumSize(600, 500)
@@ -37,8 +39,10 @@ class SQLExecutionDialog(QDialog):
         conn_group = QGroupBox("연결 정보")
         conn_layout = QVBoxLayout(conn_group)
 
-        tid = self.config.get('id')
-        db_user, _ = self.config_mgr.get_tunnel_credentials(tid)
+        db_user = None
+        if self._trust_ready:
+            tid = self.config.get('id')
+            db_user, _ = self.config_mgr.get_tunnel_credentials(tid)
         is_direct = self.config.get('connection_mode') == 'direct'
 
         if is_direct:
@@ -156,12 +160,21 @@ class SQLExecutionDialog(QDialog):
 
     def _update_execute_button(self):
         """실행 버튼 활성화 상태 업데이트"""
+        if not self._ensure_ssh_trusted():
+            self.btn_execute.setEnabled(False)
+            return
         tid = self.config.get('id')
         db_user, _ = self.config_mgr.get_tunnel_credentials(tid)
         self.btn_execute.setEnabled(bool(self.sql_file and db_user))
 
+    def _ensure_ssh_trusted(self) -> bool:
+        self._trust_ready = ensure_ssh_host_trusted(self, self.engine, self.config)
+        return self._trust_ready
+
     def _resolve_connection(self) -> Optional[tuple[str, int, Optional[Any]]]:
         """현재 설정에서 SQL/스키마 조회용 접속 정보를 해석한다."""
+        if not self._ensure_ssh_trusted():
+            return None
         tid = self.config.get('id')
         is_direct = self.config.get('connection_mode') == 'direct'
 
@@ -204,6 +217,8 @@ class SQLExecutionDialog(QDialog):
 
     def refresh_databases(self):
         """데이터베이스 목록 새로고침"""
+        if not self._ensure_ssh_trusted():
+            return
         tid = self.config.get('id')
         db_user, db_password = self.config_mgr.get_tunnel_credentials(tid)
 
@@ -241,6 +256,9 @@ class SQLExecutionDialog(QDialog):
 
         if not self.sql_file:
             QMessageBox.warning(self, "경고", "SQL 파일을 선택해주세요.")
+            return
+
+        if not self._ensure_ssh_trusted():
             return
 
         tid = self.config.get('id')
@@ -304,10 +322,11 @@ class SQLExecutionDialog(QDialog):
         self.output_text.append(f"\n{msg}")
         self._cleanup()
 
-    def _cleanup(self):
+    def _cleanup(self, *, update_button: bool = True):
         """정리"""
         self.progress_bar.hide()
-        self._update_execute_button()
+        if update_button:
+            self._update_execute_button()
 
         # 임시 터널 정리
         if self.temp_server:
@@ -327,12 +346,14 @@ class SQLExecutionDialog(QDialog):
                 event.ignore()
                 return
 
-        self._cleanup()
+        self._cleanup(update_button=False)
         event.accept()
 
 
 class TestProgressDialog(QDialog):
     """연결 테스트 진행 다이얼로그"""
+
+    __test__ = False
 
     def __init__(self, parent, title: str = "연결 테스트"):
         super().__init__(parent)

@@ -27,6 +27,7 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 from src.core.db_core_service import normalize_db_engine
+from src.core.i18n import translate_text
 from src.core.sql_query_classifier import (
     classify_sql_statement,
     is_mysql_implicit_commit_ddl,
@@ -50,6 +51,7 @@ from src.ui.dialogs.sql_editor_editability import (
     build_primary_key_query,
     quote_editor_identifier,
 )
+from src.ui.dialogs.ssh_host_key_dialog import ensure_ssh_host_trusted
 from src.ui.dialogs.sql_editor_workers import (
     SQLQueryWorker,
     SQLTransactionExecutionWorker,
@@ -218,6 +220,7 @@ class SQLEditorDialog(QDialog):
         self._tab_counter = 0  # 탭 번호 카운터
         self._result_counter = 0  # 결과 탭 번호 카운터
         self._message_collapsed = True
+        self._trust_ready = False
 
         # 지속 연결 (트랜잭션 세션)
         self.db_connection = None
@@ -253,13 +256,20 @@ class SQLEditorDialog(QDialog):
         self.setMinimumSize(1000, 700)
         self.init_ui()
         self.setup_shortcuts()
-        self.refresh_databases()
+        if self._trust_ready:
+            self.refresh_databases()
 
     def _db_engine(self) -> str:
         """Return the configured DB engine for Rust Core calls."""
         return normalize_db_engine(self.config.get('db_engine'), self.config.get('remote_port'))
 
-    def _db_credentials(self) -> Tuple[str, str]:
+    def _ensure_ssh_trusted(self) -> bool:
+        self._trust_ready = ensure_ssh_host_trusted(self, self.engine, self.config)
+        return self._trust_ready
+
+    def _db_credentials(self) -> Tuple[Optional[str], Optional[str]]:
+        if not self._ensure_ssh_trusted():
+            return None, None
         tid = self.config.get('id')
         return self.config_mgr.get_tunnel_credentials(tid)
 
@@ -269,6 +279,13 @@ class SQLEditorDialog(QDialog):
         keep_temp_tunnel: bool = False,
         log_temp_tunnel: bool = False,
     ) -> Tuple[Optional[str], Optional[int], object, Optional[str]]:
+        if not self._ensure_ssh_trusted():
+            return (
+                None,
+                None,
+                None,
+                translate_text("SSH 호스트 키 승인이 완료되지 않았습니다."),
+            )
         tid = self.config.get('id')
         if self.config.get('connection_mode') == 'direct':
             return self.config['remote_host'], int(self.config['remote_port']), None, None
@@ -326,8 +343,7 @@ class SQLEditorDialog(QDialog):
     def _build_connection_bar(self):
         conn_bar = QHBoxLayout()
 
-        tid = self.config.get('id')
-        db_user, _ = self.config_mgr.get_tunnel_credentials(tid)
+        db_user, _ = self._db_credentials()
         is_direct = self.config.get('connection_mode') == 'direct'
 
         if is_direct:
@@ -1126,6 +1142,8 @@ class SQLEditorDialog(QDialog):
         """자동 커밋 모드로 실행 (기존 워커 사용)"""
         db_user, db_password = self._db_credentials()
 
+        if not self._trust_ready:
+            return
         if not db_user:
             QMessageBox.warning(self, "경고", "DB 자격 증명이 설정되지 않았습니다.")
             return
