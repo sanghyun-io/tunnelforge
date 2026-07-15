@@ -74,14 +74,24 @@ not execution approval.
 | `int_display_width` | display-only skip | `skip` | Rust Core live One-Click does not synthesize `int_display_width` issues. Externally supplied display-only skip data does not execute SQL. |
 | `enum_empty_value` | manual | `manual` | Requires data cleanup policy. |
 
-## Real-Execution Capture Gate
+## Mutation Capture Gates
 
 `scripts\capture-oneclick-real-execution-evidence.py` is deliberately disabled
 during Phase A. Its independent capture gate fails before local-container
 seeding, facade construction, endpoint access, query execution, apply, or
 evidence output.
 
-The stable failure contract is:
+The archived charset mutation helpers are disabled at the same boundaries:
+
+- `scripts\capture-oneclick-charset-evidence.py`
+- `scripts\capture-oneclick-charset-derivation-evidence.py`
+
+Their CLI and callable entrypoints use this stable failure contract:
+
+- code: `oneclick_apply_disabled`
+- message: `Phase A disables One-Click charset mutation evidence capture; exact-plan approval and TF-STATUS-098 are required before DB mutation.`
+
+The real-execution helper retains its own stable failure contract:
 
 - code: `oneclick_apply_disabled`
 - message: `Phase A disables One-Click real-execution evidence capture; exact-plan approval and TF-STATUS-098 are required before DB mutation.`

@@ -21,7 +21,7 @@ def _load_validator():
     return module
 
 
-def _valid_evidence():
+def _archived_evidence():
     schema = "tf_oneclick_derive_charset"
     parent = "tf_oneclick_parent"
     child = "tf_oneclick_child"
@@ -166,9 +166,9 @@ def _write_report(tmp_path, evidence):
     return report
 
 
-def test_oneclick_charset_derivation_evidence_accepts_pyqt_triggered_run_report(tmp_path):
+def test_oneclick_charset_derivation_validator_accepts_archived_pyqt_shape(tmp_path):
     validator = _load_validator()
-    report = _write_report(tmp_path, _valid_evidence())
+    report = _write_report(tmp_path, _archived_evidence())
 
     assert validator.validate_report(report) == {
         "issue": 140,
@@ -181,7 +181,7 @@ def test_oneclick_charset_derivation_evidence_accepts_pyqt_triggered_run_report(
 
 def test_oneclick_charset_derivation_evidence_requires_derive_command(tmp_path):
     validator = _load_validator()
-    evidence = _valid_evidence()
+    evidence = _archived_evidence()
     evidence["service_hello"]["capabilities"].remove("oneclick.derive_charset_contracts")
     report = _write_report(tmp_path, evidence)
 
@@ -191,7 +191,7 @@ def test_oneclick_charset_derivation_evidence_requires_derive_command(tmp_path):
 
 def test_oneclick_charset_derivation_evidence_requires_pyqt_payload_inclusion(tmp_path):
     validator = _load_validator()
-    evidence = _valid_evidence()
+    evidence = _archived_evidence()
     evidence["pyqt_payload"]["included_charset_contracts"] = False
     report = _write_report(tmp_path, evidence)
 

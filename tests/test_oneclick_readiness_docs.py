@@ -42,6 +42,17 @@ def test_oneclick_readiness_marks_mutation_evidence_as_historical_archive():
     assert "current evidence supports exposing One-Click with dry-run default and a" not in doc
 
 
+def test_oneclick_readiness_records_charset_capture_helpers_as_phase_a_disabled():
+    doc = (PROJECT_ROOT / "docs" / "oneclick_readiness.md").read_text(encoding="utf-8")
+
+    assert "capture-oneclick-charset-evidence.py" in doc
+    assert "capture-oneclick-charset-derivation-evidence.py" in doc
+    assert (
+        "Phase A disables One-Click charset mutation evidence capture; exact-plan "
+        "approval and TF-STATUS-098 are required before DB mutation."
+    ) in doc
+
+
 def test_oneclick_evidence_readme_refreshes_only_dry_run_and_archives_mutation_evidence():
     readme = (
         PROJECT_ROOT / "reports" / "oneclick_readiness" / "README.md"
@@ -53,6 +64,7 @@ def test_oneclick_evidence_readme_refreshes_only_dry_run_and_archives_mutation_e
     assert "Phase B" in readme
     assert "exact-plan approval" in readme
     assert "TF-STATUS-098" in readme
+    assert "Each retired mutation capture command" in readme
 
     mutation_capture_scripts = [
         "capture-oneclick-real-execution-evidence.py",

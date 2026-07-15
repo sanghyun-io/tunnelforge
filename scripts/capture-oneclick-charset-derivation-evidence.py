@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Capture PyQt-triggered One-Click charset derivation evidence for GitHub #140."""
+"""Archived charset derivation evidence capture, disabled during Phase A."""
 
 from __future__ import annotations
 
@@ -16,14 +16,17 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.core.db_core_service import DbCoreFacade, DbEndpoint  # noqa: E402
-from src.ui.dialogs.oneclick_migration_dialog import OneClickMigrationWorker  # noqa: E402
-
-
 BASE_CAPTURE_PATH = PROJECT_ROOT / "scripts" / "capture-oneclick-charset-evidence.py"
 DEFAULT_SCHEMA = "tf_oneclick_derive_charset"
 DEFAULT_PARENT_TABLE = "tf_oneclick_parent"
 DEFAULT_CHILD_TABLE = "tf_oneclick_child"
+
+
+def _load_runtime_types():
+    from src.core.db_core_service import DbCoreFacade, DbEndpoint
+    from src.ui.dialogs.oneclick_migration_dialog import OneClickMigrationWorker
+
+    return DbCoreFacade, DbEndpoint, OneClickMigrationWorker
 
 
 def _load_base_capture():
@@ -36,6 +39,9 @@ def _load_base_capture():
 
 _base = _load_base_capture()
 CaptureError = _base.CaptureError
+OneClickCharsetCaptureDisabled = _base.OneClickCharsetCaptureDisabled
+ONECLICK_APPLY_DISABLED_CODE = _base.ONECLICK_APPLY_DISABLED_CODE
+ONECLICK_CAPTURE_DISABLED_MESSAGE = _base.ONECLICK_CAPTURE_DISABLED_MESSAGE
 DEFAULT_TARGET_CHARSET = _base.DEFAULT_TARGET_CHARSET
 DEFAULT_TARGET_COLLATION = _base.DEFAULT_TARGET_COLLATION
 
@@ -141,6 +147,8 @@ def capture_oneclick_charset_derivation(
     facade: Optional[Any] = None,
     git_sha: Optional[str] = None,
 ) -> Dict[str, Any]:
+    _base._require_charset_capture_enabled()
+    DbCoreFacade, DbEndpoint, OneClickMigrationWorker = _load_runtime_types()
     safe_tables = _base._require_safe_scope(schema, tables)
     _base._require_safe_charset_token(target_charset, "target_charset")
     _base._require_safe_charset_token(target_collation, "target_collation")
@@ -222,6 +230,12 @@ def main() -> int:
     parser.add_argument("--target-charset", default=DEFAULT_TARGET_CHARSET)
     parser.add_argument("--target-collation", default=DEFAULT_TARGET_COLLATION)
     args = parser.parse_args()
+
+    try:
+        _base._require_charset_capture_enabled()
+    except OneClickCharsetCaptureDisabled as exc:
+        print(f"{exc.code}: {exc}", file=sys.stderr)
+        return 2
 
     tables = args.tables or [DEFAULT_PARENT_TABLE, DEFAULT_CHILD_TABLE]
     if len(tables) < 2:

@@ -47,8 +47,9 @@ python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\
 ```
 
 Do not refresh real-execution, charset-mutation, or PyQt-triggered mutation
-evidence. The real-execution capture command deliberately returns
-`oneclick_apply_disabled` before container seeding or DB access.
+evidence. Each retired mutation capture command deliberately returns
+`oneclick_apply_disabled` before container seeding, DB access, or artifact
+output.
 
 ## Phase B Prerequisites
 

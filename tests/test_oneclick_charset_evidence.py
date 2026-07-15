@@ -18,7 +18,7 @@ def _load_validator():
     return module
 
 
-def _valid_evidence():
+def _archived_evidence():
     schema = "tf_oneclick_charset"
     table = "tf_oneclick_parent"
     child = "tf_oneclick_child"
@@ -155,9 +155,9 @@ def _write_report(tmp_path, evidence):
     return report
 
 
-def test_oneclick_charset_evidence_accepts_fk_safe_report(tmp_path):
+def test_oneclick_charset_validator_accepts_archived_fk_safe_shape(tmp_path):
     validator = _load_validator()
-    report = _write_report(tmp_path, _valid_evidence())
+    report = _write_report(tmp_path, _archived_evidence())
 
     assert validator.validate_report(report) == {
         "issue": 139,
@@ -169,7 +169,7 @@ def test_oneclick_charset_evidence_accepts_fk_safe_report(tmp_path):
 
 def test_oneclick_charset_evidence_rejects_production_source(tmp_path):
     validator = _load_validator()
-    evidence = _valid_evidence()
+    evidence = _archived_evidence()
     evidence["source_type"] = "production"
     report = _write_report(tmp_path, evidence)
 
@@ -179,7 +179,7 @@ def test_oneclick_charset_evidence_rejects_production_source(tmp_path):
 
 def test_oneclick_charset_evidence_rejects_unsafe_schema(tmp_path):
     validator = _load_validator()
-    evidence = _valid_evidence()
+    evidence = _archived_evidence()
     evidence["scope"]["schema"] = "prod"
     evidence["run"]["schema"] = "prod"
     report = _write_report(tmp_path, evidence)
@@ -190,7 +190,7 @@ def test_oneclick_charset_evidence_rejects_unsafe_schema(tmp_path):
 
 def test_oneclick_charset_evidence_rejects_disallowed_strategy(tmp_path):
     validator = _load_validator()
-    evidence = _valid_evidence()
+    evidence = _archived_evidence()
     evidence["run"]["attempted_strategies"].append("charset_collation_single")
     evidence["run"]["disallowed_fix_attempts"] = ["charset_issue:charset_collation_single"]
     report = _write_report(tmp_path, evidence)
@@ -201,7 +201,7 @@ def test_oneclick_charset_evidence_rejects_disallowed_strategy(tmp_path):
 
 def test_oneclick_charset_evidence_requires_fk_validation(tmp_path):
     validator = _load_validator()
-    evidence = _valid_evidence()
+    evidence = _archived_evidence()
     evidence["after"]["foreign_keys_valid"] = False
     evidence["validation"]["fk_constraints_valid"] = False
     report = _write_report(tmp_path, evidence)
@@ -212,7 +212,7 @@ def test_oneclick_charset_evidence_requires_fk_validation(tmp_path):
 
 def test_oneclick_charset_evidence_requires_rollback_metadata(tmp_path):
     validator = _load_validator()
-    evidence = _valid_evidence()
+    evidence = _archived_evidence()
     evidence["rollback"]["metadata_captured"] = False
     evidence["run"]["applied_fixes"][0]["rollback_sql"] = []
     report = _write_report(tmp_path, evidence)

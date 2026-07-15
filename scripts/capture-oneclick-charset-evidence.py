@@ -1,9 +1,5 @@
 #!/usr/bin/env python
-"""Build/capture Rust Core-backed One-Click charset evidence for GitHub #139.
-
-This module currently provides the validator-backed report shape and safety
-guards used before the Rust Core charset execution allowlist is opened.
-"""
+"""Archived One-Click charset evidence capture, disabled during Phase A."""
 
 from __future__ import annotations
 
@@ -20,21 +16,39 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.ui.dialogs.migration_dialogs import ONE_CLICK_MIGRATION_FEATURE_ENABLED  # noqa: E402
-from src.ui.dialogs.oneclick_migration_dialog import ONECLICK_REAL_EXECUTION_ENABLED  # noqa: E402
-from src.core.db_core_service import DbCoreFacade, DbEndpoint  # noqa: E402
-
-
 DEFAULT_SCHEMA = "tf_oneclick_charset"
 DEFAULT_PARENT_TABLE = "tf_oneclick_parent"
 DEFAULT_CHILD_TABLE = "tf_oneclick_child"
 DEFAULT_TARGET_CHARSET = "utf8mb4"
 DEFAULT_TARGET_COLLATION = "utf8mb4_0900_ai_ci"
 SAFE_ONECLICK_IDENTIFIER_RE = re.compile(r"^tf_oneclick_[A-Za-z0-9_]+$")
+ONECLICK_CHARSET_CAPTURE_ENABLED = False
+ONECLICK_APPLY_DISABLED_CODE = "oneclick_apply_disabled"
+ONECLICK_CAPTURE_DISABLED_MESSAGE = (
+    "Phase A disables One-Click charset mutation evidence capture; exact-plan approval "
+    "and TF-STATUS-098 are required before DB mutation."
+)
 
 
 class CaptureError(RuntimeError):
     """Raised when One-Click charset evidence capture cannot complete safely."""
+
+
+class OneClickCharsetCaptureDisabled(RuntimeError):
+    def __init__(self) -> None:
+        self.code = ONECLICK_APPLY_DISABLED_CODE
+        super().__init__(ONECLICK_CAPTURE_DISABLED_MESSAGE)
+
+
+def _require_charset_capture_enabled() -> None:
+    if not ONECLICK_CHARSET_CAPTURE_ENABLED:
+        raise OneClickCharsetCaptureDisabled()
+
+
+def _load_db_core_types():
+    from src.core.db_core_service import DbCoreFacade, DbEndpoint
+
+    return DbCoreFacade, DbEndpoint
 
 
 def current_git_sha() -> str:
@@ -123,6 +137,9 @@ def build_evidence_report(
     foreign_keys: List[Dict[str, Any]],
     source_type: str = "local_mysql_container",
 ) -> Dict[str, Any]:
+    from src.ui.dialogs.migration_dialogs import ONE_CLICK_MIGRATION_FEATURE_ENABLED
+    from src.ui.dialogs.oneclick_migration_dialog import ONECLICK_REAL_EXECUTION_ENABLED
+
     applied_fixes = [
         item for item in apply_result.get("applied_fixes") or [] if isinstance(item, dict)
     ]
@@ -204,6 +221,8 @@ def capture_oneclick_charset(
     facade: Optional[Any] = None,
     git_sha: Optional[str] = None,
 ) -> Dict[str, Any]:
+    _require_charset_capture_enabled()
+    DbCoreFacade, DbEndpoint = _load_db_core_types()
     safe_tables = _require_safe_scope(schema, tables)
     _require_safe_charset_token(target_charset, "target_charset")
     _require_safe_charset_token(target_collation, "target_collation")
@@ -370,6 +389,12 @@ def main() -> int:
     parser.add_argument("--target-charset", default=DEFAULT_TARGET_CHARSET)
     parser.add_argument("--target-collation", default=DEFAULT_TARGET_COLLATION)
     args = parser.parse_args()
+
+    try:
+        _require_charset_capture_enabled()
+    except OneClickCharsetCaptureDisabled as exc:
+        print(f"{exc.code}: {exc}", file=sys.stderr)
+        return 2
 
     tables = args.tables or [DEFAULT_PARENT_TABLE, DEFAULT_CHILD_TABLE]
     if len(tables) < 2:
