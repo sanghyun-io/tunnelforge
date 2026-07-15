@@ -325,11 +325,13 @@ memo while `SCHEDULE_FEATURE_ENABLED = False`; it must not read like current
 public UI instructions until the feature flag is intentionally re-enabled and
 runtime evidence is refreshed.
 
-One-Click readiness wording is reconfirmed against the current limited
-real-execution gate: the app supports only backup-confirmed
-`deprecated_engine -> engine_innodb` non-dry-run execution, while broad
-production automatic remediation and production charset/collation execution
-remain unsupported.
+The current One-Click Phase A safety gate supersedes the earlier limited
+real-execution wording: `ONECLICK_REAL_EXECUTION_ENABLED = False`, both Rust
+non-dry-run entry points return `oneclick_apply_disabled` before endpoint or
+SQL work, and PyQt exposes dry-run only. Historical June evidence remains a
+record of the retired path, not a command to refresh or a current capability.
+TF-STATUS-097 stays open until TF-STATUS-098 lands and an exact-plan approval
+contract can be implemented and independently proven.
 
 Current main next-issue re-audit on 2026-06-27 initially confirmed only #116
 was open and found no Rust Core baseline violation in legacy connector names:
@@ -742,6 +744,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-15 | One-Click Phase A fail-closed gate / TF-STATUS-097 | Existing mutation characterization; Rust entry-point RED/GREEN; Python worker/UI/i18n RED/GREEN; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; full Cargo; focused One-Click/DB Core/i18n and evidence/capture regressions; direct capture CLI/import-order checks; full Python; Python 3.9 compile; `git diff --check`; independent LUNA review loops | PASS: internal mutation characterization `1 passed`; Rust One-Click `23 passed`; full Rust `231 passed, 1 ignored`; focused Phase A `156 passed`; full Python `2840 passed, 2 skipped`; final Spec and Quality verdicts `APPROVE` | Both `oneclick.run` and `oneclick.apply_fixes` reject non-dry-run before phase/preflight/action/endpoint/adapter/SQL; Python rejects before connector/facade; all mutation-capture CLI/callables reject before runtime imports, seed, DB work, or artifact output; dry-run evidence accepts only exact `oneclick_real_execution_enabled=false`; backup remains disabled after completion. Historical real-execution readiness/capture instructions are superseded during Phase A. TF-STATUS-097 remains open for the TF-STATUS-098-dependent exact-plan contract. |
 | 2026-07-15 | Neutral Import timezone / TF-STATUS-096 | RED/GREEN dialog, copy, and payload tests; `.venv\Scripts\python.exe -m pytest tests\test_db_import_dialog.py tests\test_rust_dump_exporter.py tests\test_i18n.py -q`; expanded import/i18n regression; full Python; `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_mysql_and_postgresql_timezone_forms --lib`; production probe/duplicate scan; `git diff --check`; independent TERRA review and PostgreSQL legacy-compatibility follow-up | PASS: focused `120 passed`; expanded `171 passed`; full `2825 passed, 2 skipped`; Rust `1 passed, 215 filtered out`; TF-STATUS-096 final review: APPROVE with no Critical or Important findings | Auto is selected by default and emits `timezone_sql=None` for MySQL and PostgreSQL; `mysql.time_zone_name` probing and the duplicate None radio are gone; explicit UTC/KST SQL remains engine-specific; legacy `none` resolves to no SQL for both engines; the exporter already omitted a falsey timezone field, so no Rust protocol or settings migration was required. |
 | 2026-07-15 | SSH first-use approval UI / TF-STATUS-095 Task 2 | Dialog and integration RED/GREEN; expanded MainWindow, cross-engine, SQL Editor, and SQL Execution ordering regressions; focused Task 2 and wider SSH/UI suites; full `.venv\Scripts\python.exe -m pytest`; production `py_compile`; repository call-path scan; `git diff --check`; independent LUNA final review | PASS: final focused `218 passed`; wider `424 passed, 1 skipped`; full `2820 passed, 2 skipped, 2 warnings`; Task 2 final review: APPROVE with no blocking findings | Unknown hosts show host:port, algorithm, and SHA-256 fingerprint with Cancel/Escape as the safe default; changed keys have no approval action; approval races fail closed; all reviewed interactive starts approve before credential access, worker/dialog creation, or tunnel creation; direct mode bypasses SSH trust; workers/scheduler/monitor/reconnect remain noninteractive; result and QThread lifecycle signals are separated; no `PytestCollectionWarning` remains. TF-STATUS-095 is closed. |
 | 2026-07-15 | SSH host trust Core slice / TF-STATUS-095 Task 1 | RED/GREEN trust-store and engine tests; `.venv\Scripts\python.exe -m pytest tests\test_ssh_host_trust.py tests\test_platform_paths.py tests\test_tunnel_engine.py tests\test_connection_test_worker.py -q`; related call-path regression; `git diff --check`; three independent TERRA security reviews with two fix loops | PASS: final focused `71 passed, 1 skipped, 1 warning`; related regression `163 passed`; Task 1 security re-review: APPROVE with no Critical or Important findings | Core is `fixed_pending_full_verify`: opaque one-time approval tokens are consumed before approval re-probe, the supplied/current key identities must match, trust writes fsync the file and POSIX parent directory, forwarding pins the fresh key and disables hidden SSH config reinterpretation, and target preflight uses `RejectPolicy`. UI approval paths remain, so TF-STATUS-095 stays open; the existing `TestType` collection warning is carried into Task 2. |
@@ -840,7 +843,7 @@ Commands run locally:
 | 2026-06-27 | Post-merge next-issue external re-audit | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_post_merge_next_issue_external_reaudit -q`; `git status --short --branch`; `gh issue list --state open --limit 30 --json number,title,state,labels,updatedAt,url,assignees`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest -q`; direct DB/feature-flag/stale-doc scans | PASS | At that pass #116 was the only open issue, the #116 repo-side gates passed, SQL editor query execution also routed through the Rust connector shim, and no new GitHub issue was created because no confirmed repo-side issue was found yet |
 | 2026-06-27 | macOS manual workflow head policy | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_support_gate_uses_local_head_for_manual_workflow_after_pr_merge -q`; RED/GREEN: `pytest tests\test_macos_support_docs.py -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `python scripts\check-macos-support-gate.py`; `gh issue view 116 --json body` | PASS | `scripts/check-macos-support-gate.py --final` now resolves the successful manual `workflow_dispatch` macOS artifact run against the same head policy as report SHA/artifact download: PR head before merge, current merged main HEAD after PR #117 has merged; GitHub #116 body now says the same, and current macOS focused suite is 53 passed |
 | 2026-06-27 | BUILD installer version examples | RED/GREEN: `pytest tests\test_build_docs.py tests\test_current_status_docs.py::test_current_status_records_build_doc_installer_version_cleanup -q`; final: `pytest -q`; `pytest tests\test_build_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_build_docs.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | `BUILD.md` no longer shows stale 1.0.0 installer filename/AppVersion examples; installer examples use `{version}` and `AppVersion={#MyAppVersion}`; the current full Python suite count is superseded above by the 1827-test run |
-| 2026-06-27 | One-Click module scope docstring | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope tests\test_current_status_docs.py::test_current_status_records_oneclick_module_scope_docstring_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Module-level One-Click wording no longer says the whole migration process is automatically executed; it now describes Rust DB Core dry-run default and limited real execution; the current full Python suite count is superseded above by the 1827-test run |
+| 2026-06-27 | One-Click module scope docstring | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_module_docstring_matches_limited_rust_core_scope tests\test_current_status_docs.py::test_current_status_records_oneclick_module_scope_docstring_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Historical evidence: module-level wording stopped claiming full automatic execution and described that release's Rust DB Core dry-run default and limited real execution; TF-STATUS-097 Phase A now supersedes it |
 | 2026-06-27 | One-Click fallback dry-run tooltip | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_disabled_real_execution_tooltip_does_not_reference_closed_138 tests\test_current_status_docs.py::test_current_status_records_oneclick_fallback_dry_run_tooltip_cleanup -q`; final: `pytest -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | The disabled-real-execution fallback tooltip now says real execution is `disabled in this build` and no longer points at the already closed GitHub #138 gate; the current full Python suite count is superseded above by the 1827-test run |
 | 2026-06-27 | Rust Core Export/Import menu wording | RED/GREEN: `pytest tests\test_main_window_export_import_labels.py -q`; `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count tests\test_current_status_docs.py::test_current_status_records_rust_core_export_import_menu_wording -q`; final: `pytest -q`; `pytest tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py -q`; `python -m compileall -q src\ui\main_window.py tests\test_main_window_export_import_labels.py tests\test_current_status_docs.py`; `git diff --check`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py` | PASS | Tunnel context menu actions now display `Rust DB Core Export` / `Rust DB Core Import`, handlers use `_context_rust_core_export` / `_context_rust_core_import`; the current full Python suite count is superseded above by the 1827-test run |
 | 2026-06-27 | Current baseline duplicate service.hello cleanup | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_has_no_duplicate_check_rows -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | `Current Baseline Verification` now keeps one `tunnelforge-core service.hello` row that covers dump/import, migration, and One-Click capability evidence |
@@ -849,7 +852,7 @@ Commands run locally:
 | 2026-06-27 | Current main next-issue re-audit | `git status --short --branch`; `git log --oneline --decorate -5`; `gh issue list --state open --limit 20`; `gh issue view 116 --comments`; `rg -n "pymysql|psycopg|mysql\.connector|mysqldump|pg_dump|mysqlpump|mysqlimport|\bpsql\b" src scripts`; `rg -n "execute\(|cursor\(|commit\(|rollback\(" src\core src\ui src\exporters`; `python scripts\check-macos-support-gate.py --skip-github`; `python scripts\check-macos-support-gate.py`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q` | PASS | Main is aligned with origin/main, #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests now pass at 53 tests, and the Rust Core baseline scan found no new repo-side violation; legacy-shaped DB connector paths route through Rust Core shims |
 | 2026-06-27 | Current baseline verification heading | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; `pytest tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py`; `git diff --check` | PASS | Top status no longer labels the mixed current baseline as `Verified On 2026-06-26`; the section now distinguishes the refreshed 2026-06-27 full-suite count from preserved 2026-06-26 broader baseline evidence |
 | 2026-06-27 | Current full Python suite count refresh | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; `pytest -q`; `pytest tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py -q`; `python -m compileall -q tests\test_current_status_docs.py tests\test_oneclick_readiness_docs.py tests\test_schedule_docs.py`; `git diff --check` | PASS | Updated top current-status full Python suite count from stale `1826 passed` to current `1827 passed, 5 warnings` after the post-release version drift regression test was added |
-| 2026-06-27 | One-Click limited production scope wording | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; `pytest tests\test_oneclick_readiness_docs.py -q`; `pytest tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | Readiness docs no longer say all production database usage is unsupported; they distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution |
+| 2026-06-27 | One-Click limited production scope wording | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; `pytest tests\test_oneclick_readiness_docs.py -q`; `pytest tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py -q`; `python -m compileall -q tests\test_oneclick_readiness_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | Historical evidence: readiness docs distinguished that release's backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution; TF-STATUS-097 Phase A now supersedes it |
 | 2026-06-27 | Schedule guide hidden-feature wording | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; `pytest tests\test_schedule_docs.py tests\test_current_status_docs.py -q`; `rg -n -F -e '메인 툴바에서 **"스케줄"** 버튼을 클릭' -e '스케줄 시간을 기다리지 않고 바로 백업하려면:' -e '스케줄 관리 창의 **"백업 로그"** 탭에서' -e '스케줄이 작동하려면 TunnelForge가 실행 중이어야 합니다' SCHEDULE.md`; `python -m compileall -q tests\test_schedule_docs.py tests\test_current_status_docs.py`; `git diff --check` | PASS | `SCHEDULE.md` now reads as an internal/reactivation memo while `SCHEDULE_FEATURE_ENABLED = False`, and no longer gives public-toolbar/log/immediate-run instructions as current user steps |
 | 2026-06-27 | macOS artifact default source after PR #117 merge | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; `pytest tests\test_rust_core_packaging.py tests\test_macos_support_docs.py -q`; `bash -n scripts/macos-download-validation-artifacts.sh scripts/macos-manual-validation-report.sh`; `pytest tests\test_current_status_docs.py -q`; `python scripts\check-macos-support-gate.py --skip-github`; `python -m compileall -q tests\test_rust_core_packaging.py tests\test_macos_support_docs.py tests\test_current_status_docs.py scripts\check-macos-support-gate.py`; `git diff --check` | PASS | `macos-download-validation-artifacts.sh` now finds the latest successful manual `macOS App Validation` run for PR head before merge, or current merged main HEAD after PR #117 is merged, so downloaded artifact provenance matches the final report/gate SHA policy |
 | 2026-06-26 | Direct DB Export/Import Rust Core endpoint host | RED/GREEN: `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump -q`; RED/GREEN: `pytest tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q`; `pytest tests\test_db_dialogs.py::test_export_dialog_uses_direct_connector_host_for_rust_dump tests\test_db_dialogs.py::test_import_dialog_uses_direct_connector_host_for_rust_dump -q` | PASS | `RustDumpExportDialog` and `RustDumpImportDialog` now preserve direct connector `host` when creating `RustDumpConfig`; tunnel connections still use their connector host, normally `127.0.0.1` |
@@ -992,7 +995,7 @@ Evidence:
 - 2026-06-26 update: classified Rust import errors are preserved through the
   Python import wrapper message.
 
-Impact:
+Historical impact at closure:
 
 - Initial import intent and strictness gates are now enforced at the Rust Core
   boundary instead of only being represented in Python payloads.
@@ -1613,11 +1616,12 @@ Status: `closed`
 Severity: High
 Area: One-Click migration UI / Rust Core automatic fixes
 
-Evidence:
+Evidence (historical closure snapshot, superseded by the TF-STATUS-097 Phase A
+fail-closed gate):
 
 - GitHub #138 tracked the remaining scope after #137: define, implement, and
   prove the automatic fix classes before real One-Click execution is enabled.
-- Current Rust Core recommendation behavior marks `deprecated_engine` payload
+- At closure, Rust Core recommendation behavior marked `deprecated_engine` payload
   issues with `table_name` as automatic candidates using `engine_innodb`
   recommendation metadata. `oneclick.apply_fixes` can execute only those
   planned `engine_innodb` actions through Rust Core `MigrationAdapter`; other
@@ -1638,12 +1642,12 @@ Evidence:
 - MySQL live inspection now emits deprecated-engine markers for MyISAM base
   tables, and One-Click converts those markers into typed
   `deprecated_engine` issues that can be recommended as `engine_innodb`.
-- The UI-facing Rust command `oneclick.run dry_run=false` sequences the
-  validated `engine_innodb` apply path.
-- `src\ui\dialogs\oneclick_migration_dialog.py` now keeps
-  `ONECLICK_REAL_EXECUTION_ENABLED = True`, leaves Dry-run checked by default,
-  and fails closed when a non-dry-run payload lacks backup confirmation.
-- `src\ui\dialogs\migration_dialogs.py` now exposes `One-Click Migration` with
+- At closure, the UI-facing Rust command `oneclick.run dry_run=false` sequenced
+  the validated `engine_innodb` apply path.
+- At closure, `src\ui\dialogs\oneclick_migration_dialog.py` kept
+  `ONECLICK_REAL_EXECUTION_ENABLED = True`, left Dry-run checked by default,
+  and failed closed when a non-dry-run payload lacked backup confirmation.
+- At closure, `src\ui\dialogs\migration_dialogs.py` exposed `One-Click Migration` with
   user-facing copy that says Dry-run is the default and the only automatic
   non-dry-run scope is verified MyISAM/deprecated engine tables becoming
   `InnoDB` after backup confirmation.
@@ -1652,11 +1656,11 @@ GitHub issue:
 
 - https://github.com/sanghyun-io/tunnelforge/issues/138
 
-Impact:
+Historical impact at closure:
 
-- Users can run dry-run inspection by default.
-- Users can opt into non-dry-run only after backup confirmation, and Rust Core
-  applies only the validated `deprecated_engine -> engine_innodb` strategy.
+- Users could run dry-run inspection by default.
+- Users could opt into non-dry-run only after backup confirmation, and Rust Core
+  applied only the validated `deprecated_engine -> engine_innodb` strategy.
 - Automatic remediation for every other issue class remains out of scope and
   must be tracked separately.
 
@@ -1683,7 +1687,8 @@ Status: `closed`
 Severity: High
 Area: One-Click migration UI / Rust Core automatic fixes
 
-Evidence:
+Evidence (historical closure snapshot, superseded by the TF-STATUS-097 Phase A
+fail-closed gate):
 
 - GitHub #139 tracks charset/collation automatic fix coverage as a separate
   follow-up after #138.
@@ -1754,8 +1759,8 @@ GitHub issue:
 
 Impact:
 
-- Users can still run One-Click dry-run and the validated engine fix. Charset
-  execution is available only for complete local-safe Rust Core contracts,
+- Users could run One-Click dry-run and the validated engine fix. Charset
+  execution was available only for complete local-safe Rust Core contracts,
   including contracts derived by Rust Core for the PyQt worker path in local
   `tf_oneclick_` evidence scopes.
 - Production charset/collation execution remains out of scope without separate
@@ -1870,11 +1875,12 @@ Status: closed
 Severity: Medium
 Area: One-Click migration docs
 
-Evidence:
+Evidence (historical closure snapshot, superseded by the TF-STATUS-097 Phase A
+fail-closed gate):
 
 - 2026-06-27 repo-side scan found `docs/oneclick_readiness.md` still said
-  `Production database usage` was not supported, even though the current UI
-  gate allows backup-confirmed non-dry-run execution for the validated
+  `Production database usage` was not supported, even though that release's UI
+  gate allowed backup-confirmed non-dry-run execution for the validated
   `deprecated_engine -> engine_innodb` path.
 - The same document already stated `ONECLICK_REAL_EXECUTION_ENABLED = True`,
   Dry-run default, backup confirmation requirement, and limited
@@ -1886,9 +1892,9 @@ Evidence:
 
 Resolution:
 
-- `docs/oneclick_readiness.md` now states that broad production automatic
-  remediation is unsupported, while the only current non-dry-run
-  production-facing path is backup-confirmed
+- At closure, `docs/oneclick_readiness.md` stated that broad production
+  automatic remediation was unsupported, while that release's only non-dry-run
+  production-facing path was backup-confirmed
   `deprecated_engine -> engine_innodb`.
 - Production charset/collation execution remains explicitly unsupported.
 
@@ -2097,11 +2103,12 @@ Status: closed
 Severity: Low
 Area: One-Click migration UI
 
-Evidence:
+Evidence (historical closure snapshot, superseded by the TF-STATUS-097 Phase A
+fail-closed gate):
 
-- `ONECLICK_REAL_EXECUTION_ENABLED` is currently true, but the disabled fallback
+- At closure, `ONECLICK_REAL_EXECUTION_ENABLED` was true, but the disabled fallback
   tooltip still described real execution as blocked until GitHub #138 completed.
-- GitHub #138 is already closed, and the current supported state is limited
+- GitHub #138 was already closed, and that release supported limited
   backup-confirmed real execution with dry-run as the default.
 - RED/GREEN coverage now forces the disabled fallback tooltip to avoid closed
   issue wording and to state that real execution is disabled in this build.
@@ -2124,15 +2131,17 @@ Status: closed
 Severity: Low
 Area: One-Click migration UI
 
-Evidence:
+Evidence (historical closure snapshot, superseded by the TF-STATUS-097 Phase A
+fail-closed gate):
 
 - The module docstring in `src/ui/dialogs/oneclick_migration_dialog.py` still
   said the whole migration process is automatically executed.
-- Current behavior is narrower: Rust DB Core owns the workflow, dry-run is the
-  default, execution pauses for plan confirmation, and non-dry-run changes
-  require backup confirmation with validated limited scope.
-- RED/GREEN coverage now rejects the overbroad automatic-execution phrase and
-  requires Rust DB Core dry-run default and limited real execution wording.
+- Behavior at closure was narrower: Rust DB Core owned the workflow, dry-run
+  was the default, execution paused for plan confirmation, and non-dry-run
+  changes required backup confirmation with validated limited scope.
+- At closure, RED/GREEN coverage rejected the overbroad automatic-execution
+  phrase and required Rust DB Core dry-run default and limited real-execution
+  wording.
 
 Resolution:
 
@@ -2271,8 +2280,9 @@ Resolution:
 - `FixWizardWorker` raises `RuntimeError` if constructed with `dry_run=False`,
   keeping the legacy mutation path fail-closed even if a caller bypasses the
   wizard UI.
-- This remains separate from One-Click `oneclick.*`, whose current limited
-  real-execution path is already Rust Core-owned and evidence-backed.
+- This remains separate from One-Click `oneclick.*`; its earlier limited
+  real-execution path was Rust Core-owned and evidence-backed but is superseded
+  by the TF-STATUS-097 Phase A fail-closed gate.
 
 Next action:
 
@@ -2536,7 +2546,7 @@ Next action:
 | TF-STATUS-094 | Low | closed | Product strategy / status documentation | Product-maturity team review and stale `v2.3.1` latest-release wording | Keep the HTML proposal, tracker, verification log, recommended order, and session log aligned with `v2.4.0` and the Safety and Proof decision |
 | TF-STATUS-095 | Critical | closed | Security / SSH server identity | SSH preflight accepts unknown host keys and normal forwarding does not pin trusted server identity | Retain visible SHA-256 TOFU approval, one-time approval re-probe, persisted trust, pinned preflight/forwarding, changed-key rejection, and background fail-closed behavior |
 | TF-STATUS-096 | High | closed | Import / timezone semantics | Import `Auto` can inject KST `+09:00` instead of preserving server/session defaults | Retain no-session-change Auto semantics and explicit engine-specific UTC/KST choices with MySQL/PostgreSQL regression coverage |
-| TF-STATUS-097 | High | open | One-Click / execution approval | Non-dry-run plan and execution share one call and the UI cannot approve the exact plan before execution | Bind explicit approval to target identity and plan hash before execution, or disable non-dry-run until that contract exists |
+| TF-STATUS-097 | High | open | One-Click / execution approval | Non-dry-run plan and execution share one call and the UI cannot approve the exact plan before execution | Keep Phase A non-dry-run fail-closed; after TF-STATUS-098, implement and prove exact current-target plan approval before considering re-enable |
 | TF-STATUS-098 | High | open | Rust Core client / process contract | Shared request lock can block indefinitely on an unbounded core response and mismatched IDs are discarded | Specify and implement a bounded deadline, typed indeterminate result, unusable-process reaping, explicit protocol/ID failure, and no mutation auto-retry |
 | TF-STATUS-099 | High | open | Cross-engine migration / resume contract | Resume identity omits endpoint details, state writes are non-atomic, and stale state rejection is under-specified | First add focused identity, plan-fingerprint, atomic-write, stale-state, and single-terminal-state reproducers; redesign only to satisfy those contracts |
 | TF-STATUS-100 | Medium | open | Release engineering / Python dependencies | Python release inputs use compatible ranges without a hash-locked resolution | Generate and verify a release-only hash lock; reject altered artifacts while retaining compatible development ranges |
@@ -2549,9 +2559,9 @@ Next action:
    trust-before-credentials ordering on every interactive SSH path.
 2. Keep TF-STATUS-096 closed by retaining Import Auto server/session-default
    preservation and emitting no implicit timezone-changing SQL.
-3. Disable One-Click non-dry-run for TF-STATUS-097 immediately while its
-   exact-plan approval boundary is absent; preserve dry-run and explain the
-   temporary restriction.
+3. Keep One-Click non-dry-run disabled for TF-STATUS-097 while its exact-plan
+   approval boundary is absent; preserve dry-run and the temporary restriction
+   copy.
 4. Write TF-STATUS-098 executable contracts for deadline, mismatched IDs,
    process death/restart, protocol compatibility, typed indeterminate outcomes,
    and mutation non-retry; implement only the smallest passing process behavior.
@@ -2618,6 +2628,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-15 | Recorded the TF-STATUS-097 Phase A fail-closed gate without closing the issue. Rust blocks both public non-dry-run commands before DB work, Python/UI retain dry-run only, backup cannot reactivate after completion, all retired mutation captures fail before runtime imports or DB setup, and historical real-execution refresh paths are archived until TF-STATUS-098 and exact-plan approval are complete. | Rust One-Click/protocol/live harness, Python One-Click UI/worker/translations, readiness/capture docs, validators, and tests, canonical status regression | Rust One-Click `23 passed`; full Rust `231 passed, 1 ignored`; focused Phase A `156 passed`; full Python `2840 passed, 2 skipped`; direct capture/import-order, compile, and diff checks passed; final independent Spec/Quality verdicts `APPROVE`. |
 | 2026-07-15 | Closed TF-STATUS-096 after making Import Auto timezone-neutral for MySQL and PostgreSQL. Auto no longer probes MySQL timezone tables or emits session SQL, the duplicate None option is removed, explicit UTC/KST behavior remains, and legacy `none` compatibility is covered for both engines. | Import dialog, legacy translations, dialog/exporter/i18n tests, canonical status regressions | Focused `120 passed`; expanded `171 passed`; full Python `2825 passed, 2 skipped`; Rust timezone validator passed; production scan and diff check passed; final independent verdict `APPROVE`. |
 | 2026-07-15 | Closed TF-STATUS-095 after completing the SSH first-use UI and two review-fix loops. Unknown hosts now receive explicit default-Cancel SHA-256 approval, changed keys cannot be approved, every reviewed interactive path gates before credentials or tunnel creation, background paths remain noninteractive, and MainWindow result/lifecycle signals are correct. | Shared SSH approval dialog/translations, MainWindow, TunnelConfig, cross-engine endpoint, SQL Editor/Execution dialogs, connection worker, focused UI/Core/status tests | Final focused `218 passed`; wider `424 passed, 1 skipped`; full Python `2820 passed, 2 skipped, 2 warnings`; production compile and diff checks passed; independent Task 2 final verdict `APPROVE`. |
 | 2026-07-15 | Completed the TF-STATUS-095 SSH trust Core slice after two independent security-review fix loops. The Core now persists only public host identity, binds approval to a one-time token and a fresh same-endpoint probe, rejects changed keys, pins forwarding/preflight, and disables implicit `~/.ssh/config` endpoint reinterpretation. The issue remains open because the first-use PyQt approval paths are Task 2. | SSH host trust store/path, tunnel engine, focused Core tests, Safety and Proof plans, canonical status regression | RED/GREEN evidence for forged/stale approvals, directory durability, and SSH config endpoint drift; final focused `71 passed, 1 skipped, 1 warning`; related `163 passed`; final independent Task 1 verdict `APPROVE`; diff check passed. |
@@ -2740,7 +2751,7 @@ Next action:
 | 2026-06-26 | Audited stale plan/TODO candidates after #116 was confirmed external; found the One-Click Rust Core command surface exists while the PyQt entry point remains hidden, created GitHub #137, and added TF-STATUS-019 so the production-readiness gate is tracked separately from closed #124. | `docs/current_status.md` | `rg -n "oneclick\.|ONE_CLICK_MIGRATION_FEATURE_ENABLED" migration_core\src\lib.rs src tests docs README.md README.ko.md`; `tunnelforge-core service.hello`; `gh issue view 124`; `gh issue create` created #137 |
 | 2026-06-26 | Hardened the hidden One-Click path for #137 so real execution is blocked until the readiness gate opens and the hidden dialog cannot uncheck Dry-run. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens -q`; RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens -q`; final: `pytest tests\test_oneclick_rust_core_gate.py tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; `pytest tests\test_oneclick_rust_core_gate.py tests\test_db_core_service.py -q`; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; `python -m compileall -q src\ui\dialogs\oneclick_migration_dialog.py tests\test_oneclick_rust_core_gate.py`; `git diff --check` |
 | 2026-06-26 | Added One-Click dry-run evidence capture/validation tooling, archived local MySQL Rust Core `oneclick.run` dry-run evidence, documented the current hidden dry-run-only scope, and wired the optional regression gate to that evidence. | `scripts/validate-oneclick-dry-run-evidence.py`, `scripts/capture-oneclick-dry-run-evidence.py`, `scripts/rust-core-regression-gate.ps1`, `tests/test_oneclick_dry_run_evidence.py`, `reports/oneclick_readiness`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_dry_run_evidence.py -q`; capture: `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; final: `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json`; `RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE=1 powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1` |
-| 2026-06-26 | Analyzed the next #137 decision after merging One-Click evidence: current Rust Core behavior supports hidden or dry-run-only preview scope, but not full enablement because automatic fix coverage is not implemented. | `docs/oneclick_readiness.md`, `docs/current_status.md` | `rg -n "ONE_CLICK_MIGRATION_FEATURE_ENABLED|ONECLICK_REAL_EXECUTION_ENABLED|oneclick|OneClick" src migration_core tests docs README.md README.ko.md`; `gh issue view 137`; Rust Core `oneclick_*` function inspection |
+| 2026-06-26 | Analyzed the next #137 decision after merging One-Click evidence: the then-current Rust Core behavior supported hidden or dry-run-only preview scope, but not full enablement because automatic fix coverage was not implemented. | `docs/oneclick_readiness.md`, `docs/current_status.md` | `rg -n "ONE_CLICK_MIGRATION_FEATURE_ENABLED|ONECLICK_REAL_EXECUTION_ENABLED|oneclick|OneClick" src migration_core tests docs README.md README.ko.md`; `gh issue view 137`; Rust Core `oneclick_*` function inspection |
 | 2026-06-26 | Exposed #137 as a dry-run-only preview: the migration analyzer shows `One-Click Dry-run Preview`, real execution remains blocked, and refreshed evidence now requires preview UI enabled plus real execution disabled. | `src/ui/dialogs/migration_dialogs.py`, `src/core/i18n.py`, `scripts/validate-oneclick-dry-run-evidence.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_oneclick_dry_run_evidence.py`, `reports/oneclick_readiness`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_migration_analyzer_exposes_oneclick_as_dry_run_preview_only -q`; RED/GREEN: `pytest tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_accepts_complete_report tests\test_oneclick_dry_run_evidence.py::test_oneclick_dry_run_evidence_requires_preview_ui_enabled -q`; i18n: `pytest tests\test_i18n.py::test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation -q`; capture: `python scripts\capture-oneclick-dry-run-evidence.py --seed-local-container --output reports\oneclick_readiness\oneclick-dry-run-evidence.json`; validator: `python scripts\validate-oneclick-dry-run-evidence.py reports\oneclick_readiness\oneclick-dry-run-evidence.json` |
 | 2026-06-26 | Split the remaining One-Click real-execution work into GitHub #138, marked TF-STATUS-019 as the closed dry-run preview gate, opened TF-STATUS-020 for automatic fix coverage, and updated the real-execution lock copy to point at #138. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `docs/current_status.md`, `docs/oneclick_readiness.md` | `gh issue create` created #138; `gh issue view 137`; `gh issue view 138`; RED/GREEN: `pytest tests\test_oneclick_rust_core_gate.py::test_oneclick_worker_rejects_real_execution_until_readiness_gate_opens tests\test_oneclick_rust_core_gate.py::test_oneclick_dialog_locks_dry_run_until_readiness_gate_opens -q`; `rg -n "TF-STATUS-019|TF-STATUS-020|#138|ONECLICK_REAL_EXECUTION_ENABLED" docs src tests migration_core` |
 | 2026-06-26 | Started GitHub #138 automatic-fix coverage by adding typed Rust Core recommendation metadata: `deprecated_engine` with `table_name` becomes an `engine_innodb` automatic candidate while real execution remains disabled. | `migration_core/src/lib.rs`, `tests/test_oneclick_rust_core_gate.py`, `docs/oneclick_readiness.md`, `docs/current_status.md` | RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml oneclick_recommend_classifies_deprecated_engine_as_auto_fixable --lib` |
@@ -2787,7 +2798,7 @@ Next action:
 | 2026-06-26 | Fixed TF-STATUS-024 after finding that direct DB Export/Import dialogs hard-coded the Rust DB Core endpoint host to `127.0.0.1`; both dialogs now preserve `connector.host` while tunnel flows still use their local connector host. | `src/ui/dialogs/db_dialogs.py`, `tests/test_db_dialogs.py`, `docs/current_status.md` | RED/GREEN: focused Export and Import direct-host pytest |
 | 2026-06-27 | Analyzed the next remaining issue after main alignment. #116 still needs external real-Mac evidence, but the repo-side handoff had one drift: artifact download defaults still targeted PR #117 head after merge. Fixed TF-STATUS-025 so artifact lookup now follows PR head before merge and current merged main HEAD after PR #117 is merged. | `scripts/macos-download-validation-artifacts.sh`, `scripts/macos-manual-validation-report.sh`, `docs/macos_support.md`, `tests/test_rust_core_packaging.py`, `tests/test_macos_support_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_rust_core_packaging.py::test_macos_validation_artifact_download_script_uses_local_head_after_pr_merge -q`; final: macOS/docs focused pytest, shell syntax, current-status tests, #116 gate skip-github, compileall, `git diff --check` |
 | 2026-06-27 | Re-scanned disabled-feature docs after #116 remained external and fixed TF-STATUS-026: `SCHEDULE.md` no longer mixes a hidden-feature warning with current public UI instructions. | `SCHEDULE.md`, `tests/test_schedule_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_schedule_docs.py -q`; final: schedule/current-status docs pytest, stale-phrase scan, compileall, `git diff --check` |
-| 2026-06-27 | Re-scanned One-Click readiness wording and fixed TF-STATUS-027: docs now distinguish the current backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; final: One-Click/current-status docs pytest, compileall, `git diff --check` |
+| 2026-06-27 | Re-scanned One-Click readiness wording and fixed TF-STATUS-027: docs distinguished that release's backup-confirmed `engine_innodb` real-execution path from unsupported broad production automatic remediation and production charset/collation execution. TF-STATUS-097 Phase A now supersedes that capability. | `docs/oneclick_readiness.md`, `tests/test_oneclick_readiness_docs.py`, `docs/current_status.md` | RED/GREEN: `pytest tests\test_oneclick_readiness_docs.py::test_oneclick_readiness_distinguishes_limited_real_execution_from_broad_production_support -q`; final: One-Click/current-status docs pytest, compileall, `git diff --check` |
 | 2026-06-27 | Refreshed TF-STATUS-028 after rerunning the full Python suite. The current suite is now superseded by `1827 passed, 5 warnings`, replacing the stale `1786 passed` handoff count. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_does_not_keep_stale_full_pytest_count -q`; final: `pytest -q`, docs pytest, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-029 after noticing the top verification table still said `Verified On 2026-06-26` while containing a 2026-06-27 full pytest count. The section now describes a current baseline with preserved broader rows. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_current_baseline_section_is_not_stale_dated -q`; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Re-audited current main and the next remaining issue. #116 is the only open GitHub issue, #116 repo-side gates pass, macOS focused tests now pass at 53 tests, and the Rust Core boundary scan found no new repo-side baseline violation; legacy-shaped DB connector names currently route through Rust Core shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: `pytest tests\test_current_status_docs.py::test_current_status_records_current_main_next_issue_reaudit -q`; final: #116 gates, macOS/docs focused pytest, current-status pytest, compileall, `git diff --check` |
@@ -2796,7 +2807,7 @@ Next action:
 | 2026-06-27 | Merged duplicate `tunnelforge-core service.hello` rows in the current baseline table and added a regression so current baseline command rows stay unique. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: baseline duplicate-row current-status pytest; final: current-status pytest, compileall, `git diff --check` |
 | 2026-06-27 | Fixed TF-STATUS-034 after finding legacy-branded Export/Import context-menu wording on the Rust Core path; handlers and labels now use Rust DB Core naming, with a focused source-level regression and refreshed full-suite count. | `src/ui/main_window.py`, `tests/test_main_window_export_import_labels.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: Export/Import label pytest and current-status pytest; final: `pytest -q`, focused docs/UI pytest, compileall, `git diff --check`, #116 gate checks |
 | 2026-06-27 | Fixed TF-STATUS-035 after finding One-Click disabled-real-execution fallback copy still pointed at closed #138; the fallback now describes real execution as disabled in this build and keeps dry-run preview wording current. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: One-Click tooltip/current-status pytest; final: `pytest -q`, focused One-Click/current-status pytest, compileall, `git diff --check`, #116 gates |
-| 2026-06-27 | Fixed TF-STATUS-036 after finding the One-Click module docstring still overpromised full automatic migration; it now describes Rust DB Core dry-run default and limited backup-confirmed real execution. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: One-Click docstring/current-status pytest; final: `pytest -q`, focused One-Click/current-status pytest, compileall, `git diff --check`, #116 gates |
+| 2026-06-27 | Fixed TF-STATUS-036 after finding the One-Click module docstring still overpromised full automatic migration; at that time it was changed to describe Rust DB Core dry-run default and limited backup-confirmed real execution. TF-STATUS-097 Phase A now supersedes that capability. | `src/ui/dialogs/oneclick_migration_dialog.py`, `tests/test_oneclick_rust_core_gate.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: One-Click docstring/current-status pytest; final: `pytest -q`, focused One-Click/current-status pytest, compileall, `git diff --check`, #116 gates |
 | 2026-06-27 | Fixed TF-STATUS-037 after finding stale Windows installer version examples in `BUILD.md`; output/test paths now use `{version}` and the Inno snippet uses `{#MyAppVersion}`. | `BUILD.md`, `tests/test_build_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: build-doc/current-status pytest; final: `pytest -q`, focused build-doc/current-status pytest, compileall, `git diff --check`, #116 gates |
 | 2026-06-27 | Fixed TF-STATUS-038 after finding that #116 final gate manual workflow lookup still targeted PR #117 head after merge while artifact download/report SHA policy had moved to current merged main HEAD. | `scripts/check-macos-support-gate.py`, `docs/macos_support.md`, GitHub #116 body, `tests/test_rust_core_packaging.py`, `tests/test_macos_support_docs.py`, `tests/test_current_status_docs.py`, `docs/current_status.md` | RED/GREEN: manual workflow head-policy pytest, macOS support docs pytest, current-status pytest; #116 body updated and full gate rechecked |
 | 2026-06-27 | Recorded TF-STATUS-039 after a post-merge next-issue re-audit found no new repo-side issue: #116 is still the only open GitHub issue, full #116 gates pass, and SQL editor execution also routes through Rust Core connector shims. | `docs/current_status.md`, `tests/test_current_status_docs.py` | RED/GREEN: post-merge current-status pytest; final: current-status pytest, #116 gates, compileall, `git diff --check` |

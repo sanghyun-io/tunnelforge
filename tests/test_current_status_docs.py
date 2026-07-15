@@ -609,7 +609,9 @@ def test_current_status_records_oneclick_module_scope_docstring_cleanup():
 
     assert "TF-STATUS-036" in doc
     assert "One-Click module scope docstring" in doc
-    assert "Rust DB Core dry-run default and limited real execution" in doc
+    assert "Behavior at closure was narrower" in doc
+    assert "superseded by the TF-STATUS-097 Phase A" in doc
+    assert "Current behavior is narrower" not in doc
     assert "전체 마이그레이션 프로세스를 자동으로 실행합니다" not in doc
 
 
@@ -1297,7 +1299,7 @@ def test_current_status_closes_ssh_host_trust_after_core_and_ui_approval():
     assert "Task 2 final review: APPROVE" in verification
     assert "Completed the TF-STATUS-095 SSH trust Core slice" in sessions
     assert "Closed TF-STATUS-095 after completing the SSH first-use UI" in sessions
-    assert order.index("Disable One-Click non-dry-run") < order.index("TF-STATUS-098")
+    assert order.index("Keep One-Click non-dry-run disabled") < order.index("TF-STATUS-098")
     assert order.index("TF-STATUS-098") < order.index("Re-enable One-Click non-dry-run")
 
 
@@ -1314,3 +1316,25 @@ def test_current_status_closes_neutral_import_timezone_issue():
     assert "TF-STATUS-096 final review: APPROVE" in verification
     assert "Closed TF-STATUS-096" in sessions
     assert "Keep TF-STATUS-096 closed" in order
+
+
+def test_current_status_records_oneclick_phase_a_fail_closed_gate():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-097 | High | open" in tracker
+    assert "One-Click Phase A" in summary
+    assert "`ONECLICK_REAL_EXECUTION_ENABLED = False`" in summary
+    assert "supports only backup-confirmed `deprecated_engine -> engine_innodb` non-dry-run execution" not in summary
+    assert "`ONECLICK_REAL_EXECUTION_ENABLED` is currently true" not in doc
+    assert "the current supported state is limited backup-confirmed real execution" not in " ".join(doc.split())
+    assert "historical closure snapshot, superseded by the TF-STATUS-097 Phase A" in " ".join(doc.split())
+    assert "One-Click Phase A fail-closed gate / TF-STATUS-097" in verification
+    assert "2840 passed, 2 skipped" in verification
+    assert "focused Phase A `156 passed`" in verification
+    assert "oneclick_real_execution_enabled=false" in verification
+    assert "final Spec and Quality verdicts `APPROVE`" in verification
+    assert "Recorded the TF-STATUS-097 Phase A fail-closed gate" in sessions
