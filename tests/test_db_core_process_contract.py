@@ -2495,23 +2495,35 @@ def test_one_absolute_deadline_bounds_hello_write_drain_read_cleanup(stall):
     )
     client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
 
-    started = time.monotonic()
-    with pytest.raises(DbCoreServiceError) as raised:
-        client.request_result(
-            "schema.list",
-            request_id=f"stall-{stall}",
-            request_kind=DbCoreRequestKind.READ_ONLY,
-            timeout_seconds=0.15,
-        )
-    elapsed = time.monotonic() - started
+    try:
+        started = time.monotonic()
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "schema.list",
+                request_id=f"stall-{stall}",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.15,
+            )
+        elapsed = time.monotonic() - started
 
-    assert elapsed < 0.4
-    assert raised.value.code == "db_core_timeout"
-    assert raised.value.outcome in (DbCoreOutcome.NOT_STARTED, DbCoreOutcome.FAILED)
-    assert process.terminate_calls == 1
-    assert process.wait_calls >= 1
-    assert process.kill_calls == 0
-    assert client.generation_state is DbCoreGenerationState.CLOSED
+        assert elapsed < 0.4
+        assert raised.value.code == "db_core_timeout"
+        assert raised.value.outcome in (DbCoreOutcome.NOT_STARTED, DbCoreOutcome.FAILED)
+        assert process.terminate_calls == 1
+        assert process.wait_calls >= 1
+        assert process.kill_calls == 0
+        assert client.generation_state in {
+            DbCoreGenerationState.CLOSED,
+            DbCoreGenerationState.REAPING,
+        }
+        if client.generation_state is DbCoreGenerationState.REAPING:
+            assert client._owner_reap_task is not None
+            assert client._owner_reap_generation == client.process_generation
+            client.cancel_active_request(timeout_seconds=1.0)
+            assert client.generation_state is DbCoreGenerationState.CLOSED
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
 
 
 class _Task4Writer(_Task3Writer):
