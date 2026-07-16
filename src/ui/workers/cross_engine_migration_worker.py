@@ -80,23 +80,24 @@ class CrossEngineMigrationWorker(QThread):
         self._failure_emitted = False
         self._terminal_emitted = False
 
-    def cancel(self):
+    def cancel(self) -> bool:
+        """Request cooperative cancellation without contending for stream locks."""
         with self._process_lock:
             self._cancelled = True
             process = self._process
         if process is None:
-            return
+            return True
         try:
             process.terminate()
         except (OSError, ValueError):
-            pass
-        stdin = process.stdin
-        if stdin is not None:
-            try:
-                if not stdin.closed:
-                    stdin.close()
-            except (OSError, ValueError):
-                pass
+            # The worker retains the published handle for normal/future cleanup.
+            return False
+        return True
+
+    def has_unsettled_process(self) -> bool:
+        """Return whether this worker still owns a helper process handle."""
+        with self._process_lock:
+            return self._process is not None
 
     def _start_stderr_drain(self) -> None:
         """Drain stderr on a background thread so a chatty helper never fills
@@ -242,6 +243,9 @@ class CrossEngineMigrationWorker(QThread):
             return
         final_payload = None
         success = False
+        buffered_result_payload = None
+        stdout_complete = False
+        exited_zero = False
 
         try:
             process = self._popen_factory(
@@ -277,31 +281,39 @@ class CrossEngineMigrationWorker(QThread):
                 if event.event == "result":
                     final_payload = event.payload
                     success = bool(event.success)
+                    buffered_result_payload = event.payload
                 elif event.event == "error":
                     final_payload = event.payload
                     success = False
+                    buffered_result_payload = None
                 self._dispatch_event(event)
 
             return_code = process.wait()
             self._join_stderr_drain()
+            stdout_complete = not self._cancelled
+            exited_zero = return_code == 0
             if return_code != 0 and not self._cancelled:
                 success = False
+                buffered_result_payload = None
                 stderr = self._stderr_tail_text()
                 final_payload = {"error": stderr or f"tunnelforge-core exited with {return_code}"}
                 self._emit_failed_once(final_payload["error"])
 
         except HelperProtocolError as exc:
             success = False
+            buffered_result_payload = None
             final_payload = {"error": str(exc)}
             if not self._cancelled:
                 self._emit_failed_once(str(exc))
         except FileNotFoundError:
             success = False
+            buffered_result_payload = None
             final_payload = {"error": f"tunnelforge-core helper not found: {self.helper_path}"}
             if not self._cancelled:
                 self._emit_failed_once(final_payload["error"])
         except Exception as exc:
             success = False
+            buffered_result_payload = None
             final_payload = {"error": str(exc)}
             if not self._cancelled:
                 self._emit_failed_once(str(exc))
@@ -318,17 +330,25 @@ class CrossEngineMigrationWorker(QThread):
                     final_payload["state"] = self._last_checkpoint
             if cleanup_error is not None:
                 success = False
+                buffered_result_payload = None
                 message = str(cleanup_error)
                 final_payload = {
                     "error": message,
                     "cleanup_residual": True,
                 }
                 self._emit_failed_once(message)
+            if (
+                buffered_result_payload is not None
+                and stdout_complete
+                and exited_zero
+                and cleanup_error is None
+                and not self._cancelled
+            ):
+                self.result.emit(buffered_result_payload)
             self._emit_finished_once(success, final_payload)
 
     def _dispatch_event(self, event) -> bool:
         if event.event == "result":
-            self.result.emit(event.payload)
             return True
         if event.event == "error":
             self._emit_failed_once(event.message)

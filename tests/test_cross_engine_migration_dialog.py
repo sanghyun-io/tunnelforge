@@ -1,6 +1,9 @@
+import io
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
@@ -8,14 +11,20 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PyQt6.QtGui import QCloseEvent
-from PyQt6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
+from PyQt6.QtWidgets import QApplication, QMessageBox, QPushButton, QVBoxLayout, QWidget
 
 from src.core.cross_engine_migration import MigrationIssue
 from src.core.cross_engine_migration import DatabaseEngine
 from src.ui.dialogs import cross_engine_migration_endpoint_form as endpoint_form_module
-from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationDialog
+from src.ui.dialogs.cross_engine_migration_dialog import (
+    WORKER_CLOSE_WAIT_MS,
+    CrossEngineMigrationDialog,
+)
 from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
-from src.ui.workers.cross_engine_migration_worker import ProcessCleanupError
+from src.ui.workers.cross_engine_migration_worker import (
+    CrossEngineMigrationWorker,
+    ProcessCleanupError,
+)
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -1057,11 +1066,158 @@ def test_finished_cleanup_residual_retains_worker_until_timer_retry_succeeds(
         dialog.cleanup_retry_timer.timeout.emit()
         assert dialog.worker is worker
         assert dialog.cleanup_retry_timer.isActive()
+        assert dialog._cleanup_retry_thread is not None
+        dialog._cleanup_retry_thread.join(timeout=1.0)
+
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog.worker is worker
+        assert dialog._cleanup_retry_thread is None
+
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog._cleanup_retry_thread is not None
+        dialog._cleanup_retry_thread.join(timeout=1.0)
 
         dialog.cleanup_retry_timer.timeout.emit()
         assert dialog.worker is None
         assert not dialog.cleanup_retry_timer.isActive()
         assert worker.retry_timeouts
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_cleanup_retry_timer_never_blocks_the_gui_and_eventually_releases_worker():
+    class SlowResidualWorker:
+        def __init__(self):
+            self.cleanup_started = threading.Event()
+            self.release_cleanup = threading.Event()
+            self.cleanup_calls = 0
+
+        def isRunning(self):
+            return False
+
+        def retry_process_cleanup(self, *, timeout_seconds):
+            self.cleanup_calls += 1
+            self.cleanup_started.set()
+            assert self.release_cleanup.wait(timeout=2.0)
+            return True
+
+    dialog = make_dialog()
+    worker = SlowResidualWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._current_command = "migrate"
+        dialog._on_finished(
+            False,
+            {"command": "migrate", "success": False, "cleanup_residual": True},
+        )
+
+        started = time.monotonic()
+        dialog.cleanup_retry_timer.timeout.emit()
+        elapsed = time.monotonic() - started
+
+        assert elapsed < 0.2
+        assert worker.cleanup_started.wait(timeout=1.0)
+        assert dialog.worker is worker
+        assert dialog._cleanup_retry_thread is not None
+        cleanup_thread = dialog._cleanup_retry_thread
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog._cleanup_retry_thread is cleanup_thread
+        assert worker.cleanup_calls == 1
+
+        worker.release_cleanup.set()
+        dialog._cleanup_retry_thread.join(timeout=1.0)
+        dialog.cleanup_retry_timer.timeout.emit()
+
+        assert dialog.worker is None
+        assert not dialog.cleanup_retry_timer.isActive()
+    finally:
+        worker.release_cleanup.set()
+        dialog.worker = None
+        dialog.close()
+
+
+def test_finished_failure_revokes_execution_and_safety_state():
+    dialog = make_dialog()
+    try:
+        dialog._current_command = "preflight"
+        dialog._workflow_active = True
+        dialog._execution_unlocked = True
+        dialog._step_completed["safety"] = True
+
+        dialog._on_finished(False, {})
+
+        assert dialog._execution_unlocked is False
+        assert dialog._step_completed["safety"] is False
+        assert dialog._workflow_active is False
+    finally:
+        dialog.close()
+
+
+def test_malformed_frame_after_success_never_unlocks_dialog_safety():
+    class Process:
+        def __init__(self):
+            self.stdin = io.StringIO()
+            self.stdout = io.StringIO(
+                '{"event":"result","command":"preflight","success":true,"issues":[]}\n'
+                "malformed trailing frame\n"
+            )
+            self.stderr = io.StringIO()
+            self.reaped = False
+
+        def poll(self):
+            return 0 if self.reaped else None
+
+        def wait(self, timeout=None):
+            self.reaped = True
+            return 0
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            pass
+
+    process = Process()
+    worker = CrossEngineMigrationWorker(
+        "preflight",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    dialog = make_dialog()
+    try:
+        dialog.worker = worker
+        dialog._current_command = "preflight"
+        worker.result.connect(dialog._on_result)
+        worker.finished.connect(dialog._on_finished)
+
+        worker.run()
+
+        assert dialog._execution_unlocked is False
+        assert dialog._step_completed["safety"] is False
+        assert dialog.worker is None
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_full_workflow_retained_worker_guard_leaves_workflow_inactive(monkeypatch):
+    class RetainedWorker:
+        def isRunning(self):
+            return False
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    dialog = make_dialog()
+    try:
+        dialog.worker = cast(Any, RetainedWorker())
+
+        dialog._start_full_workflow()
+
+        assert dialog._workflow_active is False
     finally:
         dialog.worker = None
         dialog.close()
@@ -1075,11 +1231,13 @@ def test_close_event_retains_cleanup_residual_until_final_retry_succeeds(
     class ResidualWorker:
         def __init__(self):
             self.cleanup_succeeds = False
+            self.retry_calls = 0
 
         def isRunning(self):
             return False
 
         def retry_process_cleanup(self, *, timeout_seconds):
+            self.retry_calls += 1
             if not self.cleanup_succeeds:
                 raise residual
             return True
@@ -1103,13 +1261,103 @@ def test_close_event_retains_cleanup_residual_until_final_retry_succeeds(
 
         assert not blocked_close.isAccepted()
         assert dialog.worker is worker
+        assert worker.retry_calls == 0
 
         worker.cleanup_succeeds = True
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog._cleanup_retry_thread is not None
+        dialog._cleanup_retry_thread.join(timeout=1.0)
+        dialog.cleanup_retry_timer.timeout.emit()
+
         settled_close = QCloseEvent()
         dialog.closeEvent(settled_close)
 
         assert settled_close.isAccepted()
         assert dialog.worker is None
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_close_event_never_force_terminates_an_unresponsive_worker(monkeypatch):
+    class UnresponsiveWorker:
+        def __init__(self):
+            self.cancel_calls = 0
+            self.wait_timeouts = []
+
+        def isRunning(self):
+            return True
+
+        def cancel(self):
+            self.cancel_calls += 1
+            return True
+
+        def wait(self, timeout):
+            self.wait_timeouts.append(timeout)
+            return False
+
+        def terminate(self):
+            raise AssertionError("dialog must never force-terminate its QThread")
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    dialog = make_dialog()
+    worker = UnresponsiveWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        close_event = QCloseEvent()
+
+        dialog.closeEvent(close_event)
+
+        assert not close_event.isAccepted()
+        assert worker.cancel_calls == 1
+        assert worker.wait_timeouts == [WORKER_CLOSE_WAIT_MS]
+        assert dialog.worker is worker
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_close_event_denies_closure_when_cooperative_terminate_request_fails(monkeypatch):
+    class TerminateFailureWorker:
+        def __init__(self):
+            self.wait_called = False
+
+        def isRunning(self):
+            return True
+
+        def cancel(self):
+            return False
+
+        def wait(self, timeout):
+            self.wait_called = True
+            return True
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.question",
+        lambda *args, **kwargs: QMessageBox.StandardButton.Yes,
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    dialog = make_dialog()
+    worker = TerminateFailureWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        close_event = QCloseEvent()
+
+        dialog.closeEvent(close_event)
+
+        assert not close_event.isAccepted()
+        assert worker.wait_called is False
+        assert dialog.worker is worker
     finally:
         dialog.worker = None
         dialog.close()

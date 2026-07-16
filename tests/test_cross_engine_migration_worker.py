@@ -97,6 +97,7 @@ class BlockingWriteStream(RecordingStream):
         self.write_started = threading.Event()
         self.release_write = threading.Event()
         self.close_called = threading.Event()
+        self.allow_close = threading.Event()
         self.write_completed = threading.Event()
 
     def write(self, text):
@@ -109,8 +110,9 @@ class BlockingWriteStream(RecordingStream):
 
     def close(self):
         self.close_called.set()
+        if not self.allow_close.wait(timeout=2.0):
+            raise AssertionError("cancel synchronously closed a blocked stdin stream")
         super().close()
-        self.release_write.set()
 
 
 class FailOnceCloseStream(RecordingStream):
@@ -227,7 +229,7 @@ def test_worker_cancel_during_popen_factory_reaps_without_building_or_writing_re
     assert finished == [(False, {"cancelled": True})]
 
 
-def test_worker_cancel_interrupts_blocked_stdin_write_without_waiting_for_writer():
+def test_worker_cancel_returns_without_closing_a_blocked_stdin_writer():
     process = LifecycleProcess()
     process.stdin = BlockingWriteStream()
     process.stdout = RecordingStream(
@@ -260,14 +262,17 @@ def test_worker_cancel_interrupts_blocked_stdin_write_without_waiting_for_writer
     assert process.stdin.write_started.wait(timeout=2.0)
     cancel_thread.start()
     cancel_returned_without_external_release = cancel_returned.wait(timeout=0.5)
-    if not cancel_returned_without_external_release:
-        process.stdin.release_write.set()
+    assert cancel_returned_without_external_release is True
+    assert not process.stdin.close_called.is_set()
+    assert process.terminate_calls >= 1
+
+    process.stdin.release_write.set()
+    process.stdin.allow_close.set()
     run_thread.join(timeout=2.0)
     cancel_thread.join(timeout=2.0)
 
-    assert cancel_returned_without_external_release is True
     assert process.stdin.close_called.is_set()
-    assert not process.stdin.write_completed.is_set()
+    assert process.stdin.write_completed.is_set()
     assert process.terminate_calls >= 1
     assert results == []
     assert not run_thread.is_alive()
@@ -276,7 +281,7 @@ def test_worker_cancel_interrupts_blocked_stdin_write_without_waiting_for_writer
 
 
 @pytest.mark.parametrize("poll_error", [OSError("poll failed"), ValueError("closed handle")])
-def test_worker_cancel_poll_error_still_closes_stdin_and_terminates(poll_error):
+def test_worker_cancel_skips_stream_close_and_terminates_without_polling(poll_error):
     process = LifecycleProcess()
 
     def fail_poll():
@@ -288,7 +293,7 @@ def test_worker_cancel_poll_error_still_closes_stdin_and_terminates(poll_error):
 
     worker.cancel()
 
-    assert process.stdin.closed
+    assert not process.stdin.closed
     assert process.terminate_calls == 1
 
 
@@ -352,8 +357,10 @@ def test_worker_valid_result_followed_by_malformed_frame_finishes_false():
         popen_factory=lambda *args, **kwargs: process,
     )
     failures = []
+    results = []
     finished = []
     worker.failed.connect(failures.append)
+    worker.result.connect(results.append)
     worker.finished.connect(
         lambda success, payload: finished.append((success, payload))
     )
@@ -362,7 +369,24 @@ def test_worker_valid_result_followed_by_malformed_frame_finishes_false():
 
     assert len(failures) == 1
     assert "Invalid helper JSON" in failures[0]
+    assert results == []
     assert finished == [(False, {"error": failures[0]})]
+
+
+def test_worker_cancel_terminate_failure_retains_the_published_process_handle():
+    process = LifecycleProcess()
+
+    def fail_terminate():
+        process.terminate_calls += 1
+        raise OSError("terminate denied")
+
+    process.terminate = fail_terminate
+    worker = CrossEngineMigrationWorker("migrate", {}, helper_path="fake-helper")
+    worker._process = process
+
+    assert worker.cancel() is False
+    assert process.terminate_calls == 1
+    assert worker.has_unsettled_process() is True
 
 
 def test_worker_cleanup_continues_from_first_wait_oserror_to_kill_and_reap():
@@ -486,8 +510,10 @@ def test_worker_stream_close_failure_is_residual_until_retry():
         popen_factory=lambda *args, **kwargs: process,
     )
     failures = []
+    results = []
     finished = []
     worker.failed.connect(failures.append)
+    worker.result.connect(results.append)
     worker.finished.connect(
         lambda success, payload: finished.append((success, payload))
     )
@@ -497,6 +523,7 @@ def test_worker_stream_close_failure_is_residual_until_retry():
     assert worker._process is process
     assert not process.stdout.closed
     assert process.stdout.close_calls == 1
+    assert results == []
     assert len(failures) == 1
     assert "stream_close" in failures[0]
     assert finished[0][0] is False
