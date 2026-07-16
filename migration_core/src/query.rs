@@ -333,7 +333,8 @@ mod tests {
                 payload: json!({"connection_id": "missing", "sql": "SELECT 1"}),
             },
             |event| events.push(event),
-        );
+        )
+        .expect("unknown connection errors should emit successfully");
 
         assert_eq!(events[0]["event"], "error");
         assert_eq!(events[0]["request_id"], "query-1");
