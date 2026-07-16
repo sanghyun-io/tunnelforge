@@ -88,6 +88,15 @@ impl ProtocolEmitError {
     pub fn side_effect_started(&self) -> bool {
         self.side_effect_started
     }
+
+    pub(crate) fn with_secondary_failure(
+        mut self,
+        context: &str,
+        failure: impl fmt::Display,
+    ) -> Self {
+        self.message = format!("{}; {context}: {failure}", self.message);
+        self
+    }
 }
 
 impl fmt::Display for ProtocolEmitError {

@@ -271,12 +271,75 @@ fn sql_keyword_tokens(sql: &str) -> Vec<String> {
     tokens
 }
 
+fn sql_has_potential_function_call(sql: &str) -> bool {
+    const STRUCTURAL_PAREN_KEYWORDS: &[&str] = &[
+        "and", "as", "case", "else", "exists", "filter", "from", "having", "in", "join", "not",
+        "on", "or", "over", "select", "then", "values", "when", "where", "within",
+    ];
+
+    let bytes = sql.as_bytes();
+    let mut index = 0;
+    let mut preceding_identifier: Option<(String, bool)> = None;
+    while index < bytes.len() {
+        if let Some(end) = skip_sql_comment(bytes, index, true) {
+            index = end.min(bytes.len());
+            continue;
+        }
+        if bytes[index].is_ascii_whitespace() {
+            index += 1;
+            continue;
+        }
+        if matches!(bytes[index], b'\'' | b'"' | b'`') {
+            let quote = bytes[index];
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else if bytes[index] == quote {
+                    if index + 1 < bytes.len() && bytes[index + 1] == quote {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            preceding_identifier = (quote != b'\'').then(|| (String::new(), true));
+            continue;
+        }
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
+            {
+                index += 1;
+            }
+            preceding_identifier = Some((sql[start..index].to_ascii_lowercase(), false));
+            continue;
+        }
+        if bytes[index] == b'(' {
+            if let Some((identifier, quoted)) = preceding_identifier.as_ref() {
+                if *quoted || !STRUCTURAL_PAREN_KEYWORDS.contains(&identifier.as_str()) {
+                    return true;
+                }
+            }
+        }
+        preceding_identifier = None;
+        index += 1;
+    }
+    false
+}
+
 pub(crate) fn query_may_mutate(sql: &str) -> bool {
     match leading_sql_keyword(sql).as_str() {
-        "show" | "desc" | "describe" | "values" | "table" => false,
-        "select" => {
+        "show" | "desc" | "describe" | "table" => false,
+        "select" | "values" => {
             let tokens = sql_keyword_tokens(sql);
-            tokens.iter().any(|token| token == "into")
+            sql_has_potential_function_call(sql)
+                || tokens.iter().any(|token| token == "into")
                 || tokens
                     .windows(2)
                     .any(|window| window == ["for", "update"])
@@ -286,6 +349,12 @@ pub(crate) fn query_may_mutate(sql: &str) -> bool {
                 || tokens
                     .windows(4)
                     .any(|window| window == ["lock", "in", "share", "mode"])
+                || tokens
+                    .windows(4)
+                    .any(|window| window == ["for", "no", "key", "update"])
+                || tokens
+                    .windows(3)
+                    .any(|window| window == ["for", "key", "share"])
         }
         _ => true,
     }
@@ -396,6 +465,9 @@ mod tests {
             "DESCRIBE users",
             "VALUES (1)",
             "TABLE users",
+            "SELECT 'nextval(' AS literal",
+            "SELECT 1 /* volatile_user_function() */",
+            "VALUES ('user_function()')",
         ] {
             assert!(!query_may_mutate(sql), "expected row-only SQL: {sql}");
         }
@@ -411,7 +483,41 @@ mod tests {
             "SELECT * FROM users INTO OUTFILE '/tmp/users.tsv'",
             "SELECT * FROM users FOR SHARE",
         ] {
-            assert!(query_may_mutate(sql), "expected mutation-capable SQL: {sql}");
+            assert!(
+                query_may_mutate(sql),
+                "expected mutation-capable SQL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_side_effect_classification_rejects_select_and_values_function_calls() {
+        for sql in [
+            "SELECT nextval('users_id_seq')",
+            "SELECT volatile_user_function()",
+            "SELECT app.user_function()",
+            "SELECT app.\"volatile_user_function\"()",
+            "VALUES (nextval('users_id_seq'))",
+        ] {
+            assert!(
+                query_may_mutate(sql),
+                "expected mutation-capable SQL: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn query_side_effect_classification_rejects_all_postgresql_row_locks() {
+        for sql in [
+            "SELECT * FROM users FOR UPDATE",
+            "SELECT * FROM users FOR NO KEY UPDATE",
+            "SELECT * FROM users FOR SHARE",
+            "SELECT * FROM users FOR KEY SHARE",
+        ] {
+            assert!(
+                query_may_mutate(sql),
+                "expected mutation-capable SQL: {sql}"
+            );
         }
     }
 

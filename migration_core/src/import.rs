@@ -103,13 +103,18 @@ fn emit_post_enable_import_event<F, R, C>(
 where
     F: FnMut(Value) -> R,
     R: IntoProtocolEmitResult,
-    C: FnOnce(),
+    C: FnOnce() -> Result<(), String>,
 {
-    let result = emit_import_event(emit, event, side_effect_started);
-    if result.is_err() {
-        restore_on_failure();
+    match emit_import_event(emit, event, side_effect_started) {
+        Ok(()) => Ok(()),
+        Err(error) => match restore_on_failure() {
+            Ok(()) => Err(error),
+            Err(restore_error) => Err(error.with_secondary_failure(
+                "emergency MySQL local_infile restoration failed",
+                restore_error,
+            )),
+        },
     }
-    result
 }
 
 pub(crate) fn dump_import_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
@@ -1097,7 +1102,7 @@ where
         })
     };
     emit_post_enable_import_event(emit, event, *side_effect_started, || {
-        let _ = restore_mysql_local_infile_value(adapter, local_infile_restore.clone());
+        restore_mysql_local_infile_value(adapter, local_infile_restore.clone()).map(|_| ())
     })?;
     Ok(local_infile_restore)
 }
@@ -2081,11 +2086,31 @@ mod tests {
             || {
                 assert_eq!(owned_previous.as_deref(), Some("OFF"));
                 restored.set(true);
+                Ok(())
             },
         )
         .expect_err("post-enable phase failure must propagate");
 
         assert!(restored.get());
         assert!(error.side_effect_started());
+    }
+
+    #[test]
+    fn post_enable_emit_failure_surfaces_owned_local_infile_restoration_failure() {
+        let error = emit_post_enable_import_event(
+            &mut |_event| Err(ProtocolEmitError::io("post-enable sink failed")),
+            json!({"event": "phase", "strategy": "load_data_local_infile"}),
+            true,
+            || Err("SET GLOBAL local_infile restore was denied".to_string()),
+        )
+        .expect_err("post-enable emission and restoration failures must propagate");
+
+        assert_eq!(error.code(), "protocol_emit_failed");
+        assert!(error.side_effect_started());
+        assert!(error.to_string().starts_with("post-enable sink failed"));
+        assert!(error
+            .to_string()
+            .contains("SET GLOBAL local_infile restore was denied"));
+        assert!(!error.to_string().contains("restored successfully"));
     }
 }
