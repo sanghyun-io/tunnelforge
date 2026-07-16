@@ -2435,13 +2435,17 @@ mod tests {
     }
 
     #[test]
-    fn endpoint_query_emit_failure_uses_statement_side_effect_boundary() {
-        for (sql, expected_side_effect) in [
-            ("SELECT 1", true),
-            ("VALUES (1)", true),
-            ("SHOW TABLES", false),
-            ("UPDATE users SET name='changed'", true),
-            ("SELECT * FROM users INTO OUTFILE '/tmp/users.tsv'", true),
+    fn endpoint_query_emit_failure_is_always_indeterminate() {
+        for sql in [
+            "SELECT 1",
+            "VALUES (1)",
+            "SHOW TABLES",
+            "SHOW STATUS WHERE GET_LOCK('wire-boundary', 0) = 1",
+            "DESC users",
+            "DESCRIBE users",
+            "TABLE users",
+            "UPDATE users SET name='changed'",
+            "SELECT * FROM users INTO OUTFILE '/tmp/users.tsv'",
         ] {
             let request = Request {
                 command: "query.execute".to_string(),
@@ -2471,10 +2475,9 @@ mod tests {
             })
             .expect_err("query emitter failure must propagate");
 
-            assert_eq!(
+            assert!(
                 error.side_effect_started(),
-                expected_side_effect,
-                "unexpected side-effect boundary for {sql}"
+                "emission failure must be indeterminate for {sql}"
             );
         }
     }

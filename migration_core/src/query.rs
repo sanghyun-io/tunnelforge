@@ -227,11 +227,8 @@ fn leading_sql_keyword(sql: &str) -> String {
     text[..end].to_ascii_lowercase()
 }
 
-pub(crate) fn query_may_mutate(sql: &str) -> bool {
-    !matches!(
-        leading_sql_keyword(sql).as_str(),
-        "show" | "desc" | "describe" | "table"
-    )
+pub(crate) fn query_may_mutate(_sql: &str) -> bool {
+    true
 }
 
 fn query_returns_rows(sql: &str) -> bool {
@@ -348,14 +345,17 @@ mod tests {
     }
 
     #[test]
-    fn query_side_effect_classification_only_allows_provably_read_only_keywords() {
+    fn query_side_effect_classification_is_unconditionally_fail_closed() {
         for sql in [
+            "",
+            "-- comment only",
             "SHOW TABLES",
+            "SHOW STATUS WHERE GET_LOCK('wire-boundary', 0) = 1",
             "DESC users",
             "DESCRIBE users",
             "TABLE users",
         ] {
-            assert!(!query_may_mutate(sql), "expected row-only SQL: {sql}");
+            assert!(query_may_mutate(sql), "expected indeterminate SQL: {sql}");
         }
 
         for sql in [
