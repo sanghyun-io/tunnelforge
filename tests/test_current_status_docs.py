@@ -43,6 +43,17 @@ def test_current_status_records_oneclick_phase_b_task3_without_enabling_apply():
     assert "TF-STATUS-097 | High | open" in doc
 
 
+def test_current_status_records_oneclick_phase_b_task4_indeterminate_boundary():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized = " ".join(doc.split())
+
+    assert "TF-STATUS-097 Phase B Task 4 is complete through `2115f3a`" in doc
+    assert "oneclick_outcome_indeterminate" in doc
+    assert "Task 4 Review: APPROVE" in doc
+    assert "production apply remains unreachable" in normalized
+    assert "TF-STATUS-097 | High | open" in doc
+
+
 def test_current_status_top_handoff_does_not_present_closed_issues_as_current_work():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     top_handoff = " ".join(doc.split("## Issue Tracker", maxsplit=1)[0].split())

@@ -273,20 +273,20 @@ Protocol rejects apply `dry_run=true` as legacy preview before session creation.
 
 DB lock scope is separate from approval identity. Normalize the DB-read UUID to lowercase hyphenated form, then key exactly `"tf1:" + URL_SAFE_NO_PAD(SHA256(b"tunnelforge.oneclick.lock.v1\0" || server_uuid ASCII))`: 47 bytes, under MySQL's 64-byte limit. Route, authenticated user, engine, and schema never enter the key, while approval still compares the complete identity exactly. Test length/alphabet/no padding/determinism, equal key across aliases/users/schemas, and different key for different server UUID.
 
-**Stable Rust codes:** `oneclick_apply_disabled`, `oneclick_legacy_preview_disabled`, `oneclick_apply_payload_prohibited`, `oneclick_schema_mismatch`, `oneclick_backup_required`, `oneclick_approval_required`, `oneclick_approval_version_unsupported`, `oneclick_profile_required`, `oneclick_profile_unsupported`, `oneclick_profile_substitution`, `oneclick_target_changed`, `oneclick_snapshot_changed`, `oneclick_plan_changed`, `oneclick_replan_failed`, `oneclick_nothing_to_apply`, `oneclick_lock_unavailable`, `oneclick_precondition_changed`, `oneclick_postcondition_changed`.
+**Stable Rust codes:** `oneclick_apply_disabled`, `oneclick_legacy_preview_disabled`, `oneclick_apply_payload_prohibited`, `oneclick_schema_mismatch`, `oneclick_backup_required`, `oneclick_approval_required`, `oneclick_approval_version_unsupported`, `oneclick_profile_required`, `oneclick_profile_unsupported`, `oneclick_profile_substitution`, `oneclick_target_changed`, `oneclick_snapshot_changed`, `oneclick_plan_changed`, `oneclick_replan_failed`, `oneclick_nothing_to_apply`, `oneclick_lock_unavailable`, `oneclick_precondition_changed`, `oneclick_postcondition_changed`, `oneclick_outcome_indeterminate`.
 
-- [ ] **Step 1: RED raw-boundary protocol tests**
+- [x] **Step 1: RED raw-boundary protocol tests**
 In `protocol.rs`, test missing/malformed backup/approval/version, prohibited fields, schema mismatches, and all four gate combinations. Only true/true may reach a session factory; all others return disabled with count zero. Update the Phase A direct-apply fixture to a valid approval.
 
-- [ ] **Step 2: RED generic executor tests**
+- [x] **Step 2: RED generic executor tests**
 In `oneclick.rs`, use `RecordingPlanningSession` for initial plan/profile support and `RecordingOneClickSession` for replan, lock, mismatch, zero-action, and exact SQL tests. Assert every action executes one statement, checks its pre-state, then checks expected post-state before the next action. Column/generated/index/FK DDL stale fixtures cover plan-to-replan and replan-to-SQL; post-state drift returns `oneclick_postcondition_changed`. Retain before-first-SQL and between-actions hooks; the latter permits only action 1 SQL.
 
-- [ ] **Step 3: Implement candidate and honest hard gate**
+- [x] **Step 3: Implement candidate and honest hard gate**
 Executor reads current DB UUID, acquires the server-global lock, then rereads full identity and replans through the shared planner. Compare identity/profile/snapshot/plan and reject zero actions. For each ordered action: read exact pre-facts, execute its single SQL, read exact post-facts, then continue. Stop on any mismatch and release on every definite exit; never execute approval/client actions.
 
 MySQL `ALTER TABLE` implicitly commits; named locks coordinate only cooperating sessions and an external race remains. Production calls `oneclick_apply_enabled(ONECLICK_EXACT_PLAN_ENABLED, ONECLICK_STRONG_FENCE_PROVEN)` before session creation. This plan leaves both false, so no production execution or partial rollback claim is allowed.
 
-- [ ] **Step 4: Live tests, GREEN, and commit**
+- [x] **Step 4: Live tests, GREEN, and commit**
 Configured MySQL tests plan/approve then prove public apply is disabled and unchanged. A test-only generic adapter exercises stale replan and both concurrency windows; between-actions may retain action 1 but no later SQL.
 Run: `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`
 Run: `cargo test --manifest-path migration_core\Cargo.toml --test live_roundtrip oneclick -- --nocapture`
