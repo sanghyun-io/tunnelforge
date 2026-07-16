@@ -2020,6 +2020,7 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
         "macos-support-tracking-gate",
         "rust-core-regression-gate",
         "python-regression",
+        "python39-db-core-native",
         "macos-app-validation",
         "version-validation",
         "version-bump",
