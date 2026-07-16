@@ -246,6 +246,8 @@ class CrossEngineMigrationWorker(QThread):
         buffered_result_payload = None
         stdout_complete = False
         exited_zero = False
+        terminal_event_name = None
+        terminal_error_message = ""
 
         try:
             process = self._popen_factory(
@@ -278,20 +280,35 @@ class CrossEngineMigrationWorker(QThread):
                 if self._cancelled:
                     break
                 event = parse_helper_event(line)
-                if event.event == "result":
+                if event.event in ("result", "error"):
+                    if terminal_event_name is not None:
+                        raise HelperProtocolError(
+                            "Helper protocol emitted multiple terminal frames "
+                            f"({terminal_event_name} then {event.event}); exactly one "
+                            "terminal result/error frame is required"
+                        )
+                    terminal_event_name = event.event
                     final_payload = event.payload
-                    success = bool(event.success)
-                    buffered_result_payload = event.payload
-                elif event.event == "error":
-                    final_payload = event.payload
-                    success = False
-                    buffered_result_payload = None
+                    if event.event == "result":
+                        success = bool(event.success)
+                        buffered_result_payload = event.payload
+                    else:
+                        success = False
+                        buffered_result_payload = None
+                        terminal_error_message = event.message
+                    continue
                 self._dispatch_event(event)
 
             return_code = process.wait()
             self._join_stderr_drain()
             stdout_complete = not self._cancelled
             exited_zero = return_code == 0
+            if return_code == 0 and not self._cancelled and terminal_event_name is None:
+                raise HelperProtocolError(
+                    "Helper protocol requires exactly one terminal result/error frame"
+                )
+            if terminal_event_name == "error" and not self._cancelled:
+                self._emit_failed_once(terminal_error_message)
             if return_code != 0 and not self._cancelled:
                 success = False
                 buffered_result_payload = None

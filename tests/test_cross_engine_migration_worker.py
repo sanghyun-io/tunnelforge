@@ -373,6 +373,79 @@ def test_worker_valid_result_followed_by_malformed_frame_finishes_false():
     assert finished == [(False, {"error": failures[0]})]
 
 
+def _assert_worker_rejects_multiple_terminal_frames(stdout_lines):
+    process = FakeProcess(stdout_lines)
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    failures = []
+    results = []
+    finished = []
+    worker.failed.connect(failures.append)
+    worker.result.connect(results.append)
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+
+    assert len(failures) == 1
+    assert "multiple terminal" in failures[0].lower()
+    assert results == []
+    assert finished == [(False, {"error": failures[0]})]
+
+
+def test_worker_rejects_error_followed_by_result_terminal_frame():
+    _assert_worker_rejects_multiple_terminal_frames([
+        '{"event":"error","message":"first failure"}',
+        '{"event":"result","command":"migrate","success":true}',
+    ])
+
+
+def test_worker_rejects_result_followed_by_result_terminal_frame():
+    _assert_worker_rejects_multiple_terminal_frames([
+        '{"event":"result","command":"migrate","success":true}',
+        '{"event":"result","command":"migrate","success":false}',
+    ])
+
+
+def test_worker_rejects_result_followed_by_error_terminal_frame():
+    _assert_worker_rejects_multiple_terminal_frames([
+        '{"event":"result","command":"migrate","success":true}',
+        '{"event":"error","message":"late failure"}',
+    ])
+
+
+def test_worker_rejects_zero_exit_without_terminal_frame():
+    process = FakeProcess([
+        '{"event":"phase","phase":"migrate","message":"started"}',
+    ])
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    failures = []
+    results = []
+    finished = []
+    worker.failed.connect(failures.append)
+    worker.result.connect(results.append)
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+
+    assert len(failures) == 1
+    assert "exactly one terminal" in failures[0].lower()
+    assert results == []
+    assert finished == [(False, {"error": failures[0]})]
+
+
 def test_worker_cancel_terminate_failure_retains_the_published_process_handle():
     process = LifecycleProcess()
 

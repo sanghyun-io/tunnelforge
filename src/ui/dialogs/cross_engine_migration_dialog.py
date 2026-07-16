@@ -168,6 +168,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._cleanup_retry_thread: Optional[threading.Thread] = None
         self._cleanup_retry_result = None
         self._cleanup_retry_lock = threading.Lock()
+        self._closing = False
         self.cleanup_retry_timer = QTimer(self)
         self.cleanup_retry_timer.setInterval(CLEANUP_RETRY_INTERVAL_MS)
         self.cleanup_retry_timer.timeout.connect(self._retry_cleanup_residual)
@@ -832,6 +833,8 @@ class CrossEngineMigrationDialog(QDialog):
         return payload
 
     def _start_full_workflow(self):
+        if self._closing:
+            return
         if self.worker is not None:
             message = (
                 "이미 실행 중인 작업이 있습니다."
@@ -844,6 +847,8 @@ class CrossEngineMigrationDialog(QDialog):
         self._start_command("inspect", workflow=True)
 
     def _start_command(self, command: str, workflow: bool = False):
+        if self._closing:
+            return
         if self.worker is not None:
             message = (
                 "이미 실행 중인 작업이 있습니다."
@@ -884,6 +889,8 @@ class CrossEngineMigrationDialog(QDialog):
         self._start_command_with_payload(command, payload, workflow=workflow)
 
     def _start_command_with_payload(self, command: str, payload: Dict, workflow: bool = False):
+        if self._closing:
+            return
         if self.worker is not None:
             message = (
                 "이미 실행 중인 작업이 있습니다."
@@ -1034,6 +1041,8 @@ class CrossEngineMigrationDialog(QDialog):
             )
 
     def _on_finished(self, success: bool, payload):
+        if self._closing:
+            return
         finished_command = self._current_command
         worker = self.worker
         if not self._wait_for_worker_finish():
@@ -1535,8 +1544,9 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_safety_activity.setText(text)
         self._append_safety_log(text)
 
-    def closeEvent(self, a0: Optional[QCloseEvent]):
-        assert a0 is not None
+    def _try_begin_dismissal(self) -> bool:
+        if self._closing:
+            return True
         worker = self.worker
         if worker is not None and worker.isRunning():
             reply = QMessageBox.question(
@@ -1547,8 +1557,7 @@ class CrossEngineMigrationDialog(QDialog):
                 QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
-                a0.ignore()
-                return
+                return False
             if worker.cancel() is False:
                 self._append_log("취소 요청이 프로세스 종료를 전달하지 못했습니다.")
                 QMessageBox.warning(
@@ -1556,16 +1565,14 @@ class CrossEngineMigrationDialog(QDialog):
                     "프로세스 정리 중",
                     "Rust Core 프로세스 핸들을 유지하므로 창을 닫을 수 없습니다.",
                 )
-                a0.ignore()
-                return
+                return False
             if not worker.wait(WORKER_CLOSE_WAIT_MS):
                 QMessageBox.warning(
                     self,
                     "프로세스 정리 중",
                     "작업 thread가 아직 종료되지 않아 창을 닫을 수 없습니다.",
                 )
-                a0.ignore()
-                return
+                return False
         if worker is not None:
             if worker.isRunning() or self._worker_has_unsettled_process(worker) or self._cleanup_residual_pending:
                 self._request_cleanup_retry(worker)
@@ -1575,10 +1582,24 @@ class CrossEngineMigrationDialog(QDialog):
                     "프로세스 정리 중",
                     "Rust Core 프로세스 정리가 끝날 때까지 창을 유지합니다.",
                 )
-                a0.ignore()
-                return
+                return False
             self._clear_cleanup_worker(worker)
-        a0.accept()
+        self._closing = True
+        self._workflow_active = False
+        self._pending_after_inspect = None
+        self._current_command = None
+        return True
+
+    def reject(self):
+        if self._try_begin_dismissal():
+            super().reject()
+
+    def closeEvent(self, a0: Optional[QCloseEvent]):
+        assert a0 is not None
+        if self._try_begin_dismissal():
+            a0.accept()
+        else:
+            a0.ignore()
 
 
 

@@ -1223,6 +1223,119 @@ def test_full_workflow_retained_worker_guard_leaves_workflow_inactive(monkeypatc
         dialog.close()
 
 
+def test_reject_routes_escape_through_active_worker_dismissal_gate(monkeypatch):
+    class ActiveWorker:
+        def isRunning(self):
+            return True
+
+    questions = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.question",
+        lambda *args, **kwargs: (
+            questions.append(args) or QMessageBox.StandardButton.No
+        ),
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    dialog = make_dialog()
+    rejected = []
+    dialog.rejected.connect(lambda: rejected.append(True))
+    try:
+        dialog.worker = cast(Any, ActiveWorker())
+        dialog.show()
+        app.processEvents()
+
+        dialog.reject()
+
+        assert dialog.isVisible()
+        assert rejected == []
+        assert len(questions) == 1
+        assert dialog.worker is not None
+    finally:
+        dialog.worker = None
+        dialog.hide()
+
+
+def test_reject_retains_dialog_with_residual_worker_ownership(monkeypatch):
+    class ResidualWorker:
+        def isRunning(self):
+            return False
+
+        def has_unsettled_process(self):
+            return True
+
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    dialog = make_dialog()
+    rejected = []
+    dialog.rejected.connect(lambda: rejected.append(True))
+    try:
+        dialog.worker = cast(Any, ResidualWorker())
+        dialog._cleanup_residual_pending = True
+        dialog.show()
+        app.processEvents()
+
+        dialog.reject()
+
+        assert dialog.isVisible()
+        assert rejected == []
+        assert len(warnings) == 1
+        assert dialog.worker is not None
+    finally:
+        dialog.cleanup_retry_timer.stop()
+        dialog.worker = None
+        dialog.hide()
+
+
+def test_accepted_close_makes_queued_finished_and_continuations_inert(monkeypatch):
+    class SettledWorker:
+        def isRunning(self):
+            return False
+
+        def has_unsettled_process(self):
+            return False
+
+    starts = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.CrossEngineMigrationWorker",
+        FakeCrossEngineMigrationWorker,
+    )
+    dialog = make_dialog()
+    try:
+        dialog.worker = cast(Any, SettledWorker())
+        dialog._workflow_active = True
+        dialog._current_command = "inspect"
+        dialog._pending_after_inspect = "plan"
+        monkeypatch.setattr(
+            dialog,
+            "_start_command",
+            lambda command, workflow=False: starts.append((command, workflow)),
+        )
+        close_event = QCloseEvent()
+
+        dialog.closeEvent(close_event)
+        dialog._on_finished(
+            True,
+            {"event": "result", "command": "inspect", "success": True},
+        )
+        dialog._start_command_with_payload("plan", {}, workflow=True)
+
+        assert close_event.isAccepted()
+        assert starts == []
+        assert dialog.worker is None
+        assert dialog._workflow_active is False
+        assert dialog._current_command is None
+        assert dialog._pending_after_inspect is None
+    finally:
+        dialog.worker = None
+        dialog.hide()
+
+
 def test_close_event_retains_cleanup_residual_until_final_retry_succeeds(
     monkeypatch,
 ):
