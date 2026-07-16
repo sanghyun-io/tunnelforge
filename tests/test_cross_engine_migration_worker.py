@@ -41,11 +41,19 @@ class RecordingStream(io.StringIO):
 
 
 class LifecycleProcess:
-    def __init__(self, *, terminate_wait_times_out=False):
+    def __init__(
+        self,
+        *,
+        terminate_wait_times_out=False,
+        wait_effects=None,
+        kill_error=None,
+    ):
         self.stdin = RecordingStream()
         self.stdout = RecordingStream()
         self.stderr = RecordingStream()
         self.terminate_wait_times_out = terminate_wait_times_out
+        self.wait_effects = list(wait_effects or [])
+        self.kill_error = kill_error
         self.terminate_calls = 0
         self.kill_calls = 0
         self.wait_timeouts = []
@@ -60,9 +68,18 @@ class LifecycleProcess:
 
     def kill(self):
         self.kill_calls += 1
+        if self.kill_error is not None:
+            raise self.kill_error
 
     def wait(self, timeout=None):
         self.wait_timeouts.append(timeout)
+        if self.wait_effects:
+            effect = self.wait_effects.pop(0)
+            if isinstance(effect, BaseException):
+                raise effect
+            self.reaped = True
+            self.return_code = int(effect)
+            return self.return_code
         if (
             timeout is not None
             and self.terminate_wait_times_out
@@ -72,6 +89,34 @@ class LifecycleProcess:
         self.reaped = True
         self.return_code = -9 if self.kill_calls else -15
         return self.return_code
+
+
+class BlockingWriteStream(RecordingStream):
+    def __init__(self):
+        super().__init__()
+        self.write_started = threading.Event()
+        self.release_write = threading.Event()
+
+    def write(self, text):
+        self.write_started.set()
+        if not self.release_write.wait(timeout=2.0):
+            raise AssertionError("test did not release the blocked stdin write")
+        return super().write(text)
+
+
+class ObservedLock:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.cancel_waiting = threading.Event()
+
+    def __enter__(self):
+        if threading.current_thread().name == "worker-cancel":
+            self.cancel_waiting.set()
+        self._lock.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self._lock.release()
 
 
 def test_worker_run_emits_result():
@@ -176,6 +221,49 @@ def test_worker_cancel_during_popen_factory_reaps_without_building_or_writing_re
     assert finished == [(False, {"cancelled": True})]
 
 
+def test_worker_cancel_linearizes_after_stdin_write_begins():
+    process = LifecycleProcess()
+    process.stdin = BlockingWriteStream()
+    process.stdout = RecordingStream(
+        '{"event":"result","command":"migrate","success":true}\n'
+    )
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {"source_engine": "mysql", "target_engine": "postgresql"},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    observed_lock = ObservedLock()
+    worker._process_lock = observed_lock
+    cancel_returned = threading.Event()
+    finished = []
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload)),
+        type=Qt.ConnectionType.DirectConnection,
+    )
+
+    run_thread = threading.Thread(target=worker.run, name="worker-run")
+    cancel_thread = threading.Thread(
+        target=lambda: (worker.cancel(), cancel_returned.set()),
+        name="worker-cancel",
+    )
+    run_thread.start()
+    assert process.stdin.write_started.wait(timeout=2.0)
+    cancel_thread.start()
+    cancel_waited_for_write = observed_lock.cancel_waiting.wait(timeout=1.0)
+    cancel_returned_before_release = cancel_returned.is_set()
+    process.stdin.release_write.set()
+    run_thread.join(timeout=2.0)
+    cancel_thread.join(timeout=2.0)
+
+    assert cancel_waited_for_write is True
+    assert cancel_returned_before_release is False
+    assert process.stdin.writes
+    assert not run_thread.is_alive()
+    assert not cancel_thread.is_alive()
+    assert finished == [(False, {"cancelled": True})]
+
+
 def test_worker_exception_after_child_creation_kills_reaps_joins_and_closes():
     import src.ui.workers.cross_engine_migration_worker as worker_module
 
@@ -221,6 +309,115 @@ def test_worker_exception_after_child_creation_kills_reaps_joins_and_closes():
     assert len(failures) == 1
     assert "Invalid helper JSON" in failures[0]
     assert finished == [(False, {"error": failures[0]})]
+
+
+def test_worker_cleanup_continues_from_first_wait_oserror_to_kill_and_reap():
+    process = LifecycleProcess(wait_effects=[OSError("wait interrupted"), -9])
+    process.stdout = RecordingStream("not valid jsonl\n")
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    finished = []
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+
+    assert process.kill_calls == 1
+    assert process.reaped is True
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert finished and finished[0][0] is False
+
+
+def test_worker_cleanup_second_wait_timeout_is_residual_until_retry():
+    process = LifecycleProcess(
+        wait_effects=[
+            subprocess.TimeoutExpired("fake-helper", 2.0),
+            subprocess.TimeoutExpired("fake-helper", 2.0),
+        ]
+    )
+    process.stdout = RecordingStream(
+        '{"event":"result","command":"migrate","success":true}\n'
+        "not valid jsonl\n"
+    )
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    join_calls = []
+    worker._join_stderr_drain = lambda timeout=2.0: join_calls.append(timeout)
+    finished = []
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+
+    assert process.reaped is False
+    assert process.stdin.closed
+    assert not process.stdout.closed
+    assert not process.stderr.closed
+    assert join_calls == []
+    assert worker._process is process
+    assert finished[0][0] is False
+    assert finished[0][1]["cleanup_residual"] is True
+
+    process.wait_effects = [-9]
+    assert worker.retry_process_cleanup(timeout_seconds=0.05) is True
+    assert process.reaped is True
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert join_calls == [0.05]
+    assert len(finished) == 1
+
+
+def test_worker_cleanup_kill_failure_is_residual_until_retry():
+    process = LifecycleProcess(
+        wait_effects=[subprocess.TimeoutExpired("fake-helper", 2.0)],
+        kill_error=OSError("kill denied"),
+    )
+    process.stdout = RecordingStream("not valid jsonl\n")
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    finished = []
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+
+    assert process.reaped is False
+    assert process.stdin.closed
+    assert not process.stdout.closed
+    assert not process.stderr.closed
+    assert finished[0][0] is False
+    assert "kill" in finished[0][1]["error"]
+    assert finished[0][1]["cleanup_residual"] is True
+
+    process.kill_error = None
+    process.wait_effects = [
+        subprocess.TimeoutExpired("fake-helper", 0.05),
+        -9,
+    ]
+    assert worker.retry_process_cleanup(timeout_seconds=0.05) is True
+    assert process.reaped is True
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert len(finished) == 1
 
 
 def test_worker_run_emits_checkpoint_state():

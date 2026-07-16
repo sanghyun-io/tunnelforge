@@ -8,6 +8,7 @@ from src.core.db_core_service import (
     DbCoreOutcome,
     DbCoreRequestKind,
     DbCoreServiceError,
+    is_db_core_facade_retained,
 )
 from src.ui.dialogs.db_dialogs import RustDumpWizard
 from src.ui.dialogs.db_import_dialog import RustDumpImportDialog
@@ -171,7 +172,9 @@ def test_rust_dump_worker_cancel_does_not_touch_shared_facade_process():
 
 
 def test_rust_dump_worker_cancel_has_no_private_process_access():
-    source = inspect.getsource(RustDumpWorker.cancel)
+    source = inspect.getsource(RustDumpWorker.cancel) + inspect.getsource(
+        RustDumpWorker._cancel_owned_runner
+    )
 
     assert "_process" not in source
     assert ".poll(" not in source
@@ -425,6 +428,107 @@ def test_rust_dump_worker_cancel_after_runner_publication_skips_db_work(
         assert import_finished == [(False, "작업이 취소되었습니다.", {})]
     else:
         assert import_finished == []
+
+
+def test_rust_dump_worker_idle_cancel_in_post_check_gap_shuts_down_before_facade_request(
+    monkeypatch,
+):
+    import src.ui.workers.rust_dump_worker as worker_module
+
+    cancel_calls = []
+    shutdown_calls = []
+    facade_requests = []
+    db_calls = []
+    runner_calls = []
+    worker = None
+
+    class IdleClient:
+        def __init__(self):
+            self.shutdown_started = False
+
+        def cancel_active_request(self, *, timeout_seconds):
+            cancel_calls.append(timeout_seconds)
+            return False
+
+        def shutdown(self, *, timeout_seconds):
+            shutdown_calls.append(timeout_seconds)
+            self.shutdown_started = True
+
+    class FailClosedFacade:
+        def __init__(self):
+            self.client = IdleClient()
+
+        def import_dump(self):
+            if self.client.shutdown_started:
+                raise DbCoreServiceError(
+                    "dedicated client is shut down",
+                    code="db_core_process_closed",
+                    request_kind=DbCoreRequestKind.MUTATION,
+                    outcome=DbCoreOutcome.NOT_STARTED,
+                    request_id="idle-cancel",
+                    process_generation=1,
+                    rust_code=None,
+                    payload={"stage": "post_check_gap"},
+                )
+            facade_requests.append("dump.import")
+            db_calls.append("import")
+            return True, "ok", {}
+
+    class GapImporter:
+        def __init__(self, config):
+            self.facade = FailClosedFacade()
+            self._owns_facade = True
+            self.last_error_metadata = None
+
+        def import_dump(self, *args, **kwargs):
+            runner_calls.append("import_dump")
+            worker.cancel()
+            return self.facade.import_dump()
+
+    monkeypatch.setattr(worker_module, "RustDumpImporter", GapImporter)
+    worker = RustDumpWorker(
+        "import",
+        RustDumpConfig("127.0.0.1", 3306, "root", "pw"),
+        input_dir="C:/dump",
+    )
+    finished = []
+    import_finished = []
+    worker.finished.connect(lambda success, message: finished.append((success, message)))
+    worker.import_finished.connect(
+        lambda success, message, results: import_finished.append(
+            (success, message, results)
+        )
+    )
+
+    worker.run()
+
+    assert runner_calls == ["import_dump"]
+    assert cancel_calls == [5.0]
+    assert shutdown_calls == [5.0]
+    assert facade_requests == []
+    assert db_calls == []
+    assert finished == [(False, "작업이 취소되었습니다.")]
+    assert import_finished == [(False, "작업이 취소되었습니다.", {})]
+
+
+def test_rust_dump_worker_idle_cancel_retains_owned_facade_on_shutdown_failure():
+    residual = _service_error(
+        "owner still alive",
+        code="db_core_residual_process",
+        outcome=DbCoreOutcome.FAILED,
+    )
+    worker, runner, client = _make_worker_with_fake_runner(owns_facade=True)
+    client.cancel_active_request = MagicMock(return_value=False)
+    client.shutdown = MagicMock(side_effect=[residual, None])
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        worker.cancel()
+
+    assert raised.value is residual
+    assert is_db_core_facade_retained(runner.facade)
+    assert worker._active_runner is runner
+    assert worker.retry_owned_shutdown(timeout_seconds=0.05) is True
+    assert worker._active_runner is None
 
 
 def test_import_dialog_never_offers_or_relaunches_indeterminate_table_retry(monkeypatch):
