@@ -9,6 +9,7 @@ from typing import Callable, Dict, List, Optional, Set, Tuple
 from src.core.db_connector import MySQLConnector
 from src.core.db_core_service import (
     DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+    DbCoreCallbackError,
     DbCoreFacade,
     DbCoreOutcome,
     DbCoreRequestKind,
@@ -55,6 +56,18 @@ class RustDumpErrorMetadata:
             request_id=error.request_id,
             process_generation=error.process_generation,
             rust_code=error.rust_code,
+        )
+
+    @classmethod
+    def from_callback_error(cls, error: DbCoreCallbackError) -> "RustDumpErrorMetadata":
+        request_result = error.request_result
+        return cls(
+            code="db_core_callback_failed",
+            outcome=error.outcome,
+            request_kind=error.request_kind,
+            request_id=getattr(request_result, "request_id", ""),
+            process_generation=int(getattr(request_result, "process_generation", 0) or 0),
+            rust_code=getattr(request_result, "rust_code", None),
         )
 
 
@@ -581,6 +594,11 @@ class RustDumpImporter(_RustDumpClientBase):
             _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
             import_results[RUST_DUMP_ERROR_METADATA_KEY] = self.last_error_metadata
             return False, f"Rust DB Core import 오류: {exc}", import_results
+        except DbCoreCallbackError as exc:
+            self.last_error_metadata = RustDumpErrorMetadata.from_callback_error(exc)
+            _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
+            import_results[RUST_DUMP_ERROR_METADATA_KEY] = self.last_error_metadata
+            return False, f"Rust DB Core import callback 오류: {exc}", import_results
         except Exception as exc:
             _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
             return False, f"Import 오류: {exc}", import_results

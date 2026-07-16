@@ -10,6 +10,7 @@ import time
 from typing import Any, Dict, Optional
 
 from src.core.db_core_service import (
+    DbCoreGenerationState,
     DbCoreOutcome,
     DbCoreServiceError,
     create_rust_db_connector,
@@ -42,6 +43,7 @@ class TunnelHealthChecker:
         # Health check용 Rust DB Core 연결 캐시 (터널별 1개씩 유지)
         self._health_connections: Dict[str, Any] = {}
         self._transport_failed_generations: Dict[str, int] = {}
+        self._transport_failure_facades: Dict[str, Any] = {}
 
     def _cleanup_health_connection(
         self, tunnel_id: str, *, reset_transport_failure: bool = True
@@ -54,6 +56,7 @@ class TunnelHealthChecker:
             conn = self._health_connections.pop(tunnel_id, None)
             if reset_transport_failure:
                 self._transport_failed_generations.pop(tunnel_id, None)
+                self._transport_failure_facades.pop(tunnel_id, None)
         if conn:
             try:
                 conn.close()
@@ -67,6 +70,7 @@ class TunnelHealthChecker:
             connections = dict(self._health_connections)
             self._health_connections.clear()
             self._transport_failed_generations.clear()
+            self._transport_failure_facades.clear()
 
         for tunnel_id, conn in connections.items():
             try:
@@ -78,6 +82,7 @@ class TunnelHealthChecker:
     def _reset_transport_failure(self, tunnel_id: str) -> None:
         with self._lock:
             self._transport_failed_generations.pop(tunnel_id, None)
+            self._transport_failure_facades.pop(tunnel_id, None)
 
     @staticmethod
     def _connection_process_generation(connection: Any) -> int:
@@ -88,7 +93,12 @@ class TunnelHealthChecker:
             return 0
 
     def _mark_transport_failure(
-        self, tunnel_id: str, connection: Any, error: DbCoreServiceError
+        self,
+        tunnel_id: str,
+        connection: Any,
+        error: DbCoreServiceError,
+        *,
+        facade: Any = None,
     ) -> None:
         if error.outcome is not DbCoreOutcome.OUTCOME_INDETERMINATE:
             return
@@ -98,13 +108,50 @@ class TunnelHealthChecker:
                 generation = int(error.process_generation or 0)
             except (TypeError, ValueError):
                 generation = 0
+        if facade is None:
+            connection_state = getattr(connection, "__dict__", {})
+            if isinstance(connection_state, dict):
+                facade = connection_state.get("facade")
         with self._lock:
             self._transport_failed_generations[tunnel_id] = generation
+            if facade is not None:
+                self._transport_failure_facades[tunnel_id] = facade
+            else:
+                self._transport_failure_facades.pop(tunnel_id, None)
         logger.warning(
             "Health check transport contamination latched for %s (generation=%s)",
             tunnel_id,
             generation,
         )
+
+    def _transport_failure_blocks(self, tunnel_id: str) -> bool:
+        with self._lock:
+            failed_generation = self._transport_failed_generations.get(tunnel_id)
+            facade = self._transport_failure_facades.get(tunnel_id)
+        if failed_generation is None:
+            return False
+        if facade is None:
+            return True
+
+        client = getattr(facade, "client", None)
+        try:
+            current_generation = int(getattr(client, "process_generation", 0) or 0)
+        except (TypeError, ValueError):
+            current_generation = 0
+        state = getattr(client, "generation_state", None)
+        state_value = getattr(state, "value", state)
+        generation_is_closed = state_value == DbCoreGenerationState.CLOSED.value
+        if (
+            failed_generation <= 0
+            or current_generation <= failed_generation
+        ) and not generation_is_closed:
+            return True
+
+        with self._lock:
+            if self._transport_failed_generations.get(tunnel_id) == failed_generation:
+                self._transport_failed_generations.pop(tunnel_id, None)
+                self._transport_failure_facades.pop(tunnel_id, None)
+        return False
 
     def _get_health_credentials(self, tunnel_id: str, config: Dict[str, Any]) -> tuple:
         """Health check용 DB 자격 증명 조회
@@ -159,9 +206,8 @@ class TunnelHealthChecker:
             db_name = config.get('default_database') or config.get('db_name') or config.get('default_schema') or ''
             db_engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port'))
 
-            with self._lock:
-                if tunnel_id in self._transport_failed_generations:
-                    return -1
+            if self._transport_failure_blocks(tunnel_id):
+                return -1
 
             # 인증 정보가 없으면 측정 불가
             if not db_username:
@@ -239,9 +285,8 @@ class TunnelHealthChecker:
         """
         connector = None
         try:
-            with self._lock:
-                if tunnel_id in self._transport_failed_generations:
-                    return None
+            if self._transport_failure_blocks(tunnel_id):
+                return None
             connector = create_rust_db_connector(
                 engine,
                 host,
@@ -282,6 +327,11 @@ class TunnelHealthChecker:
                 tunnel_id,
                 getattr(connector, "connection", None),
                 e,
+                facade=(
+                    getattr(connector, "__dict__", {}).get("facade")
+                    if isinstance(getattr(connector, "__dict__", {}), dict)
+                    else None
+                ),
             )
             connection = getattr(connector, "connection", None)
             if connection is not None:

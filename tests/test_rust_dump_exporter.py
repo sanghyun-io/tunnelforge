@@ -1080,6 +1080,48 @@ class TestRustDumpImporter:
         assert metadata.rust_code == "request_timeout"
         assert results["users"]["status"] == "error"
 
+    def test_import_dump_retains_indeterminate_callback_error_metadata(self, tmp_path):
+        from src.core.db_core_service import DbCoreCallbackError
+        from src.exporters.rust_dump_exporter import (
+            RUST_DUMP_ERROR_METADATA_KEY,
+            RustDumpConfig,
+            RustDumpImporter,
+        )
+
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir(parents=True)
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps({
+                "format": "tunnelforge-dump",
+                "format_version": 1,
+                "database": "app",
+                "tables": [{"name": "users", "path": "0001_users", "rows": 1, "chunks": 1}],
+            }),
+            encoding="utf-8",
+        )
+        error = DbCoreCallbackError(
+            LookupError("progress callback failed"),
+            request_kind=DbCoreRequestKind.MUTATION,
+            outcome=DbCoreOutcome.OUTCOME_INDETERMINATE,
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                raise error
+
+        importer = RustDumpImporter(
+            RustDumpConfig("localhost", 3306, "root", "password"),
+            facade=FakeFacade(),
+        )
+
+        success, _message, results = importer.import_dump(str(dump_dir))
+
+        metadata = results[RUST_DUMP_ERROR_METADATA_KEY]
+        assert success is False
+        assert metadata.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+        assert metadata.code == "db_core_callback_failed"
+        assert results["users"]["status"] == "error"
+
     def test_import_dump_marks_remaining_tables_error_on_exception(self, tmp_path):
         """import 도중 예외가 발생하면 done이 아닌 모든 테이블이 error로 표시된다 (재시도 UI 회귀 테스트)"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter

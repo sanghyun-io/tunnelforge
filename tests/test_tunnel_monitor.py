@@ -676,6 +676,117 @@ class TestTunnelMonitor:
         assert self.monitor._measure_latency("tunnel1") == -1
         assert len(create_calls) == 1
 
+    def test_transport_contamination_allows_probe_after_new_core_generation(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from src.core.db_core_service import (
+            DbCoreGenerationState,
+            DbCoreOutcome,
+            DbCoreRequestKind,
+            DbCoreServiceError,
+        )
+
+        self.mock_engine.tunnel_configs = {
+            "tunnel1": {
+                "db_user": "alice",
+                "connection_mode": "direct",
+                "remote_host": "127.0.0.1",
+                "remote_port": 3306,
+            }
+        }
+        client = SimpleNamespace(
+            process_generation=7,
+            generation_state=DbCoreGenerationState.ACTIVE,
+        )
+
+        class ConnectionHandle:
+            process_generation = 7
+
+        contaminated = MagicMock()
+        contaminated.connection_handle = ConnectionHandle()
+        contaminated.facade = SimpleNamespace(client=client)
+        contaminated.ping.side_effect = DbCoreServiceError(
+            "transport outcome is unknown",
+            code="db_core_transport_failed",
+            request_kind=DbCoreRequestKind.MUTATION,
+            outcome=DbCoreOutcome.OUTCOME_INDETERMINATE,
+            process_generation=7,
+        )
+        self.monitor._health_connections["tunnel1"] = contaminated
+
+        assert self.monitor._measure_latency("tunnel1") == -1
+
+        create_calls = []
+
+        class FreshConnection:
+            def autocommit(self, enabled):
+                pass
+
+            def ping(self, reconnect=False):
+                pass
+
+            def close(self):
+                pass
+
+        class FreshConnector:
+            connection = FreshConnection()
+
+            def connect(self):
+                return True, "ok"
+
+        def create_connector(*args, **kwargs):
+            create_calls.append((args, kwargs))
+            return FreshConnector()
+
+        monkeypatch.setattr(
+            "src.core.tunnel_health_checker.create_rust_db_connector",
+            create_connector,
+        )
+        client.process_generation = 8
+
+        assert self.monitor._measure_latency("tunnel1") >= 0
+        assert len(create_calls) == 1
+
+    def test_transport_contamination_with_unknown_generation_stays_blocked(
+        self, monkeypatch
+    ):
+        from types import SimpleNamespace
+
+        from src.core.db_core_service import DbCoreGenerationState
+
+        self.mock_engine.tunnel_configs = {
+            "tunnel1": {
+                "db_user": "alice",
+                "connection_mode": "direct",
+                "remote_host": "127.0.0.1",
+                "remote_port": 3306,
+            }
+        }
+        client = SimpleNamespace(
+            process_generation=9,
+            generation_state=DbCoreGenerationState.ACTIVE,
+        )
+        self.monitor._health_checker._transport_failed_generations["tunnel1"] = 0
+        self.monitor._health_checker._transport_failure_facades["tunnel1"] = (
+            SimpleNamespace(client=client)
+        )
+
+        create_calls = []
+
+        def fail_create(*args, **kwargs):
+            create_calls.append((args, kwargs))
+            raise AssertionError("unknown generation must remain fail-closed")
+
+        monkeypatch.setattr(
+            "src.core.tunnel_health_checker.create_rust_db_connector",
+            fail_create,
+        )
+
+        assert self.monitor._measure_latency("tunnel1") == -1
+        assert create_calls == []
+
     def test_attempt_reconnect_exceeds_max(self):
         """최대 재연결 시도 초과 시 ERROR 상태로 전환"""
         from src.core.tunnel_monitor import TunnelStatus, TunnelState
