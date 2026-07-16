@@ -17,15 +17,61 @@ class FakeProcess:
         self.stderr = io.StringIO(stderr)
         self.return_code = return_code
         self.terminated = False
+        self.reaped = False
 
-    def wait(self):
+    def wait(self, timeout=None):
+        self.reaped = True
         return self.return_code
 
     def poll(self):
-        return None if not self.terminated else self.return_code
+        return self.return_code if self.terminated or self.reaped else None
 
     def terminate(self):
         self.terminated = True
+
+
+class RecordingStream(io.StringIO):
+    def __init__(self, initial_value=""):
+        super().__init__(initial_value)
+        self.writes = []
+
+    def write(self, text):
+        self.writes.append(text)
+        return super().write(text)
+
+
+class LifecycleProcess:
+    def __init__(self, *, terminate_wait_times_out=False):
+        self.stdin = RecordingStream()
+        self.stdout = RecordingStream()
+        self.stderr = RecordingStream()
+        self.terminate_wait_times_out = terminate_wait_times_out
+        self.terminate_calls = 0
+        self.kill_calls = 0
+        self.wait_timeouts = []
+        self.return_code = None
+        self.reaped = False
+
+    def poll(self):
+        return self.return_code
+
+    def terminate(self):
+        self.terminate_calls += 1
+
+    def kill(self):
+        self.kill_calls += 1
+
+    def wait(self, timeout=None):
+        self.wait_timeouts.append(timeout)
+        if (
+            timeout is not None
+            and self.terminate_wait_times_out
+            and self.kill_calls == 0
+        ):
+            raise subprocess.TimeoutExpired("fake-helper", timeout)
+        self.reaped = True
+        self.return_code = -9 if self.kill_calls else -15
+        return self.return_code
 
 
 def test_worker_run_emits_result():
@@ -80,6 +126,101 @@ def test_worker_cancel_before_run_skips_helper_setup_and_finishes_once():
     assert popen_calls == []
     assert failures == []
     assert finished == [(False, {"cancelled": True})]
+
+
+def test_worker_cancel_during_popen_factory_reaps_without_building_or_writing_request(
+    monkeypatch,
+):
+    import src.ui.workers.cross_engine_migration_worker as worker_module
+
+    process = LifecycleProcess()
+    request_builds = []
+    worker = None
+
+    def build_request(*args, **kwargs):
+        request_builds.append((args, kwargs))
+        return "request-must-not-be-written\n"
+
+    def factory(*args, **kwargs):
+        assert worker._process is None
+        worker.cancel()
+        return process
+
+    monkeypatch.setattr(worker_module, "build_helper_request", build_request)
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {"source_engine": "mysql", "target_engine": "postgresql"},
+        helper_path="fake-helper",
+        popen_factory=factory,
+    )
+    failures = []
+    finished = []
+    worker.failed.connect(failures.append)
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+    worker.run()
+
+    assert request_builds == []
+    assert process.stdin.writes == []
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 0
+    assert process.wait_timeouts and process.wait_timeouts[0] is not None
+    assert process.reaped is True
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert failures == []
+    assert finished == [(False, {"cancelled": True})]
+
+
+def test_worker_exception_after_child_creation_kills_reaps_joins_and_closes():
+    import src.ui.workers.cross_engine_migration_worker as worker_module
+
+    process = LifecycleProcess(terminate_wait_times_out=True)
+    process.stdout = RecordingStream("not valid jsonl\n")
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    drain_join_stream_states = []
+    original_join = worker._join_stderr_drain
+
+    def record_drain_join(timeout=2.0):
+        drain_join_stream_states.append(process.stderr.closed)
+        original_join(timeout)
+
+    worker._join_stderr_drain = record_drain_join
+    failures = []
+    finished = []
+    worker.failed.connect(failures.append)
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+    worker.run()
+
+    assert process.terminate_calls == 1
+    assert process.kill_calls == 1
+    assert process.wait_timeouts == [
+        worker_module._PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+        worker_module._PROCESS_SHUTDOWN_TIMEOUT_SECONDS,
+    ]
+    assert process.reaped is True
+    assert drain_join_stream_states == [True]
+    assert worker._stderr_thread is not None
+    assert not worker._stderr_thread.is_alive()
+    assert process.stdin.closed
+    assert process.stdout.closed
+    assert process.stderr.closed
+    assert len(failures) == 1
+    assert "Invalid helper JSON" in failures[0]
+    assert finished == [(False, {"error": failures[0]})]
 
 
 def test_worker_run_emits_checkpoint_state():

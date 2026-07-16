@@ -255,6 +255,178 @@ def test_rust_dump_worker_cancel_before_run_skips_mutation_setup_and_finishes_on
         assert import_finished == []
 
 
+@pytest.mark.parametrize(
+    ("task_type", "method_name"),
+    [
+        ("export_schema", "export_full_schema"),
+        ("export_tables", "export_tables"),
+        ("import", "import_dump"),
+    ],
+)
+def test_rust_dump_worker_cancel_during_runner_creation_cancels_published_runner_without_db_work(
+    monkeypatch, task_type, method_name
+):
+    import src.ui.workers.rust_dump_worker as worker_module
+
+    cancel_calls = []
+    shutdown_calls = []
+    db_calls = []
+    worker = None
+
+    class FakeClient:
+        def cancel_active_request(self, *, timeout_seconds):
+            cancel_calls.append(timeout_seconds)
+            return True
+
+        def shutdown(self, *, timeout_seconds):
+            shutdown_calls.append(timeout_seconds)
+
+    class FakeFacade:
+        def __init__(self):
+            self.client = FakeClient()
+
+    class CancellingRunner:
+        def __init__(self, config):
+            self.facade = FakeFacade()
+            self._owns_facade = True
+            self.last_error_metadata = None
+            worker.cancel()
+
+        def export_full_schema(self, *args, **kwargs):
+            db_calls.append("export_full_schema")
+            return True, "ok"
+
+        def export_tables(self, *args, **kwargs):
+            db_calls.append("export_tables")
+            return True, "ok", ["users"]
+
+        def import_dump(self, *args, **kwargs):
+            db_calls.append("import_dump")
+            return True, "ok", {"users": {"status": "done", "message": ""}}
+
+    monkeypatch.setattr(worker_module, "RustDumpExporter", CancellingRunner)
+    monkeypatch.setattr(worker_module, "RustDumpImporter", CancellingRunner)
+    config = RustDumpConfig("127.0.0.1", 3306, "root", "pw")
+    worker = RustDumpWorker(
+        task_type,
+        config,
+        schema="app",
+        tables=["users"],
+        output_dir="C:/dump",
+        input_dir="C:/dump",
+    )
+    finished = []
+    import_finished = []
+    worker.finished.connect(lambda success, message: finished.append((success, message)))
+    worker.import_finished.connect(
+        lambda success, message, results: import_finished.append(
+            (success, message, results)
+        )
+    )
+
+    worker.run()
+    worker.run()
+
+    assert (cancel_calls, shutdown_calls, db_calls) == (
+        [5.0],
+        [5.0],
+        [],
+    ), method_name
+    assert finished == [(False, "작업이 취소되었습니다.")]
+    if task_type == "import":
+        assert import_finished == [(False, "작업이 취소되었습니다.", {})]
+    else:
+        assert import_finished == []
+
+
+@pytest.mark.parametrize(
+    ("task_type", "method_name"),
+    [
+        ("export_schema", "export_full_schema"),
+        ("export_tables", "export_tables"),
+        ("import", "import_dump"),
+    ],
+)
+def test_rust_dump_worker_cancel_after_runner_publication_skips_db_work(
+    monkeypatch, task_type, method_name
+):
+    import src.ui.workers.rust_dump_worker as worker_module
+
+    cancel_calls = []
+    shutdown_calls = []
+    db_calls = []
+
+    class FakeClient:
+        def cancel_active_request(self, *, timeout_seconds):
+            cancel_calls.append(timeout_seconds)
+            return True
+
+        def shutdown(self, *, timeout_seconds):
+            shutdown_calls.append(timeout_seconds)
+
+    class FakeFacade:
+        def __init__(self):
+            self.client = FakeClient()
+
+    class FakeRunner:
+        def __init__(self, config):
+            self.facade = FakeFacade()
+            self._owns_facade = True
+            self.last_error_metadata = None
+
+        def export_full_schema(self, *args, **kwargs):
+            db_calls.append("export_full_schema")
+            return True, "ok"
+
+        def export_tables(self, *args, **kwargs):
+            db_calls.append("export_tables")
+            return True, "ok", ["users"]
+
+        def import_dump(self, *args, **kwargs):
+            db_calls.append("import_dump")
+            return True, "ok", {"users": {"status": "done", "message": ""}}
+
+    monkeypatch.setattr(worker_module, "RustDumpExporter", FakeRunner)
+    monkeypatch.setattr(worker_module, "RustDumpImporter", FakeRunner)
+    config = RustDumpConfig("127.0.0.1", 3306, "root", "pw")
+    worker = RustDumpWorker(
+        task_type,
+        config,
+        schema="app",
+        tables=["users"],
+        output_dir="C:/dump",
+        input_dir="C:/dump",
+    )
+    publish_runner = worker._publish_runner
+
+    def cancel_at_publication_barrier(runner):
+        published = publish_runner(runner)
+        worker.cancel()
+        return published
+
+    worker._publish_runner = cancel_at_publication_barrier
+    finished = []
+    import_finished = []
+    worker.finished.connect(lambda success, message: finished.append((success, message)))
+    worker.import_finished.connect(
+        lambda success, message, results: import_finished.append(
+            (success, message, results)
+        )
+    )
+
+    worker.run()
+    worker.run()
+
+    assert db_calls == [], method_name
+    assert cancel_calls == [5.0, 5.0]
+    assert shutdown_calls == [5.0]
+    assert finished == [(False, "작업이 취소되었습니다.")]
+    if task_type == "import":
+        assert import_finished == [(False, "작업이 취소되었습니다.", {})]
+    else:
+        assert import_finished == []
+
+
 def test_import_dialog_never_offers_or_relaunches_indeterminate_table_retry(monkeypatch):
     from src.core.db_core_service import DbCoreOutcome, DbCoreRequestKind
     from src.exporters.rust_dump_exporter import (

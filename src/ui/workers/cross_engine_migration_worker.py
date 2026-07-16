@@ -16,6 +16,7 @@ from src.core.cross_engine_migration import (
 
 _STDERR_TAIL_LINES = 200
 _STDERR_LINE_CHARS = 4000
+_PROCESS_SHUTDOWN_TIMEOUT_SECONDS = 2.0
 # Best-effort scrub for connection-secret shaped substrings (password/token/etc.)
 # that the helper may echo into stderr on panic, since payloads carry DB credentials.
 _SECRET_PATTERN = re.compile(
@@ -67,7 +68,10 @@ class CrossEngineMigrationWorker(QThread):
     def cancel(self):
         self._cancelled = True
         if self._process and self._process.poll() is None:
-            self._process.terminate()
+            try:
+                self._process.terminate()
+            except (OSError, ValueError):
+                pass
 
     def _start_stderr_drain(self) -> None:
         """Drain stderr on a background thread so a chatty helper never fills
@@ -110,6 +114,37 @@ class CrossEngineMigrationWorker(QThread):
             except (OSError, ValueError):
                 pass
 
+    def _terminate_and_reap_process(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        try:
+            if process.poll() is not None:
+                return
+        except (OSError, ValueError):
+            pass
+
+        try:
+            process.terminate()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=_PROCESS_SHUTDOWN_TIMEOUT_SECONDS)
+            return
+        except subprocess.TimeoutExpired:
+            pass
+        except (OSError, ValueError):
+            return
+
+        try:
+            process.kill()
+        except (OSError, ValueError):
+            pass
+        try:
+            process.wait(timeout=_PROCESS_SHUTDOWN_TIMEOUT_SECONDS)
+        except (subprocess.TimeoutExpired, OSError, ValueError):
+            pass
+
     def _stderr_tail_text(self) -> str:
         with self._stderr_lock:
             return "\n".join(self._stderr_tail)
@@ -145,9 +180,13 @@ class CrossEngineMigrationWorker(QThread):
                 encoding="utf-8",
                 errors="replace",
             )
+            if self._cancelled:
+                return
             self._start_stderr_drain()
 
             request = build_helper_request(self.command, self.payload, self.request_id)
+            if self._cancelled:
+                return
             assert self._process.stdin is not None
             self._process.stdin.write(request)
             self._process.stdin.close()
@@ -186,8 +225,9 @@ class CrossEngineMigrationWorker(QThread):
             if not self._cancelled:
                 self._emit_failed_once(str(exc))
         finally:
-            self._join_stderr_drain()
+            self._terminate_and_reap_process()
             self._close_process_streams()
+            self._join_stderr_drain()
             if self._cancelled:
                 success = False
                 final_payload = {"cancelled": True}

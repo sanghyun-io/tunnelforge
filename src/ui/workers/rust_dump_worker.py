@@ -1,4 +1,6 @@
 """Rust DB Core 작업 스레드"""
+import threading
+
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.core.db_core_service import (
@@ -35,8 +37,48 @@ class RustDumpWorker(QThread):
         self.kwargs = kwargs
         self._cancel_requested = False
         self._active_runner = None
+        self._runner_lock = threading.Lock()
         self.last_error_metadata = None
         self._terminal_emitted = False
+
+    def _cancel_owned_runner(self, runner, *, shutdown: bool = False) -> None:
+        if runner is None or not getattr(runner, "_owns_facade", False):
+            return
+        facade = getattr(runner, "facade", None)
+        client = getattr(facade, "client", None) if facade is not None else None
+        if client is None:
+            return
+        try:
+            client.cancel_active_request(
+                timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+            )
+        finally:
+            if shutdown:
+                try:
+                    client.shutdown(
+                        timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
+                    )
+                except BaseException:
+                    retain_db_core_facade_for_retry(facade)
+                    raise
+                else:
+                    release_db_core_facade_retry(facade)
+
+    def _publish_runner(self, runner) -> bool:
+        with self._runner_lock:
+            self._active_runner = runner
+            cancelled = self._cancel_requested
+        if cancelled:
+            self._cancel_owned_runner(runner, shutdown=True)
+            return False
+        return True
+
+    def _cancelled_before_runner_call(self, runner) -> bool:
+        with self._runner_lock:
+            cancelled = self._cancel_requested
+        if cancelled:
+            self._cancel_owned_runner(runner, shutdown=True)
+        return cancelled
 
     def cancel(self) -> bool:
         """실행 중인 dump/import 작업의 취소를 요청한다.
@@ -44,8 +86,9 @@ class RustDumpWorker(QThread):
         워커가 소유한 dedicated facade에만 owner-mediated cancellation을 전달한다.
         주입된 shared facade의 다른 작업은 건드리지 않는다.
         """
-        self._cancel_requested = True
-        runner = self._active_runner
+        with self._runner_lock:
+            self._cancel_requested = True
+            runner = self._active_runner
         if runner is not None and getattr(runner, "_owns_facade", False):
             facade = getattr(runner, "facade", None)
             client = getattr(facade, "client", None) if facade is not None else None
@@ -61,7 +104,8 @@ class RustDumpWorker(QThread):
         timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
     ) -> bool:
         """Retry cleanup for a worker-owned runner retained after residual shutdown."""
-        runner = self._active_runner
+        with self._runner_lock:
+            runner = self._active_runner
         if runner is None or not getattr(runner, "_owns_facade", False):
             return False
         facade = getattr(runner, "facade", None)
@@ -73,8 +117,9 @@ class RustDumpWorker(QThread):
             retain_db_core_facade_for_retry(facade)
             raise
         release_db_core_facade_retry(facade)
-        if self._active_runner is runner:
-            self._active_runner = None
+        with self._runner_lock:
+            if self._active_runner is runner:
+                self._active_runner = None
         return True
 
     def _is_cancelled_message(self, success: bool, msg: str):
@@ -112,7 +157,8 @@ class RustDumpWorker(QThread):
         self.finished.emit(success, message)
 
     def _capture_runner_error_metadata(self) -> None:
-        runner = self._active_runner
+        with self._runner_lock:
+            runner = self._active_runner
         if runner is not None:
             self.last_error_metadata = getattr(runner, "last_error_metadata", None)
 
@@ -137,14 +183,22 @@ class RustDumpWorker(QThread):
             else:
                 self._emit_terminal(False, str(e), {})
         finally:
-            runner = self._active_runner
+            with self._runner_lock:
+                runner = self._active_runner
             facade = getattr(runner, "facade", None) if runner is not None else None
             if facade is None or not is_db_core_facade_retained(facade):
-                self._active_runner = None
+                with self._runner_lock:
+                    if self._active_runner is runner:
+                        self._active_runner = None
 
     def _run_export_schema(self):
         exporter = RustDumpExporter(self.config)
-        self._active_runner = exporter
+        if not self._publish_runner(exporter):
+            self._emit_terminal(False, CANCELLED_MESSAGE, {})
+            return
+        if self._cancelled_before_runner_call(exporter):
+            self._emit_terminal(False, CANCELLED_MESSAGE, {})
+            return
 
         success, msg = exporter.export_full_schema(
             self.kwargs['schema'],
@@ -163,7 +217,12 @@ class RustDumpWorker(QThread):
 
     def _run_export_tables(self):
         exporter = RustDumpExporter(self.config)
-        self._active_runner = exporter
+        if not self._publish_runner(exporter):
+            self._emit_terminal(False, CANCELLED_MESSAGE, {})
+            return
+        if self._cancelled_before_runner_call(exporter):
+            self._emit_terminal(False, CANCELLED_MESSAGE, {})
+            return
 
         success, msg, tables = exporter.export_tables(
             self.kwargs['schema'],
@@ -184,7 +243,12 @@ class RustDumpWorker(QThread):
 
     def _run_import(self):
         importer = RustDumpImporter(self.config)
-        self._active_runner = importer
+        if not self._publish_runner(importer):
+            self._emit_terminal(False, CANCELLED_MESSAGE, {})
+            return
+        if self._cancelled_before_runner_call(importer):
+            self._emit_terminal(False, CANCELLED_MESSAGE, {})
+            return
 
         success, msg, results = importer.import_dump(
             self.kwargs['input_dir'],
