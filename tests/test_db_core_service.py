@@ -260,6 +260,7 @@ def test_client_maps_explicit_mutation_indeterminate_error_without_retry():
     [
         (DbCoreRequestKind.MUTATION, "true"),
         (DbCoreRequestKind.READ_ONLY, True),
+        (DbCoreRequestKind.READ_ONLY, False),
     ],
 )
 def test_client_rejects_invalid_indeterminate_error_metadata(

@@ -1663,7 +1663,7 @@ class DbCoreServiceClient:
                     False,
                 )
                 if type(outcome_indeterminate) is not bool or (
-                    outcome_indeterminate
+                    "outcome_indeterminate" in payload_event
                     and request_kind is not DbCoreRequestKind.MUTATION
                 ):
                     error = DbCoreServiceError(
