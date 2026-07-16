@@ -98,6 +98,18 @@ class CrossEngineMigrationWorker(QThread):
         if self._stderr_thread is not None:
             self._stderr_thread.join(timeout=timeout)
 
+    def _close_process_streams(self) -> None:
+        process = self._process
+        if process is None:
+            return
+        for stream in (process.stdin, process.stdout, process.stderr):
+            if stream is None or stream.closed:
+                continue
+            try:
+                stream.close()
+            except (OSError, ValueError):
+                pass
+
     def _stderr_tail_text(self) -> str:
         with self._stderr_lock:
             return "\n".join(self._stderr_tail)
@@ -175,6 +187,7 @@ class CrossEngineMigrationWorker(QThread):
                 self._emit_failed_once(str(exc))
         finally:
             self._join_stderr_drain()
+            self._close_process_streams()
             if self._cancelled:
                 success = False
                 final_payload = {"cancelled": True}

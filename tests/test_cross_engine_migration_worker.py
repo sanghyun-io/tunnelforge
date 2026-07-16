@@ -216,3 +216,7 @@ def test_worker_run_does_not_deadlock_on_large_stderr():
         pytest.fail("worker.run() did not complete within timeout - stderr likely deadlocked")
 
     assert results and results[0][0] is True
+    proc = process_holder["proc"]
+    assert proc.stdin is not None and proc.stdin.closed
+    assert proc.stdout is not None and proc.stdout.closed
+    assert proc.stderr is not None and proc.stderr.closed
