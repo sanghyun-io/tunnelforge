@@ -217,21 +217,21 @@ sha256:ec651d11903da08bbc0092ef468d38d886254e3edb0625cb3105994d91873e20
 ```
 `oneclick.plan` transmits the full typed public `snapshot` and every action's `expected_pre_facts={facts,facts_hash}` / `expected_post_facts={facts,facts_hash}` for safe UI comparison. Snapshot hash covers canonical snapshot bytes; each facts hash covers its document; plan hash covers `{plan_version,target_identity,remediation_profile,snapshot_hash,actions}` including facts. Exact domains are `tunnelforge.oneclick.snapshot.v1\0`, `tunnelforge.oneclick.action-facts.v1\0`, and `tunnelforge.oneclick.plan.v1\0`. Reject credential/connection keys, arbitrary messages, hash/document mismatch, facts outside action tables, or noncanonical order. Approval copies only versions, identity, profile, snapshot hash, and plan hash—never snapshot/actions/facts.
 
-Each `OneClickApplyAction` contains exactly one Rust-generated SQL statement. Expand charset table/column conversions and every multi-SQL recommendation into separately ordered actions with scoped expected pre/post facts and optional one-statement rollback. Plan hash commits expanded order; reject empty SQL, SQL arrays, or a nonterminal statement separator.
+Each `OneClickApplyAction` contains exactly one Rust-generated SQL statement. Charset conversion actions are generated only for isolated tables that do not participate in any foreign key; FK-connected tables remain visible inspection/manual findings because a table-level conversion can reject or widen FK columns. Expand only eligible isolated conversions and every other multi-SQL recommendation into separately ordered actions with scoped expected pre/post facts and optional one-statement rollback. Plan hash commits expanded order; reject empty SQL, SQL arrays, or a nonterminal statement separator.
 
-- [ ] **Step 1: Write RED canonical/profile/schema/payload tests**
+- [x] **Step 1: Write RED canonical/profile/schema/payload tests**
 Test golden vectors/default wire forms, sorting, stable hashes, changed column/generated/index/FK/action/profile/order hashes, one-SQL/action expansion, contiguous ordinals, identity, unsupported profile, and credential absence. Define `normalize_oneclick_schema`: nonempty string, no NUL, no leading/trailing whitespace, no case folding. Facade copies `endpoint.to_payload()`, overwrites nested `database` and `schema` with normalized root schema, then sends exactly root `connection`,`schema`. Rust treats root schema as authoritative, fills absent nested values, and returns `oneclick_schema_mismatch` when either nested value is present but not exact. Test overwrite, equal/absent acceptance, both mismatches, and invalid root.
 
 Rust `parse_oneclick_plan_request` permits only root `connection`,`schema` and endpoint keys `engine`,`host`,`port`,`user`,`password`,`database`,`schema`. Parameterize root/nested rejection of `issues`, `charset_contracts`, target overrides, `actions`, `steps`, `profile`, `remediation_profile`, `approval`, `dry_run`, `backup_confirmed`, and unknown keys with `oneclick_plan_payload_prohibited` and zero SQL.
 
-- [ ] **Step 2: Run RED**
+- [x] **Step 2: Run RED**
 Run: `cargo test --manifest-path migration_core\Cargo.toml oneclick_plan --lib`
 Expected: FAIL because typed facts/profile/hash and strict plan parser do not exist.
 
-- [ ] **Step 3: Implement deterministic generic one-session planning**
+- [x] **Step 3: Implement deterministic generic one-session planning**
 Refactor `MysqlInspectAdapter` for borrowed `mysql::PooledConn`. Implement `LiveOneClickSession` and `build_oneclick_plan<S: OneClickPlanningSession>` from the shared trait below; initial `oneclick.plan` and apply replan call this same function. Query identity, profile support, inspect, normalized table definitions, and FKs on one session; build canonical snapshot/action hashes. Never hash client JSON or execute SQL while planning.
 
-- [ ] **Step 4: Add plan command/capabilities and commit**
+- [x] **Step 4: Add plan command/capabilities and commit**
 Route `oneclick.plan`; advertise its versions plus exact boolean capabilities `oneclick_exact_plan_enabled` and `oneclick_strong_fence_proven`. Mark `oneclick.run`, `oneclick.recommend`, apply preview, and charset-contract derive deprecated; each returns `oneclick_legacy_preview_disabled` without DB/session/client remediation processing and is absent from preview capabilities. Add a protocol matrix test for every legacy command. Exact-plan is an apply-release predicate, not plan endpoint availability; this plan leaves both predicates false.
 Run: `cargo test --manifest-path migration_core\Cargo.toml oneclick_plan --lib`
 Run: `cargo test --manifest-path migration_core\Cargo.toml service_hello_advertises_core_protocol --lib`
@@ -373,6 +373,7 @@ git commit -m "docs: record disabled One-Click approval evidence"
 - [ ] Plan requests contain only connection/schema; Rust rejects every named client-derived remediation field at root/nested boundaries.
 - [ ] Typed definitions cover generated columns, index type/visibility/expression/prefix, ordered FK match/update/delete facts, hashes, vectors, and DDL-stale tests.
 - [ ] Every ordered action contains one SQL and independent expected pre/post facts; postcondition failure stops later actions.
+- [ ] Charset actions exclude every FK-connected table; those charset findings remain manual until a separately reviewed FK-safe contract exists.
 - [ ] Generic initial/replan planning shares `OneClickPlanningSession`; apply extends it, while raw validation retains separate fakes/test ownership.
 - [ ] Advisory keys are deterministic server-UUID-only 47-byte base64url across aliases/users; lock/precondition races are tested honestly.
 - [ ] Zero-action replan is `oneclick_nothing_to_apply` with zero SQL and visible/no-retry UI behavior.

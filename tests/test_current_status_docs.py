@@ -33,6 +33,16 @@ def test_current_status_summary_does_not_point_to_closed_oneclick_issue_as_next_
     assert "GitHub issue #139 now tracks the next" not in summary
 
 
+def test_current_status_records_oneclick_phase_b_task3_without_enabling_apply():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    normalized = " ".join(doc.split())
+
+    assert "TF-STATUS-097 Phase B Task 3 is complete at `62dc7f4`" in doc
+    assert "Task 3 Review: APPROVE" in doc
+    assert "both production apply predicates remain false" in normalized
+    assert "TF-STATUS-097 | High | open" in doc
+
+
 def test_current_status_top_handoff_does_not_present_closed_issues_as_current_work():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     top_handoff = " ".join(doc.split("## Issue Tracker", maxsplit=1)[0].split())
