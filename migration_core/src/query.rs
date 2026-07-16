@@ -165,8 +165,8 @@ pub(crate) fn execute_query_adapter(
 /// SQL 주석 스캐너: `bytes[i]` 에서 시작하는 주석을 감지하면 그 주석 토큰 바로 다음
 /// 인덱스를 반환하고, 주석 시작이 아니면 `None` 을 반환한다.
 ///
-/// - 라인 주석(`--`, `allow_hash` 시 `#`): 종료 개행 `'\n'` 의 인덱스(개행 미소비).
-///   개행이 없으면 `len`.
+/// - 라인 주석(`-- `, `allow_hash` 시 `#`): 종료 개행 `'\n'` 의 인덱스(개행 미소비).
+///   MySQL 규칙에 맞게 `--` 뒤에 공백/제어 문자가 있어야 하며, 개행이 없으면 `len`.
 /// - 블록 주석(`/* */`): 닫는 `*/` 바로 다음 인덱스. 닫힘이 없으면 기존 산술상 `len+1`.
 ///
 /// 반환 인덱스와 스캔 산술은 세 호출부(query::strip_leading_comments_and_parens,
@@ -178,7 +178,11 @@ pub(crate) fn skip_sql_comment(bytes: &[u8], i: usize, allow_hash: bool) -> Opti
     if i >= len {
         return None;
     }
-    if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
+    if bytes[i] == b'-'
+        && i + 2 < len
+        && bytes[i + 1] == b'-'
+        && (bytes[i + 2].is_ascii_whitespace() || bytes[i + 2].is_ascii_control())
+    {
         let mut j = i + 2;
         while j < len && bytes[j] != b'\n' {
             j += 1;
@@ -308,6 +312,11 @@ fn sql_has_potential_function_call(sql: &str) -> bool {
             }
             preceding_identifier = (quote != b'\'').then(|| (String::new(), true));
             continue;
+        }
+        if !bytes[index].is_ascii() {
+            // The byte scanner cannot prove non-ASCII identifier boundaries. Fail closed rather
+            // than allowing an unquoted Unicode function name to look read-only.
+            return true;
         }
         if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
             let start = index;
@@ -504,6 +513,18 @@ mod tests {
                 "expected mutation-capable SQL: {sql}"
             );
         }
+    }
+
+    #[test]
+    fn query_side_effect_classification_rejects_mysql_double_dash_expression_bypass() {
+        assert!(query_may_mutate("SELECT 1--volatile_user_function()"));
+        assert!(!query_may_mutate("SELECT 1 -- volatile_user_function()"));
+    }
+
+    #[test]
+    fn query_side_effect_classification_rejects_unquoted_unicode_function_calls() {
+        assert!(query_may_mutate("SELECT \u{03c0}()"));
+        assert!(!query_may_mutate("SELECT '\u{03c0}()'"));
     }
 
     #[test]
