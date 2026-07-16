@@ -10,6 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PyQt6.QtCore import QObject, pyqtSignal
 from PyQt6.QtWidgets import QApplication, QMessageBox
 
+from src.core.db_core_service import DbCoreConnectionHandle
 from src.core.sql_validator import SchemaMetadata
 from src.ui.dialogs import sql_editor_dialog as sql_editor_module
 from src.ui.dialogs.sql_editor_dialog import (
@@ -770,11 +771,19 @@ def test_autocommit_worker_uses_classifier_and_streaming_columns_for_empty_selec
     from src.ui.dialogs import sql_editor_workers as workers_module
 
     connection = FakeConnection()
-    connection.connection_id = "conn-1"
-    connection.facade = MagicMock()
-    connection.facade.execute_on_connection_streaming.return_value = {
-        "columns": ["id", "name"], "rows": [], "rows_affected": 0,
-    }
+    connection_handle = DbCoreConnectionHandle("conn-1", 3)
+    connection.connection_id = connection_handle
+
+    class StrictFacade:
+        def __init__(self):
+            self.calls = []
+
+        def execute_on_connection_streaming(self, handle, query, **kwargs):
+            assert handle is connection_handle
+            self.calls.append((handle, query, kwargs))
+            return {"columns": ["id", "name"], "rows": [], "rows_affected": 0}
+
+    connection.facade = StrictFacade()
 
     connector = MagicMock()
     connector.connect.return_value = (True, "ok")
@@ -798,6 +807,7 @@ def test_autocommit_worker_uses_classifier_and_streaming_columns_for_empty_selec
     assert columns == ["id", "name"]
     assert rows == []
     assert error == ""
+    assert connection.facade.calls[0][0] is connection_handle
 
 
 def test_on_query_result_empty_select_creates_result_tab_and_history(monkeypatch):

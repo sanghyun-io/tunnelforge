@@ -2,7 +2,7 @@ import ast
 import io
 import json
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -260,6 +260,123 @@ def test_open_connection_returns_generation_handle():
     assert isinstance(handle, db_core_service.DbCoreConnectionHandle)
     assert handle.connection_id == "conn-1"
     assert handle.process_generation == client.process_generation == 1
+
+
+def test_connection_handle_is_rejected_by_a_different_facade_before_wire():
+    class Client:
+        process_generation = 1
+
+        def __init__(self):
+            self.payload_calls = []
+
+        def request_result(self, command, payload=None, **kwargs):
+            return db_core_service.DbCoreRequestResult(
+                request_kind=kwargs["request_kind"],
+                outcome=DbCoreOutcome.DEFINITE,
+                request_id="open-request",
+                process_generation=1,
+                message="",
+                rust_code=None,
+                payload={"success": True, "connection_id": "shared-id"},
+            )
+
+        def request_payload(self, command, payload=None, **kwargs):
+            self.payload_calls.append((command, payload, kwargs))
+            return {"success": True, "rows": []}
+
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+    first_client = Client()
+    second_client = Client()
+    first_facade = DbCoreFacade(first_client)
+    second_facade = DbCoreFacade(second_client)
+    foreign_handle = first_facade.open_connection(endpoint)
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        second_facade.execute_on_connection(foreign_handle, "SELECT 1")
+
+    assert raised.value.code == "db_core_stale_connection"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert raised.value.payload["wire_writes"] == 0
+    assert second_client.payload_calls == []
+
+
+@pytest.mark.parametrize(
+    ("connection_id", "process_generation"),
+    [
+        ("", 1),
+        (None, 1),
+        ("conn-1", True),
+        ("conn-1", 1.0),
+    ],
+)
+def test_malformed_owned_handle_is_rejected_before_wire(
+    connection_id,
+    process_generation,
+):
+    class Client:
+        process_generation = 1
+
+        def __init__(self):
+            self.payload_calls = []
+
+        def request_result(self, command, payload=None, **kwargs):
+            return db_core_service.DbCoreRequestResult(
+                request_kind=kwargs["request_kind"],
+                outcome=DbCoreOutcome.DEFINITE,
+                request_id="open-request",
+                process_generation=1,
+                message="",
+                rust_code=None,
+                payload={"success": True, "connection_id": "conn-1"},
+            )
+
+        def request_payload(self, command, payload=None, **kwargs):
+            self.payload_calls.append((command, payload, kwargs))
+            return {"success": True}
+
+    client = Client()
+    facade = DbCoreFacade(client)
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+    valid_handle = facade.open_connection(endpoint)
+    malformed_handle = replace(
+        valid_handle,
+        connection_id=connection_id,
+        process_generation=process_generation,
+    )
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        facade.close_connection(malformed_handle)
+
+    assert raised.value.code == "db_core_stale_connection"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert raised.value.payload["wire_writes"] == 0
+    assert client.payload_calls == []
+
+
+def test_open_connection_rejects_malformed_success_metadata():
+    class Client:
+        process_generation = 1
+
+        def request_result(self, command, payload=None, **kwargs):
+            return db_core_service.DbCoreRequestResult(
+                request_kind=kwargs["request_kind"],
+                outcome=DbCoreOutcome.DEFINITE,
+                request_id="open-request",
+                process_generation=1,
+                message="",
+                rust_code=None,
+                payload={"success": True, "connection_id": ""},
+            )
+
+    facade = DbCoreFacade(Client())
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        facade.open_connection(endpoint)
+
+    assert raised.value.code == "db_core_protocol_mismatch"
+    assert raised.value.outcome is DbCoreOutcome.DEFINITE
+    assert raised.value.request_id == "open-request"
 
 
 @pytest.mark.parametrize(

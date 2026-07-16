@@ -3,7 +3,7 @@ import atexit
 import math
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.core.db_core_client import (
@@ -43,6 +43,15 @@ class DbEndpoint:
 class DbCoreConnectionHandle:
     connection_id: str
     process_generation: int
+    _owner_token: Any = field(default=None, repr=False, compare=False)
+
+    def is_well_formed(self) -> bool:
+        return (
+            type(self.connection_id) is str
+            and bool(self.connection_id.strip())
+            and type(self.process_generation) is int
+            and self.process_generation > 0
+        )
 
 
 def _client_process_generation(client: Any) -> int:
@@ -75,6 +84,7 @@ class DbCoreFacade:
 
     def __init__(self, client: Optional[DbCoreServiceClient] = None):
         self.client = client or DbCoreServiceClient()
+        self._connection_owner_token = object()
 
     def hello(self) -> Dict[str, Any]:
         return self.client.request_payload(
@@ -107,16 +117,41 @@ class DbCoreFacade:
                 rust_code=request_result.rust_code,
                 payload=request_result.payload,
             )
+        connection_id = request_result.payload.get("connection_id")
+        process_generation = request_result.process_generation
+        if not (
+            type(connection_id) is str
+            and bool(connection_id.strip())
+            and type(process_generation) is int
+            and process_generation > 0
+        ):
+            raise DbCoreServiceError(
+                "DB Core connection.open returned invalid handle metadata",
+                code="db_core_protocol_mismatch",
+                request_kind=DbCoreRequestKind.MUTATION,
+                outcome=DbCoreOutcome.DEFINITE,
+                request_id=request_result.request_id,
+                process_generation=(
+                    process_generation if type(process_generation) is int else 0
+                ),
+                rust_code=request_result.rust_code,
+                payload=request_result.payload,
+            )
         return DbCoreConnectionHandle(
-            connection_id=str(request_result.payload.get("connection_id", "")),
-            process_generation=request_result.process_generation,
+            connection_id=connection_id,
+            process_generation=process_generation,
+            _owner_token=self._connection_owner_token,
         )
 
     def _require_connection_handle(
         self,
         connection_handle: DbCoreConnectionHandle,
     ) -> DbCoreConnectionHandle:
-        if isinstance(connection_handle, DbCoreConnectionHandle):
+        if (
+            type(connection_handle) is DbCoreConnectionHandle
+            and connection_handle.is_well_formed()
+            and connection_handle._owner_token is self._connection_owner_token
+        ):
             return connection_handle
         raise DbCoreServiceError(
             "DB Core connection handle is missing its process generation",

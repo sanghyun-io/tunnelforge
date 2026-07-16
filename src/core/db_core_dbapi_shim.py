@@ -26,7 +26,10 @@ logger = get_logger("db_core_service")
 def _require_connection_handle(
     connection_handle: DbCoreConnectionHandle,
 ) -> DbCoreConnectionHandle:
-    if isinstance(connection_handle, DbCoreConnectionHandle):
+    if (
+        type(connection_handle) is DbCoreConnectionHandle
+        and connection_handle.is_well_formed()
+    ):
         return connection_handle
     raise DbCoreServiceError(
         "DB Core connection handle is missing its process generation",
