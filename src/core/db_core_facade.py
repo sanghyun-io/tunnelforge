@@ -3,7 +3,8 @@ import atexit
 import math
 import threading
 import time
-from dataclasses import dataclass, field
+import weakref
+from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 from src.core.db_core_client import (
@@ -43,7 +44,6 @@ class DbEndpoint:
 class DbCoreConnectionHandle:
     connection_id: str
     process_generation: int
-    _owner_token: Any = field(default=None, repr=False, compare=False)
 
     def is_well_formed(self) -> bool:
         return (
@@ -84,7 +84,28 @@ class DbCoreFacade:
 
     def __init__(self, client: Optional[DbCoreServiceClient] = None):
         self.client = client or DbCoreServiceClient()
-        self._connection_owner_token = object()
+        self._issued_connection_handles: Dict[int, Any] = {}
+
+    def _register_connection_handle(
+        self,
+        handle: DbCoreConnectionHandle,
+    ) -> DbCoreConnectionHandle:
+        handle_id = id(handle)
+        facade_ref = weakref.ref(self)
+
+        def discard_handle(completed_ref) -> None:
+            facade = facade_ref()
+            if (
+                facade is not None
+                and facade._issued_connection_handles.get(handle_id) is completed_ref
+            ):
+                facade._issued_connection_handles.pop(handle_id, None)
+
+        self._issued_connection_handles[handle_id] = weakref.ref(
+            handle,
+            discard_handle,
+        )
+        return handle
 
     def hello(self) -> Dict[str, Any]:
         return self.client.request_payload(
@@ -137,20 +158,23 @@ class DbCoreFacade:
                 rust_code=request_result.rust_code,
                 payload=request_result.payload,
             )
-        return DbCoreConnectionHandle(
-            connection_id=connection_id,
-            process_generation=process_generation,
-            _owner_token=self._connection_owner_token,
+        return self._register_connection_handle(
+            DbCoreConnectionHandle(
+                connection_id=connection_id,
+                process_generation=process_generation,
+            )
         )
 
     def _require_connection_handle(
         self,
         connection_handle: DbCoreConnectionHandle,
     ) -> DbCoreConnectionHandle:
+        issued_ref = self._issued_connection_handles.get(id(connection_handle))
         if (
             type(connection_handle) is DbCoreConnectionHandle
             and connection_handle.is_well_formed()
-            and connection_handle._owner_token is self._connection_owner_token
+            and issued_ref is not None
+            and issued_ref() is connection_handle
         ):
             return connection_handle
         raise DbCoreServiceError(
@@ -172,7 +196,10 @@ class DbCoreFacade:
             request_kind=DbCoreRequestKind.MUTATION,
             required_generation=handle.process_generation,
         )
-        return bool(result.get("success"))
+        succeeded = bool(result.get("success"))
+        if succeeded:
+            self._issued_connection_handles.pop(id(handle), None)
+        return succeeded
 
     def inspect_schema(self, endpoint: DbEndpoint) -> Dict[str, Any]:
         result = self.client.request_payload(

@@ -466,6 +466,23 @@ def test_old_cursor_rejected_when_new_generation_reuses_same_connection_id():
     assert process.stdin.getvalue() == writes_before
 
 
+def test_cloned_old_handle_cannot_claim_current_generation():
+    process, old_cursor, _new_cursor, old_handle, new_handle = _reused_connection_id_fixture()
+    forged_handle = replace(
+        old_handle,
+        process_generation=new_handle.process_generation,
+    )
+    writes_before = process.stdin.getvalue()
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        old_cursor.connection.facade.execute_on_connection(forged_handle, "SELECT 1")
+
+    assert raised.value.code == "db_core_stale_connection"
+    assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+    assert raised.value.payload["wire_writes"] == 0
+    assert process.stdin.getvalue() == writes_before
+
+
 def test_new_cursor_with_reused_id_succeeds():
     _process, _old_cursor, new_cursor, _old_handle, new_handle = _reused_connection_id_fixture()
 
@@ -622,7 +639,6 @@ def test_facade_explicitly_classifies_every_request_kind_and_preserves_shapes():
     assert facade.hello().get("service") == "tunnelforge-core"
     assert facade.test_connection(endpoint) == (True, "ok")
     handle = facade.open_connection(endpoint)
-    assert facade.close_connection(handle) is True
     assert facade.inspect_schema(endpoint)["tables"] == []
     assert facade.list_tables(endpoint)[0] == "users"
     assert facade.schema_diff({}, {})[0]["kind"] == "added"
@@ -635,6 +651,7 @@ def test_facade_explicitly_classifies_every_request_kind_and_preserves_shapes():
         on_batch=batches.append,
     ).get("success") is True
     assert batches == [[{"id": 1}]]
+    assert facade.close_connection(handle) is True
     assert facade.run_migration({}).get("success") is True
     assert facade.verify_migration({}).get("success") is True
     assert facade.run_dump({}).get("success") is True
@@ -647,13 +664,13 @@ def test_facade_explicitly_classifies_every_request_kind_and_preserves_shapes():
         ("service.hello", DbCoreRequestKind.READ_ONLY, None),
         ("connection.test", DbCoreRequestKind.READ_ONLY, None),
         ("connection.open", DbCoreRequestKind.MUTATION, None),
-        ("connection.close", DbCoreRequestKind.MUTATION, 7),
         ("schema.inspect", DbCoreRequestKind.READ_ONLY, None),
         ("schema.list", DbCoreRequestKind.READ_ONLY, None),
         ("schema.diff", DbCoreRequestKind.READ_ONLY, None),
         ("query.execute", DbCoreRequestKind.MUTATION, None),
         ("query.execute", DbCoreRequestKind.MUTATION, 7),
         ("query.execute", DbCoreRequestKind.MUTATION, 7),
+        ("connection.close", DbCoreRequestKind.MUTATION, 7),
         ("migration.run", DbCoreRequestKind.MUTATION, None),
         ("migration.verify", DbCoreRequestKind.READ_ONLY, None),
         ("dump.run", DbCoreRequestKind.MUTATION, None),
