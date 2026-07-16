@@ -2515,20 +2515,34 @@ def test_one_absolute_deadline_bounds_hello_write_drain_read_cleanup(stall):
 
 
 class _Task4Writer(_Task3Writer):
-    def __init__(self, process, *, fail_close=False, fail_wait_closed=False):
+    def __init__(
+        self,
+        process,
+        *,
+        fail_close=False,
+        fail_wait_closed=False,
+        close_error=None,
+        wait_closed_error=None,
+    ):
         super().__init__(process)
         self.fail_close = fail_close
         self.fail_wait_closed = fail_wait_closed
+        self.close_error = close_error
+        self.wait_closed_error = wait_closed_error
         self.close_calls = 0
         self.wait_closed_calls = 0
 
     def close(self):
         self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
         if self.fail_close:
             raise OSError("simulated stdin close failure")
 
     async def wait_closed(self):
         self.wait_closed_calls += 1
+        if self.wait_closed_error is not None:
+            raise self.wait_closed_error
         if self.fail_wait_closed:
             raise OSError("simulated stdin wait_closed failure")
 
@@ -2540,6 +2554,8 @@ class _Task4Process(_Task3Process):
         pid=4242,
         fail_close=False,
         fail_wait_closed=False,
+        close_error=None,
+        wait_closed_error=None,
         fail_terminate=False,
         stall_read=False,
         stall_terminate_wait=False,
@@ -2553,6 +2569,8 @@ class _Task4Process(_Task3Process):
             self,
             fail_close=fail_close,
             fail_wait_closed=fail_wait_closed,
+            close_error=close_error,
+            wait_closed_error=wait_closed_error,
         )
         self.fail_terminate_task4 = fail_terminate
         self.stall_read = stall_read
@@ -4118,16 +4136,57 @@ def test_cancel_active_task_residual_still_reaps_process():
     assert error.payload["pending_tasks"]
 
 
-def test_cleanup_close_stdin_failure_still_reaps_child():
-    process = _Task4Process(fail_close=True)
+@pytest.mark.parametrize("stdin_operation", ["close", "wait_closed"])
+@pytest.mark.parametrize("error_type", [OSError, ResourceWarning])
+def test_cleanup_stdin_failure_requires_public_retry_before_closed(
+    stdin_operation,
+    error_type,
+):
+    message = "simulated stdin {} failure".format(stdin_operation)
+    process = _Task4Process(
+        **{
+            "{}_error".format(
+                "close" if stdin_operation == "close" else "wait_closed"
+            ): error_type(message)
+        }
+    )
     client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
     client.start()
 
-    client.shutdown(timeout_seconds=0.5)
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.shutdown(timeout_seconds=0.5)
 
-    assert process.stdin.close_calls == 1
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "stdin_close"
+        assert raised.value.payload["cleanup_diagnostics"] == [
+            {
+                "stage": "stdin_close",
+                "operation": stdin_operation,
+                "exception_type": error_type.__name__,
+                "message": message,
+            }
+        ]
+        assert process.terminate_calls == 1
+        assert process.wait_calls >= 1
+        assert client._process is process
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client.shutdown_complete is False
+        assert client.owner_thread.is_alive()
+
+        if stdin_operation == "close":
+            process.stdin.close_error = None
+        else:
+            process.stdin.wait_closed_error = None
+        client.shutdown(timeout_seconds=1.0)
+    finally:
+        process.stdin.close_error = None
+        process.stdin.wait_closed_error = None
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert process.stdin.close_calls >= 2
     assert process.terminate_calls == 1
-    assert process.wait_calls >= 1
     assert client._process is None
     assert client._stderr_task is None
     assert client._process_wait_task is None
@@ -4140,27 +4199,74 @@ def test_cleanup_close_stdin_failure_still_reaps_child():
     assert client.owner_loop.is_closed()
 
 
-def test_cleanup_wait_closed_failure_still_reaps_child():
-    process = _Task4Process(fail_wait_closed=True)
+@pytest.mark.parametrize("stdin_operation", ["close", "wait_closed"])
+@pytest.mark.parametrize("terminal_error", [BrokenPipeError, ConnectionResetError])
+def test_cleanup_accepts_terminal_stdin_failure_after_close_request(
+    stdin_operation,
+    terminal_error,
+):
+    message = "terminal stdin {} closure".format(stdin_operation)
+    process = _Task4Process(
+        **{
+            "{}_error".format(
+                "close" if stdin_operation == "close" else "wait_closed"
+            ): terminal_error(message)
+        }
+    )
     client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
     client.start()
 
-    client.shutdown(timeout_seconds=0.5)
+    try:
+        client.shutdown(timeout_seconds=0.5)
+    finally:
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
 
     assert process.stdin.close_calls == 1
     assert process.stdin.wait_closed_calls == 1
-    assert process.terminate_calls == 1
-    assert process.wait_calls >= 1
-    assert client._process is None
-    assert client._stderr_task is None
-    assert client._process_wait_task is None
-    assert client._stdout_drain_task is None
-    assert client._stdin_close_task is None
-    assert client._owner_reap_task is None
     assert client.generation_state is DbCoreGenerationState.CLOSED
     assert client.shutdown_complete is True
-    assert not client.owner_thread.is_alive()
-    assert client.owner_loop.is_closed()
+
+
+@pytest.mark.parametrize("terminal_error", [BrokenPipeError, ConnectionResetError])
+def test_cleanup_rejects_terminal_wait_closed_without_close_request(terminal_error):
+    message = "terminal stdin closure without close request"
+    process = _Task4Process(wait_closed_error=terminal_error(message))
+    client = DbCoreServiceClient(executable="fake-core", process_factory=_Task3Factory([process]))
+    client.start()
+    original_close = process.stdin.close
+    process.stdin.close = None
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.shutdown(timeout_seconds=0.5)
+
+        assert raised.value.code == "db_core_residual_process"
+        assert raised.value.payload["stage"] == "stdin_close"
+        assert raised.value.payload["cleanup_diagnostics"] == [
+            {
+                "stage": "stdin_close",
+                "operation": "wait_closed",
+                "exception_type": terminal_error.__name__,
+                "message": message,
+            }
+        ]
+        assert client._process is process
+        assert client.generation_state in {
+            DbCoreGenerationState.POISONED,
+            DbCoreGenerationState.REAPING,
+        }
+
+        process.stdin.close = original_close
+        process.stdin.wait_closed_error = None
+        client.shutdown(timeout_seconds=1.0)
+    finally:
+        process.stdin.close = original_close
+        process.stdin.wait_closed_error = None
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client.generation_state is DbCoreGenerationState.CLOSED
 
 
 @pytest.mark.parametrize("expected_stage", ["final_wait", "stdout_drain", "stderr_drain"])
@@ -4216,7 +4322,10 @@ def test_cleanup_residual_preserves_stdin_close_diagnostic(
             }
         ]
         assert client._process is process
-        assert client.generation_state is DbCoreGenerationState.REAPING
+        assert client.generation_state in {
+            DbCoreGenerationState.POISONED,
+            DbCoreGenerationState.REAPING,
+        }
     finally:
         process.stdin.fail_close = False
         process.stdin.fail_wait_closed = False
@@ -4225,22 +4334,26 @@ def test_cleanup_residual_preserves_stdin_close_diagnostic(
         process.stdout.feed_eof()
         process.stderr.feed_eof()
 
-        async def restore_failed_cleanup_task():
-            if expected_stage == "stdout_drain":
-                client._stdout_drain_task = None
-            elif expected_stage == "stderr_drain":
-                client._stderr_task = asyncio.create_task(
-                    client._drain_stderr_on_owner(process)
-                )
-                await asyncio.sleep(0)
-
         if client.owner_thread.is_alive():
-            client._submit_owner(
-                restore_failed_cleanup_task(),
-                DbCoreRequestKind.MUTATION,
-                "restore-failed-cleanup-task",
-            ).result(timeout=1.0)
-            client.shutdown(timeout_seconds=1.0)
+            try:
+                client.shutdown(timeout_seconds=1.0)
+            except DbCoreServiceError:
+                async def release_failed_test_cleanup_task():
+                    if expected_stage == "stdout_drain":
+                        client._stdout_drain_task = None
+                    elif expected_stage == "stderr_drain":
+                        client._stderr_task = asyncio.create_task(
+                            client._drain_stderr_on_owner(process)
+                        )
+                        await asyncio.sleep(0)
+
+                client._submit_owner(
+                    release_failed_test_cleanup_task(),
+                    DbCoreRequestKind.MUTATION,
+                    "release-failed-test-cleanup-task",
+                ).result(timeout=1.0)
+                client.shutdown(timeout_seconds=1.0)
+                raise
 
     assert client._process is None
     assert client.generation_state is DbCoreGenerationState.CLOSED
@@ -4734,3 +4847,157 @@ def test_post_write_caller_timeout_leaves_reap_barrier_before_next_wire():
                 pass
         if client.owner_thread.is_alive():
             client.shutdown(timeout_seconds=1.0)
+
+
+def test_start_timeout_during_hello_publishes_barrier_before_read_only_interleaving(
+    monkeypatch,
+):
+    first_process = _Task4Process()
+    second_process = _Task3Process(
+        responder=lambda process, request: _task3_result(
+            process,
+            request,
+            value="must-not-run",
+        )
+    )
+    factory = _Task3Factory([first_process, second_process])
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+    hello_read_entered = threading.Event()
+    reap_entered = threading.Event()
+    release_reap = threading.Event()
+    original_terminate = client._terminate_process_on_owner
+
+    async def hold_hello_read(*args, **kwargs):
+        hello_read_entered.set()
+        await asyncio.Event().wait()
+
+    async def hold_reap(deadline_at):
+        reap_entered.set()
+        while not release_reap.is_set():
+            await asyncio.sleep(0.001)
+        return await original_terminate(deadline_at)
+
+    monkeypatch.setattr(db_core_client, "DEFAULT_SHUTDOWN_TIMEOUT_SECONDS", 0.1)
+    monkeypatch.setattr(client, "_read_logical_event_on_owner", hold_hello_read)
+    monkeypatch.setattr(client, "_terminate_process_on_owner", hold_reap)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.start()
+
+        assert raised.value.code == "db_core_timeout"
+        assert hello_read_entered.wait(timeout=0.5)
+        assert reap_entered.wait(timeout=0.5)
+        reap_task = client._owner_reap_task
+        assert reap_task is not None
+        assert not reap_task.cancelled()
+        assert client._owner_reap_generation == 1
+        assert client.generation_state in {
+            DbCoreGenerationState.POISONED,
+            DbCoreGenerationState.REAPING,
+        }
+        assert len(first_process.raw_writes) == 1
+
+        with pytest.raises(DbCoreServiceError) as blocked:
+            client.request_result(
+                "schema.list",
+                request_id="read-only-blocked-by-start-reap",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.1,
+            )
+
+        assert blocked.value.code == "db_core_reap_in_progress"
+        assert blocked.value.payload["wire_writes"] == 0
+        assert len(factory.calls) == 1
+        assert len(first_process.raw_writes) == 1
+        assert second_process.raw_writes == []
+    finally:
+        release_reap.set()
+        if client.owner_thread.is_alive():
+            try:
+                client.cancel_active_request(timeout_seconds=1.0)
+            except DbCoreServiceError:
+                pass
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client._owner_reap_task is None
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert client.shutdown_complete is True
+
+
+def test_read_only_timeout_during_hello_cleanup_retains_barrier_before_next_wire(
+    monkeypatch,
+):
+    first_process = _Task4Process(stall_hello=True)
+    second_process = _Task3Process(
+        responder=lambda process, request: _task3_result(
+            process,
+            request,
+            value="must-not-run",
+        )
+    )
+    factory = _Task3Factory([first_process, second_process])
+    client = DbCoreServiceClient(executable="fake-core", process_factory=factory)
+    cleanup_entered = threading.Event()
+    release_cleanup = threading.Event()
+    original_terminate = client._terminate_process_on_owner
+
+    async def hold_cleanup(deadline_at):
+        cleanup_entered.set()
+        while not release_cleanup.is_set():
+            await asyncio.sleep(0.001)
+        return await original_terminate(deadline_at)
+
+    monkeypatch.setattr(client, "_terminate_process_on_owner", hold_cleanup)
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "schema.list",
+                request_id="read-only-timeout-during-hello-cleanup",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.1,
+            )
+
+        assert raised.value.code == "db_core_timeout"
+        assert cleanup_entered.wait(timeout=0.5)
+        barrier_deadline = time.monotonic() + 0.5
+        while client._owner_reap_task is None and time.monotonic() < barrier_deadline:
+            time.sleep(0.001)
+        reap_task = client._owner_reap_task
+        assert reap_task is not None
+        assert not reap_task.cancelled()
+        assert client._owner_reap_generation == 1
+        assert client.generation_state in {
+            DbCoreGenerationState.POISONED,
+            DbCoreGenerationState.REAPING,
+        }
+        assert len(first_process.raw_writes) == 1
+
+        with pytest.raises(DbCoreServiceError) as blocked:
+            client.request_result(
+                "schema.list",
+                request_id="read-only-blocked-by-cleanup-reap",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.1,
+            )
+
+        assert blocked.value.code == "db_core_reap_in_progress"
+        assert blocked.value.payload["wire_writes"] == 0
+        assert len(factory.calls) == 1
+        assert len(first_process.raw_writes) == 1
+        assert second_process.raw_writes == []
+    finally:
+        release_cleanup.set()
+        if client.owner_thread.is_alive():
+            try:
+                client.cancel_active_request(timeout_seconds=1.0)
+            except DbCoreServiceError:
+                pass
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)
+
+    assert client._owner_reap_task is None
+    assert client.generation_state is DbCoreGenerationState.CLOSED
+    assert client.shutdown_complete is True

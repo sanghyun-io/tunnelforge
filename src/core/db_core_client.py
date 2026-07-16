@@ -519,7 +519,9 @@ class DbCoreServiceClient:
         self._process_wait_task: Optional[asyncio.Task] = None
         self._process_wait_reported_task: Optional[asyncio.Task] = None
         self._stdout_drain_task: Optional[asyncio.Task] = None
+        self._stdout_drain_reported_task: Optional[asyncio.Task] = None
         self._stdin_close_task: Optional[asyncio.Task] = None
+        self._stdin_close_reported_task: Optional[asyncio.Task] = None
         self._admission_lock = threading.Lock()
         self._shutdown_lock = threading.Lock()
         self._shutdown_started = False
@@ -910,6 +912,9 @@ class DbCoreServiceClient:
                 work_cutoff,
                 deadline_at,
             )
+        except asyncio.CancelledError:
+            self._ensure_cancelled_transport_reap_on_owner(deadline_at)
+            raise
         finally:
             if self._active_request_task is current:
                 self._active_request_task = None
@@ -1715,23 +1720,21 @@ class DbCoreServiceClient:
                 )
             self._active_request_task = current
             self._active_request_deadline_at = deadline_at
-            try:
-                return await self._send_on_owner(
-                    command,
-                    payload,
-                    request_id,
-                    request_kind,
-                    event_queue,
-                    required_generation,
-                    work_cutoff,
-                    deadline_at,
-                    requires_callback_ack,
-                    write_started,
-                )
-            except asyncio.CancelledError:
-                if write_started.is_set():
-                    self._ensure_cancelled_transport_reap_on_owner(deadline_at)
-                raise
+            return await self._send_on_owner(
+                command,
+                payload,
+                request_id,
+                request_kind,
+                event_queue,
+                required_generation,
+                work_cutoff,
+                deadline_at,
+                requires_callback_ack,
+                write_started,
+            )
+        except asyncio.CancelledError:
+            self._ensure_cancelled_transport_reap_on_owner(deadline_at)
+            raise
         finally:
             if self._active_request_task is current:
                 self._active_request_task = None
@@ -1996,6 +1999,10 @@ class DbCoreServiceClient:
         try:
             await self._poison_and_reap_on_owner(deadline_at)
         except BaseException as cleanup_exception:
+            if isinstance(cleanup_exception, asyncio.CancelledError):
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
             if isinstance(cleanup_exception, DbCoreServiceError):
                 cleanup_error = cleanup_exception
             else:
@@ -2129,8 +2136,15 @@ class DbCoreServiceClient:
             self._stderr_task = stderr_task
 
         stdin = getattr(process, "stdin", None)
+        stdin_close_requested = False
         stdin_close_diagnostics: List[Dict[str, str]] = []
         diagnosed_stdin_close_tasks: Set[int] = set()
+
+        def accepted_terminal_stdin_close_error(exception: BaseException) -> bool:
+            return stdin_close_requested and isinstance(
+                exception,
+                (BrokenPipeError, ConnectionResetError),
+            )
 
         def record_stdin_close_diagnostic(
             operation: str,
@@ -2152,7 +2166,9 @@ class DbCoreServiceClient:
             try:
                 task.result()
             except BaseException as exc:
-                record_stdin_close_diagnostic("wait_closed", exc)
+                if not accepted_terminal_stdin_close_error(exc):
+                    record_stdin_close_diagnostic("wait_closed", exc)
+                    self._stdin_close_reported_task = task
 
         def cleanup_residual(
             stage: str,
@@ -2174,23 +2190,49 @@ class DbCoreServiceClient:
             )
 
         stdin_close_task = self._stdin_close_task
+        if (
+            stdin_close_task is not None
+            and stdin_close_task.done()
+            and self._stdin_close_reported_task is stdin_close_task
+        ):
+            try:
+                stdin_close_task.result()
+            except BaseException:
+                pass
+            self._stdin_close_task = None
+            self._stdin_close_reported_task = None
+            stdin_close_task = None
         collect_stdin_close_task_diagnostic(stdin_close_task)
         if stdin is not None:
             close = getattr(stdin, "close", None)
             if callable(close):
+                stdin_close_requested = True
                 try:
                     close()
                 except BaseException as exc:
-                    record_stdin_close_diagnostic("close", exc)
+                    if not accepted_terminal_stdin_close_error(exc):
+                        record_stdin_close_diagnostic("close", exc)
             wait_closed = getattr(stdin, "wait_closed", None)
             if callable(wait_closed) and stdin_close_task is None:
                 pending_close = None
                 try:
                     pending_close = wait_closed()
                 except BaseException as exc:
-                    record_stdin_close_diagnostic("wait_closed", exc)
+                    if not accepted_terminal_stdin_close_error(exc):
+                        record_stdin_close_diagnostic("wait_closed", exc)
                 if inspect.isawaitable(pending_close):
-                    stdin_close_task = asyncio.ensure_future(pending_close)
+                    async def settle_stdin_close() -> Any:
+                        try:
+                            return await pending_close
+                        except (BrokenPipeError, ConnectionResetError) as exc:
+                            if not accepted_terminal_stdin_close_error(exc):
+                                raise
+                            return None
+
+                    stdin_close_task = asyncio.create_task(
+                        settle_stdin_close(),
+                        name=f"db-core-stdin-close-generation-{self._process_generation}",
+                    )
                     self._stdin_close_task = stdin_close_task
 
         needs_kill = False
@@ -2295,6 +2337,18 @@ class DbCoreServiceClient:
                 )
 
         stdout_drain_task = self._stdout_drain_task
+        if (
+            stdout_drain_task is not None
+            and stdout_drain_task.done()
+            and self._stdout_drain_reported_task is stdout_drain_task
+        ):
+            try:
+                stdout_drain_task.result()
+            except BaseException:
+                pass
+            self._stdout_drain_task = None
+            self._stdout_drain_reported_task = None
+            stdout_drain_task = None
         if stdout_drain_task is None:
             stdout_drain_task = asyncio.create_task(
                 self._drain_stdout_to_eof_on_owner(process),
@@ -2312,12 +2366,14 @@ class DbCoreServiceClient:
         except asyncio.CancelledError as exc:
             if not stdout_drain_task.cancelled():
                 raise
+            self._stdout_drain_reported_task = stdout_drain_task
             raise cleanup_residual(
                 "stdout_drain",
                 "DB Core stdout drain task was cancelled before EOF",
                 pending_tasks=[self._task_diagnostic(stdout_drain_task)],
             ) from exc
         except BaseException as exc:
+            self._stdout_drain_reported_task = stdout_drain_task
             raise cleanup_residual(
                 "stdout_drain",
                 f"DB Core stdout drain failed: {type(exc).__name__}: {exc}",
@@ -2384,6 +2440,11 @@ class DbCoreServiceClient:
                 "DB Core stdin close task resisted cancellation after process reap",
                 pending_tasks=[self._task_diagnostic(stdin_close_task)],
             )
+        if stdin_close_diagnostics:
+            raise cleanup_residual(
+                "stdin_close",
+                "DB Core stdin close did not settle cleanly",
+            )
 
         self._stderr_task = None
         self._stderr_reader_outcome_task = None
@@ -2393,7 +2454,9 @@ class DbCoreServiceClient:
         self._process_wait_task = None
         self._process_wait_reported_task = None
         self._stdout_drain_task = None
+        self._stdout_drain_reported_task = None
         self._stdin_close_task = None
+        self._stdin_close_reported_task = None
         self._process = None
         self._transition_generation(DbCoreGenerationState.CLOSED)
 
