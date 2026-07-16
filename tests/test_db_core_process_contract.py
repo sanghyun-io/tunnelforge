@@ -4567,3 +4567,170 @@ def test_public_cancel_and_shutdown_submit_mutation_owner_work(monkeypatch):
         ("cancel-active", DbCoreRequestKind.MUTATION),
         ("shutdown", DbCoreRequestKind.MUTATION),
     ]
+
+
+@pytest.mark.parametrize("terminal_event", ["result", "error"])
+def test_unterminated_terminal_jsonl_frame_poison_reaps_generation(terminal_event):
+    def respond(process, request):
+        event = {
+            "event": terminal_event,
+            "request_id": request["request_id"],
+            "command": request["command"],
+            "success": terminal_event == "result",
+        }
+        if terminal_event == "error":
+            event.update({"code": "query_failed", "message": "failed"})
+        process.stdout.feed_raw(
+            json.dumps(event, separators=(",", ":")).encode("utf-8")
+        )
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "query.execute",
+                request_kind=DbCoreRequestKind.MUTATION,
+                timeout_seconds=0.5,
+            )
+
+        assert raised.value.code == "db_core_protocol_mismatch"
+        assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+        assert process.terminate_calls == 1
+        assert client.generation_state is DbCoreGenerationState.CLOSED
+        assert client._process is None
+    finally:
+        client.shutdown(timeout_seconds=1.0)
+
+
+@pytest.mark.parametrize("success", [None, "true", 1])
+def test_terminal_result_requires_exact_boolean_success(success):
+    def respond(process, request):
+        event = {
+            "event": "result",
+            "request_id": request["request_id"],
+            "command": request["command"],
+        }
+        if success is not None:
+            event["success"] = success
+        process.stdout.feed_event(event)
+
+    process = _Task3Process(responder=respond)
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=_Task3Factory([process]),
+    )
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "schema.list",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.5,
+            )
+
+        assert raised.value.code == "db_core_protocol_mismatch"
+        assert raised.value.outcome is DbCoreOutcome.FAILED
+        assert process.terminate_calls == 1
+        assert client.generation_state is DbCoreGenerationState.CLOSED
+    finally:
+        client.shutdown(timeout_seconds=1.0)
+
+
+@pytest.mark.parametrize("request_id", ["", "  ", 7, " padded "])
+def test_invalid_explicit_request_id_is_rejected_before_process_start(request_id):
+    process = _Task3Process(responder=lambda proc, req: _task3_result(proc, req))
+    factory = _Task3Factory([process])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=factory,
+    )
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "schema.list",
+                request_id=request_id,
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.5,
+            )
+
+        assert raised.value.code == "db_core_protocol_mismatch"
+        assert raised.value.outcome is DbCoreOutcome.NOT_STARTED
+        assert raised.value.payload["wire_writes"] == 0
+        assert factory.calls == []
+        assert process.raw_writes == []
+    finally:
+        client.shutdown(timeout_seconds=1.0)
+
+
+def test_post_write_caller_timeout_leaves_reap_barrier_before_next_wire():
+    write_blocked = threading.Event()
+
+    class BlockingWriter(_Task4Writer):
+        def write(self, data):
+            super().write(data)
+            request = self.process.stdin.pending
+            if request is not None and request["command"] != "service.hello":
+                write_blocked.set()
+                time.sleep(0.2)
+
+    first_process = _Task4Process(
+        stall_terminate_wait=True,
+        fail_kill=True,
+    )
+    first_process.stdin = BlockingWriter(first_process)
+    second_process = _Task3Process(
+        responder=lambda proc, req: _task3_result(proc, req, value="must-not-run")
+    )
+    factory = _Task3Factory([first_process, second_process])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=factory,
+    )
+    client.start()
+
+    try:
+        with pytest.raises(DbCoreServiceError) as raised:
+            client.request_result(
+                "dump.import",
+                request_id="caller-timeout-after-write",
+                request_kind=DbCoreRequestKind.MUTATION,
+                timeout_seconds=0.1,
+            )
+
+        assert write_blocked.is_set()
+        assert raised.value.code == "db_core_timeout"
+        assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+        barrier_deadline = time.monotonic() + 0.5
+        while client._owner_reap_task is None and time.monotonic() < barrier_deadline:
+            time.sleep(0.001)
+        assert client._owner_reap_task is not None
+        assert client._owner_reap_generation == 1
+        assert client.generation_state is DbCoreGenerationState.REAPING
+        writes_before = len(first_process.raw_writes)
+
+        with pytest.raises(DbCoreServiceError):
+            client.request_result(
+                "schema.list",
+                request_id="blocked-behind-timeout-reap",
+                request_kind=DbCoreRequestKind.READ_ONLY,
+                timeout_seconds=0.1,
+            )
+
+        assert len(factory.calls) == 1
+        assert len(first_process.raw_writes) == writes_before
+        assert second_process.raw_writes == []
+    finally:
+        first_process.fail_kill = False
+        if client.owner_thread.is_alive():
+            try:
+                client.cancel_active_request(timeout_seconds=1.0)
+            except DbCoreServiceError:
+                pass
+        if client.owner_thread.is_alive():
+            client.shutdown(timeout_seconds=1.0)

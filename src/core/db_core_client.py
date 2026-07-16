@@ -1277,6 +1277,8 @@ class DbCoreServiceClient:
                 raise HelperProtocolError("DB Core frame is not valid UTF-8") from exc
         if enforce_frame_cap and len(encoded) > MAX_JSONL_FRAME_BYTES:
             raise HelperProtocolError("DB Core JSONL frame exceeds the 1 MiB wire cap")
+        if enforce_frame_cap and encoded and not encoded.endswith(b"\n"):
+            raise HelperProtocolError("DB Core JSONL frame is not newline terminated")
         return text
 
     async def _drain_stderr_on_owner(self, process: Any) -> None:
@@ -1576,6 +1578,18 @@ class DbCoreServiceClient:
                 )
                 await self._poison_and_reap_preserving_on_owner(error, deadline_at)
                 raise error
+            if event_type == "result" and type(payload_event.get("success")) is not bool:
+                error = DbCoreServiceError(
+                    "DB Core result event is missing an exact boolean success field",
+                    code="db_core_protocol_mismatch",
+                    request_kind=request_kind,
+                    outcome=self._transport_outcome(request_kind),
+                    request_id=request_id,
+                    process_generation=self._process_generation,
+                    payload=payload_event,
+                )
+                await self._poison_and_reap_preserving_on_owner(error, deadline_at)
+                raise error
             if requires_callback_ack:
                 delivery = _CallbackDelivery(
                     payload=payload_event,
@@ -1701,18 +1715,23 @@ class DbCoreServiceClient:
                 )
             self._active_request_task = current
             self._active_request_deadline_at = deadline_at
-            return await self._send_on_owner(
-                command,
-                payload,
-                request_id,
-                request_kind,
-                event_queue,
-                required_generation,
-                work_cutoff,
-                deadline_at,
-                requires_callback_ack,
-                write_started,
-            )
+            try:
+                return await self._send_on_owner(
+                    command,
+                    payload,
+                    request_id,
+                    request_kind,
+                    event_queue,
+                    required_generation,
+                    work_cutoff,
+                    deadline_at,
+                    requires_callback_ack,
+                    write_started,
+                )
+            except asyncio.CancelledError:
+                if write_started.is_set():
+                    self._ensure_cancelled_transport_reap_on_owner(deadline_at)
+                raise
         finally:
             if self._active_request_task is current:
                 self._active_request_task = None
@@ -1774,10 +1793,25 @@ class DbCoreServiceClient:
     ) -> DbCoreRequestResult:
         if not isinstance(request_kind, DbCoreRequestKind):
             request_kind = DbCoreRequestKind(request_kind)
+        if request_id is None:
+            request_id = f"py-{uuid.uuid4().hex}"
+        elif not (
+            type(request_id) is str
+            and bool(request_id)
+            and request_id.strip() == request_id
+        ):
+            raise DbCoreServiceError(
+                "DB Core request_id must be an exact non-empty trimmed string",
+                code="db_core_protocol_mismatch",
+                request_kind=request_kind,
+                outcome=DbCoreOutcome.NOT_STARTED,
+                request_id=request_id if type(request_id) is str else "",
+                process_generation=self._process_generation,
+                payload={"stage": "request_validation", "wire_writes": 0},
+            )
         timeout = self._validated_timeout(timeout_seconds, DEFAULT_REQUEST_TIMEOUT_SECONDS)
         deadline_at = self._monotonic() + timeout
         work_cutoff = self._cleanup_start(deadline_at, timeout)
-        request_id = request_id or f"py-{uuid.uuid4().hex}"
         events: "queue.Queue[_CallbackDelivery]" = queue.Queue(
             maxsize=(1 if on_event is not None else 0)
         )
@@ -2496,6 +2530,41 @@ class DbCoreServiceClient:
                     self._owner_reap_generation = None
 
         task.add_done_callback(retrieve_owner_reap_result)
+        return task
+
+    def _ensure_cancelled_transport_reap_on_owner(
+        self,
+        deadline_at: float,
+    ) -> asyncio.Task:
+        task = self._owner_reap_task
+        if task is not None:
+            return task
+        if self._generation_state in (
+            DbCoreGenerationState.CREATING,
+            DbCoreGenerationState.ACTIVE,
+        ):
+            self._transition_generation(DbCoreGenerationState.POISONED)
+        generation = self._process_generation
+        task = asyncio.create_task(
+            self._retry_failed_reap_cleanup_on_owner(deadline_at),
+            name=f"db-core-reap-generation-{generation}",
+        )
+        self._owner_reap_task = task
+        self._owner_reap_generation = generation
+
+        def retrieve_cancelled_transport_reap_result(completed: asyncio.Task) -> None:
+            succeeded = False
+            try:
+                completed.result()
+            except BaseException:
+                pass
+            else:
+                succeeded = True
+            if succeeded and self._owner_reap_task is completed:
+                self._owner_reap_task = None
+                self._owner_reap_generation = None
+
+        task.add_done_callback(retrieve_cancelled_transport_reap_result)
         return task
 
     async def _await_owner_reap_on_owner(
