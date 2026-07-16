@@ -227,93 +227,11 @@ fn leading_sql_keyword(sql: &str) -> String {
     text[..end].to_ascii_lowercase()
 }
 
-fn raw_sql_keyword_tokens(sql: &str) -> Vec<String> {
-    let bytes = sql.as_bytes();
-    let mut tokens = Vec::new();
-    let mut index = 0;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
-            {
-                index += 1;
-            }
-            tokens.push(sql[start..index].to_ascii_lowercase());
-            continue;
-        }
-        index += 1;
-    }
-    tokens
-}
-
-fn raw_sql_has_potential_function_call(sql: &str) -> bool {
-    const STRUCTURAL_PAREN_KEYWORDS: &[&str] = &[
-        "and", "as", "case", "else", "exists", "filter", "from", "having", "in", "join", "not",
-        "on", "or", "over", "select", "then", "values", "when", "where", "within",
-    ];
-
-    let bytes = sql.as_bytes();
-    let mut index = 0;
-    let mut preceding_identifier: Option<String> = None;
-    while index < bytes.len() {
-        if bytes[index].is_ascii_whitespace() || matches!(bytes[index], b'\'' | b'"' | b'`') {
-            index += 1;
-            continue;
-        }
-        if !bytes[index].is_ascii() {
-            return true;
-        }
-        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
-            let start = index;
-            index += 1;
-            while index < bytes.len()
-                && (bytes[index].is_ascii_alphanumeric() || matches!(bytes[index], b'_' | b'$'))
-            {
-                index += 1;
-            }
-            preceding_identifier = Some(sql[start..index].to_ascii_lowercase());
-            continue;
-        }
-        if bytes[index] == b'(' {
-            if let Some(identifier) = preceding_identifier.as_ref() {
-                if !STRUCTURAL_PAREN_KEYWORDS.contains(&identifier.as_str()) {
-                    return true;
-                }
-            }
-            preceding_identifier = None;
-        }
-        index += 1;
-    }
-    false
-}
-
 pub(crate) fn query_may_mutate(sql: &str) -> bool {
-    match leading_sql_keyword(sql).as_str() {
-        "show" | "desc" | "describe" | "table" => false,
-        "select" | "values" => {
-            let tokens = raw_sql_keyword_tokens(sql);
-            raw_sql_has_potential_function_call(sql)
-                || tokens.iter().any(|token| token == "into")
-                || tokens
-                    .windows(2)
-                    .any(|window| window == ["for", "update"])
-                || tokens
-                    .windows(2)
-                    .any(|window| window == ["for", "share"])
-                || tokens
-                    .windows(4)
-                    .any(|window| window == ["lock", "in", "share", "mode"])
-                || tokens
-                    .windows(4)
-                    .any(|window| window == ["for", "no", "key", "update"])
-                || tokens
-                    .windows(3)
-                    .any(|window| window == ["for", "key", "share"])
-        }
-        _ => true,
-    }
+    !matches!(
+        leading_sql_keyword(sql).as_str(),
+        "show" | "desc" | "describe" | "table"
+    )
 }
 
 fn query_returns_rows(sql: &str) -> bool {
@@ -426,27 +344,31 @@ mod tests {
         let sql = "--comment\nSELECT 1";
 
         assert!(query_returns_rows(sql));
-        assert!(!query_may_mutate(sql));
+        assert!(query_may_mutate(sql));
     }
 
     #[test]
-    fn query_side_effect_classification_is_conservative_but_keeps_row_only_queries_clean() {
+    fn query_side_effect_classification_only_allows_provably_read_only_keywords() {
         for sql in [
-            "SELECT 1",
-            "-- comment\nSELECT * FROM users",
             "SHOW TABLES",
             "DESC users",
             "DESCRIBE users",
-            "VALUES (1)",
             "TABLE users",
-            "SELECT 'plain literal' AS literal",
-            "SELECT 1 /* plain comment */",
-            "VALUES ('plain literal')",
         ] {
             assert!(!query_may_mutate(sql), "expected row-only SQL: {sql}");
         }
 
         for sql in [
+            "SELECT 1",
+            "VALUES (1)",
+            "-- comment\nSELECT * FROM users",
+            "SELECT 'plain literal' AS literal",
+            "SELECT 1 /* plain comment */",
+            "VALUES ('plain literal')",
+            "SELECT @user_variable",
+            "SELECT 'unterminated",
+            "SELECT * FROM users FOR/**/UPDATE",
+            "SELECT \"update\"()",
             "UPDATE users SET name='a'",
             "INSERT INTO users(id) VALUES (1)",
             "DELETE FROM users",
@@ -488,7 +410,7 @@ mod tests {
     fn query_side_effect_classification_rejects_mysql_double_dash_expression_bypass() {
         assert!(query_may_mutate("SELECT 1--volatile_user_function()"));
         assert!(query_may_mutate("SELECT 1 -- volatile_user_function()"));
-        assert!(!query_may_mutate("SELECT 1 -- plain comment"));
+        assert!(query_may_mutate("SELECT 1 -- plain comment"));
     }
 
     #[test]

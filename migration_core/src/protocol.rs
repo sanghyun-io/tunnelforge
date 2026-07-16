@@ -2437,7 +2437,8 @@ mod tests {
     #[test]
     fn endpoint_query_emit_failure_uses_statement_side_effect_boundary() {
         for (sql, expected_side_effect) in [
-            ("SELECT 1", false),
+            ("SELECT 1", true),
+            ("VALUES (1)", true),
             ("SHOW TABLES", false),
             ("UPDATE users SET name='changed'", true),
             ("SELECT * FROM users INTO OUTFILE '/tmp/users.tsv'", true),
