@@ -310,6 +310,22 @@ def test_temporary_oneclick_apply_unavailable_copy_has_exact_english_translation
     )
 
 
+def test_db_core_uncertain_retry_block_copy_has_exact_english_translation():
+    i18n.set_language("en")
+
+    assert i18n.translate_text("재시도 차단") == "Retry Blocked"
+    assert i18n.translate_text(
+        "DB Core 결과가 불확실하여 테이블 재시도를 시작할 수 없습니다.\n"
+        "대상 DB 상태를 먼저 확인한 뒤 새 Import를 실행하세요."
+    ) == (
+        "Table retry cannot be started because the DB Core result is uncertain.\n"
+        "Check the target DB status first, then run a new Import."
+    )
+    assert i18n.translate_text(
+        "DB Core 결과가 불확실하여 테이블 재시도를 시작할 수 없습니다."
+    ) == "Table retry cannot be started because the DB Core result is uncertain."
+
+
 def test_direct_hardcoded_qt_ui_strings_have_english_runtime_translation():
     ui_functions = {
         "QLabel", "QPushButton", "QCheckBox", "QRadioButton", "QGroupBox",

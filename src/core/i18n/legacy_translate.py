@@ -152,7 +152,15 @@ _EN_TEXT_TRANSLATIONS = {
     "저장 실패": "Save Failed",
     "저장 완료": "Save Complete",
     "저장 오류": "Save Error",
+    "재시도 차단": "Retry Blocked",
     "재시도할 테이블을 선택하세요.": "Select tables to retry.",
+    "DB Core 결과가 불확실하여 테이블 재시도를 시작할 수 없습니다.\n대상 DB 상태를 먼저 확인한 뒤 새 Import를 실행하세요.": (
+        "Table retry cannot be started because the DB Core result is uncertain.\n"
+        "Check the target DB status first, then run a new Import."
+    ),
+    "DB Core 결과가 불확실하여 테이블 재시도를 시작할 수 없습니다.": (
+        "Table retry cannot be started because the DB Core result is uncertain."
+    ),
     "전체 선택": "Select All",
     "전체 해제": "Deselect All",
     "정보": "About",
