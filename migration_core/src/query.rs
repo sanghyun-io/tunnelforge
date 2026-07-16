@@ -202,16 +202,6 @@ pub(crate) fn skip_sql_comment(bytes: &[u8], i: usize, allow_hash: bool) -> Opti
     None
 }
 
-fn skip_side_effect_scan_comment(bytes: &[u8], i: usize) -> Option<usize> {
-    if i < bytes.len() && bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
-        let next = *bytes.get(i + 2)?;
-        if !(next.is_ascii_whitespace() || next.is_ascii_control()) {
-            return None;
-        }
-    }
-    skip_sql_comment(bytes, i, true)
-}
-
 fn strip_leading_comments_and_parens(sql: &str) -> &str {
     let mut text = sql.trim_start();
     loop {
@@ -237,34 +227,11 @@ fn leading_sql_keyword(sql: &str) -> String {
     text[..end].to_ascii_lowercase()
 }
 
-fn sql_keyword_tokens(sql: &str) -> Vec<String> {
+fn raw_sql_keyword_tokens(sql: &str) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut tokens = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = skip_side_effect_scan_comment(bytes, index) {
-            index = end.min(bytes.len());
-            continue;
-        }
-        if matches!(bytes[index], b'\'' | b'"' | b'`') {
-            let quote = bytes[index];
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == b'\\' {
-                    index = (index + 2).min(bytes.len());
-                } else if bytes[index] == quote {
-                    if index + 1 < bytes.len() && bytes[index + 1] == quote {
-                        index += 2;
-                    } else {
-                        index += 1;
-                        break;
-                    }
-                } else {
-                    index += 1;
-                }
-            }
-            continue;
-        }
         if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
             let start = index;
             index += 1;
@@ -281,7 +248,7 @@ fn sql_keyword_tokens(sql: &str) -> Vec<String> {
     tokens
 }
 
-fn sql_has_potential_function_call(sql: &str) -> bool {
+fn raw_sql_has_potential_function_call(sql: &str) -> bool {
     const STRUCTURAL_PAREN_KEYWORDS: &[&str] = &[
         "and", "as", "case", "else", "exists", "filter", "from", "having", "in", "join", "not",
         "on", "or", "over", "select", "then", "values", "when", "where", "within",
@@ -289,39 +256,13 @@ fn sql_has_potential_function_call(sql: &str) -> bool {
 
     let bytes = sql.as_bytes();
     let mut index = 0;
-    let mut preceding_identifier: Option<(String, bool)> = None;
+    let mut preceding_identifier: Option<String> = None;
     while index < bytes.len() {
-        if let Some(end) = skip_side_effect_scan_comment(bytes, index) {
-            index = end.min(bytes.len());
-            continue;
-        }
-        if bytes[index].is_ascii_whitespace() {
+        if bytes[index].is_ascii_whitespace() || matches!(bytes[index], b'\'' | b'"' | b'`') {
             index += 1;
-            continue;
-        }
-        if matches!(bytes[index], b'\'' | b'"' | b'`') {
-            let quote = bytes[index];
-            index += 1;
-            while index < bytes.len() {
-                if bytes[index] == b'\\' {
-                    index = (index + 2).min(bytes.len());
-                } else if bytes[index] == quote {
-                    if index + 1 < bytes.len() && bytes[index + 1] == quote {
-                        index += 2;
-                    } else {
-                        index += 1;
-                        break;
-                    }
-                } else {
-                    index += 1;
-                }
-            }
-            preceding_identifier = (quote != b'\'').then(|| (String::new(), true));
             continue;
         }
         if !bytes[index].is_ascii() {
-            // The byte scanner cannot prove non-ASCII identifier boundaries. Fail closed rather
-            // than allowing an unquoted Unicode function name to look read-only.
             return true;
         }
         if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
@@ -332,17 +273,17 @@ fn sql_has_potential_function_call(sql: &str) -> bool {
             {
                 index += 1;
             }
-            preceding_identifier = Some((sql[start..index].to_ascii_lowercase(), false));
+            preceding_identifier = Some(sql[start..index].to_ascii_lowercase());
             continue;
         }
         if bytes[index] == b'(' {
-            if let Some((identifier, quoted)) = preceding_identifier.as_ref() {
-                if *quoted || !STRUCTURAL_PAREN_KEYWORDS.contains(&identifier.as_str()) {
+            if let Some(identifier) = preceding_identifier.as_ref() {
+                if !STRUCTURAL_PAREN_KEYWORDS.contains(&identifier.as_str()) {
                     return true;
                 }
             }
+            preceding_identifier = None;
         }
-        preceding_identifier = None;
         index += 1;
     }
     false
@@ -352,8 +293,8 @@ pub(crate) fn query_may_mutate(sql: &str) -> bool {
     match leading_sql_keyword(sql).as_str() {
         "show" | "desc" | "describe" | "table" => false,
         "select" | "values" => {
-            let tokens = sql_keyword_tokens(sql);
-            sql_has_potential_function_call(sql)
+            let tokens = raw_sql_keyword_tokens(sql);
+            raw_sql_has_potential_function_call(sql)
                 || tokens.iter().any(|token| token == "into")
                 || tokens
                     .windows(2)
@@ -498,9 +439,9 @@ mod tests {
             "DESCRIBE users",
             "VALUES (1)",
             "TABLE users",
-            "SELECT 'nextval(' AS literal",
-            "SELECT 1 /* volatile_user_function() */",
-            "VALUES ('user_function()')",
+            "SELECT 'plain literal' AS literal",
+            "SELECT 1 /* plain comment */",
+            "VALUES ('plain literal')",
         ] {
             assert!(!query_may_mutate(sql), "expected row-only SQL: {sql}");
         }
@@ -515,6 +456,9 @@ mod tests {
             "EXPLAIN ANALYZE UPDATE users SET name='a'",
             "SELECT * FROM users INTO OUTFILE '/tmp/users.tsv'",
             "SELECT * FROM users FOR SHARE",
+            "SELECT 'nextval(' AS literal",
+            "SELECT 1 /* volatile_user_function() */",
+            "VALUES ('user_function()')",
         ] {
             assert!(
                 query_may_mutate(sql),
@@ -530,6 +474,7 @@ mod tests {
             "SELECT volatile_user_function()",
             "SELECT app.user_function()",
             "SELECT app.\"volatile_user_function\"()",
+            "SELECT volatile_user_function/**/()",
             "VALUES (nextval('users_id_seq'))",
         ] {
             assert!(
@@ -542,13 +487,31 @@ mod tests {
     #[test]
     fn query_side_effect_classification_rejects_mysql_double_dash_expression_bypass() {
         assert!(query_may_mutate("SELECT 1--volatile_user_function()"));
-        assert!(!query_may_mutate("SELECT 1 -- volatile_user_function()"));
+        assert!(query_may_mutate("SELECT 1 -- volatile_user_function()"));
+        assert!(!query_may_mutate("SELECT 1 -- plain comment"));
+    }
+
+    #[test]
+    fn query_side_effect_classification_rejects_postgresql_hash_operator_bypasses() {
+        let classifications = [
+            query_may_mutate("SELECT 1 # volatile_user_function()"),
+            query_may_mutate("SELECT id # 1 FROM users FOR KEY SHARE"),
+        ];
+
+        assert_eq!(classifications, [true, true]);
+    }
+
+    #[test]
+    fn query_side_effect_classification_rejects_standard_conforming_string_bypass() {
+        assert!(query_may_mutate(
+            r"SELECT 'x\' || volatile_user_function()"
+        ));
     }
 
     #[test]
     fn query_side_effect_classification_rejects_unquoted_unicode_function_calls() {
         assert!(query_may_mutate("SELECT \u{03c0}()"));
-        assert!(!query_may_mutate("SELECT '\u{03c0}()'"));
+        assert!(query_may_mutate("SELECT '\u{03c0}()'"));
     }
 
     #[test]
