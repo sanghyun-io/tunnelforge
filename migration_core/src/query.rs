@@ -227,6 +227,70 @@ fn leading_sql_keyword(sql: &str) -> String {
     text[..end].to_ascii_lowercase()
 }
 
+fn sql_keyword_tokens(sql: &str) -> Vec<String> {
+    let bytes = sql.as_bytes();
+    let mut tokens = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if let Some(end) = skip_sql_comment(bytes, index, true) {
+            index = end.min(bytes.len());
+            continue;
+        }
+        if matches!(bytes[index], b'\'' | b'"' | b'`') {
+            let quote = bytes[index];
+            index += 1;
+            while index < bytes.len() {
+                if bytes[index] == b'\\' {
+                    index = (index + 2).min(bytes.len());
+                } else if bytes[index] == quote {
+                    if index + 1 < bytes.len() && bytes[index + 1] == quote {
+                        index += 2;
+                    } else {
+                        index += 1;
+                        break;
+                    }
+                } else {
+                    index += 1;
+                }
+            }
+            continue;
+        }
+        if bytes[index].is_ascii_alphabetic() || bytes[index] == b'_' {
+            let start = index;
+            index += 1;
+            while index < bytes.len()
+                && (bytes[index].is_ascii_alphanumeric() || bytes[index] == b'_')
+            {
+                index += 1;
+            }
+            tokens.push(sql[start..index].to_ascii_lowercase());
+            continue;
+        }
+        index += 1;
+    }
+    tokens
+}
+
+pub(crate) fn query_may_mutate(sql: &str) -> bool {
+    match leading_sql_keyword(sql).as_str() {
+        "show" | "desc" | "describe" | "values" | "table" => false,
+        "select" => {
+            let tokens = sql_keyword_tokens(sql);
+            tokens.iter().any(|token| token == "into")
+                || tokens
+                    .windows(2)
+                    .any(|window| window == ["for", "update"])
+                || tokens
+                    .windows(2)
+                    .any(|window| window == ["for", "share"])
+                || tokens
+                    .windows(4)
+                    .any(|window| window == ["lock", "in", "share", "mode"])
+        }
+        _ => true,
+    }
+}
+
 fn query_returns_rows(sql: &str) -> bool {
     let keyword = leading_sql_keyword(sql);
     ["select", "with", "show", "desc", "describe", "explain", "call", "values", "table"]
@@ -320,6 +384,35 @@ mod tests {
         }
 
         assert!(!query_returns_rows("/*x*/ UPDATE users SET name='a'"));
+    }
+
+    #[test]
+    fn query_side_effect_classification_is_conservative_but_keeps_row_only_queries_clean() {
+        for sql in [
+            "SELECT 1",
+            "-- comment\nSELECT * FROM users",
+            "SHOW TABLES",
+            "DESC users",
+            "DESCRIBE users",
+            "VALUES (1)",
+            "TABLE users",
+        ] {
+            assert!(!query_may_mutate(sql), "expected row-only SQL: {sql}");
+        }
+
+        for sql in [
+            "UPDATE users SET name='a'",
+            "INSERT INTO users(id) VALUES (1)",
+            "DELETE FROM users",
+            "CREATE TABLE audit(id int)",
+            "CALL mutate_users()",
+            "WITH changed AS (DELETE FROM users RETURNING id) SELECT * FROM changed",
+            "EXPLAIN ANALYZE UPDATE users SET name='a'",
+            "SELECT * FROM users INTO OUTFILE '/tmp/users.tsv'",
+            "SELECT * FROM users FOR SHARE",
+        ] {
+            assert!(query_may_mutate(sql), "expected mutation-capable SQL: {sql}");
+        }
     }
 
     #[test]

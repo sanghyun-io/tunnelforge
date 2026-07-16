@@ -1,12 +1,13 @@
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self};
+use std::io::{self, Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::*;
 use mysql::{prelude::Queryable, LocalInfileHandler};
@@ -17,6 +18,26 @@ const MYSQL_ERR_LOCAL_INFILE_DISABLED: &str = "3948";
 const MYSQL_IMPORT_NET_TIMEOUT_SECS: u32 = 600;
 /// import 세션 튜닝에서 상향하는 wait_timeout(초).
 const MYSQL_IMPORT_WAIT_TIMEOUT_SECS: u32 = 28800;
+const PARALLEL_IMPORT_ABORTED: &str = "parallel import aborted after protocol emitter failure";
+
+#[derive(Clone, Default)]
+struct ImportCancellation {
+    aborted: Arc<AtomicBool>,
+}
+
+impl ImportCancellation {
+    fn abort(&self) {
+        self.aborted.store(true, Ordering::Release);
+    }
+
+    fn ensure_active(&self) -> Result<(), String> {
+        if self.aborted.load(Ordering::Acquire) {
+            Err(PARALLEL_IMPORT_ABORTED.to_string())
+        } else {
+            Ok(())
+        }
+    }
+}
 
 #[derive(Debug)]
 enum DumpImportError {
@@ -54,6 +75,41 @@ where
             error
         }
     })
+}
+
+fn emit_parallel_import_event<F, R>(
+    emit: &mut F,
+    event: Value,
+    side_effect_started: bool,
+    cancellation: &ImportCancellation,
+) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+{
+    let result = emit_import_event(emit, event, side_effect_started);
+    if result.is_err() {
+        cancellation.abort();
+    }
+    result
+}
+
+fn emit_post_enable_import_event<F, R, C>(
+    emit: &mut F,
+    event: Value,
+    side_effect_started: bool,
+    restore_on_failure: C,
+) -> ProtocolEmitResult
+where
+    F: FnMut(Value) -> R,
+    R: IntoProtocolEmitResult,
+    C: FnOnce(),
+{
+    let result = emit_import_event(emit, event, side_effect_started);
+    if result.is_err() {
+        restore_on_failure();
+    }
+    result
 }
 
 pub(crate) fn dump_import_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
@@ -808,6 +864,7 @@ where
                 ctx.table,
                 &chunk_path,
                 ctx.compression,
+                None,
             ) {
                 Ok(rows) => rows,
                 Err(err) if is_mysql_local_infile_disabled_error(&err) => {
@@ -1019,34 +1076,30 @@ where
         LiveAdapter::MySql(conn) => mysql_local_infile_enabled(conn),
         LiveAdapter::PostgreSql(_) => false,
     };
-    if enabled {
-        emit_import_event(
-            emit,
-            json!({
+    let local_infile_restore = Some(previous);
+    let event = if enabled {
+        json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
             "message": "MySQL local_infile temporarily enabled; using fast LOAD DATA LOCAL import",
             "strategy": "load_data_local_infile",
             "performance": "fast_path"
-            }),
-            *side_effect_started,
-        )?;
+        })
     } else {
-        emit_import_event(
-            emit,
-            json!({
+        json!({
             "event": "phase",
             "request_id": request_id,
             "phase": "dump_import",
             "message": "MySQL local_infile temporary enable did not take effect; using safe Rust INSERT fallback",
             "strategy": "insert_fallback",
             "performance": "safe_fallback"
-            }),
-            *side_effect_started,
-        )?;
-    }
-    Ok(Some(previous))
+        })
+    };
+    emit_post_enable_import_event(emit, event, *side_effect_started, || {
+        let _ = restore_mysql_local_infile_value(adapter, local_infile_restore.clone());
+    })?;
+    Ok(local_infile_restore)
 }
 
 fn restore_mysql_local_infile_policy<F, R>(
@@ -1329,7 +1382,7 @@ where
     let mut first_error: Option<String> = None;
     let mut emit_error: Option<ProtocolEmitError> = None;
     let mut handles = Vec::new();
-    let aborted = Arc::new(AtomicBool::new(false));
+    let cancellation = ImportCancellation::default();
     let (sender, receiver) = mpsc::channel::<ImportChunkEvent>();
 
     while active < max_threads {
@@ -1343,7 +1396,7 @@ where
                 chunk_index,
                 ctx.compression.to_string(),
                 sender.clone(),
-                aborted.clone(),
+                cancellation.clone(),
             ));
             active += 1;
         } else {
@@ -1361,7 +1414,7 @@ where
                 rows_imported += rows;
                 completed += 1;
                 active = active.saturating_sub(1);
-                if let Err(error) = emit_import_event(
+                if let Err(error) = emit_parallel_import_event(
                     emit,
                     dump_import_row_progress_event(
                     ctx.request_id.clone(),
@@ -1380,8 +1433,8 @@ where
                     "parallel_load_data_local_infile",
                     ),
                     *side_effect_started,
+                    &cancellation,
                 ) {
-                    aborted.store(true, Ordering::Release);
                     emit_error = Some(error);
                     break;
                 }
@@ -1395,7 +1448,7 @@ where
                         next_chunk,
                         ctx.compression.to_string(),
                         sender.clone(),
-                        aborted.clone(),
+                        cancellation.clone(),
                     ));
                     active += 1;
                 }
@@ -1463,13 +1516,11 @@ fn spawn_mysql_import_chunk_worker(
     chunk_index: u64,
     compression: String,
     sender: mpsc::Sender<ImportChunkEvent>,
-    aborted: Arc<AtomicBool>,
+    cancellation: ImportCancellation,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         let result = (|| {
-            if aborted.load(Ordering::Acquire) {
-                return Err("parallel import aborted after protocol emitter failure".to_string());
-            }
+            cancellation.ensure_active()?;
             // 워커 커넥션에도 세션 튜닝(fk/unique/sql_mode + timeout)을 적용한다.
             // 이전에는 워커가 튜닝 없이 연결해 fk_checks/timeout이 누락돼 있었다.
             let mut conn = connect_tuned_mysql_import_conn(&endpoint)?;
@@ -1480,12 +1531,16 @@ fn spawn_mysql_import_chunk_worker(
                 "tsv",
                 &compression,
             )?;
-            if aborted.load(Ordering::Acquire) {
-                return Err("parallel import aborted after protocol emitter failure".to_string());
-            }
+            cancellation.ensure_active()?;
             let started = Instant::now();
-            let rows =
-                load_chunk_with_reconnect(&endpoint, &mut conn, &table, &chunk_path, &compression)?;
+            let rows = load_chunk_with_reconnect(
+                &endpoint,
+                &mut conn,
+                &table,
+                &chunk_path,
+                &compression,
+                Some(&cancellation),
+            )?;
             Ok((rows, started.elapsed().as_millis() as u64))
         })();
         match result {
@@ -1519,17 +1574,49 @@ fn load_chunk_with_reconnect(
     table: &NormalizedTable,
     chunk_path: &Path,
     compression: &str,
+    cancellation: Option<&ImportCancellation>,
 ) -> Result<u64, String> {
+    retry_import_load_with_reconnect(
+        conn,
+        cancellation,
+        |conn, cancellation| {
+            load_mysql_tsv_chunk(conn, table, chunk_path, compression, cancellation)
+        },
+        || connect_tuned_mysql_import_conn(endpoint),
+        wait_for_import_retry,
+    )
+}
+
+fn ensure_import_active(cancellation: Option<&ImportCancellation>) -> Result<(), String> {
+    cancellation.map_or(Ok(()), ImportCancellation::ensure_active)
+}
+
+fn retry_import_load_with_reconnect<T, L, C, B>(
+    conn: &mut T,
+    cancellation: Option<&ImportCancellation>,
+    mut load: L,
+    mut reconnect: C,
+    mut wait_backoff: B,
+) -> Result<u64, String>
+where
+    L: FnMut(&mut T, Option<&ImportCancellation>) -> Result<u64, String>,
+    C: FnMut() -> Result<T, String>,
+    B: FnMut(Duration, Option<&ImportCancellation>) -> Result<(), String>,
+{
     const MAX_ATTEMPTS: u32 = 3;
     let backoffs = [
-        std::time::Duration::from_millis(500),
-        std::time::Duration::from_secs(1),
-        std::time::Duration::from_secs(2),
+        Duration::from_millis(500),
+        Duration::from_secs(1),
+        Duration::from_secs(2),
     ];
     let mut attempt: u32 = 0;
     loop {
-        match load_mysql_tsv_chunk(conn, table, chunk_path, compression) {
-            Ok(rows) => return Ok(rows),
+        ensure_import_active(cancellation)?;
+        match load(conn, cancellation) {
+            Ok(rows) => {
+                ensure_import_active(cancellation)?;
+                return Ok(rows);
+            }
             Err(err) => {
                 attempt += 1;
                 let retryable = is_transient_disconnect_error(&err)
@@ -1537,11 +1624,32 @@ fn load_chunk_with_reconnect(
                 if !retryable || attempt >= MAX_ATTEMPTS {
                     return Err(err);
                 }
-                std::thread::sleep(backoffs[(attempt - 1) as usize]);
-                // 재접속 + 세션 튜닝 재적용(새 세션은 튜닝이 초기화됨).
-                *conn = connect_tuned_mysql_import_conn(endpoint)?;
+                ensure_import_active(cancellation)?;
+                wait_backoff(backoffs[(attempt - 1) as usize], cancellation)?;
+                ensure_import_active(cancellation)?;
+                *conn = reconnect()?;
+                ensure_import_active(cancellation)?;
             }
         }
+    }
+}
+
+fn wait_for_import_retry(
+    duration: Duration,
+    cancellation: Option<&ImportCancellation>,
+) -> Result<(), String> {
+    let Some(cancellation) = cancellation else {
+        thread::sleep(duration);
+        return Ok(());
+    };
+    let deadline = Instant::now() + duration;
+    loop {
+        cancellation.ensure_active()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        thread::sleep(remaining.min(Duration::from_millis(25)));
     }
 }
 
@@ -1550,13 +1658,15 @@ fn load_mysql_tsv_chunk(
     table: &NormalizedTable,
     chunk_path: &Path,
     compression: &str,
+    cancellation: Option<&ImportCancellation>,
 ) -> Result<u64, String> {
     let path = chunk_path.to_path_buf();
     let compression = compression.to_string();
+    let cancellation = cancellation.cloned();
     conn.set_local_infile_handler(Some(LocalInfileHandler::new(move |_, stream| {
         let mut reader = open_dump_reader(&path, &compression)
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::Other, err))?;
-        std::io::copy(&mut reader, stream)?;
+        copy_local_infile_with_cancellation(&mut reader, stream, cancellation.as_ref())?;
         Ok(())
     })));
     let sql = load_data_local_infile_sql("mysql", table, "tunnelforge_chunk");
@@ -1566,6 +1676,34 @@ fn load_mysql_tsv_chunk(
         .map_err(|err| format!("mysql LOAD DATA error: {err}"));
     conn.set_local_infile_handler(None);
     result
+}
+
+fn copy_local_infile_with_cancellation<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    cancellation: Option<&ImportCancellation>,
+) -> io::Result<u64>
+where
+    R: Read + ?Sized,
+    W: Write + ?Sized,
+{
+    let mut buffer = [0_u8; 64 * 1024];
+    let mut copied = 0_u64;
+    loop {
+        ensure_import_io_active(cancellation)?;
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            return Ok(copied);
+        }
+        ensure_import_io_active(cancellation)?;
+        writer.write_all(&buffer[..read])?;
+        copied += read as u64;
+    }
+}
+
+fn ensure_import_io_active(cancellation: Option<&ImportCancellation>) -> io::Result<()> {
+    ensure_import_active(cancellation)
+        .map_err(|message| io::Error::new(io::ErrorKind::Interrupted, message))
 }
 
 pub fn load_data_local_infile_sql(
@@ -1593,6 +1731,8 @@ mod tests {
     use serde_json::json;
     use std::collections::BTreeMap;
     use std::fs::{self};
+    use std::io::{Cursor, Write};
+    use std::sync::{Arc, Barrier};
     
     use crate::adapters::test_support::schema;
 
@@ -1797,6 +1937,155 @@ mod tests {
         )
         .expect_err("post-side-effect failure must propagate");
 
+        assert!(error.side_effect_started());
+    }
+
+    struct BlockingImportWriter {
+        started: Arc<Barrier>,
+        release: Arc<Barrier>,
+        writes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl Write for BlockingImportWriter {
+        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+            if self.writes.fetch_add(1, Ordering::AcqRel) < 2 {
+                self.started.wait();
+                self.release.wait();
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn parallel_import_active_loads_cancel_and_join_after_emit_failure() {
+        let cancellation = ImportCancellation::default();
+        let started = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let worker_cancellation = cancellation.clone();
+            let worker_started = started.clone();
+            let worker_release = release.clone();
+            let worker_writes = writes.clone();
+            workers.push(thread::spawn(move || {
+                let mut reader = Cursor::new(vec![b'x'; 128 * 1024]);
+                let mut writer = BlockingImportWriter {
+                    started: worker_started,
+                    release: worker_release,
+                    writes: worker_writes,
+                };
+                copy_local_infile_with_cancellation(
+                    &mut reader,
+                    &mut writer,
+                    Some(&worker_cancellation),
+                )
+            }));
+        }
+
+        started.wait();
+        let mut emit_calls = 0;
+        let error = emit_parallel_import_event(
+            &mut |_event| {
+                emit_calls += 1;
+                Err(ProtocolEmitError::io("external import sink failed"))
+            },
+            json!({"event": "row_progress"}),
+            true,
+            &cancellation,
+        )
+        .expect_err("external emit failure must cancel active loads");
+        release.wait();
+
+        for worker in workers {
+            let worker_error = worker
+                .join()
+                .expect("import worker must join without panic")
+                .expect_err("active local infile copy must observe cancellation");
+            assert_eq!(worker_error.kind(), std::io::ErrorKind::Interrupted);
+        }
+        assert_eq!(emit_calls, 1);
+        assert_eq!(writes.load(Ordering::Acquire), 2);
+        assert!(error.side_effect_started());
+    }
+
+    #[test]
+    fn parallel_import_reconnect_loop_observes_cancellation_before_reconnect() {
+        let cancellation = ImportCancellation::default();
+        let cancel_during_backoff = cancellation.clone();
+        let mut connection = 0_u8;
+        let mut loads = 0;
+        let mut reconnects = 0;
+        let mut backoffs = 0;
+
+        let error = retry_import_load_with_reconnect(
+            &mut connection,
+            Some(&cancellation),
+            |_connection, _cancellation| {
+                loads += 1;
+                Err("server disconnected during LOAD DATA".to_string())
+            },
+            || {
+                reconnects += 1;
+                Ok(1_u8)
+            },
+            |_duration, _cancellation| {
+                backoffs += 1;
+                cancel_during_backoff.abort();
+                Ok(())
+            },
+        )
+        .expect_err("cancellation during retry backoff must stop reconnect");
+
+        assert!(error.contains("parallel import aborted"));
+        assert_eq!(loads, 1);
+        assert_eq!(backoffs, 1);
+        assert_eq!(reconnects, 0);
+    }
+
+    #[test]
+    fn parallel_import_load_completion_observes_cancellation_before_done() {
+        let cancellation = ImportCancellation::default();
+        let cancel_before_return = cancellation.clone();
+        let mut connection = 0_u8;
+
+        let error = retry_import_load_with_reconnect(
+            &mut connection,
+            Some(&cancellation),
+            |_connection, _cancellation| {
+                cancel_before_return.abort();
+                Ok(7)
+            },
+            || panic!("cancelled successful load must not reconnect"),
+            |_duration, _cancellation| panic!("cancelled successful load must not back off"),
+        )
+        .expect_err("cancellation before Done must override load completion");
+
+        assert!(error.contains("parallel import aborted"));
+    }
+
+    #[test]
+    fn post_enable_emit_failure_runs_owned_local_infile_restoration() {
+        let restored = std::cell::Cell::new(false);
+        let owned_previous = Some("OFF".to_string());
+
+        let error = emit_post_enable_import_event(
+            &mut |_event| Err(ProtocolEmitError::io("post-enable sink failed")),
+            json!({"event": "phase", "strategy": "load_data_local_infile"}),
+            true,
+            || {
+                assert_eq!(owned_previous.as_deref(), Some("OFF"));
+                restored.set(true);
+            },
+        )
+        .expect_err("post-enable phase failure must propagate");
+
+        assert!(restored.get());
         assert!(error.side_effect_started());
     }
 }

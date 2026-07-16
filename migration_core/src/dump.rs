@@ -70,6 +70,51 @@ impl DumpSideEffectState {
     }
 }
 
+fn run_dump_items_until_cancelled<I, Item, F>(
+    items: I,
+    side_effect: &DumpSideEffectState,
+    mut process: F,
+) -> Result<usize, String>
+where
+    I: IntoIterator<Item = Item>,
+    F: FnMut(Item) -> Result<(), String>,
+{
+    let mut items = items.into_iter();
+    let mut completed = 0;
+    loop {
+        side_effect.ensure_active()?;
+        let Some(item) = items.next() else {
+            return Ok(completed);
+        };
+        side_effect.ensure_active()?;
+        side_effect.mark_started();
+        process(item)?;
+        completed += 1;
+    }
+}
+
+fn write_dump_rows_until_cancelled(
+    path: &Path,
+    table: &NormalizedTable,
+    rows: &[Value],
+    data_format: &str,
+    compression: &str,
+    side_effect: &DumpSideEffectState,
+) -> Result<String, String> {
+    side_effect.ensure_active()?;
+    side_effect.mark_started();
+    if rows.len() <= 1 {
+        return write_dump_rows(path, table, rows, data_format, compression);
+    }
+    let mut writer = open_dump_writer(path, compression)?;
+    run_dump_items_until_cancelled(rows.iter(), side_effect, |row| {
+        write_dump_row(&mut writer, table, row, data_format)
+    })?;
+    drop(writer);
+    side_effect.ensure_active()?;
+    sha256_file(path)
+}
+
 fn emit_dump_event<F, R>(
     emit: &mut F,
     event: Value,
@@ -1338,6 +1383,7 @@ where
         return Ok(None);
     };
 
+    side_effect.ensure_active()?;
     let mut conn = match LiveAdapter::connect(&ctx.endpoint)? {
         LiveAdapter::MySql(conn) => conn,
         LiveAdapter::PostgreSql(_) => return Ok(None),
@@ -1577,6 +1623,7 @@ fn spawn_dump_global_worker(
         }
         DumpGlobalWorkKind::WholeTable => {
             let result = (|| {
+                side_effect.ensure_active()?;
                 let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
                 let started = Instant::now();
                 dump_one_table(
@@ -1628,6 +1675,7 @@ fn dump_mysql_range_chunk(
     compression: &str,
     side_effect: &DumpSideEffectState,
 ) -> Result<(u64, u64, String), String> {
+    side_effect.ensure_active()?;
     let mut conn = match LiveAdapter::connect(endpoint)? {
         LiveAdapter::MySql(conn) => conn,
         LiveAdapter::PostgreSql(_) => {
@@ -1642,15 +1690,14 @@ fn dump_mysql_range_chunk(
     let columns = column_names(table);
     let sql = select_chunk_text_range_sql("mysql", table, pk_column, range.start, range.end);
     let stream_started = Instant::now();
+    side_effect.ensure_active()?;
     let result = conn
         .query_iter(sql)
         .map_err(|err| format!("mysql range select chunk error: {err}"))?;
-    let mut rows = 0_u64;
-    {
-        side_effect.ensure_active()?;
-        side_effect.mark_started();
-        let mut file = open_dump_writer(&chunk_path, compression)?;
-        for row in result {
+    side_effect.ensure_active()?;
+    side_effect.mark_started();
+    let mut file = open_dump_writer(&chunk_path, compression)?;
+    let rows = run_dump_items_until_cancelled(result, side_effect, |row| {
             let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
             if data_format == "tsv" {
                 write_mysql_text_row_tsv(&mut file, row)?;
@@ -1658,9 +1705,10 @@ fn dump_mysql_range_chunk(
                 let row_json = mysql_row_to_json(&columns, row);
                 write_dump_row(&mut file, table, &row_json, data_format)?;
             }
-            rows += 1;
-        }
-    }
+            Ok(())
+        })? as u64;
+    drop(file);
+    side_effect.ensure_active()?;
     let checksum = sha256_file(&chunk_path)?;
     Ok((rows, stream_started.elapsed().as_millis() as u64, checksum))
 }
@@ -1691,6 +1739,7 @@ fn spawn_dump_table_worker(
                     return Ok(result);
                 }
             }
+            side_effect.ensure_active()?;
             let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
             dump_one_table(
                 &mut adapter,
@@ -1852,6 +1901,7 @@ where
          table_dir: &Path,
          emit: &mut dyn FnMut(Value) -> ProtocolEmitResult|
          -> Result<Option<ChunkOutcome>, DumpStreamError> {
+            side_effect.ensure_active()?;
             let Some(read_limit) =
                 bounded_dump_chunk_limit(table_row_count, rows_dumped_before, ctx.chunk_size)
             else {
@@ -1869,14 +1919,13 @@ where
             }
             let chunk_name = dump_chunk_name(chunk_number, &ctx.data_format, &ctx.compression);
             let write_started = Instant::now();
-            side_effect.ensure_active()?;
-            side_effect.mark_started();
-            let checksum = write_dump_rows(
+            let checksum = write_dump_rows_until_cancelled(
                 &table_dir.join(&chunk_name),
                 table,
                 &rows,
                 &ctx.data_format,
                 &ctx.compression,
+                side_effect,
             )?;
             let write_ms = write_started.elapsed().as_millis() as u64;
 
@@ -1919,6 +1968,7 @@ where
     F: FnMut(Value) -> R,
     R: IntoProtocolEmitResult,
 {
+    side_effect.ensure_active()?;
     let table_row_count = conn
         .query_first::<u64, _>(count_sql("mysql", &table.name))
         .map(|count| count.unwrap_or(0))
@@ -1948,6 +1998,7 @@ where
          table_dir: &Path,
          emit: &mut dyn FnMut(Value) -> ProtocolEmitResult|
          -> Result<Option<ChunkOutcome>, DumpStreamError> {
+            side_effect.ensure_active()?;
             let Some(read_limit) =
                 bounded_dump_chunk_limit(table_row_count, rows_dumped_before, effective_chunk_size)
             else {
@@ -1983,13 +2034,11 @@ where
                     .map_err(|err| format!("mysql select chunk error: {err}"))?
             };
 
-            let mut chunk_rows = 0_usize;
             let mut next_key: Option<String> = None;
-            {
-                side_effect.ensure_active()?;
-                side_effect.mark_started();
-                let mut file = open_dump_writer(&chunk_path, &ctx.compression)?;
-                for row in result {
+            side_effect.ensure_active()?;
+            side_effect.mark_started();
+            let mut file = open_dump_writer(&chunk_path, &ctx.compression)?;
+            let chunk_rows = run_dump_items_until_cancelled(result, side_effect, |row| {
                     let row = row.map_err(|err| format!("mysql dump row error: {err}"))?;
                     if ctx.data_format == "tsv" && !use_keyset {
                         write_mysql_text_row_tsv(&mut file, row)?;
@@ -2000,15 +2049,16 @@ where
                         }
                         write_dump_row(&mut file, table, &row_json, &ctx.data_format)?;
                     }
-                    chunk_rows += 1;
-                }
-            }
+                    Ok(())
+                })?;
+            drop(file);
             let stream_ms = stream_started.elapsed().as_millis() as u64;
 
             if chunk_rows == 0 {
                 fs::remove_file(&chunk_path).ok();
                 return Ok(None);
             }
+            side_effect.ensure_active()?;
             let checksum = sha256_file(&chunk_path)?;
 
             if use_keyset {
@@ -2043,6 +2093,7 @@ mod tests {
     use std::fs::{self};
     
     use std::path::Path;
+    use std::sync::{Arc, Barrier};
     
     use crate::adapters::test_support::{empty_table, schema};
 
@@ -2397,6 +2448,56 @@ mod tests {
         )
         .expect_err("post-side-effect failure must propagate");
 
+        assert!(error.side_effect_started());
+    }
+
+    #[test]
+    fn parallel_dump_workers_cancel_before_more_side_effects_and_join() {
+        let side_effect = DumpSideEffectState::default();
+        let started = Arc::new(Barrier::new(3));
+        let release = Arc::new(Barrier::new(3));
+        let writes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let worker_side_effect = side_effect.clone();
+            let worker_started = started.clone();
+            let worker_release = release.clone();
+            let worker_writes = writes.clone();
+            workers.push(thread::spawn(move || {
+                run_dump_items_until_cancelled(0..3, &worker_side_effect, |index| {
+                    worker_writes.fetch_add(1, Ordering::AcqRel);
+                    if index == 0 {
+                        worker_started.wait();
+                        worker_release.wait();
+                    }
+                    Ok(())
+                })
+            }));
+        }
+
+        started.wait();
+        let mut emit_calls = 0;
+        let error = emit_dump_event(
+            &mut |_event| {
+                emit_calls += 1;
+                Err(ProtocolEmitError::io("external dump sink failed"))
+            },
+            json!({"event": "row_progress"}),
+            &side_effect,
+        )
+        .expect_err("external emit failure must cancel workers");
+        release.wait();
+
+        for worker in workers {
+            let worker_error = worker
+                .join()
+                .expect("dump worker must join without panic")
+                .expect_err("dump worker must observe shared cancellation");
+            assert!(worker_error.contains("dump aborted"));
+        }
+        assert_eq!(emit_calls, 1);
+        assert_eq!(writes.load(Ordering::Acquire), 2);
         assert!(error.side_effect_started());
     }
 }

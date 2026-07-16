@@ -916,7 +916,7 @@ impl CoreService {
             };
             let params = query_params(&request.payload);
             let bound_sql = bind_query_params(sql, &params);
-            let side_effect_started = true;
+            let side_effect_started = query_may_mutate(&bound_sql);
             let events = match execute_query_adapter(adapter, &bound_sql) {
                 Ok(result) => query_result_events(request, result),
                 Err(err) => vec![json!({
@@ -927,7 +927,7 @@ impl CoreService {
             };
             return (events, side_effect_started);
         }
-        (query_execute(request), false)
+        query_execute(request)
     }
 }
 
@@ -1008,7 +1008,10 @@ where
         "schema.list" => emit_all_events(schema_list(&request), emit),
         "schema.inspect" => emit_all_events(alias_events(&request, "inspect"), emit),
         "schema.diff" => emit_all_events(schema_diff(&request), emit),
-        "query.execute" => emit_all_events(query_execute(&request), emit),
+        "query.execute" => {
+            let (events, side_effect_started) = query_execute(&request);
+            emit_operation_events(events, side_effect_started, emit)
+        }
         "query.cancel" => emit_all_events(query_cancel(&request), emit),
         "dump.run" => dump_run_streaming(&request, emit),
         "dump.import" => dump_import_streaming(&request, emit),
@@ -1383,14 +1386,21 @@ fn schema_diff(request: &Request) -> Vec<Value> {
     })]
 }
 
-fn query_execute(request: &Request) -> Vec<Value> {
+fn query_execute(request: &Request) -> (Vec<Value>, bool) {
+    query_execute_with(request, execute_query_live)
+}
+
+fn query_execute_with<F>(request: &Request, execute: F) -> (Vec<Value>, bool)
+where
+    F: FnOnce(&Endpoint, &str) -> Result<QueryExecutionResult, String>,
+{
     if let Some(rows) = request.payload.get("rows") {
         let columns = request
             .payload
             .get("columns")
             .cloned()
             .unwrap_or_else(|| json!(memory_test_columns_from_rows(rows)));
-        return vec![json!({
+        return (vec![json!({
             "event": "result",
             "request_id": request.request_id,
             "command": "query.execute",
@@ -1398,7 +1408,7 @@ fn query_execute(request: &Request) -> Vec<Value> {
             "rows": rows,
             "columns": columns,
             "rows_affected": 0
-        })];
+        })], false);
     }
 
     let sql = request
@@ -1408,33 +1418,35 @@ fn query_execute(request: &Request) -> Vec<Value> {
         .unwrap_or("")
         .trim();
     if sql.is_empty() {
-        return vec![json!({
+        return (vec![json!({
             "event": "error",
             "request_id": request.request_id,
             "message": "query.execute requires sql"
-        })];
+        })], false);
     }
     let endpoint = match request_endpoint(request) {
         Ok(endpoint) => endpoint,
         Err(err) => {
-            return vec![json!({
+            return (vec![json!({
                 "event": "error",
                 "request_id": request.request_id,
                 "message": err
-            })]
+            })], false)
         }
     };
 
     let params = query_params(&request.payload);
     let bound_sql = bind_query_params(sql, &params);
-    match execute_query_live(&endpoint, &bound_sql) {
+    let side_effect_started = query_may_mutate(&bound_sql);
+    let events = match execute(&endpoint, &bound_sql) {
         Ok(result) => query_result_events(request, result),
         Err(err) => vec![json!({
             "event": "error",
             "request_id": request.request_id,
             "message": redact_endpoint_secret(&err, &endpoint)
         })],
-    }
+    };
+    (events, side_effect_started)
 }
 
 fn memory_test_columns_from_rows(rows: &Value) -> Vec<String> {
@@ -2411,6 +2423,50 @@ mod tests {
         let error = ProtocolEmitError::io("simulated encode failure").after_side_effect();
 
         assert!(error.side_effect_started());
+    }
+
+    #[test]
+    fn endpoint_query_emit_failure_uses_statement_side_effect_boundary() {
+        for (sql, expected_side_effect) in [
+            ("SELECT 1", false),
+            ("SHOW TABLES", false),
+            ("UPDATE users SET name='changed'", true),
+            ("SELECT * FROM users INTO OUTFILE '/tmp/users.tsv'", true),
+        ] {
+            let request = Request {
+                command: "query.execute".to_string(),
+                request_id: Some("endpoint-query-boundary".to_string()),
+                payload: json!({
+                    "sql": sql,
+                    "endpoint": {
+                        "engine": "mysql",
+                        "host": "127.0.0.1",
+                        "port": 3306,
+                        "user": "root",
+                        "password": "secret",
+                        "database": "app"
+                    }
+                }),
+            };
+            let (events, side_effect_started) = query_execute_with(&request, |_endpoint, _sql| {
+                Ok(QueryExecutionResult {
+                    rows: Vec::new(),
+                    columns: Vec::new(),
+                    rows_affected: 1,
+                })
+            });
+
+            let error = emit_operation_events(events, side_effect_started, |_event| {
+                Err(ProtocolEmitError::io("endpoint query sink failed"))
+            })
+            .expect_err("query emitter failure must propagate");
+
+            assert_eq!(
+                error.side_effect_started(),
+                expected_side_effect,
+                "unexpected side-effect boundary for {sql}"
+            );
+        }
     }
 
     fn collect_protocol_frames(event: &Value) -> Result<Vec<Vec<u8>>, ProtocolEmitError> {

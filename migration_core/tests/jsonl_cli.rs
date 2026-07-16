@@ -46,6 +46,21 @@ fn run_helper_output(input: &str) -> Vec<u8> {
     output.stdout
 }
 
+fn run_helper_with_closed_stdout(input: &str) -> std::process::Output {
+    let mut child = Command::new(helper_binary())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    {
+        let mut stdin = child.stdin.take().unwrap();
+        write!(stdin, "{input}").unwrap();
+    }
+    child.wait_with_output().unwrap()
+}
+
 #[test]
 fn helper_binary_accepts_jsonl_and_emits_result() {
     let events = run_helper(json!({
@@ -138,6 +153,22 @@ fn helper_binary_emits_structured_invalid_json_error() {
     assert_eq!(events.len(), 1);
     assert_protocol_error(&events[0], json!("protocol-invalid-request-id"));
     assert_eq!(events[0]["command"], Value::Null);
+}
+
+#[test]
+fn helper_binary_exits_nonzero_when_stdout_emission_fails() {
+    for input in [
+        "{\"command\":\"service.hello\",\"request_id\":\"closed-stdout\",\"payload\":{}}\n",
+        "{\n",
+    ] {
+        let output = run_helper_with_closed_stdout(input);
+
+        assert!(
+            !output.status.success(),
+            "closed stdout must fail the process for input {input:?}; stderr={}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]

@@ -9,7 +9,7 @@ use std::io::{self, BufRead, Write};
 fn main() -> ProtocolEmitResult {
     let stdin = io::stdin();
     let mut service = CoreService::new();
-    let handled = process_jsonl_reader(stdin.lock(), &mut service, emit_one);
+    let handled = process_jsonl_reader(stdin.lock(), &mut service, emit_one)?;
 
     if !handled {
         let command = std::env::args()
@@ -31,7 +31,7 @@ fn process_jsonl_reader<R, F, O>(
     mut reader: R,
     service: &mut CoreService,
     mut emit: F,
-) -> bool
+) -> Result<bool, ProtocolEmitError>
 where
     R: BufRead,
     F: FnMut(Value) -> O,
@@ -45,12 +45,12 @@ where
             Ok(frame) => frame,
             Err(err) => {
                 handled = true;
-                let _ = emit(protocol_error_event(
+                emit(protocol_error_event(
                     None,
                     "stdin_read_failed",
                     format!("stdin read failed: {err}"),
                 ))
-                .into_protocol_emit_result();
+                .into_protocol_emit_result()?;
                 break;
             }
         };
@@ -63,72 +63,57 @@ where
                 let line = match std::str::from_utf8(&bytes) {
                     Ok(line) => line,
                     Err(err) => {
-                        if emit(protocol_error_event(
+                        emit(protocol_error_event(
                             None,
                             "invalid_request_utf8",
                             format!("request frame is not valid UTF-8: {err}"),
                         ))
-                        .into_protocol_emit_result()
-                        .is_err()
-                        {
-                            break;
-                        }
+                        .into_protocol_emit_result()?;
                         continue;
                     }
                 };
                 match serde_json::from_str::<Request>(line) {
                     Ok(request) => {
                         let should_shutdown = request.command == "service.shutdown";
-                        if service
-                            .handle_request_streaming(request, &mut emit)
-                            .is_err()
-                            || should_shutdown
-                        {
+                        service.handle_request_streaming(request, &mut emit)?;
+                        if should_shutdown {
                             break;
                         }
                     }
                     Err(err) => {
-                        if emit(protocol_error_event(
+                        emit(protocol_error_event(
                             None,
                             "invalid_request_json",
                             format!("invalid request JSON: {err}"),
                         ))
-                        .into_protocol_emit_result()
-                        .is_err()
-                        {
-                            break;
-                        }
+                        .into_protocol_emit_result()?;
                     }
                 }
             }
             BoundedJsonlFrame::Oversized => {
                 handled = true;
-                if emit(protocol_error_event(
+                emit(protocol_error_event(
                     None,
                     "jsonl_frame_too_large",
                     "request JSONL frame exceeds MAX_JSONL_FRAME_BYTES",
                 ))
-                .into_protocol_emit_result()
-                .is_err()
-                {
-                    break;
-                }
+                .into_protocol_emit_result()?;
             }
             BoundedJsonlFrame::Unterminated => {
                 handled = true;
-                let _ = emit(protocol_error_event(
+                emit(protocol_error_event(
                     None,
                     "jsonl_frame_missing_newline",
                     "request JSONL frame is missing its newline terminator",
                 ))
-                .into_protocol_emit_result();
+                .into_protocol_emit_result()?;
                 break;
             }
             BoundedJsonlFrame::Eof => break,
         }
     }
 
-    handled
+    Ok(handled)
 }
 
 enum BoundedJsonlFrame {
@@ -176,6 +161,10 @@ fn read_bounded_jsonl_frame<R: BufRead>(reader: &mut R) -> io::Result<BoundedJso
 
 fn emit_one(event: Value) -> ProtocolEmitResult {
     let mut stdout = io::stdout().lock();
+    emit_one_to(event, &mut stdout)
+}
+
+fn emit_one_to<W: Write>(event: Value, stdout: &mut W) -> ProtocolEmitResult {
     encode_protocol_frames(&event, |frame| {
         stdout
             .write_all(frame)
@@ -189,7 +178,7 @@ fn emit_one(event: Value) -> ProtocolEmitResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{self, BufRead, Read};
+    use std::io::{self, BufRead, Read, Write};
 
     struct FailingReader;
 
@@ -220,7 +209,8 @@ mod tests {
         let mut events = Vec::new();
         let mut service = CoreService::new();
 
-        let handled = process_jsonl_reader(FailingReader, &mut service, |event| events.push(event));
+        let handled = process_jsonl_reader(FailingReader, &mut service, |event| events.push(event))
+            .expect("protocol error envelope should emit");
 
         assert!(handled);
         assert_eq!(events.len(), 1);
@@ -233,7 +223,8 @@ mod tests {
         let mut service = CoreService::new();
         let input = b"{\"command\":\"query.execute\",\"request_id\":\"stateful-1\",\"payload\":{\"connection_id\":\"missing\",\"sql\":\"SELECT 1\"}}\n";
 
-        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event));
+        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event))
+            .expect("stateful error should emit");
 
         assert!(handled);
         assert_eq!(events.len(), 1);
@@ -251,13 +242,92 @@ mod tests {
                       {\"command\":\"service.hello\",\"request_id\":\"second\",\"payload\":{}}\n";
         let mut calls = 0;
 
-        let handled = process_jsonl_reader(&input[..], &mut service, |_event| {
+        let error = process_jsonl_reader(&input[..], &mut service, |_event| {
             calls += 1;
             Err(ProtocolEmitError::io("simulated broken pipe"))
-        });
+        })
+        .expect_err("emitter failure must propagate from the request loop");
 
-        assert!(handled);
         assert_eq!(calls, 1);
+        assert_eq!(error.code(), "protocol_emit_failed");
+    }
+
+    #[test]
+    fn invalid_input_emit_failures_propagate_and_fuse_the_reader() {
+        let mut oversized = vec![b'x'; MAX_JSONL_FRAME_BYTES + 1];
+        oversized.push(b'\n');
+        let cases = vec![vec![0xff, b'\n'], b"{\n".to_vec(), oversized, b"{".to_vec()];
+
+        for input in cases {
+            let mut service = CoreService::new();
+            let mut calls = 0;
+            let error = process_jsonl_reader(&input[..], &mut service, |_event| {
+                calls += 1;
+                Err(ProtocolEmitError::io("invalid-input sink failed"))
+            })
+            .expect_err("invalid-input emitter failure must propagate");
+
+            assert_eq!(calls, 1);
+            assert_eq!(error.code(), "protocol_emit_failed");
+        }
+    }
+
+    #[test]
+    fn stdin_read_error_emit_failure_propagates() {
+        let mut service = CoreService::new();
+        let mut calls = 0;
+
+        let error = process_jsonl_reader(FailingReader, &mut service, |_event| {
+            calls += 1;
+            Err(ProtocolEmitError::io("stdin-error sink failed"))
+        })
+        .expect_err("stdin error envelope emission must propagate");
+
+        assert_eq!(calls, 1);
+        assert_eq!(error.code(), "protocol_emit_failed");
+    }
+
+    struct WriteFailingSink;
+
+    impl Write for WriteFailingSink {
+        fn write(&mut self, _buffer: &[u8]) -> io::Result<usize> {
+            Err(io::Error::new(io::ErrorKind::BrokenPipe, "closed sink"))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct FlushFailingSink {
+        bytes: Vec<u8>,
+    }
+
+    impl Write for FlushFailingSink {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.bytes.extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::other("flush failed"))
+        }
+    }
+
+    #[test]
+    fn emit_one_to_propagates_write_and_flush_failures() {
+        let event = json!({"event": "result", "request_id": "sink-failure"});
+
+        let write_error = emit_one_to(event.clone(), &mut WriteFailingSink)
+            .expect_err("write failure must propagate");
+        let mut flush_sink = FlushFailingSink::default();
+        let flush_error = emit_one_to(event, &mut flush_sink)
+            .expect_err("flush failure must propagate");
+
+        assert!(write_error.to_string().contains("stdout write failed"));
+        assert!(flush_error.to_string().contains("stdout flush failed"));
+        assert!(!flush_sink.bytes.is_empty());
     }
 
     #[test]
@@ -272,7 +342,8 @@ mod tests {
         let mut events = Vec::new();
         let mut service = CoreService::new();
 
-        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event));
+        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event))
+            .expect("maximum frame response should emit");
 
         assert!(handled);
         assert_eq!(input.len(), MAX_JSONL_FRAME_BYTES);
@@ -290,7 +361,8 @@ mod tests {
         let mut events = Vec::new();
         let mut service = CoreService::new();
 
-        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event));
+        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event))
+            .expect("oversized frame response should emit");
 
         assert!(handled);
         assert_eq!(events.len(), 2);
@@ -309,7 +381,8 @@ mod tests {
         let mut events = Vec::new();
         let mut service = CoreService::new();
 
-        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event));
+        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event))
+            .expect("UTF-8 error response should emit");
 
         assert!(handled);
         assert_eq!(events.len(), 2);
@@ -323,7 +396,8 @@ mod tests {
         let mut events = Vec::new();
         let mut service = CoreService::new();
 
-        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event));
+        let handled = process_jsonl_reader(&input[..], &mut service, |event| events.push(event))
+            .expect("unterminated frame response should emit");
 
         assert!(handled);
         assert_eq!(events.len(), 1);
