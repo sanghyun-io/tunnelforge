@@ -152,6 +152,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.unsupported_objects = []
         self._last_checkpoint_path = None
         self._workflow_active = False
+        self._workflow_generation = 0
         self._current_command: Optional[str] = None
         self._pending_after_inspect: Optional[str] = None
         self._active_payload: Optional[Dict[str, Any]] = None
@@ -169,6 +170,8 @@ class CrossEngineMigrationDialog(QDialog):
         self._cleanup_retry_result = None
         self._cleanup_retry_lock = threading.Lock()
         self._closing = False
+        self._dismissal_in_progress = False
+        self._deferred_finished = None
         self.cleanup_retry_timer = QTimer(self)
         self.cleanup_retry_timer.setInterval(CLEANUP_RETRY_INTERVAL_MS)
         self.cleanup_retry_timer.timeout.connect(self._retry_cleanup_residual)
@@ -833,7 +836,7 @@ class CrossEngineMigrationDialog(QDialog):
         return payload
 
     def _start_full_workflow(self):
-        if self._closing:
+        if self._closing or self._dismissal_in_progress:
             return
         if self.worker is not None:
             message = (
@@ -843,11 +846,12 @@ class CrossEngineMigrationDialog(QDialog):
             )
             QMessageBox.warning(self, "작업 진행 중", message)
             return
+        self._workflow_generation += 1
         self._workflow_active = True
         self._start_command("inspect", workflow=True)
 
     def _start_command(self, command: str, workflow: bool = False):
-        if self._closing:
+        if self._closing or self._dismissal_in_progress:
             return
         if self.worker is not None:
             message = (
@@ -889,7 +893,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._start_command_with_payload(command, payload, workflow=workflow)
 
     def _start_command_with_payload(self, command: str, payload: Dict, workflow: bool = False):
-        if self._closing:
+        if self._closing or self._dismissal_in_progress:
             return
         if self.worker is not None:
             message = (
@@ -1043,6 +1047,9 @@ class CrossEngineMigrationDialog(QDialog):
     def _on_finished(self, success: bool, payload):
         if self._closing:
             return
+        if self._dismissal_in_progress:
+            self._deferred_finished = (self.worker, success, payload)
+            return
         finished_command = self._current_command
         worker = self.worker
         if not self._wait_for_worker_finish():
@@ -1086,11 +1093,28 @@ class CrossEngineMigrationDialog(QDialog):
         if self._workflow_active and finished_command:
             next_command = next_workflow_command(finished_command, success)
             if next_command:
-                QTimer.singleShot(0, lambda: self._start_command(next_command, workflow=True))
+                generation = self._workflow_generation
+                QTimer.singleShot(
+                    0,
+                    lambda command=next_command, workflow_generation=generation: self._start_workflow_continuation(
+                        command,
+                        workflow_generation,
+                    ),
+                )
             else:
                 self._workflow_active = False
                 self._current_command = None
         self._refresh_navigation_state()
+
+    def _start_workflow_continuation(self, command: str, generation: int) -> None:
+        if (
+            generation != self._workflow_generation
+            or not self._workflow_active
+            or self._closing
+            or self._dismissal_in_progress
+        ):
+            return
+        self._start_command(command, workflow=True)
 
     def _wait_for_worker_finish(self) -> bool:
         worker = self.worker
@@ -1544,9 +1568,29 @@ class CrossEngineMigrationDialog(QDialog):
         self.lbl_safety_activity.setText(text)
         self._append_safety_log(text)
 
+    def _restore_after_dismissal_attempt(self) -> None:
+        self._dismissal_in_progress = False
+        deferred_finished = self._deferred_finished
+        self._deferred_finished = None
+        if deferred_finished is not None:
+            worker, success, payload = deferred_finished
+            if self.worker is worker:
+                self._on_finished(success, payload)
+                return
+        worker = self.worker
+        self._set_running(worker is not None and worker.isRunning())
+
     def _try_begin_dismissal(self) -> bool:
         if self._closing:
             return True
+        if self._dismissal_in_progress:
+            return False
+
+        self._dismissal_in_progress = True
+        self._deferred_finished = None
+        self._workflow_generation += 1
+        self._workflow_active = False
+        self._pending_after_inspect = None
         worker = self.worker
         if worker is not None and worker.isRunning():
             reply = QMessageBox.question(
@@ -1556,23 +1600,55 @@ class CrossEngineMigrationDialog(QDialog):
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
-            if reply != QMessageBox.StandardButton.Yes:
+            current_worker = self.worker
+            if current_worker is not worker:
+                self._restore_after_dismissal_attempt()
                 return False
-            if worker.cancel() is False:
+            if reply != QMessageBox.StandardButton.Yes:
+                self._restore_after_dismissal_attempt()
+                return False
+            worker = current_worker
+            if worker.isRunning() and worker.cancel() is False:
                 self._append_log("취소 요청이 프로세스 종료를 전달하지 못했습니다.")
                 QMessageBox.warning(
                     self,
                     "프로세스 정리 중",
                     "Rust Core 프로세스 핸들을 유지하므로 창을 닫을 수 없습니다.",
                 )
+                current_worker = self.worker
+                if current_worker is not worker:
+                    self._restore_after_dismissal_attempt()
+                    return False
+                self._restore_after_dismissal_attempt()
                 return False
-            if not worker.wait(WORKER_CLOSE_WAIT_MS):
+            current_worker = self.worker
+            if current_worker is not worker:
+                self._restore_after_dismissal_attempt()
+                return False
+            worker = current_worker
+            if worker.isRunning() and not worker.wait(WORKER_CLOSE_WAIT_MS):
+                current_worker = self.worker
+                if current_worker is not worker:
+                    self._restore_after_dismissal_attempt()
+                    return False
                 QMessageBox.warning(
                     self,
                     "프로세스 정리 중",
                     "작업 thread가 아직 종료되지 않아 창을 닫을 수 없습니다.",
                 )
+                current_worker = self.worker
+                if current_worker is not worker:
+                    self._restore_after_dismissal_attempt()
+                    return False
+                self._restore_after_dismissal_attempt()
                 return False
+            current_worker = self.worker
+            if current_worker is not worker:
+                self._restore_after_dismissal_attempt()
+                return False
+            worker = current_worker
+        else:
+            worker = self.worker
         if worker is not None:
             if worker.isRunning() or self._worker_has_unsettled_process(worker) or self._cleanup_residual_pending:
                 self._request_cleanup_retry(worker)
@@ -1582,9 +1658,19 @@ class CrossEngineMigrationDialog(QDialog):
                     "프로세스 정리 중",
                     "Rust Core 프로세스 정리가 끝날 때까지 창을 유지합니다.",
                 )
+                current_worker = self.worker
+                if current_worker is not worker:
+                    self._restore_after_dismissal_attempt()
+                    return False
+                self._restore_after_dismissal_attempt()
                 return False
             self._clear_cleanup_worker(worker)
+        if self.worker is not None or self._cleanup_residual_pending:
+            self._restore_after_dismissal_attempt()
+            return False
         self._closing = True
+        self._dismissal_in_progress = False
+        self._deferred_finished = None
         self._workflow_active = False
         self._pending_after_inspect = None
         self._current_command = None

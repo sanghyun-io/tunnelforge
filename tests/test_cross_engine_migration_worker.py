@@ -373,6 +373,54 @@ def test_worker_valid_result_followed_by_malformed_frame_finishes_false():
     assert finished == [(False, {"error": failures[0]})]
 
 
+def _assert_worker_rejects_invalid_terminal(frame, expected_message):
+    process = FakeProcess([frame])
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {},
+        helper_path="fake-helper",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    failures = []
+    results = []
+    finished = []
+    worker.failed.connect(failures.append)
+    worker.result.connect(results.append)
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.run()
+
+    assert len(failures) == 1
+    assert expected_message in failures[0].lower()
+    assert results == []
+    assert finished == [(False, {"error": failures[0]})]
+
+
+def test_worker_rejects_result_for_wrong_command():
+    _assert_worker_rejects_invalid_terminal(
+        '{"event":"result","command":"plan","success":true}',
+        "command mismatch",
+    )
+
+
+@pytest.mark.parametrize("invalid_success", ['"false"', "0", "1"])
+def test_worker_rejects_non_boolean_result_success(invalid_success):
+    _assert_worker_rejects_invalid_terminal(
+        '{"event":"result","command":"migrate","success":'
+        f"{invalid_success}}}",
+        "success must be a boolean",
+    )
+
+
+def test_worker_rejects_error_for_wrong_command():
+    _assert_worker_rejects_invalid_terminal(
+        '{"event":"error","command":"plan","message":"boom"}',
+        "command mismatch",
+    )
+
+
 def _assert_worker_rejects_multiple_terminal_frames(stdout_lines):
     process = FakeProcess(stdout_lines)
     worker = CrossEngineMigrationWorker(
@@ -400,7 +448,7 @@ def _assert_worker_rejects_multiple_terminal_frames(stdout_lines):
 
 def test_worker_rejects_error_followed_by_result_terminal_frame():
     _assert_worker_rejects_multiple_terminal_frames([
-        '{"event":"error","message":"first failure"}',
+        '{"event":"error","command":"migrate","message":"first failure"}',
         '{"event":"result","command":"migrate","success":true}',
     ])
 
@@ -415,7 +463,7 @@ def test_worker_rejects_result_followed_by_result_terminal_frame():
 def test_worker_rejects_result_followed_by_error_terminal_frame():
     _assert_worker_rejects_multiple_terminal_frames([
         '{"event":"result","command":"migrate","success":true}',
-        '{"event":"error","message":"late failure"}',
+        '{"event":"error","command":"migrate","message":"late failure"}',
     ])
 
 
@@ -651,7 +699,7 @@ def test_worker_dispatch_event_emits_checkpoint_state():
 
 def test_worker_run_emits_failure_on_error():
     process = FakeProcess([
-        '{"event":"error","message":"boom"}',
+        '{"event":"error","command":"plan","message":"boom"}',
     ])
 
     worker = CrossEngineMigrationWorker(

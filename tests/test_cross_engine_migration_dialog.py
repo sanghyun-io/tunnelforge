@@ -1336,6 +1336,203 @@ def test_accepted_close_makes_queued_finished_and_continuations_inert(monkeypatc
         dialog.hide()
 
 
+def test_dismissal_barrier_blocks_nested_finish_worker_replacement(monkeypatch):
+    class FinishingWorker:
+        def __init__(self):
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def cancel(self):
+            return True
+
+        def wait(self, timeout):
+            return True
+
+        def has_unsettled_process(self):
+            return False
+
+    starts = []
+
+    class ReplacementWorker(FakeCrossEngineMigrationWorker):
+        def start(self):
+            starts.append(self.command)
+
+    dialog = make_dialog()
+    worker = FinishingWorker()
+
+    def answer_question(*args, **kwargs):
+        worker.running = False
+        dialog._on_finished(
+            True,
+            {"event": "result", "command": "inspect", "success": True},
+        )
+        dialog._start_command_with_payload("preflight", {}, workflow=True)
+        return QMessageBox.StandardButton.Yes
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.CrossEngineMigrationWorker",
+        ReplacementWorker,
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.question",
+        answer_question,
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._workflow_active = True
+        dialog._current_command = "inspect"
+        close_event = QCloseEvent()
+
+        dialog.closeEvent(close_event)
+
+        assert starts == []
+        assert not (close_event.isAccepted() and dialog.worker is not None)
+    finally:
+        dialog.worker = None
+        dialog.hide()
+
+
+def test_declined_dismissal_does_not_resume_suppressed_workflow(monkeypatch):
+    class FinishingWorker:
+        def __init__(self):
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def has_unsettled_process(self):
+            return False
+
+    starts = []
+
+    class ReplacementWorker(FakeCrossEngineMigrationWorker):
+        def start(self):
+            starts.append(self.command)
+
+    dialog = make_dialog()
+    worker = FinishingWorker()
+
+    def answer_question(*args, **kwargs):
+        worker.running = False
+        dialog._on_finished(
+            True,
+            {"event": "result", "command": "inspect", "success": True},
+        )
+        dialog._start_command_with_payload("preflight", {}, workflow=True)
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.CrossEngineMigrationWorker",
+        ReplacementWorker,
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.question",
+        answer_question,
+    )
+    dialog.show()
+    app.processEvents()
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._workflow_active = True
+        dialog._current_command = "inspect"
+        close_event = QCloseEvent()
+
+        dialog.closeEvent(close_event)
+
+        assert not close_event.isAccepted()
+        assert dialog.isVisible()
+        assert starts == []
+        assert dialog._workflow_active is False
+        assert dialog._closing is False
+        assert dialog.btn_close.isEnabled()
+    finally:
+        dialog.worker = None
+        dialog.hide()
+
+
+def test_declined_dismissal_invalidates_already_queued_workflow_continuation(
+    monkeypatch,
+):
+    class SettledWorker:
+        def isRunning(self):
+            return False
+
+        def has_unsettled_process(self):
+            return False
+
+    class FinishingWorker:
+        def __init__(self):
+            self.running = True
+
+        def isRunning(self):
+            return self.running
+
+        def has_unsettled_process(self):
+            return False
+
+    callbacks = []
+    starts = []
+
+    class ReplacementWorker(FakeCrossEngineMigrationWorker):
+        def start(self):
+            starts.append(self.command)
+
+    dialog = make_dialog()
+    active_worker = FinishingWorker()
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.CrossEngineMigrationWorker",
+        ReplacementWorker,
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QTimer.singleShot",
+        lambda delay, callback: callbacks.append(callback),
+    )
+    monkeypatch.setattr(dialog, "_payload", lambda prepare_tunnels: {})
+    dialog.txt_schema.setPlainText(
+        '{"tables":[{"name":"users","columns":[{"name":"id","type":"int"}]}]}'
+    )
+
+    def answer_question(*args, **kwargs):
+        active_worker.running = False
+        dialog._on_finished(
+            True,
+            {"event": "result", "command": "inspect", "success": True},
+        )
+        return QMessageBox.StandardButton.No
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.question",
+        answer_question,
+    )
+    try:
+        dialog.worker = cast(Any, SettledWorker())
+        dialog._workflow_active = True
+        dialog._current_command = "inspect"
+        dialog._on_finished(
+            True,
+            {"event": "result", "command": "inspect", "success": True},
+        )
+        assert len(callbacks) == 1
+
+        dialog.worker = cast(Any, active_worker)
+        close_event = QCloseEvent()
+        dialog.closeEvent(close_event)
+        callbacks[0]()
+
+        assert not close_event.isAccepted()
+        assert starts == []
+        assert dialog._workflow_active is False
+    finally:
+        dialog.worker = None
+        dialog.hide()
+
+
 def test_close_event_retains_cleanup_residual_until_final_retry_succeeds(
     monkeypatch,
 ):

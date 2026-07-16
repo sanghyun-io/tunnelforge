@@ -287,10 +287,19 @@ class CrossEngineMigrationWorker(QThread):
                             f"({terminal_event_name} then {event.event}); exactly one "
                             "terminal result/error frame is required"
                         )
+                    if event.command != self.command:
+                        raise HelperProtocolError(
+                            "Helper terminal frame command mismatch: "
+                            f"expected {self.command!r}, got {event.command!r}"
+                        )
                     terminal_event_name = event.event
                     final_payload = event.payload
                     if event.event == "result":
-                        success = bool(event.success)
+                        if type(event.success) is not bool:
+                            raise HelperProtocolError(
+                                "Helper terminal result success must be a boolean"
+                            )
+                        success = event.success
                         buffered_result_payload = event.payload
                     else:
                         success = False
