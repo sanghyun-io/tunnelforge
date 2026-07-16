@@ -1658,11 +1658,34 @@ class DbCoreServiceClient:
                     )
                     await self._poison_and_reap_preserving_on_owner(error, deadline_at)
                     raise error
+                outcome_indeterminate = payload_event.get(
+                    "outcome_indeterminate",
+                    False,
+                )
+                if type(outcome_indeterminate) is not bool or (
+                    outcome_indeterminate
+                    and request_kind is not DbCoreRequestKind.MUTATION
+                ):
+                    error = DbCoreServiceError(
+                        "DB Core error event has invalid outcome metadata",
+                        code="db_core_protocol_mismatch",
+                        request_kind=request_kind,
+                        outcome=self._transport_outcome(request_kind),
+                        request_id=request_id,
+                        process_generation=self._process_generation,
+                        payload=payload_event,
+                    )
+                    await self._poison_and_reap_preserving_on_owner(error, deadline_at)
+                    raise error
                 raise DbCoreServiceError(
                     _format_error_event(payload_event),
                     code="db_core_business_failure",
                     request_kind=request_kind,
-                    outcome=DbCoreOutcome.FAILED,
+                    outcome=(
+                        DbCoreOutcome.OUTCOME_INDETERMINATE
+                        if outcome_indeterminate
+                        else DbCoreOutcome.FAILED
+                    ),
                     request_id=request_id,
                     process_generation=self._process_generation,
                     rust_code=rust_code,

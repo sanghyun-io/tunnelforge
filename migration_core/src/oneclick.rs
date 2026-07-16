@@ -34,6 +34,8 @@ pub(crate) struct OneClickContractError {
     code: &'static str,
     message: &'static str,
     applied_ordinals: Vec<u32>,
+    indeterminate_ordinal: Option<u32>,
+    outcome_indeterminate: bool,
     lock_release_failed: bool,
 }
 
@@ -43,6 +45,8 @@ impl OneClickContractError {
             code,
             message,
             applied_ordinals: Vec::new(),
+            indeterminate_ordinal: None,
+            outcome_indeterminate: false,
             lock_release_failed: false,
         }
     }
@@ -59,8 +63,22 @@ impl OneClickContractError {
         self.lock_release_failed
     }
 
+    pub(crate) fn indeterminate_ordinal(&self) -> Option<u32> {
+        self.indeterminate_ordinal
+    }
+
+    pub(crate) fn outcome_indeterminate(&self) -> bool {
+        self.outcome_indeterminate
+    }
+
     fn with_applied_ordinals(mut self, applied_ordinals: Vec<u32>) -> Self {
         self.applied_ordinals = applied_ordinals;
+        self
+    }
+
+    fn with_indeterminate_ordinal(mut self, ordinal: u32) -> Self {
+        self.indeterminate_ordinal = Some(ordinal);
+        self.outcome_indeterminate = true;
         self
     }
 
@@ -1735,10 +1753,11 @@ fn execute_locked_oneclick<S: OneClickApplySession>(
         }
         if session.execute_sql(&action.sql).is_err() {
             return Err(OneClickContractError::new(
-                "oneclick_postcondition_changed",
-                "A One-Click action did not reach its approved postcondition.",
+                "oneclick_outcome_indeterminate",
+                "A One-Click action may have committed before its result became unavailable.",
             )
-            .with_applied_ordinals(applied_ordinals));
+            .with_applied_ordinals(applied_ordinals)
+            .with_indeterminate_ordinal(action.ordinal));
         }
         applied_ordinals.push(action.ordinal);
         let post_facts = session.read_action_facts(action).map_err(|_| {
@@ -2155,6 +2174,10 @@ fn oneclick_contract_error_event(request: &Request, error: &OneClickContractErro
         error.message,
     );
     event["applied_ordinals"] = json!(error.applied_ordinals());
+    if error.outcome_indeterminate() {
+        event["outcome_indeterminate"] = json!(true);
+        event["indeterminate_ordinal"] = json!(error.indeterminate_ordinal());
+    }
     if error.lock_release_failed() {
         event["lock_release_failed"] = json!(true);
     }
@@ -5248,10 +5271,25 @@ mod tests {
             .push_back(Ok(plan.actions[0].expected_pre_facts.facts.clone()));
         sql_failed.sql_error = true;
         let error = execute_approved_oneclick(&mut sql_failed, &validated).unwrap_err();
-        assert_eq!(error.code(), "oneclick_postcondition_changed");
+        assert_eq!(error.code(), "oneclick_outcome_indeterminate");
+        assert!(error.outcome_indeterminate());
+        assert_eq!(error.indeterminate_ordinal(), Some(1));
         assert!(error.applied_ordinals().is_empty());
         assert_eq!(sql_failed.executed_sql, vec![plan.actions[0].sql.clone()]);
         assert!(sql_failed.calls.last().unwrap().starts_with("release:tf1:"));
+
+        let event = oneclick_contract_error_event(
+            &Request {
+                command: "oneclick.apply_fixes".to_string(),
+                request_id: Some("indeterminate-ddl".to_string()),
+                payload: json!({}),
+            },
+            &error,
+        );
+        assert_eq!(event["code"], "oneclick_outcome_indeterminate");
+        assert_eq!(event["outcome_indeterminate"], true);
+        assert_eq!(event["indeterminate_ordinal"], 1);
+        assert_eq!(event["applied_ordinals"], json!([]));
     }
 
     #[test]

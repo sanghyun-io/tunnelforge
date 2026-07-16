@@ -224,6 +224,69 @@ def test_client_error_includes_database_error_details():
     assert "connection.open" in message
 
 
+def test_client_maps_explicit_mutation_indeterminate_error_without_retry():
+    process = FakeProcess([
+        json.dumps({
+            "event": "error",
+            "command": "oneclick.apply_fixes",
+            "code": "oneclick_outcome_indeterminate",
+            "message": "DDL outcome is indeterminate",
+            "outcome_indeterminate": True,
+            "applied_ordinals": [],
+            "indeterminate_ordinal": 1,
+        }),
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(
+            "oneclick.apply_fixes",
+            {"dry_run": False},
+            request_kind=DbCoreRequestKind.MUTATION,
+        )
+
+    assert raised.value.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+    assert raised.value.rust_code == "oneclick_outcome_indeterminate"
+    assert raised.value.payload["indeterminate_ordinal"] == 1
+    sent = [json.loads(line) for line in process.stdin.getvalue().splitlines()]
+    assert [item["command"] for item in sent] == ["oneclick.apply_fixes"]
+
+
+@pytest.mark.parametrize(
+    ("request_kind", "metadata"),
+    [
+        (DbCoreRequestKind.MUTATION, "true"),
+        (DbCoreRequestKind.READ_ONLY, True),
+    ],
+)
+def test_client_rejects_invalid_indeterminate_error_metadata(
+    request_kind,
+    metadata,
+):
+    command = "oneclick.apply_fixes" if request_kind is DbCoreRequestKind.MUTATION else "inspect"
+    process = FakeProcess([
+        json.dumps({
+            "event": "error",
+            "command": command,
+            "code": "oneclick_outcome_indeterminate",
+            "message": "invalid outcome metadata",
+            "outcome_indeterminate": metadata,
+        }),
+    ])
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        client.request_result(command, request_kind=request_kind)
+
+    assert raised.value.code == "db_core_protocol_mismatch"
+
+
 def test_facade_open_business_failure_keeps_definite_outcome():
     process = FakeProcess([
         '{"event":"result","command":"connection.open","success":false,"message":"refused"}',
