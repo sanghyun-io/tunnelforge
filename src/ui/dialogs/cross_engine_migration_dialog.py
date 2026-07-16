@@ -41,12 +41,19 @@ from src.core.cross_engine_migration import (
 )
 from src.core.i18n import translate_text
 from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
-from src.ui.workers.cross_engine_migration_worker import CrossEngineMigrationWorker
+from src.ui.workers.cross_engine_migration_worker import (
+    CrossEngineMigrationWorker,
+    ProcessCleanupError,
+)
 
 
 WORKER_GRACEFUL_WAIT_MS = 5000
 WORKER_CLOSE_WAIT_MS = 3000
 WORKER_TERMINATE_WAIT_MS = 1000
+CLEANUP_RETRY_INTERVAL_MS = 250
+CLEANUP_RETRY_LIMIT = 3
+CLEANUP_RETRY_TIMEOUT_SECONDS = 0.25
+CLEANUP_CLOSE_TIMEOUT_SECONDS = 2.0
 # Normal finish gets the longest grace period; close and terminate waits stay shorter for responsive shutdown.
 
 _WIZARD_STYLESHEET = """
@@ -157,6 +164,11 @@ class CrossEngineMigrationDialog(QDialog):
         self.safety_activity_timer = QTimer(self)
         self.safety_activity_timer.setInterval(450)
         self.safety_activity_timer.timeout.connect(self._tick_safety_activity)
+        self._cleanup_residual_pending = False
+        self._cleanup_retry_attempts = 0
+        self.cleanup_retry_timer = QTimer(self)
+        self.cleanup_retry_timer.setInterval(CLEANUP_RETRY_INTERVAL_MS)
+        self.cleanup_retry_timer.timeout.connect(self._retry_cleanup_residual)
         self.step_ids: List[str] = [
             "connections",
             "inspect",
@@ -822,8 +834,13 @@ class CrossEngineMigrationDialog(QDialog):
         self._start_command("inspect", workflow=True)
 
     def _start_command(self, command: str, workflow: bool = False):
-        if self.worker and self.worker.isRunning():
-            QMessageBox.warning(self, "작업 진행 중", "이미 실행 중인 작업이 있습니다.")
+        if self.worker is not None:
+            message = (
+                "이미 실행 중인 작업이 있습니다."
+                if self.worker.isRunning()
+                else "이전 작업의 프로세스 정리가 완료될 때까지 기다려 주세요."
+            )
+            QMessageBox.warning(self, "작업 진행 중", message)
             return
 
         if command not in ("inspect", "migrate") and self._schema_is_empty():
@@ -857,8 +874,13 @@ class CrossEngineMigrationDialog(QDialog):
         self._start_command_with_payload(command, payload, workflow=workflow)
 
     def _start_command_with_payload(self, command: str, payload: Dict, workflow: bool = False):
-        if self.worker and self.worker.isRunning():
-            QMessageBox.warning(self, "작업 진행 중", "이미 실행 중인 작업이 있습니다.")
+        if self.worker is not None:
+            message = (
+                "이미 실행 중인 작업이 있습니다."
+                if self.worker.isRunning()
+                else "이전 작업의 프로세스 정리가 완료될 때까지 기다려 주세요."
+            )
+            QMessageBox.warning(self, "작업 진행 중", message)
             return
 
         self._workflow_active = workflow or self._workflow_active
@@ -1003,11 +1025,22 @@ class CrossEngineMigrationDialog(QDialog):
 
     def _on_finished(self, success: bool, payload):
         finished_command = self._current_command
+        worker = self.worker
         if not self._wait_for_worker_finish():
             self._set_running(True)
             self._refresh_navigation_state()
             return
-        self.worker = None
+        if (
+            worker is not None
+            and isinstance(payload, dict)
+            and payload.get("cleanup_residual") is True
+        ):
+            self._cleanup_residual_pending = True
+            self._cleanup_retry_attempts = 0
+            self.cleanup_retry_timer.start()
+            self._append_log("Rust Core 프로세스 정리를 재시도합니다.")
+        else:
+            self._clear_cleanup_worker(worker)
         self._set_running(False)
         if finished_command == "inspect" and success and self._pending_after_inspect:
             next_command = self._pending_after_inspect
@@ -1139,6 +1172,44 @@ class CrossEngineMigrationDialog(QDialog):
         self._update_execution_state()
         self.btn_cancel.setEnabled(running)
         self._refresh_navigation_state()
+
+    def _clear_cleanup_worker(self, worker) -> None:
+        self.cleanup_retry_timer.stop()
+        self._cleanup_residual_pending = False
+        self._cleanup_retry_attempts = 0
+        if self.worker is worker:
+            self.worker = None
+
+    def _retry_cleanup_residual(self) -> None:
+        if not self._cleanup_residual_pending:
+            self.cleanup_retry_timer.stop()
+            return
+        worker = self.worker
+        if worker is None:
+            self._clear_cleanup_worker(None)
+            return
+        if worker.isRunning():
+            return
+
+        self._cleanup_retry_attempts += 1
+        try:
+            worker.retry_process_cleanup(
+                timeout_seconds=CLEANUP_RETRY_TIMEOUT_SECONDS,
+            )
+        except ProcessCleanupError as exc:
+            self._append_log(
+                "Rust Core 프로세스 정리 재시도 실패 "
+                f"({self._cleanup_retry_attempts}/{CLEANUP_RETRY_LIMIT}): {exc}"
+            )
+            if self._cleanup_retry_attempts >= CLEANUP_RETRY_LIMIT:
+                self.cleanup_retry_timer.stop()
+                self._append_log(
+                    "프로세스 정리 핸들을 유지합니다. 창을 닫을 때 다시 시도합니다."
+                )
+            return
+
+        self._clear_cleanup_worker(worker)
+        self._append_log("Rust Core 프로세스 정리가 완료되었습니다.")
 
     def _set_input_controls_enabled(self, enabled: bool):
         self.source_form.set_inputs_enabled(enabled)
@@ -1402,7 +1473,8 @@ class CrossEngineMigrationDialog(QDialog):
 
     def closeEvent(self, a0: Optional[QCloseEvent]):
         assert a0 is not None
-        if self.worker and self.worker.isRunning():
+        worker = self.worker
+        if worker is not None and worker.isRunning():
             reply = QMessageBox.question(
                 self,
                 "작업 진행 중",
@@ -1413,10 +1485,36 @@ class CrossEngineMigrationDialog(QDialog):
             if reply != QMessageBox.StandardButton.Yes:
                 a0.ignore()
                 return
-            self.worker.cancel()
-            if not self.worker.wait(WORKER_CLOSE_WAIT_MS):
-                self.worker.terminate()
-                self.worker.wait(WORKER_TERMINATE_WAIT_MS)
+            worker.cancel()
+            if not worker.wait(WORKER_CLOSE_WAIT_MS):
+                worker.terminate()
+                worker.wait(WORKER_TERMINATE_WAIT_MS)
+            if worker.isRunning():
+                QMessageBox.warning(
+                    self,
+                    "프로세스 정리 중",
+                    "작업 thread가 아직 종료되지 않아 창을 닫을 수 없습니다.",
+                )
+                a0.ignore()
+                return
+        if worker is not None:
+            try:
+                worker.retry_process_cleanup(
+                    timeout_seconds=CLEANUP_CLOSE_TIMEOUT_SECONDS,
+                )
+            except ProcessCleanupError as exc:
+                self._cleanup_residual_pending = True
+                self._cleanup_retry_attempts = 0
+                self.cleanup_retry_timer.start()
+                self._append_log(f"창 닫기 전 프로세스 정리 실패: {exc}")
+                QMessageBox.warning(
+                    self,
+                    "프로세스 정리 중",
+                    "Rust Core 프로세스 정리가 끝날 때까지 창을 유지합니다.",
+                )
+                a0.ignore()
+                return
+            self._clear_cleanup_worker(worker)
         a0.accept()
 
 

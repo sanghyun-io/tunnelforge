@@ -7,6 +7,7 @@ from typing import Any, cast
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
 from src.core.cross_engine_migration import MigrationIssue
@@ -14,6 +15,7 @@ from src.core.cross_engine_migration import DatabaseEngine
 from src.ui.dialogs import cross_engine_migration_endpoint_form as endpoint_form_module
 from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationDialog
 from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
+from src.ui.workers.cross_engine_migration_worker import ProcessCleanupError
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -868,6 +870,9 @@ class FakeCrossEngineMigrationWorker:
     def isRunning(self):
         return False
 
+    def retry_process_cleanup(self, *, timeout_seconds):
+        return False
+
 
 def test_start_command_with_payload_caches_worker_start_state_key_for_checkpoint(monkeypatch):
     monkeypatch.setattr(
@@ -1001,6 +1006,110 @@ def test_finished_waits_for_worker_to_stop_before_clearing_reference():
         assert worker.wait_timeout == 5000
         assert dialog.worker is None
         assert "현재 작업이 실행 중입니다" not in dialog.lbl_next_hint.text()
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_finished_cleanup_residual_retains_worker_until_timer_retry_succeeds(
+    monkeypatch,
+):
+    residual = ProcessCleanupError("final_wait", TimeoutError("still alive"))
+
+    class ResidualWorker:
+        def __init__(self):
+            self.retry_results = [residual, True]
+            self.retry_timeouts = []
+
+        def isRunning(self):
+            return False
+
+        def retry_process_cleanup(self, *, timeout_seconds):
+            self.retry_timeouts.append(timeout_seconds)
+            result = self.retry_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    dialog = make_dialog()
+    worker = ResidualWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._current_command = "migrate"
+
+        dialog._on_finished(
+            False,
+            {"command": "migrate", "success": False, "cleanup_residual": True},
+        )
+
+        assert dialog.worker is worker
+        assert dialog.cleanup_retry_timer.isActive()
+
+        dialog._start_command_with_payload("verify", {})
+        assert dialog.worker is worker
+        assert warnings
+
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog.worker is worker
+        assert dialog.cleanup_retry_timer.isActive()
+
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog.worker is None
+        assert not dialog.cleanup_retry_timer.isActive()
+        assert worker.retry_timeouts
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_close_event_retains_cleanup_residual_until_final_retry_succeeds(
+    monkeypatch,
+):
+    residual = ProcessCleanupError("stream_close", OSError("close failed"))
+
+    class ResidualWorker:
+        def __init__(self):
+            self.cleanup_succeeds = False
+
+        def isRunning(self):
+            return False
+
+        def retry_process_cleanup(self, *, timeout_seconds):
+            if not self.cleanup_succeeds:
+                raise residual
+            return True
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    dialog = make_dialog()
+    worker = ResidualWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._current_command = "migrate"
+        dialog._on_finished(
+            False,
+            {"command": "migrate", "success": False, "cleanup_residual": True},
+        )
+
+        blocked_close = QCloseEvent()
+        dialog.closeEvent(blocked_close)
+
+        assert not blocked_close.isAccepted()
+        assert dialog.worker is worker
+
+        worker.cleanup_succeeds = True
+        settled_close = QCloseEvent()
+        dialog.closeEvent(settled_close)
+
+        assert settled_close.isAccepted()
+        assert dialog.worker is None
     finally:
         dialog.worker = None
         dialog.close()

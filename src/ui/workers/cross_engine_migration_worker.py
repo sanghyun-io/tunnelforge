@@ -84,9 +84,17 @@ class CrossEngineMigrationWorker(QThread):
         with self._process_lock:
             self._cancelled = True
             process = self._process
-        if process and process.poll() is None:
+        if process is None:
+            return
+        try:
+            process.terminate()
+        except (OSError, ValueError):
+            pass
+        stdin = process.stdin
+        if stdin is not None:
             try:
-                process.terminate()
+                if not stdin.closed:
+                    stdin.close()
             except (OSError, ValueError):
                 pass
 
@@ -121,13 +129,31 @@ class CrossEngineMigrationWorker(QThread):
 
     @staticmethod
     def _close_process_streams(process) -> None:
-        for stream in (process.stdin, process.stdout, process.stderr):
-            if stream is None or stream.closed:
+        failures = []
+        for name, stream in (
+            ("stdin", process.stdin),
+            ("stdout", process.stdout),
+            ("stderr", process.stderr),
+        ):
+            if stream is None:
                 continue
             try:
-                stream.close()
-            except (OSError, ValueError):
-                pass
+                closed = bool(stream.closed)
+            except Exception as exc:
+                failures.append(f"{name}.closed: {type(exc).__name__}: {exc}")
+                continue
+            if not closed:
+                try:
+                    stream.close()
+                except Exception as exc:
+                    failures.append(f"{name}.close: {type(exc).__name__}: {exc}")
+            try:
+                if not stream.closed:
+                    failures.append(f"{name}.close: stream remained open")
+            except Exception as exc:
+                failures.append(f"{name}.closed: {type(exc).__name__}: {exc}")
+        if failures:
+            raise ProcessCleanupError("stream_close", RuntimeError("; ".join(failures)))
 
     @staticmethod
     def _terminate_and_reap_process(process, timeout_seconds: float) -> None:
@@ -174,19 +200,16 @@ class CrossEngineMigrationWorker(QThread):
 
         try:
             self._terminate_and_reap_process(process, timeout)
+            self._close_process_streams(process)
+            self._join_stderr_drain(timeout)
+            if self._stderr_thread is not None and self._stderr_thread.is_alive():
+                raise ProcessCleanupError(
+                    "stderr_drain",
+                    TimeoutError("stderr drain did not settle after confirmed process reap"),
+                )
         except ProcessCleanupError as exc:
             self._process_cleanup_error = exc
             raise
-
-        self._close_process_streams(process)
-        self._join_stderr_drain(timeout)
-        if self._stderr_thread is not None and self._stderr_thread.is_alive():
-            error = ProcessCleanupError(
-                "stderr_drain",
-                TimeoutError("stderr drain did not settle after confirmed process reap"),
-            )
-            self._process_cleanup_error = error
-            raise error
         with self._process_lock:
             if self._process is process:
                 self._process = None
@@ -241,9 +264,10 @@ class CrossEngineMigrationWorker(QThread):
             with self._process_lock:
                 if self._cancelled:
                     return
-                assert process.stdin is not None
-                process.stdin.write(request)
-                process.stdin.close()
+                stdin = process.stdin
+            assert stdin is not None
+            stdin.write(request)
+            stdin.close()
 
             assert process.stdout is not None
             for line in process.stdout:
@@ -267,14 +291,17 @@ class CrossEngineMigrationWorker(QThread):
                 self._emit_failed_once(final_payload["error"])
 
         except HelperProtocolError as exc:
+            success = False
             final_payload = {"error": str(exc)}
             if not self._cancelled:
                 self._emit_failed_once(str(exc))
         except FileNotFoundError:
+            success = False
             final_payload = {"error": f"tunnelforge-core helper not found: {self.helper_path}"}
             if not self._cancelled:
                 self._emit_failed_once(final_payload["error"])
         except Exception as exc:
+            success = False
             final_payload = {"error": str(exc)}
             if not self._cancelled:
                 self._emit_failed_once(str(exc))

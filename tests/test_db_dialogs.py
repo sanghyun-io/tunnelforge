@@ -1,4 +1,5 @@
 import inspect
+import threading
 from unittest.mock import MagicMock
 
 import pytest
@@ -132,10 +133,14 @@ def _make_worker_with_fake_runner(owns_facade: bool):
     class FakeClient:
         def __init__(self):
             self.cancel_calls = []
+            self.shutdown_calls = []
 
         def cancel_active_request(self, *, timeout_seconds):
             self.cancel_calls.append(timeout_seconds)
             return True
+
+        def shutdown(self, *, timeout_seconds):
+            self.shutdown_calls.append(timeout_seconds)
 
     class FakeFacade:
         def __init__(self, client):
@@ -152,14 +157,15 @@ def _make_worker_with_fake_runner(owns_facade: bool):
     return worker, runner, client
 
 
-def test_rust_dump_worker_cancel_terminates_owned_dedicated_process():
+def test_rust_dump_worker_cancel_shuts_down_owned_dedicated_process_directly():
     worker, _runner, client = _make_worker_with_fake_runner(owns_facade=True)
 
     result = worker.cancel()
 
     assert result is True
     assert worker._cancel_requested is True
-    assert client.cancel_calls == [5.0]
+    assert client.cancel_calls == []
+    assert client.shutdown_calls == [5.0]
 
 def test_rust_dump_worker_cancel_does_not_touch_shared_facade_process():
     worker, _runner, client = _make_worker_with_fake_runner(owns_facade=False)
@@ -169,6 +175,7 @@ def test_rust_dump_worker_cancel_does_not_touch_shared_facade_process():
     assert result is True
     assert worker._cancel_requested is True
     assert client.cancel_calls == []
+    assert client.shutdown_calls == []
 
 
 def test_rust_dump_worker_cancel_has_no_private_process_access():
@@ -180,7 +187,54 @@ def test_rust_dump_worker_cancel_has_no_private_process_access():
     assert ".poll(" not in source
     assert ".terminate(" not in source
     assert "_owns_facade" in source
-    assert "cancel_active_request" in source
+    assert "cancel_active_request" not in source
+    assert ".shutdown(" in source
+
+
+def test_rust_dump_worker_owned_cancel_closes_request_admission_without_gap():
+    worker, _runner, _client = _make_worker_with_fake_runner(owns_facade=True)
+    admission_reached = threading.Event()
+    release_legacy_cancel = threading.Event()
+    request_admitted = []
+
+    class AdmissionAtomicClient:
+        def __init__(self):
+            self._lock = threading.Lock()
+            self.shutdown_started = False
+            self.cancel_calls = []
+            self.shutdown_calls = []
+
+        def cancel_active_request(self, *, timeout_seconds):
+            self.cancel_calls.append(timeout_seconds)
+            admission_reached.set()
+            release_legacy_cancel.wait(timeout=2.0)
+            return False
+
+        def shutdown(self, *, timeout_seconds):
+            with self._lock:
+                self.shutdown_started = True
+                self.shutdown_calls.append(timeout_seconds)
+                admission_reached.set()
+
+        def try_admit_request(self):
+            with self._lock:
+                admitted = not self.shutdown_started
+                request_admitted.append(admitted)
+
+    client = AdmissionAtomicClient()
+    worker._active_runner.facade.client = client
+    cancel_thread = threading.Thread(target=worker.cancel)
+
+    cancel_thread.start()
+    assert admission_reached.wait(timeout=2.0)
+    client.try_admit_request()
+    release_legacy_cancel.set()
+    cancel_thread.join(timeout=2.0)
+
+    assert not cancel_thread.is_alive()
+    assert request_admitted == [False]
+    assert client.cancel_calls == []
+    assert client.shutdown_calls == [5.0]
 
 
 def test_rust_dump_worker_retains_failed_runner_until_explicit_retry():
@@ -330,11 +384,7 @@ def test_rust_dump_worker_cancel_during_runner_creation_cancels_published_runner
     worker.run()
     worker.run()
 
-    assert (cancel_calls, shutdown_calls, db_calls) == (
-        [5.0],
-        [5.0],
-        [],
-    ), method_name
+    assert (cancel_calls, shutdown_calls, db_calls) == ([], [5.0], []), method_name
     assert finished == [(False, "작업이 취소되었습니다.")]
     if task_type == "import":
         assert import_finished == [(False, "작업이 취소되었습니다.", {})]
@@ -421,8 +471,8 @@ def test_rust_dump_worker_cancel_after_runner_publication_skips_db_work(
     worker.run()
 
     assert db_calls == [], method_name
-    assert cancel_calls == [5.0, 5.0]
-    assert shutdown_calls == [5.0]
+    assert cancel_calls == []
+    assert shutdown_calls == [5.0, 5.0]
     assert finished == [(False, "작업이 취소되었습니다.")]
     if task_type == "import":
         assert import_finished == [(False, "작업이 취소되었습니다.", {})]
@@ -503,7 +553,7 @@ def test_rust_dump_worker_idle_cancel_in_post_check_gap_shuts_down_before_facade
     worker.run()
 
     assert runner_calls == ["import_dump"]
-    assert cancel_calls == [5.0]
+    assert cancel_calls == []
     assert shutdown_calls == [5.0]
     assert facade_requests == []
     assert db_calls == []
@@ -518,7 +568,6 @@ def test_rust_dump_worker_idle_cancel_retains_owned_facade_on_shutdown_failure()
         outcome=DbCoreOutcome.FAILED,
     )
     worker, runner, client = _make_worker_with_fake_runner(owns_facade=True)
-    client.cancel_active_request = MagicMock(return_value=False)
     client.shutdown = MagicMock(side_effect=[residual, None])
 
     with pytest.raises(DbCoreServiceError) as raised:

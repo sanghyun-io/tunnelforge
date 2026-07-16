@@ -44,9 +44,6 @@ class RustDumpWorker(QThread):
     def _cancel_owned_runner(
         self,
         runner,
-        *,
-        shutdown: bool = False,
-        shutdown_if_idle: bool = False,
     ) -> None:
         if runner is None or not getattr(runner, "_owns_facade", False):
             return
@@ -54,29 +51,22 @@ class RustDumpWorker(QThread):
         client = getattr(facade, "client", None) if facade is not None else None
         if client is None:
             return
-        cancelled_active = None
         try:
-            cancelled_active = client.cancel_active_request(
+            client.shutdown(
                 timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
             )
-        finally:
-            if shutdown or (shutdown_if_idle and cancelled_active is False):
-                try:
-                    client.shutdown(
-                        timeout_seconds=DEFAULT_SHUTDOWN_TIMEOUT_SECONDS,
-                    )
-                except BaseException:
-                    retain_db_core_facade_for_retry(facade)
-                    raise
-                else:
-                    release_db_core_facade_retry(facade)
+        except Exception:
+            retain_db_core_facade_for_retry(facade)
+            raise
+        else:
+            release_db_core_facade_retry(facade)
 
     def _publish_runner(self, runner) -> bool:
         with self._runner_lock:
             self._active_runner = runner
             cancelled = self._cancel_requested
         if cancelled:
-            self._cancel_owned_runner(runner, shutdown=True)
+            self._cancel_owned_runner(runner)
             return False
         return True
 
@@ -84,7 +74,7 @@ class RustDumpWorker(QThread):
         with self._runner_lock:
             cancelled = self._cancel_requested
         if cancelled:
-            self._cancel_owned_runner(runner, shutdown=True)
+            self._cancel_owned_runner(runner)
         return cancelled
 
     def cancel(self) -> bool:
@@ -96,7 +86,7 @@ class RustDumpWorker(QThread):
         with self._runner_lock:
             self._cancel_requested = True
             runner = self._active_runner
-        self._cancel_owned_runner(runner, shutdown_if_idle=True)
+        self._cancel_owned_runner(runner)
         return True
 
     def retry_owned_shutdown(
@@ -114,7 +104,7 @@ class RustDumpWorker(QThread):
             return False
         try:
             facade.client.shutdown(timeout_seconds=timeout_seconds)
-        except BaseException:
+        except Exception:
             retain_db_core_facade_for_retry(facade)
             raise
         release_db_core_facade_retry(facade)
