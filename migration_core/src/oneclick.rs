@@ -1,3 +1,4 @@
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -18,6 +19,8 @@ pub(crate) const ONECLICK_STRONG_FENCE_PROVEN: bool = false;
 const ACTION_FACTS_HASH_DOMAIN: &[u8] = b"tunnelforge.oneclick.action-facts.v1\0";
 const SNAPSHOT_HASH_DOMAIN: &[u8] = b"tunnelforge.oneclick.snapshot.v1\0";
 const PLAN_HASH_DOMAIN: &[u8] = b"tunnelforge.oneclick.plan.v1\0";
+const LOCK_KEY_HASH_DOMAIN: &[u8] = b"tunnelforge.oneclick.lock.v1\0";
+const ONECLICK_LOCK_TIMEOUT_SECONDS: u32 = 10;
 
 pub(crate) fn oneclick_apply_enabled(
     exact_plan_enabled: bool,
@@ -30,15 +33,40 @@ pub(crate) fn oneclick_apply_enabled(
 pub(crate) struct OneClickContractError {
     code: &'static str,
     message: &'static str,
+    applied_ordinals: Vec<u32>,
+    lock_release_failed: bool,
 }
 
 impl OneClickContractError {
     fn new(code: &'static str, message: &'static str) -> Self {
-        Self { code, message }
+        Self {
+            code,
+            message,
+            applied_ordinals: Vec::new(),
+            lock_release_failed: false,
+        }
     }
 
     pub(crate) fn code(&self) -> &'static str {
         self.code
+    }
+
+    pub(crate) fn applied_ordinals(&self) -> &[u32] {
+        &self.applied_ordinals
+    }
+
+    pub(crate) fn lock_release_failed(&self) -> bool {
+        self.lock_release_failed
+    }
+
+    fn with_applied_ordinals(mut self, applied_ordinals: Vec<u32>) -> Self {
+        self.applied_ordinals = applied_ordinals;
+        self
+    }
+
+    fn with_lock_release_failed(mut self) -> Self {
+        self.lock_release_failed = true;
+        self
     }
 }
 
@@ -295,6 +323,11 @@ pub(crate) struct OneClickApprovalArtifact {
     pub(crate) plan_hash: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OneClickApplyOutcome {
+    pub(crate) applied_ordinals: Vec<u32>,
+}
+
 #[derive(Serialize)]
 struct OneClickPlanHashDocument<'a> {
     plan_version: u32,
@@ -308,6 +341,13 @@ struct OneClickPlanHashDocument<'a> {
 pub(crate) struct ValidatedOneClickPlanRequest {
     pub(crate) endpoint: Endpoint,
     pub(crate) schema: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ValidatedOneClickApplyRequest {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) schema: String,
+    pub(crate) approval: OneClickApprovalArtifact,
 }
 
 #[derive(Deserialize)]
@@ -449,6 +489,239 @@ pub(crate) fn parse_oneclick_plan_request(
             schema: Some(schema.clone()),
         },
         schema,
+    })
+}
+
+fn object_has_only_keys(object: &serde_json::Map<String, Value>, allowed: &[&str]) -> bool {
+    object.keys().all(|key| allowed.contains(&key.as_str()))
+}
+
+fn is_sha256_hex(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+pub(crate) fn parse_oneclick_apply_request(
+    request: &Request,
+) -> Result<ValidatedOneClickApplyRequest, OneClickContractError> {
+    const ROOT_KEYS: &[&str] = &[
+        "connection",
+        "schema",
+        "dry_run",
+        "backup_confirmed",
+        "approval",
+    ];
+    const ENDPOINT_KEYS: &[&str] = &[
+        "engine", "host", "port", "user", "password", "database", "schema",
+    ];
+    const APPROVAL_KEYS: &[&str] = &[
+        "approval_version",
+        "plan_version",
+        "target_identity",
+        "remediation_profile",
+        "snapshot_hash",
+        "plan_hash",
+    ];
+    const IDENTITY_KEYS: &[&str] = &[
+        "engine",
+        "route",
+        "server_uuid",
+        "authenticated_user",
+        "schema",
+    ];
+    const ROUTE_KEYS: &[&str] = &["host", "port"];
+    const PROFILE_KEYS: &[&str] = &[
+        "profile_version",
+        "profile_id",
+        "target_charset",
+        "target_collation",
+    ];
+
+    let prohibited = || {
+        OneClickContractError::new(
+            "oneclick_apply_payload_prohibited",
+            "One-Click apply payload is prohibited.",
+        )
+    };
+    let root = request.payload.as_object().ok_or_else(prohibited)?;
+    if !object_has_only_keys(root, ROOT_KEYS) {
+        return Err(prohibited());
+    }
+    if root.get("dry_run").and_then(Value::as_bool) != Some(false) {
+        return Err(prohibited());
+    }
+    if root.get("backup_confirmed").and_then(Value::as_bool) != Some(true) {
+        return Err(OneClickContractError::new(
+            "oneclick_backup_required",
+            "One-Click apply requires confirmed backup evidence.",
+        ));
+    }
+
+    let connection = root
+        .get("connection")
+        .and_then(Value::as_object)
+        .ok_or_else(prohibited)?;
+    if !object_has_only_keys(connection, ENDPOINT_KEYS) {
+        return Err(prohibited());
+    }
+    let schema = root
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(prohibited)
+        .and_then(normalize_oneclick_schema)?;
+    for key in ["database", "schema"] {
+        if connection
+            .get(key)
+            .is_some_and(|value| value.as_str() != Some(schema.as_str()))
+        {
+            return Err(OneClickContractError::new(
+                "oneclick_schema_mismatch",
+                "One-Click schema does not match the connection schema.",
+            ));
+        }
+    }
+    let endpoint_wire: OneClickEndpointWire =
+        serde_json::from_value(Value::Object(connection.clone())).map_err(|_| prohibited())?;
+    if endpoint_wire.engine != "mysql"
+        || endpoint_wire.host.trim().is_empty()
+        || endpoint_wire.user.trim().is_empty()
+        || endpoint_wire
+            .database
+            .as_deref()
+            .is_some_and(|nested| nested != schema)
+        || endpoint_wire
+            .schema
+            .as_deref()
+            .is_some_and(|nested| nested != schema)
+    {
+        return Err(prohibited());
+    }
+
+    let approval = root
+        .get("approval")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            OneClickContractError::new(
+                "oneclick_approval_required",
+                "One-Click apply requires an approval artifact.",
+            )
+        })?;
+    if !object_has_only_keys(approval, APPROVAL_KEYS) {
+        return Err(prohibited());
+    }
+    if approval
+        .get("approval_version")
+        .and_then(Value::as_u64)
+        != Some(u64::from(ONECLICK_APPROVAL_VERSION))
+        || approval.get("plan_version").and_then(Value::as_u64)
+            != Some(u64::from(ONECLICK_PLAN_VERSION))
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_approval_version_unsupported",
+            "The One-Click approval version is unsupported.",
+        ));
+    }
+
+    let profile_value = approval.get("remediation_profile").ok_or_else(|| {
+        OneClickContractError::new(
+            "oneclick_profile_required",
+            "One-Click apply requires a remediation profile.",
+        )
+    })?;
+    let profile_object = profile_value.as_object().ok_or_else(|| {
+        OneClickContractError::new(
+            "oneclick_profile_required",
+            "One-Click apply requires a remediation profile.",
+        )
+    })?;
+    if !object_has_only_keys(profile_object, PROFILE_KEYS) {
+        return Err(prohibited());
+    }
+    if profile_object
+        .get("profile_version")
+        .and_then(Value::as_u64)
+        != Some(u64::from(ONECLICK_PROFILE_VERSION))
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_profile_unsupported",
+            "The One-Click remediation profile version is unsupported.",
+        ));
+    }
+    let profile: OneClickRemediationProfile = serde_json::from_value(profile_value.clone())
+        .map_err(|_| {
+            OneClickContractError::new(
+                "oneclick_profile_required",
+                "One-Click apply requires a complete remediation profile.",
+            )
+        })?;
+    if profile != fixed_oneclick_profile() {
+        return Err(OneClickContractError::new(
+            "oneclick_profile_substitution",
+            "The approved One-Click remediation profile was substituted.",
+        ));
+    }
+
+    let identity = approval
+        .get("target_identity")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            OneClickContractError::new(
+                "oneclick_approval_required",
+                "One-Click apply requires a complete approval artifact.",
+            )
+        })?;
+    let route = identity
+        .get("route")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            OneClickContractError::new(
+                "oneclick_approval_required",
+                "One-Click apply requires a complete approval artifact.",
+            )
+        })?;
+    if !object_has_only_keys(identity, IDENTITY_KEYS) || !object_has_only_keys(route, ROUTE_KEYS) {
+        return Err(prohibited());
+    }
+    let approval: OneClickApprovalArtifact =
+        serde_json::from_value(Value::Object(approval.clone())).map_err(|_| {
+            OneClickContractError::new(
+                "oneclick_approval_required",
+                "One-Click apply requires a complete approval artifact.",
+            )
+        })?;
+    if approval.target_identity.schema != schema {
+        return Err(OneClickContractError::new(
+            "oneclick_schema_mismatch",
+            "One-Click approval schema does not match the request schema.",
+        ));
+    }
+    if !has_text(&approval.target_identity.engine)
+        || !has_text(&approval.target_identity.route.host)
+        || !has_text(&approval.target_identity.server_uuid)
+        || !has_text(&approval.target_identity.authenticated_user)
+        || !is_sha256_hex(&approval.snapshot_hash)
+        || !is_sha256_hex(&approval.plan_hash)
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_approval_required",
+            "One-Click apply requires a complete approval artifact.",
+        ));
+    }
+
+    Ok(ValidatedOneClickApplyRequest {
+        endpoint: Endpoint {
+            engine: endpoint_wire.engine,
+            host: endpoint_wire.host,
+            port: endpoint_wire.port,
+            user: endpoint_wire.user,
+            password: endpoint_wire.password,
+            database: schema.clone(),
+            schema: Some(schema.clone()),
+        },
+        schema,
+        approval,
     })
 }
 
@@ -995,6 +1268,16 @@ pub(crate) trait OneClickPlanningSession {
     fn read_fk_facts(&mut self, schema: &str) -> Result<Vec<ActionForeignKeyFact>, String>;
 }
 
+pub(crate) trait OneClickApplySession: OneClickPlanningSession {
+    fn acquire_advisory_lock(&mut self, key: &str, seconds: u32) -> Result<bool, String>;
+    fn release_advisory_lock(&mut self, key: &str) -> Result<(), String>;
+    fn read_action_facts(
+        &mut self,
+        action: &OneClickApplyAction,
+    ) -> Result<ActionFactsDocument, String>;
+    fn execute_sql(&mut self, sql: &str) -> Result<(), String>;
+}
+
 fn planning_failed() -> OneClickContractError {
     OneClickContractError::new(
         "oneclick_plan_failed",
@@ -1333,6 +1616,192 @@ pub(crate) fn build_oneclick_plan<S: OneClickPlanningSession>(
     Ok(plan)
 }
 
+fn normalize_oneclick_server_uuid(value: &str) -> Option<String> {
+    let bytes = value.as_bytes();
+    if bytes.len() != 32 && bytes.len() != 36 {
+        return None;
+    }
+    if bytes.len() == 36
+        && [8usize, 13, 18, 23]
+            .into_iter()
+            .any(|position| bytes[position] != b'-')
+    {
+        return None;
+    }
+    let compact = bytes
+        .iter()
+        .enumerate()
+        .filter_map(|(position, byte)| {
+            if bytes.len() == 36 && [8usize, 13, 18, 23].contains(&position) {
+                None
+            } else {
+                Some(byte.to_ascii_lowercase())
+            }
+        })
+        .collect::<Vec<_>>();
+    if compact.len() != 32 || !compact.iter().all(u8::is_ascii_hexdigit) {
+        return None;
+    }
+    let compact = String::from_utf8(compact).ok()?;
+    Some(format!(
+        "{}-{}-{}-{}-{}",
+        &compact[0..8],
+        &compact[8..12],
+        &compact[12..16],
+        &compact[16..20],
+        &compact[20..32]
+    ))
+}
+
+pub(crate) fn oneclick_advisory_lock_key(
+    identity: &OneClickTargetIdentity,
+) -> Result<String, OneClickContractError> {
+    let server_uuid = normalize_oneclick_server_uuid(&identity.server_uuid).ok_or_else(|| {
+        OneClickContractError::new(
+            "oneclick_target_changed",
+            "The One-Click target server UUID is invalid.",
+        )
+    })?;
+    let mut digest = Sha256::new();
+    digest.update(LOCK_KEY_HASH_DOMAIN);
+    digest.update(server_uuid.as_bytes());
+    let key = format!("tf1:{}", URL_SAFE_NO_PAD.encode(digest.finalize()));
+    debug_assert_eq!(key.len(), 47);
+    Ok(key)
+}
+
+fn oneclick_replan_error(error: OneClickContractError) -> OneClickContractError {
+    match error.code() {
+        "oneclick_profile_unsupported" | "oneclick_target_changed" => error,
+        _ => OneClickContractError::new(
+            "oneclick_replan_failed",
+            "The approved One-Click plan could not be rebuilt.",
+        ),
+    }
+}
+
+fn execute_locked_oneclick<S: OneClickApplySession>(
+    session: &mut S,
+    validated: &ValidatedOneClickApplyRequest,
+) -> Result<OneClickApplyOutcome, OneClickContractError> {
+    let replan = build_oneclick_plan(session, &validated.endpoint, &validated.schema)
+        .map_err(oneclick_replan_error)?;
+    if replan.target_identity != validated.approval.target_identity {
+        return Err(OneClickContractError::new(
+            "oneclick_target_changed",
+            "The approved One-Click target identity changed.",
+        ));
+    }
+    if replan.remediation_profile != validated.approval.remediation_profile {
+        return Err(OneClickContractError::new(
+            "oneclick_profile_substitution",
+            "The approved One-Click remediation profile was substituted.",
+        ));
+    }
+    if replan.actions.is_empty() {
+        return Err(OneClickContractError::new(
+            "oneclick_nothing_to_apply",
+            "The approved One-Click plan no longer has actions to apply.",
+        ));
+    }
+    if replan.snapshot_hash != validated.approval.snapshot_hash {
+        return Err(OneClickContractError::new(
+            "oneclick_snapshot_changed",
+            "The approved One-Click target snapshot changed.",
+        ));
+    }
+    if replan.plan_hash != validated.approval.plan_hash {
+        return Err(OneClickContractError::new(
+            "oneclick_plan_changed",
+            "The approved One-Click plan changed.",
+        ));
+    }
+
+    let mut applied_ordinals = Vec::new();
+    for action in &replan.actions {
+        let pre_facts = session.read_action_facts(action).map_err(|_| {
+            OneClickContractError::new(
+                "oneclick_precondition_changed",
+                "A One-Click action precondition could not be verified.",
+            )
+            .with_applied_ordinals(applied_ordinals.clone())
+        })?;
+        if pre_facts != action.expected_pre_facts.facts {
+            return Err(OneClickContractError::new(
+                "oneclick_precondition_changed",
+                "A One-Click action precondition changed.",
+            )
+            .with_applied_ordinals(applied_ordinals));
+        }
+        if session.execute_sql(&action.sql).is_err() {
+            return Err(OneClickContractError::new(
+                "oneclick_postcondition_changed",
+                "A One-Click action did not reach its approved postcondition.",
+            )
+            .with_applied_ordinals(applied_ordinals));
+        }
+        applied_ordinals.push(action.ordinal);
+        let post_facts = session.read_action_facts(action).map_err(|_| {
+            OneClickContractError::new(
+                "oneclick_postcondition_changed",
+                "A One-Click action postcondition could not be verified.",
+            )
+            .with_applied_ordinals(applied_ordinals.clone())
+        })?;
+        if post_facts != action.expected_post_facts.facts {
+            return Err(OneClickContractError::new(
+                "oneclick_postcondition_changed",
+                "A One-Click action postcondition changed.",
+            )
+            .with_applied_ordinals(applied_ordinals));
+        }
+    }
+    Ok(OneClickApplyOutcome { applied_ordinals })
+}
+
+pub(crate) fn execute_approved_oneclick<S: OneClickApplySession>(
+    session: &mut S,
+    validated: &ValidatedOneClickApplyRequest,
+) -> Result<OneClickApplyOutcome, OneClickContractError> {
+    let identity = session
+        .read_target_identity(&validated.endpoint)
+        .map_err(|_| {
+            OneClickContractError::new(
+                "oneclick_replan_failed",
+                "The One-Click target identity could not be read.",
+            )
+        })?;
+    let lock_key = oneclick_advisory_lock_key(&identity)?;
+    let acquired = session
+        .acquire_advisory_lock(&lock_key, ONECLICK_LOCK_TIMEOUT_SECONDS)
+        .map_err(|_| {
+            OneClickContractError::new(
+                "oneclick_lock_unavailable",
+                "The One-Click server advisory lock is unavailable.",
+            )
+        })?;
+    if !acquired {
+        return Err(OneClickContractError::new(
+            "oneclick_lock_unavailable",
+            "The One-Click server advisory lock is unavailable.",
+        ));
+    }
+
+    let result = execute_locked_oneclick(session, validated);
+    match session.release_advisory_lock(&lock_key) {
+        Ok(()) => result,
+        Err(_) => match result {
+            Ok(outcome) => Err(OneClickContractError::new(
+                "oneclick_lock_unavailable",
+                "The One-Click server advisory lock could not be released safely.",
+            )
+            .with_applied_ordinals(outcome.applied_ordinals)
+            .with_lock_release_failed()),
+            Err(error) => Err(error.with_lock_release_failed()),
+        },
+    }
+}
+
 pub(crate) struct LiveOneClickSession {
     conn: mysql::PooledConn,
 }
@@ -1638,13 +2107,58 @@ impl OneClickPlanningSession for LiveOneClickSession {
     }
 }
 
+impl OneClickApplySession for LiveOneClickSession {
+    fn acquire_advisory_lock(&mut self, key: &str, seconds: u32) -> Result<bool, String> {
+        let acquired = self
+            .conn
+            .exec_first::<Option<i64>, _, _>("SELECT GET_LOCK(?, ?)", (key, seconds))
+            .map_err(|err| format!("mysql One-Click lock acquisition failed: {err}"))?
+            .flatten();
+        Ok(acquired == Some(1))
+    }
+
+    fn release_advisory_lock(&mut self, key: &str) -> Result<(), String> {
+        let released = self
+            .conn
+            .exec_first::<Option<i64>, _, _>("SELECT RELEASE_LOCK(?)", (key,))
+            .map_err(|err| format!("mysql One-Click lock release failed: {err}"))?
+            .flatten();
+        if released == Some(1) {
+            Ok(())
+        } else {
+            Err("mysql One-Click lock was not released by this session".to_string())
+        }
+    }
+
+    fn read_action_facts(
+        &mut self,
+        action: &OneClickApplyAction,
+    ) -> Result<ActionFactsDocument, String> {
+        let tables = self.read_table_definitions(&action.schema)?;
+        let foreign_keys = self.read_fk_facts(&action.schema)?;
+        let names = action.tables.iter().cloned().collect::<BTreeSet<_>>();
+        scoped_action_facts(action.action_type, &tables, &foreign_keys, &names)
+            .map_err(|error| error.message.to_string())
+    }
+
+    fn execute_sql(&mut self, sql: &str) -> Result<(), String> {
+        self.conn
+            .query_drop(sql)
+            .map_err(|err| format!("mysql One-Click action failed: {err}"))
+    }
+}
+
 fn oneclick_contract_error_event(request: &Request, error: &OneClickContractError) -> Value {
-    json!({
-        "event": "error",
-        "request_id": request.request_id,
-        "code": error.code(),
-        "message": error.message
-    })
+    let mut event = protocol_error_event(
+        request.request_id.clone(),
+        error.code(),
+        error.message,
+    );
+    event["applied_ordinals"] = json!(error.applied_ordinals());
+    if error.lock_release_failed() {
+        event["lock_release_failed"] = json!(true);
+    }
+    event
 }
 
 pub(crate) fn oneclick_plan(request: &Request) -> Vec<Value> {
@@ -1677,21 +2191,50 @@ pub(crate) fn oneclick_plan(request: &Request) -> Vec<Value> {
 }
 
 pub(crate) fn oneclick_legacy_preview_disabled(request: &Request) -> Vec<Value> {
-    vec![json!({
-        "event": "error",
-        "request_id": request.request_id,
-        "code": "oneclick_legacy_preview_disabled",
-        "message": "Legacy One-Click preview is disabled; use oneclick.plan."
-    })]
+    vec![oneclick_contract_error_event(
+        request,
+        &OneClickContractError::new(
+            "oneclick_legacy_preview_disabled",
+            "Legacy One-Click preview is disabled; use oneclick.plan.",
+        ),
+    )]
 }
 
 fn oneclick_apply_disabled_event(request: &Request) -> Value {
-    json!({
-        "event": "error",
-        "request_id": request.request_id,
-        "code": "oneclick_apply_disabled",
-        "message": "One-Click apply is disabled until exact plan approval protection is available."
-    })
+    oneclick_contract_error_event(
+        request,
+        &OneClickContractError::new(
+            "oneclick_apply_disabled",
+            "One-Click apply is disabled until both execution safety proofs are available.",
+        ),
+    )
+}
+
+pub(crate) fn oneclick_apply_with_session_factory<F>(
+    request: &Request,
+    exact_plan_enabled: bool,
+    strong_fence_proven: bool,
+    factory: F,
+) -> Vec<Value>
+where
+    F: FnOnce(&ValidatedOneClickApplyRequest) -> Vec<Value>,
+{
+    let dry_run = request
+        .payload
+        .get("dry_run")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    if dry_run {
+        return oneclick_legacy_preview_disabled(request);
+    }
+    if !oneclick_apply_enabled(exact_plan_enabled, strong_fence_proven) {
+        return vec![oneclick_apply_disabled_event(request)];
+    }
+    let validated = match parse_oneclick_apply_request(request) {
+        Ok(validated) => validated,
+        Err(error) => return vec![oneclick_contract_error_event(request, &error)],
+    };
+    factory(&validated)
 }
 
 pub(crate) fn preflight_streaming<F, R>(request: &Request, mut emit: F) -> ProtocolEmitResult
@@ -2077,97 +2620,36 @@ pub(crate) fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value>
 }
 
 pub(crate) fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
-    let dry_run = request
-        .payload
-        .get("dry_run")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    if dry_run {
-        return oneclick_legacy_preview_disabled(request);
-    }
-    if !oneclick_apply_enabled(
+    oneclick_apply_with_session_factory(
+        request,
         ONECLICK_EXACT_PLAN_ENABLED,
         ONECLICK_STRONG_FENCE_PROVEN,
-    ) {
-        return vec![oneclick_apply_disabled_event(request)];
-    }
-
-    let mut events = vec![phase_event(
-        request,
-        "execution",
-        "one-click apply fixes started",
-    )];
-    let plan = oneclick_apply_actions(&request.payload);
-    if !plan.disallowed.is_empty() {
-        events.push(json!({
-            "event": "result",
-            "request_id": request.request_id,
-            "command": "oneclick.apply_fixes",
-            "success": false,
-            "dry_run": false,
-            "success_count": 0,
-            "fail_count": plan.disallowed.len(),
-            "skip_count": plan.skipped,
-            "disallowed_fix_attempts": plan.disallowed,
-            "applied_fixes": [],
-            "log": ["Disallowed One-Click automatic fix attempt blocked."]
-        }));
-        return events;
-    }
-
-    if plan.actions.is_empty() {
-        events.push(json!({
-            "event": "result",
-            "request_id": request.request_id,
-            "command": "oneclick.apply_fixes",
-            "success": true,
-            "dry_run": false,
-            "success_count": 0,
-            "fail_count": 0,
-            "skip_count": plan.skipped,
-            "disallowed_fix_attempts": [],
-            "applied_fixes": [],
-            "log": ["No automatic Rust Core fixes are currently required."]
-        }));
-        return events;
-    }
-
-    let (endpoint, _) = match oneclick_endpoint(request) {
-        Ok(endpoint) => endpoint,
-        Err(err) => {
-            events.push(error_event(request, err));
-            return events;
-        }
-    };
-    if endpoint.engine != "mysql" {
-        events.push(error_event(
-            request,
-            "oneclick.apply_fixes currently supports MySQL engine fixes only",
-        ));
-        return events;
-    }
-    let mut adapter = match LiveAdapter::connect(&endpoint) {
-        Ok(adapter) => adapter,
-        Err(err) => {
-            events.push(error_event(request, err));
-            return events;
-        }
-    };
-    let outcome = oneclick_execute_apply_plan(&plan, &mut adapter);
-    events.push(json!({
-        "event": "result",
-        "request_id": request.request_id,
-        "command": "oneclick.apply_fixes",
-        "success": outcome.fail_count == 0,
-        "dry_run": false,
-        "success_count": outcome.success_count,
-        "fail_count": outcome.fail_count,
-        "skip_count": plan.skipped,
-        "disallowed_fix_attempts": [],
-        "applied_fixes": outcome.applied_fixes,
-        "log": outcome.log
-    }));
-    events
+        |validated| {
+            let mut session = match LiveOneClickSession::connect(&validated.endpoint) {
+                Ok(session) => session,
+                Err(_) => {
+                    return vec![oneclick_contract_error_event(
+                        request,
+                        &OneClickContractError::new(
+                            "oneclick_replan_failed",
+                            "The approved One-Click target could not be opened.",
+                        ),
+                    )]
+                }
+            };
+            match execute_approved_oneclick(&mut session, validated) {
+                Ok(outcome) => vec![json!({
+                    "event": "result",
+                    "request_id": request.request_id,
+                    "command": "oneclick.apply_fixes",
+                    "success": true,
+                    "dry_run": false,
+                    "applied_ordinals": outcome.applied_ordinals
+                })],
+                Err(error) => vec![oneclick_contract_error_event(request, &error)],
+            }
+        },
+    )
 }
 
 pub(crate) fn oneclick_validate(request: &Request) -> Vec<Value> {
@@ -2989,7 +3471,7 @@ struct OneClickApplyPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct OneClickApplyOutcome {
+struct LegacyOneClickApplyOutcome {
     success_count: usize,
     fail_count: usize,
     skip_count: usize,
@@ -3191,7 +3673,7 @@ fn oneclick_dry_run_preview_fixes(payload: &Value) -> OneClickDryRunPreview {
 fn oneclick_execute_apply_plan<A: MigrationAdapter>(
     plan: &OneClickApplyPlan,
     adapter: &mut A,
-) -> OneClickApplyOutcome {
+) -> LegacyOneClickApplyOutcome {
     let mut success_count = 0usize;
     let mut fail_count = 0usize;
     let mut log = Vec::new();
@@ -3221,7 +3703,7 @@ fn oneclick_execute_apply_plan<A: MigrationAdapter>(
         }
     }
 
-    OneClickApplyOutcome {
+    LegacyOneClickApplyOutcome {
         success_count,
         fail_count,
         skip_count: plan.skipped,
@@ -3237,9 +3719,9 @@ fn oneclick_execute_stage(
     state: &OneClickState,
     apply_plan: &OneClickApplyPlan,
     dry_run: bool,
-) -> OneClickApplyOutcome {
+) -> LegacyOneClickApplyOutcome {
     if dry_run {
-        OneClickApplyOutcome {
+        LegacyOneClickApplyOutcome {
             success_count: 0,
             fail_count: 0,
             skip_count: apply_plan.actions.len() + apply_plan.skipped,
@@ -3248,7 +3730,7 @@ fn oneclick_execute_stage(
             applied_fixes: Vec::new(),
         }
     } else if !apply_plan.disallowed.is_empty() {
-        OneClickApplyOutcome {
+        LegacyOneClickApplyOutcome {
             success_count: 0,
             fail_count: apply_plan.disallowed.len(),
             skip_count: apply_plan.skipped,
@@ -3257,7 +3739,7 @@ fn oneclick_execute_stage(
             applied_fixes: Vec::new(),
         }
     } else if apply_plan.actions.is_empty() {
-        OneClickApplyOutcome {
+        LegacyOneClickApplyOutcome {
             success_count: 0,
             fail_count: 0,
             skip_count: apply_plan.skipped,
@@ -3268,7 +3750,7 @@ fn oneclick_execute_stage(
     } else {
         match LiveAdapter::connect(&state.endpoint) {
             Ok(mut adapter) => oneclick_execute_apply_plan(apply_plan, &mut adapter),
-            Err(err) => OneClickApplyOutcome {
+            Err(err) => LegacyOneClickApplyOutcome {
                 success_count: 0,
                 fail_count: apply_plan.actions.len(),
                 skip_count: apply_plan.skipped,
@@ -3410,7 +3892,7 @@ mod tests {
     
     
     use serde_json::json;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     
     
     
@@ -4346,6 +4828,460 @@ mod tests {
         }
         plan.snapshot_hash = hash_snapshot(&plan.snapshot).unwrap();
         plan.plan_hash = compute_oneclick_plan_hash(plan).unwrap();
+    }
+
+    struct RecordingOneClickSession {
+        profile_supported: bool,
+        identity: OneClickTargetIdentity,
+        inspection: InspectionResult,
+        tables: Vec<ActionTableDefinitionFact>,
+        foreign_keys: Vec<ActionForeignKeyFact>,
+        lock_result: Result<bool, String>,
+        release_error: bool,
+        sql_error: bool,
+        fact_reads: VecDeque<Result<ActionFactsDocument, String>>,
+        calls: Vec<String>,
+        executed_sql: Vec<String>,
+    }
+
+    impl RecordingOneClickSession {
+        fn from_planning(planning: &RecordingPlanningSession, endpoint: &Endpoint) -> Self {
+            let mut identity_session = planning.clone();
+            let identity = identity_session.read_target_identity(endpoint).unwrap();
+            Self {
+                profile_supported: planning.profile_supported,
+                identity,
+                inspection: planning.inspection.clone(),
+                tables: planning.tables.clone(),
+                foreign_keys: planning.foreign_keys.clone(),
+                lock_result: Ok(true),
+                release_error: false,
+                sql_error: false,
+                fact_reads: VecDeque::new(),
+                calls: Vec::new(),
+                executed_sql: Vec::new(),
+            }
+        }
+
+        fn queue_successful_action_facts(&mut self, plan: &OneClickPlanEnvelope) {
+            for action in &plan.actions {
+                self.fact_reads
+                    .push_back(Ok(action.expected_pre_facts.facts.clone()));
+                self.fact_reads
+                    .push_back(Ok(action.expected_post_facts.facts.clone()));
+            }
+        }
+    }
+
+    impl OneClickPlanningSession for RecordingOneClickSession {
+        fn profile_supported(
+            &mut self,
+            _profile: &OneClickRemediationProfile,
+        ) -> Result<bool, String> {
+            self.calls.push("profile".to_string());
+            Ok(self.profile_supported)
+        }
+
+        fn read_target_identity(
+            &mut self,
+            _endpoint: &Endpoint,
+        ) -> Result<OneClickTargetIdentity, String> {
+            self.calls.push("identity".to_string());
+            Ok(self.identity.clone())
+        }
+
+        fn inspect(&mut self, _endpoint: &Endpoint) -> Result<InspectionResult, String> {
+            self.calls.push("inspect".to_string());
+            Ok(self.inspection.clone())
+        }
+
+        fn read_table_definitions(
+            &mut self,
+            _schema: &str,
+        ) -> Result<Vec<ActionTableDefinitionFact>, String> {
+            self.calls.push("tables".to_string());
+            Ok(self.tables.clone())
+        }
+
+        fn read_fk_facts(
+            &mut self,
+            _schema: &str,
+        ) -> Result<Vec<ActionForeignKeyFact>, String> {
+            self.calls.push("fks".to_string());
+            Ok(self.foreign_keys.clone())
+        }
+    }
+
+    impl OneClickApplySession for RecordingOneClickSession {
+        fn acquire_advisory_lock(&mut self, key: &str, seconds: u32) -> Result<bool, String> {
+            self.calls.push(format!("lock:{key}:{seconds}"));
+            self.lock_result.clone()
+        }
+
+        fn release_advisory_lock(&mut self, key: &str) -> Result<(), String> {
+            self.calls.push(format!("release:{key}"));
+            if self.release_error {
+                Err("simulated release failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+
+        fn read_action_facts(
+            &mut self,
+            action: &OneClickApplyAction,
+        ) -> Result<ActionFactsDocument, String> {
+            self.calls.push(format!("facts:{}", action.ordinal));
+            self.fact_reads
+                .pop_front()
+                .unwrap_or_else(|| Err("missing recorded facts".to_string()))
+        }
+
+        fn execute_sql(&mut self, sql: &str) -> Result<(), String> {
+            self.calls.push(format!("sql:{sql}"));
+            self.executed_sql.push(sql.to_string());
+            if self.sql_error {
+                Err("simulated SQL failure".to_string())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn oneclick_two_action_fixture() -> (
+        Endpoint,
+        RecordingPlanningSession,
+        OneClickPlanEnvelope,
+        ValidatedOneClickApplyRequest,
+    ) {
+        let endpoint = oneclick_plan_endpoint();
+        let mut planning = oneclick_plan_recording_session(true);
+        planning.foreign_keys.clear();
+        planning.tables.truncate(2);
+        let plan = build_oneclick_plan(&mut planning, &endpoint, "app").unwrap();
+        assert_eq!(plan.actions.len(), 2);
+        let validated = ValidatedOneClickApplyRequest {
+            endpoint: endpoint.clone(),
+            schema: "app".to_string(),
+            approval: oneclick_approval_artifact(&plan),
+        };
+        (endpoint, planning, plan, validated)
+    }
+
+    fn assert_precondition_stale(mutator: fn(&mut ActionFactsDocument)) {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+        let mut session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        let mut stale = plan.actions[0].expected_pre_facts.facts.clone();
+        mutator(&mut stale);
+        session.fact_reads.push_back(Ok(stale));
+
+        let error = execute_approved_oneclick(&mut session, &validated).unwrap_err();
+
+        assert_eq!(error.code(), "oneclick_precondition_changed");
+        assert!(error.applied_ordinals().is_empty());
+        assert!(session.executed_sql.is_empty());
+        assert_eq!(
+            session.calls.iter().filter(|call| call.starts_with("release:")).count(),
+            1
+        );
+    }
+
+    #[test]
+    fn oneclick_lock_key_is_uuid_only_base64url_and_deterministic() {
+        let (_, planning, _, _) = oneclick_two_action_fixture();
+        let endpoint = oneclick_plan_endpoint();
+        let mut identity_session = planning.clone();
+        let identity = identity_session.read_target_identity(&endpoint).unwrap();
+        let key = oneclick_advisory_lock_key(&identity).unwrap();
+
+        assert_eq!(key.len(), 47);
+        assert_eq!(key, "tf1:yUaNKbxZldyM5ikF2MREUQdJDuPDGq7d6c8h6uutluw");
+        assert!(key.starts_with("tf1:"));
+        assert!(key[4..]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'));
+        assert!(!key.contains('='));
+        assert_eq!(oneclick_advisory_lock_key(&identity).unwrap(), key);
+
+        let mut aliases = identity.clone();
+        aliases.route.host = "db.internal".to_string();
+        aliases.route.port = 4406;
+        aliases.authenticated_user = "other@%".to_string();
+        aliases.schema = "other".to_string();
+        aliases.engine = "alias".to_string();
+        assert_eq!(oneclick_advisory_lock_key(&aliases).unwrap(), key);
+
+        let mut upper = aliases.clone();
+        upper.server_uuid = identity.server_uuid.to_ascii_uppercase();
+        assert_eq!(oneclick_advisory_lock_key(&upper).unwrap(), key);
+
+        let mut other = identity;
+        other.server_uuid = "ffffffff-bbbb-cccc-dddd-eeeeeeeeeeee".to_string();
+        assert_ne!(oneclick_advisory_lock_key(&other).unwrap(), key);
+    }
+
+    #[test]
+    fn oneclick_apply_executor_uses_one_session_and_exact_pre_sql_post_order() {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+        let mut session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        session.queue_successful_action_facts(&plan);
+
+        let outcome = execute_approved_oneclick(&mut session, &validated).unwrap();
+
+        assert_eq!(outcome.applied_ordinals, vec![1, 2]);
+        assert_eq!(
+            session.executed_sql,
+            plan.actions
+                .iter()
+                .map(|action| action.sql.clone())
+                .collect::<Vec<_>>()
+        );
+        let facts_and_sql = session
+            .calls
+            .iter()
+            .filter(|call| call.starts_with("facts:") || call.starts_with("sql:"))
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(
+            facts_and_sql,
+            vec![
+                "facts:1".to_string(),
+                format!("sql:{}", plan.actions[0].sql),
+                "facts:1".to_string(),
+                "facts:2".to_string(),
+                format!("sql:{}", plan.actions[1].sql),
+                "facts:2".to_string(),
+            ]
+        );
+        assert_eq!(session.calls[0], "identity");
+        assert!(session.calls[1].starts_with("lock:tf1:"));
+        assert!(session.calls.last().unwrap().starts_with("release:tf1:"));
+    }
+
+    #[test]
+    fn oneclick_apply_executor_detects_column_generated_index_and_fk_precondition_staleness() {
+        assert_precondition_stale(|facts| {
+            facts.tables[0].columns[0].column_type = "bigint".to_string();
+        });
+        assert_precondition_stale(|facts| {
+            facts.tables[0].columns[0].generated_expression = Some("id + 1".to_string());
+            facts.tables[0].columns[0].generated_stored = Some(true);
+            facts.tables[0].columns[0].default = ColumnDefaultFact::Absent;
+        });
+        assert_precondition_stale(|facts| {
+            facts.tables[0].indexes[0].visible = false;
+        });
+        assert_precondition_stale(|facts| {
+            let table = &facts.tables[0];
+            facts.foreign_keys.push(ActionForeignKeyFact {
+                constraint_schema: table.schema.clone(),
+                constraint_name: "fk_stale".to_string(),
+                table_schema: table.schema.clone(),
+                table_name: table.table.clone(),
+                referenced_table_schema: table.schema.clone(),
+                referenced_table_name: table.table.clone(),
+                match_option: "NONE".to_string(),
+                update_rule: "RESTRICT".to_string(),
+                delete_rule: "RESTRICT".to_string(),
+                columns: vec![ActionForeignKeyColumnFact {
+                    ordinal_position: 1,
+                    column_name: table.columns[0].name.clone(),
+                    referenced_column_name: table.columns[0].name.clone(),
+                }],
+            });
+        });
+    }
+
+    #[test]
+    fn oneclick_apply_executor_stops_between_actions_and_reports_partial_ordinals() {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+        let mut session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        session
+            .fact_reads
+            .push_back(Ok(plan.actions[0].expected_pre_facts.facts.clone()));
+        session
+            .fact_reads
+            .push_back(Ok(plan.actions[0].expected_post_facts.facts.clone()));
+        let mut stale = plan.actions[1].expected_pre_facts.facts.clone();
+        stale.tables[0].columns[0].column_type = "bigint".to_string();
+        session.fact_reads.push_back(Ok(stale));
+
+        let error = execute_approved_oneclick(&mut session, &validated).unwrap_err();
+
+        assert_eq!(error.code(), "oneclick_precondition_changed");
+        assert_eq!(error.applied_ordinals(), &[1]);
+        assert_eq!(session.executed_sql, vec![plan.actions[0].sql.clone()]);
+        assert!(session.calls.last().unwrap().starts_with("release:tf1:"));
+    }
+
+    #[test]
+    fn oneclick_apply_executor_stops_after_postcondition_drift() {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+        let mut session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        session
+            .fact_reads
+            .push_back(Ok(plan.actions[0].expected_pre_facts.facts.clone()));
+        let mut stale = plan.actions[0].expected_post_facts.facts.clone();
+        stale.tables[0].engine = Some("MyISAM".to_string());
+        session.fact_reads.push_back(Ok(stale));
+
+        let error = execute_approved_oneclick(&mut session, &validated).unwrap_err();
+
+        assert_eq!(error.code(), "oneclick_postcondition_changed");
+        assert_eq!(error.applied_ordinals(), &[1]);
+        assert_eq!(session.executed_sql, vec![plan.actions[0].sql.clone()]);
+        assert!(session.calls.last().unwrap().starts_with("release:tf1:"));
+    }
+
+    #[test]
+    fn oneclick_apply_executor_rejects_snapshot_plan_and_zero_action_replans() {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+
+        let mut snapshot_changed = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        snapshot_changed.tables[0].columns[0].column_type = "bigint".to_string();
+        let error = execute_approved_oneclick(&mut snapshot_changed, &validated).unwrap_err();
+        assert_eq!(error.code(), "oneclick_snapshot_changed");
+        assert!(snapshot_changed.executed_sql.is_empty());
+        assert!(snapshot_changed.calls.last().unwrap().starts_with("release:tf1:"));
+
+        let mut plan_changed = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        let mut substituted_plan = validated.clone();
+        substituted_plan.approval.plan_hash = "c".repeat(64);
+        let error = execute_approved_oneclick(&mut plan_changed, &substituted_plan).unwrap_err();
+        assert_eq!(error.code(), "oneclick_plan_changed");
+        assert!(plan_changed.executed_sql.is_empty());
+
+        let mut nothing = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        nothing.inspection.unsupported_objects.clear();
+        for table in &mut nothing.tables {
+            table.engine = Some("InnoDB".to_string());
+            table.charset = Some("utf8mb4".to_string());
+            table.collation = Some("utf8mb4_0900_ai_ci".to_string());
+            for column in &mut table.columns {
+                if column.charset.is_some() {
+                    column.charset = Some("utf8mb4".to_string());
+                    column.collation = Some("utf8mb4_0900_ai_ci".to_string());
+                }
+            }
+        }
+        let error = execute_approved_oneclick(&mut nothing, &validated).unwrap_err();
+        assert_eq!(error.code(), "oneclick_nothing_to_apply");
+        assert!(nothing.executed_sql.is_empty());
+
+        assert_eq!(plan.actions.len(), 2);
+    }
+
+    #[test]
+    fn oneclick_apply_executor_detects_column_generated_index_and_fk_replan_staleness() {
+        fn assert_snapshot_changed(mutator: fn(&mut RecordingOneClickSession)) {
+            let endpoint = oneclick_plan_endpoint();
+            let mut planning = oneclick_plan_recording_session(true);
+            let plan = build_oneclick_plan(&mut planning, &endpoint, "app").unwrap();
+            let validated = ValidatedOneClickApplyRequest {
+                endpoint: endpoint.clone(),
+                schema: "app".to_string(),
+                approval: oneclick_approval_artifact(&plan),
+            };
+            let mut session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+            mutator(&mut session);
+
+            let error = execute_approved_oneclick(&mut session, &validated).unwrap_err();
+
+            assert_eq!(error.code(), "oneclick_snapshot_changed");
+            assert!(error.applied_ordinals().is_empty());
+            assert!(session.executed_sql.is_empty());
+            assert!(session.calls.last().unwrap().starts_with("release:tf1:"));
+        }
+
+        assert_snapshot_changed(|session| {
+            session.tables[0].columns[0].column_type = "bigint".to_string();
+        });
+        assert_snapshot_changed(|session| {
+            session.tables[0].columns[0].generated_expression = Some("id + 1".to_string());
+            session.tables[0].columns[0].generated_stored = Some(true);
+            session.tables[0].columns[0].default = ColumnDefaultFact::Absent;
+        });
+        assert_snapshot_changed(|session| {
+            session.tables[0].indexes[0].visible = false;
+        });
+        assert_snapshot_changed(|session| {
+            session.foreign_keys[0].update_rule = "CASCADE".to_string();
+        });
+    }
+
+    #[test]
+    fn oneclick_apply_executor_handles_lock_target_profile_replan_and_sql_failures() {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+
+        let mut lock_unavailable = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        lock_unavailable.lock_result = Ok(false);
+        let error = execute_approved_oneclick(&mut lock_unavailable, &validated).unwrap_err();
+        assert_eq!(error.code(), "oneclick_lock_unavailable");
+        assert!(!lock_unavailable
+            .calls
+            .iter()
+            .any(|call| call.starts_with("release:")));
+
+        let mut target_changed = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        target_changed.identity.authenticated_user = "other@localhost".to_string();
+        let error = execute_approved_oneclick(&mut target_changed, &validated).unwrap_err();
+        assert_eq!(error.code(), "oneclick_target_changed");
+        assert!(target_changed.calls.last().unwrap().starts_with("release:tf1:"));
+
+        let mut profile_substitution = validated.clone();
+        profile_substitution.approval.remediation_profile.profile_id = "substituted".to_string();
+        let mut profile_session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        let error = execute_approved_oneclick(&mut profile_session, &profile_substitution)
+            .unwrap_err();
+        assert_eq!(error.code(), "oneclick_profile_substitution");
+        assert!(profile_session.calls.last().unwrap().starts_with("release:tf1:"));
+
+        let mut replan_failed = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        replan_failed.tables[0].columns.clear();
+        let error = execute_approved_oneclick(&mut replan_failed, &validated).unwrap_err();
+        assert_eq!(error.code(), "oneclick_replan_failed");
+        assert!(replan_failed.calls.last().unwrap().starts_with("release:tf1:"));
+
+        let mut sql_failed = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        sql_failed
+            .fact_reads
+            .push_back(Ok(plan.actions[0].expected_pre_facts.facts.clone()));
+        sql_failed.sql_error = true;
+        let error = execute_approved_oneclick(&mut sql_failed, &validated).unwrap_err();
+        assert_eq!(error.code(), "oneclick_postcondition_changed");
+        assert!(error.applied_ordinals().is_empty());
+        assert_eq!(sql_failed.executed_sql, vec![plan.actions[0].sql.clone()]);
+        assert!(sql_failed.calls.last().unwrap().starts_with("release:tf1:"));
+    }
+
+    #[test]
+    fn oneclick_apply_executor_fails_safely_when_successful_lock_release_fails() {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+        let mut session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        session.queue_successful_action_facts(&plan);
+        session.release_error = true;
+
+        let error = execute_approved_oneclick(&mut session, &validated).unwrap_err();
+
+        assert_eq!(error.code(), "oneclick_lock_unavailable");
+        assert_eq!(error.applied_ordinals(), &[1, 2]);
+        assert!(error.lock_release_failed());
+    }
+
+    #[test]
+    fn oneclick_apply_executor_preserves_primary_error_when_release_fails() {
+        let (endpoint, planning, plan, validated) = oneclick_two_action_fixture();
+        let mut session = RecordingOneClickSession::from_planning(&planning, &endpoint);
+        let mut stale = plan.actions[0].expected_pre_facts.facts.clone();
+        stale.tables[0].columns[0].column_type = "bigint".to_string();
+        session.fact_reads.push_back(Ok(stale));
+        session.release_error = true;
+
+        let error = execute_approved_oneclick(&mut session, &validated).unwrap_err();
+
+        assert_eq!(error.code(), "oneclick_precondition_changed");
+        assert!(error.lock_release_failed());
+        assert!(error.applied_ordinals().is_empty());
     }
 
     #[test]

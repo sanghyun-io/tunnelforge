@@ -12,6 +12,7 @@ name = "tunnelforge-core"
 path = "src/main.rs"
 
 [dependencies]
+base64 = "0.22"
 hex = "0.4"
 mysql = "26"
 postgres = "0.19"

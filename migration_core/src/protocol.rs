@@ -1587,6 +1587,42 @@ mod tests {
         assert!(matches!(event["message"].as_str(), Some(value) if !value.is_empty()));
     }
 
+    fn valid_oneclick_apply_payload() -> Value {
+        json!({
+            "connection": {
+                "engine": "mysql",
+                "host": "127.0.0.1",
+                "port": 3306,
+                "user": "app",
+                "password": "secret",
+                "database": "app",
+                "schema": "app"
+            },
+            "schema": "app",
+            "dry_run": false,
+            "backup_confirmed": true,
+            "approval": {
+                "approval_version": 1,
+                "plan_version": 1,
+                "target_identity": {
+                    "engine": "mysql",
+                    "route": {"host": "127.0.0.1", "port": 3306},
+                    "server_uuid": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    "authenticated_user": "app@localhost",
+                    "schema": "app"
+                },
+                "remediation_profile": {
+                    "profile_version": 1,
+                    "profile_id": "mysql-utf8mb4-0900-v1",
+                    "target_charset": "utf8mb4",
+                    "target_collation": "utf8mb4_0900_ai_ci"
+                },
+                "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "plan_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        })
+    }
+
     #[test]
     fn service_hello_advertises_core_protocol() {
         let result = handle_request(Request {
@@ -1764,6 +1800,231 @@ mod tests {
         });
         assert_error_code(&apply_events, "oneclick_apply_disabled");
         assert!(!PUBLIC_COMMANDS.contains(&"oneclick.apply_fixes"));
+    }
+
+    #[test]
+    fn oneclick_apply_raw_parser_rejects_backup_approval_and_profile_substitution() {
+        let cases = [
+            ("backup-missing", vec!["backup_confirmed"], json!(null), "oneclick_backup_required"),
+            ("backup-false", Vec::new(), json!({"backup_confirmed": false}), "oneclick_backup_required"),
+            ("backup-malformed", Vec::new(), json!({"backup_confirmed": "yes"}), "oneclick_backup_required"),
+            ("approval-missing", vec!["approval"], json!(null), "oneclick_approval_required"),
+            ("approval-malformed", Vec::new(), json!({"approval": []}), "oneclick_approval_required"),
+            ("approval-version", Vec::new(), json!({"approval": {"approval_version": 2}}), "oneclick_approval_version_unsupported"),
+            ("profile-missing", Vec::new(), json!({"approval": {"remediation_profile": null}}), "oneclick_profile_required"),
+            ("profile-version", Vec::new(), json!({"approval": {"remediation_profile": {"profile_version": 2}}}), "oneclick_profile_unsupported"),
+            ("profile-substitution", Vec::new(), json!({"approval": {"remediation_profile": {"profile_id": "client-selected"}}}), "oneclick_profile_substitution"),
+        ];
+
+        for (name, removed, overlay, expected) in cases {
+            let mut payload = valid_oneclick_apply_payload();
+            let root = payload.as_object_mut().unwrap();
+            for key in removed {
+                root.remove(key);
+            }
+            if let Some(overlay) = overlay.as_object() {
+                for (key, value) in overlay {
+                    if key == "approval" && value.is_object() {
+                        for (approval_key, approval_value) in value.as_object().unwrap() {
+                            if approval_key == "remediation_profile" && approval_value.is_object() {
+                                let profile = root["approval"]["remediation_profile"]
+                                    .as_object_mut()
+                                    .unwrap();
+                                for (profile_key, profile_value) in approval_value.as_object().unwrap() {
+                                    profile.insert(profile_key.clone(), profile_value.clone());
+                                }
+                            } else {
+                                root["approval"][approval_key] = approval_value.clone();
+                            }
+                        }
+                    } else {
+                        root.insert(key.clone(), value.clone());
+                    }
+                }
+            }
+            let error = parse_oneclick_apply_request(&Request {
+                command: "oneclick.apply_fixes".to_string(),
+                request_id: Some(name.to_string()),
+                payload,
+            })
+            .expect_err(name);
+            assert_eq!(error.code(), expected, "{name}");
+            assert!(error.applied_ordinals().is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn oneclick_apply_raw_parser_rejects_prohibited_fields_and_schema_mismatches() {
+        for key in [
+            "issues",
+            "charset_contracts",
+            "target_charset",
+            "target_collation",
+            "actions",
+            "steps",
+            "profile",
+            "remediation_profile",
+            "unknown",
+        ] {
+            let mut payload = valid_oneclick_apply_payload();
+            payload[key] = json!(true);
+            let error = parse_oneclick_apply_request(&Request {
+                command: "oneclick.apply_fixes".to_string(),
+                request_id: None,
+                payload,
+            })
+            .expect_err(key);
+            assert_eq!(error.code(), "oneclick_apply_payload_prohibited", "{key}");
+        }
+
+        let mut payload = valid_oneclick_apply_payload();
+        payload["connection"]["endpoint_override"] = json!(true);
+        let error = parse_oneclick_apply_request(&Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: None,
+            payload,
+        })
+        .expect_err("nested connection override");
+        assert_eq!(error.code(), "oneclick_apply_payload_prohibited");
+
+        let mut payload = valid_oneclick_apply_payload();
+        payload["approval"]["actions"] = json!([]);
+        let error = parse_oneclick_apply_request(&Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: None,
+            payload,
+        })
+        .expect_err("nested approval actions");
+        assert_eq!(error.code(), "oneclick_apply_payload_prohibited");
+
+        for path in ["database", "schema"] {
+            let mut payload = valid_oneclick_apply_payload();
+            payload["connection"][path] = json!("other");
+            let error = parse_oneclick_apply_request(&Request {
+                command: "oneclick.apply_fixes".to_string(),
+                request_id: None,
+                payload,
+            })
+            .expect_err(path);
+            assert_eq!(error.code(), "oneclick_schema_mismatch", "{path}");
+        }
+
+        let mut payload = valid_oneclick_apply_payload();
+        payload["approval"]["target_identity"]["schema"] = json!("other");
+        let error = parse_oneclick_apply_request(&Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: None,
+            payload,
+        })
+        .expect_err("approval schema mismatch");
+        assert_eq!(error.code(), "oneclick_schema_mismatch");
+    }
+
+    #[test]
+    fn oneclick_apply_raw_parser_rejects_missing_and_malformed_versions() {
+        for (key, replacement) in [
+            ("approval_version", None),
+            ("approval_version", Some(json!("1"))),
+            ("plan_version", None),
+            ("plan_version", Some(json!(2))),
+        ] {
+            let mut payload = valid_oneclick_apply_payload();
+            let approval = payload["approval"].as_object_mut().unwrap();
+            match replacement {
+                Some(value) => {
+                    approval.insert(key.to_string(), value);
+                }
+                None => {
+                    approval.remove(key);
+                }
+            }
+            let error = parse_oneclick_apply_request(&Request {
+                command: "oneclick.apply_fixes".to_string(),
+                request_id: None,
+                payload,
+            })
+            .expect_err(key);
+            assert_eq!(error.code(), "oneclick_approval_version_unsupported");
+        }
+    }
+
+    #[test]
+    fn oneclick_apply_gate_reaches_factory_only_when_both_proofs_are_true() {
+        for (exact_plan, strong_fence, expected_calls) in [
+            (false, false, 0),
+            (true, false, 0),
+            (false, true, 0),
+            (true, true, 1),
+        ] {
+            let request = Request {
+                command: "oneclick.apply_fixes".to_string(),
+                request_id: Some(format!("gate-{exact_plan}-{strong_fence}")),
+                payload: valid_oneclick_apply_payload(),
+            };
+            let calls = Cell::new(0usize);
+            let events = oneclick_apply_with_session_factory(
+                &request,
+                exact_plan,
+                strong_fence,
+                |_validated| {
+                    calls.set(calls.get() + 1);
+                    vec![json!({
+                        "event": "result",
+                        "request_id": request.request_id,
+                        "command": request.command,
+                        "success": true,
+                        "applied_ordinals": []
+                    })]
+                },
+            );
+
+            assert_eq!(calls.get(), expected_calls);
+            if expected_calls == 0 {
+                assert_error_code(&events, "oneclick_apply_disabled");
+                assert_eq!(events[0]["applied_ordinals"], json!([]));
+            } else {
+                assert_eq!(events[0]["success"], true);
+            }
+        }
+    }
+
+    #[test]
+    fn oneclick_apply_public_gate_precedes_raw_parser() {
+        let request = Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: Some("gate-before-parser".to_string()),
+            payload: json!({"dry_run": false, "backup_confirmed": false}),
+        };
+        let calls = Cell::new(0usize);
+
+        let events = oneclick_apply_with_session_factory(&request, false, false, |_| {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        });
+
+        assert_error_code(&events, "oneclick_apply_disabled");
+        assert_eq!(events[0]["applied_ordinals"], json!([]));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn oneclick_apply_legacy_preview_stops_before_session_factory() {
+        let mut payload = valid_oneclick_apply_payload();
+        payload["dry_run"] = json!(true);
+        let request = Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: Some("legacy-preview".to_string()),
+            payload,
+        };
+        let calls = Cell::new(0usize);
+
+        let events = oneclick_apply_with_session_factory(&request, true, true, |_| {
+            calls.set(calls.get() + 1);
+            Vec::new()
+        });
+
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
@@ -2086,7 +2347,7 @@ mod tests {
         let events = handle_request(Request {
             command: "oneclick.apply_fixes".to_string(),
             request_id: Some("oneclick-apply-disabled-1".to_string()),
-            payload: json!({"dry_run": false, "backup_confirmed": true}),
+            payload: valid_oneclick_apply_payload(),
         });
 
         assert_error_code(&events, "oneclick_apply_disabled");

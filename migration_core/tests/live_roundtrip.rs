@@ -321,7 +321,7 @@ fn live_readiness_reports_each_direction_when_env_is_configured() {
 }
 
 #[test]
-fn oneclick_run_live_engine_stays_myisam_when_apply_is_disabled() {
+fn oneclick_apply_live_engine_stays_myisam_when_apply_is_disabled() {
     let Some(mysql_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
         eprintln!("skipping oneclick live apply: TF_MYSQL_* is not configured");
         return;
@@ -342,14 +342,24 @@ fn oneclick_run_live_engine_stays_myisam_when_apply_is_disabled() {
         Some("MyISAM")
     );
 
+    let approval = result_payload(handle_request(Request {
+        command: "oneclick.plan".to_string(),
+        request_id: None,
+        payload: json!({
+            "connection": endpoint_json(&mysql_endpoint),
+            "schema": mysql_endpoint.database
+        }),
+    }))["approval"]
+        .clone();
     let error = error_payload(handle_request(Request {
-        command: "oneclick.run".to_string(),
+        command: "oneclick.apply_fixes".to_string(),
         request_id: None,
         payload: json!({
             "connection": endpoint_json(&mysql_endpoint),
             "schema": mysql_endpoint.database,
             "dry_run": false,
-            "backup_confirmed": true
+            "backup_confirmed": true,
+            "approval": approval
         }),
     }));
 
@@ -365,7 +375,7 @@ fn oneclick_run_live_engine_stays_myisam_when_apply_is_disabled() {
 }
 
 #[test]
-fn oneclick_run_live_charset_stays_unchanged_when_apply_is_disabled() {
+fn oneclick_apply_live_charset_stays_unchanged_when_apply_is_disabled() {
     let Some(base_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
         eprintln!("skipping oneclick charset live apply: TF_MYSQL_* is not configured");
         return;
@@ -406,34 +416,24 @@ fn oneclick_run_live_charset_stays_unchanged_when_apply_is_disabled() {
         Some(&(String::from("utf8mb3"), String::from("utf8mb3_general_ci")))
     );
 
+    let approval = result_payload(handle_request(Request {
+        command: "oneclick.plan".to_string(),
+        request_id: None,
+        payload: json!({
+            "connection": endpoint_json(&charset_endpoint),
+            "schema": schema
+        }),
+    }))["approval"]
+        .clone();
     let error = error_payload(handle_request(Request {
-        command: "oneclick.run".to_string(),
+        command: "oneclick.apply_fixes".to_string(),
         request_id: None,
         payload: json!({
             "connection": endpoint_json(&charset_endpoint),
             "schema": schema,
             "dry_run": false,
             "backup_confirmed": true,
-            "issues": [{
-                "issue_type": "charset_issue",
-                "severity": "warning",
-                "location": format!("{schema}.{parent}"),
-                "table_name": parent,
-                "message": "Table uses a legacy charset.",
-                "suggestion": "Convert table charset/collation after FK-safe review.",
-                "blocking": false
-            }],
-            "charset_contracts": [{
-                "issue_index": 0,
-                "tables": [parent, child],
-                "fk_order": [parent, child],
-                "target_charset": "utf8mb4",
-                "target_collation": "utf8mb4_0900_ai_ci",
-                "rollback_sql": [
-                    format!("ALTER TABLE `{schema}`.`{child}` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;"),
-                    format!("ALTER TABLE `{schema}`.`{parent}` CONVERT TO CHARACTER SET utf8mb3 COLLATE utf8mb3_general_ci;")
-                ]
-            }]
+            "approval": approval
         }),
     }));
 
