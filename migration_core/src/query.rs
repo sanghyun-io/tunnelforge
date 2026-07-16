@@ -165,8 +165,8 @@ pub(crate) fn execute_query_adapter(
 /// SQL 주석 스캐너: `bytes[i]` 에서 시작하는 주석을 감지하면 그 주석 토큰 바로 다음
 /// 인덱스를 반환하고, 주석 시작이 아니면 `None` 을 반환한다.
 ///
-/// - 라인 주석(`-- `, `allow_hash` 시 `#`): 종료 개행 `'\n'` 의 인덱스(개행 미소비).
-///   MySQL 규칙에 맞게 `--` 뒤에 공백/제어 문자가 있어야 하며, 개행이 없으면 `len`.
+/// - 라인 주석(`--`, `allow_hash` 시 `#`): 종료 개행 `'\n'` 의 인덱스(개행 미소비).
+///   개행이 없으면 `len`.
 /// - 블록 주석(`/* */`): 닫는 `*/` 바로 다음 인덱스. 닫힘이 없으면 기존 산술상 `len+1`.
 ///
 /// 반환 인덱스와 스캔 산술은 세 호출부(query::strip_leading_comments_and_parens,
@@ -178,11 +178,7 @@ pub(crate) fn skip_sql_comment(bytes: &[u8], i: usize, allow_hash: bool) -> Opti
     if i >= len {
         return None;
     }
-    if bytes[i] == b'-'
-        && i + 2 < len
-        && bytes[i + 1] == b'-'
-        && (bytes[i + 2].is_ascii_whitespace() || bytes[i + 2].is_ascii_control())
-    {
+    if bytes[i] == b'-' && i + 1 < len && bytes[i + 1] == b'-' {
         let mut j = i + 2;
         while j < len && bytes[j] != b'\n' {
             j += 1;
@@ -204,6 +200,16 @@ pub(crate) fn skip_sql_comment(bytes: &[u8], i: usize, allow_hash: bool) -> Opti
         return Some(j + 2);
     }
     None
+}
+
+fn skip_side_effect_scan_comment(bytes: &[u8], i: usize) -> Option<usize> {
+    if i < bytes.len() && bytes[i] == b'-' && i + 1 < bytes.len() && bytes[i + 1] == b'-' {
+        let next = *bytes.get(i + 2)?;
+        if !(next.is_ascii_whitespace() || next.is_ascii_control()) {
+            return None;
+        }
+    }
+    skip_sql_comment(bytes, i, true)
 }
 
 fn strip_leading_comments_and_parens(sql: &str) -> &str {
@@ -236,7 +242,7 @@ fn sql_keyword_tokens(sql: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut index = 0;
     while index < bytes.len() {
-        if let Some(end) = skip_sql_comment(bytes, index, true) {
+        if let Some(end) = skip_side_effect_scan_comment(bytes, index) {
             index = end.min(bytes.len());
             continue;
         }
@@ -285,7 +291,7 @@ fn sql_has_potential_function_call(sql: &str) -> bool {
     let mut index = 0;
     let mut preceding_identifier: Option<(String, bool)> = None;
     while index < bytes.len() {
-        if let Some(end) = skip_sql_comment(bytes, index, true) {
+        if let Some(end) = skip_side_effect_scan_comment(bytes, index) {
             index = end.min(bytes.len());
             continue;
         }
@@ -462,6 +468,24 @@ mod tests {
         }
 
         assert!(!query_returns_rows("/*x*/ UPDATE users SET name='a'"));
+    }
+
+    #[test]
+    fn shared_comment_scanner_preserves_postgresql_no_space_comments_for_view_validation() {
+        let sql = b"--comment\nCREATE VIEW app_view AS SELECT 1";
+
+        assert_eq!(
+            skip_sql_comment(sql, 0, false),
+            Some("--comment".len())
+        );
+    }
+
+    #[test]
+    fn query_dispatch_and_classification_preserve_postgresql_no_space_comments() {
+        let sql = "--comment\nSELECT 1";
+
+        assert!(query_returns_rows(sql));
+        assert!(!query_may_mutate(sql));
     }
 
     #[test]
