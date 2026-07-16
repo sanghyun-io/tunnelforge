@@ -4543,3 +4543,27 @@ def test_shutdown_owner_join_timeout_reports_residual_stage(monkeypatch):
         original_join(timeout=1.0)
         if owner.is_alive():
             client.shutdown(timeout_seconds=1.0)
+
+
+def test_public_cancel_and_shutdown_submit_mutation_owner_work(monkeypatch):
+    client = DbCoreServiceClient(
+        executable="fake-core",
+        process_factory=lambda *args, **kwargs: None,
+    )
+    client.owner_loop
+    submissions = []
+    original_submit = client._submit_owner
+
+    def record_submit(coroutine, request_kind, request_id):
+        submissions.append((request_id, request_kind))
+        return original_submit(coroutine, request_kind, request_id)
+
+    monkeypatch.setattr(client, "_submit_owner", record_submit)
+
+    assert client.cancel_active_request(timeout_seconds=0.5) is False
+    client.shutdown(timeout_seconds=0.5)
+
+    assert submissions == [
+        ("cancel-active", DbCoreRequestKind.MUTATION),
+        ("shutdown", DbCoreRequestKind.MUTATION),
+    ]

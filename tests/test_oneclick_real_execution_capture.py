@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+from src.core.db_core_service import DbCoreRequestKind, DbEndpoint
+
 
 DISABLED_MESSAGE = (
     "Phase A disables One-Click real-execution evidence capture; exact-plan approval "
@@ -57,6 +59,34 @@ def test_oneclick_real_capture_rejects_unsafe_seed_identifiers():
 
     with pytest.raises(ValueError, match="unsafe One-Click table"):
         capture._require_safe_oneclick_identifier("legacy_engine_table;DROP", "table")
+
+
+def test_engine_rows_classifies_direct_evidence_query_as_mutation():
+    capture = _load_capture()
+    calls = []
+
+    class Client:
+        def request(self, command, payload, **kwargs):
+            calls.append((command, payload, kwargs))
+            return {"rows": [{"engine": "InnoDB"}]}
+
+    class Facade:
+        client = Client()
+
+    endpoint = DbEndpoint(
+        engine="mysql",
+        host="127.0.0.1",
+        port=3306,
+        user="root",
+        password="secret",
+        database="app",
+    )
+
+    rows = capture._engine_rows(Facade(), endpoint, "app", "users")
+
+    assert rows == [{"engine": "InnoDB"}]
+    assert calls[0][0] == "query.execute"
+    assert calls[0][2]["request_kind"] is DbCoreRequestKind.MUTATION
 
 
 def test_oneclick_real_capture_fails_closed_before_facade_or_db(monkeypatch):
