@@ -9,7 +9,12 @@ TunnelMonitor에서 분리된 책임:
 import time
 from typing import Any, Dict, Optional
 
-from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+from src.core.db_core_service import (
+    DbCoreOutcome,
+    DbCoreServiceError,
+    create_rust_db_connector,
+    normalize_db_engine,
+)
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
 
@@ -36,14 +41,19 @@ class TunnelHealthChecker:
 
         # Health check용 Rust DB Core 연결 캐시 (터널별 1개씩 유지)
         self._health_connections: Dict[str, Any] = {}
+        self._transport_failed_generations: Dict[str, int] = {}
 
-    def _cleanup_health_connection(self, tunnel_id: str):
+    def _cleanup_health_connection(
+        self, tunnel_id: str, *, reset_transport_failure: bool = True
+    ):
         """특정 터널의 health check 연결 정리
 
         딕셔너리 pop만 락으로 보호하고, 실제 연결 종료(I/O)는 락 밖에서 수행한다.
         """
         with self._lock:
             conn = self._health_connections.pop(tunnel_id, None)
+            if reset_transport_failure:
+                self._transport_failed_generations.pop(tunnel_id, None)
         if conn:
             try:
                 conn.close()
@@ -56,6 +66,7 @@ class TunnelHealthChecker:
         with self._lock:
             connections = dict(self._health_connections)
             self._health_connections.clear()
+            self._transport_failed_generations.clear()
 
         for tunnel_id, conn in connections.items():
             try:
@@ -63,6 +74,37 @@ class TunnelHealthChecker:
                 logger.debug(f"Health check 연결 정리: {tunnel_id}")
             except Exception:
                 pass
+
+    def _reset_transport_failure(self, tunnel_id: str) -> None:
+        with self._lock:
+            self._transport_failed_generations.pop(tunnel_id, None)
+
+    @staticmethod
+    def _connection_process_generation(connection: Any) -> int:
+        handle = getattr(connection, "connection_handle", None)
+        try:
+            return int(getattr(handle, "process_generation", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _mark_transport_failure(
+        self, tunnel_id: str, connection: Any, error: DbCoreServiceError
+    ) -> None:
+        if error.outcome is not DbCoreOutcome.OUTCOME_INDETERMINATE:
+            return
+        generation = self._connection_process_generation(connection)
+        if not generation:
+            try:
+                generation = int(error.process_generation or 0)
+            except (TypeError, ValueError):
+                generation = 0
+        with self._lock:
+            self._transport_failed_generations[tunnel_id] = generation
+        logger.warning(
+            "Health check transport contamination latched for %s (generation=%s)",
+            tunnel_id,
+            generation,
+        )
 
     def _get_health_credentials(self, tunnel_id: str, config: Dict[str, Any]) -> tuple:
         """Health check용 DB 자격 증명 조회
@@ -117,6 +159,10 @@ class TunnelHealthChecker:
             db_name = config.get('default_database') or config.get('db_name') or config.get('default_schema') or ''
             db_engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port'))
 
+            with self._lock:
+                if tunnel_id in self._transport_failed_generations:
+                    return -1
+
             # 인증 정보가 없으면 측정 불가
             if not db_username:
                 logger.debug(f"Latency 측정 스킵 (DB 인증 정보 없음): {tunnel_id}")
@@ -153,6 +199,14 @@ class TunnelHealthChecker:
                 conn.ping(reconnect=False)
                 latency = (time.time() - start) * 1000
                 return latency
+            except DbCoreServiceError as e:
+                self._mark_transport_failure(tunnel_id, conn, e)
+                logger.debug(f"DB ping 실패 ({tunnel_id}): {e}")
+                self._cleanup_health_connection(
+                    tunnel_id,
+                    reset_transport_failure=False,
+                )
+                return -1
             except Exception as e:
                 logger.debug(f"DB ping 실패 ({tunnel_id}): {e}")
                 # 연결 끊김 - 캐시에서 제거
@@ -183,7 +237,11 @@ class TunnelHealthChecker:
         Returns:
             DB connection 또는 None
         """
+        connector = None
         try:
+            with self._lock:
+                if tunnel_id in self._transport_failed_generations:
+                    return None
             connector = create_rust_db_connector(
                 engine,
                 host,
@@ -219,6 +277,20 @@ class TunnelHealthChecker:
                 logger.debug(f"Health check 연결 생성: {tunnel_id}")
 
             return conn
+        except DbCoreServiceError as e:
+            self._mark_transport_failure(
+                tunnel_id,
+                getattr(connector, "connection", None),
+                e,
+            )
+            connection = getattr(connector, "connection", None)
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+            logger.debug(f"Health check 연결 생성 실패 ({tunnel_id}): {e}")
+            return None
         except Exception as e:
             logger.debug(f"Health check 연결 생성 실패 ({tunnel_id}): {e}")
             return None

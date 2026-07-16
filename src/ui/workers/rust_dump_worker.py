@@ -35,6 +35,8 @@ class RustDumpWorker(QThread):
         self.kwargs = kwargs
         self._cancel_requested = False
         self._active_runner = None
+        self.last_error_metadata = None
+        self._terminal_emitted = False
 
     def cancel(self) -> bool:
         """실행 중인 dump/import 작업의 취소를 요청한다.
@@ -101,7 +103,25 @@ class RustDumpWorker(QThread):
     def _on_table_chunk_progress(self, table_name: str, completed_chunks: int, total_chunks: int):
         self.table_chunk_progress.emit(table_name, completed_chunks, total_chunks)
 
+    def _emit_terminal(self, success: bool, message: str, results: dict = None) -> None:
+        if self._terminal_emitted:
+            return
+        self._terminal_emitted = True
+        if self.task_type == "import":
+            self.import_finished.emit(success, message, results or {})
+        self.finished.emit(success, message)
+
+    def _capture_runner_error_metadata(self) -> None:
+        runner = self._active_runner
+        if runner is not None:
+            self.last_error_metadata = getattr(runner, "last_error_metadata", None)
+
     def run(self):
+        if self._terminal_emitted:
+            return
+        if self._cancel_requested:
+            self._emit_terminal(False, CANCELLED_MESSAGE, {})
+            return
         try:
             if self.task_type == "export_schema":
                 self._run_export_schema()
@@ -110,13 +130,12 @@ class RustDumpWorker(QThread):
             elif self.task_type == "import":
                 self._run_import()
         except Exception as e:
+            self._capture_runner_error_metadata()
             if self._cancel_requested:
                 message = CANCELLED_MESSAGE
-                if self.task_type == "import":
-                    self.import_finished.emit(False, message, {})
-                self.finished.emit(False, message)
+                self._emit_terminal(False, message, {})
             else:
-                self.finished.emit(False, str(e))
+                self._emit_terminal(False, str(e), {})
         finally:
             runner = self._active_runner
             facade = getattr(runner, "facade", None) if runner is not None else None
@@ -139,7 +158,8 @@ class RustDumpWorker(QThread):
             self._on_raw_output,
         )
         success, msg = self._is_cancelled_message(success, msg)
-        self.finished.emit(success, msg)
+        self.last_error_metadata = exporter.last_error_metadata
+        self._emit_terminal(success, msg)
 
     def _run_export_tables(self):
         exporter = RustDumpExporter(self.config)
@@ -159,7 +179,8 @@ class RustDumpWorker(QThread):
             self._on_raw_output,
         )
         success, msg = self._is_cancelled_message(success, msg)
-        self.finished.emit(success, msg)
+        self.last_error_metadata = exporter.last_error_metadata
+        self._emit_terminal(success, msg)
 
     def _run_import(self):
         importer = RustDumpImporter(self.config)
@@ -181,5 +202,5 @@ class RustDumpWorker(QThread):
             self._on_table_chunk_progress,
         )
         success, msg = self._is_cancelled_message(success, msg)
-        self.import_finished.emit(success, msg, results)
-        self.finished.emit(success, msg)
+        self.last_error_metadata = importer.last_error_metadata
+        self._emit_terminal(success, msg, results)

@@ -281,6 +281,7 @@ class TunnelMonitor:
                 if self.tunnel_engine.is_running(tunnel_id):
                     # 연결 중
                     if status.state != TunnelState.CONNECTED:
+                        self._health_checker._reset_transport_failure(tunnel_id)
                         status.state = TunnelState.CONNECTED
                         status.connected_at = datetime.now()
                         status.reconnect_count = 0
@@ -484,6 +485,8 @@ class TunnelMonitor:
         """터널 연결 시 호출 (외부에서 호출용)"""
         with self._lock:
             status = self.get_status(tunnel_id)
+            if status.state != TunnelState.CONNECTED:
+                self._health_checker._reset_transport_failure(tunnel_id)
             status.state = TunnelState.CONNECTED
             status.connected_at = datetime.now()
             status.reconnect_count = 0

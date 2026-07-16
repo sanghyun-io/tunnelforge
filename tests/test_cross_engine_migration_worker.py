@@ -53,6 +53,35 @@ def test_worker_run_emits_result():
     assert results[0][1]["command"] == "preflight"
 
 
+def test_worker_cancel_before_run_skips_helper_setup_and_finishes_once():
+    popen_calls = []
+
+    def fail_if_started(*args, **kwargs):
+        popen_calls.append((args, kwargs))
+        raise AssertionError("cancel-before-run must not start tunnelforge-core")
+
+    worker = CrossEngineMigrationWorker(
+        "migrate",
+        {"source_engine": "mysql", "target_engine": "postgresql"},
+        helper_path="fake-helper",
+        popen_factory=fail_if_started,
+    )
+    failures = []
+    finished = []
+    worker.failed.connect(failures.append)
+    worker.finished.connect(
+        lambda success, payload: finished.append((success, payload))
+    )
+
+    worker.cancel()
+    worker.run()
+    worker.run()
+
+    assert popen_calls == []
+    assert failures == []
+    assert finished == [(False, {"cancelled": True})]
+
+
 def test_worker_run_emits_checkpoint_state():
     state = {"tables": [{"table": "users", "completed": False, "rows_copied": 2}]}
     process = FakeProcess([

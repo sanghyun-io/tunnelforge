@@ -17,6 +17,7 @@ import os
 
 from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
 from src.core.db_connector import MySQLConnector
+from src.core.db_core_service import DbCoreOutcome
 from src.core.error_report_sanitizer import (
     sanitize_local_diagnostic,
     sanitize_local_diagnostic_data,
@@ -24,7 +25,10 @@ from src.core.error_report_sanitizer import (
 from src.core.i18n import translate_text
 from src.core.logger import get_logger
 from src.exporters.rust_dump_exporter import (
-    build_rust_dump_config, check_rust_dump
+    RUST_DUMP_ERROR_METADATA_KEY,
+    RustDumpErrorMetadata,
+    build_rust_dump_config,
+    check_rust_dump,
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.workers.error_reporting_worker import ErrorReportingMixin
@@ -325,6 +329,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._error_report_workers: List[object] = []
         self._cancel_requested = False
         self._close_after_cancel = False
+        self._import_error_metadata: Optional[RustDumpErrorMetadata] = None
 
         self.rust_dump_installed, self.rust_dump_msg = check_rust_dump()
 
@@ -987,8 +992,21 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.tunnel_config or {}, "데이터 Import", schema_name, details
         )
 
+    def _table_retry_is_blocked(self) -> bool:
+        metadata = self._import_error_metadata
+        outcome = getattr(metadata, "outcome", None)
+        return outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+
     def do_import(self, retry_tables: list = None):
         """Import 실행 (retry_tables가 주어지면 해당 테이블만 재시도)"""
+        if retry_tables and self._table_retry_is_blocked():
+            QMessageBox.warning(
+                self,
+                "재시도 차단",
+                "DB Core 결과가 불확실하여 테이블 재시도를 시작할 수 없습니다.\n"
+                "대상 DB 상태를 먼저 확인한 뒤 새 Import를 실행하세요.",
+            )
+            return
         self._cancel_requested = False
         self._close_after_cancel = False
         input_dir = self.input_dir.text()
@@ -1010,6 +1028,9 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
         if not self._confirm_production_guard(input_dir, target_schema):
             return
+
+        if not retry_tables:
+            self._import_error_metadata = None
 
         self._begin_error_report_operation()
 
@@ -1398,16 +1419,24 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def on_import_finished(self, success: bool, message: str, results: dict):
         """Import 완료 처리 (결과 저장 및 재시도 버튼 표시)"""
         self.import_results = results
+        self._import_error_metadata = results.get(RUST_DUMP_ERROR_METADATA_KEY)
 
         failed_tables = [
             table for table, result in self._table_results().items()
             if result.get('status') == 'error'
         ]
 
-        if failed_tables:
+        if failed_tables and not self._table_retry_is_blocked():
             self.btn_retry.setVisible(True)
             self.btn_select_failed.setVisible(True)
             self.txt_log.addItem(f"⚠️ {len(failed_tables)}개 테이블 Import 실패")
+        else:
+            self.btn_retry.setVisible(False)
+            self.btn_select_failed.setVisible(False)
+            if failed_tables and self._table_retry_is_blocked():
+                self.txt_log.addItem(
+                    "⚠️ DB Core 결과가 불확실하여 테이블 재시도를 차단했습니다."
+                )
 
     def on_finished(self, success: bool, message: str):
         """작업 완료 처리"""
@@ -1474,12 +1503,17 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 self._add_log("Import가 취소되었습니다.")
             else:
                 if error_count > 0:
+                    retry_hint = (
+                        "실패한 테이블을 선택하여 재시도할 수 있습니다."
+                        if not self._table_retry_is_blocked()
+                        else "DB Core 결과가 불확실하여 테이블 재시도를 차단했습니다. 대상 DB 상태를 먼저 확인하세요."
+                    )
                     QMessageBox.warning(
                         self, "Import 실패",
                         f"❌ Import 중 오류가 발생했습니다.\n\n"
                         f"성공: {done_count}개 테이블\n"
                         f"실패: {error_count}개 테이블\n\n"
-                        f"실패한 테이블을 선택하여 재시도할 수 있습니다."
+                        f"{retry_hint}"
                     )
                 else:
                     QMessageBox.warning(self, "Import 실패", f"❌ {message}")
@@ -1501,6 +1535,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def select_failed_tables(self):
         """실패한 테이블 모두 선택"""
+        if self._table_retry_is_blocked():
+            return
         for table_name, result in self._table_results().items():
             if result.get('status') == 'error':
                 if table_name in self.table_items:
@@ -1508,6 +1544,14 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def do_retry(self):
         """선택한 테이블 재시도"""
+        retry_is_blocked = getattr(self, "_table_retry_is_blocked", lambda: False)
+        if retry_is_blocked():
+            QMessageBox.warning(
+                self,
+                "재시도 차단",
+                "DB Core 결과가 불확실하여 테이블 재시도를 시작할 수 없습니다.",
+            )
+            return
         # 선택된 테이블 목록 가져오기
         selected_tables = []
         for table_name, item in self.table_items.items():

@@ -61,6 +61,8 @@ class CrossEngineMigrationWorker(QThread):
         self._stderr_tail: Deque[str] = deque(maxlen=_STDERR_TAIL_LINES)
         self._stderr_lock = threading.Lock()
         self._stderr_thread: Optional[threading.Thread] = None
+        self._failure_emitted = False
+        self._terminal_emitted = False
 
     def cancel(self):
         self._cancelled = True
@@ -100,7 +102,24 @@ class CrossEngineMigrationWorker(QThread):
         with self._stderr_lock:
             return "\n".join(self._stderr_tail)
 
+    def _emit_failed_once(self, message: str) -> None:
+        if self._failure_emitted:
+            return
+        self._failure_emitted = True
+        self.failed.emit(message)
+
+    def _emit_finished_once(self, success: bool, payload: object) -> None:
+        if self._terminal_emitted:
+            return
+        self._terminal_emitted = True
+        self.finished.emit(success, payload)
+
     def run(self):
+        if self._terminal_emitted:
+            return
+        if self._cancelled:
+            self._emit_finished_once(False, {"cancelled": True})
+            return
         final_payload = None
         success = False
 
@@ -140,17 +159,20 @@ class CrossEngineMigrationWorker(QThread):
                 success = False
                 stderr = self._stderr_tail_text()
                 final_payload = {"error": stderr or f"tunnelforge-core exited with {return_code}"}
-                self.failed.emit(final_payload["error"])
+                self._emit_failed_once(final_payload["error"])
 
         except HelperProtocolError as exc:
             final_payload = {"error": str(exc)}
-            self.failed.emit(str(exc))
+            if not self._cancelled:
+                self._emit_failed_once(str(exc))
         except FileNotFoundError:
             final_payload = {"error": f"tunnelforge-core helper not found: {self.helper_path}"}
-            self.failed.emit(final_payload["error"])
+            if not self._cancelled:
+                self._emit_failed_once(final_payload["error"])
         except Exception as exc:
             final_payload = {"error": str(exc)}
-            self.failed.emit(str(exc))
+            if not self._cancelled:
+                self._emit_failed_once(str(exc))
         finally:
             self._join_stderr_drain()
             if self._cancelled:
@@ -158,14 +180,14 @@ class CrossEngineMigrationWorker(QThread):
                 final_payload = {"cancelled": True}
                 if self._last_checkpoint:
                     final_payload["state"] = self._last_checkpoint
-            self.finished.emit(success, final_payload)
+            self._emit_finished_once(success, final_payload)
 
     def _dispatch_event(self, event) -> bool:
         if event.event == "result":
             self.result.emit(event.payload)
             return True
         if event.event == "error":
-            self.failed.emit(event.message)
+            self._emit_failed_once(event.message)
             return True
         if event.event == "phase":
             self.phase_changed.emit(event.phase or "", event.message)

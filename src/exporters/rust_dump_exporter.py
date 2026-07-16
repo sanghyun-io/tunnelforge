@@ -32,6 +32,30 @@ logger = get_logger("rust_dump_exporter")
 
 DEFAULT_DUMP_COMPRESSION = "zstd"
 DEFAULT_DUMP_THREADS = 8
+RUST_DUMP_ERROR_METADATA_KEY = "__rust_dump_error_metadata__"
+
+
+@dataclass(frozen=True)
+class RustDumpErrorMetadata:
+    """Typed, non-message DB Core failure metadata for dump consumers."""
+
+    code: str
+    outcome: DbCoreOutcome
+    request_kind: DbCoreRequestKind
+    request_id: str
+    process_generation: int
+    rust_code: Optional[str]
+
+    @classmethod
+    def from_service_error(cls, error: DbCoreServiceError) -> "RustDumpErrorMetadata":
+        return cls(
+            code=error.code,
+            outcome=error.outcome,
+            request_kind=error.request_kind,
+            request_id=error.request_id,
+            process_generation=error.process_generation,
+            rust_code=error.rust_code,
+        )
 
 
 def _facade_process_generation(facade: DbCoreFacade) -> int:
@@ -172,6 +196,7 @@ class _RustDumpClientBase:
         self.config = config
         self.facade = facade if facade is not None else DbCoreFacade()
         self._owns_facade = facade is None
+        self.last_error_metadata: Optional[RustDumpErrorMetadata] = None
 
     def _endpoint(self, schema: str) -> DbEndpoint:
         return DbEndpoint(
@@ -300,6 +325,7 @@ class RustDumpExporter(_RustDumpClientBase):
         table_status_callback: Optional[Callable[[str, str, str], None]] = None,
         raw_output_callback: Optional[Callable[[str], None]] = None,
     ) -> Tuple[bool, str]:
+        self.last_error_metadata = None
         try:
             success, message = self._run_rust_dump(
                 schema=schema,
@@ -319,6 +345,7 @@ class RustDumpExporter(_RustDumpClientBase):
                 self._write_metadata(output_dir, schema, "full", None)
             return success, message
         except DbCoreServiceError as exc:
+            self.last_error_metadata = RustDumpErrorMetadata.from_service_error(exc)
             return False, f"Rust DB Core export 오류: {exc}"
         except Exception as exc:
             return False, f"Export 오류: {exc}"
@@ -339,6 +366,7 @@ class RustDumpExporter(_RustDumpClientBase):
         table_status_callback: Optional[Callable[[str, str, str], None]] = None,
         raw_output_callback: Optional[Callable[[str], None]] = None,
     ) -> Tuple[bool, str, List[str]]:
+        self.last_error_metadata = None
         try:
             final_tables = list(tables)
             added_tables: List[str] = []
@@ -369,6 +397,7 @@ class RustDumpExporter(_RustDumpClientBase):
                 return True, f"{len(final_tables)}개 테이블 Export 완료", final_tables
             return False, message, []
         except DbCoreServiceError as exc:
+            self.last_error_metadata = RustDumpErrorMetadata.from_service_error(exc)
             return False, f"Rust DB Core export 오류: {exc}", []
         except Exception as exc:
             return False, f"Export 오류: {exc}", []
@@ -474,6 +503,7 @@ class RustDumpImporter(_RustDumpClientBase):
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Tuple[bool, str, dict]:
         import_results: dict = {}
+        self.last_error_metadata = None
         try:
             manifest_path = Path(input_dir) / "_tunnelforge_dump.json"
             if not manifest_path.exists():
@@ -547,7 +577,9 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
             return True, message, import_results
         except DbCoreServiceError as exc:
+            self.last_error_metadata = RustDumpErrorMetadata.from_service_error(exc)
             _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
+            import_results[RUST_DUMP_ERROR_METADATA_KEY] = self.last_error_metadata
             return False, f"Rust DB Core import 오류: {exc}", import_results
         except Exception as exc:
             _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)

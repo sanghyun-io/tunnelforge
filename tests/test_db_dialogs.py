@@ -2,7 +2,7 @@ import inspect
 from unittest.mock import MagicMock
 
 import pytest
-from PyQt6.QtWidgets import QApplication, QDialog
+from PyQt6.QtWidgets import QApplication, QDialog, QListWidgetItem, QMessageBox
 
 from src.core.db_core_service import (
     DbCoreOutcome,
@@ -10,6 +10,7 @@ from src.core.db_core_service import (
     DbCoreServiceError,
 )
 from src.ui.dialogs.db_dialogs import RustDumpWizard
+from src.ui.dialogs.db_import_dialog import RustDumpImportDialog
 from src.exporters.rust_dump_exporter import RustDumpConfig
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
@@ -206,6 +207,107 @@ def test_rust_dump_worker_retains_failed_runner_until_explicit_retry():
 
     assert worker.retry_owned_shutdown(timeout_seconds=0.05) is True
     assert worker._active_runner is None
+
+
+@pytest.mark.parametrize("task_type", ["export_schema", "export_tables", "import"])
+def test_rust_dump_worker_cancel_before_run_skips_mutation_setup_and_finishes_once(
+    monkeypatch, task_type
+):
+    import src.ui.workers.rust_dump_worker as worker_module
+
+    constructed = []
+
+    class FailingRunner:
+        def __init__(self, *args, **kwargs):
+            constructed.append((args, kwargs))
+            raise AssertionError("cancel-before-run must not construct a DB Core runner")
+
+    monkeypatch.setattr(worker_module, "RustDumpExporter", FailingRunner)
+    monkeypatch.setattr(worker_module, "RustDumpImporter", FailingRunner)
+
+    config = RustDumpConfig("127.0.0.1", 3306, "root", "pw")
+    worker = RustDumpWorker(
+        task_type,
+        config,
+        schema="app",
+        tables=["users"],
+        output_dir="C:/dump",
+        input_dir="C:/dump",
+    )
+    finished = []
+    import_finished = []
+    worker.finished.connect(lambda success, message: finished.append((success, message)))
+    worker.import_finished.connect(
+        lambda success, message, results: import_finished.append(
+            (success, message, results)
+        )
+    )
+
+    worker.cancel()
+    worker.run()
+    worker.run()
+
+    assert constructed == []
+    assert finished == [(False, "작업이 취소되었습니다.")]
+    if task_type == "import":
+        assert import_finished == [(False, "작업이 취소되었습니다.", {})]
+    else:
+        assert import_finished == []
+
+
+def test_import_dialog_never_offers_or_relaunches_indeterminate_table_retry(monkeypatch):
+    from src.core.db_core_service import DbCoreOutcome, DbCoreRequestKind
+    from src.exporters.rust_dump_exporter import (
+        RUST_DUMP_ERROR_METADATA_KEY,
+        RustDumpErrorMetadata,
+    )
+
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_import_dialog.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpImportDialog()
+    try:
+        metadata = RustDumpErrorMetadata(
+            code="db_core_transport_failed",
+            outcome=DbCoreOutcome.OUTCOME_INDETERMINATE,
+            request_kind=DbCoreRequestKind.MUTATION,
+            request_id="request-1",
+            process_generation=3,
+            rust_code="transport_lost",
+        )
+        item = QListWidgetItem("users")
+        dialog.table_list.addItem(item)
+        dialog.table_items["users"] = item
+        item.setSelected(True)
+        dialog.on_import_finished(
+            False,
+            "transport outcome is unknown",
+            {
+                "users": {"status": "error", "message": "unknown"},
+                RUST_DUMP_ERROR_METADATA_KEY: metadata,
+            },
+        )
+
+        assert not dialog.btn_retry.isVisible()
+        assert not dialog.btn_select_failed.isVisible()
+
+        warnings = []
+        monkeypatch.setattr(
+            "src.ui.dialogs.db_import_dialog.QMessageBox.warning",
+            lambda *args, **kwargs: warnings.append(args),
+        )
+        dialog.do_import()
+        assert dialog._table_retry_is_blocked()
+
+        dialog.do_import = MagicMock()
+        dialog.do_retry()
+
+        assert not dialog.do_import.called
+        assert warnings
+    finally:
+        dialog.close()
 
 def test_start_orphan_check_disconnects_connector_after_dialog_exec(monkeypatch):
     app = QApplication.instance() or QApplication([])

@@ -312,6 +312,33 @@ class TestForeignKeyResolver:
 class TestRustDumpExporter:
     """RustDumpExporter 클래스 테스트"""
 
+    def test_export_full_schema_retains_typed_core_error_metadata(self, tmp_path):
+        """Export transport ambiguity remains available to the consumer as typed metadata."""
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        error = _service_error(
+            "transport outcome is unknown",
+            code="db_core_transport_failed",
+            outcome=DbCoreOutcome.OUTCOME_INDETERMINATE,
+            rust_code="transport_lost",
+        )
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                raise error
+
+        exporter = RustDumpExporter(
+            RustDumpConfig("localhost", 3306, "root", "password"),
+            facade=FakeFacade(),
+        )
+
+        success, _message = exporter.export_full_schema("app", str(tmp_path / "dump"))
+
+        assert success is False
+        assert exporter.last_error_metadata.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+        assert exporter.last_error_metadata.code == "db_core_transport_failed"
+        assert exporter.last_error_metadata.rust_code == "transport_lost"
+
     def test_exporter_initialization(self):
         """Exporter 초기화 테스트"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
@@ -1006,6 +1033,52 @@ class TestRustDumpImporter:
         assert "export_invalid" in msg
         assert "users" in msg
         assert "missing chunk_sha256" in msg
+
+    def test_import_dump_retains_indeterminate_core_error_metadata(self, tmp_path):
+        """Import results carry typed ambiguity metadata that table retry code can inspect."""
+        from src.exporters.rust_dump_exporter import (
+            RUST_DUMP_ERROR_METADATA_KEY,
+            RustDumpConfig,
+            RustDumpErrorMetadata,
+            RustDumpImporter,
+        )
+
+        dump_dir = tmp_path / "dump"
+        dump_dir.mkdir(parents=True)
+        (dump_dir / "_tunnelforge_dump.json").write_text(
+            json.dumps({
+                "format": "tunnelforge-dump",
+                "format_version": 1,
+                "database": "app",
+                "tables": [{"name": "users", "path": "0001_users", "rows": 1, "chunks": 1}],
+            }),
+            encoding="utf-8",
+        )
+        error = _service_error(
+            "import transport outcome is unknown",
+            code="db_core_timeout",
+            outcome=DbCoreOutcome.OUTCOME_INDETERMINATE,
+            rust_code="request_timeout",
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                raise error
+
+        importer = RustDumpImporter(
+            RustDumpConfig("localhost", 3306, "root", "password"),
+            facade=FakeFacade(),
+        )
+
+        success, _message, results = importer.import_dump(str(dump_dir))
+
+        metadata = results[RUST_DUMP_ERROR_METADATA_KEY]
+        assert success is False
+        assert isinstance(metadata, RustDumpErrorMetadata)
+        assert metadata.outcome is DbCoreOutcome.OUTCOME_INDETERMINATE
+        assert metadata.code == "db_core_timeout"
+        assert metadata.rust_code == "request_timeout"
+        assert results["users"]["status"] == "error"
 
     def test_import_dump_marks_remaining_tables_error_on_exception(self, tmp_path):
         """import 도중 예외가 발생하면 done이 아닌 모든 테이블이 error로 표시된다 (재시도 UI 회귀 테스트)"""
