@@ -383,6 +383,27 @@ pub(crate) fn parse_oneclick_plan_request(
             "One-Click plan payload is prohibited.",
         ));
     }
+    let schema = root
+        .get("schema")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            OneClickContractError::new(
+                "oneclick_plan_payload_prohibited",
+                "One-Click plan payload is prohibited.",
+            )
+        })
+        .and_then(normalize_oneclick_schema)?;
+    for key in ["database", "schema"] {
+        if connection
+            .get(key)
+            .is_some_and(|value| value.as_str() != Some(schema.as_str()))
+        {
+            return Err(OneClickContractError::new(
+                "oneclick_schema_mismatch",
+                "One-Click schema does not match the connection schema.",
+            ));
+        }
+    }
 
     let wire: OneClickPlanRequestWire =
         serde_json::from_value(request.payload.clone()).map_err(|_| {
@@ -391,17 +412,22 @@ pub(crate) fn parse_oneclick_plan_request(
                 "One-Click plan payload is prohibited.",
             )
         })?;
-    let schema = normalize_oneclick_schema(&wire.schema)?;
-    for nested in [&wire.connection.database, &wire.connection.schema]
-        .into_iter()
-        .flatten()
+    if wire.schema != schema
+        || wire
+            .connection
+            .database
+            .as_deref()
+            .is_some_and(|nested| nested != schema)
+        || wire
+            .connection
+            .schema
+            .as_deref()
+            .is_some_and(|nested| nested != schema)
     {
-        if nested != &schema {
-            return Err(OneClickContractError::new(
-                "oneclick_schema_mismatch",
-                "One-Click schema does not match the connection schema.",
-            ));
-        }
+        return Err(OneClickContractError::new(
+            "oneclick_schema_mismatch",
+            "One-Click schema does not match the connection schema.",
+        ));
     }
     if wire.connection.engine != "mysql"
         || wire.connection.host.trim().is_empty()
@@ -510,6 +536,7 @@ fn normalize_tables_and_foreign_keys(
         for index in &mut table.indexes {
             if !has_text(&index.name)
                 || !has_text(&index.index_type)
+                || index.columns.is_empty()
                 || !index_names.insert(index.name.clone())
             {
                 return Err(invalid_facts());
@@ -573,6 +600,9 @@ fn normalize_tables_and_foreign_keys(
         ]
         .into_iter()
         .any(|value| !has_text(value))
+            || foreign_key.constraint_schema != foreign_key.table_schema
+            || foreign_key.table_schema != foreign_key.referenced_table_schema
+            || foreign_key.columns.is_empty()
             || !fk_keys.insert((
                 foreign_key.constraint_schema.clone(),
                 foreign_key.constraint_name.clone(),
@@ -619,7 +649,7 @@ fn normalize_tables_and_foreign_keys(
 pub(crate) fn normalize_action_facts(
     mut facts: ActionFactsDocument,
 ) -> Result<ActionFactsDocument, OneClickContractError> {
-    if facts.action_facts_version != ACTION_FACTS_VERSION {
+    if facts.action_facts_version != ACTION_FACTS_VERSION || facts.tables.is_empty() {
         return Err(invalid_facts());
     }
     normalize_tables_and_foreign_keys(&mut facts.tables, &mut facts.foreign_keys)?;
@@ -713,7 +743,81 @@ fn normalize_snapshot(
     {
         return Err(invalid_facts());
     }
+    let table_keys = snapshot
+        .table_definitions
+        .iter()
+        .map(|table| (table.schema.as_str(), table.table.as_str()))
+        .collect::<BTreeSet<_>>();
+    let mut inspection_keys = BTreeSet::new();
+    for fact in &snapshot.inspection_facts {
+        let Some(table) = fact.table.as_deref() else {
+            return Err(invalid_facts());
+        };
+        if !table_keys.contains(&(fact.schema.as_str(), table))
+            || !inspection_keys.insert((
+                fact.issue_type.as_str(),
+                fact.severity.as_str(),
+                fact.object_kind.as_str(),
+                fact.schema.as_str(),
+                table,
+                fact.column.as_deref(),
+            ))
+        {
+            return Err(invalid_facts());
+        }
+    }
     Ok(snapshot)
+}
+
+fn snapshot_deprecated_engine_tables(
+    snapshot: &OneClickSnapshotDocument,
+    profile: &OneClickRemediationProfile,
+) -> Result<BTreeSet<String>, OneClickContractError> {
+    let tables = snapshot
+        .table_definitions
+        .iter()
+        .map(|table| (table.table.as_str(), table))
+        .collect::<BTreeMap<_, _>>();
+    let expected_charset_tables = snapshot
+        .table_definitions
+        .iter()
+        .filter(|table| {
+            table.charset.as_deref() != Some(profile.target_charset.as_str())
+                || table.collation.as_deref() != Some(profile.target_collation.as_str())
+        })
+        .map(|table| table.table.clone())
+        .collect::<BTreeSet<_>>();
+    let mut charset_tables = BTreeSet::new();
+    let mut deprecated_engine_tables = BTreeSet::new();
+    for fact in &snapshot.inspection_facts {
+        let table_name = fact.table.as_deref().ok_or_else(invalid_facts)?;
+        let table = tables.get(table_name).ok_or_else(invalid_facts)?;
+        if fact.severity != "warning"
+            || fact.object_kind != "table"
+            || fact.schema != snapshot.schema
+            || fact.column.is_some()
+        {
+            return Err(invalid_facts());
+        }
+        match fact.issue_type.as_str() {
+            "deprecated_engine"
+                if table
+                    .engine
+                    .as_deref()
+                    .is_some_and(|engine| !engine.eq_ignore_ascii_case("InnoDB")) =>
+            {
+                deprecated_engine_tables.insert(table_name.to_string());
+            }
+            "charset_issue" if expected_charset_tables.contains(table_name) => {
+                charset_tables.insert(table_name.to_string());
+            }
+            _ => return Err(invalid_facts()),
+        }
+    }
+    if charset_tables != expected_charset_tables {
+        return Err(invalid_facts());
+    }
+    Ok(deprecated_engine_tables)
 }
 
 fn hash_snapshot(snapshot: &OneClickSnapshotDocument) -> Result<String, OneClickContractError> {
@@ -744,8 +848,45 @@ fn action_expectation(
 }
 
 fn sql_is_one_statement(sql: &str) -> bool {
-    let trimmed = sql.trim();
-    !trimmed.is_empty() && trimmed.ends_with(';') && trimmed.matches(';').count() == 1
+    let bytes = sql.trim().as_bytes();
+    if bytes.is_empty() {
+        return false;
+    }
+    let mut quote = None;
+    let mut terminal_separator = None;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if byte == b'\\' {
+                index += 2;
+                continue;
+            }
+            if byte == delimiter {
+                if bytes.get(index + 1) == Some(&delimiter) {
+                    index += 2;
+                    continue;
+                }
+                quote = None;
+            }
+        } else {
+            match byte {
+                b'`' | b'\'' | b'"' => quote = Some(byte),
+                b';' => {
+                    if terminal_separator.is_some() {
+                        return false;
+                    }
+                    terminal_separator = Some(index);
+                }
+                _ if terminal_separator.is_some() && !byte.is_ascii_whitespace() => {
+                    return false;
+                }
+                _ => {}
+            }
+        }
+        index += 1;
+    }
+    quote.is_none() && terminal_separator == Some(bytes.len() - 1)
 }
 
 fn action_facts_within_tables(action: &OneClickApplyAction, facts: &ActionFactsDocument) -> bool {
@@ -755,7 +896,8 @@ fn action_facts_within_tables(action: &OneClickApplyAction, facts: &ActionFactsD
         .iter()
         .all(|table| table.schema == action.schema && allowed.contains(table.table.as_str()))
         && facts.foreign_keys.iter().all(|foreign_key| {
-            foreign_key.table_schema == action.schema
+            foreign_key.constraint_schema == action.schema
+                && foreign_key.table_schema == action.schema
                 && foreign_key.referenced_table_schema == action.schema
                 && allowed.contains(foreign_key.table_name.as_str())
                 && allowed.contains(foreign_key.referenced_table_name.as_str())
@@ -773,6 +915,8 @@ pub(crate) fn validate_oneclick_plan(
     {
         return Err(noncanonical_facts());
     }
+    let deprecated_engine_tables =
+        snapshot_deprecated_engine_tables(&plan.snapshot, &plan.remediation_profile)?;
     for (position, action) in plan.actions.iter().enumerate() {
         if action.ordinal != (position + 1) as u32
             || action.schema != plan.snapshot.schema
@@ -806,6 +950,16 @@ pub(crate) fn validate_oneclick_plan(
         {
             return Err(noncanonical_facts());
         }
+    }
+    let expected_actions = build_oneclick_actions(
+        &plan.snapshot.schema,
+        &plan.snapshot.table_definitions,
+        &plan.snapshot.foreign_keys,
+        &plan.remediation_profile,
+        &deprecated_engine_tables,
+    )?;
+    if plan.actions != expected_actions {
+        return Err(noncanonical_facts());
     }
     if plan.plan_hash != compute_oneclick_plan_hash(plan)? {
         return Err(noncanonical_facts());
@@ -906,77 +1060,43 @@ fn update_charset_fact(
     }
 }
 
-fn charset_components(
+fn validated_deprecated_engine_tables(
+    unsupported_objects: &[String],
     tables: &[ActionTableDefinitionFact],
-    foreign_keys: &[ActionForeignKeyFact],
-    profile: &OneClickRemediationProfile,
-) -> Vec<BTreeSet<String>> {
-    let seeds = tables
-        .iter()
-        .filter(|table| {
-            table.charset.as_deref() != Some(profile.target_charset.as_str())
-                || table.collation.as_deref() != Some(profile.target_collation.as_str())
-        })
-        .map(|table| table.table.clone())
-        .collect::<BTreeSet<_>>();
-    let all = tables
-        .iter()
-        .map(|table| table.table.clone())
-        .collect::<BTreeSet<_>>();
-    let mut remaining = seeds;
-    let mut components = Vec::new();
-    while let Some(seed) = remaining.iter().next().cloned() {
-        let mut component = BTreeSet::from([seed.clone()]);
-        loop {
-            let before = component.len();
-            for foreign_key in foreign_keys {
-                if component.contains(&foreign_key.table_name)
-                    && all.contains(&foreign_key.referenced_table_name)
-                {
-                    component.insert(foreign_key.referenced_table_name.clone());
-                }
-                if component.contains(&foreign_key.referenced_table_name)
-                    && all.contains(&foreign_key.table_name)
-                {
-                    component.insert(foreign_key.table_name.clone());
-                }
-            }
-            if component.len() == before {
-                break;
-            }
+) -> Result<BTreeSet<String>, OneClickContractError> {
+    let mut markers = BTreeMap::<String, String>::new();
+    for object in unsupported_objects {
+        if !object.starts_with("deprecated_engine:") {
+            continue;
         }
-        for table in &component {
-            remaining.remove(table);
+        let (table, engine) =
+            oneclick_deprecated_engine_marker(object).ok_or_else(invalid_facts)?;
+        if markers
+            .get(&table)
+            .is_some_and(|existing| !existing.eq_ignore_ascii_case(&engine))
+        {
+            return Err(invalid_facts());
         }
-        components.push(component);
+        markers.entry(table).or_insert(engine);
     }
-    components.sort_by(|left, right| left.iter().next().cmp(&right.iter().next()));
-    components
-}
 
-fn charset_action_order(
-    component: &BTreeSet<String>,
-    foreign_keys: &[ActionForeignKeyFact],
-) -> Vec<String> {
-    let mut remaining = component.clone();
-    let mut ordered = Vec::new();
-    while !remaining.is_empty() {
-        let next = remaining
-            .iter()
-            .find(|table| {
-                !foreign_keys.iter().any(|foreign_key| {
-                    foreign_key.table_name == ***table
-                        && component.contains(&foreign_key.referenced_table_name)
-                        && remaining.contains(&foreign_key.referenced_table_name)
-                })
-            })
-            .cloned()
-            .or_else(|| remaining.iter().next().cloned())
-            .expect("remaining charset component is nonempty");
-        remaining.remove(&next);
-        ordered.push(next);
+    let definitions = tables
+        .iter()
+        .map(|table| (table.table.as_str(), table))
+        .collect::<BTreeMap<_, _>>();
+    for (table_name, marker_engine) in &markers {
+        let table = definitions
+            .get(table_name.as_str())
+            .ok_or_else(invalid_facts)?;
+        if !table
+            .engine
+            .as_deref()
+            .is_some_and(|engine| engine.eq_ignore_ascii_case(marker_engine))
+        {
+            return Err(invalid_facts());
+        }
     }
-    ordered
+    Ok(markers.into_keys().collect())
 }
 
 fn build_oneclick_actions(
@@ -1041,67 +1161,73 @@ fn build_oneclick_actions(
         });
     }
 
-    for component in charset_components(&working, foreign_keys, profile) {
-        let scope_names = component.iter().cloned().collect::<Vec<_>>();
-        for table_name in charset_action_order(&component, foreign_keys) {
-            let is_target = working
-                .iter()
-                .find(|table| table.table == table_name)
-                .is_some_and(|table| {
-                    table.charset.as_deref() == Some(profile.target_charset.as_str())
-                        && table.collation.as_deref()
-                            == Some(profile.target_collation.as_str())
-                });
-            if is_target {
-                continue;
-            }
-            let pre = scoped_action_facts(
-                OneClickActionType::CharsetFkSafe,
-                &working,
-                foreign_keys,
-                &component,
-            )?;
-            let previous = working
-                .iter()
-                .find(|table| table.table == table_name)
-                .and_then(|table| Some((table.charset.clone()?, table.collation.clone()?)));
-            update_charset_fact(&mut working, &table_name, profile);
-            let post = scoped_action_facts(
-                OneClickActionType::CharsetFkSafe,
-                &working,
-                foreign_keys,
-                &component,
-            )?;
-            let rollback_sql = previous.and_then(|(charset, collation)| {
-                Some(format!(
-                    "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
-                    quote_mysql_identifier(schema),
-                    quote_mysql_identifier(&table_name),
-                    rollback_token(&charset)?,
-                    rollback_token(&collation)?
-                ))
-            });
-            actions.push(OneClickApplyAction {
-                ordinal: (actions.len() + 1) as u32,
-                action_type: OneClickActionType::CharsetFkSafe,
-                issue_type: "charset_issue".to_string(),
-                strategy: "charset_fk_safe".to_string(),
-                schema: schema.to_string(),
-                tables: scope_names.clone(),
-                sql: format!(
-                    "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
-                    quote_mysql_identifier(schema),
-                    quote_mysql_identifier(&table_name),
-                    profile.target_charset,
-                    profile.target_collation
-                ),
-                rollback_sql,
-                target_charset: Some(profile.target_charset.clone()),
-                target_collation: Some(profile.target_collation.clone()),
-                expected_pre_facts: action_expectation(pre)?,
-                expected_post_facts: action_expectation(post)?,
-            });
-        }
+    let fk_tables = foreign_keys
+        .iter()
+        .flat_map(|foreign_key| {
+            [
+                foreign_key.table_name.as_str(),
+                foreign_key.referenced_table_name.as_str(),
+            ]
+        })
+        .collect::<BTreeSet<_>>();
+    let charset_tables = working
+        .iter()
+        .filter(|table| {
+            !fk_tables.contains(table.table.as_str())
+                && (table.charset.as_deref() != Some(profile.target_charset.as_str())
+                    || table.collation.as_deref()
+                        != Some(profile.target_collation.as_str()))
+        })
+        .map(|table| table.table.clone())
+        .collect::<Vec<_>>();
+    for table_name in charset_tables {
+        let names = BTreeSet::from([table_name.clone()]);
+        let pre = scoped_action_facts(
+            OneClickActionType::CharsetFkSafe,
+            &working,
+            foreign_keys,
+            &names,
+        )?;
+        let previous = working
+            .iter()
+            .find(|table| table.table == table_name)
+            .and_then(|table| Some((table.charset.clone()?, table.collation.clone()?)));
+        update_charset_fact(&mut working, &table_name, profile);
+        let post = scoped_action_facts(
+            OneClickActionType::CharsetFkSafe,
+            &working,
+            foreign_keys,
+            &names,
+        )?;
+        let rollback_sql = previous.and_then(|(charset, collation)| {
+            Some(format!(
+                "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
+                quote_mysql_identifier(schema),
+                quote_mysql_identifier(&table_name),
+                rollback_token(&charset)?,
+                rollback_token(&collation)?
+            ))
+        });
+        actions.push(OneClickApplyAction {
+            ordinal: (actions.len() + 1) as u32,
+            action_type: OneClickActionType::CharsetFkSafe,
+            issue_type: "charset_issue".to_string(),
+            strategy: "charset_fk_safe".to_string(),
+            schema: schema.to_string(),
+            tables: vec![table_name.clone()],
+            sql: format!(
+                "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
+                quote_mysql_identifier(schema),
+                quote_mysql_identifier(&table_name),
+                profile.target_charset,
+                profile.target_collation
+            ),
+            rollback_sql,
+            target_charset: Some(profile.target_charset.clone()),
+            target_collation: Some(profile.target_collation.clone()),
+            expected_pre_facts: action_expectation(pre)?,
+            expected_post_facts: action_expectation(post)?,
+        });
     }
     Ok(actions)
 }
@@ -1138,20 +1264,25 @@ pub(crate) fn build_oneclick_plan<S: OneClickPlanningSession>(
         ));
     }
     let inspection = session.inspect(endpoint).map_err(|_| planning_failed())?;
-    let deprecated_engine_tables = inspection
-        .unsupported_objects
-        .iter()
-        .filter_map(|object| oneclick_deprecated_engine_marker(object))
-        .map(|(table, _)| table)
-        .collect::<BTreeSet<_>>();
     let tables = session
         .read_table_definitions(&schema)
         .map_err(|_| planning_failed())?;
     let foreign_keys = session
         .read_fk_facts(&schema)
         .map_err(|_| planning_failed())?;
+    let mut snapshot = normalize_snapshot(OneClickSnapshotDocument {
+        snapshot_version: ONECLICK_SNAPSHOT_VERSION,
+        schema: schema.clone(),
+        inspection_facts: Vec::new(),
+        table_definitions: tables,
+        foreign_keys,
+    })?;
+    let deprecated_engine_tables = validated_deprecated_engine_tables(
+        &inspection.unsupported_objects,
+        &snapshot.table_definitions,
+    )?;
     let mut inspection_facts = Vec::new();
-    for table in &tables {
+    for table in &snapshot.table_definitions {
         if deprecated_engine_tables.contains(&table.table) {
             inspection_facts.push(OneClickInspectionFact {
                 issue_type: "deprecated_engine".to_string(),
@@ -1175,13 +1306,11 @@ pub(crate) fn build_oneclick_plan<S: OneClickPlanningSession>(
             });
         }
     }
-    let snapshot = normalize_snapshot(OneClickSnapshotDocument {
-        snapshot_version: ONECLICK_SNAPSHOT_VERSION,
-        schema: schema.clone(),
-        inspection_facts,
-        table_definitions: tables,
-        foreign_keys,
-    })?;
+    snapshot.inspection_facts = inspection_facts;
+    snapshot = normalize_snapshot(snapshot)?;
+    if snapshot_deprecated_engine_tables(&snapshot, &profile)? != deprecated_engine_tables {
+        return Err(invalid_facts());
+    }
     let snapshot_hash = hash_snapshot(&snapshot)?;
     let actions = build_oneclick_actions(
         &schema,
@@ -2284,15 +2413,16 @@ fn issues_from_inspect_result(result: Result<InspectionResult, String>) -> Vec<M
 }
 
 fn oneclick_deprecated_engine_marker(object: &str) -> Option<(String, String)> {
-    let mut parts = object.splitn(3, ':');
-    match (parts.next(), parts.next(), parts.next()) {
-        (Some("deprecated_engine"), Some(table), Some(engine))
-            if !table.trim().is_empty() && !engine.trim().is_empty() =>
-        {
-            Some((table.trim().to_string(), engine.trim().to_string()))
-        }
-        _ => None,
+    let marker = object.strip_prefix("deprecated_engine:")?;
+    let (table, engine) = marker.rsplit_once(':')?;
+    if table.is_empty()
+        || engine.is_empty()
+        || table.contains('\0')
+        || engine.contains('\0')
+    {
+        return None;
     }
+    Some((table.to_string(), engine.to_string()))
 }
 
 fn oneclick_payload_issues(payload: &Value) -> Vec<MigrationIssue> {
@@ -3972,6 +4102,32 @@ mod tests {
     }
 
     #[test]
+    fn oneclick_plan_normalization_rejects_empty_index_and_fk_members() {
+        let mut empty_index = oneclick_plan_engine_facts();
+        empty_index.tables[0].indexes[0].columns.clear();
+        assert_eq!(
+            normalize_action_facts(empty_index).unwrap_err().code(),
+            "oneclick_plan_invalid_facts"
+        );
+
+        let mut empty_fk = oneclick_plan_charset_facts();
+        empty_fk.foreign_keys[0].columns.clear();
+        assert_eq!(
+            normalize_action_facts(empty_fk).unwrap_err().code(),
+            "oneclick_plan_invalid_facts"
+        );
+
+        let mut cross_schema_fk = oneclick_plan_charset_facts();
+        cross_schema_fk.foreign_keys[0].constraint_schema = "other".to_string();
+        assert_eq!(
+            normalize_action_facts(cross_schema_fk)
+                .unwrap_err()
+                .code(),
+            "oneclick_plan_invalid_facts"
+        );
+    }
+
+    #[test]
     fn oneclick_plan_schema_and_payload_parser_are_strict() {
         assert_eq!(normalize_oneclick_schema("App_One").unwrap(), "App_One");
         for invalid in ["", " app", "app ", "app\0prod"] {
@@ -4023,6 +4179,22 @@ mod tests {
                 .code(),
                 "oneclick_schema_mismatch"
             );
+
+            for invalid in [json!(null), json!(42), json!(" App_One"), json!("App_One ")] {
+                let mut connection = json!({
+                    "engine": "mysql", "host": "127.0.0.1", "port": 3306,
+                    "user": "app", "password": "secret"
+                });
+                connection[key] = invalid;
+                assert_eq!(
+                    parse_oneclick_plan_request(&request(json!({
+                        "connection": connection, "schema": "App_One"
+                    })))
+                    .unwrap_err()
+                    .code(),
+                    "oneclick_schema_mismatch"
+                );
+            }
         }
 
         let prohibited = [
@@ -4158,8 +4330,26 @@ mod tests {
         }
     }
 
+    fn rehash_action(action: &mut OneClickApplyAction) {
+        for expectation in [
+            &mut action.expected_pre_facts,
+            &mut action.expected_post_facts,
+        ] {
+            expectation.facts = normalize_action_facts(expectation.facts.clone()).unwrap();
+            expectation.facts_hash = hash_action_facts(&expectation.facts).unwrap();
+        }
+    }
+
+    fn rehash_plan(plan: &mut OneClickPlanEnvelope) {
+        for action in &mut plan.actions {
+            rehash_action(action);
+        }
+        plan.snapshot_hash = hash_snapshot(&plan.snapshot).unwrap();
+        plan.plan_hash = compute_oneclick_plan_hash(plan).unwrap();
+    }
+
     #[test]
-    fn oneclick_plan_builder_uses_one_session_and_expands_one_sql_actions() {
+    fn oneclick_plan_builder_uses_one_session_and_fails_closed_for_fk_charset_tables() {
         let mut session = oneclick_plan_recording_session(true);
         let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
 
@@ -4169,22 +4359,32 @@ mod tests {
         );
         assert_eq!(plan.plan_version, ONECLICK_PLAN_VERSION);
         assert_eq!(plan.remediation_profile, fixed_oneclick_profile());
-        assert_eq!(plan.actions.len(), 3);
+        assert_eq!(plan.actions.len(), 1);
         assert_eq!(
             plan.actions.iter().map(|action| action.ordinal).collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1]
         );
         assert!(plan.actions.iter().all(|action| {
-            !action.sql.trim().is_empty()
-                && action.sql.matches(';').count() == 1
-                && action.sql.trim_end().ends_with(';')
+            sql_is_one_statement(&action.sql)
                 && action.rollback_sql.as_ref().map_or(true, |sql| {
-                    sql.matches(';').count() == 1 && sql.trim_end().ends_with(';')
+                    sql_is_one_statement(sql)
                 })
         }));
         assert_eq!(plan.actions[0].action_type, OneClickActionType::EngineInnodb);
-        assert_eq!(plan.actions[1].action_type, OneClickActionType::CharsetFkSafe);
-        assert_eq!(plan.actions[2].action_type, OneClickActionType::CharsetFkSafe);
+        assert!(plan
+            .actions
+            .iter()
+            .all(|action| action.action_type != OneClickActionType::CharsetFkSafe));
+        assert_eq!(
+            plan.snapshot
+                .inspection_facts
+                .iter()
+                .filter(|fact| fact.issue_type == "charset_issue")
+                .filter_map(|fact| fact.table.as_deref())
+                .collect::<Vec<_>>(),
+            vec!["child", "parent"]
+        );
+        assert_eq!(plan.snapshot.foreign_keys.len(), 1);
         validate_oneclick_plan(&plan).unwrap();
 
         let wire = serde_json::to_string(&plan).unwrap();
@@ -4192,6 +4392,105 @@ mod tests {
         assert!(!wire.contains("password"));
         assert!(!wire.contains("connection"));
         assert!(!wire.contains("message"));
+    }
+
+    #[test]
+    fn oneclick_plan_isolated_charset_table_keeps_one_deterministic_action() {
+        let mut session = oneclick_plan_recording_session(true);
+        session.tables.push(oneclick_plan_table(
+            "standalone",
+            "InnoDB",
+            "utf8mb3",
+            "utf8mb3_general_ci",
+            vec![oneclick_plan_column(1, "id", "int")],
+            vec![oneclick_plan_index("PRIMARY", "id")],
+        ));
+
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+        let charset_actions = plan
+            .actions
+            .iter()
+            .filter(|action| action.action_type == OneClickActionType::CharsetFkSafe)
+            .collect::<Vec<_>>();
+
+        assert_eq!(charset_actions.len(), 1);
+        assert_eq!(charset_actions[0].tables, vec!["standalone"]);
+        assert_eq!(
+            charset_actions[0].sql,
+            "ALTER TABLE `app`.`standalone` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
+        );
+        assert!(sql_is_one_statement(&charset_actions[0].sql));
+    }
+
+    #[test]
+    fn oneclick_plan_deprecated_engine_markers_preserve_and_validate_table_identity() {
+        assert_eq!(
+            oneclick_deprecated_engine_marker("deprecated_engine:orders:2026:MyISAM"),
+            Some(("orders:2026".to_string(), "MyISAM".to_string()))
+        );
+        assert_eq!(
+            oneclick_deprecated_engine_marker("deprecated_engine: orders :MyISAM"),
+            Some((" orders ".to_string(), "MyISAM".to_string()))
+        );
+
+        let mut session = oneclick_plan_recording_session(true);
+        session.tables[0].table = "orders:2026".to_string();
+        session.inspection.unsupported_objects =
+            vec!["deprecated_engine:orders:2026:MyISAM".to_string()];
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+        assert_eq!(plan.actions[0].tables, vec!["orders:2026"]);
+    }
+
+    #[test]
+    fn oneclick_plan_rejects_unknown_mismatched_and_contradictory_engine_markers() {
+        let marker_sets = [
+            vec!["deprecated_engine:ghost:MyISAM".to_string()],
+            vec!["deprecated_engine:legacy:MEMORY".to_string()],
+            vec![
+                "deprecated_engine:legacy:MyISAM".to_string(),
+                "deprecated_engine:legacy:MEMORY".to_string(),
+            ],
+        ];
+
+        for unsupported_objects in marker_sets {
+            let mut session = oneclick_plan_recording_session(true);
+            session.inspection.unsupported_objects = unsupported_objects;
+            assert_eq!(
+                build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app")
+                    .unwrap_err()
+                    .code(),
+                "oneclick_plan_invalid_facts"
+            );
+        }
+    }
+
+    #[test]
+    fn oneclick_plan_sql_validation_ignores_only_quoted_semicolons() {
+        for sql in [
+            "ALTER TABLE `app`.`a;b` ENGINE=InnoDB;",
+            "SELECT 'a;''b';",
+            "SELECT \"a;\"\"b\";",
+            "SELECT `a;``b`;",
+            r#"SELECT 'a;\'b';"#,
+        ] {
+            assert!(sql_is_one_statement(sql), "expected one statement: {sql}");
+        }
+        for sql in [
+            "ALTER TABLE `app`.`a` ENGINE=InnoDB; SELECT 1;",
+            "SELECT 1; -- second;",
+            "SELECT 'unterminated;",
+            "SELECT 1",
+        ] {
+            assert!(!sql_is_one_statement(sql), "expected rejection: {sql}");
+        }
+
+        let mut session = oneclick_plan_recording_session(true);
+        session.tables[0].table = "a;b".to_string();
+        session.inspection.unsupported_objects =
+            vec!["deprecated_engine:a;b:MyISAM".to_string()];
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+        assert_eq!(plan.actions[0].tables, vec!["a;b"]);
+        validate_oneclick_plan(&plan).unwrap();
     }
 
     #[test]
@@ -4245,6 +4544,14 @@ mod tests {
     #[test]
     fn oneclick_plan_hashes_bind_typed_state_profile_actions_and_order() {
         let mut session = oneclick_plan_recording_session(true);
+        session.tables.push(oneclick_plan_table(
+            "standalone",
+            "InnoDB",
+            "utf8mb3",
+            "utf8mb3_general_ci",
+            vec![oneclick_plan_column(1, "id", "int")],
+            vec![oneclick_plan_index("PRIMARY", "id")],
+        ));
         let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
         let original = plan.plan_hash.clone();
 
@@ -4265,12 +4572,7 @@ mod tests {
         assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
 
         let mut changed = plan.clone();
-        changed.actions[1].expected_pre_facts.facts.foreign_keys[0].delete_rule =
-            "RESTRICT".to_string();
-        assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
-
-        let mut changed = plan.clone();
-        changed.actions.swap(1, 2);
+        changed.actions.swap(0, 1);
         assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
 
         let mut changed = plan.clone();
@@ -4309,7 +4611,7 @@ mod tests {
         assert!(approval.get("facts").is_none());
 
         let mut changed = plan.clone();
-        changed.actions[1].tables.reverse();
+        changed.actions[0].tables = vec!["legacy".to_string(), "legacy".to_string()];
         changed.plan_hash = compute_oneclick_plan_hash(&changed).unwrap();
         assert_eq!(
             validate_oneclick_plan(&changed).unwrap_err().code(),
@@ -4330,6 +4632,92 @@ mod tests {
         changed.snapshot_hash = "0".repeat(64);
         changed.plan_hash = compute_oneclick_plan_hash(&changed).unwrap();
         assert!(validate_oneclick_plan(&changed).is_err());
+    }
+
+    #[test]
+    fn oneclick_plan_validation_rejects_fully_rehashed_action_forgery() {
+        let mut session = oneclick_plan_recording_session(true);
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+
+        let mut empty_facts = plan.clone();
+        empty_facts.actions[0].expected_pre_facts.facts.tables.clear();
+        empty_facts.actions[0].expected_post_facts.facts.tables.clear();
+        empty_facts.actions[0].expected_pre_facts.facts_hash = domain_hash(
+            ACTION_FACTS_HASH_DOMAIN,
+            &empty_facts.actions[0].expected_pre_facts.facts,
+        )
+        .unwrap();
+        empty_facts.actions[0].expected_post_facts.facts_hash = domain_hash(
+            ACTION_FACTS_HASH_DOMAIN,
+            &empty_facts.actions[0].expected_post_facts.facts,
+        )
+        .unwrap();
+        empty_facts.plan_hash = compute_oneclick_plan_hash(&empty_facts).unwrap();
+        assert!(validate_oneclick_plan(&empty_facts).is_err());
+
+        let mut ghost = plan.clone();
+        ghost.actions[0].tables = vec!["ghost".to_string()];
+        ghost.actions[0].sql = "ALTER TABLE `app`.`ghost` ENGINE=InnoDB;".to_string();
+        ghost.actions[0].rollback_sql =
+            Some("ALTER TABLE `app`.`ghost` ENGINE=MyISAM;".to_string());
+        ghost.actions[0].expected_pre_facts.facts.tables[0].table = "ghost".to_string();
+        ghost.actions[0].expected_post_facts.facts.tables[0].table = "ghost".to_string();
+        rehash_plan(&mut ghost);
+        assert!(validate_oneclick_plan(&ghost).is_err());
+
+        let mut substituted = plan.clone();
+        substituted.actions[0].strategy = "engine_memory".to_string();
+        substituted.actions[0].sql = "ALTER TABLE `app`.`legacy` ENGINE=MEMORY;".to_string();
+        substituted.actions[0].expected_post_facts.facts.tables[0].engine =
+            Some("MEMORY".to_string());
+        rehash_plan(&mut substituted);
+        assert!(validate_oneclick_plan(&substituted).is_err());
+    }
+
+    #[test]
+    fn oneclick_plan_validation_rejects_rehashed_order_and_state_chain_forgery() {
+        let mut session = oneclick_plan_recording_session(true);
+        session.tables[0].charset = Some("utf8mb3".to_string());
+        session.tables[0].collation = Some("utf8mb3_general_ci".to_string());
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+
+        let mut reordered = plan.clone();
+        reordered.actions.swap(0, 1);
+        for (position, action) in reordered.actions.iter_mut().enumerate() {
+            action.ordinal = (position + 1) as u32;
+        }
+        rehash_plan(&mut reordered);
+        assert!(validate_oneclick_plan(&reordered).is_err());
+
+        let mut stale_pre_state = plan.clone();
+        let charset_action = stale_pre_state
+            .actions
+            .iter_mut()
+            .find(|action| {
+                action.action_type == OneClickActionType::CharsetFkSafe
+                    && action.tables == ["legacy"]
+            })
+            .unwrap();
+        charset_action.expected_pre_facts.facts.tables[0].engine =
+            Some("MyISAM".to_string());
+        rehash_plan(&mut stale_pre_state);
+        assert!(validate_oneclick_plan(&stale_pre_state).is_err());
+    }
+
+    #[test]
+    fn oneclick_plan_validation_rejects_rehashed_inspection_and_fk_schema_forgery() {
+        let mut session = oneclick_plan_recording_session(true);
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+
+        let mut ghost_inspection = plan.clone();
+        ghost_inspection.snapshot.inspection_facts[0].table = Some("ghost".to_string());
+        rehash_plan(&mut ghost_inspection);
+        assert!(validate_oneclick_plan(&ghost_inspection).is_err());
+
+        let mut foreign_schema = plan.clone();
+        foreign_schema.snapshot.foreign_keys[0].constraint_schema = "other".to_string();
+        rehash_plan(&mut foreign_schema);
+        assert!(validate_oneclick_plan(&foreign_schema).is_err());
     }
 
     #[test]

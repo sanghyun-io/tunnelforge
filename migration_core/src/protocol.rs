@@ -43,7 +43,6 @@ pub const PUBLIC_COMMANDS: &[&str] = &[
     "oneclick.preflight",
     "oneclick.analyze",
     "oneclick.plan",
-    "oneclick.apply_fixes",
     "oneclick.validate",
     "oneclick.report",
     "job.cancel",
@@ -1630,6 +1629,10 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("oneclick.derive_charset_contracts")));
+        assert!(!result["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("oneclick.apply_fixes")));
         assert_eq!(result["oneclick_plan_version"], 1);
         assert_eq!(result["oneclick_approval_version"], 1);
         assert_eq!(result["oneclick_profile_version"], 1);
@@ -1681,7 +1684,6 @@ mod tests {
                 "oneclick.preflight",
                 "oneclick.analyze",
                 "oneclick.plan",
-                "oneclick.apply_fixes",
                 "oneclick.validate",
                 "oneclick.report",
                 "job.cancel",
@@ -1761,6 +1763,7 @@ mod tests {
             payload: json!({"dry_run": false}),
         });
         assert_error_code(&apply_events, "oneclick_apply_disabled");
+        assert!(!PUBLIC_COMMANDS.contains(&"oneclick.apply_fixes"));
     }
 
     #[test]
