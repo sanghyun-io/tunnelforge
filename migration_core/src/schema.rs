@@ -230,11 +230,11 @@ fn inspect_generic<A: InspectAdapter>(
     })
 }
 
-struct MysqlInspectAdapter {
-    conn: mysql::PooledConn,
+struct MysqlInspectAdapter<'a> {
+    conn: &'a mut mysql::PooledConn,
 }
 
-impl InspectAdapter for MysqlInspectAdapter {
+impl InspectAdapter for MysqlInspectAdapter<'_> {
     fn table_names(&mut self, schema: &str) -> Result<Vec<(String, Option<String>)>, String> {
         self.conn
             .exec_map(
@@ -328,7 +328,7 @@ impl InspectAdapter for MysqlInspectAdapter {
     }
 
     fn unsupported_objects(&mut self, schema: &str) -> Result<Vec<String>, String> {
-        inspect_mysql_unsupported_objects(&mut self.conn, schema)
+        inspect_mysql_unsupported_objects(self.conn, schema)
     }
 }
 
@@ -336,9 +336,16 @@ fn inspect_mysql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let schema_name = endpoint_schema(endpoint);
     let opts = mysql_opts(endpoint);
     let pool = mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
-    let conn = pool
+    let mut conn = pool
         .get_conn()
         .map_err(|err| format!("mysql connection error: {err}"))?;
+    inspect_mysql_with_conn(&mut conn, &schema_name)
+}
+
+pub(crate) fn inspect_mysql_with_conn(
+    conn: &mut mysql::PooledConn,
+    schema_name: &str,
+) -> Result<InspectionResult, String> {
     let mut adapter = MysqlInspectAdapter { conn };
     inspect_generic(&mut adapter, &schema_name)
 }

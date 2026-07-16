@@ -40,11 +40,9 @@ pub const PUBLIC_COMMANDS: &[&str] = &[
     "migration.verify",
     "migration.resume",
     "migration.cleanup",
-    "oneclick.run",
     "oneclick.preflight",
     "oneclick.analyze",
-    "oneclick.recommend",
-    "oneclick.derive_charset_contracts",
+    "oneclick.plan",
     "oneclick.apply_fixes",
     "oneclick.validate",
     "oneclick.report",
@@ -1052,9 +1050,19 @@ where
         "oneclick.run" => oneclick_run_streaming(&request, emit),
         "oneclick.preflight" => emit_all_events(oneclick_preflight(&request), emit),
         "oneclick.analyze" => emit_all_events(oneclick_analyze(&request), emit),
+        "oneclick.plan" => emit_all_events(oneclick_plan(&request), emit),
         "oneclick.recommend" => emit_all_events(oneclick_recommend(&request), emit),
         "oneclick.derive_charset_contracts" => {
             emit_all_events(oneclick_derive_charset_contracts(&request), emit)
+        }
+        "oneclick.apply_fixes"
+            if request
+                .payload
+                .get("dry_run")
+                .and_then(Value::as_bool)
+                .unwrap_or(true) =>
+        {
+            emit_all_events(oneclick_legacy_preview_disabled(&request), emit)
         }
         "oneclick.apply_fixes" => emit_all_events(oneclick_apply_fixes(&request), emit),
         "oneclick.validate" => emit_all_events(oneclick_validate(&request), emit),
@@ -1201,6 +1209,12 @@ fn service_hello(request: &Request) -> Vec<Value> {
         "max_assembled_event_chunks": MAX_ASSEMBLED_EVENT_CHUNKS,
         "max_assembled_event_nodes": MAX_ASSEMBLED_EVENT_NODES,
         "max_assembled_event_depth": MAX_ASSEMBLED_EVENT_DEPTH,
+        "oneclick_plan_version": ONECLICK_PLAN_VERSION,
+        "oneclick_approval_version": ONECLICK_APPROVAL_VERSION,
+        "oneclick_profile_version": ONECLICK_PROFILE_VERSION,
+        "oneclick_action_facts_version": ACTION_FACTS_VERSION,
+        "oneclick_exact_plan_enabled": ONECLICK_EXACT_PLAN_ENABLED,
+        "oneclick_strong_fence_proven": ONECLICK_STRONG_FENCE_PROVEN,
         "capabilities": PUBLIC_COMMANDS
     })]
 }
@@ -1603,11 +1617,25 @@ mod tests {
         assert!(result["capabilities"]
             .as_array()
             .unwrap()
+            .contains(&json!("oneclick.plan")));
+        assert!(!result["capabilities"]
+            .as_array()
+            .unwrap()
             .contains(&json!("oneclick.run")));
-        assert!(result["capabilities"]
+        assert!(!result["capabilities"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("oneclick.recommend")));
+        assert!(!result["capabilities"]
             .as_array()
             .unwrap()
             .contains(&json!("oneclick.derive_charset_contracts")));
+        assert_eq!(result["oneclick_plan_version"], 1);
+        assert_eq!(result["oneclick_approval_version"], 1);
+        assert_eq!(result["oneclick_profile_version"], 1);
+        assert_eq!(result["oneclick_action_facts_version"], 1);
+        assert_eq!(result["oneclick_exact_plan_enabled"], false);
+        assert_eq!(result["oneclick_strong_fence_proven"], false);
     }
 
     #[test]
@@ -1650,11 +1678,9 @@ mod tests {
                 "migration.verify",
                 "migration.resume",
                 "migration.cleanup",
-                "oneclick.run",
                 "oneclick.preflight",
                 "oneclick.analyze",
-                "oneclick.recommend",
-                "oneclick.derive_charset_contracts",
+                "oneclick.plan",
                 "oneclick.apply_fixes",
                 "oneclick.validate",
                 "oneclick.report",
@@ -1666,6 +1692,75 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("migration.cleanup")));
+    }
+
+    #[test]
+    fn oneclick_plan_protocol_rejects_prohibited_payload_without_db_work() {
+        for key in [
+            "issues",
+            "charset_contracts",
+            "target_charset",
+            "target_collation",
+            "actions",
+            "steps",
+            "profile",
+            "remediation_profile",
+            "approval",
+            "dry_run",
+            "backup_confirmed",
+            "unknown",
+        ] {
+            let mut payload = json!({
+                "connection": {
+                    "engine": "mysql",
+                    "host": "invalid.invalid",
+                    "port": 3306,
+                    "user": "app",
+                    "password": "must-not-leak"
+                },
+                "schema": "app"
+            });
+            payload[key] = json!(true);
+            let events = handle_request(Request {
+                command: "oneclick.plan".to_string(),
+                request_id: Some(format!("plan-prohibited-{key}")),
+                payload,
+            });
+
+            assert_error_code(&events, "oneclick_plan_payload_prohibited");
+            assert!(!serde_json::to_string(&events).unwrap().contains("must-not-leak"));
+        }
+    }
+
+    #[test]
+    fn oneclick_plan_protocol_legacy_preview_matrix_fails_closed() {
+        let cases = [
+            ("oneclick.run", json!({})),
+            ("oneclick.run", json!({"dry_run": false})),
+            ("oneclick.recommend", json!({"issues": []})),
+            (
+                "oneclick.derive_charset_contracts",
+                json!({"table_facts": [], "fk_facts": []}),
+            ),
+            ("oneclick.apply_fixes", json!({})),
+            ("oneclick.apply_fixes", json!({"dry_run": true})),
+        ];
+
+        for (command, payload) in cases {
+            let events = handle_request(Request {
+                command: command.to_string(),
+                request_id: Some(format!("legacy-{command}")),
+                payload,
+            });
+            assert_error_code(&events, "oneclick_legacy_preview_disabled");
+        }
+
+        let apply_events = handle_request(Request {
+            command: "oneclick.apply_fixes".to_string(),
+            request_id: Some("legacy-apply-real".to_string()),
+            payload: json!({"dry_run": false}),
+        });
+        assert_error_code(&apply_events, "oneclick_apply_disabled");
     }
 
     #[test]
@@ -1789,15 +1884,7 @@ mod tests {
                 }]
             }),
         });
-        let result = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
-            .unwrap();
-
-        assert_eq!(result["command"], "oneclick.recommend");
-        assert_eq!(result["success"], true);
-        assert_eq!(result["summary"]["manual_review"], 1);
-        assert_eq!(result["steps"][0]["selected_option"]["strategy"], "manual");
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
     }
 
     #[test]
@@ -1827,27 +1914,7 @@ mod tests {
                 }]
             }),
         });
-        let result = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
-            .unwrap();
-
-        assert_eq!(result["command"], "oneclick.recommend");
-        assert_eq!(result["success"], true);
-        assert_eq!(result["summary"]["total_issues"], 2);
-        assert_eq!(result["summary"]["auto_fixable"], 1);
-        assert_eq!(result["summary"]["manual_review"], 1);
-        assert_eq!(result["steps"][0]["issue_type"], "deprecated_engine");
-        assert_eq!(result["steps"][0]["table_name"], "legacy_table");
-        assert_eq!(
-            result["steps"][0]["selected_option"]["strategy"],
-            "engine_innodb"
-        );
-        assert_eq!(
-            result["steps"][0]["selected_option"]["sql_template"],
-            "ALTER TABLE `app`.`legacy_table` ENGINE=InnoDB;"
-        );
-        assert_eq!(result["steps"][1]["selected_option"]["strategy"], "manual");
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
     }
 
     #[test]
@@ -1879,24 +1946,7 @@ mod tests {
                 }]
             }),
         });
-        let result = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
-            .unwrap();
-
-        assert_eq!(result["summary"]["auto_fixable"], 1);
-        assert_eq!(result["summary"]["manual_review"], 0);
-        assert_eq!(
-            result["steps"][0]["selected_option"]["strategy"],
-            "charset_collation_fk_safe"
-        );
-        assert_eq!(
-            result["steps"][0]["selected_option"]["sql"],
-            json!([
-                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_parent` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;",
-                "ALTER TABLE `tf_oneclick_charset`.`tf_oneclick_child` CONVERT TO CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;"
-            ])
-        );
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
     }
 
     #[test]
@@ -1917,14 +1967,7 @@ mod tests {
                 }]
             }),
         });
-        let result = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
-            .unwrap();
-
-        assert_eq!(result["summary"]["auto_fixable"], 0);
-        assert_eq!(result["summary"]["manual_review"], 1);
-        assert_eq!(result["steps"][0]["selected_option"]["strategy"], "manual");
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
     }
 
     #[test]
@@ -1960,18 +2003,7 @@ mod tests {
                 }]
             }),
         });
-        let result = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
-            .unwrap();
-
-        assert_eq!(result["command"], "oneclick.derive_charset_contracts");
-        assert_eq!(result["success"], true);
-        assert_eq!(result["contracts"].as_array().unwrap().len(), 1);
-        assert_eq!(
-            result["contracts"][0]["fk_order"],
-            json!(["tf_oneclick_parent", "tf_oneclick_child"])
-        );
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
     }
 
     #[test]
@@ -1981,15 +2013,7 @@ mod tests {
             request_id: Some("oneclick-apply-1".to_string()),
             payload: json!({"steps": [{"location": "backup"}]}),
         });
-        let result = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
-            .unwrap();
-
-        assert_eq!(result["command"], "oneclick.apply_fixes");
-        assert_eq!(result["success"], true);
-        assert_eq!(result["dry_run"], true);
-        assert_eq!(result["skip_count"], 1);
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
     }
 
     #[test]
@@ -2000,7 +2024,7 @@ mod tests {
             payload: json!({"dry_run": false, "backup_confirmed": true}),
         });
 
-        assert_error_code(&events, "oneclick_apply_disabled");
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
         assert_eq!(events[0]["request_id"], "oneclick-run-disabled-1");
     }
 
@@ -2016,17 +2040,8 @@ mod tests {
                 payload,
             });
 
-            assert_eq!(events[0]["event"], "phase");
-            let error = events
-                .iter()
-                .find(|event| event.get("event") == Some(&json!("error")))
-                .expect("dry-run should reach existing endpoint validation");
-            assert!(matches!(error["code"].as_str(), Some(value) if !value.is_empty()));
-            assert_eq!(error["request_id"], request_id);
-            assert!(error["message"]
-                .as_str()
-                .unwrap()
-                .contains("invalid endpoint"));
+            assert_error_code(&events, "oneclick_legacy_preview_disabled");
+            assert_eq!(events[0]["request_id"], request_id);
         }
     }
 
@@ -2060,21 +2075,7 @@ mod tests {
                 }]
             }),
         });
-        let result = events
-            .into_iter()
-            .find(|event| event.get("event") == Some(&json!("result")))
-            .unwrap();
-
-        assert_eq!(result["success"], true);
-        assert_eq!(result["dry_run"], true);
-        assert_eq!(result["disallowed_fix_attempts"], json!([]));
-        assert_eq!(
-            result["planned_fixes"][0]["strategy"],
-            "charset_collation_fk_safe"
-        );
-        assert_eq!(result["planned_fixes"][0]["success"], false);
-        assert_eq!(result["planned_fixes"][0]["dry_run"], true);
-        assert_eq!(result["applied_fixes"], json!([]));
+        assert_error_code(&events, "oneclick_legacy_preview_disabled");
     }
 
     #[test]

@@ -1,10 +1,1560 @@
-use serde::Deserialize;
+use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
 use mysql::prelude::Queryable;
 use crate::*;
-use crate::schema::error_event;
+use crate::schema::{error_event, inspect_mysql_with_conn};
+
+pub(crate) const ONECLICK_PLAN_VERSION: u32 = 1;
+pub(crate) const ONECLICK_APPROVAL_VERSION: u32 = 1;
+pub(crate) const ONECLICK_PROFILE_VERSION: u32 = 1;
+pub(crate) const ACTION_FACTS_VERSION: u32 = 1;
+const ONECLICK_SNAPSHOT_VERSION: u32 = 1;
+pub(crate) const ONECLICK_EXACT_PLAN_ENABLED: bool = false;
+pub(crate) const ONECLICK_STRONG_FENCE_PROVEN: bool = false;
+
+const ACTION_FACTS_HASH_DOMAIN: &[u8] = b"tunnelforge.oneclick.action-facts.v1\0";
+const SNAPSHOT_HASH_DOMAIN: &[u8] = b"tunnelforge.oneclick.snapshot.v1\0";
+const PLAN_HASH_DOMAIN: &[u8] = b"tunnelforge.oneclick.plan.v1\0";
+
+pub(crate) fn oneclick_apply_enabled(
+    exact_plan_enabled: bool,
+    strong_fence_proven: bool,
+) -> bool {
+    exact_plan_enabled && strong_fence_proven
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OneClickContractError {
+    code: &'static str,
+    message: &'static str,
+}
+
+impl OneClickContractError {
+    fn new(code: &'static str, message: &'static str) -> Self {
+        Self { code, message }
+    }
+
+    pub(crate) fn code(&self) -> &'static str {
+        self.code
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickRoute {
+    pub(crate) host: String,
+    pub(crate) port: u16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickTargetIdentity {
+    pub(crate) engine: String,
+    pub(crate) route: OneClickRoute,
+    pub(crate) server_uuid: String,
+    pub(crate) authenticated_user: String,
+    pub(crate) schema: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickRemediationProfile {
+    pub(crate) profile_version: u32,
+    pub(crate) profile_id: String,
+    pub(crate) target_charset: String,
+    pub(crate) target_collation: String,
+}
+
+pub(crate) fn fixed_oneclick_profile() -> OneClickRemediationProfile {
+    OneClickRemediationProfile {
+        profile_version: ONECLICK_PROFILE_VERSION,
+        profile_id: "mysql-utf8mb4-0900-v1".to_string(),
+        target_charset: "utf8mb4".to_string(),
+        target_collation: "utf8mb4_0900_ai_ci".to_string(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum OneClickActionType {
+    EngineInnodb,
+    CharsetFkSafe,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ColumnDefaultFact {
+    Absent,
+    Null,
+    Literal(String),
+    Expression(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct LiteralDefaultWire {
+    literal: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ExpressionDefaultWire {
+    expression: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(untagged)]
+enum ColumnDefaultWire {
+    Keyword(String),
+    Literal(LiteralDefaultWire),
+    Expression(ExpressionDefaultWire),
+}
+
+impl Serialize for ColumnDefaultFact {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let wire = match self {
+            Self::Absent => ColumnDefaultWire::Keyword("absent".to_string()),
+            Self::Null => ColumnDefaultWire::Keyword("null".to_string()),
+            Self::Literal(literal) => ColumnDefaultWire::Literal(LiteralDefaultWire {
+                literal: literal.clone(),
+            }),
+            Self::Expression(expression) => {
+                ColumnDefaultWire::Expression(ExpressionDefaultWire {
+                    expression: expression.clone(),
+                })
+            }
+        };
+        wire.serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ColumnDefaultFact {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        match ColumnDefaultWire::deserialize(deserializer)? {
+            ColumnDefaultWire::Keyword(keyword) if keyword == "absent" => Ok(Self::Absent),
+            ColumnDefaultWire::Keyword(keyword) if keyword == "null" => Ok(Self::Null),
+            ColumnDefaultWire::Keyword(_) => Err(de::Error::custom(
+                "column default keyword must be absent or null",
+            )),
+            ColumnDefaultWire::Literal(value) => Ok(Self::Literal(value.literal)),
+            ColumnDefaultWire::Expression(value) => Ok(Self::Expression(value.expression)),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActionColumnFact {
+    pub(crate) ordinal_position: u32,
+    pub(crate) name: String,
+    pub(crate) column_type: String,
+    pub(crate) nullable: bool,
+    pub(crate) default: ColumnDefaultFact,
+    pub(crate) charset: Option<String>,
+    pub(crate) collation: Option<String>,
+    pub(crate) generated_expression: Option<String>,
+    pub(crate) generated_stored: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActionIndexColumnFact {
+    pub(crate) ordinal_position: u32,
+    pub(crate) column_name: Option<String>,
+    pub(crate) expression: Option<String>,
+    pub(crate) prefix_length: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActionIndexFact {
+    pub(crate) name: String,
+    pub(crate) unique: bool,
+    pub(crate) index_type: String,
+    pub(crate) visible: bool,
+    pub(crate) columns: Vec<ActionIndexColumnFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActionTableDefinitionFact {
+    pub(crate) schema: String,
+    pub(crate) table: String,
+    pub(crate) engine: Option<String>,
+    pub(crate) charset: Option<String>,
+    pub(crate) collation: Option<String>,
+    pub(crate) columns: Vec<ActionColumnFact>,
+    pub(crate) indexes: Vec<ActionIndexFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActionForeignKeyColumnFact {
+    pub(crate) ordinal_position: u32,
+    pub(crate) column_name: String,
+    pub(crate) referenced_column_name: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActionForeignKeyFact {
+    pub(crate) constraint_schema: String,
+    pub(crate) constraint_name: String,
+    pub(crate) table_schema: String,
+    pub(crate) table_name: String,
+    pub(crate) referenced_table_schema: String,
+    pub(crate) referenced_table_name: String,
+    pub(crate) match_option: String,
+    pub(crate) update_rule: String,
+    pub(crate) delete_rule: String,
+    pub(crate) columns: Vec<ActionForeignKeyColumnFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct ActionFactsDocument {
+    pub(crate) action_facts_version: u32,
+    pub(crate) action_type: OneClickActionType,
+    pub(crate) tables: Vec<ActionTableDefinitionFact>,
+    pub(crate) foreign_keys: Vec<ActionForeignKeyFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickActionStateExpectation {
+    pub(crate) facts: ActionFactsDocument,
+    pub(crate) facts_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickApplyAction {
+    pub(crate) ordinal: u32,
+    pub(crate) action_type: OneClickActionType,
+    pub(crate) issue_type: String,
+    pub(crate) strategy: String,
+    pub(crate) schema: String,
+    pub(crate) tables: Vec<String>,
+    pub(crate) sql: String,
+    pub(crate) rollback_sql: Option<String>,
+    pub(crate) target_charset: Option<String>,
+    pub(crate) target_collation: Option<String>,
+    pub(crate) expected_pre_facts: OneClickActionStateExpectation,
+    pub(crate) expected_post_facts: OneClickActionStateExpectation,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickInspectionFact {
+    pub(crate) issue_type: String,
+    pub(crate) severity: String,
+    pub(crate) object_kind: String,
+    pub(crate) schema: String,
+    pub(crate) table: Option<String>,
+    pub(crate) column: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickSnapshotDocument {
+    pub(crate) snapshot_version: u32,
+    pub(crate) schema: String,
+    pub(crate) inspection_facts: Vec<OneClickInspectionFact>,
+    pub(crate) table_definitions: Vec<ActionTableDefinitionFact>,
+    pub(crate) foreign_keys: Vec<ActionForeignKeyFact>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickPlanEnvelope {
+    pub(crate) plan_version: u32,
+    pub(crate) target_identity: OneClickTargetIdentity,
+    pub(crate) remediation_profile: OneClickRemediationProfile,
+    pub(crate) snapshot: OneClickSnapshotDocument,
+    pub(crate) snapshot_hash: String,
+    pub(crate) actions: Vec<OneClickApplyAction>,
+    pub(crate) plan_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct OneClickApprovalArtifact {
+    pub(crate) approval_version: u32,
+    pub(crate) plan_version: u32,
+    pub(crate) target_identity: OneClickTargetIdentity,
+    pub(crate) remediation_profile: OneClickRemediationProfile,
+    pub(crate) snapshot_hash: String,
+    pub(crate) plan_hash: String,
+}
+
+#[derive(Serialize)]
+struct OneClickPlanHashDocument<'a> {
+    plan_version: u32,
+    target_identity: &'a OneClickTargetIdentity,
+    remediation_profile: &'a OneClickRemediationProfile,
+    snapshot_hash: &'a str,
+    actions: &'a [OneClickApplyAction],
+}
+
+#[derive(Debug)]
+pub(crate) struct ValidatedOneClickPlanRequest {
+    pub(crate) endpoint: Endpoint,
+    pub(crate) schema: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OneClickPlanRequestWire {
+    connection: OneClickEndpointWire,
+    schema: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OneClickEndpointWire {
+    engine: String,
+    host: String,
+    port: u16,
+    user: String,
+    password: String,
+    #[serde(default)]
+    database: Option<String>,
+    #[serde(default)]
+    schema: Option<String>,
+}
+
+pub(crate) fn normalize_oneclick_schema(
+    schema: &str,
+) -> Result<String, OneClickContractError> {
+    if schema.is_empty()
+        || schema.contains('\0')
+        || schema.trim().len() != schema.len()
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_schema_invalid",
+            "One-Click schema is invalid.",
+        ));
+    }
+    Ok(schema.to_string())
+}
+
+pub(crate) fn parse_oneclick_plan_request(
+    request: &Request,
+) -> Result<ValidatedOneClickPlanRequest, OneClickContractError> {
+    const ROOT_KEYS: &[&str] = &["connection", "schema"];
+    const ENDPOINT_KEYS: &[&str] = &[
+        "engine", "host", "port", "user", "password", "database", "schema",
+    ];
+    let root = request.payload.as_object().ok_or_else(|| {
+        OneClickContractError::new(
+            "oneclick_plan_payload_prohibited",
+            "One-Click plan payload is prohibited.",
+        )
+    })?;
+    if root.keys().any(|key| !ROOT_KEYS.contains(&key.as_str())) {
+        return Err(OneClickContractError::new(
+            "oneclick_plan_payload_prohibited",
+            "One-Click plan payload is prohibited.",
+        ));
+    }
+    let connection = root
+        .get("connection")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            OneClickContractError::new(
+                "oneclick_plan_payload_prohibited",
+                "One-Click plan payload is prohibited.",
+            )
+        })?;
+    if connection
+        .keys()
+        .any(|key| !ENDPOINT_KEYS.contains(&key.as_str()))
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_plan_payload_prohibited",
+            "One-Click plan payload is prohibited.",
+        ));
+    }
+
+    let wire: OneClickPlanRequestWire =
+        serde_json::from_value(request.payload.clone()).map_err(|_| {
+            OneClickContractError::new(
+                "oneclick_plan_payload_prohibited",
+                "One-Click plan payload is prohibited.",
+            )
+        })?;
+    let schema = normalize_oneclick_schema(&wire.schema)?;
+    for nested in [&wire.connection.database, &wire.connection.schema]
+        .into_iter()
+        .flatten()
+    {
+        if nested != &schema {
+            return Err(OneClickContractError::new(
+                "oneclick_schema_mismatch",
+                "One-Click schema does not match the connection schema.",
+            ));
+        }
+    }
+    if wire.connection.engine != "mysql"
+        || wire.connection.host.trim().is_empty()
+        || wire.connection.user.trim().is_empty()
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_plan_payload_prohibited",
+            "One-Click plan endpoint is invalid.",
+        ));
+    }
+    Ok(ValidatedOneClickPlanRequest {
+        endpoint: Endpoint {
+            engine: wire.connection.engine,
+            host: wire.connection.host,
+            port: wire.connection.port,
+            user: wire.connection.user,
+            password: wire.connection.password,
+            database: schema.clone(),
+            schema: Some(schema.clone()),
+        },
+        schema,
+    })
+}
+
+fn has_text(value: &str) -> bool {
+    !value.trim().is_empty() && !value.contains('\0')
+}
+
+fn invalid_facts() -> OneClickContractError {
+    OneClickContractError::new(
+        "oneclick_plan_invalid_facts",
+        "One-Click planning facts are invalid.",
+    )
+}
+
+fn noncanonical_facts() -> OneClickContractError {
+    OneClickContractError::new(
+        "oneclick_plan_noncanonical",
+        "One-Click planning facts are not canonical.",
+    )
+}
+
+fn normalize_tables_and_foreign_keys(
+    tables: &mut Vec<ActionTableDefinitionFact>,
+    foreign_keys: &mut Vec<ActionForeignKeyFact>,
+) -> Result<(), OneClickContractError> {
+    tables.sort_by(|left, right| (&left.schema, &left.table).cmp(&(&right.schema, &right.table)));
+    let mut table_keys = BTreeSet::new();
+    let mut table_columns = BTreeMap::<(String, String), BTreeSet<String>>::new();
+    for table in tables {
+        if !has_text(&table.schema)
+            || !has_text(&table.table)
+            || !table_keys.insert((table.schema.clone(), table.table.clone()))
+        {
+            return Err(invalid_facts());
+        }
+        if table
+            .engine
+            .as_deref()
+            .is_some_and(|value| !has_text(value))
+            || table
+                .charset
+                .as_deref()
+                .is_some_and(|value| !has_text(value))
+            || table
+                .collation
+                .as_deref()
+                .is_some_and(|value| !has_text(value))
+        {
+            return Err(invalid_facts());
+        }
+        table.columns.sort_by_key(|column| column.ordinal_position);
+        let mut column_names = BTreeSet::new();
+        for (index, column) in table.columns.iter().enumerate() {
+            if column.ordinal_position != (index + 1) as u32 {
+                return Err(noncanonical_facts());
+            }
+            if !has_text(&column.name)
+                || !has_text(&column.column_type)
+                || !column_names.insert(column.name.clone())
+            {
+                return Err(invalid_facts());
+            }
+            match (
+                column.generated_expression.as_deref(),
+                column.generated_stored,
+            ) {
+                (None, None) => {}
+                (Some(expression), Some(_)) if has_text(expression) => {}
+                _ => return Err(invalid_facts()),
+            }
+            if column
+                .charset
+                .as_deref()
+                .is_some_and(|value| !has_text(value))
+                || column
+                    .collation
+                    .as_deref()
+                    .is_some_and(|value| !has_text(value))
+            {
+                return Err(invalid_facts());
+            }
+        }
+        table.indexes.sort_by(|left, right| left.name.cmp(&right.name));
+        let mut index_names = BTreeSet::new();
+        for index in &mut table.indexes {
+            if !has_text(&index.name)
+                || !has_text(&index.index_type)
+                || !index_names.insert(index.name.clone())
+            {
+                return Err(invalid_facts());
+            }
+            index
+                .columns
+                .sort_by_key(|column| column.ordinal_position);
+            for (position, column) in index.columns.iter().enumerate() {
+                if column.ordinal_position != (position + 1) as u32 {
+                    return Err(noncanonical_facts());
+                }
+                let valid_column = column.column_name.as_deref().is_some_and(has_text);
+                let valid_expression = column.expression.as_deref().is_some_and(has_text);
+                if valid_column == valid_expression
+                    || column.prefix_length == Some(0)
+                    || column
+                        .column_name
+                        .as_ref()
+                        .is_some_and(|name| !column_names.contains(name))
+                {
+                    return Err(invalid_facts());
+                }
+            }
+        }
+        table_columns.insert(
+            (table.schema.clone(), table.table.clone()),
+            column_names,
+        );
+    }
+
+    foreign_keys.sort_by(|left, right| {
+        (
+            &left.constraint_schema,
+            &left.constraint_name,
+            &left.table_schema,
+            &left.table_name,
+            &left.referenced_table_schema,
+            &left.referenced_table_name,
+        )
+            .cmp(&(
+                &right.constraint_schema,
+                &right.constraint_name,
+                &right.table_schema,
+                &right.table_name,
+                &right.referenced_table_schema,
+                &right.referenced_table_name,
+            ))
+    });
+    let mut fk_keys = BTreeSet::new();
+    for foreign_key in foreign_keys {
+        if [
+            &foreign_key.constraint_schema,
+            &foreign_key.constraint_name,
+            &foreign_key.table_schema,
+            &foreign_key.table_name,
+            &foreign_key.referenced_table_schema,
+            &foreign_key.referenced_table_name,
+            &foreign_key.match_option,
+            &foreign_key.update_rule,
+            &foreign_key.delete_rule,
+        ]
+        .into_iter()
+        .any(|value| !has_text(value))
+            || !fk_keys.insert((
+                foreign_key.constraint_schema.clone(),
+                foreign_key.constraint_name.clone(),
+                foreign_key.table_schema.clone(),
+                foreign_key.table_name.clone(),
+                foreign_key.referenced_table_schema.clone(),
+                foreign_key.referenced_table_name.clone(),
+            ))
+        {
+            return Err(invalid_facts());
+        }
+        foreign_key
+            .columns
+            .sort_by_key(|column| column.ordinal_position);
+        for (position, column) in foreign_key.columns.iter().enumerate() {
+            if column.ordinal_position != (position + 1) as u32 {
+                return Err(noncanonical_facts());
+            }
+            if !has_text(&column.column_name) || !has_text(&column.referenced_column_name) {
+                return Err(invalid_facts());
+            }
+            let table_key = (
+                foreign_key.table_schema.clone(),
+                foreign_key.table_name.clone(),
+            );
+            let referenced_table_key = (
+                foreign_key.referenced_table_schema.clone(),
+                foreign_key.referenced_table_name.clone(),
+            );
+            if !table_columns
+                .get(&table_key)
+                .is_some_and(|columns| columns.contains(&column.column_name))
+                || !table_columns
+                    .get(&referenced_table_key)
+                    .is_some_and(|columns| columns.contains(&column.referenced_column_name))
+            {
+                return Err(invalid_facts());
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn normalize_action_facts(
+    mut facts: ActionFactsDocument,
+) -> Result<ActionFactsDocument, OneClickContractError> {
+    if facts.action_facts_version != ACTION_FACTS_VERSION {
+        return Err(invalid_facts());
+    }
+    normalize_tables_and_foreign_keys(&mut facts.tables, &mut facts.foreign_keys)?;
+    Ok(facts)
+}
+
+fn validate_canonical_action_facts(
+    facts: &ActionFactsDocument,
+) -> Result<(), OneClickContractError> {
+    if normalize_action_facts(facts.clone())? != *facts {
+        return Err(noncanonical_facts());
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub(crate) fn canonical_action_facts_json(
+    facts: &ActionFactsDocument,
+) -> Result<String, OneClickContractError> {
+    validate_canonical_action_facts(facts)?;
+    serde_json::to_string(facts).map_err(|_| invalid_facts())
+}
+
+fn domain_hash<T: Serialize>(domain: &[u8], value: &T) -> Result<String, OneClickContractError> {
+    let bytes = serde_json::to_vec(value).map_err(|_| invalid_facts())?;
+    let mut hasher = Sha256::new();
+    hasher.update(domain);
+    hasher.update(bytes);
+    Ok(hex::encode(hasher.finalize()))
+}
+
+pub(crate) fn hash_action_facts(
+    facts: &ActionFactsDocument,
+) -> Result<String, OneClickContractError> {
+    validate_canonical_action_facts(facts)?;
+    domain_hash(ACTION_FACTS_HASH_DOMAIN, facts)
+}
+
+fn normalize_snapshot(
+    mut snapshot: OneClickSnapshotDocument,
+) -> Result<OneClickSnapshotDocument, OneClickContractError> {
+    if snapshot.snapshot_version != ONECLICK_SNAPSHOT_VERSION || !has_text(&snapshot.schema) {
+        return Err(invalid_facts());
+    }
+    snapshot.inspection_facts.sort_by(|left, right| {
+        (
+            &left.issue_type,
+            &left.severity,
+            &left.object_kind,
+            &left.schema,
+            left.table.as_deref().unwrap_or(""),
+            left.column.as_deref().unwrap_or(""),
+        )
+            .cmp(&(
+                &right.issue_type,
+                &right.severity,
+                &right.object_kind,
+                &right.schema,
+                right.table.as_deref().unwrap_or(""),
+                right.column.as_deref().unwrap_or(""),
+            ))
+    });
+    for fact in &snapshot.inspection_facts {
+        if !has_text(&fact.issue_type)
+            || !has_text(&fact.severity)
+            || !has_text(&fact.object_kind)
+            || !has_text(&fact.schema)
+            || fact.table.as_deref().is_some_and(|value| !has_text(value))
+            || fact.column.as_deref().is_some_and(|value| !has_text(value))
+        {
+            return Err(invalid_facts());
+        }
+    }
+    normalize_tables_and_foreign_keys(
+        &mut snapshot.table_definitions,
+        &mut snapshot.foreign_keys,
+    )?;
+    if snapshot
+        .inspection_facts
+        .iter()
+        .any(|fact| fact.schema != snapshot.schema)
+        || snapshot
+            .table_definitions
+            .iter()
+            .any(|table| table.schema != snapshot.schema)
+        || snapshot.foreign_keys.iter().any(|foreign_key| {
+            foreign_key.constraint_schema != snapshot.schema
+                || foreign_key.table_schema != snapshot.schema
+                || foreign_key.referenced_table_schema != snapshot.schema
+        })
+    {
+        return Err(invalid_facts());
+    }
+    Ok(snapshot)
+}
+
+fn hash_snapshot(snapshot: &OneClickSnapshotDocument) -> Result<String, OneClickContractError> {
+    domain_hash(SNAPSHOT_HASH_DOMAIN, snapshot)
+}
+
+pub(crate) fn compute_oneclick_plan_hash(
+    plan: &OneClickPlanEnvelope,
+) -> Result<String, OneClickContractError> {
+    domain_hash(
+        PLAN_HASH_DOMAIN,
+        &OneClickPlanHashDocument {
+            plan_version: plan.plan_version,
+            target_identity: &plan.target_identity,
+            remediation_profile: &plan.remediation_profile,
+            snapshot_hash: &plan.snapshot_hash,
+            actions: &plan.actions,
+        },
+    )
+}
+
+fn action_expectation(
+    facts: ActionFactsDocument,
+) -> Result<OneClickActionStateExpectation, OneClickContractError> {
+    let facts = normalize_action_facts(facts)?;
+    let facts_hash = hash_action_facts(&facts)?;
+    Ok(OneClickActionStateExpectation { facts, facts_hash })
+}
+
+fn sql_is_one_statement(sql: &str) -> bool {
+    let trimmed = sql.trim();
+    !trimmed.is_empty() && trimmed.ends_with(';') && trimmed.matches(';').count() == 1
+}
+
+fn action_facts_within_tables(action: &OneClickApplyAction, facts: &ActionFactsDocument) -> bool {
+    let allowed = action.tables.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    facts
+        .tables
+        .iter()
+        .all(|table| table.schema == action.schema && allowed.contains(table.table.as_str()))
+        && facts.foreign_keys.iter().all(|foreign_key| {
+            foreign_key.table_schema == action.schema
+                && foreign_key.referenced_table_schema == action.schema
+                && allowed.contains(foreign_key.table_name.as_str())
+                && allowed.contains(foreign_key.referenced_table_name.as_str())
+        })
+}
+
+pub(crate) fn validate_oneclick_plan(
+    plan: &OneClickPlanEnvelope,
+) -> Result<(), OneClickContractError> {
+    if plan.plan_version != ONECLICK_PLAN_VERSION
+        || plan.remediation_profile != fixed_oneclick_profile()
+        || plan.snapshot != normalize_snapshot(plan.snapshot.clone())?
+        || plan.snapshot_hash != hash_snapshot(&plan.snapshot)?
+        || plan.target_identity.schema != plan.snapshot.schema
+    {
+        return Err(noncanonical_facts());
+    }
+    for (position, action) in plan.actions.iter().enumerate() {
+        if action.ordinal != (position + 1) as u32
+            || action.schema != plan.snapshot.schema
+            || action.tables.is_empty()
+            || action.tables.iter().any(|table| !has_text(table))
+            || !sql_is_one_statement(&action.sql)
+            || action
+                .rollback_sql
+                .as_deref()
+                .is_some_and(|sql| !sql_is_one_statement(sql))
+            || action.expected_pre_facts.facts.action_type != action.action_type
+            || action.expected_post_facts.facts.action_type != action.action_type
+        {
+            return Err(invalid_facts());
+        }
+        if action
+            .tables
+            .windows(2)
+            .any(|pair| pair[0].as_bytes() >= pair[1].as_bytes())
+        {
+            return Err(noncanonical_facts());
+        }
+        validate_canonical_action_facts(&action.expected_pre_facts.facts)?;
+        validate_canonical_action_facts(&action.expected_post_facts.facts)?;
+        if action.expected_pre_facts.facts_hash
+            != hash_action_facts(&action.expected_pre_facts.facts)?
+            || action.expected_post_facts.facts_hash
+                != hash_action_facts(&action.expected_post_facts.facts)?
+            || !action_facts_within_tables(action, &action.expected_pre_facts.facts)
+            || !action_facts_within_tables(action, &action.expected_post_facts.facts)
+        {
+            return Err(noncanonical_facts());
+        }
+    }
+    if plan.plan_hash != compute_oneclick_plan_hash(plan)? {
+        return Err(noncanonical_facts());
+    }
+    Ok(())
+}
+
+pub(crate) fn oneclick_approval_artifact(plan: &OneClickPlanEnvelope) -> OneClickApprovalArtifact {
+    OneClickApprovalArtifact {
+        approval_version: ONECLICK_APPROVAL_VERSION,
+        plan_version: plan.plan_version,
+        target_identity: plan.target_identity.clone(),
+        remediation_profile: plan.remediation_profile.clone(),
+        snapshot_hash: plan.snapshot_hash.clone(),
+        plan_hash: plan.plan_hash.clone(),
+    }
+}
+
+pub(crate) trait OneClickPlanningSession {
+    fn profile_supported(
+        &mut self,
+        profile: &OneClickRemediationProfile,
+    ) -> Result<bool, String>;
+    fn read_target_identity(
+        &mut self,
+        endpoint: &Endpoint,
+    ) -> Result<OneClickTargetIdentity, String>;
+    fn inspect(&mut self, endpoint: &Endpoint) -> Result<InspectionResult, String>;
+    fn read_table_definitions(
+        &mut self,
+        schema: &str,
+    ) -> Result<Vec<ActionTableDefinitionFact>, String>;
+    fn read_fk_facts(&mut self, schema: &str) -> Result<Vec<ActionForeignKeyFact>, String>;
+}
+
+fn planning_failed() -> OneClickContractError {
+    OneClickContractError::new(
+        "oneclick_plan_failed",
+        "One-Click plan could not be built from the target.",
+    )
+}
+
+fn quote_mysql_identifier(identifier: &str) -> String {
+    format!("`{}`", identifier.replace('`', "``"))
+}
+
+fn rollback_token(value: &str) -> Option<&str> {
+    if !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+fn scoped_action_facts(
+    action_type: OneClickActionType,
+    tables: &[ActionTableDefinitionFact],
+    foreign_keys: &[ActionForeignKeyFact],
+    names: &BTreeSet<String>,
+) -> Result<ActionFactsDocument, OneClickContractError> {
+    normalize_action_facts(ActionFactsDocument {
+        action_facts_version: ACTION_FACTS_VERSION,
+        action_type,
+        tables: tables
+            .iter()
+            .filter(|table| names.contains(&table.table))
+            .cloned()
+            .collect(),
+        foreign_keys: foreign_keys
+            .iter()
+            .filter(|foreign_key| {
+                names.contains(&foreign_key.table_name)
+                    && names.contains(&foreign_key.referenced_table_name)
+            })
+            .cloned()
+            .collect(),
+    })
+}
+
+fn update_charset_fact(
+    tables: &mut [ActionTableDefinitionFact],
+    table_name: &str,
+    profile: &OneClickRemediationProfile,
+) {
+    if let Some(table) = tables.iter_mut().find(|table| table.table == table_name) {
+        table.charset = Some(profile.target_charset.clone());
+        table.collation = Some(profile.target_collation.clone());
+        for column in &mut table.columns {
+            if column.charset.is_some() {
+                column.charset = Some(profile.target_charset.clone());
+                column.collation = Some(profile.target_collation.clone());
+            }
+        }
+    }
+}
+
+fn charset_components(
+    tables: &[ActionTableDefinitionFact],
+    foreign_keys: &[ActionForeignKeyFact],
+    profile: &OneClickRemediationProfile,
+) -> Vec<BTreeSet<String>> {
+    let seeds = tables
+        .iter()
+        .filter(|table| {
+            table.charset.as_deref() != Some(profile.target_charset.as_str())
+                || table.collation.as_deref() != Some(profile.target_collation.as_str())
+        })
+        .map(|table| table.table.clone())
+        .collect::<BTreeSet<_>>();
+    let all = tables
+        .iter()
+        .map(|table| table.table.clone())
+        .collect::<BTreeSet<_>>();
+    let mut remaining = seeds;
+    let mut components = Vec::new();
+    while let Some(seed) = remaining.iter().next().cloned() {
+        let mut component = BTreeSet::from([seed.clone()]);
+        loop {
+            let before = component.len();
+            for foreign_key in foreign_keys {
+                if component.contains(&foreign_key.table_name)
+                    && all.contains(&foreign_key.referenced_table_name)
+                {
+                    component.insert(foreign_key.referenced_table_name.clone());
+                }
+                if component.contains(&foreign_key.referenced_table_name)
+                    && all.contains(&foreign_key.table_name)
+                {
+                    component.insert(foreign_key.table_name.clone());
+                }
+            }
+            if component.len() == before {
+                break;
+            }
+        }
+        for table in &component {
+            remaining.remove(table);
+        }
+        components.push(component);
+    }
+    components.sort_by(|left, right| left.iter().next().cmp(&right.iter().next()));
+    components
+}
+
+fn charset_action_order(
+    component: &BTreeSet<String>,
+    foreign_keys: &[ActionForeignKeyFact],
+) -> Vec<String> {
+    let mut remaining = component.clone();
+    let mut ordered = Vec::new();
+    while !remaining.is_empty() {
+        let next = remaining
+            .iter()
+            .find(|table| {
+                !foreign_keys.iter().any(|foreign_key| {
+                    foreign_key.table_name == ***table
+                        && component.contains(&foreign_key.referenced_table_name)
+                        && remaining.contains(&foreign_key.referenced_table_name)
+                })
+            })
+            .cloned()
+            .or_else(|| remaining.iter().next().cloned())
+            .expect("remaining charset component is nonempty");
+        remaining.remove(&next);
+        ordered.push(next);
+    }
+    ordered
+}
+
+fn build_oneclick_actions(
+    schema: &str,
+    tables: &[ActionTableDefinitionFact],
+    foreign_keys: &[ActionForeignKeyFact],
+    profile: &OneClickRemediationProfile,
+    deprecated_engine_tables: &BTreeSet<String>,
+) -> Result<Vec<OneClickApplyAction>, OneClickContractError> {
+    let mut working = tables.to_vec();
+    let mut actions = Vec::new();
+
+    for table_name in tables
+        .iter()
+        .filter(|table| deprecated_engine_tables.contains(&table.table))
+        .map(|table| table.table.clone())
+    {
+        let names = BTreeSet::from([table_name.clone()]);
+        let pre = scoped_action_facts(
+            OneClickActionType::EngineInnodb,
+            &working,
+            &[],
+            &names,
+        )?;
+        let previous_engine = pre.tables[0].engine.clone();
+        if let Some(table) = working.iter_mut().find(|table| table.table == table_name) {
+            table.engine = Some("InnoDB".to_string());
+        }
+        let post = scoped_action_facts(
+            OneClickActionType::EngineInnodb,
+            &working,
+            &[],
+            &names,
+        )?;
+        let rollback_sql = previous_engine
+            .as_deref()
+            .and_then(rollback_token)
+            .map(|engine| {
+                format!(
+                    "ALTER TABLE {}.{} ENGINE={engine};",
+                    quote_mysql_identifier(schema),
+                    quote_mysql_identifier(&table_name)
+                )
+            });
+        actions.push(OneClickApplyAction {
+            ordinal: (actions.len() + 1) as u32,
+            action_type: OneClickActionType::EngineInnodb,
+            issue_type: "deprecated_engine".to_string(),
+            strategy: "engine_innodb".to_string(),
+            schema: schema.to_string(),
+            tables: vec![table_name.clone()],
+            sql: format!(
+                "ALTER TABLE {}.{} ENGINE=InnoDB;",
+                quote_mysql_identifier(schema),
+                quote_mysql_identifier(&table_name)
+            ),
+            rollback_sql,
+            target_charset: None,
+            target_collation: None,
+            expected_pre_facts: action_expectation(pre)?,
+            expected_post_facts: action_expectation(post)?,
+        });
+    }
+
+    for component in charset_components(&working, foreign_keys, profile) {
+        let scope_names = component.iter().cloned().collect::<Vec<_>>();
+        for table_name in charset_action_order(&component, foreign_keys) {
+            let is_target = working
+                .iter()
+                .find(|table| table.table == table_name)
+                .is_some_and(|table| {
+                    table.charset.as_deref() == Some(profile.target_charset.as_str())
+                        && table.collation.as_deref()
+                            == Some(profile.target_collation.as_str())
+                });
+            if is_target {
+                continue;
+            }
+            let pre = scoped_action_facts(
+                OneClickActionType::CharsetFkSafe,
+                &working,
+                foreign_keys,
+                &component,
+            )?;
+            let previous = working
+                .iter()
+                .find(|table| table.table == table_name)
+                .and_then(|table| Some((table.charset.clone()?, table.collation.clone()?)));
+            update_charset_fact(&mut working, &table_name, profile);
+            let post = scoped_action_facts(
+                OneClickActionType::CharsetFkSafe,
+                &working,
+                foreign_keys,
+                &component,
+            )?;
+            let rollback_sql = previous.and_then(|(charset, collation)| {
+                Some(format!(
+                    "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
+                    quote_mysql_identifier(schema),
+                    quote_mysql_identifier(&table_name),
+                    rollback_token(&charset)?,
+                    rollback_token(&collation)?
+                ))
+            });
+            actions.push(OneClickApplyAction {
+                ordinal: (actions.len() + 1) as u32,
+                action_type: OneClickActionType::CharsetFkSafe,
+                issue_type: "charset_issue".to_string(),
+                strategy: "charset_fk_safe".to_string(),
+                schema: schema.to_string(),
+                tables: scope_names.clone(),
+                sql: format!(
+                    "ALTER TABLE {}.{} CONVERT TO CHARACTER SET {} COLLATE {};",
+                    quote_mysql_identifier(schema),
+                    quote_mysql_identifier(&table_name),
+                    profile.target_charset,
+                    profile.target_collation
+                ),
+                rollback_sql,
+                target_charset: Some(profile.target_charset.clone()),
+                target_collation: Some(profile.target_collation.clone()),
+                expected_pre_facts: action_expectation(pre)?,
+                expected_post_facts: action_expectation(post)?,
+            });
+        }
+    }
+    Ok(actions)
+}
+
+pub(crate) fn build_oneclick_plan<S: OneClickPlanningSession>(
+    session: &mut S,
+    endpoint: &Endpoint,
+    schema: &str,
+) -> Result<OneClickPlanEnvelope, OneClickContractError> {
+    let schema = normalize_oneclick_schema(schema)?;
+    let profile = fixed_oneclick_profile();
+    if !session
+        .profile_supported(&profile)
+        .map_err(|_| planning_failed())?
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_profile_unsupported",
+            "The fixed One-Click remediation profile is unsupported by the target.",
+        ));
+    }
+    let identity = session
+        .read_target_identity(endpoint)
+        .map_err(|_| planning_failed())?;
+    if identity.engine != endpoint.engine
+        || identity.route.host != endpoint.host
+        || identity.route.port != endpoint.port
+        || identity.schema != schema
+        || !has_text(&identity.server_uuid)
+        || !has_text(&identity.authenticated_user)
+    {
+        return Err(OneClickContractError::new(
+            "oneclick_target_changed",
+            "The One-Click target identity changed.",
+        ));
+    }
+    let inspection = session.inspect(endpoint).map_err(|_| planning_failed())?;
+    let deprecated_engine_tables = inspection
+        .unsupported_objects
+        .iter()
+        .filter_map(|object| oneclick_deprecated_engine_marker(object))
+        .map(|(table, _)| table)
+        .collect::<BTreeSet<_>>();
+    let tables = session
+        .read_table_definitions(&schema)
+        .map_err(|_| planning_failed())?;
+    let foreign_keys = session
+        .read_fk_facts(&schema)
+        .map_err(|_| planning_failed())?;
+    let mut inspection_facts = Vec::new();
+    for table in &tables {
+        if deprecated_engine_tables.contains(&table.table) {
+            inspection_facts.push(OneClickInspectionFact {
+                issue_type: "deprecated_engine".to_string(),
+                severity: "warning".to_string(),
+                object_kind: "table".to_string(),
+                schema: schema.clone(),
+                table: Some(table.table.clone()),
+                column: None,
+            });
+        }
+        if table.charset.as_deref() != Some(profile.target_charset.as_str())
+            || table.collation.as_deref() != Some(profile.target_collation.as_str())
+        {
+            inspection_facts.push(OneClickInspectionFact {
+                issue_type: "charset_issue".to_string(),
+                severity: "warning".to_string(),
+                object_kind: "table".to_string(),
+                schema: schema.clone(),
+                table: Some(table.table.clone()),
+                column: None,
+            });
+        }
+    }
+    let snapshot = normalize_snapshot(OneClickSnapshotDocument {
+        snapshot_version: ONECLICK_SNAPSHOT_VERSION,
+        schema: schema.clone(),
+        inspection_facts,
+        table_definitions: tables,
+        foreign_keys,
+    })?;
+    let snapshot_hash = hash_snapshot(&snapshot)?;
+    let actions = build_oneclick_actions(
+        &schema,
+        &snapshot.table_definitions,
+        &snapshot.foreign_keys,
+        &profile,
+        &deprecated_engine_tables,
+    )?;
+    let mut plan = OneClickPlanEnvelope {
+        plan_version: ONECLICK_PLAN_VERSION,
+        target_identity: identity,
+        remediation_profile: profile,
+        snapshot,
+        snapshot_hash,
+        actions,
+        plan_hash: String::new(),
+    };
+    plan.plan_hash = compute_oneclick_plan_hash(&plan)?;
+    validate_oneclick_plan(&plan)?;
+    Ok(plan)
+}
+
+pub(crate) struct LiveOneClickSession {
+    conn: mysql::PooledConn,
+}
+
+impl LiveOneClickSession {
+    pub(crate) fn connect(endpoint: &Endpoint) -> Result<Self, OneClickContractError> {
+        let pool = mysql::Pool::new(mysql_opts(endpoint)).map_err(|_| planning_failed())?;
+        let conn = pool.get_conn().map_err(|_| planning_failed())?;
+        Ok(Self { conn })
+    }
+}
+
+impl OneClickPlanningSession for LiveOneClickSession {
+    fn profile_supported(
+        &mut self,
+        profile: &OneClickRemediationProfile,
+    ) -> Result<bool, String> {
+        let count = self
+            .conn
+            .exec_first::<u64, _, _>(
+                "SELECT COUNT(*) FROM information_schema.collations WHERE CHARACTER_SET_NAME = ? AND COLLATION_NAME = ?",
+                (&profile.target_charset, &profile.target_collation),
+            )
+            .map_err(|err| format!("mysql profile validation failed: {err}"))?
+            .unwrap_or(0);
+        Ok(count == 1)
+    }
+
+    fn read_target_identity(
+        &mut self,
+        endpoint: &Endpoint,
+    ) -> Result<OneClickTargetIdentity, String> {
+        let (server_uuid, authenticated_user) = self
+            .conn
+            .query_first::<(String, String), _>("SELECT @@server_uuid, CURRENT_USER()")
+            .map_err(|err| format!("mysql identity query failed: {err}"))?
+            .ok_or_else(|| "mysql identity query returned no row".to_string())?;
+        if !has_text(&server_uuid) || !has_text(&authenticated_user) {
+            return Err("mysql identity query returned invalid values".to_string());
+        }
+        Ok(OneClickTargetIdentity {
+            engine: endpoint.engine.clone(),
+            route: OneClickRoute {
+                host: endpoint.host.clone(),
+                port: endpoint.port,
+            },
+            server_uuid,
+            authenticated_user,
+            schema: endpoint.database.clone(),
+        })
+    }
+
+    fn inspect(&mut self, endpoint: &Endpoint) -> Result<InspectionResult, String> {
+        inspect_mysql_with_conn(&mut self.conn, &endpoint.database)
+    }
+
+    fn read_table_definitions(
+        &mut self,
+        schema: &str,
+    ) -> Result<Vec<ActionTableDefinitionFact>, String> {
+        let rows = self
+            .conn
+            .exec_map(
+                "SELECT t.TABLE_SCHEMA, t.TABLE_NAME, t.ENGINE, c.CHARACTER_SET_NAME, t.TABLE_COLLATION FROM information_schema.tables t LEFT JOIN information_schema.collations c ON c.COLLATION_NAME = t.TABLE_COLLATION WHERE t.TABLE_SCHEMA = ? AND t.TABLE_TYPE = 'BASE TABLE' ORDER BY BINARY t.TABLE_SCHEMA, BINARY t.TABLE_NAME",
+                (schema,),
+                |(schema, table, engine, charset, collation): (
+                    String,
+                    String,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )| (schema, table, engine, charset, collation),
+            )
+            .map_err(|err| format!("mysql One-Click table metadata failed: {err}"))?;
+        let mut tables = Vec::with_capacity(rows.len());
+        for (table_schema, table_name, engine, charset, collation) in rows {
+            let columns = self
+                .conn
+                .exec_map(
+                    "SELECT ORDINAL_POSITION, COLUMN_NAME, COLUMN_TYPE, IS_NULLABLE, COLUMN_DEFAULT, EXTRA, CHARACTER_SET_NAME, COLLATION_NAME, GENERATION_EXPRESSION FROM information_schema.columns WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY ORDINAL_POSITION",
+                    (&table_schema, &table_name),
+                    |(
+                        ordinal_position,
+                        name,
+                        column_type,
+                        is_nullable,
+                        default_value,
+                        extra,
+                        charset,
+                        collation,
+                        generated_expression,
+                    ): (
+                        u32,
+                        String,
+                        String,
+                        String,
+                        Option<String>,
+                        String,
+                        Option<String>,
+                        Option<String>,
+                        Option<String>,
+                    )| {
+                        let nullable = is_nullable == "YES";
+                        let generated_expression = generated_expression
+                            .filter(|expression| !expression.is_empty());
+                        let generated_stored = generated_expression.as_ref().map(|_| {
+                            extra
+                                .split_ascii_whitespace()
+                                .any(|token| token == "STORED")
+                        });
+                        let default = match default_value {
+                            _ if generated_expression.is_some() => ColumnDefaultFact::Absent,
+                            Some(value) if extra.contains("DEFAULT_GENERATED") => {
+                                ColumnDefaultFact::Expression(value)
+                            }
+                            Some(value) => ColumnDefaultFact::Literal(value),
+                            None if nullable => ColumnDefaultFact::Null,
+                            None => ColumnDefaultFact::Absent,
+                        };
+                        ActionColumnFact {
+                            ordinal_position,
+                            name,
+                            column_type,
+                            nullable,
+                            default,
+                            charset,
+                            collation,
+                            generated_expression,
+                            generated_stored,
+                        }
+                    },
+                )
+                .map_err(|err| format!("mysql One-Click column metadata failed: {err}"))?;
+            let index_rows = self
+                .conn
+                .exec_map(
+                    "SELECT INDEX_NAME, NON_UNIQUE, INDEX_TYPE, IS_VISIBLE, SEQ_IN_INDEX, COLUMN_NAME, EXPRESSION, SUB_PART FROM information_schema.statistics WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? ORDER BY BINARY INDEX_NAME, SEQ_IN_INDEX",
+                    (&table_schema, &table_name),
+                    |(
+                        name,
+                        non_unique,
+                        index_type,
+                        is_visible,
+                        ordinal_position,
+                        column_name,
+                        expression,
+                        prefix_length,
+                    ): (
+                        String,
+                        u8,
+                        String,
+                        String,
+                        u32,
+                        Option<String>,
+                        Option<String>,
+                        Option<u32>,
+                    )| {
+                        (
+                            name,
+                            non_unique == 0,
+                            index_type,
+                            is_visible == "YES",
+                            ActionIndexColumnFact {
+                                ordinal_position,
+                                column_name,
+                                expression,
+                                prefix_length,
+                            },
+                        )
+                    },
+                )
+                .map_err(|err| format!("mysql One-Click index metadata failed: {err}"))?;
+            let mut indexes = Vec::<ActionIndexFact>::new();
+            for (name, unique, index_type, visible, column) in index_rows {
+                if let Some(index) = indexes.iter_mut().find(|index| index.name == name) {
+                    if index.unique != unique
+                        || index.index_type != index_type
+                        || index.visible != visible
+                    {
+                        return Err("mysql One-Click index metadata is inconsistent".to_string());
+                    }
+                    index.columns.push(column);
+                } else {
+                    indexes.push(ActionIndexFact {
+                        name,
+                        unique,
+                        index_type,
+                        visible,
+                        columns: vec![column],
+                    });
+                }
+            }
+            tables.push(ActionTableDefinitionFact {
+                schema: table_schema,
+                table: table_name,
+                engine,
+                charset,
+                collation,
+                columns,
+                indexes,
+            });
+        }
+        Ok(tables)
+    }
+
+    fn read_fk_facts(&mut self, schema: &str) -> Result<Vec<ActionForeignKeyFact>, String> {
+        let rows = self
+            .conn
+            .exec_map(
+                "SELECT k.CONSTRAINT_SCHEMA, k.CONSTRAINT_NAME, k.TABLE_SCHEMA, k.TABLE_NAME, k.REFERENCED_TABLE_SCHEMA, k.REFERENCED_TABLE_NAME, r.MATCH_OPTION, r.UPDATE_RULE, r.DELETE_RULE, k.ORDINAL_POSITION, k.COLUMN_NAME, k.REFERENCED_COLUMN_NAME FROM information_schema.key_column_usage k JOIN information_schema.referential_constraints r ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME WHERE k.TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY BINARY k.CONSTRAINT_SCHEMA, BINARY k.CONSTRAINT_NAME, BINARY k.TABLE_SCHEMA, BINARY k.TABLE_NAME, BINARY k.REFERENCED_TABLE_SCHEMA, BINARY k.REFERENCED_TABLE_NAME, k.ORDINAL_POSITION",
+                (schema,),
+                |(
+                    constraint_schema,
+                    constraint_name,
+                    table_schema,
+                    table_name,
+                    referenced_table_schema,
+                    referenced_table_name,
+                    match_option,
+                    update_rule,
+                    delete_rule,
+                    ordinal_position,
+                    column_name,
+                    referenced_column_name,
+                ): (
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    u32,
+                    String,
+                    String,
+                )| {
+                    (
+                        constraint_schema,
+                        constraint_name,
+                        table_schema,
+                        table_name,
+                        referenced_table_schema,
+                        referenced_table_name,
+                        match_option,
+                        update_rule,
+                        delete_rule,
+                        ActionForeignKeyColumnFact {
+                            ordinal_position,
+                            column_name,
+                            referenced_column_name,
+                        },
+                    )
+                },
+            )
+            .map_err(|err| format!("mysql One-Click FK metadata failed: {err}"))?;
+        let mut foreign_keys = Vec::<ActionForeignKeyFact>::new();
+        for (
+            constraint_schema,
+            constraint_name,
+            table_schema,
+            table_name,
+            referenced_table_schema,
+            referenced_table_name,
+            match_option,
+            update_rule,
+            delete_rule,
+            column,
+        ) in rows
+        {
+            if let Some(foreign_key) = foreign_keys.iter_mut().find(|foreign_key| {
+                foreign_key.constraint_schema == constraint_schema
+                    && foreign_key.constraint_name == constraint_name
+                    && foreign_key.table_schema == table_schema
+                    && foreign_key.table_name == table_name
+                    && foreign_key.referenced_table_schema == referenced_table_schema
+                    && foreign_key.referenced_table_name == referenced_table_name
+            }) {
+                if foreign_key.match_option != match_option
+                    || foreign_key.update_rule != update_rule
+                    || foreign_key.delete_rule != delete_rule
+                {
+                    return Err("mysql One-Click FK metadata is inconsistent".to_string());
+                }
+                foreign_key.columns.push(column);
+            } else {
+                foreign_keys.push(ActionForeignKeyFact {
+                    constraint_schema,
+                    constraint_name,
+                    table_schema,
+                    table_name,
+                    referenced_table_schema,
+                    referenced_table_name,
+                    match_option,
+                    update_rule,
+                    delete_rule,
+                    columns: vec![column],
+                });
+            }
+        }
+        Ok(foreign_keys)
+    }
+}
+
+fn oneclick_contract_error_event(request: &Request, error: &OneClickContractError) -> Value {
+    json!({
+        "event": "error",
+        "request_id": request.request_id,
+        "code": error.code(),
+        "message": error.message
+    })
+}
+
+pub(crate) fn oneclick_plan(request: &Request) -> Vec<Value> {
+    let validated = match parse_oneclick_plan_request(request) {
+        Ok(validated) => validated,
+        Err(error) => return vec![oneclick_contract_error_event(request, &error)],
+    };
+    let mut session = match LiveOneClickSession::connect(&validated.endpoint) {
+        Ok(session) => session,
+        Err(error) => return vec![oneclick_contract_error_event(request, &error)],
+    };
+    match build_oneclick_plan(
+        &mut session,
+        &validated.endpoint,
+        &validated.schema,
+    ) {
+        Ok(plan) => {
+            let approval = oneclick_approval_artifact(&plan);
+            vec![json!({
+                "event": "result",
+                "request_id": request.request_id,
+                "command": "oneclick.plan",
+                "success": true,
+                "plan": plan,
+                "approval": approval
+            })]
+        }
+        Err(error) => vec![oneclick_contract_error_event(request, &error)],
+    }
+}
+
+pub(crate) fn oneclick_legacy_preview_disabled(request: &Request) -> Vec<Value> {
+    vec![json!({
+        "event": "error",
+        "request_id": request.request_id,
+        "code": "oneclick_legacy_preview_disabled",
+        "message": "Legacy One-Click preview is disabled; use oneclick.plan."
+    })]
+}
 
 fn oneclick_apply_disabled_event(request: &Request) -> Value {
     json!({
@@ -73,6 +1623,12 @@ where
     F: FnMut(Value) -> R,
     R: IntoProtocolEmitResult,
 {
+    if request.command == "oneclick.run" {
+        for event in oneclick_legacy_preview_disabled(request) {
+            emit(event).into_protocol_emit_result()?;
+        }
+        return Ok(());
+    }
     let dry_run = request
         .payload
         .get("dry_run")
@@ -285,6 +1841,9 @@ pub(crate) fn oneclick_analyze(request: &Request) -> Vec<Value> {
 }
 
 pub(crate) fn oneclick_recommend(request: &Request) -> Vec<Value> {
+    if request.command == "oneclick.recommend" {
+        return oneclick_legacy_preview_disabled(request);
+    }
     let mut events = vec![phase_event(
         request,
         "recommendation",
@@ -311,6 +1870,9 @@ pub(crate) fn oneclick_recommend(request: &Request) -> Vec<Value> {
 }
 
 pub(crate) fn oneclick_derive_charset_contracts(request: &Request) -> Vec<Value> {
+    if request.command == "oneclick.derive_charset_contracts" {
+        return oneclick_legacy_preview_disabled(request);
+    }
     let mut events = vec![phase_event(
         request,
         "recommendation",
@@ -391,7 +1953,13 @@ pub(crate) fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
         .get("dry_run")
         .and_then(Value::as_bool)
         .unwrap_or(true);
-    if !dry_run {
+    if dry_run {
+        return oneclick_legacy_preview_disabled(request);
+    }
+    if !oneclick_apply_enabled(
+        ONECLICK_EXACT_PLAN_ENABLED,
+        ONECLICK_STRONG_FENCE_PROVEN,
+    ) {
         return vec![oneclick_apply_disabled_event(request)];
     }
 
@@ -400,25 +1968,6 @@ pub(crate) fn oneclick_apply_fixes(request: &Request) -> Vec<Value> {
         "execution",
         "one-click apply fixes started",
     )];
-    if dry_run {
-        let preview = oneclick_dry_run_preview_fixes(&request.payload);
-        events.push(json!({
-            "event": "result",
-            "request_id": request.request_id,
-            "command": "oneclick.apply_fixes",
-            "success": true,
-            "dry_run": true,
-            "success_count": 0,
-            "fail_count": 0,
-            "skip_count": preview.skipped,
-            "disallowed_fix_attempts": preview.disallowed,
-            "applied_fixes": [],
-            "planned_fixes": preview.planned_fixes,
-            "log": ["DRY-RUN: no database changes were executed."]
-        }));
-        return events;
-    }
-
     let plan = oneclick_apply_actions(&request.payload);
     if !plan.disallowed.is_empty() {
         events.push(json!({
@@ -1288,7 +2837,7 @@ fn oneclick_safe_charset_token(value: Option<&str>, label: &str) -> Result<Strin
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct OneClickApplyAction {
+struct LegacyOneClickApplyAction {
     issue_type: String,
     strategy: String,
     schema: String,
@@ -1304,7 +2853,7 @@ struct OneClickApplyAction {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OneClickApplyPlan {
-    actions: Vec<OneClickApplyAction>,
+    actions: Vec<LegacyOneClickApplyAction>,
     skipped: usize,
     disallowed: Vec<String>,
 }
@@ -1320,6 +2869,7 @@ struct OneClickApplyOutcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 struct OneClickDryRunPreview {
     planned_fixes: Vec<Value>,
     skipped: usize,
@@ -1400,7 +2950,7 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
                 let rollback_sql =
                     oneclick_required_string_list(option.get("rollback_sql"), "rollback_sql")
                         .unwrap_or_default();
-                actions.push(OneClickApplyAction {
+                actions.push(LegacyOneClickApplyAction {
                     issue_type: "charset_issue".to_string(),
                     strategy: "charset_collation_fk_safe".to_string(),
                     schema: schema.to_string(),
@@ -1434,7 +2984,7 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
                     disallowed.push("deprecated_engine:engine_innodb:sql_mismatch".to_string());
                     continue;
                 }
-                actions.push(OneClickApplyAction {
+                actions.push(LegacyOneClickApplyAction {
                     issue_type: "deprecated_engine".to_string(),
                     strategy: "engine_innodb".to_string(),
                     schema: schema.to_string(),
@@ -1458,6 +3008,7 @@ fn oneclick_apply_actions(payload: &Value) -> OneClickApplyPlan {
     }
 }
 
+#[allow(dead_code)]
 fn oneclick_dry_run_preview_fixes(payload: &Value) -> OneClickDryRunPreview {
     let schema = payload
         .get("schema")
@@ -1607,7 +3158,7 @@ enum OneClickPayloadShape {
     SingleTable,
 }
 
-fn classify_oneclick_payload_shape(action: &OneClickApplyAction) -> OneClickPayloadShape {
+fn classify_oneclick_payload_shape(action: &LegacyOneClickApplyAction) -> OneClickPayloadShape {
     if action.issue_type == "charset_issue" && action.strategy == "charset_collation_fk_safe" {
         OneClickPayloadShape::CharsetCollationFkSafe
     } else {
@@ -1616,7 +3167,7 @@ fn classify_oneclick_payload_shape(action: &OneClickApplyAction) -> OneClickPayl
 }
 
 fn oneclick_applied_fix_payload(
-    action: &OneClickApplyAction,
+    action: &LegacyOneClickApplyAction,
     success: bool,
     error: Option<&str>,
 ) -> Value {
@@ -2195,5 +3746,603 @@ mod tests {
 
         assert_eq!(calls, 1);
         assert!(!error.side_effect_started());
+    }
+
+    fn oneclick_plan_column(
+        ordinal_position: u32,
+        name: &str,
+        column_type: &str,
+    ) -> ActionColumnFact {
+        ActionColumnFact {
+            ordinal_position,
+            name: name.to_string(),
+            column_type: column_type.to_string(),
+            nullable: false,
+            default: ColumnDefaultFact::Absent,
+            charset: None,
+            collation: None,
+            generated_expression: None,
+            generated_stored: None,
+        }
+    }
+
+    fn oneclick_plan_index(name: &str, column: &str) -> ActionIndexFact {
+        ActionIndexFact {
+            name: name.to_string(),
+            unique: name == "PRIMARY",
+            index_type: "BTREE".to_string(),
+            visible: true,
+            columns: vec![ActionIndexColumnFact {
+                ordinal_position: 1,
+                column_name: Some(column.to_string()),
+                expression: None,
+                prefix_length: None,
+            }],
+        }
+    }
+
+    fn oneclick_plan_table(
+        table: &str,
+        engine: &str,
+        charset: &str,
+        collation: &str,
+        columns: Vec<ActionColumnFact>,
+        indexes: Vec<ActionIndexFact>,
+    ) -> ActionTableDefinitionFact {
+        ActionTableDefinitionFact {
+            schema: "app".to_string(),
+            table: table.to_string(),
+            engine: Some(engine.to_string()),
+            charset: Some(charset.to_string()),
+            collation: Some(collation.to_string()),
+            columns,
+            indexes,
+        }
+    }
+
+    fn oneclick_plan_engine_facts() -> ActionFactsDocument {
+        ActionFactsDocument {
+            action_facts_version: ACTION_FACTS_VERSION,
+            action_type: OneClickActionType::EngineInnodb,
+            tables: vec![oneclick_plan_table(
+                "legacy",
+                "MyISAM",
+                "utf8mb3",
+                "utf8mb3_general_ci",
+                vec![oneclick_plan_column(1, "id", "int")],
+                vec![oneclick_plan_index("PRIMARY", "id")],
+            )],
+            foreign_keys: vec![],
+        }
+    }
+
+    fn oneclick_plan_charset_facts() -> ActionFactsDocument {
+        ActionFactsDocument {
+            action_facts_version: ACTION_FACTS_VERSION,
+            action_type: OneClickActionType::CharsetFkSafe,
+            tables: vec![
+                oneclick_plan_table(
+                    "parent",
+                    "InnoDB",
+                    "utf8mb3",
+                    "utf8mb3_general_ci",
+                    vec![oneclick_plan_column(1, "id", "int")],
+                    vec![oneclick_plan_index("PRIMARY", "id")],
+                ),
+                oneclick_plan_table(
+                    "child",
+                    "InnoDB",
+                    "utf8mb3",
+                    "utf8mb3_general_ci",
+                    vec![
+                        oneclick_plan_column(2, "parent_id", "int"),
+                        oneclick_plan_column(1, "id", "int"),
+                    ],
+                    vec![
+                        oneclick_plan_index("fk_child_parent", "parent_id"),
+                        oneclick_plan_index("PRIMARY", "id"),
+                    ],
+                ),
+            ],
+            foreign_keys: vec![ActionForeignKeyFact {
+                constraint_schema: "app".to_string(),
+                constraint_name: "fk_child_parent".to_string(),
+                table_schema: "app".to_string(),
+                table_name: "child".to_string(),
+                referenced_table_schema: "app".to_string(),
+                referenced_table_name: "parent".to_string(),
+                match_option: "NONE".to_string(),
+                update_rule: "RESTRICT".to_string(),
+                delete_rule: "CASCADE".to_string(),
+                columns: vec![ActionForeignKeyColumnFact {
+                    ordinal_position: 1,
+                    column_name: "parent_id".to_string(),
+                    referenced_column_name: "id".to_string(),
+                }],
+            }],
+        }
+    }
+
+    #[test]
+    fn oneclick_plan_default_wire_forms_are_exact_and_strict() {
+        let cases = [
+            (ColumnDefaultFact::Absent, json!("absent")),
+            (ColumnDefaultFact::Null, json!("null")),
+            (
+                ColumnDefaultFact::Literal("0".to_string()),
+                json!({"literal": "0"}),
+            ),
+            (
+                ColumnDefaultFact::Expression("CURRENT_TIMESTAMP".to_string()),
+                json!({"expression": "CURRENT_TIMESTAMP"}),
+            ),
+        ];
+        for (fact, wire) in cases {
+            assert_eq!(serde_json::to_value(&fact).unwrap(), wire);
+            assert_eq!(
+                serde_json::from_value::<ColumnDefaultFact>(wire).unwrap(),
+                fact
+            );
+        }
+
+        for rejected in [
+            json!("ABSENT"),
+            json!("default"),
+            json!({"literal": "0", "extra": true}),
+            json!({"expression": "NOW()", "literal": "0"}),
+            json!({"unknown": "0"}),
+        ] {
+            assert!(serde_json::from_value::<ColumnDefaultFact>(rejected).is_err());
+        }
+    }
+
+    #[test]
+    fn oneclick_plan_action_fact_golden_vectors_match_exact_bytes_and_hashes() {
+        let engine = normalize_action_facts(oneclick_plan_engine_facts()).unwrap();
+        assert_eq!(
+            canonical_action_facts_json(&engine).unwrap(),
+            r#"{"action_facts_version":1,"action_type":"engine_innodb","tables":[{"schema":"app","table":"legacy","engine":"MyISAM","charset":"utf8mb3","collation":"utf8mb3_general_ci","columns":[{"ordinal_position":1,"name":"id","column_type":"int","nullable":false,"default":"absent","charset":null,"collation":null,"generated_expression":null,"generated_stored":null}],"indexes":[{"name":"PRIMARY","unique":true,"index_type":"BTREE","visible":true,"columns":[{"ordinal_position":1,"column_name":"id","expression":null,"prefix_length":null}]}]}],"foreign_keys":[]}"#
+        );
+        assert_eq!(
+            hash_action_facts(&engine).unwrap(),
+            "82f25f33ba164c4c2ca938ab3e519561bb881bae6cfa54d6e268b09223c698a5"
+        );
+
+        let charset = normalize_action_facts(oneclick_plan_charset_facts()).unwrap();
+        assert_eq!(
+            hash_action_facts(&charset).unwrap(),
+            "ec651d11903da08bbc0092ef468d38d886254e3edb0625cb3105994d91873e20"
+        );
+        assert_eq!(charset.tables[0].table, "child");
+        assert_eq!(charset.tables[0].columns[0].name, "id");
+        assert_eq!(charset.tables[0].indexes[0].name, "PRIMARY");
+    }
+
+    #[test]
+    fn oneclick_plan_normalization_rejects_malformed_ordinals_and_fields() {
+        let mut duplicate_column = oneclick_plan_engine_facts();
+        duplicate_column.tables[0]
+            .columns
+            .push(oneclick_plan_column(1, "other", "int"));
+        assert_eq!(
+            normalize_action_facts(duplicate_column).unwrap_err().code(),
+            "oneclick_plan_noncanonical"
+        );
+
+        let mut generated = oneclick_plan_engine_facts();
+        generated.tables[0].columns[0].generated_stored = Some(true);
+        assert_eq!(
+            normalize_action_facts(generated).unwrap_err().code(),
+            "oneclick_plan_invalid_facts"
+        );
+
+        let mut index = oneclick_plan_engine_facts();
+        index.tables[0].indexes[0].columns[0].expression = Some("id".to_string());
+        assert_eq!(
+            normalize_action_facts(index).unwrap_err().code(),
+            "oneclick_plan_invalid_facts"
+        );
+
+        let mut missing_index_column = oneclick_plan_engine_facts();
+        missing_index_column.tables[0].indexes[0].columns[0].column_name =
+            Some("missing".to_string());
+        assert_eq!(
+            normalize_action_facts(missing_index_column)
+                .unwrap_err()
+                .code(),
+            "oneclick_plan_invalid_facts"
+        );
+
+        let mut fk = oneclick_plan_charset_facts();
+        fk.foreign_keys[0].columns[0].ordinal_position = 2;
+        assert_eq!(
+            normalize_action_facts(fk).unwrap_err().code(),
+            "oneclick_plan_noncanonical"
+        );
+
+        let mut missing_fk_column = oneclick_plan_charset_facts();
+        missing_fk_column.foreign_keys[0].columns[0].referenced_column_name =
+            "missing".to_string();
+        assert_eq!(
+            normalize_action_facts(missing_fk_column)
+                .unwrap_err()
+                .code(),
+            "oneclick_plan_invalid_facts"
+        );
+    }
+
+    #[test]
+    fn oneclick_plan_schema_and_payload_parser_are_strict() {
+        assert_eq!(normalize_oneclick_schema("App_One").unwrap(), "App_One");
+        for invalid in ["", " app", "app ", "app\0prod"] {
+            assert_eq!(
+                normalize_oneclick_schema(invalid).unwrap_err().code(),
+                "oneclick_schema_invalid"
+            );
+        }
+
+        let request = |payload| Request {
+            command: "oneclick.plan".to_string(),
+            request_id: Some("plan-parser-1".to_string()),
+            payload,
+        };
+        let accepted = parse_oneclick_plan_request(&request(json!({
+            "connection": {
+                "engine": "mysql", "host": "127.0.0.1", "port": 3306,
+                "user": "app", "password": "secret"
+            },
+            "schema": "App_One"
+        })))
+        .unwrap();
+        assert_eq!(accepted.schema, "App_One");
+        assert_eq!(accepted.endpoint.database, "App_One");
+        assert_eq!(accepted.endpoint.schema.as_deref(), Some("App_One"));
+        let equal = parse_oneclick_plan_request(&request(json!({
+            "connection": {
+                "engine": "mysql", "host": "127.0.0.1", "port": 3306,
+                "user": "app", "password": "secret",
+                "database": "App_One", "schema": "App_One"
+            },
+            "schema": "App_One"
+        })))
+        .unwrap();
+        assert_eq!(equal.endpoint.database, "App_One");
+        assert_eq!(equal.endpoint.schema.as_deref(), Some("App_One"));
+
+        for key in ["database", "schema"] {
+            let mut connection = json!({
+                "engine": "mysql", "host": "127.0.0.1", "port": 3306,
+                "user": "app", "password": "secret"
+            });
+            connection[key] = json!("other");
+            assert_eq!(
+                parse_oneclick_plan_request(&request(json!({
+                    "connection": connection, "schema": "App_One"
+                })))
+                .unwrap_err()
+                .code(),
+                "oneclick_schema_mismatch"
+            );
+        }
+
+        let prohibited = [
+            "issues",
+            "charset_contracts",
+            "target_charset",
+            "target_collation",
+            "actions",
+            "steps",
+            "profile",
+            "remediation_profile",
+            "approval",
+            "dry_run",
+            "backup_confirmed",
+            "unknown",
+        ];
+        for key in prohibited {
+            let mut root = json!({
+                "connection": {
+                    "engine": "mysql", "host": "127.0.0.1", "port": 3306,
+                    "user": "app", "password": "secret"
+                },
+                "schema": "app"
+            });
+            root[key] = json!(true);
+            assert_eq!(
+                parse_oneclick_plan_request(&request(root))
+                    .unwrap_err()
+                    .code(),
+                "oneclick_plan_payload_prohibited"
+            );
+
+            let mut nested = json!({
+                "engine": "mysql", "host": "127.0.0.1", "port": 3306,
+                "user": "app", "password": "secret"
+            });
+            nested[key] = json!(true);
+            assert_eq!(
+                parse_oneclick_plan_request(&request(json!({
+                    "connection": nested, "schema": "app"
+                })))
+                .unwrap_err()
+                .code(),
+                "oneclick_plan_payload_prohibited"
+            );
+        }
+    }
+
+    #[derive(Clone)]
+    struct RecordingPlanningSession {
+        profile_supported: bool,
+        calls: Vec<&'static str>,
+        inspection: InspectionResult,
+        tables: Vec<ActionTableDefinitionFact>,
+        foreign_keys: Vec<ActionForeignKeyFact>,
+    }
+
+    impl OneClickPlanningSession for RecordingPlanningSession {
+        fn profile_supported(
+            &mut self,
+            _profile: &OneClickRemediationProfile,
+        ) -> Result<bool, String> {
+            self.calls.push("profile");
+            Ok(self.profile_supported)
+        }
+
+        fn read_target_identity(
+            &mut self,
+            endpoint: &Endpoint,
+        ) -> Result<OneClickTargetIdentity, String> {
+            self.calls.push("identity");
+            Ok(OneClickTargetIdentity {
+                engine: endpoint.engine.clone(),
+                route: OneClickRoute {
+                    host: endpoint.host.clone(),
+                    port: endpoint.port,
+                },
+                server_uuid: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee".to_string(),
+                authenticated_user: "app@localhost".to_string(),
+                schema: endpoint.database.clone(),
+            })
+        }
+
+        fn inspect(&mut self, _endpoint: &Endpoint) -> Result<InspectionResult, String> {
+            self.calls.push("inspect");
+            Ok(self.inspection.clone())
+        }
+
+        fn read_table_definitions(
+            &mut self,
+            _schema: &str,
+        ) -> Result<Vec<ActionTableDefinitionFact>, String> {
+            self.calls.push("tables");
+            Ok(self.tables.clone())
+        }
+
+        fn read_fk_facts(
+            &mut self,
+            _schema: &str,
+        ) -> Result<Vec<ActionForeignKeyFact>, String> {
+            self.calls.push("fks");
+            Ok(self.foreign_keys.clone())
+        }
+    }
+
+    fn oneclick_plan_recording_session(profile_supported: bool) -> RecordingPlanningSession {
+        let engine = oneclick_plan_engine_facts();
+        let charset = oneclick_plan_charset_facts();
+        let mut legacy = engine.tables[0].clone();
+        legacy.charset = Some("utf8mb4".to_string());
+        legacy.collation = Some("utf8mb4_0900_ai_ci".to_string());
+        RecordingPlanningSession {
+            profile_supported,
+            calls: Vec::new(),
+            inspection: InspectionResult {
+                unsupported_objects: vec!["deprecated_engine:legacy:MyISAM".to_string()],
+                ..InspectionResult::default()
+            },
+            tables: vec![legacy, charset.tables[1].clone(), charset.tables[0].clone()],
+            foreign_keys: charset.foreign_keys,
+        }
+    }
+
+    fn oneclick_plan_endpoint() -> Endpoint {
+        Endpoint {
+            engine: "mysql".to_string(),
+            host: "127.0.0.1".to_string(),
+            port: 3306,
+            user: "app".to_string(),
+            password: "do-not-serialize".to_string(),
+            database: "app".to_string(),
+            schema: Some("app".to_string()),
+        }
+    }
+
+    #[test]
+    fn oneclick_plan_builder_uses_one_session_and_expands_one_sql_actions() {
+        let mut session = oneclick_plan_recording_session(true);
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+
+        assert_eq!(
+            session.calls,
+            vec!["profile", "identity", "inspect", "tables", "fks"]
+        );
+        assert_eq!(plan.plan_version, ONECLICK_PLAN_VERSION);
+        assert_eq!(plan.remediation_profile, fixed_oneclick_profile());
+        assert_eq!(plan.actions.len(), 3);
+        assert_eq!(
+            plan.actions.iter().map(|action| action.ordinal).collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+        assert!(plan.actions.iter().all(|action| {
+            !action.sql.trim().is_empty()
+                && action.sql.matches(';').count() == 1
+                && action.sql.trim_end().ends_with(';')
+                && action.rollback_sql.as_ref().map_or(true, |sql| {
+                    sql.matches(';').count() == 1 && sql.trim_end().ends_with(';')
+                })
+        }));
+        assert_eq!(plan.actions[0].action_type, OneClickActionType::EngineInnodb);
+        assert_eq!(plan.actions[1].action_type, OneClickActionType::CharsetFkSafe);
+        assert_eq!(plan.actions[2].action_type, OneClickActionType::CharsetFkSafe);
+        validate_oneclick_plan(&plan).unwrap();
+
+        let wire = serde_json::to_string(&plan).unwrap();
+        assert!(!wire.contains("do-not-serialize"));
+        assert!(!wire.contains("password"));
+        assert!(!wire.contains("connection"));
+        assert!(!wire.contains("message"));
+    }
+
+    #[test]
+    fn oneclick_plan_engine_actions_cover_only_deprecated_engines() {
+        let mut session = oneclick_plan_recording_session(true);
+        let mut memory = session.tables[0].clone();
+        memory.table = "scratch".to_string();
+        memory.engine = Some("MEMORY".to_string());
+        session.tables.push(memory);
+
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+        let engine_tables = plan
+            .actions
+            .iter()
+            .filter(|action| action.action_type == OneClickActionType::EngineInnodb)
+            .flat_map(|action| action.tables.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+
+        assert_eq!(engine_tables, vec!["legacy"]);
+    }
+
+    #[test]
+    fn oneclick_plan_unsupported_profile_stops_before_identity_or_plan() {
+        let mut session = oneclick_plan_recording_session(false);
+        let error = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app")
+            .unwrap_err();
+
+        assert_eq!(error.code(), "oneclick_profile_unsupported");
+        assert_eq!(session.calls, vec!["profile"]);
+    }
+
+    #[test]
+    fn oneclick_plan_builder_rejects_non_authoritative_schema_facts() {
+        let mut session = oneclick_plan_recording_session(true);
+        for table in &mut session.tables {
+            table.schema = "other".to_string();
+            table.engine = Some("InnoDB".to_string());
+            table.charset = Some("utf8mb4".to_string());
+            table.collation = Some("utf8mb4_0900_ai_ci".to_string());
+        }
+        session.foreign_keys.clear();
+
+        assert_eq!(
+            build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app")
+                .unwrap_err()
+                .code(),
+            "oneclick_plan_invalid_facts"
+        );
+    }
+
+    #[test]
+    fn oneclick_plan_hashes_bind_typed_state_profile_actions_and_order() {
+        let mut session = oneclick_plan_recording_session(true);
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+        let original = plan.plan_hash.clone();
+
+        let mut changed = plan.clone();
+        changed.actions[0].expected_pre_facts.facts.tables[0].columns[0].column_type =
+            "bigint".to_string();
+        assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
+
+        let mut changed = plan.clone();
+        changed.actions[1].expected_pre_facts.facts.tables[0].columns[0]
+            .generated_expression = Some("id + 1".to_string());
+        changed.actions[1].expected_pre_facts.facts.tables[0].columns[0].generated_stored =
+            Some(true);
+        assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
+
+        let mut changed = plan.clone();
+        changed.actions[1].expected_pre_facts.facts.tables[0].indexes[0].visible = false;
+        assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
+
+        let mut changed = plan.clone();
+        changed.actions[1].expected_pre_facts.facts.foreign_keys[0].delete_rule =
+            "RESTRICT".to_string();
+        assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
+
+        let mut changed = plan.clone();
+        changed.actions.swap(1, 2);
+        assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
+
+        let mut changed = plan.clone();
+        changed.remediation_profile.profile_id = "substituted".to_string();
+        assert_ne!(compute_oneclick_plan_hash(&changed).unwrap(), original);
+
+        let mut unknown = serde_json::to_value(oneclick_plan_engine_facts()).unwrap();
+        unknown["message"] = json!("not canonical");
+        assert!(serde_json::from_value::<ActionFactsDocument>(unknown).is_err());
+    }
+
+    #[test]
+    fn oneclick_plan_validation_rejects_scope_hash_and_order_substitution() {
+        let mut session = oneclick_plan_recording_session(true);
+        let plan = build_oneclick_plan(&mut session, &oneclick_plan_endpoint(), "app").unwrap();
+
+        let approval_artifact = oneclick_approval_artifact(&plan);
+        let approval_wire = serde_json::to_string(&approval_artifact).unwrap();
+        let declaration_order = [
+            "\"approval_version\"",
+            "\"plan_version\"",
+            "\"target_identity\"",
+            "\"remediation_profile\"",
+            "\"snapshot_hash\"",
+            "\"plan_hash\"",
+        ];
+        let positions = declaration_order
+            .iter()
+            .map(|field| approval_wire.find(field).unwrap())
+            .collect::<Vec<_>>();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        let approval = serde_json::to_value(approval_artifact).unwrap();
+        assert_eq!(approval.as_object().unwrap().len(), 6);
+        assert!(approval.get("snapshot").is_none());
+        assert!(approval.get("actions").is_none());
+        assert!(approval.get("facts").is_none());
+
+        let mut changed = plan.clone();
+        changed.actions[1].tables.reverse();
+        changed.plan_hash = compute_oneclick_plan_hash(&changed).unwrap();
+        assert_eq!(
+            validate_oneclick_plan(&changed).unwrap_err().code(),
+            "oneclick_plan_noncanonical"
+        );
+
+        let mut changed = plan.clone();
+        changed.actions[0]
+            .expected_pre_facts
+            .facts
+            .tables
+            .push(changed.snapshot.table_definitions[0].clone());
+        changed.actions[0].expected_pre_facts.facts_hash = "0".repeat(64);
+        changed.plan_hash = compute_oneclick_plan_hash(&changed).unwrap();
+        assert!(validate_oneclick_plan(&changed).is_err());
+
+        let mut changed = plan.clone();
+        changed.snapshot_hash = "0".repeat(64);
+        changed.plan_hash = compute_oneclick_plan_hash(&changed).unwrap();
+        assert!(validate_oneclick_plan(&changed).is_err());
+    }
+
+    #[test]
+    fn oneclick_plan_apply_predicate_requires_both_proofs_and_constants_stay_false() {
+        assert!(!ONECLICK_EXACT_PLAN_ENABLED);
+        assert!(!ONECLICK_STRONG_FENCE_PROVEN);
+        assert!(!oneclick_apply_enabled(false, false));
+        assert!(!oneclick_apply_enabled(true, false));
+        assert!(!oneclick_apply_enabled(false, true));
+        assert!(oneclick_apply_enabled(true, true));
+        assert!(!oneclick_apply_enabled(
+            ONECLICK_EXACT_PLAN_ENABLED,
+            ONECLICK_STRONG_FENCE_PROVEN
+        ));
     }
 }
