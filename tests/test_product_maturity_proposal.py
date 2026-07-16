@@ -120,7 +120,7 @@ def test_current_status_tracks_product_maturity_decision_and_latest_release():
         "TF-STATUS-095": "closed",
         "TF-STATUS-096": "closed",
         "TF-STATUS-097": "open",
-        "TF-STATUS-098": "open",
+        "TF-STATUS-098": "closed",
         "TF-STATUS-099": "open",
         "TF-STATUS-100": "open",
         "TF-STATUS-101": "open",

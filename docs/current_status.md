@@ -333,17 +333,19 @@ record of the retired path, not a command to refresh or a current capability.
 TF-STATUS-097 stays open until TF-STATUS-098 lands and an exact-plan approval
 contract can be implemented and independently proven.
 
-TF-STATUS-098 is `fixed_pending_full_verify` after the Task 2 generation
-barrier and pipe-EOF proof closed two strict Windows integration failures.
-Finalization now leaves the current live generation exclusively to production
-`client.shutdown()`, independently settles only unresolved orphan asyncio
-processes, and verifies terminal PID plus transport settlement for every
-tracked process after shutdown. A requested stdin close treats only terminal
-`BrokenPipeError`/`ConnectionResetError` as closed-pipe completion; unrelated
-exceptions and `ResourceWarning` remain visible. Fresh strict integration,
-contract, adjacent, Cargo release, compile, diff, and zero-worktree-process
-gates pass. Full-project Python and hosted CI verification remain before issue
-closure and before TF-STATUS-097 can proceed.
+TF-STATUS-098 is `closed` at final implementation commit `420518e`. The DB Core
+client now enforces bounded deadlines, strict request IDs and structured wire
+errors, generation-bound connection handles, unusable-process reaping, typed
+indeterminate mutation outcomes, zero mutation resend, and terminal pipe/PID
+settlement. Python consumers retain process ownership through cancellation and
+cleanup, never force-terminate Qt workers, accept exactly one command-correlated
+terminal frame with exact boolean success, and keep dialogs open until worker
+and residual cleanup settle. Fresh strict targeted `638 passed`, Rust `296
+passed, 1 ignored`, release build, Python 3.9 compile, diff, and process gates
+pass; independent Cleanup, Rust Wire, and Consumers reviews all approved. The
+full Python strict gate passed `3115 passed, 2 skipped`, completing local
+closure. Hosted CI remains a separate final-release gate rather than a claim in
+this local closure.
 
 Current main next-issue re-audit on 2026-06-27 initially confirmed only #116
 was open and found no Rust Core baseline violation in legacy connector names:
@@ -756,6 +758,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-16 | TF-STATUS-098 final process and consumer closure | Strict targeted DB Core/consumer gate; full Python strict warning gate; `cargo test --manifest-path migration_core\Cargo.toml`; Cargo release build; Python 3.9 compile; `git diff --check`; independent Cleanup/Rust Wire/Consumers reviews | strict targeted `638 passed`; full Python strict `3115 passed, 2 skipped`; Rust `296 passed, 1 ignored`; release build and static gates passed; `Cleanup: APPROVE`; `Rust Wire: APPROVE`; `Consumers: APPROVE` | Final commit `420518e` closes bounded request, generation, protocol/ID, typed outcome, zero mutation resend, pipe/process ownership, nonblocking cancellation, terminal-frame cardinality/correlation, and fail-closed dialog dismissal. Hosted CI remains required at the final release gate and is not claimed here. |
 | 2026-07-16 | TF-STATUS-098 Task 2 generation barrier and pipe settlement | Focused finalizer RED/GREEN; two failing real-child nodes; strict ResourceWarning integration; full process contract; adjacent DB Core/exporter/CI bundle; Cargo release; compileall; `git diff --check`; worktree Python-process gates between commands | RED `3 failed, 2 passed`; GREEN `5 passed`; named nodes `2 passed`; strict integration `16 passed`; contract `129 passed`; adjacent `255 passed`; Cargo release, compileall, and diff check exited `0`; every process gate found zero worktree-owned Python processes | The finalizer snapshots `client._process`, never independently settles that current generation, settles only unresolved orphan transports before shutdown, and verifies all tracked PIDs/transports after production shutdown. Terminal `BrokenPipeError`/`ConnectionResetError` from `wait_closed()` is accepted only after stdin close was requested; unrelated exceptions and strict `ResourceWarning` remain unsuppressed. TF-STATUS-098 is `fixed_pending_full_verify` pending full-project and hosted verification. |
 | 2026-07-15 | One-Click Phase A fail-closed gate / TF-STATUS-097 | Existing mutation characterization; Rust entry-point RED/GREEN; Python worker/UI/i18n RED/GREEN; `cargo test --manifest-path migration_core\Cargo.toml oneclick --lib`; full Cargo; focused One-Click/DB Core/i18n and evidence/capture regressions; direct capture CLI/import-order checks; full Python; Python 3.9 compile; `git diff --check`; independent LUNA review loops | PASS: internal mutation characterization `1 passed`; Rust One-Click `23 passed`; full Rust `231 passed, 1 ignored`; focused Phase A `156 passed`; full Python `2840 passed, 2 skipped`; final Spec and Quality verdicts `APPROVE` | Both `oneclick.run` and `oneclick.apply_fixes` reject non-dry-run before phase/preflight/action/endpoint/adapter/SQL; Python rejects before connector/facade; all mutation-capture CLI/callables reject before runtime imports, seed, DB work, or artifact output; dry-run evidence accepts only exact `oneclick_real_execution_enabled=false`; backup remains disabled after completion. Historical real-execution readiness/capture instructions are superseded during Phase A. TF-STATUS-097 remains open for the TF-STATUS-098-dependent exact-plan contract. |
 | 2026-07-15 | Neutral Import timezone / TF-STATUS-096 | RED/GREEN dialog, copy, and payload tests; `.venv\Scripts\python.exe -m pytest tests\test_db_import_dialog.py tests\test_rust_dump_exporter.py tests\test_i18n.py -q`; expanded import/i18n regression; full Python; `cargo test --manifest-path migration_core\Cargo.toml import_timezone_sql_accepts_mysql_and_postgresql_timezone_forms --lib`; production probe/duplicate scan; `git diff --check`; independent TERRA review and PostgreSQL legacy-compatibility follow-up | PASS: focused `120 passed`; expanded `171 passed`; full `2825 passed, 2 skipped`; Rust `1 passed, 215 filtered out`; TF-STATUS-096 final review: APPROVE with no Critical or Important findings | Auto is selected by default and emits `timezone_sql=None` for MySQL and PostgreSQL; `mysql.time_zone_name` probing and the duplicate None radio are gone; explicit UTC/KST SQL remains engine-specific; legacy `none` resolves to no SQL for both engines; the exporter already omitted a falsey timezone field, so no Rust protocol or settings migration was required. |
@@ -2560,7 +2563,7 @@ Next action:
 | TF-STATUS-095 | Critical | closed | Security / SSH server identity | SSH preflight accepts unknown host keys and normal forwarding does not pin trusted server identity | Retain visible SHA-256 TOFU approval, one-time approval re-probe, persisted trust, pinned preflight/forwarding, changed-key rejection, and background fail-closed behavior |
 | TF-STATUS-096 | High | closed | Import / timezone semantics | Import `Auto` can inject KST `+09:00` instead of preserving server/session defaults | Retain no-session-change Auto semantics and explicit engine-specific UTC/KST choices with MySQL/PostgreSQL regression coverage |
 | TF-STATUS-097 | High | open | One-Click / execution approval | Non-dry-run plan and execution share one call and the UI cannot approve the exact plan before execution | Keep Phase A non-dry-run fail-closed; after TF-STATUS-098, implement and prove exact current-target plan approval before considering re-enable |
-| TF-STATUS-098 | High | fixed_pending_full_verify | Rust Core client / process contract | Shared request lock can block indefinitely on an unbounded core response and mismatched IDs are discarded | Complete full-project Python and hosted CI verification of the bounded deadline, generation barrier, typed indeterminate result, unusable-process reaping, explicit protocol/ID failure, pipe settlement, and mutation non-retry contract before closure |
+| TF-STATUS-098 | High | closed | Rust Core client / process contract | Shared request lock can block indefinitely on an unbounded core response and mismatched IDs are discarded | Retain bounded deadlines, strict ID/protocol validation, negotiated generation barriers, typed indeterminate mutation outcomes, zero mutation resend, owned process/pipe settlement, and fail-closed consumer lifecycle regressions |
 | TF-STATUS-099 | High | open | Cross-engine migration / resume contract | Resume identity omits endpoint details, state writes are non-atomic, and stale state rejection is under-specified | First add focused identity, plan-fingerprint, atomic-write, stale-state, and single-terminal-state reproducers; redesign only to satisfy those contracts |
 | TF-STATUS-100 | Medium | open | Release engineering / Python dependencies | Python release inputs use compatible ranges without a hash-locked resolution | Generate and verify a release-only hash lock; reject altered artifacts while retaining compatible development ranges |
 | TF-STATUS-101 | Medium | open | Migration analysis / error semantics | Analysis query failures collapse to empty findings and can appear as a clean result | Separate failed analysis from successful zero findings and expose a typed, user-visible failure state |
@@ -2575,9 +2578,9 @@ Next action:
 3. Keep One-Click non-dry-run disabled for TF-STATUS-097 while its exact-plan
    approval boundary is absent; preserve dry-run and the temporary restriction
    copy.
-4. Complete full-project Python and hosted CI verification for the implemented
-   TF-STATUS-098 deadline, mismatch, generation, process-reap, pipe-settlement,
-   typed-indeterminate, and mutation non-retry contracts before closure.
+4. Keep TF-STATUS-098 closed by retaining deadline, mismatch, generation,
+   process-reap, pipe-settlement, typed-indeterminate, zero-retry, and
+   fail-closed consumer lifecycle coverage.
 5. Re-enable One-Click non-dry-run for TF-STATUS-097 only after TF-STATUS-098
    is complete and plan/apply binds a secret-free current-target identity,
    ordered actions, snapshot hash, and plan hash to explicit default-No
@@ -2641,6 +2644,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-16 | Closed TF-STATUS-098 after completing six DB Core process-contract tasks and repeated independent consumer lifecycle review loops. The final consumer boundary blocks nested-modal dismissal races, stale workflow continuations, malformed or duplicate terminal frames, wrong-command results, non-boolean success, synchronous GUI cleanup, and force-terminated Qt workers. | DB Core client/facade/wire, migration and dump consumers, focused process/UI tests, One-Click dependency checkpoint, canonical status | Strict targeted `638 passed`; full Python strict `3115 passed, 2 skipped`; Rust `296 passed, 1 ignored`; release build, Python 3.9 compile, diff and process gates passed; final independent verdicts Cleanup/Rust Wire/Consumers `APPROVE`. |
 | 2026-07-16 | Closed the two strict TF-STATUS-098 Task 2 integration failures without weakening production assertions. Test finalization now excludes the snapshotted current process from independent owner-loop settlement, leaves production shutdown as its sole owner, settles only unresolved orphan transports, and rejects any tracked process lacking terminal PID and transport proof. Requested stdin close accepts only terminal broken/reset pipe completion. | DB Core client WIP, process contract/integration tests, detached-reap Task 2 plan, local Task 4 report, canonical status | Focused RED `3 failed, 2 passed`; focused GREEN `5 passed`; named real-child nodes `2 passed`; strict integration `16 passed`; contract `129 passed`; adjacent `255 passed`; Cargo release, compileall, and diff check passed; zero worktree Python processes after every command. |
 | 2026-07-15 | Recorded the TF-STATUS-097 Phase A fail-closed gate without closing the issue. Rust blocks both public non-dry-run commands before DB work, Python/UI retain dry-run only, backup cannot reactivate after completion, all retired mutation captures fail before runtime imports or DB setup, and historical real-execution refresh paths are archived until TF-STATUS-098 and exact-plan approval are complete. | Rust One-Click/protocol/live harness, Python One-Click UI/worker/translations, readiness/capture docs, validators, and tests, canonical status regression | Rust One-Click `23 passed`; full Rust `231 passed, 1 ignored`; focused Phase A `156 passed`; full Python `2840 passed, 2 skipped`; direct capture/import-order, compile, and diff checks passed; final independent Spec/Quality verdicts `APPROVE`. |
 | 2026-07-15 | Closed TF-STATUS-096 after making Import Auto timezone-neutral for MySQL and PostgreSQL. Auto no longer probes MySQL timezone tables or emits session SQL, the duplicate None option is removed, explicit UTC/KST behavior remains, and legacy `none` compatibility is covered for both engines. | Import dialog, legacy translations, dialog/exporter/i18n tests, canonical status regressions | Focused `120 passed`; expanded `171 passed`; full Python `2825 passed, 2 skipped`; Rust timezone validator passed; production scan and diff check passed; final independent verdict `APPROVE`. |

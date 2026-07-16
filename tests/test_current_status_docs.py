@@ -1338,3 +1338,22 @@ def test_current_status_records_oneclick_phase_a_fail_closed_gate():
     assert "oneclick_real_execution_enabled=false" in verification
     assert "final Spec and Quality verdicts `APPROVE`" in verification
     assert "Recorded the TF-STATUS-097 Phase A fail-closed gate" in sessions
+
+
+def test_current_status_closes_bounded_db_core_process_contract():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "TF-STATUS-098 | High | closed" in tracker
+    assert "TF-STATUS-098 is `closed`" in summary
+    assert "TF-STATUS-098 final process and consumer closure" in verification
+    assert "strict targeted `638 passed`" in verification
+    assert "full Python strict `3115 passed, 2 skipped`" in verification
+    assert "Rust `296 passed, 1 ignored`" in verification
+    assert "Consumers: APPROVE" in verification
+    assert "Closed TF-STATUS-098" in sessions
+    assert "Keep TF-STATUS-098 closed" in order

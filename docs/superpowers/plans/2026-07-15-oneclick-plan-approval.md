@@ -90,28 +90,42 @@ git commit -m "Fix: disable unsafe One-Click apply"
 
 ## Dependency Checkpoint: TF-STATUS-098 Complete
 
-Current `DbCoreServiceClient._send_locked()` uses unbounded `stdout.readline()` and discards mismatched IDs. That is precondition/RED evidence only; this plan never assumes it is already bounded or protocol-safe.
+TF-STATUS-098 landed through commit `420518e`. `DbCoreServiceClient` now uses
+bounded request deadlines, strict request-ID/protocol validation, negotiated
+process generations, and owned poison/reap barriers. The old unbounded
+`stdout.readline()` and mismatched-ID discard behavior is historical RED
+evidence, not the current contract.
 
 **Required compatibility API in `src/core/db_core_client.py`:**
 ```python
 class DbCoreRequestKind(Enum): READ_ONLY = "read_only"; MUTATION = "mutation"
-class DbCoreOutcome(Enum): DEFINITE_FAILURE = "definite_failure"; INDETERMINATE = "outcome_indeterminate"
+class DbCoreOutcome(Enum):
+    DEFINITE = "definite"; NOT_STARTED = "not_started"
+    FAILED = "failed"; OUTCOME_INDETERMINATE = "outcome_indeterminate"
 @dataclass(frozen=True)
 class DbCoreRequestResult:
-    payload: Mapping[str, Any]; request_id: str; process_generation: int
+    request_kind: DbCoreRequestKind; outcome: DbCoreOutcome
+    request_id: str; process_generation: int; message: str
+    rust_code: Optional[str]; payload: Mapping[str, Any]
 class DbCoreServiceError(RuntimeError):
-    code: str; outcome: DbCoreOutcome; request_id: str
+    code: str; request_kind: DbCoreRequestKind; outcome: DbCoreOutcome
+    request_id: str
     process_generation: int; rust_code: Optional[str]
 ```
 `request_result(..., request_kind=..., on_event=...) -> DbCoreRequestResult` is the new structural API. `request_payload(...) -> Dict[str,Any]` returns `request_result(...).payload`; existing `request(...) -> Dict[str,Any]` remains a compatibility wrapper over `request_payload`, preserving all current facade consumers. New One-Click methods use `request_result`; no mixed `.get()` on `DbCoreRequestResult` is allowed.
 
+Stateful DB consumers use `DbCoreConnectionHandle(connection_id,
+process_generation)`, validated against the facade's issued-handle registry;
+raw, cloned, foreign, malformed, or stale-generation handles fail before wire
+admission.
+
 Every Rust failure migrates to exact structured wire shape `{"event":"error","request_id":"<matching id>","code":"<stable nonempty code>","message":"<safe text>"}`. Python validates event/type/ID/code before raising `DbCoreServiceError`; malformed, missing-code, string-only, or mismatched error lines are `db_core_protocol_mismatch`, never message-parsed Rust failures.
 
-- [ ] Land and commit TF-098 implementation first; confirm status is `closed` with bounded reads, strict ID/protocol handling, terminate/reap, recovery, and zero mutation resend. Require Python codes `db_core_capability_missing`, `db_core_protocol_mismatch`, `db_core_request_id_mismatch`, `db_core_timeout`, and `db_core_process_died`, preserving structured Rust `code` in `rust_code`.
-- [ ] Require per-generation `service.hello` negotiation of `protocol_version=1`, `process_contract_version=1`, and capabilities `request.deadline`, `request.strict_id`, `process.generation`, `mutation.outcome_indeterminate`. Classify `oneclick.plan` read-only and `oneclick.apply_fixes` mutation.
-- [ ] Test `request_result`, `request_payload`, and legacy `request` for structured result/error events; reject missing/empty/nonstring code, string-only errors, wrong IDs, old/missing capability, version mismatch, timeout, and death; verify metadata, preserved Rust code, recovery, and no retry.
-- [ ] Run `.venv\Scripts\python.exe -m pytest tests\test_db_core_service.py tests\test_db_connector.py tests\test_rust_dump_exporter.py tests\test_migration_worker.py tests\test_cross_engine_migration_worker.py tests\test_cross_engine_migration_protocol.py tests\test_cross_engine_migration_dialog.py tests\test_oneclick_rust_core_gate.py -q` and full `pytest -q`. This closes compatibility for connection/schema/query, dump/import, migration, connector, and UI consumers.
-- [ ] If the implementation commit, status closure, negotiation, structured-wire migration, or any consumer test is absent/failing, mark Task 3 blocked: do not add Phase B RED tests, code, capabilities, evidence updates, or commits; retain Phase A gates.
+- [x] Land and commit TF-098 implementation; status is `closed` with bounded reads, strict ID/protocol handling, terminate/reap, recovery, and zero mutation resend. Python codes include `db_core_capability_missing`, `db_core_protocol_mismatch`, `db_core_request_id_mismatch`, `db_core_timeout`, and `db_core_process_died`, preserving structured Rust `code` in `rust_code`.
+- [x] Require per-generation `service.hello` negotiation of `protocol_version=1`, `process_contract_version=1`, and capabilities `request.deadline`, `request.strict_id`, `process.generation`, `mutation.outcome_indeterminate`. Phase B must classify `oneclick.plan` read-only and `oneclick.apply_fixes` mutation when those commands are introduced.
+- [x] Test `request_result`, `request_payload`, and legacy `request` for structured result/error events; reject missing/empty/nonstring code, string-only errors, wrong IDs, old/missing capability, version mismatch, timeout, and death; verify metadata, preserved Rust code, recovery, and no retry.
+- [x] Run the compatibility consumer gate and full strict Python gate, covering connection/schema/query, dump/import, migration, connector, and UI consumers; final local evidence is recorded in `docs/current_status.md`.
+- [x] Checkpoint satisfied at `420518e`; Task 3 may begin. Phase A mutation gates remain active until the later exact-plan and strong-fence requirements are independently proven.
 
 ---
 
