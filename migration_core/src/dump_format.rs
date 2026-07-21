@@ -417,72 +417,256 @@ pub(crate) fn dump_import_ddl_error(operation: &str, table: &str, err: &str) -> 
     )
 }
 
-/// import set 밖의 타겟 테이블이 import set 안의 테이블을 참조하는 살아있는 FK를 가려낸다.
-///
-/// replace/recreate 모드는 대상 테이블을 통째로 재생성하는데, 덤프에 포함되지 않은
-/// 타겟 테이블이 대상 테이블을 참조하는 FK를 갖고 있으면, 부모를 재생성하는 시점에
-/// 그 살아있는 자식 FK가 새 부모 정의와 (특히 charset/collation) 호환되지 않아
-/// MySQL ERROR 3780이 발생할 수 있다. 이런 경우 import를 차단해야 한다.
-///
-/// `rows`는 `(referencing_table, constraint_name, referenced_table)` 튜플 목록이다.
-/// 반환값은 `"<referencing_table>.<constraint_name> -> <referenced_table>"` 형식의
-/// 정렬·중복제거된 위반 목록이다.
-fn surviving_fk_offenders(
-    rows: &[(String, String, String)],
-    import_set: &BTreeSet<String>,
-) -> Vec<String> {
-    let mut offenders: Vec<String> = rows
+/// 덤프 밖에 남는 MySQL FK 한 컬럼과 현재 부모 정의를 표현한다. 새 부모 정의가 이
+/// 계약을 그대로 재현할 수 있는지 확인해서, 호환되는 target-only 테이블은 보존한다.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SurvivingFkColumn {
+    referencing_table: String,
+    constraint_name: String,
+    referenced_table: String,
+    ordinal_position: u64,
+    referenced_column: String,
+    existing_parent_column_type: String,
+    existing_parent_character_set: Option<String>,
+    existing_parent_collation: Option<String>,
+}
+
+fn mysql_base_column_type(type_name: &str) -> String {
+    let lower = type_name.trim().to_ascii_lowercase();
+    [" character set ", " charset ", " collate "]
         .iter()
-        .filter(|(table, _constraint, referenced)| {
-            import_set.contains(referenced) && !import_set.contains(table)
+        .filter_map(|marker| lower.find(marker))
+        .min()
+        .map(|index| lower[..index].trim().to_string())
+        .unwrap_or(lower)
+}
+
+fn mysql_charset_from_collation(collation: &str) -> Option<String> {
+    collation.split_once('_').map(|(charset, _)| charset.to_string())
+}
+
+fn imported_mysql_column_fidelity(
+    table: &NormalizedTable,
+    column: &NormalizedColumn,
+) -> MysqlCharacterFidelity {
+    let mut fidelity = mysql_character_fidelity(&column.type_name);
+    if fidelity.collation.is_none() {
+        fidelity.collation = table.table_collation.clone();
+    }
+    if fidelity.character_set.is_none() {
+        fidelity.character_set = fidelity
+            .collation
+            .as_deref()
+            .and_then(mysql_charset_from_collation);
+    }
+    fidelity
+}
+
+fn imported_table_has_referenced_index(table: &NormalizedTable, columns: &[String]) -> bool {
+    let primary_columns = table
+        .columns
+        .iter()
+        .filter(|column| column.primary_key)
+        .map(|column| column.name.as_str())
+        .collect::<Vec<_>>();
+    let requested = columns.iter().map(String::as_str).collect::<Vec<_>>();
+    primary_columns.starts_with(&requested)
+        || table.indexes.iter().any(|index| {
+            index
+                .columns
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .starts_with(&requested)
         })
-        .map(|(table, constraint, referenced)| format!("{table}.{constraint} -> {referenced}"))
-        .collect();
+        || (columns.len() == 1
+            && table.columns.iter().any(|column| {
+                column.name == columns[0] && (column.primary_key || column.unique)
+            }))
+}
+
+fn incompatible_surviving_fk_offenders(
+    rows: &[SurvivingFkColumn],
+    import_schema: &NormalizedSchema,
+) -> Vec<String> {
+    let import_set = import_schema
+        .tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let mut offenders = Vec::new();
+
+    for row in rows {
+        if import_set.contains(row.referencing_table.as_str())
+            || !import_set.contains(row.referenced_table.as_str())
+        {
+            continue;
+        }
+        let Some(table) = import_schema
+            .tables
+            .iter()
+            .find(|table| table.name == row.referenced_table)
+        else {
+            continue;
+        };
+        let Some(column) = table
+            .columns
+            .iter()
+            .find(|column| column.name == row.referenced_column)
+        else {
+            offenders.push(format!(
+                "{}.{} -> {} (referenced column {} is absent from dump)",
+                row.referencing_table,
+                row.constraint_name,
+                row.referenced_table,
+                row.referenced_column
+            ));
+            continue;
+        };
+        let existing_type = mysql_base_column_type(&row.existing_parent_column_type);
+        let imported_type = mysql_base_column_type(&column.type_name);
+        if existing_type != imported_type {
+            offenders.push(format!(
+                "{}.{} -> {} (column {} type changes from {} to {})",
+                row.referencing_table,
+                row.constraint_name,
+                row.referenced_table,
+                row.referenced_column,
+                existing_type,
+                imported_type
+            ));
+            continue;
+        }
+        let imported_fidelity = imported_mysql_column_fidelity(table, column);
+        for (property, existing, imported) in [
+            (
+                "character set",
+                row.existing_parent_character_set.as_deref(),
+                imported_fidelity.character_set.as_deref(),
+            ),
+            (
+                "collation",
+                row.existing_parent_collation.as_deref(),
+                imported_fidelity.collation.as_deref(),
+            ),
+        ] {
+            if let (Some(existing), Some(imported)) = (existing, imported) {
+                if !existing.eq_ignore_ascii_case(imported) {
+                    offenders.push(format!(
+                        "{}.{} -> {} (column {} {} changes from {} to {})",
+                        row.referencing_table,
+                        row.constraint_name,
+                        row.referenced_table,
+                        row.referenced_column,
+                        property,
+                        existing,
+                        imported
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    let mut fk_columns = BTreeMap::<(String, String, String), Vec<(u64, String)>>::new();
+    for row in rows {
+        if import_set.contains(row.referencing_table.as_str())
+            || !import_set.contains(row.referenced_table.as_str())
+        {
+            continue;
+        }
+        fk_columns
+            .entry((
+                row.referencing_table.clone(),
+                row.constraint_name.clone(),
+                row.referenced_table.clone(),
+            ))
+            .or_default()
+            .push((row.ordinal_position, row.referenced_column.clone()));
+    }
+    for ((referencing_table, constraint_name, referenced_table), mut columns) in fk_columns {
+        columns.sort_by_key(|(ordinal, _)| *ordinal);
+        let columns = columns
+            .into_iter()
+            .map(|(_, column)| column)
+            .collect::<Vec<_>>();
+        let Some(table) = import_schema
+            .tables
+            .iter()
+            .find(|table| table.name == referenced_table)
+        else {
+            continue;
+        };
+        if !imported_table_has_referenced_index(table, &columns) {
+            offenders.push(format!(
+                "{referencing_table}.{constraint_name} -> {referenced_table} (dump does not recreate a referenced index beginning with {})",
+                columns.join(", ")
+            ));
+        }
+    }
     offenders.sort();
     offenders.dedup();
     offenders
 }
 
-/// 타겟 DB에서 import set 밖의 살아있는 referencing FK를 조회해, 있으면 import를 abort한다.
+/// 타겟 DB에서 import set 밖의 살아있는 referencing FK를 조회한다. 덤프가 재생성할
+/// 부모 정의와 구조적으로 호환되면 MySQL dump 복원처럼 그대로 보존하고 진행한다.
 ///
 /// MySQL 전용. 비-MySQL 어댑터는 그대로 통과시킨다(ERROR 3780은 MySQL 고유 증상이며,
 /// PostgreSQL은 `information_schema.KEY_COLUMN_USAGE`에 `REFERENCED_TABLE_NAME`을
 /// 노출하지 않아 별도 쿼리가 필요하다 — 후속 과제).
 ///
-/// 타겟을 수정하지 않고 오직 조회만 한다. 위반이 있으면 어떤 테이블의 어떤 FK가
-/// 충돌하는지 명시한 `preflight_surviving_fk` 에러를 반환한다.
+/// 타겟을 수정하지 않고 오직 조회만 한다. 구조가 달라지는 FK만 어떤 테이블의 어떤
+/// 제약이 충돌하는지 명시한 `preflight_surviving_fk` 에러를 반환한다.
 pub(crate) fn preflight_surviving_referencing_fks(
     adapter: &mut LiveAdapter,
-    schema: &str,
-    import_set: &BTreeSet<String>,
+    target_schema: &str,
+    import_schema: &NormalizedSchema,
 ) -> Result<(), String> {
     let conn = match adapter {
         LiveAdapter::MySql(conn) => conn,
         _ => return Ok(()),
     };
-    let rows: Vec<(String, String, String)> = conn
+    let rows: Vec<SurvivingFkColumn> = conn
         .exec_map(
-            "SELECT TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME \
-             FROM information_schema.KEY_COLUMN_USAGE \
-             WHERE TABLE_SCHEMA = ? AND REFERENCED_TABLE_NAME IS NOT NULL \
-             GROUP BY TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME \
-             ORDER BY TABLE_NAME, CONSTRAINT_NAME, REFERENCED_TABLE_NAME",
-            (schema,),
-            |(table, constraint, referenced): (String, String, String)| {
-                (table, constraint, referenced)
+            "SELECT k.TABLE_NAME, k.CONSTRAINT_NAME, k.REFERENCED_TABLE_NAME, \
+                    k.ORDINAL_POSITION, k.REFERENCED_COLUMN_NAME, c.COLUMN_TYPE, \
+                    c.CHARACTER_SET_NAME, c.COLLATION_NAME \
+             FROM information_schema.KEY_COLUMN_USAGE k \
+             JOIN information_schema.COLUMNS c \
+               ON c.TABLE_SCHEMA = k.REFERENCED_TABLE_SCHEMA \
+              AND c.TABLE_NAME = k.REFERENCED_TABLE_NAME \
+              AND c.COLUMN_NAME = k.REFERENCED_COLUMN_NAME \
+             WHERE k.TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL \
+             ORDER BY k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+            (target_schema,),
+            |(referencing_table, constraint_name, referenced_table, ordinal_position,
+              referenced_column, existing_parent_column_type,
+              existing_parent_character_set, existing_parent_collation):
+             (String, String, String, u64, String, String, Option<String>, Option<String>)| {
+                SurvivingFkColumn {
+                    referencing_table,
+                    constraint_name,
+                    referenced_table,
+                    ordinal_position,
+                    referenced_column,
+                    existing_parent_column_type,
+                    existing_parent_character_set,
+                    existing_parent_collation,
+                }
             },
         )
         .map_err(|err| format!("mysql surviving-FK preflight inspect error: {err}"))?;
 
-    let offenders = surviving_fk_offenders(&rows, import_set);
+    let offenders = incompatible_surviving_fk_offenders(&rows, import_schema);
     if offenders.is_empty() {
         Ok(())
     } else {
         Err(classified_import_error(
             "preflight_surviving_fk",
             &format!(
-                "target tables outside the import set still reference tables being recreated; \
-                 drop or detach these foreign keys on the target before re-importing: {}",
+                "target-only foreign keys are incompatible with tables being recreated; \
+                 align or detach only these constraints before re-importing: {}",
                 offenders.join(", ")
             ),
             None,
@@ -972,7 +1156,7 @@ mod tests {
     
     
     use serde_json::{json, Value};
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::fs::{self};
     
     use std::path::Path;
@@ -1802,50 +1986,105 @@ mod tests {
     }
 
     #[test]
-    fn surviving_fk_offenders_flags_only_external_references() {
-        let import_set: BTreeSet<String> = ["audit_category", "df_evaluation_results"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+    fn compatible_surviving_fk_is_preserved_for_mysql_like_import() {
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "supplement_review_item".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "id".to_string(),
+                    type_name: "bigint unsigned".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                }],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                table_collation: None,
+            }],
+        };
+        let rows = vec![SurvivingFkColumn {
+            referencing_table: "supplement_review_api_call".to_string(),
+            constraint_name: "fk_srac_item".to_string(),
+            referenced_table: "supplement_review_item".to_string(),
+            ordinal_position: 1,
+            referenced_column: "id".to_string(),
+            existing_parent_column_type: "bigint unsigned".to_string(),
+            existing_parent_character_set: None,
+            existing_parent_collation: None,
+        }];
 
-        let rows = vec![
-            // import set 밖의 테이블이 import set 안의 부모를 참조 → 위반
-            (
-                "legacy_audit_log".to_string(),
-                "fk_legacy_audit".to_string(),
-                "audit_category".to_string(),
-            ),
-            // import set 내부끼리의 FK → 위반 아님 (자식부터 drop되므로 안전)
-            (
-                "df_evaluation_results".to_string(),
-                "df_evaluation_results_ibfk_3".to_string(),
-                "audit_category".to_string(),
-            ),
-            // import set 밖의 테이블을 참조 → 위반 아님 (재생성 대상 아님)
-            (
-                "df_evaluation_results".to_string(),
-                "fk_eval_other".to_string(),
-                "some_external_table".to_string(),
-            ),
-        ];
+        assert!(incompatible_surviving_fk_offenders(&rows, &schema).is_empty());
+    }
 
-        let offenders = surviving_fk_offenders(&rows, &import_set);
+    #[test]
+    fn incompatible_surviving_fk_is_rejected_before_parent_recreate() {
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "supplement_review_item".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "id".to_string(),
+                    type_name: "bigint unsigned".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: true,
+                }],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                table_collation: None,
+            }],
+        };
+        let rows = vec![SurvivingFkColumn {
+            referencing_table: "supplement_review_api_call".to_string(),
+            constraint_name: "fk_srac_item".to_string(),
+            referenced_table: "supplement_review_item".to_string(),
+            ordinal_position: 1,
+            referenced_column: "id".to_string(),
+            existing_parent_column_type: "int unsigned".to_string(),
+            existing_parent_character_set: None,
+            existing_parent_collation: None,
+        }];
+
         assert_eq!(
-            offenders,
-            vec!["legacy_audit_log.fk_legacy_audit -> audit_category".to_string()]
+            incompatible_surviving_fk_offenders(&rows, &schema),
+            vec!["supplement_review_api_call.fk_srac_item -> supplement_review_item (column id type changes from int unsigned to bigint unsigned)".to_string()]
         );
     }
 
     #[test]
-    fn surviving_fk_offenders_empty_when_no_external_references() {
-        let import_set: BTreeSet<String> =
-            ["audit_category"].into_iter().map(String::from).collect();
-        let rows = vec![(
-            "audit_category".to_string(),
-            "fk_self".to_string(),
-            "audit_category".to_string(),
-        )];
-        assert!(surviving_fk_offenders(&rows, &import_set).is_empty());
+    fn surviving_fk_requires_dump_to_recreate_referenced_index() {
+        let schema = NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "parent".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "external_id".to_string(),
+                    type_name: "bigint unsigned".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                }],
+                indexes: Vec::new(),
+                foreign_keys: Vec::new(),
+                table_collation: None,
+            }],
+        };
+        let rows = vec![SurvivingFkColumn {
+            referencing_table: "target_only_child".to_string(),
+            constraint_name: "fk_child_parent".to_string(),
+            referenced_table: "parent".to_string(),
+            ordinal_position: 1,
+            referenced_column: "external_id".to_string(),
+            existing_parent_column_type: "bigint unsigned".to_string(),
+            existing_parent_character_set: None,
+            existing_parent_collation: None,
+        }];
+
+        assert_eq!(
+            incompatible_surviving_fk_offenders(&rows, &schema),
+            vec!["target_only_child.fk_child_parent -> parent (dump does not recreate a referenced index beginning with external_id)".to_string()]
+        );
     }
 
     #[test]

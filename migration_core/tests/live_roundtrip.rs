@@ -2,6 +2,13 @@ use migration_core::{handle_request, Endpoint, Request};
 use mysql::prelude::Queryable;
 use serde_json::{json, Value};
 use std::env;
+use std::sync::{Mutex, MutexGuard};
+
+static LIVE_DB_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+fn live_db_test_guard() -> MutexGuard<'static, ()> {
+    LIVE_DB_TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner())
+}
 
 fn endpoint(prefix: &str, default_port: u16, engine: &str) -> Option<Endpoint> {
     let host = env::var(format!("{prefix}_HOST")).ok()?;
@@ -128,6 +135,98 @@ fn mysql_table_charset_collation(
     .unwrap()
 }
 
+#[test]
+fn mysql_dump_import_preserves_compatible_target_only_fk_table_when_env_is_configured() {
+    let _guard = live_db_test_guard();
+    let Some(mysql_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
+        eprintln!("skipping MySQL dump/import FK preservation: TF_MYSQL_* is not configured");
+        return;
+    };
+    let parent = unique_table("tf_dump_parent");
+    let child = unique_table("tf_target_only_child");
+    let dump_dir = std::env::temp_dir().join(unique_table("tf_mysql_dump"));
+    let mut mysql = mysql_conn(&mysql_endpoint);
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE `{parent}` (`id` BIGINT UNSIGNED NOT NULL PRIMARY KEY, `value` VARCHAR(32) NOT NULL) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci"
+        ))
+        .unwrap();
+    mysql
+        .query_drop(format!("INSERT INTO `{parent}` VALUES (1, 'from_dump')"))
+        .unwrap();
+
+    let export = result_payload(handle_request(Request {
+        command: "dump.run".to_string(),
+        request_id: None,
+        payload: json!({
+            "source": endpoint_json(&mysql_endpoint),
+            "output_dir": dump_dir.to_string_lossy(),
+            "threads": 8,
+            "chunk_size": 1000,
+            "data_format": "tsv",
+            "compression": "none",
+            "tables": [parent]
+        }),
+    }));
+    assert_eq!(export["success"], true);
+    assert_eq!(export["snapshot_policy"], "mysql_shared_consistent_snapshot");
+    assert_eq!(export["strict_export"], true);
+
+    mysql
+        .query_drop(format!(
+            "CREATE TABLE `{child}` (`id` BIGINT UNSIGNED NOT NULL PRIMARY KEY, `parent_id` BIGINT UNSIGNED NOT NULL, CONSTRAINT `fk_target_only_parent` FOREIGN KEY (`parent_id`) REFERENCES `{parent}` (`id`)) ENGINE=InnoDB"
+        ))
+        .unwrap();
+    mysql
+        .query_drop(format!("INSERT INTO `{child}` VALUES (1, 1)"))
+        .unwrap();
+    mysql
+        .query_drop(format!("UPDATE `{parent}` SET `value`='changed' WHERE `id`=1"))
+        .unwrap();
+
+    let import = result_payload(handle_request(Request {
+        command: "dump.import".to_string(),
+        request_id: None,
+        payload: json!({
+            "target": endpoint_json(&mysql_endpoint),
+            "input_dir": dump_dir.to_string_lossy(),
+            "mode": "replace",
+            "threads": 8,
+            "strict_manifest": true
+        }),
+    }));
+    assert_eq!(import["success"], true);
+    assert_eq!(
+        mysql
+            .query_first::<String, _>(format!("SELECT `value` FROM `{parent}` WHERE `id`=1"))
+            .unwrap()
+            .as_deref(),
+        Some("from_dump")
+    );
+    assert_eq!(
+        mysql
+            .query_first::<u64, _>(format!("SELECT COUNT(*) FROM `{child}`"))
+            .unwrap(),
+        Some(1)
+    );
+    assert_eq!(
+        mysql
+            .exec_first::<u64, _, _>(
+                "SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA = ? AND TABLE_NAME = ? AND CONSTRAINT_NAME = 'fk_target_only_parent'",
+                (&mysql_endpoint.database, &child),
+            )
+            .unwrap(),
+        Some(1)
+    );
+
+    mysql.query_drop("SET SESSION foreign_key_checks=0").unwrap();
+    mysql
+        .query_drop(format!("DROP TABLE IF EXISTS `{child}`, `{parent}`"))
+        .unwrap();
+    mysql.query_drop("SET SESSION foreign_key_checks=1").unwrap();
+    std::fs::remove_dir_all(&dump_dir).unwrap();
+}
+
 fn unsupported_objects_from_inspect(endpoint: &Endpoint) -> Vec<String> {
     let inspect = result_payload(handle_request(Request {
         command: "inspect".to_string(),
@@ -145,6 +244,7 @@ fn unsupported_objects_from_inspect(endpoint: &Endpoint) -> Vec<String> {
 
 #[test]
 fn live_inspect_reports_views_as_unsupported_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some((mysql_endpoint, postgres_endpoint)) = test_endpoints() else {
         eprintln!("skipping live inspect: TF_MYSQL_* and TF_POSTGRES_* are not configured");
         return;
@@ -209,6 +309,7 @@ fn live_inspect_reports_views_as_unsupported_when_env_is_configured() {
 
 #[test]
 fn live_preflight_blocks_non_empty_target_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some((_mysql_endpoint, postgres_endpoint)) = test_endpoints() else {
         eprintln!("skipping live preflight: TF_MYSQL_* and TF_POSTGRES_* are not configured");
         return;
@@ -255,6 +356,7 @@ fn live_preflight_blocks_non_empty_target_when_env_is_configured() {
 
 #[test]
 fn live_readiness_reports_each_direction_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some((mysql_endpoint, postgres_endpoint)) = test_endpoints() else {
         eprintln!("skipping live readiness: TF_MYSQL_* and TF_POSTGRES_* are not configured");
         return;
@@ -315,6 +417,7 @@ fn live_readiness_reports_each_direction_when_env_is_configured() {
 
 #[test]
 fn oneclick_run_live_engine_innodb_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some(mysql_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
         eprintln!("skipping oneclick live apply: TF_MYSQL_* is not configured");
         return;
@@ -359,6 +462,7 @@ fn oneclick_run_live_engine_innodb_when_env_is_configured() {
 
 #[test]
 fn oneclick_run_live_charset_contract_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some(base_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
         eprintln!("skipping oneclick charset live apply: TF_MYSQL_* is not configured");
         return;
@@ -447,6 +551,7 @@ fn oneclick_run_live_charset_contract_when_env_is_configured() {
 
 #[test]
 fn oneclick_derive_charset_contracts_live_facts_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some(base_endpoint) = endpoint("TF_MYSQL", 3306, "mysql") else {
         eprintln!("skipping oneclick charset live derivation: TF_MYSQL_* is not configured");
         return;
@@ -514,6 +619,7 @@ fn oneclick_derive_charset_contracts_live_facts_when_env_is_configured() {
 
 #[test]
 fn live_guide_includes_row_values_and_sql_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some((mysql_endpoint, postgres_endpoint)) = test_endpoints() else {
         eprintln!("skipping live guide: TF_MYSQL_* and TF_POSTGRES_* are not configured");
         return;
@@ -571,6 +677,7 @@ fn live_guide_includes_row_values_and_sql_when_env_is_configured() {
 
 #[test]
 fn mysql_to_postgresql_live_roundtrip_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some((mysql_endpoint, postgres_endpoint)) = test_endpoints() else {
         eprintln!("skipping live roundtrip: TF_MYSQL_* and TF_POSTGRES_* are not configured");
         return;
@@ -684,6 +791,7 @@ fn mysql_to_postgresql_live_roundtrip_when_env_is_configured() {
 
 #[test]
 fn postgresql_to_mysql_live_roundtrip_when_env_is_configured() {
+    let _guard = live_db_test_guard();
     let Some((mysql_endpoint, postgres_endpoint)) = test_endpoints() else {
         eprintln!("skipping live roundtrip: TF_MYSQL_* and TF_POSTGRES_* are not configured");
         return;

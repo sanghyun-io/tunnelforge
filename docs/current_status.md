@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-07-15
+Last reviewed: 2026-07-21
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -77,6 +77,14 @@ Windows clean build, frozen main-app UI/Rust Core smoke, and WebSetup
 self-check. The clean-build review also made the installer command build and
 verify WebSetup itself, stopped it from rewriting the tracked Inno source, and
 pinned all external actions in the required version and macOS workflows.
+
+The `2.4.1` patch release candidate fixes MySQL dump/import behavior from
+TF-STATUS-094. Replace/recreate now scopes destructive work to dump-contained
+tables and preserves compatible target-only FK tables. MySQL export uses fixed
+worker sessions on one shared InnoDB snapshot: the initial global read lock is
+bounded to two seconds and released immediately, normal DML remains available,
+and only DDL is held by the backup lock until export finishes. TF-STATUS-095
+tracks protected merge, tag, asset verification, and stable publication.
 
 The `2.3.1` release candidate now contains the completed release-trust scope:
 GitHub Release asset `digest` verification prevents unverified downloaded
@@ -622,7 +630,7 @@ Historical release-review snapshots (preserved for audit):
     | `pytest -q` | PASS, 1827 passed, 6 warnings |
     | `pytest -q` | PASS, 1955 passed, 1 skipped, 4 warnings, 60.38s, exit 0 |
 
-Version references are aligned at `2.4.0` across:
+Version references are aligned at `2.4.1` across:
 
 - `src/version.py`
 - `pyproject.toml`
@@ -720,6 +728,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-21 | TF-STATUS-004/094/095 MySQL dump/import patch candidate | Cargo full test with disposable MySQL 8.4; focused Python Export/Import/UI/i18n; split broad Python groups; release build; version sync; `git diff --check` | Rust 221 lib, 2 JSONL CLI, 10 live, and 2 stress passed / 1 ignored; target-only FK live roundtrip passed; focused Python/UI 144 passed and i18n gate passed; split `a-h`, `i-m`, `n-p`, non-macOS Rust packaging, remaining Rust-focused, and `s-z` groups passed after status alignment; release build and version sync passed | MySQL uses fixed shared-snapshot workers, a two-second bounded initial global read lock, and a backup lock that permits DML while restricting DDL. Compatible target-only FK tables survive replace import. The monolithic Python command was not used as the closure claim because the existing macOS packaging-test group blocks on this Windows host; hosted CI remains required before closure/publication. |
 | 2026-07-15 | `v2.4.0` protected publication closure / TF-STATUS-093 | PR #247 hosted checks and merge; protected `create-release-tag.yml` run `29391247402`; approved `release.yml` run `29391317995`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest API and live `UpdateChecker` checks; post-release relay health and repository-secret inventory | runs `29390539762`, `29390540655`, and `29390539802` passed the required Python, Rust, version, support-tracking, and internal/external macOS arm64/x86_64 gates; PR #247 merged at `2026-07-15T05:21:06Z` as `bfee81613c7f77d96136346fa305858bf62670d7`; tag object `34a111cc90373a485c6dd168d4755f43cfccc768` peels to that exact commit; release run built all platforms and published at `2026-07-15T05:33:59Z`; all 10 expected assets have GitHub SHA-256 digests and all four macOS sidecars match their DMG/ZIP asset digests; `UpdateChecker` returned latest `2.4.0` with no error; relay health returned HTTP 200, schema 1, mode `active`; exactly `RELEASER_APP_ID` and `RELEASER_APP_PRIVATE_KEY` remain | `v2.4.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.4.0`. Release notes explicitly identify macOS artifacts as unsigned and unnotarized. TF-STATUS-093 is closed; TF-STATUS-090 and TF-STATUS-091 remain watch items. |
 | 2026-07-15 | `2.4.0` release-candidate preparation / TF-STATUS-093 | RED/GREEN status and version sync; full Python; Rust regression/Cargo test+release; Worker test/typecheck/audit/dry-run; `build-installer.ps1 -Clean`; frozen UI/Rust Core and WebSetup self-checks; workflow pin scan; `git diff --check` | RED proved the source remained `2.3.1`; deterministic minor bump aligned all three sources at `2.4.0`; release-candidate full Python 2697 passed / 1 skipped / 4 warnings; Rust and Worker gates passed; all external actions in `version-gate.yml` are full-SHA pinned; `build-installer.ps1 -Clean` completed end to end and produced the main app, WebSetup, and `TunnelForge-Setup-2.4.0.exe`; Installer source unchanged; frozen checks passed | The initial local installer command exposed stale-output handling, missing bootstrapper creation after clean, tracked Inno-source rewriting, and Windows PowerShell 5.1 UTF-8 parsing problems. TDD added bootstrapper build/self-check, read-only version validation, and a UTF-8 BOM contract. A concurrent clean-build deleted one independent-review test's transient evidence ZIP; two focused reruns and a later standalone full suite passed. Protected version PR, exact-main tag, draft asset/digest inspection, and publication remain. |
 | 2026-07-15 | TF-STATUS-092 protected merge closure | `gh pr checks 245 --watch`; `gh pr ready 245`; `gh pr merge 245 --merge`; post-merge PR/main ancestry, repository-secret inventory, and production health verification | fresh-head runs `29385868513` and `29385868516` passed all required gates; PR #245 merged at `2026-07-15T03:22:13Z` as `6dbcd51c8c60acef3569697fa79a9e6914a7c0e0`; `origin/main` has the expected two-parent merge ancestry; `GH_APP_PRIVATE_KEY` remains absent while exactly the two Releaser secrets remain; relay health returned schema 1 and mode `active` | TF-STATUS-092 is closed. The exposed Reporter key, its possible derived-token lifetime, the unused repository secret, client credential retirement, replacement canary/rollout, frozen package smoke, fresh-head hosted gates, and protected merge are all complete. |
@@ -1042,6 +1051,16 @@ Evidence:
 - 2026-06-26 update: new single-thread exports are marked
   `connection_consistent` and strict; parallel exports are marked
   `non_consistent_parallel`, non-strict, with a warning.
+- 2026-07-21 update: MySQL exports now pre-open the requested fixed worker
+  sessions, start every worker on the same `REPEATABLE READ` consistent
+  snapshot under a brief global read lock, acquire a backup lock, and release
+  the global read lock before scanning data. Successful manifests are strict
+  and use `snapshot_policy = "mysql_shared_consistent_snapshot"` for both
+  single- and multi-worker exports.
+- The global read-lock acquisition is bounded to two seconds. DML remains
+  available during the dump; DDL is restricted until the coordinator releases
+  `LOCK INSTANCE FOR BACKUP`. Non-InnoDB selections fail closed instead of
+  claiming transactional consistency.
 
 Impact:
 
@@ -1050,7 +1069,8 @@ Impact:
 
 Next action:
 
-1. Keep export consistency metadata coverage when export scheduling changes.
+1. Keep the shared-snapshot, short-lock, InnoDB, and manifest metadata coverage
+   aligned when export scheduling changes.
 
 ## Medium Priority Issues
 
@@ -2410,6 +2430,57 @@ Next action:
    as a Rust Core command instead of reviving a generic Python `execute_many`
    helper.
 
+### TF-STATUS-094: MySQL-Like Dump-Scoped Replace Import
+
+Status: `fixed_pending_full_verify`
+Severity: High
+Area: Rust Core dump.import / Import UI
+
+Evidence:
+
+- The `2.4.0` production failure log showed a 241-table dump while the target
+  also contained `supplement_review_api_call`, whose FKs referenced two dump
+  tables. The old preflight treated any such target-only FK as a global
+  blocker and Python then marked all 241 pending tables as failed.
+- Replace/recreate still drops only manifest-selected tables, with
+  `foreign_key_checks=0`, matching MySQL dump restore scope. Target-only tables
+  and compatible FKs are not dropped.
+- The preflight now compares only the surviving FK contract that the recreated
+  parent must preserve: referenced column type/sign, effective charset and
+  collation, and referenced-index prefix. It blocks before mutation only when
+  that structure actually changes.
+- Python keeps table rows pending for operation-scoped preflight failures
+  instead of reporting every dump table as independently failed.
+- A disposable MySQL 8.4 live roundtrip exported a parent with eight workers,
+  created a target-only child/FK afterward, replaced the parent from the dump,
+  and verified the child table, child row, FK constraint, and restored parent
+  data all remained correct.
+
+Next action:
+
+1. Close after protected CI/merge evidence for the `2.4.1` release commit.
+
+### TF-STATUS-095: `2.4.1` MySQL Export/Import Patch Publication
+
+Status: `fixed_pending_full_verify`
+Severity: High
+Area: Release readiness / versioning
+
+Evidence:
+
+- `src/version.py`, `pyproject.toml`, and `installer/TunnelForge.iss` are
+  aligned at `2.4.1`.
+- Local Rust unit/CLI/live/stress tests, the target-only FK MySQL 8.4
+  roundtrip, focused Python/UI/i18n tests, version sync, release build, and
+  diff check passed. The broad Python suite was split because the existing
+  macOS packaging-test group blocks on this Windows host; all other collected
+  groups passed, while that file's non-macOS/version gate passed separately.
+
+Next action:
+
+1. Complete protected PR checks, exact-main annotated tag creation, release
+   artifact/digest verification, stable publication, and updater visibility.
+
 ## Issue Tracker
 
 | ID | Severity | Status | Area | Short Title | Next Action |
@@ -2507,9 +2578,15 @@ Next action:
 | TF-STATUS-091 | Medium | watch | Release governance / independent approval | Only one write/admin collaborator exists | Keep single-maintainer approval enabled; revisit independent approval after adding a second trusted maintainer |
 | TF-STATUS-092 | High | closed | Security / GitHub App credentials | Legacy issue-reporter App private key was embedded in public releases | Keep the exposed key and unused legacy repository secret absent; retain the replacement Reporter key, separate Releaser credentials, D1 global mutation caps, affirmative consent, strict allowlists, fail-closed edge free text, emergency off, and protected hosted gates |
 | TF-STATUS-093 | High | closed | Release readiness / `2.4.0` publication | Anonymous error reporting is merged but not present in the latest stable `v2.3.1` release | Keep `v2.4.0` stable/latest with its exact-main annotated tag, 10 verified assets, explicit unsigned macOS notice, updater visibility, active relay health, and separate Releaser credential lane |
+| TF-STATUS-094 | High | fixed_pending_full_verify | Rust Core dump.import / Import UI | Over-broad target-only FK preflight blocked MySQL-like dump-scoped restore | Close after protected `2.4.1` CI/merge evidence; preserve compatible target-only tables and report operation-level failures once |
+| TF-STATUS-095 | High | fixed_pending_full_verify | Release readiness / `2.4.1` publication | MySQL shared-snapshot and dump-scoped import fixes await protected publication | Complete protected merge, exact-main tag, release asset/digest verification, stable publication, and updater visibility |
 
 ## Recommended Execution Order
 
+1. Complete TF-STATUS-094/095 through protected `2.4.1` CI, merge, exact-main
+   tag creation, release asset/digest verification, stable publication, and
+   updater visibility. Keep compatible target-only FK tables intact and retain
+   the bounded shared-snapshot lock behavior.
 1. Keep TF-STATUS-085 closed by retaining the POSIX residue policy,
    pre-dispatch abandonment cleanup, and manual-SQL Fix Wizard wording.
 2. Keep TF-STATUS-086 closed by retaining synchronized cancellation/result
@@ -2570,6 +2647,7 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-21 | Implemented the `2.4.1` MySQL-standard dump/import patch: compatible target-only FK tables are preserved, incompatible surviving contracts alone fail preflight, operation-level failures are not expanded to every table, and all MySQL workers share one bounded-lock InnoDB snapshot while DML stays available. Completed direct review and prepared the patch version for protected publication. | Rust dump/import core, Python Export/Import bridge and UI/i18n, live/focused tests, version sources, design/status docs | Cargo full including disposable MySQL 8.4 live roundtrip passed; focused/split Python groups passed after translation/status fixes; release build, version sync, and diff check passed. Hosted protected checks and publication remain TF-STATUS-094/095 closure gates. |
 | 2026-07-15 | Published `v2.4.0` as the stable/latest release and closed TF-STATUS-093 after the complete protected PR, exact-main tag, approved draft-build, asset inspection, updater, and production-health sequence. Release notes now explicitly identify the free macOS downloads as unsigned and unnotarized. | PR #247, tag `v2.4.0`, release workflow/metadata, canonical status and status regression contract | Runs `29390539762`, `29390540655`, and `29390539802` passed; merge commit `bfee81613c7f77d96136346fa305858bf62670d7`; tag run `29391247402` and release run `29391317995` passed; 10/10 assets had valid GitHub digests and four macOS sidecars matched; public latest and `UpdateChecker` returned `2.4.0`; relay health was HTTP 200/schema 1/`active`; only the two Releaser repository secrets remain. |
 | 2026-07-15 | Prepared the `2.4.0` release candidate for anonymous error reporting and opened TF-STATUS-093. Hardened the local clean-build path and full-SHA-pinned the version/macOS workflow actions before release. Historical `v2.3.1` publication evidence remains immutable. | version sources, installer/bootstrapper build script and contract, CI workflows/tests, canonical status | Focused RED/GREEN; standalone full Python 2697/1 skipped/4 warnings; Rust and Worker gates passed; corrected `build-installer.ps1 -Clean` completed without source mutation; frozen main/WebSetup checks passed; diff check passed. Protected hosted gates, tag, draft inspection, and publication remain. |
 | 2026-07-15 | Closed TF-STATUS-092 after protected PR #245 merged. The replacement anonymous error-reporting path, credential containment, client retirement, hosted gates, and protected integration are complete. | PR #245, `origin/main`, GitHub repository-secret inventory, production relay health, canonical status | Fresh-head runs `29385868513` and `29385868516` passed; PR #245 merged at `2026-07-15T03:22:13Z` as two-parent merge commit `6dbcd51c8c60acef3569697fa79a9e6914a7c0e0`; the legacy secret remains absent, only the separate Releaser secrets remain, and post-merge relay health is schema 1 / `active`. |

@@ -496,6 +496,11 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.spin_threads = QSpinBox()
         self.spin_threads.setRange(1, 16)
         self.spin_threads.setValue(8)
+        self.spin_threads.setToolTip(
+            "MySQL은 모든 워커가 같은 일관 스냅샷을 사용합니다. "
+            "시작 시 쓰기 잠금을 최대 2초 안에 잠깐 획득해 즉시 해제하고, "
+            "Export 중 일반 조회/입력/수정은 계속 가능하며 DDL만 제한됩니다."
+        )
         option_layout.addRow("병렬 스레드:", self.spin_threads)
 
         self.combo_compression = QComboBox()

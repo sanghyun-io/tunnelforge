@@ -125,7 +125,26 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
     set_mysql_import_session_tuning(&mut adapter, false)?;
 
     let target_schema = endpoint_schema(&endpoint);
-    prepare_import_target(mode, &tables, &mut adapter, &target_schema)?;
+    let selected_table_names = tables
+        .iter()
+        .map(|table| table.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let import_schema = NormalizedSchema {
+        tables: manifest
+            .schema
+            .tables
+            .iter()
+            .filter(|table| selected_table_names.contains(table.name.as_str()))
+            .cloned()
+            .collect(),
+    };
+    prepare_import_target(
+        mode,
+        &tables,
+        &import_schema,
+        &mut adapter,
+        &target_schema,
+    )?;
 
     let import_result = (|| -> Result<(), String> {
         for (index, table_manifest) in tables.iter().enumerate() {
@@ -210,10 +229,9 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
 
 /// replace/recreate 모드일 때 import 전에 대상 테이블을 재생성 가능한 상태로 만든다.
 ///
-/// (1) Surviving-FK preflight (MySQL 전용, abort): import set 밖의 타겟 테이블이
-///     대상 테이블을 참조하는 FK를 갖고 있으면, 부모 재생성 시 그 살아있는 자식 FK가
-///     새 부모와 (charset/collation) 호환되지 않아 ERROR 3780이 난다. 타겟을 손대지
-///     않고 명확한 에러로 차단한다.
+/// (1) Surviving-FK preflight (MySQL 전용): import set 밖의 타겟 테이블과 그 FK는
+///     그대로 둔다. 새 부모 정의의 타입/charset/collation/index가 기존 FK 계약과
+///     달라지는 경우만 타겟을 손대기 전에 명확한 에러로 차단한다.
 ///
 /// (2) Drop-all-then-create-all 순서: import set 내부의 모든 대상 테이블을 자식 우선
 ///     (역의존성) 순서로 먼저 DROP한 뒤 루프에서 생성한다. 이렇게 하지 않고 테이블별로
@@ -224,14 +242,14 @@ fn dump_import<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value,
 fn prepare_import_target(
     mode: &str,
     tables: &[DumpTableManifest],
+    import_schema: &NormalizedSchema,
     adapter: &mut LiveAdapter,
     target_schema: &str,
 ) -> Result<(), String> {
     if !matches!(mode, "replace" | "recreate") {
         return Ok(());
     }
-    let import_set: BTreeSet<String> = tables.iter().map(|table| table.name.clone()).collect();
-    preflight_surviving_referencing_fks(adapter, target_schema, &import_set)?;
+    preflight_surviving_referencing_fks(adapter, target_schema, import_schema)?;
 
     // tables는 parent-first(dependency order)이므로 rev()는 child-first가 된다.
     // foreign_key_checks=0이 이미 켜져 있어 역순 DROP은 안전하다.

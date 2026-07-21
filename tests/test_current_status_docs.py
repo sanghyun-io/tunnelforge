@@ -959,10 +959,10 @@ def test_current_status_records_published_240_release():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert source_version == "2.4.0"
+    assert source_version == "2.4.1"
     assert "The latest stable release is now `v2.4.0`" in summary
     assert "anonymous error reporting" in summary
-    assert "Version references are aligned at `2.4.0`" in baseline
+    assert "Version references are aligned at `2.4.1`" in baseline
     assert "TF-STATUS-093 is `closed`" in summary
     assert "TF-STATUS-093 | High | closed" in tracker
     assert "`2.4.0` release-candidate preparation" in verification
@@ -984,6 +984,24 @@ def test_current_status_records_published_240_release():
     assert "Prepared the `2.4.0` release candidate" in sessions
     assert "Published `v2.4.0` as the stable/latest release" in sessions
     assert "https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.4.0" in verification
+
+
+def test_current_status_tracks_241_mysql_dump_import_patch_candidate():
+    doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
+    summary = " ".join(_section(doc, "Summary").split())
+    tracker = " ".join(_section(doc, "Issue Tracker").split())
+    verification = " ".join(_section(doc, "Verification Log").split())
+    order = " ".join(_section(doc, "Recommended Execution Order").split())
+    sessions = " ".join(_section(doc, "Session Log").split())
+
+    assert "`2.4.1` patch release candidate" in summary
+    assert "TF-STATUS-094 | High | fixed_pending_full_verify" in tracker
+    assert "TF-STATUS-095 | High | fixed_pending_full_verify" in tracker
+    assert "mysql_shared_consistent_snapshot" in doc
+    assert "two-second bounded initial global read lock" in verification
+    assert "target-only FK live roundtrip passed" in verification
+    assert "Complete TF-STATUS-094/095" in order
+    assert "DML stays available" in sessions
 
 
 def test_current_status_closes_final_review_update_boundary_after_fresh_verification():
@@ -1188,7 +1206,7 @@ def test_current_status_records_anonymous_error_reporting_design():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "Last reviewed: 2026-07-15" in doc
+    assert "Last reviewed: 2026-07-21" in doc
     assert "dedicated reporter GitHub App" in summary
     assert "Cloudflare Worker" in summary
     assert "TF-STATUS-092 | High | closed" in tracker

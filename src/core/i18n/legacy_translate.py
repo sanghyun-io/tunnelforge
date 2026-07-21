@@ -17,6 +17,7 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "MySQL은 모든 워커가 같은 일관 스냅샷을 사용합니다. 시작 시 쓰기 잠금을 최대 2초 안에 잠깐 획득해 즉시 해제하고, Export 중 일반 조회/입력/수정은 계속 가능하며 DDL만 제한됩니다.": "All MySQL workers use the same consistent snapshot. Export briefly acquires a write-blocking lock within a 2-second limit and releases it immediately; normal reads and writes remain available while only DDL is restricted until export completes.",
     "(백업 없음)": "(No backups)",
     "(미설정)": "(Not set)",
     "(복사)": "(Copy)",
