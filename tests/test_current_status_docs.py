@@ -986,7 +986,7 @@ def test_current_status_records_published_240_release():
     assert "https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.4.0" in verification
 
 
-def test_current_status_tracks_241_mysql_dump_import_patch_candidate():
+def test_current_status_tracks_241_mysql_dump_import_release_closure():
     doc = (PROJECT_ROOT / "docs" / "current_status.md").read_text(encoding="utf-8")
     summary = " ".join(_section(doc, "Summary").split())
     tracker = " ".join(_section(doc, "Issue Tracker").split())
@@ -994,13 +994,13 @@ def test_current_status_tracks_241_mysql_dump_import_patch_candidate():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "`2.4.1` patch release candidate" in summary
-    assert "TF-STATUS-094 | High | fixed_pending_full_verify" in tracker
-    assert "TF-STATUS-095 | High | fixed_pending_full_verify" in tracker
+    assert "stable/latest `v2.4.1` release" in summary
+    assert "TF-STATUS-094 | High | closed" in tracker
+    assert "TF-STATUS-095 | High | closed" in tracker
     assert "mysql_shared_consistent_snapshot" in doc
     assert "two-second bounded initial global read lock" in verification
     assert "target-only FK live roundtrip passed" in verification
-    assert "Complete TF-STATUS-094/095" in order
+    assert "Keep TF-STATUS-094/095 closed" in order
     assert "DML stays available" in sessions
 
 
