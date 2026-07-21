@@ -815,6 +815,51 @@ class TestRustDumpImporter:
         assert ("orders", "error") in error_events
         assert ("products", "error") in error_events
 
+    def test_import_dump_keeps_tables_pending_for_operation_preflight_error(self, tmp_path):
+        """대상 전체 사전검사 실패를 덤프의 모든 테이블 실패로 부풀리지 않는다."""
+        from src.core.db_core_service import DbCoreServiceError
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter
+
+        dump_dir = tmp_path / 'dump'
+        dump_dir.mkdir(parents=True)
+        (dump_dir / '_tunnelforge_dump.json').write_text(
+            json.dumps(
+                {
+                    "format": "tunnelforge-dump",
+                    "format_version": 2,
+                    "database": "app",
+                    "tables": [
+                        {"name": "users", "path": "0001_users", "rows": 1, "chunks": 1},
+                        {"name": "orders", "path": "0002_orders", "rows": 1, "chunks": 1},
+                    ],
+                }
+            ),
+            encoding='utf-8',
+        )
+
+        class FakeFacade:
+            def import_dump(self, payload, on_event=None):
+                raise DbCoreServiceError(
+                    "preflight_surviving_fk: target-only foreign key is incompatible"
+                )
+
+        importer = RustDumpImporter(
+            RustDumpConfig('localhost', 3306, 'root', 'password'),
+            facade=FakeFacade(),
+        )
+        status_events = []
+
+        success, message, results = importer.import_dump(
+            str(dump_dir),
+            table_status_callback=lambda *event: status_events.append(event),
+        )
+
+        assert success is False
+        assert results["users"]["status"] == "pending"
+        assert results["orders"]["status"] == "pending"
+        assert not [event for event in status_events if event[1] == "error"]
+        assert "preflight_surviving_fk" in message
+
     def test_import_dump_reports_view_results_in_message(self, tmp_path):
         """import 결과의 views_imported/failed/skipped 가 메시지에 반영됨"""
         from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpImporter

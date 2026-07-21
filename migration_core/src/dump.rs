@@ -4,14 +4,173 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use mysql::prelude::Queryable;
 use crate::*;
 
 /// dump.run / dump.import 요청에 threads가 명시되지 않았을 때 사용하는 기본 워커 수.
 pub(crate) const DEFAULT_DUMP_THREADS: usize = 8;
+const MYSQL_GLOBAL_READ_LOCK_TIMEOUT: Duration = Duration::from_secs(2);
+
+fn mysql_snapshot_worker_setup_sql() -> [&'static str; 2] {
+    [
+        "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+    ]
+}
+
+fn mysql_snapshot_coordinator_sql() -> [&'static str; 4] {
+    [
+        "SET SESSION lock_wait_timeout=2",
+        "FLUSH TABLES WITH READ LOCK",
+        "LOCK INSTANCE FOR BACKUP",
+        "UNLOCK TABLES",
+    ]
+}
+
+struct MysqlSharedSnapshot {
+    coordinator: mysql::PooledConn,
+    workers: Vec<mysql::PooledConn>,
+    setup_ms: u64,
+}
+
+impl MysqlSharedSnapshot {
+    fn acquire(endpoint: &Endpoint, worker_count: usize) -> Result<Self, String> {
+        let started = Instant::now();
+        let mut coordinator = mysql_connection(endpoint)?;
+        let mut control = mysql_connection(endpoint)?;
+        let mut workers = (0..worker_count.max(1))
+            .map(|_| mysql_connection(endpoint))
+            .collect::<Result<Vec<_>, _>>()?;
+        let [isolation_sql, snapshot_sql] = mysql_snapshot_worker_setup_sql();
+        for worker in &mut workers {
+            worker
+                .query_drop(isolation_sql)
+                .map_err(|err| format!("mysql snapshot isolation setup failed: {err}"))?;
+        }
+
+        let [timeout_sql, global_lock_sql, backup_lock_sql, unlock_tables_sql] =
+            mysql_snapshot_coordinator_sql();
+        coordinator
+            .query_drop(timeout_sql)
+            .map_err(|err| format!("mysql snapshot lock timeout setup failed: {err}"))?;
+        let connection_id = coordinator
+            .query_first::<u64, _>("SELECT CONNECTION_ID()")
+            .map_err(|err| format!("mysql snapshot coordinator id failed: {err}"))?
+            .ok_or_else(|| "mysql snapshot coordinator id was empty".to_string())?;
+        let (cancel_tx, cancel_rx) = mpsc::channel::<()>();
+        let watchdog = thread::spawn(move || {
+            if cancel_rx.recv_timeout(MYSQL_GLOBAL_READ_LOCK_TIMEOUT).is_err() {
+                let _ = control.query_drop(format!("KILL QUERY {connection_id}"));
+            }
+        });
+        let global_lock_result = coordinator.query_drop(global_lock_sql);
+        let _ = cancel_tx.send(());
+        let _ = watchdog.join();
+        global_lock_result.map_err(|err| {
+            format!(
+                "mysql consistent snapshot could not acquire the brief global read lock within 2 seconds: {err}"
+            )
+        })?;
+
+        let setup_result = (|| -> Result<(), String> {
+            for worker in &mut workers {
+                worker.query_drop(snapshot_sql).map_err(|err| {
+                    format!("mysql worker consistent snapshot start failed: {err}")
+                })?;
+            }
+            coordinator.query_drop(backup_lock_sql).map_err(|err| {
+                format!(
+                    "mysql backup lock failed; BACKUP_ADMIN is required for a safe online export: {err}"
+                )
+            })?;
+            coordinator
+                .query_drop(unlock_tables_sql)
+                .map_err(|err| format!("mysql global read lock release failed: {err}"))?;
+            Ok(())
+        })();
+        if let Err(err) = setup_result {
+            let _ = coordinator.query_drop("UNLOCK TABLES");
+            let _ = coordinator.query_drop("UNLOCK INSTANCE");
+            for worker in &mut workers {
+                let _ = worker.query_drop("ROLLBACK");
+            }
+            return Err(err);
+        }
+
+        Ok(Self {
+            coordinator,
+            workers,
+            setup_ms: started.elapsed().as_millis().max(1) as u64,
+        })
+    }
+
+    fn take_workers(&mut self) -> Vec<mysql::PooledConn> {
+        std::mem::take(&mut self.workers)
+    }
+
+    fn validate_transactional_tables(
+        &mut self,
+        endpoint: &Endpoint,
+        tables: &[NormalizedTable],
+    ) -> Result<(), String> {
+        let worker = self
+            .workers
+            .first_mut()
+            .ok_or_else(|| "mysql snapshot worker was not initialized".to_string())?;
+        let table_names = tables
+            .iter()
+            .map(|table| sql_literal(&Value::String(table.name.clone())))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let rows = worker
+            .query::<(String, String), _>(format!(
+                "SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = {} AND TABLE_NAME IN ({})",
+                sql_literal(&Value::String(endpoint_schema(endpoint))),
+                table_names
+            ))
+            .map_err(|err| format!("mysql snapshot table-engine inspection failed: {err}"))?;
+        let offenders = non_transactional_mysql_tables(&rows);
+        if offenders.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "mysql online consistent export requires InnoDB tables; convert or separately handle: {}",
+                offenders.join(", ")
+            ))
+        }
+    }
+}
+
+fn non_transactional_mysql_tables(rows: &[(String, String)]) -> Vec<String> {
+    let mut offenders = rows
+        .iter()
+        .filter(|(_, engine)| !engine.eq_ignore_ascii_case("innodb"))
+        .map(|(table, engine)| format!("{table} ({engine})"))
+        .collect::<Vec<_>>();
+    offenders.sort();
+    offenders
+}
+
+impl Drop for MysqlSharedSnapshot {
+    fn drop(&mut self) {
+        for worker in &mut self.workers {
+            let _ = worker.query_drop("ROLLBACK");
+        }
+        let _ = self.coordinator.query_drop("UNLOCK TABLES");
+        let _ = self.coordinator.query_drop("UNLOCK INSTANCE");
+    }
+}
+
+fn mysql_connection(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
+    match LiveAdapter::connect(endpoint)? {
+        LiveAdapter::MySql(conn) => Ok(conn),
+        LiveAdapter::PostgreSql(_) => Err("mysql connection requires mysql endpoint".to_string()),
+    }
+}
 
 pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F) {
     emit(json!({
@@ -357,7 +516,6 @@ fn parse_dump_run_options(request: &Request) -> Result<DumpRunOptions, String> {
 
 /// engine/threads/table_total로 결정되는 덤프 실행 전략.
 enum DumpStrategy {
-    SingleMysqlParallel,
     GlobalMysql,
     TableParallel,
     Sequential,
@@ -373,9 +531,7 @@ impl DumpStrategy {
 }
 
 fn select_dump_strategy(engine: &str, threads: usize, table_total: usize) -> DumpStrategy {
-    if engine == "mysql" && threads > 1 && table_total == 1 {
-        DumpStrategy::SingleMysqlParallel
-    } else if engine == "mysql" && threads > 1 && table_total > 1 {
+    if engine == "mysql" {
         DumpStrategy::GlobalMysql
     } else if threads > 1 && table_total > 1 {
         DumpStrategy::TableParallel
@@ -414,7 +570,7 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     };
     let views_count = views.len();
     let (snapshot_policy, strict_export, manifest_warnings) =
-        dump_manifest_consistency_metadata(options.threads);
+        dump_manifest_consistency_metadata(&endpoint.engine, options.threads);
 
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
@@ -443,6 +599,31 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     let output_path = Path::new(&options.output_dir);
     prepare_dump_output_dir(output_path, options.overwrite)?;
 
+    let mut mysql_snapshot = if endpoint.engine == "mysql" {
+        emit(json!({
+            "event": "phase",
+            "request_id": request.request_id,
+            "phase": "snapshot",
+            "message": "공유 일관 스냅샷 준비 중 (쓰기 잠금은 최대 2초 내 획득 후 즉시 해제)"
+        }));
+        let snapshot = MysqlSharedSnapshot::acquire(&endpoint, options.threads)?;
+        emit(json!({
+            "event": "phase",
+            "request_id": request.request_id,
+            "phase": "snapshot",
+            "message": format!(
+                "MySQL 공유 일관 스냅샷 준비 완료: {}개 워커, {} ms (일반 쓰기 가능, DDL만 export 종료까지 제한)",
+                snapshot.workers.len(), snapshot.setup_ms
+            ),
+            "snapshot_policy": "mysql_shared_consistent_snapshot",
+            "worker_count": snapshot.workers.len(),
+            "setup_ms": snapshot.setup_ms
+        }));
+        Some(snapshot)
+    } else {
+        None
+    };
+
     // 부분 export(tables 지정) 시에는 View가 참조하는 base table이 빠질 수 있으므로 View를 수집하지 않는다.
     let full_export = options.selected_tables.is_empty();
     let inspection = inspect_live(&endpoint)?;
@@ -454,6 +635,9 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     schema = dependency_ordered_schema(&schema);
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
+    }
+    if let Some(snapshot) = mysql_snapshot.as_mut() {
+        snapshot.validate_transactional_tables(&endpoint, &schema.tables)?;
     }
 
     let row_counts = dump_table_row_counts(&endpoint, &schema.tables);
@@ -491,22 +675,12 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         request_id: request.request_id.clone(),
     };
     let (table_manifests, total_rows, total_chunks) = match strategy {
-        DumpStrategy::SingleMysqlParallel => {
-            match dump_single_mysql_table_parallel(
-                &ctx,
-                &export_tables[0],
-                parallel_limits.range_workers_per_table,
-                |event| emit(event),
-            )? {
-                Some(result) => result,
-                None => {
-                    let mut adapter = LiveAdapter::connect(&endpoint)?;
-                    dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
-                }
-            }
-        }
         DumpStrategy::GlobalMysql => {
-            dump_tables_global_mysql(&ctx, &export_tables, options.threads, |event| emit(event))?
+            let workers = mysql_snapshot
+                .as_mut()
+                .ok_or_else(|| "mysql snapshot session was not initialized".to_string())?
+                .take_workers();
+            dump_tables_global_mysql(&ctx, &export_tables, workers, |event| emit(event))?
         }
         DumpStrategy::TableParallel => dump_tables_parallel(
             &ctx,
@@ -847,16 +1021,13 @@ fn dump_tables_parallel<F: FnMut(Value)>(
 fn dump_tables_global_mysql<F: FnMut(Value)>(
     ctx: &DumpJobContext,
     tables: &[NormalizedTable],
-    threads: usize,
+    mut workers: Vec<mysql::PooledConn>,
     mut emit: F,
 ) -> Result<(Vec<DumpTableManifest>, u64, u64), String> {
     let table_total = tables.len();
-    let mut conn = match LiveAdapter::connect(&ctx.endpoint)? {
-        LiveAdapter::MySql(conn) => conn,
-        LiveAdapter::PostgreSql(_) => {
-            return Err("global mysql dump requires mysql endpoint".to_string())
-        }
-    };
+    let mut conn = workers
+        .pop()
+        .ok_or_else(|| "global mysql dump requires at least one snapshot worker".to_string())?;
     let profiles = load_dump_perf_profiles();
     let mut ranges_by_table = BTreeMap::<String, Vec<DumpRange>>::new();
     let mut states = Vec::<DumpGlobalTableState>::new();
@@ -920,6 +1091,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
             manifest: None,
         });
     }
+    workers.push(conn);
 
     let plan = global_dump_work_plan_for_ranges(tables, &ranges_by_table);
     let table_index_by_name = tables
@@ -962,19 +1134,41 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
     if work_total == 0 {
         return Ok((Vec::new(), 0, 0));
     }
-    let max_threads = threads.max(1).min(work_total);
+    let max_threads = workers.len().max(1).min(work_total);
     let mut first_error: Option<String> = None;
     let (sender, receiver) = mpsc::channel::<DumpGlobalEvent>();
+    let pending = Arc::new(Mutex::new(pending));
+    let mut handles = Vec::with_capacity(max_threads);
+    for conn in workers.into_iter().take(max_threads) {
+        let pending = Arc::clone(&pending);
+        let sender = sender.clone();
+        let ctx = ctx.clone();
+        handles.push(thread::spawn(move || {
+            let mut adapter = LiveAdapter::MySql(conn);
+            loop {
+                let work = pending.lock().ok().and_then(|mut queue| queue.pop_front());
+                let Some(work) = work else { break };
+                run_dump_global_work(
+                    &mut adapter,
+                    &ctx,
+                    work,
+                    table_total,
+                    &sender,
+                );
+            }
+            let _ = adapter.execute_sql("ROLLBACK");
+        }));
+    }
+    drop(sender);
 
-    run_bounded_pool(
-        pending,
-        max_threads,
-        &receiver,
-        |work| spawn_dump_global_worker(ctx.clone(), work, table_total, sender.clone()),
-        |event| match event {
+    let mut completed = 0_usize;
+    while completed < work_total {
+        let event = receiver
+            .recv()
+            .map_err(|_| "mysql snapshot worker pool stopped unexpectedly".to_string())?;
+        match event {
             DumpGlobalEvent::Progress(event) => {
                 emit(event);
-                PoolAction::KeepGoing
             }
             DumpGlobalEvent::RangeDone {
                 table_index,
@@ -1027,7 +1221,7 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                         "strategy": "global_pk_range_parallel"
                     }));
                 }
-                PoolAction::Advance
+                completed += 1;
             }
             DumpGlobalEvent::TableDone {
                 index,
@@ -1042,15 +1236,17 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
                 state.chunks_total = chunks;
                 state.work_ms = duration_ms.max(1);
                 state.manifest = Some(manifest);
-                PoolAction::Advance
+                completed += 1;
             }
-            // 글로벌 경로 에러는 리필하지 않고 슬롯만 반환한다(기존 동작 보존).
             DumpGlobalEvent::Error(err) => {
                 first_error.get_or_insert(err);
-                PoolAction::AdvanceNoRefill
+                completed += 1;
             }
-        },
-    );
+        }
+    }
+    for handle in handles {
+        let _ = handle.join();
+    }
     if let Some(err) = first_error {
         return Err(err);
     }
@@ -1086,18 +1282,6 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
     let total_rows = manifests.iter().map(|table| table.rows).sum();
     let total_chunks = manifests.iter().map(|table| table.chunks).sum();
     Ok((manifests, total_rows, total_chunks))
-}
-
-fn dump_single_mysql_table_parallel<F: FnMut(Value)>(
-    ctx: &DumpJobContext,
-    table: &NormalizedTable,
-    threads: usize,
-    mut emit: F,
-) -> Result<Option<(Vec<DumpTableManifest>, u64, u64)>, String> {
-    Ok(
-        dump_mysql_table_parallel_ranges(ctx, table, 0, 1, threads, |event| emit(event))?
-            .map(|(manifest, rows, chunks)| (vec![manifest], rows, chunks)),
-    )
 }
 
 fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
@@ -1291,28 +1475,34 @@ fn spawn_mysql_range_worker(
     })
 }
 
-fn spawn_dump_global_worker(
-    ctx: DumpJobContext,
+fn run_dump_global_work(
+    adapter: &mut LiveAdapter,
+    ctx: &DumpJobContext,
     work: DumpGlobalWorkItem,
     table_total: usize,
-    sender: mpsc::Sender<DumpGlobalEvent>,
-) -> thread::JoinHandle<()> {
-    thread::spawn(move || match work.kind {
+    sender: &mpsc::Sender<DumpGlobalEvent>,
+) {
+    match work.kind {
         DumpGlobalWorkKind::MysqlRange {
             table_path,
             pk_column,
             range,
         } => {
-            let result = dump_mysql_range_chunk(
-                &ctx.endpoint,
-                &ctx.output_path,
-                &work.table,
-                &table_path,
-                &pk_column,
-                &range,
-                &ctx.data_format,
-                &ctx.compression,
-            );
+            let result = match adapter {
+                LiveAdapter::MySql(conn) => dump_mysql_range_chunk_on_conn(
+                    conn,
+                    &ctx.output_path,
+                    &work.table,
+                    &table_path,
+                    &pk_column,
+                    &range,
+                    &ctx.data_format,
+                    &ctx.compression,
+                ),
+                LiveAdapter::PostgreSql(_) => {
+                    Err("global mysql worker received a PostgreSQL connection".to_string())
+                }
+            };
             match result {
                 Ok((rows, stream_ms, checksum)) => {
                     let _ = sender.send(DumpGlobalEvent::RangeDone {
@@ -1331,28 +1521,25 @@ fn spawn_dump_global_worker(
             }
         }
         DumpGlobalWorkKind::WholeTable => {
-            let result = (|| {
-                let mut adapter = LiveAdapter::connect(&ctx.endpoint)?;
-                let started = Instant::now();
-                dump_one_table(
-                    &mut adapter,
-                    &ctx,
-                    &work.table,
-                    work.table_index,
-                    table_total,
-                    |event| {
-                        let _ = sender.send(DumpGlobalEvent::Progress(event));
-                    },
+            let started = Instant::now();
+            let result = dump_one_table(
+                adapter,
+                ctx,
+                &work.table,
+                work.table_index,
+                table_total,
+                |event| {
+                    let _ = sender.send(DumpGlobalEvent::Progress(event));
+                },
+            )
+            .map(|(manifest, rows, chunks)| {
+                (
+                    manifest,
+                    rows,
+                    chunks,
+                    started.elapsed().as_millis().max(1) as u64,
                 )
-                .map(|(manifest, rows, chunks)| {
-                    (
-                        manifest,
-                        rows,
-                        chunks,
-                        started.elapsed().as_millis().max(1) as u64,
-                    )
-                })
-            })();
+            });
             match result {
                 Ok((manifest, rows, chunks, duration_ms)) => {
                     let _ = sender.send(DumpGlobalEvent::TableDone {
@@ -1368,11 +1555,11 @@ fn spawn_dump_global_worker(
                 }
             }
         }
-    })
+    }
 }
 
-fn dump_mysql_range_chunk(
-    endpoint: &Endpoint,
+fn dump_mysql_range_chunk_on_conn(
+    conn: &mut mysql::PooledConn,
     output_path: &Path,
     table: &NormalizedTable,
     table_path: &str,
@@ -1381,12 +1568,6 @@ fn dump_mysql_range_chunk(
     data_format: &str,
     compression: &str,
 ) -> Result<(u64, u64, String), String> {
-    let mut conn = match LiveAdapter::connect(endpoint)? {
-        LiveAdapter::MySql(conn) => conn,
-        LiveAdapter::PostgreSql(_) => {
-            return Err("pk range dump requires mysql endpoint".to_string())
-        }
-    };
     let chunk_path = output_path.join(table_path).join(dump_chunk_name(
         range.chunk_index,
         data_format,
@@ -1414,6 +1595,34 @@ fn dump_mysql_range_chunk(
     }
     let checksum = sha256_file(&chunk_path)?;
     Ok((rows, stream_started.elapsed().as_millis() as u64, checksum))
+}
+
+fn dump_mysql_range_chunk(
+    endpoint: &Endpoint,
+    output_path: &Path,
+    table: &NormalizedTable,
+    table_path: &str,
+    pk_column: &str,
+    range: &DumpRange,
+    data_format: &str,
+    compression: &str,
+) -> Result<(u64, u64, String), String> {
+    let mut conn = match LiveAdapter::connect(endpoint)? {
+        LiveAdapter::MySql(conn) => conn,
+        LiveAdapter::PostgreSql(_) => {
+            return Err("pk range dump requires mysql endpoint".to_string())
+        }
+    };
+    dump_mysql_range_chunk_on_conn(
+        &mut conn,
+        output_path,
+        table,
+        table_path,
+        pk_column,
+        range,
+        data_format,
+        compression,
+    )
 }
 
 fn spawn_dump_table_worker(
@@ -1858,6 +2067,43 @@ mod tests {
         assert_eq!(event["rows_total"], 42);
         assert_eq!(event["tables"][0]["name"], "users");
         assert_eq!(event["tables"][0]["rows"], 42);
+    }
+
+    #[test]
+    fn mysql_snapshot_setup_uses_repeatable_read_read_only_transactions() {
+        assert_eq!(
+            mysql_snapshot_worker_setup_sql(),
+            [
+                "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+                "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_snapshot_lock_sequence_releases_global_lock_before_dumping() {
+        assert_eq!(
+            mysql_snapshot_coordinator_sql(),
+            [
+                "SET SESSION lock_wait_timeout=2",
+                "FLUSH TABLES WITH READ LOCK",
+                "LOCK INSTANCE FOR BACKUP",
+                "UNLOCK TABLES",
+            ]
+        );
+    }
+
+    #[test]
+    fn mysql_shared_snapshot_rejects_non_transactional_tables() {
+        let rows = vec![
+            ("users".to_string(), "InnoDB".to_string()),
+            ("legacy_cache".to_string(), "MyISAM".to_string()),
+        ];
+
+        assert_eq!(
+            non_transactional_mysql_tables(&rows),
+            vec!["legacy_cache (MyISAM)".to_string()]
+        );
     }
 
     #[test]

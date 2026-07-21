@@ -254,6 +254,8 @@ class RustDumpExporter(_RustDumpClientBase):
         message = f"Rust DB Core export 완료: {table_count}개 테이블, {rows:,} rows"
         if view_count:
             message += f", View {view_count}개"
+        if result.get("snapshot_policy") == "mysql_shared_consistent_snapshot":
+            message += f" (MySQL 공유 일관 스냅샷, {max(1, int(threads))}개 워커)"
         return True, message
 
     def export_full_schema(
@@ -334,7 +336,7 @@ class RustDumpExporter(_RustDumpClientBase):
             )
             if success:
                 self._write_metadata(output_dir, schema, "partial", final_tables, added_tables)
-                return True, f"{len(final_tables)}개 테이블 Export 완료", final_tables
+                return True, message, final_tables
             return False, message, []
         except DbCoreServiceError as exc:
             return False, f"Rust DB Core export 오류: {exc}", []
@@ -377,6 +379,10 @@ def _mark_non_done_import_results_error(
         import_results[table] = {"status": "error", "message": message}
         if table_status_callback:
             table_status_callback(table, "error", message)
+
+
+def _is_operation_scoped_import_error(message: str) -> bool:
+    return message.lstrip().startswith("preflight_surviving_fk:")
 
 
 class RustDumpImporter(_RustDumpClientBase):
@@ -515,7 +521,8 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
             return True, message, import_results
         except DbCoreServiceError as exc:
-            _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
+            if not _is_operation_scoped_import_error(str(exc)):
+                _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
             return False, f"Rust DB Core import 오류: {exc}", import_results
         except Exception as exc:
             _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)

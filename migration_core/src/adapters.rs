@@ -709,12 +709,15 @@ fn default_snapshot_policy() -> String {
     "unknown".to_string()
 }
 
-pub(crate) fn dump_manifest_consistency_metadata(threads: usize) -> (String, bool, Vec<String>) {
-    if threads > 1 {
+pub(crate) fn dump_manifest_consistency_metadata(
+    engine: &str,
+    _threads: usize,
+) -> (String, bool, Vec<String>) {
+    if engine == "mysql" {
         (
-            "non_consistent_parallel".to_string(),
-            false,
-            vec!["parallel export did not prove a shared consistent snapshot".to_string()],
+            "mysql_shared_consistent_snapshot".to_string(),
+            true,
+            Vec::new(),
         )
     } else {
         ("connection_consistent".to_string(), true, Vec::new())
@@ -1038,20 +1041,29 @@ mod tests {
     }
 
     #[test]
-    fn dump_manifest_consistency_metadata_marks_parallel_as_non_strict() {
-        let (snapshot_policy, strict_export, warnings) = dump_manifest_consistency_metadata(8);
+    fn dump_manifest_consistency_metadata_marks_mysql_parallel_as_shared_snapshot() {
+        let (snapshot_policy, strict_export, warnings) =
+            dump_manifest_consistency_metadata("mysql", 8);
 
-        assert_eq!(snapshot_policy, "non_consistent_parallel");
-        assert!(!strict_export);
-        assert_eq!(
-            warnings,
-            vec!["parallel export did not prove a shared consistent snapshot".to_string()]
-        );
+        assert_eq!(snapshot_policy, "mysql_shared_consistent_snapshot");
+        assert!(strict_export);
+        assert!(warnings.is_empty());
     }
 
     #[test]
     fn dump_manifest_consistency_metadata_marks_single_thread_as_strict() {
-        let (snapshot_policy, strict_export, warnings) = dump_manifest_consistency_metadata(1);
+        let (snapshot_policy, strict_export, warnings) =
+            dump_manifest_consistency_metadata("mysql", 1);
+
+        assert_eq!(snapshot_policy, "mysql_shared_consistent_snapshot");
+        assert!(strict_export);
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn dump_manifest_consistency_metadata_keeps_postgres_policy_separate() {
+        let (snapshot_policy, strict_export, warnings) =
+            dump_manifest_consistency_metadata("postgresql", 8);
 
         assert_eq!(snapshot_policy, "connection_consistent");
         assert!(strict_export);
