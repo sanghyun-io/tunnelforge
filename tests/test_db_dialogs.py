@@ -107,19 +107,12 @@ def _make_worker_with_fake_runner(owns_facade: bool):
     config = RustDumpConfig(host="127.0.0.1", port=3306, user="root", password="pw", engine="mysql")
     worker = RustDumpWorker("export_schema", config)
 
-    class FakeProcess:
-        def __init__(self):
-            self.terminated = False
-
-        def poll(self):
-            return None
-
-        def terminate(self):
-            self.terminated = True
-
     class FakeClient:
-        def __init__(self, process):
-            self._process = process
+        def __init__(self):
+            self.shutdown_calls = 0
+
+        def shutdown(self):
+            self.shutdown_calls += 1
 
     class FakeFacade:
         def __init__(self, client):
@@ -130,29 +123,29 @@ def _make_worker_with_fake_runner(owns_facade: bool):
             self.facade = facade
             self._owns_facade = owns
 
-    process = FakeProcess()
-    runner = FakeRunner(FakeFacade(FakeClient(process)), owns_facade)
+    client = FakeClient()
+    runner = FakeRunner(FakeFacade(client), owns_facade)
     worker._active_runner = runner
-    return worker, process
+    return worker, client
 
 
-def test_rust_dump_worker_cancel_terminates_owned_dedicated_process():
-    worker, process = _make_worker_with_fake_runner(owns_facade=True)
+def test_rust_dump_worker_cancel_shuts_down_owned_dedicated_client():
+    worker, client = _make_worker_with_fake_runner(owns_facade=True)
 
     result = worker.cancel()
 
     assert result is True
     assert worker._cancel_requested is True
-    assert process.terminated is True
+    assert client.shutdown_calls == 1
 
 def test_rust_dump_worker_cancel_does_not_touch_shared_facade_process():
-    worker, process = _make_worker_with_fake_runner(owns_facade=False)
+    worker, client = _make_worker_with_fake_runner(owns_facade=False)
 
     result = worker.cancel()
 
     assert result is True
     assert worker._cancel_requested is True
-    assert process.terminated is False
+    assert client.shutdown_calls == 0
 
 def test_start_orphan_check_disconnects_connector_after_dialog_exec(monkeypatch):
     app = QApplication.instance() or QApplication([])

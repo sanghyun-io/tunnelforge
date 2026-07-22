@@ -34,20 +34,16 @@ class RustDumpWorker(QThread):
         """실행 중인 dump/import 작업의 취소를 요청한다.
 
         RustDumpExporter/RustDumpImporter가 이 워커를 위해 전용으로 만든
-        DbCoreFacade(`_owns_facade=True`)의 Rust core 프로세스만 직접 terminate()한다.
-        DbCoreServiceClient.shutdown()은 request()가 블로킹 중에 잡고 있는 것과
-        동일한 락을 요구하므로, dump.run/dump.import가 진행 중일 때 UI 스레드에서
-        호출하면 그대로 멈춘다. 프로세스를 직접 종료시키면 워커 스레드가 블로킹 중인
-        읽기에서 즉시 깨어나 예외/실패 결과로 빠져나온다.
+        DbCoreFacade(`_owns_facade=True`)에만 shutdown admission을 전달한다.
+        Shared facade는 다른 작업의 소유권을 가지므로 건드리지 않는다.
         """
         self._cancel_requested = True
         runner = self._active_runner
         if runner is not None and getattr(runner, "_owns_facade", False):
             facade = getattr(runner, "facade", None)
             client = getattr(facade, "client", None) if facade is not None else None
-            process = getattr(client, "_process", None) if client is not None else None
-            if process is not None and process.poll() is None:
-                process.terminate()
+            if client is not None:
+                client.shutdown()
         return True
 
     def _is_cancelled_message(self, success: bool, msg: str):

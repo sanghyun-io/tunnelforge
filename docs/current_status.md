@@ -1,6 +1,6 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-07-10
+Last reviewed: 2026-07-21
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -518,6 +518,9 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-07-21 | MySQL dump/load reference comparison | compared TunnelForge `replace` and parallel dump behavior with official `mysqldump`, MySQL Shell dump/load, and MySQL 8.0 FK-check documentation; traced `dump_manifest_consistency_metadata`, `prepare_import_target`, and commit `a4c7a06` | TWO OPEN GAPS | `replace` should scope drop/recreate to objects present in the dump and preserve other target objects, while the current blanket surviving-FK abort over-blocks this contract. Separately, the production dump's eight-thread `non_consistent_parallel` policy diverges from MySQL Shell's default consistent parallel snapshot, so TF-STATUS-004 is reopened. |
+| 2026-07-21 | v2.4.0 production dump import failure diagnosis | inspected `import_log_PROD_failed_20260721_154406.txt`, `_export_metadata.json`, and `_tunnelforge_dump.json`; traced the `v2.4.0` Rust Core surviving-FK preflight and introducing commit `a4c7a06`; compared behavior with the MySQL 8.0 foreign-key-check contract | CONFIRMED OVER-BROAD GUARD | The 241-table full-replace import stopped before any table was loaded because target-only table `supplement_review_api_call` retains two FKs into imported parents. Preserving that target-only table is valid when the recreated parent definitions and referenced key values remain compatible, but the current preflight rejects every external FK without checking structural or row-level compatibility. This is one blanket preflight failure, not 241 independent table failures. |
+| 2026-07-20 | Export/Import collation preservation audit | `git log --all --grep="collation\|charset\|dump\|export\|import" -i`; source tracing through Rust Core `dump.run` inspection/manifest and `dump.import` DDL generation; `cargo test --manifest-path migration_core\Cargo.toml table_collation --lib`; `cargo test --manifest-path migration_core\Cargo.toml mysql_column_inspection_captures_character_metadata --lib`; `cargo test --manifest-path migration_core\Cargo.toml mysql_to_postgres_type_mapping_strips_mysql_character_options --lib` | PASS | Confirmed release `v2.2.0` / PR #173 preserves table-level collation for newly exported MySQL dumps imported back into MySQL, while column charset/collation fidelity is also retained. Legacy pre-v2.2.0 manifests lack `table_collation`; merge mode keeps an existing target table's schema; cross-engine and PostgreSQL paths intentionally omit MySQL table-level collation. Focused Rust tests passed at 10 + 1 + 1. |
 | 2026-07-10 | Role-specialized strategy, release, and security review | six role-specific read-only repository reviews plus cross-critique; `python scripts\check-macos-support-gate.py --final`; `git rev-list --left-right --count v2.3.0...HEAD`; `gh api repos/sanghyun-io/tunnelforge/branches/main/protection/required_status_checks`; focused source tracing for updater execution and ProductionGuard; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `git diff --check` | PASS with expected macOS final-gate failure | Confirmed TF-STATUS-079 through TF-STATUS-083 and refreshed TF-STATUS-008. Current-status tests passed at 56 passed; full Python suite passed at 1827 passed / 6 warnings. The final macOS gate fails only for missing current-HEAD manual workflow evidence and the real-Mac report. |
 | 2026-07-10 | Round 3 completion and open-issue reconciliation | `git status --short --branch`; `git rev-list --left-right --count origin/main...main`; `gh issue list --state open --limit 30 --json number,title,updatedAt,url`; `gh issue view 170 --json ...`; `git branch --contains a4c7a06`; `git merge-base --is-ancestor a4c7a06 HEAD`; `gh pr view 171 --json ...`; `git tag --contains a4c7a06`; `pytest tests\test_current_status_docs.py -q`; `pytest -q`; `git diff --check` | PASS | Round 3 remains complete and pushed at `09ab060`. GitHub #170 is still open, but PR #171 fixed its ERROR 3780 path, the fix is in current `main`, and release tags from `v2.1.8` through `v2.3.0` contain it. Remaining #170 work is issue confirmation/closure, not implementation. Current-status tests passed at 55 passed; full Python suite passed at 1826 passed / 6 warnings. |
 | 2026-07-09 | Clean Code Round 3 UI/dialog/main-window integration | `python -m py_compile` on all Round 3 production Python files; `pytest` focused Round 3 suite; `powershell -ExecutionPolicy Bypass -File scripts\rust-core-regression-gate.ps1`; custom whole-tree `MySQLConnector` allowlist scan; `git diff --check HEAD~8..HEAD`; `pytest -q` | PASS | Integrated WP-3.1 through WP-3.8 as behavior-preserving commits. Focused Round 3 tests passed at 491 passed / 2 warnings, Rust Core regression gate passed, allowlist scan found 22 product imports with no missing entries, and full Python suite passed at 1819 passed / 4 warnings. |
@@ -778,9 +781,9 @@ Next action:
 
 1. Keep the regression test that rejects `모든 객체`.
 
-### TF-STATUS-004: Export Consistency Is Explicit In The Manifest
+### TF-STATUS-004: Parallel Export Lacks A Shared Consistent Snapshot
 
-Status: `closed`
+Status: `open`
 Severity: High
 Area: Rust Core dump.run manifest
 
@@ -793,15 +796,23 @@ Evidence:
 - 2026-06-26 update: new single-thread exports are marked
   `connection_consistent` and strict; parallel exports are marked
   `non_consistent_parallel`, non-strict, with a warning.
+- 2026-07-21 re-audit: the production full dump used eight threads and is
+  explicitly marked `non_consistent_parallel`; recording the warning does not
+  provide the shared consistent snapshot that MySQL Shell dump utilities use by
+  default.
 
 Impact:
 
-- Dump artifacts now communicate the export consistency policy instead of
-  implying a shared snapshot that was not proven.
+- Dump artifacts communicate the risk, but a concurrent production export can
+  still contain tables from different logical points in time.
+- This remains a data-correctness gap even though the manifest no longer
+  overpromises consistency.
 
 Next action:
 
-1. Keep export consistency metadata coverage when export scheduling changes.
+1. Make full parallel export consistent by default using a MySQL-supported
+   shared snapshot/backup-lock protocol, and fail closed unless the operator
+   explicitly chooses an unsafe non-consistent export.
 
 ## Medium Priority Issues
 
@@ -2167,7 +2178,7 @@ Next action:
 | TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Keep regression coverage aligned with import intent changes |
 | TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Keep row verification/report coverage aligned with import mode changes |
 | TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
-| TF-STATUS-004 | High | closed | Rust Core export | Export consistency explicit | Keep metadata coverage aligned with export scheduling changes |
+| TF-STATUS-004 | High | open | Rust Core export | Parallel export is labeled non-consistent but still lacks a shared consistent snapshot | Make full parallel export consistent by default and require an explicit unsafe override for non-consistent export |
 | TF-STATUS-005 | Medium | closed | Docs/UI flags | Disabled UI features labeled | Reverify docs if feature flags change |
 | TF-STATUS-006 | Medium | watch | Maintainability | Remaining large files after Clean Code Round 3 | Keep future fixes narrow; split further only when nearby work justifies it |
 | TF-STATUS-007 | Low | closed | Reporting | Referenced HTML report exists | Keep report aligned with future recovery changes |
@@ -2247,6 +2258,7 @@ Next action:
 | TF-STATUS-081 | High | open | Release readiness / versioning | Main contains post-release commits while still declaring the published version | Freeze a release candidate, choose the next version, synchronize all version sources, and keep post-RC feature commits out |
 | TF-STATUS-082 | Medium | open | Product documentation / feature flags | README advertises disabled scheduled backups and queries | Remove current-feature claims or reframe them as unavailable until the feature is intentionally re-enabled and verified |
 | TF-STATUS-083 | Medium | open | CI / branch protection | Only `version-gate` is required on protected main | Add full Python regression and Rust Core regression as required checks after measuring stable CI cost and flake behavior |
+| TF-STATUS-084 | High | open | Rust Core dump.import / surviving target tables | v2.4.0 preflight rejects every target-only FK into the import set without checking whether the recreated parent remains compatible | Preserve target-only tables and their data; replace the blanket abort with structural plus referenced-key data validation or a safe capture/detach/recreate FK workflow, covered by live MySQL regressions for compatible, structurally incompatible, and orphan-producing imports |
 
 ## Recommended Execution Order
 
@@ -2266,7 +2278,12 @@ Next action:
 7. Resolve TF-STATUS-078: close #170 after confirming the merged fix from PR
    #171 / commit `a4c7a06`; reopen implementation work only if it reproduces on
    a release that contains the fix.
-8. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
+8. Fix TF-STATUS-084 before retrying the reported production import: preserve
+   target-only tables while handling their incoming FKs safely, and reject only
+   genuinely incompatible parent recreation.
+9. Fix TF-STATUS-004 so parallel production dumps use a shared consistent
+   snapshot by default rather than merely recording a non-consistency warning.
+10. Defer another broad Clean Code round, Schedule reactivation, One-Click scope
    expansion, and Rust Core concurrency redesign until the release-trust work is
    complete and user/benchmark evidence justifies them.
 
@@ -2274,6 +2291,9 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-07-21 | Compared TunnelForge dump/import semantics with official MySQL tooling. Confirmed that the blanket target-wide incoming-FK abort is not standard `mysqldump` or MySQL Shell object-scope behavior, and reopened TF-STATUS-004 because warning about an eight-thread non-consistent export is not a substitute for MySQL Shell's default consistent parallel snapshot. | `docs/current_status.md` | Official MySQL 8.0 `mysqldump`, MySQL Shell dump/load, and FK documentation plus local Rust Core source/history inspection |
+| 2026-07-21 | Diagnosed the v2.4.0 production full-replace Import failure and corrected the initial classification after tracing MySQL semantics and commit `a4c7a06`. The target-only `supplement_review_api_call` table can remain; only its surviving FK contract must remain compatible with the recreated parents. The current guard does not inspect compatibility and therefore over-blocks valid preservation cases. No application or database mutation was performed. | `docs/current_status.md` | Import log, dump metadata/manifest, v2.4.0 source/history, focused Rust tests, and MySQL 8.0 foreign-key documentation |
+| 2026-07-20 | Audited the reported Export/Import collation concern. The implementation landed in `v2.2.0` / PR #173: current Rust Core dump inspection records MySQL table default collation plus per-column charset/collation, and same-engine MySQL import reproduces them in generated DDL. Documented the legacy-dump, merge-mode, and cross-engine boundaries; no product-code change was needed. | `docs/current_status.md` | Rust Core focused tests passed at 10 + 1 + 1; commit/tag and current source data-flow inspection |
 | 2026-07-10 | Convened architecture, product, UX, quality, security, and critical-program-review agents for two rounds of repository-grounded strategy review. Consensus prioritizes update integrity, dangerous-SQL defaults, release truth, public capability accuracy, required regression gates, and real-Mac evidence before new features or broad refactors. | `docs/current_status.md`, `tests/test_current_status_docs.py` | six independent reviews plus cross-critique; direct source and GitHub verification; current-status pytest 56 passed; full pytest 1827 passed / 6 warnings; expected macOS final-gate failure for two missing evidence conditions |
 | 2026-07-10 | Reconciled Round 3 completion against current Git and GitHub state. Round 3 remains complete and synchronized; #170 is open only because the already merged/released ERROR 3780 fix was not linked for automatic closure. | `docs/current_status.md`, `tests/test_current_status_docs.py` | `git` ancestry/sync checks; GitHub open-issue, #170, and PR #171 inspection; release-tag containment check; current-status pytest 55 passed; full pytest 1826 passed / 6 warnings |
 | 2026-07-09 | Integrated Clean Code Round 3 WP-3.1 through WP-3.8 into `main`, covering SQL editor, DB dialogs, migration dialogs, Fix Wizard pages, cross-engine/diff dialogs, settings/schedule/tunnel dialogs, main window controllers, and UI workers. | Round 3 UI/core helper files plus `docs/current_status.md` | Round 3 focused pytest 491 passed; full `pytest -q` 1819 passed / 4 warnings; Rust Core regression gate passed; whole-tree `MySQLConnector` allowlist scan passed; `git diff --check` passed |

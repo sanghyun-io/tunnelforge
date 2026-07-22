@@ -1,16 +1,24 @@
 import json
+import inspect
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 from typing import Any, cast
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
+from PyQt6.QtGui import QCloseEvent
 from PyQt6.QtWidgets import QApplication, QPushButton, QVBoxLayout, QWidget
 
 from src.core.cross_engine_migration import MigrationIssue
+from src.core.cross_engine_migration import DatabaseEngine
+from src.ui.dialogs import cross_engine_migration_endpoint_form as endpoint_form_module
 from src.ui.dialogs.cross_engine_migration_dialog import CrossEngineMigrationDialog
+from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
+from src.ui.workers.cross_engine_migration_worker import ProcessCleanupError
 
 
 app = QApplication.instance() or QApplication(sys.argv)
@@ -865,6 +873,9 @@ class FakeCrossEngineMigrationWorker:
     def isRunning(self):
         return False
 
+    def retry_process_cleanup(self, *, timeout_seconds):
+        return False
+
 
 def test_start_command_with_payload_caches_worker_start_state_key_for_checkpoint(monkeypatch):
     monkeypatch.setattr(
@@ -998,6 +1009,191 @@ def test_finished_waits_for_worker_to_stop_before_clearing_reference():
         assert worker.wait_timeout == 5000
         assert dialog.worker is None
         assert "현재 작업이 실행 중입니다" not in dialog.lbl_next_hint.text()
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_finished_failure_revokes_execution_unlock_and_safety_completion():
+    dialog = make_dialog()
+    try:
+        dialog._set_execution_unlocked(True)
+        dialog._step_completed["safety"] = True
+        dialog._current_command = "preflight"
+
+        dialog._on_finished(False, {"command": "preflight", "success": False})
+
+        assert not dialog._execution_unlocked
+        assert not dialog._step_completed["safety"]
+    finally:
+        dialog.close()
+
+
+def test_dialog_never_uses_qthread_terminate_for_close_cleanup():
+    assert ".terminate(" not in inspect.getsource(CrossEngineMigrationDialog)
+
+
+def test_finished_cleanup_residual_retains_worker_until_timer_retry_succeeds(
+    monkeypatch,
+):
+    residual = ProcessCleanupError("final_wait", TimeoutError("still alive"))
+
+    class ResidualWorker:
+        def __init__(self):
+            self.retry_results = [residual, True]
+            self.retry_timeouts = []
+
+        def isRunning(self):
+            return False
+
+        def retry_process_cleanup(self, *, timeout_seconds):
+            self.retry_timeouts.append(timeout_seconds)
+            result = self.retry_results.pop(0)
+            if isinstance(result, BaseException):
+                raise result
+            return result
+
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    dialog = make_dialog()
+    worker = ResidualWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._current_command = "migrate"
+
+        dialog._on_finished(
+            False,
+            {"command": "migrate", "success": False, "cleanup_residual": True},
+        )
+
+        assert dialog.worker is worker
+        assert dialog.cleanup_retry_timer.isActive()
+
+        dialog._start_command_with_payload("verify", {})
+        assert dialog.worker is worker
+        assert warnings
+
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog.worker is worker
+        assert dialog.cleanup_retry_timer.isActive()
+
+        dialog.cleanup_retry_timer.timeout.emit()
+        assert dialog.worker is None
+        assert not dialog.cleanup_retry_timer.isActive()
+        assert worker.retry_timeouts
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_cleanup_residual_retry_does_not_block_gui_or_start_duplicate_retry():
+    class SlowResidualWorker:
+        def __init__(self):
+            self.calls = 0
+            self.started = threading.Event()
+            self.release = threading.Event()
+
+        def isRunning(self):
+            return False
+
+        def retry_process_cleanup(self, *, timeout_seconds):
+            self.calls += 1
+            self.started.set()
+            self.release.wait(timeout=2.0)
+            return True
+
+    dialog = make_dialog()
+    worker = SlowResidualWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._cleanup_residual_pending = True
+        started = time.monotonic()
+        dialog._retry_cleanup_residual()
+
+        assert time.monotonic() - started < 0.1
+        assert worker.started.wait(timeout=0.5)
+        assert dialog._cleanup_retry_thread is not None
+
+        dialog._retry_cleanup_residual()
+        assert worker.calls == 1
+    finally:
+        worker.release.set()
+        retry_thread = getattr(dialog, "_cleanup_retry_thread", None)
+        if retry_thread is not None:
+            retry_thread.join(timeout=2.0)
+        dialog.worker = None
+        dialog.close()
+
+
+def test_full_workflow_does_not_arm_when_retained_worker_blocks_start(monkeypatch):
+    class RetainedWorker:
+        def isRunning(self):
+            return False
+
+    warnings = []
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+    dialog = make_dialog()
+    try:
+        dialog.worker = cast(Any, RetainedWorker())
+
+        dialog._start_full_workflow()
+
+        assert not dialog._workflow_active
+        assert warnings
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_close_event_retains_cleanup_residual_until_final_retry_succeeds(
+    monkeypatch,
+):
+    residual = ProcessCleanupError("stream_close", OSError("close failed"))
+
+    class ResidualWorker:
+        def __init__(self):
+            self.cleanup_succeeds = False
+
+        def isRunning(self):
+            return False
+
+        def retry_process_cleanup(self, *, timeout_seconds):
+            if not self.cleanup_succeeds:
+                raise residual
+            return True
+
+    monkeypatch.setattr(
+        "src.ui.dialogs.cross_engine_migration_dialog.QMessageBox.warning",
+        lambda *args, **kwargs: None,
+    )
+    dialog = make_dialog()
+    worker = ResidualWorker()
+    try:
+        dialog.worker = cast(Any, worker)
+        dialog._current_command = "migrate"
+        dialog._on_finished(
+            False,
+            {"command": "migrate", "success": False, "cleanup_residual": True},
+        )
+
+        blocked_close = QCloseEvent()
+        dialog.closeEvent(blocked_close)
+
+        assert not blocked_close.isAccepted()
+        assert dialog.worker is worker
+
+        worker.cleanup_succeeds = True
+        settled_close = QCloseEvent()
+        dialog.closeEvent(settled_close)
+
+        assert settled_close.isAccepted()
+        assert dialog.worker is None
     finally:
         dialog.worker = None
         dialog.close()
@@ -1460,6 +1656,237 @@ def test_tunnel_selection_fills_endpoint_fields_from_configured_list():
         assert dialog.source_form.input_schema.text() == "analytics"
     finally:
         dialog.close()
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("unknown_declined", "changed", "cancelled", "approval_race"),
+)
+def test_cross_engine_selection_fails_before_credentials(monkeypatch, failure_mode):
+    events = []
+    config = {
+        "id": "ssh-source",
+        "name": "SSH Source",
+        "connection_mode": "ssh_tunnel",
+        "remote_host": "db.internal",
+        "remote_port": 3306,
+        "local_port": 3307,
+        "db_engine": "mysql",
+    }
+
+    class Engine:
+        tunnel_configs = {"ssh-source": config}
+
+        def get_active_tunnels(self):
+            return []
+
+        def is_running(self, tunnel_id):
+            return False
+
+        def start_tunnel(self, started_config):
+            raise AssertionError("blocked selection must not start a tunnel")
+
+    class ConfigManager:
+        def load_config(self):
+            return {"tunnels": [config]}
+
+        def get_tunnel_credentials(self, tunnel_id):
+            events.append("credentials")
+            return "should-not-load", "should-not-load"
+
+    monkeypatch.setattr(
+        endpoint_form_module,
+        "ensure_ssh_host_trusted",
+        lambda *args: events.append(f"trust:{failure_mode}") or False,
+    )
+    form = EndpointForm(
+        "Source",
+        DatabaseEngine.MYSQL,
+        tunnel_engine=Engine(),
+        config_manager=ConfigManager(),
+        require_tunnel=True,
+    )
+    try:
+        form.combo_tunnel.setCurrentIndex(1)
+
+        assert events == [f"trust:{failure_mode}"]
+        assert form.input_user.text() == ""
+        assert form.input_password.text() == ""
+    finally:
+        form.close()
+
+
+def test_cross_engine_selection_approves_before_credentials(monkeypatch):
+    events = []
+    config = {
+        "id": "ssh-source",
+        "name": "SSH Source",
+        "connection_mode": "ssh_tunnel",
+        "remote_host": "db.internal",
+        "remote_port": 3306,
+        "local_port": 3307,
+        "db_engine": "mysql",
+    }
+
+    class Engine:
+        tunnel_configs = {"ssh-source": config}
+
+        def get_active_tunnels(self):
+            return []
+
+        def is_running(self, tunnel_id):
+            return False
+
+    class ConfigManager:
+        def load_config(self):
+            return {"tunnels": [config]}
+
+        def get_tunnel_credentials(self, tunnel_id):
+            events.append("credentials")
+            return "db-user", "db-password"
+
+    engine = Engine()
+    monkeypatch.setattr(
+        endpoint_form_module,
+        "ensure_ssh_host_trusted",
+        lambda parent, checked_engine, checked_config: events.append("trust") or True,
+    )
+    form = EndpointForm(
+        "Source",
+        DatabaseEngine.MYSQL,
+        tunnel_engine=engine,
+        config_manager=ConfigManager(),
+        require_tunnel=True,
+    )
+    try:
+        form.combo_tunnel.setCurrentIndex(1)
+
+        assert events == ["trust", "credentials"]
+        assert form.input_user.text() == "db-user"
+        assert form.input_password.text() == "db-password"
+    finally:
+        form.close()
+
+
+def test_cross_engine_endpoint_checks_trust_before_starting_selected_tunnel(
+    monkeypatch,
+):
+    events = []
+    config = {
+        "id": "ssh-source",
+        "name": "SSH Source",
+        "connection_mode": "ssh_tunnel",
+        "bastion_host": "bastion.example",
+        "bastion_port": 22,
+        "remote_host": "db.internal",
+        "remote_port": 3306,
+        "local_port": 3307,
+        "db_engine": "mysql",
+        "default_database": "source_db",
+        "default_schema": "source_db",
+    }
+
+    class Engine:
+        tunnel_configs = {"ssh-source": config}
+
+        def get_active_tunnels(self):
+            return []
+
+        def is_running(self, tunnel_id):
+            return False
+
+        def start_tunnel(self, started_config):
+            events.append("start")
+            assert started_config == config
+            return True, "ok"
+
+        def get_connection_info(self, tunnel_id):
+            return "127.0.0.1", 3307
+
+    class ConfigManager:
+        def load_config(self):
+            return {"tunnels": [config]}
+
+        def get_tunnel_credentials(self, tunnel_id):
+            events.append("credentials")
+            return "db-user", "db-password"
+
+    engine = Engine()
+    form = EndpointForm(
+        "Source",
+        DatabaseEngine.MYSQL,
+        tunnel_engine=engine,
+        config_manager=ConfigManager(),
+        require_tunnel=True,
+    )
+    def ensure(parent, checked_engine, checked_config):
+        events.append("trust")
+        assert parent is form
+        assert checked_engine is engine
+        assert checked_config == config
+        return True
+
+    monkeypatch.setattr(
+        endpoint_form_module, "ensure_ssh_host_trusted", ensure, raising=False
+    )
+    try:
+        form.combo_tunnel.setCurrentIndex(1)
+        form.payload(prepare_tunnel=True)
+        assert events == ["trust", "credentials", "trust", "start"]
+    finally:
+        form.close()
+
+
+def test_cross_engine_endpoint_declined_trust_never_starts_tunnel(monkeypatch):
+    config = {
+        "id": "ssh-source",
+        "name": "SSH Source",
+        "connection_mode": "ssh_tunnel",
+        "remote_host": "db.internal",
+        "remote_port": 3306,
+        "local_port": 3307,
+        "db_engine": "mysql",
+        "default_schema": "source_db",
+    }
+
+    class Engine:
+        tunnel_configs = {"ssh-source": config}
+
+        def get_active_tunnels(self):
+            return []
+
+        def is_running(self, tunnel_id):
+            return False
+
+        def start_tunnel(self, started_config):
+            raise AssertionError("tunnel must not start without trust approval")
+
+    class ConfigManager:
+        def load_config(self):
+            return {"tunnels": [config]}
+
+        def get_tunnel_credentials(self, tunnel_id):
+            return "db-user", "db-password"
+
+    form = EndpointForm(
+        "Source",
+        DatabaseEngine.MYSQL,
+        tunnel_engine=Engine(),
+        config_manager=ConfigManager(),
+        require_tunnel=True,
+    )
+    monkeypatch.setattr(
+        endpoint_form_module,
+        "ensure_ssh_host_trusted",
+        lambda *args: False,
+        raising=False,
+    )
+    try:
+        form.combo_tunnel.setCurrentIndex(1)
+        with pytest.raises(ValueError, match="SSH 호스트 키"):
+            form.payload(prepare_tunnel=True)
+    finally:
+        form.close()
 
 
 def test_readiness_result_shows_only_selected_direction_summary():
