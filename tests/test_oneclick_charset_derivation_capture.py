@@ -1,138 +1,39 @@
 import importlib.util
-import os
-import subprocess
-import sys
 from pathlib import Path
 
-import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-DISABLED_MESSAGE = (
-    "Phase A disables One-Click charset mutation evidence capture; exact-plan approval "
-    "and TF-STATUS-098 are required before DB mutation."
-)
-
-
-def _write_runtime_dependency_blocker(tmp_path):
-    sitecustomize = tmp_path / "sitecustomize.py"
-    sitecustomize.write_text(
-        """import builtins
-
-_original_import = builtins.__import__
-_blocked = {
-    "src.core.db_core_service",
-    "src.ui.dialogs.migration_dialogs",
-    "src.ui.dialogs.oneclick_migration_dialog",
-}
-
-def _blocking_import(name, *args, **kwargs):
-    if name in _blocked:
-        raise RuntimeError(f"runtime dependency imported before Phase A gate: {name}")
-    return _original_import(name, *args, **kwargs)
-
-builtins.__import__ = _blocking_import
-""",
-        encoding="utf-8",
-    )
-
-
-def _load_capture():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "capture-oneclick-charset-derivation-evidence.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "capture_oneclick_charset_derivation_evidence",
-        script,
-    )
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-def test_oneclick_charset_derivation_capture_fails_before_scope_facade_or_endpoint(
-    monkeypatch,
-):
-    capture = _load_capture()
-    constructions = []
-    monkeypatch.setattr(
-        capture,
-        "_load_runtime_types",
-        lambda: constructions.append("runtime dependencies"),
-    )
-
-    with pytest.raises(capture.OneClickCharsetCaptureDisabled) as exc_info:
-        capture.capture_oneclick_charset_derivation(
-            host="127.0.0.1",
-            port=3406,
-            user="root",
-            password="test",
-            schema="prod",
-            tables=["tf_oneclick_parent", "tf_oneclick_child"],
-        )
-
-    assert exc_info.value.code == "oneclick_apply_disabled"
-    assert str(exc_info.value) == DISABLED_MESSAGE
-    assert constructions == []
-
-
-def test_oneclick_charset_derivation_capture_cli_fails_before_seed_capture_or_output(
-    monkeypatch,
-    capsys,
-    tmp_path,
-):
-    capture = _load_capture()
+def test_charset_derivation_capture_has_no_legacy_derivation_or_client_contracts(monkeypatch):
+    capture = _load(ROOT / "scripts" / "capture-oneclick-charset-derivation-evidence.py", "derivation_capture")
+    fixture = _load(ROOT / "tests" / "test_oneclick_dry_run_evidence.py", "oneclick_fixture_derivation")
     calls = []
-    output_path = tmp_path / "must-not-exist.json"
-    monkeypatch.setattr(
-        capture._base,
-        "seed_local_mysql_container",
-        lambda **_kwargs: calls.append("seed"),
+    class Disabled(RuntimeError): code = "oneclick_apply_disabled"
+    class Facade:
+        def __init__(self): self.client = type("Client", (), {"shutdown": lambda _self: None})()
+        def hello(self): return fixture.hello()
+        def plan_oneclick(self, endpoint, schema):
+            calls.append("plan"); plan = fixture.public_plan(schema)
+            return {"plan": plan, "approval": fixture.approval_for(plan)}
+        def apply_oneclick_plan(self, *args, **kwargs): calls.append("apply"); raise Disabled("disabled")
+        def __getattr__(self, name):
+            if "derive" in name or "run_oneclick" in name: raise AssertionError(name)
+            raise AttributeError(name)
+    monkeypatch.setattr(capture, "_load_db_core_types", lambda: (Facade, lambda **kwargs: kwargs))
+    monkeypatch.setattr(capture, "current_git_sha", lambda: "abcdef123456")
+    report = capture.capture_oneclick_charset_derivation(
+        host="127.0.0.1", port=3406, user="root", password="test",
+        schema="tf_oneclick_derive_charset", tables=["tf_oneclick_parent"],
     )
-    monkeypatch.setattr(
-        capture,
-        "capture_oneclick_charset_derivation",
-        lambda **_kwargs: calls.append("capture") or {"must_not_be_used": True},
-    )
-    monkeypatch.setattr(
-        sys,
-        "argv",
-        [
-            "capture-oneclick-charset-derivation-evidence.py",
-            "--seed-local-container",
-            "--output",
-            str(output_path),
-        ],
-    )
-
-    assert capture.main() == 2
-
-    output = capsys.readouterr()
-    assert output.out == ""
-    assert output.err.strip() == f"oneclick_apply_disabled: {DISABLED_MESSAGE}"
-    assert calls == []
-    assert not output_path.exists()
-
-
-def test_oneclick_charset_derivation_cli_gates_before_runtime_dependency_imports(tmp_path):
-    _write_runtime_dependency_blocker(tmp_path)
-    project_root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        value for value in [str(tmp_path), env.get("PYTHONPATH", "")] if value
-    )
-
-    result = subprocess.run(
-        [sys.executable, "scripts/capture-oneclick-charset-derivation-evidence.py"],
-        cwd=project_root,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr.strip() == f"oneclick_apply_disabled: {DISABLED_MESSAGE}"
+    assert calls == ["plan", "apply"]
+    assert "derivation" not in report and "pyqt_payload" not in report
+    assert report["apply"]["request_count"] == 1

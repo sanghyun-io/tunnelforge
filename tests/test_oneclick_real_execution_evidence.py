@@ -1,3 +1,4 @@
+import copy
 import importlib.util
 import json
 from pathlib import Path
@@ -5,174 +6,67 @@ from pathlib import Path
 import pytest
 
 
-def _load_validator():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "validate-oneclick-real-execution-evidence.py"
-    )
-    spec = importlib.util.spec_from_file_location(
-        "validate_oneclick_real_execution_evidence",
-        script,
-    )
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load(path, name):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-def _archived_evidence():
+def mutation_report(issue=138, exact=False, fence=False):
+    fixture = _load(ROOT / "tests" / "test_oneclick_dry_run_evidence.py", "oneclick_fixture_mutation")
+    plan = fixture.public_plan("tf_oneclick_real_execution")
     return {
-        "issue": 138,
-        "git_sha": "abcdef123456",
-        "source_type": "local_mysql_container",
-        "feature_flags": {
-            "oneclick_ui_enabled": True,
-            "oneclick_real_execution_enabled": False,
-        },
-        "service_hello": {
-            "capabilities": [
-                "oneclick.run",
-                "oneclick.preflight",
-                "oneclick.analyze",
-                "oneclick.recommend",
-                "oneclick.apply_fixes",
-                "oneclick.validate",
-                "oneclick.report",
-            ],
-        },
-        "scope": {
-            "schema": "tf_oneclick_real_execution",
-            "allowed_fix_types": ["deprecated_engine"],
-            "allowed_strategies": ["engine_innodb"],
-        },
-        "run": {
-            "command": "oneclick.apply_fixes",
-            "dry_run": False,
-            "backup_confirmed": True,
-            "success": True,
-            "schema": "tf_oneclick_real_execution",
-            "attempted_fix_types": ["deprecated_engine"],
-            "attempted_strategies": ["engine_innodb"],
-            "disallowed_fix_attempts": [],
-            "applied_fixes": [
-                {
-                    "issue_type": "deprecated_engine",
-                    "strategy": "engine_innodb",
-                    "schema": "tf_oneclick_real_execution",
-                    "table": "legacy_engine_table",
-                    "sql": (
-                        "ALTER TABLE `tf_oneclick_real_execution`."
-                        "`legacy_engine_table` ENGINE=InnoDB;"
-                    ),
-                    "success": True,
-                    "rows_affected": 0,
-                }
-            ],
-        },
-        "before": {
-            "tables": [
-                {
-                    "schema": "tf_oneclick_real_execution",
-                    "table": "legacy_engine_table",
-                    "engine": "MyISAM",
-                }
-            ],
-        },
-        "after": {
-            "tables": [
-                {
-                    "schema": "tf_oneclick_real_execution",
-                    "table": "legacy_engine_table",
-                    "engine": "InnoDB",
-                }
-            ],
-            "unrelated_tables_unchanged": True,
-        },
-        "validation": {
-            "all_fixed": True,
-            "remaining_issues": 0,
-            "post_engine": "InnoDB",
-        },
+        "report_version": 2, "issue": issue, "git_sha": "abcdef123456",
+        "source_type": "local_mysql_container", "mode": "apply_attempt",
+        "service_hello": fixture.hello(exact, fence), "plan": plan,
+        "approval": fixture.approval_for(plan),
+        "apply": {"attempted": True, "request_count": 1, "success": False,
+                  "error_code": "oneclick_apply_disabled"},
+        "before": copy.deepcopy(plan["snapshot"]), "after": copy.deepcopy(plan["snapshot"]),
     }
 
 
-def _write_report(tmp_path, evidence):
-    report = tmp_path / "oneclick-real-execution-evidence.json"
-    report.write_text(json.dumps(evidence), encoding="utf-8")
-    return report
+def _validate(tmp_path, report):
+    validator = _load(ROOT / "scripts" / "validate-oneclick-real-execution-evidence.py", "real_validator")
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    return validator, path
 
 
-def test_oneclick_real_execution_validator_accepts_archived_engine_innodb_shape(tmp_path):
-    validator = _load_validator()
-    report = _write_report(tmp_path, _archived_evidence())
-
-    summary = validator.validate_report(report)
-
-    assert summary == {
-        "issue": 138,
-        "schema": "tf_oneclick_real_execution",
-        "applied_fixes": 1,
-    }
+@pytest.mark.parametrize("exact,fence", [(False, False), (True, False), (False, True)])
+def test_real_validator_accepts_disabled_only_when_a_gate_is_false(tmp_path, exact, fence):
+    validator, path = _validate(tmp_path, mutation_report(exact=exact, fence=fence))
+    assert validator.validate_report(path) == {"issue": 138, "actions": 1, "status": "disabled"}
 
 
-def test_oneclick_real_execution_evidence_rejects_production_source(tmp_path):
-    validator = _load_validator()
-    evidence = _archived_evidence()
-    evidence["source_type"] = "production_mysql"
-    report = _write_report(tmp_path, evidence)
-
-    with pytest.raises(validator.EvidenceError, match="source_type"):
-        validator.validate_report(report)
-
-
-def test_oneclick_real_execution_evidence_rejects_unsafe_schema(tmp_path):
-    validator = _load_validator()
-    evidence = _archived_evidence()
-    evidence["scope"]["schema"] = "prod"
-    evidence["run"]["schema"] = "prod"
-    report = _write_report(tmp_path, evidence)
-
-    with pytest.raises(validator.EvidenceError, match="tf_oneclick_"):
-        validator.validate_report(report)
+def test_real_validator_allows_success_only_with_both_exact_capabilities(tmp_path):
+    report = mutation_report(exact=True, fence=True)
+    report["apply"] = {"attempted": True, "request_count": 1, "success": True}
+    validator, path = _validate(tmp_path, report)
+    assert validator.validate_report(path)["status"] == "success"
+    report["service_hello"]["oneclick_strong_fence_proven"] = False
+    validator, path = _validate(tmp_path, report)
+    with pytest.raises(validator.EvidenceError, match="disabled"):
+        validator.validate_report(path)
 
 
-def test_oneclick_real_execution_evidence_rejects_disallowed_fix_type(tmp_path):
-    validator = _load_validator()
-    evidence = _archived_evidence()
-    evidence["run"]["attempted_fix_types"].append("charset_issue")
-    evidence["run"]["disallowed_fix_attempts"] = ["charset_issue"]
-    report = _write_report(tmp_path, evidence)
-
-    with pytest.raises(validator.EvidenceError, match="disallowed"):
-        validator.validate_report(report)
-
-
-def test_oneclick_real_execution_evidence_requires_before_after_engine_proof(tmp_path):
-    validator = _load_validator()
-    evidence = _archived_evidence()
-    evidence["after"]["tables"][0]["engine"] = "MyISAM"
-    evidence["validation"]["post_engine"] = "MyISAM"
-    report = _write_report(tmp_path, evidence)
-
-    with pytest.raises(validator.EvidenceError, match="InnoDB"):
-        validator.validate_report(report)
-
-
-def test_oneclick_real_execution_evidence_requires_boolean_real_execution_flag(tmp_path):
-    validator = _load_validator()
-    evidence = _archived_evidence()
-    evidence["feature_flags"]["oneclick_real_execution_enabled"] = "yes"
-    report = _write_report(tmp_path, evidence)
-
-    with pytest.raises(validator.EvidenceError, match="boolean"):
-        validator.validate_report(report)
-
-
-def test_regression_gate_can_require_oneclick_real_execution_evidence():
-    gate = Path(__file__).resolve().parents[1] / "scripts" / "rust-core-regression-gate.ps1"
-    text = gate.read_text(encoding="utf-8")
-
-    assert "RUST_CORE_REQUIRE_ONECLICK_REAL_EXECUTION_EVIDENCE" in text
-    assert "validate-oneclick-real-execution-evidence.py" in text
-    assert "reports/oneclick_readiness/oneclick-real-execution-evidence.json" in text
+@pytest.mark.parametrize("mutate", [
+    lambda r: r.update({"report_version": 1}),
+    lambda r: r["approval"].update({"snapshot": r["plan"]["snapshot"]}),
+    lambda r: r["plan"]["actions"][0]["expected_post_facts"].update({"facts_hash": "0" * 64}),
+    lambda r: r.update({"steps": []}),
+    lambda r: r["apply"].update({"request_count": 2}),
+    lambda r: r["plan"]["snapshot"].update({"api_token": "secret"}),
+])
+def test_real_validator_rejects_old_shape_stale_secret_client_or_retry(tmp_path, mutate):
+    validator, path = _validate(tmp_path, mutation_report())
+    report = mutation_report()
+    mutate(report)
+    path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(validator.EvidenceError):
+        validator.validate_report(path)

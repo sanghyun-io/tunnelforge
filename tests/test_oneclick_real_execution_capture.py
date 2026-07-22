@@ -1,227 +1,85 @@
 import importlib.util
-import os
-import subprocess
-import sys
 from pathlib import Path
 
 import pytest
 
-from src.core.db_core_service import DbCoreRequestKind, DbEndpoint
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
-DISABLED_MESSAGE = (
-    "Phase A disables One-Click real-execution evidence capture; exact-plan approval "
-    "and TF-STATUS-098 are required before DB mutation."
-)
-
-
-def _write_runtime_dependency_blocker(tmp_path):
-    sitecustomize = tmp_path / "sitecustomize.py"
-    sitecustomize.write_text(
-        """import builtins
-
-_original_import = builtins.__import__
-_blocked = {
-    "src.core.db_core_service",
-    "src.ui.dialogs.migration_dialogs",
-    "src.ui.dialogs.oneclick_migration_dialog",
-}
-
-def _blocking_import(name, *args, **kwargs):
-    if name in _blocked:
-        raise RuntimeError(f"runtime dependency imported before Phase A gate: {name}")
-    return _original_import(name, *args, **kwargs)
-
-builtins.__import__ = _blocking_import
-""",
-        encoding="utf-8",
-    )
+def _fixtures():
+    path = ROOT / "tests" / "test_oneclick_dry_run_evidence.py"
+    spec = importlib.util.spec_from_file_location("oneclick_evidence_fixtures", path)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module.hello, module.public_plan
 
 
 def _load_capture():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "capture-oneclick-real-execution-evidence.py"
-    )
-    spec = importlib.util.spec_from_file_location("capture_oneclick_real_execution_evidence", script)
+    path = ROOT / "scripts" / "capture-oneclick-real-execution-evidence.py"
+    spec = importlib.util.spec_from_file_location("capture_oneclick_real", path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-def test_oneclick_real_capture_rejects_unsafe_seed_identifiers():
+def test_real_capture_records_only_definite_disabled_and_one_apply(monkeypatch):
     capture = _load_capture()
-
-    with pytest.raises(ValueError, match="unsafe One-Click schema"):
-        capture._require_safe_oneclick_identifier("prod", "schema")
-
-    with pytest.raises(ValueError, match="unsafe One-Click table"):
-        capture._require_safe_oneclick_identifier("legacy_engine_table;DROP", "table")
-
-
-def test_engine_rows_classifies_direct_evidence_query_as_mutation():
-    capture = _load_capture()
+    hello, public_plan = _fixtures()
     calls = []
 
-    class Client:
-        def request(self, command, payload, **kwargs):
-            calls.append((command, payload, kwargs))
-            return {"rows": [{"engine": "InnoDB"}]}
+    class Disabled(RuntimeError):
+        code = "oneclick_apply_disabled"
 
     class Facade:
-        client = Client()
+        def __init__(self):
+            self.client = type("Client", (), {"shutdown": lambda _self: None})()
+        def hello(self): return hello()
+        def plan_oneclick(self, endpoint, schema):
+            calls.append("plan"); plan = public_plan(schema)
+            return {"plan": plan, "approval": {"approval_version": 1, "plan_version": 1, "target_identity": plan["target_identity"], "remediation_profile": plan["remediation_profile"], "snapshot_hash": plan["snapshot_hash"], "plan_hash": plan["plan_hash"]}}
+        def apply_oneclick_plan(self, endpoint, schema, backup_confirmed, approval):
+            calls.append(("apply", backup_confirmed, approval)); raise Disabled("disabled")
 
-    endpoint = DbEndpoint(
-        engine="mysql",
-        host="127.0.0.1",
-        port=3306,
-        user="root",
-        password="secret",
-        database="app",
+    monkeypatch.setattr(capture, "_load_db_core_types", lambda: (Facade, lambda **kwargs: kwargs))
+    monkeypatch.setattr(capture, "current_git_sha", lambda: "abcdef123456")
+    report = capture.capture_oneclick_real_execution(
+        host="127.0.0.1", port=3406, user="root", password="test",
+        schema="tf_oneclick_real_execution", table="tf_oneclick_legacy_engine_table",
     )
+    assert calls[0] == "plan"
+    assert len(calls) == 2
+    assert report["apply"] == {
+        "attempted": True, "request_count": 1, "success": False,
+        "error_code": "oneclick_apply_disabled",
+    }
+    assert report["before"] == report["after"] == public_plan("tf_oneclick_real_execution")["snapshot"]
 
-    rows = capture._engine_rows(Facade(), endpoint, "app", "users")
 
-    assert rows == [{"engine": "InnoDB"}]
-    assert calls[0][0] == "query.execute"
-    assert calls[0][2]["request_kind"] is DbCoreRequestKind.MUTATION
-
-
-def test_oneclick_real_capture_fails_closed_before_facade_or_db(monkeypatch):
+@pytest.mark.parametrize("code", ["oneclick_outcome_indeterminate", "oneclick_plan_changed", None])
+def test_real_capture_reraises_non_disabled_without_retry(monkeypatch, code):
     capture = _load_capture()
-    facade_constructions = []
-    monkeypatch.setattr(
-        capture,
-        "_load_db_core_types",
-        lambda: facade_constructions.append("runtime dependencies"),
-    )
-
-    with pytest.raises(capture.OneClickRealExecutionCaptureDisabled) as exc_info:
-        capture.capture_oneclick_real_execution(
-            host="127.0.0.1",
-            port=3406,
-            user="root",
-            password="test",
-            schema="tf_oneclick_real_execution",
-            table="tf_oneclick_legacy_engine_table",
-        )
-
-    assert exc_info.value.code == "oneclick_apply_disabled"
-    assert str(exc_info.value) == DISABLED_MESSAGE
-    assert "exact-plan approval" in str(exc_info.value)
-    assert "TF-STATUS-098" in str(exc_info.value)
-    assert facade_constructions == []
-
-
-def test_oneclick_real_capture_command_fails_before_seed_or_capture(
-    monkeypatch,
-    capsys,
-    tmp_path,
-):
-    capture = _load_capture()
+    hello, public_plan = _fixtures()
     calls = []
-    expected_error = (
-        "oneclick_apply_disabled: Phase A disables One-Click real-execution evidence "
-        "capture; exact-plan approval and TF-STATUS-098 are required before DB mutation."
-    )
-    monkeypatch.setattr(
-        capture,
-        "seed_local_mysql_container",
-        lambda **_kwargs: calls.append("seed"),
-    )
-    monkeypatch.setattr(
-        capture,
-        "capture_oneclick_real_execution",
-        lambda **_kwargs: calls.append("capture") or {"must_not_be_used": True},
-    )
-    monkeypatch.setattr(
-        "sys.argv",
-        [
-            "capture-oneclick-real-execution-evidence.py",
-            "--seed-local-container",
-            "--output",
-            str(tmp_path / "must-not-exist.json"),
-        ],
-    )
-
-    exit_code = capture.main()
-    output = capsys.readouterr()
-
-    assert exit_code == 2
-    assert output.out == ""
-    assert output.err.strip() == expected_error
-    assert calls == []
-    assert not (tmp_path / "must-not-exist.json").exists()
-
-
-def test_oneclick_real_capture_cli_gates_before_runtime_dependency_imports(tmp_path):
-    _write_runtime_dependency_blocker(tmp_path)
-    project_root = Path(__file__).resolve().parents[1]
-    output_path = tmp_path / "must-not-exist.json"
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        value for value in [str(tmp_path), env.get("PYTHONPATH", "")] if value
-    )
-
-    result = subprocess.run(
-        [
-            sys.executable,
-            "scripts/capture-oneclick-real-execution-evidence.py",
-            "--seed-local-container",
-            "--output",
-            str(output_path),
-        ],
-        cwd=project_root,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr.strip() == f"oneclick_apply_disabled: {DISABLED_MESSAGE}"
-    assert not output_path.exists()
-
-
-def test_oneclick_real_capture_callable_gates_before_runtime_dependency_imports(tmp_path):
-    _write_runtime_dependency_blocker(tmp_path)
-    project_root = Path(__file__).resolve().parents[1]
-    env = os.environ.copy()
-    env["PYTHONPATH"] = os.pathsep.join(
-        value for value in [str(tmp_path), env.get("PYTHONPATH", "")] if value
-    )
-    runner = """
-import importlib.util
-import sys
-from pathlib import Path
-
-script = Path('scripts/capture-oneclick-real-execution-evidence.py').resolve()
-spec = importlib.util.spec_from_file_location('capture_oneclick_real_execution_evidence', script)
-module = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(module)
-try:
-    module.capture_oneclick_real_execution(
-        host='127.0.0.1', port=3406, user='root', password='test',
-        schema='tf_oneclick_real_execution', table='tf_oneclick_legacy_engine_table',
-    )
-except module.OneClickRealExecutionCaptureDisabled as exc:
-    print(f'{exc.code}: {exc}', file=sys.stderr)
-    raise SystemExit(2)
-raise SystemExit('callable did not fail closed')
-"""
-
-    result = subprocess.run(
-        [sys.executable, "-c", runner],
-        cwd=project_root,
-        env=env,
-        text=True,
-        capture_output=True,
-        check=False,
-    )
-
-    assert result.returncode == 2
-    assert result.stdout == ""
-    assert result.stderr.strip() == f"oneclick_apply_disabled: {DISABLED_MESSAGE}"
+    class Failure(RuntimeError):
+        pass
+    error = Failure("no retry")
+    if code is not None:
+        error.code = code
+    class Facade:
+        def __init__(self): self.client = type("Client", (), {"shutdown": lambda _self: None})()
+        def hello(self): return hello()
+        def plan_oneclick(self, endpoint, schema):
+            plan = public_plan(schema)
+            return {"plan": plan, "approval": {"approval_version": 1, "plan_version": 1, "target_identity": plan["target_identity"], "remediation_profile": plan["remediation_profile"], "snapshot_hash": plan["snapshot_hash"], "plan_hash": plan["plan_hash"]}}
+        def apply_oneclick_plan(self, *args, **kwargs): calls.append("apply"); raise error
+    monkeypatch.setattr(capture, "_load_db_core_types", lambda: (Facade, lambda **kwargs: kwargs))
+    with pytest.raises(Failure) as raised:
+        capture.capture_oneclick_real_execution(
+            host="127.0.0.1", port=3406, user="root", password="test",
+            schema="tf_oneclick_real_execution", table="tf_oneclick_legacy_engine_table",
+        )
+    assert raised.value is error
+    assert calls == ["apply"]

@@ -1,3 +1,5 @@
+import copy
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -5,254 +7,175 @@ from pathlib import Path
 import pytest
 
 
-def _load_validator():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "validate-oneclick-dry-run-evidence.py"
-    )
-    spec = importlib.util.spec_from_file_location("validate_oneclick_dry_run_evidence", script)
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def _load(name):
+    path = ROOT / "scripts" / name
+    spec = importlib.util.spec_from_file_location(path.stem.replace("-", "_"), path)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(module)
     return module
 
 
-def _load_capture():
-    script = (
-        Path(__file__).resolve().parents[1]
-        / "scripts"
-        / "capture-oneclick-dry-run-evidence.py"
-    )
-    spec = importlib.util.spec_from_file_location("capture_oneclick_dry_run_evidence", script)
-    module = importlib.util.module_from_spec(spec)
-    assert spec.loader is not None
-    spec.loader.exec_module(module)
-    return module
-
-
-def _valid_evidence():
+def public_plan(schema="tf_oneclick_readiness"):
+    facts = {
+        "action_facts_version": 1,
+        "action_type": "engine_innodb",
+        "tables": [],
+        "foreign_keys": [],
+    }
+    facts_hash = hashlib.sha256(
+        b"tunnelforge.oneclick.action-facts.v1\0"
+        + json.dumps(facts, separators=(",", ":")).encode()
+    ).hexdigest()
+    snapshot = {
+        "snapshot_version": 1,
+        "schema": schema,
+        "inspection_facts": [],
+        "table_definitions": [],
+        "foreign_keys": [],
+    }
+    snapshot_hash = hashlib.sha256(
+        b"tunnelforge.oneclick.snapshot.v1\0"
+        + json.dumps(snapshot, separators=(",", ":")).encode()
+    ).hexdigest()
+    action = {
+        "ordinal": 1,
+        "action_type": "engine_innodb",
+        "issue_type": "deprecated_engine",
+        "strategy": "engine_innodb",
+        "schema": schema,
+        "tables": [],
+        "sql": "SELECT 1;",
+        "rollback_sql": None,
+        "target_charset": None,
+        "target_collation": None,
+        "expected_pre_facts": {"facts": facts, "facts_hash": facts_hash},
+        "expected_post_facts": {"facts": facts, "facts_hash": facts_hash},
+    }
+    identity = {
+        "engine": "mysql",
+        "route": {"host": "127.0.0.1", "port": 3406},
+        "server_uuid": "11111111-1111-1111-1111-111111111111",
+        "authenticated_user": "root@%",
+        "schema": schema,
+    }
+    profile = {
+        "profile_version": 1,
+        "profile_id": "mysql-utf8mb4-0900-v1",
+        "target_charset": "utf8mb4",
+        "target_collation": "utf8mb4_0900_ai_ci",
+    }
+    plan_hash_document = {
+        "plan_version": 1,
+        "target_identity": identity,
+        "remediation_profile": profile,
+        "snapshot_hash": snapshot_hash,
+        "actions": [action],
+    }
     return {
-        "issue": 137,
-        "git_sha": "abcdef123456",
-        "source_type": "local_mysql_container",
-        "feature_flags": {
-            "oneclick_ui_enabled": True,
-            "oneclick_real_execution_enabled": False,
-        },
-        "service_hello": {
-            "capabilities": [
-                "oneclick.run",
-                "oneclick.preflight",
-                "oneclick.analyze",
-                "oneclick.recommend",
-                "oneclick.apply_fixes",
-                "oneclick.validate",
-                "oneclick.report",
-            ],
-        },
-        "run": {
-            "command": "oneclick.run",
-            "dry_run": True,
-            "backup_confirmed": True,
-            "success": True,
-            "schema": "tf_oneclick_readiness",
-            "phase_events": ["preflight", "analysis", "recommendation", "execution", "validation"],
-            "progress_percents": [5, 20, 40, 55, 80, 100],
-            "preflight": {"passed": True, "checks": 3, "issues": 0},
-            "analysis": {"table_count": 1, "total_issues": 0},
-            "execution": {
-                "dry_run": True,
-                "success_count": 0,
-                "fail_count": 0,
-                "skip_count": 0,
-                "log": ["DRY-RUN: no database changes were executed."],
-            },
-            "validation": {"all_fixed": True, "remaining_issues": 0},
-            "report": {
-                "success": True,
-                "pre_issue_count": 0,
-                "post_issue_count": 0,
-                "execution_log": ["DRY-RUN: no database changes were executed."],
-            },
-        },
+        **plan_hash_document,
+        "snapshot": snapshot,
+        "plan_hash": hashlib.sha256(
+            b"tunnelforge.oneclick.plan.v1\0"
+            + json.dumps(plan_hash_document, separators=(",", ":")).encode()
+        ).hexdigest(),
     }
 
 
-def test_oneclick_dry_run_evidence_accepts_complete_report(tmp_path):
-    validator = _load_validator()
-    report = tmp_path / "oneclick-evidence.json"
-    report.write_text(json.dumps(_valid_evidence()), encoding="utf-8")
-
-    summary = validator.validate_report(report)
-
-    assert summary == {"issue": 137, "phase_events": 5, "progress_events": 6}
+def hello(exact=False, fence=False):
+    return {
+        "capabilities": ["oneclick.plan"],
+        "oneclick_exact_plan_enabled": exact,
+        "oneclick_strong_fence_proven": fence,
+    }
 
 
-@pytest.mark.parametrize("value", [True, "false", 0, None])
-def test_oneclick_dry_run_evidence_requires_real_execution_flag_false(tmp_path, value):
-    validator = _load_validator()
-    evidence = _valid_evidence()
-    evidence["feature_flags"]["oneclick_real_execution_enabled"] = value
-    report = tmp_path / "oneclick-evidence.json"
-    report.write_text(json.dumps(evidence), encoding="utf-8")
-
-    with pytest.raises(validator.EvidenceError) as exc_info:
-        validator.validate_report(report)
-
-    assert str(exc_info.value) == "feature_flags.oneclick_real_execution_enabled must be false"
+def approval_for(plan):
+    return {
+        "approval_version": 1,
+        "plan_version": plan["plan_version"],
+        "target_identity": copy.deepcopy(plan["target_identity"]),
+        "remediation_profile": copy.deepcopy(plan["remediation_profile"]),
+        "snapshot_hash": plan["snapshot_hash"],
+        "plan_hash": plan["plan_hash"],
+    }
 
 
-def test_oneclick_dry_run_evidence_requires_real_execution_flag_present(tmp_path):
-    validator = _load_validator()
-    evidence = _valid_evidence()
-    del evidence["feature_flags"]["oneclick_real_execution_enabled"]
-    report = tmp_path / "oneclick-evidence.json"
-    report.write_text(json.dumps(evidence), encoding="utf-8")
-
-    with pytest.raises(validator.EvidenceError) as exc_info:
-        validator.validate_report(report)
-
-    assert str(exc_info.value) == "feature_flags.oneclick_real_execution_enabled must be false"
-
-
-def test_oneclick_dry_run_evidence_rejects_real_execution(tmp_path):
-    validator = _load_validator()
-    evidence = _valid_evidence()
-    evidence["run"]["dry_run"] = False
-    report = tmp_path / "oneclick-evidence.json"
-    report.write_text(json.dumps(evidence), encoding="utf-8")
-
-    with pytest.raises(validator.EvidenceError, match="dry_run must be true"):
-        validator.validate_report(report)
-
-
-def test_oneclick_dry_run_evidence_requires_preview_ui_enabled(tmp_path):
-    validator = _load_validator()
-    evidence = _valid_evidence()
-    evidence["feature_flags"]["oneclick_ui_enabled"] = False
-    report = tmp_path / "oneclick-evidence.json"
-    report.write_text(json.dumps(evidence), encoding="utf-8")
-
-    with pytest.raises(validator.EvidenceError, match="oneclick_ui_enabled"):
-        validator.validate_report(report)
-
-
-def test_oneclick_dry_run_evidence_requires_all_oneclick_capabilities(tmp_path):
-    validator = _load_validator()
-    evidence = _valid_evidence()
-    evidence["service_hello"]["capabilities"].remove("oneclick.validate")
-    report = tmp_path / "oneclick-evidence.json"
-    report.write_text(json.dumps(evidence), encoding="utf-8")
-
-    with pytest.raises(validator.EvidenceError, match="missing service capability"):
-        validator.validate_report(report)
-
-
-def test_oneclick_dry_run_evidence_requires_dry_run_log(tmp_path):
-    validator = _load_validator()
-    evidence = _valid_evidence()
-    evidence["run"]["execution"]["log"] = []
-    evidence["run"]["report"]["execution_log"] = []
-    report = tmp_path / "oneclick-evidence.json"
-    report.write_text(json.dumps(evidence), encoding="utf-8")
-
-    with pytest.raises(validator.EvidenceError, match="DRY-RUN"):
-        validator.validate_report(report)
-
-
-def test_regression_gate_can_require_oneclick_dry_run_evidence():
-    gate = Path(__file__).resolve().parents[1] / "scripts" / "rust-core-regression-gate.ps1"
-    text = gate.read_text(encoding="utf-8")
-
-    assert "RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE" in text
-    assert "validate-oneclick-dry-run-evidence.py" in text
-    assert "reports/oneclick_readiness/oneclick-dry-run-evidence.json" in text
-
-
-def test_oneclick_capture_rejects_unsafe_seed_identifiers():
-    capture = _load_capture()
-
-    with pytest.raises(ValueError, match="unsafe One-Click schema"):
-        capture._require_safe_oneclick_identifier("tf_oneclick_bad`; DROP DATABASE prod; --", "schema")
-
-    with pytest.raises(ValueError, match="unsafe One-Click table"):
-        capture._require_safe_oneclick_identifier("prod_table", "table")
-
-
-def test_oneclick_capture_summarizes_core_events(tmp_path):
-    capture = _load_capture()
-    validator = _load_validator()
-    events = [
-        {"event": "phase", "phase": "preflight", "message": "started"},
-        {"event": "progress", "percent": 5, "message": "Pre-flight started"},
-        {
-            "event": "preflight",
-            "passed": True,
-            "checks": [{"name": "MySQL engine"}, {"name": "Backup status"}],
-            "issues": [],
-        },
-        {"event": "phase", "phase": "analysis", "message": "started"},
-        {"event": "progress", "percent": 20, "message": "Analysis started"},
-        {
-            "event": "analysis",
-            "summary": {"table_count": 1, "total_issues": 0},
-        },
-        {"event": "phase", "phase": "recommendation", "message": "started"},
-        {"event": "progress", "percent": 40, "message": "Recommendation started"},
-        {"event": "phase", "phase": "execution", "message": "started"},
-        {"event": "progress", "percent": 80, "message": "Execution started"},
-        {
-            "event": "execution",
-            "dry_run": True,
-            "success_count": 0,
-            "fail_count": 0,
-            "skip_count": 0,
-            "log": ["DRY-RUN: no database changes were executed."],
-        },
-        {"event": "phase", "phase": "validation", "message": "started"},
-        {"event": "progress", "percent": 100, "message": "Validation complete"},
-        {
-            "event": "validation",
-            "all_fixed": True,
-            "remaining_issues": [],
-        },
-        {
-            "event": "result",
-            "command": "oneclick.run",
-            "success": True,
-            "report": {
-                "schema": "tf_oneclick_readiness",
-                "success": True,
-                "pre_issue_count": 0,
-                "post_issue_count": 0,
-                "execution_log": ["DRY-RUN: no database changes were executed."],
-            },
-        },
-    ]
-
+def test_dry_run_report_is_v2_plan_preview_without_apply(tmp_path):
+    capture = _load("capture-oneclick-dry-run-evidence.py")
+    validator = _load("validate-oneclick-dry-run-evidence.py")
     report = capture.build_evidence_report(
         git_sha="abcdef123456",
-        service_hello={"capabilities": list(validator.REQUIRED_CAPABILITIES)},
-        run_events=events,
+        service_hello=hello(),
+        plan=public_plan(),
     )
 
-    assert report["issue"] == 137
-    assert report["run"]["dry_run"] is True
-    assert report["run"]["schema"] == "tf_oneclick_readiness"
-    assert report["run"]["phase_events"] == [
-        "preflight",
-        "analysis",
-        "recommendation",
-        "execution",
-        "validation",
-    ]
-    assert report["run"]["preflight"]["checks"] == 2
+    assert report["report_version"] == 2
+    assert report["mode"] == "plan_preview"
+    assert report["approval"] is None
+    assert report["apply"] == {"attempted": False, "request_count": 0}
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    assert validator.validate_report(path) == {"issue": 137, "actions": 1}
 
-    report_path = tmp_path / "oneclick-evidence.json"
-    report_path.write_text(json.dumps(report), encoding="utf-8")
-    assert validator.validate_report(report_path) == {
-        "issue": 137,
-        "phase_events": 5,
-        "progress_events": 5,
+
+def test_dry_run_capture_calls_plan_once_and_never_legacy(monkeypatch):
+    capture = _load("capture-oneclick-dry-run-evidence.py")
+    calls = []
+
+    class Facade:
+        def __init__(self):
+            self.client = type("Client", (), {"shutdown": lambda _self: None})()
+
+        def hello(self):
+            return hello()
+
+        def plan_oneclick(self, endpoint, schema):
+            calls.append((endpoint, schema))
+            plan = public_plan(schema)
+            return {"plan": plan, "approval": approval_for(plan)}
+
+        def __getattr__(self, name):
+            if "oneclick" in name:
+                raise AssertionError(f"legacy API called: {name}")
+            raise AttributeError(name)
+
+    monkeypatch.setattr(capture, "_load_db_core_types", lambda: (Facade, lambda **kwargs: kwargs))
+    monkeypatch.setattr(capture, "current_git_sha", lambda: "abcdef123456")
+    report = capture.capture_oneclick_dry_run(
+        host="127.0.0.1", port=3406, user="root", password="test", schema="tf_oneclick_readiness"
+    )
+
+    assert len(calls) == 1
+    assert report["plan"] == public_plan()
+
+
+@pytest.mark.parametrize("mutate", [
+    lambda report: report.update({"run": {"command": "oneclick.run"}}),
+    lambda report: report["plan"]["actions"][0]["expected_pre_facts"].update({"facts_hash": "0" * 64}),
+    lambda report: report["plan"]["target_identity"].update({"password": "secret"}),
+    lambda report: report.update({"issues": []}),
+    lambda report: report["apply"].update({"request_count": 1}),
+])
+def test_dry_run_validator_rejects_legacy_stale_secret_client_or_apply(tmp_path, mutate):
+    validator = _load("validate-oneclick-dry-run-evidence.py")
+    report = {
+        "report_version": 2, "issue": 137, "git_sha": "abcdef123456",
+        "source_type": "local_mysql_container", "service_hello": hello(),
+        "mode": "plan_preview", "plan": public_plan(), "approval": None,
+        "apply": {"attempted": False, "request_count": 0},
     }
+    mutate(report)
+    path = tmp_path / "report.json"
+    path.write_text(json.dumps(report), encoding="utf-8")
+    with pytest.raises(validator.EvidenceError):
+        validator.validate_report(path)
+
+
+def test_optional_dry_run_regression_gate_remains_wired():
+    gate = (ROOT / "scripts" / "rust-core-regression-gate.ps1").read_text(encoding="utf-8")
+    assert "RUST_CORE_REQUIRE_ONECLICK_DRY_RUN_EVIDENCE" in gate
+    assert "validate-oneclick-dry-run-evidence.py" in gate

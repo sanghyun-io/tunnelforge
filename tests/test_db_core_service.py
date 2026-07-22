@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import io
 import json
 import time
@@ -65,6 +66,59 @@ def _service_error(
         rust_code=rust_code,
         payload=payload or {},
     )
+
+
+def _oneclick_domain_hash(domain, document):
+    encoded = json.dumps(
+        document,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(domain + encoded).hexdigest()
+
+
+def _minimal_oneclick_plan_payload(schema="app"):
+    snapshot = {
+        "snapshot_version": 1,
+        "schema": schema,
+        "inspection_facts": [],
+        "table_definitions": [],
+        "foreign_keys": [],
+    }
+    plan = {
+        "plan_version": 1,
+        "target_identity": {
+            "engine": "mysql",
+            "route": {"host": "127.0.0.1", "port": 3306},
+            "server_uuid": "12345678-1234-1234-1234-123456789abc",
+            "authenticated_user": "app@localhost",
+            "schema": schema,
+        },
+        "remediation_profile": {
+            "profile_version": 1,
+            "profile_id": "mysql-utf8mb4-0900-v1",
+            "target_charset": "utf8mb4",
+            "target_collation": "utf8mb4_0900_ai_ci",
+        },
+        "snapshot": snapshot,
+        "snapshot_hash": _oneclick_domain_hash(
+            b"tunnelforge.oneclick.snapshot.v1\0",
+            snapshot,
+        ),
+        "actions": [],
+        "plan_hash": "",
+    }
+    plan["plan_hash"] = _oneclick_domain_hash(
+        b"tunnelforge.oneclick.plan.v1\0",
+        {
+            "plan_version": plan["plan_version"],
+            "target_identity": plan["target_identity"],
+            "remediation_profile": plan["remediation_profile"],
+            "snapshot_hash": plan["snapshot_hash"],
+            "actions": plan["actions"],
+        },
+    )
+    return plan
 
 
 class FakeProcess:
@@ -640,6 +694,245 @@ def test_facade_uses_oneclick_apply_fixes_protocol():
     assert events[0]["phase"] == "execution"
 
 
+def test_db_core_request_result_is_metadata_not_a_dict():
+    result = db_core_service.DbCoreRequestResult(
+        request_kind=DbCoreRequestKind.READ_ONLY,
+        outcome=DbCoreOutcome.DEFINITE,
+        request_id="plan-request",
+        process_generation=3,
+        message="",
+        rust_code=None,
+        payload={"success": True},
+    )
+
+    assert not isinstance(result, dict)
+    with pytest.raises(TypeError):
+        result["success"]
+
+
+def test_facade_plan_oneclick_uses_request_result_payload_and_overwrites_schema_copy():
+    calls = []
+    plan = _minimal_oneclick_plan_payload("App_One")
+
+    class ResultOnlyClient:
+        def request_result(self, command, payload=None, **kwargs):
+            calls.append((command, payload, kwargs))
+            return db_core_service.DbCoreRequestResult(
+                request_kind=kwargs["request_kind"],
+                outcome=DbCoreOutcome.DEFINITE,
+                request_id="plan-request",
+                process_generation=4,
+                message="",
+                rust_code=None,
+                payload={
+                    "event": "result",
+                    "command": "oneclick.plan",
+                    "success": True,
+                    "plan": plan,
+                    "approval": {"snapshot": "must-not-survive"},
+                },
+            )
+
+    facade = DbCoreFacade(ResultOnlyClient())
+    endpoint = DbEndpoint(
+        "mysql",
+        "127.0.0.1",
+        3306,
+        "user",
+        "secret",
+        "original_db",
+        "original_schema",
+    )
+
+    result = facade.plan_oneclick(endpoint, "App_One")
+
+    assert isinstance(result, dict)
+    assert result["plan"] == plan
+    assert result["approval"] == {
+        "approval_version": 1,
+        "plan_version": 1,
+        "target_identity": plan["target_identity"],
+        "remediation_profile": plan["remediation_profile"],
+        "snapshot_hash": plan["snapshot_hash"],
+        "plan_hash": plan["plan_hash"],
+    }
+    assert endpoint.database == "original_db"
+    assert endpoint.schema == "original_schema"
+    assert len(calls) == 1
+    command, payload, kwargs = calls[0]
+    assert command == "oneclick.plan"
+    assert kwargs == {"request_kind": DbCoreRequestKind.READ_ONLY}
+    assert payload == {
+        "connection": {
+            "engine": "mysql",
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "user",
+            "password": "secret",
+            "database": "App_One",
+            "schema": "App_One",
+        },
+        "schema": "App_One",
+    }
+
+
+def test_facade_apply_oneclick_plan_sends_one_hash_only_mutation_request():
+    from src.core.oneclick_approval import OneClickPlan
+
+    calls = []
+    plan = OneClickPlan.parse(_minimal_oneclick_plan_payload())
+
+    class ResultOnlyClient:
+        def request_result(self, command, payload=None, **kwargs):
+            calls.append((command, payload, kwargs))
+            return db_core_service.DbCoreRequestResult(
+                request_kind=kwargs["request_kind"],
+                outcome=DbCoreOutcome.DEFINITE,
+                request_id="apply-request",
+                process_generation=4,
+                message="",
+                rust_code=None,
+                payload={"success": True, "applied_ordinals": []},
+            )
+
+    facade = DbCoreFacade(ResultOnlyClient())
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "old")
+
+    result = facade.apply_oneclick_plan(
+        endpoint,
+        "app",
+        True,
+        plan.approval(),
+    )
+
+    assert result == {"success": True, "applied_ordinals": []}
+    assert len(calls) == 1
+    command, payload, kwargs = calls[0]
+    assert command == "oneclick.apply_fixes"
+    assert kwargs == {"request_kind": DbCoreRequestKind.MUTATION}
+    assert payload == {
+        "connection": {
+            "engine": "mysql",
+            "host": "127.0.0.1",
+            "port": 3306,
+            "user": "user",
+            "password": "secret",
+            "database": "app",
+            "schema": "app",
+        },
+        "schema": "app",
+        "dry_run": False,
+        "backup_confirmed": True,
+        "approval": plan.approval().to_dict(),
+    }
+    rendered = json.dumps(payload, sort_keys=True)
+    for prohibited in (
+        '"issues"',
+        '"charset_contracts"',
+        '"actions"',
+        '"steps"',
+        '"profile"',
+        '"remediation_profile_override"',
+    ):
+        assert prohibited not in rendered
+
+
+@pytest.mark.parametrize(
+    ("outcome", "rust_code"),
+    [
+        (DbCoreOutcome.OUTCOME_INDETERMINATE, "oneclick_outcome_indeterminate"),
+        (DbCoreOutcome.FAILED, "oneclick_apply_disabled"),
+        (DbCoreOutcome.FAILED, "oneclick_replan_failed"),
+    ],
+)
+def test_facade_apply_oneclick_plan_reraises_every_failure_without_retry(
+    outcome,
+    rust_code,
+):
+    from src.core.oneclick_approval import OneClickPlan
+
+    calls = []
+    expected = _service_error(
+        "apply failed",
+        outcome=outcome,
+        rust_code=rust_code,
+        payload={"outcome_indeterminate": outcome is DbCoreOutcome.OUTCOME_INDETERMINATE},
+    )
+
+    class FailingClient:
+        def request_result(self, command, payload=None, **kwargs):
+            calls.append((command, payload, kwargs))
+            raise expected
+
+    plan = OneClickPlan.parse(_minimal_oneclick_plan_payload())
+    facade = DbCoreFacade(FailingClient())
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    with pytest.raises(DbCoreServiceError) as raised:
+        facade.apply_oneclick_plan(endpoint, "app", True, plan.approval())
+
+    assert raised.value is expected
+    assert len(calls) == 1
+
+
+def test_facade_apply_oneclick_plan_rejects_nonboolean_backup_before_wire():
+    from src.core.oneclick_approval import OneClickPlan
+
+    class NoWireClient:
+        def request_result(self, command, payload=None, **kwargs):
+            raise AssertionError("wire request must not be made")
+
+    plan = OneClickPlan.parse(_minimal_oneclick_plan_payload())
+    facade = DbCoreFacade(NoWireClient())
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    with pytest.raises(ValueError, match="backup_confirmed"):
+        facade.apply_oneclick_plan(endpoint, "app", 1, plan.approval())
+
+
+@pytest.mark.parametrize("schema", ["", " app", "app ", "app\0prod", 1])
+def test_facade_oneclick_schema_validation_happens_before_wire(schema):
+    class NoWireClient:
+        def request_result(self, command, payload=None, **kwargs):
+            raise AssertionError("wire request must not be made")
+
+    facade = DbCoreFacade(NoWireClient())
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 3306, "user", "secret", "app")
+
+    with pytest.raises(ValueError, match="schema"):
+        facade.plan_oneclick(endpoint, schema)
+
+
+@pytest.mark.parametrize(
+    ("exact_value", "fence_value", "expected"),
+    [
+        (True, True, (True, True)),
+        (False, True, (False, True)),
+        (1, "true", (False, False)),
+        (None, [], (False, False)),
+    ],
+)
+def test_facade_hello_normalizes_oneclick_capabilities_as_exact_booleans(
+    exact_value,
+    fence_value,
+    expected,
+):
+    class HelloClient:
+        def request_payload(self, command, payload=None, **kwargs):
+            return {
+                "service": "tunnelforge-core",
+                "oneclick_exact_plan_enabled": exact_value,
+                "oneclick_strong_fence_proven": fence_value,
+            }
+
+    hello = DbCoreFacade(HelloClient()).hello()
+
+    assert (
+        hello["oneclick_exact_plan_enabled"],
+        hello["oneclick_strong_fence_proven"],
+    ) == expected
+
+
 def test_facade_uses_oneclick_derive_charset_contracts_protocol():
     process = FakeProcess([
         '{"event":"phase","phase":"recommendation","message":"started"}',
@@ -671,6 +964,26 @@ def test_facade_explicitly_classifies_every_request_kind_and_preserves_shapes():
 
         def request_result(self, command, payload=None, **kwargs):
             calls.append((command, kwargs["request_kind"], kwargs.get("required_generation")))
+            if command == "oneclick.plan":
+                return db_core_service.DbCoreRequestResult(
+                    request_kind=kwargs["request_kind"],
+                    outcome=DbCoreOutcome.DEFINITE,
+                    request_id="plan-request",
+                    process_generation=self.process_generation,
+                    message="",
+                    rust_code=None,
+                    payload={"success": True, "plan": _minimal_oneclick_plan_payload()},
+                )
+            if command == "oneclick.apply_fixes":
+                return db_core_service.DbCoreRequestResult(
+                    request_kind=kwargs["request_kind"],
+                    outcome=DbCoreOutcome.DEFINITE,
+                    request_id="apply-request",
+                    process_generation=self.process_generation,
+                    message="",
+                    rust_code=None,
+                    payload={"success": True, "applied_ordinals": []},
+                )
             return db_core_service.DbCoreRequestResult(
                 request_kind=kwargs["request_kind"],
                 outcome=DbCoreOutcome.DEFINITE,
@@ -723,6 +1036,14 @@ def test_facade_explicitly_classifies_every_request_kind_and_preserves_shapes():
     assert facade.run_oneclick({}).get("success") is True
     assert facade.derive_oneclick_charset_contracts({}).get("success") is True
     assert facade.apply_oneclick_fixes({}).get("success") is True
+    planned = facade.plan_oneclick(endpoint, "app")
+    assert planned.get("success") is True
+    assert facade.apply_oneclick_plan(
+        endpoint,
+        "app",
+        True,
+        planned["approval"],
+    ).get("success") is True
 
     assert calls == [
         ("service.hello", DbCoreRequestKind.READ_ONLY, None),
@@ -741,6 +1062,8 @@ def test_facade_explicitly_classifies_every_request_kind_and_preserves_shapes():
         ("dump.import", DbCoreRequestKind.MUTATION, None),
         ("oneclick.run", DbCoreRequestKind.MUTATION, None),
         ("oneclick.derive_charset_contracts", DbCoreRequestKind.READ_ONLY, None),
+        ("oneclick.apply_fixes", DbCoreRequestKind.MUTATION, None),
+        ("oneclick.plan", DbCoreRequestKind.READ_ONLY, None),
         ("oneclick.apply_fixes", DbCoreRequestKind.MUTATION, None),
     ]
 

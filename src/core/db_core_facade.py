@@ -16,6 +16,12 @@ from src.core.db_core_client import (
     has_bootstrap_residual_db_core_clients,
     retry_bootstrap_residual_db_core_clients,
 )
+from src.core.oneclick_approval import (
+    OneClickApproval,
+    OneClickCapabilities,
+    OneClickPlan,
+    normalize_oneclick_schema,
+)
 
 
 @dataclass(frozen=True)
@@ -108,10 +114,15 @@ class DbCoreFacade:
         return handle
 
     def hello(self) -> Dict[str, Any]:
-        return self.client.request_payload(
+        payload = self.client.request_payload(
             "service.hello",
             request_kind=DbCoreRequestKind.READ_ONLY,
         )
+        capabilities = OneClickCapabilities.from_hello(payload)
+        result = dict(payload)
+        result["oneclick_exact_plan_enabled"] = capabilities.exact_plan_enabled
+        result["oneclick_strong_fence_proven"] = capabilities.strong_fence_proven
+        return result
 
     def test_connection(self, endpoint: DbEndpoint) -> Tuple[bool, str]:
         result = self.client.request_payload(
@@ -398,6 +409,63 @@ class DbCoreFacade:
             request_kind=DbCoreRequestKind.MUTATION,
             on_event=on_event,
         )
+
+    @staticmethod
+    def _oneclick_request_payload(
+        endpoint: DbEndpoint,
+        schema: str,
+    ) -> Dict[str, Any]:
+        normalized_schema = normalize_oneclick_schema(schema)
+        connection = dict(endpoint.to_payload())
+        connection["database"] = normalized_schema
+        connection["schema"] = normalized_schema
+        return {
+            "connection": connection,
+            "schema": normalized_schema,
+        }
+
+    def plan_oneclick(
+        self,
+        endpoint: DbEndpoint,
+        schema: str,
+    ) -> Dict[str, Any]:
+        request_result = self.client.request_result(
+            "oneclick.plan",
+            self._oneclick_request_payload(endpoint, schema),
+            request_kind=DbCoreRequestKind.READ_ONLY,
+        )
+        payload = dict(request_result.payload)
+        plan = OneClickPlan.parse(payload.get("plan"))
+        payload["plan"] = plan.to_dict()
+        payload["approval"] = plan.approval().to_dict()
+        return payload
+
+    def apply_oneclick_plan(
+        self,
+        endpoint: DbEndpoint,
+        schema: str,
+        backup_confirmed: bool,
+        approval: Any,
+    ) -> Dict[str, Any]:
+        if type(backup_confirmed) is not bool:
+            raise ValueError("backup_confirmed must be an exact boolean")
+        request_payload = self._oneclick_request_payload(endpoint, schema)
+        parsed_approval = OneClickApproval.parse(approval)
+        if parsed_approval.target_identity.schema != request_payload["schema"]:
+            raise ValueError("approval schema must match the normalized request schema")
+        request_payload.update(
+            {
+                "dry_run": False,
+                "backup_confirmed": backup_confirmed,
+                "approval": parsed_approval.to_dict(),
+            }
+        )
+        request_result = self.client.request_result(
+            "oneclick.apply_fixes",
+            request_payload,
+            request_kind=DbCoreRequestKind.MUTATION,
+        )
+        return dict(request_result.payload)
 
 
 _shared_facade_lock = threading.Lock()

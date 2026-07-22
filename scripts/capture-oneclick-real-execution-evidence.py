@@ -1,301 +1,83 @@
 #!/usr/bin/env python
-"""Archived One-Click real-execution capture, disabled during Phase A."""
-
+"""Capture One-Click v2 apply evidence; the disabled result is evidence, not a retry."""
 from __future__ import annotations
 
 import argparse
+import copy
 import json
-import re
-import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, Optional
 
+from importlib.util import module_from_spec, spec_from_file_location
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
-
 DEFAULT_SCHEMA = "tf_oneclick_real_execution"
 DEFAULT_TABLE = "tf_oneclick_legacy_engine_table"
-SAFE_ONECLICK_IDENTIFIER_RE = re.compile(r"^tf_oneclick_[A-Za-z0-9_]+$")
-ONECLICK_REAL_EXECUTION_CAPTURE_ENABLED = False
-ONECLICK_APPLY_DISABLED_CODE = "oneclick_apply_disabled"
-ONECLICK_CAPTURE_DISABLED_MESSAGE = (
-    "Phase A disables One-Click real-execution evidence capture; exact-plan approval "
-    "and TF-STATUS-098 are required before DB mutation."
-)
 
 
-class OneClickRealExecutionCaptureDisabled(RuntimeError):
-    def __init__(self) -> None:
-        self.code = ONECLICK_APPLY_DISABLED_CODE
-        super().__init__(ONECLICK_CAPTURE_DISABLED_MESSAGE)
+def _load_base():
+    spec = spec_from_file_location("capture_oneclick_dry_run_evidence", PROJECT_ROOT / "scripts" / "capture-oneclick-dry-run-evidence.py")
+    module = module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
-def _require_real_execution_capture_enabled() -> None:
-    if not ONECLICK_REAL_EXECUTION_CAPTURE_ENABLED:
-        raise OneClickRealExecutionCaptureDisabled()
+_base = _load_base()
+_load_db_core_types = _base._load_db_core_types
+current_git_sha = _base.current_git_sha
 
 
-def _load_db_core_types():
-    from src.core.db_core_service import DbCoreFacade, DbEndpoint
-
-    return DbCoreFacade, DbEndpoint
+def _approval(plan: Dict[str, Any]) -> Dict[str, Any]:
+    return {key: copy.deepcopy(plan[key]) for key in ("target_identity", "remediation_profile", "snapshot_hash", "plan_hash")} | {"approval_version": 1, "plan_version": plan["plan_version"]}
 
 
-def _run_checked(args: List[str]) -> None:
-    subprocess.run(args, check=True, text=True)
+def _error_code(error: BaseException) -> Optional[str]:
+    return getattr(error, "rust_code", None) or getattr(error, "code", None)
 
 
-def current_git_sha() -> str:
-    result = subprocess.run(
-        ["git", "rev-parse", "HEAD"],
-        cwd=PROJECT_ROOT,
-        check=True,
-        text=True,
-        capture_output=True,
-    )
-    return result.stdout.strip()
-
-
-def _require_safe_oneclick_identifier(value: str, label: str) -> None:
-    if not SAFE_ONECLICK_IDENTIFIER_RE.fullmatch(value):
-        raise ValueError(f"refusing to seed unsafe One-Click {label}: {value!r}")
-
-
-def seed_local_mysql_container(
-    *,
-    container: str,
-    user: str,
-    password: str,
-    schema: str,
-    table: str,
-) -> None:
-    _require_safe_oneclick_identifier(schema, "schema")
-    _require_safe_oneclick_identifier(table, "table")
-
-    sql = f"""
-CREATE DATABASE IF NOT EXISTS `{schema}`;
-USE `{schema}`;
-DROP TABLE IF EXISTS `{table}`;
-CREATE TABLE `{table}` (
-  `id` INT NOT NULL PRIMARY KEY,
-  `name` VARCHAR(64) NOT NULL
-) ENGINE=MyISAM;
-INSERT INTO `{table}` (`id`, `name`) VALUES
-  (1, 'engine-row-1'),
-  (2, 'engine-row-2');
-"""
-    _run_checked([
-        "docker",
-        "exec",
-        container,
-        "mysql",
-        f"-u{user}",
-        f"-p{password}",
-        "-e",
-        sql,
-    ])
-
-
-def build_evidence_report(
-    *,
-    git_sha: str,
-    service_hello: Dict[str, Any],
-    schema: str,
-    table: str,
-    apply_result: Dict[str, Any],
-    before_tables: List[Dict[str, Any]],
-    after_tables: List[Dict[str, Any]],
-    source_type: str = "local_mysql_container",
-) -> Dict[str, Any]:
-    from src.ui.dialogs.migration_dialogs import ONE_CLICK_MIGRATION_FEATURE_ENABLED
-    from src.ui.dialogs.oneclick_migration_dialog import ONECLICK_REAL_EXECUTION_ENABLED
-
-    attempted_fix_types = [
-        str(item.get("issue_type"))
-        for item in apply_result.get("applied_fixes") or []
-        if isinstance(item, dict) and item.get("issue_type")
-    ]
-    attempted_strategies = [
-        str(item.get("strategy"))
-        for item in apply_result.get("applied_fixes") or []
-        if isinstance(item, dict) and item.get("strategy")
-    ]
-    post_engine = _table_engine(after_tables, schema, table)
-
+def build_evidence_report(*, git_sha: str, service_hello: Dict[str, Any], plan: Any, approval: Optional[Dict[str, Any]] = None, issue: int = 138, source_type: str = "local_mysql_container") -> Dict[str, Any]:
+    public_plan = _base._public_plan(plan)
     return {
-        "issue": 138,
-        "git_sha": git_sha,
-        "source_type": source_type,
-        "feature_flags": {
-            "oneclick_ui_enabled": bool(ONE_CLICK_MIGRATION_FEATURE_ENABLED),
-            "oneclick_real_execution_enabled": bool(ONECLICK_REAL_EXECUTION_ENABLED),
-        },
-        "service_hello": {
-            "capabilities": service_hello.get("capabilities") or [],
-        },
-        "scope": {
-            "schema": schema,
-            "allowed_fix_types": ["deprecated_engine"],
-            "allowed_strategies": ["engine_innodb"],
-        },
-        "run": {
-            "command": apply_result.get("command") or "oneclick.apply_fixes",
-            "dry_run": bool(apply_result.get("dry_run")),
-            "backup_confirmed": True,
-            "success": apply_result.get("success") is True,
-            "schema": schema,
-            "attempted_fix_types": attempted_fix_types,
-            "attempted_strategies": attempted_strategies,
-            "disallowed_fix_attempts": apply_result.get("disallowed_fix_attempts") or [],
-            "applied_fixes": apply_result.get("applied_fixes") or [],
-        },
-        "before": {
-            "tables": before_tables,
-        },
-        "after": {
-            "tables": after_tables,
-            "unrelated_tables_unchanged": True,
-        },
-        "validation": {
-            "all_fixed": apply_result.get("success") is True and post_engine.lower() == "innodb",
-            "remaining_issues": 0 if post_engine.lower() == "innodb" else 1,
-            "post_engine": post_engine,
-        },
+        "report_version": 2, "issue": issue, "git_sha": git_sha, "source_type": source_type,
+        "mode": "apply_attempt", "service_hello": copy.deepcopy(service_hello), "plan": public_plan,
+        "approval": copy.deepcopy(approval) if approval is not None else _approval(public_plan),
+        "apply": {"attempted": True, "request_count": 1, "success": False, "error_code": "oneclick_apply_disabled"},
+        "before": copy.deepcopy(public_plan["snapshot"]), "after": copy.deepcopy(public_plan["snapshot"]),
     }
 
 
-def _table_engine(tables: List[Dict[str, Any]], schema: str, table: str) -> str:
-    for item in tables:
-        if item.get("schema") == schema and item.get("table") == table:
-            return str(item.get("engine") or "")
-    return ""
-
-
-def _engine_rows(facade: DbCoreFacade, endpoint: DbEndpoint, schema: str, table: str) -> List[Dict[str, Any]]:
-    from src.core.db_core_service import DbCoreRequestKind
-
-    result = facade.client.request(
-        "query.execute",
-        {
-            "connection": endpoint.to_payload(),
-            "sql": (
-                "SELECT TABLE_SCHEMA AS `schema`, TABLE_NAME AS `table`, ENGINE AS engine "
-                "FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA = %s AND TABLE_NAME = %s"
-            ),
-            "params": [schema, table],
-        },
-        request_kind=DbCoreRequestKind.MUTATION,
-    )
-    rows = result.get("rows")
-    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
-
-
-def capture_oneclick_real_execution(
-    *,
-    host: str,
-    port: int,
-    user: str,
-    password: str,
-    schema: str,
-    table: str,
-) -> Dict[str, Any]:
-    _require_real_execution_capture_enabled()
-    DbCoreFacade, DbEndpoint = _load_db_core_types()
-    _require_safe_oneclick_identifier(schema, "schema")
-    _require_safe_oneclick_identifier(table, "table")
-
-    facade = DbCoreFacade()
-    endpoint = DbEndpoint(
-        engine="mysql",
-        host=host,
-        port=port,
-        user=user,
-        password=password,
-        database=schema,
-    )
+def capture_oneclick_real_execution(*, host: str, port: int, user: str, password: str, schema: str, table: str) -> Dict[str, Any]:
+    facade_type, endpoint_type = _load_db_core_types()
+    facade = facade_type()
+    endpoint = endpoint_type(engine="mysql", host=host, port=port, user=user, password=password, database=schema)
     try:
         service_hello = facade.hello()
-        before_tables = _engine_rows(facade, endpoint, schema, table)
-        apply_result = facade.apply_oneclick_fixes(
-            {
-                "connection": endpoint.to_payload(),
-                "schema": schema,
-                "dry_run": False,
-                "backup_confirmed": True,
-                "steps": [{
-                    "issue_type": "deprecated_engine",
-                    "location": f"{schema}.{table}",
-                    "table_name": table,
-                    "selected_option": {
-                        "strategy": "engine_innodb",
-                        "sql_template": f"ALTER TABLE `{schema}`.`{table}` ENGINE=InnoDB;",
-                    },
-                }],
-            }
-        )
-        after_tables = _engine_rows(facade, endpoint, schema, table)
+        planned = facade.plan_oneclick(endpoint, schema)
+        public_plan, approval = _base._planned_artifacts(planned)
+        try:
+            facade.apply_oneclick_plan(endpoint, schema, True, approval)
+        except BaseException as error:
+            if _error_code(error) != "oneclick_apply_disabled":
+                raise
+        else:
+            raise RuntimeError("apply evidence capture requires a definite oneclick_apply_disabled result")
     finally:
         facade.client.shutdown()
-
-    return build_evidence_report(
-        git_sha=current_git_sha(),
-        service_hello=service_hello,
-        schema=schema,
-        table=table,
-        apply_result=apply_result,
-        before_tables=before_tables,
-        after_tables=after_tables,
-    )
+    return build_evidence_report(git_sha=current_git_sha(), service_hello=service_hello, plan=public_plan, approval=approval)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument(
-        "--output",
-        default="reports/oneclick_readiness/oneclick-real-execution-evidence.json",
-    )
-    parser.add_argument("--seed-local-container", action="store_true")
-    parser.add_argument("--mysql-container", default="tf-live-mysql")
-    parser.add_argument("--mysql-host", default="127.0.0.1")
-    parser.add_argument("--mysql-port", type=int, default=3406)
-    parser.add_argument("--mysql-user", default="root")
-    parser.add_argument("--mysql-password", default="test")
-    parser.add_argument("--schema", default=DEFAULT_SCHEMA)
-    parser.add_argument("--table", default=DEFAULT_TABLE)
+    parser.add_argument("--output", default="reports/oneclick_readiness/oneclick-real-execution-evidence.json")
+    parser.add_argument("--mysql-host", default="127.0.0.1"); parser.add_argument("--mysql-port", type=int, default=3406)
+    parser.add_argument("--mysql-user", default="root"); parser.add_argument("--mysql-password", default="test")
+    parser.add_argument("--schema", default=DEFAULT_SCHEMA); parser.add_argument("--table", default=DEFAULT_TABLE)
     args = parser.parse_args()
-
-    try:
-        _require_real_execution_capture_enabled()
-    except OneClickRealExecutionCaptureDisabled as exc:
-        print(f"{exc.code}: {exc}", file=sys.stderr)
-        return 2
-
-    if args.seed_local_container:
-        seed_local_mysql_container(
-            container=args.mysql_container,
-            user=args.mysql_user,
-            password=args.mysql_password,
-            schema=args.schema,
-            table=args.table,
-        )
-
-    report = capture_oneclick_real_execution(
-        host=args.mysql_host,
-        port=args.mysql_port,
-        user=args.mysql_user,
-        password=args.mysql_password,
-        schema=args.schema,
-        table=args.table,
-    )
-
-    output = Path(args.output)
-    output.parent.mkdir(parents=True, exist_ok=True)
-    output.write_bytes((json.dumps(report, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
-    print(f"Wrote One-Click real-execution evidence: {output}")
+    report = capture_oneclick_real_execution(host=args.mysql_host, port=args.mysql_port, user=args.mysql_user, password=args.mysql_password, schema=args.schema, table=args.table)
+    output = Path(args.output); output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return 0
 
 
