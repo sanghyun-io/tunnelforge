@@ -15,6 +15,7 @@ from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
+from src.ui.workers.db_connection_worker import has_active_connection_workers
 from src.ui.dialogs.test_dialogs import TestProgressDialog
 from src.ui.controllers import TrayController, TunnelActionsController, WizardLauncher
 from src.ui.dialogs.migration_dialogs import has_active_detached_migration_workers
@@ -451,10 +452,15 @@ class TunnelManagerUI(QMainWindow):
 
         dialog = TestProgressDialog(self, title)
         worker = ConnectionTestWorker(test_type, tunnel, self.engine, self.config_mgr, self)
+        if not hasattr(self, "_connection_test_workers"):
+            self._connection_test_workers = set()
+        workers = self._connection_test_workers
+        workers.add(worker)
         worker.progress.connect(dialog.update_progress)
-        worker.finished.connect(
+        worker.test_finished.connect(
             lambda success, message: self._on_connection_test_finished(dialog, tunnel_name, success, message)
         )
+        worker.finished.connect(lambda: workers.discard(worker))
         worker.finished.connect(worker.deleteLater)
         worker.start()
         dialog.exec()
@@ -877,17 +883,26 @@ class TunnelManagerUI(QMainWindow):
                     self.hide()
                     event.ignore()
                 else:
-                    self.close_app()
+                    if self.close_app() is False:
+                        event.ignore()
             else:
                 event.ignore()  # 취소
         elif close_action == 'minimize':
             self.hide()
             event.ignore()
         else:  # 'exit'
-            self.close_app()
+            if self.close_app() is False:
+                event.ignore()
 
     def close_app(self):
         """진짜 종료"""
+        if has_active_connection_workers() or any(
+            worker.isRunning() for worker in getattr(self, "_connection_test_workers", ())
+        ):
+            QMessageBox.information(
+                self, "연결 정리 중", "연결 요청을 정리하고 있습니다. 잠시 후 다시 종료해주세요."
+            )
+            return False
         self.prepare_for_shutdown()
         # 현재 활성화된 터널 ID 목록 저장 (다음 시작 시 자동 연결용)
         active_ids = list(self.engine.active_tunnels.keys())
