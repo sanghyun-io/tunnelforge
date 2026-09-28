@@ -74,25 +74,28 @@ declared schema objects matched. This does not repair omitted attributes or
 manually removed FKs in the user's live Staging. The user requires safe restore
 before release (TF-STATUS-118). The new default prepares and verifies a separate
 candidate, then offers guarded engine-specific replacement. Failure/race tests and
-the large test-only cutover have passed; the final commit's protected release gates
-remain pending. Advanced legacy modes remain non-atomic. The proposed feature
-release is 2.6.0.
+the large test-only cutover and final exact-head protected gates have passed.
+PR #259 is merged and annotated tag v2.6.0 points to verified main
+`4526484adc226bd25442995bdab879857057d4a5`. Release run `36395943193` passed;
+v2.6.0 is stable/latest with all 10 downloaded asset hashes and four macOS
+sidecars verified. Actual UpdateChecker detects 2.5.0 -> 2.6.0 without error.
+Advanced legacy modes remain non-atomic.
 
 Safe verification of the exact supplied dump found 11 orphan references in one
 of its 304 FKs and correctly refused cutover while retaining the original DB.
 A separate test-only copy excludes those rows for the large success rehearsal;
-neither the supplied dump nor live databases were repaired or modified. Draft
-PR #259 starts protected validation; it is not an approved/published release.
+neither the supplied dump nor live databases were repaired or modified.
+PR #259 and the protected publication sequence are complete.
 
 The user has authorized a sequential follow-up: deep Export/Import verification,
 fixes, versioned protected release, then the commercial/usability roadmap.
-TF-STATUS-115 is active: additional real roundtrips reproduced silent MySQL
+TF-STATUS-115 is closed: additional real roundtrips reproduced and corrected silent MySQL
 truncation, nullable-unique export duplication, PostgreSQL schema/default/array
 failures and fractional timestamp loss. Python inspection also found database/
 schema routing gaps. Earlier passing gates did not cover these cases; do not
 interpret their historical pass counts as closure of the export/import contract.
-See `docs/export_import_verification_2026-09-28.md`. Release TF-STATUS-116 follows
-verification; product work TF-STATUS-117 follows release.
+See `docs/export_import_verification_2026-09-28.md`. Release TF-STATUS-116 is
+complete; post-release product work TF-STATUS-117 is active.
 
 Commercial-readiness discovery on 2026-09-28 is recorded in
 `docs/commercial_readiness_2026-09-28.md`. Existing SQL tabs, history/favorites,
@@ -841,6 +844,10 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-28 | Connection usability full regression | Windows `.venv/Scripts/python.exe -m pytest -q --tb=short`; isolated Linux snapshot with inherited XDG_CONFIG_HOME `python -m pytest -q --tb=short`; final focused CI/docs/connection tests | Windows 2846 passed / 9 skipped / 6 warnings in 111.70s; Linux 2813 passed / 42 skipped / 4 warnings in 29.22s; focused120 passed; independent lifecycle review9 passed | Preparing separate 2.6.1 patch; new connection tests also added to both macOS CI paths. Existing synchronous preselected-wizard entry is tracked separately as TF-STATUS-120. |
+| 2026-09-28 | First post-release connection responsiveness package | `pytest tests/test_db_connection_responsiveness.py tests/test_db_dialogs.py tests/test_main_window_export_import_labels.py tests/test_connection_test_worker.py -q --tb=short` | RED6 reproduced GUI blocking/missing lifecycle/result delivery; GREEN40. Independent review reproduced queued-completion shutdown gap; added regression and fixed active ownership guard. | New QThread orchestration preserves Rust DB ownership, drops cancelled/deleted-dialog results, performs cleanup off GUI and fixes test_finished routing. Broader Windows/Linux regression remains pending; not included in published 2.6.0. |
+| 2026-09-28 | `v2.6.0` protected publication closure / TF-STATUS-116 | PR #259 protected checks and merge; approved `create-release-tag.yml` run `36395840568`; approved `release.yml` run `36395943193`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `36394236889` and `36394237579` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `4526484adc226bd25442995bdab879857057d4a5`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.6.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.6.0`. TF-STATUS-116 is closed. |
+| 2026-09-28 | Final protected checks, merge and annotated tag | PR runs `36394236889` and `36394237579`; required-check inspection and `gh pr merge --merge --match-head-commit 2ba9a618992eeabcf38f832fade396e42d2df47e`; approved tag run `36395840568` | All required/internal/external macOS checks passed. Windows 2837 passed / 9 skipped; Linux 2804 passed / 42 skipped; DB targets 43, promotion17 and proof7 passed with explicit live environment. Merge and tag peel to `4526484adc226bd25442995bdab879857057d4a5` | TF-STATUS-115/118 closed with fresh evidence. Release run `36395943193` passed tag preflight and received normal configured environment approval for builds. No protection bypass; final asset/publication/updater checks are pending. |
 | 2026-09-28 | Large guarded cutover and independent backup preservation | Core `dump.promote` plan/confirm on the derived isolated fixture; independent actual COUNT queries against active and backup tables | Plan passed in 235.58s; confirmed promotion passed in 496.56s including revalidation. All 452 table counts matched: active 8,937,323 rows; backup original 8,937,334 rows; zero query errors | Source dump/live DBs untouched. Original 11 orphan rows remain preserved in backup; removal was test-fixture preparation only. This timing is not the write-lock duration. Backup lifecycle and recovery UX remain TF-STATUS-119. |
 | 2026-09-28 | Final view literal fidelity and mandatory MySQL promotion gate | Configured `cargo test --test live_safe_restore -- --test-threads=1`; promotion suite with BOTH `TF_PROMOTE_MYSQL_HOST` and `TF_POSTGRES_HOST`; CI environment contract RED/GREEN | Safe preparation 4 passed; actual both-engine promotion suite 17 passed in 41.98s. View security words and definer-looking strings retain exact values. | Fixed header-only view sanitization. Earlier root promotion runs supplied only TF_MYSQL_HOST, so MySQL-specific live bodies returned early; separate specialist evidence existed, but CI now explicitly supplies TF_PROMOTE_MYSQL_HOST and tests its wiring. No skipped live body is treated as actual DB evidence. |
 | 2026-09-28 | CI fixture isolation and large safe preparation | Linux config/group tests with inherited `XDG_CONFIG_HOME`; matching Windows tests; final Core safe import of separate derived private fixture | Reproduced exact CI 18 failures / 57 passes, fixed test-owned XDG paths, then both platforms 75 passed. Large fixture 226 tables / 8,937,323 rows / 8 views reached `ready_for_switch`, proof v2 verified, original unchanged in 715.76s | Product configuration path semantics unchanged. Original exact dump still has 11 orphan references and is not modified. Original DB remained 226 tables/8 views; temporary local_infile returned to OFF. Guarded large cutover is now running. |
@@ -2835,12 +2842,14 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-121 | Medium | in_progress | Usability patch release | Publish verified direct-connection/result-signal fixes as 2.6.1 | Run exact-head protected gates, version bot, approved tag/build, asset hashes and updater checks |
+| TF-STATUS-120 | Medium | open | Wizard responsiveness | Preselected wizard connector preparation still performs synchronous connection work | Reuse verified worker ownership with a cancellable wizard progress flow; direct connection dialog fix does not cover this entry |
 | TF-STATUS-119 | Medium | open | Backup lifecycle | Successful safe promotion retains backup namespaces and MySQL saved-view aliases; guided cleanup/recovery UI is not implemented | Add explicit recovery/retention review after release; never silently delete retained evidence or label saved aliases as backup-data views |
-| TF-STATUS-118 | High | fixed_pending_full_verify | Restore availability | Safe preparation, both-engine guarded promotion and large cutover/backup preservation passed | Required before release; finish final exact-head protected gates, preserve fail-closed unsupported/unknown-outcome policy |
-| TF-STATUS-115 | High | fixed_pending_full_verify | Export/Import contract | Real data/schema/default/precision/snapshot defects fixed; large source inconsistency now safely refused | Finish final exact-head protected gates; retain supported policy and distinguish old dump omissions/orphan rows from recoverable metadata |
-| TF-STATUS-116 | High | in_progress | Versioned release | Draft PR #259 proposes minor 2.6.0 with safe restore; large success rehearsal and exact-head CI are pending | Verify fixes, version bot, protected PR/merge/tag/build, inspect asset digests, publish and verify updater |
-| TF-STATUS-117 | Medium | watch | Commercial/usability implementation | User authorized roadmap after the verified release | Begin first product work package after TF-STATUS-116 completes; retain agreed developer/small-team focus |
-| TF-STATUS-113 | High | open | Connection responsiveness | Direct connection dialog calls blocking connect in GUI callbacks | Move connection/auth work to cancellable workers and verify UI responsiveness under unreachable endpoints |
+| TF-STATUS-118 | High | closed | Restore availability | Safe preparation, both-engine guarded promotion, large cutover and exact-head protected gates passed | Preserve fail-closed unsupported/unknown-outcome policy; backup lifecycle is TF-STATUS-119 |
+| TF-STATUS-115 | High | closed | Export/Import contract | Data/schema/default/precision/snapshot fixes passed actual DB and protected gates; inconsistent old dumps safely refused | Retain supported policy; old dump omissions and orphan rows need authoritative reconciliation, not guessed repairs |
+| TF-STATUS-116 | High | closed | Versioned release | v2.6.0 published stable/latest; 10 assets/four sidecars and actual updater verified | Preserve immutable tag, exact-head CI and approved release workflow |
+| TF-STATUS-117 | Medium | in_progress | Commercial/usability implementation | First post-release work package addresses connection responsiveness for developers/small teams | Complete TF-STATUS-113 with event-loop, cancellation/cleanup and result-signal regression proof; next security/query limits remain explicit |
+| TF-STATUS-113 | High | fixed_pending_full_verify | Connection responsiveness | Background connect/test, cancelled-result cleanup and result-signal fix pass focused tests | Complete Windows/Linux regressions and preserve shutdown ownership through queued completion; follow-up is not yet released |
 | TF-STATUS-114 | Medium | watch | Product readiness | Prioritized commercial-use candidates and demonstration scenarios | Developer/small-team persona confirmed; validate observed task success using `docs/commercial_readiness_2026-09-28.md` before implementation |
 | TF-STATUS-100 | High | closed | SSH / TCP | Loopback isolation, resource cleanup, assigned ports and IPv6 probes fixed | Preserve real protocol regressions; peer trust remains TF-STATUS-110 |
 | TF-STATUS-101 | High | closed | Rust SQL | Safe parameter scanning, PostgreSQL statements and non-lossy column aliases | Preserve configured live query regressions; richer result model is TF-STATUS-112 |
@@ -2854,7 +2863,7 @@ Next action:
 | TF-STATUS-109 | High | fixed_pending_full_verify | OS / CI | Linux full application gate and Windows frozen-main smoke added | Run hosted gates and real Mac validation; local frozen Windows/Linux smoke passes |
 | TF-STATUS-110 | High | open | Connection security | TLS policy and persisted SSH host identity verification incomplete | Design and implement verified TLS and host trust, including passphrase key handling |
 | TF-STATUS-111 | High | open | Complete backup fidelity | Normalized schema does not preserve all engine objects and attributes | Preserve or explicitly reject each unsupported construct; retain incomplete-export warnings |
-| TF-STATUS-112 | High | open | Query / restore limits | Cancellation, large results, multiple result sets and atomic restore gaps | Add bounded execution and fault/load coverage; expose actual guarantees |
+| TF-STATUS-112 | High | open | Query limits | Actual cancellation, bounded large results and multiple result sets remain incomplete | Add bounded execution and fault/load coverage; safe restore is separately verified under TF-STATUS-118 |
 | TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Keep regression coverage aligned with import intent changes |
 | TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Keep row verification/report coverage aligned with import mode changes |
 | TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
@@ -2957,15 +2966,15 @@ Next action:
 
 ## Recommended Execution Order
 
-TF-STATUS-118 is explicitly required before release. Finish safe preparation,
-guarded promotion, interruption/replay tests and private-copy large restoration.
-Failure reports alone do not constitute recovery. Verify common MySQL fidelity
-and durable diagnostics under TF-STATUS-115 alongside those gates.
+TF-STATUS-115/118 and protected v2.6.0 publication TF-STATUS-116 are complete.
+The first post-release usability package TF-STATUS-113 passed local Windows/Linux
+gates. Finish its separate 2.6.1 publication via TF-STATUS-121, then prioritize
+verified connection security (110), remaining wizard responsiveness (120), actual
+query cancellation/bounded results (112), and backup lifecycle review (119).
 
-Active user order: finish TF-STATUS-115 deep roundtrip and policy verification,
-publish the verified version through TF-STATUS-116, then proceed with
-TF-STATUS-117 using the existing commercial-readiness priorities. Do not begin
-unrelated new features before the requested verification/release sequence.
+Continue TF-STATUS-117 using the existing commercial-readiness priorities and the
+confirmed developer/small-team audience. The released 2.6.0 tag remains immutable;
+new usability changes are separate follow-up work until their own verification.
 
 Product follow-up: use `docs/commercial_readiness_2026-09-28.md` for acceptance
 criteria. Prioritize verified connection security/responsiveness (110/113),
@@ -3058,6 +3067,7 @@ The historical release-preservation checklist follows.
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-09-28 | Published verified v2.6.0; started the user-authorized next usability package. Removed direct-connection GUI blocking, fixed main connection-test result routing and guarded worker cleanup at shutdown. | Release ledger, connection dialog/worker, main window, regression tests and i18n | Stable/latest and old-version updater verified. Focused40 passed after RED6; independent shutdown-race finding reproduced and fixed. Follow-up full regression/PR preparation in progress; immutable release untouched. |
 | 2026-09-28 | Completed large safe cutover rehearsal and independent active/backup verification. Corrected the final view-header literal fidelity edge case and wired the MySQL-specific live promotion environment into mandatory CI. | View sanitizer/tests, CI contract, policy/evidence/status | 452 actual table counts match; active/backup totals 8,937,323/8,937,334, eight declared view counts match, both namespaces retain 304 FKs. Final safe fixtures4 and both-engine promotion17 passed. Exact supplied dump remains unmodified and safely refused for 11 orphan references. |
 | 2026-09-28 | Protected PR #259 version bot selected 2.6.0; latest-head real DB and Rust gates passed. Fixed inherited-XDG test isolation exposed only by hosted Linux CI, without weakening assertions or changing production settings behavior. | Config/group test fixtures, incident and canonical status | Reproduced exact 18 hosted failures locally; Linux/Windows focused 75 passed. Final large safe preparation succeeded in 715.76s; cutover and full protected CI remain pending. |
 | 2026-09-28 | Completed independent safe-restore review fixes: bind full candidate schema/views, block qualified view-target escapes, enforce MySQL metadata visibility and uncertain-attempt guards. Real dump's orphan rows now cause safe refusal. | Core preparation/promotion/schema, regression fixtures, incident/policy/evidence docs | Final native Core tests and Windows/Linux release builds passed; configured promotion 17 and proof 7 passed; Python live8 passed; Windows packaged UI/Core smoke passed. Large derived-fixture cutover and protected release remain pending. |

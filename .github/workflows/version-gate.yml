@@ -294,6 +294,7 @@ jobs:
             tests/test_rust_core_packaging.py \
             tests/test_settings_update_actions.py \
             tests/test_app_self_check.py \
+            tests/test_db_connection_responsiveness.py \
             tests/test_macos_support_docs.py
           cargo test --manifest-path migration_core/Cargo.toml
 

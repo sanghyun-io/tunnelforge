@@ -17,6 +17,9 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "연결 확인 중… 취소하면 결과를 사용하지 않습니다.": "Checking connection… Cancel discards the result.",
+    "연결 정리 중": "Finishing connection cleanup",
+    "연결 요청을 정리하고 있습니다. 잠시 후 다시 종료해주세요.": "Connection cleanup is still running. Please try exiting again shortly.",
     "데이터 차이가 확인된 테이블": "Tables with confirmed data differences",
     "전환 중 서비스 영향": "Service impact during switching",
     "기존 대상": "Original destination",

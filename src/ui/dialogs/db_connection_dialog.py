@@ -4,15 +4,15 @@ DB 연결 다이얼로그
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLineEdit, QSpinBox, QPushButton, QComboBox,
-    QGroupBox, QMessageBox, QApplication,
+    QGroupBox, QMessageBox, QLabel,
     QRadioButton, QButtonGroup
 )
-from PyQt6.QtCore import Qt
 from typing import Optional
 
 from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
 from src.core.constants import DEFAULT_MYSQL_PORT, DEFAULT_LOCAL_HOST
+from src.ui.workers.db_connection_worker import DBConnectionWorker
 
 
 class DBConnectionDialog(QDialog):
@@ -26,6 +26,8 @@ class DBConnectionDialog(QDialog):
         self.tunnel_engine = tunnel_engine
         self.config_manager = config_manager
         self.connector = None
+        self._connection_worker = None
+        self._connection_engine = None
 
         self.init_ui()
 
@@ -93,6 +95,10 @@ class DBConnectionDialog(QDialog):
 
         layout.addWidget(conn_group)
 
+        self.connection_status = QLabel()
+        self.connection_status.hide()
+        layout.addWidget(self.connection_status)
+
         # --- 버튼 ---
         button_layout = QHBoxLayout()
 
@@ -103,6 +109,7 @@ class DBConnectionDialog(QDialog):
                 padding: 6px 16px; border-radius: 4px; border: none;
             }
             QPushButton:hover { background-color: #d4ac0d; }
+            QPushButton:disabled { background-color: #d5d8dc; color: #7f8c8d; }
         """)
         btn_test.clicked.connect(self.test_connection)
 
@@ -113,6 +120,7 @@ class DBConnectionDialog(QDialog):
                 padding: 6px 16px; border-radius: 4px; border: none;
             }
             QPushButton:hover { background-color: #2980b9; }
+            QPushButton:disabled { background-color: #d5d8dc; color: #7f8c8d; }
         """)
         btn_connect.clicked.connect(self.do_connect)
 
@@ -125,6 +133,9 @@ class DBConnectionDialog(QDialog):
             QPushButton:hover { background-color: #d5dbdb; }
         """)
         btn_cancel.clicked.connect(self.reject)
+
+        self.btn_test = btn_test
+        self.btn_connect = btn_connect
 
         button_layout.addWidget(btn_test)
         button_layout.addStretch()
@@ -218,54 +229,70 @@ class DBConnectionDialog(QDialog):
 
     def test_connection(self):
         """연결 테스트"""
-        host, port, user, password, database = self._read_connection_fields()
-
-        if not user:
-            QMessageBox.warning(self, "입력 오류", "사용자명을 입력하세요.")
-            return
-
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-
-        try:
-            engine, connector = self._build_connector_or_raise(host, port, user, password, database)
-            success, msg = connector.connect()
-            connector.disconnect()
-
-            QApplication.restoreOverrideCursor()
-
-            if success:
-                QMessageBox.information(self, "연결 성공", f"✅ {self._engine_label(engine)} {msg}")
-            else:
-                QMessageBox.warning(self, "연결 실패", f"❌ {msg}")
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            QMessageBox.critical(self, "오류", str(e))
+        self._start_connection("test")
 
     def do_connect(self):
         """연결 수행"""
-        host, port, user, password, database = self._read_connection_fields()
+        self._start_connection("connect")
 
+    def _start_connection(self, action):
+        if self._connection_worker is not None:
+            return
+        host, port, user, password, database = self._read_connection_fields()
         if not user:
             QMessageBox.warning(self, "입력 오류", "사용자명을 입력하세요.")
             return
-
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-
         try:
-            _, self.connector = self._build_connector_or_raise(host, port, user, password, database)
-            success, msg = self.connector.connect()
+            self._connection_engine, connector = self._build_connector_or_raise(
+                host, port, user, password, database
+            )
+            worker = DBConnectionWorker(connector, action)
+            self._connection_worker = worker
+            worker.connection_finished.connect(self._connection_finished)
+            self.destroyed.connect(worker.cancel)
+            self._set_connection_busy(True)
+            worker.start()
+        except Exception as exc:
+            self._connection_worker = None
+            self._set_connection_busy(False)
+            QMessageBox.critical(self, "오류", str(exc))
 
-            QApplication.restoreOverrideCursor()
+    def _set_connection_busy(self, busy):
+        for widget in (self.btn_test, self.btn_connect, self.radio_direct,
+                       self.radio_tunnel, self.combo_tunnel, self.combo_engine,
+                       self.input_host, self.input_port, self.input_user,
+                       self.input_password, self.input_database):
+            widget.setEnabled(not busy)
+        self.connection_status.setText("연결 확인 중… 취소하면 결과를 사용하지 않습니다.")
+        self.connection_status.setVisible(busy)
+        if not busy:
+            has_tunnels = self.combo_tunnel.currentData() is not None
+            self.radio_tunnel.setEnabled(has_tunnels)
+            self.on_mode_changed()
 
-            if success:
-                self.accept()
-            else:
-                self.connector = None
-                QMessageBox.warning(self, "연결 실패", msg)
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
-            self.connector = None
-            QMessageBox.critical(self, "오류", str(e))
+    def _connection_finished(self, worker):
+        if worker is not self._connection_worker:
+            return
+        self._connection_worker = None
+        self._set_connection_busy(False)
+        if worker.error:
+            QMessageBox.critical(self, "오류", worker.message)
+        elif not worker.success:
+            QMessageBox.warning(self, "연결 실패", worker.message)
+        elif worker.action == "test":
+            QMessageBox.information(
+                self, "연결 성공", f"✅ {self._engine_label(self._connection_engine)} {worker.message}"
+            )
+        else:
+            self.connector = worker.take_connector()
+            self.accept()
+
+    def reject(self):
+        if self._connection_worker is not None:
+            self._connection_worker.cancel()
+            self._connection_worker = None
+        self._set_connection_busy(False)
+        super().reject()
 
     def get_connector(self) -> Optional[MySQLConnector]:
         """연결된 커넥터 반환"""
