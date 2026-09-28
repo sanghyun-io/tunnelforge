@@ -81,6 +81,13 @@ v2.6.0 is stable/latest with all 10 downloaded asset hashes and four macOS
 sidecars verified. Actual UpdateChecker detects 2.5.0 -> 2.6.0 without error.
 Advanced legacy modes remain non-atomic.
 
+The first follow-up usability patch is also published: v2.6.1, PR #260,
+merge/tag commit `fd843baae4b30278921489b28b72534fe897ae0e`, approved release run
+`36402586622`. All 10 downloaded assets and four macOS sidecars match. Actual
+UpdateChecker detects upgrades from both 2.5.0 and 2.6.0 to latest 2.6.1.
+Direct-connection responsiveness, cancellation cleanup and result-signal delivery
+are verified; remaining security, query and wizard work stays explicitly open.
+
 Safe verification of the exact supplied dump found 11 orphan references in one
 of its 304 FKs and correctly refused cutover while retaining the original DB.
 A separate test-only copy excludes those rows for the large success rehearsal;
@@ -844,6 +851,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-28 | `v2.6.1` protected publication closure / TF-STATUS-121 | PR #260 protected checks and merge; approved `create-release-tag.yml` run `36402377780`; approved `release.yml` run `36402586622`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `36400986857` and `36400986774` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `fd843baae4b30278921489b28b72534fe897ae0e`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.6.1` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.6.1`. TF-STATUS-121 is closed. |
 | 2026-09-28 | Connection usability full regression | Windows `.venv/Scripts/python.exe -m pytest -q --tb=short`; isolated Linux snapshot with inherited XDG_CONFIG_HOME `python -m pytest -q --tb=short`; final focused CI/docs/connection tests | Windows 2846 passed / 9 skipped / 6 warnings in 111.70s; Linux 2813 passed / 42 skipped / 4 warnings in 29.22s; focused120 passed; independent lifecycle review9 passed | Preparing separate 2.6.1 patch; new connection tests also added to both macOS CI paths. Existing synchronous preselected-wizard entry is tracked separately as TF-STATUS-120. |
 | 2026-09-28 | First post-release connection responsiveness package | `pytest tests/test_db_connection_responsiveness.py tests/test_db_dialogs.py tests/test_main_window_export_import_labels.py tests/test_connection_test_worker.py -q --tb=short` | RED6 reproduced GUI blocking/missing lifecycle/result delivery; GREEN40. Independent review reproduced queued-completion shutdown gap; added regression and fixed active ownership guard. | New QThread orchestration preserves Rust DB ownership, drops cancelled/deleted-dialog results, performs cleanup off GUI and fixes test_finished routing. Broader Windows/Linux regression remains pending; not included in published 2.6.0. |
 | 2026-09-28 | `v2.6.0` protected publication closure / TF-STATUS-116 | PR #259 protected checks and merge; approved `create-release-tag.yml` run `36395840568`; approved `release.yml` run `36395943193`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `36394236889` and `36394237579` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `4526484adc226bd25442995bdab879857057d4a5`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.6.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.6.0`. TF-STATUS-116 is closed. |
@@ -2842,14 +2850,14 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
-| TF-STATUS-121 | Medium | in_progress | Usability patch release | Publish verified direct-connection/result-signal fixes as 2.6.1 | Run exact-head protected gates, version bot, approved tag/build, asset hashes and updater checks |
+| TF-STATUS-121 | Medium | closed | Usability patch release | v2.6.1 published through PR #260 and approved workflows; assets and actual updater verified | Preserve exact-head checks and immutable tag |
 | TF-STATUS-120 | Medium | open | Wizard responsiveness | Preselected wizard connector preparation still performs synchronous connection work | Reuse verified worker ownership with a cancellable wizard progress flow; direct connection dialog fix does not cover this entry |
 | TF-STATUS-119 | Medium | open | Backup lifecycle | Successful safe promotion retains backup namespaces and MySQL saved-view aliases; guided cleanup/recovery UI is not implemented | Add explicit recovery/retention review after release; never silently delete retained evidence or label saved aliases as backup-data views |
 | TF-STATUS-118 | High | closed | Restore availability | Safe preparation, both-engine guarded promotion, large cutover and exact-head protected gates passed | Preserve fail-closed unsupported/unknown-outcome policy; backup lifecycle is TF-STATUS-119 |
 | TF-STATUS-115 | High | closed | Export/Import contract | Data/schema/default/precision/snapshot fixes passed actual DB and protected gates; inconsistent old dumps safely refused | Retain supported policy; old dump omissions and orphan rows need authoritative reconciliation, not guessed repairs |
 | TF-STATUS-116 | High | closed | Versioned release | v2.6.0 published stable/latest; 10 assets/four sidecars and actual updater verified | Preserve immutable tag, exact-head CI and approved release workflow |
 | TF-STATUS-117 | Medium | in_progress | Commercial/usability implementation | First post-release work package addresses connection responsiveness for developers/small teams | Complete TF-STATUS-113 with event-loop, cancellation/cleanup and result-signal regression proof; next security/query limits remain explicit |
-| TF-STATUS-113 | High | fixed_pending_full_verify | Connection responsiveness | Background connect/test, cancelled-result cleanup and result-signal fix pass focused tests | Complete Windows/Linux regressions and preserve shutdown ownership through queued completion; follow-up is not yet released |
+| TF-STATUS-113 | High | closed | Connection responsiveness | Direct connect/test background work, cancellation cleanup and result-signal fix verified and shipped in 2.6.1 | Preserve queued-completion ownership and all-OS regressions; preselected wizard entry remains TF-STATUS-120 |
 | TF-STATUS-114 | Medium | watch | Product readiness | Prioritized commercial-use candidates and demonstration scenarios | Developer/small-team persona confirmed; validate observed task success using `docs/commercial_readiness_2026-09-28.md` before implementation |
 | TF-STATUS-100 | High | closed | SSH / TCP | Loopback isolation, resource cleanup, assigned ports and IPv6 probes fixed | Preserve real protocol regressions; peer trust remains TF-STATUS-110 |
 | TF-STATUS-101 | High | closed | Rust SQL | Safe parameter scanning, PostgreSQL statements and non-lossy column aliases | Preserve configured live query regressions; richer result model is TF-STATUS-112 |
@@ -2967,8 +2975,8 @@ Next action:
 ## Recommended Execution Order
 
 TF-STATUS-115/118 and protected v2.6.0 publication TF-STATUS-116 are complete.
-The first post-release usability package TF-STATUS-113 passed local Windows/Linux
-gates. Finish its separate 2.6.1 publication via TF-STATUS-121, then prioritize
+The first follow-up usability package TF-STATUS-113 is verified and published
+as v2.6.1 through TF-STATUS-121. Continue with
 verified connection security (110), remaining wizard responsiveness (120), actual
 query cancellation/bounded results (112), and backup lifecycle review (119).
 
@@ -3067,6 +3075,7 @@ The historical release-preservation checklist follows.
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-09-28 | Published connection usability patch v2.6.1 and closed TF-STATUS-113/121. Retained original v2.6.0 safety release and both immutable tags. | Canonical release ledger and commercial-readiness progress | PR #260 exact-head runs 36400986857/36400986774 passed, including connection tests on both macOS architectures. Tag run 36402377780 and release run 36402586622 passed. All 10 downloaded hashes/four sidecars match; actual updater correctly handles installed 2.5.0, 2.6.0 and 2.6.1. |
 | 2026-09-28 | Published verified v2.6.0; started the user-authorized next usability package. Removed direct-connection GUI blocking, fixed main connection-test result routing and guarded worker cleanup at shutdown. | Release ledger, connection dialog/worker, main window, regression tests and i18n | Stable/latest and old-version updater verified. Focused40 passed after RED6; independent shutdown-race finding reproduced and fixed. Follow-up full regression/PR preparation in progress; immutable release untouched. |
 | 2026-09-28 | Completed large safe cutover rehearsal and independent active/backup verification. Corrected the final view-header literal fidelity edge case and wired the MySQL-specific live promotion environment into mandatory CI. | View sanitizer/tests, CI contract, policy/evidence/status | 452 actual table counts match; active/backup totals 8,937,323/8,937,334, eight declared view counts match, both namespaces retain 304 FKs. Final safe fixtures4 and both-engine promotion17 passed. Exact supplied dump remains unmodified and safely refused for 11 orphan references. |
 | 2026-09-28 | Protected PR #259 version bot selected 2.6.0; latest-head real DB and Rust gates passed. Fixed inherited-XDG test isolation exposed only by hosted Linux CI, without weakening assertions or changing production settings behavior. | Config/group test fixtures, incident and canonical status | Reproduced exact 18 hosted failures locally; Linux/Windows focused 75 passed. Final large safe preparation succeeded in 715.76s; cutover and full protected CI remain pending. |
