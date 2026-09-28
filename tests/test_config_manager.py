@@ -59,14 +59,17 @@ class TestCredentialEncryptor:
         self.test_dir = tmp_path / 'TunnelForge'
         self.test_dir.mkdir()
 
-        # 환경 변수 패치 (OS별 설정 경로 분기 대응)
+        # Hosted Linux runners may set XDG_CONFIG_HOME, which overrides HOME.
+        # Isolate every configuration-path override before loading the module.
         self.env_patch = patch.dict(
             os.environ,
-            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path)}
+            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path),
+             'XDG_CONFIG_HOME': str(tmp_path / '.config')}
         )
         self.env_patch.start()
 
         config_module = _load_config_manager_module()
+        assert Path(config_module.APP_DIR).is_relative_to(tmp_path)
         Path(config_module.APP_DIR).mkdir(parents=True, exist_ok=True)
         self.encryptor = config_module.CredentialEncryptor()
 
@@ -118,11 +121,13 @@ class TestConfigManager:
         # 환경 변수 패치 (OS별 설정 경로 분기 대응)
         self.env_patch = patch.dict(
             os.environ,
-            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path)}
+            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path),
+             'XDG_CONFIG_HOME': str(tmp_path / '.config')}
         )
         self.env_patch.start()
 
         config_module = _load_config_manager_module()
+        assert Path(config_module.APP_DIR).is_relative_to(tmp_path)
         self.config_module = config_module
         self.config_mgr = config_module.ConfigManager()
 

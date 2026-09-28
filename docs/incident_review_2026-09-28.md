@@ -29,6 +29,10 @@ counts are not independently verified counts of the current PROD schema.
   The existing destination retained all 226 tables and 8 views throughout.
   The earlier row-count/declared-object proof did not establish referential
   integrity; creating FKs with checks disabled does not validate existing rows.
+  Its legacy `mysql_parallel_no_backup_lock_consistent_snapshot` policy used
+  independent worker snapshots despite `strict_export=true`. The orphaned dump
+  does not prove current PROD has orphan rows: snapshot timing is another possible
+  cause. The replacement policy now uses one consistent source connection.
 - For complete large cutover testing, a separate owned test copy excludes those
   11 rows and is freshly exported. This is a derived rehearsal fixture, not a
   repair of the supplied dump or live PROD/Staging, and not a recommendation to
