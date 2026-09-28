@@ -493,6 +493,7 @@ def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
         assert job['env'][f'{prefix}_USER'] == ('root' if service == 'mysql' else 'postgres')
     assert job['services']['mysql']['env']['MYSQL_ROOT_HOST'] == '%'
     assert job['services']['mysql']['env']['MYSQL_DATABASE'] == 'tf_test'
+    assert job['env']['TF_PROMOTE_MYSQL_HOST'] == job['env']['TF_MYSQL_HOST']
     assert job['services']['postgres']['env']['POSTGRES_DB'] == 'tf_test'
     commands = '\n'.join(step.get('run', '') for step in job['steps'])
     fixtures = ['live_roundtrip', 'live_dump_cross_engine', 'live_schema_fidelity',

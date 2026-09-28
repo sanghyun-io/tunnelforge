@@ -48,6 +48,9 @@ separate candidate first. Compare the existing objects and offer retention of
 the original, use of the candidate, or explicitly confirmed replacement. A new
 name may be entered before preparation. An existing namespace is never silently
 reused as a staging area. PostgreSQL stays in the selected database.
+Preparation requires permission to create a database (MySQL) or schema
+(PostgreSQL), plus the privileges needed to load the declared objects. A denied
+creation leaves the existing destination unchanged.
 
 Verification includes streamed SHA-256 content digests, not just row counts.
 Preparation failures retain the candidate for inspection and preserve the

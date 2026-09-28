@@ -93,6 +93,7 @@ jobs:
           --health-interval=10s --health-timeout=5s --health-retries=12
     env:
       TF_MYSQL_HOST: 127.0.0.1
+      TF_PROMOTE_MYSQL_HOST: 127.0.0.1
       TF_MYSQL_PORT: "3306"
       TF_MYSQL_USER: root
       TF_MYSQL_PASSWORD: tf_local_test

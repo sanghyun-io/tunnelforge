@@ -799,7 +799,13 @@ pub(crate) fn sanitize_view_definition(definition: &str, source_schema: &str, en
     let mut sql = definition.to_string();
     if engine == "mysql" {
         sql = strip_mysql_definer(&sql);
-        sql = replace_ignore_ascii_case(&sql, "SQL SECURITY DEFINER", "SQL SECURITY INVOKER");
+        if let Some(view_start) = mysql_view_header_end(&sql) {
+            let mut header = replace_ignore_ascii_case(&sql[..view_start], "SQL SECURITY DEFINER", "SQL SECURITY INVOKER");
+            if !header.split_whitespace().collect::<Vec<_>>().join(" ").to_ascii_lowercase().contains("sql security") {
+                header = format!("{} SQL SECURITY INVOKER ", header.trim_end());
+            }
+            sql = format!("{header}{}", &sql[view_start..]);
+        }
     }
     if !source_schema.trim().is_empty() {
         sql = strip_view_namespace(&sql, source_schema, engine);
@@ -905,7 +911,8 @@ fn replace_ignore_ascii_case(haystack: &str, needle: &str, replacement: &str) ->
 /// `CREATE ALGORITHM=... DEFINER=\`u\`@\`h\` SQL SECURITY ... VIEW` 에서 DEFINER 절만 제거한다.
 /// `DEFINER=` 키워드 매칭은 case-insensitive로 수행한다.
 fn strip_mysql_definer(sql: &str) -> String {
-    let lower = sql.to_ascii_lowercase();
+    let Some(header_end) = mysql_view_header_end(sql) else { return sql.to_string(); };
+    let lower = sql[..header_end].to_ascii_lowercase();
     let Some(start) = lower.find("definer=") else {
         return sql.to_string();
     };
@@ -914,7 +921,7 @@ fn strip_mysql_definer(sql: &str) -> String {
     let bytes = sql.as_bytes();
     let mut idx = start + "DEFINER=".len();
     let mut in_backtick = false;
-    while idx < bytes.len() {
+    while idx < header_end {
         let ch = bytes[idx];
         if ch == b'`' {
             in_backtick = !in_backtick;
@@ -932,6 +939,35 @@ fn strip_mysql_definer(sql: &str) -> String {
     result
 }
 
+/// Find the CREATE header boundary without treating quoted identifiers, account
+/// names or comments as the VIEW keyword. Everything from VIEW onward is opaque
+/// to DEFINER/security rewriting, including the view's own quoted name.
+fn mysql_view_header_end(sql: &str) -> Option<usize> {
+    let bytes=sql.as_bytes();let mut i=0;let mut previous=None;
+    while i<bytes.len() {
+        if bytes[i].is_ascii_whitespace() {i+=1;continue;}
+        if let Some(end)=skip_sql_comment(bytes,i,true) {i=end.min(bytes.len());continue;}
+        if matches!(bytes[i],b'\''|b'"'|b'`') {
+            let quote=bytes[i];i+=1;
+            while i<bytes.len() {
+                if bytes[i]==quote {i+=1;if bytes.get(i)==Some(&quote){i+=1;}else{break;}}
+                else if bytes[i]==b'\\' && quote!=b'`' {i=(i+2).min(bytes.len());}
+                else{i+=1;}
+            }
+            previous=Some(quote);continue;
+        }
+        if bytes[i].is_ascii_alphabetic()||bytes[i]==b'_' {
+            let start=i;i+=1;
+            while bytes.get(i).is_some_and(|byte|byte.is_ascii_alphanumeric()||*byte==b'_'||*byte==b'$'){i+=1;}
+            if sql[start..i].eq_ignore_ascii_case("view") && !matches!(previous,Some(b'='|b'@')) {return Some(start);}
+            previous=bytes.get(i-1).copied();
+        } else {
+            previous=Some(bytes[i]);i+=sql[i..].chars().next()?.len_utf8();
+        }
+    }
+    None
+}
+
 pub(crate) fn drop_view_sql(engine: &str, view: &str) -> String {
     format!("DROP VIEW IF EXISTS {}", quote_ident(engine, view))
 }
@@ -940,6 +976,7 @@ pub(crate) fn drop_view_sql(engine: &str, view: &str) -> String {
 /// 정상 경로(`SHOW CREATE VIEW`의 대문자/단일공백 정규화 출력)는 sanitize가 모두 처리하므로
 /// 여기서 잔존이 감지된다는 것은 탭/주석을 끼운 비정규(변조 의심) 정의라는 뜻 → fail-closed로 거부한다.
 pub(crate) fn mysql_definition_has_residual_definer(sql: &str) -> bool {
+    let sql = &sql[..mysql_view_header_end(sql).unwrap_or(sql.len())];
     // 주석(-- 라인, /* */ 블록)을 공백으로 치환하고, 모든 공백류를 단일 공백으로 정규화한 검사용 사본.
     let mut cleaned = String::with_capacity(sql.len());
     let bytes = sql.as_bytes();
@@ -1373,6 +1410,20 @@ mod tests {
                    VIEW `v` AS SELECT 1";
         let sanitized = sanitize_view_definition(sql, "", "mysql");
         assert!(!mysql_definition_has_residual_definer(&sanitized));
+    }
+
+    #[test]
+    fn mysql_view_security_rewrite_preserves_body_literals_and_quoted_view_names() {
+        let body="AS SELECT 'SQL SECURITY DEFINER' AS policy_text, 'definer=body_value' AS owner_text";
+        let native=format!("CREATE DEFINER=`root`@`localhost` SQL SECURITY DEFINER VIEW `SQL SECURITY DEFINER` {body}");
+        let sanitized=sanitize_view_definition(&native,"","mysql");
+        assert!(sanitized.ends_with(body),"{sanitized}");
+        assert!(sanitized.contains("VIEW `SQL SECURITY DEFINER`"));
+        assert!(sanitized.contains("SQL SECURITY INVOKER VIEW"));
+        assert!(!mysql_definition_has_residual_definer(&sanitized));
+        let legacy=format!("CREATE VIEW `legacy` {body}");
+        assert_eq!(strip_mysql_definer(&legacy),legacy);
+        assert!(sanitize_view_definition(&legacy,"","mysql").ends_with(body));
     }
 
     #[test]

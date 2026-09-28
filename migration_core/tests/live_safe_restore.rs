@@ -369,3 +369,38 @@ fn safe_restore_rejects_view_target_outside_candidate_before_creation() {
         assert!(result["message"].as_str().unwrap().contains("view_target_invalid"));
     }
 }
+
+#[test]
+fn mysql_safe_restore_preserves_security_words_in_view_names_and_body_literals() {
+    let Some(base) = endpoint("mysql") else { return };
+    let mut admin = LiveAdapter::connect(&base).unwrap();
+    let name = unique();
+    admin.execute_sql(&format!("CREATE DATABASE {name}")).unwrap();
+    let mut source = base.clone(); source.database = name.clone();
+    let mut db = LiveAdapter::connect(&source).unwrap();
+    db.execute_sql("CREATE TABLE items(id INT PRIMARY KEY)").unwrap();
+    db.execute_sql("INSERT INTO items VALUES(1)").unwrap();
+    db.execute_sql("CREATE VIEW `SQL SECURITY DEFINER` AS SELECT 'SQL SECURITY DEFINER' AS policy_text, 'definer=body_value' AS owner_text FROM items").unwrap();
+    db.execute_sql("CREATE VIEW legacy_view AS SELECT 'SQL SECURITY DEFINER' AS policy_text, 'definer=body_value' AS owner_text FROM items").unwrap();
+    let output = std::env::temp_dir().join(unique());
+    assert!(!run("dump.run", json!({"source":source,"output_dir":output,"data_format":"jsonl","threads":1,"mysql_snapshot_mode":"single_connection"})).iter().any(|event|event["event"]=="error"));
+    let path = output.join("_tunnelforge_dump.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let legacy = manifest["views"].as_array_mut().unwrap().iter_mut().find(|view|view["name"]=="legacy_view").unwrap();
+    legacy["definition"] = json!("CREATE VIEW legacy_view AS SELECT 'SQL SECURITY DEFINER' AS policy_text, 'definer=body_value' AS owner_text FROM items");
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let events = run("dump.import", json!({"target":source,"input_dir":output,"mode":"safe"}));
+    let result = events.iter().find(|event|event["event"]=="result").unwrap();
+    assert_eq!(result["success"],true,"{result:?}");
+    let mut candidate = source.clone();
+    candidate.database = result["candidate_target"]["database"].as_str().unwrap().into();
+    candidate.schema = Some(candidate.database.clone());
+    assert!(candidate.database.starts_with("tf_restore_") && candidate.database != source.database);
+    for view in ["SQL SECURITY DEFINER", "legacy_view"] {
+        let rows=run("query.execute",json!({"connection":candidate,"sql":format!("SELECT policy_text,owner_text FROM `{view}`")}));
+        assert!(rows.iter().any(|event|event["rows"]==json!([{"policy_text":"SQL SECURITY DEFINER","owner_text":"definer=body_value"}])));
+    }
+    admin.execute_sql(&format!("DROP DATABASE {}",candidate.database)).unwrap();
+    admin.execute_sql(&format!("DROP DATABASE {name}")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+}
