@@ -237,19 +237,11 @@ class MySQLConnector:
                 return cached
 
         try:
-            with self.connection.cursor() as cursor:
-                if schema:
-                    cursor.execute(f"SHOW TABLES FROM `{schema}`")
-                else:
-                    cursor.execute("SHOW TABLES")
-
-                result = [list(row.values())[0] for row in cursor.fetchall()]
-
-                # 캐시에 저장
-                if use_cache and self._cache:
-                    self._cache.set(cache_key, result)
-
-                return result
+            # Rust inventory lists base tables; views are exported separately.
+            result = self._delegate.get_tables(target_schema or None, use_cache=False)
+            if use_cache and self._cache:
+                self._cache.set(cache_key, result)
+            return result
         except Exception as e:
             logger.error(f"테이블 조회 오류: {e}")
             return []

@@ -1,4 +1,4 @@
-use migration_core::{handle_request, Endpoint, Request};
+use migration_core::{handle_request, Endpoint, Request, LiveAdapter, MigrationAdapter};
 use mysql::prelude::Queryable;
 use serde_json::{json, Value};
 use std::env;
@@ -68,10 +68,64 @@ fn postgres_client(endpoint: &Endpoint) -> postgres::Client {
 }
 
 fn result_payload(events: Vec<Value>) -> Value {
+    assert!(!events.iter().any(|event| event["event"] == "error"), "{events:#?}");
     events
         .into_iter()
         .find(|event| event.get("event") == Some(&json!("result")))
         .unwrap_or_else(|| panic!("missing result event"))
+}
+
+#[test]
+fn same_engine_selected_dump_restores_values_in_all_formats_when_env_is_configured() {
+    let _guard = live_db_test_guard();
+    let Some((mysql, postgres)) = test_endpoints() else {
+        eprintln!("skipping dump matrix: TF_MYSQL_* and TF_POSTGRES_* are not configured");
+        return;
+    };
+    for endpoint in [mysql, postgres] {
+        let mut adapter = LiveAdapter::connect(&endpoint).unwrap();
+        let table = unique_table("tf_dump_values");
+        let untouched = unique_table("tf_dump_untouched");
+        let (text_type, binary_type, binary, timestamp_type) = if endpoint.engine == "mysql" {
+            ("VARCHAR(100)", "BLOB", "X'00ff5c09'", "DATETIME(6)")
+        } else {
+            ("TEXT", "BYTEA", "decode('00ff5c09', 'hex')", "TIMESTAMP(6)")
+        };
+        adapter.execute_sql(&format!("CREATE TABLE {table} (id INTEGER PRIMARY KEY, label {text_type}, amount DECIMAL(30,10), body {binary_type}, stamp {timestamp_type} DEFAULT CURRENT_TIMESTAMP(6))")).unwrap();
+        adapter.execute_sql(&format!("CREATE INDEX {table}_label ON {table} (label)")).unwrap();
+        adapter.execute_sql(&format!("INSERT INTO {table} VALUES (1, '한글 😀', 12345678901234567890.1234567890, {binary}, '2026-09-28 01:02:03.123456'), (2, '', NULL, NULL, NULL), (3, NULL, -0.0000000001, {binary}, '2000-01-01 00:00:00.000001')")).unwrap();
+        adapter.execute_sql(&format!("CREATE TABLE {untouched} (id INTEGER PRIMARY KEY, note {text_type})")).unwrap();
+        adapter.execute_sql(&format!("CREATE INDEX {untouched}_note ON {untouched} (note)")).unwrap();
+        adapter.execute_sql(&format!("INSERT INTO {untouched} VALUES (7, 'keep')")).unwrap();
+        let amount_text = if endpoint.engine == "mysql" { "CAST(amount AS CHAR)" } else { "amount::text" };
+        let query = || result_payload(handle_request(Request {
+            command: "query.execute".into(), request_id: None,
+            payload: json!({"connection": endpoint_json(&endpoint), "sql": format!("SELECT id, label, {amount_text} AS amount, body, stamp FROM {table} ORDER BY id")}),
+        }))["rows"].clone();
+        let expected = query();
+        assert_eq!(expected[0]["amount"], "12345678901234567890.1234567890");
+        for format in ["jsonl", "tsv"] {
+            for compression in ["none", "zstd"] {
+                let dir = std::env::temp_dir().join(unique_table("tf_dump_matrix"));
+                let exported = result_payload(handle_request(Request {
+                    command: "dump.run".into(), request_id: None,
+                    payload: json!({"source": endpoint_json(&endpoint), "tables": [table, untouched], "output_dir": dir, "threads": 2, "chunk_size": 1, "data_format": format, "compression": compression}),
+                }));
+                assert_eq!(exported["success"], true);
+                adapter.execute_sql(&format!("UPDATE {table} SET label='changed'")).unwrap();
+                let imported = result_payload(handle_request(Request {
+                    command: "dump.import".into(), request_id: None,
+                    payload: json!({"target": endpoint_json(&endpoint), "tables": [table], "input_dir": dir, "mode": "replace", "threads": 1}),
+                }));
+                assert_eq!(imported["success"], true);
+                assert_eq!(query(), expected, "{} {format} {compression}", endpoint.engine);
+                assert_eq!(adapter.row_count(&untouched).unwrap(), 1);
+                std::fs::remove_dir_all(dir).unwrap();
+            }
+        }
+        adapter.execute_sql(&format!("DROP TABLE {table}")).unwrap();
+        adapter.execute_sql(&format!("DROP TABLE {untouched}")).unwrap();
+    }
 }
 
 fn endpoint_json(endpoint: &Endpoint) -> Value {

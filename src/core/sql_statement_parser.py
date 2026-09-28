@@ -11,14 +11,14 @@ class SqlStatement:
     boundary_end: int
 
 
-def parse_sql_statements(sql_text: str) -> list[str]:
+def parse_sql_statements(sql_text: str, dialect: str = "mysql") -> list[str]:
     """Split SQL text into statements while preserving SQL-internal semicolons."""
-    return [statement.text for statement in parse_sql_statement_ranges(sql_text)]
+    return [statement.text for statement in parse_sql_statement_ranges(sql_text, dialect)]
 
 
-def find_sql_statement_at_position(sql_text: str, cursor_pos: int) -> str:
+def find_sql_statement_at_position(sql_text: str, cursor_pos: int, dialect: str = "mysql") -> str:
     """Return the parsed SQL statement containing or nearest to cursor_pos."""
-    statements = parse_sql_statement_ranges(sql_text)
+    statements = parse_sql_statement_ranges(sql_text, dialect)
     if not statements:
         return (sql_text or "").strip()
 
@@ -32,11 +32,16 @@ def find_sql_statement_at_position(sql_text: str, cursor_pos: int) -> str:
     return statements[-1].text
 
 
-def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
-    """Split SQL text and keep source ranges for cursor-based statement lookup."""
+def parse_sql_statement_ranges(sql_text: str, dialect: str = "mysql") -> list[SqlStatement]:
+    """Split SQL and retain source ranges using the engine's default string rules.
+
+    PostgreSQL assumes standard_conforming_strings=on; MySQL assumes default
+    SQL mode. Session changes to those lexical modes are not interpreted here.
+    """
     if not sql_text or not sql_text.strip():
         return []
 
+    postgresql = dialect.lower() in ("postgresql", "postgres")
     statements: list[SqlStatement] = []
     current: list[str] = []
     current_start: Optional[int] = None
@@ -44,7 +49,8 @@ def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
     quote = None
     dollar_quote = None
     line_comment = False
-    block_comment = False
+    block_comment = 0
+    backslash_escapes = False
     escape_next = False
     i = 0
 
@@ -72,7 +78,7 @@ def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
 
         if not any([quote, dollar_quote, line_comment, block_comment]):
             line_start = i == 0 or sql_text[i - 1] == "\n"
-            if line_start:
+            if line_start and not postgresql:
                 line_end = sql_text.find("\n", i)
                 if line_end == -1:
                     line_end = len(sql_text)
@@ -88,7 +94,7 @@ def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
             continue
 
         if block_comment:
-            i, block_comment = _consume_block_comment(sql_text, i, append_text)
+            i, block_comment = _consume_block_comment(sql_text, i, append_text, block_comment, postgresql)
             continue
 
         if dollar_quote:
@@ -96,7 +102,9 @@ def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
             continue
 
         if quote:
-            i, quote, escape_next = _consume_quoted_string(sql_text, i, quote, escape_next, append_text)
+            i, quote, escape_next = _consume_quoted_string(
+                sql_text, i, quote, escape_next, append_text, backslash_escapes
+            )
             continue
 
         if delimiter != ";" and delimiter and sql_text.startswith(delimiter, i):
@@ -112,26 +120,33 @@ def parse_sql_statement_ranges(sql_text: str) -> list[SqlStatement]:
                 i += len(marker)
                 continue
 
-        if char in ("'", '"', "`"):
+        if char in (("'", '"') if postgresql else ("'", '"', "`")):
             quote = char
+            backslash_escapes = (not postgresql and char != "`") or (
+                postgresql and char == "'" and i > 0 and sql_text[i - 1] in "eE"
+                and (i < 2 or not _is_identifier_char(sql_text[i - 2]))
+            )
             append_text(char, i)
             i += 1
             continue
 
-        if char == "-" and next_char == "-":
+        if char == "-" and next_char == "-" and (
+            postgresql or i + 2 == len(sql_text) or sql_text[i + 2].isspace()
+            or ord(sql_text[i + 2]) < 32
+        ):
             line_comment = True
             append_text(char + next_char, i)
             i += 2
             continue
 
-        if char == "#":
+        if char == "#" and not postgresql:
             line_comment = True
             append_text(char, i)
             i += 1
             continue
 
         if char == "/" and next_char == "*":
-            block_comment = True
+            block_comment = 1
             append_text(char + next_char, i)
             i += 2
             continue
@@ -160,15 +175,20 @@ def _consume_line_comment(sql_text: str, i: int, append_text: AppendText) -> Tup
     return i + 1, True
 
 
-def _consume_block_comment(sql_text: str, i: int, append_text: AppendText) -> Tuple[int, bool]:
-    """블록 주석(`/* ... */`) 내부 문자를 소비. Returns (다음 커서 위치, 주석 지속 여부)."""
+def _consume_block_comment(
+    sql_text: str, i: int, append_text: AppendText, depth: int, nested: bool
+) -> Tuple[int, int]:
+    """Consume block comment text and return the next position and nesting depth."""
     char = sql_text[i]
     next_char = sql_text[i + 1] if i + 1 < len(sql_text) else ""
     append_text(char, i)
     if char == "*" and next_char == "/":
         append_text(next_char, i + 1)
-        return i + 2, False
-    return i + 1, True
+        return i + 2, depth - 1
+    if nested and char == "/" and next_char == "*":
+        append_text(next_char, i + 1)
+        return i + 2, depth + 1
+    return i + 1, depth
 
 
 def _consume_dollar_quote(
@@ -184,7 +204,8 @@ def _consume_dollar_quote(
 
 
 def _consume_quoted_string(
-    sql_text: str, i: int, quote: str, escape_next: bool, append_text: AppendText
+    sql_text: str, i: int, quote: str, escape_next: bool, append_text: AppendText,
+    backslash_escapes: bool,
 ) -> Tuple[int, Optional[str], bool]:
     """따옴표(`'`/`"`/backtick) 문자열 내부 문자를 소비.
 
@@ -194,11 +215,18 @@ def _consume_quoted_string(
     append_text(char, i)
     if escape_next:
         return i + 1, quote, False
-    if char == "\\":
+    if char == "\\" and backslash_escapes:
         return i + 1, quote, True
     if char == quote:
+        if i + 1 < len(sql_text) and sql_text[i + 1] == quote:
+            append_text(quote, i + 1)
+            return i + 2, quote, False
         return i + 1, None, False
     return i + 1, quote, False
+
+
+def _is_identifier_char(char: str) -> bool:
+    return char.isalnum() or char in "_$" or ord(char) >= 128
 
 
 def read_dollar_quote(sql_text: str, start: int) -> str:
@@ -206,6 +234,8 @@ def read_dollar_quote(sql_text: str, start: int) -> str:
     if start < 0 or start >= len(sql_text):
         return ""
     if sql_text[start] != "$":
+        return ""
+    if start > 0 and _is_identifier_char(sql_text[start - 1]):
         return ""
     end = sql_text.find("$", start + 1)
     if end == -1:

@@ -2,6 +2,7 @@ import io
 import json
 import threading
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -23,6 +24,67 @@ from src.core.sql_query_classifier import (
     is_mysql_implicit_commit_ddl,
     statement_returns_rows,
 )
+
+
+def test_cursor_fetches_advance_and_new_execution_resets_position():
+    facade = Mock()
+    facade.execute_on_connection_result.return_value = {
+        "columns": ["id"], "rows": [{"id": 1}, {"id": 2}],
+    }
+    connection = RustDbConnection(DbEndpoint("mysql", "localhost", 3306, "u", "p", "app"), facade, "c")
+    cursor = connection.cursor()
+    cursor.execute("SELECT id FROM items")
+    assert cursor.fetchone() == {"id": 1}
+    assert cursor.fetchall() == [{"id": 2}]
+    assert cursor.fetchone() is None
+    assert cursor.fetchall() == []
+    assert cursor.rowcount == 2
+    cursor.execute("SELECT id FROM items")
+    assert cursor.fetchone() == {"id": 1}
+
+
+def test_failed_execute_clears_previous_result():
+    facade = Mock()
+    facade.execute_on_connection_result.side_effect = [
+        {"columns": ["id"], "rows": [{"id": 1}]}, DbCoreServiceError("bad SQL"),
+    ]
+    connection = RustDbConnection(DbEndpoint("mysql", "localhost", 3306, "u", "p", "app"), facade, "c")
+    cursor = connection.cursor()
+    cursor.execute("SELECT id FROM items")
+    with pytest.raises(DbCoreServiceError, match="bad SQL"):
+        cursor.execute("broken SQL")
+    assert cursor.fetchall() == []
+    assert cursor.description is None
+    assert cursor.rowcount == -1
+
+
+def test_closed_connection_does_not_dispatch_cursor_query():
+    facade = Mock()
+    facade.execute_on_connection_result.return_value = {}
+    connection = RustDbConnection(DbEndpoint("mysql", "localhost", 3306, "u", "p", "app"), facade, "c")
+    cursor = connection.cursor()
+    connection.close()
+    with pytest.raises(DbCoreServiceError, match="closed"):
+        cursor.execute("DELETE FROM items")
+    facade.execute_on_connection_result.assert_not_called()
+
+
+def test_failed_database_selection_preserves_endpoint():
+    facade = Mock()
+    facade.execute_on_connection.side_effect = DbCoreServiceError("access denied")
+    endpoint = DbEndpoint("mysql", "localhost", 3306, "u", "p", "original")
+    connection = RustDbConnection(endpoint, facade, "c")
+    with pytest.raises(DbCoreServiceError, match="access denied"):
+        connection.select_db("other")
+    assert connection.endpoint == endpoint
+
+
+def test_postgres_database_switch_is_explicitly_rejected():
+    endpoint = DbEndpoint("postgresql", "localhost", 5432, "u", "p", "original")
+    connection = RustDbConnection(endpoint, Mock(), "c")
+    with pytest.raises(DbCoreServiceError, match="reconnect"):
+        connection.select_db("other")
+    assert connection.endpoint == endpoint
 
 
 class FakeProcess:

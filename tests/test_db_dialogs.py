@@ -84,7 +84,7 @@ def test_preselected_export_tunnel_uses_postgres_connector_for_postgresql(monkey
         preselected_tunnel={
             "id": "pg-tunnel",
             "name": "PostgreSQL 터널",
-            "db_engine": "postgresql",
+            "db_engine": "postgres",
             "default_database": "postgres",
             "default_schema": "public",
         },

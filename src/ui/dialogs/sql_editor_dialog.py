@@ -950,7 +950,7 @@ class SQLEditorDialog(QDialog):
         if not full_text.strip():
             return ""
 
-        return find_sql_statement_at_position(full_text, cursor_pos)
+        return find_sql_statement_at_position(full_text, cursor_pos, self._db_engine())
 
     def _execute_sql(self, sql_text, single_query=False):
         """SQL 실행 (내부 메서드) — 트랜잭션 모드는 QThread 워커로 순차 실행한다."""
@@ -1411,7 +1411,7 @@ class SQLEditorDialog(QDialog):
 
     def _split_queries(self, sql_text):
         """SQL 텍스트를 개별 쿼리로 분리."""
-        return parse_sql_statements(sql_text)
+        return parse_sql_statements(sql_text, self._db_engine())
 
     def _get_limit_value(self):
         """LIMIT 설정값 반환 (None이면 제한 없음)"""

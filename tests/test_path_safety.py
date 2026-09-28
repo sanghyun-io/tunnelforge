@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from src.core.path_safety import safe_output_dir
@@ -20,7 +21,7 @@ def test_safe_output_dir_replaces_unsafe_filename_characters(tmp_path):
 def test_safe_output_dir_expands_user_base_and_returns_string(monkeypatch, tmp_path):
     home = tmp_path / "home"
     home.mkdir()
-    monkeypatch.setenv("USERPROFILE", str(home))
+    monkeypatch.setenv("USERPROFILE" if os.name == "nt" else "HOME", str(home))
 
     output = Path(safe_output_dir("~", "dump")).resolve()
 

@@ -208,7 +208,9 @@ END//
 DELIMITER ;
 SELECT 1;"""
 
-    assert SQLEditorDialog._split_queries(None, sql) == [
+    dialog = MagicMock()
+    dialog._db_engine.return_value = "mysql"
+    assert SQLEditorDialog._split_queries(dialog, sql) == [
         "-- comment; ignored\nSELECT 'a;b'",
         "CREATE FUNCTION f() RETURNS void AS $body$\n"
         "BEGIN\n"
@@ -217,6 +219,14 @@ SELECT 1;"""
         "$body$ LANGUAGE plpgsql",
         "CREATE PROCEDURE p()\nBEGIN\n    SELECT 'c;d';\nEND",
         "SELECT 1",
+    ]
+
+
+def test_split_queries_uses_editor_postgresql_dialect():
+    dialog = MagicMock()
+    dialog._db_engine.return_value = "postgresql"
+    assert SQLEditorDialog._split_queries(dialog, "SELECT 5 # 3; SELECT 2;") == [
+        "SELECT 5 # 3", "SELECT 2",
     ]
 
 

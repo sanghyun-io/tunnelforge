@@ -1,3 +1,5 @@
+> Superseded behavior (2026-09-28): `parallel_no_backup_lock` remains an accepted API value, but now uses one worker and one transaction to preserve consistency across tables and chunks. It emits `mysql_single_connection_consistent_snapshot`. Independent worker snapshots cannot guarantee a consistent export. The historical parallel design below is not the current execution contract.
+
 # MySQL Parallel Export Without BACKUP_ADMIN Design
 
 ## Goal

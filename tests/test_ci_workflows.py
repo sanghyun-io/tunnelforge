@@ -1,6 +1,13 @@
 import re
+import json
+import os
+import runpy
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -59,7 +66,9 @@ def test_pr_head_regression_jobs_use_read_only_checkout_without_credentials():
     jobs = load_version_gate()["jobs"]
     expected_pr_head_jobs = {
         "rust-core-regression-gate": {"contents": "read"},
+        "dump-roundtrip-regression": {"contents": "read"},
         "python-regression": {"contents": "read"},
+        "python-linux-regression": {"contents": "read"},
         "macos-app-validation": {"contents": "read"},
     }
     pr_head_jobs = {}
@@ -377,7 +386,9 @@ def test_required_version_gate_is_terminal_and_aggregates_all_results():
     expected_needs = [
         "macos-support-tracking-gate",
         "rust-core-regression-gate",
+        "dump-roundtrip-regression",
         "python-regression",
+        "python-linux-regression",
         "macos-app-validation",
         "version-validation",
         "version-bump",
@@ -434,3 +445,132 @@ def test_python_regression_runs_full_suite_with_built_core():
     assert "pyinstaller bootstrapper/bootstrapper.spec" in job_text
     assert "dist\\TunnelForge-WebSetup.exe --self-check" in job_text
     assert "TUNNELFORGE_WEBSETUP_SELF_CHECK_OK" in job_text
+
+
+def test_linux_regression_builds_and_launches_main_app_after_full_suite():
+    job = load_version_gate()['jobs']['python-linux-regression']
+    assert job['runs-on'] == 'ubuntu-24.04'
+    assert job['env']['QT_QPA_PLATFORM'] == 'offscreen'
+    commands = '\n'.join(step.get('run', '') for step in job['steps'])
+    required = [
+        'cargo build --manifest-path migration_core/Cargo.toml --release',
+        'pytest -q',
+        'python -m PyInstaller tunnel-manager.spec',
+        'python scripts/verify-frozen-app.py dist/TunnelForge/TunnelForge',
+    ]
+    positions = [commands.index(command) for command in required]
+    assert positions == sorted(positions)
+
+
+@pytest.mark.parametrize('result_key', ['LINUX_PYTHON_RESULT', 'DUMP_ROUNDTRIP_RESULT'])
+@pytest.mark.parametrize('job_result', ['success', 'failure', 'skipped', 'cancelled'])
+def test_terminal_gate_requires_live_and_linux_success(result_key, job_result):
+    bash = shutil.which('bash')
+    if not bash:
+        pytest.skip('bash unavailable')
+    step = load_version_gate()['jobs']['version-gate']['steps'][0]
+    env = dict(os.environ)
+    env.update({key: 'success' for key in step['env']})
+    env.update(BUMP_TYPE='', VERSION_BUMP_RESULT='skipped')
+    env[result_key] = job_result
+    result = subprocess.run([bash], input=step['run'], text=True, capture_output=True, env=env, timeout=10)
+    assert (result.returncode == 0) == (job_result == 'success'), result.stderr
+
+
+def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
+    job = load_version_gate()['jobs']['dump-roundtrip-regression']
+    assert job['runs-on'] == 'ubuntu-24.04'
+    assert job['timeout-minutes'] == 15
+    for service, image, port in [('mysql', 'mysql:8.4', 3306), ('postgres', 'postgres:18.4', 5432)]:
+        container = job['services'][service]
+        assert container['image'] == image
+        assert container['ports'] == [f'{port}:{port}']
+        assert '--health-cmd' in container['options']
+        prefix = 'TF_MYSQL' if service == 'mysql' else 'TF_POSTGRES'
+        assert job['env'][f'{prefix}_HOST'] == '127.0.0.1'
+        assert job['env'][f'{prefix}_DATABASE'] == 'tf_test'
+        assert job['env'][f'{prefix}_PASSWORD'] == 'tf_local_test'
+        assert job['env'][f'{prefix}_USER'] == ('root' if service == 'mysql' else 'postgres')
+    assert job['services']['mysql']['env']['MYSQL_ROOT_HOST'] == '%'
+    assert job['services']['mysql']['env']['MYSQL_DATABASE'] == 'tf_test'
+    assert job['env']['TF_PROMOTE_MYSQL_HOST'] == job['env']['TF_MYSQL_HOST']
+    assert job['services']['postgres']['env']['POSTGRES_DB'] == 'tf_test'
+    commands = '\n'.join(step.get('run', '') for step in job['steps'])
+    fixtures = ['live_roundtrip', 'live_dump_cross_engine', 'live_schema_fidelity',
+                'live_import_policy', 'live_foreign_key_actions', 'live_export_contract',
+                'live_safe_restore']
+    assert re.findall(r'--test ([a-z_]+)', commands) == fixtures
+    assert 'cargo test --manifest-path migration_core/Cargo.toml' in commands
+    assert '--include-ignored --test-threads=1' in commands
+    assert '--lib safe_promote_ -- --test-threads=1' in commands
+    assert '--lib import::safe_restore_digest:: -- --include-ignored --test-threads=1' in commands
+
+
+@pytest.mark.parametrize('workflow_path, job_name', [
+    (VERSION_GATE_PATH, 'python-regression'),
+    (RELEASE_PATH, 'build-windows-installer'),
+])
+def test_windows_main_app_is_built_and_smoked_before_artifact_upload(workflow_path, job_name):
+    steps = load_workflow(workflow_path)['jobs'][job_name]['steps']
+    build_index = next(i for i, step in enumerate(steps) if 'python -m PyInstaller tunnel-manager.spec' in step.get('run', ''))
+    smoke_index = next(i for i, step in enumerate(steps) if 'python scripts/verify-frozen-app.py dist/TunnelForge/TunnelForge.exe' in step.get('run', ''))
+    assert build_index < smoke_index
+    for index, step in enumerate(steps):
+        if step.get('uses', '').startswith('actions/upload-artifact@'):
+            assert smoke_index < index
+
+
+@pytest.fixture
+def smoke_runner():
+    return runpy.run_path(str(PROJECT_ROOT / 'scripts' / 'verify-frozen-app.py'))['verify_frozen_app']
+
+
+@pytest.fixture
+def smoke_response():
+    return {'success': True, 'window_title': 'TunnelForge', 'self_check': {
+        'success': True, 'icon_exists': True, 'core_exists': True,
+        'core_hello': {'success': True, 'event': 'result', 'request_id': 'self-check', 'service': 'tunnelforge-core'},
+    }}
+
+
+def write_smoke_app(tmp_path, response, file_output=False, exit_code=0):
+    app = tmp_path / 'app.py'
+    app.write_text(
+        "import json, os, pathlib, sys\n"
+        "assert sys.argv[1:] == ['--ui-smoke-check']\n"
+        "assert os.environ['QT_QPA_PLATFORM'] == 'offscreen'\n"
+        f"payload = {json.dumps(response)!r}\n"
+        + ("pathlib.Path(os.environ['TUNNELFORGE_CLI_OUTPUT']).write_text(payload, encoding='utf-8')\n" if file_output else "print(payload)\n")
+        + f"sys.exit({exit_code})\n", encoding='utf-8',
+    )
+    return [sys.executable, str(app)]
+
+
+@pytest.mark.parametrize('file_output', [False, True])
+def test_frozen_smoke_executes_app_and_accepts_console_or_file_json(smoke_runner, smoke_response, tmp_path, file_output):
+    command = write_smoke_app(tmp_path, smoke_response, file_output)
+    assert smoke_runner(command, timeout=5) == smoke_response
+
+
+@pytest.mark.parametrize('field', ['success', 'window_title', 'icon_exists', 'core_exists', 'core_hello'])
+def test_frozen_smoke_rejects_broken_ui_or_core(smoke_runner, smoke_response, tmp_path, field):
+    if field in ('success', 'window_title'):
+        smoke_response[field] = False
+    else:
+        smoke_response['self_check'][field] = False
+    command = write_smoke_app(tmp_path, smoke_response, file_output=True)
+    with pytest.raises((ValueError, TypeError)):
+        smoke_runner(command, timeout=5)
+
+
+def test_frozen_smoke_rejects_nonzero_exit_with_success_payload(smoke_runner, smoke_response, tmp_path):
+    command = write_smoke_app(tmp_path, smoke_response, exit_code=3)
+    with pytest.raises(subprocess.CalledProcessError):
+        smoke_runner(command, timeout=5)
+
+
+def test_frozen_smoke_times_out_a_hung_app(smoke_runner, tmp_path):
+    app = tmp_path / 'hung.py'
+    app.write_text('import time\ntime.sleep(10)\n', encoding='utf-8')
+    with pytest.raises(subprocess.TimeoutExpired):
+        smoke_runner([sys.executable, str(app)], timeout=0.2)

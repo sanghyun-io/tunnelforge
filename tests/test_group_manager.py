@@ -4,6 +4,7 @@ TunnelGroupManager 테스트
 import pytest
 import os
 import importlib
+from pathlib import Path
 from unittest.mock import patch
 
 # 실제 패키지로 import해둔다. 각 테스트는 patch.dict(os.environ, ...)를 적용한
@@ -26,13 +27,16 @@ class TestTunnelGroupManager:
         self.test_dir = tmp_path / 'TunnelForge'
         self.test_dir.mkdir()
 
+        # XDG_CONFIG_HOME takes precedence over HOME on hosted Linux runners.
         self.env_patch = patch.dict(
             os.environ,
-            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path)}
+            {'LOCALAPPDATA': str(tmp_path), 'HOME': str(tmp_path),
+             'XDG_CONFIG_HOME': str(tmp_path / '.config')}
         )
         self.env_patch.start()
 
         config_module = _load_config_manager_module()
+        assert Path(config_module.APP_DIR).is_relative_to(tmp_path)
         self.config_module = config_module
         self.config_mgr = config_module.ConfigManager()
         self.group_mgr = self.config_mgr.group_manager

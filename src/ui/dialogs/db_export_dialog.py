@@ -1099,16 +1099,14 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         message_box = QMessageBox(self)
         message_box.setIcon(QMessageBox.Icon.Warning)
         message_box.setWindowTitle("병렬 Export 권한 필요")
-        # lock-free 병렬 모드는 글로벌 락(FTWRL)도 백업 락(LOCK INSTANCE FOR BACKUP)도
-        # 쓰지 않으므로, 어떤 락 권한이 거부됐든(FLUSH_TABLES_OR_RELOAD 또는 BACKUP_ADMIN)
-        # 병렬 처리를 유지한 채 우회할 수 있다. RDS처럼 FTWRL이 막힌 환경이 여기 해당한다.
-        can_keep_parallel = denied_privilege is not None
-        if can_keep_parallel:
+        # 락 없는 모드는 테이블 간 일관성을 위해 단일 워커를 사용한다.
+        # 기존 API 모드와 버튼 식별자는 호환성을 위해 유지한다.
+        can_use_lock_free = denied_privilege is not None
+        if can_use_lock_free:
             message_box.setText(
                 "병렬 Export에 필요한 락 권한이 없습니다.\n\n"
-                "락 없이 각 워커가 독립 스냅샷으로 병렬 Export할 수 있습니다. 속도는 유지되며, "
-                "워커 간 스냅샷 시점이 미세하게 달라질 수 있어 덤프 후 스키마 변경(DDL) 여부를 "
-                "검사해 무결성을 확인합니다."
+                "테이블 간 데이터 일관성을 위해 락 없이 단일 연결·단일 워커로 Export합니다. "
+                "병렬 처리보다 느릴 수 있으며, 덤프 후 스키마 변경(DDL) 여부를 검사합니다."
             )
         else:
             message_box.setText(
@@ -1118,9 +1116,9 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             )
 
         parallel_button = None
-        if can_keep_parallel:
+        if can_use_lock_free:
             parallel_button = message_box.addButton(
-                translate_text("병렬로 계속 (락 없이)"),
+                translate_text("락 없이 계속 (단일 워커)"),
                 QMessageBox.ButtonRole.AcceptRole,
             )
             parallel_button.setObjectName("mysql_parallel_no_backup_lock_continue")
@@ -1185,11 +1183,11 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _retry_with_parallel_no_backup_lock(self) -> None:
         self._mysql_no_backup_lock_fallback = True
         self._add_log(
-            "락 권한 없음: 락 없이 각 워커 독립 스냅샷으로 병렬 재시도합니다."
+            "락 권한 없음: 데이터 일관성을 위해 락 없는 단일 워커로 다시 시도합니다."
         )
         self.set_ui_enabled(False)
         self.collapse_config_section()
-        self.label_status.setText("락 없는 병렬 스냅샷으로 다시 시도 중...")
+        self.label_status.setText("락 없는 단일 연결 스냅샷으로 다시 시도 중...")
         worker = self._build_worker(
             self.export_schema,
             self.input_output_dir.text(),

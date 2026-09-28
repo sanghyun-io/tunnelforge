@@ -9,6 +9,9 @@ mod migrate;
 mod compare;
 mod dump_format;
 mod ddl;
+mod safe_promote_mysql;
+mod safe_promote_postgres;
+mod safe_promotion;
 
 pub use adapters::*;
 pub use protocol::*;

@@ -9,6 +9,21 @@ from unittest.mock import patch, MagicMock
 class TestRustDumpChecker:
     """RustDumpChecker 클래스 테스트"""
 
+    def test_export_surfaces_manifest_warnings(self, tmp_path):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        facade = MagicMock()
+        facade.run_dump.return_value = {
+            "success": True, "tables": 1, "rows_dumped": 1,
+            "manifest_warnings": ["Object not exported: trigger:audit"],
+        }
+        progress = []
+        exporter = RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+        success, message = exporter.export_full_schema("app", str(tmp_path), progress_callback=progress.append)
+        assert success
+        assert any("Object not exported: trigger:audit" in line for line in progress)
+        assert "Object not exported: trigger:audit" in message
+
     def test_check_installation_success(self):
         """Rust DB Core 확인 성공 테스트"""
         from src.exporters.rust_dump_exporter import RustDumpChecker
@@ -523,7 +538,8 @@ class TestRustDumpExporter:
 
         assert success is True
         assert facade.payload["source"]["engine"] == "postgresql"
-        assert facade.payload["source"]["database"] == "public"
+        assert facade.payload["source"]["database"] == "postgres"
+        assert facade.payload["source"]["schema"] == "public"
 
     def test_exporter_default_uses_dedicated_facade_and_shuts_it_down(self, tmp_path, monkeypatch):
         """기본 Exporter는 공유 facade 대신 전용 DbCoreFacade를 생성하고, 사용 후 종료한다"""
@@ -809,11 +825,12 @@ class TestRustDumpImporter:
         )
         importer = RustDumpImporter(config, facade=facade)
 
-        success, _msg, _results = importer.import_dump(str(dump_dir), import_mode='replace')
+        success, _msg, _results = importer.import_dump(str(dump_dir), target_schema='public', import_mode='replace')
 
         assert success is True
         assert facade.payload["target"]["engine"] == "postgresql"
-        assert facade.payload["target"]["database"] == "public"
+        assert facade.payload["target"]["database"] == "postgres"
+        assert facade.payload["target"]["schema"] == "public"
 
     def test_import_dump_forwards_timezone_and_strict_manifest(self, tmp_path):
         """Import 의도(timezone/strict manifest)가 Rust payload로 전달된다"""
@@ -928,14 +945,14 @@ class TestRustDumpImporter:
         assert success is False
         assert results["users"]["status"] == "done"
         assert results["orders"]["status"] == "error"
-        assert results["products"]["status"] == "error"
+        assert results["products"]["status"] == "blocked"
         assert "connection lost during import" in results["orders"]["message"]
-        assert "connection lost during import" in results["products"]["message"]
+        assert "not started" in results["products"]["message"]
         assert "connection lost during import" in msg
 
         error_events = {(table, status) for table, status, _ in status_events if status == "error"}
         assert ("orders", "error") in error_events
-        assert ("products", "error") in error_events
+        assert ("products", "error") not in error_events
 
     def test_import_dump_keeps_tables_pending_for_operation_preflight_error(self, tmp_path):
         """대상 전체 사전검사 실패를 덤프의 모든 테이블 실패로 부풀리지 않는다."""
@@ -1013,7 +1030,7 @@ class TestRustDumpImporter:
 
         success, msg, _results = importer.import_dump(str(dump_dir), import_mode='replace')
 
-        assert success is True
+        assert success is False
         assert "View 2개" in msg
         assert "broken_view" in msg
         assert "생성 실패" in msg

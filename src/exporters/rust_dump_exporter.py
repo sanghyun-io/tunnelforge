@@ -34,7 +34,7 @@ MYSQL_SNAPSHOT_MODES = frozenset(
 )
 # FTWRL(글로벌 read lock) 단계에서 거부되면 병렬 스냅샷 자체가 불가능하고,
 # BACKUP_ADMIN(LOCK INSTANCE FOR BACKUP) 단계에서만 거부되면 백업 락을 생략한
-# 병렬 스냅샷(parallel_no_backup_lock)으로 우회할 수 있다.
+# 단일 연결 스냅샷(parallel_no_backup_lock 호환 모드)으로 우회할 수 있다.
 MYSQL_PRIVILEGE_BACKUP_ADMIN = "BACKUP_ADMIN"
 MYSQL_PRIVILEGE_FLUSH_OR_RELOAD = "FLUSH_TABLES_OR_RELOAD"
 
@@ -63,6 +63,24 @@ def mysql_parallel_snapshot_denied_privilege(message: object) -> Optional[str]:
 
 
 DEFAULT_DUMP_THREADS = 8
+
+
+def dump_original_namespace(manifest: dict, target_engine: str) -> str:
+    """Return an unambiguous same-engine namespace; empty requires user selection."""
+    source_engine = normalize_db_engine(manifest.get("source_engine") or target_engine)
+    if source_engine != target_engine:
+        return ""
+    if source_engine == "postgresql":
+        return str(manifest.get("source_schema") or "")
+    return str(manifest.get("database") or "")
+
+
+def restore_target_connection_info(value: object) -> dict:
+    """Credential-free endpoint fields for the operator's local handoff."""
+    if not isinstance(value, dict):
+        return {}
+    return {key: value[key] for key in ("engine", "host", "port", "database", "schema")
+            if isinstance(value.get(key), (str, int))}
 
 
 def _safe_dump_child_dir(dump_dir: str, table_path: str) -> Optional[Path]:
@@ -113,6 +131,7 @@ class RustDumpConfig:
     password: str
     schema: str = ""
     engine: str = "mysql"
+    database: str = ""
 
     def __post_init__(self) -> None:
         self.engine = normalize_db_engine(self.engine, self.port)
@@ -129,6 +148,7 @@ def build_rust_dump_config(connector) -> RustDumpConfig:
         user=connector.user if hasattr(connector, 'user') else DEFAULT_DB_USER,
         password=connector.password if hasattr(connector, 'password') else "",
         engine=getattr(connector, 'engine', DEFAULT_DB_ENGINE),
+        database=getattr(connector, 'database', '') or '',
     )
 
 
@@ -184,7 +204,8 @@ class _RustDumpClientBase:
             port=int(self.config.port),
             user=self.config.user,
             password=self.config.password,
-            database=schema,
+            database=(self.config.database or "postgres") if self.config.engine == "postgresql" else schema,
+            schema=schema if self.config.engine == "postgresql" else "",
         )
 
 
@@ -310,6 +331,12 @@ class RustDumpExporter(_RustDumpClientBase):
             )
         elif snapshot_policy == "mysql_single_connection_consistent_snapshot":
             message += " (MySQL 단일 연결 일관 스냅샷)"
+        warnings = [str(warning) for warning in result.get("manifest_warnings", [])]
+        for warning in warnings:
+            if callbacks.progress:
+                callbacks.progress(f"Export warning: {warning}")
+        if warnings:
+            message += "\n" + "\n".join(f"Export warning: {warning}" for warning in warnings)
         return True, message
 
     def export_full_schema(
@@ -434,9 +461,12 @@ def _mark_non_done_import_results_error(
         status = result.get("status") if isinstance(result, dict) else None
         if status == "done":
             continue
-        import_results[table] = {"status": "error", "message": message}
+        failed = status in ("loading", "error") or f": {table}:" in message
+        next_status = "error" if failed else "blocked"
+        detail = message if failed else "Import stopped; this table was not started."
+        import_results[table] = {"status": next_status, "message": detail}
         if table_status_callback:
-            table_status_callback(table, "error", message)
+            table_status_callback(table, next_status, detail)
 
 
 def _is_operation_scoped_import_error(message: str) -> bool:
@@ -482,7 +512,7 @@ class RustDumpImporter(_RustDumpClientBase):
                 "table_rows": table_rows,
                 "total_bytes": total_bytes,
                 "total_rows": total_rows,
-                "schema": manifest.get("database", ""),
+                "schema": dump_original_namespace(manifest, self.config.engine),
                 "format": manifest.get("format", ""),
                 "format_version": manifest.get("format_version", 0),
             }
@@ -494,7 +524,7 @@ class RustDumpImporter(_RustDumpClientBase):
         input_dir: str,
         target_schema: Optional[str] = None,
         threads: int = DEFAULT_DUMP_THREADS,
-        import_mode: str = "replace",
+        import_mode: str = "safe",
         timezone_sql: Optional[str] = None,
         progress_callback: Optional[Callable[[str], None]] = None,
         table_progress_callback: Optional[Callable[[int, int, str], None]] = None,
@@ -504,6 +534,7 @@ class RustDumpImporter(_RustDumpClientBase):
         retry_tables: Optional[List[str]] = None,
         metadata_callback: Optional[Callable[[dict], None]] = None,
         table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
+        use_source_timezone: bool = True,
     ) -> Tuple[bool, str, dict]:
         import_results: dict = {}
         try:
@@ -512,7 +543,7 @@ class RustDumpImporter(_RustDumpClientBase):
                 return False, "TunnelForge Rust dump manifest를 찾을 수 없습니다.", import_results
 
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            source_schema = str(manifest.get("database") or "")
+            source_schema = dump_original_namespace(manifest, self.config.engine)
             tables_to_import = [
                 str(table.get("name"))
                 for table in manifest.get("tables", [])
@@ -533,7 +564,7 @@ class RustDumpImporter(_RustDumpClientBase):
 
             final_target_schema = target_schema or source_schema
             if not final_target_schema:
-                return False, "대상 스키마를 지정할 수 없습니다.", import_results
+                return False, "원본 스키마를 확정할 수 없습니다. 대상 데이터베이스/스키마를 직접 선택하세요.", import_results
 
             payload = {
                 "target": self._endpoint(final_target_schema).to_payload(),
@@ -541,6 +572,7 @@ class RustDumpImporter(_RustDumpClientBase):
                 "mode": import_mode,
                 "threads": max(1, int(threads)),
                 "strict_manifest": True,
+                "use_source_timezone": use_source_timezone,
             }
             if timezone_sql:
                 payload["timezone_sql"] = timezone_sql
@@ -561,6 +593,20 @@ class RustDumpImporter(_RustDumpClientBase):
                 ),
             )
 
+            if import_mode == "safe":
+                candidate = restore_target_connection_info(result.get("candidate_target"))
+                state = {key: result.get(key) for key in ("status", "verified", "original_unchanged", "cutover_pending", "ready_for_switch", "blockers", "namespace_existed", "namespace_created", "restore_id", "report_path", "plan_digest")}
+                state.update(event="safe_restore_ready", candidate_target=candidate,
+                             original_target=restore_target_connection_info(result.get("original_target")))
+                if raw_output_callback:
+                    raw_output_callback(json.dumps(state, ensure_ascii=False))
+                new_target = result.get("status") == "completed_new_target" and result.get("namespace_existed") is False and result.get("namespace_created") is True
+                if not ((new_target or result.get("status") in ("ready_for_switch", "ready_for_review"))
+                        and result.get("verified") is True and result.get("original_unchanged") is True
+                        and result.get("cutover_pending") is (not new_target) and candidate.get("database")
+                        and (self.config.engine != "postgresql" or candidate.get("schema"))):
+                    return False, "안전 복원의 검증된 새 대상 정보를 확인할 수 없습니다. 원본과 복원 대상의 상태를 보고서에서 확인하세요.", import_results
+
             for table in tables_to_import:
                 import_results[table] = {"status": "done", "message": ""}
             rows = int(result.get("rows_imported") or 0)
@@ -568,6 +614,15 @@ class RustDumpImporter(_RustDumpClientBase):
             views_failed = result.get("views_failed") or []
             views_skipped = result.get("views_skipped_cross_engine") or []
             message = f"Rust DB Core import 완료: {len(tables_to_import)}개 테이블, {rows:,} rows"
+            if import_mode == "safe":
+                candidate_name = candidate.get("schema") if self.config.engine == "postgresql" else candidate.get("database")
+                message = f"안전 복원 검증 완료: {candidate_name}. 원본 미변경 · 전환 대기."
+                if new_target:
+                    message = f"요청한 새 대상 복원·검증 완료: {candidate_name}. 기존 대상 변경 없음."
+                if result.get("status") == "ready_for_review":
+                    message += " 전환 전 추가 검토가 필요합니다."
+                    for blocker in result.get("blockers") or []:
+                        message += f"\n{blocker}"
             if views_imported:
                 message += f", View {len(views_imported)}개"
             if views_failed:
@@ -577,7 +632,12 @@ class RustDumpImporter(_RustDumpClientBase):
                 message += f" (View {len(views_failed)}개 생성 실패: {failed_names})"
             if views_skipped:
                 message += f" (크로스 엔진 View {len(views_skipped)}개 건너뜀)"
-            return True, message, import_results
+            for warning in (result.get("verification") or {}).get("warnings", []) or []:
+                warning_line = f"Import warning: {warning}"
+                message += "\n" + warning_line
+                if progress_callback:
+                    progress_callback(warning_line)
+            return not bool(views_failed), message, import_results
         except DbCoreServiceError as exc:
             if not _is_operation_scoped_import_error(str(exc)):
                 _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
@@ -643,7 +703,7 @@ def import_dump(
     input_dir: str,
     target_schema: Optional[str] = None,
     threads: int = DEFAULT_DUMP_THREADS,
-    import_mode: str = "replace",
+    import_mode: str = "safe",
     progress_callback: Optional[Callable[[str], None]] = None,
     table_chunk_progress_callback: Optional[Callable[[str, int, int], None]] = None,
     engine: str = "mysql",

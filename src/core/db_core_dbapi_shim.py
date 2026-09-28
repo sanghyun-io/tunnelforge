@@ -278,9 +278,13 @@ class RustDbConnection:
             self._in_transaction = True
 
     def select_db(self, database: str) -> None:
-        self.endpoint = replace(self.endpoint, database=database)
+        if not self.open:
+            raise DbCoreServiceError("connection is closed")
         if self.endpoint.engine == "mysql":
             self.facade.execute_on_connection(self.connection_id, f"USE {quote_mysql_ident(database)}")
+        elif database != self.endpoint.database:
+            raise DbCoreServiceError("PostgreSQL database selection requires reconnect")
+        self.endpoint = replace(self.endpoint, database=database)
 
 
 class RustDbCursor:
@@ -289,6 +293,7 @@ class RustDbCursor:
     def __init__(self, connection: RustDbConnection):
         self.connection = connection
         self._rows: List[Dict[str, Any]] = []
+        self._position = 0
         self.rowcount = 0
         self.description = None
 
@@ -299,6 +304,12 @@ class RustDbCursor:
         return False
 
     def execute(self, query: str, params: Optional[Sequence[Any]] = None) -> int:
+        self._rows = []
+        self._position = 0
+        self.description = None
+        self.rowcount = -1
+        if not self.connection.open:
+            raise DbCoreServiceError("connection is closed")
         result = self.connection.facade.execute_on_connection_result(
             self.connection.connection_id,
             query,
@@ -327,10 +338,16 @@ class RustDbCursor:
         )
 
     def fetchall(self) -> List[Dict[str, Any]]:
-        return list(self._rows)
+        rows = self._rows[self._position:]
+        self._position = len(self._rows)
+        return rows
 
     def fetchone(self) -> Optional[Dict[str, Any]]:
-        return self._rows[0] if self._rows else None
+        if self._position >= len(self._rows):
+            return None
+        row = self._rows[self._position]
+        self._position += 1
+        return row
 
 
 def quote_mysql_ident(identifier: str) -> str:

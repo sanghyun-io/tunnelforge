@@ -2,6 +2,7 @@ from sshtunnel import SSHTunnelForwarder
 import paramiko
 import socket
 import os
+from contextlib import closing
 
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_LOCAL_HOST
@@ -17,10 +18,9 @@ class TunnelEngine:
     def is_port_available(self, port: int) -> bool:
         """포트가 사용 가능한지 확인"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(1)
-            s.bind(('0.0.0.0', port))
-            s.close()
+            with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as s:
+                s.settimeout(1)
+                s.bind((DEFAULT_LOCAL_HOST, port))
             return True
         except OSError:
             return False
@@ -118,6 +118,8 @@ class TunnelEngine:
                 return True, "이미 연결 중입니다."
             elif self.active_tunnels[tunnel_id] and self.active_tunnels[tunnel_id].is_active:
                 return True, "이미 실행 중입니다."
+            if not self.stop_tunnel(tunnel_id):
+                return False, "기존 터널을 종료하지 못했습니다. 다시 시도해주세요."
 
         # 직접 연결 모드
         if config.get('connection_mode') == 'direct':
@@ -139,6 +141,7 @@ class TunnelEngine:
         """SSH 터널 시작 (내부 메서드)"""
         tunnel_id = config['id']
         connection_logs = []
+        server = None
 
         try:
             connection_logs.append(f"🚀 터널 시작 시도: {config['name']}")
@@ -160,7 +163,7 @@ class TunnelEngine:
             logger.debug("SSH 터널 생성 중...")
             server = self._build_forwarder(
                 config,
-                local_bind_address=('0.0.0.0', int(config['local_port'])),
+                local_bind_address=(DEFAULT_LOCAL_HOST, int(config['local_port'])),
                 pkey_obj=pkey_obj,
                 set_keepalive=30.0,
             )
@@ -174,6 +177,7 @@ class TunnelEngine:
             return True, "연결 성공"
 
         except Exception as e:
+            self.close_temp_tunnel(server)
             error_msg = str(e)
             error_type = type(e).__name__
 
@@ -221,7 +225,10 @@ class TunnelEngine:
         if config.get('connection_mode') == 'direct':
             return config['remote_host'], int(config['remote_port'])
         else:
-            return DEFAULT_LOCAL_HOST, int(config['local_port'])
+            server = self.active_tunnels.get(tunnel_id)
+            if server is None or not server.is_active:
+                return None, None
+            return DEFAULT_LOCAL_HOST, server.local_bind_port
 
     def create_temp_tunnel(self, config):
         """
@@ -232,6 +239,7 @@ class TunnelEngine:
         if config.get('connection_mode') == 'direct':
             return True, None, ""
 
+        temp_server = None
         try:
             # SSH 키 로드
             pkey_obj = self._load_private_key(config['bastion_key'])
@@ -248,6 +256,7 @@ class TunnelEngine:
             return True, temp_server, ""
 
         except Exception as e:
+            self.close_temp_tunnel(temp_server)
             error_msg = f"{type(e).__name__}: {str(e)}"
             return False, None, error_msg
 
@@ -339,7 +348,7 @@ class TunnelEngine:
         """활성화된 터널/연결 목록 반환 (DB Export용)"""
         result = []
         for tunnel_id, server in self.active_tunnels.items():
-            if tunnel_id in self.tunnel_configs:
+            if tunnel_id in self.tunnel_configs and self.is_running(tunnel_id):
                 config = self.tunnel_configs[tunnel_id]
                 host, port = self.get_connection_info(tunnel_id)
                 result.append({
@@ -369,10 +378,10 @@ class TunnelEngine:
     def _test_direct_connection(self, config):
         """직접 연결 테스트"""
         try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5)
-            s.connect((config['remote_host'], int(config['remote_port'])))
-            s.close()
+            with closing(socket.create_connection(
+                (config['remote_host'], int(config['remote_port'])), timeout=5
+            )):
+                pass
             return True, f"✅ 직접 연결 성공: {config['remote_host']}:{config['remote_port']}"
         except Exception as e:
             return False, f"❌ 직접 연결 실패\n원인: {str(e)}"
@@ -430,5 +439,4 @@ class TunnelEngine:
             return False, f"❌ 1. Bastion Host 연결 실패\n에러 타입: {error_type}\n원인: {error_msg}\n\n📋 전체 로그:\n{logs_summary}"
 
         finally:
-            if temp_server:
-                temp_server.stop()
+            self.close_temp_tunnel(temp_server)

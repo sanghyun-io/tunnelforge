@@ -127,6 +127,9 @@ fn stress_table() -> NormalizedTable {
                 nullable: false,
                 primary_key: true,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             },
             NormalizedColumn {
                 name: "name".to_string(),
@@ -135,6 +138,9 @@ fn stress_table() -> NormalizedTable {
                 nullable: false,
                 primary_key: false,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             },
             NormalizedColumn {
                 name: "amount".to_string(),
@@ -143,11 +149,17 @@ fn stress_table() -> NormalizedTable {
                 nullable: false,
                 primary_key: false,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             },
         ],
         indexes: Vec::new(),
         foreign_keys: Vec::new(),
         table_collation: None,
+        auto_increment: None,
+        comment: None,
+        checks: Vec::new(),
     }
 }
 

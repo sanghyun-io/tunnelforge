@@ -12,6 +12,54 @@ const MYSQL_IDENTIFIER_MAX_LEN: usize = 64;
 /// 초과하는 값은 주입 시도로 보고 파싱 전에 fail-closed로 거부한다.
 const MAX_COLUMN_TYPE_LEN: usize = 512;
 
+fn schema_string_literal(engine: &str, value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('\'', "''");
+    format!("{}'{escaped}'", if engine == "postgresql" { "E" } else { "" })
+}
+
+pub(crate) fn supported_mysql_default_expression(value: &str) -> bool {
+    let value=value.trim().to_ascii_uppercase();
+    matches!(value.as_str(), "UUID()" | "(UUID())" | "NOW()") || is_safe_temporal_default_expression(&value)
+}
+
+/// Keep a CHECK inside its single expression boundary. The target server probe
+/// validates expression syntax/functions; this rejects statement/DDL escapes.
+pub(crate) fn is_safe_check_expression(expression: &str) -> bool {
+    let bytes=expression.as_bytes(); let mut i=0; let mut depth=0_u32;
+    if expression.trim().is_empty() { return false; }
+    while i<bytes.len() {
+        match bytes[i] {
+            b'\'' | b'"' | b'`' => {
+                let quote=bytes[i]; i+=1; let mut closed=false;
+                while i<bytes.len() {
+                    // ANSI_QUOTES changes double quotes to identifiers. Reject
+                    // the ambiguous escape form rather than disagree with it.
+                    if bytes[i]==b'\\' && quote==b'"' { return false; }
+                    if bytes[i]==b'\\' && quote!=b'`' { i+=2; }
+                    else if bytes[i]==quote {
+                        i+=1;
+                        if bytes.get(i)==Some(&quote) { i+=1; } else { closed=true; break; }
+                    } else { i+=1; }
+                }
+                if !closed { return false; }
+            }
+            b'(' => { depth+=1; i+=1; }
+            b')' => { if depth==0 { return false; } depth-=1; i+=1; }
+            b';' | b'#' | b'@' | 0 => return false,
+            b'-' if bytes.get(i+1)==Some(&b'-') => return false,
+            b'/' if bytes.get(i+1)==Some(&b'*') => return false,
+            b',' if depth==0 => return false,
+            byte if byte.is_ascii_alphabetic() || byte==b'_' => {
+                let start=i; i+=1;
+                while i<bytes.len() && (bytes[i].is_ascii_alphanumeric() || matches!(bytes[i],b'_'|b'$') || bytes[i]>=128) { i+=1; }
+                if matches!(expression[start..i].to_ascii_uppercase().as_str(), "SELECT"|"INSERT"|"UPDATE"|"DELETE"|"DROP"|"ALTER"|"CREATE"|"CONSTRAINT"|"COMMENT"|"REFERENCES"|"UNION"|"RETURNING"|"INTO"|"OUTFILE"|"DUMPFILE") { return false; }
+            }
+            _ => i+=1,
+        }
+    }
+    depth==0
+}
+
 pub(crate) fn read_engine(payload: &Value, key: &str) -> String {
     payload
         .get(key)
@@ -41,6 +89,36 @@ pub(crate) fn unsupported_objects(payload: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+pub(crate) fn validate_target_foreign_key_actions(table: &NormalizedTable, target: &str) -> Result<(), String> {
+    if target != "mysql" {
+        if !table.checks.is_empty() { return Err(format!("cannot translate MySQL CHECK expressions for table {} to {target}", table.name)); }
+        if table.indexes.iter().any(|index| index.visible == Some(false)) { return Err(format!("cannot preserve invisible indexes for table {} on {target}",table.name)); }
+        for column in &table.columns {
+            if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| value.trim().eq_ignore_ascii_case("uuid()") || value.trim().eq_ignore_ascii_case("(uuid())")) {
+                return Err(format!("cannot translate MySQL UUID() expression default for {}.{} to {target}",table.name,column.name));
+            }
+        }
+    }
+    for check in &table.checks {
+        if !is_safe_check_expression(&check.expression) { return Err(format!("unsafe CHECK expression in table {} constraint {}",table.name,check.name)); }
+    }
+    for column in &table.columns {
+        if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| !supported_mysql_default_expression(value)) {
+            return Err(format!("unsupported expression default for {}.{}",table.name,column.name));
+        }
+    }
+    if target.eq_ignore_ascii_case("mysql") {
+        for fk in &table.foreign_keys {
+            if [fk.on_delete.as_ref(), fk.on_update.as_ref()].into_iter().flatten()
+                .any(|action| action.as_sql() == "SET DEFAULT")
+            {
+                return Err(format!("MySQL does not support SET DEFAULT foreign key actions: table {} constraint {}", table.name, fk.name));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn generate_schema_ddl(
     schema: &NormalizedSchema,
     source: &str,
@@ -53,6 +131,7 @@ pub fn generate_schema_ddl(
         .tables
         .iter()
         .map(|table| {
+            validate_target_foreign_key_actions(table, target)?;
             generate_table_ddl(table, source, target).ok_or_else(|| {
                 format!(
                     "cannot generate DDL for table `{}` (invalid table collation?)",
@@ -73,6 +152,9 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
             if index.columns.is_empty() {
                 continue;
             }
+            // MySQL must expose referenced unique keys at CREATE TABLE time,
+            // even while foreign_key_checks=0 and target-only children survive.
+            if target == "mysql" && index.unique { continue; }
             let unique = if index.unique { "UNIQUE " } else { "" };
             let columns = index
                 .columns
@@ -90,12 +172,14 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
+            let visibility = if target == "mysql" && index.visible == Some(false) { " INVISIBLE" } else { "" };
             ddl.push(format!(
-                "CREATE {}INDEX {} ON {} ({});",
+                "CREATE {}INDEX {} ON {} ({}){};",
                 unique,
                 quote_ident(target, &index.name),
                 quote_ident(target, &table.name),
-                columns
+                columns,
+                visibility
             ));
         }
     }
@@ -116,14 +200,30 @@ pub fn generate_post_data_ddl(schema: &NormalizedSchema, target: &str) -> Vec<St
                 .map(|column| quote_ident(target, column))
                 .collect::<Vec<_>>()
                 .join(", ");
+            let mut actions = String::new();
+            if let Some(action) = &fk.on_delete {
+                actions.push_str(&format!(" ON DELETE {}", action.as_sql()));
+            }
+            if let Some(action) = &fk.on_update {
+                actions.push_str(&format!(" ON UPDATE {}", action.as_sql()));
+            }
             ddl.push(format!(
-                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({});",
+                "ALTER TABLE {} ADD CONSTRAINT {} FOREIGN KEY ({}) REFERENCES {} ({}){};",
                 quote_ident(target, &table.name),
                 quote_ident(target, &fk.name),
                 columns,
                 quote_ident(target, &fk.referenced_table),
-                referenced_columns
+                referenced_columns,
+                actions
             ));
+        }
+    }
+    if target == "postgresql" {
+        for table in &schema.tables {
+            if let Some(comment) = &table.comment { ddl.push(format!("COMMENT ON TABLE {} IS {};",quote_ident(target,&table.name),schema_string_literal(target,comment))); }
+            for column in &table.columns {
+                if let Some(comment) = &column.comment { ddl.push(format!("COMMENT ON COLUMN {}.{} IS {};",quote_ident(target,&table.name),quote_ident(target,&column.name),schema_string_literal(target,comment))); }
+            }
         }
     }
     ddl
@@ -138,11 +238,12 @@ pub fn generate_sequence_reset_ddl(schema: &NormalizedSchema, target: &str) -> V
         for column in &table.columns {
             if is_auto_increment_type(&column.type_name) {
                 ddl.push(format!(
-                    "SELECT setval(pg_get_serial_sequence('{}', '{}'), COALESCE((SELECT MAX({}) FROM {}), 0) + 1, false);",
-                    table.name.replace('\'', "''"),
-                    column.name.replace('\'', "''"),
+                    "SELECT setval(pg_get_serial_sequence({}, {}), GREATEST(COALESCE((SELECT MAX({}) FROM {}), 0) + 1, {}), false);",
+                    schema_string_literal(target, &quote_ident(target, &table.name)),
+                    schema_string_literal(target, &column.name),
                     quote_ident(target, &column.name),
-                    quote_ident(target, &table.name)
+                    quote_ident(target, &table.name),
+                    table.auto_increment.unwrap_or(1)
                 ));
             }
         }
@@ -262,7 +363,7 @@ pub fn select_chunk_sql(
 /// 청크 SELECT의 텍스트 컬럼 프로젝션 절을 생성한다. 바이너리 컬럼은 hex로 인코딩하고
 /// (postgresql=encode, 그 외=HEX), 나머지는 엔진별로 text/CAST로 정규화하여 JSONL 직렬화가
 /// 안전한 문자열이 되도록 한다. 세 select_chunk_text_* 함수가 동일 프로젝션을 공유한다.
-fn projected_text_columns_sql(engine: &str, table: &NormalizedTable) -> String {
+pub(crate) fn projected_text_columns_sql(engine: &str, table: &NormalizedTable) -> String {
     table
         .columns
         .iter()
@@ -773,9 +874,9 @@ pub fn inspect_tables_sql(engine: &str) -> &'static str {
 
 pub fn inspect_columns_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
-        "SELECT column_name, data_type, is_nullable, character_maximum_length, numeric_precision, numeric_scale, column_default, is_identity FROM information_schema.columns WHERE table_schema = $1 AND table_name = $2 ORDER BY ordinal_position"
+        "SELECT c.column_name, c.data_type, c.is_nullable, c.character_maximum_length, c.numeric_precision, c.numeric_scale, c.column_default, c.is_identity, pg_catalog.format_type(a.atttypid, a.atttypmod) FROM information_schema.columns c JOIN pg_catalog.pg_namespace n ON n.nspname=c.table_schema JOIN pg_catalog.pg_class t ON t.relnamespace=n.oid AND t.relname=c.table_name JOIN pg_catalog.pg_attribute a ON a.attrelid=t.oid AND a.attname=c.column_name WHERE c.table_schema = $1 AND c.table_name = $2 ORDER BY c.ordinal_position"
     } else {
-        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
+        "SELECT COLUMN_NAME AS column_name, COLUMN_TYPE AS data_type, CHARACTER_SET_NAME AS character_set, COLLATION_NAME AS collation, IS_NULLABLE AS is_nullable, COLUMN_DEFAULT AS column_default, EXTRA AS extra, COLUMN_COMMENT AS column_comment FROM information_schema.columns WHERE table_schema = ? AND table_name = ? ORDER BY ORDINAL_POSITION"
     }
 }
 
@@ -811,9 +912,9 @@ pub fn inspect_keys_sql(engine: &str) -> &'static str {
 
 pub fn inspect_foreign_keys_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
-        "SELECT tc.constraint_name, kcu.column_name, ccu.table_name AS referenced_table, ccu.column_name AS referenced_column FROM information_schema.table_constraints tc JOIN information_schema.key_column_usage kcu ON tc.constraint_schema = kcu.constraint_schema AND tc.constraint_name = kcu.constraint_name JOIN information_schema.constraint_column_usage ccu ON tc.constraint_schema = ccu.constraint_schema AND tc.constraint_name = ccu.constraint_name WHERE tc.table_schema = $1 AND tc.table_name = $2 AND tc.constraint_type = 'FOREIGN KEY' ORDER BY tc.constraint_name, kcu.ordinal_position"
+        "SELECT c.conname, a.attname, parent.relname, pa.attname, CASE c.confdeltype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END, CASE c.confupdtype WHEN 'a' THEN 'NO ACTION' WHEN 'r' THEN 'RESTRICT' WHEN 'c' THEN 'CASCADE' WHEN 'n' THEN 'SET NULL' WHEN 'd' THEN 'SET DEFAULT' END FROM pg_constraint c JOIN pg_class child ON child.oid = c.conrelid JOIN pg_namespace n ON n.oid = child.relnamespace JOIN pg_class parent ON parent.oid = c.confrelid JOIN unnest(c.conkey, c.confkey) WITH ORDINALITY AS k(child_num, parent_num, ord) ON TRUE JOIN pg_attribute a ON a.attrelid = child.oid AND a.attnum = k.child_num JOIN pg_attribute pa ON pa.attrelid = parent.oid AND pa.attnum = k.parent_num WHERE n.nspname = $1 AND child.relname = $2 AND c.contype = 'f' ORDER BY c.conname, k.ord"
     } else {
-        "SELECT CONSTRAINT_NAME AS constraint_name, COLUMN_NAME AS column_name, REFERENCED_TABLE_NAME AS referenced_table, REFERENCED_COLUMN_NAME AS referenced_column FROM information_schema.KEY_COLUMN_USAGE WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND REFERENCED_TABLE_NAME IS NOT NULL ORDER BY CONSTRAINT_NAME, ORDINAL_POSITION"
+        "SELECT k.CONSTRAINT_NAME, k.COLUMN_NAME, k.REFERENCED_TABLE_NAME, k.REFERENCED_COLUMN_NAME, r.DELETE_RULE, r.UPDATE_RULE FROM information_schema.KEY_COLUMN_USAGE k JOIN information_schema.REFERENTIAL_CONSTRAINTS r ON r.CONSTRAINT_SCHEMA = k.CONSTRAINT_SCHEMA AND r.CONSTRAINT_NAME = k.CONSTRAINT_NAME AND r.TABLE_NAME = k.TABLE_NAME WHERE k.TABLE_SCHEMA = ? AND k.TABLE_NAME = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL ORDER BY k.CONSTRAINT_NAME, k.ORDINAL_POSITION"
     }
 }
 
@@ -821,7 +922,7 @@ pub fn inspect_indexes_sql(engine: &str) -> &'static str {
     if engine == "postgresql" {
         "SELECT i.relname AS index_name, a.attname AS column_name, ix.indisunique AS is_unique FROM pg_class t JOIN pg_index ix ON t.oid = ix.indrelid JOIN pg_class i ON i.oid = ix.indexrelid JOIN pg_namespace n ON n.oid = t.relnamespace JOIN unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON TRUE JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum WHERE n.nspname = $1 AND t.relname = $2 AND NOT ix.indisprimary ORDER BY i.relname, k.ord"
     } else {
-        "SELECT INDEX_NAME AS index_name, COLUMN_NAME AS column_name, SUB_PART AS sub_part, CASE WHEN NON_UNIQUE = 0 THEN 1 ELSE 0 END AS is_unique FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME <> 'PRIMARY' ORDER BY INDEX_NAME, SEQ_IN_INDEX"
+        "SELECT INDEX_NAME AS index_name, COLUMN_NAME AS column_name, SUB_PART AS sub_part, CASE WHEN NON_UNIQUE = 0 THEN 1 ELSE 0 END AS is_unique FROM information_schema.STATISTICS WHERE TABLE_SCHEMA = ? AND TABLE_NAME = ? AND INDEX_NAME <> 'PRIMARY' AND COLUMN_NAME IS NOT NULL ORDER BY INDEX_NAME, SEQ_IN_INDEX"
     }
 }
 
@@ -855,6 +956,7 @@ pub(crate) fn group_indexes(
                 columns: Vec::new(),
                 column_prefixes: Vec::new(),
                 unique,
+                visible: None,
             });
         index.unique = index.unique || unique;
         index.columns.push(column);
@@ -863,9 +965,13 @@ pub(crate) fn group_indexes(
     grouped.into_values().collect()
 }
 
-pub(crate) fn group_foreign_keys(rows: Vec<(String, String, String, String)>) -> Vec<NormalizedForeignKey> {
+pub(crate) fn group_foreign_keys(rows: Vec<(String, String, String, String, String, String)>) -> Result<Vec<NormalizedForeignKey>, String> {
     let mut grouped: BTreeMap<String, NormalizedForeignKey> = BTreeMap::new();
-    for (name, column, referenced_table, referenced_column) in rows {
+    for (name, column, referenced_table, referenced_column, on_delete, on_update) in rows {
+        let on_delete = serde_json::from_value::<ForeignKeyAction>(serde_json::json!(on_delete))
+            .map_err(|err| format!("invalid FK delete action: {err}"))?;
+        let on_update = serde_json::from_value::<ForeignKeyAction>(serde_json::json!(on_update))
+            .map_err(|err| format!("invalid FK update action: {err}"))?;
         let fk = grouped
             .entry(name.clone())
             .or_insert_with(|| NormalizedForeignKey {
@@ -873,19 +979,41 @@ pub(crate) fn group_foreign_keys(rows: Vec<(String, String, String, String)>) ->
                 columns: Vec::new(),
                 referenced_table,
                 referenced_columns: Vec::new(),
+                on_delete: Some(on_delete),
+                on_update: Some(on_update),
             });
         fk.columns.push(column);
         fk.referenced_columns.push(referenced_column);
     }
-    grouped.into_values().collect()
+    Ok(grouped.into_values().collect())
 }
 
 pub(crate) fn generate_table_ddl(table: &NormalizedTable, source: &str, target: &str) -> Option<String> {
+    validate_target_foreign_key_actions(table,target).ok()?;
     let (mut lines, primary_keys) = column_ddl_lines(table, source, target)?;
     if !primary_keys.is_empty() {
         lines.push(format!("  PRIMARY KEY ({})", primary_keys.join(", ")));
     }
-    let table_suffix = mysql_table_collation_suffix(source, target, table)?;
+    if target == "mysql" {
+        for index in table.indexes.iter().filter(|index| index.unique && !index.columns.is_empty()) {
+            let columns = index.columns.iter().enumerate().map(|(position, column)| {
+                let name = quote_ident(target, column);
+                match index.column_prefixes.get(position).copied().flatten() {
+                    Some(prefix) => format!("{name}({prefix})"), None => name,
+                }
+            }).collect::<Vec<_>>().join(", ");
+            let visibility = if index.visible == Some(false) { " INVISIBLE" } else { "" };
+            lines.push(format!("  UNIQUE KEY {} ({columns}){visibility}", quote_ident(target, &index.name)));
+        }
+        for check in &table.checks {
+            lines.push(format!("  CONSTRAINT {} CHECK ({}) {}",quote_ident(target,&check.name),check.expression,if check.enforced { "ENFORCED" } else { "NOT ENFORCED" }));
+        }
+    }
+    let mut table_suffix = mysql_table_collation_suffix(source, target, table)?;
+    if target == "mysql" {
+        if let Some(counter) = table.auto_increment { table_suffix.push_str(&format!(" AUTO_INCREMENT={counter}")); }
+        if let Some(comment) = &table.comment { table_suffix.push_str(&format!(" COMMENT={}",schema_string_literal(target,comment))); }
+    }
     Some(format!(
         "CREATE TABLE {} (\n{}\n){};",
         quote_ident(target, &table.name),
@@ -918,24 +1046,38 @@ fn column_ddl_lines(
         }
         let default_sql = if auto_increment {
             String::new()
+        } else if column.default_is_expression && column.default_value.as_deref().is_some_and(|value| value.trim().trim_matches(['(',')']).eq_ignore_ascii_case("uuid")) {
+            if target != "mysql" { return None; }
+            " DEFAULT (UUID())".to_string()
         } else {
+            if source == "postgresql" && target != "postgresql" && column.default_value.as_deref()
+                .map(|value| value.eq_ignore_ascii_case("gen_random_uuid()") || value.to_ascii_uppercase().starts_with("ARRAY["))
+                .unwrap_or(false) { return None; }
             default_clause(target, column.default_value.as_deref(), &column.type_name)
         };
+        let on_update_sql = if let Some(value) = &column.on_update {
+            let value = value.to_ascii_uppercase();
+            if target != "mysql" || !is_safe_temporal_default_expression(&value) { return None; }
+            format!(" ON UPDATE {value}")
+        } else { String::new() };
         let null_sql = if column.nullable { "" } else { " NOT NULL" };
         let generation_sql = if auto_increment && target == "postgresql" {
-            " GENERATED BY DEFAULT AS IDENTITY"
+            table.auto_increment.map(|counter| format!(" GENERATED BY DEFAULT AS IDENTITY (START WITH {counter})")).unwrap_or_else(|| " GENERATED BY DEFAULT AS IDENTITY".to_string())
         } else if auto_increment && target == "mysql" {
-            " AUTO_INCREMENT"
+            " AUTO_INCREMENT".to_string()
         } else {
-            ""
+            String::new()
         };
+        let comment_sql = if target == "mysql" { column.comment.as_ref().map(|comment| format!(" COMMENT {}",schema_string_literal(target,comment))).unwrap_or_default() } else { String::new() };
         lines.push(format!(
-            "  {} {}{}{}{}",
+            "  {} {}{}{}{}{}{}",
             quote_ident(target, &column.name),
             mapped_type,
             generation_sql,
             default_sql,
-            null_sql
+            on_update_sql,
+            null_sql,
+            comment_sql
         ));
         if column.primary_key {
             primary_keys.push(quote_ident(target, &column.name));
@@ -1199,7 +1341,8 @@ fn parse_modifier_word(s: &str, bytes: &[u8], i: usize) -> Option<usize> {
 /// enum('a','b'), decimal(10,2), varchar(45) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin 등 정상 타입은 통과한다.
 /// enum/set 값 리스트는 따옴표 문자열이라 단순 식별자 allowlist로는 걸러낼 수 없어 구조적으로 파싱한다.
 fn is_safe_column_type(type_name: &str) -> bool {
-    let s = type_name.trim();
+    let mut s = type_name.trim();
+    while let Some(base) = s.strip_suffix("[]") { s = base.trim_end(); }
     if s.is_empty() || s.len() > MAX_COLUMN_TYPE_LEN {
         return false;
     }
@@ -1255,6 +1398,10 @@ fn map_default_literal(target: &str, default_value: &str, source_type: &str) -> 
     let value = strip_postgresql_type_cast(default_value.trim());
     let upper = value.to_ascii_uppercase();
     let source_type = source_type.to_ascii_lowercase();
+    if upper == "NOW()" { return "CURRENT_TIMESTAMP".to_string(); }
+    if target == "postgresql" && (upper == "GEN_RANDOM_UUID()" || is_safe_numeric_array_default(value)) {
+        return value.to_string();
+    }
     if target == "postgresql" && source_type.starts_with("tinyint(1)") {
         if matches!(value, "1") || value.eq_ignore_ascii_case("true") {
             return "TRUE".to_string();
@@ -1302,7 +1449,41 @@ fn map_default_literal(target: &str, default_value: &str, source_type: &str) -> 
     } else {
         value.to_string()
     };
-    format!("'{}'", inner.replace('\\', "\\\\").replace('\'', "''"))
+    if target == "postgresql" && inner.contains('\\') {
+        format!("E'{}'", inner.replace('\\', "\\\\").replace('\'', "''"))
+    } else if target == "postgresql" {
+        format!("'{}'", inner.replace('\'', "''"))
+    } else {
+        format!("'{}'", inner.replace('\\', "\\\\").replace('\'', "''"))
+    }
+}
+
+fn is_safe_numeric_array_default(value: &str) -> bool {
+    let Some(body) = value.strip_prefix("ARRAY[").and_then(|s| s.strip_suffix(']')) else { return false; };
+    !body.is_empty() && body.split(',').all(|item| {
+        let item = item.trim();
+        matches!(item.to_ascii_uppercase().as_str(), "NULL" | "TRUE" | "FALSE")
+            || (!item.is_empty() && item.bytes().all(|b| b.is_ascii_digit() || matches!(b, b'.' | b'-' | b'+' | b'e' | b'E')) && item.parse::<f64>().is_ok())
+    })
+}
+
+pub(crate) fn supported_postgresql_default(value: &str) -> bool {
+    let value = strip_postgresql_type_cast(value);
+    let upper = value.to_ascii_uppercase();
+    if matches!(upper.as_str(), "NULL" | "TRUE" | "FALSE" | "NOW()" | "GEN_RANDOM_UUID()")
+        || is_safe_temporal_default_expression(&upper) || is_safe_numeric_array_default(value)
+        || value.parse::<f64>().is_ok() { return true; }
+    if !value.starts_with('\'') { return false; }
+    // A single SQL string token, with doubled quotes, is safe to re-escape.
+    let bytes = value.as_bytes(); let mut i = 1;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if bytes.get(i+1) == Some(&b'\'') { i += 2; continue; }
+            return i + 1 == bytes.len();
+        }
+        i += 1;
+    }
+    false
 }
 
 fn is_safe_temporal_default_expression(value: &str) -> bool {
@@ -1334,11 +1515,17 @@ fn is_safe_temporal_default_expression(value: &str) -> bool {
 }
 
 fn strip_postgresql_type_cast(value: &str) -> &str {
-    value
-        .split_once("::")
-        .map(|(literal, _)| literal)
-        .unwrap_or(value)
-        .trim()
+    let bytes = value.as_bytes();
+    let mut quoted = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'\'' {
+            if quoted && bytes.get(i+1) == Some(&b'\'') { i += 2; continue; }
+            quoted = !quoted;
+        } else if !quoted && bytes[i..].starts_with(b"::") { return value[..i].trim(); }
+        i += 1;
+    }
+    value.trim()
 }
 
 pub(crate) fn with_auto_increment_marker(type_name: &str, extra: &str) -> String {
@@ -1490,11 +1677,11 @@ fn map_mysql_to_postgres(ty: &str) -> String {
     } else if ty == "date" {
         "DATE".to_string()
     } else if ty.starts_with("datetime") {
-        "TIMESTAMP".to_string()
+        temporal_type_with_precision("TIMESTAMP", ty, "")
     } else if ty.starts_with("timestamp") {
-        "TIMESTAMPTZ".to_string()
+        temporal_type_with_precision("TIMESTAMPTZ", ty, "")
     } else if ty.starts_with("time") {
-        "TIME".to_string()
+        temporal_type_with_precision("TIME", ty, "")
     } else if ty.starts_with("json") {
         "JSONB".to_string()
     } else if ty.contains("blob") || ty.contains("binary") {
@@ -1543,9 +1730,9 @@ fn map_postgres_to_mysql(ty: &str) -> String {
     } else if ty == "date" {
         "DATE".to_string()
     } else if ty == "time" || ty.starts_with("time ") || ty.starts_with("time(") {
-        "TIME".to_string()
+        temporal_type_with_precision("TIME", ty, "(6)")
     } else if ty.starts_with("timestamp") {
-        "DATETIME".to_string()
+        temporal_type_with_precision("DATETIME", ty, "(6)")
     } else if ty == "jsonb" || ty == "json" {
         "JSON".to_string()
     } else if ty == "bytea" {
@@ -1557,10 +1744,50 @@ fn map_postgres_to_mysql(ty: &str) -> String {
     }
 }
 
+fn temporal_type_with_precision(base: &str, source_type: &str, default_precision: &str) -> String {
+    let precision = source_type.find('(').and_then(|start| source_type[start..].find(')').map(|end| &source_type[start..start+end+1]))
+        .filter(|value| value.len() == 3 && matches!(value.as_bytes()[1], b'0'..=b'6'))
+        .unwrap_or(default_precision);
+    format!("{base}{precision}")
+}
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_expression_validation_preserves_one_expression_boundary() {
+        for expression in ["`quantity` > 0", "((quantity > 0) and (quantity < 10))", "label <> 'semi;colon'", "length(label) <= 80", "label in ('a','b')", "`select` <> 0"] {
+            assert!(is_safe_check_expression(expression), "{expression}");
+        }
+        for expression in ["", "quantity > 0); DROP TABLE important; --", "quantity > 0) COMMENT 'x'", "quantity > 0 /* comment */", "quantity > 0 -- comment", "SELECT secret FROM other", "quantity > 0, injected int", "((quantity > 0)", "\"ambiguous\\\"identifier\"=1", "@session_variable=1"] {
+            assert!(!is_safe_check_expression(expression), "{expression}");
+        }
+        assert!(supported_mysql_default_expression("uuid()"));
+        assert!(supported_mysql_default_expression("CURRENT_TIMESTAMP(3)"));
+        assert!(!supported_mysql_default_expression("custom_function()"));
+        assert!(!supported_mysql_default_expression("uuid()); DROP TABLE important"));
+    }
+
+    #[test]
+    fn mysql_specific_metadata_fails_cross_engine_preflight_explicitly() {
+        for (metadata, expected) in [
+            (serde_json::json!({"checks":[{"name":"positive","expression":"value>0","enforced":true}]}), "CHECK"),
+            (serde_json::json!({"indexes":[{"name":"hidden","columns":["value"],"visible":false}]}), "invisible"),
+            (serde_json::json!({"columns":[{"name":"value","type":"varchar(36)","default":"uuid()","default_is_expression":true}]}), "UUID()"),
+        ] {
+            let mut table=serde_json::json!({"name":"sample","columns":[{"name":"value","type":"int"}]});
+            table.as_object_mut().unwrap().extend(metadata.as_object().unwrap().clone());
+            let schema: NormalizedSchema=serde_json::from_value(serde_json::json!({"tables":[table]})).unwrap();
+            let error=generate_schema_ddl(&schema,"mysql","postgresql").unwrap_err();
+            assert!(error.contains(expected),"{error}");
+        }
+        let schema: NormalizedSchema=serde_json::from_value(serde_json::json!({"tables":[{
+            "name":"sample","columns":[{"name":"value","type":"varchar(36)","default":"custom_function()","default_is_expression":true}]
+        }]})).unwrap();
+        assert!(generate_schema_ddl(&schema,"mysql","mysql").unwrap_err().contains("unsupported expression default"));
+    }
     
     
     use serde_json::json;
@@ -1587,10 +1814,16 @@ mod tests {
                 nullable: false,
                 primary_key: false,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
         let json_text = r#"{"facts":[{"content":"문서 제목은 \"工伤管理表\"로 표기되어 있다."}]}"#;
         insert_rows_literal_sql_for_table("mysql", &table, &[json!({"result_json": json_text})])
@@ -1629,7 +1862,7 @@ mod tests {
         assert_eq!(map_type("postgresql", "mysql", "jsonb"), "JSON");
         assert_eq!(
             map_type("postgresql", "mysql", "timestamp with time zone"),
-            "DATETIME"
+            "DATETIME(6)"
         );
     }
 
@@ -1677,10 +1910,16 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
 
@@ -1712,10 +1951,16 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
                 NormalizedTable {
                     name: "orders".to_string(),
@@ -1727,6 +1972,9 @@ mod tests {
                             nullable: false,
                             primary_key: true,
                             unique: false,
+                            comment: None,
+                            default_is_expression: false,
+                            on_update: None,
                         },
                         NormalizedColumn {
                             name: "user_id".to_string(),
@@ -1735,6 +1983,9 @@ mod tests {
                             nullable: false,
                             primary_key: false,
                             unique: false,
+                            comment: None,
+                            default_is_expression: false,
+                            on_update: None,
                         },
                     ],
                     indexes: vec![NormalizedIndex {
@@ -1742,14 +1993,20 @@ mod tests {
                         columns: vec!["user_id".to_string()],
                         column_prefixes: vec![None],
                         unique: false,
+                        visible: None,
                     }],
                     foreign_keys: vec![NormalizedForeignKey {
                         name: "fk_orders_users".to_string(),
                         columns: vec!["user_id".to_string()],
                         referenced_table: "users".to_string(),
                         referenced_columns: vec!["id".to_string()],
+                        on_delete: None,
+                        on_update: None,
                     }],
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
             ],
         };
@@ -1779,6 +2036,9 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -1786,8 +2046,13 @@ mod tests {
                         columns: vec!["brief_slug".to_string()],
                         referenced_table: "cr_industry_briefs".to_string(),
                         referenced_columns: vec!["slug".to_string()],
+                        on_delete: None,
+                        on_update: None,
                     }],
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
                 NormalizedTable {
                     name: "cr_industry_briefs".to_string(),
@@ -1798,30 +2063,32 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: true,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: vec![NormalizedIndex {
                         name: "ux_cr_industry_briefs_slug".to_string(),
                         columns: vec!["slug".to_string()],
                         column_prefixes: vec![None],
                         unique: true,
+                        visible: None,
                     }],
                     foreign_keys: Vec::new(),
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
             ],
         };
 
+        let create = generate_schema_ddl(&schema, "mysql", "mysql").unwrap();
+        assert!(create.iter().any(|sql| sql.contains("UNIQUE KEY `ux_cr_industry_briefs_slug`")));
         let ddl = generate_post_data_ddl(&schema, "mysql");
-        let parent_unique_index = ddl
-            .iter()
-            .position(|sql| sql.contains("ux_cr_industry_briefs_slug"))
-            .unwrap();
-        let child_foreign_key = ddl
-            .iter()
-            .position(|sql| sql.contains("cr_industry_map_ibfk_1"))
-            .unwrap();
+        assert!(!ddl.iter().any(|sql| sql.contains("ux_cr_industry_briefs_slug")));
+        assert!(ddl.iter().any(|sql| sql.contains("cr_industry_map_ibfk_1")));
 
-        assert!(parent_unique_index < child_foreign_key);
     }
 
     #[test]
@@ -1836,15 +2103,22 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
+                    visible: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut adapter = RecordingAdapter::default();
@@ -1877,10 +2151,16 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
                 NormalizedTable {
                     name: "is_read_comment".to_string(),
@@ -1891,6 +2171,9 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -1898,8 +2181,13 @@ mod tests {
                         columns: vec!["user_id".to_string()],
                         referenced_table: "users".to_string(),
                         referenced_columns: vec!["id".to_string()],
+                        on_delete: None,
+                        on_update: None,
                     }],
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
             ],
         };
@@ -1939,15 +2227,22 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
+                    visible: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut adapter = RecordingAdapter {
@@ -1982,15 +2277,22 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_orders_user_id".to_string(),
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
+                    visible: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut adapter = RecordingAdapter::default();
@@ -2017,10 +2319,16 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -2032,20 +2340,29 @@ mod tests {
                         nullable: true,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: vec![NormalizedIndex {
                         name: "idx_df_evaluation_results_audit_category_code".to_string(),
                         columns: vec!["audit_category_code".to_string()],
                         column_prefixes: vec![None],
                         unique: false,
+                        visible: None,
                     }],
                     foreign_keys: vec![NormalizedForeignKey {
                         name: "df_evaluation_results_ibfk_3".to_string(),
                         columns: vec!["audit_category_code".to_string()],
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
+                        on_delete: None,
+                        on_update: None,
                     }],
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
             ],
         };
@@ -2069,15 +2386,22 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: vec![NormalizedIndex {
                     name: "idx_login_attempts_user_id".to_string(),
                     columns: vec!["user_id".to_string()],
                     column_prefixes: vec![None],
                     unique: false,
+                    visible: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut adapter = RecordingAdapter {
@@ -2118,10 +2442,16 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let postgresql_schema = NormalizedSchema {
@@ -2134,10 +2464,16 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
 
@@ -2151,7 +2487,7 @@ mod tests {
         );
         assert_eq!(
             generate_sequence_reset_ddl(&mysql_schema, "postgresql")[0],
-            "SELECT setval(pg_get_serial_sequence('users', 'id'), COALESCE((SELECT MAX(\"id\") FROM \"users\"), 0) + 1, false);"
+            "SELECT setval(pg_get_serial_sequence(E'\"users\"', E'id'), GREATEST(COALESCE((SELECT MAX(\"id\") FROM \"users\"), 0) + 1, 1), false);"
         );
     }
 
@@ -2168,6 +2504,9 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "enabled".to_string(),
@@ -2176,11 +2515,17 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let postgresql_schema = NormalizedSchema {
@@ -2193,10 +2538,16 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
 
@@ -2261,6 +2612,9 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
                 NormalizedColumn {
                     name: "payload".to_string(),
@@ -2269,11 +2623,17 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert_eq!(
@@ -2303,15 +2663,15 @@ mod tests {
         assert_eq!(map_type("postgresql", "mysql", "date"), "DATE");
         assert_eq!(
             map_type("postgresql", "mysql", "time without time zone"),
-            "TIME"
+            "TIME(6)"
         );
         assert_eq!(
             map_type("postgresql", "mysql", "timestamp without time zone"),
-            "DATETIME"
+            "DATETIME(6)"
         );
         assert_eq!(
             map_type("postgresql", "mysql", "timestamp with time zone"),
-            "DATETIME"
+            "DATETIME(6)"
         );
     }
 
@@ -2360,10 +2720,16 @@ mod tests {
                 nullable: false,
                 primary_key: false,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
         let mysql_schema = NormalizedTable {
             name: "flags".to_string(),
@@ -2374,10 +2740,16 @@ mod tests {
                 nullable: false,
                 primary_key: false,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert_eq!(
@@ -2404,7 +2776,7 @@ mod tests {
         assert!(inspect_columns_sql("postgresql").contains("information_schema.columns"));
         assert!(inspect_columns_sql("postgresql").contains("character_maximum_length"));
         assert!(inspect_keys_sql("mysql").contains("KEY_COLUMN_USAGE"));
-        assert!(inspect_foreign_keys_sql("postgresql").contains("FOREIGN KEY"));
+        assert!(inspect_foreign_keys_sql("postgresql").contains("c.contype = 'f'"));
         assert!(inspect_indexes_sql("postgresql").contains("pg_index"));
     }
 
@@ -2552,6 +2924,9 @@ mod tests {
             nullable: true,
             primary_key: false,
             unique: false,
+            comment: None,
+            default_is_expression: false,
+            on_update: None,
         });
         assert!(
             generate_table_ddl(&table, "mysql", "mysql").is_none(),
@@ -2571,6 +2946,9 @@ mod tests {
             nullable: true,
             primary_key: false,
             unique: false,
+            comment: None,
+            default_is_expression: false,
+            on_update: None,
         });
         assert!(
             generate_table_ddl(&table, "postgresql", "mysql").is_none(),
@@ -2623,10 +3001,16 @@ mod tests {
                 nullable: false,
                 primary_key: false,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         let ddl = generate_table_ddl(&table, "mysql", "mysql").expect("valid MySQL DDL");
@@ -2686,18 +3070,67 @@ mod tests {
                 "tenant_id".to_string(),
                 "orders".to_string(),
                 "tenant_id".to_string(),
+                "CASCADE".to_string(),
+                "SET NULL".to_string(),
             ),
             (
                 "fk_order_items_order".to_string(),
                 "order_id".to_string(),
                 "orders".to_string(),
                 "id".to_string(),
+                "CASCADE".to_string(),
+                "SET NULL".to_string(),
             ),
-        ]);
+        ]).unwrap();
 
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].columns, vec!["tenant_id", "order_id"]);
         assert_eq!(keys[0].referenced_columns, vec!["tenant_id", "id"]);
+    }
+
+    #[test]
+    fn foreign_key_actions_survive_manifest_and_ddl() {
+        let fk: NormalizedForeignKey = serde_json::from_value(json!({
+            "name": "fk_child_parent", "columns": ["parent_id"],
+            "referenced_table": "parent", "referenced_columns": ["id"],
+            "on_delete": "CASCADE", "on_update": "SET NULL"
+        })).unwrap();
+        let schema = NormalizedSchema { tables: vec![crate::adapters::test_support::empty_table("child", vec![fk])] };
+        for engine in ["mysql", "postgresql"] {
+            let ddl = generate_post_data_ddl(&schema, engine);
+            assert!(ddl.last().unwrap().contains("ON DELETE CASCADE ON UPDATE SET NULL"));
+        }
+        let invalid = serde_json::from_value::<NormalizedForeignKey>(json!({
+            "name": "fk", "referenced_table": "parent", "on_delete": "CASCADE; DROP TABLE parent"
+        }));
+        assert!(invalid.is_err());
+        let legacy: NormalizedForeignKey = serde_json::from_value(json!({
+            "name": "fk", "referenced_table": "parent"
+        })).unwrap();
+        assert_eq!(legacy.on_delete, None);
+        assert_eq!(legacy.on_update, None);
+        for action in ["NO ACTION", "RESTRICT", "CASCADE", "SET NULL", "SET DEFAULT"] {
+            let parsed: ForeignKeyAction = serde_json::from_value(json!(action)).unwrap();
+            assert_eq!(parsed.as_sql(), action);
+            assert_eq!(serde_json::to_value(parsed).unwrap(), json!(action));
+        }
+    }
+
+    #[test]
+    fn mysql_set_default_foreign_keys_are_blocked_before_planning() {
+        for field in ["on_delete", "on_update"] {
+            let mut schema = schema();
+            let mut fk = json!({"name": "fk_default", "columns": ["id"],
+                "referenced_table": "users", "referenced_columns": ["id"]});
+            fk[field] = json!("SET DEFAULT");
+            schema.tables[0].foreign_keys.push(serde_json::from_value(fk).unwrap());
+            let result = generate_schema_ddl(&schema, "postgresql", "mysql");
+            assert!(result.is_err(), "accepted {field} SET DEFAULT for MySQL");
+            assert!(result.unwrap_err().contains("SET DEFAULT"));
+            assert!(generate_schema_ddl(&schema, "mysql", "postgresql").is_ok());
+            let payload = json!({"source_engine": "postgresql", "target_engine": "mysql", "schema": schema});
+            assert!(preflight_issues(&payload).iter().any(|issue| issue.blocking && issue.message.contains("SET DEFAULT")));
+        }
     }
 
     #[test]
@@ -2739,9 +3172,13 @@ mod tests {
                     columns: vec!["filename".to_string()],
                     column_prefixes: vec![Some(255)],
                     unique: false,
+                    visible: None,
                 }],
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let ddl = generate_post_data_ddl(&schema, "mysql");

@@ -1,8 +1,8 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-07-31
+Last reviewed: 2026-09-28
 
-Current shipping version: `v2.5.1` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
+Current shipping version: `v2.6.0` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -66,6 +66,52 @@ Do not mark an issue `closed` without fresh verification evidence in the same
 session. If only focused tests passed, use `fixed_pending_full_verify`.
 
 ## Summary
+
+The user supplied a detailed 2.5.0/2.5.1 incident analysis. The point-by-point
+assessment is in `docs/incident_review_2026-09-28.md`. A private-copy restore
+completed 226 tables / 8,937,334 rows / 8 views; independent row counts and
+declared schema objects matched. This does not repair omitted attributes or
+manually removed FKs in the user's live Staging. The user requires safe restore
+before release (TF-STATUS-118). The new default prepares and verifies a separate
+candidate, then offers guarded engine-specific replacement. Failure/race tests and
+the large test-only cutover have passed; the final commit's protected release gates
+remain pending. Advanced legacy modes remain non-atomic. The proposed feature
+release is 2.6.0.
+
+Safe verification of the exact supplied dump found 11 orphan references in one
+of its 304 FKs and correctly refused cutover while retaining the original DB.
+A separate test-only copy excludes those rows for the large success rehearsal;
+neither the supplied dump nor live databases were repaired or modified. Draft
+PR #259 starts protected validation; it is not an approved/published release.
+
+The user has authorized a sequential follow-up: deep Export/Import verification,
+fixes, versioned protected release, then the commercial/usability roadmap.
+TF-STATUS-115 is active: additional real roundtrips reproduced silent MySQL
+truncation, nullable-unique export duplication, PostgreSQL schema/default/array
+failures and fractional timestamp loss. Python inspection also found database/
+schema routing gaps. Earlier passing gates did not cover these cases; do not
+interpret their historical pass counts as closure of the export/import contract.
+See `docs/export_import_verification_2026-09-28.md`. Release TF-STATUS-116 follows
+verification; product work TF-STATUS-117 follows release.
+
+Commercial-readiness discovery on 2026-09-28 is recorded in
+`docs/commercial_readiness_2026-09-28.md`. Existing SQL tabs, history/favorites,
+editing and transactions are retained as baseline capabilities. Inspection
+confirmed that query cancellation returns `cancelled=false`, row batching still
+materializes the complete result, and the direct connection dialog performs
+blocking connection work in GUI callbacks (TF-STATUS-113). Prioritized product
+candidates remain proposals under TF-STATUS-114. The user confirmed developers
+and small teams doing everyday DB work as the first target persona; no new features were implemented
+or released by this discovery pass, and no user-study outcomes are claimed.
+
+The 2026-09-28 stability audit prioritizes the user-confirmed MySQL/PostgreSQL
+and Windows/macOS/Linux scope. TF-STATUS-100 through TF-STATUS-109 track local
+fixes for tunneling, SQL execution, import validation/data fidelity, consistent
+exports, retry safety, and application CI. Fresh verification and concrete
+remaining commercial-readiness gaps are detailed in
+`docs/stability_audit_2026-09-28.md`; TF-STATUS-110 through TF-STATUS-112 remain
+open. Historical release evidence below is preserved and is not new validation
+of this worktree. No release has been published by this session.
 
 TunnelForge is in a strong build/test state. The active architecture baseline
 is Rust Core ownership of DB operations through `tunnelforge-core`, with
@@ -795,6 +841,23 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-28 | Large guarded cutover and independent backup preservation | Core `dump.promote` plan/confirm on the derived isolated fixture; independent actual COUNT queries against active and backup tables | Plan passed in 235.58s; confirmed promotion passed in 496.56s including revalidation. All 452 table counts matched: active 8,937,323 rows; backup original 8,937,334 rows; zero query errors | Source dump/live DBs untouched. Original 11 orphan rows remain preserved in backup; removal was test-fixture preparation only. This timing is not the write-lock duration. Backup lifecycle and recovery UX remain TF-STATUS-119. |
+| 2026-09-28 | Final view literal fidelity and mandatory MySQL promotion gate | Configured `cargo test --test live_safe_restore -- --test-threads=1`; promotion suite with BOTH `TF_PROMOTE_MYSQL_HOST` and `TF_POSTGRES_HOST`; CI environment contract RED/GREEN | Safe preparation 4 passed; actual both-engine promotion suite 17 passed in 41.98s. View security words and definer-looking strings retain exact values. | Fixed header-only view sanitization. Earlier root promotion runs supplied only TF_MYSQL_HOST, so MySQL-specific live bodies returned early; separate specialist evidence existed, but CI now explicitly supplies TF_PROMOTE_MYSQL_HOST and tests its wiring. No skipped live body is treated as actual DB evidence. |
+| 2026-09-28 | CI fixture isolation and large safe preparation | Linux config/group tests with inherited `XDG_CONFIG_HOME`; matching Windows tests; final Core safe import of separate derived private fixture | Reproduced exact CI 18 failures / 57 passes, fixed test-owned XDG paths, then both platforms 75 passed. Large fixture 226 tables / 8,937,323 rows / 8 views reached `ready_for_switch`, proof v2 verified, original unchanged in 715.76s | Product configuration path semantics unchanged. Original exact dump still has 11 orphan references and is not modified. Original DB remained 226 tables/8 views; temporary local_infile returned to OFF. Guarded large cutover is now running. |
+| 2026-09-28 | Frozen applications and protected draft PR | Windows/Linux PyInstaller builds and `scripts/verify-frozen-app.py`; `gh pr create --draft --label version:minor`; repository Actions permission query | Both frozen applications passed UI/icon/bundled Core handshake. Draft PR #259 created from f0131a81109c662ade9d9ae8027df6b8a6593032 | Actions was disabled, so the initial PR received no checks. Enabled Actions through its existing configuration; allowed-actions remains all and workflow SHA pins/branch/environment protections were not changed. Publication is still blocked on final proof and protected checks. |
+| 2026-09-28 | Real dump safe rejection and final candidate/cutover regressions | Private-copy safe import; independent 304 FK count queries; configured `cargo test --lib safe_promote_`; `cargo test --lib import::safe_restore_digest:: -- --include-ignored --test-threads=1` | Real dump: all 226 content checks passed, then 11 orphan references in one FK caused `failed_original_untouched` in 1210.18s; all original tables/views retained. Promotion 17 passed; proof/digest 7 passed. | No original dump/live DB modification. A separately owned copy excluding 11 rows is used only for the large successful-cutover rehearsal. Uncertain outcomes block replay; candidate schema/view changes invalidate proof. |
+| 2026-09-28 | Linux Python and configured public DB gate | Linux source snapshot with valid local Git checkout and installed Node: `python -m pytest -q --tb=short`; configured Core seven live test binaries with `--include-ignored --test-threads=1` | Linux 2804 passed / 42 skipped / 4 warnings in 41.70s; public DB gate 41 passed | Initial Linux attempt exposed a platform-dependent username assertion (fixed) plus missing Node/Windows Git-path harness issues (corrected). The live gate used MySQL 8.4/PostgreSQL 18.4. Final candidate proof review and large-data cutover remain pending. |
+| 2026-09-28 | Integrated safe-restore Python and Core regression | Windows `.venv/Scripts/python.exe -m pytest -q --tb=short`; native `cargo test`; Docker `cargo test --manifest-path migration_core/Cargo.toml --lib --test jsonl_cli` | Windows 2836 passed / 9 skipped / 6 warnings in 145.68s; native Cargo passed; Linux 277 library tests and 3 CLI tests passed, 5 explicit library ignores | Env-gated DB cases without DB environment are not live proof. Subsequent focused review found candidate-view/schema proof binding gaps; fixes and final configured live gates continue. |
+| 2026-09-28 | Required safe-restore CI coverage | `.venv/Scripts/python.exe -m pytest tests/test_ci_workflows.py tests/test_rust_core_packaging.py -q` | RED missing safe targets; GREEN 86 passed / 2 warnings in 118.17s | Required live gate now includes safe preparation, both engine promotion suites and content-digest regressions. Large private-copy safe preparation is running; no deployment claim. |
+| 2026-09-28 | Supplied incident / private-copy actual restore | Core `dump.import` into isolated MySQL; independent Core queries for every table count, information_schema defaults and schema inspection | 226 tables / 8,937,334 rows / 8 views restored in 541.33s; 226/226 row counts, 2342/2342 raw defaults, all 520 declared indexes and 304 FKs present | Private dump/log contents are not committed. Original source files and real PROD/Staging were untouched. Missing legacy metadata cannot be reconstructed by this proof. |
+| 2026-09-28 | Additional actual dump roundtrips / TF-STATUS-115 | Configured `cargo test --manifest-path migration_core/Cargo.toml --test live_dump_cross_engine -- --nocapture`; specialist live schema/policy/nullable-key regressions | RED: PostgreSQL to MySQL lost timestamp microseconds; schema/default, truncation/timezone and nullable-key defects reproduced | New coverage exercises dump files directly; previous successful migration/limited roundtrip gates remain historical evidence. Fixes and final verification in progress. |
+| 2026-09-28 | Commercial-readiness discovery | Read current status/audit; `rg` and source inspection of SQL worker/protocol, connection, import and scheduling paths; official DataGrip/DBeaver docs | Confirmed cancellation stub, whole-result buffering and blocking direct-connect callbacks; prioritized proposals and acceptance criteria documented | Static/code-based exploration, not a visual UX audit or runtime benchmark. Prior full-suite counts are historical session evidence, not a new full run. |
+| 2026-09-28 | Final-source frozen app verification | Windows and Linux PyInstaller rebuild; `python scripts/verify-frozen-app.py <packaged executable> --timeout 60` | Both rebuilt applications return success, main-window title, icon presence and bundled Rust Core handshake | Local verification builds only; no signed/notarized claim, installer publication, or macOS runtime claim. |
+| 2026-09-28 | Final full Python gates, TF-STATUS-100..109 | Windows `.venv/Scripts/python.exe -m pytest -q --tb=short`; Linux activated venv `python -m pytest -q --tb=short` | Windows 2800 passed / 1 skipped / 6 warnings in 104.29 s; Linux 2767 passed / 34 skipped / 4 warnings in 50.84 s | Full terminal results after fixes, including actual loopback SSH protocol smoke; platform skips retained. Linux runtime and container Git/PATH setup corrected before final run. |
+| 2026-09-28 | Final Rust and disposable DB gates | Native and Docker `cargo test --manifest-path migration_core/Cargo.toml`; configured Docker `cargo test --manifest-path migration_core/Cargo.toml --lib -- --ignored --test-threads=1`; native/Linux release builds | Both platforms pass 244 library tests; Linux configured query tests, 11 live roundtrip tests and FK integration pass; all 3 explicit live fault/snapshot tests pass; both optimized builds pass | Windows env-gated DB cases are not live evidence. Linux runs use disposable MySQL 8.4/PostgreSQL 18.4. Ten-million-row stress remains unrun. |
+| 2026-09-28 | Stability audit baseline and reproduced failures | `.venv/Scripts/python.exe -m pytest -q --tb=short` | Initial baseline: 2746 passed, 2 failed, 1 skipped | Both failures were Windows redirected CLI encoding; later tests reproduced additional source defects before fixes. Intermediate runs during parallel edits are not final gates. |
+| 2026-09-28 | Real database fidelity and SQL | Docker `cargo test --manifest-path migration_core/Cargo.toml --test live_roundtrip`; configured query and FK tests | Existing 10 live integration tests passed; eight same-engine format/compression roundtrips passed; both-engine FK actions and query tests passed | Disposable MySQL 8.4/PostgreSQL 18.4. PostgreSQL concurrent-write and count-permission tests explicitly exercised. No external database used. |
+| 2026-09-28 | Native and Linux frozen applications | Native and Docker `cargo build --manifest-path migration_core/Cargo.toml --release`; PyInstaller; `scripts/verify-frozen-app.py` | Windows and Linux optimized builds and frozen main-window/Core handshake smoke passed | Actual binaries launched offscreen. macOS hardware and remote workflow runs remain unverified. Final source-freeze rerun recorded separately below. |
 | 2026-07-31 | `v2.5.1` protected publication closure / TF-STATUS-099 | PR #257 protected checks and merge; approved `create-release-tag.yml` run `30601333778`; approved `release.yml` run `30601400813`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `30600955343` and `30600955319` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `97c1c1479b8b24deea89b27f01cae1ee3a930471`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.5.1` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.5.1`. TF-STATUS-099 is closed. |
 | 2026-07-31 | TF-STATUS-099 `v2.5.1` local release-candidate gate | `.venv\Scripts\python.exe scripts\bump_version.py --bump-type patch`; UTF-8 focused Import/exporter/status/version pytest; `cargo test --manifest-path migration_core\Cargo.toml`; `cargo build --manifest-path migration_core\Cargo.toml --release`; compileall; `git diff --check` | PASS: `new_version=2.5.1`; 249 Python tests; Rust 232 unit + 2 JSONL CLI + 10 live-configurable + 2 stress / 1 manual stress ignored; optimized build, compile, and diff check | A larger local Python command that included the macOS packaging support module was non-terminal beyond five minutes in the known `check-macos-support-gate.py --final --skip-github` subprocess and was stopped explicitly. No failure output was emitted from that attempt. Hosted `python-regression` remains a mandatory merge gate; release remains gated on protected PR CI, exact-current-main tag creation, approved multi-platform build, asset/digest inspection, stable activation, and updater visibility. |
 | 2026-07-31 | TF-STATUS-098 fractional temporal default and durable Import-mode summary | TDD RED/GREEN: `cargo test --manifest-path migration_core\Cargo.toml generate_table_ddl_preserves_mysql_fractional_current_timestamp_default --lib -- --nocapture`; unsafe temporal-expression regression; saved-log executed-mode regression; `cargo test --manifest-path migration_core\Cargo.toml`; `.venv\Scripts\python.exe -m pytest tests\test_db_import_dialog.py tests\test_rust_dump_exporter.py -q`; Python compile; `cargo build --manifest-path migration_core\Cargo.toml --release`; `git diff --check` | PASS: RED reproduced quoted `CURRENT_TIMESTAMP(6)` and missing summary mode; GREEN Rust 232 unit + 2 JSONL CLI + 10 live-configurable + 2 stress passed / 1 manual stress ignored; focused Python 112 passed; compile, release build, and diff check passed | Safe temporal expressions retain only bounded 0-6 fractional precision; malformed suffixes remain quoted. Saved logs report the actual Core mode from the run rather than the current radio state. The user confirmed the failed run was `replace`; no target DB was mutated during this implementation session. |
@@ -2772,6 +2835,26 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-119 | Medium | open | Backup lifecycle | Successful safe promotion retains backup namespaces and MySQL saved-view aliases; guided cleanup/recovery UI is not implemented | Add explicit recovery/retention review after release; never silently delete retained evidence or label saved aliases as backup-data views |
+| TF-STATUS-118 | High | fixed_pending_full_verify | Restore availability | Safe preparation, both-engine guarded promotion and large cutover/backup preservation passed | Required before release; finish final exact-head protected gates, preserve fail-closed unsupported/unknown-outcome policy |
+| TF-STATUS-115 | High | fixed_pending_full_verify | Export/Import contract | Real data/schema/default/precision/snapshot defects fixed; large source inconsistency now safely refused | Finish final exact-head protected gates; retain supported policy and distinguish old dump omissions/orphan rows from recoverable metadata |
+| TF-STATUS-116 | High | in_progress | Versioned release | Draft PR #259 proposes minor 2.6.0 with safe restore; large success rehearsal and exact-head CI are pending | Verify fixes, version bot, protected PR/merge/tag/build, inspect asset digests, publish and verify updater |
+| TF-STATUS-117 | Medium | watch | Commercial/usability implementation | User authorized roadmap after the verified release | Begin first product work package after TF-STATUS-116 completes; retain agreed developer/small-team focus |
+| TF-STATUS-113 | High | open | Connection responsiveness | Direct connection dialog calls blocking connect in GUI callbacks | Move connection/auth work to cancellable workers and verify UI responsiveness under unreachable endpoints |
+| TF-STATUS-114 | Medium | watch | Product readiness | Prioritized commercial-use candidates and demonstration scenarios | Developer/small-team persona confirmed; validate observed task success using `docs/commercial_readiness_2026-09-28.md` before implementation |
+| TF-STATUS-100 | High | closed | SSH / TCP | Loopback isolation, resource cleanup, assigned ports and IPv6 probes fixed | Preserve real protocol regressions; peer trust remains TF-STATUS-110 |
+| TF-STATUS-101 | High | closed | Rust SQL | Safe parameter scanning, PostgreSQL statements and non-lossy column aliases | Preserve configured live query regressions; richer result model is TF-STATUS-112 |
+| TF-STATUS-102 | High | closed | Import preflight | Validate metadata and decoded payload before target mutation; scope final DDL | Preserve pre-mutation validation; non-atomic restore remains TF-STATUS-112 |
+| TF-STATUS-103 | High | closed | SQL UI / DB shim | Dialect splitting, cursor consumption and database selection state fixed | Preserve dialect, cursor and endpoint-state regressions |
+| TF-STATUS-104 | High | closed | TSV | Single-column empty string rows preserved | Retain compressed/uncompressed streaming and buffered roundtrip coverage |
+| TF-STATUS-105 | High | fixed_pending_full_verify | Export snapshot | Consistent PostgreSQL and lock-free MySQL snapshots; honest manifest warnings | Preserve PG concurrent-write regression; finish limited-account MySQL concurrent-write/provider evidence |
+| TF-STATUS-106 | High | closed | Schema fidelity | FK actions and PostgreSQL composite key pairing preserved | Retain live cascade/set-null restore tests on both engines |
+| TF-STATUS-107 | Medium | closed | Release CLI | UTF-8 redirected output on Windows | Preserve CP949 redirected-stream regression checks |
+| TF-STATUS-108 | High | fixed_pending_full_verify | Import retries | Merge no longer truncates on retry; ambiguous chunk replay removed | Preserve failure safety; expand real disconnect fault injection |
+| TF-STATUS-109 | High | fixed_pending_full_verify | OS / CI | Linux full application gate and Windows frozen-main smoke added | Run hosted gates and real Mac validation; local frozen Windows/Linux smoke passes |
+| TF-STATUS-110 | High | open | Connection security | TLS policy and persisted SSH host identity verification incomplete | Design and implement verified TLS and host trust, including passphrase key handling |
+| TF-STATUS-111 | High | open | Complete backup fidelity | Normalized schema does not preserve all engine objects and attributes | Preserve or explicitly reject each unsupported construct; retain incomplete-export warnings |
+| TF-STATUS-112 | High | open | Query / restore limits | Cancellation, large results, multiple result sets and atomic restore gaps | Add bounded execution and fault/load coverage; expose actual guarantees |
 | TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Keep regression coverage aligned with import intent changes |
 | TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Keep row verification/report coverage aligned with import mode changes |
 | TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
@@ -2874,6 +2957,30 @@ Next action:
 
 ## Recommended Execution Order
 
+TF-STATUS-118 is explicitly required before release. Finish safe preparation,
+guarded promotion, interruption/replay tests and private-copy large restoration.
+Failure reports alone do not constitute recovery. Verify common MySQL fidelity
+and durable diagnostics under TF-STATUS-115 alongside those gates.
+
+Active user order: finish TF-STATUS-115 deep roundtrip and policy verification,
+publish the verified version through TF-STATUS-116, then proceed with
+TF-STATUS-117 using the existing commercial-readiness priorities. Do not begin
+unrelated new features before the requested verification/release sequence.
+
+Product follow-up: use `docs/commercial_readiness_2026-09-28.md` for acceptance
+criteria. Prioritize verified connection security/responsiveness (110/113),
+actual query cancellation/bounded results (112), and restore plans/fidelity
+(111/112), followed by results-to-file and workspace recovery for the confirmed
+developer/small-team audience (114); reusable jobs follow observed demand.
+
+Current audit priority (2026-09-28): preserve the passing Windows/Linux full
+test/build/frozen smoke evidence; finish broader TF-STATUS-105/108/109 gates
+and resolve transport/host trust
+(TF-STATUS-110), full schema fidelity (TF-STATUS-111), and execution/failure
+limits (TF-STATUS-112). Keep actual-Mac TF-STATUS-008 and provider-specific
+TF-STATUS-096/098 proof pending until their environments are exercised.
+The historical release-preservation checklist follows.
+
 1. Keep TF-STATUS-099 closed by preserving PR #257 hosted gates, the exact-main
    annotated `v2.5.1` tag, separate protected approvals, all 10 asset digests,
    matching macOS sidecars, stable/latest state, and updater visibility.
@@ -2951,6 +3058,15 @@ Next action:
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-09-28 | Completed large safe cutover rehearsal and independent active/backup verification. Corrected the final view-header literal fidelity edge case and wired the MySQL-specific live promotion environment into mandatory CI. | View sanitizer/tests, CI contract, policy/evidence/status | 452 actual table counts match; active/backup totals 8,937,323/8,937,334, eight declared view counts match, both namespaces retain 304 FKs. Final safe fixtures4 and both-engine promotion17 passed. Exact supplied dump remains unmodified and safely refused for 11 orphan references. |
+| 2026-09-28 | Protected PR #259 version bot selected 2.6.0; latest-head real DB and Rust gates passed. Fixed inherited-XDG test isolation exposed only by hosted Linux CI, without weakening assertions or changing production settings behavior. | Config/group test fixtures, incident and canonical status | Reproduced exact 18 hosted failures locally; Linux/Windows focused 75 passed. Final large safe preparation succeeded in 715.76s; cutover and full protected CI remain pending. |
+| 2026-09-28 | Completed independent safe-restore review fixes: bind full candidate schema/views, block qualified view-target escapes, enforce MySQL metadata visibility and uncertain-attempt guards. Real dump's orphan rows now cause safe refusal. | Core preparation/promotion/schema, regression fixtures, incident/policy/evidence docs | Final native Core tests and Windows/Linux release builds passed; configured promotion 17 and proof 7 passed; Python live8 passed; Windows packaged UI/Core smoke passed. Large derived-fixture cutover and protected release remain pending. |
+| 2026-09-28 | User requires safe restore before release and reviewed destination-name choices. Implemented candidate preparation and engine-specific guarded promotion; independent review is hardening uncertain-outcome replay. Proposed release moves to minor 2.6.0. | Safe restore/promotion Core modules, UI/facade, policy/design, required live CI | Real Python-to-Core promotion passed on both engines; live PostgreSQL DateStyle false-positive reproduced and fixed. Required CI contract 86 passed. Final integrated and large-data gates remain pending. |
+| 2026-09-28 | Mapped the user's detailed incident to implemented fixes and remaining gaps; verified a private copy of the real dump, and continued server-DDL preflight, persistent reports and common MySQL metadata preservation. | Incident assessment, policy/verification documents, schema/import/UI regressions, canonical status | Actual isolated restore and independent row/default/index/FK checks; current live Staging not altered. Atomic replacement remains explicitly open. |
+| 2026-09-28 | Started user-authorized additional Export/Import verification, patch deployment, then product improvements. Confirmed release credentials/protections read-only and created isolated test DBs. Reproduced gaps beyond earlier fixtures. | Core/UI regression work, dump cross-engine integration test, verification record and canonical status | New RED real DB roundtrips; release path inspected without remote mutation. |
+| 2026-09-28 | Clarified that previous local fixes are complete but commercial readiness is not; explored code-backed additions/polish and three meaningful user demonstrations. User confirmed developers/small teams doing everyday DB work. | Commercial-readiness discovery document and canonical status | Source inspection and official product documentation; existing features separated from proposals; current-status tests 76 passed / 2 existing warnings and whitespace check passed. |
+| 2026-09-28 | Completed final local verification and closed TF-STATUS-100..104, 106 and 107. Broader snapshot/retry/platform proof stays pending, and explicit TF-STATUS-110..112 commercial-readiness gaps remain open. | Canonical status and stability audit | Windows full Python 2800 passed; Linux 2767 passed; both full Cargo/release builds; configured real DB matrix, FK/SQL/snapshot/disconnect checks; both rebuilt frozen applications passed UI/Core smoke. |
+| 2026-09-28 | Audited user-confirmed current engines and three OS targets; reproduced and corrected tunnel, SQL, dump/import fidelity, snapshot and retry defects; added Linux and frozen-main CI gates. Recorded concrete security/fidelity/execution gaps without claiming a perfect application. | Rust Core, Python UI/shims, CLI and CI, regression/integration tests, `docs/stability_audit_2026-09-28.md`, canonical status | Baseline/full and focused Python, native/Linux Rust, real disposable DB matrix, concurrent-write/FK tests, Windows/Linux frozen UI/Core smoke; final verification rows tracked above. No remote messages or release publication. |
 | 2026-07-31 | Published `v2.5.1` as stable/latest and closed TF-STATUS-099 after the complete protected PR, exact-main tag, separately approved multi-platform build, asset inspection, and updater verification sequence. Repository Actions had been disabled before PR checks; it was re-enabled under the retained allowed-actions policy and all declared checks ran without bypass. | PR #257, tag `v2.5.1`, release workflow/metadata, repository Actions setting, canonical status | Runs `30600955343` and `30600955319` passed; merge commit `97c1c1479b8b24deea89b27f01cae1ee3a930471`; tag run `30601333778` and release run `30601400813` passed; 10/10 assets have GitHub digests and four macOS sidecars match; public latest and `UpdateChecker` return `2.5.1`. |
 | 2026-07-31 | Started TF-STATUS-099 protected `v2.5.1` patch publication for the fractional temporal-default Import fix and durable executed-mode log summary. Created a dedicated agent branch, synchronized all official version sources, and completed the bounded local release-candidate gate. | `src/version.py`, `pyproject.toml`, `installer/TunnelForge.iss`, implementation/tests, canonical status | `scripts/bump_version.py --bump-type patch` reported `new_version=2.5.1`; focused Python 249, full Cargo, optimized Core build, compile, and diff check passed. The macOS-support packaging module reproduced the known Windows non-terminal subprocess pattern, so hosted full Python and all protected publication gates remain mandatory. |
 | 2026-07-31 | Implemented the focused TF-STATUS-098 fix on the current `v2.5.0` main baseline. Rust Core now emits fractional `CURRENT_TIMESTAMP(6)` as a temporal expression under a bounded injection-safe grammar, and saved Import logs include the actual executed mode in the durable summary even if the detailed log header ages out. User confirmation establishes that the failed production-shaped run used destructive `replace` mode. | `migration_core/src/ddl.rs`, `src/ui/dialogs/db_import_dialog.py`, focused Rust/Python tests, canonical status | TDD RED/GREEN; full Cargo gate passed at 232 unit + 2 CLI + 10 live-configurable + 2 stress / 1 ignored; focused Python 112 passed; compile, optimized build, and diff check passed. Monolithic Python was non-terminal after five minutes at a macOS support-gate subprocess and is not claimed as passing; clean live 185-table restore remains. |

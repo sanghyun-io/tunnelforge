@@ -244,7 +244,7 @@ def test_single_connection_failure_does_not_prompt_again(monkeypatch):
         dialog.close()
 
 
-def test_backup_admin_denial_offers_parallel_continue(monkeypatch):
+def test_backup_admin_denial_offers_single_worker_fallback(monkeypatch):
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(
         "src.ui.dialogs.db_export_dialog.check_rust_dump",
@@ -257,19 +257,18 @@ def test_backup_admin_denial_offers_parallel_continue(monkeypatch):
         button_texts = {button.text() for button in message_box.buttons()}
 
         assert button_texts == {
-            "병렬로 계속 (락 없이)",
+            "락 없이 계속 (단일 워커)",
             "단일 연결로 계속",
             "권한 설정 안내",
             "취소",
         }
-        assert message_box.defaultButton().text() == "병렬로 계속 (락 없이)"
+        assert message_box.defaultButton().text() == "락 없이 계속 (단일 워커)"
     finally:
         dialog.close()
 
 
-def test_flush_reload_denial_also_offers_lock_free_parallel(monkeypatch):
-    # RDS는 FTWRL 자체가 막혀 FLUSH_TABLES_OR_RELOAD 마커가 뜨는데, lock-free 병렬 모드는
-    # FTWRL을 쓰지 않으므로 이 경우에도 병렬 계속을 제시해야 한다.
+def test_flush_reload_denial_also_offers_single_worker_fallback(monkeypatch):
+    # RDS의 FTWRL 권한 거부에도 락 없는 단일 워커 모드를 제시한다.
     app = QApplication.instance() or QApplication([])
     monkeypatch.setattr(
         "src.ui.dialogs.db_export_dialog.check_rust_dump",
@@ -282,12 +281,12 @@ def test_flush_reload_denial_also_offers_lock_free_parallel(monkeypatch):
         button_texts = {button.text() for button in message_box.buttons()}
 
         assert button_texts == {
-            "병렬로 계속 (락 없이)",
+            "락 없이 계속 (단일 워커)",
             "단일 연결로 계속",
             "권한 설정 안내",
             "취소",
         }
-        assert message_box.defaultButton().text() == "병렬로 계속 (락 없이)"
+        assert message_box.defaultButton().text() == "락 없이 계속 (단일 워커)"
     finally:
         dialog.close()
 

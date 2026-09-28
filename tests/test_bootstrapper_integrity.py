@@ -33,6 +33,8 @@ def _assert_failed_download_cleanup(download_dir, final_path, *, part_created=Tr
         assert download_dir.exists()
         if part_created:
             assert part_path.exists()
+        else:
+            assert not part_path.exists()
 
 
 def test_bootstrapper_source_self_check_runs_without_gui_or_network():
@@ -227,7 +229,9 @@ def test_bootstrapper_size_mismatch_removes_all_owned_download_files(
         downloader.download_installer()
 
     final_path = download_dir / OFFLINE_NAME
-    _assert_failed_download_cleanup(download_dir, final_path)
+    # The mismatched response header is rejected before creating a partial file.
+    response.iter_content.assert_not_called()
+    _assert_failed_download_cleanup(download_dir, final_path, part_created=False)
 
 
 @pytest.mark.parametrize(
@@ -340,8 +344,8 @@ def test_bootstrapper_keeps_verified_installer_when_launch_fails(monkeypatch, tm
     app.downloader = downloader
     errors = []
     app._show_error = errors.append
-    monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0)
-    monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0, raising=False)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0, raising=False)
     monkeypatch.setattr(
         bundled_bootstrapper.subprocess,
         "Popen",
@@ -1193,8 +1197,8 @@ def test_bootstrapper_verified_launch_closes_replacement_race(
             replacement_blocked.append(True)
         return MagicMock()
 
-    monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0)
-    monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "DETACHED_PROCESS", 0, raising=False)
+    monkeypatch.setattr(bundled_bootstrapper.subprocess, "CREATE_NEW_PROCESS_GROUP", 0, raising=False)
     monkeypatch.setattr(bundled_bootstrapper.subprocess, "Popen", popen)
 
     app._launch_installer()

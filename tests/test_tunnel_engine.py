@@ -205,3 +205,121 @@ class TestTunnelEngine:
 
                 assert success is False
                 assert "시간 초과" in msg
+
+    def test_live_tunnel_binds_only_loopback(self, sample_tunnel_config):
+        with patch('src.core.tunnel_engine.SSHTunnelForwarder') as forwarder:
+            with patch.object(self.engine, '_load_private_key', return_value=object()):
+                success, _ = self.engine.start_tunnel(sample_tunnel_config, check_port=False)
+        assert success
+        assert forwarder.call_args.kwargs['local_bind_address'] == (
+            '127.0.0.1', sample_tunnel_config['local_port'])
+
+    @pytest.mark.parametrize('temporary', [False, True])
+    @pytest.mark.parametrize('cleanup_fails', [False, True])
+    def test_failed_start_cleans_up_forwarder(self, sample_tunnel_config, temporary, cleanup_fails):
+        server = MagicMock()
+        server.start.side_effect = RuntimeError('start failed')
+        if cleanup_fails:
+            server.stop.side_effect = RuntimeError('cleanup failed')
+        with patch('src.core.tunnel_engine.SSHTunnelForwarder', return_value=server):
+            with patch.object(self.engine, '_load_private_key', return_value=object()):
+                if temporary:
+                    success, returned_server, message = self.engine.create_temp_tunnel(sample_tunnel_config)
+                    assert returned_server is None
+                else:
+                    success, message = self.engine.start_tunnel(sample_tunnel_config, check_port=False)
+        assert not success
+        assert 'start failed' in message
+        server.stop.assert_called_once()
+        assert not self.engine.active_tunnels
+        assert not self.engine.tunnel_configs
+
+    def test_restart_stops_dead_forwarder_before_checking_port(self, sample_tunnel_config):
+        old_server = MagicMock(is_active=False)
+        tunnel_id = sample_tunnel_config['id']
+        self.engine.active_tunnels[tunnel_id] = old_server
+        self.engine.tunnel_configs[tunnel_id] = sample_tunnel_config
+
+        def port_available(port):
+            return old_server.stop.called
+
+        with patch.object(self.engine, 'is_port_available', side_effect=port_available):
+            with patch.object(self.engine, '_load_private_key', return_value=object()):
+                with patch('src.core.tunnel_engine.SSHTunnelForwarder') as forwarder:
+                    success, _ = self.engine.start_tunnel(sample_tunnel_config)
+        assert success
+        old_server.stop.assert_called_once()
+        assert self.engine.active_tunnels[tunnel_id] is forwarder.return_value
+
+    def test_restart_retains_dead_forwarder_if_cleanup_fails(self, sample_tunnel_config):
+        old_server = MagicMock(is_active=False)
+        old_server.stop.side_effect = RuntimeError('still owns listener')
+        tunnel_id = sample_tunnel_config['id']
+        self.engine.active_tunnels[tunnel_id] = old_server
+        self.engine.tunnel_configs[tunnel_id] = sample_tunnel_config
+        with patch.object(self.engine, '_load_private_key', return_value=object()):
+            with patch('src.core.tunnel_engine.SSHTunnelForwarder') as forwarder:
+                success, _ = self.engine.start_tunnel(sample_tunnel_config, check_port=False)
+        assert not success
+        assert self.engine.active_tunnels[tunnel_id] is old_server
+        forwarder.assert_not_called()
+
+    def test_allocated_port_is_used_by_connection_and_export_list(self, sample_tunnel_config):
+        sample_tunnel_config['local_port'] = 0
+        with patch('src.core.tunnel_engine.SSHTunnelForwarder') as forwarder:
+            forwarder.return_value.local_bind_port = 43210
+            with patch.object(self.engine, '_load_private_key', return_value=object()):
+                success, _ = self.engine.start_tunnel(sample_tunnel_config)
+        assert success
+        assert self.engine.get_connection_info(sample_tunnel_config['id']) == ('127.0.0.1', 43210)
+        assert self.engine.get_active_tunnels()[0]['port'] == 43210
+
+    def test_direct_connection_supports_ipv6(self, sample_direct_config):
+        try:
+            listener = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+            listener.bind(('::1', 0))
+            listener.listen(1)
+        except OSError:
+            if 'listener' in locals():
+                listener.close()
+            pytest.skip('IPv6 loopback unavailable')
+        with listener:
+            sample_direct_config.update(remote_host='::1', remote_port=listener.getsockname()[1])
+            success, message = self.engine.test_connection(sample_direct_config)
+        assert success, message
+
+    def test_failed_direct_connection_closes_socket(self, sample_direct_config):
+        sample_direct_config['remote_host'] = '127.0.0.1'
+        with patch('socket.socket') as socket_class:
+            sock = socket_class.return_value
+            sock.connect.side_effect = OSError('connection refused')
+            success, _ = self.engine.test_connection(sample_direct_config)
+        assert not success
+        sock.close.assert_called()
+
+    def test_failed_port_check_closes_socket(self):
+        with patch('socket.socket') as socket_class:
+            sock = socket_class.return_value
+            sock.bind.side_effect = OSError('port in use')
+            assert not self.engine.is_port_available(12345)
+        sock.close.assert_called_once()
+
+    def test_ssh_connection_test_preserves_start_error_if_cleanup_fails(self, sample_tunnel_config):
+        server = MagicMock()
+        server.start.side_effect = RuntimeError('start failed')
+        server.stop.side_effect = RuntimeError('cleanup failed')
+        with patch('src.core.tunnel_engine.SSHTunnelForwarder', return_value=server):
+            with patch.object(self.engine, '_load_private_key', return_value=object()):
+                success, message = self.engine.test_connection(sample_tunnel_config)
+        assert not success
+        assert 'start failed' in message
+        server.stop.assert_called_once()
+
+    def test_dead_tunnel_has_no_endpoint_and_is_excluded_from_export_list(self, sample_tunnel_config):
+        server = MagicMock(is_active=False)
+        type(server).local_bind_port = PropertyMock(side_effect=RuntimeError('server not started'))
+        tunnel_id = sample_tunnel_config['id']
+        self.engine.active_tunnels[tunnel_id] = server
+        self.engine.tunnel_configs[tunnel_id] = sample_tunnel_config
+        assert self.engine.get_connection_info(tunnel_id) == (None, None)
+        assert self.engine.get_active_tunnels() == []

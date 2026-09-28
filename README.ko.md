@@ -64,7 +64,7 @@
 
 | | 기능 | 설명 |
 |:-:|------|------|
-| ⚡ | **병렬 Export/Import** | Rust DB Core의 병렬 처리로 초고속 스키마/데이터 전송. |
+| ⚡ | **Export/Import** | 데이터 검증, 엔진별 스냅샷 정책, MySQL 병렬 처리와 명확한 복원 제약을 제공하는 테이블 전송. |
 | 🧩 | **고아 레코드 분석** | 깨진 외래키 관계로 남은 고아 레코드를 탐지하고 보고서로 내보내기. |
 
 예약 백업 & 쿼리 실행은 기본 UI에서 비활성화되어 있으며, 의도적인 재활성화와 검증 전에는 사용할 수 없습니다. 현재 상태는 [SCHEDULE.md](SCHEDULE.md)를 참조하세요.
@@ -152,9 +152,10 @@ graph LR
 <details>
 <summary><b>Export 모범 사례</b></summary>
 
-- 구조 백업에는 **스키마 전용 Export** 사용
+- 복원 전에 [Export/Import 정책 및 제약](docs/export_import_policy.md) 확인
 - 필요한 것만 내보내려면 **테이블 선택** 사용
-- Export는 병렬로 실행되어 빠르게 완료
+- MySQL 공유 스냅샷은 병렬 처리, 권한 대체 경로와 PostgreSQL은 단일 일관 세션 사용
+- 새 v3 덤프는 **TunnelForge 2.6.0 이상** 필요. 기존 v1/v2 덤프는 계속 읽을 수 있음
 
 </details>
 

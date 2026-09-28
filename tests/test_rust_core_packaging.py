@@ -2019,7 +2019,9 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
     assert jobs["version-gate"]["needs"] == [
         "macos-support-tracking-gate",
         "rust-core-regression-gate",
+        "dump-roundtrip-regression",
         "python-regression",
+        "python-linux-regression",
         "macos-app-validation",
         "version-validation",
         "version-bump",
