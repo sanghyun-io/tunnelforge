@@ -77,6 +77,12 @@ candidate, then offers guarded engine-specific replacement; final failure/race
 and private-copy large-data verification are in progress. Advanced legacy modes
 remain non-atomic. The proposed feature release is 2.6.0, pending protected gates.
 
+Safe verification of the exact supplied dump found 11 orphan references in one
+of its 304 FKs and correctly refused cutover while retaining the original DB.
+A separate test-only copy excludes those rows for the large success rehearsal;
+neither the supplied dump nor live databases were repaired or modified. Draft
+PR #259 starts protected validation; it is not an approved/published release.
+
 The user has authorized a sequential follow-up: deep Export/Import verification,
 fixes, versioned protected release, then the commercial/usability roadmap.
 TF-STATUS-115 is active: additional real roundtrips reproduced silent MySQL
@@ -834,6 +840,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-28 | Frozen applications and protected draft PR | Windows/Linux PyInstaller builds and `scripts/verify-frozen-app.py`; `gh pr create --draft --label version:minor`; repository Actions permission query | Both frozen applications passed UI/icon/bundled Core handshake. Draft PR #259 created from f0131a81109c662ade9d9ae8027df6b8a6593032 | Actions was disabled, so the initial PR received no checks. Enabled Actions through its existing configuration; allowed-actions remains all and workflow SHA pins/branch/environment protections were not changed. Publication is still blocked on final proof and protected checks. |
 | 2026-09-28 | Real dump safe rejection and final candidate/cutover regressions | Private-copy safe import; independent 304 FK count queries; configured `cargo test --lib safe_promote_`; `cargo test --lib import::safe_restore_digest:: -- --include-ignored --test-threads=1` | Real dump: all 226 content checks passed, then 11 orphan references in one FK caused `failed_original_untouched` in 1210.18s; all original tables/views retained. Promotion 17 passed; proof/digest 7 passed. | No original dump/live DB modification. A separately owned copy excluding 11 rows is used only for the large successful-cutover rehearsal. Uncertain outcomes block replay; candidate schema/view changes invalidate proof. |
 | 2026-09-28 | Linux Python and configured public DB gate | Linux source snapshot with valid local Git checkout and installed Node: `python -m pytest -q --tb=short`; configured Core seven live test binaries with `--include-ignored --test-threads=1` | Linux 2804 passed / 42 skipped / 4 warnings in 41.70s; public DB gate 41 passed | Initial Linux attempt exposed a platform-dependent username assertion (fixed) plus missing Node/Windows Git-path harness issues (corrected). The live gate used MySQL 8.4/PostgreSQL 18.4. Final candidate proof review and large-data cutover remain pending. |
 | 2026-09-28 | Integrated safe-restore Python and Core regression | Windows `.venv/Scripts/python.exe -m pytest -q --tb=short`; native `cargo test`; Docker `cargo test --manifest-path migration_core/Cargo.toml --lib --test jsonl_cli` | Windows 2836 passed / 9 skipped / 6 warnings in 145.68s; native Cargo passed; Linux 277 library tests and 3 CLI tests passed, 5 explicit library ignores | Env-gated DB cases without DB environment are not live proof. Subsequent focused review found candidate-view/schema proof binding gaps; fixes and final configured live gates continue. |
@@ -2826,7 +2833,7 @@ Next action:
 | --- | --- | --- | --- | --- | --- |
 | TF-STATUS-118 | High | in_progress | Restore availability | Safe candidate restoration and reviewed MySQL/PostgreSQL cutover implemented; final replay/race/large-data verification pending | Required before release by user decision; preserve original until verified cutover, block uncertain replay, retain backups and reject unsupported graphs |
 | TF-STATUS-115 | High | in_progress | Export/Import contract | Real roundtrips reveal data coercion, schema routing/default/precision and nullable-key defects | Fix with real regression evidence; publish supported policy/constraint matrix and run full gates before release |
-| TF-STATUS-116 | High | open | Versioned release | User-authorized patch release after Export/Import verification | Verify fixes, version bot, protected PR/merge/tag/build, inspect asset digests, publish and verify updater |
+| TF-STATUS-116 | High | in_progress | Versioned release | Draft PR #259 proposes minor 2.6.0 with safe restore; large success rehearsal and exact-head CI are pending | Verify fixes, version bot, protected PR/merge/tag/build, inspect asset digests, publish and verify updater |
 | TF-STATUS-117 | Medium | watch | Commercial/usability implementation | User authorized roadmap after the verified release | Begin first product work package after TF-STATUS-116 completes; retain agreed developer/small-team focus |
 | TF-STATUS-113 | High | open | Connection responsiveness | Direct connection dialog calls blocking connect in GUI callbacks | Move connection/auth work to cancellable workers and verify UI responsiveness under unreachable endpoints |
 | TF-STATUS-114 | Medium | watch | Product readiness | Prioritized commercial-use candidates and demonstration scenarios | Developer/small-team persona confirmed; validate observed task success using `docs/commercial_readiness_2026-09-28.md` before implementation |
