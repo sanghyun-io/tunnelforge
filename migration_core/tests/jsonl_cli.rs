@@ -92,3 +92,13 @@ fn query_execute_memory_payload_preserves_explicit_columns() {
     assert_eq!(result["rows"], json!([]));
     assert_eq!(result["columns"], json!(["id", "name"]));
 }
+
+#[test]
+fn promotion_requires_an_explicit_action_and_confirmation_before_loading_a_plan() {
+    let invalid = run_helper(json!({"command":"dump.promote","payload":{"action":"unsafe"}}));
+    assert_eq!(invalid[0]["event"], "error");
+    assert!(invalid[0]["message"].as_str().unwrap().contains("action must be plan or confirm"));
+    let unconfirmed = run_helper(json!({"command":"dump.promote","payload":{"action":"confirm"}}));
+    assert_eq!(unconfirmed[0]["event"], "error");
+    assert!(unconfirmed[0]["message"].as_str().unwrap().contains("explicit overwrite confirmation"));
+}

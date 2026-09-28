@@ -62,3 +62,19 @@ class PostgresConnector:
             return delegate.schema_exists(schema_name)
         except Exception:
             return False
+
+    def _metadata_delegate(self) -> RustDbConnector:
+        delegate = RustDbConnector(
+            "postgresql", self.host, self.port, self.user, self.password,
+            database=self.database, facade=self.facade,
+        )
+        delegate.connection = self.connection
+        return delegate
+
+    def get_schemas(self, use_cache: bool = True):
+        if self.connection is None and not self.connect()[0]:
+            return []
+        return self._metadata_delegate().get_schemas(use_cache)
+
+    def get_tables(self, schema: Optional[str] = None, use_cache: bool = True):
+        return self._metadata_delegate().get_tables(schema, use_cache)

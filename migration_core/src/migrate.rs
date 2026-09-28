@@ -899,6 +899,23 @@ pub fn preflight_issues(payload: &Value) -> Vec<MigrationIssue> {
         });
     }
 
+    if let Ok(schema) = parse_schema(&payload["schema"]) {
+        for table in &schema.tables {
+            if let Err(message) = validate_target_foreign_key_actions(table, &target) {
+                issues.push(MigrationIssue {
+                    issue_type: Some("unsupported_fk_action".to_string()),
+                    severity: "error".to_string(),
+                    location: table.name.clone(),
+                    message,
+                    suggestion: "Choose a supported target or explicitly revise the source foreign key action before migrating.".to_string(),
+                    blocking: true,
+                    table_name: Some(table.name.clone()),
+                    column_name: None,
+                });
+            }
+        }
+    }
+
     for object_name in unsupported_objects(payload) {
         issues.push(MigrationIssue {
             issue_type: None,
@@ -2150,6 +2167,9 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "id".to_string(),
@@ -2158,6 +2178,9 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "name".to_string(),
@@ -2166,11 +2189,17 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let source = MemoryAdapter::from_value(Some(&json!({
@@ -2232,6 +2261,9 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "enabled".to_string(),
@@ -2240,11 +2272,17 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -2272,6 +2310,9 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "event_date".to_string(),
@@ -2280,6 +2321,9 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "event_time".to_string(),
@@ -2288,6 +2332,9 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "created_at".to_string(),
@@ -2296,11 +2343,17 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -2338,6 +2391,9 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "amount".to_string(),
@@ -2346,11 +2402,17 @@ mod tests {
                         nullable: false,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({
@@ -2378,6 +2440,9 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "message".to_string(),
@@ -2386,11 +2451,17 @@ mod tests {
                         nullable: true,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let mut source = MemoryAdapter::from_value(Some(&json!({

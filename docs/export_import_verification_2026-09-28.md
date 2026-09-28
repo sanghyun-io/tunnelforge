@@ -1,0 +1,57 @@
+# Export/Import 추가 검증과 배포 작업 기록
+
+사용자 요청 순서: 기존 수정 사항의 추가 검증 → Export/Import 정책 불일치 수정 →
+버전 반영·정식 배포 → 상용화/사용성 개선안 진행.
+
+현재 단계: 추가 검증 및 재현된 결함 수정. 배포 전에는 아래 판정을 실제 명령 결과로 갱신한다.
+
+## 검증 기준
+
+- Export 성공 파일을 Import하는 실제 경로를 사용한다. 별도 migration 명령 성공으로 대신하지 않는다.
+- MySQL 8.4와 PostgreSQL 18.4의 폐기 가능한 DB에서 먼저 재현한다. 사용자 DB는 변경하지 않는다.
+- 행 수 외에 값, NULL/빈 문자열, 이진값, 소수·시간 정밀도, 기본값, FK 및 복원 후 INSERT를 비교한다.
+- JSONL/TSV, 비압축/Zstandard, 단일/병렬, replace/recreate/merge, 신규/기존 대상, 권한 제한을 구분한다.
+- 옵션이 UI → Python → JSONL → Rust → 모든 DB 세션까지 유지되는지 확인한다.
+- 미지원 객체는 불완전한 성공으로 숨기지 않는다. 지원 가능한 일반 스키마의 재생성 오류는 수정한다.
+- 실패 후 부분 적재/롤백 범위와 재시도 가능성을 명시한다. merge는 증분 동기화 또는 upsert로 표현하지 않는다.
+- 버전 봇·보호 PR·필수 검사·승인된 태그/릴리스 워크플로·자산 해시를 거쳐 배포한다.
+
+## 추가로 재현된 문제
+
+| 경로 | 재현/코드 근거 | 상태 |
+| --- | --- | --- |
+| PostgreSQL UI Export/Import | 커넥터 metadata API 부재 및 database와 schema 혼용 | 수정; 실제 Python/Core 경로 통과 |
+| PostgreSQL 기본값/배열 | ARRAY DDL 오류, now()/cast 기본값 처리 | 수정; 실제 스키마 왕복 통과 |
+| MySQL 기본값/속성 | DEFAULT '' 누락으로 복원 후 INSERT 실패, ON UPDATE 보존 공백 | 수정; 실제 INSERT/UPDATE 검증 통과 |
+| PostgreSQL → MySQL 덤프 복원 | timestamp(6)의 소수 초가 사라짐 | RED → GREEN 실제 교차 엔진 왕복 |
+| MySQL merge 타입 불일치 | VARCHAR20 → VARCHAR3에서 JSONL/TSV/fallback/LOAD 경로가 잘린 값을 성공으로 반환 | 수정; 모든 경로의 오류·원본 값 보존 검증 통과 |
+| Import 시간대 | +09 설정이 임시 전역 설정을 위한 재연결/병렬 세션에서 유실 | 수정; 병렬·재연결 실제 검증 통과 |
+| nullable UNIQUE Export | MySQL chunk1에서 NULL 행 반복, PostgreSQL keyset NULL 비교 공백 | 수정; NULL/중복 경계 실제 왕복 통과 |
+
+## 현재 검증 증거와 남은 배포 조건
+
+- Windows 전체 Python: 2,836 passed / 9 skipped / 6 warnings, 145.68초.
+- 실제 MySQL 8.4/PostgreSQL 18.4 공개 DB 통합 게이트: 7개 바이너리,
+  41개 테스트 통과. `live_roundtrip`, `live_dump_cross_engine`,
+  `live_schema_fidelity`, `live_import_policy`, `live_foreign_key_actions`,
+  `live_export_contract`, `live_safe_restore`를 순차 실행했다.
+- Python → Core 실제 통합: 8개 통과. 두 엔진의 기존/신규 이름 안전 복원,
+  전환 확인, 이전 데이터 보존 및 PostgreSQL 기존 뷰 의존성의 변경 전 거부 포함.
+- 안전 복원 후보의 뷰·스키마 변경 감지와 미확정 전환 재시도 차단을 독립 리뷰로
+  보강했다. 최종 후보 증거 테스트 7개, 전환/경합 테스트 17개가 통과했다.
+  최종 소스의 대용량 안전 복원·전환,
+  패키징·보호 CI를 통과한 뒤 배포한다. 이전 테스트 횟수를 최종 검증으로 대체하지 않는다.
+- 실제 덤프 안전 복원은 모든 226개 테이블의 행/값 검증 뒤 FK 고아행 11개를
+  감지해 원본을 유지하고 전환을 거부했다(1,210.18초, INSERT fallback 포함).
+  독립적인 304개 FK 점검도 한 제약의 11개 위반만 확인했다. 원본 덤프는 보존하며,
+  11개 행을 제외한 별도 시험용 복사본으로 성공 전환 경로를 검증 중이다.
+
+## 배포 단계
+
+예정 버전: 현재 v2.5.1에서 minor v2.6.0. 안전 복원 기능을 포함하며 최종 버전은 원격 최신 상태와 버전 봇 결과로 확정한다.
+현재 main 기준 SHA는 배포 시점에 다시 확인한다. 태그를 재지정하거나 보호 검사를 우회하지 않는다.
+사용자의 배포 지시는 이 작업의 PR·버전·머지·정상 환경 승인·검증된 릴리스 공개를 포함한다.
+실제 Mac 하드웨어 검증 여부와 unsigned macOS 정책은 사실대로 유지한다.
+
+배포 이후 개선안의 첫 묶음은 검증된 연결/응답성, 실제 쿼리 취소/제한, 복원 계획 미리보기다.
+이번 버그 수정 배포와 후속 기능 구현을 구분해 기록한다.

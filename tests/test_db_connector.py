@@ -262,11 +262,26 @@ class TestMySQLConnector:
         ]
         mock_conn.cursor.return_value = mock_cursor
         self.connector.connection = mock_conn
+        self.connector._delegate.get_tables = MagicMock(return_value=['users', 'orders'])
 
         tables = self.connector.get_tables(use_cache=False)
 
         assert 'users' in tables
         assert 'orders' in tables
+
+    def test_get_tables_uses_rust_base_table_inventory_and_preserves_cache(self):
+        self.connector.connection = MagicMock()
+        self.connector.connection.cursor.return_value.__enter__.return_value.fetchall.return_value = [
+            {"Tables_in_app": "users"}, {"Tables_in_app": "users_view"},
+        ]
+        self.connector._delegate.get_tables = MagicMock(return_value=["users"])
+        self.connector._cache = MagicMock()
+        self.connector._cache.get.side_effect = [None, ["users"]]
+        assert self.connector.get_tables("app") == ["users"]
+        assert self.connector.get_tables("app") == ["users"]
+        self.connector._delegate.get_tables.assert_called_once_with("app", use_cache=False)
+        self.connector.connection.cursor.assert_not_called()
+        self.connector._cache.set.assert_called_once()
 
     def test_get_tables_no_connection(self):
         """연결 없을 때 빈 리스트 반환"""

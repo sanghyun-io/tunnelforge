@@ -5,6 +5,7 @@ from PyQt6.QtWidgets import QDialog, QMessageBox
 
 from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
+from src.core.db_core_service import normalize_db_engine
 from src.ui.dialogs.db_connection_dialog import DBConnectionDialog
 from src.ui.dialogs.db_export_dialog import (
     RustDumpExportDialog,
@@ -67,7 +68,7 @@ class RustDumpWizard:
             )
             return None, None
 
-        db_engine = tunnel.get('db_engine')
+        db_engine = normalize_db_engine(tunnel.get('db_engine'), tunnel.get('remote_port'))
         database = tunnel.get('default_database') or (
             tunnel.get('default_schema') if db_engine == 'mysql' else None
         )
@@ -167,7 +168,6 @@ class RustDumpWizard:
                 connector.disconnect()
 
         return True
-
 
 
 

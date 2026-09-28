@@ -138,6 +138,18 @@ class TestInsertRow:
 
 
 class TestCLI:
+    @pytest.mark.parametrize('help_only', [False, True])
+    def test_redirected_output_is_utf8_with_legacy_locale(self, monkeypatch, tmp_path, help_only):
+        monkeypatch.setenv('PYTHONIOENCODING', 'cp949')
+        args = ['--help'] if help_only else self._valid_args(tmp_path / 'missing.md')
+        result = subprocess.run(
+            [sys.executable, CLI, *args], capture_output=True,
+        )
+        assert result.returncode == (0 if help_only else 1)
+        output = result.stdout if help_only else result.stderr
+        expected = '릴리스' if help_only else '문서를 찾을 수 없습니다'
+        assert expected in output.decode('utf-8')
+
     def run(self, *args, cwd=None):
         result = subprocess.run(
             [sys.executable, CLI, *args],

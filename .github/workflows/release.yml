@@ -187,6 +187,9 @@ jobs:
           $exeSize = (Get-Item "dist\TunnelForge\TunnelForge.exe").Length / 1MB
           Write-Host "✅ EXE built: $($exeSize.ToString('0.0')) MB"
 
+      - name: Smoke frozen main app
+        run: python scripts/verify-frozen-app.py dist/TunnelForge/TunnelForge.exe --timeout 60
+
       - name: Build Bootstrapper (for recovery feature)
         run: |
           Write-Host "Building bootstrapper for recovery/update feature..."

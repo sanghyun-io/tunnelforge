@@ -349,12 +349,33 @@ pub(crate) fn write_dump_manifest(output_path: &Path, manifest: &DumpManifest) -
 pub(crate) fn read_dump_manifest(input_path: &Path) -> Result<DumpManifest, String> {
     let path = input_path.join("_tunnelforge_dump.json");
     let file = File::open(&path).map_err(|err| format!("failed to open dump manifest: {err}"))?;
-    let manifest: DumpManifest = serde_json::from_reader(file)
+    let mut manifest: DumpManifest = serde_json::from_reader(file)
         .map_err(|err| format!("failed to parse dump manifest: {err}"))?;
     for table in &manifest.tables {
         validate_dump_table_path(&table.path)?;
     }
+    normalize_legacy_mysql_defaults(&mut manifest);
     Ok(manifest)
+}
+
+fn normalize_legacy_mysql_defaults(manifest: &mut DumpManifest) {
+    // v1/v2 stored MySQL COLUMN_DEFAULT strings exactly as information_schema
+    // returned them. v3 stores SQL-quoted string literals, like PostgreSQL.
+    // Normalize only the legacy representation; even surrounding quotes and
+    // spaces in the old value belong to the literal and must be preserved.
+    if !matches!(manifest.format_version, 1 | 2)
+        || !manifest.source_engine.eq_ignore_ascii_case("mysql") { return; }
+    for table in &mut manifest.schema.tables {
+        for column in &mut table.columns {
+            let base_type = column.type_name.trim_start().split(|ch: char| !ch.is_ascii_alphabetic())
+                .next().unwrap_or("").to_ascii_lowercase();
+            if matches!(base_type.as_str(), "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" | "enum" | "set") {
+                if let Some(value) = &mut column.default_value {
+                    *value = format!("'{}'", value.replace('\'', "''"));
+                }
+            }
+        }
+    }
 }
 
 fn validate_dump_table_path(path: &str) -> Result<(), String> {
@@ -663,10 +684,20 @@ pub(crate) fn detect_incompatible_surviving_fks(
 pub(crate) fn validate_dump_import_manifest_strictness(
     tables: &[DumpTableManifest],
     strict: bool,
+    data_format: &str,
+    compression: &str,
 ) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     for table in tables {
-        if table.chunks > 0 && table.chunk_sha256.len() < table.chunks as usize {
+        let expected_names = (1..=table.chunks)
+            .map(|index| dump_chunk_name(index, data_format, compression))
+            .collect::<BTreeSet<_>>();
+        for name in table.chunk_sha256.keys() {
+            if !expected_names.contains(name) {
+                return Err(classified_import_error("export_invalid", &format!("unexpected chunk_sha256 entry: {name}"), Some(&table.name)));
+            }
+        }
+        if expected_names.iter().any(|name| !table.chunk_sha256.contains_key(name)) {
             let message = if table.chunk_sha256.is_empty() {
                 format!(
                     "table {} has chunks but no chunk_sha256 metadata",
@@ -813,12 +844,42 @@ pub(crate) fn write_dump_import_report(input_path: &Path, report: &Value) -> Res
     let report_path = dump_import_report_path(input_path)?;
     let bytes = serde_json::to_vec_pretty(report)
         .map_err(|err| format!("cannot serialize import report: {err}"))?;
-    fs::write(&report_path, bytes).map_err(|err| {
-        format!(
-            "cannot write import report {}: {err}",
-            report_path.display()
-        )
-    })
+    let nonce = SystemTime::now().duration_since(UNIX_EPOCH)
+        .map_err(|err| format!("cannot allocate import report checkpoint: {err}"))?.as_nanos();
+    let temporary = input_path.join(format!(".import-report-{}-{nonce}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new().write(true).create_new(true).open(&temporary)
+        .map_err(|err| format!("cannot create import report checkpoint: {err}"))?;
+    let write_result = (|| -> std::io::Result<()> {
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        drop(file);
+        replace_import_report_file(&temporary, &report_path)?;
+        #[cfg(unix)]
+        File::open(input_path)?.sync_all()?;
+        Ok(())
+    })();
+    if write_result.is_err() { let _ = fs::remove_file(&temporary); }
+    write_result.map_err(|err| format!("cannot write import report {}: {err}", report_path.display()))
+}
+
+#[cfg(not(windows))]
+fn replace_import_report_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    fs::rename(source, target)
+}
+
+#[cfg(windows)]
+fn replace_import_report_file(source: &Path, target: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
+    }
+    let source = source.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    let target = target.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<_>>();
+    // Same-directory replace without deleting the previous checkpoint first.
+    if unsafe { MoveFileExW(source.as_ptr(), target.as_ptr(), 0x1 | 0x8) } == 0 {
+        Err(std::io::Error::last_os_error())
+    } else { Ok(()) }
 }
 
 pub(crate) fn validate_dump_manifest_chunks(
@@ -826,8 +887,13 @@ pub(crate) fn validate_dump_manifest_chunks(
     tables: &[DumpTableManifest],
     data_format: &str,
     compression: &str,
+    schema: &NormalizedSchema,
 ) -> Result<(), String> {
     for table in tables {
+        let invalid = |message: &str| classified_import_error("export_invalid", message, Some(&table.name));
+        let definition = schema.tables.iter().find(|item| item.name == table.name)
+            .ok_or_else(|| invalid("manifest schema missing table"))?;
+        let mut row_count = 0_u64;
         for chunk_index in 1..=table.chunks {
             let chunk_name = dump_chunk_name(chunk_index, data_format, compression);
             let chunk_path = dump_manifest_chunk_path(
@@ -848,6 +914,35 @@ pub(crate) fn validate_dump_manifest_chunks(
                     ));
                 }
             }
+            // Decode one row at a time before any target DROP; a valid checksum
+            // alone does not establish that the payload is a usable dump.
+            let reader = open_dump_reader(&chunk_path, compression)
+                .map_err(|err| invalid(&format!("{chunk_name}: {err}")))?;
+            for (line_index, line) in reader.lines().enumerate() {
+                let row_error = |message: &str| invalid(&format!("{chunk_name} line {}: {message}", line_index + 1));
+                let line = line.map_err(|err| row_error(&format!("failed to decode dump row: {err}")))?;
+                if data_format == "tsv" {
+                    if line.split('\t').count() != definition.columns.len() {
+                        return Err(row_error("TSV field count does not match schema"));
+                    }
+                } else {
+                    if line.trim().is_empty() {
+                        continue;
+                    }
+                    let row: Value = serde_json::from_str(&line)
+                        .map_err(|err| row_error(&format!("invalid JSON row: {err}")))?;
+                    let object = row.as_object().ok_or_else(|| row_error("JSON row must be an object"))?;
+                    if object.len() != definition.columns.len()
+                        || definition.columns.iter().any(|column| !object.contains_key(&column.name))
+                    {
+                        return Err(row_error("JSON row columns do not match schema"));
+                    }
+                }
+                row_count = row_count.checked_add(1).ok_or_else(|| row_error("row count overflow"))?;
+            }
+        }
+        if row_count != table.rows {
+            return Err(invalid(&format!("dump row count mismatch: expected {} got {row_count}", table.rows)));
         }
     }
     Ok(())
@@ -1028,9 +1123,6 @@ fn read_tsv_rows(
     let mut rows = Vec::new();
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read dump row: {err}"))?;
-        if line.is_empty() {
-            continue;
-        }
         rows.push(tsv_line_to_row(&line, table));
     }
     Ok(rows)
@@ -1053,9 +1145,6 @@ pub(crate) fn stream_tsv_rows_in_batches<F: FnMut(&[Value]) -> Result<(), String
 
     for line in reader.lines() {
         let line = line.map_err(|err| format!("failed to read dump row: {err}"))?;
-        if line.is_empty() {
-            continue;
-        }
         let row_bytes = line.len() + 1;
         if !batch.is_empty() && (batch.len() >= max_rows || batch_bytes + row_bytes > max_bytes) {
             insert_batch(&batch)?;
@@ -1139,6 +1228,79 @@ fn read_jsonl_rows(path: &Path, compression: &str) -> Result<Vec<Value>, String>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_mysql_defaults_normalize_only_old_string_column_representation() {
+        for (version, engine) in [(1, "mysql"), (2, "mysql"), (3, "mysql"), (1, "postgresql"), (2, "postgresql")] {
+            let kinds = ["VARCHAR(80)", "char(8)", "tinytext", "text", "mediumtext", "longtext", "enum('TRUE','FALSE')", "set('TRUE','null')", "int", "datetime(6)"];
+            let columns: Vec<_> = kinds.iter().enumerate().map(|(index, kind)| json!({
+                "name": format!("c{index}"), "type": kind, "default": "  O'Reilly  "
+            })).collect();
+            let mut manifest: DumpManifest = serde_json::from_value(json!({
+                "format":"tunnelforge-dump", "format_version":version, "source_engine":engine, "database":"app",
+                "schema":{"tables":[{"name":"sample","columns":columns}]}, "chunk_size":1,"created_unix_seconds":1,"tables":[]
+            })).unwrap();
+            normalize_legacy_mysql_defaults(&mut manifest);
+            for (index, column) in manifest.schema.tables[0].columns.iter().enumerate() {
+                let expected = if version <= 2 && engine == "mysql" && index < 8 { "'  O''Reilly  '" } else { "  O'Reilly  " };
+                assert_eq!(column.default_value.as_deref(), Some(expected), "v{version} {engine} {}", kinds[index]);
+            }
+        }
+    }
+
+    #[test]
+    fn chunk_preflight_rejects_hashed_invalid_payloads() {
+        for (case, format, compression, payload, expected_rows) in [
+            ("json_syntax", "jsonl", "none", "{broken}\n", 1),
+            ("json_scalar", "jsonl", "none", "1\n", 1),
+            ("json_missing", "jsonl", "none", "{\"id\":1}\n", 1),
+            ("json_extra", "jsonl", "none", "{\"id\":1,\"name\":\"a\",\"extra\":2}\n", 1),
+            ("tsv_short", "tsv", "none", "1\n", 1),
+            ("tsv_long", "tsv", "none", "1\ta\textra\n", 1),
+            ("empty", "tsv", "none", "", 1),
+            ("count", "tsv", "none", "1\ta\n", 2),
+            ("zstd", "tsv", "zstd", "not zstd", 1),
+        ] {
+            let dir = std::env::temp_dir().join(format!("tf-chunk-preflight-{}-{case}", std::process::id()));
+            fs::create_dir_all(dir.join("users")).unwrap();
+            let name = dump_chunk_name(1, format, compression);
+            let path = dir.join("users").join(&name);
+            fs::write(&path, payload).unwrap();
+            let table = DumpTableManifest {
+                name: "users".into(), path: "users".into(), rows: expected_rows,
+                chunks: 1, chunk_sha256: BTreeMap::from([(name, sha256_file(&path).unwrap())]),
+            };
+            let result = validate_dump_manifest_chunks(&dir, &[table], format, compression, &schema());
+            fs::remove_dir_all(dir).unwrap();
+            assert!(result.is_err(), "accepted {case}");
+        }
+    }
+
+    #[test]
+    fn chunk_preflight_streams_all_formats_and_preserves_legacy_and_empty_rows() {
+        let mut definition = schema();
+        definition.tables[0].columns.truncate(1);
+        for format in ["jsonl", "tsv"] {
+            for compression in ["none", "zstd"] {
+                let dir = std::env::temp_dir().join(format!("tf-valid-preflight-{}-{format}-{compression}", std::process::id()));
+                fs::create_dir_all(dir.join("users")).unwrap();
+                let mut table = DumpTableManifest {
+                    name: "users".into(), path: "users".into(), rows: 4,
+                    chunks: 2, chunk_sha256: BTreeMap::new(),
+                };
+                for index in 1..=2 {
+                    let name = dump_chunk_name(index, format, compression);
+                    let checksum = write_dump_rows(&dir.join("users").join(&name),
+                        &definition.tables[0], &[json!({"id": ""}), json!({"id": null})], format, compression).unwrap();
+                    table.chunk_sha256.insert(name, checksum);
+                }
+                validate_dump_manifest_chunks(&dir, &[table.clone()], format, compression, &definition).unwrap();
+                table.chunk_sha256.clear();
+                validate_dump_manifest_chunks(&dir, &[table], format, compression, &definition).unwrap();
+                fs::remove_dir_all(dir).unwrap();
+            }
+        }
+    }
     
     
     use serde_json::{json, Value};
@@ -1154,6 +1316,29 @@ mod tests {
     use crate::adapters::test_support::{empty_table, fk, schema};
 
     #[test]
+    fn tsv_single_column_preserves_empty_string_rows() {
+        let mut table = schema().tables.remove(0);
+        table.columns.truncate(1);
+        table.columns[0].type_name = "text".to_string();
+        let expected = vec![json!({"id": ""}), json!({"id": null}), json!({"id": "\\N"}), json!({"id": ""})];
+        let dir = std::env::temp_dir().join(format!("tf-empty-tsv-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        for compression in ["none", "zstd"] {
+            let path = dir.join(compression);
+            write_dump_rows(&path, &table, &expected, "tsv", compression).unwrap();
+            assert_eq!(read_dump_rows(&path, &table, "tsv", compression).unwrap(), expected);
+            let mut actual = Vec::new();
+            let count = stream_tsv_rows_in_batches(&path, &table, compression, 2, 1024, |rows| {
+                actual.extend_from_slice(rows);
+                Ok(())
+            }).unwrap();
+            assert_eq!(count, expected.len() as u64);
+            assert_eq!(actual, expected);
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn dump_manifest_and_jsonl_rows_roundtrip() {
         let dir =
             std::env::temp_dir().join(format!("tunnelforge-dump-test-{}", current_unix_seconds()));
@@ -1165,6 +1350,8 @@ mod tests {
             data_format: "jsonl".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1208,6 +1395,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "zstd".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1261,6 +1450,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1278,7 +1469,7 @@ mod tests {
             }],
         };
 
-        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none").unwrap_err();
+        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
 
         assert!(err.contains("outside dump directory"));
         fs::remove_dir_all(&dir).ok();
@@ -1298,6 +1489,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1315,7 +1508,7 @@ mod tests {
             }],
         };
 
-        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none").unwrap_err();
+        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
 
         assert!(err.contains("failed to validate dump chunk"));
         fs::remove_dir_all(&dir).unwrap();
@@ -1338,6 +1531,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1355,7 +1550,7 @@ mod tests {
             }],
         };
 
-        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none").unwrap_err();
+        let err = validate_dump_manifest_chunks(&dir, &manifest.tables, "tsv", "none", &manifest.schema).unwrap_err();
 
         assert!(err.contains("checksum mismatch"));
         fs::remove_dir_all(&dir).unwrap();
@@ -1389,7 +1584,7 @@ mod tests {
             chunk_sha256: checksums,
         };
 
-        validate_dump_manifest_chunks(&dir, &[manifest], "tsv", "none").unwrap();
+        validate_dump_manifest_chunks(&dir, &[manifest], "tsv", "none", &schema()).unwrap();
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -1404,7 +1599,7 @@ mod tests {
             chunk_sha256: BTreeMap::new(),
         };
 
-        let err = validate_dump_import_manifest_strictness(&[table], true).unwrap_err();
+        let err = validate_dump_import_manifest_strictness(&[table], true, "tsv", "none").unwrap_err();
 
         assert!(err.contains("export_invalid"));
         assert!(err.contains("users"));
@@ -1421,12 +1616,30 @@ mod tests {
             chunk_sha256: BTreeMap::new(),
         };
 
-        let warnings = validate_dump_import_manifest_strictness(&[table], false).unwrap();
+        let warnings = validate_dump_import_manifest_strictness(&[table], false, "tsv", "none").unwrap();
 
         assert_eq!(
             warnings,
             vec!["legacy dump: table users has chunks but no chunk_sha256 metadata".to_string()]
         );
+    }
+
+    #[test]
+    fn manifest_checksums_match_expected_filenames_for_each_format() {
+        for format in ["tsv", "jsonl"] {
+            for compression in ["none", "zstd"] {
+                let mut table = DumpTableManifest {
+                    name: "users".into(), path: "users".into(), rows: 2, chunks: 2,
+                    chunk_sha256: BTreeMap::from([(dump_chunk_name(1, format, compression), "0".repeat(64))]),
+                };
+                assert!(validate_dump_import_manifest_strictness(&[table.clone()], true, format, compression).is_err());
+                assert_eq!(validate_dump_import_manifest_strictness(&[table.clone()], false, format, compression).unwrap().len(), 1);
+                table.chunk_sha256.insert(dump_chunk_name(2, format, compression), "1".repeat(64));
+                assert!(validate_dump_import_manifest_strictness(&[table.clone()], true, format, compression).unwrap().is_empty());
+                table.chunk_sha256.insert("unexpected.tsv".into(), "2".repeat(64));
+                assert!(validate_dump_import_manifest_strictness(&[table], false, format, compression).is_err());
+            }
+        }
     }
 
     #[test]
@@ -1467,6 +1680,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1490,6 +1705,7 @@ mod tests {
             request_id: Some("strict-import".to_string()),
             payload: json!({
                 "input_dir": dir.to_string_lossy(),
+                "mode": "replace",
                 "target": {
                     "engine": "mysql",
                     "host": "127.0.0.1",
@@ -1578,10 +1794,16 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -1593,6 +1815,9 @@ mod tests {
                         nullable: true,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -1600,8 +1825,13 @@ mod tests {
                         columns: vec!["audit_category_code".to_string()],
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
+                        on_delete: None,
+                        on_update: None,
                     }],
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
             ],
         };
@@ -1628,10 +1858,16 @@ mod tests {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: Vec::new(),
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
                 NormalizedTable {
                     name: "df_evaluation_results".to_string(),
@@ -1643,6 +1879,9 @@ mod tests {
                         nullable: true,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     }],
                     indexes: Vec::new(),
                     foreign_keys: vec![NormalizedForeignKey {
@@ -1650,8 +1889,13 @@ mod tests {
                         columns: vec!["audit_category_code".to_string()],
                         referenced_table: "audit_category".to_string(),
                         referenced_columns: vec!["code".to_string()],
+                        on_delete: None,
+                        on_update: None,
                     }],
                     table_collation: None,
+                    auto_increment: None,
+                    comment: None,
+                    checks: Vec::new(),
                 },
             ],
         };
@@ -1690,6 +1934,12 @@ mod tests {
         let report_text = fs::read_to_string(&report_path).unwrap();
         assert!(report_text.contains("\"row_counts\": \"passed\""));
 
+        write_dump_import_report(&dir, &json!({"success":false,"status":"running"})).unwrap();
+        let replaced: Value = serde_json::from_slice(&fs::read(&report_path).unwrap()).unwrap();
+        assert_eq!(replaced["success"], false);
+        assert_eq!(replaced["status"], "running");
+        assert_eq!(fs::read_dir(&dir).unwrap().count(), 1, "checkpoint temporary files were left behind");
+
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1706,6 +1956,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1787,6 +2039,9 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
                 NormalizedColumn {
                     name: "body".to_string(),
@@ -1795,6 +2050,9 @@ mod tests {
                     nullable: true,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
                 NormalizedColumn {
                     name: "empty".to_string(),
@@ -1803,11 +2061,17 @@ mod tests {
                     nullable: true,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
         let rows = vec![json!({"id": "1", "body": "a\tb\nc\\d", "empty": null})];
         let path = dir.join("chunk_000001.tsv");
@@ -1834,10 +2098,16 @@ mod tests {
                 nullable: false,
                 primary_key: false,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
         let rows = vec![json!({"importance": "MEDIUM"})];
         let path = dir.join("chunk_000001.tsv");
@@ -1865,6 +2135,9 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: true,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
                 NormalizedColumn {
                     name: "notes".to_string(),
@@ -1873,11 +2146,17 @@ mod tests {
                     nullable: true,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
         let rows = vec![
             json!({"id": "1", "notes": "hello\tworld"}),
@@ -1983,10 +2262,16 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: true,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let rows = vec![SurvivingFkColumn {
@@ -2015,10 +2300,16 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: true,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let rows = vec![SurvivingFkColumn {
@@ -2050,10 +2341,16 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 }],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         };
         let rows = vec![SurvivingFkColumn {
@@ -2124,6 +2421,9 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
                 NormalizedColumn {
                     name: "tenant_id".to_string(),
@@ -2132,11 +2432,17 @@ mod tests {
                     nullable: false,
                     primary_key: false,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert_eq!(single_numeric_primary_key(&table), Some("id"));
@@ -2154,6 +2460,9 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
                 NormalizedColumn {
                     name: "id".to_string(),
@@ -2162,11 +2471,17 @@ mod tests {
                     nullable: false,
                     primary_key: true,
                     unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
                 },
             ],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert_eq!(single_numeric_primary_key(&table), None);
@@ -2183,10 +2498,16 @@ mod tests {
                 nullable: false,
                 primary_key: true,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert!(should_use_pk_range_dump(&table, 200_000, 50_000));
@@ -2203,10 +2524,16 @@ mod tests {
                 nullable: false,
                 primary_key: true,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert!(!should_use_pk_range_dump_for_span(
@@ -2229,10 +2556,16 @@ mod tests {
                 nullable: false,
                 primary_key: true,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert!(should_use_pk_range_dump_for_span(
@@ -2251,10 +2584,16 @@ mod tests {
                 nullable: false,
                 primary_key: true,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         };
 
         assert!(!should_use_pk_range_dump(&table, 10_000, 50_000));

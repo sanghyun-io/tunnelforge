@@ -30,28 +30,27 @@ impl MysqlSnapshotMode {
         match self {
             MysqlSnapshotMode::ParallelStrict => "mysql_shared_consistent_snapshot",
             MysqlSnapshotMode::ParallelNoBackupLock => {
-                "mysql_parallel_no_backup_lock_consistent_snapshot"
+                "mysql_single_connection_consistent_snapshot"
             }
             MysqlSnapshotMode::SingleConnection => "mysql_single_connection_consistent_snapshot",
         }
     }
 
-    /// 덤프 중 DDL 변경을 백업 락으로 막지 못하므로 사후 schema drift 검사가 필요한 모드인지.
+    /// Inspection precedes snapshot setup, so even strict mode must check the
+    /// interval before its backup lock was acquired.
     fn requires_ddl_drift_check(self) -> bool {
-        matches!(
-            self,
-            MysqlSnapshotMode::ParallelNoBackupLock | MysqlSnapshotMode::SingleConnection
-        )
+        true
     }
 
     /// 단일 연결 모드는 워커 수를 1로 강제한다.
     fn forces_single_thread(self) -> bool {
-        matches!(self, MysqlSnapshotMode::SingleConnection)
+        !matches!(self, MysqlSnapshotMode::ParallelStrict)
     }
 }
 
-fn mysql_snapshot_worker_setup_sql() -> [&'static str; 2] {
+fn mysql_snapshot_worker_setup_sql() -> [&'static str; 3] {
     [
+        "SET SESSION time_zone = '+00:00'",
         "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
         "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
     ]
@@ -95,8 +94,10 @@ impl MysqlSharedSnapshot {
         let mut workers = (0..worker_count.max(1))
             .map(|_| mysql_connection(endpoint))
             .collect::<Result<Vec<_>, _>>()?;
-        let [isolation_sql, snapshot_sql] = mysql_snapshot_worker_setup_sql();
+        let [timezone_sql, isolation_sql, snapshot_sql] = mysql_snapshot_worker_setup_sql();
         for worker in &mut workers {
+            worker.query_drop(timezone_sql)
+                .map_err(|err| format!("mysql snapshot timezone setup failed: {err}"))?;
             worker
                 .query_drop(isolation_sql)
                 .map_err(|err| format!("mysql snapshot isolation setup failed: {err}"))?;
@@ -163,19 +164,11 @@ impl MysqlSharedSnapshot {
         })
     }
 
-    /// lock-free 경로: 글로벌 락(FTWRL)도 백업 락(LOCK INSTANCE FOR BACKUP)도 요청하지 않는다.
-    /// 각 워커가 자기 연결에서 독립적으로 REPEATABLE READ + CONSISTENT SNAPSHOT을 잡는다.
-    /// - RDS처럼 글로벌 락이 막힌 환경에서도 동작한다.
-    /// - worker_count>1이면 병렬로 처리량을 높인다(각 워커/청크가 자기 스냅샷을 읽음).
-    /// - 워커 간 스냅샷 시점이 완전히 동일하지는 않으므로(테이블/청크 간 미세한 시점차),
-    ///   시점-완전-일관이 필수가 아닌 용도(prod→test 데이터 복제 등)에 적합하다.
-    ///   worker_count==1이면 단일 트랜잭션이라 완전 일관(구 single_connection과 동일).
-    /// - 덤프 중 DDL 변경은 이후 schema drift 검사로 잡는다.
-    fn acquire_lock_free(endpoint: &Endpoint, worker_count: usize) -> Result<Self, String> {
+    /// Without a global write barrier MySQL cannot share snapshots across sessions.
+    /// Keep all chunks on one transaction; check schema drift after extraction.
+    fn acquire_lock_free(endpoint: &Endpoint) -> Result<Self, String> {
         let started = Instant::now();
-        let mut workers = (0..worker_count.max(1))
-            .map(|_| mysql_connection(endpoint))
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut workers = vec![mysql_connection(endpoint)?];
         for worker in &mut workers {
             for sql in mysql_snapshot_worker_setup_sql() {
                 worker
@@ -245,6 +238,17 @@ impl Drop for MysqlSharedSnapshot {
 }
 
 fn mysql_schema_drifted(before: &NormalizedSchema, after: &NormalizedSchema) -> bool {
+    // The allocator advances on ordinary INSERTs (including rolled-back ones),
+    // independently of the row snapshot. All static metadata still participates
+    // in the comparison, including CHECKs, visibility, defaults and comments.
+    let mut before = before.clone();
+    let mut after = after.clone();
+    for table in &mut before.tables {
+        table.auto_increment = None;
+    }
+    for table in &mut after.tables {
+        table.auto_increment = None;
+    }
     before != after
 }
 
@@ -647,14 +651,22 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     options: &DumpRunOptions,
     output_path: &Path,
     full_export: bool,
+    export_warnings: Vec<String>,
     request_id: Option<String>,
     mut emit: F,
 ) -> Result<(DumpManifest, usize), String> {
     // View 정의 수집 (전체 export 시에만). 실패해도 테이블 덤프는 유효하므로 fatal로 보지 않는다.
+    let mut view_warning = None;
     let views = if full_export {
         match collect_views(endpoint) {
-            Ok(views) => views,
+            Ok(views) => {
+                if !views.is_empty() {
+                    view_warning = Some("View definitions were collected outside the table data snapshot; their consistency with that snapshot is not guaranteed.".to_string());
+                }
+                views
+            }
             Err(err) => {
+                view_warning = Some(format!("View definitions could not be collected: {err}"));
                 emit(json!({
                     "event": "phase",
                     "request_id": request_id,
@@ -668,18 +680,33 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
         Vec::new()
     };
     let views_count = views.len();
-    let (snapshot_policy, strict_export, manifest_warnings) =
+    let (snapshot_policy, mut strict_export, mut manifest_warnings) =
         dump_manifest_consistency_metadata(
             &endpoint.engine,
             options.mysql_snapshot_mode.policy_label(),
         );
+    if !export_warnings.is_empty() {
+        strict_export = false;
+        manifest_warnings.extend(export_warnings);
+    }
+    if let Some(warning) = view_warning {
+        strict_export = false;
+        manifest_warnings.push(warning);
+    }
 
+    for warning in &manifest_warnings {
+        emit(json!({"event": "phase", "request_id": request_id, "phase": "dump_warning", "message": warning}));
+    }
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
-        format_version: if options.data_format == "jsonl" { 1 } else { 2 },
+        // Older readers ignore namespace, timezone and ON UPDATE metadata. Fail
+        // their version gate instead of silently restoring different semantics.
+        format_version: 3,
         data_format: options.data_format.clone(),
         compression: options.compression.clone(),
         source_engine: endpoint.engine.clone(),
+        source_schema: Some(endpoint_schema(endpoint)),
+        source_timezone: Some("UTC".to_string()),
         database: endpoint.database.clone(),
         schema,
         snapshot_policy,
@@ -694,15 +721,53 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     Ok((manifest, views_count))
 }
 
+fn validate_dump_schema_fidelity(objects: &[String], schema: &NormalizedSchema) -> Result<(), String> {
+    let scoped_kinds = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk"];
+    let unsupported: Vec<_> = objects.iter().filter(|object| {
+        scoped_kinds.iter().any(|kind| schema.tables.iter().any(|table| object.starts_with(&format!("{kind}:{}:", table.name))))
+    }).cloned().collect();
+    if unsupported.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("dump.run cannot preserve selected table schema: {}", unsupported.join(", ")))
+    }
+}
+
 fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
     let endpoint = request_endpoint(request)?;
     let options = parse_dump_run_options(request)?;
 
     let output_path = Path::new(&options.output_dir);
+
+    // 부분 export(tables 지정) 시에는 View가 참조하는 base table이 빠질 수 있으므로 View를 수집하지 않는다.
+    let full_export = options.selected_tables.is_empty();
+    // AUTO_INCREMENT is the allocator observed by this initial inspection,
+    // before snapshot acquisition; it is not MVCC state. Restoring its captured
+    // value and then explicit keys lets MySQL retain max(captured, MAX(id) + 1).
+    let inspection = inspect_live(&endpoint)?;
+    let mut export_warnings: Vec<String> = inspection.unsupported_objects.iter()
+        .filter(|object| !object.starts_with("view:"))
+        .map(|object| format!("Object not exported: {object}"))
+        .collect();
+    let mut schema = inspection.schema;
+    if !options.selected_tables.is_empty() {
+        let selected: BTreeSet<String> = options.selected_tables.iter().cloned().collect();
+        let available: BTreeSet<_> = schema.tables.iter().map(|table| table.name.clone()).collect();
+        let missing: Vec<_> = selected.difference(&available).cloned().collect();
+        if !missing.is_empty() {
+            return Err(format!("dump.run selected tables were not found: {}", missing.join(", ")));
+        }
+        schema.tables.retain(|table| selected.contains(&table.name));
+    }
+    schema = dependency_ordered_schema(&schema);
+    if schema.tables.is_empty() {
+        return Err("dump.run found no tables to export".to_string());
+    }
+    validate_dump_schema_fidelity(&inspection.unsupported_objects, &schema)?;
     prepare_dump_output_dir(output_path, options.overwrite)?;
 
-    let effective_threads = if endpoint.engine == "mysql"
-        && options.mysql_snapshot_mode.forces_single_thread()
+    let effective_threads = if endpoint.engine == "postgresql" || (endpoint.engine == "mysql"
+        && options.mysql_snapshot_mode.forces_single_thread())
     {
         1
     } else {
@@ -717,7 +782,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                 MysqlSnapshotMode::SingleConnection =>
                     "단일 연결 일관 스냅샷 준비 중 (관리 권한 불필요)",
                 MysqlSnapshotMode::ParallelNoBackupLock =>
-                    "병렬 일관 스냅샷 준비 중 (백업 락 생략, BACKUP_ADMIN 불필요; 쓰기 잠금은 최대 2초 내 획득 후 즉시 해제)",
+                    "락 없는 일관 스냅샷: 테이블 간 일관성을 위해 단일 워커로 전환 (관리 권한 불필요)",
                 MysqlSnapshotMode::ParallelStrict =>
                     "공유 일관 스냅샷 준비 중 (쓰기 잠금은 최대 2초 내 획득 후 즉시 해제)",
             }
@@ -726,9 +791,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             MysqlSnapshotMode::ParallelStrict => {
                 MysqlSharedSnapshot::acquire(&endpoint, effective_threads)?
             }
-            // ParallelNoBackupLock: 락 없이 각 워커가 독립 스냅샷으로 병렬.
-            // SingleConnection: 락 없이 단일 워커(effective_threads가 1로 강제됨).
-            _ => MysqlSharedSnapshot::acquire_lock_free(&endpoint, effective_threads)?,
+            _ => MysqlSharedSnapshot::acquire_lock_free(&endpoint)?,
         };
         emit(json!({
             "event": "phase",
@@ -740,7 +803,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
                     snapshot.setup_ms
                 ),
                 MysqlSnapshotMode::ParallelNoBackupLock => format!(
-                    "MySQL 병렬 일관 스냅샷 준비 완료 (백업 락 생략): {}개 워커, {} ms (덤프 후 DDL 변경 검사)",
+                    "MySQL 단일 연결 일관 스냅샷 준비 완료 (병렬 요청을 안전한 단일 워커로 전환): {}개 워커, {} ms (덤프 후 DDL 변경 검사)",
                     snapshot.workers.len(), snapshot.setup_ms
                 ),
                 MysqlSnapshotMode::ParallelStrict => format!(
@@ -757,24 +820,34 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         None
     };
 
-    // 부분 export(tables 지정) 시에는 View가 참조하는 base table이 빠질 수 있으므로 View를 수집하지 않는다.
-    let full_export = options.selected_tables.is_empty();
-    let inspection = inspect_live(&endpoint)?;
-    let mut schema = inspection.schema;
-    if !options.selected_tables.is_empty() {
-        let selected: BTreeSet<String> = options.selected_tables.iter().cloned().collect();
-        schema.tables.retain(|table| selected.contains(&table.name));
-    }
-    schema = dependency_ordered_schema(&schema);
-    if schema.tables.is_empty() {
-        return Err("dump.run found no tables to export".to_string());
-    }
+    let mut postgres_snapshot = if endpoint.engine == "postgresql" {
+        let mut adapter = LiveAdapter::connect(&endpoint)?;
+        adapter.execute_sql("BEGIN ISOLATION LEVEL REPEATABLE READ READ ONLY")?;
+        adapter.execute_sql("SET LOCAL TIME ZONE 'UTC'")?;
+        adapter.execute_sql("SET LOCAL DateStyle = 'ISO, YMD'")?;
+        adapter.execute_sql("SET LOCAL lock_timeout = '2s'")?;
+        let tables = schema.tables.iter()
+            .map(|table| quote_ident("postgresql", &table.name))
+            .collect::<Vec<_>>().join(", ");
+        // ACCESS SHARE blocks destructive DDL/TRUNCATE but permits normal writes.
+        adapter.execute_sql(&format!("LOCK TABLE {tables} IN ACCESS SHARE MODE"))?;
+        let exported: BTreeSet<_> = schema.tables.iter().map(|t| t.name.clone()).collect();
+        let mut locked_schema = inspect_live(&endpoint)?.schema;
+        locked_schema.tables.retain(|t| exported.contains(&t.name));
+        if dependency_ordered_schema(&locked_schema) != schema {
+            return Err("postgresql schema changed before snapshot locks were acquired; retry export".into());
+        }
+        Some(adapter)
+    } else {
+        None
+    };
     if let Some(snapshot) = mysql_snapshot.as_mut() {
         // consistent snapshot은 InnoDB MVCC 기반이라 MEMORY/MyISAM 등 비트랜잭션 테이블은
         // 스냅샷 일관성을 보장할 수 없다. 전체 export를 막는 대신 해당 테이블만 제외하고
         // 경고를 남긴다(휘발성 MEMORY 임시 테이블 등은 복제 대상이 아닌 경우가 대부분).
         let non_txn = snapshot.non_transactional_table_names(&endpoint, &schema.tables)?;
         if !non_txn.is_empty() {
+            export_warnings.push(format!("Non-transactional tables excluded from export: {}", non_txn.join(", ")));
             let excluded: BTreeSet<String> = non_txn.iter().cloned().collect();
             schema.tables.retain(|table| !excluded.contains(&table.name));
             emit(json!({
@@ -846,8 +919,12 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
             |event| emit(event),
         )?,
         DumpStrategy::Sequential => {
-            let mut adapter = LiveAdapter::connect(&endpoint)?;
-            dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
+            if let Some(adapter) = postgres_snapshot.as_mut() {
+                dump_tables_sequential(adapter, &ctx, &export_tables, |event| emit(event))?
+            } else {
+                let mut adapter = LiveAdapter::connect(&endpoint)?;
+                dump_tables_sequential(&mut adapter, &ctx, &export_tables, |event| emit(event))?
+            }
         }
     };
 
@@ -877,6 +954,7 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         &options,
         output_path,
         full_export,
+        export_warnings,
         request.request_id.clone(),
         |event| emit(event),
     )?;
@@ -1214,8 +1292,8 @@ fn dump_tables_global_mysql<F: FnMut(Value)>(
             .map_err(|err| format!("failed to create dump table dir: {err}"))?;
         let table_row_count = conn
             .query_first::<u64, _>(count_sql("mysql", &table.name))
-            .map(|count| count.unwrap_or(0))
-            .unwrap_or(0);
+            .map_err(|err| format!("mysql count error for {}: {err}", table.name))?
+            .ok_or_else(|| format!("mysql count returned no result for {}", table.name))?;
         let mut chunks_total = 0_u64;
         let avg_row_bytes = mysql_table_avg_row_length(&mut conn, &ctx.endpoint, &table.name);
         if let Some(pk_column) = single_numeric_primary_key(table) {
@@ -1477,8 +1555,8 @@ fn dump_mysql_table_parallel_ranges<F: FnMut(Value)>(
     };
     let table_row_count = conn
         .query_first::<u64, _>(count_sql("mysql", &table.name))
-        .map(|count| count.unwrap_or(0))
-        .unwrap_or(0);
+        .map_err(|err| format!("mysql count error for {}: {err}", table.name))?
+        .ok_or_else(|| format!("mysql count returned no result for {}", table.name))?;
     let avg_row_bytes = mysql_table_avg_row_length(&mut conn, &ctx.endpoint, &table.name);
     let range_chunk_size = mysql_range_chunk_size_for_avg_row(ctx.chunk_size, avg_row_bytes);
     if !should_use_pk_range_dump(table, table_row_count, range_chunk_size) {
@@ -1931,6 +2009,63 @@ fn run_table_dump_loop<F: FnMut(Value)>(
     ))
 }
 
+fn dump_key_columns(table: &NormalizedTable) -> Vec<String> {
+    let keys = key_columns(table);
+    // NULL cannot advance a strict > cursor. Offset reads on the same snapshot
+    // preserve nullable UNIQUE rows, including multiple NULL values.
+    if keys.iter().any(|key| table.columns.iter().any(|column| &column.name == key && column.nullable)) {
+        Vec::new()
+    } else {
+        keys
+    }
+}
+
+fn dump_mysql_table_stream<F: FnMut(Value)>(
+    conn: &mut mysql::PooledConn,
+    ctx: &DumpJobContext,
+    table: &NormalizedTable,
+    index: usize,
+    table_total: usize,
+    chunk_size: usize,
+    expected_rows: u64,
+    emit: F,
+) -> Result<(DumpTableManifest, u64, u64), String> {
+    // One server result preserves every physical row without sorting large TEXT/
+    // JSON/BLOB values or assuming nullable UNIQUE values can advance a cursor.
+    let sql = format!("SELECT {} FROM {}", projected_text_columns_sql("mysql", table), quote_ident("mysql", &table.name));
+    let mut rows = conn.query_iter(sql).map_err(|err| format!("mysql streaming export failed: {err}"))?;
+    let columns = column_names(table);
+    let result = run_table_dump_loop(table, index, table_total, &ctx.output_path, ctx.request_id.clone(), emit,
+        |chunk_number, rows_before, table_dir, emit| {
+            let chunk_name = dump_chunk_name(chunk_number, &ctx.data_format, &ctx.compression);
+            let chunk_path = table_dir.join(&chunk_name);
+            let mut copied = 0u64;
+            {
+                let mut writer = open_dump_writer(&chunk_path, &ctx.compression)?;
+                for row in rows.by_ref().take(chunk_size.max(1)) {
+                    let row = row.map_err(|err| format!("mysql streaming row error: {err}"))?;
+                    if ctx.data_format == "tsv" {
+                        write_mysql_text_row_tsv(&mut writer, row)?;
+                    } else {
+                        write_dump_row(&mut writer, table, &mysql_row_to_json(&columns, row), &ctx.data_format)?;
+                    }
+                    copied += 1;
+                }
+            }
+            if copied == 0 {
+                fs::remove_file(chunk_path).map_err(|err| format!("failed to remove empty chunk: {err}"))?;
+                return Ok(None);
+            }
+            emit(json!({"event": "row_progress", "request_id": ctx.request_id, "table": table.name,
+                "rows": rows_before + copied, "total": expected_rows, "chunk_rows": copied}));
+            Ok(Some(ChunkOutcome { rows: copied, checksum: sha256_file(&chunk_path)?, chunk_name }))
+        })?;
+    if result.1 != expected_rows {
+        return Err(format!("mysql export row count mismatch for {}: expected {expected_rows}, exported {}", table.name, result.1));
+    }
+    Ok(result)
+}
+
 fn dump_one_table<F: FnMut(Value)>(
     adapter: &mut LiveAdapter,
     ctx: &DumpJobContext,
@@ -1943,8 +2078,8 @@ fn dump_one_table<F: FnMut(Value)>(
         return dump_one_mysql_table(conn, ctx, table, index, table_total, emit);
     }
 
-    let table_row_count = adapter.row_count(&table.name).unwrap_or(0) as u64;
-    let key_columns = key_columns(table);
+    let table_row_count = adapter.row_count(&table.name)? as u64;
+    let key_columns = dump_key_columns(table);
     let use_keyset = !key_columns.is_empty();
     let mut last_key: Option<String> = None;
     let mut offset = 0_usize;
@@ -2023,8 +2158,8 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
 ) -> Result<(DumpTableManifest, u64, u64), String> {
     let table_row_count = conn
         .query_first::<u64, _>(count_sql("mysql", &table.name))
-        .map(|count| count.unwrap_or(0))
-        .unwrap_or(0);
+        .map_err(|err| format!("mysql count error for {}: {err}", table.name))?
+        .ok_or_else(|| format!("mysql count returned no result for {}", table.name))?;
     // 청크당 행 수를 바이트 목표(≈64MB) + 절대 행수 상한으로 산출한다. 대형 TEXT/JSON
     // 컬럼 테이블에서 하나의 result set가 과대해져 스트리밍 코덱이 크래시하는 것을 막는다.
     // 병렬 경로와 동일한 avg-row-length 헬퍼를 재사용하며, 조회 실패/통계 부재 시
@@ -2032,7 +2167,10 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
     let avg_row_bytes = mysql_table_avg_row_length(conn, &ctx.endpoint, &table.name);
     let effective_chunk_size = sequential_mysql_chunk_size(ctx.chunk_size, avg_row_bytes);
     let columns = column_names(table);
-    let key_columns = key_columns(table);
+    let key_columns = dump_key_columns(table);
+    if key_columns.is_empty() {
+        return dump_mysql_table_stream(conn, ctx, table, index, table_total, effective_chunk_size, table_row_count, emit);
+    }
     let use_keyset = !key_columns.is_empty();
     let mut last_key: Option<String> = None;
     let mut offset = 0_usize;
@@ -2153,6 +2291,68 @@ mod tests {
     use crate::adapters::test_support::{empty_table, schema};
 
     #[test]
+    fn dump_rejects_lossy_selected_schema_but_allows_unselected_objects() {
+        let schema = schema();
+        let table = &schema.tables[0].name;
+        for kind in ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk"] {
+            assert!(validate_dump_schema_fidelity(&[format!("{kind}:{table}:example")], &schema).is_err());
+            assert!(validate_dump_schema_fidelity(&[format!("{kind}:unselected_table:example")], &schema).is_ok());
+        }
+    }
+
+    #[test]
+    #[ignore = "requires TF_DUMP_TEST_POSTGRES_HOST and a disposable tf_dump_snapshot database"]
+    fn postgres_dump_retains_snapshot_across_chunks_and_tables() {
+        let host = std::env::var("TF_DUMP_TEST_POSTGRES_HOST").unwrap();
+        let endpoint = Endpoint {
+            engine: "postgresql".into(), host, port: 5432,
+            user: "postgres".into(), password: "tf_local_test".into(),
+            database: "tf_dump_snapshot".into(), schema: Some("public".into()),
+        };
+        let mut writer = LiveAdapter::connect(&endpoint).unwrap();
+        for threads in [1, 8] {
+            writer.execute_sql("DROP VIEW IF EXISTS snapshot_view; DROP TABLE IF EXISTS snapshot_a, snapshot_b; CREATE TABLE snapshot_a(id int PRIMARY KEY, value int); CREATE TABLE snapshot_b(id int PRIMARY KEY, value int); INSERT INTO snapshot_a SELECT i, 10 FROM generate_series(1,3) i; INSERT INTO snapshot_b SELECT i, 10 FROM generate_series(1,3) i; CREATE VIEW snapshot_view AS SELECT * FROM snapshot_a; CREATE OR REPLACE FUNCTION snapshot_fn() RETURNS integer LANGUAGE sql AS 'SELECT 1'").unwrap();
+            let output = std::env::temp_dir().join(format!("tf-snapshot-{}", std::process::id()));
+            let request = Request { command: "dump.run".into(), request_id: None, payload: json!({
+                "endpoint": endpoint, "output_dir": output, "threads": threads,
+                "chunk_size": 1, "data_format": "jsonl", "compression": "none", "overwrite": true,
+            }) };
+            let mut updated = false;
+            let missing_output = output.with_extension("missing");
+            let mut missing_payload = request.payload.clone();
+            missing_payload["tables"] = json!(["snapshot_a", "missing_selected_table"]);
+            missing_payload["output_dir"] = json!(missing_output);
+            let missing_request = Request { command: "dump.run".into(), request_id: None, payload: missing_payload };
+            let missing_result = dump_run(&missing_request, |_| {});
+            assert!(missing_result.is_err(), "unknown selected tables must fail: {missing_result:?}");
+            assert!(!missing_output.join("_tunnelforge_dump.json").exists());
+            fs::remove_dir_all(missing_output).unwrap();
+            dump_run(&request, |event| {
+                if !updated && event["event"] == "row_progress" {
+                    writer.execute_sql("UPDATE snapshot_a SET value=20; UPDATE snapshot_b SET value=20").unwrap();
+                    updated = true;
+                }
+            }).unwrap();
+            assert!(updated);
+            let manifest: DumpManifest = serde_json::from_slice(&fs::read(output.join("_tunnelforge_dump.json")).unwrap()).unwrap();
+            assert_eq!(manifest.tables.len(), 2);
+            assert!(!manifest.strict_export);
+            assert_eq!(manifest.views.len(), 1);
+            assert!(manifest.manifest_warnings.iter().any(|warning| warning.contains("routine:snapshot_fn")));
+            assert!(manifest.manifest_warnings.iter().any(|warning| warning.contains("outside the table data snapshot")));
+            for table in &manifest.tables {
+                assert_eq!(table.rows, 3);
+                assert_eq!(table.chunk_sha256.len(), 3);
+                for chunk in table.chunk_sha256.keys() {
+                    let rows = fs::read_to_string(output.join(&table.path).join(chunk)).unwrap();
+                    assert!(!rows.contains("20"), "newer values leaked into snapshot: {rows}");
+                }
+            }
+            fs::remove_dir_all(output).unwrap();
+        }
+    }
+
+    #[test]
     fn dump_overwrite_rejects_non_dump_directory() {
         let dir = std::env::temp_dir().join(format!(
             "tunnelforge-dump-overwrite-test-{}",
@@ -2167,6 +2367,37 @@ mod tests {
         assert!(err.contains("refusing to overwrite"));
         assert!(keep_file.exists());
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires TF_DUMP_TEST_POSTGRES_HOST and a disposable tf_dump_snapshot database"]
+    fn postgres_dump_count_permission_failure_never_writes_success_manifest() {
+        let endpoint = Endpoint {
+            engine: "postgresql".into(), host: std::env::var("TF_DUMP_TEST_POSTGRES_HOST").unwrap(),
+            port: 5432, user: "postgres".into(), password: "tf_local_test".into(),
+            database: "tf_dump_snapshot".into(), schema: Some("public".into()),
+        };
+        let mut admin = LiveAdapter::connect(&endpoint).unwrap();
+        admin.execute_sql("DROP TABLE IF EXISTS count_denied; DROP ROLE IF EXISTS tf_dump_count_reader; CREATE ROLE tf_dump_count_reader LOGIN PASSWORD 'tf_local_test'; CREATE TABLE count_denied(id int PRIMARY KEY); INSERT INTO count_denied VALUES (1); GRANT SELECT ON count_denied TO tf_dump_count_reader").unwrap();
+        let reader = Endpoint { user: "tf_dump_count_reader".into(), ..endpoint };
+        let output = std::env::temp_dir().join(format!("tf-count-denied-{}", std::process::id()));
+        let request = Request { command: "dump.run".into(), request_id: None, payload: json!({
+            "endpoint": reader, "output_dir": output, "threads": 1,
+            "tables": ["count_denied"], "data_format": "jsonl", "overwrite": true,
+        }) };
+        let mut revoked = false;
+        let result = dump_run(&request, |event| {
+            if event["event"] == "dump_schedule" {
+                admin.execute_sql("REVOKE SELECT ON count_denied FROM tf_dump_count_reader").unwrap();
+                revoked = true;
+            }
+        });
+        assert!(revoked);
+        assert!(result.is_err(), "count failure must abort export: {result:?}");
+        assert!(result.unwrap_err().contains("count error"));
+        assert!(!output.join("_tunnelforge_dump.json").exists());
+        admin.execute_sql("DROP TABLE count_denied; DROP ROLE tf_dump_count_reader").unwrap();
+        fs::remove_dir_all(output).unwrap();
     }
 
     #[test]
@@ -2201,6 +2432,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "none".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: schema(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -2249,6 +2482,7 @@ mod tests {
         assert_eq!(
             mysql_snapshot_worker_setup_sql(),
             [
+                "SET SESSION time_zone = '+00:00'",
                 "SET SESSION TRANSACTION ISOLATION LEVEL REPEATABLE READ",
                 "START TRANSACTION WITH CONSISTENT SNAPSHOT, READ ONLY",
             ]
@@ -2308,20 +2542,20 @@ mod tests {
 
     #[test]
     fn mysql_snapshot_mode_drift_and_thread_semantics() {
-        // parallel_strict: 백업 락이 DDL을 차단하므로 drift 검사 불필요, 병렬 유지
-        assert!(!MysqlSnapshotMode::ParallelStrict.requires_ddl_drift_check());
+        // Strict mode also checks the interval before backup lock acquisition.
+        assert!(MysqlSnapshotMode::ParallelStrict.requires_ddl_drift_check());
         assert!(!MysqlSnapshotMode::ParallelStrict.forces_single_thread());
         assert_eq!(
             MysqlSnapshotMode::ParallelStrict.policy_label(),
             "mysql_shared_consistent_snapshot"
         );
 
-        // parallel_no_backup_lock: 락 없음, drift 검사로 DDL 보완, 병렬 유지
+        // Lock-free modes must share one transaction across all tables/chunks.
         assert!(MysqlSnapshotMode::ParallelNoBackupLock.requires_ddl_drift_check());
-        assert!(!MysqlSnapshotMode::ParallelNoBackupLock.forces_single_thread());
+        assert!(MysqlSnapshotMode::ParallelNoBackupLock.forces_single_thread());
         assert_eq!(
             MysqlSnapshotMode::ParallelNoBackupLock.policy_label(),
-            "mysql_parallel_no_backup_lock_consistent_snapshot"
+            "mysql_single_connection_consistent_snapshot"
         );
 
         // single_connection: 락 없음, drift 검사 필요, 단일 스레드 강제
@@ -2389,6 +2623,35 @@ mod tests {
 
         assert!(mysql_schema_drifted(&before, &after));
         assert!(!mysql_schema_drifted(&before, &before));
+    }
+
+    #[test]
+    fn mysql_schema_drift_ignores_allocator_progress_only() {
+        let mut initial = serde_json::to_value(schema()).unwrap();
+        initial["tables"][0]["auto_increment"] = json!(10003);
+        initial["tables"][0]["comment"] = json!("original table comment");
+        initial["tables"][0]["columns"][0]["comment"] = json!("original column comment");
+        initial["tables"][0]["indexes"] = json!([{"name": "ix", "columns": ["id"], "visible": true}]);
+        initial["tables"][0]["checks"] = json!([{"name": "positive", "expression": "id > 0", "enforced": true}]);
+        let before: NormalizedSchema = serde_json::from_value(initial.clone()).unwrap();
+        initial["tables"][0]["auto_increment"] = json!(10004);
+        let progressed: NormalizedSchema = serde_json::from_value(initial.clone()).unwrap();
+        assert!(!mysql_schema_drifted(&before, &progressed));
+        for (path, changed) in [
+            ("/tables/0/comment", json!("changed table comment")),
+            ("/tables/0/columns/0/comment", json!("changed column comment")),
+            ("/tables/0/indexes/0/visible", json!(false)),
+            ("/tables/0/checks/0/enforced", json!(false)),
+            ("/tables/0/checks/0/expression", json!("id > 1")),
+        ] {
+            let mut altered = initial.clone();
+            *altered.pointer_mut(path).unwrap() = changed;
+            let altered: NormalizedSchema = serde_json::from_value(altered).unwrap();
+            assert!(mysql_schema_drifted(&before, &altered), "missed static metadata drift: {path}");
+        }
+        initial["tables"][0]["columns"][0]["nullable"] = json!(true);
+        let altered: NormalizedSchema = serde_json::from_value(initial).unwrap();
+        assert!(mysql_schema_drifted(&before, &altered));
     }
 
     #[test]
@@ -2568,6 +2831,9 @@ mod tests {
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             },
             NormalizedTable {
                 name: "huge".to_string(),
@@ -2575,6 +2841,9 @@ mod tests {
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             },
             NormalizedTable {
                 name: "medium".to_string(),
@@ -2582,6 +2851,9 @@ mod tests {
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             },
         ];
         let mut counts = BTreeMap::new();

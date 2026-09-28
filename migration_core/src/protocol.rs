@@ -105,8 +105,7 @@ impl CoreService {
                 })];
             };
             let params = query_params(&request.payload);
-            let bound_sql = bind_query_params(sql, &params);
-            return match execute_query_adapter(adapter, &bound_sql) {
+            return match execute_query_adapter(adapter, sql, &params) {
                 Ok(result) => query_result_events(request, result),
                 Err(err) => vec![json!({
                     "event": "error",
@@ -165,6 +164,7 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "query.cancel" => emit_all_events(query_cancel(&request), emit),
         "dump.run" => dump_run_streaming(&request, emit),
         "dump.import" => dump_import_streaming(&request, emit),
+        "dump.promote" => crate::safe_promotion::handle(&request, emit),
         "migration.plan" => emit_all_events(alias_events(&request, "plan"), emit),
         "migration.verify" => emit_all_events(alias_events(&request, "verify"), emit),
         "migration.resume" => emit_all_events(alias_events(&request, "resume"), emit),
@@ -264,6 +264,7 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "query.cancel",
             "dump.run",
             "dump.import",
+            "dump.promote",
             "migration.plan",
             "migration.run",
             "migration.verify",
@@ -515,8 +516,7 @@ fn query_execute(request: &Request) -> Vec<Value> {
     };
 
     let params = query_params(&request.payload);
-    let bound_sql = bind_query_params(sql, &params);
-    match execute_query_live(&endpoint, &bound_sql) {
+    match execute_query_live(&endpoint, sql, &params) {
         Ok(result) => query_result_events(request, result),
         Err(err) => vec![json!({
             "event": "error",

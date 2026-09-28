@@ -1,4 +1,5 @@
 """Rust DB Core 작업 스레드"""
+import json
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.exporters.rust_dump_exporter import (
@@ -21,6 +22,7 @@ class RustDumpWorker(QThread):
     raw_output = pyqtSignal(str)  # rust_dump 실시간 출력
     metadata_analyzed = pyqtSignal(dict)  # dump 메타데이터 분석 결과 (chunk_counts, table_sizes, total_bytes, schema)
     table_chunk_progress = pyqtSignal(str, int, int)  # table_name, completed_chunks, total_chunks (테이블별 chunk 진행률)
+    promotion_finished = pyqtSignal(bool, str, dict)
 
     def __init__(self, task_type: str, config: RustDumpConfig, **kwargs):
         super().__init__()
@@ -84,6 +86,8 @@ class RustDumpWorker(QThread):
                 self._run_export_tables()
             elif self.task_type == "import":
                 self._run_import()
+            elif self.task_type == "promote":
+                self._run_promotion()
         except Exception as e:
             if self._cancel_requested:
                 message = CANCELLED_MESSAGE
@@ -94,6 +98,22 @@ class RustDumpWorker(QThread):
                 self.finished.emit(False, str(e))
         finally:
             self._active_runner = None
+
+    def _run_promotion(self):
+        runner = RustDumpImporter(self.config)
+        self._active_runner = runner
+        try:
+            result = runner.facade.promote_dump(
+                self.kwargs["payload"],
+                on_event=lambda event: self._on_raw_output(json.dumps(event, ensure_ascii=False)),
+            )
+            success, message = self._is_cancelled_message(result.get("success", True) is True, str(result.get("message") or ""))
+            self.promotion_finished.emit(success, message, result)
+        except Exception as exc:
+            _, message = self._is_cancelled_message(False, str(exc))
+            self.promotion_finished.emit(False, message, {})
+        finally:
+            runner.facade.client.shutdown()
 
     def _run_export_schema(self):
         exporter = RustDumpExporter(self.config)
@@ -147,7 +167,7 @@ class RustDumpWorker(QThread):
             self.kwargs['input_dir'],
             self.kwargs.get('target_schema'),
             self.kwargs.get('threads', 8),
-            self.kwargs.get('import_mode', 'replace'),
+            self.kwargs.get('import_mode', 'safe'),
             self.kwargs.get('timezone_sql'),
             self._on_progress,
             self._on_table_progress,
@@ -157,6 +177,7 @@ class RustDumpWorker(QThread):
             self.kwargs.get('retry_tables'),  # 재시도할 테이블 목록
             self._on_metadata,
             self._on_table_chunk_progress,
+            use_source_timezone=self.kwargs.get('use_source_timezone', True),
         )
         success, msg = self._is_cancelled_message(success, msg)
         self.import_finished.emit(success, msg, results)

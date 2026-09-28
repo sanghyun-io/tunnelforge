@@ -335,6 +335,7 @@ def test_import_dialog_uses_direct_connector_host_for_rust_dump(monkeypatch, tmp
     dialog.do_import()
 
     assert captured["task_type"] == "import"
+    assert captured["kwargs"]["import_mode"] == "safe"
     assert captured["config"].host == "db.example.com"
     assert captured["config"].port == 5432
     assert captured["config"].user == "importer"
@@ -1372,33 +1373,13 @@ def test_import_error_report_workers_are_retained_without_table_context(monkeypa
     dialog.close()
 
 
-def test_import_retry_confirmation_sanitizes_rust_table_names(monkeypatch):
-    class SelectedItem:
-        @staticmethod
-        def isSelected():
-            return True
-
-    captured = {}
-    malicious_table = "customer_orders\n[FORGED]\u202ereversed"
-    dialog = type("DummyDialog", (), {})()
-    dialog.table_items = {malicious_table: SelectedItem()}
-
-    def capture_question(_parent, _title, message, _buttons):
-        captured["message"] = message
-        return QMessageBox.StandardButton.No
-
-    monkeypatch.setattr(
-        "src.ui.dialogs.db_import_dialog.QMessageBox.question",
-        capture_question,
-    )
-
+def test_import_retry_refuses_partial_rerun(monkeypatch):
+    warning = MagicMock()
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", warning)
+    dialog = MagicMock()
     RustDumpImportDialog.do_retry(dialog)
-
-    message = captured["message"]
-    assert "\n[FORGED]" not in message
-    assert "\u202e" not in message
-    assert r"\n[FORGED]\u202e" in message
-    assert "customer_orders" in message
+    warning.assert_called_once()
+    dialog.do_import.assert_not_called()
 
 
 def test_import_save_log_escapes_result_controls(tmp_path, monkeypatch):
@@ -1446,7 +1427,8 @@ def test_import_save_log_escapes_result_controls(tmp_path, monkeypatch):
     dialog.close()
 
 
-def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeypatch):
+@pytest.mark.parametrize("db_engine", ["mysql", "postgresql"])
+def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeypatch, db_engine):
     app = QApplication.instance() or QApplication([])
 
     class FakeSignal:
@@ -1477,10 +1459,11 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
 
     class FakeConnector:
         host = "127.0.0.1"
-        port = 3306
-        user = "root"
+        port = 5432 if db_engine == "postgresql" else 3306
+        user = "audit_sensitive_login"
         password = "pw"
-        engine = "mysql"
+        engine = db_engine
+        database = "selected_database"
 
         def get_schemas(self):
             return ["grireport"]
@@ -1488,6 +1471,9 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
     dump_dir = tmp_path / "dump"
     dump_dir.mkdir()
     output_path = tmp_path / "import-log.txt"
+    manifest_path = dump_dir / "_tunnelforge_dump.json"
+    manifest_path.write_text(json.dumps({"source_engine": db_engine, "database": "original/db", "source_schema": "original/db", "tables": []}), encoding="utf-8")
+    dialog_paths = []
     monkeypatch.setattr(
         "src.ui.dialogs.db_import_dialog.check_rust_dump",
         lambda: (True, "Rust DB Core OK"),
@@ -1495,7 +1481,7 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
     monkeypatch.setattr("src.ui.dialogs.db_import_dialog.RustDumpWorker", FakeWorker)
     monkeypatch.setattr(
         "src.ui.dialogs.db_import_dialog.QFileDialog.getSaveFileName",
-        lambda *_args: (str(output_path), ""),
+        lambda *_args: (dialog_paths.append(_args[2]) or str(output_path), ""),
     )
     monkeypatch.setattr(
         "src.ui.dialogs.db_import_dialog.QMessageBox.information",
@@ -1504,20 +1490,55 @@ def test_import_save_log_summary_records_executed_replace_mode(tmp_path, monkeyp
 
     dialog = RustDumpImportDialog(
         connector=FakeConnector(),
-        tunnel_config={"environment": "development"},
+        tunnel_config={"name": "staging-profile", "environment": "development", "connection_mode": "ssh", "remote_host": "staging-db.internal", "remote_port": 5432, "bastion_host": "staging-jump.internal", "bastion_user": "private-ssh-user", "bastion_key": "private-key-file", "db_password": "private-db-password"},
     )
     dialog.input_dir.setText(str(dump_dir))
     dialog.radio_tz_none.setChecked(True)
     dialog.radio_replace.setChecked(True)
 
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", lambda *args: QMessageBox.StandardButton.Yes)
     dialog.do_import()
     dialog.radio_merge.setChecked(True)
+    dialog.connector.host = "changed-after-job"
+    dialog.tunnel_config.update(name="production-profile", environment="production", remote_host="production-db.internal", bastion_host="production-jump.internal")
+    manifest_path.write_text('{"source_engine":"mysql","database":"changed_after_job","tables":[]}', encoding="utf-8")
+    dialog.on_raw_output(json.dumps({"event": "target_change", "phase": "dump_import_prepare", "action": "drop_table", "status": "completed", "table": "confirmed_drop"}))
+    dialog.on_raw_output(json.dumps({"event": "target_change", "phase": "dump_import_prepare", "action": "drop_table", "status": "failed", "table": "not_confirmed"}))
+    dialog.on_raw_output(json.dumps({"event": "import_report", "status": "failed", "report_path": "report.json"}))
+    dialog.import_results["unattempted"] = {"status": "blocked", "message": "not started"}
+    for index in range(600):
+        dialog._add_log(f"progress {index}")
     dialog.import_success = False
     dialog.save_log()
 
     saved_summary = output_path.read_text(encoding="utf-8").split("상세 로그", 1)[0]
     assert "Import 모드: 전체 교체 Import" in saved_summary
     assert "Import 모드: 증분 Import (병합)" not in saved_summary
+    assert f"127.0.0.1:{5432 if db_engine == 'postgresql' else 3306}" in saved_summary
+    assert Path(dialog_paths[0]).name.startswith("import_log_original_db_failed_")
+    assert dialog.worker.kwargs["target_schema"] == "original/db"
+    if db_engine == "postgresql":
+        assert "Target database: selected_database" in saved_summary
+        assert "Target schema: original/db" in saved_summary
+    assert "original/db" in saved_summary
+    assert "changed-after-job" not in saved_summary
+    assert "staging-profile" in saved_summary
+    assert "Environment: development" in saved_summary
+    assert "staging-db.internal:5432" in saved_summary
+    assert "staging-jump.internal" in saved_summary
+    assert "production-profile" not in saved_summary
+    assert "production-db.internal" not in saved_summary
+    assert "production-jump.internal" not in saved_summary
+    assert "private-ssh-user" not in saved_summary
+    assert "private-key-file" not in saved_summary
+    assert "private-db-password" not in saved_summary
+    assert "changed_after_job" not in saved_summary
+    assert "confirmed_drop" in saved_summary
+    assert "not_confirmed" not in saved_summary
+    assert "dump_import_prepare" in saved_summary
+    assert "report.json" in saved_summary
+    assert "audit_sensitive_login" not in saved_summary
+    assert "pw" not in saved_summary
     dialog.deleteLater()
 
 
@@ -1546,7 +1567,7 @@ def test_import_mode_text_uses_single_korean_label_source(monkeypatch):
     dialog = RustDumpImportDialog()
 
     dialog.radio_merge.setChecked(True)
-    assert dialog._get_import_mode_text() == "증분 Import (병합)"
+    assert dialog._get_import_mode_text() == "데이터 추가 Import"
 
     dialog.radio_replace.setChecked(True)
     assert dialog._get_import_mode_text() == "전체 교체 Import"
@@ -1564,6 +1585,106 @@ def test_resolve_timezone_sql_preserves_engine_specific_modes():
     assert resolve_timezone_sql("mysql", "kst") == "SET SESSION time_zone = '+09:00'"
     assert resolve_timezone_sql("mysql", "utc") == "SET SESSION time_zone = '+00:00'"
     assert resolve_timezone_sql("mysql", "none") is None
+
+
+def test_import_retry_does_not_append_partial_data(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    warning = MagicMock()
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", warning)
+    dialog = RustDumpImportDialog()
+    dialog.input_dir.setText(str(tmp_path))
+    dialog.last_import_mode = "merge"
+    dialog._confirm_production_guard = MagicMock(return_value=False)
+    dialog.do_import(retry_tables=["users"])
+    warning.assert_called_once()
+    dialog._confirm_production_guard.assert_not_called()
+    dialog.last_import_mode = "replace"
+    dialog.radio_merge.setChecked(True)
+    dialog.do_import(retry_tables=["users"])
+    assert warning.call_count == 2
+    dialog._confirm_production_guard.assert_not_called()
+    dialog.close()
+
+
+def test_import_guard_reads_rust_manifest_namespace(tmp_path):
+    import json
+    (tmp_path / "_tunnelforge_dump.json").write_text(json.dumps({
+        "database": "analytics", "source_schema": "reporting", "source_engine": "postgresql",
+    }), encoding="utf-8")
+    dialog = type("Dialog", (), {"connector": None})()
+    assert RustDumpImportDialog._get_dump_schema_name(dialog, str(tmp_path)) == "reporting"
+
+
+def test_import_replace_policy_discloses_destructive_alias_and_partial_failure(monkeypatch):
+    from PyQt6.QtWidgets import QLabel
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    dialog = RustDumpImportDialog()
+    descriptions = "\n".join(label.text() for label in dialog.findChildren(QLabel))
+    assert dialog._get_selected_import_mode() == "safe"
+    assert "권장" not in dialog.radio_replace.text()
+    assert "동일" in dialog.radio_recreate.text()
+    assert "선택한 테이블을 삭제" in descriptions
+    assert "자동으로 되돌리지" in descriptions
+    assert "선택한 테이블" in dialog.radio_replace.toolTip()
+    dialog.close()
+
+
+def test_import_unknown_original_namespace_requires_explicit_ui_selection(monkeypatch, tmp_path):
+    import json
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    dialog = RustDumpImportDialog()
+    (tmp_path / "_tunnelforge_dump.json").write_text(json.dumps({"source_engine": "postgresql", "database": "app"}), encoding="utf-8")
+    dialog._update_original_schema_option(str(tmp_path))
+    assert not dialog.chk_use_original.isEnabled()
+    assert not dialog.chk_use_original.isChecked()
+    assert dialog.combo_target_schema.isEnabled()
+    assert dialog.combo_target_schema.isEditable()
+    dialog.close()
+
+
+@pytest.mark.parametrize("restore_status", ["ready_for_switch", "ready_for_review"])
+def test_safe_restore_candidate_handoff_excludes_credentials(monkeypatch, restore_status):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    dialog = RustDumpImportDialog()
+    assert dialog._get_selected_import_mode() == "safe"
+    dialog.last_import_mode = "safe"
+    dialog.on_raw_output(json.dumps({
+        "event": "safe_restore_ready", "status": restore_status, "verified": True,
+        "original_unchanged": True, "cutover_pending": True,
+        "original_target": {"engine": "mysql", "database": "original"},
+        "candidate_target": {"engine": "mysql", "host": "127.0.0.1", "port": 3333, "database": "candidate", "password": "private", "user": "private-user"},
+    }))
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.information", lambda *args: None)
+    dialog.on_finished(True, "candidate ready")
+    assert ("전환 대기" if restore_status == "ready_for_switch" else "검토 필요") in dialog.label_status.text()
+    assert dialog.btn_copy_restore_target.isEnabled()
+    dialog.copy_restore_target()
+    copied = json.loads(app.clipboard().text())
+    assert copied["database"] == "candidate"
+    assert "password" not in copied and "user" not in copied
+    assert dialog.import_audit["original_target"]["database"] == "original"
+    dialog.close()
+
+
+def test_destructive_import_decline_never_starts_worker(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    question = MagicMock(return_value=QMessageBox.StandardButton.No)
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", question)
+    dialog = RustDumpImportDialog()
+    dialog.input_dir.setText(str(tmp_path))
+    dialog.radio_replace.setChecked(True)
+    dialog._confirm_production_guard = MagicMock(return_value=True)
+    dialog._begin_error_report_operation = MagicMock()
+    dialog.do_import()
+    assert question.call_args.args[-1] == QMessageBox.StandardButton.No
+    dialog._begin_error_report_operation.assert_not_called()
+    assert dialog.worker is None
+    dialog.close()
 
 
 def test_import_table_result_helpers_ignore_fk_restore_and_non_dict_entries():

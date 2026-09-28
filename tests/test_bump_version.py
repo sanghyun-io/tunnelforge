@@ -338,6 +338,19 @@ class TestBumpVersionCLI:
     CLI = str(Path(__file__).parent.parent / "scripts" / "bump_version.py")
     PROJECT_ROOT = str(Path(__file__).parent.parent)
 
+    @pytest.mark.parametrize('args, stream, expected', [
+        (['--help'], 'stdout', '버전'),
+        (['--bump-type', 'patch', '--dry-run'], 'stderr', '현재 버전'),
+    ])
+    def test_redirected_output_is_utf8_with_legacy_locale(self, monkeypatch, args, stream, expected):
+        monkeypatch.setenv('PYTHONIOENCODING', 'cp949')
+        result = subprocess.run(
+            [sys.executable, self.CLI, *args], capture_output=True,
+            cwd=self.PROJECT_ROOT,
+        )
+        assert result.returncode == 0
+        assert expected in getattr(result, stream).decode('utf-8')
+
     def run_cli(self, *args):
         """CLI 실행 후 (returncode, stdout, stderr) 반환."""
         result = subprocess.run(

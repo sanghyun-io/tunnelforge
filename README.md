@@ -64,7 +64,7 @@
 
 | | Feature | Description |
 |:-:|---------|-------------|
-| ⚡ | **Parallel Export/Import** | Blazing-fast schema and data transfers powered by Rust DB Core's parallel processing. |
+| ⚡ | **Export/Import** | Validated table transfers with engine-specific snapshot policies, parallel MySQL paths, and explicit restore constraints. |
 | 🧩 | **Orphan Record Analysis** | Detect rows left behind by broken foreign-key relationships and export the findings as a report. |
 
 Scheduled Backups & Queries are disabled in the default UI and cannot be used pending intentional reactivation and verification. See [SCHEDULE.md](SCHEDULE.md) for the current status.
@@ -152,9 +152,10 @@ Create separate tunnel configs for each environment (Dev, Staging, Production) w
 <details>
 <summary><b>Export Best Practices</b></summary>
 
-- Use **schema-only export** for structure backups
+- Review the [Export/Import contract](docs/export_import_policy.md) before restoring a backup
 - Use **table selection** to export only what you need
-- Exports run in parallel for faster completion
+- MySQL shared-snapshot export supports parallel workers; privilege fallback and PostgreSQL use one consistent session
+- New v3 dumps require **TunnelForge 2.6.0+**; existing v1/v2 dumps remain readable
 
 </details>
 

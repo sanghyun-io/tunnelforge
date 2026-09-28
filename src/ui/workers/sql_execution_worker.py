@@ -51,7 +51,7 @@ class SQLExecutionWorker(QThread):
             with open(self.sql_file, "r", encoding="utf-8") as f:
                 sql_content = f.read()
 
-            statements = self._parse_sql_statements(sql_content)
+            statements = self._parse_sql_statements(sql_content, self.db_engine)
             if not statements:
                 self.finished.emit(False, "❌ 실행할 SQL 문이 없습니다.")
                 return
@@ -85,8 +85,8 @@ class SQLExecutionWorker(QThread):
                     pass
 
     @staticmethod
-    def _parse_sql_statements(sql_text: str) -> list:
-        return parse_sql_statements(sql_text)
+    def _parse_sql_statements(sql_text: str, dialect: str = "mysql") -> list:
+        return parse_sql_statements(sql_text, dialect)
 
     @staticmethod
     def _read_dollar_quote(sql_text: str, start: int) -> str:

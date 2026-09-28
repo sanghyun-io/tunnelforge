@@ -913,7 +913,8 @@ def test_current_status_records_strategy_review_findings_and_priority():
         "TF-STATUS-008",
         "TF-STATUS-078",
     ]
-    positions = [order.index(issue_id) for issue_id in priorities]
+    historical_order = order.split("The historical release-preservation checklist follows.", 1)[-1]
+    positions = [historical_order.index(issue_id) for issue_id in priorities]
     assert positions == sorted(positions)
 
 
@@ -1217,7 +1218,8 @@ def test_current_status_records_anonymous_error_reporting_design():
     order = " ".join(_section(doc, "Recommended Execution Order").split())
     sessions = " ".join(_section(doc, "Session Log").split())
 
-    assert "Last reviewed: 2026-07-31" in doc
+    reviewed = re.search(r"^Last reviewed: (\d{4}-\d{2}-\d{2})$", doc, re.MULTILINE)
+    assert reviewed and reviewed.group(1) >= "2026-07-31"
     assert "dedicated reporter GitHub App" in summary
     assert "Cloudflare Worker" in summary
     assert "TF-STATUS-092 | High | closed" in tracker

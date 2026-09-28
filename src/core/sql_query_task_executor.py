@@ -69,7 +69,7 @@ class SqlQueryTaskExecutor:
 
             try:
                 # 멀티 쿼리 파싱 (세미콜론으로 구분)
-                queries = self.parse_queries(schedule.sql_query)
+                queries = self.parse_queries(schedule.sql_query, resolved.engine)
                 if not queries:
                     error_msg = "실행할 SQL 쿼리가 없습니다."
                     logger.error(error_msg)
@@ -120,9 +120,9 @@ class SqlQueryTaskExecutor:
             self.log_writer.log_execution(schedule, False, error_msg)
             return False, error_msg
 
-    def parse_queries(self, sql_text: str) -> List[str]:
+    def parse_queries(self, sql_text: str, dialect: str = "mysql") -> List[str]:
         """SQL 텍스트를 개별 쿼리로 파싱."""
-        return parse_sql_statements(sql_text)
+        return parse_sql_statements(sql_text, dialect)
 
     def execute_single(
         self,

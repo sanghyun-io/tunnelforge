@@ -198,4 +198,8 @@ def main() -> int:
 
 
 if __name__ == '__main__':
+    # Pipes and CI consumers use UTF-8; keep interactive terminal settings.
+    for stream in (sys.stdout, sys.stderr):
+        if not stream.isatty():
+            stream.reconfigure(encoding='utf-8')
     sys.exit(main())

@@ -46,7 +46,7 @@ class FakeConnector:
 
 def test_sql_execution_worker_uses_rust_core_connector(monkeypatch, tmp_path):
     sql_file = tmp_path / "script.sql"
-    sql_file.write_text("SELECT 1; INSERT INTO logs VALUES ('a;b');", encoding="utf-8")
+    sql_file.write_text("SELECT 5 # 3; INSERT INTO logs VALUES ('a;b');", encoding="utf-8")
     executed = []
     created = {}
     connector = FakeConnector(executed)
@@ -91,7 +91,7 @@ def test_sql_execution_worker_uses_rust_core_connector(monkeypatch, tmp_path):
         "database": "analytics",
         "schema": "public",
     }
-    assert executed == ["SELECT 1", "INSERT INTO logs VALUES ('a;b')"]
+    assert executed == ["SELECT 5 # 3", "INSERT INTO logs VALUES ('a;b')"]
     assert outputs == ["value\n1"]
     assert finished and finished[0][0] is True
     assert connector.disconnected is True

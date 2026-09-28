@@ -81,6 +81,20 @@ pub struct NormalizedTable {
     /// PostgreSQL 소스나 cross-engine에서는 None(PostgreSQL은 테이블 레벨 collation 개념이 없음).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub table_collation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_increment: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<NormalizedCheck>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NormalizedCheck {
+    pub name: String,
+    pub expression: String,
+    #[serde(default = "default_nullable")]
+    pub enforced: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -90,6 +104,12 @@ pub struct NormalizedColumn {
     pub type_name: String,
     #[serde(rename = "default", default)]
     pub default_value: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_update: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comment: Option<String>,
+    #[serde(default)]
+    pub default_is_expression: bool,
     #[serde(default = "default_nullable")]
     pub nullable: bool,
     #[serde(default)]
@@ -110,6 +130,34 @@ pub struct NormalizedIndex {
     pub column_prefixes: Vec<Option<u32>>,
     #[serde(default)]
     pub unique: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub visible: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ForeignKeyAction {
+    #[serde(rename = "NO ACTION")]
+    NoAction,
+    #[serde(rename = "RESTRICT")]
+    Restrict,
+    #[serde(rename = "CASCADE")]
+    Cascade,
+    #[serde(rename = "SET NULL")]
+    SetNull,
+    #[serde(rename = "SET DEFAULT")]
+    SetDefault,
+}
+
+impl ForeignKeyAction {
+    pub fn as_sql(&self) -> &'static str {
+        match self {
+            Self::NoAction => "NO ACTION",
+            Self::Restrict => "RESTRICT",
+            Self::Cascade => "CASCADE",
+            Self::SetNull => "SET NULL",
+            Self::SetDefault => "SET DEFAULT",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -120,6 +168,10 @@ pub struct NormalizedForeignKey {
     pub referenced_table: String,
     #[serde(default)]
     pub referenced_columns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_delete: Option<ForeignKeyAction>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_update: Option<ForeignKeyAction>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -164,6 +216,10 @@ pub struct DumpManifest {
     #[serde(default = "default_dump_compression")]
     pub compression: String,
     pub source_engine: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_schema: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_timezone: Option<String>,
     pub database: String,
     pub schema: NormalizedSchema,
     #[serde(default = "default_snapshot_policy")]
@@ -623,6 +679,9 @@ impl MigrationAdapter for LiveAdapter {
 
 pub(crate) fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
     mysql::OptsBuilder::new()
+        // Pools are private to a single worker/adapter; driver defaults would
+        // eagerly open ten connections per worker and exhaust server limits.
+        .pool_opts(mysql::PoolOpts::default().with_constraints(mysql::PoolConstraints::new(0, 1).unwrap()))
         .ip_or_hostname(Some(endpoint.host.clone()))
         .tcp_port(endpoint.port)
         .user(Some(endpoint.user.clone()))
@@ -723,16 +782,15 @@ pub(crate) fn dump_manifest_consistency_metadata(
             mysql_snapshot_policy == "mysql_parallel_no_backup_lock_consistent_snapshot";
         let warnings = if backup_lock_skipped {
             vec![
-                "LOCK INSTANCE FOR BACKUP was skipped (BACKUP_ADMIN not required); \
-                 schema DDL drift was verified after extraction instead."
+                "Workers used independent snapshots; cross-table and cross-chunk consistency is not guaranteed."
                     .to_string(),
             ]
         } else {
             Vec::new()
         };
-        (mysql_snapshot_policy.to_string(), true, warnings)
+        (mysql_snapshot_policy.to_string(), !backup_lock_skipped, warnings)
     } else {
-        ("connection_consistent".to_string(), true, Vec::new())
+        ("postgresql_repeatable_read_snapshot".to_string(), true, Vec::new())
     }
 }
 
@@ -756,6 +814,9 @@ pub(crate) mod test_support {
                         nullable: false,
                         primary_key: true,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                     NormalizedColumn {
                         name: "name".to_string(),
@@ -764,11 +825,17 @@ pub(crate) mod test_support {
                         nullable: true,
                         primary_key: false,
                         unique: false,
+                        comment: None,
+                        default_is_expression: false,
+                        on_update: None,
                     },
                 ],
                 indexes: Vec::new(),
                 foreign_keys: Vec::new(),
                 table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
             }],
         }
     }
@@ -780,6 +847,9 @@ pub(crate) mod test_support {
             indexes: Vec::new(),
             foreign_keys,
             table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         }
     }
 
@@ -789,6 +859,8 @@ pub(crate) mod test_support {
             columns: vec!["parent_id".to_string()],
             referenced_table: referenced_table.to_string(),
             referenced_columns: vec!["id".to_string()],
+            on_delete: None,
+            on_update: None,
         }
     }
 
@@ -904,10 +976,16 @@ pub(crate) mod test_support {
                 nullable: false,
                 primary_key: true,
                 unique: false,
+                comment: None,
+                default_is_expression: false,
+                on_update: None,
             }],
             indexes: Vec::new(),
             foreign_keys: Vec::new(),
             table_collation: table_collation.map(str::to_string),
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
         }
     }
 }
@@ -915,6 +993,15 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mysql_connection_pool_opens_only_one_connection_on_demand() {
+        let endpoint = Endpoint { engine: "mysql".into(), host: "localhost".into(), port: 3306, user: "test".into(), password: String::new(), database: "test".into(), schema: None };
+        let opts: mysql::Opts = mysql_opts(&endpoint).into();
+        let constraints = opts.get_pool_opts().constraints();
+        assert_eq!(constraints.min(), 0, "workers must not eagerly open ten connections");
+        assert_eq!(constraints.max(), 1, "one worker owns one database connection");
+    }
     
     
     
@@ -1088,10 +1175,9 @@ mod tests {
             snapshot_policy,
             "mysql_parallel_no_backup_lock_consistent_snapshot"
         );
-        assert!(strict_export);
+        assert!(!strict_export);
         assert_eq!(warnings.len(), 1);
-        assert!(warnings[0].contains("LOCK INSTANCE FOR BACKUP"));
-        assert!(warnings[0].contains("BACKUP_ADMIN not required"));
+        assert!(warnings[0].contains("independent snapshots"));
     }
 
     #[test]
@@ -1101,7 +1187,7 @@ mod tests {
             "mysql_shared_consistent_snapshot",
         );
 
-        assert_eq!(snapshot_policy, "connection_consistent");
+        assert_eq!(snapshot_policy, "postgresql_repeatable_read_snapshot");
         assert!(strict_export);
         assert!(warnings.is_empty());
     }
@@ -1114,6 +1200,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "zstd".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: NormalizedSchema::default(),
             snapshot_policy: "connection_consistent".to_string(),
@@ -1141,6 +1229,8 @@ mod tests {
             data_format: "tsv".to_string(),
             compression: "zstd".to_string(),
             source_engine: "mysql".to_string(),
+            source_schema: None,
+            source_timezone: None,
             database: "app".to_string(),
             schema: NormalizedSchema::default(),
             snapshot_policy: "connection_consistent".to_string(),
