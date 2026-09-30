@@ -121,6 +121,7 @@ jobs:
             --test live_foreign_key_actions \
             --test live_export_contract \
             --test live_safe_restore \
+            --test live_backup_lifecycle \
             -- --include-ignored --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib safe_promote_ -- --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib import::safe_restore_digest:: -- --include-ignored --test-threads=1
