@@ -13,6 +13,7 @@ from PyQt6.QtGui import QColor, QDrag
 
 from src.ui.styles import ButtonStyles
 from src.core.i18n import tr
+from src.core.connection_trust import insecure_connection_warning
 
 
 class TunnelTreeWidget(QTreeWidget):
@@ -258,6 +259,12 @@ class TunnelTreeWidget(QTreeWidget):
         remote_host = tunnel.get('remote_host', '')
         remote_port = tunnel.get('remote_port', '')
         item.setText(3, f"{remote_host}:{remote_port}")
+
+        # TLS 검증이 없는 연결은 목록에서 상시 경고로 표시한다 (TF-STATUS-110)
+        tls_warning = insecure_connection_warning(tunnel)
+        if tls_warning:
+            item.setText(3, f"⚠ {remote_host}:{remote_port}")
+            item.setToolTip(3, tls_warning)
 
         # 기본 스키마
         item.setText(4, tunnel.get('default_schema', '-') or '-')

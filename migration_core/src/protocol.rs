@@ -96,14 +96,7 @@ impl CoreService {
                     "engine": endpoint.engine
                 })]
             }
-            Err(err) => vec![json!({
-                "event": "result",
-                "request_id": request.request_id,
-                "command": "connection.open",
-                "success": false,
-                "engine": endpoint.engine,
-                "message": redact_endpoint_secret(&err, &endpoint)
-            })],
+            Err(err) => vec![connection_failure(request, "connection.open", &endpoint, &err)],
         }
     }
 
@@ -369,14 +362,7 @@ fn connection_test(request: &Request) -> Vec<Value> {
             "engine": endpoint.engine,
             "message": "connection successful"
         })],
-        Err(err) => vec![json!({
-            "event": "result",
-            "request_id": request.request_id,
-            "command": "connection.test",
-            "success": false,
-            "engine": endpoint.engine,
-            "message": redact_endpoint_secret(&err, &endpoint)
-        })],
+        Err(err) => vec![connection_failure(request, "connection.test", &endpoint, &err)],
     }
 }
 
@@ -401,15 +387,24 @@ fn connection_open(request: &Request) -> Vec<Value> {
             "connection_id": connection_id(&endpoint),
             "engine": endpoint.engine
         })],
-        Err(err) => vec![json!({
-            "event": "result",
-            "request_id": request.request_id,
-            "command": "connection.open",
-            "success": false,
-            "engine": endpoint.engine,
-            "message": redact_endpoint_secret(&err, &endpoint)
-        })],
+        Err(err) => vec![connection_failure(request, "connection.open", &endpoint, &err)],
     }
+}
+
+/// Connection failure result; carries `error_code` when the failure is a TLS one.
+fn connection_failure(request: &Request, command: &str, endpoint: &Endpoint, err: &str) -> Value {
+    let mut event = json!({
+        "event": "result",
+        "request_id": request.request_id,
+        "command": command,
+        "success": false,
+        "engine": endpoint.engine,
+        "message": redact_endpoint_secret(err, endpoint)
+    });
+    if let Some(code) = error_code_of(err) {
+        event["error_code"] = json!(code);
+    }
+    event
 }
 
 fn connection_close(request: &Request) -> Vec<Value> {
