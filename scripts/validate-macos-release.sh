@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/macos-dmg-mount.sh"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -70,19 +72,19 @@ shasum -a 256 -c "$ZIP_PATH.sha256"
 echo "[6/8] Smoke testing DMG package"
 rm -rf "$DMG_SMOKE_MOUNT"
 mkdir -p "$DMG_SMOKE_MOUNT"
-hdiutil attach "$DMG_PATH" -mountpoint "$DMG_SMOKE_MOUNT" -quiet
-trap 'hdiutil detach "$DMG_SMOKE_MOUNT" -quiet || true' EXIT
+dmg_attach "$DMG_PATH" "$DMG_SMOKE_MOUNT"
+trap 'dmg_detach "$DMG_SMOKE_MOUNT" || true' EXIT
 smoke_app "$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"
-hdiutil detach "$DMG_SMOKE_MOUNT" -quiet
+dmg_detach "$DMG_SMOKE_MOUNT"
 trap - EXIT
 
 echo "[7/8] Smoke testing copied DMG install"
 rm -rf "$INSTALL_SMOKE_MOUNT" build/install-smoke
 mkdir -p "$INSTALL_SMOKE_MOUNT" build/install-smoke
-hdiutil attach "$DMG_PATH" -mountpoint "$INSTALL_SMOKE_MOUNT" -quiet
-trap 'hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet || true' EXIT
+dmg_attach "$DMG_PATH" "$INSTALL_SMOKE_MOUNT"
+trap 'dmg_detach "$INSTALL_SMOKE_MOUNT" || true' EXIT
 ditto "$INSTALL_SMOKE_MOUNT/TunnelForge.app" "build/install-smoke/TunnelForge.app"
-hdiutil detach "$INSTALL_SMOKE_MOUNT" -quiet
+dmg_detach "$INSTALL_SMOKE_MOUNT"
 trap - EXIT
 smoke_app "build/install-smoke/TunnelForge.app/Contents/MacOS/TunnelForge"
 

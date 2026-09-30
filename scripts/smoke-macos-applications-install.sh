@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/macos-dmg-mount.sh"
+
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
@@ -42,7 +44,7 @@ remove_target_app() {
 
 cleanup() {
   if [[ "$MOUNTED" -eq 1 ]]; then
-    hdiutil detach "$MOUNT_PATH" -quiet || true
+    dmg_detach "$MOUNT_PATH" || true
   fi
   remove_target_app
 }
@@ -50,7 +52,7 @@ trap cleanup EXIT
 
 rm -rf "$MOUNT_PATH"
 mkdir -p "$MOUNT_PATH" "$(dirname "$TARGET_APP")"
-hdiutil attach "$DMG_PATH" -mountpoint "$MOUNT_PATH" -quiet
+dmg_attach "$DMG_PATH" "$MOUNT_PATH"
 MOUNTED=1
 
 SOURCE_APP="$MOUNT_PATH/TunnelForge.app"
