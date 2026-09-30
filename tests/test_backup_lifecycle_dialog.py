@@ -103,3 +103,37 @@ def test_rollback_apply_needs_confirmation_and_reviewed_digest():
                            "restore_id": "r1", "plan_digest": "d1", "confirmed": True}
     finally:
         dialog.close()
+
+def test_import_dialog_backup_management_carries_registered_tls(monkeypatch):
+    from types import SimpleNamespace
+
+    from src.core import connection_trust as ct
+    from src.ui.dialogs import db_import_dialog
+    from src.ui.dialogs.db_import_dialog import RustDumpImportDialog
+
+    ct.clear_registered_tls()
+    ct.register_endpoint_tls("127.0.0.1", 13306, ct.TlsPolicy("verify_full", "ca.pem", "db.internal"))
+    captured = {}
+
+    class FakeDialog:
+        def __init__(self, endpoint, input_dirs, parent=None):
+            captured["endpoint"] = endpoint
+
+        def refresh(self):
+            pass
+
+        def exec(self):
+            pass
+
+    monkeypatch.setattr(db_import_dialog, "BackupLifecycleDialog", FakeDialog)
+    dummy = SimpleNamespace(
+        import_audit={"original_target": {"engine": "mysql", "host": "127.0.0.1", "port": 13306, "database": "d"},
+                      "report_path": "C:/dump/_tunnelforge_import_report.json"},
+        restore_config=SimpleNamespace(user="u", password="p"),
+    )
+    try:
+        RustDumpImportDialog.open_backup_lifecycle(dummy)
+    finally:
+        ct.clear_registered_tls()
+    assert captured["endpoint"]["tls"]["mode"] == "verify_full"
+    assert captured["endpoint"]["user"] == "u"
