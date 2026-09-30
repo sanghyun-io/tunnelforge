@@ -42,14 +42,7 @@ fn endpoint_identity(endpoint: &Endpoint) -> Value {
     json!({"engine":endpoint.engine,"host":endpoint.host,"port":endpoint.port,"database":endpoint.database,"user":endpoint.user})
 }
 fn connect(endpoint: &Endpoint) -> Result<Client, String> {
-    postgres::Config::new()
-        .host(&endpoint.host)
-        .port(endpoint.port)
-        .user(&endpoint.user)
-        .password(&endpoint.password)
-        .dbname(&endpoint.database)
-        .connect(postgres::NoTls)
-        .map_err(|e| e.to_string())
+    connect_postgres(endpoint).map_err(|e| e.to_string())
 }
 fn digest(plan: &PromotionPlan) -> Result<String, String> {
     let mut copy = plan.clone();
@@ -597,6 +590,7 @@ mod tests {
             password: "tf_local_test".into(),
             database: "tf_test".into(),
             schema: None,
+            tls: Default::default(),
         })
     }
     fn run(command: &str, payload: Value) -> Value {

@@ -1560,6 +1560,7 @@ mod tests {
             password: "tf_local_test".into(),
             database: "tf_test".into(),
             schema: None,
+            tls: Default::default(),
         };
         let mut conn = connect(&original).unwrap();
         let nonce = std::time::SystemTime::now()

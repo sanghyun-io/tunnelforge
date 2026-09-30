@@ -9,6 +9,7 @@ fn endpoint() -> Option<Endpoint> {
     Some(Endpoint {
         engine: "mysql".into(), host: std::env::var("TF_MYSQL_HOST").ok()?, port: 3306,
         user: "root".into(), password: "tf_local_test".into(), database: "tf_test".into(), schema: None,
+        tls: Default::default(),
     })
 }
 
@@ -280,6 +281,7 @@ fn postgres_manifest_timezone_overrides_target_role_default_without_changing_wal
         engine: "postgresql".into(), host: host.clone(), port: 5432,
         user: "postgres".into(), password: "tf_local_test".into(), database: "tf_test".into(),
         schema: Some(source_schema.clone()),
+        tls: Default::default(),
     };
     let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test")
         .dbname("tf_test").connect(postgres::NoTls).unwrap();
@@ -315,6 +317,7 @@ fn postgres_failed_view_reports_partial_import_after_table_data_is_restored() {
         engine: "postgresql".into(), host: host.clone(), port: 5432,
         user: "postgres".into(), password: "tf_local_test".into(), database: "tf_test".into(),
         schema: Some(schema.clone()),
+        tls: Default::default(),
     };
     let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test")
         .dbname("tf_test").connect(postgres::NoTls).unwrap();
@@ -451,7 +454,7 @@ fn postgres_post_load_failure_persists_restored_data_and_incomplete_finalization
     use sha2::{Digest, Sha256};
     let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
     let schema = unique("tf_postload_report");
-    let endpoint = Endpoint { engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone()) };
+    let endpoint = Endpoint { engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone()), tls: Default::default() };
     let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test").dbname("tf_test").connect(postgres::NoTls).unwrap();
     admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.items(id INT PRIMARY KEY, value INT UNIQUE); INSERT INTO {schema}.items VALUES(1,17),(2,18)")).unwrap();
     let output = std::env::temp_dir().join(unique("tf_postload_report"));
@@ -483,7 +486,7 @@ fn postgres_post_load_failure_persists_restored_data_and_incomplete_finalization
 fn postgres_legacy_replace_refuses_dependent_views_before_any_table_drop() {
     let Ok(host)=std::env::var("TF_POSTGRES_HOST") else{return};
     let schema=unique("tf_pg_dependency");
-    let endpoint=Endpoint{engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone())};
+    let endpoint=Endpoint{engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone()), tls: Default::default()};
     let mut admin=postgres::Config::new().host(&host).user("postgres").password("tf_local_test").dbname("tf_test").connect(postgres::NoTls).unwrap();
     admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.a_protected(id INT PRIMARY KEY); CREATE TABLE {schema}.z_independent(id INT PRIMARY KEY); INSERT INTO {schema}.a_protected VALUES(7); INSERT INTO {schema}.z_independent VALUES(11); CREATE VIEW {schema}.v_protected AS SELECT * FROM {schema}.a_protected")).unwrap();
     let output=std::env::temp_dir().join(unique("tf_pg_dependency"));

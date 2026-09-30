@@ -839,6 +839,7 @@ mod tests {
             password: "super-secret-password".to_string(),
             database: "prod".to_string(),
             schema: None,
+            tls: Default::default(),
         };
 
         let message = redact_endpoint_secret(
@@ -873,6 +874,7 @@ mod tests {
             password: "secret".to_string(),
             database: "app".to_string(),
             schema: None,
+            tls: Default::default(),
         };
 
         let first = unique_connection_id(&endpoint, 1);

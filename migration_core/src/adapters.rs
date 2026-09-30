@@ -184,6 +184,33 @@ pub struct Endpoint {
     pub database: String,
     #[serde(default)]
     pub schema: Option<String>,
+    #[serde(default)]
+    pub tls: TlsSettings,
+}
+
+/// Server identity policy for DB connections (TF-STATUS-110).
+/// `Disable` is the legacy default so payloads without `tls` keep working.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TlsMode {
+    #[default]
+    Disable,
+    /// Encrypt and verify the certificate chain, but not the host name.
+    VerifyCa,
+    /// Encrypt and verify both the chain and `server_name` (or `host`).
+    VerifyFull,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TlsSettings {
+    #[serde(default)]
+    pub mode: TlsMode,
+    /// Extra PEM CA bundle trusted in addition to the OS store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ca_file: Option<String>,
+    /// Name verified instead of `host`; required when `host` is a local SSH tunnel port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -483,8 +510,7 @@ impl LiveAdapter {
                 Ok(Self::MySql(conn))
             }
             "postgresql" => {
-                let mut client = postgres_config(endpoint)
-                    .connect(NoTls)
+                let mut client = connect_postgres(endpoint)
                     .map_err(|err| format!("postgresql connection error: {err}"))?;
                 let schema = endpoint_schema(endpoint);
                 client
@@ -706,6 +732,20 @@ pub(crate) fn postgres_config(endpoint: &Endpoint) -> postgres::Config {
         .password(&endpoint.password)
         .dbname(&endpoint.database);
     config
+}
+
+/// Single PostgreSQL connection entry point; TLS policy is applied here only.
+pub(crate) fn connect_postgres(endpoint: &Endpoint) -> Result<postgres::Client, postgres::Error> {
+    postgres_config(endpoint).connect(NoTls)
+}
+
+/// Out-of-band PostgreSQL cancel request; must use the same TLS policy as `connect_postgres`.
+#[allow(dead_code)] // TF-STATUS-112 wires this into query.cancel.
+pub(crate) fn cancel_postgres_query(
+    token: &postgres::CancelToken,
+    _endpoint: &Endpoint,
+) -> Result<(), postgres::Error> {
+    token.cancel_query(NoTls)
 }
 
 pub(crate) fn endpoint_schema(endpoint: &Endpoint) -> String {
@@ -996,11 +1036,27 @@ mod tests {
 
     #[test]
     fn mysql_connection_pool_opens_only_one_connection_on_demand() {
-        let endpoint = Endpoint { engine: "mysql".into(), host: "localhost".into(), port: 3306, user: "test".into(), password: String::new(), database: "test".into(), schema: None };
+        let endpoint = Endpoint { engine: "mysql".into(), host: "localhost".into(), port: 3306, user: "test".into(), password: String::new(), database: "test".into(), schema: None, tls: Default::default() };
         let opts: mysql::Opts = mysql_opts(&endpoint).into();
         let constraints = opts.get_pool_opts().constraints();
         assert_eq!(constraints.min(), 0, "workers must not eagerly open ten connections");
         assert_eq!(constraints.max(), 1, "one worker owns one database connection");
+    }
+
+    #[test]
+    fn endpoint_tls_defaults_to_disable_and_parses_contract_fields() {
+        let base = serde_json::json!({"engine":"postgresql","host":"127.0.0.1","port":5432,"user":"u","password":"p","database":"d"});
+        let legacy: Endpoint = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.tls, TlsSettings::default());
+        assert_eq!(legacy.tls.mode, TlsMode::Disable);
+
+        let mut with_tls = base;
+        with_tls["tls"] = serde_json::json!({"mode":"verify_full","ca_file":"ca.pem","server_name":"db.internal"});
+        let parsed: Endpoint = serde_json::from_value(with_tls).unwrap();
+        assert_eq!(parsed.tls.mode, TlsMode::VerifyFull);
+        assert_eq!(parsed.tls.ca_file.as_deref(), Some("ca.pem"));
+        assert_eq!(parsed.tls.server_name.as_deref(), Some("db.internal"));
+        assert!(serde_json::from_value::<TlsMode>(serde_json::json!("require")).is_err(), "unverified TLS is not offered");
     }
     
     
@@ -1026,6 +1082,7 @@ mod tests {
             password: String::new(),
             database: "dataflare".to_string(),
             schema: Some(String::new()),
+            tls: Default::default(),
         };
 
         assert_eq!(endpoint_schema(&endpoint), "dataflare");

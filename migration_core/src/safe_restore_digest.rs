@@ -625,6 +625,7 @@ mod tests {
                 password: "tf_local_test".into(),
                 database: "tf_test".into(),
                 schema: None,
+                tls: Default::default(),
             };
             let name = format!("tf_content_digest_{}", std::process::id());
             let mut writer = LiveAdapter::connect(&endpoint).unwrap();
@@ -777,6 +778,7 @@ mod tests {
             password: "tf_local_test".into(),
             database: "tf_test".into(),
             schema: None,
+            tls: Default::default(),
         };
         let name = format!("tf_datestyle_{}", std::process::id());
         let dmy = format!("{name}_dmy");
@@ -889,6 +891,7 @@ mod tests {
             password: "tf_local_test".into(),
             database: "tf_test".into(),
             schema: None,
+            tls: Default::default(),
         };
         let name = format!("tf_review_view_{}_{suffix}", std::process::id());
         let mut admin = LiveAdapter::connect(&endpoint).unwrap();

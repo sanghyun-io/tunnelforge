@@ -11,6 +11,7 @@ fn endpoint(engine: &str) -> Option<Endpoint> {
         user: std::env::var(format!("{prefix}_USER")).unwrap_or_else(|_| if engine == "mysql" { "root".into() } else { "postgres".into() }),
         password: std::env::var(format!("{prefix}_PASSWORD")).unwrap_or_else(|_| "tf_local_test".into()),
         database: std::env::var(format!("{prefix}_DATABASE")).unwrap_or_else(|_| "tf_test".into()), schema: None,
+        tls: Default::default(),
     })
 }
 fn unique_name() -> String {
