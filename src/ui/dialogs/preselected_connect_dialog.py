@@ -8,7 +8,9 @@ from typing import Optional
 
 from PyQt6.QtWidgets import QDialog, QLabel, QProgressBar, QPushButton, QVBoxLayout
 
-from src.ui.workers.db_connection_worker import DBConnectionWorker
+from src.ui.workers.db_connection_worker import (
+    DBConnectionWorker, TunnelStartWorker, is_tunnel_start_in_flight,
+)
 
 
 class PreselectedConnectDialog(QDialog):
@@ -55,3 +57,54 @@ class PreselectedConnectDialog(QDialog):
             self._worker.cancel()
             self._worker = None
         super().reject()
+
+
+class TunnelStartDialog(QDialog):
+    """터널 시작 대기창: 이벤트 루프를 돌려 GUI 를 유지하고, 취소를 지원한다."""
+
+    def __init__(self, parent, engine, config, check_port=None):
+        super().__init__(parent)
+        self.setWindowTitle("터널 연결")
+        self.result_pair = None  # (success, message); 취소면 None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(f"'{config.get('name', '')}' 터널을 연결하는 중… 취소하면 결과를 사용하지 않습니다."))
+        bar = QProgressBar()
+        bar.setRange(0, 0)
+        layout.addWidget(bar)
+        self.btn_cancel = QPushButton("취소")
+        self.btn_cancel.clicked.connect(self.reject)
+        layout.addWidget(self.btn_cancel)
+
+        self._worker = TunnelStartWorker(engine, config, check_port)
+        self._worker.tunnel_finished.connect(self._tunnel_finished)
+        self.destroyed.connect(self._worker.cancel)
+
+    def start(self):
+        self._worker.start()
+
+    def _tunnel_finished(self, worker):
+        if worker is not self._worker:
+            return
+        self._worker = None
+        self.result_pair = (worker.success, worker.message)
+        self.accept()
+
+    def reject(self):
+        if self._worker is not None:
+            self._worker.cancel()
+            self._worker = None
+        super().reject()
+
+
+def start_tunnel_with_progress(parent, engine, config, check_port=None):
+    """터널을 시작하고 (success, message) 를 반환한다. 사용자가 취소하면 None.
+
+    호출자 시그니처는 동기지만 대기 중 이벤트 루프가 돌아 GUI 가 멈추지 않는다.
+    """
+    if is_tunnel_start_in_flight(config.get('id')):
+        return False, "이전 연결 시도를 정리하는 중입니다. 잠시 후 다시 시도하세요."
+    dialog = TunnelStartDialog(parent, engine, config, check_port)
+    dialog.start()
+    dialog.exec()
+    return dialog.result_pair

@@ -12,6 +12,7 @@ from PyQt6.QtGui import QAction, QIcon
 from src.ui.styles import ButtonStyles, LabelStyles, get_full_app_style
 from src.ui.theme_manager import ThemeManager
 from src.ui.trust_prompts import TrustPrompter
+from src.ui.dialogs.preselected_connect_dialog import start_tunnel_with_progress
 from src.core.connection_trust import insecure_connection_warning
 from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
@@ -635,7 +636,13 @@ class TunnelManagerUI(QMainWindow):
 
     def start_tunnel(self, tunnel_config):
         self.statusBar().showMessage(f"연결 시도 중: {tunnel_config['name']}...")
-        success, msg = self.engine.start_tunnel(tunnel_config)
+        # SSH 접속(호스트 키 확인/개인키 비밀번호 포함)은 백그라운드에서 수행한다 (TF-STATUS-120).
+        outcome = start_tunnel_with_progress(self, self.engine, tunnel_config)
+        if outcome is None:
+            self.statusBar().showMessage(f"연결 취소: {tunnel_config['name']}")
+            self.refresh_table()
+            return False
+        success, msg = outcome
 
         if success:
             tls_warning = insecure_connection_warning(tunnel_config)
@@ -1159,7 +1166,8 @@ class TunnelManagerUI(QMainWindow):
                 continue
 
             # 연결 시도
-            success, msg = self.engine.start_tunnel(tunnel, check_port=True)
+            outcome = start_tunnel_with_progress(self, self.engine, tunnel, check_port=True)
+            success, msg = outcome if outcome is not None else (False, "cancelled")
             if success:
                 connected.append(tunnel['name'])
                 logger.info(f"자동 연결 성공: {tunnel['name']}")

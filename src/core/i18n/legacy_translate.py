@@ -17,6 +17,7 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "'{}' 터널을 연결하는 중… 취소하면 결과를 사용하지 않습니다.": "Connecting tunnel '{}'… Cancelling discards the result.",
     "DB에 연결하는 중… 취소하면 결과를 사용하지 않습니다.": "Connecting to the DB… Cancelling discards the result.",
     "처음 접속하는 SSH 서버": "First connection to this SSH server",
     "처음 접속하는 SSH 서버입니다.\n\n서버: {}:{}\n키 종류: {}\nSHA256 지문: {}": "This is the first connection to this SSH server.\n\nServer: {}:{}\nKey type: {}\nSHA256 fingerprint: {}",

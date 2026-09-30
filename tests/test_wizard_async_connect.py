@@ -164,3 +164,147 @@ def test_trust_prompt_from_connect_thread_is_shown_on_gui_thread(monkeypatch):
     assert answers == [True]
     assert seen["thread"] is threading.main_thread()
     pump_until(lambda: not has_active_connection_workers())
+
+
+# ---- tunnel start (TF-STATUS-120 follow-up) ---------------------------------------------
+
+from src.ui.dialogs.preselected_connect_dialog import TunnelStartDialog, start_tunnel_with_progress
+
+
+class BlockingEngine:
+    def __init__(self, success=True, running=False, on_start=None):
+        self.started = threading.Event()
+        self.release = threading.Event()
+        self.stopped = []
+        self.success = success
+        self.running = running
+        self.on_start = on_start
+        self.start_calls = 0
+        self.start_thread = None
+
+    def is_running(self, tunnel_id):
+        return self.running
+
+    def start_tunnel(self, config, check_port=True):
+        self.start_calls += 1
+        self.start_thread = threading.get_ident()
+        self.started.set()
+        if self.on_start:
+            self.on_start()
+        assert self.release.wait(3), "tunnel start was not released"
+        return self.success, "ok" if self.success else "ssh failed"
+
+    def stop_tunnel(self, tunnel_id):
+        self.stopped.append(tunnel_id)
+        return True
+
+
+CONFIG = {"id": "t1", "name": "tunnel-one"}
+
+
+def _cancel_dialog_when_started(engine, then_release=True):
+    def step():
+        if not engine.started.is_set():
+            QTimer.singleShot(5, step)
+            return
+        for widget in app.topLevelWidgets():
+            if isinstance(widget, TunnelStartDialog):
+                widget.reject()
+        if then_release:
+            engine.release.set()
+
+    QTimer.singleShot(0, step)
+
+
+def test_tunnel_start_keeps_gui_responsive(monkeypatch):
+    engine = BlockingEngine()
+    ticks = []
+    timer = QTimer()
+    timer.timeout.connect(lambda: ticks.append(1))
+    timer.start(5)
+
+    def release():
+        if engine.started.is_set() and len(ticks) >= 3:
+            engine.release.set()
+        else:
+            QTimer.singleShot(5, release)
+
+    QTimer.singleShot(0, release)
+    try:
+        assert start_tunnel_with_progress(QWidget(), engine, CONFIG) == (True, "ok")
+    finally:
+        timer.stop()
+    assert engine.start_thread != threading.get_ident() and len(ticks) >= 3
+    pump_until(lambda: not has_active_connection_workers())
+
+
+def test_tunnel_start_failure_is_returned_not_raised():
+    engine = BlockingEngine(success=False)
+    engine.release.set()
+    assert start_tunnel_with_progress(QWidget(), engine, CONFIG) == (False, "ssh failed")
+
+
+def test_cancelled_tunnel_start_discards_result_and_closes_late_tunnel():
+    engine = BlockingEngine()
+    _cancel_dialog_when_started(engine)
+    assert start_tunnel_with_progress(QWidget(), engine, CONFIG) is None
+    pump_until(lambda: engine.stopped == ["t1"] and not has_active_connection_workers())
+
+
+def test_cancel_does_not_stop_a_tunnel_that_was_already_running():
+    engine = BlockingEngine(running=True)
+    _cancel_dialog_when_started(engine)
+    assert start_tunnel_with_progress(QWidget(), engine, CONFIG) is None
+    pump_until(lambda: not has_active_connection_workers())
+    assert engine.stopped == []
+
+
+def test_second_start_is_refused_while_cancelled_attempt_is_cleaning_up():
+    engine = BlockingEngine()
+    _cancel_dialog_when_started(engine, then_release=False)
+    assert start_tunnel_with_progress(QWidget(), engine, CONFIG) is None
+    ok, message = start_tunnel_with_progress(QWidget(), engine, CONFIG)
+    assert ok is False and engine.start_calls == 1
+    engine.release.set()
+    pump_until(lambda: not has_active_connection_workers())
+    engine.release.set()
+    assert start_tunnel_with_progress(QWidget(), engine, CONFIG) == (True, "ok")
+
+
+def test_destroyed_tunnel_dialog_closes_late_tunnel():
+    engine = BlockingEngine()
+    dialog = TunnelStartDialog(None, engine, CONFIG)
+    dialog.start()
+    pump_until(engine.started.is_set)
+    sip.delete(dialog)
+    engine.release.set()
+    pump_until(lambda: engine.stopped == ["t1"] and not has_active_connection_workers())
+
+
+def test_ssh_trust_prompt_during_tunnel_start_is_shown_on_gui_thread(monkeypatch):
+    seen = {}
+    parent = QWidget()
+    prompter = trust_prompts.TrustPrompter(parent)
+    monkeypatch.setattr(trust_prompts, "confirm_host_key",
+                        lambda _p, prompt: seen.setdefault("thread", threading.current_thread()) and True)
+    answers = []
+    engine = BlockingEngine(on_start=lambda: answers.append(
+        prompter.confirm_host_key(HostKeyPrompt("h", 22, "ssh-ed25519", "SHA256:x"))))
+    engine.release.set()
+    assert start_tunnel_with_progress(parent, engine, CONFIG) == (True, "ok")
+    assert answers == [True] and seen["thread"] is threading.main_thread()
+
+
+def test_main_window_start_tunnel_is_silent_on_cancel(monkeypatch, boxes):
+    from src.ui import main_window
+
+    engine = BlockingEngine()
+    messages = []
+    dummy = SimpleNamespace(
+        engine=engine,
+        statusBar=lambda: SimpleNamespace(showMessage=messages.append),
+        refresh_table=lambda: None,
+    )
+    monkeypatch.setattr(main_window, "start_tunnel_with_progress", lambda *a, **k: None)
+    assert main_window.TunnelManagerUI.start_tunnel(dummy, CONFIG) is False
+    assert boxes == [] and any("취소" in m for m in messages)
