@@ -17,6 +17,7 @@ fn foreign_key_actions_and_composite_columns_survive_dump_import_when_env_is_con
             user: std::env::var(format!("{prefix}_USER")).unwrap(),
             password: std::env::var(format!("{prefix}_PASSWORD")).unwrap_or_default(),
             database: std::env::var(format!("{prefix}_DATABASE")).unwrap(), schema: None,
+            tls: Default::default(),
         };
         let suffix = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
         let parent = format!("tf_fk_p_{suffix}");

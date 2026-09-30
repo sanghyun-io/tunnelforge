@@ -2308,6 +2308,7 @@ mod tests {
             engine: "postgresql".into(), host, port: 5432,
             user: "postgres".into(), password: "tf_local_test".into(),
             database: "tf_dump_snapshot".into(), schema: Some("public".into()),
+            tls: Default::default(),
         };
         let mut writer = LiveAdapter::connect(&endpoint).unwrap();
         for threads in [1, 8] {
@@ -2376,6 +2377,7 @@ mod tests {
             engine: "postgresql".into(), host: std::env::var("TF_DUMP_TEST_POSTGRES_HOST").unwrap(),
             port: 5432, user: "postgres".into(), password: "tf_local_test".into(),
             database: "tf_dump_snapshot".into(), schema: Some("public".into()),
+            tls: Default::default(),
         };
         let mut admin = LiveAdapter::connect(&endpoint).unwrap();
         admin.execute_sql("DROP TABLE IF EXISTS count_denied; DROP ROLE IF EXISTS tf_dump_count_reader; CREATE ROLE tf_dump_count_reader LOGIN PASSWORD 'tf_local_test'; CREATE TABLE count_denied(id int PRIMARY KEY); INSERT INTO count_denied VALUES (1); GRANT SELECT ON count_denied TO tf_dump_count_reader").unwrap();

@@ -8,6 +8,7 @@ fn endpoints() -> Vec<Endpoint> {
         .into_iter().map(|(engine, host, port, user)| Endpoint {
             engine: engine.into(), host: std::env::var(host).expect("live database host required"),
             port, user: user.into(), password: "tf_local_test".into(), database: "tf_test".into(), schema: None,
+            tls: Default::default(),
         }).filter(|endpoint| std::env::var("TF_EXPORT_ENGINE").map(|engine| engine == endpoint.engine).unwrap_or(true)).collect()
 }
 

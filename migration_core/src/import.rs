@@ -1867,6 +1867,7 @@ mod tests {
         let endpoint = Endpoint {
             engine: "mysql".into(), host: std::env::var("TF_MYSQL_HOST").unwrap(), port: 3306,
             user: "root".into(), password: "tf_local_test".into(), database: "tf_test".into(), schema: None,
+            tls: Default::default(),
         };
         let mut admin = LiveAdapter::connect(&endpoint).unwrap();
         let LiveAdapter::MySql(admin_conn) = &mut admin else { unreachable!() };

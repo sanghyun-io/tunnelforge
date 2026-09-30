@@ -897,6 +897,7 @@ mod tests {
             password: "secret-value".into(),
             database: "app".into(),
             schema: None,
+            tls: Default::default(),
         };
         let candidate = Endpoint {
             database: "tf_restore_123_456".into(),

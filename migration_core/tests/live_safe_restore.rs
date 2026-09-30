@@ -30,6 +30,7 @@ fn endpoint(engine: &str) -> Option<Endpoint> {
         password: "tf_local_test".into(),
         database: "tf_test".into(),
         schema: None,
+        tls: Default::default(),
     })
 }
 fn unique() -> String {

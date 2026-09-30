@@ -15,6 +15,7 @@ fn endpoint(prefix: &str, engine: &str, port: u16) -> Option<Endpoint> {
         port, user: std::env::var(format!("{prefix}_USER")).ok()?,
         password: std::env::var(format!("{prefix}_PASSWORD")).unwrap_or_default(),
         database: std::env::var(format!("{prefix}_DATABASE")).ok()?, schema: None,
+        tls: Default::default(),
     })
 }
 

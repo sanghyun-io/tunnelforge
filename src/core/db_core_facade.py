@@ -16,9 +16,13 @@ class DbEndpoint:
     password: str
     database: str
     schema: str = ""
+    # TF-STATUS-110: "disable" | "verify_ca" | "verify_full" (Rust `TlsMode`)
+    tls_mode: str = "disable"
+    tls_ca_file: str = ""
+    tls_server_name: str = ""
 
     def to_payload(self) -> Dict[str, Any]:
-        return {
+        payload = {
             "engine": self.engine,
             "host": self.host,
             "port": int(self.port),
@@ -27,6 +31,14 @@ class DbEndpoint:
             "database": self.database,
             "schema": self.schema,
         }
+        if self.tls_mode != "disable":
+            tls: Dict[str, Any] = {"mode": self.tls_mode}
+            if self.tls_ca_file:
+                tls["ca_file"] = self.tls_ca_file
+            if self.tls_server_name:
+                tls["server_name"] = self.tls_server_name
+            payload["tls"] = tls
+        return payload
 
 
 class DbCoreFacade:

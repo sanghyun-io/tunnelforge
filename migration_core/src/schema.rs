@@ -2,7 +2,6 @@ use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
 use mysql::prelude::Queryable;
-use postgres::NoTls;
 use crate::*;
 use crate::query::skip_sql_comment;
 
@@ -611,8 +610,7 @@ impl InspectAdapter for PostgresInspectAdapter {
 
 fn inspect_postgresql(endpoint: &Endpoint) -> Result<InspectionResult, String> {
     let schema_name = endpoint_schema(endpoint);
-    let mut client = postgres_config(endpoint)
-        .connect(NoTls)
+    let mut client = connect_postgres(endpoint)
         .map_err(|err| format!("postgresql connection error: {err}"))?;
     client.batch_execute("SET DateStyle = 'ISO, YMD'; SET TIME ZONE 'UTC'")
         .map_err(|err| format!("postgresql metadata session setup error: {err}"))?;
@@ -762,8 +760,7 @@ fn collect_mysql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, Strin
 
 fn collect_postgresql_views(endpoint: &Endpoint) -> Result<Vec<NormalizedView>, String> {
     let schema_name = endpoint_schema(endpoint);
-    let mut client = postgres_config(endpoint)
-        .connect(NoTls)
+    let mut client = connect_postgres(endpoint)
         .map_err(|err| format!("postgresql connection error: {err}"))?;
     client.batch_execute("SET DateStyle = 'ISO, YMD'; SET TIME ZONE 'UTC'")
         .map_err(|err| format!("postgresql view metadata session setup error: {err}"))?;

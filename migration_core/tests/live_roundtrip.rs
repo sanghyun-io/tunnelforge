@@ -28,6 +28,7 @@ fn endpoint(prefix: &str, default_port: u16, engine: &str) -> Option<Endpoint> {
         password,
         database,
         schema: None,
+        tls: Default::default(),
     })
 }
 
