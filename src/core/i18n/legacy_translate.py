@@ -17,6 +17,7 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "DB에 연결하는 중… 취소하면 결과를 사용하지 않습니다.": "Connecting to the DB… Cancelling discards the result.",
     "처음 접속하는 SSH 서버": "First connection to this SSH server",
     "처음 접속하는 SSH 서버입니다.\n\n서버: {}:{}\n키 종류: {}\nSHA256 지문: {}": "This is the first connection to this SSH server.\n\nServer: {}:{}\nKey type: {}\nSHA256 fingerprint: {}",
     "이 지문이 서버 관리자가 알려준 값과 같은지 확인하세요.\n확인 없이 신뢰하면 중간자 공격에 노출될 수 있습니다.": "Check that this fingerprint matches the value given by the server administrator.\nTrusting it without checking exposes you to man-in-the-middle attacks.",
