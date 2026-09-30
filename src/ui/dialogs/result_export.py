@@ -7,6 +7,7 @@ Two distinct actions (see `docs/query_results_export.md`):
 """
 import logging
 import os
+import re
 import time
 from typing import Any, Dict, Optional, Tuple
 
@@ -18,11 +19,32 @@ from PyQt6.QtWidgets import (
 
 from src.core.query_limits import CANCEL_ERROR_CODES, ERROR_QUERY_TIMEOUT, new_job_id
 from src.core.result_file_writer import FORMAT_CSV, FORMAT_JSONL, write_result_file
+from src.core.sql_query_classifier import _leading_tokens
 
 logger = logging.getLogger(__name__)
 
 _FILTER_CSV = "CSV (*.csv)"
 _FILTER_JSONL = "JSON Lines (*.jsonl)"
+
+
+_DATA_CHANGING_WORD = re.compile(r"\b(insert|update|delete|merge)\b", re.IGNORECASE)
+
+
+def is_export_safe_query(sql: str) -> bool:
+    """UI hint only: True for plain read queries (SELECT/TABLE/VALUES/SHOW/DESCRIBE, WITH without
+    data-changing CTEs, EXPLAIN without ANALYZE). The safety guarantee is the Rust core, which
+    runs every file export in a server-enforced read-only transaction and rolls it back."""
+    tokens = _leading_tokens(sql or "", max_tokens=2)
+    if not tokens:
+        return False
+    keyword = tokens[0]
+    if keyword in ("select", "table", "values", "show", "describe", "desc"):
+        return True
+    if keyword == "with":
+        return not _DATA_CHANGING_WORD.search(sql)
+    if keyword == "explain":
+        return not re.search(r"\banalyze\b", sql[:200], re.IGNORECASE)
+    return False
 
 
 class ResultExportOptionsDialog(QDialog):
@@ -140,6 +162,10 @@ def describe_export_failure(exc: Exception, output: Dict[str, Any]) -> str:
     code = getattr(exc, "error_code", None)
     if code in CANCEL_ERROR_CODES:
         head = "⏱ 제한시간 초과로 중단" if code == ERROR_QUERY_TIMEOUT else "⏹ 사용자가 취소"
+    elif code == "export_requires_read_only":
+        head = "🔒 이 쿼리는 데이터를 변경하므로 저장하지 않았습니다 (읽기 전용 트랜잭션에서 거부됨, 변경 없음)"
+    elif code == "export_session_in_transaction":
+        head = f"❌ 저장 실패: 열린 트랜잭션이 있는 연결에서는 실행할 수 없습니다 ({exc})"
     else:
         head = f"❌ 저장 실패: {exc}"
     rows = int(payload.get("rows_written") or 0)
@@ -207,6 +233,13 @@ class ResultExportMixin:
         if not sql:
             QMessageBox.warning(self, "경고", "이 결과의 원본 쿼리를 알 수 없습니다.")
             return
+        if not is_export_safe_query(sql):
+            QMessageBox.warning(
+                self, "경고",
+                "데이터를 변경할 수 있는 쿼리는 다시 실행해 파일로 저장할 수 없습니다. "
+                "'표시된 결과 저장'을 사용하세요.",
+            )
+            return
         db_user, db_password = self._db_credentials()
         if not db_user:
             QMessageBox.warning(self, "경고", "DB 자격 증명이 설정되지 않았습니다.")
@@ -240,7 +273,7 @@ class ResultExportMixin:
 
         self._set_executing_state(True)
         self.message_text.append(f"\n{'─' * 40}")
-        self.message_text.append(f"💾 전체 결과를 파일로 저장 (쿼리 재실행, 별도 연결·자동 커밋 스냅샷): {path}")
+        self.message_text.append(f"💾 전체 결과를 파일로 저장 (읽기 전용 트랜잭션으로 쿼리 재실행): {path}")
         self.worker = SQLResultExportWorker(params, sql, output, timeout_ms=timeout_ms)
         self.worker.progress.connect(self._on_export_progress)
         self.worker.finished.connect(self._on_export_finished)

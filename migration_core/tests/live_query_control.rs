@@ -763,3 +763,93 @@ fn export_large_result_is_streamed_with_flat_memory() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// A file export re-runs the query, so the server must refuse anything that writes.
+#[test]
+fn export_runs_read_only_and_never_changes_data() {
+    let engines = engines();
+    if skip_if_none(&engines) {
+        return;
+    }
+    for engine in engines {
+        let mut core = Core::start();
+        let conn = core.open(&engine.endpoint);
+        let observer = core.open(&engine.endpoint);
+        let mut writers: Vec<(&str, &str)> = Vec::new();
+        let setup: Vec<&str> = if engine.name == "postgresql" {
+            writers.push(("DELETE FROM tf_b_del RETURNING id", "tf_b_del"));
+            writers.push(("SELECT nextval('tf_b_sq') AS v", "seq"));
+            vec![
+                "DROP TABLE IF EXISTS tf_b_del",
+                "CREATE TABLE tf_b_del (id INT)",
+                "INSERT INTO tf_b_del VALUES (1),(2),(3)",
+                "DROP SEQUENCE IF EXISTS tf_b_sq",
+                "CREATE SEQUENCE tf_b_sq",
+            ]
+        } else {
+            writers.push(("SELECT tf_b_ins() AS v", "tf_b_fx"));
+            vec![
+                "DROP TABLE IF EXISTS tf_b_del",
+                "CREATE TABLE tf_b_del (id INT) ENGINE=InnoDB",
+                "INSERT INTO tf_b_del VALUES (1),(2),(3)",
+                "DROP TABLE IF EXISTS tf_b_fx",
+                "CREATE TABLE tf_b_fx (id INT) ENGINE=InnoDB",
+                "SET GLOBAL log_bin_trust_function_creators = 1",
+                "DROP FUNCTION IF EXISTS tf_b_ins",
+                "CREATE FUNCTION tf_b_ins() RETURNS INT MODIFIES SQL DATA BEGIN INSERT INTO tf_b_fx VALUES (1); RETURN 1; END",
+            ]
+        };
+        for sql in setup {
+            let result = core.query(&conn, sql);
+            assert_eq!(result["success"], true, "{} {sql} {result}", engine.name);
+        }
+
+        for (sql, watched) in writers {
+            let path = export_path(&format!("ro_{}.csv", engine.name));
+            let events = export(&mut core, &conn, sql, json!({"path": path.to_string_lossy()}));
+            let last = events.last().unwrap();
+            assert_eq!(last["event"], "error", "{} {sql}: {last}", engine.name);
+            assert_eq!(last["error_code"], "export_requires_read_only", "{} {sql}: {last}", engine.name);
+            assert!(!path.exists() && !partial_of(&path).exists(), "{} left a file", engine.name);
+            match watched {
+                "seq" => assert_eq!(
+                    core.scalar(&observer, "SELECT is_called FROM tf_b_sq"),
+                    "false",
+                    "nextval() advanced the sequence"
+                ),
+                table => {
+                    let expected = if table == "tf_b_del" { "3" } else { "0" };
+                    assert_eq!(core.scalar(&observer, &format!("SELECT COUNT(*) FROM {table}")), expected, "{} {table} changed", engine.name);
+                }
+            }
+        }
+
+        // The failed export must not leave the session in a read-only transaction.
+        assert_eq!(core.query(&conn, "INSERT INTO tf_b_del VALUES (9)")["success"], true);
+        assert_eq!(core.scalar(&observer, "SELECT COUNT(*) FROM tf_b_del"), "4");
+
+        // Plain SELECT exports keep working.
+        let path = export_path(&format!("ro_ok_{}.csv", engine.name));
+        let events = export(&mut core, &conn, "SELECT id FROM tf_b_del ORDER BY id", json!({"path": path.to_string_lossy()}));
+        assert_eq!(events.last().unwrap()["success"], true, "{:?}", events.last());
+        assert_eq!(events.last().unwrap()["rows_written"], 4);
+
+        // A caller's open transaction is refused (never committed or rolled back by the export).
+        let begin = if engine.name == "mysql" { "START TRANSACTION" } else { "BEGIN" };
+        assert_eq!(core.query(&conn, begin)["success"], true);
+        assert_eq!(core.query(&conn, "INSERT INTO tf_b_del VALUES (10)")["success"], true);
+        let path = export_path(&format!("ro_tx_{}.csv", engine.name));
+        let events = export(&mut core, &conn, "SELECT id FROM tf_b_del", json!({"path": path.to_string_lossy()}));
+        let last = events.last().unwrap();
+        assert_eq!(last["error_code"], "export_session_in_transaction", "{} {last}", engine.name);
+        assert!(!path.exists());
+        assert_eq!(core.scalar(&conn, "SELECT COUNT(*) FROM tf_b_del"), "5", "{} txn state lost", engine.name);
+        assert_eq!(core.scalar(&observer, "SELECT COUNT(*) FROM tf_b_del"), "4", "{} txn was committed", engine.name);
+        assert_eq!(core.query(&conn, "ROLLBACK")["success"], true);
+        assert_eq!(core.scalar(&conn, "SELECT COUNT(*) FROM tf_b_del"), "4");
+        eprintln!("{}: read-only export enforced (writers refused, data/sequence unchanged, open txn protected)", engine.name);
+        for sql in ["DROP TABLE IF EXISTS tf_b_del", "DROP TABLE IF EXISTS tf_b_fx"] {
+            core.query(&conn, sql);
+        }
+    }
+}

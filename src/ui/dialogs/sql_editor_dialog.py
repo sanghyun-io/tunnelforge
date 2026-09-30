@@ -29,7 +29,7 @@ from typing import List, Dict, Optional, Tuple
 
 from src.core.db_core_service import normalize_db_engine
 from src.core.query_limits import build_query_limits
-from src.ui.dialogs.result_export import ResultExportMixin
+from src.ui.dialogs.result_export import ResultExportMixin, is_export_safe_query
 from src.core.sql_query_classifier import (
     classify_sql_statement,
     is_mysql_implicit_commit_ddl,
@@ -1805,6 +1805,9 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
         save_full_action = menu.addAction("💾 전체 결과를 파일로 (쿼리 재실행)...")
         save_full_action.setToolTip("쿼리를 다시 실행해 모든 행을 파일로 직접 저장합니다 (행 상한 없음)")
         save_full_action.triggered.connect(lambda: self._export_result_full(table))
+        if not is_export_safe_query(getattr(table, '_source_query', '')):
+            save_full_action.setEnabled(False)
+            save_full_action.setToolTip("데이터를 변경할 수 있는 쿼리는 재실행 저장을 지원하지 않습니다 (표시된 결과 저장 사용)")
 
         # 편집 기능 메뉴
         ctx = getattr(table, '_edit_context', None)

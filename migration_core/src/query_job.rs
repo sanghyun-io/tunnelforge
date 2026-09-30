@@ -272,6 +272,46 @@ impl<'a> Sink<'a> {
 enum RunError {
     Message(String),
     MultipleResultSets,
+    /// The session already has an open transaction, so a read-only one cannot be started safely.
+    InTransaction(String),
+}
+
+/// A file export re-runs a user query, so it must never change data: the server enforces it.
+/// MySQL `SET TRANSACTION` fails inside an open transaction, which also protects a caller's
+/// manual transaction from the implicit commit of `START TRANSACTION`.
+fn begin_read_only(adapter: &mut LiveAdapter) -> Result<(), RunError> {
+    match adapter {
+        LiveAdapter::MySql(conn) => {
+            conn.query_drop("SET TRANSACTION READ ONLY").map_err(|err| {
+                RunError::InTransaction(format!("read-only export could not start: {err}"))
+            })?;
+            conn.query_drop("START TRANSACTION READ ONLY")
+                .map_err(|err| RunError::Message(format!("mysql read-only transaction error: {err}")))
+        }
+        LiveAdapter::PostgreSql(client) => {
+            if probe_in_transaction_client(client) == Some(true) {
+                return Err(RunError::InTransaction(
+                    "read-only export cannot run inside an open transaction".to_string(),
+                ));
+            }
+            client
+                .batch_execute("BEGIN TRANSACTION READ ONLY")
+                .map_err(|err| RunError::Message(format!("postgresql read-only transaction error: {err}")))
+        }
+    }
+}
+
+/// Never commits: the read-only transaction is always rolled back.
+fn end_read_only(adapter: &mut LiveAdapter) {
+    let _ = match adapter {
+        LiveAdapter::MySql(conn) => conn.query_drop("ROLLBACK").map_err(|e| e.to_string()),
+        LiveAdapter::PostgreSql(client) => client.batch_execute("ROLLBACK").map_err(|e| e.to_string()),
+    };
+}
+
+fn is_read_only_violation(message: &str) -> bool {
+    let lowered = message.to_ascii_lowercase();
+    lowered.contains("read-only transaction") || lowered.contains("read only transaction")
 }
 
 struct Outcome {
@@ -397,7 +437,7 @@ fn fetch_rows(
                 {
                     RunError::MultipleResultSets
                 } else {
-                    RunError::Message(format!("postgresql query error: {err}"))
+                    RunError::Message(format_postgres_error("postgresql query error", &err))
                 }
             })?;
             let columns = unique_query_columns(
@@ -414,7 +454,7 @@ fn fetch_rows(
                 // are collected, not streamed; upgrade path is a cursor-based fetch.
                 let messages = client
                     .simple_query(&sql)
-                    .map_err(|err| RunError::Message(format!("postgresql query error: {err}")))?;
+                    .map_err(|err| RunError::Message(format_postgres_error("postgresql query error", &err)))?;
                 let mut rows_affected = 0;
                 for message in messages {
                     match message {
@@ -443,7 +483,7 @@ fn fetch_rows(
             let copy_sql = format!("COPY (\n{}\n) TO STDOUT", sql.trim_end().trim_end_matches(';'));
             let mut reader = client
                 .copy_out(&copy_sql)
-                .map_err(|err| RunError::Message(format!("postgresql query error: {err}")))?;
+                .map_err(|err| RunError::Message(format_postgres_error("postgresql query error", &err)))?;
             let mut line = Vec::new();
             let mut halted = false;
             let mut fetch_error = None;
@@ -453,7 +493,13 @@ fn fetch_rows(
                     Ok(0) => break,
                     Ok(_) => {}
                     Err(err) => {
-                        fetch_error = Some(format!("postgresql query error: {err}"));
+                        // The driver wraps its error in io::Error; keep the server's own message.
+                        fetch_error = Some(
+                            match err.get_ref().and_then(|inner| inner.downcast_ref::<postgres::Error>()) {
+                                Some(pg) => format_postgres_error("postgresql query error", pg),
+                                None => format!("postgresql query error: {err}"),
+                            },
+                        );
                         break;
                     }
                 }
@@ -651,6 +697,10 @@ fn probe_in_transaction(adapter: &mut LiveAdapter) -> Option<bool> {
     let LiveAdapter::PostgreSql(client) = adapter else {
         return None;
     };
+    probe_in_transaction_client(client)
+}
+
+fn probe_in_transaction_client(client: &mut postgres::Client) -> Option<bool> {
     match client.simple_query("SELECT now() <> statement_timestamp()") {
         Ok(messages) => messages.into_iter().find_map(|message| match message {
             postgres::SimpleQueryMessage::Row(row) => row.get(0).map(|text| text == "t"),
@@ -678,8 +728,17 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> JobRun {
         let mut adapter = lock(&session.adapter);
         let mut sink = Sink::new(&emit, &spec);
-        let mut result = run_streaming(&mut adapter, &spec, &ctl, &mut sink);
+        let exporting = spec.output.is_some();
+        let begun = if exporting { begin_read_only(&mut adapter) } else { Ok(()) };
+        let began = begun.is_ok();
+        let mut result = match begun {
+            Ok(()) => run_streaming(&mut adapter, &spec, &ctl, &mut sink),
+            Err(err) => Err(err),
+        };
         sink.flush();
+        if exporting && began {
+            end_read_only(&mut adapter);
+        }
         // A file is only ever published after a complete, error-free run.
         let mut output_info = Value::Null;
         if let Some(writer) = sink.out.take() {
@@ -762,6 +821,17 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
             "message": "여러 결과 집합을 반환하는 문장은 지원하지 않습니다",
             "in_transaction": in_transaction
         }))),
+        Err(RunError::InTransaction(message)) => emit(base(json!({
+            "event": "error", "error_code": "export_session_in_transaction", "message": message,
+            "in_transaction": in_transaction
+        }))),
+        Err(RunError::Message(message)) if spec.output.is_some() && is_read_only_violation(&message) => {
+            emit(base(json!({
+                "event": "error", "error_code": "export_requires_read_only",
+                "message": format!("이 쿼리는 데이터를 변경하므로 파일로 저장할 수 없습니다 (읽기 전용 트랜잭션에서 거부됨): {message}"),
+                "in_transaction": in_transaction
+            })))
+        }
         Err(RunError::Message(message)) => emit(base(json!({
             "event": "error", "message": message, "in_transaction": in_transaction
         }))),

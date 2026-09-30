@@ -7,12 +7,20 @@ The SQL editor result grid offers two different actions (right-click a result ta
 | Save displayed results | Only the rows already in the grid (bounded by the editor limit, default 100,000 rows / 256 MiB) | Python, from memory |
 | Save full result to file | Every row: the query is **re-run** on its own autocommit connection | Rust core streams straight to the file; no row limit, constant memory, cancellable |
 
-The full-result export does not see uncommitted changes of a manual transaction (it uses a
-separate connection) and can differ from the grid if data changed since the first run.
+The full-result export **re-runs the query in a server-enforced read-only transaction** on its
+own connection and always rolls it back (never commits). It therefore cannot change data: a
+query that writes (`DELETE ... RETURNING`, `SELECT nextval(...)`, a stored function that
+inserts) is refused with `error_code: "export_requires_read_only"`, no file is created and
+nothing is modified. Uncommitted changes of a manual transaction are not visible, and the
+result can differ from the grid if data changed since the first run. The editor also disables
+the menu entry for queries that do not look like plain reads (a UI hint only; the core is the
+guarantee). A session with an open transaction is refused with
+`export_session_in_transaction` (MySQL `START TRANSACTION` would otherwise commit it).
 
 ## Core protocol
 
-`query.execute` accepts an `output` object (session queries only):
+`query.execute` accepts an `output` object (session queries only; runs inside `START TRANSACTION READ ONLY` /
+`BEGIN TRANSACTION READ ONLY`, rolled back afterwards):
 
 | Key | Default | Meaning |
 | --- | --- | --- |

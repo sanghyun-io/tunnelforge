@@ -162,3 +162,45 @@ def test_full_export_requires_a_known_source_query():
     with patch("src.ui.dialogs.result_export.QMessageBox.warning") as warning:
         stub._export_result_full(table)
     warning.assert_called_once()
+
+
+@pytest.mark.parametrize("sql,expected", [
+    ("SELECT * FROM t", True),
+    ("  -- c\n (select 1)", True),
+    ("WITH a AS (SELECT 1) SELECT * FROM a", True),
+    ("WITH d AS (DELETE FROM t RETURNING *) SELECT * FROM d", False),
+    ("DELETE FROM t RETURNING id", False),
+    ("INSERT INTO t VALUES (1) RETURNING id", False),
+    ("UPDATE t SET a = 1 RETURNING a", False),
+    ("CALL do_things()", False),
+    ("SHOW TABLES", True),
+    ("EXPLAIN SELECT 1", True),
+    ("EXPLAIN ANALYZE DELETE FROM t", False),
+    ("TABLE t", True),
+    ("VALUES (1)", True),
+    ("", False),
+])
+def test_export_safe_query_hint(sql, expected):
+    from src.ui.dialogs.result_export import is_export_safe_query
+
+    assert is_export_safe_query(sql) is expected
+
+
+def test_full_export_refuses_data_changing_query_before_touching_anything():
+    from unittest.mock import patch
+
+    stub = _Stub(None)
+    stub._query_executing = False
+    stub._db_credentials = MagicMock()
+    table = MagicMock()
+    table._source_query = "DELETE FROM t RETURNING id"
+    with patch("src.ui.dialogs.result_export.QMessageBox.warning") as warning:
+        stub._export_result_full(table)
+    warning.assert_called_once()
+    stub._db_credentials.assert_not_called()
+
+
+def test_read_only_rejection_is_reported_as_no_change():
+    err = DbCoreServiceError("x", error_code="export_requires_read_only", payload={})
+    text = describe_export_failure(err, {})
+    assert "변경 없음" in text and "저장하지 않았습니다" in text
