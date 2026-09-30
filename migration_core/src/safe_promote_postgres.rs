@@ -19,6 +19,10 @@ pub(crate) struct PromotionPlan {
     inventory: Vec<Value>,
     dependencies: Value,
     incoming: Vec<IncomingKey>,
+    /// Fingerprints of the candidate tables (= the promoted content), taken while the
+    /// candidate is verified and unwritten; the baseline for guided recovery.
+    #[serde(default)]
+    candidate_fingerprint: Value,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -54,6 +58,7 @@ fn digest(plan: &PromotionPlan) -> Result<String, String> {
 fn inventory_digest(plan: &PromotionPlan) -> Result<String, String> {
     let mut copy = plan.clone();
     copy.attempt_nonce.clear();
+    copy.candidate_fingerprint = Value::Null;
     digest(&copy)
 }
 fn objects(db: &mut impl GenericClient, schemas: &[String]) -> Result<Vec<Value>, String> {
@@ -145,6 +150,15 @@ pub(crate) fn plan(
     original: &Endpoint,
     candidate: &Endpoint,
     restore_id: &str,
+) -> Result<PromotionPlan, String> {
+    plan_inner(original, candidate, restore_id, true)
+}
+
+fn plan_inner(
+    original: &Endpoint,
+    candidate: &Endpoint,
+    restore_id: &str,
+    with_fingerprint: bool,
 ) -> Result<PromotionPlan, String> {
     let from = endpoint_schema(original);
     let staged = endpoint_schema(candidate);
@@ -292,7 +306,15 @@ pub(crate) fn plan(
         inventory,
         dependencies,
         incoming,
+        candidate_fingerprint: Value::Null,
     };
+    if with_fingerprint {
+        let mut fingerprint = serde_json::Map::new();
+        for table in tables(&planned.inventory, &planned.candidate_schema) {
+            fingerprint.insert(name(table).to_string(), table_fingerprint(&mut db, &planned.candidate_schema, name(table))?);
+        }
+        planned.candidate_fingerprint = Value::Object(fingerprint);
+    }
     planned.plan_digest = digest(&planned)?;
     db.batch_execute("COMMIT").map_err(|e| e.to_string())?;
     Ok(planned)
@@ -313,7 +335,7 @@ pub(crate) fn promote(
     {
         return Err("promotion confirmation does not match the reviewed plan".into());
     }
-    let fresh = plan(original, candidate, &planned.restore_id)?;
+    let fresh = plan_inner(original, candidate, &planned.restore_id, false)?;
     if inventory_digest(&fresh)? != inventory_digest(planned)? {
         return Err("promotion inventory changed after review".into());
     }
@@ -658,7 +680,7 @@ pub(crate) fn external_references(endpoint: &Endpoint, namespace: &str) -> Resul
 
 /// Order-independent content fingerprint of one table: row count and a sum of
 /// per-row hashes. Used to prove that a retained backup was not modified.
-pub(crate) fn table_fingerprint(db: &mut Client, schema: &str, table: &str) -> Result<Value, String> {
+pub(crate) fn table_fingerprint(db: &mut impl GenericClient, schema: &str, table: &str) -> Result<Value, String> {
     let row = db.query_one(
         &format!(
             "SELECT count(*)::text, COALESCE(sum(('x'||substr(md5(t::text),1,16))::bit(64)::bigint::numeric),0)::text FROM {} t",
@@ -802,6 +824,296 @@ pub(crate) fn drop_namespace(endpoint: &Endpoint, namespace: &str) -> Result<(),
 pub(crate) fn backup_named_namespaces(endpoint: &Endpoint) -> Result<Vec<String>, String> {
     let mut db = connect(endpoint)?;
     Ok(db.query("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'tf\\_backup\\_%' ORDER BY nspname", &[]).map_err(|e| e.to_string())?.into_iter().map(|row| row.get(0)).collect())
+}
+
+// ---------------------------------------------------------------------------
+// Guided recovery (TF-STATUS-119): the inverse of the promotion, in one
+// transaction. The retained original tables move back into the original schema
+// and the active promoted tables move into a new retained backup schema; nothing
+// is deleted. Supported only for promotions without views and only while every
+// recorded proof still holds.
+// ---------------------------------------------------------------------------
+
+fn candidate_table_list(plan: &PromotionPlan) -> Vec<&Value> {
+    tables(&plan.inventory, &plan.candidate_schema)
+}
+
+/// Proofs that must hold when the recovery is reviewed and again under the locks.
+fn rollback_blockers(
+    db: &mut impl GenericClient,
+    plan: &PromotionPlan,
+    backup_fingerprint: Option<&Value>,
+    displaced: Option<&str>,
+) -> Result<Vec<String>, String> {
+    let mut blockers = Vec::new();
+    if plan.inventory.iter().any(|o| o["kind"] == "v") {
+        blockers.push("this promotion involved views; guided recovery of views is not supported".into());
+    }
+    if let Some(displaced) = displaced {
+        let exists: i64 = db.query_one("SELECT count(*) FROM pg_namespace WHERE nspname=$1", &[&displaced]).map_err(|e| e.to_string())?.get(0);
+        if exists != 0 {
+            blockers.push(format!("the recovery backup schema {displaced} already exists"));
+        }
+    }
+    let Some(backup_fp) = backup_fingerprint.filter(|f| f["tables"].is_object()) else {
+        blockers.push("the journal has no backup fingerprint (written by an older version)".into());
+        return Ok(blockers);
+    };
+    if plan.candidate_fingerprint.is_null() {
+        blockers.push("the promotion plan has no fingerprint of the promoted content (written by an older version)".into());
+        return Ok(blockers);
+    }
+    let backup = plan.backup_schema.as_str();
+    let original = plan.original_schema.as_str();
+    let actual = objects(db, &[original.to_string(), plan.candidate_schema.clone(), backup.to_string()])?;
+    let in_schema = |schema: &str, oid: &Value| actual.iter().find(|a| namespace(a) == schema && a["oid"] == *oid);
+    let moved = moved_tables(plan);
+    // Retained originals: exactly the recorded objects, unmodified.
+    let allowed: BTreeSet<String> = plan.inventory.iter().filter(|o| namespace(o) == original).map(|o| o["oid"].to_string()).collect();
+    for object in actual.iter().filter(|a| namespace(a) == backup) {
+        if !allowed.contains(&object["oid"].to_string()) {
+            blockers.push(format!("the backup schema contains an unrecorded object: {}", name(object)));
+        }
+    }
+    for table in &moved {
+        if in_schema(backup, &table["oid"]).is_none() {
+            blockers.push(format!("backup table {} is missing or is not the recorded original", name(table)));
+            continue;
+        }
+        let now = table_fingerprint(db, backup, name(table))?;
+        if backup_fp["tables"].get(name(table)) != Some(&now) {
+            blockers.push(format!("backup table {} changed after promotion", name(table)));
+        }
+    }
+    if backup_fp["structure"].as_str() != Some(structure_digest(&actual, backup)?.as_str()) {
+        blockers.push("the definition of the backup objects changed after promotion".into());
+    }
+    // Active tables: the promoted identities with exactly the promoted content.
+    let candidates = candidate_table_list(plan);
+    for table in &candidates {
+        if in_schema(original, &table["oid"]).is_none() {
+            blockers.push(format!("active table {} is not the promoted table (identity differs or missing)", name(table)));
+            continue;
+        }
+        let now = table_fingerprint(db, original, name(table))?;
+        if plan.candidate_fingerprint.get(name(table)) != Some(&now) {
+            blockers.push(format!("active table {} was modified after promotion; recovery would discard those writes", name(table)));
+        }
+    }
+    // Dependencies: only the recorded incoming foreign keys may point at the active tables.
+    let oids: Vec<i64> = candidates.iter().filter_map(|t| t["oid"].as_i64()).collect();
+    let rows = db.query(
+        "SELECT t.relname, c.conname, ref.relname FROM pg_constraint c JOIN pg_class t ON t.oid=c.conrelid JOIN pg_class ref ON ref.oid=c.confrelid WHERE c.contype='f' AND c.confrelid = ANY($1::bigint[]::oid[]) AND NOT (c.conrelid = ANY($1::bigint[]::oid[]))",
+        &[&oids],
+    ).map_err(|e| e.to_string())?;
+    let recorded: BTreeSet<(String, String)> = plan.incoming.iter().map(|k| (k.table.clone(), k.name.clone())).collect();
+    for row in rows {
+        let key = (row.get::<_, String>(0), row.get::<_, String>(1));
+        if !recorded.contains(&key) {
+            blockers.push(format!("foreign key {}.{} now references the active tables and was not part of the promotion", key.0, key.1));
+        }
+    }
+    let dependents = db.query_one(
+        "SELECT count(*) FROM pg_depend d JOIN pg_rewrite r ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid WHERE d.refclassid='pg_class'::regclass AND d.refobjid = ANY($1::bigint[]::oid[])",
+        &[&oids],
+    ).map_err(|e| e.to_string())?;
+    if dependents.get::<_, i64>(0) > 0 {
+        blockers.push("views or rules now depend on the active tables".into());
+    }
+    Ok(blockers)
+}
+
+/// Read-only review of the recovery: what returns, what is displaced, blockers.
+pub(crate) fn rollback_plan(
+    endpoint: &Endpoint,
+    plan: &PromotionPlan,
+    backup_fingerprint: Option<&Value>,
+    displaced: &str,
+) -> Result<Value, String> {
+    let mut db = lifecycle_connect(endpoint, plan)?;
+    let blockers = rollback_blockers(&mut db, plan, backup_fingerprint, Some(displaced))?;
+    let mut displace = Vec::new();
+    for table in candidate_table_list(plan) {
+        let rows = table_fingerprint(&mut db, &plan.original_schema, name(table)).ok().and_then(|f| f["rows"].as_str().and_then(|s| s.parse::<i64>().ok())).unwrap_or(0);
+        displace.push(json!({"name": name(table), "rows": rows}));
+    }
+    let restore: Vec<Value> = moved_tables(plan).iter().map(|t| json!({"name": name(t)})).collect();
+    Ok(json!({"engine": "postgresql", "blockers": blockers, "displace": displace, "restore": restore,
+        "displaced_backup": displaced, "backup_namespace": plan.backup_schema,
+        "note": "The active tables are moved into a new retained backup schema; nothing is deleted."}))
+}
+
+/// Executes the recovery in one transaction after re-verifying under ACCESS EXCLUSIVE locks.
+pub(crate) fn rollback_apply(
+    endpoint: &Endpoint,
+    plan: &PromotionPlan,
+    backup_fingerprint: Option<&Value>,
+    displaced: &str,
+    journal_dir: &Path,
+) -> Result<Value, String> {
+    let mut db = lifecycle_connect(endpoint, plan)?;
+    let early = rollback_blockers(&mut db, plan, backup_fingerprint, Some(displaced))?;
+    if !early.is_empty() {
+        return Err(format!("recovery is blocked: {}", early.join("; ")));
+    }
+    let original = plan.original_schema.as_str();
+    let backup = plan.backup_schema.as_str();
+    let candidates = candidate_table_list(plan);
+    let moved = moved_tables(plan);
+    let mut state = json!({"success": false, "status": "preparing", "restore_id": plan.restore_id,
+        "original_schema": original, "backup_schema": backup, "displaced_backup": displaced,
+        "displaced_tables": candidates.iter().map(|t| json!({"name": name(t), "oid": t["oid"]})).collect::<Vec<_>>(),
+        "restored_tables": moved.iter().map(|t| json!({"name": name(t), "oid": t["oid"]})).collect::<Vec<_>>(),
+        "displaced_fingerprint": plan.candidate_fingerprint, "phase": "lock_and_verify"});
+    write_dump_import_report(journal_dir, &state)?;
+    let mut tx = db.transaction().map_err(|e| e.to_string())?;
+    let outcome = (|| -> Result<(), String> {
+        tx.batch_execute("SET LOCAL lock_timeout='2s'; SET LOCAL statement_timeout='30s'; SET LOCAL search_path TO pg_catalog").map_err(|e| e.to_string())?;
+        let mut locked: Vec<String> = candidates.iter().map(|t| qualified(original, name(t))).collect();
+        locked.extend(moved.iter().map(|t| qualified(backup, name(t))));
+        for key in &plan.incoming {
+            locked.push(qualified(original, &key.table));
+        }
+        locked.sort();
+        locked.dedup();
+        tx.batch_execute(&format!("LOCK TABLE {} IN ACCESS EXCLUSIVE MODE", locked.join(","))).map_err(|e| e.to_string())?;
+        let blockers = rollback_blockers(&mut tx, plan, backup_fingerprint, Some(displaced))?;
+        if !blockers.is_empty() {
+            return Err(format!("recovery is blocked under lock: {}", blockers.join("; ")));
+        }
+        state["phase"] = json!("transactional_recovery");
+        write_dump_import_report(journal_dir, &state)?;
+        tx.batch_execute(&format!("CREATE SCHEMA {}; REVOKE ALL ON SCHEMA {} FROM PUBLIC", q(displaced), q(displaced))).map_err(|e| e.to_string())?;
+        for table in &candidates {
+            tx.batch_execute(&format!("ALTER TABLE {} SET SCHEMA {}", qualified(original, name(table)), q(displaced))).map_err(|e| e.to_string())?;
+        }
+        for table in &moved {
+            tx.batch_execute(&format!("ALTER TABLE {} SET SCHEMA {}", qualified(backup, name(table)), q(original))).map_err(|e| e.to_string())?;
+        }
+        for key in &plan.incoming {
+            let table = qualified(original, &key.table);
+            tx.batch_execute(&format!("ALTER TABLE {table} DROP CONSTRAINT {}; ALTER TABLE {table} ADD CONSTRAINT {} {}", q(&key.name), q(&key.name), key.definition)).map_err(|e| e.to_string())?;
+            if let Some(comment) = &key.comment {
+                tx.batch_execute(&format!("COMMENT ON CONSTRAINT {} ON {table} IS {}", q(&key.name), literal(comment))).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(())
+    })();
+    match outcome {
+        Err(error) => {
+            let rollback = tx.rollback();
+            state["status"] = json!(if rollback.is_ok() { "failed_no_change" } else { "rollback_unknown" });
+            state["error"] = json!(redact_endpoint_secret(&error, endpoint));
+        }
+        Ok(()) => {
+            state["phase"] = json!("commit_requested");
+            state["status"] = json!("rollback_unknown");
+            write_dump_import_report(journal_dir, &state)?;
+            match tx.commit() {
+                Ok(()) => state["status"] = json!("rolled_back"),
+                Err(error) => {
+                    state["error"] = json!(redact_endpoint_secret(&error.to_string(), endpoint));
+                    // A lost commit reply: classify by relation identity.
+                    if let Ok(mut retry) = connect(endpoint) {
+                        if let Ok(actual) = objects(&mut retry, &[original.to_string(), backup.to_string(), displaced.to_string()]) {
+                            let restored = moved.iter().all(|t| actual.iter().any(|a| namespace(a) == original && a["oid"] == t["oid"]));
+                            let displaced_ok = candidates.iter().all(|t| actual.iter().any(|a| namespace(a) == displaced && a["oid"] == t["oid"]));
+                            let untouched = candidates.iter().all(|t| actual.iter().any(|a| namespace(a) == original && a["oid"] == t["oid"]));
+                            if restored && displaced_ok {
+                                state["status"] = json!("rolled_back");
+                            } else if untouched {
+                                state["status"] = json!("failed_no_change");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    state["success"] = json!(state["status"] == "rolled_back");
+    if state["success"] == true {
+        // Structure digest of the retained displaced schema, for later cleanup proof.
+        match connect(endpoint).and_then(|mut d| objects(&mut d, &[displaced.to_string()])).and_then(|a| structure_digest(&a, displaced)) {
+            Ok(digest) => state["displaced_structure"] = json!(digest),
+            Err(error) => state["displaced_structure_warning"] = json!(error),
+        }
+    }
+    state["phase"] = json!(if state["success"] == true { "completed" } else { "finished" });
+    if let Err(error) = write_dump_import_report(journal_dir, &state) {
+        state["journal_error"] = json!(error);
+    }
+    Ok(state)
+}
+
+/// Objects left in the candidate schema after a promotion that the plan does not
+/// record (recorded leftovers are only the candidate's own views).
+pub(crate) fn candidate_unrecorded(endpoint: &Endpoint, plan: &PromotionPlan) -> Result<Vec<String>, String> {
+    let mut db = lifecycle_connect(endpoint, plan)?;
+    let actual = objects(&mut db, std::slice::from_ref(&plan.candidate_schema))?;
+    let recorded: BTreeSet<String> = plan.inventory.iter()
+        .filter(|o| namespace(o) == plan.candidate_schema && o["kind"] == "v")
+        .map(|o| o["oid"].to_string())
+        .collect();
+    Ok(actual.iter().filter(|a| !(a["kind"] == "v" && recorded.contains(&a["oid"].to_string()))).map(|a| name(a).to_string()).collect())
+}
+
+/// The retained schema a recovery created: ownership by recorded relation OIDs,
+/// unchanged content and structure, no outside references.
+pub(crate) fn inspect_displaced(
+    endpoint: &Endpoint,
+    plan: &PromotionPlan,
+    record: &Value,
+    deep: bool,
+) -> Result<Value, String> {
+    let mut db = lifecycle_connect(endpoint, plan)?;
+    let namespace_name = record["displaced_backup"].as_str().unwrap_or("").to_string();
+    let exists = !namespace_name.is_empty() && schema_exists(&mut db, &namespace_name)?;
+    let mut blockers: Vec<String> = Vec::new();
+    let mut result = json!({"namespace": namespace_name, "exists": exists, "engine": "postgresql", "ownership": "missing",
+        "contents_exact": false, "tables": [], "external_references": [], "unchanged": null, "rows_estimated": !deep});
+    if !exists {
+        blockers.push("recovery backup schema does not exist".into());
+        result["blockers"] = json!(blockers);
+        return Ok(result);
+    }
+    let actual = objects(&mut db, std::slice::from_ref(&namespace_name))?;
+    // Everything the candidate contributed (tables, indexes, sequences) is recorded in the plan.
+    let allowed: BTreeSet<String> = plan.inventory.iter().filter(|o| namespace(o) == plan.candidate_schema).map(|o| o["oid"].to_string()).collect();
+    let candidates = tables(&plan.inventory, &plan.candidate_schema);
+    let foreign: Vec<String> = actual.iter().filter(|a| !allowed.contains(&a["oid"].to_string())).map(|a| name(a).to_string()).collect();
+    let missing: Vec<String> = candidates.iter().filter(|t| !actual.iter().any(|a| a["oid"] == t["oid"])).map(|t| name(t).to_string()).collect();
+    let exact = foreign.is_empty() && missing.is_empty() && !candidates.is_empty();
+    result["contents_exact"] = json!(exact);
+    result["ownership"] = json!(if exact { "proven" } else { "unproven" });
+    if !exact {
+        blockers.push(format!("ownership is not proven: unrecorded [{}], missing [{}]", foreign.join(", "), missing.join(", ")));
+    }
+    let mut rows_out = Vec::new();
+    let mut unchanged = exact;
+    if deep && exact {
+        if record["displaced_structure"].as_str() != Some(structure_digest(&actual, &namespace_name)?.as_str()) {
+            unchanged = false;
+            blockers.push("the definition of the recovery backup changed".into());
+        }
+        for table in &candidates {
+            let now = table_fingerprint(&mut db, &namespace_name, name(table))?;
+            if plan.candidate_fingerprint.get(name(table)) != Some(&now) {
+                unchanged = false;
+                blockers.push(format!("table {} changed after the recovery", name(table)));
+            }
+            rows_out.push(json!({"name": name(table), "rows": now["rows"].as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0)}));
+        }
+        result["unchanged"] = json!(unchanged);
+        drop(db);
+        let references = external_references(endpoint, &namespace_name)?;
+        if !references.is_empty() {
+            blockers.push(format!("objects outside the backup still reference it: {}", references.join(", ")));
+        }
+        result["external_references"] = json!(references);
+    }
+    result["tables"] = json!(rows_out);
+    result["blockers"] = json!(blockers);
+    Ok(result)
 }
 
 #[cfg(test)]

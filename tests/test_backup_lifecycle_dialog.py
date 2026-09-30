@@ -72,3 +72,34 @@ def test_apply_requires_confirmation_and_carries_reviewed_digest():
         assert payload["restore_id"] == "r1" and payload["target"] == "backup"
     finally:
         dialog.close()
+
+
+def test_blocked_rollback_plan_never_reaches_apply(monkeypatch):
+    dialog = _dialog()
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: None)
+    dialog._request = MagicMock()
+    dialog._confirm_rollback = MagicMock(return_value=True)
+    try:
+        dialog._on_rollback_plan("r1", True, "", {"can_rollback": False, "blockers": ["views"]})
+        dialog._confirm_rollback.assert_not_called()
+        dialog._request.assert_not_called()
+    finally:
+        dialog.close()
+
+
+def test_rollback_apply_needs_confirmation_and_reviewed_digest():
+    dialog = _dialog()
+    dialog._request = MagicMock()
+    plan = {"can_rollback": True, "plan_digest": "d1", "displaced_backup": "tf_backup_rb_x", "displace": []}
+    try:
+        dialog._confirm_rollback = MagicMock(return_value=False)
+        dialog._on_rollback_plan("r1", True, "", plan)
+        dialog._request.assert_not_called()
+
+        dialog._confirm_rollback = MagicMock(return_value=True)
+        dialog._on_rollback_plan("r1", True, "", plan)
+        payload = dialog._request.call_args[0][0]
+        assert payload == {"action": "rollback_apply", "endpoint": {"engine": "mysql"}, "input_dirs": ["C:/dump"],
+                           "restore_id": "r1", "plan_digest": "d1", "confirmed": True}
+    finally:
+        dialog.close()

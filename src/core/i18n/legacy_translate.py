@@ -261,6 +261,17 @@ _EN_TEXT_TRANSLATIONS = {
 }
 
 _EN_PHRASE_TRANSLATIONS = {
+    "임시 clone 정리 미리보기": "Preview Temporary Clone Cleanup",
+    "복구 백업 정리 미리보기": "Preview Recovery Backup Cleanup",
+    "백업으로 복구 미리보기": "Preview Recovery From Backup",
+    "복구 확인": "Confirm Recovery",
+    "보존된 원본 테이블을 원래 이름으로 되돌립니다.": "The retained original tables will be restored under their original names.",
+    "현재 활성 테이블은 새 백업": "The currently active tables are kept, not deleted, in the new backup",
+    "으로 이동해 보존되며 삭제되지 않습니다.": "(they are moved there).",
+    "복구 미리보기 실패": "Recovery Preview Failed",
+    "복구 차단": "Recovery Blocked",
+    "복구 실패": "Recovery Failed",
+    "복구 결과": "Recovery Result",
     "전환 결과 대조": "Reconcile Cutover Result",
     "후보 정리 미리보기": "Preview Candidate Cleanup",
     "판정": "Verdict",

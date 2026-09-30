@@ -93,10 +93,27 @@ text), no change since the cutover (definition and content fingerprints recorded
 right after the commit; a journal without a fingerprint is refused), and a
 confirmed promotion. MySQL additionally needs proven global SELECT/SHOW
 VIEW/PROCESS visibility. A candidate (`tf_restore_<id>` only, never the restore
-destination itself) is removable when empty after promotion, or when unpromoted and
-still proven identical to its verification. Original objects and namespaces without
-a journal are never dropped. Guided recovery (restoring a backup under its original
-name) is not implemented; it remains a manual, reviewed procedure.
+destination itself) is removable when unpromoted and still proven identical to its
+verification, or, after promotion, when it holds only objects the promotion plan
+recorded (PostgreSQL: the candidate's own views; MySQL: the recorded replacement
+views, after the recorded temporary `tf_promote_` clone database, which is a separate
+`target: "clone"` cleanup, is gone). Original objects and namespaces without a
+journal are never dropped.
+
+Guided recovery (`rollback_plan` / `rollback_apply`) is the inverse of the
+promotion: one atomic multi-object RENAME (MySQL) or one transaction (PostgreSQL)
+puts the retained original tables back and moves the active tables into a new
+retained backup namespace (`tf_backup_rb_<hash>`); nothing is deleted and the
+review plus `confirmed: true` are mandatory. It is refused unless the promotion is
+confirmed, the retained backup is proven unchanged, the active tables still have
+exactly the promoted content (MySQL: verified candidate/clone digests; PostgreSQL:
+fingerprints taken from the verified candidate at plan time, so older plans are
+refused) and identity, no view or routine is involved, and no other object depends
+on the active tables (PostgreSQL: only the recorded incoming foreign keys, which are
+re-pointed). Writes accepted after the promotion therefore block recovery instead of
+being discarded. After a recovery the emptied promotion backup namespace and the
+recovery backup can be removed with `target: "backup"` / `"displaced"` under the
+same ownership, reference and no-change checks.
 Verified live on MySQL 8.0.46/8.4.11 and PostgreSQL 13.23/18.4
 (`live_backup_lifecycle`).
 

@@ -30,6 +30,28 @@ impl Entry {
         }
     }
 
+    /// Recovery journals written by `rollback_apply`, oldest first.
+    fn rollbacks(&self) -> Vec<Value> {
+        let Ok(plan_dir) = plan_dir_for(&self.input_dir, &self.restore_id) else { return vec![] };
+        let Ok(read) = fs::read_dir(&plan_dir) else { return vec![] };
+        let mut dirs: Vec<PathBuf> = read
+            .flatten()
+            .filter(|item| item.file_name().to_string_lossy().starts_with("rollback-"))
+            .map(|item| item.path())
+            .filter(|path| fs::symlink_metadata(path).map(|m| m.is_dir() && !m.file_type().is_symlink()).unwrap_or(false))
+            .collect();
+        dirs.sort();
+        dirs.iter().filter_map(|dir| read_json(&dump_import_report_path(dir).ok()?)).collect()
+    }
+
+    fn rolled_back(&self) -> Option<Value> {
+        self.rollbacks().into_iter().rev().find(|r| r["status"] == "rolled_back")
+    }
+
+    fn new_table_ids(&self) -> Option<Value> {
+        self.attempt.as_ref().map(|a| a["result"]["new_table_ids"].clone()).filter(|v| v.is_object())
+    }
+
     fn fingerprint(&self) -> Option<Value> {
         self.attempt.as_ref().and_then(|a| a["result"]["backup_fingerprint"].as_object()).map(|m| Value::Object(m.clone()))
     }
@@ -153,6 +175,24 @@ fn inspect_backup(entry: &Entry, credentials: &Endpoint, deep: bool) -> Result<O
     }
 }
 
+fn inspect_displaced(entry: &Entry, credentials: &Endpoint, record: &Value, deep: bool) -> Result<Option<Value>, String> {
+    let Some(stored) = &entry.stored else { return Ok(None) };
+    match &stored.engine_plan {
+        EnginePlan::MySql(plan) => crate::safe_promote_mysql::inspect_displaced(credentials, plan, record, deep).map(Some),
+        EnginePlan::Postgres(plan) => crate::safe_promote_postgres::inspect_displaced(credentials, plan, record, deep).map(Some),
+    }
+}
+
+/// Deterministic name of the namespace a recovery of this restore would create.
+fn displaced_name(entry: &Entry) -> Result<String, String> {
+    let backup = match &entry.stored.as_ref().ok_or("this restore has no promotion journal")?.engine_plan {
+        EnginePlan::MySql(plan) => plan.backup_database.clone(),
+        EnginePlan::Postgres(plan) => plan.backup_schema.clone(),
+    };
+    let digest = hex::encode(Sha256::digest(format!("{}|{backup}", entry.restore_id).as_bytes()));
+    Ok(format!("tf_backup_rb_{}", &digest[..16]))
+}
+
 fn counts(credentials: &Endpoint, _target: &Value, namespace: &str) -> Result<(bool, u64, u64), String> {
     let endpoint = credentials.clone();
     if credentials.engine == "mysql" {
@@ -178,6 +218,20 @@ fn entry_json(entry: &Entry, credentials: &Endpoint) -> Result<Value, String> {
     });
     if let Some(backup) = inspect_backup(entry, credentials, false)? {
         out["backup"] = backup;
+    }
+    let rollbacks = entry.rollbacks();
+    if !rollbacks.is_empty() {
+        out["rollbacks"] = json!(rollbacks.iter().map(|r| json!({"status": r["status"], "displaced_backup": r["displaced_backup"]})).collect::<Vec<_>>());
+    }
+    if let Some(record) = entry.rolled_back() {
+        if let Some(displaced) = inspect_displaced(entry, credentials, &record, false)? {
+            out["displaced"] = displaced;
+        }
+    }
+    if let Some(EnginePlan::MySql(plan)) = entry.stored.as_ref().map(|s| &s.engine_plan) {
+        let (exists, _) = crate::safe_promote_mysql::clone_unrecorded(credentials, plan)?;
+        out["clone"] = json!({"namespace": plan.clone_database, "exists": exists,
+            "note": "Temporary database the promotion prepared its replacement views in."});
     }
     if let Some((name, target)) = candidate_namespace(entry) {
         if same_server(credentials, &target) {
@@ -241,6 +295,64 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
     let (namespace, tables, notes): (String, Vec<Value>, Vec<String>);
     let mut engine_endpoint = credentials.clone();
     match target {
+        "backup" if entry.rolled_back().is_some() => {
+            // After a recovery the promotion backup namespace is an empty shell.
+            let backup = inspect_backup(entry, credentials, false)?.ok_or("this restore has no promotion journal on this server")?;
+            namespace = backup["namespace"].as_str().unwrap_or("").to_string();
+            let (exists, table_count, view_count) = counts(credentials, &Value::Null, &namespace)?;
+            if !exists {
+                blockers.push("backup namespace does not exist".into());
+            }
+            if table_count + view_count > 0 {
+                blockers.push("the promotion backup namespace still holds objects after the recovery; it is not an empty shell".into());
+            }
+            if !namespace.starts_with("tf_backup_") {
+                blockers.push("namespace does not follow the owned backup naming".into());
+            }
+            tables = vec![];
+            notes = vec!["The recovery moved every retained table back; this namespace is the empty shell that held them.".into()];
+        }
+        "clone" => {
+            let Some(EnginePlan::MySql(plan)) = entry.stored.as_ref().map(|s| &s.engine_plan) else {
+                return Err("only MySQL promotions leave a temporary clone database".into());
+            };
+            namespace = plan.clone_database.clone();
+            if status != "promoted" {
+                blockers.push(format!("the promotion is not recorded as promoted (journal {status}); reconcile first"));
+            }
+            if !namespace.starts_with("tf_promote_") {
+                blockers.push("namespace does not follow the owned promotion clone naming".into());
+            }
+            let (exists, unrecorded) = crate::safe_promote_mysql::clone_unrecorded(credentials, plan)?;
+            if !exists {
+                blockers.push("clone database does not exist".into());
+            }
+            if !unrecorded.is_empty() {
+                blockers.push(format!("the clone database holds objects the promotion journal does not record: {}", unrecorded.join(", ")));
+            }
+            if exists {
+                let references = crate::safe_promote_mysql::external_references(credentials, &namespace)?;
+                if !references.is_empty() {
+                    blockers.push(format!("objects outside the clone still reference it: {}", references.join(", ")));
+                }
+            }
+            tables = vec![];
+            notes = vec!["Temporary database of the promotion; its tables were renamed into place, only prepared views remain.".into()];
+        }
+        "displaced" => {
+            let record = entry.rolled_back().ok_or("no completed recovery is recorded for this restore")?;
+            let displaced = inspect_displaced(entry, credentials, &record, true)?.ok_or("this restore has no promotion journal")?;
+            blockers.extend(displaced["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+            if displaced["ownership"] != "proven" || displaced["unchanged"] != true {
+                blockers.push("the recovery backup is not proven owned and unchanged".into());
+            }
+            namespace = displaced["namespace"].as_str().unwrap_or("").to_string();
+            if !namespace.starts_with("tf_backup_rb_") {
+                blockers.push("namespace does not follow the owned recovery backup naming".into());
+            }
+            tables = displaced["tables"].as_array().cloned().unwrap_or_default();
+            notes = vec!["This namespace holds the tables that were active before the recovery.".into()];
+        }
         "backup" => {
             let backup = inspect_backup(entry, credentials, true)?.ok_or("this restore has no promotion journal on this server")?;
             blockers.extend(backup["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
@@ -281,7 +393,17 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
             if !exists {
                 blockers.push("candidate namespace does not exist".into());
             }
-            if table_count + view_count > 0 {
+            let promoted = status == "promoted";
+            if table_count + view_count > 0 && promoted {
+                // After a promotion the candidate may only hold the views the plan recorded for it.
+                let unrecorded = match &entry.stored.as_ref().ok_or("promotion journal missing")?.engine_plan {
+                    EnginePlan::MySql(plan) => crate::safe_promote_mysql::candidate_unrecorded(credentials, plan)?,
+                    EnginePlan::Postgres(plan) => crate::safe_promote_postgres::candidate_unrecorded(credentials, plan)?,
+                };
+                if !unrecorded.is_empty() {
+                    blockers.push(format!("the candidate holds objects the promotion journal does not record: {}", unrecorded.join(", ")));
+                }
+            } else if table_count + view_count > 0 {
                 // A staged candidate still holds data: only an unpromoted, still-verified copy may go.
                 let verdict = inspect_backup(entry, credentials, false)?
                     .map(|b| b["verdict"].as_str().unwrap_or("undeterminable").to_string())
@@ -327,6 +449,91 @@ fn cleanup_plan(request: &Request, credentials: &Endpoint) -> Result<Value, Stri
         "namespace": namespace, "tables": tables, "will_delete": [namespace], "blockers": blockers, "notes": notes,
         "plan_digest": plan_digest, "confirmation_required": true,
         "message": "Original and unproven objects are never deleted. Nothing has been changed."}))
+}
+
+fn rollback_context<'a>(entries: &'a [Entry], request: &Request, credentials: &Endpoint) -> Result<(&'a Entry, String, Vec<String>), String> {
+    let entry = find(entries, request)?;
+    let stored = entry.stored.as_ref().ok_or("this restore has no promotion journal")?;
+    if !same_server(credentials, &stored.original_target) {
+        return Err("this restore belongs to a different server".into());
+    }
+    let mut blockers = Vec::new();
+    let status = entry.journal_status();
+    let verdict = inspect_backup(entry, credentials, false)?.map(|b| b["verdict"].as_str().unwrap_or("undeterminable").to_string()).unwrap_or_default();
+    if status != "promoted" && verdict != "promoted" {
+        blockers.push(format!("promotion outcome is not confirmed (journal {status}, live objects {verdict}); reconcile first"));
+    }
+    if entry.rollbacks().iter().any(|r| r["status"] != "failed_no_change") {
+        blockers.push("a recovery of this restore was already attempted; inspect its journal (rollback-*) before another attempt".into());
+    }
+    Ok((entry, displaced_name(entry)?, blockers))
+}
+
+fn rollback_plan(request: &Request, credentials: &Endpoint) -> Result<Value, String> {
+    let entries = discover(request)?;
+    let (entry, displaced, mut blockers) = rollback_context(&entries, request, credentials)?;
+    let stored = entry.stored.as_ref().ok_or("promotion journal missing")?;
+    let fingerprint = entry.fingerprint();
+    let mut detail = match &stored.engine_plan {
+        EnginePlan::MySql(plan) => crate::safe_promote_mysql::rollback_plan(credentials, plan, fingerprint.as_ref(), entry.new_table_ids().as_ref(), &displaced)?,
+        EnginePlan::Postgres(plan) => crate::safe_promote_postgres::rollback_plan(credentials, plan, fingerprint.as_ref(), &displaced)?,
+    };
+    blockers.extend(detail["blockers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(str::to_string));
+    let digest_input = json!({"restore_id": entry.restore_id, "displaced": displaced, "engine": credentials.engine,
+        "host": credentials.host, "port": credentials.port, "restore": detail["restore"], "displace": detail["displace"], "blockers": blockers});
+    let plan_digest = hex::encode(Sha256::digest(digest_input.to_string().as_bytes()));
+    detail["success"] = json!(true);
+    detail["can_rollback"] = json!(blockers.is_empty());
+    detail["blockers"] = json!(blockers);
+    detail["restore_id"] = json!(entry.restore_id);
+    detail["plan_digest"] = json!(plan_digest);
+    detail["confirmation_required"] = json!(true);
+    detail["message"] = json!("Review only: nothing has been changed. The active tables are retained in a new backup; nothing is deleted.");
+    Ok(detail)
+}
+
+fn rollback_apply(request: &Request, credentials: &Endpoint) -> Result<Value, String> {
+    if request.payload.get("confirmed") != Some(&Value::Bool(true)) {
+        return Err("recovery requires explicit confirmation (confirmed: true)".into());
+    }
+    let confirmed = request.payload.get("plan_digest").and_then(Value::as_str).unwrap_or("");
+    let fresh = rollback_plan(request, credentials)?;
+    if confirmed.is_empty() || fresh["plan_digest"] != confirmed {
+        return Err("the objects changed since the recovery plan was reviewed; review a fresh plan".into());
+    }
+    if fresh["can_rollback"] != true {
+        return Err(format!("recovery is blocked: {}", fresh["blockers"]));
+    }
+    let entries = discover(request)?;
+    let (entry, displaced, _) = rollback_context(&entries, request, credentials)?;
+    let stored = entry.stored.as_ref().ok_or("promotion journal missing")?;
+    let plan_dir = plan_dir_for(&entry.input_dir, &entry.restore_id)?;
+    let journal_dir = plan_dir.join(format!("rollback-{displaced}"));
+    match fs::create_dir(&journal_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Only a proven no-change attempt may be retried; its journal is kept aside.
+            let previous = read_json(&dump_import_report_path(&journal_dir)?).ok_or("previous recovery journal is unreadable")?;
+            if previous["status"] != "failed_no_change" {
+                return Err("a previous recovery attempt is not proven to have changed nothing".into());
+            }
+            fs::rename(&journal_dir, plan_dir.join(format!("failed-{displaced}-{}", std::process::id()))).map_err(|e| e.to_string())?;
+            fs::create_dir(&journal_dir).map_err(|e| e.to_string())?;
+        }
+        Err(error) => return Err(format!("cannot create the recovery journal: {error}")),
+    }
+    let fingerprint = entry.fingerprint();
+    let mut result = match &stored.engine_plan {
+        EnginePlan::MySql(plan) => crate::safe_promote_mysql::rollback_apply(credentials, plan, fingerprint.as_ref(), entry.new_table_ids().as_ref(), &displaced, &journal_dir)?,
+        EnginePlan::Postgres(plan) => crate::safe_promote_postgres::rollback_apply(credentials, plan, fingerprint.as_ref(), &displaced, &journal_dir)?,
+    };
+    result["restore_id"] = json!(entry.restore_id);
+    result["message"] = json!(match result["status"].as_str() {
+        Some("rolled_back") => "The retained original tables are active again. The tables that were active are kept in the recovery backup namespace; nothing was deleted.",
+        Some("failed_no_change") => "The recovery did not change anything.",
+        _ => "The recovery outcome is unknown. Reconcile the recorded identities before any retry; nothing was deleted.",
+    });
+    Ok(result)
 }
 
 fn cleanup_apply(request: &Request, credentials: &Endpoint) -> Result<Value, String> {
@@ -380,7 +587,9 @@ pub(crate) fn handle<F: FnMut(Value)>(request: &Request, mut emit: F) {
             "reconcile" => reconcile(request, &credentials),
             "cleanup_plan" => cleanup_plan(request, &credentials),
             "cleanup_apply" => cleanup_apply(request, &credentials),
-            _ => Err("restore.backups action must be list, reconcile, cleanup_plan or cleanup_apply".into()),
+            "rollback_plan" => rollback_plan(request, &credentials),
+            "rollback_apply" => rollback_apply(request, &credentials),
+            _ => Err("restore.backups action must be list, reconcile, cleanup_plan, cleanup_apply, rollback_plan or rollback_apply".into()),
         }
         .map_err(|error| redact_endpoint_secret(&error, &credentials))
     });
@@ -448,6 +657,11 @@ mod tests {
         let mut events = Vec::new();
         handle(&Request { command: "restore.backups".into(), request_id: None,
             payload: json!({"action": "cleanup_apply", "restore_id": "r", "plan_digest": "d", "endpoint": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "u", "password": "p", "database": "d"}, "input_dirs": ["x"]}) },
+            |event| events.push(event));
+        assert!(events[0]["message"].as_str().unwrap().contains("confirmation"), "{events:?}");
+        let mut events = Vec::new();
+        handle(&Request { command: "restore.backups".into(), request_id: None,
+            payload: json!({"action": "rollback_apply", "restore_id": "r", "plan_digest": "d", "endpoint": {"engine": "mysql", "host": "127.0.0.1", "port": 1, "user": "u", "password": "p", "database": "d"}, "input_dirs": ["x"]}) },
             |event| events.push(event));
         assert!(events[0]["message"].as_str().unwrap().contains("confirmation"), "{events:?}");
     }

@@ -52,7 +52,11 @@ class BackupLifecycleDialog(QDialog):
         self.btn_reconcile = QPushButton("전환 결과 대조")
         self.btn_cleanup_backup = QPushButton("백업 정리 미리보기")
         self.btn_cleanup_candidate = QPushButton("후보 정리 미리보기")
-        for button in (self.btn_refresh, self.btn_reconcile, self.btn_cleanup_backup, self.btn_cleanup_candidate):
+        self.btn_cleanup_clone = QPushButton("임시 clone 정리 미리보기")
+        self.btn_cleanup_displaced = QPushButton("복구 백업 정리 미리보기")
+        self.btn_rollback = QPushButton("백업으로 복구 미리보기")
+        for button in (self.btn_refresh, self.btn_reconcile, self.btn_rollback, self.btn_cleanup_backup,
+                       self.btn_cleanup_candidate, self.btn_cleanup_clone, self.btn_cleanup_displaced):
             buttons.addWidget(button)
         buttons.addStretch()
         layout.addLayout(buttons)
@@ -60,6 +64,9 @@ class BackupLifecycleDialog(QDialog):
         self.btn_reconcile.clicked.connect(self.reconcile)
         self.btn_cleanup_backup.clicked.connect(lambda: self.cleanup("backup"))
         self.btn_cleanup_candidate.clicked.connect(lambda: self.cleanup("candidate"))
+        self.btn_cleanup_clone.clicked.connect(lambda: self.cleanup("clone"))
+        self.btn_cleanup_displaced.clicked.connect(lambda: self.cleanup("displaced"))
+        self.btn_rollback.clicked.connect(self.rollback)
 
     # -- 요청 -----------------------------------------------------------
     def _payload(self, action: str, **extra) -> dict:
@@ -126,6 +133,52 @@ class BackupLifecycleDialog(QDialog):
             self, "전환 결과 대조",
             f"판정: {result.get('conclusion')}\n{result.get('message', '')}\n\n"
             "이 대조는 조회 전용이며 저널이나 DB 객체를 바꾸지 않습니다.")
+
+    # -- 복구 -----------------------------------------------------------
+    def rollback(self) -> None:
+        restore_id = self._selected_restore_id()
+        if restore_id:
+            self._request(self._payload("rollback_plan", restore_id=restore_id),
+                          lambda ok, msg, res: self._on_rollback_plan(restore_id, ok, msg, res))
+
+    def _confirm_rollback(self, plan: dict) -> bool:
+        displaced = "\n".join(f"- {t.get('name')}: {int(t.get('rows') or 0):,} rows" for t in plan.get("displace") or [])
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Warning)
+        box.setWindowTitle("복구 확인")
+        box.setText(
+            "보존된 원본 테이블을 원래 이름으로 되돌립니다.\n"
+            f"현재 활성 테이블은 새 백업 {plan.get('displaced_backup')} 으로 이동해 보존되며 삭제되지 않습니다.\n\n"
+            f"{displaced}")
+        yes = box.addButton("복구", QMessageBox.ButtonRole.DestructiveRole)
+        no = box.addButton("취소", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(no)
+        box.setEscapeButton(no)
+        box.exec()
+        return box.clickedButton() is yes
+
+    def _on_rollback_plan(self, restore_id: str, success: bool, message: str, plan: dict) -> None:
+        if not success:
+            QMessageBox.warning(self, "복구 미리보기 실패", message)
+            return
+        if not plan.get("can_rollback"):
+            QMessageBox.warning(
+                self, "복구 차단",
+                "복구할 수 없습니다:\n" + "\n".join(f"- {b}" for b in plan.get("blockers") or []))
+            return
+        if not self._confirm_rollback(plan):
+            return
+        self._request(
+            self._payload("rollback_apply", restore_id=restore_id,
+                          plan_digest=plan.get("plan_digest"), confirmed=True),
+            self._on_rolled_back)
+
+    def _on_rolled_back(self, success: bool, message: str, result: dict) -> None:
+        if not success:
+            QMessageBox.warning(self, "복구 실패", message)
+        else:
+            QMessageBox.information(self, "복구 결과", f"{result.get('status')}\n{result.get('message', '')}")
+        self.refresh()
 
     # -- 정리 -----------------------------------------------------------
     def cleanup(self, target: str) -> None:
