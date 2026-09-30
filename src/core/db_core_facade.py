@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from src.core.connection_trust import extract_error_code, friendly_error_message, lookup_endpoint_tls
 from src.core.db_core_client import DbCoreServiceClient, DbCoreServiceError
 
 
@@ -35,10 +36,18 @@ class DbEndpoint:
     password: str
     database: str
     schema: str = ""
-    # TF-STATUS-110: "disable" | "verify_ca" | "verify_full" (Rust `TlsMode`)
-    tls_mode: str = "disable"
+    # TF-STATUS-110: "disable" | "verify_ca" | "verify_full" (Rust `TlsMode`).
+    # Empty = take the policy registered for host:port by the tunnel engine (else "disable").
+    tls_mode: str = ""
     tls_ca_file: str = ""
     tls_server_name: str = ""
+
+    def __post_init__(self):
+        if not self.tls_mode:
+            policy = lookup_endpoint_tls(self.host, self.port)
+            object.__setattr__(self, "tls_mode", policy.mode)
+            object.__setattr__(self, "tls_ca_file", self.tls_ca_file or policy.ca_file)
+            object.__setattr__(self, "tls_server_name", self.tls_server_name or policy.server_name)
 
     def to_payload(self) -> Dict[str, Any]:
         payload = {
@@ -60,6 +69,12 @@ class DbEndpoint:
         return payload
 
 
+def _with_friendly_hint(message: str, code: Optional[str]) -> str:
+    """안정 오류 코드가 있으면 사용자가 바로 조치할 수 있는 설명을 앞에 붙인다."""
+    hint = friendly_error_message(code or extract_error_code(message))
+    return f"{hint}\n\n{message}" if hint else message
+
+
 class DbCoreFacade:
     """High-level DB operations exposed to UI/workers."""
 
@@ -71,12 +86,17 @@ class DbCoreFacade:
 
     def test_connection(self, endpoint: DbEndpoint) -> Tuple[bool, str]:
         result = self.client.request("connection.test", {"connection": endpoint.to_payload()})
-        return bool(result.get("success")), str(result.get("message", ""))
+        message = str(result.get("message", ""))
+        if not result.get("success"):
+            message = _with_friendly_hint(message, result.get("error_code"))
+        return bool(result.get("success")), message
 
     def open_connection(self, endpoint: DbEndpoint) -> str:
         result = self.client.request("connection.open", {"connection": endpoint.to_payload()})
         if not result.get("success"):
-            raise DbCoreServiceError(str(result.get("message", "connection failed")))
+            message = str(result.get("message", "connection failed"))
+            code = result.get("error_code") or extract_error_code(message)
+            raise DbCoreServiceError(_with_friendly_hint(message, code), error_code=code, payload=result)
         return str(result.get("connection_id", ""))
 
     def close_connection(self, connection_id: str) -> bool:

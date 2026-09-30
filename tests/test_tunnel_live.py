@@ -35,14 +35,18 @@ def test_real_ssh_tunnel_forwards_bytes_and_releases_listener(tmp_path):
     listener.settimeout(5)
     transports = []
 
-    def serve():
+    authenticated = []
+
+    def handle(sock):
+        transport = None
         try:
-            sock, _ = listener.accept()
             transport = paramiko.Transport(sock)
             transports.append(transport)
             transport.add_server_key(host_key)
             transport.start_server(server=Server())
-            while not stopping.is_set():
+            while not stopping.is_set() and transport.is_active():
+                if transport.is_authenticated() and transport not in authenticated:
+                    authenticated.append(transport)
                 channel = transport.accept(0.2)
                 if channel is None:
                     continue
@@ -52,12 +56,37 @@ def test_real_ssh_tunnel_forwards_bytes_and_releases_listener(tmp_path):
                     if data:
                         channel.sendall(data)
         except Exception as exc:
-            if not stopping.is_set():
+            # The engine's host-key probe hangs up right after key exchange, before any
+            # authentication; that (and only that) is expected. Errors on authenticated
+            # connections, i.e. the real tunnel, still count.
+            probe = transport is None or not transport.is_authenticated()
+            if not stopping.is_set() and not probe:
                 failures.append(exc)
+
+    def serve():
+        # the engine first probes the host key (TOFU), then opens the real forwarder connection
+        while not stopping.is_set():
+            try:
+                sock, _ = listener.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(sock,), daemon=True).start()
 
     thread = threading.Thread(target=serve, daemon=True)
     thread.start()
-    engine = TunnelEngine()
+    class Store:
+        entries = {}
+
+        def get_known_host(self, host, port):
+            return self.entries.get((host, port))
+
+        def save_known_host(self, host, port, entry):
+            self.entries[(host, port)] = entry
+
+    engine = TunnelEngine(known_hosts=Store())
+    engine.host_key_confirmer = lambda prompt: True
     try:
         success, message = engine.start_tunnel({
             "id": "ssh-live", "name": "Local protocol smoke",
@@ -82,6 +111,7 @@ def test_real_ssh_tunnel_forwards_bytes_and_releases_listener(tmp_path):
         assert not engine.is_running("ssh-live")
         assert engine.get_connection_info("ssh-live") == (None, None)
         assert not failures
+        assert authenticated, "the real tunnel connection never authenticated"
     finally:
         stopping.set()
         engine.stop_all()
