@@ -96,9 +96,7 @@ class DbCoreFacade:
         if not result.get("success"):
             message = str(result.get("message", "connection failed"))
             code = result.get("error_code") or extract_error_code(message)
-            error = DbCoreServiceError(_with_friendly_hint(message, code))
-            error.error_code = code
-            raise error
+            raise DbCoreServiceError(_with_friendly_hint(message, code), error_code=code, payload=result)
         return str(result.get("connection_id", ""))
 
     def close_connection(self, connection_id: str) -> bool:
