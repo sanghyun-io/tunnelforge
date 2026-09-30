@@ -223,7 +223,8 @@ def main() -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
 
-    doc_path.write_text(new_text, encoding="utf-8")
+    # write_text would translate LF to CRLF on Windows and rewrite the whole LF document.
+    doc_path.write_bytes(new_text.encode("utf-8"))
     print(f"[OK] `v{args.version}` 발행 행을 {doc_path} 에 추가했습니다", file=sys.stderr)
     print(row)
     return 0
