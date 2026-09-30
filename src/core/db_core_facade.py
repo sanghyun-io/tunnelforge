@@ -4,7 +4,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
-from src.core.connection_trust import extract_error_code, lookup_endpoint_tls
+from src.core.connection_trust import extract_error_code, friendly_error_message, lookup_endpoint_tls
 from src.core.db_core_client import DbCoreServiceClient, DbCoreServiceError
 
 
@@ -50,6 +50,12 @@ class DbEndpoint:
         return payload
 
 
+def _with_friendly_hint(message: str, code: Optional[str]) -> str:
+    """안정 오류 코드가 있으면 사용자가 바로 조치할 수 있는 설명을 앞에 붙인다."""
+    hint = friendly_error_message(code or extract_error_code(message))
+    return f"{hint}\n\n{message}" if hint else message
+
+
 class DbCoreFacade:
     """High-level DB operations exposed to UI/workers."""
 
@@ -61,14 +67,18 @@ class DbCoreFacade:
 
     def test_connection(self, endpoint: DbEndpoint) -> Tuple[bool, str]:
         result = self.client.request("connection.test", {"connection": endpoint.to_payload()})
-        return bool(result.get("success")), str(result.get("message", ""))
+        message = str(result.get("message", ""))
+        if not result.get("success"):
+            message = _with_friendly_hint(message, result.get("error_code"))
+        return bool(result.get("success")), message
 
     def open_connection(self, endpoint: DbEndpoint) -> str:
         result = self.client.request("connection.open", {"connection": endpoint.to_payload()})
         if not result.get("success"):
             message = str(result.get("message", "connection failed"))
-            error = DbCoreServiceError(message)
-            error.error_code = result.get("error_code") or extract_error_code(message)
+            code = result.get("error_code") or extract_error_code(message)
+            error = DbCoreServiceError(_with_friendly_hint(message, code))
+            error.error_code = code
             raise error
         return str(result.get("connection_id", ""))
 

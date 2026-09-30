@@ -11,6 +11,8 @@ from PyQt6.QtGui import QAction, QIcon
 
 from src.ui.styles import ButtonStyles, LabelStyles, get_full_app_style
 from src.ui.theme_manager import ThemeManager
+from src.ui.trust_prompts import TrustPrompter
+from src.core.connection_trust import insecure_connection_warning
 from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
@@ -80,6 +82,10 @@ class TunnelManagerUI(QMainWindow):
         self.config_mgr = config_manager
         self.engine = tunnel_engine
         self._start_background = start_background
+
+        # SSH 호스트 키 확인 / 개인키 비밀번호 입력 대화상자를 GUI 스레드에서 띄우는 다리 (TF-STATUS-110)
+        self._trust_prompter = TrustPrompter(self)
+        self._trust_prompter.install(self.engine)
 
         # 설정 로드
         self.config_data = self.config_mgr.load_config()
@@ -632,7 +638,13 @@ class TunnelManagerUI(QMainWindow):
         success, msg = self.engine.start_tunnel(tunnel_config)
 
         if success:
-            self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
+            tls_warning = insecure_connection_warning(tunnel_config)
+            if tls_warning:
+                # 검증 없는 연결은 연결할 때마다 다시 알린다 (자동 승격/무시 없음)
+                self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']} - ⚠ {tls_warning}")
+                logger.warning(f"Unverified DB TLS connection: {tunnel_config['name']}")
+            else:
+                self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
             self.tray_icon.showMessage("TunnelForge", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
             self._register_login_path(tunnel_config)
         else:

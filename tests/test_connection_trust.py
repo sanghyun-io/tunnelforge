@@ -96,3 +96,64 @@ def test_friendly_message_is_korean_for_known_codes():
     for code in ("tls_verification_failed", "tls_unavailable", "ssh_host_key_unknown", "ssh_host_key_changed"):
         assert ct.friendly_error_message(code)
     assert ct.friendly_error_message("nope") is None
+
+
+# ---- every DbEndpoint construction site picks up the registered policy -------------------
+
+POLICY = ct.TlsPolicy("verify_full", "ca.pem", "db.internal")
+EXPECTED = {"mode": "verify_full", "ca_file": "ca.pem", "server_name": "db.internal"}
+
+
+class _CapturingFacade:
+    def __init__(self):
+        self.endpoints = []
+
+    def open_connection(self, endpoint):
+        self.endpoints.append(endpoint)
+        return "cid"
+
+
+def test_postgres_connector_uses_registered_policy():
+    from src.core.postgres_connector import PostgresConnector
+
+    ct.register_endpoint_tls("127.0.0.1", 15432, POLICY)
+    facade = _CapturingFacade()
+    assert PostgresConnector("127.0.0.1", 15432, "u", "p", "d", facade=facade).connect()[0]
+    assert facade.endpoints[0].to_payload()["tls"] == EXPECTED
+
+
+def test_dbapi_shim_and_factory_use_registered_policy():
+    from src.core.db_core_dbapi_shim import RustDbConnector, create_rust_db_connector
+
+    ct.register_endpoint_tls("127.0.0.1", 13306, POLICY)
+    facade = _CapturingFacade()
+    assert RustDbConnector("mysql", "127.0.0.1", 13306, "u", "p", "d", facade=facade).connect()[0]
+    assert create_rust_db_connector("mysql", "127.0.0.1", 13306, "u", "p", facade=facade).endpoint.to_payload()["tls"] == EXPECTED
+    assert facade.endpoints[0].to_payload()["tls"] == EXPECTED
+
+
+def test_dump_exporter_endpoint_uses_registered_policy():
+    from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+    ct.register_endpoint_tls("127.0.0.1", 13306, POLICY)
+    config = RustDumpConfig(host="127.0.0.1", port=13306, user="u", password="p", engine="mysql")
+    exporter = RustDumpExporter(config, facade=_CapturingFacade())
+    assert exporter._endpoint("appdb").to_payload()["tls"] == EXPECTED
+
+
+def test_facade_adds_friendly_hint_and_exposes_error_code():
+    from src.core.db_core_client import DbCoreServiceError
+    from src.core.db_core_facade import DbCoreFacade
+
+    class Client:
+        def request(self, command, payload=None):
+            return {"success": False, "message": "boom (error_code=tls_verification_failed)",
+                    "error_code": "tls_verification_failed"}
+
+    facade = DbCoreFacade(Client())
+    endpoint = DbEndpoint("mysql", "127.0.0.1", 1, "u", "p", "d")
+    ok, message = facade.test_connection(endpoint)
+    assert not ok and "인증서" in message and "boom" in message
+    with pytest.raises(DbCoreServiceError) as info:
+        facade.open_connection(endpoint)
+    assert info.value.error_code == "tls_verification_failed" and "인증서" in str(info.value)
