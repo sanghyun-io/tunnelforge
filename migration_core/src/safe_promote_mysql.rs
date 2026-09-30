@@ -1539,10 +1539,204 @@ fn promote_with_hook<F: FnMut(&str, &mut Db) -> Result<(), String>>(
     }
     state["message"]=json!(match state["status"].as_str() { Some("promoted")=>"Verified candidate promoted at the original database name. Original tables are retained in the recorded backup namespace.",Some("failed_original_unchanged")=>"Promotion did not change original tables or their foreign keys. The verified candidate remains available.",_=>"Cutover outcome is unknown. Retain all recorded namespaces and inspect table identities before any retry or recovery." });
     state["interrupted_attempt_policy"]=json!("A checkpoint at cutover_started is UNKNOWN after process loss. Compare recorded InnoDB table identities at original/candidate/backup locations; never retry or roll back blindly.");
+    if state["status"] == "promoted" {
+        // Retention evidence for TF-STATUS-119: content/definition digests of the
+        // backup tables right after the cutover, so a later cleanup can prove the
+        // backup was not modified.
+        match record_backup_fingerprint(original, plan) {
+            Ok(fingerprint) => state["backup_fingerprint"] = fingerprint,
+            Err(err) => state["backup_fingerprint_warning"] = json!(err),
+        }
+    }
     if let Err(err) = write_dump_import_report(&journal_dir, &state) {
         state["journal_error"] = json!(err);
     }
     Ok(state)
+}
+
+fn record_backup_fingerprint(original: &Endpoint, plan: &PromotionPlan) -> Result<Value, String> {
+    let mut conn = connect(original)?;
+    let mut out = serde_json::Map::new();
+    for name in plan.original_tables.keys() {
+        let table = inspect_table(&mut conn, &plan.backup_database, name, true)?;
+        out.insert(name.clone(), json!({"static_digest": table.static_digest, "content_digest": table.content_digest}));
+    }
+    Ok(Value::Object(out))
+}
+
+// ---------------------------------------------------------------------------
+// Backup lifecycle (TF-STATUS-119): read-only inspection and explicit drop of the
+// owned backup namespace. Ownership is proven by the InnoDB table ids the
+// promotion journal recorded for the original tables.
+// ---------------------------------------------------------------------------
+
+fn lifecycle_connect(endpoint: &Endpoint, plan: &PromotionPlan) -> Result<Db, String> {
+    if endpoint.host != plan.host || endpoint.port != plan.port {
+        return Err("backup lifecycle endpoint does not match the promotion journal".into());
+    }
+    connect(endpoint)
+}
+
+/// Objects and counts of one namespace: (exists, base tables, views).
+pub(crate) fn namespace_counts(endpoint: &Endpoint, namespace: &str) -> Result<(bool, u64, u64), String> {
+    let mut conn = connect(endpoint)?;
+    if !database_exists(&mut conn, namespace)? {
+        return Ok((false, 0, 0));
+    }
+    let present = tables(&mut conn, namespace)?;
+    let views = present.values().filter(|engine| engine.as_str() == "VIEW").count() as u64;
+    Ok((true, present.len() as u64 - views, views))
+}
+
+/// Foreign keys, views and routines outside `namespace` that mention it.
+pub(crate) fn external_references(endpoint: &Endpoint, namespace: &str) -> Result<Vec<String>, String> {
+    let mut conn = connect(endpoint)?;
+    prove_metadata_visibility(&mut conn)?;
+    let mut found = Vec::new();
+    let fks: Vec<(String, String, String)> = conn.exec(
+        "SELECT DISTINCT TABLE_SCHEMA,TABLE_NAME,CONSTRAINT_NAME FROM information_schema.KEY_COLUMN_USAGE WHERE REFERENCED_TABLE_SCHEMA=? AND TABLE_SCHEMA<>?",
+        (namespace, namespace),
+    ).map_err(|e| error("external foreign key scan", e))?;
+    found.extend(fks.into_iter().map(|(s, t, c)| format!("foreign_key:{s}.{t}:{c}")));
+    let views: Vec<(String, String)> = conn.exec(
+        "SELECT DISTINCT VIEW_SCHEMA,VIEW_NAME FROM information_schema.VIEW_TABLE_USAGE WHERE TABLE_SCHEMA=? AND VIEW_SCHEMA<>?",
+        (namespace, namespace),
+    ).map_err(|e| error("external view scan", e))?;
+    found.extend(views.into_iter().map(|(s, v)| format!("view:{s}.{v}")));
+    // Routine/trigger/event bodies cannot be resolved structurally; a textual
+    // mention is treated as a reference (fail closed).
+    let needle = format!("%{namespace}%");
+    for (sql, kind) in [
+        ("SELECT ROUTINE_SCHEMA,ROUTINE_NAME FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA<>? AND ROUTINE_DEFINITION LIKE ?", "routine"),
+        ("SELECT TRIGGER_SCHEMA,TRIGGER_NAME FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA<>? AND ACTION_STATEMENT LIKE ?", "trigger"),
+        ("SELECT EVENT_SCHEMA,EVENT_NAME FROM information_schema.EVENTS WHERE EVENT_SCHEMA<>? AND EVENT_DEFINITION LIKE ?", "event"),
+    ] {
+        let rows: Vec<(String, String)> = conn.exec(sql, (namespace, &needle)).map_err(|e| error("routine text scan", e))?;
+        found.extend(rows.into_iter().map(|(s, n)| format!("{kind}_text:{s}.{n}")));
+    }
+    Ok(found)
+}
+
+/// Inspect the promotion backup database. `deep` reads every row (digests, exact
+/// counts, metadata-visibility proof, external references); otherwise only
+/// catalog identities and estimates are used.
+pub(crate) fn inspect_backup(endpoint: &Endpoint, plan: &PromotionPlan, deep: bool, journal_fingerprint: Option<&Value>) -> Result<Value, String> {
+    let mut conn = lifecycle_connect(endpoint, plan)?;
+    let mut blockers: Vec<String> = Vec::new();
+    let server_uuid: String = conn.query_first("SELECT @@server_uuid").map_err(|e| e.to_string())?.unwrap_or_default();
+    let same_server = server_uuid == plan.server_uuid;
+    if !same_server {
+        blockers.push("the server identity differs from the one recorded by the promotion journal".into());
+    }
+    let backup = plan.backup_database.as_str();
+    let exists = database_exists(&mut conn, backup)?;
+    let old_ids: BTreeMap<String, u64> = plan.original_tables.iter().map(|(n, t)| (n.clone(), t.table_id)).collect();
+    let mut result = json!({"namespace": backup, "exists": exists, "engine": "mysql",
+        "ownership": "missing", "contents_exact": false, "verdict": "undeterminable",
+        "tables": [], "rows_estimated": !deep, "external_references": [], "unchanged": null,
+        "saved_view_aliases": plan.saved_views,
+        "saved_view_alias_note": "Saved view aliases keep old definitions but reference the active table names; they are not views over backup data."});
+    if !same_server {
+        result["blockers"] = json!(blockers);
+        return Ok(result);
+    }
+    // Verdict of the cutover itself, from InnoDB identities.
+    let new_ids: BTreeMap<String, u64> = plan.candidate_tables.iter().map(|(n, t)| (n.clone(), t.table_id)).collect();
+    let verdict = classify_table_ids(&old_ids, &new_ids, |in_backup, name| {
+        let db = if in_backup { &plan.backup_database } else { &plan.original_database };
+        optional_table_id(&mut conn, db, name)
+    });
+    result["verdict"] = json!(match verdict.as_str() {
+        "promoted" => "promoted",
+        "failed_original_unchanged" => "not_promoted",
+        _ => "undeterminable",
+    });
+    if !exists {
+        blockers.push("backup namespace does not exist".into());
+        result["blockers"] = json!(blockers);
+        return Ok(result);
+    }
+    let present = tables(&mut conn, backup)?;
+    let expected: BTreeSet<&String> = old_ids.keys().collect();
+    let actual: BTreeSet<&String> = present.keys().collect();
+    let exact = expected == actual && present.values().all(|engine| engine != "VIEW");
+    result["contents_exact"] = json!(exact);
+    if !exact {
+        blockers.push("backup namespace does not contain exactly the recorded original tables (unknown or missing objects)".into());
+    }
+    let mut owned = exact;
+    for (name, id) in &old_ids {
+        if optional_table_id(&mut conn, backup, name)? != Some(*id) {
+            owned = false;
+        }
+    }
+    result["ownership"] = json!(if owned { "proven" } else { "unproven" });
+    if !owned {
+        blockers.push("ownership is not proven: table identities differ from the promotion journal".into());
+    }
+    let mut table_rows = Vec::new();
+    let mut unchanged = owned;
+    if deep && exact {
+        if let Err(problem) = prove_metadata_visibility(&mut conn) {
+            blockers.push(problem);
+        }
+        let recorded = journal_fingerprint.and_then(Value::as_object);
+        if recorded.is_none() {
+            unchanged = false;
+            blockers.push("the journal has no content fingerprint (written by an older version); an unmodified backup cannot be proven".into());
+        }
+        for name in plan.original_tables.keys() {
+            let now = inspect_table(&mut conn, backup, name, true)?;
+            if let Some(recorded) = recorded {
+                let now_json = json!({"static_digest": now.static_digest, "content_digest": now.content_digest});
+                if recorded.get(name) != Some(&now_json) {
+                    unchanged = false;
+                    blockers.push(format!("table {name} changed after promotion (definition or content differs from the journal)"));
+                }
+            }
+            let rows: Option<u64> = conn.query_first(format!("SELECT COUNT(*) FROM {}", qualified(backup, name))).map_err(|e| e.to_string())?;
+            table_rows.push(json!({"name": name, "rows": rows.unwrap_or(0)}));
+        }
+        result["unchanged"] = json!(unchanged);
+        for (sql, what) in [
+            ("SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA=?", "triggers"),
+            ("SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA=?", "routines"),
+            ("SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA=?", "events"),
+        ] {
+            let count: Option<u64> = conn.exec_first(sql, (backup,)).map_err(|e| e.to_string())?;
+            if count.unwrap_or(0) > 0 {
+                blockers.push(format!("backup namespace contains {what}, which the journal does not cover"));
+            }
+        }
+    } else {
+        let estimates: Vec<(String, Option<u64>)> = conn.exec("SELECT TABLE_NAME,TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA=?", (backup,)).map_err(|e| e.to_string())?;
+        table_rows = estimates.into_iter().map(|(name, rows)| json!({"name": name, "rows": rows.unwrap_or(0)})).collect();
+    }
+    result["tables"] = json!(table_rows);
+    if deep {
+        drop(conn);
+        let references = external_references(endpoint, backup)?;
+        if !references.is_empty() {
+            blockers.push(format!("objects outside the backup still reference it: {}", references.join(", ")));
+        }
+        result["external_references"] = json!(references);
+    }
+    result["blockers"] = json!(blockers);
+    Ok(result)
+}
+
+/// Drop one owned namespace. Callers must have verified ownership, contents and
+/// references immediately before.
+pub(crate) fn drop_namespace(endpoint: &Endpoint, namespace: &str) -> Result<(), String> {
+    let mut conn = connect(endpoint)?;
+    conn.query_drop(format!("DROP DATABASE {}", q(namespace))).map_err(|e| error("drop owned namespace", e))
+}
+
+/// Backup namespaces on the server that follow the promotion naming but are not
+/// (or no longer) covered by any journal the caller supplied.
+pub(crate) fn backup_named_namespaces(endpoint: &Endpoint) -> Result<Vec<String>, String> {
+    let mut conn = connect(endpoint)?;
+    conn.query("SELECT SCHEMA_NAME FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'tf\\_backup\\_%' ORDER BY SCHEMA_NAME").map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

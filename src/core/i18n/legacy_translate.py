@@ -261,6 +261,19 @@ _EN_TEXT_TRANSLATIONS = {
 }
 
 _EN_PHRASE_TRANSLATIONS = {
+    "전환 결과 대조": "Reconcile Cutover Result",
+    "후보 정리 미리보기": "Preview Candidate Cleanup",
+    "판정": "Verdict",
+    "이 대조는 조회 전용이며 저널이나 DB 객체를 바꾸지 않습니다.": "This check is read-only and changes neither the journal nor any database object.",
+    "다음 네임스페이스를 삭제합니다 (되돌릴 수 없음)": "The following namespaces will be dropped (cannot be undone)",
+    "원본과 다른 객체는 삭제되지 않습니다.": "The original and other objects are not deleted.",
+    "안전 전환이 남긴 백업과 후보 네임스페이스입니다. 저널로 소유가 증명된 항목만 정리할 수 있으며 원본과 미확인 객체는 삭제되지 않습니다.": "Backups and candidate namespaces left by safe promotion. Only items whose ownership is proven by the journal can be cleaned up; the original and unverified objects are never deleted.",
+    "소유 미증명": "Ownership not proven",
+    "삭제 대상이 아닙니다.": "It is not a deletion target.",
+    "먼저 목록에서 항목을 선택하세요.": "Select an item from the list first.",
+    "대조 실패": "Reconciliation Failed",
+    "정리 차단": "Cleanup Blocked",
+    "안전 복원 보고서가 있는 Import 후에 사용할 수 있습니다.": "Available after an Import that produced a safe restore report.",
     "그룹 없음": "Ungrouped",
     "연결 테스트 중": "Testing connection",
     "연결 테스트 중단": "Connection test stopped",

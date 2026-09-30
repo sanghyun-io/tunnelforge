@@ -197,6 +197,10 @@ class DbCoreFacade:
     def promote_dump(self, payload: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
         return self.client.request("dump.promote", payload, on_event=on_event)
 
+    def restore_backups(self, payload: Dict[str, Any], on_event: Optional[Callable[[Dict[str, Any]], None]] = None) -> Dict[str, Any]:
+        """TF-STATUS-119: list / reconcile / cleanup_plan / cleanup_apply for promotion backups."""
+        return self.client.request("restore.backups", payload, on_event=on_event)
+
     def derive_oneclick_charset_contracts(
         self,
         payload: Dict[str, Any],

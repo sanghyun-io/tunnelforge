@@ -72,6 +72,34 @@ MySQL saved old-view aliases preserve definitions but reference the active table
 names: they are not views of backup data. The journal records their definitions.
 Backup namespaces do not represent an independently complete full-database backup.
 
+### Backup lifecycle (`restore.backups`)
+
+The Core command `restore.backups` (UI: Import dialog, "복원 백업 관리") works from the
+promotion journals stored in the dump directories passed as `input_dirs`; a
+namespace that only follows the `tf_backup_` naming is listed as unproven and is
+never deleted.
+
+| Action | Effect |
+| --- | --- |
+| `list` | Journal status, backup namespace, ownership proof, table count and estimated rows, cutover verdict, candidate namespace. MySQL saved view aliases are reported as "not views over backup data". |
+| `reconcile` | Compares an unknown/pending journal with live identities (MySQL InnoDB table ids, PostgreSQL relation OIDs): `promoted`, `not_promoted` or `undeterminable`. Report-only; retry and cleanup stay blocked unless the result is `promoted`. |
+| `cleanup_plan` | Read-only preview of exactly what would be dropped, with blockers. |
+| `cleanup_apply` | Requires `confirmed: true` and the digest of a plan reviewed just before; every check is re-derived from the live objects, then one owned namespace is dropped. |
+
+Cleanup of a backup requires all of: recorded ownership (identities match the
+journal and the namespace holds exactly the recorded tables), no object outside it
+that references it (foreign keys, views, column defaults, inheritance, routine
+text), no change since the cutover (definition and content fingerprints recorded
+right after the commit; a journal without a fingerprint is refused), and a
+confirmed promotion. MySQL additionally needs proven global SELECT/SHOW
+VIEW/PROCESS visibility. A candidate (`tf_restore_<id>` only, never the restore
+destination itself) is removable when empty after promotion, or when unpromoted and
+still proven identical to its verification. Original objects and namespaces without
+a journal are never dropped. Guided recovery (restoring a backup under its original
+name) is not implemented; it remains a manual, reviewed procedure.
+Verified live on MySQL 8.0.46/8.4.11 and PostgreSQL 13.23/18.4
+(`live_backup_lifecycle`).
+
 An interrupted cutover can have an unknown outcome. Its journal must be reconciled
 before retry; a client-side error is not evidence that replacement did not occur.
 After a proven rollback, reviewing a fresh plan can reuse the verified candidate;

@@ -27,6 +27,7 @@ from src.core.path_safety import safe_filename_component
 from src.exporters.rust_dump_exporter import (
     build_rust_dump_config, check_rust_dump, dump_original_namespace, restore_target_connection_info
 )
+from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.workers.error_reporting_worker import ErrorReportingMixin
 from src.ui.workers.rust_dump_worker import RustDumpWorker
@@ -835,6 +836,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.btn_review_restore = QPushButton("기존 대상과 비교 / 전환 검토")
         self.btn_review_restore.setEnabled(False)
         self.btn_review_restore.clicked.connect(self.review_restore_target)
+        self.btn_manage_backups = QPushButton("복원 백업 관리")
+        self.btn_manage_backups.clicked.connect(self.open_backup_lifecycle)
 
         btn_cancel = QPushButton("닫기")
         btn_cancel.setStyleSheet("""
@@ -849,6 +852,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         button_layout.addWidget(self.btn_save_log)
         button_layout.addWidget(self.btn_copy_restore_target)
         button_layout.addWidget(self.btn_review_restore)
+        button_layout.addWidget(self.btn_manage_backups)
         button_layout.addStretch()
         button_layout.addWidget(self.btn_import)
         button_layout.addWidget(btn_cancel)
@@ -1727,6 +1731,18 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if (candidate and self.import_audit.get("verified") is True
                 and self.import_audit.get("restore_status") in ("ready_for_switch", "ready_for_review", "completed_new_target", "promoted")):
             QApplication.clipboard().setText(json.dumps(candidate, ensure_ascii=False, indent=2))
+
+    def open_backup_lifecycle(self):
+        """TF-STATUS-119: 이 덤프 폴더의 복원/전환 저널이 남긴 백업을 조회·정리한다."""
+        original = restore_target_connection_info(self.import_audit.get("original_target"))
+        report_path = self.import_audit.get("report_path")
+        if not self.restore_config or not original or not report_path:
+            QMessageBox.information(self, "백업 관리", "안전 복원 보고서가 있는 Import 후에 사용할 수 있습니다.")
+            return
+        original.update(user=self.restore_config.user, password=self.restore_config.password)
+        dialog = BackupLifecycleDialog(original, [os.path.dirname(str(report_path))], self)
+        dialog.refresh()
+        dialog.exec()
 
     def _promotion_payload(self, action: str) -> dict:
         original = restore_target_connection_info(self.import_audit.get("original_target"))

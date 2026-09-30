@@ -562,6 +562,14 @@ pub(crate) fn promote(
             }
         }
     }
+    if state["status"] == "promoted" {
+        // Retention evidence for TF-STATUS-119: lets a later cleanup prove the
+        // backup tables were not modified after this cutover.
+        match record_backup_fingerprint(original, planned) {
+            Ok(fingerprint) => state["backup_fingerprint"] = fingerprint,
+            Err(error) => state["backup_fingerprint_warning"] = json!(error),
+        }
+    }
     state["phase"] = json!(match state["status"].as_str() {
         Some("promoted") => "completed",
         Some("failed_original_unchanged") => "rolled_back",
@@ -575,6 +583,225 @@ pub(crate) fn promote(
         state["journal_error"] = json!(error);
     }
     Ok(state)
+}
+
+// ---------------------------------------------------------------------------
+// Backup lifecycle (TF-STATUS-119): read-only inspection and explicit drop of the
+// owned backup schema. Ownership is proven by the relation OIDs the promotion
+// plan recorded for the original tables.
+// ---------------------------------------------------------------------------
+
+fn lifecycle_connect(endpoint: &Endpoint, plan: &PromotionPlan) -> Result<Client, String> {
+    if plan.endpoint["engine"] != endpoint.engine
+        || plan.endpoint["host"] != endpoint.host
+        || plan.endpoint["port"] != endpoint.port
+        || plan.endpoint["database"] != endpoint.database
+    {
+        return Err("backup lifecycle endpoint does not match the promotion journal".into());
+    }
+    let mut db = connect(endpoint)?;
+    db.batch_execute("SET DateStyle='ISO, YMD'; SET TIME ZONE 'UTC'; SET extra_float_digits=3")
+        .map_err(|e| e.to_string())?;
+    Ok(db)
+}
+
+fn schema_exists(db: &mut Client, schema: &str) -> Result<bool, String> {
+    db.query_one("SELECT count(*) FROM pg_namespace WHERE nspname=$1", &[&schema])
+        .map(|row| row.get::<_, i64>(0) == 1)
+        .map_err(|e| e.to_string())
+}
+
+/// Objects and counts of one schema: (exists, base tables, views).
+pub(crate) fn namespace_counts(endpoint: &Endpoint, namespace: &str) -> Result<(bool, u64, u64), String> {
+    let mut db = connect(endpoint)?;
+    if !schema_exists(&mut db, namespace)? {
+        return Ok((false, 0, 0));
+    }
+    let row = db.query_one(
+        "SELECT count(*) FILTER (WHERE c.relkind IN ('r','p')), count(*) FILTER (WHERE c.relkind IN ('v','m')) FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1",
+        &[&namespace],
+    ).map_err(|e| e.to_string())?;
+    Ok((true, row.get::<_, i64>(0) as u64, row.get::<_, i64>(1) as u64))
+}
+
+/// Foreign keys, views/rules, column defaults and inheritance links outside
+/// `namespace` that depend on relations inside it.
+pub(crate) fn external_references(endpoint: &Endpoint, namespace: &str) -> Result<Vec<String>, String> {
+    let mut db = connect(endpoint)?;
+    let mut found = Vec::new();
+    for row in db.query(
+        "SELECT ns.nspname||'.'||child.relname, c.conname FROM pg_constraint c JOIN pg_class ref ON ref.oid=c.confrelid JOIN pg_namespace rn ON rn.oid=ref.relnamespace JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace ns ON ns.oid=child.relnamespace WHERE c.contype='f' AND rn.nspname=$1 AND ns.nspname<>$1",
+        &[&namespace],
+    ).map_err(|e| e.to_string())? {
+        found.push(format!("foreign_key:{}:{}", row.get::<_, String>(0), row.get::<_, String>(1)));
+    }
+    for row in db.query(
+        "SELECT DISTINCT vn.nspname||'.'||v.relname FROM pg_depend d JOIN pg_rewrite r ON d.classid='pg_rewrite'::regclass AND d.objid=r.oid JOIN pg_class v ON v.oid=r.ev_class JOIN pg_namespace vn ON vn.oid=v.relnamespace JOIN pg_class dep ON d.refclassid='pg_class'::regclass AND d.refobjid=dep.oid JOIN pg_namespace dn ON dn.oid=dep.relnamespace WHERE dn.nspname=$1 AND vn.nspname<>$1",
+        &[&namespace],
+    ).map_err(|e| e.to_string())? {
+        found.push(format!("view:{}", row.get::<_, String>(0)));
+    }
+    for row in db.query(
+        "SELECT DISTINCT tn.nspname||'.'||t.relname FROM pg_depend d JOIN pg_attrdef ad ON d.classid='pg_attrdef'::regclass AND d.objid=ad.oid JOIN pg_class t ON t.oid=ad.adrelid JOIN pg_namespace tn ON tn.oid=t.relnamespace JOIN pg_class dep ON d.refclassid='pg_class'::regclass AND d.refobjid=dep.oid JOIN pg_namespace dn ON dn.oid=dep.relnamespace WHERE dn.nspname=$1 AND tn.nspname<>$1",
+        &[&namespace],
+    ).map_err(|e| e.to_string())? {
+        found.push(format!("column_default:{}", row.get::<_, String>(0)));
+    }
+    for row in db.query(
+        "SELECT DISTINCT cn.nspname||'.'||ch.relname FROM pg_inherits i JOIN pg_class p ON p.oid=i.inhparent JOIN pg_namespace pn ON pn.oid=p.relnamespace JOIN pg_class ch ON ch.oid=i.inhrelid JOIN pg_namespace cn ON cn.oid=ch.relnamespace WHERE pn.nspname=$1 AND cn.nspname<>$1",
+        &[&namespace],
+    ).map_err(|e| e.to_string())? {
+        found.push(format!("inheritance:{}", row.get::<_, String>(0)));
+    }
+    Ok(found)
+}
+
+/// Order-independent content fingerprint of one table: row count and a sum of
+/// per-row hashes. Used to prove that a retained backup was not modified.
+pub(crate) fn table_fingerprint(db: &mut Client, schema: &str, table: &str) -> Result<Value, String> {
+    let row = db.query_one(
+        &format!(
+            "SELECT count(*)::text, COALESCE(sum(('x'||substr(md5(t::text),1,16))::bit(64)::bigint::numeric),0)::text FROM {} t",
+            qualified(schema, table)
+        ),
+        &[],
+    ).map_err(|e| e.to_string())?;
+    Ok(json!({"rows": row.get::<_, String>(0), "hash_sum": row.get::<_, String>(1)}))
+}
+
+/// Fingerprints of every table that was moved into the backup schema; recorded in
+/// the journal right after a successful commit.
+fn record_backup_fingerprint(original: &Endpoint, planned: &PromotionPlan) -> Result<Value, String> {
+    let mut db = lifecycle_connect(original, planned)?;
+    let mut out = serde_json::Map::new();
+    for object in moved_tables(planned) {
+        out.insert(name(object).to_string(), table_fingerprint(&mut db, &planned.backup_schema, name(object))?);
+    }
+    let actual = objects(&mut db, std::slice::from_ref(&planned.backup_schema))?;
+    Ok(json!({"tables": out, "structure": structure_digest(&actual, &planned.backup_schema)?}))
+}
+
+fn moved_tables(plan: &PromotionPlan) -> Vec<&Value> {
+    let selected: BTreeSet<&str> = tables(&plan.inventory, &plan.candidate_schema).iter().map(|t| name(t)).collect();
+    tables(&plan.inventory, &plan.original_schema).into_iter().filter(|t| selected.contains(name(t))).collect()
+}
+
+/// Digest of every object's catalog definition inside one schema.
+fn structure_digest(actual: &[Value], schema: &str) -> Result<String, String> {
+    let objects: Vec<&Value> = actual.iter().filter(|a| namespace(a) == schema).collect();
+    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&objects).map_err(|e| e.to_string())?)))
+}
+
+/// Inspect the promotion backup schema. `deep` reads every row (fingerprints,
+/// exact counts, external references); otherwise only catalog identities are used.
+/// `journal_fingerprint` is the value recorded when the journal was written.
+pub(crate) fn inspect_backup(
+    endpoint: &Endpoint,
+    plan: &PromotionPlan,
+    deep: bool,
+    journal_fingerprint: Option<&Value>,
+) -> Result<Value, String> {
+    let mut db = lifecycle_connect(endpoint, plan)?;
+    let backup = plan.backup_schema.as_str();
+    let mut blockers: Vec<String> = Vec::new();
+    let exists = schema_exists(&mut db, backup)?;
+    let mut result = json!({"namespace": backup, "exists": exists, "engine": "postgresql",
+        "ownership": "missing", "contents_exact": false, "verdict": "undeterminable",
+        "tables": [], "rows_estimated": !deep, "external_references": [], "unchanged": null});
+    let actual = objects(&mut db, &[plan.original_schema.clone(), plan.candidate_schema.clone(), backup.to_string()])?;
+    let moved = moved_tables(plan);
+    let candidate_tables = tables(&plan.inventory, &plan.candidate_schema);
+    let in_schema = |schema: &str, oid: &Value| actual.iter().any(|a| namespace(a) == schema && a["oid"] == *oid);
+    let promoted = !moved.is_empty() || !candidate_tables.is_empty();
+    let all_moved_in_backup = moved.iter().all(|t| in_schema(backup, &t["oid"]));
+    let all_candidates_active = candidate_tables.iter().all(|t| in_schema(&plan.original_schema, &t["oid"]));
+    let untouched = plan.inventory.iter().filter(|o| o["kind"] == "r").all(|o| in_schema(namespace(o), &o["oid"]));
+    result["verdict"] = json!(if promoted && all_moved_in_backup && all_candidates_active {
+        "promoted"
+    } else if untouched {
+        "not_promoted"
+    } else {
+        "undeterminable"
+    });
+    if !exists {
+        blockers.push("backup schema does not exist".into());
+        result["blockers"] = json!(blockers);
+        return Ok(result);
+    }
+    // Everything in the backup schema must be an object the journal recorded.
+    let allowed: BTreeSet<String> = plan.inventory.iter()
+        .filter(|o| namespace(o) == plan.original_schema)
+        .map(|o| o["oid"].to_string())
+        .collect();
+    let present: Vec<&Value> = actual.iter().filter(|a| namespace(a) == backup).collect();
+    let foreign: Vec<String> = present.iter().filter(|a| !allowed.contains(&a["oid"].to_string())).map(|a| name(a).to_string()).collect();
+    let missing: Vec<String> = moved.iter().filter(|t| !in_schema(backup, &t["oid"])).map(|t| name(t).to_string()).collect();
+    let exact = foreign.is_empty() && missing.is_empty() && !moved.is_empty();
+    result["contents_exact"] = json!(exact);
+    result["ownership"] = json!(if exact { "proven" } else { "unproven" });
+    if !foreign.is_empty() {
+        blockers.push(format!("backup schema contains objects the journal does not record: {}", foreign.join(", ")));
+    }
+    if !missing.is_empty() {
+        blockers.push(format!("recorded backup tables are missing: {}", missing.join(", ")));
+    }
+    let mut table_rows = Vec::new();
+    let mut unchanged = exact;
+    let mut estimates: Vec<(String, i64)> = Vec::new();
+    if !deep {
+        for row in db.query("SELECT c.relname, c.reltuples::bigint FROM pg_class c JOIN pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname=$1 AND c.relkind='r' ORDER BY c.relname", &[&backup]).map_err(|e| e.to_string())? {
+            estimates.push((row.get(0), row.get(1)));
+        }
+    }
+    table_rows.extend(estimates.into_iter().map(|(n, r)| json!({"name": n, "rows": r.max(0)})));
+    if deep && exact {
+        // Data: fingerprints must match those recorded right after the commit.
+        let structure_now = structure_digest(&actual, backup)?;
+        match journal_fingerprint.and_then(|f| f["tables"].as_object()) {
+            None => {
+                unchanged = false;
+                blockers.push("the journal has no content fingerprint (written by an older version); an unmodified backup cannot be proven".into());
+            }
+            Some(expected) => {
+                if journal_fingerprint.and_then(|f| f["structure"].as_str()) != Some(structure_now.as_str()) {
+                    unchanged = false;
+                    blockers.push("the definition of the backup objects changed after promotion".into());
+                }
+                for table in &moved {
+                    let now = table_fingerprint(&mut db, backup, name(table))?;
+                    if expected.get(name(table)) != Some(&now) {
+                        unchanged = false;
+                        blockers.push(format!("table {} content changed after promotion", name(table)));
+                    }
+                    let rows = now["rows"].as_str().and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                    table_rows.push(json!({"name": name(table), "rows": rows}));
+                }
+            }
+        }
+        result["unchanged"] = json!(unchanged);
+        drop(db);
+        let references = external_references(endpoint, backup)?;
+        if !references.is_empty() {
+            blockers.push(format!("objects outside the backup still reference it: {}", references.join(", ")));
+        }
+        result["external_references"] = json!(references);
+    }
+    result["tables"] = json!(table_rows);
+    result["blockers"] = json!(blockers);
+    Ok(result)
+}
+
+/// Drop one owned schema. Callers must have verified ownership, contents and
+/// references immediately before; CASCADE only removes what was just verified.
+pub(crate) fn drop_namespace(endpoint: &Endpoint, namespace: &str) -> Result<(), String> {
+    let mut db = connect(endpoint)?;
+    db.batch_execute(&format!("SET lock_timeout='2s'; DROP SCHEMA {} CASCADE", q(namespace))).map_err(|e| e.to_string())
+}
+
+/// Backup schemas following the promotion naming, whether or not a journal covers them.
+pub(crate) fn backup_named_namespaces(endpoint: &Endpoint) -> Result<Vec<String>, String> {
+    let mut db = connect(endpoint)?;
+    Ok(db.query("SELECT nspname FROM pg_namespace WHERE nspname LIKE 'tf\\_backup\\_%' ORDER BY nspname", &[]).map_err(|e| e.to_string())?.into_iter().map(|row| row.get(0)).collect())
 }
 
 #[cfg(test)]
