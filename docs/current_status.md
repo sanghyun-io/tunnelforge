@@ -1,11 +1,15 @@
 # TunnelForge Current Status
 
-Last reviewed: 2026-09-28
+Last reviewed: 2026-09-29
 
 Current shipping version: `v2.6.1` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
+
+Next-agent execution guide: [2026-09-29 handoff](handoff_2026-09-29.md).
+It records remaining priorities, Opus 5.5 manager / Sonnet 5.5 worker ownership, entry points, and validation
+gates; this status index remains authoritative for issue states.
 
 ## Continuity Contract
 
@@ -851,6 +855,10 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-30 | Package start decisions | `git fetch`; `pytest tests/test_current_status_docs.py -q`; `git diff --check` | origin/main unchanged at `92472b5`; documentation checks 76 passed | Documentation only. Recorded user decisions for TLS/SSH trust, export scope, Docker test environments, and per-lane releases; corrected agent-role names. No product behavior verified or issue closed. |
+| 2026-09-29 | Next-agent handoff | Source-path and workflow review; remote main/tag and published-release inspection; `pytest tests/test_current_status_docs.py -q` | Documentation checks 76 passed; execution guide added | Documentation only; no new product verification, implementation, deployment, or issue closure. Historical release evidence remains labeled as historical. |
+| 2026-09-29 | Remaining-work prioritization | Read tracker/roadmap; `pytest tests/test_current_status_docs.py -q`; `git diff --check` | Execution order recorded with acceptance criteria; documentation checks 76 passed | Planning only. Three Sol lanes are scoped under Astra; environment preparation and OS/provider checks run alongside each feature. No implementation or issue closure claimed. |
+| 2026-09-29 | Remaining-work scheduling estimate | Read current issue tracker/roadmap; `pytest tests/test_current_status_docs.py -q`; `git diff --check` | Planning estimate: Astra coordination plus three concurrent Sol workers, 30–60 elapsed agent hours; documentation checks 76 passed | Not a measured model benchmark or new verification of product behavior. Mac/provider access waits and production-data reconciliation are outside the estimate; no issue closed. |
 | 2026-09-28 | `v2.6.1` protected publication closure / TF-STATUS-121 | PR #260 protected checks and merge; approved `create-release-tag.yml` run `36402377780`; approved `release.yml` run `36402586622`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `36400986857` and `36400986774` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `fd843baae4b30278921489b28b72534fe897ae0e`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.6.1` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.6.1`. TF-STATUS-121 is closed. |
 | 2026-09-28 | Connection usability full regression | Windows `.venv/Scripts/python.exe -m pytest -q --tb=short`; isolated Linux snapshot with inherited XDG_CONFIG_HOME `python -m pytest -q --tb=short`; final focused CI/docs/connection tests | Windows 2846 passed / 9 skipped / 6 warnings in 111.70s; Linux 2813 passed / 42 skipped / 4 warnings in 29.22s; focused120 passed; independent lifecycle review9 passed | Preparing separate 2.6.1 patch; new connection tests also added to both macOS CI paths. Existing synchronous preselected-wizard entry is tracked separately as TF-STATUS-120. |
 | 2026-09-28 | First post-release connection responsiveness package | `pytest tests/test_db_connection_responsiveness.py tests/test_db_dialogs.py tests/test_main_window_export_import_labels.py tests/test_connection_test_worker.py -q --tb=short` | RED6 reproduced GUI blocking/missing lifecycle/result delivery; GREEN40. Independent review reproduced queued-completion shutdown gap; added regression and fixed active ownership guard. | New QThread orchestration preserves Rust DB ownership, drops cancelled/deleted-dialog results, performs cleanup off GUI and fixes test_finished routing. Broader Windows/Linux regression remains pending; not included in published 2.6.0. |
@@ -2856,7 +2864,7 @@ Next action:
 | TF-STATUS-118 | High | closed | Restore availability | Safe preparation, both-engine guarded promotion, large cutover and exact-head protected gates passed | Preserve fail-closed unsupported/unknown-outcome policy; backup lifecycle is TF-STATUS-119 |
 | TF-STATUS-115 | High | closed | Export/Import contract | Data/schema/default/precision/snapshot fixes passed actual DB and protected gates; inconsistent old dumps safely refused | Retain supported policy; old dump omissions and orphan rows need authoritative reconciliation, not guessed repairs |
 | TF-STATUS-116 | High | closed | Versioned release | v2.6.0 published stable/latest; 10 assets/four sidecars and actual updater verified | Preserve immutable tag, exact-head CI and approved release workflow |
-| TF-STATUS-117 | Medium | in_progress | Commercial/usability implementation | First post-release work package addresses connection responsiveness for developers/small teams | Complete TF-STATUS-113 with event-loop, cancellation/cleanup and result-signal regression proof; next security/query limits remain explicit |
+| TF-STATUS-117 | Medium | in_progress | Commercial/usability implementation | First connection package shipped; remaining work ranked and handed off on 2026-09-29 | Follow `docs/handoff_2026-09-29.md`: parallel lanes for connection trust (110), export/import contract/faults (111/105/108), and query control (112); then recovery/cleanup (119) and remaining wizard responsiveness (120) |
 | TF-STATUS-113 | High | closed | Connection responsiveness | Direct connect/test background work, cancellation cleanup and result-signal fix verified and shipped in 2.6.1 | Preserve queued-completion ownership and all-OS regressions; preselected wizard entry remains TF-STATUS-120 |
 | TF-STATUS-114 | Medium | watch | Product readiness | Prioritized commercial-use candidates and demonstration scenarios | Developer/small-team persona confirmed; validate observed task success using `docs/commercial_readiness_2026-09-28.md` before implementation |
 | TF-STATUS-100 | High | closed | SSH / TCP | Loopback isolation, resource cleanup, assigned ports and IPv6 probes fixed | Preserve real protocol regressions; peer trust remains TF-STATUS-110 |
@@ -2974,11 +2982,54 @@ Next action:
 
 ## Recommended Execution Order
 
+Current execution priority (2026-09-29):
+
+Use [the execution handoff](handoff_2026-09-29.md) for startup checks, agent
+assignments, validation commands, and release gates.
+
+1. P0: verified TLS/SSH identity and key handling (110).
+2. P0: explicit export/import support contract and remaining fault coverage
+   (111/105/108), with preservation or pre-mutation refusal for agreed objects.
+3. P0: actual query cancellation, timeouts, bounded streaming and memory (112).
+4. P0: backup inventory, uncertain-outcome reconciliation, supported recovery
+   and explicit ownership-checked cleanup (119).
+5. P1: remaining preselected wizard responsiveness (120), then operational
+   read-only/changes review, results-to-file (after streaming), and workspace recovery.
+
+Start Mac/provider/certificate/SSH test-environment preparation immediately.
+OS/provider evidence (008/096/098/109) gates each relevant feature, rather than
+forming a final deferred testing phase. Priority is not a fully serial schedule:
+connection, execution and restore lanes can run in parallel under the Opus 5.5
+manager's shared-interface decisions. Details and acceptance criteria are in
+`docs/commercial_readiness_2026-09-28.md`.
+
+Scheduling note (2026-09-29, agent names corrected 2026-09-30): use the Opus 5.5
+manager for architecture, interface decisions, review and integration; assign
+Sonnet 5.5 workers to connection/security, query execution, and restore/fidelity
+lanes. Earlier "Astra"/"gpt-6-sol" wording in 2026-09-29 log rows refers to these
+same roles. Keep cancellation and result streaming under one owner because they
+share Core protocol/session changes. Estimate assumptions and external validation
+dependencies are in the commercial-readiness document.
+
+User decisions (2026-09-30) for the current package:
+
+1. TLS implementation uses `native-tls` (OS certificate stores).
+2. Existing saved profiles keep connecting without TLS but show a warning; newly
+   created profiles require verified TLS.
+3. SSH host identity uses trust-on-first-use: show and persist the fingerprint on
+   first connect, block on change, and update only after explicit user confirmation.
+4. TF-STATUS-111 keeps the current supported object scope and refuses unsupported
+   objects before export; broader object preservation is deferred until requested.
+5. Test environments use newly created, disposable Docker resources with a dedicated
+   `tf-test-` prefix (DBs, restricted accounts, test certificates, SSH server).
+   Real Mac and managed-provider databases are not available for this package, so
+   TF-STATUS-008/109 and provider evidence remain open.
+6. Planning documents are published in a separate documentation PR before code work.
+7. Each lane releases when complete; connection security ships first.
+
 TF-STATUS-115/118 and protected v2.6.0 publication TF-STATUS-116 are complete.
 The first follow-up usability package TF-STATUS-113 is verified and published
-as v2.6.1 through TF-STATUS-121. Continue with
-verified connection security (110), remaining wizard responsiveness (120), actual
-query cancellation/bounded results (112), and backup lifecycle review (119).
+as v2.6.1 through TF-STATUS-121. Continue using the current priorities above.
 
 Continue TF-STATUS-117 using the existing commercial-readiness priorities and the
 confirmed developer/small-team audience. The released 2.6.0 tag remains immutable;
@@ -3075,6 +3126,10 @@ The historical release-preservation checklist follows.
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-09-30 | Started the next package with user-approved decisions (native-tls, warn-only legacy profiles with TLS required for new ones, SSH trust-on-first-use, current export scope with pre-export refusal, disposable `tf-test-` Docker environments, per-lane releases). Corrected agent roles to an Opus 5.5 manager and Sonnet 5.5 workers. | Canonical execution order, handoff, commercial-readiness document | Documentation checks 76 passed; diff check passed. Planning documentation PR precedes code work. |
+| 2026-09-29 | Created an actionable Korean handoff with remaining priorities, Astra/gpt-6-sol ownership, acceptance criteria, live-test prerequisites, production-data boundaries, and protected release steps. | `docs/handoff_2026-09-29.md`, canonical status index | Source/workflow review and current-status documentation tests: 76 passed. Existing planning edits preserved; no application code changed. |
+| 2026-09-29 | Ranked remaining work and assigned parallel Astra/Sol lanes with concrete completion criteria. Preserved completed releases and distinguished operational Staging reconciliation from application work. | Canonical execution order/tracker and commercial-readiness priorities | Documentation checks 76 passed; no new product behavior validation or implementation claimed. |
+| 2026-09-29 | Estimated remaining work for the user's planned Astra/Sol division of responsibilities; did not start implementation. | Canonical status and commercial-readiness estimate | Repository/status inspection only; ranges are planning judgments, not model-speed measurements or completion evidence. |
 | 2026-09-28 | Published connection usability patch v2.6.1 and closed TF-STATUS-113/121. Retained original v2.6.0 safety release and both immutable tags. | Canonical release ledger and commercial-readiness progress | PR #260 exact-head runs 36400986857/36400986774 passed, including connection tests on both macOS architectures. Tag run 36402377780 and release run 36402586622 passed. All 10 downloaded hashes/four sidecars match; actual updater correctly handles installed 2.5.0, 2.6.0 and 2.6.1. |
 | 2026-09-28 | Published verified v2.6.0; started the user-authorized next usability package. Removed direct-connection GUI blocking, fixed main connection-test result routing and guarded worker cleanup at shutdown. | Release ledger, connection dialog/worker, main window, regression tests and i18n | Stable/latest and old-version updater verified. Focused40 passed after RED6; independent shutdown-race finding reproduced and fixed. Follow-up full regression/PR preparation in progress; immutable release untouched. |
 | 2026-09-28 | Completed large safe cutover rehearsal and independent active/backup verification. Corrected the final view-header literal fidelity edge case and wired the MySQL-specific live promotion environment into mandatory CI. | View sanitizer/tests, CI contract, policy/evidence/status | 452 actual table counts match; active/backup totals 8,937,323/8,937,334, eight declared view counts match, both namespaces retain 304 FKs. Final safe fixtures4 and both-engine promotion17 passed. Exact supplied dump remains unmodified and safely refused for 11 orphan references. |
