@@ -455,3 +455,311 @@ fn unbounded_stream_keeps_core_memory_flat() {
         assert!(peak < 200 * 1024, "core RSS grew to {peak} KiB while streaming");
     }
 }
+
+// ------------------------------------------------------------------ result export to file
+
+fn vals_sql(engine: &Engine) -> Vec<&'static str> {
+    if engine.name == "mysql" {
+        vec![
+            "DROP TABLE IF EXISTS tf_b_vals",
+            "CREATE TABLE tf_b_vals (id INT PRIMARY KEY, s VARCHAR(100), n DECIMAL(30,10), b VARBINARY(16), \
+             t DATETIME(6), d DATE) DEFAULT CHARSET=utf8mb4",
+            "INSERT INTO tf_b_vals VALUES \
+             (1, '', 12345678901234567890.1234567890, x'00ff10ab', '2024-02-29 23:59:59.123456', '2024-02-29'), \
+             (2, NULL, NULL, NULL, NULL, NULL), \
+             (3, CONCAT('a,b \"q\"', CHAR(10), 'line2 한글 ✓ 😀'), -0.0000000001, x'', '2024-01-01 00:00:00', '2024-01-01'), \
+             (4, '=1+1', 0.5, x'41', NULL, NULL), \
+             (5, '-abc', -5, NULL, NULL, NULL)",
+        ]
+    } else {
+        vec![
+            "DROP TABLE IF EXISTS tf_b_vals",
+            "CREATE TABLE tf_b_vals (id INT PRIMARY KEY, s TEXT, n NUMERIC(30,10), b BYTEA, t TIMESTAMP(6), d DATE)",
+            "INSERT INTO tf_b_vals VALUES \
+             (1, '', 12345678901234567890.1234567890, decode('00ff10ab','hex'), '2024-02-29 23:59:59.123456', '2024-02-29'), \
+             (2, NULL, NULL, NULL, NULL, NULL), \
+             (3, E'a,b \"q\"\\nline2 한글 ✓ 😀', -0.0000000001, decode('','hex'), '2024-01-01 00:00:00', '2024-01-01'), \
+             (4, '=1+1', 0.5, decode('41','hex'), NULL, NULL), \
+             (5, '-abc', -5, NULL, NULL, NULL)",
+        ]
+    }
+}
+
+const VALS_QUERY: &str = "SELECT id, s, n, b, t, d FROM tf_b_vals ORDER BY id";
+
+/// Minimal RFC 4180 reader: an empty unquoted field is NULL, `""` is the empty string.
+fn parse_csv(data: &str) -> Vec<Vec<Option<String>>> {
+    let mut rows = Vec::new();
+    let mut row: Vec<Option<String>> = Vec::new();
+    let mut field = String::new();
+    let mut quoted = false;
+    let mut in_quotes = false;
+    let mut chars = data.chars().peekable();
+    while let Some(c) = chars.next() {
+        if in_quotes {
+            if c == '"' {
+                if chars.peek() == Some(&'"') {
+                    field.push('"');
+                    chars.next();
+                } else {
+                    in_quotes = false;
+                }
+            } else {
+                field.push(c);
+            }
+            continue;
+        }
+        match c {
+            '"' => {
+                in_quotes = true;
+                quoted = true;
+            }
+            ',' | '\r' | '\n' => {
+                if c == '\r' {
+                    chars.next(); // the \n
+                }
+                row.push(if field.is_empty() && !quoted { None } else { Some(std::mem::take(&mut field)) });
+                quoted = false;
+                if c != ',' {
+                    rows.push(std::mem::take(&mut row));
+                }
+            }
+            other => field.push(other),
+        }
+    }
+    rows
+}
+
+fn partial_of(path: &std::path::Path) -> std::path::PathBuf {
+    let mut partial = path.to_path_buf().into_os_string();
+    partial.push(".partial");
+    partial.into()
+}
+
+fn export_path(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join("tf_query_export_live");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let _ = std::fs::remove_file(&path);
+    let _ = std::fs::remove_file(partial_of(&path));
+    path
+}
+
+fn export(core: &mut Core, conn: &str, sql: &str, output: Value) -> Vec<Value> {
+    let id = core.send("query.execute", json!({"connection_id": conn, "sql": sql, "output": output}));
+    core.finish(&id, Duration::from_secs(300))
+}
+
+#[test]
+fn export_preserves_values_in_csv_and_jsonl() {
+    let engines = engines();
+    if skip_if_none(&engines) {
+        return;
+    }
+    for engine in engines {
+        let mut core = Core::start();
+        let conn = core.open(&engine.endpoint);
+        for sql in vals_sql(&engine) {
+            let result = core.query(&conn, sql);
+            assert_eq!(result["success"], true, "{} {result}", engine.name);
+        }
+        let s = |v: &str| Some(v.to_string());
+        let expected: Vec<Vec<Option<String>>> = vec![
+            vec![s("1"), s(""), s("12345678901234567890.1234567890"), s("00ff10ab"), s("2024-02-29 23:59:59.123456"), s("2024-02-29")],
+            vec![s("2"), None, None, None, None, None],
+            // MySQL renders DATETIME(6) with all six fractional digits; the server text is kept as is.
+            vec![
+                s("3"), s("a,b \"q\"\nline2 한글 ✓ 😀"), s("-0.0000000001"), s(""),
+                s(if engine.name == "mysql" { "2024-01-01 00:00:00.000000" } else { "2024-01-01 00:00:00" }),
+                s("2024-01-01"),
+            ],
+            vec![s("4"), s("=1+1"), s("0.5000000000"), s("41"), None, None],
+            vec![s("5"), s("-abc"), s("-5.0000000000"), None, None, None],
+        ];
+
+        // CSV, guard off + BOM: exact values.
+        let path = export_path(&format!("vals_{}.csv", engine.name));
+        let events = export(
+            &mut core,
+            &conn,
+            VALS_QUERY,
+            json!({"path": path.to_string_lossy(), "format": "csv", "bom": true, "formula_guard": false}),
+        );
+        let result = events.last().unwrap();
+        assert_eq!(result["success"], true, "{} {result}", engine.name);
+        assert_eq!(result["rows_written"], 5);
+        assert_eq!(result["output_path"], path.to_string_lossy().as_ref());
+        assert!(!partial_of(&path).exists());
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], b"\xEF\xBB\xBF");
+        let table = parse_csv(std::str::from_utf8(&bytes[3..]).unwrap());
+        assert_eq!(table[0], ["id", "s", "n", "b", "t", "d"].map(|c| Some(c.to_string())));
+        assert_eq!(&table[1..], &expected[..], "{}", engine.name);
+
+        // CSV with the default guard: formulas escaped, plain numbers untouched.
+        let path = export_path(&format!("vals_guard_{}.csv", engine.name));
+        let events = export(&mut core, &conn, VALS_QUERY, json!({"path": path.to_string_lossy()}));
+        assert_eq!(events.last().unwrap()["success"], true);
+        let data = std::fs::read(&path).unwrap();
+        assert_ne!(&data[..3], b"\xEF\xBB\xBF", "BOM is opt-in");
+        let table = parse_csv(std::str::from_utf8(&data).unwrap());
+        assert_eq!(table[4][1], s("'=1+1"));
+        assert_eq!(table[5][1], s("'-abc"));
+        assert_eq!(table[5][2], s("-5.0000000000"));
+
+        // JSON Lines: NULL vs "" and exact decimal text.
+        let path = export_path(&format!("vals_{}.jsonl", engine.name));
+        let output = json!({"path": path.to_string_lossy(), "format": "jsonl", "binary": "base64"});
+        let events = export(&mut core, &conn, VALS_QUERY, output.clone());
+        assert_eq!(events.last().unwrap()["success"], true);
+        let text = std::fs::read_to_string(&path).unwrap();
+        let lines: Vec<Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[0]["s"], "");
+        assert_eq!(lines[1]["s"], Value::Null);
+        assert_eq!(lines[0]["n"], "12345678901234567890.1234567890");
+        assert_eq!(lines[0]["b"], "AP8Qqw==");
+        assert_eq!(lines[2]["s"], "a,b \"q\"\nline2 한글 ✓ 😀");
+        eprintln!("{}: value round trip OK (csv guard off/on, jsonl)", engine.name);
+
+        // An existing file is never silently replaced.
+        let events = export(&mut core, &conn, VALS_QUERY, output);
+        assert_eq!(events.last().unwrap()["event"], "error");
+        assert!(events.last().unwrap()["message"].as_str().unwrap().contains("already exists"));
+        assert_eq!(core.scalar(&conn, "SELECT 1 AS one"), "1", "session usable after refused export");
+        core.query(&conn, "DROP TABLE tf_b_vals");
+    }
+}
+
+#[test]
+fn export_cancel_and_timeout_never_leave_a_final_file() {
+    let engines = engines();
+    if skip_if_none(&engines) {
+        return;
+    }
+    for engine in engines {
+        let mut core = Core::start();
+        let conn = core.open_prepared(&engine);
+
+        // Cancel mid-export: no final file, partial deleted by default.
+        let path = export_path(&format!("cancel_{}.csv", engine.name));
+        let id = core.send(
+            "query.execute",
+            json!({
+                "connection_id": conn, "sql": (engine.big)(20_000_000), "job_id": "exp-1",
+                "output": {"path": path.to_string_lossy()}
+            }),
+        );
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(partial_of(&path).exists(), "data goes to .partial while running");
+        assert!(!path.exists());
+        core.call("query.cancel", json!({"job_id": "exp-1"}));
+        let result = core.finish(&id, Duration::from_secs(60)).pop().unwrap();
+        assert_eq!(result["error_code"], "query_cancelled", "{result}");
+        assert_eq!(result["output_path"], Value::Null);
+        if engine.name == "mysql" {
+            // PostgreSQL may still be materializing generate_series() at this point.
+            assert!(result["rows_written"].as_u64().unwrap() > 0);
+        }
+        assert!(!path.exists() && !partial_of(&path).exists(), "{} cancelled export left files", engine.name);
+
+        // Timeout with keep_partial: partial is kept and reported, final never appears.
+        let path = export_path(&format!("timeout_{}.csv", engine.name));
+        let id = core.send(
+            "query.execute",
+            json!({
+                "connection_id": conn, "sql": (engine.big)(20_000_000), "timeout_ms": 700,
+                "output": {"path": path.to_string_lossy(), "keep_partial": true}
+            }),
+        );
+        let result = core.finish(&id, Duration::from_secs(60)).pop().unwrap();
+        assert_eq!(result["error_code"], "query_timeout", "{result}");
+        let partial = result["partial_path"].as_str().expect("kept partial path is reported");
+        assert!(partial.ends_with(".partial") && std::path::Path::new(partial).exists());
+        assert_eq!(result["output_path"], Value::Null);
+        assert!(!path.exists());
+        let _ = std::fs::remove_file(partial);
+        assert_eq!(core.scalar(&conn, "SELECT 1 AS one"), "1");
+    }
+}
+
+#[test]
+fn export_failure_midway_leaves_no_final_file_and_bad_path_is_an_error() {
+    let engines = engines();
+    if skip_if_none(&engines) {
+        return;
+    }
+    for engine in engines.iter().filter(|e| e.name == "postgresql") {
+        let mut core = Core::start();
+        let conn = core.open(&engine.endpoint);
+        let path = export_path("midway_error.csv");
+        // Fails at row 3, after rows 1-2 were already written to the partial file.
+        let events = export(
+            &mut core,
+            &conn,
+            "SELECT 1 / (3 - g) AS x FROM generate_series(1, 10) g",
+            json!({"path": path.to_string_lossy()}),
+        );
+        assert_eq!(events.last().unwrap()["event"], "error", "{:?}", events.last());
+        assert!(!path.exists() && !partial_of(&path).exists());
+    }
+    for engine in &engines {
+        let mut core = Core::start();
+        let conn = core.open(&engine.endpoint);
+        let missing = std::env::temp_dir().join("tf_query_export_live").join("no_such_dir").join("x.csv");
+        let events = export(&mut core, &conn, "SELECT 1 AS one", json!({"path": missing.to_string_lossy()}));
+        assert_eq!(events.last().unwrap()["event"], "error");
+        assert_eq!(core.scalar(&conn, "SELECT 1 AS one"), "1");
+    }
+}
+
+/// Millions of rows go to disk with flat core memory and an atomic, complete final file.
+#[test]
+fn export_large_result_is_streamed_with_flat_memory() {
+    let engines = engines();
+    if skip_if_none(&engines) {
+        return;
+    }
+    for engine in engines {
+        let mut core = Core::start();
+        let conn = core.open_prepared(&engine);
+        let pid = core.child.id();
+        let baseline = rss_kb(pid).unwrap_or(0);
+        let path = export_path(&format!("big_{}.csv", engine.name));
+        let id = core.send(
+            "query.execute",
+            json!({"connection_id": conn, "sql": (engine.big)(3_000_000), "output": {"path": path.to_string_lossy()}}),
+        );
+        let started = Instant::now();
+        let mut peak = baseline;
+        let mut progress_events = 0;
+        let result = loop {
+            match core.rx.recv_timeout(Duration::from_secs(300)) {
+                Ok(event) if event["request_id"] == id => match event["event"].as_str() {
+                    Some("progress") => {
+                        progress_events += 1;
+                        peak = peak.max(rss_kb(pid).unwrap_or(0));
+                    }
+                    Some("result") | Some("error") => break event,
+                    _ => {}
+                },
+                Ok(_) => {}
+                Err(err) => panic!("{err:?}"),
+            }
+        };
+        assert_eq!(result["success"], true, "{result}");
+        assert_eq!(result["rows_written"], 3_000_000);
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert_eq!(result["bytes_written"], size);
+        assert!(!partial_of(&path).exists());
+        let lines = std::fs::read(&path).unwrap().iter().filter(|b| **b == b'\n').count();
+        assert_eq!(lines, 3_000_001, "header + rows");
+        eprintln!(
+            "{}: exported 3M rows ({} MiB) in {:?}, {} progress events, RSS baseline {} KiB peak {} KiB",
+            engine.name, size >> 20, started.elapsed(), progress_events, baseline, peak
+        );
+        assert!(progress_events > 0);
+        assert!(peak < 100 * 1024, "core RSS grew to {peak} KiB while exporting");
+        let _ = std::fs::remove_file(&path);
+    }
+}

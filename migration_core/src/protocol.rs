@@ -156,6 +156,13 @@ impl CoreService {
                 id
             }
         };
+        let spec = match QuerySpec::from_request(request, job_id.clone(), sql.to_string()) {
+            Ok(spec) => spec,
+            Err(message) => {
+                fail(json!({"event": "error", "message": message}));
+                return None;
+            }
+        };
         let ctl = match register_job(&session, &self.jobs, &job_id) {
             Ok(ctl) => ctl,
             Err(event) => {
@@ -163,7 +170,6 @@ impl CoreService {
                 return None;
             }
         };
-        let spec = QuerySpec::from_request(request, job_id, sql.to_string());
         let jobs = self.jobs.clone();
         let emit = emit.clone();
         Some(Box::new(move || run_job(session, ctl, jobs, spec, emit)))

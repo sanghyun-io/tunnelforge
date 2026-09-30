@@ -123,13 +123,14 @@ pub(crate) struct QuerySpec {
     pub(crate) timeout_ms: Option<u64>,
     pub(crate) max_rows: Option<u64>,
     pub(crate) max_bytes: Option<u64>,
+    pub(crate) output: Option<OutputSpec>,
 }
 
 impl QuerySpec {
-    pub(crate) fn from_request(request: &Request, job_id: String, sql: String) -> Self {
+    pub(crate) fn from_request(request: &Request, job_id: String, sql: String) -> Result<Self, String> {
         let p = &request.payload;
         let num = |key: &str| p.get(key).and_then(Value::as_u64).filter(|n| *n > 0);
-        Self {
+        Ok(Self {
             request_id: request.request_id.clone(),
             job_id,
             sql,
@@ -143,7 +144,8 @@ impl QuerySpec {
             timeout_ms: num("timeout_ms"),
             max_rows: num("max_rows"),
             max_bytes: num("max_bytes"),
-        }
+            output: OutputSpec::from_payload(p)?,
+        })
     }
 }
 
@@ -158,6 +160,11 @@ struct Sink<'a> {
     bytes: u64,
     last_flush: Instant,
     truncated_by: Option<&'static str>,
+    out: Option<OutputWriter>,
+    io_error: Option<String>,
+    /// Per column: value is raw binary (MySQL BLOB/BINARY/BIT, PostgreSQL bytea).
+    binary: Vec<bool>,
+    last_progress: Instant,
 }
 
 impl<'a> Sink<'a> {
@@ -172,10 +179,23 @@ impl<'a> Sink<'a> {
             bytes: 0,
             last_flush: Instant::now(),
             truncated_by: None,
+            out: None,
+            io_error: None,
+            binary: Vec::new(),
+            last_progress: Instant::now(),
         }
     }
 
-    fn begin(&mut self, columns: &[String]) {
+    /// Binary encoding when the result goes to a file (values are then kept exact, as text).
+    fn export_encoding(&self) -> Option<BinaryEncoding> {
+        self.spec.output.as_ref().map(|output| output.binary)
+    }
+
+    fn begin(&mut self, columns: &[String]) -> Result<(), String> {
+        if let Some(output) = &self.spec.output {
+            self.out = Some(OutputWriter::create(output, columns)?);
+            return Ok(());
+        }
         if self.spec.stream {
             (self.emit)(json!({
                 "event": "columns",
@@ -185,6 +205,7 @@ impl<'a> Sink<'a> {
                 "columns": columns
             }));
         }
+        Ok(())
     }
 
     /// Returns false when a limit stopped the fetch (the row was not accepted).
@@ -201,6 +222,22 @@ impl<'a> Sink<'a> {
                 return false;
             }
             self.bytes += len;
+        }
+        if let Some(out) = self.out.as_mut() {
+            if let Err(err) = out.write_row(&row) {
+                self.io_error = Some(err);
+                return false;
+            }
+            self.streamed += 1;
+            if self.last_progress.elapsed() >= Duration::from_millis(500) {
+                self.last_progress = Instant::now();
+                (self.emit)(json!({
+                    "event": "progress", "request_id": self.spec.request_id,
+                    "command": "query.execute", "job_id": self.spec.job_id,
+                    "rows_written": out.rows, "bytes_written": out.bytes
+                }));
+            }
+            return true;
         }
         self.streamed += 1;
         if !self.spec.stream {
@@ -299,7 +336,13 @@ fn fetch_rows(
                     .collect(),
             );
             let rows_affected = result.affected_rows();
-            sink.begin(&columns);
+            sink.binary = result.columns().as_ref().iter().map(mysql_column_is_binary).collect();
+            if let Err(err) = sink.begin(&columns) {
+                let _ = stop.send(());
+                drop(result);
+                return Err(RunError::Message(err));
+            }
+            let export_binary = sink.export_encoding().filter(|_| sink.binary.iter().any(|b| *b));
             let mut set_index = 0;
             let mut multi = false;
             let mut fetch_error = None;
@@ -312,7 +355,11 @@ fn fetch_rows(
                         }
                         match row {
                             Ok(row) => {
-                                if !sink.push(mysql_row_to_json(&columns, row)) {
+                                let json = match export_binary {
+                                    Some(encoding) => mysql_export_row(&columns, &sink.binary, encoding, row),
+                                    None => mysql_row_to_json(&columns, row),
+                                };
+                                if !sink.push(json) {
                                     // Must precede the drop of `set`, which drains the rest.
                                     let _ = stop.send(());
                                     break 'sets;
@@ -358,7 +405,9 @@ fn fetch_rows(
             );
             let types: Vec<postgres::types::Type> =
                 statement.columns().iter().map(|column| column.type_().clone()).collect();
-            sink.begin(&columns);
+            sink.binary = types.iter().map(|ty| *ty == postgres::types::Type::BYTEA).collect();
+            sink.begin(&columns).map_err(RunError::Message)?;
+            let export = sink.export_encoding();
 
             if statement.columns().is_empty() || !copy_wrappable(&sql) {
                 // ponytail: SHOW/EXPLAIN/no-row statements cannot be wrapped in COPY, so they
@@ -374,7 +423,7 @@ fn fetch_rows(
                             for (index, ty) in types.iter().enumerate() {
                                 let value = row
                                     .get(index)
-                                    .map(|text| postgres_text_value(text, ty))
+                                    .map(|text| pg_value(text, ty, export))
                                     .transpose()
                                     .map_err(RunError::Message)?
                                     .unwrap_or(Value::Null);
@@ -413,7 +462,7 @@ fn fetch_rows(
                     let _ = stop.send(());
                     break;
                 }
-                let row = parse_copy_line(&line, &columns, &types).map_err(RunError::Message)?;
+                let row = parse_copy_line(&line, &columns, &types, export).map_err(RunError::Message)?;
                 if !sink.push(row) {
                     halted = true;
                     let _ = stop.send(());
@@ -470,8 +519,69 @@ fn copy_wrappable(sql: &str) -> bool {
     )
 }
 
+/// Column value for the UI (typed JSON) or, for file export (`export` set), exact text:
+/// numbers, JSON, arrays and temporal values keep the server's own text (no float rounding);
+/// only booleans become JSON booleans and bytea is encoded as hex/base64.
+fn pg_value(text: &str, ty: &postgres::types::Type, export: Option<BinaryEncoding>) -> Result<Value, String> {
+    use postgres::types::Type;
+    match export {
+        None => postgres_text_value(text, ty),
+        Some(encoding) => Ok(match *ty {
+            Type::BOOL => Value::Bool(text == "t"),
+            Type::BYTEA => Value::String(pg_bytea_text(text, encoding)),
+            _ => Value::String(text.to_string()),
+        }),
+    }
+}
+
+fn mysql_column_is_binary(column: &mysql::Column) -> bool {
+    use mysql::consts::ColumnType::*;
+    // Character set 63 is "binary"; numbers and dates carry it too, so restrict by type.
+    matches!(column.column_type(), MYSQL_TYPE_BIT | MYSQL_TYPE_GEOMETRY)
+        || (column.character_set() == 63
+            && matches!(
+                column.column_type(),
+                MYSQL_TYPE_TINY_BLOB
+                    | MYSQL_TYPE_MEDIUM_BLOB
+                    | MYSQL_TYPE_LONG_BLOB
+                    | MYSQL_TYPE_BLOB
+                    | MYSQL_TYPE_VAR_STRING
+                    | MYSQL_TYPE_STRING
+                    | MYSQL_TYPE_VARCHAR
+            ))
+}
+
+/// Like `mysql_row_to_json`, but binary columns are encoded from their raw bytes (the plain
+/// conversion is lossy UTF-8).
+fn mysql_export_row(columns: &[String], binary: &[bool], encoding: BinaryEncoding, row: mysql::Row) -> Value {
+    let raw: Vec<(usize, Option<Vec<u8>>)> = (0..columns.len())
+        .filter(|index| binary.get(*index).copied().unwrap_or(false))
+        .map(|index| {
+            let bytes = match row.as_ref(index) {
+                Some(mysql::Value::Bytes(bytes)) => Some(bytes.clone()),
+                _ => None,
+            };
+            (index, bytes)
+        })
+        .collect();
+    let mut json = mysql_row_to_json(columns, row);
+    if let Value::Object(object) = &mut json {
+        for (index, bytes) in raw {
+            if let Some(bytes) = bytes {
+                object.insert(columns[index].clone(), Value::String(encode_binary(&bytes, encoding)));
+            }
+        }
+    }
+    json
+}
+
 /// One `COPY ... TO STDOUT` text-format line -> JSON object (same typing as simple_query text).
-fn parse_copy_line(line: &[u8], columns: &[String], types: &[postgres::types::Type]) -> Result<Value, String> {
+fn parse_copy_line(
+    line: &[u8],
+    columns: &[String],
+    types: &[postgres::types::Type],
+    export: Option<BinaryEncoding>,
+) -> Result<Value, String> {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     let mut object = serde_json::Map::new();
     for (index, field) in line.split(|b| *b == b'\t').enumerate() {
@@ -481,7 +591,7 @@ fn parse_copy_line(line: &[u8], columns: &[String], types: &[postgres::types::Ty
         let value = if field == b"\\N" {
             Value::Null
         } else {
-            postgres_text_value(&copy_unescape(field), ty)?
+            pg_value(&copy_unescape(field), ty, export)?
         };
         object.insert(name.clone(), value);
     }
@@ -551,7 +661,7 @@ fn probe_in_transaction(adapter: &mut LiveAdapter) -> Option<bool> {
     }
 }
 
-type JobRun = (Result<Outcome, RunError>, Option<&'static str>, u64, Vec<Value>, Option<bool>);
+type JobRun = (Result<Outcome, RunError>, Option<&'static str>, u64, Vec<Value>, Option<bool>, Value);
 
 /// Runs one query job to completion and emits its final event. Never panics outward.
 pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec: QuerySpec, emit: Emitter) {
@@ -568,11 +678,35 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> JobRun {
         let mut adapter = lock(&session.adapter);
         let mut sink = Sink::new(&emit, &spec);
-        let result = run_streaming(&mut adapter, &spec, &ctl, &mut sink);
+        let mut result = run_streaming(&mut adapter, &spec, &ctl, &mut sink);
         sink.flush();
+        // A file is only ever published after a complete, error-free run.
+        let mut output_info = Value::Null;
+        if let Some(writer) = sink.out.take() {
+            let (rows, bytes) = (writer.rows, writer.bytes);
+            if let Some(err) = sink.io_error.take() {
+                result = Err(RunError::Message(err));
+            }
+            if result.is_ok() && !ctl.stopped() {
+                match writer.finish() {
+                    Ok(path) => {
+                        output_info = json!({
+                            "output_path": path.to_string_lossy(), "rows_written": rows, "bytes_written": bytes
+                        });
+                    }
+                    Err(err) => result = Err(RunError::Message(err)),
+                }
+            } else {
+                let partial = writer.abort().map(|path| path.to_string_lossy().to_string());
+                output_info = json!({
+                    "output_path": Value::Null, "partial_path": partial,
+                    "rows_written": rows, "bytes_written": bytes
+                });
+            }
+        }
         let stopped = ctl.stopped() || sink.truncated_by.is_some() || result.is_err();
         let in_transaction = if stopped { probe_in_transaction(&mut adapter) } else { None };
-        (result, sink.truncated_by, sink.streamed, std::mem::take(&mut sink.all), in_transaction)
+        (result, sink.truncated_by, sink.streamed, std::mem::take(&mut sink.all), in_transaction, output_info)
     }));
 
     // Free the session before the final event so a client's next request never sees `busy`.
@@ -581,16 +715,22 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
     lock(&jobs).remove(&spec.job_id);
     *lock(&session.running) = None;
 
+    let server_cancel_sent = ctl.server_cancel_sent.load(Ordering::SeqCst);
+    let Ok((result, truncated_by, streamed, rows, in_transaction, output_info)) = outcome else {
+        emit(json!({
+            "event": "error", "request_id": spec.request_id, "command": "query.execute",
+            "job_id": spec.job_id, "message": "query worker panicked"
+        }));
+        return;
+    };
     let base = |mut event: Value| {
         event["request_id"] = json!(spec.request_id);
         event["command"] = json!("query.execute");
         event["job_id"] = json!(spec.job_id);
+        if let (Some(target), Some(extra)) = (event.as_object_mut(), output_info.as_object()) {
+            target.extend(extra.iter().map(|(k, v)| (k.clone(), v.clone())));
+        }
         event
-    };
-    let server_cancel_sent = ctl.server_cancel_sent.load(Ordering::SeqCst);
-    let Ok((result, truncated_by, streamed, rows, in_transaction)) = outcome else {
-        emit(base(json!({"event": "error", "message": "query worker panicked"})));
-        return;
     };
     let timed_out = ctl.timed_out.load(Ordering::SeqCst);
     let cancelled = ctl.cancelled.load(Ordering::SeqCst);
@@ -706,7 +846,7 @@ mod tests {
             request_id: None,
             payload: json!({}),
         };
-        let mut spec = QuerySpec::from_request(&request, "j".into(), "select 1".into());
+        let mut spec = QuerySpec::from_request(&request, "j".into(), "select 1".into()).unwrap();
         spec.max_rows = Some(2);
         let mut sink = Sink::new(&emit, &spec);
         assert!(sink.push(json!(1)) && sink.push(json!(2)));

@@ -1,0 +1,19 @@
+[
+  {"value": null, "guard": true, "expected": ""},
+  {"value": "", "guard": true, "expected": "\"\""},
+  {"value": "plain", "guard": true, "expected": "plain"},
+  {"value": "a,b", "guard": true, "expected": "\"a,b\""},
+  {"value": "say \"hi\"\nnow", "guard": true, "expected": "\"say \"\"hi\"\"\nnow\""},
+  {"value": "한글 ✓ 😀", "guard": true, "expected": "한글 ✓ 😀"},
+  {"value": "12345678901234567890.1234567890", "guard": true, "expected": "12345678901234567890.1234567890"},
+  {"value": "=1+1", "guard": true, "expected": "'=1+1"},
+  {"value": "+SUM(A1)", "guard": true, "expected": "'+SUM(A1)"},
+  {"value": "-abc", "guard": true, "expected": "'-abc"},
+  {"value": "@cmd", "guard": true, "expected": "'@cmd"},
+  {"value": "=1+1", "guard": false, "expected": "=1+1"},
+  {"value": "-5", "guard": true, "expected": "-5"},
+  {"value": "+3", "guard": true, "expected": "+3"},
+  {"value": "-0.25", "guard": true, "expected": "-0.25"},
+  {"value": "1e-3", "guard": true, "expected": "1e-3"},
+  {"value": true, "guard": true, "expected": "true"}
+]
