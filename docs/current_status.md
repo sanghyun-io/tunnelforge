@@ -855,6 +855,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-09-30 | v2.7.0 package integration | Manager re-ran `cargo test` and `pytest -q` in each lane worktree; protected PR CI with the live DB gate | Lane 111: 2856 passed; lane 112: 2860 passed; lane 110 after main merge: 2940 passed / 11 skipped; all Rust suites passed; PRs #264/#266/#267 merged after exact-head CI | Lane live runs (Docker, disposable): TLS/SSH/cancel on MySQL 8.4 and PostgreSQL 18; export refusal and round trips on MySQL 8.0.46/8.4.11 and PostgreSQL 13.23/18.4; query cancel/limits on MySQL 8.4 and PostgreSQL 13. No real Mac or managed-provider run. |
 | 2026-09-30 | Package start decisions | `git fetch`; `pytest tests/test_current_status_docs.py -q`; `git diff --check` | origin/main unchanged at `92472b5`; documentation checks 76 passed | Documentation only. Recorded user decisions for TLS/SSH trust, export scope, Docker test environments, and per-lane releases; corrected agent-role names. No product behavior verified or issue closed. |
 | 2026-09-29 | Next-agent handoff | Source-path and workflow review; remote main/tag and published-release inspection; `pytest tests/test_current_status_docs.py -q` | Documentation checks 76 passed; execution guide added | Documentation only; no new product verification, implementation, deployment, or issue closure. Historical release evidence remains labeled as historical. |
 | 2026-09-29 | Remaining-work prioritization | Read tracker/roadmap; `pytest tests/test_current_status_docs.py -q`; `git diff --check` | Execution order recorded with acceptance criteria; documentation checks 76 passed | Planning only. Three Sol lanes are scoped under Astra; environment preparation and OS/provider checks run alongside each feature. No implementation or issue closure claimed. |
@@ -2858,13 +2859,16 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-124 | Low | open | CI stability | macOS arm64 `Smoke copied DMG install` intermittently exits in under a second without output (seen on PR #262 and #267; reruns pass) | Retry `hdiutil attach` without `-quiet` and log its error; do not treat as product failure |
+| TF-STATUS-123 | Medium | in_progress | Query results to file | Displayed and full-result CSV/JSON Lines export; full export re-runs in a server-enforced read-only transaction (PR #271) | Merge after v2.7.0 |
+| TF-STATUS-122 | Medium | in_progress | Versioned release | v2.7.0 with 110/111/112/120 and 105/108 live evidence; real Mac not validated by user decision | Protected tag and release workflows, asset digest checks, updater check, then record publication |
 | TF-STATUS-121 | Medium | closed | Usability patch release | v2.6.1 published through PR #260 and approved workflows; assets and actual updater verified | Preserve exact-head checks and immutable tag |
-| TF-STATUS-120 | Medium | open | Wizard responsiveness | Preselected wizard connector preparation still performs synchronous connection work | Reuse verified worker ownership with a cancellable wizard progress flow; direct connection dialog fix does not cover this entry |
-| TF-STATUS-119 | Medium | open | Backup lifecycle | Successful safe promotion retains backup namespaces and MySQL saved-view aliases; guided cleanup/recovery UI is not implemented | Add explicit recovery/retention review after release; never silently delete retained evidence or label saved aliases as backup-data views |
+| TF-STATUS-120 | Medium | closed | Wizard responsiveness | Preselected wizard connection and tunnel start run in cancellable background dialogs (PR #268) | Preserve queued-completion ownership, late-result discard and shutdown protection; SSH trust prompts stay on the GUI thread |
+| TF-STATUS-119 | Medium | in_progress | Backup lifecycle | List/reconcile/ownership-checked cleanup (PR #269) and guarded rollback (PR #270) implemented with live tests; not yet merged | Merge after v2.7.0; rollback only when backup and active tables are unchanged since cutover |
 | TF-STATUS-118 | High | closed | Restore availability | Safe preparation, both-engine guarded promotion, large cutover and exact-head protected gates passed | Preserve fail-closed unsupported/unknown-outcome policy; backup lifecycle is TF-STATUS-119 |
 | TF-STATUS-115 | High | closed | Export/Import contract | Data/schema/default/precision/snapshot fixes passed actual DB and protected gates; inconsistent old dumps safely refused | Retain supported policy; old dump omissions and orphan rows need authoritative reconciliation, not guessed repairs |
 | TF-STATUS-116 | High | closed | Versioned release | v2.6.0 published stable/latest; 10 assets/four sidecars and actual updater verified | Preserve immutable tag, exact-head CI and approved release workflow |
-| TF-STATUS-117 | Medium | in_progress | Commercial/usability implementation | First connection package shipped; remaining work ranked and handed off on 2026-09-29 | Follow `docs/handoff_2026-09-29.md`: parallel lanes for connection trust (110), export/import contract/faults (111/105/108), and query control (112); then recovery/cleanup (119) and remaining wizard responsiveness (120) |
+| TF-STATUS-117 | Medium | in_progress | Commercial/usability implementation | 2026-09-30 package: 110/111/112/120 done, 105/108 live evidence added; 119 and results-to-file (TF-STATUS-123) in review | Publish v2.7.0 (TF-STATUS-122), then merge 119/123 and continue P1 (read-only policy, workspace recovery) |
 | TF-STATUS-113 | High | closed | Connection responsiveness | Direct connect/test background work, cancellation cleanup and result-signal fix verified and shipped in 2.6.1 | Preserve queued-completion ownership and all-OS regressions; preselected wizard entry remains TF-STATUS-120 |
 | TF-STATUS-114 | Medium | watch | Product readiness | Prioritized commercial-use candidates and demonstration scenarios | Developer/small-team persona confirmed; validate observed task success using `docs/commercial_readiness_2026-09-28.md` before implementation |
 | TF-STATUS-100 | High | closed | SSH / TCP | Loopback isolation, resource cleanup, assigned ports and IPv6 probes fixed | Preserve real protocol regressions; peer trust remains TF-STATUS-110 |
@@ -2872,14 +2876,14 @@ Next action:
 | TF-STATUS-102 | High | closed | Import preflight | Validate metadata and decoded payload before target mutation; scope final DDL | Preserve pre-mutation validation; non-atomic restore remains TF-STATUS-112 |
 | TF-STATUS-103 | High | closed | SQL UI / DB shim | Dialect splitting, cursor consumption and database selection state fixed | Preserve dialect, cursor and endpoint-state regressions |
 | TF-STATUS-104 | High | closed | TSV | Single-column empty string rows preserved | Retain compressed/uncompressed streaming and buffered roundtrip coverage |
-| TF-STATUS-105 | High | fixed_pending_full_verify | Export snapshot | Consistent PostgreSQL and lock-free MySQL snapshots; honest manifest warnings | Preserve PG concurrent-write regression; finish limited-account MySQL concurrent-write/provider evidence |
+| TF-STATUS-105 | High | fixed_pending_full_verify | Export snapshot | Restricted MySQL account and concurrent-writer live tests pass (PR #267): strict parallel refused without privileges, explicit single-connection snapshot consistent | Managed-provider (RDS etc.) evidence remains |
 | TF-STATUS-106 | High | closed | Schema fidelity | FK actions and PostgreSQL composite key pairing preserved | Retain live cascade/set-null restore tests on both engines |
 | TF-STATUS-107 | Medium | closed | Release CLI | UTF-8 redirected output on Windows | Preserve CP949 redirected-stream regression checks |
-| TF-STATUS-108 | High | fixed_pending_full_verify | Import retries | Merge no longer truncates on retry; ambiguous chunk replay removed | Preserve failure safety; expand real disconnect fault injection |
+| TF-STATUS-108 | High | fixed_pending_full_verify | Import retries | Proxy-injected disconnect and lost-response faults verified for merge/replace on both engines (PR #267, in the live CI gate) | Real network partition and server-side commit-boundary kill not yet exercised |
 | TF-STATUS-109 | High | fixed_pending_full_verify | OS / CI | Linux full application gate and Windows frozen-main smoke added | Run hosted gates and real Mac validation; local frozen Windows/Linux smoke passes |
-| TF-STATUS-110 | High | open | Connection security | TLS policy and persisted SSH host identity verification incomplete | Design and implement verified TLS and host trust, including passphrase key handling |
-| TF-STATUS-111 | High | open | Complete backup fidelity | Normalized schema does not preserve all engine objects and attributes | Preserve or explicitly reject each unsupported construct; retain incomplete-export warnings |
-| TF-STATUS-112 | High | open | Query limits | Actual cancellation, bounded large results and multiple result sets remain incomplete | Add bounded execution and fault/load coverage; safe restore is separately verified under TF-STATUS-118 |
+| TF-STATUS-110 | High | closed | Connection security | Verified TLS (native-tls, verify_ca/verify_full, CA file, server name), SSH host-key trust-on-first-use and encrypted keys; live TLS/SSH/cancel tests (PR #265 via #268) | Preserve fail-closed TLS and host-key checks; vendored mysql patch documented in `migration_core/vendor/mysql/PATCH.md` |
+| TF-STATUS-111 | High | closed | Complete backup fidelity | Support table published; unsupported objects refused before export unless table-data-only is chosen (PR #264) | Keep refusal before any file write; broader object preservation only on demand |
+| TF-STATUS-112 | High | closed | Query limits | Server-side cancel/timeout, streamed batches, row/byte limits and multiple-result refusal verified on both engines (PR #266) | Incremental grid rendering and MySQL transaction-state reporting are follow-ups |
 | TF-STATUS-001 | High | closed | Export/Import Recovery | Initial import intent and strictness gates | Keep regression coverage aligned with import intent changes |
 | TF-STATUS-002 | High | closed | Rust Core import | Import success gated by row verification | Keep row verification/report coverage aligned with import mode changes |
 | TF-STATUS-003 | High | closed | Import UI | Object restoration wording | Keep focused regression |
@@ -2981,6 +2985,12 @@ Next action:
 | TF-STATUS-099 | High | closed | Release readiness / `2.5.1` publication | Import schema-fidelity and durable-mode logging patch published through protected gates | Keep `v2.5.1` stable/latest and retain exact-main tag, approvals, asset digests, and updater evidence |
 
 ## Recommended Execution Order
+
+Current state (2026-09-30): TF-STATUS-110/111/112/120 are implemented and verified;
+v2.7.0 publication is TF-STATUS-122. Next: merge 119 (#269/#270) and results-to-file
+(TF-STATUS-123, #271), fix the macOS DMG smoke flake (TF-STATUS-124), then P1
+operational read-only policy and workspace recovery. Real Mac validation is deferred
+by user decision; reported field errors drive follow-up.
 
 Current execution priority (2026-09-29):
 
@@ -3126,6 +3136,7 @@ The historical release-preservation checklist follows.
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-09-30 | Ran the package with an Opus 5.5 manager and three Sonnet 5.5 workers. Merged shared TLS contract (#263), export refusal (#264), query control (#266) and 105/108 live faults (#267); prepared v2.7.0 with connection trust (#265) and wizard/tunnel responsiveness (#268). Reviewed and fixed CRLF churn, a machine-wide process kill incident, a Linux-only test race, and a data-changing re-run risk in results export. | Canonical tracker, verification log, execution order | See the verification row of the same date; real Mac validation deferred by user decision. |
 | 2026-09-30 | Started the next package with user-approved decisions (native-tls, warn-only legacy profiles with TLS required for new ones, SSH trust-on-first-use, current export scope with pre-export refusal, disposable `tf-test-` Docker environments, per-lane releases). Corrected agent roles to an Opus 5.5 manager and Sonnet 5.5 workers. | Canonical execution order, handoff, commercial-readiness document | Documentation checks 76 passed; diff check passed. Planning documentation PR precedes code work. |
 | 2026-09-29 | Created an actionable Korean handoff with remaining priorities, Astra/gpt-6-sol ownership, acceptance criteria, live-test prerequisites, production-data boundaries, and protected release steps. | `docs/handoff_2026-09-29.md`, canonical status index | Source/workflow review and current-status documentation tests: 76 passed. Existing planning edits preserved; no application code changed. |
 | 2026-09-29 | Ranked remaining work and assigned parallel Astra/Sol lanes with concrete completion criteria. Preserved completed releases and distinguished operational Staging reconciliation from application work. | Canonical execution order/tracker and commercial-readiness priorities | Documentation checks 76 passed; no new product behavior validation or implementation claimed. |
