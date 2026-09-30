@@ -338,7 +338,7 @@ def test_macos_applications_install_smoke_script_validates_real_applications_pat
     assert "This script must run on macOS." in script
     assert "MACOS_APPLICATIONS_SMOKE_ALLOW_SYSTEM=1" in script
     assert "/Applications/TunnelForge.app" in script
-    assert "hdiutil attach" in script
+    assert "dmg_attach" in script
     assert "ditto" in script
     assert "python - <<'PY'" in script
     assert "--ui-smoke-check" in script
@@ -1961,7 +1961,9 @@ def test_macos_validation_workflow_builds_pr_artifacts():
     assert 'data["core_hello"]["service"] == "tunnelforge-core"' in workflow
     assert "bash scripts/package-macos.sh" in workflow
     assert "Smoke DMG package" in workflow
-    assert "hdiutil attach" in workflow
+    assert "dmg_attach" in workflow
+    assert 'source scripts/macos-dmg-mount.sh' in workflow
+    assert "hdiutil attach" not in workflow  # bare `hdiutil attach -quiet` hid the cause of flaky failures
     assert "build/dmg-smoke-mount" in workflow
     assert "build/install-smoke-mount" in workflow
     assert '"$DMG_SMOKE_MOUNT/TunnelForge.app/Contents/MacOS/TunnelForge"' in workflow
@@ -2115,3 +2117,72 @@ def test_windows_installer_installs_onedir_app_and_defers_postinstall_launch():
     assert "-WorkingDirectory '{app}'" in run_section
     assert "runhidden nowait postinstall skipifsilent" in run_section
     assert 'Filename: "{app}\\{#MyAppExeName}"' not in run_section
+
+
+def test_macos_dmg_mount_helper_retries_and_reports_failures():
+    helper = (PROJECT_ROOT / "scripts" / "macos-dmg-mount.sh").read_text(encoding="utf-8")
+
+    assert "hdiutil attach" in helper and "-quiet" not in helper
+    assert "attempt" in helper and "sleep" in helper
+    assert "hdiutil info" in helper  # diagnostics when every attempt failed
+    assert "hdiutil detach" in helper and "-force" in helper
+    for path in (
+        ".github/workflows/macos-app.yml",
+        ".github/workflows/release.yml",
+        ".github/workflows/version-gate.yml",
+        "scripts/validate-macos-release.sh",
+        "scripts/smoke-macos-applications-install.sh",
+    ):
+        text = (PROJECT_ROOT / path).read_text(encoding="utf-8")
+        assert "hdiutil attach" not in text and "hdiutil detach" not in text, path
+        assert "dmg_attach" in text and "dmg_detach" in text and "macos-dmg-mount.sh" in text, path
+
+
+def test_macos_dmg_mount_helper_behaves_with_a_fake_hdiutil(tmp_path):
+    import shutil
+    import subprocess
+
+    bash = shutil.which("bash")
+    if not bash:
+        pytest.skip("bash not available")
+    def bash_path(path):
+        # Git Bash on Windows needs /c/... instead of C:/... inside PATH
+        text = Path(path).as_posix()
+        return f"/{text[0].lower()}{text[2:]}" if re.match(r"^[A-Za-z]:/", text) else text
+
+    fake = tmp_path / "hdiutil"
+    counter = tmp_path / "count"
+    fake_lines = [
+        "#!/usr/bin/env bash",
+        'if [[ "$1" == attach ]]; then',
+        f'  n=$(cat "{bash_path(counter)}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{bash_path(counter)}"',
+        '  [[ $n -ge ${FAKE_OK_AT:-3} ]] && exit 0',
+        '  echo "hdiutil: attach failed - Resource busy" >&2; exit 1',
+        "fi",
+        'if [[ "$1" == detach ]]; then',
+        '  [[ " $* " == *" -force "* ]] && exit 0',
+        "  echo busy >&2; exit 1",
+        "fi",
+        'echo "fake info"',
+    ]
+    fake.write_text(chr(10).join(fake_lines) + chr(10), encoding="utf-8")
+    fake.chmod(0o755)
+    helper = PROJECT_ROOT / "scripts" / "macos-dmg-mount.sh"
+
+    def run(body, **env):
+        return subprocess.run(
+            [bash, "-c", f'export PATH="{bash_path(tmp_path)}:$PATH"; source "{bash_path(helper)}"; sleep() {{ :; }}; {body}'],
+            capture_output=True, text=True, env={**os.environ, **env},
+        )
+
+    ok = run('dmg_attach a.dmg /m', FAKE_OK_AT="3")
+    assert ok.returncode == 0 and counter.read_text().strip() == "3"
+    assert ok.stderr.count("attempt") == 2 and "Resource busy" in ok.stderr
+
+    counter.unlink()
+    failed = run('dmg_attach a.dmg /m', FAKE_OK_AT="99", DMG_MOUNT_MAX_ATTEMPTS="2")
+    assert failed.returncode == 1
+    assert "Resource busy" in failed.stderr and "fake info" in failed.stderr and "after 2 attempts" in failed.stderr
+
+    detached = run('dmg_detach /m')
+    assert detached.returncode == 0 and "detach failed on attempt 3/3" in detached.stderr
