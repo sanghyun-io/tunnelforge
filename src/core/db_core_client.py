@@ -1,6 +1,10 @@
-"""Sequential JSONL client for the long-lived Rust TunnelForge DB core process."""
+"""JSONL client for the long-lived Rust TunnelForge DB core process.
+
+One stdout reader thread routes events by `request_id`, so several requests (for example a
+running query and its `query.cancel`) can be in flight at once. The lock covers writes only."""
 import json
 import re
+import queue
 import subprocess
 import threading
 import uuid
@@ -15,7 +19,17 @@ logger = get_logger("db_core_service")
 
 
 class DbCoreServiceError(RuntimeError):
-    """Raised when the Rust DB core service cannot complete a request."""
+    """Raised when the Rust DB core service cannot complete a request.
+
+    `error_code` is the stable machine-readable code from the core (for example
+    `query_cancelled`); UI logic must branch on it, never on the message text.
+    """
+
+    def __init__(self, message: str = "", *, error_code: Optional[str] = None,
+                 payload: Optional[Dict[str, Any]] = None):
+        super().__init__(message)
+        self.error_code = error_code
+        self.payload = payload or {}
 
 
 def _format_error_event(payload: Dict[str, Any]) -> str:
@@ -81,8 +95,22 @@ def default_database_for_engine(engine: str, database: Optional[str] = None) -> 
     return "postgres" if normalize_db_engine(engine) == "postgresql" else ""
 
 
+class _Pending:
+    """One in-flight request: events are queued by the reader and consumed by the caller thread."""
+
+    __slots__ = ("events", "process")
+
+    def __init__(self, process: Any):
+        self.events: "queue.Queue[Any]" = queue.Queue()
+        self.process = process
+
+
+_CLOSED = object()
+_UNROUTED_LIMIT = 256
+
+
 class DbCoreServiceClient:
-    """Sequential JSONL client for the long-lived Rust DB core process."""
+    """JSONL client for the long-lived Rust DB core process (multiplexed by `request_id`)."""
 
     def __init__(
         self,
@@ -92,10 +120,18 @@ class DbCoreServiceClient:
         self.executable = executable or db_core_executable()
         self._popen_factory = popen_factory or subprocess.Popen
         self._process: Optional[subprocess.Popen] = None
+        # `_lock` serializes process start/shutdown and stdin writes; it is never held while
+        # waiting for a result (except by shutdown), so a cancel can overtake a running query.
         self._lock = threading.Lock()
         self._stderr_tail: Deque[str] = deque(maxlen=200)
         self._stderr_lock = threading.Lock()
         self._stderr_thread: Optional[threading.Thread] = None
+        self._pending_lock = threading.Lock()
+        self._pending: Dict[str, _Pending] = {}
+        # Events whose request is not registered yet (or unknown); claimed by the next request.
+        self._unrouted: Deque[Tuple[Optional[str], Any]] = deque(maxlen=_UNROUTED_LIMIT)
+        self._closed_processes: set = set()
+        self._reader_thread: Optional[threading.Thread] = None
 
     def start(self) -> None:
         with self._lock:
@@ -127,6 +163,7 @@ class DbCoreServiceClient:
         with self._stderr_lock:
             self._stderr_tail.clear()
         self._start_stderr_drain_locked(process)
+        self._start_reader_locked(process)
 
     def _start_stderr_drain_locked(self, process: subprocess.Popen) -> None:
         """Spawn a background thread draining stderr so it never fills the OS pipe buffer."""
@@ -151,18 +188,84 @@ class DbCoreServiceClient:
         self._stderr_thread = thread
         thread.start()
 
+    def _start_reader_locked(self, process: subprocess.Popen) -> None:
+        """Spawn the single stdout reader that routes events to their requests."""
+        stdout = process.stdout
+        if stdout is None:
+            return
+
+        def _read() -> None:
+            try:
+                while True:
+                    line = stdout.readline()
+                    if line == "":
+                        break
+                    self._route_line(line)
+            except (ValueError, OSError):
+                pass
+            self._process_closed(process)
+
+        thread = threading.Thread(target=_read, daemon=True, name="db-core-reader")
+        self._reader_thread = thread
+        thread.start()
+
+    def _route_line(self, line: str) -> None:
+        try:
+            event = parse_helper_event(line)
+        except Exception:
+            logger.warning("DB core emitted an unparsable line: %s", line[:200])
+            return
+        with self._pending_lock:
+            pending = self._pending.get(event.request_id) if event.request_id else None
+            if pending is None and event.request_id is None and len(self._pending) == 1:
+                pending = next(iter(self._pending.values()))
+            if pending is None:
+                self._unrouted.append((event.request_id, event))
+                return
+        pending.events.put(event)
+
+    def _process_closed(self, process: Any) -> None:
+        """stdout reached EOF: wake every request that was waiting on this process."""
+        thread = self._stderr_thread
+        if thread is not None:
+            thread.join(timeout=1.0)  # let the last stderr lines land in the tail
+        with self._pending_lock:
+            self._closed_processes.add(id(process))
+            waiting = [p for p in self._pending.values() if p.process is process]
+        for pending in waiting:
+            pending.events.put(_CLOSED)
+
     def _stderr_tail_text(self) -> str:
         with self._stderr_lock:
             return "\n".join(self._stderr_tail)
 
-    def _send_locked(
-        self,
-        command: str,
-        payload: Optional[Dict[str, Any]],
-        request_id: str,
-        on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
-    ) -> Dict[str, Any]:
-        """Send one JSONL request and read its result. Caller must already hold `_lock`."""
+    def _register_locked(self, request_id: str) -> _Pending:
+        """Register a request before writing it. Caller must hold `_lock` (process is running)."""
+        process = self._process
+        assert process is not None
+        pending = _Pending(process)
+        with self._pending_lock:
+            self._pending[request_id] = pending
+            keep: Deque[Tuple[Optional[str], Any]] = deque(maxlen=_UNROUTED_LIMIT)
+            claimed_final = False  # id-less events belong to one request: stop after its result
+            for key, event in self._unrouted:
+                anonymous = key is None and len(self._pending) == 1 and not claimed_final
+                if key == request_id or anonymous:
+                    pending.events.put(event)
+                    if key is None and event.event in ("result", "error"):
+                        claimed_final = True
+                else:
+                    keep.append((key, event))
+            self._unrouted = keep
+            if id(process) in self._closed_processes:
+                pending.events.put(_CLOSED)
+        return pending
+
+    def _forget(self, request_id: str) -> None:
+        with self._pending_lock:
+            self._pending.pop(request_id, None)
+
+    def _write_locked(self, request_id: str, command: str, payload: Optional[Dict[str, Any]]) -> _Pending:
         body = {
             "command": command,
             "request_id": request_id,
@@ -171,27 +274,42 @@ class DbCoreServiceClient:
         process = self._process
         assert process is not None
         stdin = process.stdin
-        stdout = process.stdout
-        if stdin is None or stdout is None:
+        if stdin is None or process.stdout is None:
             raise DbCoreServiceError("DB core service pipes are not available")
+        pending = self._register_locked(request_id)
+        try:
+            stdin.write(json.dumps(body, ensure_ascii=False) + "\n")
+            stdin.flush()
+        except Exception:
+            self._forget(request_id)
+            raise
+        return pending
 
-        stdin.write(json.dumps(body, ensure_ascii=False) + "\n")
-        stdin.flush()
-
-        while True:
-            line = stdout.readline()
-            if line == "":
-                raise DbCoreServiceError(self._stderr_tail_text() or "DB core service stopped before a result")
-
-            event = parse_helper_event(line)
-            if event.request_id not in (None, request_id):
-                continue
-            if on_event:
-                on_event(event.payload)
-            if event.event == "result":
-                return event.payload
-            if event.event == "error":
-                raise DbCoreServiceError(_format_error_event(event.payload))
+    def _await(
+        self,
+        request_id: str,
+        pending: _Pending,
+        on_event: Optional[Callable[[Dict[str, Any]], None]],
+    ) -> Dict[str, Any]:
+        """Consume this request's events on the caller thread until its result or error."""
+        try:
+            while True:
+                item = pending.events.get()
+                if item is _CLOSED:
+                    raise DbCoreServiceError(self._stderr_tail_text() or "DB core service stopped before a result")
+                event = item
+                if on_event:
+                    on_event(event.payload)
+                if event.event == "result":
+                    return event.payload
+                if event.event == "error":
+                    raise DbCoreServiceError(
+                        _format_error_event(event.payload),
+                        error_code=event.payload.get("error_code"),
+                        payload=event.payload,
+                    )
+        finally:
+            self._forget(request_id)
 
     def request(
         self,
@@ -203,7 +321,8 @@ class DbCoreServiceClient:
         request_id = request_id or f"py-{uuid.uuid4().hex}"
         with self._lock:
             self._start_locked()
-            return self._send_locked(command, payload, request_id, on_event)
+            pending = self._write_locked(request_id, command, payload)
+        return self._await(request_id, pending, on_event)
 
     def shutdown(self) -> None:
         with self._lock:
@@ -212,7 +331,9 @@ class DbCoreServiceClient:
                 return
             try:
                 if process.poll() is None:
-                    self._send_locked("service.shutdown", None, f"py-{uuid.uuid4().hex}")
+                    request_id = f"py-{uuid.uuid4().hex}"
+                    pending = self._write_locked(request_id, "service.shutdown", None)
+                    self._await(request_id, pending, None)
             except Exception:
                 process.terminate()
             finally:

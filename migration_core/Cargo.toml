@@ -13,9 +13,15 @@ path = "src/main.rs"
 
 [dependencies]
 hex = "0.4"
-mysql = "26"
+mysql = { version = "26", features = ["native-tls"] }
+native-tls = "0.2"
 postgres = "0.19"
+postgres-native-tls = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 zstd = "0.13"
+
+# Vendored mysql 26.0.1 + SslOpts::with_tls_server_name (see vendor/mysql/PATCH.md).
+[patch.crates-io]
+mysql = { path = "vendor/mysql" }

@@ -11,6 +11,9 @@ from PyQt6.QtGui import QAction, QIcon
 
 from src.ui.styles import ButtonStyles, LabelStyles, get_full_app_style
 from src.ui.theme_manager import ThemeManager
+from src.ui.trust_prompts import TrustPrompter
+from src.ui.dialogs.preselected_connect_dialog import start_tunnel_with_progress
+from src.core.connection_trust import insecure_connection_warning
 from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
@@ -80,6 +83,10 @@ class TunnelManagerUI(QMainWindow):
         self.config_mgr = config_manager
         self.engine = tunnel_engine
         self._start_background = start_background
+
+        # SSH 호스트 키 확인 / 개인키 비밀번호 입력 대화상자를 GUI 스레드에서 띄우는 다리 (TF-STATUS-110)
+        self._trust_prompter = TrustPrompter(self)
+        self._trust_prompter.install(self.engine)
 
         # 설정 로드
         self.config_data = self.config_mgr.load_config()
@@ -629,10 +636,22 @@ class TunnelManagerUI(QMainWindow):
 
     def start_tunnel(self, tunnel_config):
         self.statusBar().showMessage(f"연결 시도 중: {tunnel_config['name']}...")
-        success, msg = self.engine.start_tunnel(tunnel_config)
+        # SSH 접속(호스트 키 확인/개인키 비밀번호 포함)은 백그라운드에서 수행한다 (TF-STATUS-120).
+        outcome = start_tunnel_with_progress(self, self.engine, tunnel_config)
+        if outcome is None:
+            self.statusBar().showMessage(f"연결 취소: {tunnel_config['name']}")
+            self.refresh_table()
+            return False
+        success, msg = outcome
 
         if success:
-            self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
+            tls_warning = insecure_connection_warning(tunnel_config)
+            if tls_warning:
+                # 검증 없는 연결은 연결할 때마다 다시 알린다 (자동 승격/무시 없음)
+                self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']} - ⚠ {tls_warning}")
+                logger.warning(f"Unverified DB TLS connection: {tunnel_config['name']}")
+            else:
+                self.statusBar().showMessage(f"연결 성공: {tunnel_config['name']}")
             self.tray_icon.showMessage("TunnelForge", f"{tunnel_config['name']} 연결되었습니다.", QSystemTrayIcon.MessageIcon.Information, 2000)
             self._register_login_path(tunnel_config)
         else:
@@ -1147,7 +1166,8 @@ class TunnelManagerUI(QMainWindow):
                 continue
 
             # 연결 시도
-            success, msg = self.engine.start_tunnel(tunnel, check_port=True)
+            outcome = start_tunnel_with_progress(self, self.engine, tunnel, check_port=True)
+            success, msg = outcome if outcome is not None else (False, "cancelled")
             if success:
                 connected.append(tunnel['name'])
                 logger.info(f"자동 연결 성공: {tunnel['name']}")

@@ -8,6 +8,7 @@ SQL 에디터 다이얼로그
 - 멀티 탭 에디터 지원
 """
 import os
+import threading
 import time
 import logging
 from PyQt6.QtWidgets import (
@@ -16,7 +17,7 @@ from PyQt6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QFileDialog, QMessageBox,
     QStatusBar, QApplication, QAbstractItemView, QListWidget, QListWidgetItem, QProgressBar,
     QDialogButtonBox, QMenu, QCheckBox, QFrame, QToolTip, QLineEdit,
-    QTreeWidget, QTreeWidgetItem
+    QTreeWidget, QTreeWidgetItem, QSpinBox
 )
 from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QThread, QTimer, QPoint
 from PyQt6.QtGui import (
@@ -27,6 +28,7 @@ import re
 from typing import List, Dict, Optional, Tuple
 
 from src.core.db_core_service import normalize_db_engine
+from src.core.query_limits import build_query_limits
 from src.core.sql_query_classifier import (
     classify_sql_statement,
     is_mysql_implicit_commit_ddl,
@@ -371,6 +373,20 @@ class SQLEditorDialog(QDialog):
         self.btn_execute_all.setToolTip("전체 쿼리 실행 (F5)\n에디터의 모든 쿼리 실행")
         self.btn_execute_all.clicked.connect(self.execute_all_queries)
         toolbar.addWidget(self.btn_execute_all)
+
+        self.btn_cancel_query = QPushButton("⏹ 취소")
+        self.btn_cancel_query.setStyleSheet(SECONDARY_BUTTON_QSS)
+        self.btn_cancel_query.setToolTip("실행 중인 쿼리를 서버에서 취소합니다")
+        self.btn_cancel_query.clicked.connect(self._cancel_running_query)
+        self.btn_cancel_query.setVisible(False)
+        toolbar.addWidget(self.btn_cancel_query)
+
+        self.query_timeout_spin = QSpinBox()
+        self.query_timeout_spin.setRange(0, 86400)
+        self.query_timeout_spin.setSuffix(" 초")
+        self.query_timeout_spin.setSpecialValueText("제한시간 없음")
+        self.query_timeout_spin.setToolTip("쿼리 제한시간 (0 = 사용 안 함). 초과하면 서버에서 취소됩니다")
+        toolbar.addWidget(self.query_timeout_spin)
 
         btn_open = QPushButton("📂 열기")
         btn_open.setToolTip("SQL 파일 열기 (Ctrl+O)")
@@ -1032,7 +1048,10 @@ class SQLEditorDialog(QDialog):
         if len(queries) > 1:
             self.progress_bar.setMaximum(len(queries))
 
-        self.worker = SQLTransactionExecutionWorker(self.db_connection, queries, self._db_engine())
+        self.worker = SQLTransactionExecutionWorker(
+            self.db_connection, queries, self._db_engine(), limits=self._query_limits()
+        )
+        self.worker.result_truncated.connect(self._on_result_truncated)
         self.worker.progress.connect(self._on_transaction_progress)
         self.worker.query_result.connect(self._on_transaction_query_result)
         self.worker.postgres_rolled_back.connect(self._on_postgres_transaction_rolled_back)
@@ -1165,7 +1184,10 @@ class SQLEditorDialog(QDialog):
                 queries,
                 engine=self._db_engine(),
                 schema=schema,
+                limits=self._query_limits(),
             )
+            self.worker.result_truncated.connect(self._on_result_truncated)
+            self.worker.rows_progress.connect(self._on_rows_progress)
             self.worker.progress.connect(self._on_progress)
             self.worker.query_result.connect(self._on_query_result)
             self.worker.finished.connect(self._on_finished)
@@ -1687,6 +1709,10 @@ class SQLEditorDialog(QDialog):
         """
         self.btn_execute_current.setEnabled(not is_executing)
         self.btn_execute_all.setEnabled(not is_executing)
+        cancel_button = getattr(self, 'btn_cancel_query', None)
+        if cancel_button is not None:
+            cancel_button.setVisible(is_executing)
+            cancel_button.setEnabled(is_executing)
         self.db_combo.setEnabled(not is_executing)
         self.auto_commit_check.setEnabled(not is_executing)
         self.progress_bar.setVisible(is_executing)
@@ -1715,6 +1741,28 @@ class SQLEditorDialog(QDialog):
                 self._exec_timer = None
             self._exec_start_time = None
             self._update_tx_status()
+
+    def _query_limits(self):
+        """결과 상한(기본 10만 행/256 MiB)과 사용자 제한시간(기본 꺼짐)"""
+        spin = getattr(self, 'query_timeout_spin', None)
+        return build_query_limits(spin.value() if spin is not None else 0)
+
+    def _cancel_running_query(self):
+        """취소 버튼: 서버 쿼리를 실제로 취소한다 (UI가 멈추지 않도록 별도 스레드에서 요청)."""
+        worker = self.worker
+        cancel = getattr(worker, 'cancel_query', None)
+        if cancel is None:
+            return
+        self.btn_cancel_query.setEnabled(False)
+        self.status_bar.showMessage("⏹ 취소 요청 중...")
+        threading.Thread(target=cancel, daemon=True).start()
+
+    def _on_result_truncated(self, idx, notice):
+        self.message_text.append(f"⚠️ 쿼리 {idx + 1}: {notice}")
+        self._set_message_summary(f"쿼리 {idx + 1} · {notice}")
+
+    def _on_rows_progress(self, idx, rows):
+        self.status_bar.showMessage(f"⏳ 쿼리 {idx + 1}: {rows:,}행 수신 중...")
 
     def _update_elapsed_time(self):
         """경과 시간 실시간 업데이트"""

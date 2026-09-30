@@ -120,6 +120,7 @@ jobs:
             --test live_import_policy \
             --test live_foreign_key_actions \
             --test live_export_contract \
+            --test live_fault_injection \
             --test live_safe_restore \
             --test live_backup_lifecycle \
             -- --include-ignored --test-threads=1

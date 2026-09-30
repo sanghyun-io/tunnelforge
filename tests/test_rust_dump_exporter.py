@@ -1433,3 +1433,61 @@ class TestCoreEventForwarding:
                 "scheduled_tables": [{"name": "huge", "rows": 100, "estimated_chunks": 1}],
             }
         ]
+
+
+class TestExportRefusalContract:
+    def _exporter(self, facade):
+        from src.exporters.rust_dump_exporter import RustDumpConfig, RustDumpExporter
+
+        return RustDumpExporter(RustDumpConfig("localhost", 3306, "root", "password"), facade=facade)
+
+    def test_refusal_event_is_captured_by_error_code_not_message(self, tmp_path):
+        from src.core.db_core_client import DbCoreServiceError
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                on_event({
+                    "event": "error", "error_code": "unsupported_objects",
+                    "message": "unrelated wording", "objects": ["trigger:t:trg", "routine:fn"],
+                    "bypassable": True,
+                })
+                raise DbCoreServiceError("unrelated wording")
+
+        facade = FakeFacade()
+        exporter = self._exporter(facade)
+        success, _ = exporter.export_full_schema("app", str(tmp_path / "dump"))
+
+        assert success is False
+        assert "allow_incomplete" not in facade.payload
+        assert exporter.last_refusal == {"objects": ["trigger:t:trg", "routine:fn"], "bypassable": True}
+
+    def test_other_errors_do_not_look_like_refusals(self, tmp_path):
+        from src.core.db_core_client import DbCoreServiceError
+
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                on_event({"event": "error", "message": "trigger:x mentioned in text"})
+                raise DbCoreServiceError("boom")
+
+        exporter = self._exporter(FakeFacade())
+        exporter.export_tables("app", ["t"], str(tmp_path / "dump"), include_fk_parents=False)
+
+        assert exporter.last_refusal is None
+
+    def test_incomplete_choice_reaches_core_payload_and_resets_refusal(self, tmp_path):
+        class FakeFacade:
+            def run_dump(self, payload, on_event=None):
+                self.payload = payload
+                return {"success": True, "tables": 1, "rows_dumped": 1}
+
+        facade = FakeFacade()
+        exporter = self._exporter(facade)
+        exporter.last_refusal = {"objects": ["x"], "bypassable": True}
+        success, _, _ = exporter.export_tables(
+            "app", ["t"], str(tmp_path / "dump"), include_fk_parents=False, allow_incomplete=True
+        )
+
+        assert success is True
+        assert facade.payload["allow_incomplete"] is True
+        assert exporter.last_refusal is None

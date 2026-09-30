@@ -437,9 +437,9 @@ fn inspect_mysql_unsupported_objects(
     objects.extend(views);
     let triggers: Vec<String> = conn
         .exec_map(
-            "SELECT TRIGGER_NAME FROM information_schema.triggers WHERE TRIGGER_SCHEMA = ? ORDER BY TRIGGER_NAME",
+            "SELECT EVENT_OBJECT_TABLE, TRIGGER_NAME FROM information_schema.triggers WHERE TRIGGER_SCHEMA = ? ORDER BY TRIGGER_NAME",
             (database,),
-            |name: String| format!("trigger:{name}"),
+            |(table, name): (String, String)| format!("trigger:{table}:{name}"),
         )
         .map_err(|err| format!("mysql trigger inspect error: {err}"))?;
     objects.extend(triggers);
@@ -451,6 +451,14 @@ fn inspect_mysql_unsupported_objects(
         )
         .map_err(|err| format!("mysql routine inspect error: {err}"))?;
     objects.extend(routines);
+    let events: Vec<String> = conn
+        .exec_map(
+            "SELECT EVENT_NAME FROM information_schema.events WHERE EVENT_SCHEMA = ? ORDER BY EVENT_NAME",
+            (database,),
+            |name: String| format!("event:{name}"),
+        )
+        .map_err(|err| format!("mysql event inspect error: {err}"))?;
+    objects.extend(events);
     let columns: Vec<(String, String, String, Option<String>, String)> = conn.exec(
         "SELECT TABLE_NAME, COLUMN_NAME, EXTRA, COLUMN_DEFAULT, DATA_TYPE FROM information_schema.columns WHERE TABLE_SCHEMA=? ORDER BY TABLE_NAME, ORDINAL_POSITION",
         (database,),
@@ -637,14 +645,24 @@ fn inspect_postgresql_unsupported_objects(
 
     let triggers = client
         .query(
-            "SELECT DISTINCT trigger_name FROM information_schema.triggers WHERE trigger_schema = $1 ORDER BY trigger_name",
+            "SELECT DISTINCT event_object_table, trigger_name FROM information_schema.triggers WHERE trigger_schema = $1 ORDER BY trigger_name",
             &[&schema_name],
         )
         .map_err(|err| format!("postgresql trigger inspect error: {err}"))?;
+    objects.extend(triggers.into_iter().map(|row| {
+        format!("trigger:{}:{}", row.get::<_, String>(0), row.get::<_, String>(1))
+    }));
+
+    let matviews = client
+        .query(
+            "SELECT matviewname FROM pg_matviews WHERE schemaname = $1 ORDER BY matviewname",
+            &[&schema_name],
+        )
+        .map_err(|err| format!("postgresql materialized view inspect error: {err}"))?;
     objects.extend(
-        triggers
+        matviews
             .into_iter()
-            .map(|row| format!("trigger:{}", row.get::<_, String>(0))),
+            .map(|row| format!("materialized_view:{}", row.get::<_, String>(0))),
     );
 
     let routines = client
