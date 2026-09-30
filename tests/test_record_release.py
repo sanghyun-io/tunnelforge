@@ -186,6 +186,13 @@ class TestCLI:
             next(ln for ln in content.splitlines() if "`v2.4.3`" in ln and ln.startswith("| "))
         )
 
+    def test_real_insert_keeps_lf_line_endings(self, tmp_path):
+        doc = tmp_path / "current_status.md"
+        doc.write_bytes(SAMPLE_DOC.encode("utf-8"))
+        code, _, stderr = self.run(*self._valid_args(doc))
+        assert code == 0, stderr
+        assert b"\r\n" not in doc.read_bytes()
+
     def test_duplicate_exit_nonzero(self, tmp_path):
         doc = tmp_path / "current_status.md"
         doc.write_text(SAMPLE_DOC, encoding="utf-8")

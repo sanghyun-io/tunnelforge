@@ -2,8 +2,13 @@
 Cross-Engine 마이그레이션 소스/타겟 엔드포인트 입력 폼
 """
 from typing import Dict, Optional
-from PyQt6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QLineEdit, QSpinBox
+from PyQt6.QtWidgets import (
+    QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QPushButton, QSpinBox, QWidget,
+)
 
+from src.core.connection_trust import (
+    TLS_DISABLE, TLS_MODE_LABELS, TLS_MODES, default_tls_mode, insecure_connection_warning, resolve_tls_policy,
+)
 from src.ui.dialogs.preselected_connect_dialog import start_tunnel_with_progress
 from src.core.cross_engine_migration import (
     DEFAULT_MYSQL_PORT,
@@ -70,7 +75,88 @@ class EndpointForm(QGroupBox):
         layout.addRow("Password:", self.input_password)
         layout.addRow("Database:", self.input_database)
         layout.addRow("Schema scope:", self.input_schema)
+        self._build_tls_rows(layout)
         self._apply_tunnel_only_state()
+
+    # --- TLS (TF-STATUS-110): 수동 입력 host 도 검증 모드를 명시적으로 고른다 ---
+    def _build_tls_rows(self, layout):
+        self._tls_touched = False
+        self._tls_server_name = ""  # 터널 프로필에서 온 값 (호스트를 직접 고치면 폐기)
+        self._tls_connection_mode = "direct"
+        self.combo_tls = QComboBox()
+        for mode in (TLS_MODES[2], TLS_MODES[1], TLS_MODES[0]):
+            self.combo_tls.addItem(TLS_MODE_LABELS[mode], mode)
+        self.combo_tls.activated.connect(self._on_tls_chosen)
+        self.combo_tls.currentIndexChanged.connect(self._update_tls_state)
+        layout.addRow("TLS 검증:", self.combo_tls)
+
+        self.input_tls_ca = QLineEdit()
+        self.input_tls_ca.setPlaceholderText("(선택) 사설 CA 인증서 PEM 파일")
+        self.btn_tls_ca = QPushButton("파일 찾기")
+        self.btn_tls_ca.clicked.connect(self._select_tls_ca)
+        self.tls_ca_widget = QWidget()
+        ca_layout = QHBoxLayout(self.tls_ca_widget)
+        ca_layout.setContentsMargins(0, 0, 0, 0)
+        ca_layout.addWidget(self.input_tls_ca)
+        ca_layout.addWidget(self.btn_tls_ca)
+        layout.addRow("CA 인증서:", self.tls_ca_widget)
+
+        self.lbl_tls_warning = QLabel("")
+        self.lbl_tls_warning.setWordWrap(True)
+        self.lbl_tls_warning.setStyleSheet("color: #c0392b; font-weight: bold;")
+        layout.addRow(self.lbl_tls_warning)
+
+        self.input_host.textEdited.connect(self._on_host_edited)
+        self._apply_default_tls_mode()
+        self._update_tls_state()
+
+    def _apply_default_tls_mode(self):
+        default = default_tls_mode(self._tls_connection_mode, self.input_host.text().strip() or "127.0.0.1")
+        self.combo_tls.setCurrentIndex(self.combo_tls.findData(default))
+
+    def _on_tls_chosen(self, _index=None):
+        self._tls_touched = True
+
+    def _on_host_edited(self, _text=""):
+        # 직접 입력한 호스트는 더 이상 선택했던 터널의 것이 아니다
+        self._tls_server_name = ""
+        self._tls_connection_mode = "direct"
+        if not self._tls_touched:
+            self._apply_default_tls_mode()
+        self._update_tls_state()
+
+    def _select_tls_ca(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "CA 인증서 파일 선택", "", "Certificate Files (*.pem *.crt *.cer);;All Files (*)")
+        if filename:
+            self.input_tls_ca.setText(filename)
+
+    def _update_tls_state(self, *_args):
+        verified = self.combo_tls.currentData() != TLS_DISABLE
+        self.tls_ca_widget.setEnabled(verified and not self.require_tunnel)
+        warning = insecure_connection_warning({
+            "connection_mode": self._tls_connection_mode,
+            "remote_host": self.input_host.text().strip() or "127.0.0.1",
+            "db_tls_mode": self.combo_tls.currentData(),
+        })
+        self.lbl_tls_warning.setText(f"⚠ {warning}" if warning else "")
+        self.lbl_tls_warning.setVisible(bool(warning))
+
+    def _apply_tunnel_tls(self, config: Dict):
+        """선택한 터널 프로필의 TLS 설정을 폼에 반영한다 (프로필 = 정책의 원천)."""
+        policy = resolve_tls_policy(config)
+        self._tls_connection_mode = config.get("connection_mode", "ssh_tunnel")
+        self._tls_server_name = policy.server_name
+        self.combo_tls.setCurrentIndex(self.combo_tls.findData(policy.mode))
+        self.input_tls_ca.setText(policy.ca_file)
+        self._update_tls_state()
+
+    def tls_settings(self) -> Dict:
+        return {
+            "tls_mode": self.combo_tls.currentData(),
+            "tls_ca_file": self.input_tls_ca.text().strip(),
+            "tls_server_name": self._tls_server_name,
+        }
 
     def _load_tunnels(self):
         selected_data = self.combo_tunnel.currentData() if hasattr(self, "combo_tunnel") else None
@@ -198,6 +284,7 @@ class EndpointForm(QGroupBox):
             self.input_host.setText(str(host))
         if port:
             self.input_port.setValue(int(port))
+        self._apply_tunnel_tls(config)
 
         engine = self._detect_engine(config)
         engine_index = self.combo_engine.findData(engine.value)
@@ -250,6 +337,9 @@ class EndpointForm(QGroupBox):
         self.input_user.setReadOnly(True)
         self.input_password.setReadOnly(True)
         self.input_database.setReadOnly(True)
+        self.combo_tls.setEnabled(False)
+        self.input_tls_ca.setReadOnly(True)
+        self.btn_tls_ca.setEnabled(False)
 
     def set_inputs_enabled(self, enabled: bool):
         """Lock/unlock the mutable inputs while a worker is running.
@@ -270,6 +360,9 @@ class EndpointForm(QGroupBox):
             self.input_password.setEnabled(enabled)
             self.input_database.setEnabled(enabled)
             self.input_schema.setEnabled(enabled)
+            self.combo_tls.setEnabled(enabled)
+            self.input_tls_ca.setEnabled(enabled)
+            self.btn_tls_ca.setEnabled(enabled)
 
     def _prepare_selected_tunnel(self):
         data = self.combo_tunnel.currentData()
@@ -318,4 +411,5 @@ class EndpointForm(QGroupBox):
             password=self.input_password.text(),
             database=database,
             schema=schema,
+            **self.tls_settings(),
         ).to_payload()

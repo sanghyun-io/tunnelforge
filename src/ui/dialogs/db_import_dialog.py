@@ -15,6 +15,7 @@ from datetime import datetime
 import json
 import os
 
+from src.core.connection_trust import apply_registered_tls
 from src.core.constants import MAX_LOG_ENTRIES, MAX_VISIBLE_LOG_LINES, TABLE_STATUS_ICONS
 from src.core.db_connector import MySQLConnector
 from src.core.error_report_sanitizer import (
@@ -1750,7 +1751,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             raise ValueError("검증된 복원 계획 정보가 없습니다. 안전 복원 보고서를 확인하세요.")
         original.update(user=self.restore_config.user, password=self.restore_config.password)
         return {"action": action, "restore_id": self.import_audit["restore_id"],
-                "report_path": self.import_audit["report_path"], "target": original}
+                "report_path": self.import_audit["report_path"], "target": apply_registered_tls(original)}
 
     def review_restore_target(self):
         try:
