@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 use mysql::prelude::Queryable;
 use postgres::{error::SqlState, NoTls};
+use postgres::config::SslMode;
 
 pub(crate) const MYSQL_INSERT_FALLBACK_BATCH_ROWS: usize = 500;
 pub(crate) const MYSQL_INSERT_FALLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
@@ -506,7 +507,10 @@ impl LiveAdapter {
                     mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
                 let conn = pool
                     .get_conn()
-                    .map_err(|err| format!("mysql connection error: {err}"))?;
+                    .map_err(|err| {
+                        let suffix = tls_error_suffix(classify_mysql_error(endpoint, &err));
+                        format!("mysql connection error: {err}{suffix}")
+                    })?;
                 Ok(Self::MySql(conn))
             }
             "postgresql" => {
@@ -713,6 +717,7 @@ pub(crate) fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
         .user(Some(endpoint.user.clone()))
         .pass(Some(endpoint.password.clone()))
         .db_name(Some(endpoint.database.clone()))
+        .ssl_opts(mysql_ssl_opts(endpoint))
         // TCP keepalive: 유휴 소켓에 주기적 하트비트를 흘려 SSH 터널/방화벽/LB의
         // idle-timeout으로 연결이 끊기는 것을 막는다(대량 import 중 pooled 연결이
         // 쿼리 없이 대기하는 구간 방어). 밀리초 단위, Windows 포함 전 플랫폼 지원.
@@ -735,17 +740,32 @@ pub(crate) fn postgres_config(endpoint: &Endpoint) -> postgres::Config {
 }
 
 /// Single PostgreSQL connection entry point; TLS policy is applied here only.
-pub(crate) fn connect_postgres(endpoint: &Endpoint) -> Result<postgres::Client, postgres::Error> {
-    postgres_config(endpoint).connect(NoTls)
+pub(crate) fn connect_postgres(endpoint: &Endpoint) -> Result<postgres::Client, ConnectError> {
+    let mut config = postgres_config(endpoint);
+    match postgres_tls(endpoint)? {
+        None => config.connect(NoTls).map_err(|err| ConnectError::new(None, err.to_string())),
+        Some(tls) => {
+            // Require: never fall back to plaintext when verified TLS was asked for.
+            config.ssl_mode(SslMode::Require);
+            config.connect(tls).map_err(|err| {
+                ConnectError::new(classify_postgres_error(endpoint, &err), error_chain(&err))
+            })
+        }
+    }
 }
 
 /// Out-of-band PostgreSQL cancel request; must use the same TLS policy as `connect_postgres`.
 #[allow(dead_code)] // TF-STATUS-112 wires this into query.cancel.
 pub(crate) fn cancel_postgres_query(
     token: &postgres::CancelToken,
-    _endpoint: &Endpoint,
-) -> Result<(), postgres::Error> {
-    token.cancel_query(NoTls)
+    endpoint: &Endpoint,
+) -> Result<(), ConnectError> {
+    match postgres_tls(endpoint)? {
+        None => token.cancel_query(NoTls).map_err(|err| ConnectError::new(None, err.to_string())),
+        Some(tls) => token.cancel_query(tls).map_err(|err| {
+            ConnectError::new(classify_postgres_error(endpoint, &err), error_chain(&err))
+        }),
+    }
 }
 
 pub(crate) fn endpoint_schema(endpoint: &Endpoint) -> String {

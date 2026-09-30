@@ -693,6 +693,38 @@ class TestConfigManager:
             'auto_update_check': True,
         }
 
+    def test_known_host_round_trip(self):
+        assert self.config_mgr.get_known_host("Bastion", 22) is None
+        entry = {"key_type": "ssh-ed25519", "key_b64": "AAAA", "fingerprint": "SHA256:x"}
+        self.config_mgr.save_known_host("Bastion", 22, entry)
+        assert self.config_mgr.get_known_host("bastion", "22") == entry
+        assert self.config_mgr.get_known_host("bastion", 2222) is None
+        assert self.config_mgr.load_config()["tunnels"]  # other config is untouched
+
+    def test_known_hosts_are_not_exported_and_survive_import(self, tmp_path, sample_config_data):
+        entry = {"key_type": "ssh-ed25519", "key_b64": "AAAA", "fingerprint": "SHA256:local"}
+        self.config_mgr.save_config(sample_config_data)
+        self.config_mgr.save_known_host("bastion", 22, entry)
+        export_file = tmp_path / 'exported_config.json'
+        assert self.config_mgr.export_config(str(export_file))[0]
+        exported = json.loads(export_file.read_text(encoding='utf-8'))
+        assert 'ssh_known_hosts' not in exported
+
+        # an imported file must not be able to plant trusted host keys
+        exported['ssh_known_hosts'] = {"bastion:22": {"key_type": "ssh-ed25519", "key_b64": "BBBB",
+                                                      "fingerprint": "SHA256:planted"}}
+        import_file = tmp_path / 'import_config.json'
+        import_file.write_text(json.dumps(exported), encoding='utf-8')
+        assert self.config_mgr.import_config(str(import_file))[0]
+        assert self.config_mgr.get_known_host("bastion", 22) == entry
+
+    def test_import_rejects_unknown_tls_mode(self, tmp_path, sample_config_data):
+        sample_config_data['tunnels'][0]['db_tls_mode'] = 'require'
+        import_file = tmp_path / 'import_config.json'
+        import_file.write_text(json.dumps(sample_config_data), encoding='utf-8')
+        success, msg = self.config_mgr.import_config(str(import_file))
+        assert not success and 'TLS' in msg
+
     def test_import_config_success(self, tmp_path, sample_config_data):
         """설정 가져오기 성공 테스트"""
         import_file = tmp_path / 'import_config.json'

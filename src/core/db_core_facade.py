@@ -4,6 +4,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
+from src.core.connection_trust import extract_error_code, lookup_endpoint_tls
 from src.core.db_core_client import DbCoreServiceClient, DbCoreServiceError
 
 
@@ -16,10 +17,18 @@ class DbEndpoint:
     password: str
     database: str
     schema: str = ""
-    # TF-STATUS-110: "disable" | "verify_ca" | "verify_full" (Rust `TlsMode`)
-    tls_mode: str = "disable"
+    # TF-STATUS-110: "disable" | "verify_ca" | "verify_full" (Rust `TlsMode`).
+    # Empty = take the policy registered for host:port by the tunnel engine (else "disable").
+    tls_mode: str = ""
     tls_ca_file: str = ""
     tls_server_name: str = ""
+
+    def __post_init__(self):
+        if not self.tls_mode:
+            policy = lookup_endpoint_tls(self.host, self.port)
+            object.__setattr__(self, "tls_mode", policy.mode)
+            object.__setattr__(self, "tls_ca_file", self.tls_ca_file or policy.ca_file)
+            object.__setattr__(self, "tls_server_name", self.tls_server_name or policy.server_name)
 
     def to_payload(self) -> Dict[str, Any]:
         payload = {
@@ -57,7 +66,10 @@ class DbCoreFacade:
     def open_connection(self, endpoint: DbEndpoint) -> str:
         result = self.client.request("connection.open", {"connection": endpoint.to_payload()})
         if not result.get("success"):
-            raise DbCoreServiceError(str(result.get("message", "connection failed")))
+            message = str(result.get("message", "connection failed"))
+            error = DbCoreServiceError(message)
+            error.error_code = result.get("error_code") or extract_error_code(message)
+            raise error
         return str(result.get("connection_id", ""))
 
     def close_connection(self, connection_id: str) -> bool:

@@ -11,6 +11,8 @@ from src.core.logger import get_logger
 from src.core.constants import DEFAULT_MYSQL_PORT
 from src.core.platform_paths import backups_dir, config_file, encryption_key_file, app_support_dir
 from src.core.group_manager import TunnelGroupManager
+from src.core.connection_trust import TLS_MODES
+from src.core.ssh_trust import host_id
 
 logger = get_logger('config_manager')
 
@@ -76,6 +78,9 @@ def _with_local_reporting_privacy_state(
     if local_privacy_state:
         merged.setdefault('settings', {}).update(local_privacy_state)
     return merged
+
+
+_KNOWN_HOSTS_KEY = 'ssh_known_hosts'
 
 
 class ConfigLoadError(RuntimeError):
@@ -515,6 +520,7 @@ class ConfigManager:
                 export_data = _without_reporting_privacy_state(
                     self._read_json_file(CONFIG_FILE)
                 )
+                export_data.pop(_KNOWN_HOSTS_KEY, None)  # 신뢰 호스트 키는 기기 로컬 데이터
             with open(normalized_export, 'w', encoding='utf-8') as export_file:
                 json.dump(export_data, export_file, indent=4, ensure_ascii=False)
             logger.info(f"설정 내보내기 완료: {normalized_export}")
@@ -577,6 +583,9 @@ class ConfigManager:
             if db_engine not in (None, '', 'mysql', 'postgresql'):
                 return False, f"db_engine은 mysql 또는 postgresql이어야 합니다. ({idx}번째 항목)"
 
+            if tunnel.get('db_tls_mode') not in (None, *TLS_MODES):
+                return False, f"db_tls_mode(TLS 모드)가 올바르지 않습니다. ({idx}번째 항목)"
+
         settings = import_data.get('settings')
         if settings is not None and not isinstance(settings, dict):
             return False, "유효하지 않은 설정 파일입니다. (settings는 객체여야 함)"
@@ -629,6 +638,10 @@ class ConfigManager:
                     import_data,
                     current_data,
                 )
+                # 가져온 파일이 신뢰할 SSH 호스트 키를 심을 수 없도록 로컬 값만 유지한다.
+                import_data.pop(_KNOWN_HOSTS_KEY, None)
+                if _KNOWN_HOSTS_KEY in current_data:
+                    import_data[_KNOWN_HOSTS_KEY] = current_data[_KNOWN_HOSTS_KEY]
                 self._create_backup()
                 self._write_config_atomic_unlocked(import_data)
 
@@ -650,6 +663,19 @@ class ConfigManager:
         except Exception as e:
             logger.error(f"설정 가져오기 실패: {e}")
             return False, f"가져오기 중 오류 발생: {e}"
+
+    def get_known_host(self, host: str, port) -> Optional[dict]:
+        """저장된 SSH 호스트 키 항목 조회 (없으면 None)"""
+        entry = (self.load_config().get(_KNOWN_HOSTS_KEY) or {}).get(host_id(host, port))
+        return dict(entry) if isinstance(entry, dict) else None
+
+    def save_known_host(self, host: str, port, entry: dict) -> None:
+        """SSH 호스트 키 항목을 저장/교체한다 (사용자 확인 후에만 호출할 것)"""
+        def mutator(config):
+            config.setdefault(_KNOWN_HOSTS_KEY, {})[host_id(host, port)] = dict(entry)
+            return True, None
+
+        self._mutate_config(mutator)
 
     def get_backup_dir(self) -> str:
         """백업 디렉토리 경로 반환"""
