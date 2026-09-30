@@ -212,6 +212,10 @@ class _RustDumpClientBase:
 class RustDumpExporter(_RustDumpClientBase):
     """Rust DB Core backed dump exporter."""
 
+    # Set when the core refused the export before writing anything
+    # (error_code "unsupported_objects"): {"objects": [...], "bypassable": bool}.
+    last_refusal: Optional[Dict] = None
+
     def _resolve_required_tables_from_rust_schema(
         self,
         selected_tables: List[str],
@@ -278,8 +282,10 @@ class RustDumpExporter(_RustDumpClientBase):
         compression: str = DEFAULT_DUMP_COMPRESSION,
         callbacks: Optional[DumpEventCallbacks] = None,
         mysql_snapshot_mode: str = "parallel_strict",
+        allow_incomplete: bool = False,
     ) -> Tuple[bool, str]:
         callbacks = callbacks or DumpEventCallbacks()
+        self.last_refusal = None
         normalized_snapshot_mode = str(mysql_snapshot_mode).strip().lower()
         if normalized_snapshot_mode not in MYSQL_SNAPSHOT_MODES:
             raise ValueError(
@@ -301,21 +307,28 @@ class RustDumpExporter(_RustDumpClientBase):
         }
         if tables:
             payload["tables"] = tables
+        if allow_incomplete:
+            payload["allow_incomplete"] = True
 
-        if callbacks.progress:
-            callbacks.progress(f"Rust DB Core export 시작: {self.config.get_masked_uri()}/{schema}")
-
-        result = self.facade.run_dump(
-            payload,
-            on_event=lambda event: self._emit_core_event(
+        def on_core_event(event: Dict) -> None:
+            if event.get("event") == "error" and event.get("error_code") == "unsupported_objects":
+                self.last_refusal = {
+                    "objects": [str(item) for item in event.get("objects") or []],
+                    "bypassable": bool(event.get("bypassable")),
+                }
+            self._emit_core_event(
                 event,
                 callbacks.progress,
                 callbacks.table_progress,
                 callbacks.detail,
                 callbacks.table_status,
                 callbacks.raw_output,
-            ),
-        )
+            )
+
+        if callbacks.progress:
+            callbacks.progress(f"Rust DB Core export 시작: {self.config.get_masked_uri()}/{schema}")
+
+        result = self.facade.run_dump(payload, on_event=on_core_event)
         rows = int(result.get("rows_dumped") or 0)
         table_count = int(result.get("tables") or 0)
         view_count = int(result.get("views") or 0)
@@ -351,6 +364,7 @@ class RustDumpExporter(_RustDumpClientBase):
         table_status_callback: Optional[Callable[[str, str, str], None]] = None,
         raw_output_callback: Optional[Callable[[str], None]] = None,
         mysql_snapshot_mode: str = "parallel_strict",
+        allow_incomplete: bool = False,
     ) -> Tuple[bool, str]:
         try:
             success, message = self._run_rust_dump(
@@ -367,6 +381,7 @@ class RustDumpExporter(_RustDumpClientBase):
                     raw_output=raw_output_callback,
                 ),
                 mysql_snapshot_mode=mysql_snapshot_mode,
+                allow_incomplete=allow_incomplete,
             )
             if success:
                 self._write_metadata(output_dir, schema, "full", None)
@@ -392,6 +407,7 @@ class RustDumpExporter(_RustDumpClientBase):
         table_status_callback: Optional[Callable[[str, str, str], None]] = None,
         raw_output_callback: Optional[Callable[[str], None]] = None,
         mysql_snapshot_mode: str = "parallel_strict",
+        allow_incomplete: bool = False,
     ) -> Tuple[bool, str, List[str]]:
         try:
             final_tables = list(tables)
@@ -418,6 +434,7 @@ class RustDumpExporter(_RustDumpClientBase):
                     raw_output=raw_output_callback,
                 ),
                 mysql_snapshot_mode=mysql_snapshot_mode,
+                allow_incomplete=allow_incomplete,
             )
             if success:
                 self._write_metadata(output_dir, schema, "partial", final_tables, added_tables)
