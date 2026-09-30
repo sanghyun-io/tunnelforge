@@ -19,6 +19,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from src.core.connection_trust import apply_registered_tls
 from src.core.platform_paths import data_dir
 
 
@@ -57,7 +58,7 @@ class ConnectionEndpointInput:
     schema: str = ""
 
     def to_payload(self) -> Dict[str, Any]:
-        return {
+        return apply_registered_tls({
             "engine": self.engine.value,
             "host": self.host,
             "port": int(self.port),
@@ -65,7 +66,7 @@ class ConnectionEndpointInput:
             "password": self.password,
             "database": self.database,
             "schema": self.schema,
-        }
+        })
 
 
 @dataclass
