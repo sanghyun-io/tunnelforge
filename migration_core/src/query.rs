@@ -226,7 +226,7 @@ pub(crate) fn execute_query_live(
 
 // The JSONL row object needs unique keys. Reserve original aliases before
 // suffixing duplicates so a real "x (2)" column can never be overwritten.
-fn unique_query_columns(columns: Vec<String>) -> Vec<String> {
+pub(crate) fn unique_query_columns(columns: Vec<String>) -> Vec<String> {
     let reserved: std::collections::HashSet<_> = columns.iter().cloned().collect();
     let mut used = std::collections::HashSet::new();
     columns
@@ -247,6 +247,39 @@ fn unique_query_columns(columns: Vec<String>) -> Vec<String> {
         .collect()
 }
 
+pub(crate) fn mysql_bound_sql(
+    conn: &mut mysql::PooledConn,
+    sql: &str,
+    params: &[Value],
+) -> Result<String, String> {
+    let mode = if params.is_empty() {
+        String::new()
+    } else {
+        conn.query_first::<String, _>("SELECT @@SESSION.sql_mode")
+            .map_err(|err| format!("mysql SQL mode error: {err}"))?
+            .unwrap_or_default()
+    };
+    let backslash_escapes = !mode.split(',').any(|mode| mode == "NO_BACKSLASH_ESCAPES");
+    let ansi_quotes = mode.split(',').any(|mode| mode == "ANSI_QUOTES");
+    bind_query_params(sql, params, "mysql", backslash_escapes, ansi_quotes)
+}
+
+pub(crate) fn pg_bound_sql(
+    client: &mut postgres::Client,
+    sql: &str,
+    params: &[Value],
+) -> Result<String, String> {
+    let backslash_escapes = if params.is_empty() {
+        false
+    } else {
+        let row = client
+            .query_one("SHOW standard_conforming_strings", &[])
+            .map_err(|err| format!("postgresql SQL mode error: {err}"))?;
+        row.get::<_, String>(0) == "off"
+    };
+    bind_query_params(sql, params, "postgresql", backslash_escapes, false)
+}
+
 pub(crate) fn execute_query_adapter(
     adapter: &mut LiveAdapter,
     sql: &str,
@@ -254,16 +287,7 @@ pub(crate) fn execute_query_adapter(
 ) -> Result<QueryExecutionResult, String> {
     match adapter {
         LiveAdapter::MySql(conn) => {
-            let mode = if params.is_empty() {
-                String::new()
-            } else {
-                conn.query_first::<String, _>("SELECT @@SESSION.sql_mode")
-                    .map_err(|err| format!("mysql SQL mode error: {err}"))?
-                    .unwrap_or_default()
-            };
-            let backslash_escapes = !mode.split(',').any(|mode| mode == "NO_BACKSLASH_ESCAPES");
-            let ansi_quotes = mode.split(',').any(|mode| mode == "ANSI_QUOTES");
-            let sql = bind_query_params(sql, params, "mysql", backslash_escapes, ansi_quotes)?;
+            let sql = mysql_bound_sql(conn, sql, params)?;
             let mut result = conn
                 .query_iter(sql)
                 .map_err(|err| format!("mysql query error: {err}"))?;
@@ -295,15 +319,7 @@ pub(crate) fn execute_query_adapter(
             })
         }
         LiveAdapter::PostgreSql(client) => {
-            let backslash_escapes = if params.is_empty() {
-                false
-            } else {
-                let row = client
-                    .query_one("SHOW standard_conforming_strings", &[])
-                    .map_err(|err| format!("postgresql SQL mode error: {err}"))?;
-                row.get::<_, String>(0) == "off"
-            };
-            let sql = bind_query_params(sql, params, "postgresql", backslash_escapes, false)?;
+            let sql = pg_bound_sql(client, sql, params)?;
             // Preparation supplies names/types even for empty results and rejects
             // multiple statements. Execute the original SQL, including SHOW,
             // EXPLAIN, DML RETURNING, and data-changing CTEs, without a SELECT wrapper.
@@ -348,7 +364,7 @@ pub(crate) fn execute_query_adapter(
     }
 }
 
-fn postgres_text_value(text: &str, typ: &postgres::types::Type) -> Result<Value, String> {
+pub(crate) fn postgres_text_value(text: &str, typ: &postgres::types::Type) -> Result<Value, String> {
     use postgres::types::{Kind, Type};
     // Catalog vectors are array types whose text format is whitespace separated.
     if *typ == Type::INT2_VECTOR || *typ == Type::OID_VECTOR {

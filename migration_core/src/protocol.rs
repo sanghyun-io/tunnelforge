@@ -1,26 +1,67 @@
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
+use std::sync::{Arc, Mutex};
 
 use crate::*;
 
 pub struct CoreService {
-    connections: BTreeMap<String, LiveAdapter>,
+    connections: BTreeMap<String, Arc<Session>>,
     next_connection_sequence: u64,
+    jobs: Jobs,
+    next_job_sequence: u64,
 }
+
+type Task = Box<dyn FnOnce() + Send + 'static>;
 
 impl CoreService {
     pub fn new() -> Self {
         Self {
             connections: BTreeMap::new(),
             next_connection_sequence: 1,
+            jobs: new_jobs(),
+            next_job_sequence: 1,
         }
     }
 
-    pub fn handle_request_streaming<F: FnMut(Value)>(&mut self, request: Request, emit: F) {
+    /// Entry point for the JSONL loop: session queries and cancels run on worker threads so the
+    /// caller keeps reading requests; everything else keeps its synchronous semantics.
+    pub fn dispatch(&mut self, request: Request, emit: Emitter) {
+        match request.command.as_str() {
+            "query.execute" if has_connection_id(&request) => {
+                if let Some(task) = self.prepare_query(&request, &emit) {
+                    std::thread::spawn(task);
+                }
+            }
+            "query.cancel" => {
+                let jobs = self.jobs.clone();
+                std::thread::spawn(move || {
+                    for event in cancel_events(&request, &jobs) {
+                        emit(event);
+                    }
+                });
+            }
+            _ => self.handle_request_streaming(request, |event| emit(event)),
+        }
+    }
+
+    pub fn handle_request_streaming<F: FnMut(Value)>(&mut self, request: Request, mut emit: F) {
         match request.command.as_str() {
             "connection.open" => emit_all_events(self.connection_open(&request), emit),
             "connection.close" => emit_all_events(self.connection_close(&request), emit),
-            "query.execute" => emit_all_events(self.query_execute(&request), emit),
+            "query.execute" if has_connection_id(&request) => {
+                // Synchronous variant (tests, embedding): run the worker task inline.
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let sink = events.clone();
+                let collector: Emitter = Arc::new(move |event| sink.lock().unwrap().push(event));
+                if let Some(task) = self.prepare_query(&request, &collector) {
+                    task();
+                }
+                let collected: Vec<Value> = std::mem::take(&mut *events.lock().unwrap());
+                for event in collected {
+                    emit(event);
+                }
+            }
+            "query.cancel" => emit_all_events(cancel_events(&request, &self.jobs), emit),
             "service.shutdown" => {
                 self.connections.clear();
                 emit_all_events(service_shutdown(&request), emit);
@@ -44,7 +85,8 @@ impl CoreService {
             Ok(adapter) => {
                 let id = unique_connection_id(&endpoint, self.next_connection_sequence);
                 self.next_connection_sequence = self.next_connection_sequence.saturating_add(1);
-                self.connections.insert(id.clone(), adapter);
+                self.connections
+                    .insert(id.clone(), Arc::new(Session::new(adapter, &endpoint)));
                 vec![json!({
                     "event": "result",
                     "request_id": request.request_id,
@@ -71,51 +113,65 @@ impl CoreService {
             .get("connection_id")
             .and_then(Value::as_str)
             .unwrap_or("");
-        let removed = self.connections.remove(connection_id).is_some();
+        let session = self.connections.remove(connection_id);
+        if let Some(session) = &session {
+            cancel_session_jobs(session, &self.jobs);
+        }
         vec![json!({
             "event": "result",
             "request_id": request.request_id,
             "command": "connection.close",
             "success": true,
-            "closed": removed,
+            "closed": session.is_some(),
             "connection_id": connection_id
         })]
     }
 
-    fn query_execute(&mut self, request: &Request) -> Vec<Value> {
-        if let Some(connection_id) = request.payload.get("connection_id").and_then(Value::as_str) {
-            let sql = request
-                .payload
-                .get("sql")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim();
-            if sql.is_empty() {
-                return vec![json!({
-                    "event": "error",
-                    "request_id": request.request_id,
-                    "message": "query.execute requires sql"
-                })];
-            }
-            let Some(adapter) = self.connections.get_mut(connection_id) else {
-                return vec![json!({
-                    "event": "error",
-                    "request_id": request.request_id,
-                    "message": format!("unknown connection_id: {connection_id}")
-                })];
-            };
-            let params = query_params(&request.payload);
-            return match execute_query_adapter(adapter, sql, &params) {
-                Ok(result) => query_result_events(request, result),
-                Err(err) => vec![json!({
-                    "event": "error",
-                    "request_id": request.request_id,
-                    "message": err
-                })],
-            };
+    /// Validates and registers a session query. Errors are emitted here and yield no task.
+    fn prepare_query(&mut self, request: &Request, emit: &Emitter) -> Option<Task> {
+        let fail = |mut event: Value| {
+            event["request_id"] = json!(request.request_id);
+            emit(event);
+        };
+        let connection_id = request.payload.get("connection_id").and_then(Value::as_str)?;
+        let sql = request
+            .payload
+            .get("sql")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim();
+        if sql.is_empty() {
+            fail(json!({"event": "error", "message": "query.execute requires sql"}));
+            return None;
         }
-        query_execute(request)
+        let Some(session) = self.connections.get(connection_id).cloned() else {
+            fail(json!({"event": "error", "message": format!("unknown connection_id: {connection_id}")}));
+            return None;
+        };
+        let job_id = match request.payload.get("job_id").and_then(Value::as_str) {
+            Some(id) if !id.is_empty() => id.to_string(),
+            _ => {
+                let id = format!("job-{}", self.next_job_sequence);
+                self.next_job_sequence = self.next_job_sequence.saturating_add(1);
+                id
+            }
+        };
+        let ctl = match register_job(&session, &self.jobs, &job_id) {
+            Ok(ctl) => ctl,
+            Err(event) => {
+                fail(event);
+                return None;
+            }
+        };
+        let spec = QuerySpec::from_request(request, job_id, sql.to_string());
+        let jobs = self.jobs.clone();
+        let emit = emit.clone();
+        Some(Box::new(move || run_job(session, ctl, jobs, spec, emit)))
     }
+}
+
+fn has_connection_id(request: &Request) -> bool {
+    request.payload.get("connection_id").and_then(Value::as_str).is_some()
 }
 
 impl Default for CoreService {
@@ -1041,6 +1097,39 @@ mod tests {
         assert!(differences
             .iter()
             .any(|diff| diff["kind"] == "type_mismatch" && diff["column"] == "id"));
+    }
+
+    fn service_events(command: &str, payload: Value) -> Vec<Value> {
+        let mut events = Vec::new();
+        CoreService::new().handle_request_streaming(
+            Request {
+                command: command.to_string(),
+                request_id: Some("r1".to_string()),
+                payload,
+            },
+            |event| events.push(event),
+        );
+        events
+    }
+
+    #[test]
+    fn query_cancel_for_unknown_job_reports_nothing_cancelled() {
+        let events = service_events("query.cancel", json!({"job_id": "nope"}));
+        assert_eq!(events[0]["event"], "result");
+        assert_eq!(events[0]["cancelled"], false);
+        assert_eq!(events[0]["server_cancel_sent"], false);
+        assert_eq!(events[0]["job_id"], "nope");
+    }
+
+    #[test]
+    fn session_query_rejects_unknown_connection_and_empty_sql() {
+        let events = service_events("query.execute", json!({"connection_id": "missing", "sql": "SELECT 1"}));
+        assert_eq!(events[0]["event"], "error");
+        assert!(events[0]["message"].as_str().unwrap().contains("unknown connection_id"));
+        assert_eq!(events[0]["request_id"], "r1");
+
+        let events = service_events("query.execute", json!({"connection_id": "missing", "sql": "  "}));
+        assert!(events[0]["message"].as_str().unwrap().contains("requires sql"));
     }
 
     #[test]

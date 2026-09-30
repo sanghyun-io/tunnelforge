@@ -326,6 +326,9 @@ class SQLExecutionDialog(QDialog):
             if reply == QMessageBox.StandardButton.No:
                 event.ignore()
                 return
+            cancel = getattr(self.worker, "cancel_query", None)
+            if cancel is not None:
+                cancel()  # 닫기 전에 서버에서 실행 중인 SQL을 취소
 
         self._cleanup()
         event.accept()
