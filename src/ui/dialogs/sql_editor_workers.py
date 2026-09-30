@@ -7,6 +7,12 @@ import time
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
+from src.core.query_limits import (
+    CANCEL_ERROR_CODES,
+    build_query_limits,
+    new_job_id,
+    truncation_notice,
+)
 from src.core.sql_query_classifier import classify_sql_statement, statement_returns_rows
 
 logger = logging.getLogger(__name__)
@@ -67,14 +73,39 @@ def _rows_from_cursor(cursor) -> tuple[list, list]:
     return columns, row_list
 
 
+def _cancel_running_query(connection) -> None:
+    """연결에서 실행 중인 쿼리를 서버 측에서 취소 (실패해도 UI 흐름은 유지)."""
+    cancel = getattr(connection, "cancel_running_query", None)
+    if cancel is None:
+        return
+    try:
+        cancel()
+    except Exception:
+        logger.warning("query cancel request to server failed", exc_info=True)
+
+
+def _cancelled_transaction_message(engine, error) -> str:
+    in_tx = (getattr(error, "payload", None) or {}).get("in_transaction")
+    if engine == "postgresql":
+        state = "트랜잭션이 중단(aborted) 상태입니다. 롤백을 실행하세요" if in_tx else "트랜잭션 상태를 확인하세요"
+    else:
+        state = "MySQL 트랜잭션은 유지됩니다. 커밋 또는 롤백을 선택하세요"
+    return f"⚠️ 쿼리가 취소되었습니다 - {state}"
+
+
 class SQLQueryWorker(QThread):
     """SQL 쿼리 실행 워커 (자동 커밋)"""
     progress = pyqtSignal(str)
     query_result = pyqtSignal(int, bool, list, list, str, int, float)  # idx, returns_rows, columns, rows, error, affected, time
+    rows_progress = pyqtSignal(int, int)  # idx, 지금까지 받은 행 수 (스트리밍 진행)
+    result_truncated = pyqtSignal(int, str)  # idx, 안내 메시지 (상한 도달로 결과가 잘림)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None):
+    def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None,
+                 limits=None):
         super().__init__()
+        self.limits = dict(limits) if limits is not None else build_query_limits()
+        self._connector = None
         self.engine = normalize_db_engine(engine, port)
         self.host = host
         self.port = port
@@ -93,10 +124,16 @@ class SQLQueryWorker(QThread):
         )
         self.queries = queries  # List of query strings
 
+    def cancel_query(self):
+        """UI 스레드에서 호출: 실행 중인 쿼리를 서버에서 실제로 취소하고 남은 쿼리 실행을 중단한다."""
+        self.requestInterruption()
+        _cancel_running_query(getattr(self._connector, "connection", None))
+
     def run(self):
         connector = None
         try:
             connector = connector_from_params(self.params)
+            self._connector = connector
             success, msg = connector.connect()
 
             if not success:
@@ -126,15 +163,25 @@ class SQLQueryWorker(QThread):
                     if statement_returns_rows(query):
                         rows = []
 
-                        def collect_batch(batch):
+                        def collect_batch(batch, idx=idx):
                             rows.extend(batch)
+                            self.rows_progress.emit(idx, len(rows))
 
-                        result = connector.connection.facade.execute_on_connection_streaming(
-                            connector.connection.connection_id,
-                            query,
-                            row_batch_size=500,
-                            on_batch=collect_batch,
-                        )
+                        job_id = new_job_id()
+                        connector.connection.current_job_id = job_id
+                        try:
+                            result = connector.connection.facade.execute_on_connection_streaming(
+                                connector.connection.connection_id,
+                                query,
+                                row_batch_size=500,
+                                on_batch=collect_batch,
+                                job_id=job_id,
+                                **self.limits,
+                            )
+                        finally:
+                            connector.connection.current_job_id = None
+                        if result.get("truncated"):
+                            self.result_truncated.emit(idx, truncation_notice(result.get("truncated_by"), self.limits))
                         columns = result.get("columns") or []
                         row_list = [[row.get(col) for col in columns] for row in rows]
                         execution_time = time.time() - start_time
@@ -143,8 +190,11 @@ class SQLQueryWorker(QThread):
                         continue
 
                     # 직접 커서 사용하여 실행
+                    connector.connection.query_limits = dict(self.limits)
                     with connector.connection.cursor() as cursor:
                         cursor.execute(query)
+                        if cursor.truncated:
+                            self.result_truncated.emit(idx, truncation_notice(cursor.truncated_by, self.limits))
 
                         # 행을 반환하는 statement인지 확인 (None만 비행-statement)
                         if cursor.description is not None:
@@ -168,6 +218,9 @@ class SQLQueryWorker(QThread):
                         idx, statement_returns_rows(query), [], [], str(e), 0, execution_time
                     )
                     error_count += 1
+                    if getattr(e, "error_code", None) in CANCEL_ERROR_CODES or self.isInterruptionRequested():
+                        self.finished.emit(False, "⚠️ 실행이 취소되었습니다")
+                        return
 
             if error_count == 0:
                 self.finished.emit(True, f"✅ {success_count}개 쿼리 실행 완료")
@@ -195,15 +248,23 @@ class SQLTransactionExecutionWorker(QThread):
     progress = pyqtSignal(int, int, str, str)  # idx, total, query_type, preview
     query_result = pyqtSignal(int, str, bool, list, list, str, int, float)  # idx, query, returns_rows, columns, rows, error, affected, time
     postgres_rolled_back = pyqtSignal(str)
+    result_truncated = pyqtSignal(int, str)  # idx, 안내 메시지 (상한 도달로 결과가 잘림)
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, connection, queries, engine):
+    def __init__(self, connection, queries, engine, limits=None):
         super().__init__()
         self.connection = connection
         self.queries = queries
         self.engine = engine
+        self.limits = dict(limits) if limits is not None else build_query_limits()
+
+    def cancel_query(self):
+        """UI 스레드에서 호출: 실행 중인 쿼리를 서버에서 취소한다. 트랜잭션은 자동 커밋/롤백하지 않는다."""
+        self.requestInterruption()
+        _cancel_running_query(self.connection)
 
     def run(self):
+        self.connection.query_limits = dict(self.limits)
         total = len(self.queries)
         for idx, raw_query in enumerate(self.queries):
             if self.isInterruptionRequested():
@@ -223,6 +284,8 @@ class SQLTransactionExecutionWorker(QThread):
             try:
                 with self.connection.cursor() as cursor:
                     cursor.execute(query)
+                    if cursor.truncated:
+                        self.result_truncated.emit(idx, truncation_notice(cursor.truncated_by, self.limits))
 
                     if cursor.description is not None:
                         columns, row_list = _rows_from_cursor(cursor)
@@ -235,6 +298,11 @@ class SQLTransactionExecutionWorker(QThread):
 
             except Exception as e:
                 execution_time = time.time() - start_time
+                if getattr(e, "error_code", None) in CANCEL_ERROR_CODES:
+                    # 취소/제한시간: 트랜잭션을 몰래 커밋/롤백하지 않고 상태만 알린다.
+                    self.query_result.emit(idx, query, False, [], [], str(e), 0, execution_time)
+                    self.finished.emit(False, _cancelled_transaction_message(self.engine, e))
+                    return
                 if self.engine == "postgresql":
                     try:
                         self.connection.rollback()
