@@ -29,6 +29,7 @@ from typing import List, Dict, Optional, Tuple
 
 from src.core.db_core_service import normalize_db_engine
 from src.core.query_limits import build_query_limits
+from src.ui.dialogs.result_export import ResultExportMixin, is_export_safe_query
 from src.core.sql_query_classifier import (
     classify_sql_statement,
     is_mysql_implicit_commit_ddl,
@@ -208,7 +209,7 @@ def format_metadata_db_version(db_version) -> str:
 # =====================================================================
 # SQL 에디터 다이얼로그
 # =====================================================================
-class SQLEditorDialog(QDialog):
+class SQLEditorDialog(ResultExportMixin, QDialog):
     """SQL 에디터 다이얼로그"""
 
     def __init__(self, parent, tunnel_config: dict, config_manager, tunnel_engine):
@@ -1200,6 +1201,10 @@ class SQLEditorDialog(QDialog):
     def _add_result_table(self, columns, rows, exec_time, query=''):
         """결과 테이블 탭 추가"""
         table = QTableWidget()
+        # 파일 저장용: 화면에 받은 행(같은 리스트 참조)과 원본 쿼리
+        table._export_columns = columns
+        table._export_rows = rows
+        table._source_query = query
         table.setColumnCount(len(columns))
         table.setHorizontalHeaderLabels(columns)
         table.setRowCount(len(rows))
@@ -1792,6 +1797,17 @@ class SQLEditorDialog(QDialog):
 
         copy_header_action = menu.addAction("📋 헤더 포함 복사")
         copy_header_action.triggered.connect(lambda: self._copy_table_data(table, columns, True))
+
+        menu.addSeparator()
+        save_shown_action = menu.addAction("💾 표시된 결과 저장 (CSV/JSON)...")
+        save_shown_action.setToolTip("화면에 받은 행만 저장합니다 (결과 상한이 적용된 행)")
+        save_shown_action.triggered.connect(lambda: self._save_displayed_result(table))
+        save_full_action = menu.addAction("💾 전체 결과를 파일로 (쿼리 재실행)...")
+        save_full_action.setToolTip("쿼리를 다시 실행해 모든 행을 파일로 직접 저장합니다 (행 상한 없음)")
+        save_full_action.triggered.connect(lambda: self._export_result_full(table))
+        if not is_export_safe_query(getattr(table, '_source_query', '')):
+            save_full_action.setEnabled(False)
+            save_full_action.setToolTip("데이터를 변경할 수 있는 쿼리는 재실행 저장을 지원하지 않습니다 (표시된 결과 저장 사용)")
 
         # 편집 기능 메뉴
         ctx = getattr(table, '_edit_context', None)

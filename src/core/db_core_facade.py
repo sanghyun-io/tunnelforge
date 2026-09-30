@@ -181,6 +181,39 @@ class DbCoreFacade:
             "in_transaction": result.get("in_transaction"),
         }
 
+    def export_query_to_file(
+        self,
+        connection_id: str,
+        sql: str,
+        output: Dict[str, Any],
+        params: Optional[Sequence[Any]] = None,
+        job_id: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        on_progress: Optional[Callable[[int, int], None]] = None,
+    ) -> Dict[str, Any]:
+        """Re-run `sql` and let the core stream the whole result into `output["path"]`.
+
+        `output` keys: path, format (csv|jsonl), bom, formula_guard, binary (hex|base64),
+        keep_partial, overwrite. The core writes `<path>.partial` and renames it only after a
+        complete run; cancel/timeout/errors raise `DbCoreServiceError` (its payload reports
+        `partial_path` when a partial file was kept) and never leave a final file behind.
+        """
+        payload: Dict[str, Any] = {
+            "connection_id": connection_id,
+            "sql": sql,
+            "params": list(params or []),
+            "output": dict(output),
+        }
+        payload.update(_query_control(job_id, timeout_ms, None, None))
+
+        def handle_event(event: Dict[str, Any]) -> None:
+            if on_progress and event.get("event") == "progress":
+                on_progress(int(event.get("rows_written") or 0), int(event.get("bytes_written") or 0))
+
+        result = self.client.request("query.execute", payload, on_event=handle_event)
+        _raise_if_query_failed(result)
+        return result
+
     def cancel_query(self, job_id: str) -> Dict[str, Any]:
         """Ask the core to cancel a running query on the server (KILL QUERY / pg cancel)."""
         return self.client.request("query.cancel", {"job_id": job_id})
