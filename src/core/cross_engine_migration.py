@@ -56,9 +56,13 @@ class ConnectionEndpointInput:
     password: str
     database: str
     schema: str = ""
+    # 폼에서 명시적으로 고른 TLS 설정. 비어 있으면(=None) 등록부 정책을 따른다. 명시값이 우선한다.
+    tls_mode: Optional[str] = None
+    tls_ca_file: str = ""
+    tls_server_name: str = ""
 
     def to_payload(self) -> Dict[str, Any]:
-        return apply_registered_tls({
+        payload = {
             "engine": self.engine.value,
             "host": self.host,
             "port": int(self.port),
@@ -66,7 +70,16 @@ class ConnectionEndpointInput:
             "password": self.password,
             "database": self.database,
             "schema": self.schema,
-        })
+        }
+        if self.tls_mode:
+            tls: Dict[str, Any] = {"mode": self.tls_mode}
+            if self.tls_mode != "disable":
+                if self.tls_ca_file:
+                    tls["ca_file"] = self.tls_ca_file
+                if self.tls_server_name:
+                    tls["server_name"] = self.tls_server_name
+            payload["tls"] = tls
+        return apply_registered_tls(payload)
 
 
 @dataclass

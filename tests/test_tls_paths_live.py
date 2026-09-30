@@ -148,3 +148,44 @@ def test_safe_promotion_uses_verified_tls_and_rejects_bad_certificate(tmp_path):
         print("PASS safe promotion with an untrusted server certificate refused:", str(refused)[:120])
     finally:
         facade.client.shutdown()
+
+
+def test_manual_host_form_sends_chosen_tls_and_it_is_enforced():
+    """Cross-engine form without a tunnel profile: the TLS choice made in the form reaches the core."""
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
+
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841 (keeps the app alive)
+    ct.clear_registered_tls()  # nothing registered: only the form's own values can carry TLS
+    _swap("mysql", "good")
+    facade = _facade()
+    try:
+        form = EndpointForm("src", DatabaseEngine.MYSQL)
+        form.input_host.setText("127.0.0.1")
+        form.input_port.setValue(MYSQL_PORT)
+        form.input_user.setText("root")
+        form.input_password.setText("tfpass")
+        form.input_database.setText("tfdb")
+        form.input_schema.setText("tfdb")
+        form.combo_tls.setCurrentIndex(form.combo_tls.findData("verify_full"))
+        form.input_tls_ca.setText(f"{CERTS}/ca.pem")
+        payload = form.payload()
+        assert payload["tls"] == {"mode": "verify_full", "ca_file": f"{CERTS}/ca.pem"}
+        inspected = facade.client.request("schema.inspect", {"source": payload})
+        assert inspected.get("success"), inspected
+        print("PASS manual-host form: verify_full + CA file accepted end to end")
+
+        # same form without the CA file: the private CA is not in the OS store -> refused
+        form.input_tls_ca.setText("")
+        try:
+            refused = facade.client.request("schema.inspect", {"source": form.payload()})
+            assert not refused.get("success"), refused
+            text = str(refused.get("message"))
+        except DbCoreServiceError as exc:
+            text = str(exc)
+        assert "Tls" in text or "TLS" in text, text
+        print("PASS manual-host form: verify_full without the private CA refused")
+    finally:
+        facade.client.shutdown()
