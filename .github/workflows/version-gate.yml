@@ -120,6 +120,7 @@ jobs:
             --test live_import_policy \
             --test live_foreign_key_actions \
             --test live_export_contract \
+            --test live_fault_injection 
             --test live_safe_restore \
             -- --include-ignored --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib safe_promote_ -- --test-threads=1
