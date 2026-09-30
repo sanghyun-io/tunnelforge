@@ -183,3 +183,15 @@ def test_cancelled_passphrase_prompt_reports_required(encrypted_key):
     engine.passphrase_provider = lambda path, retry: None
     with pytest.raises(ssh_trust.SshPassphraseRequired):
         engine._load_private_key(encrypted_key)
+
+
+def test_two_profiles_on_one_address_keep_the_strict_policy_until_both_stop():
+    engine = TunnelEngine(known_hosts=MemoryStore())
+    base = {'connection_mode': 'direct', 'remote_host': 'db.example.com', 'remote_port': 3306, 'name': 'n'}
+    assert engine.start_tunnel({**base, 'id': 'a', 'db_tls_mode': 'verify_full'})[0]
+    assert engine.start_tunnel({**base, 'id': 'b'})[0]  # legacy profile, same address
+    assert ct.lookup_endpoint_tls('db.example.com', 3306).mode == 'verify_full'
+    engine.stop_tunnel('a')
+    assert ct.lookup_endpoint_tls('db.example.com', 3306).mode == 'disable'
+    engine.stop_tunnel('b')
+    assert ct._registry == {}

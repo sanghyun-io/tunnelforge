@@ -157,3 +157,31 @@ def test_facade_adds_friendly_hint_and_exposes_error_code():
     with pytest.raises(DbCoreServiceError) as info:
         facade.open_connection(endpoint)
     assert info.value.error_code == "tls_verification_failed" and "인증서" in str(info.value)
+
+
+def test_strictest_policy_wins_for_shared_address():
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("verify_ca", "a.pem", ""), "p1")
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("verify_full", "b.pem", "db.internal"), "p2")
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("disable"), "p3")
+    assert ct.lookup_endpoint_tls("h", 1) == ct.TlsPolicy("verify_full", "b.pem", "db.internal")
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("verify_ca", "c.pem", ""), "p1")
+    assert ct.lookup_endpoint_tls("h", 1).mode == "verify_full"  # last registration does not win
+
+
+def test_disable_never_weakens_a_registered_policy():
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("verify_full", "", "n"), "strict")
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("disable"), "legacy")
+    assert ct.lookup_endpoint_tls("h", 1).mode == "verify_full"
+
+
+def test_same_owner_can_downgrade_and_unregister_leaves_no_residue():
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("verify_full"), "p1")
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("disable"), "p1")  # user edited the profile
+    assert ct.lookup_endpoint_tls("h", 1).mode == "disable"
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("verify_ca"), "p1")
+    ct.register_endpoint_tls("h", 1, ct.TlsPolicy("verify_full"), "p2")
+    ct.unregister_endpoint_tls("h", 1, "p2")
+    assert ct.lookup_endpoint_tls("h", 1).mode == "verify_ca"
+    ct.unregister_endpoint_tls("h", 1, "p1")
+    assert ct.lookup_endpoint_tls("h", 1) == ct.TlsPolicy()
+    assert ct._registry == {}

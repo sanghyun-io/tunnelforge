@@ -94,7 +94,10 @@ def insecure_connection_warning(config: Mapping) -> Optional[str]:
     return "DB 연결이 암호화/서버 신원 검증 없이 이루어집니다. 프로필의 TLS 설정을 '검증'으로 바꾸세요."
 
 
-_registry: Dict[Tuple[str, int], TlsPolicy] = {}
+_STRICTNESS = {TLS_DISABLE: 0, TLS_VERIFY_CA: 1, TLS_VERIFY_FULL: 2}
+
+# host:port -> {owner: policy}. 여러 프로필/임시 터널이 같은 주소를 가리켜도 가장 엄격한 정책이 이긴다.
+_registry: Dict[Tuple[str, int], Dict[str, TlsPolicy]] = {}
 _registry_lock = threading.Lock()
 
 
@@ -102,17 +105,22 @@ def _key(host: str, port) -> Tuple[str, int]:
     return (str(host or "").strip().lower(), int(port))
 
 
-def register_endpoint_tls(host: str, port, policy: TlsPolicy) -> None:
+def register_endpoint_tls(host: str, port, policy: TlsPolicy, owner: str = "") -> None:
+    """owner(터널 id 등) 단위로 정책을 등록한다. 같은 owner 의 재등록은 교체(다운그레이드 가능)."""
     with _registry_lock:
-        if policy.mode == TLS_DISABLE:
-            _registry.pop(_key(host, port), None)
-        else:
-            _registry[_key(host, port)] = policy
+        owners = _registry.setdefault(_key(host, port), {})
+        owners[owner] = policy
 
 
-def unregister_endpoint_tls(host: str, port) -> None:
+def unregister_endpoint_tls(host: str, port, owner: str = "") -> None:
     with _registry_lock:
-        _registry.pop(_key(host, port), None)
+        key = _key(host, port)
+        owners = _registry.get(key)
+        if owners is None:
+            return
+        owners.pop(owner, None)
+        if not owners:
+            del _registry[key]
 
 
 def lookup_endpoint_tls(host: str, port) -> TlsPolicy:
@@ -121,7 +129,11 @@ def lookup_endpoint_tls(host: str, port) -> TlsPolicy:
     except (TypeError, ValueError):
         return TlsPolicy()
     with _registry_lock:
-        return _registry.get(key, TlsPolicy())
+        policies = list(_registry.get(key, {}).values())
+    if not policies:
+        return TlsPolicy()
+    # max() 는 동률에서 먼저 나온 것을 고르므로 등록 순서상 가장 앞의 엄격한 정책이 유지된다.
+    return max(policies, key=lambda policy: _STRICTNESS[policy.mode])
 
 
 def clear_registered_tls() -> None:

@@ -6,7 +6,7 @@ from contextlib import closing
 
 from src.core import ssh_trust
 from src.core.connection_trust import (
-    TLS_DISABLE, register_endpoint_tls, resolve_tls_policy, unregister_endpoint_tls,
+    register_endpoint_tls, resolve_tls_policy, unregister_endpoint_tls,
 )
 from src.core.logger import get_logger
 from src.core.constants import DEFAULT_LOCAL_HOST
@@ -49,12 +49,8 @@ class TunnelEngine:
         """명시적 '호스트 키 갱신' — 사용자가 새 지문을 확인한 뒤에만 호출한다."""
         return ssh_trust.refresh_host_key(host, int(port), self.known_hosts)
 
-    def _register_db_tls(self, config, host, port):
-        policy = resolve_tls_policy(config)
-        if policy.mode == TLS_DISABLE:
-            unregister_endpoint_tls(host, port)
-        else:
-            register_endpoint_tls(host, port, policy)
+    def _register_db_tls(self, config, host, port, owner=None):
+        register_endpoint_tls(host, port, resolve_tls_policy(config), owner or config['id'])
 
     def is_port_available(self, port: int) -> bool:
         """포트가 사용 가능한지 확인"""
@@ -274,9 +270,9 @@ class TunnelEngine:
                     port = getattr(server, 'local_bind_port', None)
                     server.stop()
                     if port:
-                        unregister_endpoint_tls(DEFAULT_LOCAL_HOST, port)
+                        unregister_endpoint_tls(DEFAULT_LOCAL_HOST, port, tunnel_id)
                 elif config:
-                    unregister_endpoint_tls(config['remote_host'], config['remote_port'])
+                    unregister_endpoint_tls(config['remote_host'], config['remote_port'], tunnel_id)
                 del self.active_tunnels[tunnel_id]
                 if tunnel_id in self.tunnel_configs:
                     del self.tunnel_configs[tunnel_id]
@@ -316,7 +312,7 @@ class TunnelEngine:
         """
         # 직접 연결 모드인 경우 터널 불필요
         if config.get('connection_mode') == 'direct':
-            self._register_db_tls(config, config['remote_host'], config['remote_port'])
+            self._register_db_tls(config, config['remote_host'], config['remote_port'], f"temp:{config['id']}")
             return True, None, ""
 
         temp_server = None
@@ -332,8 +328,9 @@ class TunnelEngine:
             )
 
             temp_server.start()
-            self._register_db_tls(config, DEFAULT_LOCAL_HOST, temp_server.local_bind_port)
-            self._temp_endpoints[id(temp_server)] = (DEFAULT_LOCAL_HOST, temp_server.local_bind_port)
+            owner = f"temp:{id(temp_server)}"
+            self._register_db_tls(config, DEFAULT_LOCAL_HOST, temp_server.local_bind_port, owner)
+            self._temp_endpoints[id(temp_server)] = (DEFAULT_LOCAL_HOST, temp_server.local_bind_port, owner)
             logger.debug(f"임시 터널 생성: localhost:{temp_server.local_bind_port} -> {config['remote_host']}:{config['remote_port']}")
             return True, temp_server, ""
 
@@ -347,7 +344,7 @@ class TunnelEngine:
         if temp_server:
             endpoint = self._temp_endpoints.pop(id(temp_server), None)
             if endpoint:
-                unregister_endpoint_tls(*endpoint)
+                unregister_endpoint_tls(*endpoint[:2], endpoint[2])
             try:
                 temp_server.stop()
                 logger.debug("임시 터널 종료됨")
