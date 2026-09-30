@@ -1741,7 +1741,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             QMessageBox.information(self, "백업 관리", "안전 복원 보고서가 있는 Import 후에 사용할 수 있습니다.")
             return
         original.update(user=self.restore_config.user, password=self.restore_config.password)
-        dialog = BackupLifecycleDialog(original, [os.path.dirname(str(report_path))], self)
+        dialog = BackupLifecycleDialog(apply_registered_tls(original), [os.path.dirname(str(report_path))], self)
         dialog.refresh()
         dialog.exec()
 
