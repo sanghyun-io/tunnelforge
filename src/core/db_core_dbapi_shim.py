@@ -1,4 +1,5 @@
 """DB-API-like shim adapters backed by the Rust TunnelForge DB core service."""
+import uuid
 from dataclasses import replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -221,6 +222,16 @@ class RustDbConnection:
         self.open = True
         self._autocommit = True
         self._in_transaction = False
+        # Opt-in limits for cursor.execute (max_rows / max_bytes / timeout_ms); empty = unlimited.
+        self.query_limits: Dict[str, int] = {}
+        self.current_job_id: Optional[str] = None
+
+    def cancel_running_query(self) -> bool:
+        """Cancel the query currently running on this connection (safe from another thread)."""
+        job_id = self.current_job_id
+        if not job_id:
+            return False
+        return bool(self.facade.cancel_query(job_id).get("cancelled"))
 
     def cursor(self) -> "RustDbCursor":
         return RustDbCursor(self)
@@ -296,6 +307,8 @@ class RustDbCursor:
         self._position = 0
         self.rowcount = 0
         self.description = None
+        self.truncated = False
+        self.truncated_by: Optional[str] = None
 
     def __enter__(self) -> "RustDbCursor":
         return self
@@ -310,11 +323,23 @@ class RustDbCursor:
         self.rowcount = -1
         if not self.connection.open:
             raise DbCoreServiceError("connection is closed")
-        result = self.connection.facade.execute_on_connection_result(
-            self.connection.connection_id,
-            query,
-            params=params,
-        )
+        self.truncated = False
+        self.truncated_by = None
+        control = {}
+        if self.connection.query_limits:  # controlled execution (limits + cancellable job id)
+            control = {"job_id": f"cur-{uuid.uuid4().hex}", **self.connection.query_limits}
+            self.connection.current_job_id = control["job_id"]
+        try:
+            result = self.connection.facade.execute_on_connection_result(
+                self.connection.connection_id,
+                query,
+                params=params,
+                **control,
+            )
+        finally:
+            self.connection.current_job_id = None
+        self.truncated = bool(result.get("truncated"))
+        self.truncated_by = result.get("truncated_by")
         self._rows = result.get("rows", [])
         columns = result.get("columns") or None
         rows_affected = int(result.get("rows_affected") or 0)

@@ -1,11 +1,13 @@
-use migration_core::{handle_request_streaming, CoreService, Request};
+use migration_core::{handle_request_streaming, CoreService, Emitter, Request};
 use serde_json::{json, Value};
 use std::io::{self, BufRead, Write};
+use std::sync::Arc;
 
 fn main() {
     let stdin = io::stdin();
     let mut handled = false;
     let mut service = CoreService::new();
+    let emit: Emitter = Arc::new(emit_one);
 
     for line in stdin.lock().lines() {
         match line {
@@ -17,7 +19,7 @@ fn main() {
                 match serde_json::from_str::<Request>(&line) {
                     Ok(request) => {
                         let should_shutdown = request.command == "service.shutdown";
-                        service.handle_request_streaming(request, emit_one);
+                        service.dispatch(request, emit.clone());
                         if should_shutdown {
                             break;
                         }
