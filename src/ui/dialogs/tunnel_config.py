@@ -10,6 +10,10 @@ import uuid
 
 from src.core.logger import get_logger
 from src.core.i18n import translate_text
+from src.core.connection_trust import (
+    TLS_DISABLE, TLS_MODE_LABELS, TLS_MODES, default_tls_mode, insecure_connection_warning,
+)
+from src.ui import trust_prompts
 from src.ui.styles import ButtonStyles, LabelStyles
 from src.ui.workers.test_worker import ConnectionTestWorker, TestType
 from src.ui.dialogs.test_dialogs import TestProgressDialog
@@ -90,6 +94,7 @@ class TunnelConfigDialog(QDialog):
         self._build_connection_mode_section(form_layout)
         self._build_bastion_section(form_layout)
         self._build_target_db_section(form_layout)
+        self._build_tls_section(form_layout)
         self._build_environment_section(form_layout)
         self._build_local_section(form_layout)
         self._build_auth_section(form_layout)
@@ -211,6 +216,122 @@ class TunnelConfigDialog(QDialog):
         self.input_default_schema.setPlaceholderText("(선택사항) MySQL DB명 또는 PostgreSQL schema명")
         form_layout.addRow("기본 스키마:", self.input_default_schema)
 
+    def _initial_tls_mode(self) -> str:
+        saved = self.tunnel_data.get('db_tls_mode')
+        if saved in TLS_MODES:
+            return saved
+        if self.tunnel_data.get('id'):
+            # 저장된 TLS 설정이 없는 기존 프로필: 자동 승격하지 않고 disable 로 유지 (경고 표시)
+            return TLS_DISABLE
+        is_direct = self.tunnel_data.get('connection_mode') == 'direct'
+        return default_tls_mode('direct' if is_direct else 'ssh_tunnel',
+                                self.tunnel_data.get('remote_host', ''))
+
+    def _build_tls_section(self, form_layout: QFormLayout):
+        lbl_tls = QLabel("--- DB 연결 보안 (TLS) ---")
+        lbl_tls.setStyleSheet(LabelStyles.SECTION_HEADER)
+        form_layout.addRow(lbl_tls)
+
+        self.combo_tls_mode = QComboBox()
+        for mode in (TLS_MODES[2], TLS_MODES[1], TLS_MODES[0]):
+            self.combo_tls_mode.addItem(TLS_MODE_LABELS[mode], mode)
+        self.combo_tls_mode.setCurrentIndex(self.combo_tls_mode.findData(self._initial_tls_mode()))
+        self._tls_touched = False
+        self.combo_tls_mode.activated.connect(self._on_tls_mode_chosen)
+        self.combo_tls_mode.currentIndexChanged.connect(self._update_tls_state)
+        form_layout.addRow("TLS 검증:", self.combo_tls_mode)
+
+        self.input_tls_ca = QLineEdit(self.tunnel_data.get('db_tls_ca_file', ''))
+        self.input_tls_ca.setPlaceholderText("(선택) 사설 CA 인증서 PEM 파일 - 시스템 인증서 저장소에 추가로 신뢰")
+        self.btn_tls_ca = QPushButton("파일 찾기")
+        self.btn_tls_ca.clicked.connect(self.select_tls_ca_file)
+        self.tls_ca_widget = QWidget()
+        ca_layout = QHBoxLayout(self.tls_ca_widget)
+        ca_layout.setContentsMargins(0, 0, 0, 0)
+        ca_layout.addWidget(self.input_tls_ca)
+        ca_layout.addWidget(self.btn_tls_ca)
+        self.lbl_tls_ca = QLabel("CA 인증서:")
+        form_layout.addRow(self.lbl_tls_ca, self.tls_ca_widget)
+
+        self.lbl_tls_warning = QLabel("")
+        self.lbl_tls_warning.setWordWrap(True)
+        self.lbl_tls_warning.setStyleSheet("color: #c0392b; font-weight: bold;")
+        form_layout.addRow(self.lbl_tls_warning)
+
+        self.btn_host_key = QPushButton("SSH 호스트 키 확인/갱신")
+        self.btn_host_key.setToolTip(
+            "Bastion 서버의 호스트 키 지문을 확인하고, 서버가 교체된 경우에만 저장된 키를 갱신합니다."
+        )
+        self.btn_host_key.clicked.connect(self._manage_host_key)
+        form_layout.addRow("", self.btn_host_key)
+
+        self.radio_direct.toggled.connect(self._on_connection_mode_for_tls)
+        self.input_remote_host.textChanged.connect(self._on_connection_mode_for_tls)
+        self._update_tls_state()
+
+    def _on_tls_mode_chosen(self, _index=None):
+        self._tls_touched = True
+
+    def _on_connection_mode_for_tls(self, *_args):
+        """새 프로필에서 사용자가 TLS 를 직접 고르기 전까지는 연결 방식에 맞는 기본값을 따른다."""
+        if self.tunnel_data.get('id') or self._tls_touched:
+            return
+        mode = 'direct' if self.radio_direct.isChecked() else 'ssh_tunnel'
+        default = default_tls_mode(mode, self.input_remote_host.text().strip() or '127.0.0.1')
+        self.combo_tls_mode.setCurrentIndex(self.combo_tls_mode.findData(default))
+
+    def _tls_form_config(self) -> dict:
+        is_direct = self.radio_direct.isChecked()
+        return {
+            'connection_mode': 'direct' if is_direct else 'ssh_tunnel',
+            'remote_host': self.input_remote_host.text().strip() or ('127.0.0.1' if is_direct else ''),
+            'db_tls_mode': self.combo_tls_mode.currentData(),
+        }
+
+    def _update_tls_state(self, *_args):
+        verified = self.combo_tls_mode.currentData() != TLS_DISABLE
+        self.lbl_tls_ca.setEnabled(verified)
+        self.tls_ca_widget.setEnabled(verified)
+        warning = insecure_connection_warning(self._tls_form_config())
+        if warning and self.tunnel_data.get('id') and not self.tunnel_data.get('db_tls_mode'):
+            warning += "\n(이 프로필에는 저장된 TLS 설정이 없어 기존 방식 그대로 연결됩니다.)"
+        self.lbl_tls_warning.setText(f"⚠ {warning}" if warning else "")
+        self.lbl_tls_warning.setVisible(bool(warning))
+
+    def select_tls_ca_file(self):
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "CA 인증서 파일 선택", "", "Certificate Files (*.pem *.crt *.cer);;All Files (*)")
+        if filename:
+            self.input_tls_ca.setText(filename)
+
+    def _manage_host_key(self):
+        """저장된 SSH 호스트 키와 서버의 현재 키를 비교해 보여주고, 확인 후에만 갱신한다."""
+        if not self.engine:
+            QMessageBox.critical(self, "오류", "터널 엔진이 초기화되지 않았습니다.")
+            return
+        host = self.input_bastion_host.text().strip()
+        port = self.input_bastion_port.value()
+        if not host:
+            QMessageBox.warning(self, "필수 필드 누락", "SSH 호스트를 먼저 입력해주세요.")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            current = self.engine.probe_bastion_fingerprint(host, port)
+            stored = self.engine.known_hosts.get_known_host(host, port)
+        except Exception as exc:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.critical(self, "SSH 호스트 키", f"서버의 호스트 키를 가져오지 못했습니다.\n\n{exc}")
+            return
+        QApplication.restoreOverrideCursor()
+
+        stored_fp = stored.get('fingerprint') if stored else None
+        if stored_fp == current.fingerprint:
+            QMessageBox.information(self, "SSH 호스트 키", f"저장된 키와 서버의 키가 같습니다.\n\n{current.fingerprint}")
+            return
+        if trust_prompts.confirm_host_key_refresh(self, host, port, stored_fp, current):
+            self.engine.refresh_host_key(host, port)
+            QMessageBox.information(self, "SSH 호스트 키", "호스트 키를 저장했습니다.")
+
     def _build_environment_section(self, form_layout: QFormLayout):
         lbl_env = QLabel("--- 환경 설정 ---")
         lbl_env.setStyleSheet(LabelStyles.SECTION_HEADER)
@@ -312,7 +433,7 @@ class TunnelConfigDialog(QDialog):
             self.lbl_bastion_port, self.input_bastion_port,
             self.lbl_bastion_user, self.input_bastion_user,
             self.lbl_bastion_key, self.key_layout_widget,
-            self.btn_copy_bastion
+            self.btn_copy_bastion, self.btn_host_key
         ]
         for widget in bastion_widgets:
             widget.setEnabled(is_ssh_mode)
@@ -401,7 +522,9 @@ class TunnelConfigDialog(QDialog):
             "db_engine": self.combo_db_engine.currentData(),
             "default_database": self.input_default_database.text().strip() or None,
             "default_schema": self.input_default_schema.text().strip() or None,
-            "environment": environment
+            "environment": environment,
+            "db_tls_mode": self.combo_tls_mode.currentData(),
+            "db_tls_ca_file": self.input_tls_ca.text().strip(),
         }
 
         # MySQL 자격 증명 (체크된 경우에만)

@@ -4,6 +4,7 @@ Cross-Engine 마이그레이션 소스/타겟 엔드포인트 입력 폼
 from typing import Dict, Optional
 from PyQt6.QtWidgets import QComboBox, QFormLayout, QGroupBox, QLineEdit, QSpinBox
 
+from src.ui.dialogs.preselected_connect_dialog import start_tunnel_with_progress
 from src.core.cross_engine_migration import (
     DEFAULT_MYSQL_PORT,
     DEFAULT_POSTGRESQL_DATABASE,
@@ -278,7 +279,10 @@ class EndpointForm(QGroupBox):
         config = data.get("config") or {}
         tid = data.get("tunnel_id")
         if self.tunnel_engine and config and tid and not self.tunnel_engine.is_running(tid):
-            success, message = self.tunnel_engine.start_tunnel(config)
+            outcome = start_tunnel_with_progress(self, self.tunnel_engine, config)
+            if outcome is None:
+                raise ValueError(f"{self.title()} 터널 연결이 취소되었습니다.")
+            success, message = outcome
             if not success:
                 raise ValueError(f"{self.title()} 터널 시작 실패: {message}")
             host, port = self.tunnel_engine.get_connection_info(tid)

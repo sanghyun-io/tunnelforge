@@ -13,7 +13,9 @@ class TestTunnelEngine:
     def setup(self):
         """각 테스트 전 TunnelEngine 인스턴스 생성"""
         from src.core.tunnel_engine import TunnelEngine
-        self.engine = TunnelEngine()
+        self.engine = TunnelEngine(known_hosts=MagicMock())
+        # 호스트 키 TOFU 검증은 tests/test_tunnel_engine_trust.py 에서 별도로 검증한다.
+        self.engine._verified_host_key = MagicMock(return_value=MagicMock())
 
     def test_is_port_available_success(self):
         """사용 가능한 포트 확인 테스트"""

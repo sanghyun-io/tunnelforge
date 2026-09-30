@@ -851,8 +851,9 @@ def test_execute_sql_transaction_uses_qthread_worker_not_process_events(monkeypa
         started = {}
 
         class FakeWorker:
-            def __init__(self, connection, queries, engine):
+            def __init__(self, connection, queries, engine, limits=None):
                 started['connection'] = connection
+                self.result_truncated = MagicMock()
                 started['queries'] = queries
                 started['engine'] = engine
                 self.progress = MagicMock()
@@ -896,6 +897,8 @@ def test_autocommit_history_is_per_query_failure_not_prelogged_batch_success(mon
             def __init__(self, *a, **k):
                 self.progress = MagicMock()
                 self.query_result = MagicMock()
+                self.result_truncated = MagicMock()
+                self.rows_progress = MagicMock()
                 self.finished = MagicMock()
 
             def start(self):
@@ -946,6 +949,8 @@ def test_persistent_and_autocommit_temp_tunnels_are_separate(monkeypatch):
             def __init__(self, *a, **k):
                 self.progress = MagicMock()
                 self.query_result = MagicMock()
+                self.result_truncated = MagicMock()
+                self.rows_progress = MagicMock()
                 self.finished = MagicMock()
 
             def start(self):

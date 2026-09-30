@@ -7,6 +7,7 @@ from src.core.db_connector import MySQLConnector
 from src.core.postgres_connector import PostgresConnector
 from src.core.db_core_service import normalize_db_engine
 from src.ui.dialogs.db_connection_dialog import DBConnectionDialog
+from src.ui.dialogs.preselected_connect_dialog import PreselectedConnectDialog
 from src.ui.dialogs.db_export_dialog import (
     RustDumpExportDialog,
 )
@@ -77,14 +78,18 @@ class RustDumpWizard:
             connector = PostgresConnector(host, port, db_user, db_password, database)
         else:
             connector = MySQLConnector(host, port, db_user, db_password, database)
-        success, msg = connector.connect()
-
-        if not success:
-            QMessageBox.critical(
-                self.parent, "연결 오류",
-                f"DB 연결에 실패했습니다:\n{msg}"
-            )
+        # 연결은 백그라운드 워커에서 수행한다. 모달 대기창이 이벤트 루프를 돌려 GUI 는 멈추지 않고,
+        # 취소/창 닫힘 이후 늦게 도착한 결과는 폐기·정리된다.
+        connect_dialog = PreselectedConnectDialog(self.parent, connector)
+        connect_dialog.start()
+        if connect_dialog.exec() != QDialog.DialogCode.Accepted:
+            if connect_dialog.failure is not None:
+                QMessageBox.critical(
+                    self.parent, "연결 오류",
+                    f"DB 연결에 실패했습니다:\n{connect_dialog.failure}"
+                )
             return None, None
+        connector = connect_dialog.take_connector()
 
         # 연결 식별자 (Export 폴더명 등에 사용)
         connection_info = f"{tunnel.get('name', 'Unknown')}_{db_user}"

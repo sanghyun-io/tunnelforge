@@ -31,6 +31,9 @@ class RustDumpWorker(QThread):
         self.kwargs = kwargs
         self._cancel_requested = False
         self._active_runner = None
+        # Core refusal (error_code unsupported_objects) of the last export:
+        # {"objects": [...], "bypassable": bool}. Set before `finished` fires.
+        self.export_refusal = None
 
     def cancel(self) -> bool:
         """실행 중인 dump/import 작업의 취소를 요청한다.
@@ -132,7 +135,9 @@ class RustDumpWorker(QThread):
             mysql_snapshot_mode=self.kwargs.get(
                 'mysql_snapshot_mode', 'parallel_strict'
             ),
+            allow_incomplete=self.kwargs.get('allow_incomplete', False),
         )
+        self.export_refusal = getattr(exporter, "last_refusal", None)
         success, msg = self._is_cancelled_message(success, msg)
         self.finished.emit(success, msg)
 
@@ -155,7 +160,9 @@ class RustDumpWorker(QThread):
             mysql_snapshot_mode=self.kwargs.get(
                 'mysql_snapshot_mode', 'parallel_strict'
             ),
+            allow_incomplete=self.kwargs.get('allow_incomplete', False),
         )
+        self.export_refusal = getattr(exporter, "last_refusal", None)
         success, msg = self._is_cancelled_message(success, msg)
         self.finished.emit(success, msg)
 
