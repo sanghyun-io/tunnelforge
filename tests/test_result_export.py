@@ -204,3 +204,26 @@ def test_read_only_rejection_is_reported_as_no_change():
     err = DbCoreServiceError("x", error_code="export_requires_read_only", payload={})
     text = describe_export_failure(err, {})
     assert "변경 없음" in text and "저장하지 않았습니다" in text
+
+
+def test_export_connection_follows_the_registered_tls_policy(monkeypatch):
+    """The full-export worker opens its own connection through the same connector path as the
+    editor, so the tunnel's registered TLS policy (verify_full + server_name) must reach the core."""
+    from src.core.connection_trust import TlsPolicy, clear_registered_tls, register_endpoint_tls
+    from src.ui.dialogs.sql_editor_workers import ConnectionParams, connector_from_params
+
+    clear_registered_tls()
+    register_endpoint_tls("127.0.0.1", 45432, TlsPolicy(mode="verify_full", ca_file="ca.pem", server_name="db.internal"))
+    try:
+        connector = connector_from_params(ConnectionParams("postgresql", "127.0.0.1", 45432, "u", "p", "d", "public"))
+        payload = connector.endpoint.to_payload()
+        assert payload["tls"] == {"mode": "verify_full", "ca_file": "ca.pem", "server_name": "db.internal"}
+        # Same endpoint object is what connection.open sends, so the session (and therefore the
+        # export, KILL/cancel connection included) uses the verified TLS settings.
+        facade = MagicMock()
+        facade.open_connection.return_value = "c1"
+        connector.facade = facade
+        connector.connect()
+        assert facade.open_connection.call_args.args[0].tls_mode == "verify_full"
+    finally:
+        clear_registered_tls()
