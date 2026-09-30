@@ -1177,3 +1177,94 @@ def test_export_cancellation_does_not_start_error_reporting(monkeypatch):
     dialog._report_error_anonymously.assert_not_called()
     assert dialog.export_success is False
     dialog.close()
+
+
+def _refusal_dialog(monkeypatch, refusal, prompt_answer):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_export_dialog.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_export_dialog.QMessageBox.warning",
+        lambda *_args: None,
+    )
+    dialog = RustDumpExportDialog()
+    dialog._test_app = app  # keep QApplication alive for the dialog's lifetime
+    failed_worker = MagicMock()
+    failed_worker.isRunning.return_value = False
+    failed_worker.export_refusal = refusal
+    retry_worker = MagicMock()
+    retry_worker.isRunning.return_value = False
+    dialog.worker = failed_worker
+    dialog.export_schema = "app"
+    dialog.input_output_dir.setText("C:/tmp/tunnelforge-export")
+    dialog._prompt_incomplete_export = MagicMock(return_value=prompt_answer)
+    dialog._build_worker = MagicMock(return_value=retry_worker)
+    dialog._start_export_worker = MagicMock()
+    dialog._report_error_anonymously = MagicMock()
+    return dialog, retry_worker
+
+
+def test_bypassable_refusal_retries_only_after_explicit_incomplete_choice(monkeypatch):
+    dialog, retry_worker = _refusal_dialog(
+        monkeypatch, {"objects": ["trigger:t:trg"], "bypassable": True}, True
+    )
+    try:
+        dialog.on_finished(False, "Rust DB Core export 오류: refused")
+
+        dialog._prompt_incomplete_export.assert_called_once_with(["trigger:t:trg"])
+        assert dialog._allow_incomplete is True
+        dialog._build_worker.assert_called_once_with(
+            "app", "C:/tmp/tunnelforge-export", mysql_snapshot_mode="parallel_strict"
+        )
+        dialog._start_export_worker.assert_called_once_with(retry_worker)
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_declining_incomplete_choice_does_not_retry(monkeypatch):
+    dialog, _ = _refusal_dialog(
+        monkeypatch, {"objects": ["routine:fn"], "bypassable": True}, False
+    )
+    try:
+        dialog.on_finished(False, "Rust DB Core export 오류: refused")
+
+        assert dialog._allow_incomplete is False
+        dialog._build_worker.assert_not_called()
+        dialog._start_export_worker.assert_not_called()
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_lossy_definition_refusal_is_never_offered_as_incomplete_export(monkeypatch):
+    dialog, _ = _refusal_dialog(
+        monkeypatch, {"objects": ["generated_column:t:g"], "bypassable": False}, True
+    )
+    try:
+        dialog.on_finished(False, "Rust DB Core export 오류: refused")
+
+        dialog._prompt_incomplete_export.assert_not_called()
+        dialog._build_worker.assert_not_called()
+    finally:
+        dialog.worker = None
+        dialog.close()
+
+
+def test_incomplete_choice_survives_snapshot_fallback_worker_rebuild(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr(
+        "src.ui.dialogs.db_export_dialog.check_rust_dump",
+        lambda: (True, "Rust DB Core OK"),
+    )
+    dialog = RustDumpExportDialog()
+    dialog.radio_full.setChecked(True)
+    dialog._allow_incomplete = True
+    try:
+        worker = dialog._build_worker("app", "C:/tmp/x", mysql_snapshot_mode="single_connection")
+        assert worker.kwargs["allow_incomplete"] is True
+        assert worker.kwargs["mysql_snapshot_mode"] == "single_connection"
+    finally:
+        dialog.close()

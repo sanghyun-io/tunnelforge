@@ -267,14 +267,33 @@ pub(crate) fn dump_run_streaming<F: FnMut(Value)>(request: &Request, mut emit: F
         "message": "dump started"
     }));
 
-    match dump_run(request, |event| emit(event)) {
+    let mut refusal = None;
+    match dump_run_with_refusal(request, |event| emit(event), &mut refusal) {
         Ok(result) => emit(result),
-        Err(err) => emit(json!({
-            "event": "error",
-            "request_id": request.request_id,
-            "message": err
-        })),
+        Err(err) => {
+            let mut event = json!({
+                "event": "error",
+                "request_id": request.request_id,
+                "message": err
+            });
+            if let Some(refusal) = refusal {
+                event["error_code"] = json!("unsupported_objects");
+                event["objects"] = json!(refusal.objects);
+                event["bypassable"] = json!(refusal.bypassable);
+            }
+            emit(event)
+        }
     }
+}
+
+/// Objects the export scope contains that the dump format cannot preserve.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct DumpRefusal {
+    pub(crate) objects: Vec<String>,
+    /// True when only omittable objects (triggers, routines, events, ...) are
+    /// involved, so "table data only (incomplete)" may proceed. Lossy table
+    /// definitions are never bypassable.
+    pub(crate) bypassable: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -544,6 +563,9 @@ struct DumpRunOptions {
     data_format: String,
     compression: String,
     mysql_snapshot_mode: MysqlSnapshotMode,
+    /// Explicit "table data only (incomplete)" choice: proceed although the scope
+    /// contains objects the dump cannot preserve (they are omitted with warnings).
+    allow_incomplete: bool,
 }
 
 fn parse_dump_run_options(request: &Request) -> Result<DumpRunOptions, String> {
@@ -614,6 +636,11 @@ fn parse_dump_run_options(request: &Request) -> Result<DumpRunOptions, String> {
         data_format,
         compression,
         mysql_snapshot_mode,
+        allow_incomplete: request
+            .payload
+            .get("allow_incomplete")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -721,19 +748,79 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     Ok((manifest, views_count))
 }
 
-fn validate_dump_schema_fidelity(objects: &[String], schema: &NormalizedSchema) -> Result<(), String> {
-    let scoped_kinds = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk"];
-    let unsupported: Vec<_> = objects.iter().filter(|object| {
-        scoped_kinds.iter().any(|kind| schema.tables.iter().any(|table| object.starts_with(&format!("{kind}:{}:", table.name))))
-    }).cloned().collect();
-    if unsupported.is_empty() {
-        Ok(())
+const LOSSY_SCHEMA_KINDS: [&str; 6] = ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk"];
+
+fn scoped_unrepresentable(objects: &[String], schema: &NormalizedSchema) -> Vec<String> {
+    objects.iter().filter(|object| {
+        LOSSY_SCHEMA_KINDS.iter().any(|kind| schema.tables.iter().any(|table| object.starts_with(&format!("{kind}:{}:", table.name))))
+    }).cloned().collect()
+}
+
+/// Objects inside the export scope that the dump omits. Triggers and
+/// non-transactional tables belong to a table; routines, events and
+/// materialized views are schema-level and only in scope for a full export.
+fn scoped_omitted_objects(objects: &[String], schema: &NormalizedSchema, full_export: bool) -> Vec<String> {
+    let selected = |name: &str| schema.tables.iter().any(|table| table.name == name);
+    objects.iter().filter(|object| {
+        let mut parts = object.splitn(3, ':');
+        match (parts.next(), parts.next()) {
+            (Some("trigger" | "deprecated_engine" | "non_transactional_table"), Some(table)) => selected(table),
+            (Some("routine" | "event" | "materialized_view"), _) => full_export,
+            _ => false,
+        }
+    }).cloned().collect()
+}
+
+/// Default export refuses before anything is written; `allow_incomplete`
+/// waives only the omittable objects.
+fn dump_scope_refusal(
+    objects: &[String],
+    schema: &NormalizedSchema,
+    full_export: bool,
+    allow_incomplete: bool,
+) -> Option<DumpRefusal> {
+    let mut listed = scoped_unrepresentable(objects, schema);
+    let bypassable = listed.is_empty();
+    if bypassable && allow_incomplete {
+        return None;
+    }
+    listed.extend(scoped_omitted_objects(objects, schema, full_export));
+    if listed.is_empty() {
+        None
     } else {
-        Err(format!("dump.run cannot preserve selected table schema: {}", unsupported.join(", ")))
+        Some(DumpRefusal { objects: listed, bypassable })
     }
 }
 
-fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, String> {
+/// MySQL tables of the scope on a non-InnoDB engine (excluded from consistent
+/// snapshots). MyISAM is already reported as `deprecated_engine:`; this adds the
+/// others (MEMORY, ARCHIVE, ...) as `non_transactional_table:table:ENGINE`.
+fn mysql_non_transactional_objects(endpoint: &Endpoint, schema: &NormalizedSchema) -> Result<Vec<String>, String> {
+    let mut conn = mysql_connection(endpoint)?;
+    let rows: Vec<(String, String)> = conn
+        .exec(
+            "SELECT TABLE_NAME, ENGINE FROM information_schema.TABLES WHERE TABLE_SCHEMA = ? AND TABLE_TYPE = 'BASE TABLE'",
+            (endpoint_schema(endpoint),),
+        )
+        .map_err(|err| format!("mysql table-engine inspection failed: {err}"))?;
+    let selected: BTreeSet<&str> = schema.tables.iter().map(|table| table.name.as_str()).collect();
+    Ok(rows
+        .into_iter()
+        .filter(|(table, engine)| selected.contains(table.as_str()) && !engine.eq_ignore_ascii_case("innodb") && !engine.eq_ignore_ascii_case("myisam"))
+        .map(|(table, engine)| format!("non_transactional_table:{table}:{engine}"))
+        .collect())
+}
+
+#[cfg(test)]
+fn dump_run<F: FnMut(Value)>(request: &Request, emit: F) -> Result<Value, String> {
+    dump_run_with_refusal(request, emit, &mut None)
+}
+
+fn dump_run_with_refusal<F: FnMut(Value)>(
+    request: &Request,
+    mut emit: F,
+    refusal_slot: &mut Option<DumpRefusal>,
+) -> Result<Value, String> {
     let endpoint = request_endpoint(request)?;
     let options = parse_dump_run_options(request)?;
 
@@ -763,7 +850,19 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
     if schema.tables.is_empty() {
         return Err("dump.run found no tables to export".to_string());
     }
-    validate_dump_schema_fidelity(&inspection.unsupported_objects, &schema)?;
+    let mut scope_objects = inspection.unsupported_objects.clone();
+    if endpoint.engine == "mysql" {
+        scope_objects.extend(mysql_non_transactional_objects(&endpoint, &schema)?);
+    }
+    if let Some(refusal) = dump_scope_refusal(&scope_objects, &schema, full_export, options.allow_incomplete) {
+        let message = format!(
+            "dump.run refused: the selected scope contains objects the dump cannot preserve ({}): {}",
+            if refusal.bypassable { "table data only export is possible" } else { "table definitions would be lossy" },
+            refusal.objects.join(", ")
+        );
+        *refusal_slot = Some(refusal);
+        return Err(message);
+    }
     prepare_dump_output_dir(output_path, options.overwrite)?;
 
     let effective_threads = if endpoint.engine == "postgresql" || (endpoint.engine == "mysql"
@@ -846,6 +945,12 @@ fn dump_run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Value, St
         // 스냅샷 일관성을 보장할 수 없다. 전체 export를 막는 대신 해당 테이블만 제외하고
         // 경고를 남긴다(휘발성 MEMORY 임시 테이블 등은 복제 대상이 아닌 경우가 대부분).
         let non_txn = snapshot.non_transactional_table_names(&endpoint, &schema.tables)?;
+        if !non_txn.is_empty() && !options.allow_incomplete {
+            return Err(format!(
+                "dump.run refused: tables changed to a non-transactional engine before the snapshot: {}",
+                non_txn.join(", ")
+            ));
+        }
         if !non_txn.is_empty() {
             export_warnings.push(format!("Non-transactional tables excluded from export: {}", non_txn.join(", ")));
             let excluded: BTreeSet<String> = non_txn.iter().cloned().collect();
@@ -2291,13 +2396,66 @@ mod tests {
     use crate::adapters::test_support::{empty_table, schema};
 
     #[test]
-    fn dump_rejects_lossy_selected_schema_but_allows_unselected_objects() {
+    fn dump_refuses_lossy_selected_schema_but_allows_unselected_objects() {
         let schema = schema();
         let table = &schema.tables[0].name;
-        for kind in ["generated_column", "check_constraint", "unsupported_default", "custom_type", "unsupported_index", "cross_schema_fk"] {
-            assert!(validate_dump_schema_fidelity(&[format!("{kind}:{table}:example")], &schema).is_err());
-            assert!(validate_dump_schema_fidelity(&[format!("{kind}:unselected_table:example")], &schema).is_ok());
+        for kind in LOSSY_SCHEMA_KINDS {
+            let selected = dump_scope_refusal(&[format!("{kind}:{table}:example")], &schema, true, true).unwrap();
+            assert!(!selected.bypassable, "{kind} must not be waived by allow_incomplete");
+            assert!(dump_scope_refusal(&[format!("{kind}:unselected_table:example")], &schema, true, false).is_none());
         }
+    }
+
+    #[test]
+    fn dump_refuses_omitted_objects_by_default_and_waives_them_on_opt_in() {
+        let schema = schema();
+        let table = &schema.tables[0].name;
+        let objects = vec![
+            format!("trigger:{table}:audit"),
+            "routine:fn_a".to_string(),
+            "event:ev_a".to_string(),
+            "materialized_view:mv_a".to_string(),
+            format!("non_transactional_table:{table}:MEMORY"),
+            format!("deprecated_engine:{table}:MyISAM"),
+            "view:v_a".to_string(),
+        ];
+        let refusal = dump_scope_refusal(&objects, &schema, true, false).unwrap();
+        assert!(refusal.bypassable);
+        assert_eq!(refusal.objects.len(), 6, "view: is captured separately, not refused: {refusal:?}");
+        assert!(dump_scope_refusal(&objects, &schema, true, true).is_none());
+    }
+
+    #[test]
+    fn dump_partial_scope_only_refuses_triggers_of_selected_tables() {
+        let schema = schema();
+        let table = &schema.tables[0].name;
+        let objects = vec![
+            "trigger:other_table:audit".to_string(),
+            "routine:fn_a".to_string(),
+            "event:ev_a".to_string(),
+            "materialized_view:mv_a".to_string(),
+        ];
+        assert!(dump_scope_refusal(&objects, &schema, false, false).is_none());
+        let refusal = dump_scope_refusal(&[format!("trigger:{table}:audit")], &schema, false, false).unwrap();
+        assert_eq!(refusal.objects, vec![format!("trigger:{table}:audit")]);
+    }
+
+    #[test]
+    fn dump_refusal_lists_lossy_and_omitted_objects_together() {
+        let schema = schema();
+        let table = &schema.tables[0].name;
+        let objects = vec![format!("generated_column:{table}:g"), "routine:fn_a".to_string()];
+        let refusal = dump_scope_refusal(&objects, &schema, true, true).unwrap();
+        assert!(!refusal.bypassable);
+        assert_eq!(refusal.objects.len(), 2);
+    }
+
+    #[test]
+    fn dump_run_options_default_to_strict_refusal() {
+        let request = Request { command: "dump.run".into(), request_id: None, payload: json!({"output_dir": "x"}) };
+        assert!(!parse_dump_run_options(&request).unwrap().allow_incomplete);
+        let request = Request { command: "dump.run".into(), request_id: None, payload: json!({"output_dir": "x", "allow_incomplete": true}) };
+        assert!(parse_dump_run_options(&request).unwrap().allow_incomplete);
     }
 
     #[test]
@@ -2318,6 +2476,23 @@ mod tests {
                 "endpoint": endpoint, "output_dir": output, "threads": threads,
                 "chunk_size": 1, "data_format": "jsonl", "compression": "none", "overwrite": true,
             }) };
+            let refused_output = output.with_extension("refused");
+            let mut refused_payload = request.payload.clone();
+            refused_payload["output_dir"] = json!(refused_output);
+            let mut refusal = None;
+            let refused = dump_run_with_refusal(
+                &Request { command: "dump.run".into(), request_id: None, payload: refused_payload },
+                |_| {},
+                &mut refusal,
+            );
+            assert!(refused.is_err(), "routine in scope must refuse by default");
+            assert!(refusal.unwrap().objects.contains(&"routine:snapshot_fn".to_string()));
+            assert!(!refused_output.exists(), "nothing may be written before refusal");
+            let request = Request { command: "dump.run".into(), request_id: None, payload: {
+                let mut payload = request.payload.clone();
+                payload["allow_incomplete"] = json!(true);
+                payload
+            } };
             let mut updated = false;
             let missing_output = output.with_extension("missing");
             let mut missing_payload = request.payload.clone();
@@ -2327,7 +2502,7 @@ mod tests {
             let missing_result = dump_run(&missing_request, |_| {});
             assert!(missing_result.is_err(), "unknown selected tables must fail: {missing_result:?}");
             assert!(!missing_output.join("_tunnelforge_dump.json").exists());
-            fs::remove_dir_all(missing_output).unwrap();
+            assert!(!missing_output.exists());
             dump_run(&request, |event| {
                 if !updated && event["event"] == "row_progress" {
                     writer.execute_sql("UPDATE snapshot_a SET value=20; UPDATE snapshot_b SET value=20").unwrap();

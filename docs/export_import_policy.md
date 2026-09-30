@@ -144,11 +144,43 @@ that appears complete. PostgreSQL ALWAYS identities and custom/shared sequence
 semantics are also refused. Ordinary identity restoration uses `MAX(id)+1`, not
 the source's unused/deleted allocation gaps.
 
-Triggers/routines and excluded nontransactional tables are not a full backup.
-Known omissions and separately captured views produce persistent warnings and
-`strict_export=false`; retain and review them. A successful table transfer does
-not certify complete database backup fidelity. No new signing/notarization
-requirement or external database dump tool is introduced.
+### Object support table (Export)
+
+Only the scope below is officially supported; the format is not being extended to
+triggers, routines or events. Live-verified on MySQL 8.0.46 / 8.4.11 and
+PostgreSQL 13.23 / 18.4 (`live_export_contract`,
+`unsupported_objects_are_refused_before_any_file_and_opt_in_proceeds`): the
+preserved core, triggers, routines, events, materialized views, MEMORY tables,
+default refusal, opt-in and a strict export/import round trip. The lossy-definition
+rows (generated columns, CHECK, defaults, advanced indexes, cross-schema FKs)
+come from the existing inspection and its earlier fixtures. Other versions are not
+claimed.
+
+| Object | MySQL | PostgreSQL |
+| --- | --- | --- |
+| Tables, rows, PK/UNIQUE/secondary indexes, supported FKs, comments, supported defaults | Preserved | Preserved |
+| Views (full export only) | Preserved as separately captured definitions; persistent warning, `strict_export=false` | Same |
+| Generated columns, unsafe CHECK, unsupported defaults, advanced indexes (functional/descending/FULLTEXT/SPATIAL/partial/non-btree), cross-schema FKs | Refused before export; **not waivable** | Same, plus custom types/ALWAYS identity/custom sequences |
+| Triggers on an exported table | Refused before export; waivable | Same |
+| Routines (functions/procedures), events, materialized views | Refused before export for a **full** export; waivable. Not in scope of a table subset, so a subset export proceeds with a persistent warning (unchanged behavior) | Same (no events; materialized views apply) |
+| Non-InnoDB tables (MyISAM, MEMORY, ...) in the exported scope | Refused before export; waivable | n/a |
+
+Default behavior: when the selected scope contains any refused object, `dump.run`
+fails before the target directory or any dump file is created, with
+`error_code: "unsupported_objects"`, `objects` (one `kind:table:name` entry per
+object) and `bypassable`. Only the waivable objects can be omitted, and only by
+the explicit choice "table data only (incomplete)" (`allow_incomplete: true` in the
+`dump.run` payload; the UI asks after showing the object list). That choice
+keeps `strict_export=false` and adds a persistent `Object not exported: ...`
+warning per object. Lossy table definitions (`bypassable: false`) cannot be
+waived. Scheduled backups have no such prompt and therefore fail with the
+refusal instead of silently producing an incomplete backup. Import behavior is
+unchanged. Objects this inspection does not detect (for example MySQL
+partitioning, PostgreSQL extensions, rules or privileges) are not reported.
+
+A successful table transfer does not certify complete database backup fidelity.
+No new signing/notarization requirement or external database dump tool is
+introduced.
 
 See [verification evidence](export_import_verification_2026-09-28.md) for fixtures
 and results. Keep a recoverable target backup before destructive replacement.
