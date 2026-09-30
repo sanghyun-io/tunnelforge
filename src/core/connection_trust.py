@@ -139,3 +139,22 @@ def lookup_endpoint_tls(host: str, port) -> TlsPolicy:
 def clear_registered_tls() -> None:
     with _registry_lock:
         _registry.clear()
+
+
+def apply_registered_tls(payload: dict) -> dict:
+    """Core 로 보내는 연결 dict 에 등록부의 TLS 정책을 싣는다 (이미 `tls` 가 있으면 그대로 둔다).
+
+    DbEndpoint 를 거치지 않고 host/port dict 를 직접 만드는 모든 경로는 이 함수를 통해야 한다
+    (tests/test_connection_payload_guard.py 가 소스 전체에서 이를 강제한다).
+    """
+    if "tls" in payload:
+        return payload
+    policy = lookup_endpoint_tls(payload.get("host"), payload.get("port"))
+    if policy.mode == TLS_DISABLE:
+        return payload
+    tls = {"mode": policy.mode}
+    if policy.ca_file:
+        tls["ca_file"] = policy.ca_file
+    if policy.server_name:
+        tls["server_name"] = policy.server_name
+    return {**payload, "tls": tls}
