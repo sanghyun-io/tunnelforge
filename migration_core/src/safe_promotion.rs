@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "engine", content = "plan")]
-enum EnginePlan {
+pub(crate) enum EnginePlan {
     #[serde(rename = "mysql")]
     MySql(crate::safe_promote_mysql::PromotionPlan),
     #[serde(rename = "postgresql")]
@@ -43,16 +43,16 @@ impl EnginePlan {
 }
 
 #[derive(Serialize, Deserialize)]
-struct StoredPlan {
-    restore_id: String,
+pub(crate) struct StoredPlan {
+    pub(crate) restore_id: String,
     restore_digest: String,
-    original_target: Value,
-    candidate_target: Value,
-    engine_plan: EnginePlan,
-    attempt_nonce: String,
+    pub(crate) original_target: Value,
+    pub(crate) candidate_target: Value,
+    pub(crate) engine_plan: EnginePlan,
+    pub(crate) attempt_nonce: String,
 }
 
-fn public_target(endpoint: &Endpoint) -> Value {
+pub(crate) fn public_target(endpoint: &Endpoint) -> Value {
     json!({"engine": endpoint.engine, "host": endpoint.host, "port": endpoint.port,
         "database": endpoint.database, "schema": endpoint_schema(endpoint)})
 }
@@ -74,7 +74,7 @@ fn validate_prior_outcome(report: &Value) -> Result<(), String> {
     Ok(())
 }
 
-fn prior_attempt(directory: &Path) -> Result<Option<Value>, String> {
+pub(crate) fn prior_attempt(directory: &Path) -> Result<Option<Value>, String> {
     let path = directory.join("attempt");
     match fs::symlink_metadata(&path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),

@@ -72,6 +72,51 @@ MySQL saved old-view aliases preserve definitions but reference the active table
 names: they are not views of backup data. The journal records their definitions.
 Backup namespaces do not represent an independently complete full-database backup.
 
+### Backup lifecycle (`restore.backups`)
+
+The Core command `restore.backups` (UI: Import dialog, "복원 백업 관리") works from the
+promotion journals stored in the dump directories passed as `input_dirs`; a
+namespace that only follows the `tf_backup_` naming is listed as unproven and is
+never deleted.
+
+| Action | Effect |
+| --- | --- |
+| `list` | Journal status, backup namespace, ownership proof, table count and estimated rows, cutover verdict, candidate namespace. MySQL saved view aliases are reported as "not views over backup data". |
+| `reconcile` | Compares an unknown/pending journal with live identities (MySQL InnoDB table ids, PostgreSQL relation OIDs): `promoted`, `not_promoted` or `undeterminable`. Report-only; retry and cleanup stay blocked unless the result is `promoted`. |
+| `cleanup_plan` | Read-only preview of exactly what would be dropped, with blockers. |
+| `cleanup_apply` | Requires `confirmed: true` and the digest of a plan reviewed just before; every check is re-derived from the live objects, then one owned namespace is dropped. |
+
+Cleanup of a backup requires all of: recorded ownership (identities match the
+journal and the namespace holds exactly the recorded tables), no object outside it
+that references it (foreign keys, views, column defaults, inheritance, routine
+text), no change since the cutover (definition and content fingerprints recorded
+right after the commit; a journal without a fingerprint is refused), and a
+confirmed promotion. MySQL additionally needs proven global SELECT/SHOW
+VIEW/PROCESS visibility. A candidate (`tf_restore_<id>` only, never the restore
+destination itself) is removable when unpromoted and still proven identical to its
+verification, or, after promotion, when it holds only objects the promotion plan
+recorded (PostgreSQL: the candidate's own views; MySQL: the recorded replacement
+views, after the recorded temporary `tf_promote_` clone database, which is a separate
+`target: "clone"` cleanup, is gone). Original objects and namespaces without a
+journal are never dropped.
+
+Guided recovery (`rollback_plan` / `rollback_apply`) is the inverse of the
+promotion: one atomic multi-object RENAME (MySQL) or one transaction (PostgreSQL)
+puts the retained original tables back and moves the active tables into a new
+retained backup namespace (`tf_backup_rb_<hash>`); nothing is deleted and the
+review plus `confirmed: true` are mandatory. It is refused unless the promotion is
+confirmed, the retained backup is proven unchanged, the active tables still have
+exactly the promoted content (MySQL: verified candidate/clone digests; PostgreSQL:
+fingerprints taken from the verified candidate at plan time, so older plans are
+refused) and identity, no view or routine is involved, and no other object depends
+on the active tables (PostgreSQL: only the recorded incoming foreign keys, which are
+re-pointed). Writes accepted after the promotion therefore block recovery instead of
+being discarded. After a recovery the emptied promotion backup namespace and the
+recovery backup can be removed with `target: "backup"` / `"displaced"` under the
+same ownership, reference and no-change checks.
+Verified live on MySQL 8.0.46/8.4.11 and PostgreSQL 13.23/18.4
+(`live_backup_lifecycle`).
+
 An interrupted cutover can have an unknown outcome. Its journal must be reconciled
 before retry; a client-side error is not evidence that replacement did not occur.
 After a proven rollback, reviewing a fresh plan can reuse the verified candidate;

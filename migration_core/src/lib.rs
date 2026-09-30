@@ -15,6 +15,7 @@ mod ddl;
 mod safe_promote_mysql;
 mod safe_promote_postgres;
 mod safe_promotion;
+mod safe_backups;
 
 pub use adapters::*;
 pub(crate) use tls::*;
