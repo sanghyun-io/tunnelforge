@@ -35,13 +35,18 @@ def test_real_ssh_tunnel_forwards_bytes_and_releases_listener(tmp_path):
     listener.settimeout(5)
     transports = []
 
+    authenticated = []
+
     def handle(sock):
+        transport = None
         try:
             transport = paramiko.Transport(sock)
             transports.append(transport)
             transport.add_server_key(host_key)
             transport.start_server(server=Server())
             while not stopping.is_set() and transport.is_active():
+                if transport.is_authenticated() and transport not in authenticated:
+                    authenticated.append(transport)
                 channel = transport.accept(0.2)
                 if channel is None:
                     continue
@@ -51,7 +56,11 @@ def test_real_ssh_tunnel_forwards_bytes_and_releases_listener(tmp_path):
                     if data:
                         channel.sendall(data)
         except Exception as exc:
-            if not stopping.is_set():
+            # The engine's host-key probe hangs up right after key exchange, before any
+            # authentication; that (and only that) is expected. Errors on authenticated
+            # connections, i.e. the real tunnel, still count.
+            probe = transport is None or not transport.is_authenticated()
+            if not stopping.is_set() and not probe:
                 failures.append(exc)
 
     def serve():
@@ -102,6 +111,7 @@ def test_real_ssh_tunnel_forwards_bytes_and_releases_listener(tmp_path):
         assert not engine.is_running("ssh-live")
         assert engine.get_connection_info("ssh-live") == (None, None)
         assert not failures
+        assert authenticated, "the real tunnel connection never authenticated"
     finally:
         stopping.set()
         engine.stop_all()

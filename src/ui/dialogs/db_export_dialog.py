@@ -319,6 +319,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._close_after_cancel = False
         self._mysql_single_connection_fallback = False
         self._mysql_no_backup_lock_fallback = False
+        self._allow_incomplete = False
+        self._snapshot_mode = "parallel_strict"
 
         # 로그 수집용 변수
         self.log_entries: List[str] = []
@@ -1051,6 +1053,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._close_after_cancel = False
         self._mysql_single_connection_fallback = False
         self._mysql_no_backup_lock_fallback = False
+        self._allow_incomplete = False
+        self._snapshot_mode = "parallel_strict"
 
     def _build_worker(
         self,
@@ -1059,6 +1063,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         mysql_snapshot_mode: str = "parallel_strict",
     ):
         config = build_rust_dump_config(self.connector)
+        self._snapshot_mode = mysql_snapshot_mode
         threads = (
             1 if mysql_snapshot_mode == "single_connection"
             else self.spin_threads.value()
@@ -1071,6 +1076,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 threads=threads,
                 compression=self.combo_compression.currentText(),
                 mysql_snapshot_mode=mysql_snapshot_mode,
+                allow_incomplete=self._allow_incomplete,
             )
         return RustDumpWorker(
             "export_tables", config,
@@ -1081,6 +1087,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             compression=self.combo_compression.currentText(),
             include_fk_parents=self.chk_include_fk.isChecked(),
             mysql_snapshot_mode=mysql_snapshot_mode,
+            allow_incomplete=self._allow_incomplete,
         )
 
     def _start_export_worker(self, worker: RustDumpWorker) -> None:
@@ -1195,6 +1202,45 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         )
         self._start_export_worker(worker)
 
+    def _prompt_incomplete_export(self, objects: List[str]) -> bool:
+        """지원되지 않는 객체 목록을 보여주고 불완전 Export를 명시적으로 선택받는다."""
+        message_box = QMessageBox(self)
+        message_box.setIcon(QMessageBox.Icon.Warning)
+        message_box.setWindowTitle("Export 범위에 보존할 수 없는 객체가 있습니다")
+        message_box.setText(
+            "선택한 범위에 이 덤프 형식이 보존할 수 없는 객체가 있어 Export를 시작하지 않았습니다 "
+            "(파일은 생성되지 않았습니다).\n\n"
+            "'테이블 데이터만 내보내기 (불완전)'를 선택하면 아래 객체를 제외하고 진행하며, "
+            "결과는 완전한 백업이 아닙니다."
+        )
+        message_box.setDetailedText("\n".join(objects))
+        proceed_button = message_box.addButton(
+            translate_text("테이블 데이터만 내보내기 (불완전)"),
+            QMessageBox.ButtonRole.DestructiveRole,
+        )
+        proceed_button.setObjectName("export_incomplete_proceed")
+        cancel_button = message_box.addButton(
+            translate_text("취소"), QMessageBox.ButtonRole.RejectRole
+        )
+        cancel_button.setObjectName("export_incomplete_cancel")
+        message_box.setDefaultButton(cancel_button)
+        message_box.setEscapeButton(cancel_button)
+        message_box.exec()
+        return message_box.clickedButton() is proceed_button
+
+    def _retry_allow_incomplete(self) -> None:
+        self._allow_incomplete = True
+        self._add_log("사용자가 '테이블 데이터만 내보내기 (불완전)'를 선택했습니다.")
+        self.set_ui_enabled(False)
+        self.collapse_config_section()
+        self.label_status.setText("테이블 데이터만 Export (불완전) 진행 중...")
+        worker = self._build_worker(
+            self.export_schema,
+            self.input_output_dir.text(),
+            mysql_snapshot_mode=self._snapshot_mode,
+        )
+        self._start_export_worker(worker)
+
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용)"""
         timestamp = datetime.now().strftime('%H:%M:%S')
@@ -1231,6 +1277,16 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def on_finished(self, success: bool, message: str):
         message = _escape_local_diagnostic_text(message)
         handled_privilege_failure = False
+        refusal = getattr(self.worker, "export_refusal", None)
+        if (
+            not success
+            and not self._allow_incomplete
+            and isinstance(refusal, dict)
+            and refusal.get("bypassable")
+            and self._prompt_incomplete_export(list(refusal.get("objects") or []))
+        ):
+            self._retry_allow_incomplete()
+            return
         if (
             not success
             and not self._mysql_single_connection_fallback
@@ -1294,6 +1350,11 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             QMessageBox.information(
                 self, "Export 완료",
                 f"✅ Export가 완료되었습니다.\n\n폴더: {self.input_output_dir.text()}"
+                + (
+                    "\n\n⚠️ 테이블 데이터만 내보낸 불완전 Export입니다. "
+                    "제외된 객체는 결과 로그와 manifest 경고를 확인하세요."
+                    if self._allow_incomplete else ""
+                )
             )
         else:
             self.txt_log.addItem(f"❌ 실패: {message}")

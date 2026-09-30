@@ -8,6 +8,25 @@ from src.core.connection_trust import extract_error_code, friendly_error_message
 from src.core.db_core_client import DbCoreServiceClient, DbCoreServiceError
 
 
+def _query_control(job_id, timeout_ms, max_rows, max_bytes) -> Dict[str, Any]:
+    control: Dict[str, Any] = {}
+    for key, value in (("job_id", job_id), ("timeout_ms", timeout_ms),
+                       ("max_rows", max_rows), ("max_bytes", max_bytes)):
+        if value:
+            control[key] = value
+    return control
+
+
+def _raise_if_query_failed(result: Dict[str, Any]) -> None:
+    """Cancel/timeout arrive as a failed result (with partial counts); surface them as errors."""
+    if result.get("success") is False and result.get("error_code"):
+        raise DbCoreServiceError(
+            str(result.get("message") or result["error_code"]),
+            error_code=result["error_code"],
+            payload=result,
+        )
+
+
 @dataclass(frozen=True)
 class DbEndpoint:
     engine: str
@@ -77,9 +96,7 @@ class DbCoreFacade:
         if not result.get("success"):
             message = str(result.get("message", "connection failed"))
             code = result.get("error_code") or extract_error_code(message)
-            error = DbCoreServiceError(_with_friendly_hint(message, code))
-            error.error_code = code
-            raise error
+            raise DbCoreServiceError(_with_friendly_hint(message, code), error_code=code, payload=result)
         return str(result.get("connection_id", ""))
 
     def close_connection(self, connection_id: str) -> bool:
@@ -144,18 +161,29 @@ class DbCoreFacade:
         connection_id: str,
         sql: str,
         params: Optional[Sequence[Any]] = None,
+        job_id: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        max_rows: Optional[int] = None,
+        max_bytes: Optional[int] = None,
     ) -> Dict[str, Any]:
-        result = self.client.request(
-            "query.execute",
-            {"connection_id": connection_id, "sql": sql, "params": list(params or [])},
-        )
+        payload = {"connection_id": connection_id, "sql": sql, "params": list(params or [])}
+        payload.update(_query_control(job_id, timeout_ms, max_rows, max_bytes))
+        result = self.client.request("query.execute", payload)
+        _raise_if_query_failed(result)
         rows = result.get("rows")
         columns = result.get("columns")
         return {
             "rows": [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else [],
             "columns": [str(column) for column in columns] if isinstance(columns, list) else [],
             "rows_affected": int(result.get("rows_affected") or 0),
+            "truncated": bool(result.get("truncated")),
+            "truncated_by": result.get("truncated_by"),
+            "in_transaction": result.get("in_transaction"),
         }
+
+    def cancel_query(self, job_id: str) -> Dict[str, Any]:
+        """Ask the core to cancel a running query on the server (KILL QUERY / pg cancel)."""
+        return self.client.request("query.cancel", {"job_id": job_id})
 
     def execute_on_connection_streaming(
         self,
@@ -164,6 +192,10 @@ class DbCoreFacade:
         params: Optional[Sequence[Any]] = None,
         row_batch_size: int = 500,
         on_batch: Optional[Callable[[List[Dict[str, Any]]], None]] = None,
+        job_id: Optional[str] = None,
+        timeout_ms: Optional[int] = None,
+        max_rows: Optional[int] = None,
+        max_bytes: Optional[int] = None,
     ) -> Dict[str, Any]:
         def handle_event(payload: Dict[str, Any]) -> None:
             # Ignores the leading "columns" progress event; only row_batch is consumed here.
@@ -173,17 +205,17 @@ class DbCoreFacade:
             if isinstance(rows, list):
                 on_batch([row for row in rows if isinstance(row, dict)])
 
-        return self.client.request(
-            "query.execute",
-            {
-                "connection_id": connection_id,
-                "sql": sql,
-                "params": list(params or []),
-                "stream_rows": True,
-                "row_batch_size": int(row_batch_size),
-            },
-            on_event=handle_event,
-        )
+        payload = {
+            "connection_id": connection_id,
+            "sql": sql,
+            "params": list(params or []),
+            "stream_rows": True,
+            "row_batch_size": int(row_batch_size),
+        }
+        payload.update(_query_control(job_id, timeout_ms, max_rows, max_bytes))
+        result = self.client.request("query.execute", payload, on_event=handle_event)
+        _raise_if_query_failed(result)
+        return result
 
     def run_migration(
         self,
