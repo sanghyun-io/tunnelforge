@@ -52,10 +52,12 @@ history, schema metadata.
 The SQL text itself can contain secrets typed by the user (for example
 `CREATE USER ... IDENTIFIED BY '...'`). `sql_history.json` already keeps executed
 SQL permanently in plaintext, so plaintext drafts do not widen the exposure class,
-but they also cover statements that were never executed. Mitigations: file mode
-0600 where the OS supports it, a user-visible off switch that also deletes stored
-workspaces, no SQL in logs or error reports, and (decision D3) optional encryption
-with the existing `ConfigManager` encryptor.
+but they also cover statements that were never executed. Drafts are stored in
+plaintext (decision D3). Protection: file mode 0600 on POSIX; on Windows a mode bit
+is meaningless, so the files rely on the default ACL of the user's profile
+directory (`%LOCALAPPDATA%`), exactly like `config.json` and `sql_history.json`.
+Settings provide an off switch and "Delete stored workspaces"; SQL never appears
+in logs or error reports.
 
 ## 3. Storage
 
@@ -153,11 +155,11 @@ read-only default and its explicit unlock (production profiles) apply unchanged,
 and a restored tab never carries an unlocked state.
 
 Deleted profiles: the editor can only be opened for an existing profile, so a
-workspace whose profile id no longer exists is an **orphan**. Orphans are not
-restored automatically; the main window lists them under "Recovered SQL" (D4) where
-each tab can be opened in an editor for a chosen profile (SQL only, no target),
-exported to a `.sql` file, or deleted. Orphans older than 90 days are offered for
-deletion, never deleted silently.
+workspace whose profile id no longer exists is an **orphan**. Orphans are kept and
+never restored automatically. The main window menu "Recovered SQL" shows a
+**read-only** list (view content, copy to clipboard, save to a `.sql` file,
+delete); there is no editing feature. Orphans older than 90 days are marked
+expired in that list and removed only when the user deletes them.
 
 ## 6. Failure handling
 
@@ -233,19 +235,27 @@ accessors on `SQLEditorTab`); `src/ui/main_window.py` ("Recovered SQL" entry,
 `aboutToQuit` flush); settings dialog; `src/core/i18n/legacy_translate.py`;
 `docs/commercial_readiness_2026-09-28.md` status line.
 
-## 10. Decisions needed
+## 10. Decisions (resolved by the manager, 2026-10-01)
 
-- D1 Per-tab targets: tabs share one connection target today. Keep a
-  dialog-level target (proposed) or wait for per-tab targets from the editor work?
-  The format reserves `tabs[].target` either way.
-- D2 Close semantics: keep drafts on normal close and change the warning text
-  (proposed), or keep the loss warning and only recover after crashes.
-- D3 Plaintext vs encrypted drafts: plaintext with 0600 (consistent with
-  `sql_history.json`, proposed) or encrypt with the `ConfigManager` encryptor
-  (protects against casual disclosure, adds key-loss failure modes).
-- D4 Orphan workspaces: a "Recovered SQL" list in the main window (proposed) or
-  silently delete when the profile is deleted.
-- D5 Retention: should unsaved drafts expire (proposed: no expiry for open
-  profiles, 90-day prompt for orphans)?
-- D6 Sequencing: implementation after the SQL editor changes merge, in two PRs:
-  store + tests first (no UI), then the dialog integration and settings.
+- D1 Dialog-level target; `tabs[].target` stays reserved (always null for now).
+- D2 Normal close keeps the drafts. The close warning says unsaved SQL "will be
+  restored next time" and offers an explicit "Discard" (removes the stored
+  workspace). Pending transactions and unsaved cell edits keep the loss warning.
+- D3 Plaintext, consistent with `sql_history.json`; Windows relies on the default
+  profile-directory ACL (section 2). Settings must offer the off switch and
+  "Delete stored workspaces".
+- D4 Minimal orphan handling: keep orphans, read-only "Recovered SQL" menu list
+  (view, copy, save to file, delete); no editing.
+- D5 No expiry for open profiles; orphans older than 90 days are marked and shown
+  in the list before any cleanup.
+- D6 Two phases. Phase 1 (this branch): `src/core/workspace_store.py`,
+  `platform_paths.workspaces_dir()` and tests, no UI and no SQL editor file
+  changes. Phase 2 (after the production read-only editor work merges): dialog
+  integration, settings and the menu.
+
+Phase 1 store API (implemented): `WorkspaceStore.save/load/delete/delete_all/
+cleanup_stale_tmp/list_workspaces`, `parse_workspace`, `compute_file_state` /
+`compare_file_state`, `autosave_seconds`, setting-key constants. `save` reports
+`omitted_tabs` (limits) and `wrote_sibling` (newer-version file left untouched);
+`load` returns `ok | missing | corrupt (quarantined) | newer_version` plus a
+`crashed` flag.
