@@ -211,6 +211,11 @@ class TunnelManagerUI(QMainWindow):
         header_layout.addWidget(self.btn_migration)
         header_layout.addWidget(self.btn_db_transition)
         header_layout.addWidget(self.btn_schedule)
+        # [작업 목록] Export/Import/전환/이관 실행 기록
+        self.btn_job_list = QPushButton()
+        self.btn_job_list.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_job_list.clicked.connect(self.open_job_list_dialog)
+        header_layout.addWidget(self.btn_job_list)
         # [복구된 SQL] 삭제된 프로필에서 남은 작업 공간이 있을 때만 보인다 (읽기 전용 목록)
         self.btn_recovered_sql = QPushButton()
         self.btn_recovered_sql.setStyleSheet(ButtonStyles.SECONDARY)
@@ -241,6 +246,8 @@ class TunnelManagerUI(QMainWindow):
 
         self.refresh_table()
         self._refresh_recovered_sql_button()
+        from src.core.job_history import sweep_interrupted
+        sweep_interrupted()  # 이전 실행에서 작업 도중 종료된 기록을 '중단됨'으로 표시
 
     def _icon_text(self, icon: str, key: str) -> str:
         return f"{icon} {tr(key)}" if icon else tr(key)
@@ -254,6 +261,7 @@ class TunnelManagerUI(QMainWindow):
         self.btn_db_transition.setText(tr("main.db_transition"))
         self.btn_schedule.setText(self._icon_text("📅", "main.schedule"))
         self.btn_settings.setText(self._icon_text("⚙️", "main.settings"))
+        self.btn_job_list.setText("📋 작업 목록")
         self.btn_recovered_sql.setText("📝 복구된 SQL")
         self.statusBar().showMessage(tr("app.ready"))
         if hasattr(self, "tunnel_tree"):
@@ -603,6 +611,25 @@ class TunnelManagerUI(QMainWindow):
             self._apply_language()
             self.refresh_table()
         self._refresh_recovered_sql_button()
+
+    def open_job_list_dialog(self):
+        """작업 목록 (TF-STATUS-132)"""
+        from src.core.job_history import make_history
+        from src.ui.dialogs.job_list_dialog import JobListDialog
+        JobListDialog(make_history(), reopen=self.reopen_job_dialog, parent=self).exec()
+
+    def reopen_job_dialog(self, record):
+        """작업 목록에서 원래 대화상자를 연다. Export 만 이전 설정으로 화면을 채우고, 나머지는 설정 없이 연다
+        (실행 때마다 사전 검증을 새로 거치며 Import/전환/이관의 부분 재시도는 하지 않는다)."""
+        from src.core import job_history as jh
+        tunnel = next((t for t in self.config_mgr.load_config().get('tunnels', [])
+                       if record.profile_id and t.get('id') == record.profile_id), None)
+        if record.kind in (jh.KIND_EXPORT_FULL, jh.KIND_EXPORT_TABLES):
+            self._wizard_launcher.open_rust_dump_export(tunnel, record.rerun)
+        elif record.kind in (jh.KIND_IMPORT, jh.KIND_PROMOTE):
+            self._wizard_launcher.open_rust_dump_import(tunnel)
+        else:
+            self._wizard_launcher.open_cross_engine_migration()
 
     def _known_profile_ids(self):
         return [t.get('id') for t in self.config_mgr.load_config().get('tunnels', []) if t.get('id')]

@@ -125,6 +125,15 @@ def sql_history_file(
     return app_support_dir(platform_name, home, environ) / "sql_history.json"
 
 
+def job_history_file(
+    platform_name: Optional[str] = None,
+    home: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    """Export/Import/전환/이관 작업 기록(최근 N건) 파일."""
+    return app_support_dir(platform_name, home, environ) / "job_history.json"
+
+
 def workspaces_dir(
     platform_name: Optional[str] = None,
     home: Optional[Path] = None,

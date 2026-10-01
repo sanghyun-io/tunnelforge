@@ -31,6 +31,7 @@ from src.exporters.rust_dump_exporter import (
 )
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.workers.error_reporting_worker import ErrorReportingMixin
+from src.ui.dialogs.job_recording import begin_export_job, finish_export_job
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 
 logger = get_logger("db_dialogs")
@@ -303,10 +304,12 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     """Rust DB Core Export 다이얼로그"""
 
     def __init__(self, parent=None, connector: MySQLConnector = None,
-                 config_manager=None, connection_info: str = ""):
+                 config_manager=None, connection_info: str = "", job_context: dict = None):
         super().__init__(parent)
         self.setWindowTitle("Rust DB Core Export (병렬 처리)")
         self.resize(600, 650)
+        self.job_context = job_context or {}  # 작업 목록 기록용 프로필 정보 (id/name)
+        self._job_id = None
 
         self.connector = connector
         self.config_manager = config_manager
@@ -882,6 +885,35 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         is_partial = self.radio_partial.isChecked()
         self.table_group.setVisible(is_partial)
 
+    def apply_job_rerun(self, rerun: dict) -> None:
+        """작업 목록의 이전 실행 설정으로 화면만 채운다 (스키마/범위/테이블/압축/스레드).
+
+        실행은 사용자가 직접 시작하며, 그때 Core 의 사전 검증(지원 객체 거부 등)을 새로 거친다.
+        """
+        if not isinstance(rerun, dict):
+            return
+        schema = rerun.get("schema")
+        if isinstance(schema, str):
+            index = self.combo_schema.findText(schema)
+            if index >= 0:
+                self.combo_schema.setCurrentIndex(index)
+        if rerun.get("scope") == "tables":
+            self.radio_partial.setChecked(True)
+            wanted = set(rerun.get("tables") or [])
+            for i in range(self.list_tables.count()):
+                item = self.list_tables.item(i)
+                item.setCheckState(Qt.CheckState.Checked if item.text() in wanted else Qt.CheckState.Unchecked)
+        else:
+            self.radio_full.setChecked(True)
+        compression = rerun.get("compression")
+        if isinstance(compression, str) and self.combo_compression.findText(compression) >= 0:
+            self.combo_compression.setCurrentText(compression)
+        threads = rerun.get("threads")
+        if isinstance(threads, int) and not isinstance(threads, bool):
+            self.spin_threads.setValue(threads)
+        if isinstance(rerun.get("include_fk_parents"), bool):
+            self.chk_include_fk.setChecked(rerun["include_fk_parents"])
+
     def load_schemas(self):
         self.combo_schema.clear()
         if not self.connector:
@@ -1031,6 +1063,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def _reset_export_state(self, schema: str):
         self._begin_error_report_operation()
+        self._job_id = None
         self.log_entries.clear()
         self.export_start_time = datetime.now()
         self.export_end_time = None
@@ -1091,6 +1124,8 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         )
 
     def _start_export_worker(self, worker: RustDumpWorker) -> None:
+        if self._job_id is None:  # 재시도(권한 대체/불완전 선택)는 같은 작업으로 기록한다
+            self._job_id = begin_export_job(self)
         self.worker = worker
         worker.progress.connect(self.on_progress)
         worker.table_progress.connect(self.on_table_progress)
@@ -1310,6 +1345,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # 로그 기록
         self.export_end_time = datetime.now()
         self.export_success = success
+        finish_export_job(self, success, message)
 
         self._add_log(f"{'='*60}")
         self._add_log(f"Export {'성공' if success else '실패'}")
