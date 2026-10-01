@@ -9,9 +9,9 @@ import os
 from typing import Callable, List, Optional
 
 from PyQt6.QtCore import Qt, QUrl
-from PyQt6.QtGui import QDesktopServices
+from PyQt6.QtGui import QBrush, QColor, QDesktopServices
 from PyQt6.QtWidgets import (
-    QAbstractItemView, QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
+    QAbstractItemView, QComboBox, QHeaderView, QDialog, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
     QPushButton, QTableWidget, QTableWidgetItem, QVBoxLayout,
 )
 
@@ -36,6 +36,12 @@ STATUS_LABELS = {
     jh.STATUS_FAILED: "실패",
     jh.STATUS_CANCELLED: "취소",
     jh.STATUS_INTERRUPTED: "중단됨 (앱 종료)",
+}
+# 상태 열 글자색. 색만으로 구분하지 않도록 상태 텍스트는 항상 함께 표시한다.
+STATUS_COLORS = {
+    jh.STATUS_FAILED: "#c0392b",
+    jh.STATUS_PARTIAL: "#b9770e",
+    jh.STATUS_INTERRUPTED: "#8e44ad",
 }
 # 새 사전 검증을 다시 거치는 종류만 "설정을 채워" 다시 연다.
 REOPEN_WITH_SETTINGS = (jh.KIND_EXPORT_FULL, jh.KIND_EXPORT_TABLES)
@@ -102,6 +108,13 @@ class JobListDialog(QDialog):
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.setSortingEnabled(True)
+        header = self.table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)  # 대상: 긴 경로는 사용자가 조절
+        self.table.setColumnWidth(2, 240)
+        header.setSectionResizeMode(len(COLUMNS) - 1, QHeaderView.ResizeMode.Stretch)  # 오류 요약이 남은 폭을 채운다
+        header.setStretchLastSection(True)
+        self.table.setTextElideMode(Qt.TextElideMode.ElideRight)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self.table, 3)
 
@@ -168,10 +181,20 @@ class JobListDialog(QDialog):
                 QTableWidgetItem(record.error_summary),
             ]
             cells[0].setData(Qt.ItemDataRole.UserRole, record.id)
+            color = STATUS_COLORS.get(record.status)
+            if color:
+                cells[5].setForeground(QBrush(QColor(color)))
+            # 잘린 열은 툴팁에서 전체를 읽는다
+            for column in (2, 3):
+                cells[column].setToolTip(cells[column].text())
+            if record.error_summary:
+                cells[7].setToolTip(record.error_summary)
             for column, item in enumerate(cells):
                 self.table.setItem(row, column, item)
         self.table.setSortingEnabled(True)
         self.table.sortByColumn(0, Qt.SortOrder.DescendingOrder)
+        for column in (0, 1, 3, 4, 5, 6):
+            self.table.resizeColumnToContents(column)
         self.detail.clear()
         self._update_buttons()
 
