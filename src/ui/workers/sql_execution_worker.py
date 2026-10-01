@@ -18,8 +18,10 @@ class SQLExecutionWorker(QThread):
 
     def __init__(self, sql_file: str, host: str, port: int,
                  user: str, password: str, database: str = None,
-                 db_engine: str = "mysql", schema: str = "", parent=None, limits=None):
+                 db_engine: str = "mysql", schema: str = "", parent=None, limits=None,
+                 read_only: bool = False):
         super().__init__(parent)
+        self.read_only = read_only  # TF-STATUS-128: production windows run read-only sessions
         self.limits = dict(limits) if limits is not None else build_query_limits()
         self._connector = None
         self.sql_file = sql_file
@@ -54,6 +56,7 @@ class SQLExecutionWorker(QThread):
                 self.password,
                 self.database,
                 schema=self.schema if self.db_engine == "postgresql" else "",
+                **({"read_only": True} if self.read_only else {}),
             )
 
             self._connector = connector

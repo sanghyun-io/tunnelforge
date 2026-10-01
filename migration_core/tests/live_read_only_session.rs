@@ -367,3 +367,53 @@ fn read_only_session_keeps_cancel_streaming_and_export_working() {
         let _ = std::fs::remove_file(&path);
     }
 }
+
+/// The core never reconnects a session: a killed read-only session fails (it is not silently
+/// replaced by a writable one), and a fresh `connection.open` is read-only again. One-off endpoint
+/// queries honour `read_only` too.
+#[test]
+fn killed_read_only_session_is_not_replaced_by_a_writable_one() {
+    let cases = cases();
+    if skip_if_none(&cases) {
+        return;
+    }
+    for case in cases {
+        let mut core = Core::start();
+        let rw = open_with(&mut core, &case.endpoint, false);
+        for sql in &case.setup {
+            core.query(&rw, sql);
+        }
+        let before = core.scalar(&rw, "SELECT COUNT(*) FROM t");
+        let ro = open_with(&mut core, &case.endpoint, true);
+        let (id_sql, kill) = if case.engine == "mysql" {
+            ("SELECT CONNECTION_ID() AS id", "KILL ")
+        } else {
+            ("SELECT pg_backend_pid() AS id", "SELECT pg_terminate_backend(")
+        };
+        let id = core.scalar(&ro, id_sql);
+        let kill_sql = if case.engine == "mysql" { format!("{kill}{id}") } else { format!("{kill}{id})") };
+        assert_eq!(core.query(&rw, &kill_sql)["success"], true);
+        std::thread::sleep(Duration::from_millis(800));
+
+        for sql in ["SELECT 1 AS one", "INSERT INTO t VALUES (777, 7)"] {
+            let result = core.query(&ro, sql);
+            assert_eq!(result["event"], "error", "{} killed session answered {sql}: {result}", case.engine);
+        }
+        assert_eq!(core.scalar(&rw, "SELECT COUNT(*) FROM t"), before, "{} write got through", case.engine);
+
+        let reopened = open_with(&mut core, &case.endpoint, true);
+        assert_eq!(core.query(&reopened, "INSERT INTO t VALUES (777, 7)")["error_code"], "read_only_session");
+
+        // one-off endpoint query (no session): same policy
+        let mut endpoint = case.endpoint.clone();
+        endpoint["read_only"] = json!(true);
+        let one_off = |core: &mut Core, sql: &str| core.call("query.execute", json!({"connection": endpoint, "sql": sql}));
+        let result = one_off(&mut core, "INSERT INTO t VALUES (778, 7)");
+        assert_eq!(result["error_code"], "read_only_session", "{} {result}", case.engine);
+        let bypass = if case.engine == "mysql" { "SET SESSION TRANSACTION READ WRITE" } else { "SET default_transaction_read_only = off" };
+        assert_eq!(one_off(&mut core, bypass)["error_code"], "read_only_session");
+        assert_eq!(one_off(&mut core, "SELECT COUNT(*) AS c FROM t")["success"], true);
+        assert_eq!(core.scalar(&rw, "SELECT COUNT(*) FROM t"), before);
+        eprintln!("{}: killed session fails closed, reopen and one-off queries stay read-only", case.engine);
+    }
+}

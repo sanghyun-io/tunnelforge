@@ -68,6 +68,28 @@ class ProductionSessionMixin:
     _write_unlocked = False
     _unlock_target = None
 
+    # Hooks: the SQL editor uses the defaults, the SQL file dialog overrides what differs.
+
+    def _session_log(self, text: str) -> None:
+        self.message_text.append(text)
+
+    def _session_target(self):
+        """(database, schema) the window currently points at."""
+        return self._database_and_schema_for_selection(self.db_combo.currentText().strip())
+
+    def _session_has_pending(self) -> bool:
+        return bool(getattr(self, "pending_queries", None)) or bool(self._pending_cell_edits())
+
+    def _pending_cell_edits(self):
+        collect = getattr(self, "_collect_all_pending_edits", None)
+        return collect() if collect else []
+
+    def _session_reset_connection(self) -> None:
+        """Drop the persistent session so the next run reconnects with the current policy."""
+        close = getattr(self, "_close_db_connection", None)
+        if close:
+            close()
+
     # ------------------------------------------------------------------ policy
 
     def _is_production_profile(self) -> bool:
@@ -108,9 +130,9 @@ class ProductionSessionMixin:
             return
         environment = ProductionGuard.get_environment(self.config)
         env_label = SchemaConfirmDialog.ENV_LABELS.get(environment, "⚪ 환경 미분류")
-        pending = len(getattr(self, "pending_queries", []))
+        pending = len(getattr(self, "pending_queries", None) or [])
         try:
-            cell_edits = sum(len(ctx["pending_edits"]) for _, ctx in self._collect_all_pending_edits())
+            cell_edits = sum(len(ctx["pending_edits"]) for _, ctx in self._pending_cell_edits())
         except Exception:
             cell_edits = 0
         text, (fg, bg) = banner_content(
@@ -151,19 +173,19 @@ class ProductionSessionMixin:
         if dialog.exec() != QDialog.DialogCode.Accepted:
             return
         self._write_unlocked = True
-        self._unlock_target = self._database_and_schema_for_selection(self.db_combo.currentText().strip())
-        self._close_db_connection()  # next run reconnects without the read-only flag
-        self.message_text.append("⚠️ 운영 읽기 전용 해제: 이 창의 세션이 쓰기 가능으로 다시 연결됩니다.")
+        self._unlock_target = self._session_target()
+        self._session_reset_connection()  # next run reconnects without the read-only flag
+        self._session_log("⚠️ 운영 읽기 전용 해제: 이 창의 세션이 쓰기 가능으로 다시 연결됩니다.")
         self._update_session_banner()
 
     def _lock_writes(self) -> None:
-        if self.pending_queries or self._collect_all_pending_edits():
+        if self._session_has_pending():
             QMessageBox.warning(self, "경고", "미커밋 변경을 커밋하거나 롤백한 뒤 읽기 전용으로 돌아갈 수 있습니다.")
             return
         self._write_unlocked = False
         self._unlock_target = None
-        self._close_db_connection()
-        self.message_text.append("🔒 읽기 전용으로 복귀했습니다.")
+        self._session_reset_connection()
+        self._session_log("🔒 읽기 전용으로 복귀했습니다.")
         self._update_session_banner()
 
     def _relock_if_target_changed(self, target) -> None:
@@ -171,7 +193,7 @@ class ProductionSessionMixin:
         if self._write_unlocked and self._unlock_target is not None and target != self._unlock_target:
             self._write_unlocked = False
             self._unlock_target = None
-            self.message_text.append("🔒 대상이 바뀌어 읽기 전용으로 복귀했습니다.")
+            self._session_log("🔒 대상이 바뀌어 읽기 전용으로 복귀했습니다.")
         self._update_session_banner()
 
     # ------------------------------------------------------------------ change review

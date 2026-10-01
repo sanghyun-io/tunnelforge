@@ -592,8 +592,22 @@ fn query_execute(request: &Request) -> Vec<Value> {
     };
 
     let params = query_params(&request.payload);
-    match execute_query_live(&endpoint, sql, &params) {
+    // One-off endpoint queries honour `read_only` exactly like sessions (TF-STATUS-128).
+    let endpoint_value = ["connection", "endpoint", "source", "target"]
+        .iter()
+        .find_map(|key| request.payload.get(*key))
+        .unwrap_or(&request.payload);
+    let read_only = endpoint_value.get("read_only").and_then(Value::as_bool).unwrap_or(false);
+    if read_only {
+        if let Some(reason) = read_only_bypass(sql) {
+            return vec![read_only_error_event(&request.request_id, &reason)];
+        }
+    }
+    match execute_query_live(&endpoint, sql, &params, read_only) {
         Ok(result) => query_result_events(request, result),
+        Err(err) if read_only && is_read_only_violation(&err) => {
+            vec![read_only_error_event(&request.request_id, &redact_endpoint_secret(&err, &endpoint))]
+        }
         Err(err) => vec![json!({
             "event": "error",
             "request_id": request.request_id,

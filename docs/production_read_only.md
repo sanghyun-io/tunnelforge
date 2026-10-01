@@ -19,6 +19,21 @@ existing ProductionGuard confirmations and are not affected.
   total are listed; a MySQL DDL (implicit commit) during a transaction warns which earlier
   changes will be committed automatically.
 
+## Scope and design notes
+
+- Windows covered: the SQL editor (all its connectors, workers and the grid) and the SQL file
+  execution dialog. Both use the same banner, per-window unlock and re-lock rules. Tunnel health
+  checks (`SELECT 1`) are not affected.
+- Contract deviation: `read_only` is read from the request's endpoint dict (`{"connection":
+  {..., "read_only": true}}`), not from a new Rust `Endpoint` field, so the many `Endpoint`
+  literals owned by other areas stay untouched. One-off endpoint queries (`query.execute` with a
+  `connection` instead of a `connection_id`) honour it exactly like sessions.
+- No reconnect exists to lose the setting: a core session holds one connection and the core never
+  re-creates it (a killed session answers with errors); the Python shim does not reconnect
+  (`ping(reconnect=False)`); the editor's own reconnect goes through `_create_db_connector`, which
+  passes the current policy. A new `connection.open` re-applies `SET SESSION ... READ ONLY`. The
+  cancel/KILL connection runs no user SQL. Covered by a live test that kills a read-only session.
+
 ## What stops what (verified on MySQL 8.0/8.4, PostgreSQL 13/18)
 
 Errors carry `error_code: "read_only_session"` whichever layer refused.
