@@ -27,7 +27,7 @@ def dialog(tmp_path):
         (jh.KIND_PROMOTE, jh.STATUS_PARTIAL, "일부만 이동됨"),
         (jh.KIND_MIGRATION_RUN, jh.STATUS_CANCELLED, ""),
     ]):
-        job_id = history.begin(kind, profile_name="p", target=f"C:/very/long/path/{index}", now=now - timedelta(minutes=index))
+        job_id = history.begin(kind, profile_name="p", target=f"/very/long/path/to/some/export/{index}", now=now - timedelta(minutes=index))
         history.finish(job_id, status, error=error, now=now)
     shown = JobListDialog(history)
     shown.resize(1100, 560)
@@ -79,7 +79,7 @@ def test_status_colours_never_replace_the_status_text(dialog):
 def test_recovered_sql_list_is_wide_and_shows_full_details_in_tooltips(tmp_path):
     store = ws.WorkspaceStore(tmp_path / "ws")
     profile = "c3f1a9d2-7b44-4c1e-9d3a-5e2b7a8f0011"
-    path = "C:/Users/someone/projects/reports/monthly_sales_report_2026_09.sql"
+    path = str(tmp_path / "projects" / "reports" / "monthly_sales_report_2026_09.sql")  # absolute on every OS
     store.save(ws.WorkspaceState(profile_id=profile, tabs=[ws.TabState(id="t", title_index=1, text="SELECT 1;", dirty=True),
                                                            ws.TabState(id="u", title_index=2, text="SELECT 2;", dirty=True, file_path=path)]),
                now=datetime.now(timezone.utc) - timedelta(days=100))
