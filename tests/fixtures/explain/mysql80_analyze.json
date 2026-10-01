@@ -1,0 +1,12 @@
+{
+ "meta": {
+  "analyze": true,
+  "engine": "mysql",
+  "format": "tree"
+ },
+ "rows": [
+  {
+   "EXPLAIN": "-> Sort: n DESC  (actual time=0.374..0.374 rows=7 loops=1)\n    -> Table scan on <temporary>  (actual time=0.363..0.363 rows=7 loops=1)\n        -> Aggregate using temporary table  (actual time=0.362..0.362 rows=7 loops=1)\n            -> Nested loop inner join  (cost=41.9 rows=33.3) (actual time=0.0336..0.302 rows=333 loops=1)\n                -> Filter: (a.`name` like 'n1%')  (cost=30.2 rows=33.3) (actual time=0.0208..0.0953 rows=111 loops=1)\n                    -> Table scan on a  (cost=30.2 rows=300) (actual time=0.0184..0.0693 rows=300 loops=1)\n                -> Covering index lookup on b using ix_a (a_id=a.id)  (cost=0.253 rows=1) (actual time=0.00121..0.00158 rows=3 loops=111)\n"
+  }
+ ]
+}

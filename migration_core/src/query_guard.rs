@@ -111,7 +111,7 @@ fn check_statement(statement: &str) -> Option<String> {
 
 /// Splits on `;` outside quotes, comments and PostgreSQL dollar quotes. Comments are dropped,
 /// quoted text is kept (a `set_config('default_transaction_read_only', ...)` argument matters).
-fn split_statements(sql: &str) -> Vec<String> {
+pub(crate) fn split_statements(sql: &str) -> Vec<String> {
     let bytes = sql.as_bytes();
     let mut statements = Vec::new();
     let mut current = String::new();

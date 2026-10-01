@@ -77,6 +77,13 @@ impl Session {
     pub(crate) fn read_only(&self) -> bool {
         self.read_only
     }
+
+    pub(crate) fn engine(&self) -> &'static str {
+        match self.canceller {
+            Canceller::MySql { .. } => "mysql",
+            Canceller::PostgreSql { .. } => "postgresql",
+        }
+    }
 }
 
 pub(crate) struct JobCtl {
