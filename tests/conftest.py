@@ -347,3 +347,13 @@ def isolate_workspace_store(tmp_path, monkeypatch):
     monkeypatch.setattr(sql_editor_workspace, "make_workspace_store",
                         lambda: workspace_store.WorkspaceStore(directory))
     yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_job_history(tmp_path, monkeypatch):
+    """Job history must never touch the real application directory during tests."""
+    from src.core import job_history
+
+    path = tmp_path / "job-history-isolated" / "job_history.json"
+    monkeypatch.setattr(job_history, "make_history", lambda: job_history.JobHistory(path))
+    yield

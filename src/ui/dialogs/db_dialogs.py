@@ -120,19 +120,23 @@ class RustDumpWizard:
         )
         return connector, connection_info
 
-    def start_export(self) -> bool:
-        """Export 마법사 시작"""
+    def start_export(self, rerun: dict = None) -> bool:
+        """Export 마법사 시작 (rerun: 작업 목록의 이전 설정으로 화면을 채운다)"""
         connector, connection_info = self._resolve_connector(need_connection_info=True)
         if not connector:
             return False
 
         # 2단계: Export
+        tunnel = self.preselected_tunnel or {}
         export_dialog = RustDumpExportDialog(
             self.parent,
             connector=connector,
             config_manager=self.config_manager,
-            connection_info=connection_info
+            connection_info=connection_info,
+            job_context={"profile_id": tunnel.get("id"), "profile_name": tunnel.get("name")},
         )
+        if rerun:
+            export_dialog.apply_job_rerun(rerun)
         export_dialog.exec()
 
         return True

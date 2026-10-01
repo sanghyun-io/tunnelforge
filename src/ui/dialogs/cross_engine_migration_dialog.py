@@ -41,6 +41,7 @@ from src.core.cross_engine_migration import (
 )
 from src.core.i18n import translate_text
 from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
+from src.ui.dialogs.job_recording import begin_migration_job, finish_migration_job
 from src.ui.workers.cross_engine_migration_worker import CrossEngineMigrationWorker
 
 
@@ -141,6 +142,7 @@ class CrossEngineMigrationDialog(QDialog):
         self.tunnel_engine = tunnel_engine
         self.config_manager = config_manager
         self.worker: Optional[CrossEngineMigrationWorker] = None
+        self._job_id: Optional[str] = None  # 작업 목록 기록
         self._ui_running = False
         self.last_result: Optional[Dict] = None
         self.unsupported_objects = []
@@ -870,6 +872,7 @@ class CrossEngineMigrationDialog(QDialog):
         self._reset_command_ui(command)
         self._append_log(f"[{command}] 시작")
         self._set_running(True)
+        self._job_id = begin_migration_job(command, payload)
         self.worker = CrossEngineMigrationWorker(command, payload)
         self.worker.phase_changed.connect(self._on_phase_changed)
         self.worker.table_progress.connect(self._on_table_progress)
@@ -1009,6 +1012,8 @@ class CrossEngineMigrationDialog(QDialog):
             return
         self.worker = None
         self._set_running(False)
+        finish_migration_job(self._job_id, success, payload)
+        self._job_id = None
         if finished_command == "inspect" and success and self._pending_after_inspect:
             next_command = self._pending_after_inspect
             pending_workflow = self._workflow_active
