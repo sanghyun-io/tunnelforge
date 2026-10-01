@@ -17,6 +17,12 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "🔍 실행 계획": "🔍 Execution plan",
+    "선택한 문장(없으면 커서 위치의 문장)의 실행 계획 보기 (Ctrl+E)\nANALYZE 는 대화상자에서 따로 선택해야 하며 쿼리를 실제로 실행합니다": "Show the execution plan of the selected statement (or the one at the cursor) (Ctrl+E)\nANALYZE is chosen separately in the dialog and really runs the query",
+    "실행 계획을 볼 쿼리가 없습니다.": "There is no query to explain.",
+    "실행 계획은 한 번에 한 문장만 볼 수 있습니다.\n한 문장만 선택하거나 커서를 문장 위에 두세요.": "The execution plan can be shown for one statement at a time.\nSelect a single statement or put the cursor on it.",
+    "쿼리가 실행 중입니다. 끝난 뒤 실행 계획을 조회하세요.": "A query is running. Show the execution plan after it finishes.",
+    "DB에 연결할 수 없습니다.\n{}": "Cannot connect to the database.\n{}",
     "결과를 받는 중에는 저장할 수 없습니다.": "Cannot save while the result is still being received.",
     "⚠️ 중단 전까지 {}행을 받았습니다": "⚠️ Received {} rows before it stopped",
     "⚠️ 쿼리 {}: 중단 전까지 {}행을 받았습니다": "⚠️ Query {}: received {} rows before it stopped",

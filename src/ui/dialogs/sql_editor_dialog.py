@@ -41,6 +41,7 @@ from src.core.sql_statement_parser import (
     find_sql_statement_at_position,
     parse_sql_statements,
 )
+from src.ui.dialogs.explain_plan_dialog import show_explain_plan
 from src.ui.dialogs.sql_editor_highlighters import SQLHighlighter, SQLValidatorHighlighter
 from src.ui.dialogs.sql_editor_autocomplete import AutoCompletePopup
 from src.ui.dialogs.sql_editor_code_editor import (
@@ -381,6 +382,12 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self.btn_execute_all.clicked.connect(self.execute_all_queries)
         toolbar.addWidget(self.btn_execute_all)
 
+        self.btn_explain = QPushButton("🔍 실행 계획")
+        self.btn_explain.setStyleSheet(SECONDARY_BUTTON_QSS)
+        self.btn_explain.setToolTip("선택한 문장(없으면 커서 위치의 문장)의 실행 계획 보기 (Ctrl+E)\nANALYZE 는 대화상자에서 따로 선택해야 하며 쿼리를 실제로 실행합니다")
+        self.btn_explain.clicked.connect(self.show_execution_plan)
+        toolbar.addWidget(self.btn_explain)
+
         self.btn_cancel_query = QPushButton("⏹ 취소")
         self.btn_cancel_query.setStyleSheet(SECONDARY_BUTTON_QSS)
         self.btn_cancel_query.setToolTip("실행 중인 쿼리를 서버에서 취소합니다")
@@ -605,6 +612,10 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         # Ctrl+Enter: 현재 쿼리 실행
         self.shortcut_ctrl_enter = QShortcut(QKeySequence("Ctrl+Return"), self)
         self.shortcut_ctrl_enter.activated.connect(self.execute_current_query)
+
+        # Ctrl+E: 실행 계획
+        self.shortcut_explain = QShortcut(QKeySequence("Ctrl+E"), self)
+        self.shortcut_explain.activated.connect(self.show_execution_plan)
 
         # Ctrl+Shift+Enter: 전체 실행
         self.shortcut_ctrl_shift_enter = QShortcut(QKeySequence("Ctrl+Shift+Return"), self)
@@ -957,6 +968,41 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
             return
 
         self._execute_sql(sql_text, single_query=True)
+
+    def _explain_target_sql(self):
+        """실행 계획을 볼 문장 1개: 선택 영역, 없으면 커서 위치의 문장. 안내가 필요하면 None."""
+        cursor = self.editor.textCursor()
+        if cursor.hasSelection():
+            sql_text = cursor.selectedText().replace('\u2029', '\n')
+        else:
+            sql_text = self._get_query_at_cursor()
+        if not sql_text or not sql_text.strip():
+            self.status_bar.showMessage("실행 계획을 볼 쿼리가 없습니다.")
+            return None
+        statements = parse_sql_statements(sql_text, self._db_engine())
+        if len(statements) > 1:
+            QMessageBox.warning(
+                self, "실행 계획",
+                "실행 계획은 한 번에 한 문장만 볼 수 있습니다.\n한 문장만 선택하거나 커서를 문장 위에 두세요.")
+            return None
+        return (statements[0] if statements else sql_text).strip()
+
+    def show_execution_plan(self):
+        """선택한 문장(없으면 커서 위치의 문장) 1개의 실행 계획 대화상자를 연다 (Ctrl+E)."""
+        sql_text = self._explain_target_sql()
+        if sql_text is None:
+            return
+        if self._query_executing or (self.worker and self.worker.isRunning()):
+            QMessageBox.warning(self, "경고", "쿼리가 실행 중입니다. 끝난 뒤 실행 계획을 조회하세요.")
+            return
+        ok, message = self._ensure_connection()
+        if not ok:
+            QMessageBox.warning(self, "실행 계획", f"DB에 연결할 수 없습니다.\n{message}")
+            return
+        connection = self.db_connection
+        timeout_ms = (self.query_timeout_spin.value() * 1000) or None
+        dialog = show_explain_plan(self, connection.facade, connection.connection_id, sql_text, timeout_ms)
+        dialog.exec()
 
     def execute_all_queries(self):
         """전체 쿼리 실행 (F5)"""
@@ -1751,6 +1797,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         """
         self.btn_execute_current.setEnabled(not is_executing)
         self.btn_execute_all.setEnabled(not is_executing)
+        self.btn_explain.setEnabled(not is_executing)
         cancel_button = getattr(self, 'btn_cancel_query', None)
         if cancel_button is not None:
             cancel_button.setVisible(is_executing)
@@ -1759,7 +1806,8 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
         self.auto_commit_check.setEnabled(not is_executing)
         self.progress_bar.setVisible(is_executing)
 
-        for shortcut in (self.shortcut_f5, self.shortcut_ctrl_enter, self.shortcut_ctrl_shift_enter):
+        for shortcut in (self.shortcut_f5, self.shortcut_ctrl_enter, self.shortcut_ctrl_shift_enter,
+                         self.shortcut_explain):
             shortcut.setEnabled(not is_executing)
 
         if is_executing:
