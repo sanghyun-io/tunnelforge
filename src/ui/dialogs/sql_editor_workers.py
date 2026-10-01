@@ -3,6 +3,7 @@ SQL 에디터 쿼리 실행 백그라운드 워커 (자동커밋 모드 / 명시
 """
 from dataclasses import dataclass
 import logging
+import threading
 import time
 from PyQt6.QtCore import QThread, pyqtSignal
 
@@ -77,11 +78,56 @@ def _rows_from_cursor(cursor) -> tuple[list, list]:
     return columns, row_list
 
 
-def run_streaming_query(connection, query, limits, on_started, on_rows, on_progress=None):
+class StreamFlow:
+    """Backpressure between a streaming worker and the GUI that renders its rows.
+
+    The worker calls `produced(n)` after emitting a batch and blocks while more than `limit_rows`
+    emitted rows are still waiting to be appended; the GUI calls `consumed(n)` after it appended
+    them. This bounds the queued signals (each one converts its rows into Qt variants on the GUI
+    thread), so a fast core cannot stall the event loop. Rows are never dropped or reordered.
+    The wait ends early when `should_stop()` turns true (cancel / window close) or, as a last
+    resort, when the GUI made no progress for `stall_seconds`.
+    """
+
+    def __init__(self, limit_rows: int = 5000, stall_seconds: float = 30.0):
+        self.limit_rows = limit_rows
+        self.stall_seconds = stall_seconds
+        self._cond = threading.Condition()
+        self._pending = 0
+        self._last_progress = time.monotonic()
+
+    @property
+    def pending(self) -> int:
+        with self._cond:
+            return self._pending
+
+    def produced(self, count: int, should_stop=None) -> None:
+        with self._cond:
+            if self._pending == 0:
+                self._last_progress = time.monotonic()
+            self._pending += count
+            while self._pending > self.limit_rows:
+                if should_stop is not None and should_stop():
+                    return
+                if time.monotonic() - self._last_progress > self.stall_seconds:
+                    return
+                self._cond.wait(0.05)
+
+    def consumed(self, count: int) -> None:
+        with self._cond:
+            self._pending = max(0, self._pending - count)
+            self._last_progress = time.monotonic()
+            self._cond.notify_all()
+
+
+def run_streaming_query(connection, query, limits, on_started, on_rows, on_progress=None,
+                        flow=None, should_stop=None):
     """Stream one row-returning statement on `connection` without collecting it.
 
     `on_started(columns)` fires once, before the first row; `on_rows(rows)` gets each batch as
-    lists in column order (converted on the worker thread). Returns (columns, row_count, result).
+    lists in column order (converted on the worker thread). With `flow`, the stream waits for the
+    GUI to keep up; once `should_stop()` is true later batches are no longer forwarded.
+    Returns (columns, row_count, result).
     """
     state = {"columns": None, "count": 0}
 
@@ -91,6 +137,8 @@ def run_streaming_query(connection, query, limits, on_started, on_rows, on_progr
             on_started(state["columns"])
 
     def on_batch(batch):
+        if should_stop is not None and should_stop():
+            return  # cancelled: the core is being stopped, forward nothing more
         if state["columns"] is None:
             start(list(batch[0].keys()) if batch else [])
         columns = state["columns"]
@@ -99,6 +147,8 @@ def run_streaming_query(connection, query, limits, on_started, on_rows, on_progr
         on_rows(rows)
         if on_progress:
             on_progress(state["count"])
+        if flow is not None:
+            flow.produced(len(rows), should_stop)
 
     job_id = new_job_id()
     connection.current_job_id = job_id
@@ -154,6 +204,7 @@ class SQLQueryWorker(QThread):
                  limits=None, read_only=False):
         super().__init__()
         self.limits = dict(limits) if limits is not None else build_query_limits()
+        self.stream_flow = StreamFlow()  # GUI backpressure for streamed rows
         self._connector = None
         self.engine = normalize_db_engine(engine, port)
         self.host = host
@@ -215,6 +266,8 @@ class SQLQueryWorker(QThread):
                             connector.connection,
                             query,
                             self.limits,
+                            flow=self.stream_flow,
+                            should_stop=self.isInterruptionRequested,
                             on_started=lambda cols, idx=idx: self.result_started.emit(idx, cols),
                             on_rows=lambda rows, idx=idx: self.result_rows.emit(idx, rows),
                             on_progress=lambda count, idx=idx: self.rows_progress.emit(idx, count),
@@ -298,6 +351,7 @@ class SQLTransactionExecutionWorker(QThread):
         self.queries = queries
         self.engine = engine
         self.limits = dict(limits) if limits is not None else build_query_limits()
+        self.stream_flow = StreamFlow()  # GUI backpressure for streamed rows
 
     def cancel_query(self):
         """UI 스레드에서 호출: 실행 중인 쿼리를 서버에서 취소한다. 트랜잭션은 자동 커밋/롤백하지 않는다."""
@@ -328,6 +382,8 @@ class SQLTransactionExecutionWorker(QThread):
                         self.connection,
                         query,
                         self.limits,
+                        flow=self.stream_flow,
+                        should_stop=self.isInterruptionRequested,
                         on_started=lambda cols, idx=idx: self.result_started.emit(idx, cols),
                         on_rows=lambda rows, idx=idx: self.result_rows.emit(idx, rows),
                         on_progress=lambda count, idx=idx: self.rows_progress.emit(idx, count),

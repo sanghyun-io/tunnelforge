@@ -56,7 +56,7 @@ class GcPause:
                 gc.enable()
 # One GUI slice: batches are appended until this much time has passed, then the event loop runs
 # again (timers, repaints, input) before the next slice.
-FLUSH_BUDGET_SECONDS = 0.025
+FLUSH_BUDGET_SECONDS = 0.015
 
 
 def append_result_rows(table: QTableWidget, rows: Sequence[Sequence[Any]]) -> None:
@@ -80,6 +80,7 @@ def append_result_rows(table: QTableWidget, rows: Sequence[Sequence[Any]]) -> No
 
 def fit_columns(table: QTableWidget, max_width: int) -> None:
     """Size columns to the rows received so far, capped like a finished result."""
+    table.horizontalHeader().setResizeContentsPrecision(200)  # sample rows: cheap on 100k-row grids
     table.resizeColumnsToContents()
     header = table.horizontalHeader()
     for column in range(table.columnCount()):
@@ -123,6 +124,7 @@ class StreamingResultMixin:
         table._truncated = False
         table._pending = deque()
         table._flush_scheduled = False
+        table._flow = getattr(getattr(self, "worker", None), "stream_flow", None)
         self._hold_gc(table)
         table._result_number = self._result_counter
         self._streams()[idx] = table
@@ -145,7 +147,11 @@ class StreamingResultMixin:
         deadline = time.monotonic() + budget
         while table._pending and time.monotonic() < deadline:
             first_rows = table.rowCount() == 0
-            append_result_rows(table, table._pending.popleft())
+            batch = table._pending.popleft()
+            append_result_rows(table, batch)
+            flow = table._flow
+            if flow is not None:
+                flow.consumed(len(batch))  # lets a throttled worker send more
             if first_rows:
                 from src.ui.dialogs.sql_editor_dialog import MAX_AUTO_COLUMN_WIDTH_PX
                 fit_columns(table, MAX_AUTO_COLUMN_WIDTH_PX)
