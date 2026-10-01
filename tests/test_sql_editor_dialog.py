@@ -853,6 +853,7 @@ def test_execute_sql_transaction_uses_qthread_worker_not_process_events(monkeypa
         class FakeWorker:
             def __init__(self, connection, queries, engine, limits=None):
                 started['connection'] = connection
+                self.rows_progress = MagicMock()
                 self.result_truncated = MagicMock()
                 self.result_started = MagicMock()
                 self.result_rows = MagicMock()
