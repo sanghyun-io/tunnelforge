@@ -67,7 +67,7 @@
 | ⚡ | **Export/Import** | Validated table transfers with engine-specific snapshot policies, parallel MySQL paths, and explicit restore constraints. |
 | 🧩 | **Orphan Record Analysis** | Detect rows left behind by broken foreign-key relationships and export the findings as a report. |
 
-Scheduled Backups & Queries are disabled in the default UI and cannot be used pending intentional reactivation and verification. See [SCHEDULE.md](SCHEDULE.md) for the current status.
+Scheduled backups are available (backup tasks only: DST-aware times, at most one catch-up after sleep, unattended runs that never auto-accept SSH host keys, ownership-checked retention). Scheduled SQL execution is not supported. See [SCHEDULE.md](SCHEDULE.md).
 
 ### General
 

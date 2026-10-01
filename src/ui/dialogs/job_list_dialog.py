@@ -28,6 +28,8 @@ KIND_LABELS = {
     jh.KIND_MIGRATION_PREFLIGHT: "이관 사전 점검",
     jh.KIND_MIGRATION_RUN: "이관 실행",
     jh.KIND_MIGRATION_RESUME: "이관 재개",
+    jh.KIND_SCHEDULED_BACKUP: "예약 백업",
+    jh.KIND_RESTORE_REHEARSAL: "복원 리허설",
 }
 STATUS_LABELS = {
     jh.STATUS_RUNNING: "실행 중",
@@ -36,6 +38,7 @@ STATUS_LABELS = {
     jh.STATUS_FAILED: "실패",
     jh.STATUS_CANCELLED: "취소",
     jh.STATUS_INTERRUPTED: "중단됨 (앱 종료)",
+    jh.STATUS_SKIPPED: "건너뜀",
 }
 # 상태 열 글자색. 색만으로 구분하지 않도록 상태 텍스트는 항상 함께 표시한다.
 STATUS_COLORS = {

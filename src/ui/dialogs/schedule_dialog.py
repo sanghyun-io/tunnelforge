@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTime, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QColor, QTextCharFormat, QSyntaxHighlighter
 
+from src.core.schedule_time import validate_expression
 from src.core.scheduler import ScheduleConfig, CronParser, BackupScheduler, ScheduleTaskType
 from src.core.sql_safety import find_dangerous_sql_warnings
 from src.core.logger import get_logger
@@ -130,16 +131,18 @@ class ScheduleEditDialog(QDialog):
     """스케줄 추가/수정 다이얼로그"""
 
     def __init__(self, parent=None, tunnel_list: List[tuple] = None,
-                 schedule: ScheduleConfig = None):
+                 schedule: ScheduleConfig = None, min_interval_minutes: int = 15):
         """
         Args:
             parent: 부모 위젯
             tunnel_list: [(tunnel_id, tunnel_name), ...] 터널 목록
             schedule: 수정할 스케줄 (None이면 새로 생성)
+            min_interval_minutes: 허용되는 최소 실행 간격(분)
         """
         super().__init__(parent)
         self.tunnel_list = tunnel_list or []
         self.schedule = schedule
+        self.min_interval_minutes = min_interval_minutes
         self.result_config: Optional[ScheduleConfig] = None
 
         self._setup_ui()
@@ -155,7 +158,24 @@ class ScheduleEditDialog(QDialog):
         self.setMinimumHeight(550)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self._build_task_type_group())
+        # 예약은 백업만 지원한다: 작업 유형 선택은 숨기고 항상 백업으로 저장한다 (예약 SQL 실행 금지).
+        self.task_type_box = self._build_task_type_group()
+        self.task_type_box.setVisible(False)
+        layout.addWidget(self.task_type_box)
+        self.unattended_note = QLabel(
+            "예약 백업은 사람이 없는 상태로 실행됩니다. 처음 보는 SSH 호스트 키와 비밀번호가 필요한 SSH 개인키는 "
+            "자동으로 수락/입력되지 않고 실패하며, 이 경우 작업 목록에 사유가 기록됩니다."
+        )
+        self.unattended_note.setWordWrap(True)
+        self.unattended_note.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(self.unattended_note)
+        self.unsupported_label = QLabel(
+            "이 일정은 예약 SQL 실행 작업입니다. 예약 SQL 실행은 지원되지 않으므로 실행되지 않으며 삭제만 할 수 있습니다."
+        )
+        self.unsupported_label.setWordWrap(True)
+        self.unsupported_label.setStyleSheet("color: #c0392b; font-weight: bold;")
+        self.unsupported_label.setVisible(False)
+        layout.addWidget(self.unsupported_label)
         layout.addWidget(self._build_basic_info_group())
 
         self.task_stack = QStackedWidget()
@@ -168,6 +188,10 @@ class ScheduleEditDialog(QDialog):
         self.enabled_check = QCheckBox("스케줄 활성화")
         self.enabled_check.setChecked(True)
         layout.addWidget(self.enabled_check)
+
+        self.catch_up_check = QCheckBox("절전/앱 미실행으로 놓친 실행은 복귀 후 한 번만 따라잡기")
+        self.catch_up_check.setChecked(True)
+        layout.addWidget(self.catch_up_check)
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -520,8 +544,12 @@ class ScheduleEditDialog(QDialog):
 
         self.schema_edit.setText(schedule.schema)
 
+        self.catch_up_check.setChecked(bool(getattr(schedule, "catch_up_missed", True)))
+
         # 작업 유형
         if schedule.is_sql_query_task():
+            self.unsupported_label.setVisible(True)
+            self.save_btn.setEnabled(False)
             self.sql_radio.setChecked(True)
             self.task_stack.setCurrentIndex(1)
             # SQL 관련 필드
@@ -588,11 +616,11 @@ class ScheduleEditDialog(QDialog):
             return
 
         schema = self.schema_edit.text().strip()
-        is_sql_task = self.sql_radio.isChecked()
-        if is_sql_task:
-            task_fields = self._validate_and_build_sql_task()
-        else:
-            task_fields = self._validate_and_build_backup_task(schema)
+        if self.schedule is not None and self.schedule.is_sql_query_task():
+            QMessageBox.warning(self, "지원되지 않음", "예약 SQL 실행은 지원되지 않습니다.")
+            return
+        is_sql_task = False  # 예약은 백업만 지원한다
+        task_fields = self._validate_and_build_backup_task(schema)
         if task_fields is None:
             return
 
@@ -601,11 +629,12 @@ class ScheduleEditDialog(QDialog):
             QMessageBox.warning(self, "입력 오류", "스케줄을 설정하세요.")
             return
 
-        # Cron 유효성 검사
-        next_run = CronParser.get_next_run(cron_expr)
-        if not next_run:
-            QMessageBox.warning(self, "입력 오류", "잘못된 Cron 표현식입니다.")
+        # Cron 유효성 검사 (형식 + 최소 실행 간격)
+        error = validate_expression(cron_expr, self.min_interval_minutes)
+        if error:
+            QMessageBox.warning(self, "입력 오류", error)
             return
+        next_run = CronParser.get_next_run(cron_expr)
 
         # ScheduleConfig 생성
         self.result_config = ScheduleConfig(
@@ -619,6 +648,7 @@ class ScheduleEditDialog(QDialog):
             enabled=self.enabled_check.isChecked(),
             retention_count=task_fields["retention_count"],
             retention_days=task_fields["retention_days"],
+            catch_up_missed=self.catch_up_check.isChecked(),
             last_run=self.schedule.last_run if self.schedule else None,
             next_run=next_run.isoformat(),
             # SQL 관련 필드
@@ -889,8 +919,11 @@ class ScheduleListDialog(QDialog):
             else:
                 self.table.setItem(row, 4, QTableWidgetItem("-"))
 
-            # 상태
-            status = "대기 중" if schedule.enabled else "비활성"
+            # 상태 (예약 SQL 실행은 지원되지 않아 실행되지 않는다)
+            if schedule.is_sql_query_task():
+                status = "지원 중단 (실행 안 됨)"
+            else:
+                status = "대기 중" if schedule.enabled else "비활성"
             self.table.setItem(row, 5, QTableWidgetItem(status))
 
             # 활성화 체크박스
@@ -959,7 +992,7 @@ class ScheduleListDialog(QDialog):
 
     def _add_schedule(self):
         """스케줄 추가"""
-        dialog = ScheduleEditDialog(self, self.tunnel_list)
+        dialog = ScheduleEditDialog(self, self.tunnel_list, min_interval_minutes=self.scheduler.min_interval_minutes())
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_config:
             try:
                 self.scheduler.add_schedule(dialog.result_config)
@@ -978,7 +1011,8 @@ class ScheduleListDialog(QDialog):
         if not schedule:
             return
 
-        dialog = ScheduleEditDialog(self, self.tunnel_list, schedule)
+        dialog = ScheduleEditDialog(self, self.tunnel_list, schedule,
+                                    min_interval_minutes=self.scheduler.min_interval_minutes())
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_config:
             try:
                 self.scheduler.update_schedule(dialog.result_config)

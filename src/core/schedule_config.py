@@ -7,7 +7,7 @@
 """
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 class ScheduleTaskType(str, Enum):
@@ -29,6 +29,8 @@ class ScheduleConfig:
     enabled: bool = True
     retention_count: int = 5    # 보관할 백업 수
     retention_days: int = 30    # 보관 기간 (일)
+    # 절전/앱 미실행으로 놓친 실행을 복귀 후 최대 1회 따라잡을지 (끄면 놓친 실행은 건너뛰고 기록만 남긴다)
+    catch_up_missed: bool = True
     last_run: Optional[str] = None  # ISO format
     next_run: Optional[str] = None  # ISO format
 
@@ -51,6 +53,7 @@ class ScheduleConfig:
         """딕셔너리에서 생성 (하위 호환성 지원)"""
         # 기존 설정에 새 필드가 없으면 기본값 적용
         defaults = {
+            'catch_up_missed': True,
             'task_type': 'backup',
             'sql_query': '',
             'result_format': 'csv',
@@ -79,6 +82,7 @@ class _ExecutionJob:
     """실행 큐에 올라가는 작업 단위 (스케줄 스냅샷 + 실행 후 처리 방식)"""
     schedule: ScheduleConfig
     update_next_run: bool
+    trigger: str = 'scheduled'  # scheduled | catch_up | manual
 
 
 @dataclass(frozen=True)
@@ -89,3 +93,5 @@ class _ResolvedConnection:
     user: str
     password: str
     engine: str
+    # 무인 실행이 직접 연 임시 터널을 백업이 끝나면 닫는 정리 콜백 (없으면 None)
+    release: Optional[Callable[[], None]] = field(default=None, compare=False, repr=False)

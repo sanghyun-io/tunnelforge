@@ -349,6 +349,12 @@ _EN_TEXT_TRANSLATIONS = {
 }
 
 _EN_PHRASE_TRANSLATIONS = {
+    "예약 백업은 사람이 없는 상태로 실행됩니다. 처음 보는 SSH 호스트 키와 비밀번호가 필요한 SSH 개인키는 자동으로 수락/입력되지 않고 실패하며, 이 경우 작업 목록에 사유가 기록됩니다.": "Scheduled backups run unattended. An unknown SSH host key or an SSH private key that needs a passphrase is never accepted or entered automatically and fails; the reason is recorded in the job list.",
+    "이 일정은 예약 SQL 실행 작업입니다. 예약 SQL 실행은 지원되지 않으므로 실행되지 않으며 삭제만 할 수 있습니다.": "This schedule is a scheduled SQL task. Scheduled SQL execution is not supported, so it will not run and can only be deleted.",
+    "절전/앱 미실행으로 놓친 실행은 복귀 후 한 번만 따라잡기": "Catch up a run missed during sleep or while the app was closed (at most once)",
+    "지원되지 않음": "Not supported",
+    "예약 SQL 실행은 지원되지 않습니다.": "Scheduled SQL execution is not supported.",
+    "지원 중단 (실행 안 됨)": "Unsupported (will not run)",
     "작업 목록": "Job List",
     "대상 / 프로필 / 오류 검색": "Search target / profile / error",
     "실패 원인 보기": "Show Failure Reason",

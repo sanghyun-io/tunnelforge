@@ -33,7 +33,8 @@ from src.core.error_report_consent import ConsentPolicy
 from src.ui.dialogs.error_reporting_consent_dialog import ErrorReportingConsentDialog
 
 logger = get_logger('main_window')
-SCHEDULE_FEATURE_ENABLED = False
+# 예약 백업만 노출한다. 예약 SQL 실행은 무인 쓰기 위험(운영 읽기 전용 정책과 충돌) 때문에 지원하지 않는다.
+SCHEDULE_FEATURE_ENABLED = True
 ERROR_REPORTING_INITIAL_DELAY_MS = 500
 ERROR_REPORTING_RETRY_DELAY_MS = 500
 
@@ -106,7 +107,7 @@ class TunnelManagerUI(QMainWindow):
         # ThemeManager 초기화
         self._init_theme_manager()
 
-        # Scheduled backup is hidden until the feature is reliable enough to expose.
+        # Scheduled backup (backup tasks only; scheduled SQL execution stays unsupported).
         self.scheduler = None
         if SCHEDULE_FEATURE_ENABLED:
             from src.core.scheduler import BackupScheduler
@@ -628,6 +629,8 @@ class TunnelManagerUI(QMainWindow):
             self._wizard_launcher.open_rust_dump_export(tunnel, record.rerun)
         elif record.kind in (jh.KIND_IMPORT, jh.KIND_PROMOTE):
             self._wizard_launcher.open_rust_dump_import(tunnel)
+        elif record.kind in (jh.KIND_SCHEDULED_BACKUP, jh.KIND_RESTORE_REHEARSAL):
+            self._open_schedule_dialog()
         else:
             self._wizard_launcher.open_cross_engine_migration()
 

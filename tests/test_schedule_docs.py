@@ -9,14 +9,14 @@ README_CONTRACTS = {
     "README.md": {
         "features_heading": "Features",
         "tips_heading": "Tips",
-        "disabled_status": "disabled in the default UI",
-        "reactivation_status": "intentional reactivation and verification",
+        "disabled_status": "Scheduled SQL execution is not supported",
+        "reactivation_status": "backup tasks only",
     },
     "README.ko.md": {
         "features_heading": "주요 기능",
         "tips_heading": "사용 팁",
-        "disabled_status": "기본 UI에서 비활성화",
-        "reactivation_status": "의도적인 재활성화와 검증",
+        "disabled_status": "예약 SQL 실행은 지원하지 않습니다",
+        "reactivation_status": "백업만",
     },
 }
 
@@ -71,7 +71,7 @@ def test_schedule_claim_matcher_catches_common_table_and_tip_variants():
     )
 
 
-def test_bilingual_readmes_describe_schedule_as_unavailable_until_verified():
+def test_bilingual_readmes_describe_scheduled_backups_as_backup_only():
     for filename, contract in README_CONTRACTS.items():
         doc = (PROJECT_ROOT / filename).read_text(encoding="utf-8")
         feature_section = _extract_h2_section(doc, contract["features_heading"])
@@ -84,18 +84,11 @@ def test_bilingual_readmes_describe_schedule_as_unavailable_until_verified():
         assert "SCHEDULE.md" in doc
 
 
-def test_schedule_guide_does_not_present_hidden_feature_as_public_ui():
+def test_schedule_guide_states_the_backup_only_scope_and_the_safety_rules():
     doc = (PROJECT_ROOT / "SCHEDULE.md").read_text(encoding="utf-8")
 
-    assert "현재 메인 UI에서 비활성화" in doc
-    assert "재활성화 후 UI 확인 항목" in doc
-
-    public_ui_phrases = [
-        '메인 툴바에서 **"스케줄"** 버튼을 클릭',
-        "스케줄 시간을 기다리지 않고 바로 백업하려면:",
-        "스케줄 관리 창의 **\"백업 로그\"** 탭에서",
-        "스케줄이 작동하려면 TunnelForge가 실행 중이어야 합니다.",
-    ]
-
-    for phrase in public_ui_phrases:
-        assert phrase not in doc
+    assert "예약 SQL 실행은 지원하지 않습니다" in doc
+    assert "현재 메인 UI에서 비활성화" not in doc
+    for rule in ("존재하지 않는 시각", "반복되는 시각", "최대 1회", "자동 수락하지 않고 실패",
+                 "소유 마커", "마커가 없는 폴더", "가장 최근 완료 백업은 항상 남깁니다"):
+        assert rule in doc
