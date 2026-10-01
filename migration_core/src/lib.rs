@@ -7,6 +7,7 @@ mod query;
 mod query_job;
 mod query_export;
 mod query_guard;
+mod explain;
 mod schema;
 mod oneclick;
 mod migrate;

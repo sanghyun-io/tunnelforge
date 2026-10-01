@@ -32,6 +32,11 @@ impl CoreService {
                     std::thread::spawn(task);
                 }
             }
+            "query.explain" if has_connection_id(&request) => {
+                if let Some(task) = self.prepare_explain(&request, &emit) {
+                    std::thread::spawn(task);
+                }
+            }
             "query.cancel" => {
                 let jobs = self.jobs.clone();
                 std::thread::spawn(move || {
@@ -54,6 +59,18 @@ impl CoreService {
                 let sink = events.clone();
                 let collector: Emitter = Arc::new(move |event| sink.lock().unwrap().push(event));
                 if let Some(task) = self.prepare_query(&request, &collector) {
+                    task();
+                }
+                let collected: Vec<Value> = std::mem::take(&mut *events.lock().unwrap());
+                for event in collected {
+                    emit(event);
+                }
+            }
+            "query.explain" if has_connection_id(&request) => {
+                let events = Arc::new(Mutex::new(Vec::new()));
+                let sink = events.clone();
+                let collector: Emitter = Arc::new(move |event| sink.lock().unwrap().push(event));
+                if let Some(task) = self.prepare_explain(&request, &collector) {
                     task();
                 }
                 let collected: Vec<Value> = std::mem::take(&mut *events.lock().unwrap());
@@ -129,6 +146,27 @@ impl CoreService {
             "closed": session.is_some(),
             "connection_id": connection_id
         })]
+    }
+
+    /// `query.explain` on a session: one EXPLAIN statement through the normal query path.
+    fn prepare_explain(&mut self, request: &Request, emit: &Emitter) -> Option<Task> {
+        let connection_id = request.payload.get("connection_id").and_then(Value::as_str)?;
+        let Some(engine) = self.connections.get(connection_id).map(|session| session.engine()) else {
+            emit(json!({"event": "error", "request_id": request.request_id,
+                        "message": format!("unknown connection_id: {connection_id}")}));
+            return None;
+        };
+        match crate::explain::rewrite(request, engine) {
+            Ok((rewritten, meta)) => {
+                let outer = emit.clone();
+                let tagged: Emitter = Arc::new(move |event| outer(crate::explain::tag_event(event, &meta)));
+                self.prepare_query(&rewritten, &tagged)
+            }
+            Err(event) => {
+                emit(event);
+                None
+            }
+        }
     }
 
     /// Validates and registers a session query. Errors are emitted here and yield no task.
@@ -234,6 +272,7 @@ pub fn handle_request_streaming<F: FnMut(Value)>(request: Request, mut emit: F) 
         "schema.diff" => emit_all_events(schema_diff(&request), emit),
         "query.execute" => emit_all_events(query_execute(&request), emit),
         "query.cancel" => emit_all_events(query_cancel(&request), emit),
+        "query.explain" => emit_all_events(crate::explain::explain_stateless(&request), emit),
         "dump.run" => dump_run_streaming(&request, emit),
         "dump.import" => dump_import_streaming(&request, emit),
         "dump.promote" => crate::safe_promotion::handle(&request, emit),
@@ -335,6 +374,7 @@ fn service_hello(request: &Request) -> Vec<Value> {
             "schema.diff",
             "query.execute",
             "query.cancel",
+            "query.explain",
             "dump.run",
             "dump.import",
             "dump.promote",
