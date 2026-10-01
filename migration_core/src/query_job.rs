@@ -60,16 +60,22 @@ pub(crate) struct Session {
     adapter: Mutex<LiveAdapter>,
     canceller: Canceller,
     running: Mutex<Option<String>>,
+    read_only: bool,
 }
 
 impl Session {
-    pub(crate) fn new(adapter: LiveAdapter, endpoint: &Endpoint) -> Self {
+    pub(crate) fn new(adapter: LiveAdapter, endpoint: &Endpoint, read_only: bool) -> Self {
         let canceller = Canceller::for_adapter(&adapter, endpoint);
         Self {
             adapter: Mutex::new(adapter),
             canceller,
             running: Mutex::new(None),
+            read_only,
         }
+    }
+
+    pub(crate) fn read_only(&self) -> bool {
+        self.read_only
     }
 }
 
@@ -309,10 +315,6 @@ fn end_read_only(adapter: &mut LiveAdapter) {
     };
 }
 
-fn is_read_only_violation(message: &str) -> bool {
-    let lowered = message.to_ascii_lowercase();
-    lowered.contains("read-only transaction") || lowered.contains("read only transaction")
-}
 
 struct Outcome {
     columns: Vec<String>,
@@ -825,6 +827,13 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
             "event": "error", "error_code": "export_session_in_transaction", "message": message,
             "in_transaction": in_transaction
         }))),
+        Err(RunError::Message(message)) if session.read_only() && is_read_only_violation(&message) => {
+            emit(base(json!({
+                "event": "error", "error_code": READ_ONLY_ERROR_CODE,
+                "message": format!("읽기 전용 세션에서는 데이터를 변경할 수 없습니다: {message}"),
+                "in_transaction": in_transaction
+            })))
+        }
         Err(RunError::Message(message)) if spec.output.is_some() && is_read_only_violation(&message) => {
             emit(base(json!({
                 "event": "error", "error_code": "export_requires_read_only",

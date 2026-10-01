@@ -219,8 +219,12 @@ pub(crate) fn execute_query_live(
     endpoint: &Endpoint,
     sql: &str,
     params: &[Value],
+    read_only: bool,
 ) -> Result<QueryExecutionResult, String> {
     let mut adapter = LiveAdapter::connect(endpoint)?;
+    if read_only {
+        apply_read_only(&mut adapter)?;
+    }
     execute_query_adapter(&mut adapter, sql, params)
 }
 
@@ -325,7 +329,7 @@ pub(crate) fn execute_query_adapter(
             // EXPLAIN, DML RETURNING, and data-changing CTEs, without a SELECT wrapper.
             let statement = client
                 .prepare(&sql)
-                .map_err(|err| format!("postgresql query error: {err}"))?;
+                .map_err(|err| format_postgres_error("postgresql query error", &err))?;
             let columns: Vec<String> = statement
                 .columns()
                 .iter()
@@ -334,7 +338,7 @@ pub(crate) fn execute_query_adapter(
             let columns = unique_query_columns(columns);
             let messages = client
                 .simple_query(&sql)
-                .map_err(|err| format!("postgresql query error: {err}"))?;
+                .map_err(|err| format_postgres_error("postgresql query error", &err))?;
             let mut rows = Vec::new();
             let mut rows_affected = 0;
             for message in messages {

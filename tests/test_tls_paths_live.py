@@ -189,3 +189,48 @@ def test_manual_host_form_sends_chosen_tls_and_it_is_enforced():
         print("PASS manual-host form: verify_full without the private CA refused")
     finally:
         facade.client.shutdown()
+
+
+def test_manual_host_form_certificate_name_for_ip_connection():
+    """Connect by IP to a certificate issued for a DNS name only: needs the form's certificate name."""
+    import sys
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+    from src.ui.dialogs.cross_engine_migration_endpoint_form import EndpointForm
+
+    app = QApplication.instance() or QApplication(sys.argv)  # noqa: F841
+    ct.clear_registered_tls()
+    _swap("mysql", "dnsonly")  # SAN = DNS:tf-db.test only, no IP
+    facade = _facade()
+
+    def inspect(name):
+        form = EndpointForm("src", DatabaseEngine.MYSQL)
+        form.input_host.setText("127.0.0.1")
+        form.input_port.setValue(MYSQL_PORT)
+        form.input_user.setText("root")
+        form.input_password.setText("tfpass")
+        form.input_database.setText("tfdb")
+        form.input_schema.setText("tfdb")
+        form.combo_tls.setCurrentIndex(form.combo_tls.findData("verify_full"))
+        form.input_tls_ca.setText(f"{CERTS}/ca.pem")
+        form.input_tls_name.setText(name)
+        payload = form.payload()
+        assert payload["tls"].get("server_name", "") == name
+        try:
+            result = facade.client.request("schema.inspect", {"source": payload})
+            return bool(result.get("success")), str(result.get("message"))
+        except DbCoreServiceError as exc:
+            return False, str(exc)
+
+    try:
+        ok, text = inspect("")
+        assert not ok and ("Tls" in text or "TLS" in text), text
+        print("PASS verify_full by IP without a certificate name refused (name mismatch)")
+        ok, text = inspect("other.test")
+        assert not ok and ("Tls" in text or "TLS" in text), text
+        print("PASS verify_full with a wrong certificate name refused")
+        ok, text = inspect("tf-db.test")
+        assert ok, text
+        print("PASS verify_full by IP with certificate name tf-db.test accepted")
+    finally:
+        facade.client.shutdown()
