@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                              QSpinBox, QProgressBar, QApplication)
 from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices, QFont
+from src.ui.dialogs.workspace_settings_group import WorkspaceRecoverySettingsGroup
 from src.version import __version__, __app_name__, GITHUB_OWNER, GITHUB_REPO
 from src.core.update_downloader import format_size
 from src.update_integrity import (
@@ -166,6 +167,8 @@ class SettingsDialog(QDialog):
         self._refresh_backup_list()
         layout.addWidget(self._build_reconnect_group())
         layout.addWidget(self._build_startup_group())
+        self.workspace_group = WorkspaceRecoverySettingsGroup(self.config_mgr)
+        layout.addWidget(self.workspace_group)
         layout.addStretch()
 
         return tab
@@ -702,6 +705,9 @@ class SettingsDialog(QDialog):
         # 시작 프로그램 설정 저장
         if StartupRegistrar().is_supported:
             self._set_startup_registry(self.chk_startup.isChecked())
+
+        # SQL 작업 공간 복구 설정 저장
+        self.workspace_group.save()
 
         self.accept()
 

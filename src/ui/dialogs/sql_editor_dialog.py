@@ -31,6 +31,7 @@ from src.core.db_core_service import normalize_db_engine
 from src.core.query_limits import build_query_limits
 from src.ui.dialogs.result_export import ResultExportMixin, is_export_safe_query
 from src.ui.dialogs.production_session import ProductionSessionMixin, build_commit_summary
+from src.ui.dialogs.sql_editor_workspace import WorkspaceRecoveryMixin
 from src.core.sql_query_classifier import (
     classify_sql_statement,
     is_mysql_implicit_commit_ddl,
@@ -210,7 +211,7 @@ def format_metadata_db_version(db_version) -> str:
 # =====================================================================
 # SQL 에디터 다이얼로그
 # =====================================================================
-class SQLEditorDialog(ProductionSessionMixin, ResultExportMixin, QDialog):
+class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExportMixin, QDialog):
     """SQL 에디터 다이얼로그"""
 
     def __init__(self, parent, tunnel_config: dict, config_manager, tunnel_engine):
@@ -258,6 +259,7 @@ class SQLEditorDialog(ProductionSessionMixin, ResultExportMixin, QDialog):
         self.init_ui()
         self.setup_shortcuts()
         self.refresh_databases()
+        self._ws_start()  # 작업 공간 복구: 이전 탭/초안 복원 후 자동 저장 시작
 
     def _db_engine(self) -> str:
         """Return the configured DB engine for Rust Core calls."""
@@ -703,6 +705,7 @@ class SQLEditorDialog(ProductionSessionMixin, ResultExportMixin, QDialog):
         tab_title = tab.get_title()
         index = self.editor_tabs.addTab(tab, tab_title)
         self.editor_tabs.setCurrentIndex(index)
+        self._ws_on_tab_added(tab)
 
         return tab
 
@@ -728,6 +731,7 @@ class SQLEditorDialog(ProductionSessionMixin, ResultExportMixin, QDialog):
                 return
 
         self.editor_tabs.removeTab(index)
+        self._ws_schedule(immediate=True)
 
     def _close_current_tab(self):
         """현재 탭 닫기"""
@@ -2576,10 +2580,20 @@ class SQLEditorDialog(ProductionSessionMixin, ResultExportMixin, QDialog):
             if tab and tab.is_modified:
                 modified_tabs.append(tab.get_title().rstrip(' *'))
 
-        if modified_tabs:
+        # 작업 공간 복구가 켜져 있으면 미저장 SQL은 손실이 아니라 다음 실행 때 복원된다.
+        recoverable = self._ws_recovery_active()
+        if recoverable:
+            modified_tabs = self._ws_unsaved_draft_titles()
+        if modified_tabs and not recoverable:
             warnings.append(f"저장되지 않은 SQL 편집 내용 ({len(modified_tabs)}개 탭)")
 
-        if warnings:
+        close_decision = 'close'
+        if recoverable and modified_tabs:
+            close_decision = self._ws_confirm_close(warnings, modified_tabs)
+            if close_decision == 'cancel':
+                event.ignore()
+                return
+        elif warnings:
             msg = "\n".join(f"• {w}" for w in warnings)
             reply = QMessageBox.question(
                 self, "닫기 확인",
@@ -2609,4 +2623,5 @@ class SQLEditorDialog(ProductionSessionMixin, ResultExportMixin, QDialog):
                 logger.debug("메타데이터 연결 정리 실패 (닫기)", exc_info=True)
             self._metadata_connector = None
 
+        self._ws_finalize(discard=(close_decision == 'discard'))
         event.accept()

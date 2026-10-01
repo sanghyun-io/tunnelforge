@@ -334,3 +334,16 @@ SELECT * FROM users GROUP BY name ASC;
 
 GRANT SUPER ON *.* TO 'admin'@'localhost';
 """
+
+
+@pytest.fixture(autouse=True)
+def isolate_workspace_store(tmp_path, monkeypatch):
+    """Workspace recovery must never touch the real app-support directory during tests."""
+    from src.core import workspace_store
+    from src.ui.dialogs import sql_editor_workspace
+
+    directory = tmp_path / "workspaces-isolated"
+    monkeypatch.setattr(workspace_store, "workspaces_dir", lambda *a, **k: directory)
+    monkeypatch.setattr(sql_editor_workspace, "make_workspace_store",
+                        lambda: workspace_store.WorkspaceStore(directory))
+    yield

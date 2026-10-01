@@ -211,6 +211,12 @@ class TunnelManagerUI(QMainWindow):
         header_layout.addWidget(self.btn_migration)
         header_layout.addWidget(self.btn_db_transition)
         header_layout.addWidget(self.btn_schedule)
+        # [복구된 SQL] 삭제된 프로필에서 남은 작업 공간이 있을 때만 보인다 (읽기 전용 목록)
+        self.btn_recovered_sql = QPushButton()
+        self.btn_recovered_sql.setStyleSheet(ButtonStyles.SECONDARY)
+        self.btn_recovered_sql.clicked.connect(self.open_recovered_sql_dialog)
+        self.btn_recovered_sql.setVisible(False)
+        header_layout.addWidget(self.btn_recovered_sql)
         header_layout.addWidget(self.btn_settings)
         layout.addLayout(header_layout)
 
@@ -234,6 +240,7 @@ class TunnelManagerUI(QMainWindow):
         self._apply_language()
 
         self.refresh_table()
+        self._refresh_recovered_sql_button()
 
     def _icon_text(self, icon: str, key: str) -> str:
         return f"{icon} {tr(key)}" if icon else tr(key)
@@ -247,6 +254,7 @@ class TunnelManagerUI(QMainWindow):
         self.btn_db_transition.setText(tr("main.db_transition"))
         self.btn_schedule.setText(self._icon_text("📅", "main.schedule"))
         self.btn_settings.setText(self._icon_text("⚙️", "main.settings"))
+        self.btn_recovered_sql.setText("📝 복구된 SQL")
         self.statusBar().showMessage(tr("app.ready"))
         if hasattr(self, "tunnel_tree"):
             self.tunnel_tree.apply_language()
@@ -594,6 +602,25 @@ class TunnelManagerUI(QMainWindow):
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self._apply_language()
             self.refresh_table()
+        self._refresh_recovered_sql_button()
+
+    def _known_profile_ids(self):
+        return [t.get('id') for t in self.config_mgr.load_config().get('tunnels', []) if t.get('id')]
+
+    def _refresh_recovered_sql_button(self):
+        """고아 SQL 작업 공간(삭제된 프로필)이 있을 때만 '복구된 SQL' 버튼을 보인다."""
+        try:
+            from src.core.workspace_store import WorkspaceStore
+            from src.ui.dialogs.recovered_sql_dialog import find_orphans
+            self.btn_recovered_sql.setVisible(bool(find_orphans(WorkspaceStore(), self._known_profile_ids())))
+        except Exception:
+            self.btn_recovered_sql.setVisible(False)
+
+    def open_recovered_sql_dialog(self):
+        from src.core.workspace_store import WorkspaceStore
+        from src.ui.dialogs.recovered_sql_dialog import RecoveredSqlDialog
+        RecoveredSqlDialog(WorkspaceStore(), self._known_profile_ids(), self).exec()
+        self._refresh_recovered_sql_button()
 
     def open_rust_dump_export(self):
         """Rust DB Core Export 마법사 열기 (병렬 처리)"""

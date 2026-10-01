@@ -7,6 +7,7 @@ from PyQt6.QtCore import Qt, QRect, QSize, pyqtSignal, QTimer
 from PyQt6.QtGui import QColor, QPainter, QTextCharFormat, QTextCursor
 from typing import List, Dict, Optional
 
+from src.core.workspace_store import compute_file_state
 from src.ui.dialogs.sql_editor_highlighters import SQLHighlighter, SQLValidatorHighlighter
 from src.ui.dialogs.sql_editor_autocomplete import AutoCompletePopup
 
@@ -360,6 +361,7 @@ class SQLEditorTab(QWidget):
         self.file_path = None
         self.is_modified = False
         self._tab_index = tab_index
+        self.file_state = None  # 마지막으로 읽거나 저장한 시점의 디스크 파일 상태 (작업 공간 복구용)
 
         self._init_ui()
 
@@ -415,6 +417,7 @@ class SQLEditorTab(QWidget):
                 content = f.read()
             self.file_path = file_path
             self._apply_text(content)
+            self.file_state = compute_file_state(file_path)
             return True
         except Exception:
             return False
@@ -453,6 +456,7 @@ class SQLEditorTab(QWidget):
             with open(target_path, 'w', encoding='utf-8') as f:
                 f.write(self.editor.toPlainText())
             self.file_path = target_path
+            self.file_state = compute_file_state(target_path)
             self.is_modified = False
             self.modified_changed.emit(False)
             self.title_changed.emit(self.get_title())

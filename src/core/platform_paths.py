@@ -125,6 +125,15 @@ def sql_history_file(
     return app_support_dir(platform_name, home, environ) / "sql_history.json"
 
 
+def workspaces_dir(
+    platform_name: Optional[str] = None,
+    home: Optional[Path] = None,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Path:
+    """SQL 작업 공간 복구 파일(프로필별 JSON) 디렉토리."""
+    return app_support_dir(platform_name, home, environ) / "workspaces"
+
+
 def analysis_dir() -> Path:
     return app_support_dir() / "analysis"
 
