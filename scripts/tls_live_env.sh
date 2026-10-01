@@ -4,7 +4,7 @@
 #   scripts/tls_live_env.sh certs                 # generate CAs + scenario certs into $TF_TLS_CERT_DIR
 #   scripts/tls_live_env.sh up-pg | up-mysql      # start servers on 25432 / 23306 (tmpfs, no volumes)
 #   scripts/tls_live_env.sh cert pg|mysql <scenario>   # hot-swap the server certificate
-#                                                 # scenarios: good | wrongname | expired | untrusted | none
+#                                                 # scenarios: good | wrongname | dnsonly (no IP SAN) | expired | untrusted | none
 #   scripts/tls_live_env.sh up-ssh [pubkey-file] | authorize <pubkey-file> | rotate-ssh
 #                                                 # OpenSSH server on 22222 (same docker network as PG) / regenerate host key
 #   scripts/tls_live_env.sh down                  # remove every tf-test-a-* container
@@ -65,6 +65,7 @@ cmd_certs() {
   gen_leaf good ca "$SAN"
   gen_leaf wrongname ca "subjectAltName=DNS:other.test,IP:127.0.0.1"
   gen_leaf wrongname-only ca "subjectAltName=DNS:other.test"
+  gen_leaf dnsonly ca "subjectAltName=DNS:tf-db.test"
   gen_leaf expired ca "$SAN" 20200101000000Z 20200102000000Z
   gen_leaf untrusted other-ca "$SAN"
   echo "certs in $CERT_DIR"

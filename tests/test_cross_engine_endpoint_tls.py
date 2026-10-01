@@ -115,3 +115,54 @@ def test_tunnel_only_form_locks_tls_inputs():
     assert not form.combo_tls.isEnabled() and not form.btn_tls_ca.isEnabled()
     form.combo_tunnel.setCurrentIndex(1)
     assert form.payload()["tls"]["mode"] == "verify_full"
+
+
+def test_manual_certificate_name_is_sent_only_for_verify_full():
+    form = _form()
+    _type_host(form, "10.0.0.5")
+    assert _mode(form) == "verify_full" and form.input_tls_name.isEnabled()
+    assert "server_name" not in form.payload()["tls"]  # blank = use the host
+    form.input_tls_name.setText("  db.internal  ")
+    assert form.payload()["tls"]["server_name"] == "db.internal"
+
+    form.combo_tls.setCurrentIndex(form.combo_tls.findData("verify_ca"))
+    assert not form.input_tls_name.isEnabled()
+    assert "server_name" not in form.payload()["tls"]
+    form.combo_tls.setCurrentIndex(form.combo_tls.findData("disable"))
+    assert not form.input_tls_name.isEnabled()
+
+
+def test_typed_certificate_name_survives_host_edits_but_tunnel_name_does_not():
+    form = _form(TUNNEL)
+    _type_host(form, "10.0.0.5")
+    form.input_tls_name.setText("typed.example")
+    _type_host(form, "10.0.0.6")
+    assert form.payload()["tls"]["server_name"] == "typed.example"
+
+    form.combo_tunnel.setCurrentIndex(1)
+    assert form.input_tls_name.text() == "db.internal"  # filled from the profile's remote host
+    _type_host(form, "127.0.0.1")
+    assert form.input_tls_name.text() == "" and "server_name" not in form.payload()["tls"]
+
+
+def test_tunnel_only_form_locks_certificate_name():
+    form = _form(TUNNEL, require_tunnel=True)
+    form.combo_tunnel.setCurrentIndex(1)
+    assert not form.input_tls_name.isEnabled()
+    assert form.payload()["tls"]["server_name"] == "db.internal"
+    form.set_inputs_enabled(False)
+    form.set_inputs_enabled(True)
+    assert not form.input_tls_name.isEnabled()
+
+
+def test_inputs_are_restored_per_mode_after_a_worker_finishes():
+    form = _form()
+    _type_host(form, "10.0.0.5")
+    form.set_inputs_enabled(False)
+    assert not form.input_tls_name.isEnabled() and not form.tls_ca_widget.isEnabled()
+    form.set_inputs_enabled(True)
+    assert form.input_tls_name.isEnabled() and form.tls_ca_widget.isEnabled()
+    form.combo_tls.setCurrentIndex(form.combo_tls.findData("disable"))
+    form.set_inputs_enabled(False)
+    form.set_inputs_enabled(True)
+    assert not form.input_tls_name.isEnabled() and not form.tls_ca_widget.isEnabled()
