@@ -17,6 +17,9 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "(선택) 인증서에 적힌 이름 - 비우면 Host 사용": "(Optional) Name on the certificate - leave empty to use the host",
+    "IP 주소로 접속하는데 인증서가 DNS 이름으로 발급된 경우 그 이름을 입력하세요.": "Enter the DNS name on the certificate when you connect by IP address.",
+    "인증서 이름:": "Certificate name:",
     "💾 표시된 결과 {}행 저장: {}": "💾 Saved {} displayed rows: {}",
     "💾 표시된 결과 {}행을 저장했습니다": "💾 Saved {} displayed rows",
     "💾 파일로 저장 중... {}행, {} MiB": "💾 Saving to file... {} rows, {} MiB",
