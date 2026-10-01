@@ -115,6 +115,7 @@ jobs:
         run: |
           cargo test --manifest-path migration_core/Cargo.toml \
             --test live_roundtrip \
+            --test live_binary_keyset \
             --test live_dump_cross_engine \
             --test live_schema_fidelity \
             --test live_import_policy \

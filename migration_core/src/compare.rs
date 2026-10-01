@@ -216,6 +216,62 @@ pub(crate) fn row_key_token(row: &Value, key_columns: &[String]) -> Option<Strin
     values.map(|values| serde_json::to_string(&values).unwrap_or_default())
 }
 
+/// Defensive check for keyset pagination: the last key of a page must be strictly greater than the previous
+/// page's last key. A cursor that repeats or rewinds (the failure mode of a mis-typed key comparison) would
+/// otherwise silently duplicate and drop rows, because the callers stop on a row count, not on the key.
+/// Integer and binary key parts are ordered exactly; other types (text collations, decimals, uuid) cannot be
+/// ordered here, so for them only an unchanged key is rejected. Returns the new cursor token.
+pub(crate) fn advance_keyset_cursor(
+    table: &NormalizedTable,
+    key_columns: &[String],
+    previous: Option<&str>,
+    next: Option<String>,
+) -> Result<String, String> {
+    let next = next.ok_or_else(|| format!("keyset cursor for {} could not read the key of the last row", table.name))?;
+    let Some(previous) = previous else { return Ok(next) };
+    let (Some(before), Some(after)) = (decode_key_token(previous), decode_key_token(&next)) else {
+        return Ok(next);
+    };
+    for (index, column) in key_columns.iter().enumerate() {
+        let (Some(left), Some(right)) = (before.get(index), after.get(index)) else { break };
+        if left == right {
+            continue;
+        }
+        let type_name = table
+            .columns
+            .iter()
+            .find(|candidate| &candidate.name == column)
+            .map(|candidate| candidate.type_name.to_ascii_lowercase())
+            .unwrap_or_default();
+        let ordering = if is_binary_type(&type_name) {
+            hex_bytes(left).zip(hex_bytes(right)).map(|(a, b)| a.cmp(&b))
+        } else if type_name.contains("int") {
+            left.parse::<i128>().ok().zip(right.parse::<i128>().ok()).map(|(a, b)| a.cmp(&b))
+        } else {
+            None
+        };
+        return match ordering {
+            Some(std::cmp::Ordering::Greater) => Err(keyset_regression_message(table)),
+            _ => Ok(next),
+        };
+    }
+    Err(keyset_regression_message(table))
+}
+
+fn keyset_regression_message(table: &NormalizedTable) -> String {
+    format!(
+        "keyset cursor for {} did not advance (the next page's last key is not greater than the previous one); stopping to avoid duplicated or skipped rows",
+        table.name
+    )
+}
+
+fn hex_bytes(text: &str) -> Option<Vec<u8>> {
+    if text.len() % 2 != 0 {
+        return None;
+    }
+    (0..text.len()).step_by(2).map(|index| u8::from_str_radix(text.get(index..index + 2)?, 16).ok()).collect()
+}
+
 pub(crate) fn keyset_start_index(rows: &[Value], key_columns: &[String], last_key: Option<&str>) -> usize {
     let Some(last_key) = last_key else {
         return 0;
@@ -523,5 +579,87 @@ mod tests {
         };
 
         assert_eq!(next_table_to_copy(&state), Some("orders".to_string()));
+    }
+}
+
+#[cfg(test)]
+mod keyset_guard_tests {
+    use super::*;
+
+    fn table(columns: &[(&str, &str)]) -> NormalizedTable {
+        NormalizedTable {
+            name: "events".to_string(),
+            columns: columns
+                .iter()
+                .map(|(name, type_name)| NormalizedColumn {
+                    name: name.to_string(),
+                    type_name: type_name.to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: true,
+                    unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
+                })
+                .collect(),
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
+        }
+    }
+
+    fn advance(table: &NormalizedTable, keys: &[&str], previous: Option<&str>, next: &str) -> Result<String, String> {
+        let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        advance_keyset_cursor(table, &keys, previous, Some(next.to_string()))
+    }
+
+    #[test]
+    fn first_page_and_a_greater_key_advance() {
+        let ints = table(&[("id", "bigint")]);
+        assert_eq!(advance(&ints, &["id"], None, r#"["5"]"#).unwrap(), r#"["5"]"#);
+        assert!(advance(&ints, &["id"], Some(r#"["9"]"#), r#"["10"]"#).is_ok(), "numeric, not text, order for integers");
+    }
+
+    #[test]
+    fn a_repeated_or_rewound_integer_key_stops_the_scan() {
+        let ints = table(&[("id", "int")]);
+        for next in [r#"["9"]"#, r#"["3"]"#] {
+            let err = advance(&ints, &["id"], Some(r#"["9"]"#), next).unwrap_err();
+            assert!(err.contains("did not advance") && err.contains("events"), "{err}");
+            assert!(!err.contains('9'), "key values stay out of the message: {err}");
+        }
+    }
+
+    #[test]
+    fn binary_keys_compare_as_bytes_regardless_of_hex_case() {
+        let binary = table(&[("id", "binary(16)")]);
+        assert!(advance(&binary, &["id"], Some(r#"["0A"]"#), r#"["0b"]"#).is_ok());
+        assert!(advance(&binary, &["id"], Some(r#"["ff"]"#), r#"["FF00"]"#).is_ok(), "a longer key with the same prefix sorts after");
+        assert!(advance(&binary, &["id"], Some(r#"["FF00"]"#), r#"["ff"]"#).is_err(), "and the prefix sorts before it");
+    }
+
+    #[test]
+    fn composite_keys_decide_on_the_first_differing_part() {
+        let mixed = table(&[("grp", "int"), ("id", "bytea")]);
+        assert!(advance(&mixed, &["grp", "id"], Some(r#"["1","ff"]"#), r#"["2","00"]"#).is_ok());
+        assert!(advance(&mixed, &["grp", "id"], Some(r#"["1","ff"]"#), r#"["1","fe"]"#).is_err());
+        assert!(advance(&mixed, &["grp", "id"], Some(r#"["1","ff"]"#), r#"["1","ff"]"#).is_err());
+    }
+
+    #[test]
+    fn unorderable_types_only_reject_an_unchanged_key() {
+        let text = table(&[("code", "varchar(20)")]);
+        assert!(advance(&text, &["code"], Some(r#"["b"]"#), r#"["a"]"#).is_ok(), "collation order is unknown here");
+        assert!(advance(&text, &["code"], Some(r#"["a"]"#), r#"["a"]"#).is_err());
+    }
+
+    #[test]
+    fn an_unreadable_last_key_is_an_error() {
+        let ints = table(&[("id", "int")]);
+        assert!(advance_keyset_cursor(&ints, &["id".to_string()], None, None).is_err());
     }
 }
