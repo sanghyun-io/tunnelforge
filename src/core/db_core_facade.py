@@ -41,6 +41,8 @@ class DbEndpoint:
     tls_mode: str = ""
     tls_ca_file: str = ""
     tls_server_name: str = ""
+    # TF-STATUS-128: server-enforced read-only session (production profiles); sent only when true.
+    read_only: bool = False
 
     def __post_init__(self):
         if not self.tls_mode:
@@ -66,6 +68,8 @@ class DbEndpoint:
             if self.tls_server_name:
                 tls["server_name"] = self.tls_server_name
             payload["tls"] = tls
+        if self.read_only:
+            payload["read_only"] = True
         return payload
 
 

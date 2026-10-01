@@ -10,11 +10,12 @@ from PyQt6.QtCore import Qt
 
 from src.core.db_core_service import create_rust_db_connector, normalize_db_engine
 from src.core.logger import get_logger
+from src.ui.dialogs.production_session import ProductionSessionMixin
 
 logger = get_logger(__name__)
 
 
-class SQLExecutionDialog(QDialog):
+class SQLExecutionDialog(ProductionSessionMixin, QDialog):
     """SQL 파일 실행 다이얼로그"""
 
     def __init__(self, parent, tunnel_config: dict, config_manager, tunnel_engine):
@@ -29,6 +30,21 @@ class SQLExecutionDialog(QDialog):
         self.setWindowTitle(f"SQL 파일 실행 - {self.config.get('name', 'Unknown')}")
         self.setMinimumSize(600, 500)
         self.init_ui()
+
+    # --- ProductionSessionMixin hooks (TF-STATUS-128) ---
+
+    @property
+    def _query_executing(self) -> bool:
+        return bool(self.worker and self.worker.isRunning())
+
+    def _session_log(self, text: str) -> None:
+        self.output_text.append(text)
+
+    def _session_target(self):
+        return (self.db_combo.currentText().strip(), "")
+
+    def _session_reset_connection(self) -> None:
+        pass  # every run opens its own session
 
     def init_ui(self):
         layout = QVBoxLayout(self)
@@ -58,6 +74,7 @@ class SQLExecutionDialog(QDialog):
             conn_layout.addWidget(warning)
 
         layout.addWidget(conn_group)
+        layout.addWidget(self._build_session_banner())
 
         # --- SQL 파일 선택 ---
         file_group = QGroupBox("SQL 파일")
@@ -81,6 +98,9 @@ class SQLExecutionDialog(QDialog):
         self.db_combo.setEditable(True)
         self.db_combo.setPlaceholderText("데이터베이스를 선택하거나 입력하세요 (생략 가능)")
         self.db_combo.setMinimumWidth(300)
+        self.db_combo.currentTextChanged.connect(
+            lambda _text: self._relock_if_target_changed(self._session_target())
+        )
 
         btn_refresh_db = QPushButton("🔄")
         btn_refresh_db.setToolTip("데이터베이스 목록 새로고침")
@@ -280,6 +300,7 @@ class SQLExecutionDialog(QDialog):
                 database,
                 db_engine=db_engine,
                 schema=database if db_engine == 'postgresql' else "",
+                read_only=self._session_read_only(),
             )
             self.worker.progress.connect(self._on_progress)
             self.worker.output.connect(self._on_output)

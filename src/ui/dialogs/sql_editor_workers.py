@@ -29,6 +29,7 @@ class ConnectionParams:
     password: str
     database: str = None
     schema: str = None
+    read_only: bool = False  # TF-STATUS-128: production windows open read-only sessions
 
 
 def truncate_sql_preview(text, length=60) -> str:
@@ -36,7 +37,8 @@ def truncate_sql_preview(text, length=60) -> str:
     return text[:length] + ("..." if len(text) > length else "")
 
 
-def create_sql_editor_connector(engine, host, port, user, password, database=None, schema=None):
+def create_sql_editor_connector(engine, host, port, user, password, database=None, schema=None,
+                                read_only=False):
     db_engine = normalize_db_engine(engine, port)
     return create_rust_db_connector(
         db_engine,
@@ -46,6 +48,7 @@ def create_sql_editor_connector(engine, host, port, user, password, database=Non
         password,
         database,
         schema=(schema or "") if db_engine == "postgresql" else "",
+        read_only=read_only,
     )
 
 
@@ -58,6 +61,7 @@ def connector_from_params(params: ConnectionParams):
         params.password,
         params.database,
         params.schema,
+        read_only=params.read_only,
     )
 
 
@@ -102,7 +106,7 @@ class SQLQueryWorker(QThread):
     finished = pyqtSignal(bool, str)
 
     def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None,
-                 limits=None):
+                 limits=None, read_only=False):
         super().__init__()
         self.limits = dict(limits) if limits is not None else build_query_limits()
         self._connector = None
@@ -121,6 +125,7 @@ class SQLQueryWorker(QThread):
             self.password,
             self.database,
             self.schema,
+            read_only=read_only,
         )
         self.queries = queries  # List of query strings
 

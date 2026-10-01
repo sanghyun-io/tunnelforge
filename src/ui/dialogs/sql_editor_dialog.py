@@ -30,6 +30,7 @@ from typing import List, Dict, Optional, Tuple
 from src.core.db_core_service import normalize_db_engine
 from src.core.query_limits import build_query_limits
 from src.ui.dialogs.result_export import ResultExportMixin, is_export_safe_query
+from src.ui.dialogs.production_session import ProductionSessionMixin, build_commit_summary
 from src.core.sql_query_classifier import (
     classify_sql_statement,
     is_mysql_implicit_commit_ddl,
@@ -209,7 +210,7 @@ def format_metadata_db_version(db_version) -> str:
 # =====================================================================
 # SQL 에디터 다이얼로그
 # =====================================================================
-class SQLEditorDialog(ResultExportMixin, QDialog):
+class SQLEditorDialog(ProductionSessionMixin, ResultExportMixin, QDialog):
     """SQL 에디터 다이얼로그"""
 
     def __init__(self, parent, tunnel_config: dict, config_manager, tunnel_engine):
@@ -302,6 +303,7 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
             password,
             database,
             schema,
+            read_only=self._session_read_only(),
         )
 
     def _database_and_schema_for_selection(self, selected: Optional[str] = None) -> Tuple[Optional[str], str]:
@@ -322,6 +324,7 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
         layout.setSpacing(8)
 
         layout.addLayout(self._build_connection_bar())
+        layout.addWidget(self._build_session_banner())
         layout.addLayout(self._build_toolbar())
         layout.addWidget(self._build_editor_panel())
         self._build_status_bar(layout)
@@ -1026,9 +1029,12 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
             and self.pending_queries
             and any(is_mysql_implicit_commit_ddl(q) for q in queries)
         ):
+            summary_text, summary_total = build_commit_summary(self.pending_queries)
             reply = QMessageBox.question(
                 self, "DDL 실행 확인",
-                "MySQL DDL은 암묵적 COMMIT을 발생시켜 이전 미커밋 변경을 롤백할 수 없게 됩니다. 계속 실행하시겠습니까?",
+                "MySQL DDL은 암묵적 COMMIT을 발생시켜 이전 미커밋 변경이 자동 커밋되고 롤백할 수 없게 됩니다.\n\n"
+                f"자동 커밋될 변경 {len(self.pending_queries)}건 (영향 행 합계 {summary_total}행):\n{summary_text}\n\n"
+                "계속 실행하시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             )
             if reply != QMessageBox.StandardButton.Yes:
@@ -1186,6 +1192,7 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
                 engine=self._db_engine(),
                 schema=schema,
                 limits=self._query_limits(),
+                read_only=self._session_read_only(),
             )
             self.worker.result_truncated.connect(self._on_result_truncated)
             self.worker.rows_progress.connect(self._on_rows_progress)
@@ -1357,6 +1364,7 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
         쿼리 실행 중이거나 PostgreSQL 오류로 롤백된 직후에는 커밋/롤백 버튼을
         pending 건수와 무관하게 별도로 가드한다.
         """
+        self._update_session_banner()
         pending_count = len(self.pending_queries)
         try:
             cell_edit_count = sum(
@@ -1627,6 +1635,8 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
             return
 
         if not self._confirm_cell_edit_commit(table_edits):
+            return
+        if not self._confirm_commit_summary():
             return
 
         self._apply_commit(table_edits)
@@ -1939,7 +1949,10 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
         조건 미충족 시 전체 읽기 전용.
         """
         edit_ctx = None
-        analysis = self._analyze_query_editability(query)
+        if self._session_read_only():
+            analysis = None  # production windows are read-only until unlocked (TF-STATUS-128)
+        else:
+            analysis = self._analyze_query_editability(query)
         if analysis and self.db_connection and self.db_connection.open:
             pk_cols = self._fetch_primary_keys(analysis['schema'], analysis['table'])
             if pk_cols:
@@ -2264,6 +2277,7 @@ class SQLEditorDialog(ResultExportMixin, QDialog):
             else:
                 self._close_db_connection()
 
+        self._relock_if_target_changed(target)
         self.metadata_provider.invalidate()
         self._load_metadata(schema)
 
