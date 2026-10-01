@@ -32,6 +32,7 @@ from src.core.sql_query_task_executor import SqlQueryTaskExecutor
 from src.core.job_history import KIND_SCHEDULED_BACKUP, STATUS_SKIPPED, job_begin, job_finish
 from src.core.schedule_time import classify_due, validate_expression
 from src.core import scheduled_backup_store as backup_store
+from src.core.restore_rehearsal import RestoreRehearsal, rehearsal_target_error
 
 # 하위 호환 재노출 (consumer: src/ui/dialogs/schedule_dialog.py, src/ui/main_window.py)
 __all__ = [
@@ -92,9 +93,15 @@ class BackupScheduler:
 
         # 작업 실행 협력자 조립 (DI - 아래 모듈들은 scheduler.py를 import하지 않는 leaf 모듈)
         self._log_writer = ExecutionLogWriter()
+        self._rehearsal = RestoreRehearsal(
+            resolve_connection=self._resolve_connection,
+            find_tunnel_config=self._find_tunnel_config,
+            connector_factory=self._make_connector,
+        )
         self._backup_executor = BackupTaskExecutor(
             resolve_connection=self._resolve_connection,
             log_writer=self._log_writer,
+            rehearsal=self._rehearsal,
         )
         self._sql_executor = SqlQueryTaskExecutor(
             resolve_connection=self._resolve_connection,
@@ -158,6 +165,9 @@ class BackupScheduler:
             return SQL_TASK_UNSUPPORTED_MESSAGE
         if not config.output_dir:
             return "백업 출력 폴더를 지정하세요."
+        error = rehearsal_target_error(self._find_tunnel_config(config.rehearsal_tunnel_id), config)
+        if error:
+            return error
         return validate_expression(config.cron_expression, self.min_interval_minutes())
 
     def _save_schedules(self):
@@ -442,16 +452,22 @@ class BackupScheduler:
             # 60초 대기 (중단 가능)
             self._stop_event.wait(60)
 
+    def _find_tunnel_config(self, tunnel_id: str) -> Optional[dict]:
+        if not tunnel_id:
+            return None
+        config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(tunnel_id)
+        if not config:
+            stored_tunnels = self.config_manager.load_config().get('tunnels', [])
+            config = next((t for t in stored_tunnels if t.get('id') == tunnel_id), None)
+        return config
+
     def _resolve_connection(self, schedule: ScheduleConfig) -> Tuple[Optional["_ResolvedConnection"], str]:
         """백업/SQL 실행이 공유하는 터널 연결 정보 + 복호화된 자격 증명 해석
 
         Returns:
             (resolved, error_message) - 실패 시 resolved는 None이고 error_message에 사유가 담긴다.
         """
-        config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(schedule.tunnel_id)
-        if not config:
-            stored_tunnels = self.config_manager.load_config().get('tunnels', [])
-            config = next((t for t in stored_tunnels if t.get('id') == schedule.tunnel_id), None)
+        config = self._find_tunnel_config(schedule.tunnel_id)
         if not config:
             return None, "터널 설정을 찾을 수 없습니다."
 

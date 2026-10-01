@@ -139,3 +139,42 @@ def test_postgresql_tunnels_pick_a_database_and_legacy_schedules_show_postgres(w
         assert dialog.result_config.database == ""
     finally:
         dialog.close()
+
+
+def test_rehearsal_targets_are_limited_to_dev_staging_profiles_and_saved_with_the_schedule(warnings):
+    tunnels = [("prod", "Prod"), ("dev", "Dev"), ("stg", "Stage"), ("none", "Unset")]
+    envs = {"prod": "production", "dev": "development", "stg": "staging", "none": None}
+    dialog = filled_dialog_with(tunnels, envs)
+    try:
+        names = [dialog.rehearsal_tunnel_combo.itemText(i) for i in range(dialog.rehearsal_tunnel_combo.count())]
+        assert names == ["Dev", "Stage"], "production and unset-environment profiles are not selectable"
+        dialog.rehearsal_check.setChecked(True)
+        dialog._save()
+        assert dialog.result_config is None and "스키마" in warnings[-1]
+        dialog.rehearsal_schema_edit.setText("rehearsal")
+        dialog._save()
+        config = dialog.result_config
+        assert (config.rehearsal_tunnel_id, config.rehearsal_schema, config.rehearsal_database) == ("dev", "rehearsal", "")
+        dialog.rehearsal_check.setChecked(False)
+        dialog._save()
+        assert dialog.result_config.rehearsal_tunnel_id == ""
+    finally:
+        dialog.close()
+
+
+def filled_dialog_with(tunnels, envs):
+    dialog = ScheduleEditDialog(None, tunnels, tunnel_environments=envs)
+    dialog.name_edit.setText("nightly")
+    dialog.schema_edit.setText("app")
+    dialog.output_edit.setText("C:/backups")
+    dialog.cron_edit.setText("0 3 * * *")
+    dialog.schedule_tabs.setCurrentIndex(1)
+    return dialog
+
+
+def test_the_rehearsal_option_is_disabled_when_no_profile_qualifies():
+    dialog = ScheduleEditDialog(None, [("prod", "Prod")], tunnel_environments={"prod": "production"})
+    try:
+        assert not dialog.rehearsal_check.isEnabled()
+    finally:
+        dialog.close()

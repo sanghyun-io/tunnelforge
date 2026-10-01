@@ -1026,7 +1026,8 @@ class TunnelManagerUI(QMainWindow):
         from src.ui.dialogs.schedule_dialog import ScheduleListDialog
 
         tunnel_engines = {t['id']: normalize_db_engine(t.get('db_engine'), t.get('remote_port')) for t in self.tunnels}
-        dialog = ScheduleListDialog(self, self.scheduler, tunnel_list, tunnel_engines)
+        tunnel_environments = {t['id']: t.get('environment') for t in self.tunnels}
+        dialog = ScheduleListDialog(self, self.scheduler, tunnel_list, tunnel_engines, tunnel_environments)
         dialog.schedule_changed.connect(self._update_schedule_run_menu)
         dialog.exec()
 

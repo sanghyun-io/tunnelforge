@@ -90,5 +90,5 @@ def test_schedule_guide_states_the_backup_only_scope_and_the_safety_rules():
     assert "예약 SQL 실행은 지원하지 않습니다" in doc
     assert "현재 메인 UI에서 비활성화" not in doc
     for rule in ("존재하지 않는 시각", "반복되는 시각", "최대 1회", "자동 수락하지 않고 실패",
-                 "소유 마커", "마커가 없는 폴더", "가장 최근 완료 백업은 항상 남깁니다"):
+                 "소유 마커", "복원 리허설", "운영 프로필", "마커가 없는 폴더", "가장 최근 완료 백업은 항상 남깁니다"):
         assert rule in doc

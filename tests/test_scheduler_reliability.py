@@ -1,5 +1,6 @@
 """Scheduled backup reliability: validation, missed runs, overlap, unattended credentials, ownership and
 retention, job-history records."""
+from types import SimpleNamespace
 import os
 import threading
 from datetime import datetime, timedelta
@@ -378,3 +379,29 @@ def test_postgresql_backup_connects_to_the_schedule_database_and_records_it(env,
     assert env.scheduler._execute_backup(schedule)[0] is True
     assert seen == {"database": "sales", "engine": "postgresql"}
     assert history_records()[0].target == "sales.app"
+
+
+def test_a_failed_rehearsal_reports_failure_even_though_the_backup_succeeded(env, exporter):
+    seen = {}
+
+    class FakeRehearsal:
+        def run(self, schedule, backup_dir, source):
+            seen["dir"] = backup_dir
+            return SimpleNamespace(ok=False, message="복원 리허설 실패: x")
+
+    env.scheduler._backup_executor.rehearsal = FakeRehearsal()
+    schedule = env.schedule(rehearsal_tunnel_id="tgt", rehearsal_schema="rehearsal")
+    ok, message = env.scheduler._execute_backup(schedule)
+    assert ok is False and "백업 완료" in message and "복원 리허설 실패" in message
+    owned = backup_store.list_owned(schedule.output_dir, "s1")
+    assert len(owned) == 1 and owned[0].state == backup_store.STATE_COMPLETED and seen["dir"] == owned[0].path
+    assert history_records()[0].status == jh.STATUS_COMPLETED  # the backup record itself stays completed
+
+
+def test_no_rehearsal_runs_when_the_option_is_off(env, exporter):
+    class Boom:
+        def run(self, *args):
+            raise AssertionError("rehearsal must not run")
+
+    env.scheduler._backup_executor.rehearsal = Boom()
+    assert env.scheduler._execute_backup(env.schedule())[0] is True

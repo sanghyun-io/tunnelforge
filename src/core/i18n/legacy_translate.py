@@ -349,6 +349,15 @@ _EN_TEXT_TRANSLATIONS = {
 }
 
 _EN_PHRASE_TRANSLATIONS = {
+    "복원 리허설 (선택)": "Restore Rehearsal (optional)",
+    "백업 직후 복원 리허설 실행 (후보 복원 → 행/digest 검증 → 후보 정리)": "Run a restore rehearsal right after the backup (restore candidate -> verify rows/digest -> clean candidate)",
+    "방금 만든 백업을 아래 비운영 대상에 안전 복원(별도 후보 네임스페이스)으로 복원해 검증하고, 이 실행이 만든 후보만 정리합니다. 대상의 기존 네임스페이스는 변경되지 않으며 반드시 미리 존재해야 합니다. 환경이 개발/스테이징으로 설정된 프로필만 선택할 수 있고 운영 프로필은 선택할 수 없습니다.": "The backup just created is restored into the non-production target below as a safe restore (separate candidate namespace) and verified, and only the candidate created by this run is cleaned up. The existing target namespace is never changed and must already exist. Only profiles whose environment is set to development/staging can be selected; production profiles cannot.",
+    "리허설 대상 터널:": "Rehearsal target tunnel:",
+    "리허설 데이터베이스:": "Rehearsal database:",
+    "이미 존재하는 대상 스키마 (MySQL은 데이터베이스)": "Existing target schema (database for MySQL)",
+    "리허설 스키마:": "Rehearsal schema:",
+    "환경이 개발/스테이징으로 설정된 프로필이 없습니다.": "No profile has its environment set to development/staging.",
+    "복원 리허설 대상 터널과 스키마를 지정하세요.": "Specify the rehearsal target tunnel and schema.",
     "비우면 postgres": "Empty means postgres",
     "목록 불러오기": "Load list",
     "데이터베이스 목록": "Database List",

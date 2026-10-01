@@ -52,6 +52,7 @@ class OwnedBackup:
     state: str
     created_at: datetime
     finished_at: Optional[datetime] = None
+    hold: str = ''  # 비어 있지 않으면 보존 정책이 삭제하지 않는다 (예: 정리되지 않은 리허설 후보의 저널이 이 폴더에 있음)
 
 
 def marker_path(directory: str) -> str:
@@ -76,6 +77,7 @@ def write_marker(directory: str, schedule_id: str, schedule_name: str, state: st
         'created_at': _iso(created),
         'finished_at': _iso(finished_at) if finished_at else '',
         'message': (message or '')[:300],
+        'hold': (previous or {}).get('hold', ''),
     }
     tmp = f'{path}.tmp.{os.getpid()}.{threading.get_ident()}'
     try:
@@ -122,8 +124,23 @@ def list_owned(output_dir: str, schedule_id: str) -> List[OwnedBackup]:
             continue
         marker = read_marker(path)
         if marker and marker['schedule_id'] == schedule_id:
-            owned.append(OwnedBackup(path, schedule_id, marker['state'], marker['created_at'], marker['finished_at']))
+            owned.append(OwnedBackup(path, schedule_id, marker['state'], marker['created_at'], marker['finished_at'],
+                                     str(marker.get('hold') or '')))
     return sorted(owned, key=lambda b: b.created_at)
+
+
+def set_hold(directory: str, hold: str) -> None:
+    """소유 마커에 보존 보류 사유를 기록한다 (마커가 없으면 아무것도 하지 않는다)."""
+    marker = read_marker(directory)
+    if not marker:
+        return
+    path = marker_path(directory)
+    payload = {**marker, 'created_at': _iso(marker['created_at']),
+               'finished_at': _iso(marker['finished_at']) if marker['finished_at'] else '', 'hold': hold}
+    tmp = f'{path}.tmp.{os.getpid()}.{threading.get_ident()}'
+    with open(tmp, 'w', encoding='utf-8') as handle:
+        json.dump(payload, handle, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
 
 
 def sweep_interrupted(output_dir: str, schedule_id: str, schedule_active: bool) -> int:
@@ -154,6 +171,7 @@ def select_for_deletion(owned: List[OwnedBackup], retention_count: int, retentio
     """
     now = now or _now()
     cutoff = now - timedelta(days=max(0, retention_days))
+    held = {b.path for b in owned if b.hold}
     completed = [b for b in owned if b.state == STATE_COMPLETED]
     victims: List[OwnedBackup] = []
     keep_count = max(1, retention_count)
@@ -166,7 +184,7 @@ def select_for_deletion(owned: List[OwnedBackup], retention_count: int, retentio
     for backup in owned:
         if backup.state in (STATE_FAILED, STATE_INTERRUPTED) and backup.created_at < cutoff:
             victims.append(backup)
-    unique = {b.path: b for b in victims}
+    unique = {b.path: b for b in victims if b.path not in held}
     return sorted(unique.values(), key=lambda b: b.created_at)
 
 

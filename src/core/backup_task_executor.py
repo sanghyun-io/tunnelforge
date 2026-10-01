@@ -16,6 +16,7 @@ from src.core.job_history import (
 from src.core.logger import get_logger
 from src.core.schedule_config import ScheduleConfig
 from src.core import scheduled_backup_store as backup_store
+from src.core.restore_rehearsal import RestoreRehearsal
 
 logger = get_logger(__name__)
 
@@ -36,14 +37,16 @@ def safe_folder_name(name: str) -> str:
 class BackupTaskExecutor:
     """스케줄 백업 실행 + 보존 정책 적용"""
 
-    def __init__(self, resolve_connection: Callable, log_writer):
+    def __init__(self, resolve_connection: Callable, log_writer, rehearsal=None):
         """
         Args:
             resolve_connection: schedule -> (resolved, error_message) 콜백
             log_writer: ExecutionLogWriter 인스턴스 (log_execution 메서드 제공)
+            rehearsal: 복원 리허설 실행기 (없으면 리허설 옵션은 무시됨)
         """
         self.resolve_connection = resolve_connection
         self.log_writer = log_writer
+        self.rehearsal = rehearsal
 
     @staticmethod
     def _target_label(schedule: ScheduleConfig) -> str:
@@ -122,6 +125,9 @@ class BackupTaskExecutor:
             if success:
                 backup_store.write_marker(output_subdir, schedule.id, schedule.name, backup_store.STATE_COMPLETED,
                                           finished_at=datetime.now(), message='ok')
+                rehearsal_outcome = None
+                if schedule.rehearsal_tunnel_id and self.rehearsal is not None:
+                    rehearsal_outcome = self.rehearsal.run(schedule, output_subdir, resolved)
                 removed = self._apply_retention(schedule)
 
                 schedule.last_run = datetime.now().isoformat()
@@ -129,12 +135,15 @@ class BackupTaskExecutor:
                 message = f"백업 완료: {output_subdir}"
                 if removed:
                     message += f" (보존 정책으로 오래된 백업 {len(removed)}개 정리)"
+                if rehearsal_outcome is not None:
+                    message += f" / {rehearsal_outcome.message}"
                 logger.info(message)
                 self.log_writer.log_execution(schedule, True, message)
                 job_finish(job_id, STATUS_COMPLETED,
                            report_path=os.path.join(output_subdir, '_tunnelforge_dump.json'),
                            details={'retention_removed': len(removed)})
-                return True, message
+                # 백업은 성공했어도 리허설이 실패하면 호출자(트레이 알림)에는 실패로 알린다.
+                return (rehearsal_outcome is None or rehearsal_outcome.ok), message
             return self._fail(schedule, job_id, f"Export 실패: {result}", output_subdir)
 
         except Exception as e:

@@ -32,6 +32,10 @@ class ScheduleConfig:
     retention_days: int = 30    # 보관 기간 (일)
     # 절전/앱 미실행으로 놓친 실행을 복귀 후 최대 1회 따라잡을지 (끄면 놓친 실행은 건너뛰고 기록만 남긴다)
     catch_up_missed: bool = True
+    # 복원 리허설 (선택): 백업 직후 이 비운영 대상에 안전 복원(후보) → 검증 → 후보 정리. 터널 ID가 비어 있으면 꺼짐.
+    rehearsal_tunnel_id: str = ""
+    rehearsal_database: str = ""   # PostgreSQL 대상 데이터베이스 (비어 있으면 postgres)
+    rehearsal_schema: str = ""     # 대상 스키마 (MySQL은 데이터베이스). 이미 존재해야 하며 변경되지 않는다.
     last_run: Optional[str] = None  # ISO format
     next_run: Optional[str] = None  # ISO format
 
