@@ -233,10 +233,14 @@ class DbCoreFacade:
         timeout_ms: Optional[int] = None,
         max_rows: Optional[int] = None,
         max_bytes: Optional[int] = None,
+        on_columns: Optional[Callable[[List[str]], None]] = None,
     ) -> Dict[str, Any]:
         def handle_event(payload: Dict[str, Any]) -> None:
-            # Ignores the leading "columns" progress event; only row_batch is consumed here.
-            if payload.get("event") != "row_batch" or not on_batch:
+            event = payload.get("event")
+            if event == "columns" and on_columns:
+                on_columns([str(column) for column in payload.get("columns") or []])
+                return
+            if event != "row_batch" or not on_batch:
                 return
             rows = payload.get("rows")
             if isinstance(rows, list):

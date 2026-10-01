@@ -1296,6 +1296,14 @@ impl Conn {
         self.0.local_infile_handler = handler;
     }
 
+    /// TunnelForge patch: `SERVER_STATUS_IN_TRANS` from the last OK/EOF packet, i.e. whether the
+    /// server reports an open transaction. An error packet clears the flags (run a cheap
+    /// statement such as `DO 0` first when the last reply was an error).
+    pub fn server_in_transaction(&self) -> bool {
+        self.0.status_flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS)
+            || self.0.status_flags.contains(StatusFlags::SERVER_STATUS_IN_TRANS_READONLY)
+    }
+
     pub fn no_backslash_escape(&self) -> bool {
         self.0
             .status_flags

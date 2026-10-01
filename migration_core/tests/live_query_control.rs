@@ -853,3 +853,45 @@ fn export_runs_read_only_and_never_changes_data() {
         }
     }
 }
+
+/// `in_transaction` is a real value on both engines (MySQL reads the server's transaction flag).
+#[test]
+fn in_transaction_is_reported_after_success_cancel_and_rollback() {
+    let engines = engines();
+    if skip_if_none(&engines) {
+        return;
+    }
+    for engine in engines {
+        let mut core = Core::start();
+        let conn = core.open(&engine.endpoint);
+        assert_eq!(core.query(&conn, engine.create_table)["success"], true);
+        let cancel_state = |core: &mut Core, job: &str| -> Value {
+            let id = core.send("query.execute", json!({"connection_id": conn, "sql": engine.sleep_60, "job_id": job}));
+            std::thread::sleep(Duration::from_millis(600));
+            core.call("query.cancel", json!({"job_id": job}));
+            core.finish(&id, Duration::from_secs(15)).pop().unwrap()["in_transaction"].clone()
+        };
+
+        // autocommit session
+        let result = core.query(&conn, "SELECT 1 AS one");
+        if engine.name == "mysql" {
+            assert_eq!(result["in_transaction"], false, "{result}");
+        }
+        assert_eq!(cancel_state(&mut core, "tx-0"), json!(false), "{} idle session", engine.name);
+
+        // open transaction with an uncommitted write
+        let begin = if engine.name == "mysql" { "START TRANSACTION" } else { "BEGIN" };
+        assert_eq!(core.query(&conn, begin)["success"], true);
+        assert_eq!(core.query(&conn, "INSERT INTO tf_b_txn VALUES (1)")["success"], true);
+        if engine.name == "mysql" {
+            assert_eq!(core.query(&conn, "SELECT 1 AS one")["in_transaction"], true);
+        }
+        assert_eq!(cancel_state(&mut core, "tx-1"), json!(true), "{} open transaction", engine.name);
+
+        // after rollback the session is clean again
+        core.query(&conn, "ROLLBACK");
+        assert_eq!(cancel_state(&mut core, "tx-2"), json!(false), "{} after rollback", engine.name);
+        core.query(&conn, "DROP TABLE tf_b_txn");
+        eprintln!("{}: in_transaction idle=false, open txn=true after cancel, rollback=false", engine.name);
+    }
+}

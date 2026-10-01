@@ -202,6 +202,9 @@ class ResultExportMixin:
 
     def _save_displayed_result(self, table) -> None:
         """Save the rows the grid already holds (bounded by the editor's result limit)."""
+        if getattr(table, "_streaming", False) is True:
+            QMessageBox.warning(self, "경고", "결과를 받는 중에는 저장할 수 없습니다.")
+            return
         columns = getattr(table, "_export_columns", None)
         rows = getattr(table, "_export_rows", None)
         if columns is None or rows is None:

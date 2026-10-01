@@ -704,13 +704,19 @@ fn copy_unescape(field: &[u8]) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Known for PostgreSQL only: `now()` is the transaction start, so it differs from the
+/// PostgreSQL: `now()` is the transaction start, so it differs from the
 /// statement time inside an explicit transaction. A failed transaction (25P02) is still open.
 fn probe_in_transaction(adapter: &mut LiveAdapter) -> Option<bool> {
-    let LiveAdapter::PostgreSql(client) = adapter else {
-        return None;
-    };
-    probe_in_transaction_client(client)
+    match adapter {
+        LiveAdapter::PostgreSql(client) => probe_in_transaction_client(client),
+        LiveAdapter::MySql(conn) => {
+            // An error/KILL reply clears the driver's status flags; `DO 0` touches no table and
+            // returns an OK packet carrying the server's current transaction flag.
+            use mysql::prelude::Queryable;
+            conn.query_drop("DO 0").ok()?;
+            Some(conn.server_in_transaction())
+        }
+    }
 }
 
 fn probe_in_transaction_client(client: &mut postgres::Client) -> Option<bool> {
@@ -777,7 +783,13 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
             }
         }
         let stopped = ctl.stopped() || sink.truncated_by.is_some() || result.is_err();
-        let in_transaction = if stopped { probe_in_transaction(&mut adapter) } else { None };
+        let in_transaction = if stopped {
+            probe_in_transaction(&mut adapter)
+        } else if let LiveAdapter::MySql(conn) = &*adapter {
+            Some(conn.server_in_transaction()) // flags of the final OK/EOF packet, no extra query
+        } else {
+            None
+        };
         (result, sink.truncated_by, sink.streamed, std::mem::take(&mut sink.all), in_transaction, output_info)
     }));
 
