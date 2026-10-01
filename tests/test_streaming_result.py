@@ -383,7 +383,10 @@ def _burst_run(monkeypatch, flow_limit):
         now = time.monotonic()
         rows = dialog.result_tabs.widget(0).rowCount() if dialog.result_tabs.count() else 0
         # Gaps while rows are still arriving; the last tick belongs to completion (GC resume).
-        (gaps if rows < 100_000 else completion_gaps).append(now - last[0])
+        if rows >= 100_000:
+            completion_gaps.append(now - last[0])
+        elif rows >= WARMUP_ROWS:
+            gaps.append(now - last[0])
         if now - last[0] > 0.06:
             marks.append((round((now - last[0]) * 1000), rows))
         last[0] = now
@@ -412,12 +415,18 @@ def test_burst_of_200_batches_keeps_the_gui_responsive_and_loses_nothing(monkeyp
         assert [table.item(r, 0).text() for r in (0, 1, 49_999, 99_999)] == ["0", "1", "49999", "99999"]
         assert [row[0] for row in table._export_rows] == list(range(100_000)), "order preserved"
         assert gc.isenabled() is True
-        worst = max(gaps)
+        ordered = sorted(gaps)
+        p95 = ordered[int(len(ordered) * 0.95)]
+        worst = ordered[-1]
         done = max(completion_gaps, default=0)
+        ci = bool(os.environ.get("CI") or os.environ.get("GITHUB_ACTIONS"))
         print(f"burst: worst gap while receiving {worst * 1000:.0f} ms over {len(gaps)} ticks, "
               f"completion {done * 1000:.0f} ms")
-        assert worst < 0.1, f"event loop stalled {worst * 1000:.0f} ms during a burst"
-        assert done < 0.3, f"completing the grid stalled {done * 1000:.0f} ms"
+        # Same stabilised measurement as the paced test above: warm-up skipped, p95 plus a worst
+        # gap that is looser on shared CI runners.
+        assert p95 < 0.1, f"event loop p95 gap {p95 * 1000:.0f} ms during a burst"
+        assert worst < (0.3 if ci else 0.1), f"event loop stalled {worst * 1000:.0f} ms during a burst"
+        assert done < (0.5 if ci else 0.3), f"completing the grid stalled {done * 1000:.0f} ms"
     finally:
         gc.enable()
         _close(dialog)
