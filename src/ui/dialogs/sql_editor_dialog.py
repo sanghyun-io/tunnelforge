@@ -31,6 +31,7 @@ from src.core.db_core_service import normalize_db_engine
 from src.core.query_limits import build_query_limits
 from src.ui.dialogs.result_export import ResultExportMixin, is_export_safe_query
 from src.ui.dialogs.production_session import ProductionSessionMixin, build_commit_summary
+from src.ui.dialogs.streaming_result import StreamingResultMixin
 from src.ui.dialogs.sql_editor_workspace import WorkspaceRecoveryMixin
 from src.core.sql_query_classifier import (
     classify_sql_statement,
@@ -211,7 +212,7 @@ def format_metadata_db_version(db_version) -> str:
 # =====================================================================
 # SQL 에디터 다이얼로그
 # =====================================================================
-class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExportMixin, QDialog):
+class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExportMixin, QDialog):
     """SQL 에디터 다이얼로그"""
 
     def __init__(self, parent, tunnel_config: dict, config_manager, tunnel_engine):
@@ -1063,6 +1064,9 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
             self.db_connection, queries, self._db_engine(), limits=self._query_limits()
         )
         self.worker.result_truncated.connect(self._on_result_truncated)
+        self.worker.rows_progress.connect(self._on_rows_progress)
+        self.worker.result_started.connect(self._on_result_started)
+        self.worker.result_rows.connect(self._on_result_rows)
         self.worker.progress.connect(self._on_transaction_progress)
         self.worker.query_result.connect(self._on_transaction_query_result)
         self.worker.postgres_rolled_back.connect(self._on_postgres_transaction_rolled_back)
@@ -1082,15 +1086,21 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
         preview = preview.replace('\n', ' ')
 
         if error:
+            received = self._finalize_streamed_result(idx, error=error)
+            if received:
+                self.message_text.append(f"⚠️ 중단 전까지 {received:,}행을 받았습니다")
             self.message_text.append(f"❌ {error}")
             self.message_text.append(f"   └ {preview}")
             self.history_manager.add_query(query, False, 0, exec_time, status='error', error=error)
         elif returns_rows:
             # columns == [] 인 0행 결과도 결과 탭으로 표시 (SELECT 실행 자체는 성공)
-            self._add_result_table(columns, rows, exec_time, query)
-            self.message_text.append(f"✅ {len(rows)}행 반환 ({exec_time:.3f}초)")
+            row_total = self._finalize_streamed_result(idx)
+            if row_total is None:
+                self._add_result_table(columns, rows, exec_time, query)
+                row_total = len(rows)
+            self.message_text.append(f"✅ {row_total}행 반환 ({exec_time:.3f}초)")
             self.message_text.append(f"   └ {preview}")
-            self.history_manager.add_query(query, True, len(rows), exec_time)
+            self.history_manager.add_query(query, True, row_total, exec_time)
         else:
             query_type = (classify_sql_statement(query).leading_keyword or "other").upper()
             if self._db_engine() == 'mysql' and is_mysql_implicit_commit_ddl(query):
@@ -1142,6 +1152,7 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
 
     def _on_transaction_finished(self, success, msg):
         """트랜잭션 워커 실행 종료 — 지속 연결은 유지, 커밋/롤백은 사용자가 결정"""
+        self._finalize_all_streamed()
         total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
         self.message_text.append(f"\n{msg}")
         self._set_message_summary(f"{msg} · {total_elapsed:.1f}초")
@@ -1200,6 +1211,8 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
             )
             self.worker.result_truncated.connect(self._on_result_truncated)
             self.worker.rows_progress.connect(self._on_rows_progress)
+            self.worker.result_started.connect(self._on_result_started)
+            self.worker.result_rows.connect(self._on_result_rows)
             self.worker.progress.connect(self._on_progress)
             self.worker.query_result.connect(self._on_query_result)
             self.worker.finished.connect(self._on_finished)
@@ -1209,8 +1222,8 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
             self.message_text.append(f"❌ 오류: {str(e)}")
             self._cleanup()
 
-    def _add_result_table(self, columns, rows, exec_time, query=''):
-        """결과 테이블 탭 추가"""
+    def _add_result_table(self, columns, rows, exec_time, query='', finalize=True):
+        """결과 테이블 탭 추가 (finalize=False: 스트리밍 수신 중 — 편집 설정은 완료 후)"""
         table = QTableWidget()
         # 파일 저장용: 화면에 받은 행(같은 리스트 참조)과 원본 쿼리
         table._export_columns = columns
@@ -1281,7 +1294,9 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
         self.result_tabs.setCurrentWidget(table)
 
         # 편집 가능성 분석 + 설정
-        self._setup_result_table_editability(table, query, columns, rows)
+        if finalize:
+            self._setup_result_table_editability(table, query, columns, rows)
+        return table
 
     def _pending_edit_count_for_result_tab(self, index: int) -> int:
         """특정 결과 탭의 미저장 셀 편집 건수"""
@@ -1502,17 +1517,24 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
                 worker_query = ''
 
         if error:
+            received = self._finalize_streamed_result(idx, error=error)
+            if received:
+                self.message_text.append(f"⚠️ 쿼리 {idx + 1}: 중단 전까지 {received:,}행을 받았습니다")
             self.message_text.append(f"❌ 쿼리 {idx + 1}: {error}")
             self._set_message_summary(f"쿼리 {idx + 1} 실패 · {error}")
             self.history_manager.add_query(worker_query, False, 0, exec_time, status='error', error=error)
         elif returns_rows:
-            # 편집 가능성 분석 + 설정 (워커에 실행된 원본 쿼리 사용)
-            self._add_result_table(columns, rows, exec_time, worker_query)
+            # 스트리밍으로 이미 채워진 표가 있으면 마무리만, 없으면 한 번에 생성
+            row_total = self._finalize_streamed_result(idx)
+            if row_total is None:
+                # 편집 가능성 분석 + 설정 (워커에 실행된 원본 쿼리 사용)
+                self._add_result_table(columns, rows, exec_time, worker_query)
+                row_total = len(rows)
 
-            self.message_text.append(f"✅ 쿼리 {idx + 1}: {len(rows)}행 반환 ({exec_time:.3f}초)")
-            self._set_message_summary(f"쿼리 {idx + 1} 완료 · {len(rows)}행 반환 · {exec_time:.3f}초")
+            self.message_text.append(f"✅ 쿼리 {idx + 1}: {row_total}행 반환 ({exec_time:.3f}초)")
+            self._set_message_summary(f"쿼리 {idx + 1} 완료 · {row_total}행 반환 · {exec_time:.3f}초")
             self._set_message_panel_collapsed(True)
-            self.history_manager.add_query(worker_query, True, len(rows), exec_time)
+            self.history_manager.add_query(worker_query, True, row_total, exec_time)
         else:
             # INSERT/UPDATE/DELETE
             self.message_text.append(f"✅ 쿼리 {idx + 1}: {affected}행 영향받음 ({exec_time:.3f}초)")
@@ -1524,6 +1546,7 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
 
     def _on_finished(self, success, msg):
         """실행 완료"""
+        self._finalize_all_streamed()
         total_elapsed = time.time() - self._exec_start_time if self._exec_start_time else 0
         self.message_text.append(f"\n{msg}")
         self._set_message_summary(f"{msg} · {total_elapsed:.1f}초")
@@ -1777,6 +1800,7 @@ class SQLEditorDialog(WorkspaceRecoveryMixin, ProductionSessionMixin, ResultExpo
         threading.Thread(target=cancel, daemon=True).start()
 
     def _on_result_truncated(self, idx, notice):
+        self._mark_stream_truncated(idx)
         self.message_text.append(f"⚠️ 쿼리 {idx + 1}: {notice}")
         self._set_message_summary(f"쿼리 {idx + 1} · {notice}")
 

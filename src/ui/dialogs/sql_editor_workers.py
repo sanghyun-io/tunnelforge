@@ -77,6 +77,47 @@ def _rows_from_cursor(cursor) -> tuple[list, list]:
     return columns, row_list
 
 
+def run_streaming_query(connection, query, limits, on_started, on_rows, on_progress=None):
+    """Stream one row-returning statement on `connection` without collecting it.
+
+    `on_started(columns)` fires once, before the first row; `on_rows(rows)` gets each batch as
+    lists in column order (converted on the worker thread). Returns (columns, row_count, result).
+    """
+    state = {"columns": None, "count": 0}
+
+    def start(columns):
+        if state["columns"] is None:
+            state["columns"] = list(columns)
+            on_started(state["columns"])
+
+    def on_batch(batch):
+        if state["columns"] is None:
+            start(list(batch[0].keys()) if batch else [])
+        columns = state["columns"]
+        rows = [[row.get(column) for column in columns] for row in batch]
+        state["count"] += len(rows)
+        on_rows(rows)
+        if on_progress:
+            on_progress(state["count"])
+
+    job_id = new_job_id()
+    connection.current_job_id = job_id
+    try:
+        result = connection.facade.execute_on_connection_streaming(
+            connection.connection_id,
+            query,
+            row_batch_size=500,
+            on_batch=on_batch,
+            on_columns=start,
+            job_id=job_id,
+            **limits,
+        )
+    finally:
+        connection.current_job_id = None
+    columns = result.get("columns") or state["columns"] or []
+    return columns, state["count"], result
+
+
 def _cancel_running_query(connection) -> None:
     """연결에서 실행 중인 쿼리를 서버 측에서 취소 (실패해도 UI 흐름은 유지)."""
     cancel = getattr(connection, "cancel_running_query", None)
@@ -92,6 +133,8 @@ def _cancelled_transaction_message(engine, error) -> str:
     in_tx = (getattr(error, "payload", None) or {}).get("in_transaction")
     if engine == "postgresql":
         state = "트랜잭션이 중단(aborted) 상태입니다. 롤백을 실행하세요" if in_tx else "트랜잭션 상태를 확인하세요"
+    elif in_tx is False:
+        state = "열린 트랜잭션이 없습니다"
     else:
         state = "MySQL 트랜잭션은 유지됩니다. 커밋 또는 롤백을 선택하세요"
     return f"⚠️ 쿼리가 취소되었습니다 - {state}"
@@ -103,6 +146,8 @@ class SQLQueryWorker(QThread):
     query_result = pyqtSignal(int, bool, list, list, str, int, float)  # idx, returns_rows, columns, rows, error, affected, time
     rows_progress = pyqtSignal(int, int)  # idx, 지금까지 받은 행 수 (스트리밍 진행)
     result_truncated = pyqtSignal(int, str)  # idx, 안내 메시지 (상한 도달로 결과가 잘림)
+    result_started = pyqtSignal(int, list)  # idx, columns - 첫 행이 오기 전 (증분 표시 시작)
+    result_rows = pyqtSignal(int, list)  # idx, 행 배치(컬럼 순서 리스트의 리스트)
     finished = pyqtSignal(bool, str)
 
     def __init__(self, host, port, user, password, database, queries, engine="mysql", schema=None,
@@ -166,31 +211,19 @@ class SQLQueryWorker(QThread):
                 start_time = time.time()
                 try:
                     if statement_returns_rows(query):
-                        rows = []
-
-                        def collect_batch(batch, idx=idx):
-                            rows.extend(batch)
-                            self.rows_progress.emit(idx, len(rows))
-
-                        job_id = new_job_id()
-                        connector.connection.current_job_id = job_id
-                        try:
-                            result = connector.connection.facade.execute_on_connection_streaming(
-                                connector.connection.connection_id,
-                                query,
-                                row_batch_size=500,
-                                on_batch=collect_batch,
-                                job_id=job_id,
-                                **self.limits,
-                            )
-                        finally:
-                            connector.connection.current_job_id = None
+                        columns, row_count, result = run_streaming_query(
+                            connector.connection,
+                            query,
+                            self.limits,
+                            on_started=lambda cols, idx=idx: self.result_started.emit(idx, cols),
+                            on_rows=lambda rows, idx=idx: self.result_rows.emit(idx, rows),
+                            on_progress=lambda count, idx=idx: self.rows_progress.emit(idx, count),
+                        )
                         if result.get("truncated"):
                             self.result_truncated.emit(idx, truncation_notice(result.get("truncated_by"), self.limits))
-                        columns = result.get("columns") or []
-                        row_list = [[row.get(col) for col in columns] for row in rows]
                         execution_time = time.time() - start_time
-                        self.query_result.emit(idx, True, columns, row_list, "", len(row_list), execution_time)
+                        # 행은 result_rows로 이미 전달됨 — 최종 신호에는 개수만 의미가 있다.
+                        self.query_result.emit(idx, True, columns, [], "", row_count, execution_time)
                         success_count += 1
                         continue
 
@@ -254,6 +287,9 @@ class SQLTransactionExecutionWorker(QThread):
     query_result = pyqtSignal(int, str, bool, list, list, str, int, float)  # idx, query, returns_rows, columns, rows, error, affected, time
     postgres_rolled_back = pyqtSignal(str)
     result_truncated = pyqtSignal(int, str)  # idx, 안내 메시지 (상한 도달로 결과가 잘림)
+    rows_progress = pyqtSignal(int, int)  # idx, 지금까지 받은 행 수
+    result_started = pyqtSignal(int, list)  # idx, columns
+    result_rows = pyqtSignal(int, list)  # idx, 행 배치
     finished = pyqtSignal(bool, str)
 
     def __init__(self, connection, queries, engine, limits=None):
@@ -287,6 +323,20 @@ class SQLTransactionExecutionWorker(QThread):
 
             start_time = time.time()
             try:
+                if statement_returns_rows(query):
+                    columns, row_count, result = run_streaming_query(
+                        self.connection,
+                        query,
+                        self.limits,
+                        on_started=lambda cols, idx=idx: self.result_started.emit(idx, cols),
+                        on_rows=lambda rows, idx=idx: self.result_rows.emit(idx, rows),
+                        on_progress=lambda count, idx=idx: self.rows_progress.emit(idx, count),
+                    )
+                    if result.get("truncated"):
+                        self.result_truncated.emit(idx, truncation_notice(result.get("truncated_by"), self.limits))
+                    execution_time = time.time() - start_time
+                    self.query_result.emit(idx, query, True, columns, [], "", row_count, execution_time)
+                    continue
                 with self.connection.cursor() as cursor:
                     cursor.execute(query)
                     if cursor.truncated:

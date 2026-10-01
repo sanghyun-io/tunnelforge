@@ -17,6 +17,9 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "결과를 받는 중에는 저장할 수 없습니다.": "Cannot save while the result is still being received.",
+    "⚠️ 중단 전까지 {}행을 받았습니다": "⚠️ Received {} rows before it stopped",
+    "⚠️ 쿼리 {}: 중단 전까지 {}행을 받았습니다": "⚠️ Query {}: received {} rows before it stopped",
     "... 외 {}건": "... and {} more",
     "⚠️ 운영 읽기 전용 해제: 이 창의 세션이 쓰기 가능으로 다시 연결됩니다.": "⚠️ Production read-only lifted: this window's session is reconnected as writable.",
     "🔒 읽기 전용으로 복귀했습니다.": "🔒 Returned to read-only.",

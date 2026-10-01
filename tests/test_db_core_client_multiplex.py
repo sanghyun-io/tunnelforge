@@ -238,6 +238,10 @@ def test_transaction_worker_reports_cancel_without_rollback():
 
     connection = MagicMock()
     connection.cursor.return_value = Cursor()
+    # row-returning statements stream through the facade
+    connection.facade.execute_on_connection_streaming.side_effect = DbCoreServiceError(
+        "cancelled", error_code="query_cancelled", payload={"in_transaction": True}
+    )
     worker = SQLTransactionExecutionWorker(connection, ["SELECT pg_sleep(60)"], "postgresql")
     finished = []
     results = []
