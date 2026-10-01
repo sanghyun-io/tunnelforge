@@ -423,9 +423,14 @@ class WorkspaceStore:
 
     # -- 삭제 / 정리 ----------------------------------------------------
     def delete(self, profile_id: str) -> None:
-        """한 프로필의 작업 공간(호환 사본 포함)을 지운다. 손상 백업은 유지한다."""
+        """한 프로필의 작업 공간(호환 사본 포함)을 지운다. 손상 백업은 유지한다.
+
+        더 새 버전이 쓴 파일은 건드리지 않는다 (호환 사본만 지운다)."""
         with _WRITE_LOCK:
-            for path in (self.path_for(profile_id), self._sibling_path(profile_id)):
+            paths = [self._sibling_path(profile_id)]
+            if not self._primary_is_newer(profile_id):
+                paths.insert(0, self.path_for(profile_id))
+            for path in paths:
                 try:
                     path.unlink()
                 except FileNotFoundError:

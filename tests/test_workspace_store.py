@@ -299,3 +299,13 @@ def test_concurrent_saves_leave_a_valid_file(store):
     assert not errors
     assert store.load(PID).state.tabs[0].text.startswith("SELECT ")
     assert list(store.directory.glob("*.tmp.*")) == []
+
+
+def test_delete_never_removes_a_file_written_by_a_newer_version(store):
+    store.directory.mkdir(parents=True)
+    future = json.dumps({"version": 99, "profile_id": PID, "tabs": []})
+    store.path_for(PID).write_text(future, encoding="utf-8")
+    store.save(sample_state())  # goes to the compat sibling
+    store.delete(PID)
+    assert store.path_for(PID).read_text(encoding="utf-8") == future
+    assert not (store.directory / f"{PID}.compat-v1.json").exists()

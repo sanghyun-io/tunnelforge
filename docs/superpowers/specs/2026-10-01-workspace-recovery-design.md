@@ -259,3 +259,29 @@ cleanup_stale_tmp/list_workspaces`, `parse_workspace`, `compute_file_state` /
 `omitted_tabs` (limits) and `wrote_sibling` (newer-version file left untouched);
 `load` returns `ok | missing | corrupt (quarantined) | newer_version` plus a
 `crashed` flag.
+
+## 11. Phase 2 (implemented)
+
+- `src/core/workspace_writer.py`: one background thread, newest-snapshot coalescing,
+  `flush`/`stop`, one-shot error/omitted reporting.
+- `src/ui/dialogs/sql_editor_workspace.py` (`WorkspaceRecoveryMixin`, first base of
+  `SQLEditorDialog`): started at the end of `__init__` (after the database list was
+  filled), restore before the writer exists, 2 s debounce + periodic tick (setting,
+  default 30 s) + immediate saves on tab add/close/move/switch and target change,
+  final write in `closeEvent`, `done()` (Esc/reject paths) and `aboutToQuit`. Hooks in
+  the dialog are five one-line calls plus the close-confirmation change.
+- Close: with recovery active only tabs that hold text count as "recoverable"; the
+  dialog offers "Close (restore next time)", "Discard" (deletes the stored workspace)
+  and "Cancel"; pending transactions and cell edits keep the loss warning.
+- Restore never executes SQL or connects; a changed file on disk asks "keep my draft"
+  or "reload from disk" (the draft is then kept in a new tab); a missing target keeps
+  the SQL; corrupt / newer-version files follow section 6. Production editors open
+  read-only because nothing about write state is stored.
+- Settings group (`workspace_settings_group.py`, in the general tab): on/off, interval
+  (5-300 s), scope note, "Delete stored workspaces". Main window: a "Recovered SQL"
+  button appears only when orphan workspaces exist (`recovered_sql_dialog.py`,
+  read-only view / copy / save to file / delete; entries older than 90 days marked
+  expired).
+- Tests: `test_workspace_store.py`, `test_workspace_writer.py`,
+  `test_sql_editor_workspace.py` (offscreen Qt integration), and an autouse fixture in
+  `tests/conftest.py` that keeps every test away from the real application directory.
