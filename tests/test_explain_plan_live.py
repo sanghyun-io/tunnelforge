@@ -127,3 +127,59 @@ def test_running_analyze_can_be_cancelled_on_the_server(engine, label, port, use
         print(f"PASS {label}: running EXPLAIN ANALYZE cancelled on the server (query_cancelled), session still usable")
     finally:
         facade.client.shutdown()
+
+
+@pytest.mark.parametrize("engine,label,port,user,database", SERVERS, ids=[s[1] for s in SERVERS])
+def test_analyze_cannot_write_through_functions_and_refuses_open_transactions(engine, label, port, user, database):
+    """ANALYZE runs in a server-enforced read-only transaction that is always rolled back."""
+    facade = _facade()
+    try:
+        connection_id = facade.open_connection(DbEndpoint(engine, "127.0.0.1", port, user, "tfpass", database))
+        if engine == "mysql":
+            # disposable test server: let root create a function that modifies data while binary logging is on
+            _run(facade, connection_id, "SET GLOBAL log_bin_trust_function_creators = 1")
+            _run(facade, connection_id, "DROP FUNCTION IF EXISTS tf_plan_audit", "DROP TABLE IF EXISTS tf_plan_log", "DROP TABLE IF EXISTS tf_plan")
+            _run(facade, connection_id, "CREATE TABLE tf_plan (id INT PRIMARY KEY)", "CREATE TABLE tf_plan_log (v INT)",
+                 "CREATE FUNCTION tf_plan_audit(i INT) RETURNS INT MODIFIES SQL DATA "
+                 "BEGIN INSERT INTO tf_plan_log VALUES (i); RETURN i; END")
+        else:
+            _run(facade, connection_id, "DROP FUNCTION IF EXISTS tf_plan_audit(int)", "DROP TABLE IF EXISTS tf_plan_log", "DROP TABLE IF EXISTS tf_plan")
+            _run(facade, connection_id, "CREATE TABLE tf_plan (id INT PRIMARY KEY)", "CREATE TABLE tf_plan_log (v INT)",
+                 "CREATE FUNCTION tf_plan_audit(i INT) RETURNS INT LANGUAGE plpgsql AS "
+                 "$$ BEGIN INSERT INTO tf_plan_log VALUES (i); RETURN i; END $$")
+        _run(facade, connection_id, "INSERT INTO tf_plan VALUES (1),(2),(3)")
+
+        def logged():
+            result = facade.client.request("query.execute", {"connection_id": connection_id, "sql": "SELECT COUNT(*) AS n FROM tf_plan_log"})
+            return int(str(result["rows"][0]["n"]))
+
+        # a SELECT that calls a writing function: the word filter cannot see it, the server must refuse it
+        with pytest.raises(DbCoreServiceError) as info:
+            explain_on_connection(facade, connection_id, "SELECT tf_plan_audit(id) FROM tf_plan", analyze=True)
+        assert info.value.error_code == "explain_refused", info.value
+        assert logged() == 0
+        print(f"PASS {label}: ANALYZE of a SELECT calling a writing function refused by the read-only transaction, log table unchanged")
+        # the session is back to normal afterwards (nothing left open, writes still work there)
+        _run(facade, connection_id, "INSERT INTO tf_plan_log VALUES (42)")
+        assert logged() == 1
+        _run(facade, connection_id, "DELETE FROM tf_plan_log")
+
+        # plain EXPLAIN never calls the function either
+        explain_on_connection(facade, connection_id, "SELECT tf_plan_audit(id) FROM tf_plan")
+        assert logged() == 0
+
+        # an open manual transaction: ANALYZE is refused and the transaction is neither committed nor rolled back
+        _run(facade, connection_id, "BEGIN" if engine == "postgresql" else "START TRANSACTION", "INSERT INTO tf_plan VALUES (100)")
+        with pytest.raises(DbCoreServiceError) as info:
+            explain_on_connection(facade, connection_id, "SELECT * FROM tf_plan", analyze=True)
+        assert info.value.error_code == "explain_refused" and "트랜잭션" in str(info.value), info.value
+        count = facade.client.request("query.execute", {"connection_id": connection_id, "sql": "SELECT COUNT(*) AS n FROM tf_plan"})
+        assert int(str(count["rows"][0]["n"])) == 4  # the caller's uncommitted row is still visible: nothing was committed or rolled back
+        _run(facade, connection_id, "ROLLBACK")
+        count = facade.client.request("query.execute", {"connection_id": connection_id, "sql": "SELECT COUNT(*) AS n FROM tf_plan"})
+        assert int(str(count["rows"][0]["n"])) == 3
+        print(f"PASS {label}: ANALYZE refused inside an open transaction; the caller's transaction is untouched")
+        _run(facade, connection_id, "DROP FUNCTION tf_plan_audit" + ("(int)" if engine == "postgresql" else ""),
+             "DROP TABLE tf_plan_log", "DROP TABLE tf_plan")
+    finally:
+        facade.client.shutdown()

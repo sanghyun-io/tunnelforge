@@ -107,6 +107,10 @@ pub(crate) fn rewrite(request: &Request, engine: &str) -> Result<(Request, Value
         for key in ["stream_rows", "max_rows", "max_bytes", "output"] {
             object.remove(key);
         }
+        // ANALYZE really executes the statement (including any stored function it calls), so it runs
+        // in a server-enforced read-only transaction that is always rolled back. The word-based
+        // refusal above is only a first filter.
+        object.insert("read_only_txn".to_string(), json!(analyze));
     }
     let rewritten = Request { command: "query.execute".to_string(), request_id: request.request_id.clone(), payload };
     Ok((rewritten, plan.meta))
@@ -209,6 +213,12 @@ mod tests {
         assert!(rewritten.payload.get("max_rows").is_none() && rewritten.payload.get("stream_rows").is_none());
         assert_eq!(rewritten.payload["timeout_ms"], 1000);
         assert_eq!(meta["analyze"], false);
+        assert_eq!(rewritten.payload["read_only_txn"], false);
+
+        let mut analyze_request = request;
+        analyze_request.payload["analyze"] = json!(true);
+        let (analyzed, _) = rewrite(&analyze_request, "postgresql").unwrap();
+        assert_eq!(analyzed.payload["read_only_txn"], true, "ANALYZE must run in a read-only transaction");
     }
 
     #[test]
