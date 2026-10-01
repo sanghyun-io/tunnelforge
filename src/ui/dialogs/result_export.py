@@ -259,7 +259,8 @@ class ResultExportMixin:
         selected = self.db_combo.currentText().strip()
         database, schema = self._database_and_schema_for_selection(selected)
         engine = self._db_engine()
-        params = ConnectionParams(engine, host, port, db_user, db_password, database, schema)
+        params = ConnectionParams(engine, host, port, db_user, db_password, database, schema,
+                                  read_only=self._session_read_only())
         output = {
             "path": path,
             "format": file_format,

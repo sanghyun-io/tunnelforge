@@ -17,6 +17,14 @@ _HANGUL_CHAR_CLASS = f"[{_HANGUL_SYLLABLES_START}-{_HANGUL_SYLLABLES_END}]"
 
 
 _EN_TEXT_TRANSLATIONS = {
+    "... 외 {}건": "... and {} more",
+    "⚠️ 운영 읽기 전용 해제: 이 창의 세션이 쓰기 가능으로 다시 연결됩니다.": "⚠️ Production read-only lifted: this window's session is reconnected as writable.",
+    "🔒 읽기 전용으로 복귀했습니다.": "🔒 Returned to read-only.",
+    "이번 트랜잭션에서 실행한 쓰기 {}건 (영향 행 합계 {}행)을 커밋합니다.\n\n{}": "Committing {} write statement(s) of this transaction ({} rows affected in total).\n\n{}",
+    "쿼리 실행 중에는 변경할 수 없습니다.": "Cannot change this while a query is running.",
+    "미커밋 변경을 커밋하거나 롤백한 뒤 읽기 전용으로 돌아갈 수 있습니다.": "Commit or roll back the uncommitted changes before returning to read-only.",
+    "🔒 대상이 바뀌어 읽기 전용으로 복귀했습니다.": "🔒 The target changed, so the window is read-only again.",
+    "MySQL DDL은 암묵적 COMMIT을 발생시켜 이전 미커밋 변경이 자동 커밋되고 롤백할 수 없게 됩니다.\n\n자동 커밋될 변경 {}건 (영향 행 합계 {}행):\n{}\n\n계속 실행하시겠습니까?": "MySQL DDL causes an implicit COMMIT: earlier uncommitted changes are committed automatically and cannot be rolled back.\n\nChanges that will be auto-committed: {} (rows affected in total: {}):\n{}\n\nContinue?",
     "💾 표시된 결과 {}행 저장: {}": "💾 Saved {} displayed rows: {}",
     "💾 표시된 결과 {}행을 저장했습니다": "💾 Saved {} displayed rows",
     "💾 파일로 저장 중... {}행, {} MiB": "💾 Saving to file... {} rows, {} MiB",

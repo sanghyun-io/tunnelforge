@@ -81,12 +81,23 @@ impl CoreService {
                 })]
             }
         };
-        match LiveAdapter::connect(&endpoint) {
+        // `read_only: true` makes the session server-enforced read-only (TF-STATUS-128).
+        let endpoint_value = ["connection", "endpoint", "source", "target"]
+            .iter()
+            .find_map(|key| request.payload.get(*key))
+            .unwrap_or(&request.payload);
+        let read_only = endpoint_value.get("read_only").and_then(Value::as_bool).unwrap_or(false);
+        match LiveAdapter::connect(&endpoint).and_then(|mut adapter| {
+            if read_only {
+                apply_read_only(&mut adapter)?;
+            }
+            Ok(adapter)
+        }) {
             Ok(adapter) => {
                 let id = unique_connection_id(&endpoint, self.next_connection_sequence);
                 self.next_connection_sequence = self.next_connection_sequence.saturating_add(1);
                 self.connections
-                    .insert(id.clone(), Arc::new(Session::new(adapter, &endpoint)));
+                    .insert(id.clone(), Arc::new(Session::new(adapter, &endpoint, read_only)));
                 vec![json!({
                     "event": "result",
                     "request_id": request.request_id,
@@ -141,6 +152,12 @@ impl CoreService {
             fail(json!({"event": "error", "message": format!("unknown connection_id: {connection_id}")}));
             return None;
         };
+        if session.read_only() {
+            if let Some(reason) = read_only_bypass(sql) {
+                emit(read_only_error_event(&request.request_id, &reason));
+                return None;
+            }
+        }
         let job_id = match request.payload.get("job_id").and_then(Value::as_str) {
             Some(id) if !id.is_empty() => id.to_string(),
             _ => {

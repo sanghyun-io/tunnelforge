@@ -189,6 +189,7 @@ def create_rust_db_connector(
     database: Optional[str] = None,
     schema: str = "",
     facade: Optional[DbCoreFacade] = None,
+    read_only: bool = False,
 ) -> RustDbConnector:
     """Create an engine-aware Rust connector for UI/orchestration code."""
     resolved_engine = normalize_db_engine(engine, port)
@@ -200,6 +201,7 @@ def create_rust_db_connector(
         password=password,
         database=default_database_for_engine(resolved_engine, database),
         schema=schema,
+        read_only=read_only,
     )
     return RustDbConnector(
         resolved_engine,
