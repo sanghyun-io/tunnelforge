@@ -1210,7 +1210,15 @@ fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
 
         let copied_now = rows.len();
         let next_key = if use_keyset {
-            rows.last().and_then(|row| row_key_token(row, &key_columns))
+            match advance_keyset_cursor(
+                table,
+                &key_columns,
+                last_key.as_deref(),
+                rows.last().and_then(|row| row_key_token(row, &key_columns)),
+            ) {
+                Ok(token) => Some(token),
+                Err(err) => return Err(TableCopyControl::Error(err)),
+            }
         } else {
             None
         };

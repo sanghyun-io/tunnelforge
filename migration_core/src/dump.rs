@@ -2217,6 +2217,16 @@ fn dump_one_table<F: FnMut(Value)>(
                 return Ok(None);
             }
             let chunk_name = dump_chunk_name(chunk_number, &ctx.data_format, &ctx.compression);
+            let next_key = if use_keyset {
+                Some(advance_keyset_cursor(
+                    table,
+                    &key_columns,
+                    last_key.as_deref(),
+                    rows.last().and_then(|row| row_key_token(row, &key_columns)),
+                )?)
+            } else {
+                None
+            };
             let write_started = Instant::now();
             let checksum = write_dump_rows(
                 &table_dir.join(&chunk_name),
@@ -2229,7 +2239,7 @@ fn dump_one_table<F: FnMut(Value)>(
 
             let copied_now = rows.len();
             if use_keyset {
-                last_key = rows.last().and_then(|row| row_key_token(row, &key_columns));
+                last_key = next_key;
             } else {
                 offset += copied_now;
             }
@@ -2354,7 +2364,7 @@ fn dump_one_mysql_table<F: FnMut(Value)>(
             let checksum = sha256_file(&chunk_path)?;
 
             if use_keyset {
-                last_key = next_key;
+                last_key = Some(advance_keyset_cursor(table, &key_columns, last_key.as_deref(), next_key)?);
             } else {
                 offset += chunk_rows;
             }
