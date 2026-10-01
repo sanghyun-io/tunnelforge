@@ -5,9 +5,10 @@ View, copy, save to a file and delete only - there is deliberately no editing. E
 """
 from typing import Iterable, List, Optional
 
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QFileDialog, QHBoxLayout, QLabel, QListWidget, QMessageBox,
-    QPlainTextEdit, QPushButton, QVBoxLayout,
+    QPlainTextEdit, QPushButton, QSplitter, QVBoxLayout, QWidget,
 )
 
 from src.core.workspace_store import (
@@ -23,7 +24,7 @@ class RecoveredSqlDialog(QDialog):
     def __init__(self, store: WorkspaceStore, known_profile_ids: Iterable[str], parent=None):
         super().__init__(parent)
         self.setWindowTitle("복구된 SQL")
-        self.resize(900, 520)
+        self.resize(1000, 540)
         self.store = store
         self.known_profile_ids = list(known_profile_ids)
         self._items: List[WorkspaceSummary] = []
@@ -32,19 +33,30 @@ class RecoveredSqlDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel(
             "삭제된 연결 프로필에서 남은 SQL 작업 공간입니다. 읽기 전용이며 90일이 지난 항목은 '만료'로 표시됩니다."))
-        body = QHBoxLayout()
-        left = QVBoxLayout()
+        # 목록 폭을 넉넉히 잡고(프로필 id/시각이 잘리지 않게) 사용자가 분할선을 끌어 조절할 수 있게 한다.
+        self.splitter = QSplitter(Qt.Orientation.Horizontal)
+        left_panel = QWidget()
+        left = QVBoxLayout(left_panel)
+        left.setContentsMargins(0, 0, 0, 0)
         self.workspace_list = QListWidget()
+        self.workspace_list.setMinimumWidth(300)
+        self.workspace_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.workspace_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)  # 넘치면 가운데를 줄이고 툴팁으로 확인
         self.workspace_list.currentRowChanged.connect(self._on_workspace_selected)
         left.addWidget(self.workspace_list)
         self.tab_list = QListWidget()
+        self.tab_list.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        self.tab_list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.tab_list.currentRowChanged.connect(self._on_tab_selected)
         left.addWidget(self.tab_list)
-        body.addLayout(left, 1)
+        self.splitter.addWidget(left_panel)
         self.viewer = QPlainTextEdit()
         self.viewer.setReadOnly(True)
-        body.addWidget(self.viewer, 2)
-        layout.addLayout(body)
+        self.splitter.addWidget(self.viewer)
+        self.splitter.setStretchFactor(0, 0)
+        self.splitter.setStretchFactor(1, 1)
+        self.splitter.setSizes([420, 580])
+        layout.addWidget(self.splitter, 1)
 
         buttons = QHBoxLayout()
         self.btn_copy = QPushButton("클립보드로 복사")
@@ -67,6 +79,10 @@ class RecoveredSqlDialog(QDialog):
             when = item.saved_at.strftime("%Y-%m-%d %H:%M") if item.saved_at else "?"
             mark = " [만료]" if item.expired else ""
             self.workspace_list.addItem(f"{item.profile_id[:8]}…  {when}  탭 {item.tab_count}개{mark}")
+            # 잘릴 수 있는 정보는 툴팁에 전체를 보여 준다
+            self.workspace_list.item(self.workspace_list.count() - 1).setToolTip(
+                f"프로필 ID: {item.profile_id}\n저장 시각: {when}\n탭: {item.tab_count}개"
+                + ("\n90일이 지나 만료됨" if item.expired else ""))
         self.tab_list.clear()
         self.viewer.clear()
         self._tabs = []
@@ -88,6 +104,7 @@ class RecoveredSqlDialog(QDialog):
             name = tab.file_path or f"Query {tab.title_index}"
             suffix = "" if tab.text else " (디스크 파일 / 초안 없음)"
             self.tab_list.addItem(name + suffix)
+            self.tab_list.item(self.tab_list.count() - 1).setToolTip(name + suffix)
         if self._tabs:
             self.tab_list.setCurrentRow(0)
 

@@ -1,8 +1,14 @@
 """
 pytest 공용 fixtures
 """
-import pytest
 import os
+
+# 어떤 PyQt import 보다 먼저: 일부 테스트 파일만 설정하면 전체 실행 시 첫 QApplication 이 만들어지는
+# 순서에 따라 실제 화면에 대화상자가 뜬다. CI 가 다른 값을 주면 그것을 존중한다(setdefault).
+if not os.environ.get("QT_QPA_PLATFORM"):  # 미설정/빈 값만 채운다
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+import pytest
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -346,4 +352,14 @@ def isolate_workspace_store(tmp_path, monkeypatch):
     monkeypatch.setattr(workspace_store, "workspaces_dir", lambda *a, **k: directory)
     monkeypatch.setattr(sql_editor_workspace, "make_workspace_store",
                         lambda: workspace_store.WorkspaceStore(directory))
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolate_job_history(tmp_path, monkeypatch):
+    """Job history must never touch the real application directory during tests."""
+    from src.core import job_history
+
+    path = tmp_path / "job-history-isolated" / "job_history.json"
+    monkeypatch.setattr(job_history, "make_history", lambda: job_history.JobHistory(path))
     yield

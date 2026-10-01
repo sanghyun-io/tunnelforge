@@ -31,6 +31,7 @@ from src.exporters.rust_dump_exporter import (
 from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
 from src.ui.workers.error_reporting_worker import ErrorReportingMixin
+from src.ui.dialogs.job_recording import begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
@@ -404,6 +405,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self._error_report_workers: List[object] = []
         self._cancel_requested = False
         self._close_after_cancel = False
+        self._job_id = None  # 작업 목록 기록 (Import)
+        self._promotion_job_id = None  # 작업 목록 기록 (안전 전환)
 
         self.rust_dump_installed, self.rust_dump_msg = check_rust_dump()
 
@@ -1285,6 +1288,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.txt_log.addItem(f"🔄 재시도 모드: {len(retry_tables)}개 테이블")
 
         # 작업 스레드 시작
+        self._job_id = begin_import_job(self, input_dir, namespace or target_schema, import_mode, self.spin_threads.value())
         self.worker = RustDumpWorker(
             "import", config,
             input_dir=input_dir,
@@ -1614,6 +1618,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         blocked_count = self._count_by_status(table_results, 'blocked')
         total_count = len(table_results)
 
+        finish_import_job(self, success, message, done_count, error_count, blocked_count)
+
         self._add_log(f"{'='*60}")
         self._add_log(f"Import {'성공' if success else '실패'}")
         self._add_log(f"종료 시간: {self.import_end_time.strftime('%Y-%m-%d %H:%M:%S')}")
@@ -1776,6 +1782,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_audit["restore_status"] = "promotion_in_progress"
             self.btn_copy_restore_target.setEnabled(False)
             self._add_log("원래 이름으로 전환 시작. 결과가 확인될 때까지 원본 상태는 알 수 없습니다.")
+        if self._promotion_action == "confirm":
+            self._promotion_job_id = begin_promotion_job(self, payload)
         self.worker = RustDumpWorker("promote", self.restore_config, payload=payload)
         self.worker.raw_output.connect(self.on_raw_output)
         self.worker.promotion_finished.connect(self._on_promotion_finished)
@@ -1783,6 +1791,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def _on_promotion_finished(self, success: bool, message: str, result: dict):
         action = self._promotion_action
+        if action == "confirm":
+            finish_promotion_job(self, success, message, result)
         self.set_ui_enabled(True)
         self.btn_save_log.setEnabled(True)
         if action == "confirm":

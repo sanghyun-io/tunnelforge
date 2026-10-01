@@ -13,7 +13,7 @@ class WizardLauncher:
     def __init__(self, window):
         self._window = window
 
-    def _launch_rust_dump_wizard(self, action: str, tunnel: Optional[dict] = None):
+    def _launch_rust_dump_wizard(self, action: str, tunnel: Optional[dict] = None, **action_kwargs):
         kwargs = {
             "parent": self._window,
             "tunnel_engine": self._window.engine,
@@ -23,13 +23,13 @@ class WizardLauncher:
             kwargs["preselected_tunnel"] = tunnel
 
         wizard = RustDumpWizard(**kwargs)
-        getattr(wizard, action)()
+        getattr(wizard, action)(**action_kwargs)
 
-    def open_rust_dump_export(self):
-        self._launch_rust_dump_wizard("start_export")
+    def open_rust_dump_export(self, tunnel: Optional[dict] = None, rerun: Optional[dict] = None):
+        self._launch_rust_dump_wizard("start_export", tunnel, **({"rerun": rerun} if rerun else {}))
 
-    def open_rust_dump_import(self):
-        self._launch_rust_dump_wizard("start_import")
+    def open_rust_dump_import(self, tunnel: Optional[dict] = None):
+        self._launch_rust_dump_wizard("start_import", tunnel)
 
     def open_migration_analyzer(self):
         MigrationWizard.start(
