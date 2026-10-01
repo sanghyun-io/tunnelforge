@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTime, pyqtSignal
 from PyQt6.QtGui import QIcon, QFont, QColor, QTextCharFormat, QSyntaxHighlighter
 
+from src.core.schedule_time import validate_expression
 from src.core.scheduler import ScheduleConfig, CronParser, BackupScheduler, ScheduleTaskType
 from src.core.sql_safety import find_dangerous_sql_warnings
 from src.core.logger import get_logger
@@ -130,16 +131,24 @@ class ScheduleEditDialog(QDialog):
     """스케줄 추가/수정 다이얼로그"""
 
     def __init__(self, parent=None, tunnel_list: List[tuple] = None,
-                 schedule: ScheduleConfig = None):
+                 schedule: ScheduleConfig = None, min_interval_minutes: int = 15,
+                 tunnel_engines: dict = None, database_lister=None, tunnel_environments: dict = None):
         """
         Args:
             parent: 부모 위젯
             tunnel_list: [(tunnel_id, tunnel_name), ...] 터널 목록
             schedule: 수정할 스케줄 (None이면 새로 생성)
+            min_interval_minutes: 허용되는 최소 실행 간격(분)
+            tunnel_engines: {tunnel_id: db_engine} - PostgreSQL 터널에서만 데이터베이스 선택을 보여준다
+            database_lister: tunnel_id -> (데이터베이스 목록, 오류) - "목록 불러오기" 버튼용
         """
         super().__init__(parent)
+        self.tunnel_engines = tunnel_engines or {}
+        self.tunnel_environments = tunnel_environments or {}
+        self.database_lister = database_lister
         self.tunnel_list = tunnel_list or []
         self.schedule = schedule
+        self.min_interval_minutes = min_interval_minutes
         self.result_config: Optional[ScheduleConfig] = None
 
         self._setup_ui()
@@ -155,7 +164,24 @@ class ScheduleEditDialog(QDialog):
         self.setMinimumHeight(550)
 
         layout = QVBoxLayout(self)
-        layout.addWidget(self._build_task_type_group())
+        # 예약은 백업만 지원한다: 작업 유형 선택은 숨기고 항상 백업으로 저장한다 (예약 SQL 실행 금지).
+        self.task_type_box = self._build_task_type_group()
+        self.task_type_box.setVisible(False)
+        layout.addWidget(self.task_type_box)
+        self.unattended_note = QLabel(
+            "예약 백업은 사람이 없는 상태로 실행됩니다. 처음 보는 SSH 호스트 키와 비밀번호가 필요한 SSH 개인키는 "
+            "자동으로 수락/입력되지 않고 실패하며, 이 경우 작업 목록에 사유가 기록됩니다."
+        )
+        self.unattended_note.setWordWrap(True)
+        self.unattended_note.setStyleSheet("color: gray; font-size: 11px;")
+        layout.addWidget(self.unattended_note)
+        self.unsupported_label = QLabel(
+            "이 일정은 예약 SQL 실행 작업입니다. 예약 SQL 실행은 지원되지 않으므로 실행되지 않으며 삭제만 할 수 있습니다."
+        )
+        self.unsupported_label.setWordWrap(True)
+        self.unsupported_label.setStyleSheet("color: #c0392b; font-weight: bold;")
+        self.unsupported_label.setVisible(False)
+        layout.addWidget(self.unsupported_label)
         layout.addWidget(self._build_basic_info_group())
 
         self.task_stack = QStackedWidget()
@@ -168,6 +194,12 @@ class ScheduleEditDialog(QDialog):
         self.enabled_check = QCheckBox("스케줄 활성화")
         self.enabled_check.setChecked(True)
         layout.addWidget(self.enabled_check)
+
+        self.catch_up_check = QCheckBox("절전/앱 미실행으로 놓친 실행은 복귀 후 한 번만 따라잡기")
+        self.catch_up_check.setChecked(True)
+        layout.addWidget(self.catch_up_check)
+
+        layout.addWidget(self._build_rehearsal_group())
 
         btn_layout = QHBoxLayout()
         btn_layout.addStretch()
@@ -214,11 +246,76 @@ class ScheduleEditDialog(QDialog):
             self.tunnel_combo.addItem(tunnel_name, tunnel_id)
         basic_layout.addRow("터널:", self.tunnel_combo)
 
+        self.database_combo = QComboBox()
+        self.database_combo.setEditable(True)
+        self.database_combo.lineEdit().setPlaceholderText("비우면 postgres")
+        self.database_load_btn = QPushButton("목록 불러오기")
+        self.database_load_btn.clicked.connect(self._load_databases)
+        database_row = QWidget()
+        database_layout = QHBoxLayout(database_row)
+        database_layout.setContentsMargins(0, 0, 0, 0)
+        database_layout.addWidget(self.database_combo, 1)
+        database_layout.addWidget(self.database_load_btn)
+        self.database_row = database_row
+        basic_layout.addRow("데이터베이스 (PostgreSQL):", database_row)
+        self.tunnel_combo.currentIndexChanged.connect(self._update_database_row)
+
         self.schema_edit = QLineEdit()
-        self.schema_edit.setPlaceholderText("대상 데이터베이스 (스키마)")
+        self.schema_edit.setPlaceholderText("대상 스키마 (MySQL은 데이터베이스)")
         basic_layout.addRow("스키마:", self.schema_edit)
 
         return basic_group
+
+    def _build_rehearsal_group(self) -> QGroupBox:
+        group = QGroupBox("복원 리허설 (선택)")
+        form = QFormLayout(group)
+        self.rehearsal_check = QCheckBox("백업 직후 복원 리허설 실행 (후보 복원 → 행/digest 검증 → 후보 정리)")
+        form.addRow(self.rehearsal_check)
+        note = QLabel(
+            "방금 만든 백업을 아래 비운영 대상에 안전 복원(별도 후보 네임스페이스)으로 복원해 검증하고, 이 실행이 만든 "
+            "후보만 정리합니다. 대상의 기존 네임스페이스는 변경되지 않으며 반드시 미리 존재해야 합니다. "
+            "환경이 개발/스테이징으로 설정된 프로필만 선택할 수 있고 운영 프로필은 선택할 수 없습니다."
+        )
+        note.setWordWrap(True)
+        note.setStyleSheet("color: gray; font-size: 11px;")
+        form.addRow(note)
+        self.rehearsal_tunnel_combo = QComboBox()
+        for tunnel_id, tunnel_name in self.tunnel_list:
+            if self.tunnel_environments.get(tunnel_id) in ("development", "staging"):
+                self.rehearsal_tunnel_combo.addItem(tunnel_name, tunnel_id)
+        form.addRow("리허설 대상 터널:", self.rehearsal_tunnel_combo)
+        self.rehearsal_database_edit = QLineEdit()
+        self.rehearsal_database_edit.setPlaceholderText("PostgreSQL 데이터베이스 (비우면 postgres)")
+        form.addRow("리허설 데이터베이스:", self.rehearsal_database_edit)
+        self.rehearsal_schema_edit = QLineEdit()
+        self.rehearsal_schema_edit.setPlaceholderText("이미 존재하는 대상 스키마 (MySQL은 데이터베이스)")
+        form.addRow("리허설 스키마:", self.rehearsal_schema_edit)
+        has_targets = self.rehearsal_tunnel_combo.count() > 0
+        self.rehearsal_check.setEnabled(has_targets)
+        if not has_targets:
+            self.rehearsal_check.setToolTip("환경이 개발/스테이징으로 설정된 프로필이 없습니다.")
+        return group
+
+    def _tunnel_is_postgresql(self) -> bool:
+        return self.tunnel_engines.get(self.tunnel_combo.currentData()) == "postgresql"
+
+    def _update_database_row(self, *_):
+        # 엔진을 모르면(tunnel_engines 없음) 숨기지 않는다. MySQL 터널에서는 의미가 없으므로 숨긴다.
+        visible = not self.tunnel_engines or self._tunnel_is_postgresql()
+        self.database_row.setVisible(visible)
+        self.database_load_btn.setEnabled(self.database_lister is not None)
+
+    def _load_databases(self):
+        if not self.database_lister:
+            return
+        databases, error = self.database_lister(self.tunnel_combo.currentData())
+        if error:
+            QMessageBox.warning(self, "데이터베이스 목록", error)
+            return
+        current = self.database_combo.currentText()
+        self.database_combo.clear()
+        self.database_combo.addItems(databases)
+        self.database_combo.setCurrentText(current)
 
     def _build_backup_page(self) -> QWidget:
         backup_page = QWidget()
@@ -519,9 +616,26 @@ class ScheduleEditDialog(QDialog):
                 break
 
         self.schema_edit.setText(schedule.schema)
+        # 이전 버전 일정(database 없음)은 항상 postgres에 접속했으므로 그대로 표시한다
+        self.database_combo.setCurrentText(schedule.database or ("postgres" if self._tunnel_is_postgresql() else ""))
+        self._update_database_row()
+
+        self.catch_up_check.setChecked(bool(getattr(schedule, "catch_up_missed", True)))
+        if getattr(schedule, "rehearsal_tunnel_id", ""):
+            index = self.rehearsal_tunnel_combo.findData(schedule.rehearsal_tunnel_id)
+            if index < 0:  # 이제 대상이 될 수 없는 프로필(환경 변경 등): 저장 시 검증이 막도록 그대로 보여 준다
+                self.rehearsal_tunnel_combo.addItem(schedule.rehearsal_tunnel_id, schedule.rehearsal_tunnel_id)
+                index = self.rehearsal_tunnel_combo.count() - 1
+            self.rehearsal_tunnel_combo.setCurrentIndex(index)
+            self.rehearsal_check.setEnabled(True)
+            self.rehearsal_check.setChecked(True)
+            self.rehearsal_database_edit.setText(schedule.rehearsal_database)
+            self.rehearsal_schema_edit.setText(schedule.rehearsal_schema)
 
         # 작업 유형
         if schedule.is_sql_query_task():
+            self.unsupported_label.setVisible(True)
+            self.save_btn.setEnabled(False)
             self.sql_radio.setChecked(True)
             self.task_stack.setCurrentIndex(1)
             # SQL 관련 필드
@@ -588,11 +702,19 @@ class ScheduleEditDialog(QDialog):
             return
 
         schema = self.schema_edit.text().strip()
-        is_sql_task = self.sql_radio.isChecked()
-        if is_sql_task:
-            task_fields = self._validate_and_build_sql_task()
-        else:
-            task_fields = self._validate_and_build_backup_task(schema)
+        if self.schedule is not None and self.schedule.is_sql_query_task():
+            QMessageBox.warning(self, "지원되지 않음", "예약 SQL 실행은 지원되지 않습니다.")
+            return
+        is_sql_task = False  # 예약은 백업만 지원한다
+        rehearsal = {"tunnel_id": "", "database": "", "schema": ""}
+        if self.rehearsal_check.isChecked():
+            rehearsal = {"tunnel_id": self.rehearsal_tunnel_combo.currentData() or "",
+                         "database": self.rehearsal_database_edit.text().strip(),
+                         "schema": self.rehearsal_schema_edit.text().strip()}
+            if not rehearsal["tunnel_id"] or not rehearsal["schema"]:
+                QMessageBox.warning(self, "입력 오류", "복원 리허설 대상 터널과 스키마를 지정하세요.")
+                return
+        task_fields = self._validate_and_build_backup_task(schema)
         if task_fields is None:
             return
 
@@ -601,11 +723,12 @@ class ScheduleEditDialog(QDialog):
             QMessageBox.warning(self, "입력 오류", "스케줄을 설정하세요.")
             return
 
-        # Cron 유효성 검사
-        next_run = CronParser.get_next_run(cron_expr)
-        if not next_run:
-            QMessageBox.warning(self, "입력 오류", "잘못된 Cron 표현식입니다.")
+        # Cron 유효성 검사 (형식 + 최소 실행 간격)
+        error = validate_expression(cron_expr, self.min_interval_minutes)
+        if error:
+            QMessageBox.warning(self, "입력 오류", error)
             return
+        next_run = CronParser.get_next_run(cron_expr)
 
         # ScheduleConfig 생성
         self.result_config = ScheduleConfig(
@@ -613,12 +736,17 @@ class ScheduleEditDialog(QDialog):
             name=name,
             tunnel_id=self.tunnel_combo.currentData(),
             schema=schema,
+            database=self.database_combo.currentText().strip() if self._tunnel_is_postgresql() else "",
             tables=task_fields["tables"],
             output_dir=task_fields["output_dir"],
             cron_expression=cron_expr,
             enabled=self.enabled_check.isChecked(),
             retention_count=task_fields["retention_count"],
             retention_days=task_fields["retention_days"],
+            catch_up_missed=self.catch_up_check.isChecked(),
+            rehearsal_tunnel_id=rehearsal["tunnel_id"],
+            rehearsal_database=rehearsal["database"],
+            rehearsal_schema=rehearsal["schema"],
             last_run=self.schedule.last_run if self.schedule else None,
             next_run=next_run.isoformat(),
             # SQL 관련 필드
@@ -710,14 +838,17 @@ class ScheduleListDialog(QDialog):
     _execution_finished = pyqtSignal(str, bool, str)
 
     def __init__(self, parent=None, scheduler: BackupScheduler = None,
-                 tunnel_list: List[tuple] = None):
+                 tunnel_list: List[tuple] = None, tunnel_engines: dict = None, tunnel_environments: dict = None):
         """
         Args:
             parent: 부모 위젯
             scheduler: BackupScheduler 인스턴스
             tunnel_list: [(tunnel_id, tunnel_name), ...] 터널 목록
+            tunnel_engines: {tunnel_id: db_engine}
         """
         super().__init__(parent)
+        self.tunnel_engines = tunnel_engines or {}
+        self.tunnel_environments = tunnel_environments or {}
         self.scheduler = scheduler
         self.tunnel_list = tunnel_list or []
         self._refreshing = False
@@ -889,8 +1020,11 @@ class ScheduleListDialog(QDialog):
             else:
                 self.table.setItem(row, 4, QTableWidgetItem("-"))
 
-            # 상태
-            status = "대기 중" if schedule.enabled else "비활성"
+            # 상태 (예약 SQL 실행은 지원되지 않아 실행되지 않는다)
+            if schedule.is_sql_query_task():
+                status = "지원 중단 (실행 안 됨)"
+            else:
+                status = "대기 중" if schedule.enabled else "비활성"
             self.table.setItem(row, 5, QTableWidgetItem(status))
 
             # 활성화 체크박스
@@ -959,7 +1093,9 @@ class ScheduleListDialog(QDialog):
 
     def _add_schedule(self):
         """스케줄 추가"""
-        dialog = ScheduleEditDialog(self, self.tunnel_list)
+        dialog = ScheduleEditDialog(self, self.tunnel_list, min_interval_minutes=self.scheduler.min_interval_minutes(),
+                                    tunnel_engines=self.tunnel_engines, database_lister=self.scheduler.list_databases,
+                                    tunnel_environments=self.tunnel_environments)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_config:
             try:
                 self.scheduler.add_schedule(dialog.result_config)
@@ -978,7 +1114,10 @@ class ScheduleListDialog(QDialog):
         if not schedule:
             return
 
-        dialog = ScheduleEditDialog(self, self.tunnel_list, schedule)
+        dialog = ScheduleEditDialog(self, self.tunnel_list, schedule,
+                                    min_interval_minutes=self.scheduler.min_interval_minutes(),
+                                    tunnel_engines=self.tunnel_engines, database_lister=self.scheduler.list_databases,
+                                    tunnel_environments=self.tunnel_environments)
         if dialog.exec() == QDialog.DialogCode.Accepted and dialog.result_config:
             try:
                 self.scheduler.update_schedule(dialog.result_config)

@@ -17,6 +17,7 @@ BackupScheduler는 스케줄링 엔진(등록/실행 큐/직렬화 실행 루프
 import copy
 import queue
 import threading
+import time
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Callable, Tuple
 
@@ -28,6 +29,10 @@ from src.core.cron_parser import CronParser
 from src.core.execution_log_writer import ExecutionLogWriter
 from src.core.backup_task_executor import BackupTaskExecutor
 from src.core.sql_query_task_executor import SqlQueryTaskExecutor
+from src.core.job_history import KIND_SCHEDULED_BACKUP, STATUS_SKIPPED, job_begin, job_finish
+from src.core.schedule_time import classify_due, validate_expression
+from src.core import scheduled_backup_store as backup_store
+from src.core.restore_rehearsal import RestoreRehearsal, rehearsal_target_error
 
 # 하위 호환 재노출 (consumer: src/ui/dialogs/schedule_dialog.py, src/ui/main_window.py)
 __all__ = [
@@ -38,6 +43,28 @@ __all__ = [
 ]
 
 logger = get_logger(__name__)
+
+DEFAULT_MIN_INTERVAL_MINUTES = 15
+SQL_TASK_UNSUPPORTED_MESSAGE = (
+    "예약 SQL 실행은 지원되지 않습니다 (무인 상태의 쓰기 위험과 운영 읽기 전용 정책 때문). "
+    "예약은 백업만 사용할 수 있습니다."
+)
+
+
+def describe_unattended_tunnel_failure(message: str) -> str:
+    """무인 터널 시작 실패를 사용자에게 보이는 한 줄 사유로 바꾼다 (원인 코드 우선, 상세는 로그에만)."""
+    text = message or ""
+    if "ssh_host_key_unknown" in text:
+        return ("SSH 호스트 키가 아직 신뢰되지 않았습니다. 예약 실행은 호스트 키를 자동으로 수락하지 않습니다. "
+                "앱에서 이 연결을 한 번 직접 열어 지문을 확인하고 신뢰한 뒤 다시 시도하세요.")
+    if "ssh_host_key_changed" in text:
+        return ("SSH 서버의 호스트 키가 저장된 값과 다릅니다. 중간자 공격일 수 있어 예약 실행을 차단했습니다. "
+                "서버 교체가 확실할 때만 터널 설정에서 '호스트 키 갱신'을 사용하세요.")
+    if "Passphrase" in text or "개인키 비밀번호" in text:
+        return ("SSH 개인키가 비밀번호로 보호되어 있어 예약 실행에서 사용할 수 없습니다 "
+                "(키 비밀번호는 저장하지 않으며 무인 실행에서는 묻지 않습니다). 비밀번호 없는 전용 키를 사용하세요.")
+    first_line = next((line.strip() for line in text.splitlines() if line.strip()), "알 수 없는 오류")
+    return f"터널 연결 실패: {first_line[:200]}"
 
 
 class BackupScheduler:
@@ -66,9 +93,15 @@ class BackupScheduler:
 
         # 작업 실행 협력자 조립 (DI - 아래 모듈들은 scheduler.py를 import하지 않는 leaf 모듈)
         self._log_writer = ExecutionLogWriter()
+        self._rehearsal = RestoreRehearsal(
+            resolve_connection=self._resolve_connection,
+            find_tunnel_config=self._find_tunnel_config,
+            connector_factory=self._make_connector,
+        )
         self._backup_executor = BackupTaskExecutor(
             resolve_connection=self._resolve_connection,
             log_writer=self._log_writer,
+            rehearsal=self._rehearsal,
         )
         self._sql_executor = SqlQueryTaskExecutor(
             resolve_connection=self._resolve_connection,
@@ -95,14 +128,47 @@ class BackupScheduler:
         for data in schedules_data:
             try:
                 schedule = ScheduleConfig.from_dict(data)
-                # next_run 갱신
-                if schedule.enabled:
-                    next_run = CronParser.get_next_run(schedule.cron_expression)
-                    if next_run:
-                        schedule.next_run = next_run.isoformat()
+                # 저장된 next_run 은 그대로 둔다: 앱이 꺼져 있는 동안 지나간 실행을 시작 직후 감지해
+                # (최대 1회) 따라잡거나 건너뛰기 위해서다. 유효한 next_run 이 없을 때만 새로 계산한다.
+                if schedule.enabled and not self._valid_iso(schedule.next_run):
+                    schedule.next_run = self._compute_next_run(schedule.cron_expression)
                 self._schedules.append(schedule)
+                if not schedule.is_sql_query_task() and schedule.output_dir:
+                    backup_store.sweep_interrupted(schedule.output_dir, schedule.id, schedule_active=False)
             except Exception as e:
                 logger.error(f"스케줄 로드 실패: {e}")
+
+    @staticmethod
+    def _valid_iso(value) -> bool:
+        try:
+            datetime.fromisoformat(value)
+            return True
+        except (TypeError, ValueError):
+            return False
+
+    @staticmethod
+    def _compute_next_run(expression: str, after: Optional[datetime] = None) -> Optional[str]:
+        next_run = CronParser.get_next_run(expression, after)
+        return next_run.isoformat() if next_run else None
+
+    def min_interval_minutes(self) -> int:
+        try:
+            value = int(self.config_manager.get_app_setting('scheduled_backup_min_interval_minutes',
+                                                            DEFAULT_MIN_INTERVAL_MINUTES))
+        except (TypeError, ValueError):
+            return DEFAULT_MIN_INTERVAL_MINUTES
+        return max(1, value)
+
+    def validate_schedule(self, config: ScheduleConfig) -> Optional[str]:
+        """저장 전 검증. 사용자에게 보여줄 오류 문구 또는 None."""
+        if config.is_sql_query_task():
+            return SQL_TASK_UNSUPPORTED_MESSAGE
+        if not config.output_dir:
+            return "백업 출력 폴더를 지정하세요."
+        error = rehearsal_target_error(self._find_tunnel_config(config.rehearsal_tunnel_id), config)
+        if error:
+            return error
+        return validate_expression(config.cron_expression, self.min_interval_minutes())
 
     def _save_schedules(self):
         """스케줄을 설정에 저장"""
@@ -180,11 +246,13 @@ class BackupScheduler:
                 if s.id == config.id:
                     raise ValueError(f"중복된 스케줄 ID: {config.id}")
 
+            error = self.validate_schedule(config)
+            if error:
+                raise ValueError(error)
+
             # next_run 계산
             if config.enabled:
-                next_run = CronParser.get_next_run(config.cron_expression)
-                if next_run:
-                    config.next_run = next_run.isoformat()
+                config.next_run = self._compute_next_run(config.cron_expression) or config.next_run
 
             self._schedules.append(config)
             self._save_schedules()
@@ -195,11 +263,12 @@ class BackupScheduler:
         with self._lock:
             for i, s in enumerate(self._schedules):
                 if s.id == config.id:
+                    error = self.validate_schedule(config)
+                    if error:
+                        raise ValueError(error)
                     # next_run 재계산
                     if config.enabled:
-                        next_run = CronParser.get_next_run(config.cron_expression)
-                        if next_run:
-                            config.next_run = next_run.isoformat()
+                        config.next_run = self._compute_next_run(config.cron_expression) or config.next_run
 
                     self._schedules[i] = config
                     self._save_schedules()
@@ -226,9 +295,8 @@ class BackupScheduler:
         if schedule:
             schedule.enabled = enabled
             if enabled:
-                next_run = CronParser.get_next_run(schedule.cron_expression)
-                if next_run:
-                    schedule.next_run = next_run.isoformat()
+                # 다시 켜는 순간부터 계산한다: 꺼져 있던 동안의 실행은 '놓친 실행'이 아니다.
+                schedule.next_run = self._compute_next_run(schedule.cron_expression) or schedule.next_run
             self._save_schedules()
             logger.info(f"스케줄 {'활성화' if enabled else '비활성화'}: {schedule.name}")
 
@@ -253,23 +321,39 @@ class BackupScheduler:
             if not schedule:
                 return False, "스케줄을 찾을 수 없습니다."
             if schedule.id in self._active_schedule_ids:
-                return False, "이미 실행 중인 스케줄입니다."
-            self._active_schedule_ids.add(schedule.id)
-            job = _ExecutionJob(copy.deepcopy(schedule), update_next_run=False)
+                already_running = copy.deepcopy(schedule)
+                job = None
+            else:
+                self._active_schedule_ids.add(schedule.id)
+                job = _ExecutionJob(copy.deepcopy(schedule), update_next_run=False, trigger='manual')
+        if job is None:
+            self._record_skip(already_running, "이미 실행 중이라 '지금 실행' 요청을 건너뜀")
+            return False, "이미 실행 중인 스케줄입니다."
 
         self._ensure_execution_thread()
         self._execution_queue.put(job)
         return True, "실행 요청이 등록되었습니다. 완료되면 실행 로그와 알림으로 표시됩니다."
 
-    def _execute_task(self, schedule: ScheduleConfig) -> tuple:
-        """작업 유형별 분기 실행
+    def _execute_task(self, schedule: ScheduleConfig, trigger: str = 'scheduled') -> tuple:
+        """작업 유형별 분기 실행. 예약은 백업만 실행한다 (SQL 작업은 거부).
 
         Returns:
             (success, message)
         """
         if schedule.is_sql_query_task():
-            return self._execute_sql_query(schedule)
-        return self._execute_backup(schedule)
+            self._log_writer.log_execution(schedule, False, SQL_TASK_UNSUPPORTED_MESSAGE)
+            return False, SQL_TASK_UNSUPPORTED_MESSAGE
+        return self._execute_backup(schedule, trigger)
+
+    def _record_skip(self, schedule: ScheduleConfig, reason: str) -> None:
+        """건너뛴 예약 실행을 작업 목록과 실행 로그에 남긴다."""
+        try:
+            job_id = job_begin(KIND_SCHEDULED_BACKUP, profile_id=schedule.tunnel_id, profile_name=schedule.name,
+                               target=schedule.schema, mode="예약 실행")
+            job_finish(job_id, STATUS_SKIPPED, error=reason)
+            self._log_writer.log_execution(schedule, False, f"건너뜀: {reason}")
+        except Exception:
+            logger.warning("건너뛴 실행 기록 실패", exc_info=True)
 
     def _ensure_execution_thread(self):
         """실행 워커 스레드가 살아있지 않으면 새로 시작"""
@@ -300,7 +384,7 @@ class BackupScheduler:
         success = False
         message = ""
         try:
-            success, message = self._execute_task(job.schedule)
+            success, message = self._execute_task(job.schedule, job.trigger)
         except Exception as e:
             message = f"스케줄 실행 오류: {e}"
             logger.exception(message)
@@ -313,26 +397,42 @@ class BackupScheduler:
                 if job.schedule.last_run:
                     live.last_run = job.schedule.last_run
                 if job.update_next_run and live.enabled:
-                    next_run = CronParser.get_next_run(live.cron_expression)
-                    live.next_run = next_run.isoformat() if next_run else None
+                    live.next_run = self._compute_next_run(live.cron_expression)
                 self._save_schedules()
             self._active_schedule_ids.discard(job.schedule.id)
 
     def _snapshot_due_jobs(self, now: datetime) -> List["_ExecutionJob"]:
         """실행 대상 스케줄을 락 안에서 스냅샷만 뜨고, 실제 실행은 락 밖에서 진행하기 위한 준비"""
         jobs = []
+        skipped: List[Tuple[ScheduleConfig, str]] = []
+        now_epoch = now.timestamp()
         with self._lock:
+            changed = False
             for schedule in self._schedules:
-                if not schedule.enabled or not schedule.next_run:
-                    continue
-                if schedule.id in self._active_schedule_ids:
+                if not schedule.enabled or not schedule.next_run or schedule.is_sql_query_task():
                     continue
                 try:
-                    if datetime.fromisoformat(schedule.next_run) <= now:
+                    due = classify_due(datetime.fromisoformat(schedule.next_run).timestamp(), now_epoch)
+                    if due == 'not_due':
+                        continue
+                    if schedule.id in self._active_schedule_ids:
+                        # 같은 일정의 중복 실행 방지: 실행 중이면 이번 시각은 건너뛰고 다음 시각으로 넘긴다.
+                        skipped.append((copy.deepcopy(schedule), "이전 실행이 아직 진행 중이라 이번 예약을 건너뜀"))
+                    elif due == 'missed' and not schedule.catch_up_missed:
+                        skipped.append((copy.deepcopy(schedule), "절전/앱 미실행으로 놓친 실행 (따라잡기 설정 꺼짐)"))
+                    else:
                         self._active_schedule_ids.add(schedule.id)
-                        jobs.append(_ExecutionJob(copy.deepcopy(schedule), update_next_run=True))
+                        trigger = 'catch_up' if due == 'missed' else 'scheduled'
+                        jobs.append(_ExecutionJob(copy.deepcopy(schedule), update_next_run=True, trigger=trigger))
+                        continue
+                    schedule.next_run = self._compute_next_run(schedule.cron_expression, now)
+                    changed = True
                 except Exception as e:
                     logger.error(f"스케줄 체크 오류 ({schedule.name}): {e}")
+            if changed:
+                self._save_schedules()
+        for schedule, reason in skipped:
+            self._record_skip(schedule, reason)
         return jobs
 
     def _run_loop(self):
@@ -352,29 +452,41 @@ class BackupScheduler:
             # 60초 대기 (중단 가능)
             self._stop_event.wait(60)
 
+    def _find_tunnel_config(self, tunnel_id: str) -> Optional[dict]:
+        if not tunnel_id:
+            return None
+        config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(tunnel_id)
+        if not config:
+            stored_tunnels = self.config_manager.load_config().get('tunnels', [])
+            config = next((t for t in stored_tunnels if t.get('id') == tunnel_id), None)
+        return config
+
     def _resolve_connection(self, schedule: ScheduleConfig) -> Tuple[Optional["_ResolvedConnection"], str]:
         """백업/SQL 실행이 공유하는 터널 연결 정보 + 복호화된 자격 증명 해석
 
         Returns:
             (resolved, error_message) - 실패 시 resolved는 None이고 error_message에 사유가 담긴다.
         """
-        config = getattr(self.tunnel_engine, 'tunnel_configs', {}).get(schedule.tunnel_id)
-        if not config:
-            stored_tunnels = self.config_manager.load_config().get('tunnels', [])
-            config = next((t for t in stored_tunnels if t.get('id') == schedule.tunnel_id), None)
+        config = self._find_tunnel_config(schedule.tunnel_id)
         if not config:
             return None, "터널 설정을 찾을 수 없습니다."
 
-        # 터널 연결 확인
+        # 터널 연결 확인. 사용자가 이미 연 터널은 그대로 쓰고, 없으면 무인 모드로 연다
+        # (처음 보는 SSH 호스트 키/비밀번호가 필요한 개인키는 묻거나 자동 수락하지 않고 실패한다).
+        started_here = False
         if not self.tunnel_engine.is_running(schedule.tunnel_id):
+            start = getattr(self.tunnel_engine, 'start_tunnel_unattended', None) or self.tunnel_engine.start_tunnel
             # 터널 시작 시도 (설정 딕셔너리 전체를 전달 - 터널 ID 문자열이 아님)
-            success, msg = self.tunnel_engine.start_tunnel(config)
+            success, msg = start(config)
             if not success:
-                return None, f"터널 연결 실패: {msg}"
+                return None, describe_unattended_tunnel_failure(msg)
+            started_here = True
 
         # 연결 정보 가져오기 (host, port) 튜플만 반환됨
         host, port = self.tunnel_engine.get_connection_info(schedule.tunnel_id)
         if host is None or port is None:
+            if started_here:
+                self._stop_tunnel_quietly(schedule.tunnel_id)
             return None, "연결 정보를 가져올 수 없습니다."
 
         # 저장된 자격 증명 복호화
@@ -393,14 +505,48 @@ class BackupScheduler:
         password = credential_password or config.get('db_password') or ''
         engine = normalize_db_engine(config.get('db_engine'), config.get('remote_port') or port)
 
+        tunnel_id = schedule.tunnel_id
         resolved = _ResolvedConnection(
             host=host or DEFAULT_LOCAL_HOST,
             port=int(port),
             user=user,
             password=password,
             engine=engine,
+            release=(lambda: self._stop_tunnel_quietly(tunnel_id)) if started_here else None,
         )
         return resolved, ""
+
+    def list_databases(self, tunnel_id: str) -> Tuple[List[str], str]:
+        """PostgreSQL 터널의 접속 가능한 데이터베이스 목록 (UI 선택용). 반환: (목록, 오류 메시지)"""
+        resolved, error = self._resolve_connection(ScheduleConfig(id="", name="", tunnel_id=tunnel_id, schema=""))
+        if resolved is None:
+            return [], error
+        connector = None
+        try:
+            if resolved.engine != "postgresql":
+                return [], "PostgreSQL 터널이 아닙니다."
+            connector = self._make_connector(resolved.engine, resolved.host, resolved.port,
+                                             resolved.user, resolved.password)
+            ok, message = connector.connect()
+            if not ok:
+                return [], message
+            with connector.connection.cursor() as cursor:
+                cursor.execute("SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY 1")
+                return [row["datname"] for row in cursor.fetchall()], ""
+        except Exception as exc:
+            return [], str(exc)
+        finally:
+            if connector is not None:
+                connector.disconnect()
+            if resolved.release:
+                resolved.release()
+
+    def _stop_tunnel_quietly(self, tunnel_id: str) -> None:
+        """예약 실행이 직접 연 터널만 닫는다 (사용자가 열어 둔 터널은 건드리지 않는다)."""
+        try:
+            self.tunnel_engine.stop_tunnel(tunnel_id)
+        except Exception:
+            logger.warning("예약 실행 터널 정리 실패", exc_info=True)
 
     # =========================================================================
     # 작업 실행 - BackupTaskExecutor / SqlQueryTaskExecutor로 위임
@@ -408,13 +554,13 @@ class BackupScheduler:
     #  private 표면이므로 이름/시그니처를 그대로 유지한다)
     # =========================================================================
 
-    def _execute_backup(self, schedule: ScheduleConfig) -> tuple:
+    def _execute_backup(self, schedule: ScheduleConfig, trigger: str = 'scheduled') -> tuple:
         """백업 실행 (BackupTaskExecutor에 위임)
 
         Returns:
             (success, message)
         """
-        return self._backup_executor.execute(schedule)
+        return self._backup_executor.execute(schedule, trigger)
 
     def get_backup_logs(self, days: int = 7) -> List[Dict[str, Any]]:
         """최근 백업 로그 조회 (ExecutionLogWriter에 위임)

@@ -2,6 +2,7 @@ from sshtunnel import SSHTunnelForwarder
 import paramiko
 import socket
 import os
+import threading
 from contextlib import closing
 
 from src.core import ssh_trust
@@ -25,6 +26,8 @@ class TunnelEngine:
         self.passphrase_provider = None  # (key_path, retry) -> Optional[str]
         self._passphrases = {}           # 세션 메모리 전용. 절대 디스크/config에 쓰지 않는다.
         self._temp_endpoints = {}        # id(temp_server) -> (host, port)
+        # 무인(예약) 실행 스레드에서는 사용자에게 묻지 않는다: 스레드별 플래그 (UI 스레드의 대화형 흐름과 분리)
+        self._unattended = threading.local()
 
     @property
     def known_hosts(self):
@@ -33,11 +36,26 @@ class TunnelEngine:
             self._known_hosts = ConfigManager()
         return self._known_hosts
 
+    def _is_unattended(self):
+        return bool(getattr(self._unattended, 'active', False))
+
+    def start_tunnel_unattended(self, config, check_port: bool = True):
+        """예약 백업처럼 사람이 없는 실행용 시작.
+
+        처음 보는 SSH 호스트 키는 자동 수락하지 않고 실패하며(ssh_host_key_unknown), 비밀번호가 필요한
+        개인키는 묻지 않고 실패한다. 세션 메모리의 캐시된 비밀번호도 쓰지 않는다. 호출한 스레드에서만 적용된다.
+        """
+        self._unattended.active = True
+        try:
+            return self.start_tunnel(config, check_port)
+        finally:
+            self._unattended.active = False
+
     def _verified_host_key(self, config):
         """Bastion 호스트 키를 TOFU 정책으로 검증하고 신뢰된 키를 반환한다."""
         return ssh_trust.verify_host_key(
             config['bastion_host'], int(config['bastion_port']),
-            self.known_hosts, self.host_key_confirmer,
+            self.known_hosts, None if self._is_unattended() else self.host_key_confirmer,
         )
 
     def probe_bastion_fingerprint(self, host, port):
@@ -99,7 +117,7 @@ class TunnelEngine:
             raise FileNotFoundError(f"키 파일을 찾을 수 없습니다: {key_path}")
 
         cache_id = os.path.abspath(key_path)
-        cached = self._passphrases.get(cache_id)
+        cached = None if self._is_unattended() else self._passphrases.get(cache_id)
         key, encrypted, attempt_logs = self._read_key(key_path, cached)
         if key is not None:
             return key
@@ -121,7 +139,8 @@ class TunnelEngine:
         self._passphrases.pop(cache_id, None)
         retry = cached is not None
         for _ in range(3):
-            passphrase = self.passphrase_provider(key_path, retry) if self.passphrase_provider else None
+            provider = None if self._is_unattended() else self.passphrase_provider
+            passphrase = provider(key_path, retry) if provider else None
             if passphrase is None:
                 raise ssh_trust.SshPassphraseRequired(key_path)
             key, _, _ = self._read_key(key_path, passphrase)

@@ -1,10 +1,11 @@
 """
 간단한 Cron 표현식 파서
 """
-from datetime import datetime, timedelta
+from datetime import datetime
 from typing import List, Optional
 
 from src.core.logger import get_logger
+from src.core.schedule_time import next_occurrence
 
 logger = get_logger(__name__)
 
@@ -52,55 +53,26 @@ class CronParser:
 
     @staticmethod
     def get_next_run(expression: str, after: datetime = None) -> Optional[datetime]:
-        """다음 실행 시간 계산
+        """다음 실행 시간 계산 (로컬 벽시계, naive)
+
+        DST 전환 규칙(존재하지 않는 시각은 전환 직후 한 번, 반복되는 시각은 첫 번째 발생에서만)은
+        src/core/schedule_time.py 가 정의한다.
 
         Args:
             expression: Cron 표현식 "분 시 일 월 요일"
             after: 이 시간 이후의 다음 실행 시간 (기본: 현재)
 
         Returns:
-            다음 실행 datetime 또는 None (파싱 실패 시)
+            다음 실행 datetime 또는 None (파싱 실패/1년 내 실행 없음)
         """
-        if after is None:
-            after = datetime.now()
-
         try:
-            parts = expression.strip().split()
-            if len(parts) != 5:
-                logger.warning(f"잘못된 cron 표현식: {expression}")
-                return None
-
-            minute_field, hour_field, day_field, month_field, dow_field = parts
-
-            # 최대 1년간 검색
-            check_time = after.replace(second=0, microsecond=0) + timedelta(minutes=1)
-            end_time = after + timedelta(days=366)
-
-            while check_time < end_time:
-                minutes = CronParser.parse_field(minute_field, 0, 59, check_time.minute)
-                hours = CronParser.parse_field(hour_field, 0, 23, check_time.hour)
-                days = CronParser.parse_field(day_field, 1, 31, check_time.day)
-                months = CronParser.parse_field(month_field, 1, 12, check_time.month)
-                dows = CronParser.parse_field(dow_field, 0, 6, check_time.weekday(), normalize_dow_7=True)
-                # cron에서 0=일요일, Python에서 0=월요일 변환
-                # Python weekday(): 월=0, 화=1, ..., 일=6
-                # Cron: 일=0, 월=1, ..., 토=6
-                python_dow = (check_time.weekday() + 1) % 7
-
-                if (check_time.month in months and
-                    check_time.day in days and
-                    check_time.hour in hours and
-                    check_time.minute in minutes and
-                    python_dow in dows):
-                    return check_time
-
-                check_time += timedelta(minutes=1)
-
-            return None
-
+            result = next_occurrence(expression, after)
         except Exception as e:
             logger.error(f"Cron 파싱 오류: {e}")
             return None
+        if result is None:
+            logger.warning(f"잘못되었거나 1년 안에 실행되지 않는 cron 표현식: {expression}")
+        return result
 
     @staticmethod
     def describe(expression: str) -> str:

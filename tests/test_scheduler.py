@@ -542,7 +542,7 @@ class TestBackupScheduler:
                 return True, "ok"
 
         self.mock_engine.is_running.return_value = False
-        self.mock_engine.start_tunnel.return_value = (True, "연결 성공")
+        self.mock_engine.start_tunnel_unattended.return_value = (True, "연결 성공")
         self.mock_engine.tunnel_configs = {}  # 아직 활성화된 터널 없음 -> 저장된 설정으로 폴백
         self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 13306)
         self.mock_config_manager.load_config.return_value = {
@@ -561,8 +561,8 @@ class TestBackupScheduler:
         success, message = self.scheduler._execute_backup(schedule)
 
         assert success is True
-        self.mock_engine.start_tunnel.assert_called_once()
-        called_config = self.mock_engine.start_tunnel.call_args[0][0]
+        self.mock_engine.start_tunnel_unattended.assert_called_once()
+        called_config = self.mock_engine.start_tunnel_unattended.call_args[0][0]
         assert isinstance(called_config, dict)
         assert called_config.get("id") == "tunnel-001"
 
@@ -604,7 +604,7 @@ class TestBackupScheduler:
             return FakeConnector()
 
         self.mock_engine.is_running.return_value = False
-        self.mock_engine.start_tunnel.return_value = (True, "연결 성공")
+        self.mock_engine.start_tunnel_unattended.return_value = (True, "연결 성공")
         self.mock_engine.tunnel_configs = {}
         self.mock_engine.get_connection_info.return_value = ("127.0.0.1", 13306)
         self.mock_config_manager.load_config.return_value = {
@@ -625,8 +625,8 @@ class TestBackupScheduler:
         success, _ = self.scheduler._execute_sql_query(schedule)
 
         assert success is True
-        self.mock_engine.start_tunnel.assert_called_once()
-        called_config = self.mock_engine.start_tunnel.call_args[0][0]
+        self.mock_engine.start_tunnel_unattended.assert_called_once()
+        called_config = self.mock_engine.start_tunnel_unattended.call_args[0][0]
         assert isinstance(called_config, dict)
         assert called_config.get("id") == "tunnel-001"
         # 문자열 tunnel_id가 실수로 start_tunnel에 전달되지 않았는지 확인
@@ -730,7 +730,7 @@ class TestBackupScheduler:
         started = threading.Event()
         release = threading.Event()
 
-        def fake_execute_task(sched):
+        def fake_execute_task(sched, trigger='scheduled'):
             started.set()
             release.wait(timeout=5)
             return True, "완료"
@@ -768,7 +768,7 @@ class TestBackupScheduler:
         started = threading.Event()
         release = threading.Event()
 
-        def fake_execute_task(sched):
+        def fake_execute_task(sched, trigger='scheduled'):
             started.set()
             release.wait(timeout=5)
             return True, "완료"
@@ -1165,6 +1165,7 @@ SELECT 1;"""
             name='Disabled',
             tunnel_id='t1',
             schema='db',
+            output_dir='/tmp/backup',
             enabled=False,
             cron_expression='0 3 * * *'
         )
@@ -1274,6 +1275,7 @@ class TestScheduleListDialogUi:
             name=f'Schedule {schedule_id}',
             tunnel_id='t1',
             schema='db',
+            output_dir='/tmp/backup',
             cron_expression='0 3 * * *',
             enabled=enabled,
         )
@@ -1345,7 +1347,7 @@ class TestScheduleListDialogUi:
 
         release = threading.Event()
 
-        def fake_execute_task(sched):
+        def fake_execute_task(sched, trigger='scheduled'):
             release.wait(timeout=5)
             return True, "완료"
 

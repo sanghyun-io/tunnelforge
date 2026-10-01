@@ -7,7 +7,7 @@
 """
 from dataclasses import dataclass, field, asdict
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 
 class ScheduleTaskType(str, Enum):
@@ -23,12 +23,19 @@ class ScheduleConfig:
     name: str
     tunnel_id: str              # 사용할 터널 ID
     schema: str                 # Export 대상 스키마
+    database: str = ""          # PostgreSQL 접속 데이터베이스 (비어 있으면 postgres, MySQL은 사용 안 함)
     tables: List[str] = field(default_factory=list)  # 빈 리스트 = 전체
     output_dir: str = ""        # 출력 디렉토리
     cron_expression: str = "0 3 * * *"  # 기본: 매일 03:00
     enabled: bool = True
     retention_count: int = 5    # 보관할 백업 수
     retention_days: int = 30    # 보관 기간 (일)
+    # 절전/앱 미실행으로 놓친 실행을 복귀 후 최대 1회 따라잡을지 (끄면 놓친 실행은 건너뛰고 기록만 남긴다)
+    catch_up_missed: bool = True
+    # 복원 리허설 (선택): 백업 직후 이 비운영 대상에 안전 복원(후보) → 검증 → 후보 정리. 터널 ID가 비어 있으면 꺼짐.
+    rehearsal_tunnel_id: str = ""
+    rehearsal_database: str = ""   # PostgreSQL 대상 데이터베이스 (비어 있으면 postgres)
+    rehearsal_schema: str = ""     # 대상 스키마 (MySQL은 데이터베이스). 이미 존재해야 하며 변경되지 않는다.
     last_run: Optional[str] = None  # ISO format
     next_run: Optional[str] = None  # ISO format
 
@@ -51,6 +58,7 @@ class ScheduleConfig:
         """딕셔너리에서 생성 (하위 호환성 지원)"""
         # 기존 설정에 새 필드가 없으면 기본값 적용
         defaults = {
+            'catch_up_missed': True,
             'task_type': 'backup',
             'sql_query': '',
             'result_format': 'csv',
@@ -79,6 +87,7 @@ class _ExecutionJob:
     """실행 큐에 올라가는 작업 단위 (스케줄 스냅샷 + 실행 후 처리 방식)"""
     schedule: ScheduleConfig
     update_next_run: bool
+    trigger: str = 'scheduled'  # scheduled | catch_up | manual
 
 
 @dataclass(frozen=True)
@@ -89,3 +98,5 @@ class _ResolvedConnection:
     user: str
     password: str
     engine: str
+    # 무인 실행이 직접 연 임시 터널을 백업이 끝나면 닫는 정리 콜백 (없으면 None)
+    release: Optional[Callable[[], None]] = field(default=None, compare=False, repr=False)
