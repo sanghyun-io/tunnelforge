@@ -77,6 +77,13 @@ impl Session {
     pub(crate) fn read_only(&self) -> bool {
         self.read_only
     }
+
+    pub(crate) fn engine(&self) -> &'static str {
+        match self.canceller {
+            Canceller::MySql { .. } => "mysql",
+            Canceller::PostgreSql { .. } => "postgresql",
+        }
+    }
 }
 
 pub(crate) struct JobCtl {
@@ -130,6 +137,9 @@ pub(crate) struct QuerySpec {
     pub(crate) max_rows: Option<u64>,
     pub(crate) max_bytes: Option<u64>,
     pub(crate) output: Option<OutputSpec>,
+    /// Run inside a server-enforced read-only transaction that is always rolled back
+    /// (`query.explain` with ANALYZE, which really executes the statement).
+    pub(crate) read_only_txn: bool,
 }
 
 impl QuerySpec {
@@ -151,6 +161,7 @@ impl QuerySpec {
             max_rows: num("max_rows"),
             max_bytes: num("max_bytes"),
             output: OutputSpec::from_payload(p)?,
+            read_only_txn: p.get("read_only_txn").and_then(Value::as_bool).unwrap_or(false),
         })
     }
 }
@@ -730,7 +741,7 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> JobRun {
         let mut adapter = lock(&session.adapter);
         let mut sink = Sink::new(&emit, &spec);
-        let exporting = spec.output.is_some();
+        let exporting = spec.output.is_some() || spec.read_only_txn;
         let begun = if exporting { begin_read_only(&mut adapter) } else { Ok(()) };
         let began = begun.is_ok();
         let mut result = match begun {
@@ -823,6 +834,11 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
             "message": "여러 결과 집합을 반환하는 문장은 지원하지 않습니다",
             "in_transaction": in_transaction
         }))),
+        Err(RunError::InTransaction(message)) if spec.read_only_txn => emit(base(json!({
+            "event": "error", "error_code": crate::explain::EXPLAIN_REFUSED_CODE,
+            "message": format!("진행 중인 트랜잭션이 있어 ANALYZE를 실행할 수 없습니다 (읽기 전용 트랜잭션을 시작할 수 없음): {message}"),
+            "in_transaction": in_transaction
+        }))),
         Err(RunError::InTransaction(message)) => emit(base(json!({
             "event": "error", "error_code": "export_session_in_transaction", "message": message,
             "in_transaction": in_transaction
@@ -831,6 +847,13 @@ pub(crate) fn run_job(session: Arc<Session>, ctl: Arc<JobCtl>, jobs: Jobs, spec:
             emit(base(json!({
                 "event": "error", "error_code": READ_ONLY_ERROR_CODE,
                 "message": format!("읽기 전용 세션에서는 데이터를 변경할 수 없습니다: {message}"),
+                "in_transaction": in_transaction
+            })))
+        }
+        Err(RunError::Message(message)) if spec.read_only_txn && is_read_only_violation(&message) => {
+            emit(base(json!({
+                "event": "error", "error_code": crate::explain::EXPLAIN_REFUSED_CODE,
+                "message": format!("ANALYZE는 쿼리를 실제로 실행하며, 이 쿼리는 데이터를 변경하려 해 읽기 전용 트랜잭션에서 거부되었습니다 (변경 사항은 없습니다): {message}"),
                 "in_transaction": in_transaction
             })))
         }

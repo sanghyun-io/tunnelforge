@@ -1,0 +1,105 @@
+{
+ "meta": {
+  "analyze": false,
+  "engine": "postgresql",
+  "format": "json"
+ },
+ "rows": [
+  {
+   "QUERY PLAN": [
+    {
+     "Plan": {
+      "Async Capable": false,
+      "Disabled": false,
+      "Node Type": "Sort",
+      "Parallel Aware": false,
+      "Plan Rows": 7,
+      "Plan Width": 12,
+      "Plans": [
+       {
+        "Async Capable": false,
+        "Disabled": false,
+        "Group Key": [
+         "a.grp"
+        ],
+        "Node Type": "Aggregate",
+        "Parallel Aware": false,
+        "Parent Relationship": "Outer",
+        "Partial Mode": "Simple",
+        "Plan Rows": 7,
+        "Plan Width": 12,
+        "Planned Partitions": 0,
+        "Plans": [
+         {
+          "Async Capable": false,
+          "Disabled": false,
+          "Hash Cond": "(b.a_id = a.id)",
+          "Inner Unique": true,
+          "Join Type": "Inner",
+          "Node Type": "Hash Join",
+          "Parallel Aware": false,
+          "Parent Relationship": "Outer",
+          "Plan Rows": 336,
+          "Plan Width": 4,
+          "Plans": [
+           {
+            "Alias": "b",
+            "Async Capable": false,
+            "Disabled": false,
+            "Node Type": "Seq Scan",
+            "Parallel Aware": false,
+            "Parent Relationship": "Outer",
+            "Plan Rows": 900,
+            "Plan Width": 4,
+            "Relation Name": "tf_b",
+            "Startup Cost": 0.0,
+            "Total Cost": 13.0
+           },
+           {
+            "Async Capable": false,
+            "Disabled": false,
+            "Node Type": "Hash",
+            "Parallel Aware": false,
+            "Parent Relationship": "Inner",
+            "Plan Rows": 112,
+            "Plan Width": 8,
+            "Plans": [
+             {
+              "Alias": "a",
+              "Async Capable": false,
+              "Disabled": false,
+              "Filter": "((name)::text ~~ 'n1%'::text)",
+              "Node Type": "Seq Scan",
+              "Parallel Aware": false,
+              "Parent Relationship": "Outer",
+              "Plan Rows": 112,
+              "Plan Width": 8,
+              "Relation Name": "tf_a",
+              "Startup Cost": 0.0,
+              "Total Cost": 5.75
+             }
+            ],
+            "Startup Cost": 5.75,
+            "Total Cost": 5.75
+           }
+          ],
+          "Startup Cost": 7.15,
+          "Total Cost": 22.55
+         }
+        ],
+        "Startup Cost": 24.23,
+        "Strategy": "Hashed",
+        "Total Cost": 24.3
+       }
+      ],
+      "Sort Key": [
+       "(count(*)) DESC"
+      ],
+      "Startup Cost": 24.39,
+      "Total Cost": 24.41
+     }
+    }
+   ]
+  }
+ ]
+}
