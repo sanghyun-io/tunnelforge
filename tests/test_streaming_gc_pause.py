@@ -132,3 +132,32 @@ def test_release_is_idempotent_and_never_goes_negative():
     assert gc.isenabled() is False and GcPause._holds == 1
     other.release()
     assert gc.isenabled() is True and GcPause._holds == 0
+
+
+def test_closing_a_real_dialog_mid_stream_restores_gc(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from src.ui.dialogs.sql_editor_dialog import SQLEditorDialog
+
+    monkeypatch.setattr(SQLEditorDialog, "refresh_databases", lambda self: None)
+    config_manager = MagicMock()
+    config_manager.get_tunnel_credentials.return_value = ("u", "p")
+    dialog = SQLEditorDialog(
+        None,
+        {"id": "t", "name": "n", "connection_mode": "direct", "environment": "development",
+         "remote_host": "127.0.0.1", "remote_port": 3306},
+        config_manager, MagicMock(),
+    )
+    dialog.worker = MagicMock()
+    dialog.worker.queries = ["SELECT 1"]
+    dialog.worker.isRunning.return_value = False  # a truthy MagicMock would open the close modal
+    for index in range(dialog.editor_tabs.count()):
+        tab = dialog.editor_tabs.widget(index)
+        if tab:
+            tab.is_modified = False
+    dialog._on_result_started(0, ["id"])
+    dialog._on_result_rows(0, [["1"]])
+    assert gc.isenabled() is False
+    dialog.close()
+    assert gc.isenabled() is True
+    dialog.deleteLater()
