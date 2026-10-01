@@ -362,3 +362,19 @@ def test_resolution_errors_are_recorded_as_failed_jobs(env):
     ok, message = env.scheduler._execute_backup(env.schedule())
     assert ok is False and "터널 설정을 찾을 수 없습니다" in message
     assert history_records()[0].status == jh.STATUS_FAILED
+
+
+def test_postgresql_backup_connects_to_the_schedule_database_and_records_it(env, monkeypatch):
+    seen = {}
+
+    class Capture(FakeExporter):
+        def __init__(self, config):
+            seen["database"], seen["engine"] = config.database, config.engine
+
+    FakeExporter.outcome = (True, "ok")
+    monkeypatch.setattr("src.exporters.rust_dump_exporter.RustDumpExporter", Capture)
+    env.config_manager.load_config.return_value = {"tunnels": [{"id": "t1", "db_engine": "postgresql", "name": "PG"}]}
+    schedule = env.schedule(database="sales")
+    assert env.scheduler._execute_backup(schedule)[0] is True
+    assert seen == {"database": "sales", "engine": "postgresql"}
+    assert history_records()[0].target == "sales.app"

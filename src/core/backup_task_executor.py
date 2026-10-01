@@ -45,6 +45,13 @@ class BackupTaskExecutor:
         self.resolve_connection = resolve_connection
         self.log_writer = log_writer
 
+    @staticmethod
+    def _target_label(schedule: ScheduleConfig) -> str:
+        """작업 기록의 대상 표시: PostgreSQL은 database.schema (database 미지정 일정은 postgres)."""
+        if schedule.database:
+            return f"{schedule.database}.{schedule.schema}"
+        return schedule.schema
+
     def _unique_output_subdir(self, schedule: ScheduleConfig) -> str:
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
         base = os.path.join(schedule.output_dir, f"{safe_folder_name(schedule.name)}_{timestamp}")
@@ -69,7 +76,7 @@ class BackupTaskExecutor:
         mode = (f"{TRIGGER_LABELS.get(trigger, trigger)} · "
                 f"{'선택 테이블 ' + str(len(schedule.tables)) + '개' if schedule.tables else '전체 스키마'} · 스레드 4")
         job_id = job_begin(KIND_SCHEDULED_BACKUP, profile_id=schedule.tunnel_id, profile_name=schedule.name,
-                           target=schedule.schema, mode=mode)
+                           target=self._target_label(schedule), mode=mode)
         resolved = None
         output_subdir = ""
         try:
@@ -93,6 +100,7 @@ class BackupTaskExecutor:
                 password=resolved.password,
                 schema=schedule.schema,
                 engine=resolved.engine,
+                database=schedule.database if resolved.engine == "postgresql" else "",
             )
 
             exporter = RustDumpExporter(config)

@@ -500,6 +500,31 @@ class BackupScheduler:
         )
         return resolved, ""
 
+    def list_databases(self, tunnel_id: str) -> Tuple[List[str], str]:
+        """PostgreSQL 터널의 접속 가능한 데이터베이스 목록 (UI 선택용). 반환: (목록, 오류 메시지)"""
+        resolved, error = self._resolve_connection(ScheduleConfig(id="", name="", tunnel_id=tunnel_id, schema=""))
+        if resolved is None:
+            return [], error
+        connector = None
+        try:
+            if resolved.engine != "postgresql":
+                return [], "PostgreSQL 터널이 아닙니다."
+            connector = self._make_connector(resolved.engine, resolved.host, resolved.port,
+                                             resolved.user, resolved.password)
+            ok, message = connector.connect()
+            if not ok:
+                return [], message
+            with connector.connection.cursor() as cursor:
+                cursor.execute("SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY 1")
+                return [row["datname"] for row in cursor.fetchall()], ""
+        except Exception as exc:
+            return [], str(exc)
+        finally:
+            if connector is not None:
+                connector.disconnect()
+            if resolved.release:
+                resolved.release()
+
     def _stop_tunnel_quietly(self, tunnel_id: str) -> None:
         """예약 실행이 직접 연 터널만 닫는다 (사용자가 열어 둔 터널은 건드리지 않는다)."""
         try:

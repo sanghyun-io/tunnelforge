@@ -98,9 +98,9 @@ def test_list_dialog_marks_legacy_sql_rows_as_unsupported_and_passes_the_interva
         captured = {}
 
         class Capture(ScheduleEditDialog):
-            def __init__(self, parent=None, tunnel_list=None, schedule=None, min_interval_minutes=15):
+            def __init__(self, parent=None, tunnel_list=None, schedule=None, min_interval_minutes=15, **kwargs):
                 captured["min"] = min_interval_minutes
-                super().__init__(parent, tunnel_list, schedule, min_interval_minutes)
+                super().__init__(parent, tunnel_list, schedule, min_interval_minutes, **kwargs)
 
             def exec(self):
                 return 0
@@ -116,3 +116,26 @@ def test_the_schedule_feature_is_exposed_for_backups_only():
     import src.ui.main_window as main_window
 
     assert main_window.SCHEDULE_FEATURE_ENABLED is True
+
+
+def test_postgresql_tunnels_pick_a_database_and_legacy_schedules_show_postgres(warnings):
+    engines = {"t1": "postgresql", "t2": "mysql"}
+    lister = MagicMock(return_value=(["app_db", "postgres"], ""))
+    legacy = ScheduleConfig(id="b1", name="n", tunnel_id="t1", schema="app", output_dir="C:/b")
+    dialog = ScheduleEditDialog(None, [("t1", "PG"), ("t2", "My")], schedule=legacy,
+                                tunnel_engines=engines, database_lister=lister)
+    try:
+        assert not dialog.database_row.isHidden() and dialog.database_combo.currentText() == "postgres"
+        dialog._load_databases()
+        assert [dialog.database_combo.itemText(i) for i in range(dialog.database_combo.count())] == ["app_db", "postgres"]
+        dialog.database_combo.setCurrentText("app_db")
+        dialog.cron_edit.setText("0 3 * * *")
+        dialog.schedule_tabs.setCurrentIndex(1)
+        dialog._save()
+        assert dialog.result_config.database == "app_db"
+        dialog.tunnel_combo.setCurrentIndex(1)  # MySQL tunnel: the field is hidden and not saved
+        assert dialog.database_row.isHidden()
+        dialog._save()
+        assert dialog.result_config.database == ""
+    finally:
+        dialog.close()

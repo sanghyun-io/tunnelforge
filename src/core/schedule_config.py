@@ -23,6 +23,7 @@ class ScheduleConfig:
     name: str
     tunnel_id: str              # 사용할 터널 ID
     schema: str                 # Export 대상 스키마
+    database: str = ""          # PostgreSQL 접속 데이터베이스 (비어 있으면 postgres, MySQL은 사용 안 함)
     tables: List[str] = field(default_factory=list)  # 빈 리스트 = 전체
     output_dir: str = ""        # 출력 디렉토리
     cron_expression: str = "0 3 * * *"  # 기본: 매일 03:00

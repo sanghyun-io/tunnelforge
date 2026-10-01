@@ -14,6 +14,7 @@ from src.ui.theme_manager import ThemeManager
 from src.ui.trust_prompts import TrustPrompter
 from src.ui.dialogs.preselected_connect_dialog import start_tunnel_with_progress
 from src.core.connection_trust import insecure_connection_warning
+from src.core.db_core_service import normalize_db_engine
 from src.ui.themes import ThemeColors
 from src.ui.widgets.tunnel_tree import TunnelTreeWidget
 from src.ui.dialogs.group_dialog import create_group_dialog, edit_group_dialog
@@ -1024,7 +1025,8 @@ class TunnelManagerUI(QMainWindow):
 
         from src.ui.dialogs.schedule_dialog import ScheduleListDialog
 
-        dialog = ScheduleListDialog(self, self.scheduler, tunnel_list)
+        tunnel_engines = {t['id']: normalize_db_engine(t.get('db_engine'), t.get('remote_port')) for t in self.tunnels}
+        dialog = ScheduleListDialog(self, self.scheduler, tunnel_list, tunnel_engines)
         dialog.schedule_changed.connect(self._update_schedule_run_menu)
         dialog.exec()
 
