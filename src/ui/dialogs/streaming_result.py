@@ -4,6 +4,7 @@ The worker thread streams row batches; each batch becomes one bounded GUI update
 `setRowCount` growth plus its cells) so the event loop stays responsive for 100k+ rows. Sorting,
 cell editing and "save" actions stay off until the result is complete.
 """
+import gc
 import time
 from collections import deque
 from typing import Any, List, Optional, Sequence
@@ -50,6 +51,28 @@ class StreamingResultMixin:
     """Methods mixed into SQLEditorDialog."""
 
     _streamed_tables = None
+    _gc_holds = 0
+    _gc_was_enabled = True
+
+    # The cyclic GC walks every live object; with ~600k table items a generation-2 pass stalls the
+    # GUI for 100+ ms (measured). Table items are not garbage cycles, so it is paused while grids
+    # fill and resumed when the last streaming grid is finished.
+    def _hold_gc(self, table) -> None:
+        if getattr(table, "_gc_held", False):
+            return
+        table._gc_held = True
+        if self._gc_holds == 0:
+            self._gc_was_enabled = gc.isenabled()
+            gc.disable()
+        self._gc_holds += 1
+
+    def _release_gc(self, table) -> None:
+        if not getattr(table, "_gc_held", False):
+            return
+        table._gc_held = False
+        self._gc_holds -= 1
+        if self._gc_holds == 0 and self._gc_was_enabled:
+            gc.enable()
 
     def _streams(self) -> dict:
         if self._streamed_tables is None:
@@ -71,6 +94,7 @@ class StreamingResultMixin:
         table._truncated = False
         table._pending = deque()
         table._flush_scheduled = False
+        self._hold_gc(table)
         table._result_number = self._result_counter
         self._streams()[idx] = table
         self._set_stream_tab_text(table)
@@ -136,6 +160,7 @@ class StreamingResultMixin:
             return None
         self._drain_stream(table)
         table._streaming = False
+        self._release_gc(table)
         count = table.rowCount()
         if error:
             state = "취소됨" if "취소" in error else "오류로 중단됨"

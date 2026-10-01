@@ -1,4 +1,5 @@
 """Result grid that fills while rows arrive + worker streaming signals (TF-STATUS-131)."""
+import gc
 import time
 from unittest.mock import MagicMock
 
@@ -24,6 +25,7 @@ def _dialog(monkeypatch):
         config_manager, MagicMock(),
     )
     dialog.worker = MagicMock()
+    dialog.worker.isRunning.return_value = False  # a truthy MagicMock would make closeEvent open a modal
     dialog.worker.queries = ["SELECT id, v FROM t"]
     dialog.history_manager = MagicMock()
     return dialog
@@ -126,6 +128,8 @@ def test_interrupted_worker_closes_open_grids(monkeypatch):
         assert "중단됨" in dialog.result_tabs.tabText(0)
         assert dialog.result_tabs.widget(0)._streaming is False
     finally:
+        dialog._finalize_all_streamed()
+        gc.enable()
         _close(dialog)
 
 
@@ -187,8 +191,9 @@ def test_worker_derives_columns_from_the_first_batch_when_no_columns_event():
 class _Producer(QThread):
     batch = pyqtSignal(int, list)
 
-    def __init__(self, batches, rows_per_batch, columns):
+    def __init__(self, batches, rows_per_batch, columns, pause_ms=0):
         super().__init__()
+        self._pause_ms = pause_ms
         self._row = [str(i) * 3 for i in range(columns)]
         self._batches = batches
         self._rows = rows_per_batch
@@ -196,6 +201,8 @@ class _Producer(QThread):
     def run(self):
         for _ in range(self._batches):
             self.batch.emit(0, [list(self._row) for _ in range(self._rows)])
+            if self._pause_ms:
+                self.msleep(self._pause_ms)
 
 
 def test_event_loop_stays_responsive_while_100k_rows_arrive(monkeypatch):
@@ -215,7 +222,8 @@ def test_event_loop_stays_responsive_while_100k_rows_arrive(monkeypatch):
         timer.setInterval(10)
         timer.timeout.connect(tick)
         timer.start()
-        producer = _Producer(batches=200, rows_per_batch=500, columns=6)  # 100,000 rows
+        # 100,000 rows at ~100k rows/s (one 500-row batch per 5 ms), faster than the core delivers
+        producer = _Producer(batches=200, rows_per_batch=500, columns=6, pause_ms=5)
         producer.batch.connect(dialog._on_result_rows)
         producer.start()
         deadline = time.monotonic() + 120
@@ -225,8 +233,12 @@ def test_event_loop_stays_responsive_while_100k_rows_arrive(monkeypatch):
         producer.wait()
         timer.stop()
         assert table.rowCount() == 100_000
+        assert gc.isenabled() is False, "GC is paused while the grid fills"
+        dialog._finalize_streamed_result(0)
+        assert gc.isenabled() is True, "GC is resumed when the result is complete"
         worst = max(gaps)
-        print(f"100k rows: {len(gaps)} timer ticks, worst event-loop gap {worst * 1000:.0f} ms")
+        top = sorted(gaps, reverse=True)[:5]
+        print(f"100k rows: {len(gaps)} timer ticks, worst event-loop gap {worst * 1000:.0f} ms, top5 {[round(g * 1000) for g in top]}")
         assert worst < 0.1, f"GUI event loop stalled {worst * 1000:.0f} ms while rows arrived"
     finally:
         _close(dialog)
