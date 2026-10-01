@@ -81,7 +81,7 @@ class EndpointForm(QGroupBox):
     # --- TLS (TF-STATUS-110): 수동 입력 host 도 검증 모드를 명시적으로 고른다 ---
     def _build_tls_rows(self, layout):
         self._tls_touched = False
-        self._tls_server_name = ""  # 터널 프로필에서 온 값 (호스트를 직접 고치면 폐기)
+        self._tls_name_from_tunnel = False  # 인증서 이름이 터널 프로필에서 온 값이면 True (호스트를 직접 고치면 폐기)
         self._tls_connection_mode = "direct"
         self.combo_tls = QComboBox()
         for mode in (TLS_MODES[2], TLS_MODES[1], TLS_MODES[0]):
@@ -101,6 +101,14 @@ class EndpointForm(QGroupBox):
         ca_layout.addWidget(self.btn_tls_ca)
         layout.addRow("CA 인증서:", self.tls_ca_widget)
 
+        self.input_tls_name = QLineEdit()
+        self.input_tls_name.setPlaceholderText("(선택) 인증서에 적힌 이름 - 비우면 Host 사용")
+        self.input_tls_name.setToolTip(
+            "IP 주소로 접속하는데 인증서가 DNS 이름으로 발급된 경우 그 이름을 입력하세요."
+        )
+        self.lbl_tls_name = QLabel("인증서 이름:")
+        layout.addRow(self.lbl_tls_name, self.input_tls_name)
+
         self.lbl_tls_warning = QLabel("")
         self.lbl_tls_warning.setWordWrap(True)
         self.lbl_tls_warning.setStyleSheet("color: #c0392b; font-weight: bold;")
@@ -118,8 +126,10 @@ class EndpointForm(QGroupBox):
         self._tls_touched = True
 
     def _on_host_edited(self, _text=""):
-        # 직접 입력한 호스트는 더 이상 선택했던 터널의 것이 아니다
-        self._tls_server_name = ""
+        # 직접 입력한 호스트는 더 이상 선택했던 터널의 것이 아니다 (직접 입력한 인증서 이름은 유지)
+        if self._tls_name_from_tunnel:
+            self.input_tls_name.clear()
+            self._tls_name_from_tunnel = False
         self._tls_connection_mode = "direct"
         if not self._tls_touched:
             self._apply_default_tls_mode()
@@ -134,6 +144,10 @@ class EndpointForm(QGroupBox):
     def _update_tls_state(self, *_args):
         verified = self.combo_tls.currentData() != TLS_DISABLE
         self.tls_ca_widget.setEnabled(verified and not self.require_tunnel)
+        # 이름 검증은 verify_full 에서만 의미가 있다
+        name_applies = self.combo_tls.currentData() == TLS_MODES[2]
+        self.lbl_tls_name.setEnabled(name_applies and not self.require_tunnel)
+        self.input_tls_name.setEnabled(name_applies and not self.require_tunnel)
         warning = insecure_connection_warning({
             "connection_mode": self._tls_connection_mode,
             "remote_host": self.input_host.text().strip() or "127.0.0.1",
@@ -146,7 +160,8 @@ class EndpointForm(QGroupBox):
         """선택한 터널 프로필의 TLS 설정을 폼에 반영한다 (프로필 = 정책의 원천)."""
         policy = resolve_tls_policy(config)
         self._tls_connection_mode = config.get("connection_mode", "ssh_tunnel")
-        self._tls_server_name = policy.server_name
+        self.input_tls_name.setText(policy.server_name)
+        self._tls_name_from_tunnel = bool(policy.server_name)
         self.combo_tls.setCurrentIndex(self.combo_tls.findData(policy.mode))
         self.input_tls_ca.setText(policy.ca_file)
         self._update_tls_state()
@@ -155,7 +170,9 @@ class EndpointForm(QGroupBox):
         return {
             "tls_mode": self.combo_tls.currentData(),
             "tls_ca_file": self.input_tls_ca.text().strip(),
-            "tls_server_name": self._tls_server_name,
+            "tls_server_name": (
+                self.input_tls_name.text().strip() if self.combo_tls.currentData() == TLS_MODES[2] else ""
+            ),
         }
 
     def _load_tunnels(self):
@@ -361,8 +378,12 @@ class EndpointForm(QGroupBox):
             self.input_database.setEnabled(enabled)
             self.input_schema.setEnabled(enabled)
             self.combo_tls.setEnabled(enabled)
-            self.input_tls_ca.setEnabled(enabled)
             self.btn_tls_ca.setEnabled(enabled)
+            if enabled:
+                self._update_tls_state()  # CA/이름 입력란은 선택한 모드에 맞춰 다시 켠다
+            else:
+                self.tls_ca_widget.setEnabled(False)
+                self.input_tls_name.setEnabled(False)
 
     def _prepare_selected_tunnel(self):
         data = self.combo_tunnel.currentData()
