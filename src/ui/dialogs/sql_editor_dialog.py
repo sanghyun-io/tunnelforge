@@ -2585,6 +2585,7 @@ class SQLEditorDialog(StreamingResultMixin, WorkspaceRecoveryMixin, ProductionSe
             self.worker.requestInterruption()
             self.worker.wait()
 
+        self._finalize_all_streamed()  # 수신 중이던 그리드/GC 일시정지 해제
         # 미커밋 쿼리 + 미저장 셀 편집 + 수정된 탭 확인
         warnings = []
         if self.pending_queries:

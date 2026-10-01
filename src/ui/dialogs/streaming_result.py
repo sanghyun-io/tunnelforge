@@ -5,7 +5,10 @@ The worker thread streams row batches; each batch becomes one bounded GUI update
 cell editing and "save" actions stay off until the result is complete.
 """
 import gc
+import threading
 import time
+import logging
+import weakref
 from collections import deque
 from typing import Any, List, Optional, Sequence
 
@@ -13,7 +16,44 @@ from PyQt6.QtCore import QCoreApplication, QEventLoop, QTimer
 from PyQt6.QtGui import QColor
 from PyQt6.QtWidgets import QHeaderView, QTableWidget, QTableWidgetItem
 
+logger = logging.getLogger(__name__)
 _NULL_COLOR = QColor("#888888")
+
+
+class GcPause:
+    """Process-wide, reference-counted pause of Python's cyclic GC.
+
+    With ~600k table items a generation-2 pass stalls the GUI for 100+ ms (measured), and table
+    items are not garbage cycles. Every grid that fills holds one handle; the collector is
+    re-enabled only when the last handle is released, and only if it was enabled before the first
+    one (a GC that was already disabled stays disabled). `release()` is idempotent.
+    """
+
+    _lock = threading.Lock()
+    _holds = 0
+    _was_enabled = True
+
+    def __init__(self):
+        self._released = False
+
+    @classmethod
+    def acquire(cls) -> "GcPause":
+        with cls._lock:
+            if cls._holds == 0:
+                cls._was_enabled = gc.isenabled()
+                gc.disable()
+            cls._holds += 1
+        return cls()
+
+    def release(self) -> None:
+        cls = type(self)
+        with cls._lock:
+            if self._released:
+                return
+            self._released = True
+            cls._holds -= 1
+            if cls._holds == 0 and cls._was_enabled:
+                gc.enable()
 # One GUI slice: batches are appended until this much time has passed, then the event loop runs
 # again (timers, repaints, input) before the next slice.
 FLUSH_BUDGET_SECONDS = 0.025
@@ -51,28 +91,17 @@ class StreamingResultMixin:
     """Methods mixed into SQLEditorDialog."""
 
     _streamed_tables = None
-    _gc_holds = 0
-    _gc_was_enabled = True
 
-    # The cyclic GC walks every live object; with ~600k table items a generation-2 pass stalls the
-    # GUI for 100+ ms (measured). Table items are not garbage cycles, so it is paused while grids
-    # fill and resumed when the last streaming grid is finished.
     def _hold_gc(self, table) -> None:
-        if getattr(table, "_gc_held", False):
-            return
-        table._gc_held = True
-        if self._gc_holds == 0:
-            self._gc_was_enabled = gc.isenabled()
-            gc.disable()
-        self._gc_holds += 1
+        # The handle is released on completion/cancel/error/close; weakref.finalize is the safety
+        # net for a grid that is destroyed (window closed) without being finished.
+        table._gc_hold = GcPause.acquire()
+        weakref.finalize(table, table._gc_hold.release)
 
     def _release_gc(self, table) -> None:
-        if not getattr(table, "_gc_held", False):
-            return
-        table._gc_held = False
-        self._gc_holds -= 1
-        if self._gc_holds == 0 and self._gc_was_enabled:
-            gc.enable()
+        hold = getattr(table, "_gc_hold", None)
+        if hold is not None:
+            hold.release()
 
     def _streams(self) -> dict:
         if self._streamed_tables is None:
@@ -158,9 +187,11 @@ class StreamingResultMixin:
         table = self._streams().pop(idx, None)
         if table is None:
             return None
-        self._drain_stream(table)
-        table._streaming = False
-        self._release_gc(table)
+        try:
+            self._drain_stream(table)
+            table._streaming = False
+        finally:
+            self._release_gc(table)
         count = table.rowCount()
         if error:
             state = "취소됨" if "취소" in error else "오류로 중단됨"
@@ -178,4 +209,7 @@ class StreamingResultMixin:
     def _finalize_all_streamed(self) -> None:
         """The worker ended: whatever is still open was interrupted."""
         for idx in list(self._streams()):
-            self._finalize_streamed_result(idx, error="중단됨")
+            try:
+                self._finalize_streamed_result(idx, error="중단됨")
+            except Exception:
+                logger.exception("streamed result cleanup failed")
