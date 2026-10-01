@@ -1,8 +1,14 @@
 """
 pytest 공용 fixtures
 """
-import pytest
 import os
+
+# 어떤 PyQt import 보다 먼저: 일부 테스트 파일만 설정하면 전체 실행 시 첫 QApplication 이 만들어지는
+# 순서에 따라 실제 화면에 대화상자가 뜬다. CI 가 다른 값을 주면 그것을 존중한다(setdefault).
+if not os.environ.get("QT_QPA_PLATFORM"):  # 미설정/빈 값만 채운다
+    os.environ["QT_QPA_PLATFORM"] = "offscreen"
+
+import pytest
 import json
 from pathlib import Path
 from unittest.mock import MagicMock, patch
