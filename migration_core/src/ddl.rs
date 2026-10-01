@@ -445,7 +445,7 @@ pub fn select_chunk_text_after_key_sql(
         .collect::<Vec<_>>()
         .join(", ");
     let where_clause = if let Some(values) = last_key_values {
-        let predicates = keyset_predicates(engine, &table.name, key_columns, values);
+        let predicates = keyset_predicates(engine, table, key_columns, values);
         if predicates.is_empty() {
             String::new()
         } else {
@@ -494,9 +494,21 @@ pub fn select_chunk_text_range_sql(
     )
 }
 
+/// Literal for a keyset comparison value. The cursor token is the text the SELECT projected, which for
+/// binary columns is the HEX of the bytes (`projected_text_columns_sql`). Comparing that text to the raw
+/// binary column compares bytes against ASCII hex digits, so the cursor skips and repeats rows (or stops
+/// advancing); binary keys must be decoded back to bytes.
+fn keyset_value_literal(engine: &str, table: &NormalizedTable, column: &str, value: &str) -> String {
+    let text = Value::String(value.to_string());
+    match table.columns.iter().find(|candidate| candidate.name == column) {
+        Some(found) if is_binary_type(&found.type_name) => sql_literal_for_column(engine, &found.type_name, &text),
+        _ => sql_literal(&text),
+    }
+}
+
 fn keyset_predicates(
     engine: &str,
-    table: &str,
+    table: &NormalizedTable,
     key_columns: &[String],
     values: &[String],
 ) -> Vec<String> {
@@ -507,14 +519,14 @@ fn keyset_predicates(
         for previous in 0..index {
             parts.push(format!(
                 "{} = {}",
-                quote_column_ref(engine, table, &key_columns[previous]),
-                sql_literal(&Value::String(values[previous].clone()))
+                quote_column_ref(engine, &table.name, &key_columns[previous]),
+                keyset_value_literal(engine, table, &key_columns[previous], &values[previous])
             ));
         }
         parts.push(format!(
             "{} > {}",
-            quote_column_ref(engine, table, &key_columns[index]),
-            sql_literal(&Value::String(values[index].clone()))
+            quote_column_ref(engine, &table.name, &key_columns[index]),
+            keyset_value_literal(engine, table, &key_columns[index], &values[index])
         ));
         predicates.push(format!("({})", parts.join(" AND ")));
     }
@@ -3266,5 +3278,81 @@ mod tests {
         assert!(columns
             .iter()
             .any(|column| column.name == "name" && column.unique));
+    }
+}
+
+#[cfg(test)]
+mod binary_keyset_tests {
+    use super::*;
+
+    fn column(name: &str, type_name: &str) -> NormalizedColumn {
+        NormalizedColumn {
+            name: name.to_string(),
+            type_name: type_name.to_string(),
+            default_value: None,
+            nullable: false,
+            primary_key: true,
+            unique: false,
+            comment: None,
+            default_is_expression: false,
+            on_update: None,
+        }
+    }
+
+    fn table(columns: Vec<NormalizedColumn>) -> NormalizedTable {
+        NormalizedTable {
+            name: "events".to_string(),
+            columns,
+            indexes: Vec::new(),
+            foreign_keys: Vec::new(),
+            table_collation: None,
+            auto_increment: None,
+            comment: None,
+            checks: Vec::new(),
+        }
+    }
+
+    fn after_key(engine: &str, table: &NormalizedTable, keys: &[&str], values: &[&str]) -> String {
+        let keys: Vec<String> = keys.iter().map(|key| key.to_string()).collect();
+        let values: Vec<String> = values.iter().map(|value| value.to_string()).collect();
+        select_chunk_text_after_key_sql(engine, table, &keys, Some(&values), 10)
+    }
+
+    #[test]
+    fn binary_key_cursor_decodes_the_hex_token_back_to_bytes() {
+        let mysql_table = table(vec![column("id", "binary(16)")]);
+        let sql = after_key("mysql", &mysql_table, &["id"], &["A1B2C3D4E5F60718293A4B5C6D7E8F90"]);
+        assert!(sql.contains("`events`.`id` > X'A1B2C3D4E5F60718293A4B5C6D7E8F90'"), "{sql}");
+        assert!(!sql.contains("> 'A1B2"), "a text literal compares ASCII digits with raw bytes: {sql}");
+
+        let varbinary = table(vec![column("id", "varbinary(20)")]);
+        assert!(after_key("mysql", &varbinary, &["id"], &["00FF"]).contains("> X'00FF'"));
+
+        let pg_table = table(vec![column("id", "bytea")]);
+        let sql = after_key("postgresql", &pg_table, &["id"], &["a1b2c3"]);
+        assert!(sql.contains("\"events\".\"id\" > decode('a1b2c3', 'hex')"), "{sql}");
+    }
+
+    #[test]
+    fn composite_keys_decode_only_the_binary_part() {
+        let mixed = table(vec![column("grp", "int"), column("id", "binary(16)")]);
+        let sql = after_key("mysql", &mixed, &["grp", "id"], &["3", "FF00"]);
+        assert!(sql.contains("(`events`.`grp` > '3') OR (`events`.`grp` = '3' AND `events`.`id` > X'FF00')"), "{sql}");
+        let sql = after_key("postgresql", &table(vec![column("id", "bytea"), column("seq", "bigint")]), &["id", "seq"], &["ab", "9"]);
+        assert!(sql.contains("(\"events\".\"id\" > decode('ab', 'hex')) OR (\"events\".\"id\" = decode('ab', 'hex') AND \"events\".\"seq\" > '9')"), "{sql}");
+    }
+
+    #[test]
+    fn non_binary_key_cursor_is_unchanged() {
+        let ints = table(vec![column("id", "bigint")]);
+        assert!(after_key("mysql", &ints, &["id"], &["42"]).contains("`events`.`id` > '42'"));
+        let text = table(vec![column("code", "varchar(20)")]);
+        assert!(after_key("postgresql", &text, &["code"], &["it's"]).contains("\"events\".\"code\" > 'it''s'"));
+    }
+
+    #[test]
+    fn a_key_column_missing_from_the_table_falls_back_to_a_text_literal() {
+        let ints = table(vec![column("id", "bigint")]);
+        assert!(after_key("mysql", &ints, &["other"], &["1"]).contains("`events`.`other` > '1'"));
     }
 }
