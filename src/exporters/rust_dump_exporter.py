@@ -19,6 +19,7 @@ from src.core.constants import (
     DEFAULT_LOCAL_HOST,
     DEFAULT_MYSQL_PORT,
 )
+from src.core.error_report_codes import classify_error_code
 from src.core.foreign_key_resolver import ForeignKeyResolver, OrphanRecordInfo
 from src.core.logger import get_logger
 from src.exporters.dump_progress import DumpEventCallbacks, TableProgressTracker, emit_core_event
@@ -196,6 +197,11 @@ class _RustDumpClientBase:
         self.config = config
         self.facade = facade if facade is not None else DbCoreFacade()
         self._owns_facade = facade is None
+        self.last_error_code: Optional[str] = None
+
+    def _remember_error_code(self, exc: BaseException) -> None:
+        """Keep only the allowlisted failure code for anonymous error reports."""
+        self.last_error_code = classify_error_code(getattr(exc, "error_code", None), str(exc))
 
     def _endpoint(self, schema: str) -> DbEndpoint:
         return DbEndpoint(
@@ -387,8 +393,10 @@ class RustDumpExporter(_RustDumpClientBase):
                 self._write_metadata(output_dir, schema, "full", None)
             return success, message
         except DbCoreServiceError as exc:
+            self._remember_error_code(exc)
             return False, f"Rust DB Core export 오류: {exc}"
         except Exception as exc:
+            self._remember_error_code(exc)
             return False, f"Export 오류: {exc}"
         finally:
             _shutdown_owned_facade(self.facade, self._owns_facade)
@@ -441,8 +449,10 @@ class RustDumpExporter(_RustDumpClientBase):
                 return True, message, final_tables
             return False, message, []
         except DbCoreServiceError as exc:
+            self._remember_error_code(exc)
             return False, f"Rust DB Core export 오류: {exc}", []
         except Exception as exc:
+            self._remember_error_code(exc)
             return False, f"Export 오류: {exc}", []
         finally:
             _shutdown_owned_facade(self.facade, self._owns_facade)
@@ -486,8 +496,17 @@ def _mark_non_done_import_results_error(
             table_status_callback(table, next_status, detail)
 
 
+# Rust Core refusals raised before any target table is changed.
+_OPERATION_SCOPED_IMPORT_CODES = (
+    "incompatible_surviving_fk:",
+    "target_dependency_preflight_failed:",
+    "ddl_preflight_failed:",
+    "preflight_surviving_fk:",
+)
+
+
 def _is_operation_scoped_import_error(message: str) -> bool:
-    return message.lstrip().startswith("preflight_surviving_fk:")
+    return message.lstrip().startswith(_OPERATION_SCOPED_IMPORT_CODES)
 
 
 class RustDumpImporter(_RustDumpClientBase):
@@ -656,10 +675,12 @@ class RustDumpImporter(_RustDumpClientBase):
                     progress_callback(warning_line)
             return not bool(views_failed), message, import_results
         except DbCoreServiceError as exc:
+            self._remember_error_code(exc)
             if not _is_operation_scoped_import_error(str(exc)):
                 _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
             return False, f"Rust DB Core import 오류: {exc}", import_results
         except Exception as exc:
+            self._remember_error_code(exc)
             _mark_non_done_import_results_error(import_results, str(exc), table_status_callback)
             return False, f"Import 오류: {exc}", import_results
         finally:

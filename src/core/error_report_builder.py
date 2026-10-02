@@ -7,6 +7,7 @@ import threading
 import unicodedata
 import uuid
 
+from src.core.error_report_codes import is_classified_error_code
 from src.core.error_report_environment import collect_environment
 from src.core.error_report_sanitizer import sanitize_error_text
 from src.core.error_report_schema import REPORT_SCHEMA_VERSION, validate_report_payload
@@ -196,15 +197,21 @@ def build_error_report(
     error_message,
     exception=None,
     db_server_version=None,
+    error_code=None,
 ) -> dict:
-    """Build and validate one schema-v1 privacy-allowlisted report."""
+    """Build and validate one schema-v1 privacy-allowlisted report.
+
+    ``error_code`` is only accepted when it is a value produced by
+    ``classify_error_code`` (fixed Rust Core codes and server error numbers).
+    """
 
     environment = collect_environment()
     kind = _normalized_text(operation_kind).lower()
     engine = _normalized_text(db_engine).lower()
     normalized_phase = _normalized_text(phase).lower()
     exception_class = _exception_class(exception)
-    error_code = _error_code(exception)
+    classified_code = error_code if is_classified_error_code(error_code) else None
+    error_code = _error_code(exception) or classified_code
     frames = _application_frames(exception)
 
     operation = {"kind": kind, "db_engine": engine, "phase": normalized_phase}

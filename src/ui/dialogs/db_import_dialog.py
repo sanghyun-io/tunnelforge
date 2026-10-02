@@ -1751,11 +1751,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         """Submit a privacy-allowlisted report in the background."""
         if not self.config_manager:
             return
-        self._start_error_report_worker(
-            operation_kind="import",
-            db_engine=getattr(self.connector, "engine", ""),
-            phase="dump.import",
-        )
+        report_args = {
+            "operation_kind": "import",
+            "db_engine": getattr(self.connector, "engine", ""),
+            "phase": "dump.import",
+        }
+        error_code = getattr(getattr(self, "worker", None), "error_code", None)
+        if error_code:
+            report_args["error_code"] = error_code
+        self._start_error_report_worker(**report_args)
 
     def select_failed_tables(self):
         """실패한 테이블 모두 선택"""

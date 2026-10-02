@@ -19,6 +19,22 @@ GitHub installation identity. The complete schema and sanitizer behavior are
 implemented in the client reporting modules and tested against the shared
 contract fixtures.
 
+### Failure codes
+
+Export/Import reports carry an optional `error_code` so different causes get
+different fingerprints. It is derived locally (`src/core/error_report_codes.py`)
+and is limited to:
+
+- a fixed Rust DB Core code such as `INCOMPATIBLE_SURVIVING_FK` or `LOAD_FAILED`
+  (only codes on the built-in list; the identifier after the code, which can be a
+  table or constraint name, is never used),
+- a server error number, `MYSQL-1822` or PostgreSQL SQLSTATE `PG-23503`,
+- or both, as `LOAD_FAILED:MYSQL-1822`.
+
+The builder drops any other value, so table, schema, host or user names cannot
+reach a report through this field. The relay already accepts and fingerprints
+`error_code`; no relay change is required.
+
 ## Local Preview and Health
 
 The Settings preview is read-only: it builds and displays the local sanitized
