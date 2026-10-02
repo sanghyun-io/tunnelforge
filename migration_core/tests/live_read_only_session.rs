@@ -197,7 +197,7 @@ fn cases() -> Vec<Case> {
             allowed: vec!["SELECT COUNT(*) AS c FROM t", "EXPLAIN SELECT * FROM t", "SHOW TABLES", "ANALYZE TABLE t"],
             sleep: "SELECT SLEEP(30) AS s",
             state_sql: "SELECT CONCAT((SELECT COUNT(*) FROM t), '/', (SELECT SUM(v) FROM t), '/', \
-                (SELECT GROUP_CONCAT(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_schema = 'tfdb'), '/', \
+                (SELECT GROUP_CONCAT(table_name ORDER BY table_name) FROM information_schema.tables WHERE table_schema = DATABASE()), '/', \
                 (SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = 'ro_db'), '/', \
                 (SELECT COUNT(*) FROM mysql.user WHERE user = 'ro_probe'), '/', @@global.max_connections) AS state",
         });
@@ -258,6 +258,10 @@ fn cases() -> Vec<Case> {
 }
 
 fn skip_if_none(cases: &[Case]) -> bool {
+    // The CI live gate sets TF_LIVE_REQUIRED: both engines must be configured there.
+    if std::env::var_os("TF_LIVE_REQUIRED").is_some() {
+        assert_eq!(cases.len(), 2, "TF_LIVE_REQUIRED is set but TF_QUERY_LIVE_MYSQL_* / TF_QUERY_LIVE_PG_* are incomplete");
+    }
     if cases.is_empty() {
         eprintln!("skipped: TF_QUERY_LIVE_MYSQL_* / TF_QUERY_LIVE_PG_* not set");
     }
