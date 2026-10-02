@@ -2,6 +2,7 @@
 import json
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from src.core.error_report_codes import classify_error_code
 from src.exporters.rust_dump_exporter import (
     DEFAULT_DUMP_COMPRESSION, RustDumpConfig, RustDumpExporter, RustDumpImporter
 )
@@ -31,6 +32,7 @@ class RustDumpWorker(QThread):
         self.kwargs = kwargs
         self._cancel_requested = False
         self._active_runner = None
+        self.error_code = None
         # Core refusal (error_code unsupported_objects) of the last export:
         # {"objects": [...], "bypassable": bool}. Set before `finished` fires.
         self.export_refusal = None
@@ -98,6 +100,7 @@ class RustDumpWorker(QThread):
                     self.import_finished.emit(False, message, {})
                 self.finished.emit(False, message)
             else:
+                self.error_code = classify_error_code(getattr(e, "error_code", None), str(e))
                 self.finished.emit(False, str(e))
         finally:
             self._active_runner = None
@@ -138,6 +141,7 @@ class RustDumpWorker(QThread):
             allow_incomplete=self.kwargs.get('allow_incomplete', False),
         )
         self.export_refusal = getattr(exporter, "last_refusal", None)
+        self.error_code = getattr(exporter, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)
         self.finished.emit(success, msg)
 
@@ -163,6 +167,7 @@ class RustDumpWorker(QThread):
             allow_incomplete=self.kwargs.get('allow_incomplete', False),
         )
         self.export_refusal = getattr(exporter, "last_refusal", None)
+        self.error_code = getattr(exporter, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)
         self.finished.emit(success, msg)
 
@@ -186,6 +191,7 @@ class RustDumpWorker(QThread):
             self._on_table_chunk_progress,
             use_source_timezone=self.kwargs.get('use_source_timezone', True),
         )
+        self.error_code = getattr(importer, "last_error_code", None)
         success, msg = self._is_cancelled_message(success, msg)
         self.import_finished.emit(success, msg, results)
         self.finished.emit(success, msg)
