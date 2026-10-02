@@ -39,6 +39,7 @@ class ErrorReportingWorker(QThread):
         exception: Optional[BaseException] = None,
         db_server_version=None,
         relay_url: Optional[str] = None,
+        error_code: Optional[str] = None,
     ):
         super().__init__()
         self.config_manager = config_manager
@@ -47,6 +48,7 @@ class ErrorReportingWorker(QThread):
         self.phase = phase
         self.exception = exception
         self.db_server_version = db_server_version
+        self.error_code = error_code
         self.relay_url = (
             ERROR_REPORT_RELAY_URL if relay_url is None else relay_url
         )
@@ -83,6 +85,7 @@ class ErrorReportingWorker(QThread):
                 error_message=safe_error_message,
                 exception=self.exception,
                 db_server_version=self.db_server_version,
+                **({"error_code": self.error_code} if self.error_code is not None else {}),
             )
             if not policy.is_submission_token_current(self._consent_token):
                 self._emit_consent_changed()
@@ -156,6 +159,7 @@ class ErrorReportingMixin:
         phase: str,
         exception: Optional[BaseException] = None,
         db_server_version=None,
+        error_code: Optional[str] = None,
     ):
         worker_args = {
             "operation_kind": operation_kind,
@@ -166,6 +170,8 @@ class ErrorReportingMixin:
             worker_args["exception"] = exception
         if db_server_version is not None:
             worker_args["db_server_version"] = db_server_version
+        if error_code is not None:
+            worker_args["error_code"] = error_code
         worker = None
         lifecycle_connected = False
         retained_workers = None

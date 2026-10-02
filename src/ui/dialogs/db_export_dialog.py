@@ -1563,11 +1563,15 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         """Submit a privacy-allowlisted report in the background."""
         if not self.config_manager:
             return
-        self._start_error_report_worker(
-            operation_kind="export",
-            db_engine=getattr(self.connector, "engine", ""),
-            phase="dump.run",
-        )
+        report_args = {
+            "operation_kind": "export",
+            "db_engine": getattr(self.connector, "engine", ""),
+            "phase": "dump.run",
+        }
+        error_code = getattr(getattr(self, "worker", None), "error_code", None)
+        if error_code:
+            report_args["error_code"] = error_code
+        self._start_error_report_worker(**report_args)
 
     def _export_table_duration_seconds(self, table_name: str) -> float:
         start = self.export_table_started_at.get(table_name)

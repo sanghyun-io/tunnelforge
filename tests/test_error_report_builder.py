@@ -237,6 +237,7 @@ def test_task2_modules_import_only_the_explicit_local_allowlist():
             "hashlib",
             "json",
             "re",
+            "src.core.error_report_codes",
             "src.core.error_report_environment",
             "src.core.error_report_sanitizer",
             "src.core.error_report_schema",
@@ -244,6 +245,7 @@ def test_task2_modules_import_only_the_explicit_local_allowlist():
             "unicodedata",
             "uuid",
         },
+        "src/core/error_report_codes.py": {"re", "typing"},
     }
 
     for relative_path, allowed in allowed_imports.items():
