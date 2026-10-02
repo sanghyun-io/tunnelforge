@@ -118,6 +118,7 @@ jobs:
             --test live_binary_keyset \
             --test live_keyset_pk_matrix \
             --test live_mysql_bit \
+            --test live_cross_engine_types \
             --test live_dump_cross_engine \
             --test live_schema_fidelity \
             --test live_import_policy \
