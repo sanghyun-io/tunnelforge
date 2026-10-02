@@ -30,15 +30,21 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | Mode | Effect and constraints |
 | --- | --- |
 | `safe` (default) | Restores the complete same-engine dump into a new owned namespace, verifies rows, values and schema, then offers reviewed replacement when supported. Existing namespaces remain unchanged during preparation. |
-| `replace` | Drops and recreates only the selected dump tables, then loads data and finalizes indexes/FKs/views. Existing selected-table data is lost. |
+| `replace` | Like mysqldump: each selected dump table is dropped and immediately recreated and loaded, one table at a time, then indexes/FKs/views are finalized. Existing selected-table data is lost. A failure leaves at most the table in progress missing or partially loaded; tables not yet reached keep their original data, but may have lost FKs to already replaced parents (reported). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
 | `merge` | Appends dump rows to compatible existing tables (creates missing tables). It is not synchronization, deduplication, upsert, or change-data capture. Existing keys/FKs can reject rows. Existing MySQL targets must use InnoDB. |
 
 Target-only tables are preserved. A target-only FK referencing an imported parent
-requires the recreated parent to retain a compatible key/type contract. MySQL
-secondary UNIQUE keys are created with the table so surviving children do not
-prevent its recreation. Unsupported target actions, including MySQL `SET DEFAULT`
-foreign keys, fail preflight.
+requires the recreated parent to retain a compatible key/type contract, including
+children in other schemas. MySQL creates only the primary key and full-column
+UNIQUE keys with the table, so a surviving child FK must reference one of them;
+FKs bound to a non-unique or prefix index (possible on MySQL 8.0 or with
+`restrict_fk_on_non_standard_key=OFF`) are refused before any table is dropped,
+because re-creating the parent would otherwise fail (ERROR 1822/6125) right after
+the drop. FKs between selected tables are dropped from the not-yet-replaced child
+just before its parent is replaced and recreated from the dump after loading.
+Unsupported target actions, including MySQL `SET DEFAULT` foreign keys, fail
+preflight.
 
 ### Safe restoration and destination names
 
@@ -139,7 +145,10 @@ See the [design and verification contract](superpowers/specs/2026-09-28-safe-res
   earlier successful chunks and already running parallel workers may remain after
   a later failure. No new chunks are scheduled once a worker failure is known.
 - Failed/unattempted/data-loaded tables are reported separately. Data-loaded does
-  not mean all deferred indexes/FKs or final verification completed.
+  not mean all deferred indexes/FKs or final verification completed. A failed
+  `replace` reports `dropped_not_restored_tables` (dropped, not fully reloaded),
+  `unattempted_tables` (original data kept) and `dropped_foreign_keys`; the Import
+  failure dialog lists them, including FKs removed from untouched original tables.
 - UI subset retry is disabled: retrying only unfinished tables could leave earlier
   tables without deferred constraints. Inspect the partial target and rerun the
   full original selected scope from the dump with explicit confirmation. Never

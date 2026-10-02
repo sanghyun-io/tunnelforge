@@ -707,6 +707,24 @@ impl MigrationAdapter for LiveAdapter {
     }
 }
 
+impl LiveAdapter {
+    /// Like `create_table`, but an existing table is an error. Replace imports
+    /// drop the table first, so a surviving table must never receive rows.
+    pub(crate) fn create_new_table(&mut self, ddl: &str) -> Result<(), String> {
+        if ddl.trim().is_empty() {
+            return Ok(());
+        }
+        match self {
+            Self::MySql(conn) => conn
+                .query_drop(ddl)
+                .map_err(|err| format!("mysql create table error: {err}")),
+            Self::PostgreSql(client) => client
+                .batch_execute(ddl)
+                .map_err(|err| format_postgres_error("postgresql create table error", &err)),
+        }
+    }
+}
+
 pub(crate) fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
     mysql::OptsBuilder::new()
         // Pools are private to a single worker/adapter; driver defaults would
