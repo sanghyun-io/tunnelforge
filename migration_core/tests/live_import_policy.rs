@@ -432,13 +432,17 @@ fn mysql_import_failure_persists_confirmed_changes_and_unattempted_tables() {
     std::fs::write(output.join("_tunnelforge_import_report.json"), b"{\"success\":true}").unwrap();
     let imported = run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
     let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let untouched = conn.query_first::<u64,_>(format!("SELECT value FROM {} WHERE id=1", tables[2]));
     for table in &tables { conn.query_drop(format!("DROP TABLE IF EXISTS {table}")).unwrap(); }
     std::fs::remove_dir_all(output).unwrap();
     assert!(!success(&imported));
     assert_eq!(report["success"],false);
     assert_eq!(report["status"],"failed");
     assert_eq!(report["phase"],"dump_import_data");
-    assert_eq!(report["dropped_tables"].as_array().unwrap().len(),3);
+    // mysqldump처럼 테이블마다 DROP→CREATE: 실패 이후 테이블은 원본을 유지한다.
+    assert_eq!(report["dropped_tables"],json!([tables[0],tables[1]]));
+    assert_eq!(report["dropped_not_restored_tables"],json!([tables[1]]));
+    assert_eq!(untouched.ok().flatten(),Some(17),"a table after the failure lost its original data");
     assert_eq!(report["data_loaded_tables"],json!([tables[0]]));
     assert_eq!(report["failed_tables"],json!([tables[1]]));
     assert_eq!(report["unattempted_tables"],json!([tables[2]]));
@@ -446,7 +450,124 @@ fn mysql_import_failure_persists_confirmed_changes_and_unattempted_tables() {
     assert_eq!(report["target"]["engine"],"mysql");
     assert!(report["error"].as_str().unwrap().contains("not-an-integer"));
     assert!(!report.to_string().contains("tf_local_test"));
-    assert_eq!(imported.iter().filter(|event|event["event"]=="target_change" && event["status"]=="completed").count(),3);
+    assert_eq!(imported.iter().filter(|event|event["event"]=="target_change" && event["status"]=="completed").count(),2);
+    let summary = imported.iter().filter(|event|event["event"]=="import_report").last().unwrap();
+    assert_eq!(summary["dropped_not_restored_tables"],json!([tables[1]]));
+    assert_eq!(summary["unattempted_tables"],json!([tables[2]]));
+}
+
+#[test]
+fn mysql_replace_refuses_surviving_fk_bound_to_post_load_index_before_any_drop() {
+    // MySQL creates non-unique indexes after the data load, so re-creating the
+    // parent would fail (ERROR 1822/6125) right after it was dropped.
+    let Some(endpoint) = endpoint() else { return };
+    let mut conn = connect(&endpoint);
+    let parent = unique("tf_fk_nonunique_parent");
+    let child = unique("tf_fk_nonunique_child");
+    conn.query_drop(format!("CREATE TABLE {parent}(id INT PRIMARY KEY, code VARCHAR(20) NOT NULL, KEY idx_code(code)) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("INSERT INTO {parent} VALUES(1,'a')")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_fk_nonunique"));
+    let exported = run("dump.run", json!({"source":endpoint,"tables":[parent],"output_dir":output,"data_format":"jsonl","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    // MySQL 8.4 refuses new FKs on non-unique keys by default; 8.0 has no such variable.
+    let _ = conn.query_drop("SET SESSION restrict_fk_on_non_standard_key=OFF");
+    conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, code VARCHAR(20), CONSTRAINT fk_{child} FOREIGN KEY(code) REFERENCES {parent}(code)) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("INSERT INTO {child} VALUES(7,'a')")).unwrap();
+    let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
+    let report: Value = serde_json::from_slice(&std::fs::read(output.join("_tunnelforge_import_report.json")).unwrap()).unwrap();
+    let parent_row = conn.query_first::<String,_>(format!("SELECT code FROM {parent} WHERE id=1"));
+    conn.query_drop(format!("DROP TABLE {child}")).unwrap();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {parent}")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert!(!success(&imported));
+    assert_eq!(parent_row.ok().flatten().as_deref(), Some("a"), "parent was dropped before the import failed");
+    assert_eq!(report["dropped_tables"], json!([]));
+    let error = imported.iter().find(|event| event["event"] == "error").unwrap();
+    assert!(error["message"].as_str().unwrap().contains("incompatible_surviving_fk"), "{error}");
+}
+
+#[test]
+fn mysql_replace_rebinds_import_set_child_after_parent_key_type_change() {
+    // Before per-table replace, re-creating the parent while the original child
+    // FK (INT) was alive raised ERROR 3780; the in-set FK is now dropped first.
+    let Some(endpoint) = endpoint() else { return };
+    let mut conn = connect(&endpoint);
+    let parent = unique("tf_rebind_parent");
+    let child = unique("tf_rebind_child");
+    conn.query_drop(format!("CREATE TABLE {parent}(id BIGINT PRIMARY KEY) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, parent_id BIGINT, CONSTRAINT fk_{child} FOREIGN KEY(parent_id) REFERENCES {parent}(id)) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("INSERT INTO {parent} VALUES(5000000000)")).unwrap();
+    conn.query_drop(format!("INSERT INTO {child} VALUES(1,5000000000)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_rebind"));
+    let exported = run("dump.run", json!({"source":endpoint,"tables":[parent,child],"output_dir":output,"data_format":"jsonl","threads":1,"mysql_snapshot_mode":"single_connection"}));
+    assert!(success(&exported), "{exported:?}");
+    conn.query_drop(format!("DROP TABLE {child}")).unwrap();
+    conn.query_drop(format!("DROP TABLE {parent}")).unwrap();
+    conn.query_drop(format!("CREATE TABLE {parent}(id INT PRIMARY KEY) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("CREATE TABLE {child}(id INT PRIMARY KEY, parent_id INT, CONSTRAINT fk_{child} FOREIGN KEY(parent_id) REFERENCES {parent}(id)) ENGINE=InnoDB")).unwrap();
+    conn.query_drop(format!("INSERT INTO {parent} VALUES(1)")).unwrap();
+    conn.query_drop(format!("INSERT INTO {child} VALUES(9,1)")).unwrap();
+    let imported = run("dump.import", json!({"target":endpoint,"input_dir":output,"mode":"replace","threads":1}));
+    let joined = conn.query_first::<u64,_>(format!("SELECT COUNT(*) FROM {child} c JOIN {parent} p ON c.parent_id=p.id WHERE p.id=5000000000"));
+    let fks = conn.query_first::<u64,_>(format!("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME='{child}' AND REFERENCED_TABLE_NAME='{parent}'"));
+    conn.query_drop(format!("DROP TABLE IF EXISTS {child}")).unwrap();
+    conn.query_drop(format!("DROP TABLE IF EXISTS {parent}")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert!(success(&imported), "{imported:?}");
+    assert_eq!(joined.ok().flatten(), Some(1));
+    assert_eq!(fks.ok().flatten(), Some(1), "dump FK was not recreated");
+    let dropped_fk = imported.iter().any(|event| event["event"] == "target_change" && event["action"] == "drop_foreign_key" && event["table"] == child.as_str());
+    assert!(dropped_fk, "the original in-set child FK was not dropped before replacing its parent");
+}
+
+#[test]
+fn postgres_replace_drops_import_set_child_fk_before_parent() {
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_per_table");
+    let endpoint = Endpoint { engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone()), tls: Default::default() };
+    let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test").dbname("tf_test").connect(postgres::NoTls).unwrap();
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.parent(id INT PRIMARY KEY); CREATE TABLE {schema}.child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_child_parent REFERENCES {schema}.parent(id)); INSERT INTO {schema}.parent VALUES(1); INSERT INTO {schema}.child VALUES(10,1)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_per_table"));
+    assert!(success(&run("dump.run",json!({"source":endpoint,"output_dir":output,"data_format":"jsonl","threads":1}))));
+    admin.batch_execute(&format!("INSERT INTO {schema}.parent VALUES(2); INSERT INTO {schema}.child VALUES(20,2)")).unwrap();
+    let imported = run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace"}));
+    let rows:i64 = admin.query_one(&format!("SELECT COUNT(*) FROM {schema}.child c JOIN {schema}.parent p ON p.id=c.parent_id"),&[]).unwrap().get(0);
+    let fks:i64 = admin.query_one("SELECT COUNT(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid=c.connamespace WHERE c.contype='f' AND n.nspname=$1",&[&schema]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert!(success(&imported), "{imported:?}");
+    assert_eq!(rows,1);
+    assert_eq!(fks,1);
+    assert!(imported.iter().any(|event| event["event"]=="target_change" && event["action"]=="drop_foreign_key" && event["table"]=="child"));
+}
+
+#[test]
+fn postgres_replace_failure_keeps_unreached_child_and_reports_its_dropped_fk() {
+    use sha2::{Digest, Sha256};
+    let Ok(host) = std::env::var("TF_POSTGRES_HOST") else { return };
+    let schema = unique("tf_pg_per_table_fail");
+    let endpoint = Endpoint { engine:"postgresql".into(),host:host.clone(),port:5432,user:"postgres".into(),password:"tf_local_test".into(),database:"tf_test".into(),schema:Some(schema.clone()), tls: Default::default() };
+    let mut admin = postgres::Config::new().host(&host).user("postgres").password("tf_local_test").dbname("tf_test").connect(postgres::NoTls).unwrap();
+    admin.batch_execute(&format!("CREATE SCHEMA {schema}; CREATE TABLE {schema}.parent(id INT PRIMARY KEY); CREATE TABLE {schema}.child(id INT PRIMARY KEY, parent_id INT CONSTRAINT fk_child_parent REFERENCES {schema}.parent(id)); INSERT INTO {schema}.parent VALUES(1); INSERT INTO {schema}.child VALUES(10,1)")).unwrap();
+    let output = std::env::temp_dir().join(unique("tf_pg_per_table_fail"));
+    assert!(success(&run("dump.run",json!({"source":endpoint,"output_dir":output,"data_format":"jsonl","compression":"none","threads":1}))));
+    let path = output.join("_tunnelforge_dump.json");
+    let mut manifest: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let table = manifest["tables"].as_array_mut().unwrap().iter_mut().find(|table| table["name"]=="parent").unwrap();
+    let bytes = b"{\"id\":\"not-an-integer\"}\n";
+    std::fs::write(output.join(table["path"].as_str().unwrap()).join("chunk_000001.jsonl"), bytes).unwrap();
+    table["chunk_sha256"]["chunk_000001.jsonl"] = json!(format!("{:x}", Sha256::digest(bytes)));
+    std::fs::write(path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+    let imported = run("dump.import",json!({"target":endpoint,"input_dir":output,"mode":"replace"}));
+    let child_rows:i64 = admin.query_one(&format!("SELECT COUNT(*) FROM {schema}.child"),&[]).unwrap().get(0);
+    admin.batch_execute(&format!("DROP SCHEMA {schema} CASCADE")).unwrap();
+    std::fs::remove_dir_all(output).unwrap();
+    assert!(!success(&imported));
+    assert_eq!(child_rows, 1, "the unreached child lost its original rows");
+    let summary = imported.iter().filter(|event| event["event"]=="import_report").last().unwrap();
+    assert_eq!(summary["dropped_not_restored_tables"], json!(["parent"]));
+    assert_eq!(summary["unattempted_tables"], json!(["child"]));
+    assert_eq!(summary["dropped_foreign_keys"], json!([{"table":"child","constraint":"fk_child_parent","referenced_table":"parent"}]));
 }
 
 #[test]

@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-09-29
 
-Current shipping version: `v2.11.1` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
+Current shipping version: `v2.11.2` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -855,6 +855,7 @@ Commands run locally:
 
 | Date | Scope | Command | Result | Notes |
 | --- | --- | --- | --- | --- |
+| 2026-10-02 | Per-table replace import (139) | Rust lib `cargo test --lib`; full `pytest -q`; live CI set (`live_roundtrip`, `live_binary_keyset`, `live_dump_cross_engine`, `live_schema_fidelity`, `live_import_policy`, `live_foreign_key_actions`, `live_export_contract`, `live_fault_injection`, `live_safe_restore`, `live_backup_lifecycle`, `safe_promote_`, `safe_restore_digest`) in a Linux container against disposable MySQL 8.4 / PostgreSQL 18.4, plus `live_import_policy mysql_` against MySQL 8.0 | Rust lib 328 passed; pytest 3314 passed / 27 skipped; live set all passed (live_import_policy 18); MySQL 8.0 12 passed | The three new MySQL assertions fail on main a9db474 (old code dropped the parent, then failed: data loss reproduced on 8.4) and pass after the change. Manual repro: a surviving FK on a non-unique index makes the re-created parent fail with ERROR 1822 on 8.0.46 and 8.4.11. |
 | 2026-10-01 | `v2.11.1` protected publication closure / TF-STATUS-138 | PR #291 protected checks and merge; approved `create-release-tag.yml` run `36863713426`; approved `release.yml` run `36863796869`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `36860929479` and `36860929387` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `461fcf10c19a105127e26c63cf5344b117ddf77b`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.11.1` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.11.1`. TF-STATUS-138 is closed. |
 | 2026-10-01 | `v2.11.0` protected publication closure / TF-STATUS-136 | PR #289 protected checks and merge; approved `create-release-tag.yml` run `36855961668`; approved `release.yml` run `36856033043`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `36853359837` and `36853359859` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `b4f9ce4a9ccc73165308fddf1cc1d66dfbc8b049`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.11.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.11.0`. TF-STATUS-136 is closed. |
 | 2026-10-01 | `v2.10.0` protected publication closure / TF-STATUS-134 | PR #284 protected checks and merge; approved `create-release-tag.yml` run `36843581566`; approved `release.yml` run `36843653917`; annotated-tag object/peeled-commit inspection; draft asset/digest and checksum-sidecar inspection; stable/latest publication and live `UpdateChecker` | PR runs `36840495536` and `36840495674` passed the required Python, Rust Core, version, support-tracking, and internal/external macOS arm64/x86_64 gates; merge commit `e56ca80a1eb15972b027d0b3fa429ec2e3ac0ef7`; tag peels to that exact commit; release run built and verified Windows plus unsigned macOS arm64/x86_64 artifacts; all 10 release assets have GitHub SHA-256 digests and all four macOS sidecars match | `v2.10.0` is stable/latest at `https://github.com/sanghyun-io/tunnelforge/releases/tag/v2.10.0`. TF-STATUS-134 is closed. |
@@ -2872,6 +2873,7 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-139 | High | fixed_pending_full_verify | Rust Core dump.import replace / data safety | Advanced `replace`/`recreate` dropped every selected table up front and stopped on the first error without rollback (2026-09-28 Staging incident). Now mysqldump-style per table: in-set child FKs referencing a parent are dropped just before it, then DROP -> CREATE (strict) -> load; a failure leaves at most the table in progress missing or partial and unreached tables keep their data. Surviving-FK preflight now requires a primary or full-column UNIQUE key at CREATE time (non-unique/prefix index FK reproduced as ERROR 1822 after the drop on MySQL 8.0/8.4), covers other-schema children and `lower_case_table_names`; the failure dialog lists lost/untouched tables and FKs removed from original tables | Merge through the protected PR (CI live gate) and publish; the safe-restore-backed "overwrite" default (option C) is the follow-up |
 | TF-STATUS-138 | High | closed | Versioned release | v2.11.1 published stable/latest via PR #291 and approved workflows; 10 asset digests, four macOS sidecars and live updater (2.11.0 -> 2.11.1) verified; release notes ask users to re-export backups of binary primary-key tables | Preserve exact-head checks and immutable tag |
 | TF-STATUS-137 | High | closed | Export/migration correctness | Keyset cursors compared hex-projected binary keys as text: `dump.run` silently wrote duplicated/missing rows for BINARY/VARBINARY/BYTEA (incl. composite) primary keys on both engines and MySQL->PostgreSQL migration failed after the first chunk. Fixed by decoding binary key tokens in predicates plus a cursor-progress guard that aborts on non-advancing keys; live regression `live_binary_keyset` added to the CI live gate (PR #291, supersedes #109) | Backups of binary-key tables taken with <= 2.11.0 may be incomplete and must be re-taken; PostgreSQL bytea -> MySQL key length mapping remains a separate limitation |
 | TF-STATUS-136 | Medium | closed | Versioned release | v2.11.0 published stable/latest via PR #289 and approved workflows; 10 asset digests, four macOS sidecars and live updater (2.10.0 -> 2.11.0) verified; release notes explain re-enabled scheduled backups and unattended trust rules | Preserve exact-head checks and immutable tag |
@@ -3013,9 +3015,13 @@ Next action:
 
 ## Recommended Execution Order
 
-Current state (2026-10-01): v2.11.1 (TF-STATUS-138) fixes silent export corruption
-for binary primary keys (137); affected backups taken with <= 2.11.0 must be re-taken.
-The commercial-readiness P1/P2 list is implemented; next work is driven by field reports.
+Current state (2026-10-02): PM agenda after v2.11.1 -> (1) per-table replace import and
+stricter surviving-FK preflight (139, this change), (2) privacy-allowlisted error codes in
+automatic reports so field reports become diagnosable, (3) run the TLS/query-control/
+read-only live tests in the CI gate, (4) "overwrite" backed by safe restore + automatic
+swap with `replace` kept as an always-visible advanced option (user decision 2026-10-02).
+v2.11.1 (TF-STATUS-138) fixed silent export corruption for binary primary keys (137);
+affected backups taken with <= 2.11.0 must be re-taken.
 Real Mac and managed-provider validation stay deferred by user decision.
 
 Current execution priority (2026-09-29):
@@ -3162,6 +3168,7 @@ The historical release-preservation checklist follows.
 
 | Date | Session Summary | Files Touched | Verification |
 | --- | --- | --- | --- |
+| 2026-10-02 | PM review set the next agenda; closed GitHub #170 (fixed by #171) and #249/#252 (undiagnosable pre-2.6 auto-report buckets), moved #116 to backlog. Redesigned advanced replace import to mysqldump-style per-table DROP/CREATE, tightened the surviving-FK preflight, surfaced dropped/untouched tables in the failure dialog; a 3-lens review with adversarial verification found partition FK clones, other-schema FKs, `lower_case_table_names` and a composite-key fallback, all fixed. | `migration_core/src/{import,dump_format,adapters}.rs`, `migration_core/tests/live_import_policy.rs`, `src/ui/dialogs/db_import_dialog.py`, `src/core/i18n/legacy_translate.py`, `tests/test_db_import_dialog.py`, `docs/export_import_policy.md`, canonical tracker | See the per-table replace verification row. |
 | 2026-10-01 | Revisited stale PR #109 and found its binary-key keyset bug still on main; reproduced it live as silent dump corruption, fixed it with a progress guard and a CI live test (#291), and prepared patch v2.11.1. | Canonical tracker, verification log | See the binary-key verification row. |
 | 2026-10-01 | Continued autonomously: stabilized the flaky responsiveness test (#287), added worker backpressure (#286), and shipped scheduled backups with restore rehearsal (#288 via #289). Prepared v2.11.0 from #289. | Canonical tracker, verification log, execution order | See the v2.11.0 verification row. |
 | 2026-10-01 | Ran the v2.10.0 package autonomously per user goal: incremental grid (#283, GC pause made process-wide after review), job list (#281), execution plan (#280 with read-only ANALYZE after review, editor hook #284), dialog polish and the offscreen-Qt test guard (#282, fixes on-screen test dialogs). A background CI poll was reaped under memory pressure and not restarted. | Canonical tracker, verification log, execution order | See the v2.10.0 verification row. |

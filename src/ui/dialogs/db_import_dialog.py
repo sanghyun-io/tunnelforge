@@ -78,7 +78,9 @@ def _capture_import_audit(audit: dict, event: dict):
         for key in ("status", "report_path"):
             if isinstance(event.get(key), str):
                 audit[key] = event[key]
-
+        for key in ("dropped_tables", "dropped_not_restored_tables", "unattempted_tables", "dropped_foreign_keys"):
+            if isinstance(event.get(key), list):
+                audit[key] = event[key]
 
     if str(event.get("event", "")).startswith("safe_restore") or event.get("candidate_target"):
         for key in ("original_target", "candidate_target"):
@@ -94,6 +96,35 @@ def _capture_import_audit(audit: dict, event: dict):
         for key in ("restore_id", "report_path", "plan_digest"):
             if isinstance(event.get(key), str):
                 audit[key] = event[key]
+
+
+def _names_preview(names: list, limit: int = 10) -> str:
+    shown = ", ".join(str(name) for name in names[:limit])
+    if len(names) > limit:
+        shown += translate_text(" 외 {}개").format(len(names) - limit)
+    return shown
+
+
+def _replace_failure_details(audit: dict) -> str:
+    """Which tables a failed per-table replace left empty, and which kept their data."""
+    lines = []
+    lost = [name for name in audit.get("dropped_not_restored_tables") or [] if isinstance(name, str)]
+    kept = [name for name in audit.get("unattempted_tables") or [] if isinstance(name, str)]
+    if lost:
+        lines.append(translate_text("삭제 후 복원되지 않은 테이블: {}").format(_names_preview(lost)))
+    if kept:
+        lines.append(translate_text("원본 데이터를 유지한 테이블(미실행): {}").format(_names_preview(kept)))
+    # A child that was never dropped (unattempted, or failed before its own DROP)
+    # still holds its original rows but lost the FK to an already replaced parent.
+    dropped = set(audit.get("dropped_tables") or [])
+    unlinked = sorted({
+        f"{fk.get('table')}.{fk.get('constraint')}"
+        for fk in audit.get("dropped_foreign_keys") or []
+        if isinstance(fk, dict) and isinstance(fk.get("table"), str) and fk["table"] not in dropped
+    })
+    if unlinked:
+        lines.append(translate_text("원본 테이블에서 제거된 외래 키: {}").format(_names_preview(unlinked)))
+    return "\n".join(lines)
 
 
 def _promotion_review_text(plan: dict, profile: dict) -> str:
@@ -645,10 +676,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         # 2. Replace selected tables; failure cannot roll back the whole restore.
         mode_replace_layout = QVBoxLayout()
         self.radio_replace = QRadioButton("고급: 전체 교체 Import (선택 테이블 삭제 후 재생성)")
-        self.radio_replace.setToolTip("선택한 테이블의 기존 구조와 데이터를 삭제합니다. 실패해도 자동으로 되돌리지 않습니다.")
+        self.radio_replace.setToolTip("mysqldump처럼 선택한 테이블을 하나씩 삭제한 직후 다시 만듭니다. 실패해도 자동으로 되돌리지 않습니다.")
         mode_replace_desc = QLabel(
-            "   선택한 테이블을 삭제한 후 Dump의 구조와 데이터로 다시 만듭니다.\n"
-            "   ⚠️ 기존 데이터가 손실되며, 실패 시 일부만 복원될 수 있습니다.\n"
+            "   mysqldump처럼 선택한 테이블을 하나씩 삭제한 직후 Dump의 구조와 데이터로 다시 만듭니다.\n"
+            "   ⚠️ 실패하면 진행 중이던 테이블은 없거나 일부만 적재된 채 남고, 아직 차례가 오지 않은 테이블은 원본 데이터를 유지합니다.\n"
             "   자동으로 되돌리지 않습니다. 실행 전 대상 백업을 확인하세요."
         )
         mode_replace_desc.setStyleSheet("color: #b45309; font-size: 10pt; margin-left: 20px;")
@@ -1178,7 +1209,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if self._get_selected_import_mode() in ("replace", "recreate"):
             reply = QMessageBox.question(
                 self, "기존 대상 삭제 확인",
-                "선택한 기존 테이블과 데이터를 삭제하고 다시 만듭니다. 실패해도 자동으로 되돌리지 않습니다. 안전 복원 대신 기존 대상을 직접 변경하시겠습니까?",
+                "선택한 기존 테이블을 하나씩 삭제하고 다시 만듭니다. 실패하면 진행 중이던 테이블은 없거나 일부만 적재된 채 남으며 자동으로 되돌리지 않습니다. 안전 복원 대신 기존 대상을 직접 변경하시겠습니까?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1699,17 +1730,17 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             else:
                 if self.last_import_mode == "safe":
                     QMessageBox.warning(self, "안전 복원 실패", self.label_status.text() + "\n\n" + message)
-                elif error_count > 0:
-                    QMessageBox.warning(
-                        self, "Import 실패",
-                        translate_text("❌ Import 중 오류가 발생했습니다.\n\n"
-                        "성공: {}개 테이블\n"
-                        "실패: {}개 테이블\n\n"
-                        "미실행: {}개 테이블\n\n"
-                        "대상 데이터를 확인한 후 원래 범위로 전체 Import를 다시 시작하세요.").format(done_count, error_count, blocked_count)
-                    )
                 else:
-                    QMessageBox.warning(self, "Import 실패", f"❌ {message}")
+                    details = _replace_failure_details(getattr(self, "import_audit", {}))
+                    if error_count > 0:
+                        text = translate_text("❌ Import 중 오류가 발생했습니다.\n\n"
+                            "성공: {}개 테이블\n"
+                            "실패: {}개 테이블\n\n"
+                            "미실행: {}개 테이블\n\n"
+                            "대상 데이터를 확인한 후 원래 범위로 전체 Import를 다시 시작하세요.").format(done_count, error_count, blocked_count)
+                    else:
+                        text = f"❌ {message}"
+                    QMessageBox.warning(self, "Import 실패", f"{text}\n\n{details}" if details else text)
 
                 self._report_error_anonymously()
 

@@ -130,6 +130,7 @@ struct ImportJournal {
     loaded: Vec<String>,
     current_table: Option<String>,
     pending_drop: Option<String>,
+    dropped_foreign_keys: Vec<Value>,
     rows_imported: u64,
     chunks_imported: u64,
     safe_context: Option<Value>,
@@ -143,6 +144,8 @@ impl ImportJournal {
             "success": false, "status": status, "mode": self.mode, "target": self.target,
             "phase": self.phase, "planned_tables": self.planned,
             "dropped_tables": self.dropped, "data_loaded_tables": self.loaded,
+            "dropped_not_restored_tables": self.dropped.iter().filter(|name| !self.loaded.contains(*name)).collect::<Vec<_>>(),
+            "dropped_foreign_keys": self.dropped_foreign_keys,
             "failed_tables": failed, "unattempted_tables": unattempted,
             "pending_drop_table": self.pending_drop,
             "drop_outcome_unknown": self.pending_drop.is_some(),
@@ -187,7 +190,7 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
             "database": endpoint.database, "schema": endpoint_schema(&endpoint)}),
         mode: mode.into(), phase: "dump_import_validation".into(), planned: Vec::new(),
         load_attempted: BTreeSet::new(), dropped: Vec::new(), loaded: Vec::new(),
-        current_table: None, pending_drop: None, rows_imported: 0, chunks_imported: 0,
+        current_table: None, pending_drop: None, dropped_foreign_keys: Vec::new(), rows_imported: 0, chunks_imported: 0,
         safe_context,
     };
     // Replacing a prior success report is a prerequisite for starting a new attempt.
@@ -217,7 +220,11 @@ fn dump_import_with_context<F: FnMut(Value)>(request: &Request, safe_context: Op
         emit(json!({"event":"import_report", "request_id":request.request_id, "status":"failed", "report_path":report_path, "report_write_failed":true, "message":error}));
         return Err(match result { Err(original) => format!("{original}; failure report could not be persisted: {error}"), Ok(_) => format!("Import data was applied, but its completion report could not be persisted: {error}") });
     }
-    emit(json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path}));
+    let mut summary = json!({"event":"import_report", "request_id":request.request_id, "status":report["status"], "report_path":report_path});
+    for key in ["phase", "dropped_tables", "dropped_not_restored_tables", "failed_tables", "unattempted_tables", "dropped_foreign_keys", "drop_outcome_unknown", "post_load_completed"] {
+        summary[key] = report[key].clone();
+    }
+    emit(summary);
     result
 }
 
@@ -365,11 +372,9 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
             &import_schema,
             &mut adapter,
             &target_schema,
-            journal,
-            request.request_id.clone(),
-            &mut emit,
         )?;
 
+        let planned_set = tables.iter().map(|table| table.name.clone()).collect::<BTreeSet<_>>();
         for (index, table_manifest) in tables.iter().enumerate() {
             let table = manifest
                 .schema
@@ -385,16 +390,24 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
                 "current": index + 1,
                 "total": table_total
             }));
-            // replace/recreate의 DROP은 루프 진입 전에 일괄(자식 우선)로 끝냈다.
-            // 여기서는 생성과 적재만 수행한다.
             let ddl = &table_ddls[&table.name];
             journal.current_table = Some(table.name.clone());
             journal.load_attempted.insert(table.name.clone());
             journal.phase = "dump_import_create".into();
             journal.checkpoint()?;
-            adapter
-                .create_table(table, ddl)
-                .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
+            if matches!(mode, "replace" | "recreate") {
+                // mysqldump처럼 테이블마다 DROP 직후 CREATE한다. 실패해도 이 테이블만
+                // 비고, 아직 차례가 오지 않은 테이블은 원본 데이터를 유지한다.
+                replace_target_table(&mut adapter, &target_schema, &table.name, &planned_set,
+                    journal, request.request_id.clone(), &mut emit)?;
+                adapter
+                    .create_new_table(ddl)
+                    .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
+            } else {
+                adapter
+                    .create_table(table, ddl)
+                    .map_err(|err| dump_import_ddl_error("create_table", &table.name, &err))?;
+            }
 
             journal.phase = "dump_import_data".into();
             journal.checkpoint()?;
@@ -513,27 +526,20 @@ fn execute_owned_ddl_probe(
     ))
 }
 
-/// replace/recreate 모드일 때 import 전에 대상 테이블을 재생성 가능한 상태로 만든다.
+/// replace/recreate 모드일 때 대상 테이블을 바꾸기 전에 막을 수 있는 실패를 먼저 거부한다.
 ///
-/// (1) Surviving-FK preflight (MySQL 전용): import set 밖의 타겟 테이블과 그 FK는
-///     그대로 둔다. 새 부모 정의의 타입/charset/collation/index가 기존 FK 계약과
-///     달라지는 경우만 타겟을 손대기 전에 명확한 에러로 차단한다.
-///
-/// (2) Drop-all-then-create-all 순서: import set 내부의 모든 대상 테이블을 자식 우선
-///     (역의존성) 순서로 먼저 DROP한 뒤 루프에서 생성한다. 이렇게 하지 않고 테이블별로
-///     즉시 DROP→CREATE 하면, 부모를 재생성하는 시점에 아직 DROP되지 않은 자식의 FK가
-///     살아 있어 동일한 ERROR 3780을 유발한다.
+/// Surviving-FK preflight (MySQL 전용): import set 밖의 타겟 테이블과 그 FK는 그대로 둔다.
+/// 새 부모 정의의 타입/charset/collation/생성 시점 키가 기존 FK 계약과 달라지는 경우만
+/// 타겟을 손대기 전에 명확한 에러로 차단한다. 실제 DROP은 import 루프에서 테이블마다
+/// CREATE 직전에 수행한다(`replace_target_table`).
 ///
 /// merge 모드에서는 기존 MySQL 대상의 트랜잭션 지원 여부만 확인한다.
-fn prepare_import_target<F: FnMut(Value)>(
+fn prepare_import_target(
     mode: &str,
     tables: &[DumpTableManifest],
     import_schema: &NormalizedSchema,
     adapter: &mut LiveAdapter,
     target_schema: &str,
-    journal: &mut ImportJournal,
-    request_id: Option<String>,
-    emit: &mut F,
 ) -> Result<(), String> {
     if !matches!(mode, "replace" | "recreate") {
         if let LiveAdapter::MySql(conn) = adapter {
@@ -561,28 +567,81 @@ fn prepare_import_target<F: FnMut(Value)>(
         ));
     }
 
-    // tables는 parent-first(dependency order)이므로 rev()는 child-first가 된다.
-    // foreign_key_checks=0이 이미 켜져 있어 역순 DROP은 안전하다.
-    for table_manifest in tables.iter().rev() {
-        journal.current_table = Some(table_manifest.name.clone());
-        if !import_target_table_exists(adapter, target_schema, &table_manifest.name)? {
-            journal.current_table = None;
-            continue;
-        }
-        journal.pending_drop = Some(table_manifest.name.clone());
-        journal.checkpoint()?;
-        adapter
-            .execute_sql(&drop_table_sql(adapter.engine(), &table_manifest.name))
-            .map_err(|err| dump_import_ddl_error("drop_table", &table_manifest.name, &err))?;
-        journal.dropped.push(table_manifest.name.clone());
-        journal.pending_drop = None;
-        emit(json!({"event":"target_change", "request_id":request_id, "phase":"dump_import_prepare",
-            "action":"drop_table", "status":"completed", "table":table_manifest.name,
-            "report_path":dump_import_report_path(&journal.input_path)?.display().to_string()}));
-        journal.checkpoint()?;
-    }
-    journal.current_table = None;
     Ok(())
+}
+
+/// 테이블 하나를 교체 가능한 상태로 만든다. import set 안의 다른(아직 원본인) 테이블이 이
+/// 테이블을 참조하는 FK만 먼저 떼고 테이블을 DROP한다. 그 자식들도 차례가 오면 교체되고
+/// post-load가 덤프 정의로 FK를 다시 만든다. 떼지 않으면 부모를 다시 만들 때 원본 자식의
+/// FK가 다시 묶이며 ERROR 3780/6125(MySQL)나 DROP 거부(PostgreSQL)가 난다.
+fn replace_target_table<F: FnMut(Value)>(
+    adapter: &mut LiveAdapter,
+    target_schema: &str,
+    table: &str,
+    planned: &BTreeSet<String>,
+    journal: &mut ImportJournal,
+    request_id: Option<String>,
+    emit: &mut F,
+) -> Result<(), String> {
+    if !import_target_table_exists(adapter, target_schema, table)? {
+        return Ok(());
+    }
+    let report_path = dump_import_report_path(&journal.input_path)?.display().to_string();
+    for (child, constraint) in incoming_import_set_foreign_keys(adapter, target_schema, table, planned)? {
+        let engine = adapter.engine();
+        let drop_keyword = if engine == "mysql" { "FOREIGN KEY" } else { "CONSTRAINT" };
+        let sql = format!("ALTER TABLE {} DROP {drop_keyword} {}", quote_ident(engine, &child), quote_ident(engine, &constraint));
+        adapter.execute_sql(&sql)
+            .map_err(|err| dump_import_ddl_error("drop_foreign_key", &format!("{child}.{constraint}"), &err))?;
+        journal.dropped_foreign_keys.push(json!({"table": child, "constraint": constraint, "referenced_table": table}));
+        journal.checkpoint()?;
+        emit(json!({"event":"target_change", "request_id":request_id, "phase":journal.phase,
+            "action":"drop_foreign_key", "status":"completed", "table":child, "constraint":constraint,
+            "report_path":report_path}));
+    }
+    journal.pending_drop = Some(table.to_string());
+    journal.checkpoint()?;
+    adapter
+        .execute_sql(&drop_table_sql(adapter.engine(), table))
+        .map_err(|err| dump_import_ddl_error("drop_table", table, &err))?;
+    journal.dropped.push(table.to_string());
+    journal.pending_drop = None;
+    journal.checkpoint()?;
+    emit(json!({"event":"target_change", "request_id":request_id, "phase":journal.phase,
+        "action":"drop_table", "status":"completed", "table":table, "report_path":report_path}));
+    Ok(())
+}
+
+/// `parent`를 참조하는 같은 스키마 import set 테이블의 FK `(child, constraint)` 목록.
+/// 자기 참조 FK는 테이블과 함께 사라지므로 제외한다.
+fn incoming_import_set_foreign_keys(
+    adapter: &mut LiveAdapter, schema: &str, parent: &str, planned: &BTreeSet<String>,
+) -> Result<Vec<(String, String)>, String> {
+    let mut fold_case = false;
+    let rows: Vec<(String, String)> = match adapter {
+        LiveAdapter::MySql(conn) => {
+            fold_case = mysql_folds_table_names(conn)?;
+            conn.exec(
+                "SELECT TABLE_NAME, CONSTRAINT_NAME FROM information_schema.REFERENTIAL_CONSTRAINTS \
+                 WHERE CONSTRAINT_SCHEMA=? AND UNIQUE_CONSTRAINT_SCHEMA=? AND REFERENCED_TABLE_NAME=? AND TABLE_NAME<>? \
+                 ORDER BY TABLE_NAME, CONSTRAINT_NAME",
+                (schema, schema, parent, parent),
+            ).map_err(|err| format!("target foreign key inspection failed: {err}"))?
+        }
+        LiveAdapter::PostgreSql(client) => client.query(
+            "SELECT child.relname::text, c.conname::text FROM pg_constraint c \
+             JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace cn ON cn.oid=child.relnamespace \
+             JOIN pg_class parent ON parent.oid=c.confrelid JOIN pg_namespace pn ON pn.oid=parent.relnamespace \
+             WHERE c.contype='f' AND c.conparentid=0 AND pn.nspname=$1 AND cn.nspname=$1 AND parent.relname=$2 AND child.oid<>parent.oid \
+             ORDER BY 1, 2",
+            &[&schema, &parent],
+        ).map_err(|err| format!("target foreign key inspection failed: {err}"))?
+            .iter().map(|row| (row.get(0), row.get(1))).collect(),
+    };
+    // Partition clones (conparentid<>0) go away with their root constraint.
+    Ok(rows.into_iter().filter(|(child, _)| {
+        planned.contains(child) || fold_case && planned.iter().any(|name| name.eq_ignore_ascii_case(child))
+    }).collect())
 }
 
 fn import_target_table_exists(adapter: &mut LiveAdapter, schema: &str, table: &str) -> Result<bool, String> {
@@ -610,19 +669,17 @@ fn validate_postgres_drop_dependencies(adapter: &mut LiveAdapter, schema: &str, 
         let names=views.iter().map(|row|format!("{}.{}",row.get::<_,String>(0),row.get::<_,String>(1))).collect::<Vec<_>>();
         return Err(fail(format!("Dependent views: {}",names.join(", "))));
     }
-    let positions=tables.iter().rev().enumerate().map(|(position,table)|(table.name.as_str(),position)).collect::<BTreeMap<_,_>>();
+    let planned=tables.iter().map(|table|table.name.as_str()).collect::<BTreeSet<_>>();
     let keys=client.query(
         "SELECT child_ns.nspname,child.relname,parent.relname,c.conname FROM pg_constraint c JOIN pg_class child ON child.oid=c.conrelid JOIN pg_namespace child_ns ON child_ns.oid=child.relnamespace JOIN pg_class parent ON parent.oid=c.confrelid JOIN pg_namespace parent_ns ON parent_ns.oid=parent.relnamespace WHERE c.contype='f' AND parent_ns.nspname=$1 AND parent.relname=ANY($2::text[])",
         &[&schema,&names],
     ).map_err(|err|fail(format!("Foreign key inspection failed: {err}")))?;
     for row in keys {
         let child_schema:String=row.get(0);let child:String=row.get(1);let parent:String=row.get(2);let constraint:String=row.get(3);
-        let child_position=positions.get(child.as_str());
-        if child_schema!=schema || child_position.is_none() {
+        // Import-set children lose this FK just before the parent is replaced
+        // (replace_target_table); only target-only children would block DROP.
+        if child_schema!=schema || !planned.contains(child.as_str()) {
             return Err(fail(format!("Target-only foreign key {child_schema}.{child}.{constraint} references {parent}")));
-        }
-        if child!=parent && child_position>positions.get(parent.as_str()) {
-            return Err(fail(format!("Existing foreign key {constraint} requires a different table drop order")));
         }
     }
     Ok(())

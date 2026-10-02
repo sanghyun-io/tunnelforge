@@ -483,50 +483,54 @@ fn imported_mysql_column_fidelity(
     fidelity
 }
 
+/// MySQL re-binds a surviving child FK when the parent is re-created, so the
+/// referenced key must exist at CREATE TABLE time. Only the primary key and
+/// full-column UNIQUE keys are emitted inline (ddl.rs generate_table_ddl);
+/// non-unique and prefix indexes arrive post-load and would fail with ERROR 6125.
+/// Column-level `primary_key`/`unique` flags are not used: they are set for every
+/// member of a composite key.
 fn imported_table_has_referenced_index(table: &NormalizedTable, columns: &[String]) -> bool {
+    let requested = columns.iter().map(String::as_str).collect::<Vec<_>>();
     let primary_columns = table
         .columns
         .iter()
         .filter(|column| column.primary_key)
         .map(|column| column.name.as_str())
         .collect::<Vec<_>>();
-    let requested = columns.iter().map(String::as_str).collect::<Vec<_>>();
     primary_columns.starts_with(&requested)
         || table.indexes.iter().any(|index| {
-            index
-                .columns
-                .iter()
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .starts_with(&requested)
+            index.unique
+                && index.column_prefixes.iter().take(requested.len()).all(Option::is_none)
+                && index.columns.iter().map(String::as_str).collect::<Vec<_>>().starts_with(&requested)
         })
-        || (columns.len() == 1
-            && table.columns.iter().any(|column| {
-                column.name == columns[0] && (column.primary_key || column.unique)
-            }))
 }
 
+/// `fold_case`: the target compares table names case-insensitively
+/// (MySQL `lower_case_table_names` != 0), so information_schema may return
+/// `orders` for a dump table named `Orders`.
 fn incompatible_surviving_fk_offenders(
     rows: &[SurvivingFkColumn],
     import_schema: &NormalizedSchema,
+    fold_case: bool,
 ) -> Vec<String> {
+    let key = |name: &str| if fold_case { name.to_lowercase() } else { name.to_string() };
     let import_set = import_schema
         .tables
         .iter()
-        .map(|table| table.name.as_str())
+        .map(|table| key(&table.name))
         .collect::<BTreeSet<_>>();
     let mut offenders = Vec::new();
 
     for row in rows {
-        if import_set.contains(row.referencing_table.as_str())
-            || !import_set.contains(row.referenced_table.as_str())
+        if import_set.contains(&key(&row.referencing_table))
+            || !import_set.contains(&key(&row.referenced_table))
         {
             continue;
         }
         let Some(table) = import_schema
             .tables
             .iter()
-            .find(|table| table.name == row.referenced_table)
+            .find(|table| key(&table.name) == key(&row.referenced_table))
         else {
             continue;
         };
@@ -591,8 +595,8 @@ fn incompatible_surviving_fk_offenders(
 
     let mut fk_columns = BTreeMap::<(String, String, String), Vec<(u64, String)>>::new();
     for row in rows {
-        if import_set.contains(row.referencing_table.as_str())
-            || !import_set.contains(row.referenced_table.as_str())
+        if import_set.contains(&key(&row.referencing_table))
+            || !import_set.contains(&key(&row.referenced_table))
         {
             continue;
         }
@@ -614,13 +618,13 @@ fn incompatible_surviving_fk_offenders(
         let Some(table) = import_schema
             .tables
             .iter()
-            .find(|table| table.name == referenced_table)
+            .find(|table| key(&table.name) == key(&referenced_table))
         else {
             continue;
         };
         if !imported_table_has_referenced_index(table, &columns) {
             offenders.push(format!(
-                "{referencing_table}.{constraint_name} -> {referenced_table} (dump does not recreate a referenced index beginning with {})",
+                "{referencing_table}.{constraint_name} -> {referenced_table} (dump does not create a primary or full-column unique key beginning with {} at table creation)",
                 columns.join(", ")
             ));
         }
@@ -635,9 +639,9 @@ fn incompatible_surviving_fk_offenders(
 ///
 /// MySQL 전용. 비-MySQL 어댑터는 빈 목록으로 통과시킨다.
 ///
-/// 타겟을 수정하지 않고 오직 조회만 한다. import은 이미 foreign_key_checks=0으로 표준
-/// 도구(mysqldump restore)처럼 강행하므로, 이 목록은 import을 차단하지 않고 호출부에서
-/// 경고로만 사용한다(대상에만 있는 FK의 정합성은 표준 도구와 마찬가지로 사용자 책임).
+/// 타겟을 수정하지 않고 오직 조회만 한다. 호출부(import.rs prepare_import_target)는 결과가
+/// 비어 있지 않으면 어떤 대상 테이블도 바꾸기 전에 import를 차단한다. 다른 스키마의 자식이
+/// 타겟 부모를 참조하는 FK도 포함하며, 그 자식은 `schema.table` 이름으로 import set 밖에 둔다.
 pub(crate) fn detect_incompatible_surviving_fks(
     adapter: &mut LiveAdapter,
     target_schema: &str,
@@ -649,7 +653,9 @@ pub(crate) fn detect_incompatible_surviving_fks(
     };
     let rows: Vec<SurvivingFkColumn> = conn
         .exec_map(
-            "SELECT k.TABLE_NAME, k.CONSTRAINT_NAME, k.REFERENCED_TABLE_NAME, \
+            "SELECT IF(k.TABLE_SCHEMA = k.REFERENCED_TABLE_SCHEMA, k.TABLE_NAME, \
+                       CONCAT(k.TABLE_SCHEMA, '.', k.TABLE_NAME)), \
+                    k.CONSTRAINT_NAME, k.REFERENCED_TABLE_NAME, \
                     k.ORDINAL_POSITION, k.REFERENCED_COLUMN_NAME, c.COLUMN_TYPE, \
                     c.CHARACTER_SET_NAME, c.COLLATION_NAME \
              FROM information_schema.KEY_COLUMN_USAGE k \
@@ -657,8 +663,8 @@ pub(crate) fn detect_incompatible_surviving_fks(
                ON c.TABLE_SCHEMA = k.REFERENCED_TABLE_SCHEMA \
               AND c.TABLE_NAME = k.REFERENCED_TABLE_NAME \
               AND c.COLUMN_NAME = k.REFERENCED_COLUMN_NAME \
-             WHERE k.TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL \
-             ORDER BY k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
+             WHERE k.REFERENCED_TABLE_SCHEMA = ? AND k.REFERENCED_TABLE_NAME IS NOT NULL \
+             ORDER BY k.TABLE_SCHEMA, k.TABLE_NAME, k.CONSTRAINT_NAME, k.ORDINAL_POSITION",
             (target_schema,),
             |(referencing_table, constraint_name, referenced_table, ordinal_position,
               referenced_column, existing_parent_column_type,
@@ -677,8 +683,18 @@ pub(crate) fn detect_incompatible_surviving_fks(
             },
         )
         .map_err(|err| format!("mysql surviving-FK preflight inspect error: {err}"))?;
+    let fold_case = mysql_folds_table_names(conn)?;
 
-    Ok(incompatible_surviving_fk_offenders(&rows, import_schema))
+    Ok(incompatible_surviving_fk_offenders(&rows, import_schema, fold_case))
+}
+
+/// MySQL `lower_case_table_names` != 0 (Windows/macOS defaults) stores and returns
+/// table names folded, so names from the target and the dump must be compared
+/// without case.
+pub(crate) fn mysql_folds_table_names(conn: &mut mysql::PooledConn) -> Result<bool, String> {
+    conn.query_first::<u64, _>("SELECT @@lower_case_table_names")
+        .map(|value| value.unwrap_or(0) != 0)
+        .map_err(|err| format!("mysql lower_case_table_names inspection failed: {err}"))
 }
 
 pub(crate) fn validate_dump_import_manifest_strictness(
@@ -2218,39 +2234,6 @@ mod tests {
     }
 
     #[test]
-    fn dump_import_replace_drops_children_before_parents() {
-        // dependency order는 parent-first(users -> orders)이므로,
-        // replace/recreate가 일괄 DROP할 때 쓰는 rev()는 child-first(orders -> users)여야 한다.
-        // 자식을 먼저 drop해야 부모를 재생성할 때 살아있는 자식 FK와 충돌(ERROR 3780)하지 않는다.
-        let schema = NormalizedSchema {
-            tables: vec![
-                empty_table("orders", vec![fk("fk_orders_users", "users")]),
-                empty_table("users", Vec::new()),
-            ],
-        };
-        let make_manifest = |name: &str, path: &str| DumpTableManifest {
-            name: name.to_string(),
-            path: path.to_string(),
-            rows: 1,
-            chunks: 1,
-            chunk_sha256: BTreeMap::new(),
-        };
-        let tables = vec![
-            make_manifest("orders", "0001_orders"),
-            make_manifest("users", "0002_users"),
-        ];
-
-        let ordered = dependency_ordered_dump_tables(&schema, tables);
-        let drop_order: Vec<&str> = ordered
-            .iter()
-            .rev()
-            .map(|table| table.name.as_str())
-            .collect();
-
-        assert_eq!(drop_order, vec!["orders", "users"]);
-    }
-
-    #[test]
     fn compatible_surviving_fk_is_preserved_for_mysql_like_import() {
         let schema = NormalizedSchema {
             tables: vec![NormalizedTable {
@@ -2285,7 +2268,7 @@ mod tests {
             existing_parent_collation: None,
         }];
 
-        assert!(incompatible_surviving_fk_offenders(&rows, &schema).is_empty());
+        assert!(incompatible_surviving_fk_offenders(&rows, &schema, false).is_empty());
     }
 
     #[test]
@@ -2324,7 +2307,7 @@ mod tests {
         }];
 
         assert_eq!(
-            incompatible_surviving_fk_offenders(&rows, &schema),
+            incompatible_surviving_fk_offenders(&rows, &schema, false),
             vec!["supplement_review_api_call.fk_srac_item -> supplement_review_item (column id type changes from int unsigned to bigint unsigned)".to_string()]
         );
     }
@@ -2365,9 +2348,68 @@ mod tests {
         }];
 
         assert_eq!(
-            incompatible_surviving_fk_offenders(&rows, &schema),
-            vec!["target_only_child.fk_child_parent -> parent (dump does not recreate a referenced index beginning with external_id)".to_string()]
+            incompatible_surviving_fk_offenders(&rows, &schema, false),
+            vec!["target_only_child.fk_child_parent -> parent (dump does not create a primary or full-column unique key beginning with external_id at table creation)".to_string()]
         );
+    }
+
+    #[test]
+    fn surviving_fk_needs_a_key_that_exists_when_the_parent_is_created() {
+        // MySQL creates non-unique and prefix indexes post-load, so a surviving FK
+        // bound to them would fail with ERROR 6125 right after the parent DROP.
+        let parent = |index: NormalizedIndex| NormalizedSchema {
+            tables: vec![NormalizedTable {
+                name: "parent".to_string(),
+                columns: vec![NormalizedColumn {
+                    name: "code".to_string(),
+                    type_name: "varchar(64)".to_string(),
+                    default_value: None,
+                    nullable: false,
+                    primary_key: false,
+                    unique: false,
+                    comment: None,
+                    default_is_expression: false,
+                    on_update: None,
+                }],
+                indexes: vec![index],
+                foreign_keys: Vec::new(),
+                table_collation: None,
+                auto_increment: None,
+                comment: None,
+                checks: Vec::new(),
+            }],
+        };
+        let index = |unique: bool, prefix: Option<u32>| NormalizedIndex {
+            name: "idx_code".to_string(),
+            columns: vec!["code".to_string()],
+            column_prefixes: vec![prefix],
+            unique,
+            visible: None,
+        };
+        let rows = vec![SurvivingFkColumn {
+            referencing_table: "target_only_child".to_string(),
+            constraint_name: "fk_child_parent".to_string(),
+            referenced_table: "parent".to_string(),
+            ordinal_position: 1,
+            referenced_column: "code".to_string(),
+            existing_parent_column_type: "varchar(64)".to_string(),
+            existing_parent_character_set: None,
+            existing_parent_collation: None,
+        }];
+
+        assert!(incompatible_surviving_fk_offenders(&rows, &parent(index(true, None)), false).is_empty());
+        assert_eq!(incompatible_surviving_fk_offenders(&rows, &parent(index(false, None)), false).len(), 1);
+        assert_eq!(incompatible_surviving_fk_offenders(&rows, &parent(index(true, Some(10))), false).len(), 1);
+        // A column that is only the second member of a composite UNIQUE key is flagged
+        // `unique` at column level but cannot back the FK.
+        let mut composite = parent(NormalizedIndex { name: "uq_pair".to_string(), columns: vec!["tenant".to_string(), "code".to_string()], column_prefixes: vec![None, None], unique: true, visible: None });
+        composite.tables[0].columns[0].unique = true;
+        assert_eq!(incompatible_surviving_fk_offenders(&rows, &composite, false).len(), 1);
+        // lower_case_table_names folds target names; the mixed-case dump table still matches.
+        let mut folded = rows.clone();
+        folded[0].referenced_table = "PARENT".to_string();
+        assert_eq!(incompatible_surviving_fk_offenders(&folded, &parent(index(false, None)), true).len(), 1);
+        assert!(incompatible_surviving_fk_offenders(&folded, &parent(index(false, None)), false).is_empty());
     }
 
     #[test]

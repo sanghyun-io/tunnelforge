@@ -1625,10 +1625,33 @@ def test_import_replace_policy_discloses_destructive_alias_and_partial_failure(m
     assert dialog._get_selected_import_mode() == "safe"
     assert "권장" not in dialog.radio_replace.text()
     assert "동일" in dialog.radio_recreate.text()
-    assert "선택한 테이블을 삭제" in descriptions
+    assert "하나씩 삭제한 직후" in descriptions
+    assert "원본 데이터를 유지" in descriptions
     assert "자동으로 되돌리지" in descriptions
     assert "선택한 테이블" in dialog.radio_replace.toolTip()
     dialog.close()
+
+
+def test_replace_failure_details_name_lost_and_untouched_tables():
+    from src.ui.dialogs.db_import_dialog import _capture_import_audit, _replace_failure_details
+    audit = {}
+    _capture_import_audit(audit, {
+        "event": "import_report", "status": "failed",
+        "dropped_not_restored_tables": ["orders"],
+        "unattempted_tables": ["items", "logs"],
+        "dropped_foreign_keys": [
+            {"table": "items", "constraint": "fk_items_orders", "referenced_table": "orders"},
+            {"table": "orders", "constraint": "fk_orders_users", "referenced_table": "users"},
+        ],
+    })
+    details = _replace_failure_details(audit)
+    assert "삭제 후 복원되지 않은 테이블: orders" in details
+    assert "원본 데이터를 유지한 테이블(미실행): items, logs" in details
+    assert "items.fk_items_orders" in details
+    assert "orders.fk_orders_users" in details  # orders was never dropped: its original rows remain
+    _capture_import_audit(audit, {"event": "import_report", "dropped_tables": ["orders"]})
+    assert "orders.fk_orders_users" not in _replace_failure_details(audit)
+    assert _replace_failure_details({}) == ""
 
 
 def test_import_unknown_original_namespace_requires_explicit_ui_selection(monkeypatch, tmp_path):
