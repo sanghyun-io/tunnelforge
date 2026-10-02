@@ -724,11 +724,15 @@ fn finalize_dump_manifest<F: FnMut(Value)>(
     for warning in &manifest_warnings {
         emit(json!({"event": "phase", "request_id": request_id, "phase": "dump_warning", "message": warning}));
     }
+    // Version 4 marks MySQL BIT cells written as binary digits. Older readers would load the digit
+    // text into BIT columns, so only dumps that contain BIT columns carry it.
+    let has_bit_columns = endpoint.engine == "mysql"
+        && schema.tables.iter().any(|table| table.columns.iter().any(|column| mysql_bit_width(&column.type_name).is_some()));
     let manifest = DumpManifest {
         format: "tunnelforge-dump".to_string(),
         // Older readers ignore namespace, timezone and ON UPDATE metadata. Fail
         // their version gate instead of silently restoring different semantics.
-        format_version: 3,
+        format_version: if has_bit_columns { 4 } else { 3 },
         data_format: options.data_format.clone(),
         compression: options.compression.clone(),
         source_engine: endpoint.engine.clone(),
