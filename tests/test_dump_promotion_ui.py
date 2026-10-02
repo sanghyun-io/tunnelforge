@@ -123,3 +123,91 @@ def test_review_summary_labels_unknown_data_and_counts_without_forged_lines():
     assert "sample: 미확인 / 3" in text
     assert "행 수만으로 데이터 일치를 보장하지 않습니다." in text
     assert "\nforged" not in text
+
+
+def test_overwrite_mode_runs_safe_restore_after_one_confirmation(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "ok"))
+    question = MagicMock(return_value=QMessageBox.StandardButton.No)
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.question", question)
+    dialog = RustDumpImportDialog()
+    dialog.input_dir.setText(str(tmp_path))
+    dialog.radio_overwrite.setChecked(True)
+    dialog._confirm_production_guard = MagicMock(return_value=True)
+    dialog._begin_error_report_operation = MagicMock()
+    assert dialog._get_selected_import_mode() == "overwrite"
+    dialog.do_import()
+    assert question.call_args.args[1] == "덮어쓰기 확인"
+    assert question.call_args.args[-1] == QMessageBox.StandardButton.No
+    dialog._begin_error_report_operation.assert_not_called()
+    assert dialog.worker is None
+    dialog.close()
+
+
+def test_overwrite_mode_swaps_a_clean_plan_without_the_review_dialog(promotion_dialog):
+    promotion_dialog._auto_overwrite = True
+    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
+    promotion_dialog._review_promotion_plan = MagicMock()
+    promotion_dialog._promotion_action = "plan"
+    plan = {"success": True, "can_promote": True, "plan_digest": "verified-digest", "blockers": []}
+    promotion_dialog._on_promotion_finished(True, "planned", plan)
+    promotion_dialog._review_promotion_plan.assert_not_called()
+    payload = promotion_dialog._start_promotion.call_args.args[0]
+    assert payload["action"] == "confirm"
+    assert payload["plan_digest"] == "verified-digest" and payload["overwrite_confirmed"] is True
+    assert payload["target"]["database"] == "original"
+    assert promotion_dialog._auto_overwrite is False  # one shot
+
+
+@pytest.mark.parametrize("restore_status, plan", [
+    ("ready_for_review", {"can_promote": True, "plan_digest": "d", "blockers": []}),
+    ("ready_for_switch", {"can_promote": False, "plan_digest": "d", "blockers": ["incoming FK"]}),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "d", "blockers": ["view dependency"]}),
+    ("ready_for_switch", {"can_promote": True, "plan_digest": "", "blockers": []}),
+])
+def test_overwrite_mode_falls_back_to_review_when_the_swap_needs_a_decision(promotion_dialog, restore_status, plan):
+    promotion_dialog._auto_overwrite = True
+    promotion_dialog.import_audit["restore_status"] = restore_status
+    promotion_dialog._review_promotion_plan = MagicMock()
+    promotion_dialog._promotion_action = "plan"
+    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, **plan})
+    promotion_dialog._review_promotion_plan.assert_called_once()
+    promotion_dialog._start_promotion.assert_not_called()
+
+
+def test_safe_mode_still_reviews_every_plan(promotion_dialog):
+    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
+    promotion_dialog._review_promotion_plan = MagicMock()
+    promotion_dialog._promotion_action = "plan"
+    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, "can_promote": True, "plan_digest": "d"})
+    promotion_dialog._review_promotion_plan.assert_called_once()
+    promotion_dialog._start_promotion.assert_not_called()
+
+
+def test_overwrite_flag_is_cleared_when_the_auto_plan_fails(promotion_dialog, monkeypatch):
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.QMessageBox.warning", MagicMock())
+    promotion_dialog._auto_overwrite = True
+    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
+    promotion_dialog._review_promotion_plan = MagicMock()
+    promotion_dialog._promotion_action = "plan"
+    promotion_dialog._on_promotion_finished(False, "core unavailable", {})
+    assert promotion_dialog._auto_overwrite is False
+    # A later manual review click must show the review dialog, not swap.
+    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, "can_promote": True, "plan_digest": "d"})
+    promotion_dialog._review_promotion_plan.assert_called_once()
+    promotion_dialog._start_promotion.assert_not_called()
+
+
+def test_auto_overwrite_records_the_operator_authorization(promotion_dialog):
+    promotion_dialog._auto_overwrite = True
+    promotion_dialog.import_audit["restore_status"] = "ready_for_switch"
+    promotion_dialog._promotion_action = "plan"
+    promotion_dialog._on_promotion_finished(True, "planned", {"success": True, "can_promote": True, "plan_digest": "d"})
+    assert promotion_dialog.import_audit["operator_choice"] == "overwrite_confirmed_before_import"
+
+
+def test_overwrite_radio_is_locked_with_the_other_modes(promotion_dialog):
+    promotion_dialog.set_ui_enabled(False)
+    assert all(not button.isEnabled() for button in promotion_dialog.btn_import_mode.buttons())
+    promotion_dialog.set_ui_enabled(True)
+    assert promotion_dialog.radio_overwrite.isEnabled()

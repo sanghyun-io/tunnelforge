@@ -30,6 +30,7 @@ Import requires an explicit destination. Legacy PostgreSQL dumps without
 | Mode | Effect and constraints |
 | --- | --- |
 | `safe` (default) | Restores the complete same-engine dump into a new owned namespace, verifies rows, values and schema, then offers reviewed replacement when supported. Existing namespaces remain unchanged during preparation. |
+| Overwrite (UI) | Runs `safe`, then, after one up-front confirmation, swaps the verified candidate in under the original name with the core's promotion plan; the replaced data stays under a backup name. The swap is automatic only for a `ready_for_switch` restore whose plan is promotable with no blockers; anything else falls back to the reviewed choice. The core receives `mode: safe` and `dump.promote`; there is no separate core mode. |
 | `replace` | Like mysqldump: each selected dump table is dropped and immediately recreated and loaded, one table at a time, then indexes/FKs/views are finalized. Existing selected-table data is lost. A failure leaves at most the table in progress missing or partially loaded; tables not yet reached keep their original data, but may have lost FKs to already replaced parents (reported). |
 | `recreate` | Legacy alias of `replace`; does not delete the entire database or unrelated tables. |
 | `merge` | Appends dump rows to compatible existing tables (creates missing tables). It is not synchronization, deduplication, upsert, or change-data capture. Existing keys/FKs can reject rows. Existing MySQL targets must use InnoDB. |

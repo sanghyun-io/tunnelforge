@@ -664,6 +664,14 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         mode_layout.addWidget(safe_description)
         self.btn_import_mode.addButton(self.radio_safe)
 
+        # Overwrite = safe restore + automatic promotion under the original name.
+        self.radio_overwrite = QRadioButton("덮어쓰기: 검증 후 기존 이름으로 교체")
+        overwrite_description = QLabel("   mysqldump처럼 Dump로 기존 대상을 덮어씁니다. 먼저 새 대상에 복원·검증하고 기존 이름으로 한 번에 교체합니다.\n   교체한 이전 데이터는 백업으로 보존되고, 검증 실패나 교체 불가 시 기존 대상은 그대로입니다.")
+        overwrite_description.setWordWrap(True)
+        mode_layout.addWidget(self.radio_overwrite)
+        mode_layout.addWidget(overwrite_description)
+        self.btn_import_mode.addButton(self.radio_overwrite)
+
         # 1. 증분 Import (병합)
         mode_merge_layout = QVBoxLayout()
         self.radio_merge = QRadioButton("데이터 추가 Import")
@@ -1083,6 +1091,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         self.radio_safe.setEnabled(enabled)
         self.radio_replace.setEnabled(enabled)
         self.radio_recreate.setEnabled(enabled)
+        self.radio_overwrite.setEnabled(enabled)
         self.radio_tz_auto.setEnabled(enabled)
         self.radio_tz_kst.setEnabled(enabled)
         self.radio_tz_utc.setEnabled(enabled)
@@ -1143,6 +1152,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _get_selected_import_mode(self) -> str:
         if self.radio_safe.isChecked():
             return "safe"
+        if self.radio_overwrite.isChecked():
+            return "overwrite"
         if self.radio_replace.isChecked():
             return "replace"
         if self.radio_recreate.isChecked():
@@ -1154,6 +1165,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         mode = import_mode or self._get_selected_import_mode()
         return {
             "safe": "안전 복원: 새 대상에 복원·검증",
+            "overwrite": "덮어쓰기: 검증 후 기존 이름으로 교체",
             "merge": "데이터 추가 Import",
             "replace": "전체 교체 Import",
             "recreate": "완전 재생성 Import",
@@ -1215,13 +1227,25 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             )
             if reply != QMessageBox.StandardButton.Yes:
                 return
+        if self._get_selected_import_mode() == "overwrite":
+            reply = QMessageBox.question(
+                self, "덮어쓰기 확인",
+                "Dump를 새 대상에 복원·검증한 뒤 기존 이름으로 교체합니다. 교체한 이전 데이터는 백업 이름으로 보존되며, 검증에 실패하거나 교체할 수 없으면 기존 대상은 바꾸지 않습니다. 진행하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
 
         self._begin_error_report_operation()
 
         # 저장 (재시도용)
         self.last_input_dir = input_dir
         self.last_target_schema = target_schema
-        import_mode = self._get_selected_import_mode()
+        selected_mode = self._get_selected_import_mode()
+        # Overwrite runs the core's safe restore; the swap follows its verified plan.
+        self._auto_overwrite = selected_mode == "overwrite"
+        import_mode = "safe" if self._auto_overwrite else selected_mode
         self.last_import_mode = import_mode
         if self.config_manager:
             self.config_manager.set_app_setting('rust_dump_import_dir', input_dir)
@@ -1257,7 +1281,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.import_start_time = datetime.now()
             self.import_end_time = None
             self.import_success = None
-            self.import_audit = {}
+            self.import_audit = {"overwrite_requested": True} if getattr(self, "_auto_overwrite", False) else {}
             self.last_import_context = {}
             self.btn_copy_restore_target.setEnabled(False)
             self.btn_review_restore.setEnabled(False)
@@ -1269,6 +1293,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self._add_log(f"Dump 폴더: {input_dir}")
             self._add_log(f"대상 스키마: {target_schema if target_schema else '원본 스키마명 사용'}")
             self._add_log(f"Import 모드: {self._get_import_mode_text(import_mode)}")
+            if getattr(self, "_auto_overwrite", False):
+                self._add_log("덮어쓰기 요청: 검증 후 교체 가능하면 기존 이름으로 자동 교체합니다.")
             self._add_log(f"병렬 스레드: {self.spin_threads.value()}")
             self._add_log(f"{'='*60}")
 
@@ -1703,9 +1729,14 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.progress_bar.setValue(100)
             self.btn_copy_restore_target.setEnabled(bool(self.import_audit.get("candidate_target")))
             self.btn_review_restore.setEnabled(not new_target and bool(self.import_audit.get("restore_id") and self.import_audit.get("report_path")))
-            QMessageBox.information(self, "안전 복원 검증 완료", message)
+            if getattr(self, "_auto_overwrite", False) and self.btn_review_restore.isEnabled():
+                self._add_log("검증 완료 · 기존 이름으로 교체할 수 있는지 확인합니다.")
+            else:
+                QMessageBox.information(self, "안전 복원 검증 완료", message)
             if self.btn_review_restore.isEnabled():
                 QTimer.singleShot(0, self.review_restore_target)
+            else:
+                self._auto_overwrite = False
         elif success:
             self.label_status.setText(f"✅ Import 완료: {done_count}/{total_count} 테이블 성공")
             self.progress_bar.setValue(100)
@@ -1836,7 +1867,15 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 "status", "success", "original_unchanged", "cutover_pending", "backup_namespace", "report_path", "phase", "message")}
         if action == "plan" and success and not self._close_after_cancel:
             self.btn_review_restore.setEnabled(True)
-            self._review_promotion_plan(result)
+            if self._take_auto_overwrite(result):
+                self._remember_promotion_plan(result)
+                self.import_audit["operator_choice"] = "overwrite_confirmed_before_import"
+                self._add_log("검증된 복원본으로 기존 이름 교체를 시작합니다.")
+                payload = self._promotion_payload("confirm")
+                payload.update(plan_digest=result["plan_digest"], overwrite_confirmed=True)
+                self._start_promotion(payload)
+            else:
+                self._review_promotion_plan(result)
         elif action == "confirm" and success and result.get("status") == "promoted":
             self.import_success = True
             self.import_end_time = datetime.now()
@@ -1849,6 +1888,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             QMessageBox.information(self, "전환 완료", _structured_local_diagnostic_text(result))
         else:
             if action == "plan":
+                self._auto_overwrite = False
                 self.btn_review_restore.setEnabled(True)
             if action == "confirm":
                 self.import_success = False
@@ -1864,10 +1904,25 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 
-    def _review_promotion_plan(self, plan: dict):
+    def _take_auto_overwrite(self, plan: dict) -> bool:
+        """One-shot: swap without the review dialog only for a clean, promotable plan."""
+        if not getattr(self, "_auto_overwrite", False):
+            return False
+        self._auto_overwrite = False
+        clean = (self.import_audit.get("restore_status") == "ready_for_switch"
+                 and plan.get("can_promote") is True and bool(plan.get("plan_digest"))
+                 and not plan.get("blockers"))
+        if not clean:
+            self._add_log("자동 교체 불가: 비교 결과를 검토하고 직접 선택하세요.")
+        return clean
+
+    def _remember_promotion_plan(self, plan: dict):
         safe_plan = _sanitized_rust_event(plan)
         self.import_audit["promotion_plan"] = {key: safe_plan.get(key) for key in (
             "plan_digest", "can_promote", "original_target", "candidate_target", "backup_namespace", "summary", "blockers")}
+
+    def _review_promotion_plan(self, plan: dict):
+        self._remember_promotion_plan(plan)
         review = QMessageBox(self)
         review.setTextFormat(Qt.TextFormat.PlainText)
         review.setWindowTitle("복원 대상 비교 및 전환 선택")
@@ -2034,6 +2089,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                     else '확인 불가'
                 )
                 f.write(f"Import 모드: {safe(import_mode)}\n")
+                if self.import_audit.get("overwrite_requested"):
+                    f.write("Overwrite requested: automatic swap only for a clean, promotable plan\n")
                 if self.import_success is None:
                     result_label = "진행 중"
                 else:
