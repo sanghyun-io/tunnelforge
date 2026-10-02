@@ -2022,6 +2022,7 @@ def test_version_gate_runs_macos_validation_from_existing_pr_workflow():
         "macos-support-tracking-gate",
         "rust-core-regression-gate",
         "dump-roundtrip-regression",
+        "live-security-regression",
         "python-regression",
         "python-linux-regression",
         "macos-app-validation",

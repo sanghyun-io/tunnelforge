@@ -190,6 +190,10 @@ fn engines() -> Vec<Engine> {
 }
 
 fn skip_if_none(engines: &[Engine]) -> bool {
+    // The CI live gate sets TF_LIVE_REQUIRED: both engines must be configured there.
+    if std::env::var_os("TF_LIVE_REQUIRED").is_some() {
+        assert_eq!(engines.len(), 2, "TF_LIVE_REQUIRED is set but TF_QUERY_LIVE_MYSQL_* / TF_QUERY_LIVE_PG_* are incomplete");
+    }
     if engines.is_empty() {
         eprintln!("skipped: TF_QUERY_LIVE_MYSQL_* / TF_QUERY_LIVE_PG_* not set");
     }
