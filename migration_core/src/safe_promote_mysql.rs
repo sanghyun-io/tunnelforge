@@ -156,7 +156,7 @@ fn optional_table_id(conn: &mut Db, db: &str, name: &str) -> Result<Option<u64>,
 fn content_digest(conn: &mut Db, db: &str, table: &NormalizedTable) -> Result<Value, String> {
     let sql = format!(
         "SELECT {} FROM {}",
-        projected_text_columns_sql("mysql", table),
+        legacy_projected_text_columns_sql("mysql", table),
         qualified(db, &table.name)
     );
     crate::import::safe_restore_digest::mysql_table_content_digest(conn, table, &sql)

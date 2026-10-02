@@ -248,9 +248,10 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
 
     let input_path = Path::new(input_dir);
     let manifest = read_dump_manifest(input_path)?;
-    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3) {
+    if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4) {
         return Err("unsupported dump manifest format".to_string());
     }
+    let legacy_bit_text = manifest.format_version < 4 && manifest.source_engine == "mysql";
     let data_format = manifest.data_format.to_ascii_lowercase();
     if !matches!(data_format.as_str(), "jsonl" | "tsv") {
         return Err(format!("unsupported dump data_format: {data_format}"));
@@ -420,6 +421,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
                 &data_format,
                 &compression,
                 mode,
+                legacy_bit_text,
                 timezone_sql.as_deref(),
                 threads,
                 request.request_id.clone(),
@@ -688,6 +690,27 @@ fn validate_postgres_drop_dependencies(adapter: &mut LiveAdapter, schema: &str, 
 /// 단일 테이블의 데이터를 적재한다. MySQL TSV fast-path(LOAD DATA / 병렬 / fallback)와
 /// 엔진 무관 generic 청크 INSERT 경로를 분기하고, 이 테이블에 적재한 (rows, chunks)를 반환한다.
 /// 테이블 생성(DDL)과 진행률 table_progress 이벤트는 호출자가 담당한다.
+/// Rewrites BIT cells of a pre-version-4 MySQL dump (raw bytes read as text) into binary digits.
+fn convert_legacy_bit_cells(table: &NormalizedTable, rows: &mut [Value]) -> Result<(), String> {
+    let bits = table.columns.iter()
+        .filter_map(|column| mysql_bit_width(&column.type_name).map(|width| (column.name.as_str(), width)))
+        .collect::<Vec<_>>();
+    if bits.is_empty() {
+        return Ok(());
+    }
+    for row in rows.iter_mut() {
+        let Some(object) = row.as_object_mut() else { continue };
+        for (name, width) in &bits {
+            if let Some(Value::String(text)) = object.get(*name) {
+                let digits = legacy_mysql_bit_digits(text, *width)
+                    .map_err(|err| classified_import_error("load_failed", &format!("BIT column {name}: {err}"), Some(&table.name)))?;
+                object.insert((*name).to_string(), Value::String(digits));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn import_table_rows<F: FnMut(Value)>(
     endpoint: &Endpoint,
     adapter: &mut LiveAdapter,
@@ -697,6 +720,7 @@ fn import_table_rows<F: FnMut(Value)>(
     data_format: &str,
     compression: &str,
     mode: &str,
+    legacy_bit_text: bool,
     timezone_sql: Option<&str>,
     threads: usize,
     request_id: Option<String>,
@@ -737,7 +761,10 @@ fn import_table_rows<F: FnMut(Value)>(
             data_format,
             compression,
         )?;
-        let rows = read_dump_rows(&chunk_path, table, data_format, compression)?;
+        let mut rows = read_dump_rows(&chunk_path, table, data_format, compression)?;
+        if legacy_bit_text {
+            convert_legacy_bit_cells(table, &mut rows)?;
+        }
         let row_count = rows.len() as u64;
         if let LiveAdapter::MySql(conn) = adapter {
             let enum_zero = enum_zero_cells(table, &rows);

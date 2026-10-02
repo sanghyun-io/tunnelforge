@@ -364,6 +364,16 @@ pub fn select_chunk_sql(
 /// (postgresql=encode, 그 외=HEX), 나머지는 엔진별로 text/CAST로 정규화하여 JSONL 직렬화가
 /// 안전한 문자열이 되도록 한다. 세 select_chunk_text_* 함수가 동일 프로젝션을 공유한다.
 pub(crate) fn projected_text_columns_sql(engine: &str, table: &NormalizedTable) -> String {
+    projected_columns_sql(engine, table, true)
+}
+
+/// Projection used before MySQL BIT/FLOAT were read exactly. Safe-promotion journals store content
+/// digests computed with it, so live-to-live digest checks keep using it (both sides read alike).
+pub(crate) fn legacy_projected_text_columns_sql(engine: &str, table: &NormalizedTable) -> String {
+    projected_columns_sql(engine, table, false)
+}
+
+fn projected_columns_sql(engine: &str, table: &NormalizedTable, exact_mysql_values: bool) -> String {
     table
         .columns
         .iter()
@@ -386,7 +396,15 @@ pub(crate) fn projected_text_columns_sql(engine: &str, table: &NormalizedTable) 
                     quote_ident(engine, &column.name),
                     quote_ident(engine, &column.name)
                 )
-            } else if engine == "mysql" && column.type_name.trim().to_ascii_lowercase().starts_with("float") {
+            } else if let (true, Some(width)) = (exact_mysql_values && engine == "mysql", mysql_bit_width(&column.type_name)) {
+                // The text protocol returns BIT as raw bytes (lossy as UTF-8). Zero-padded binary digits
+                // are exact and match PostgreSQL's bit::text, so cross-engine values compare equal.
+                format!(
+                    "LPAD(BIN({}), {width}, '0') AS {}",
+                    quote_ident(engine, &column.name),
+                    quote_ident(engine, &column.name)
+                )
+            } else if exact_mysql_values && engine == "mysql" && column.type_name.trim().to_ascii_lowercase().starts_with("float") {
                 // The text protocol renders FLOAT with 6 significant digits; as a double it round-trips
                 // exactly, so dumps keep the stored value and keyset cursors stay exact.
                 format!(
@@ -561,6 +579,11 @@ fn keyset_term(engine: &str, table: &NormalizedTable, column: &str, value: &str,
         }
         "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => {
             return format!("{column_ref} {op} {}", mysql_text_literal(value));
+        }
+        "bit" => {
+            if let Ok(number) = u64::from_str_radix(value, 2) {
+                return format!("{column_ref} {op} {number}");
+            }
         }
         _ => {}
     }
@@ -807,6 +830,13 @@ pub(crate) fn sanitize_postgresql_text(value: &str) -> String {
 
 pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Value) -> String {
     if let Value::String(text) = value {
+        if target_engine == "mysql"
+            && mysql_bit_width(source_type).is_some()
+            && !text.is_empty()
+            && text.bytes().all(|byte| byte == b'0' || byte == b'1')
+        {
+            return format!("b'{text}'");
+        }
         let source_type = source_type.to_ascii_lowercase();
         if is_binary_type(&source_type) {
             let hex = text.trim();
@@ -866,10 +896,44 @@ pub fn is_binary_type(type_name: &str) -> bool {
 }
 
 pub(crate) fn has_binary_columns(table: &NormalizedTable) -> bool {
+    // BIT digits must be written as bit literals, not loaded as text, so BIT tables take the literal path too.
     table
         .columns
         .iter()
-        .any(|column| is_binary_type(&column.type_name))
+        .any(|column| is_binary_type(&column.type_name) || mysql_bit_width(&column.type_name).is_some())
+}
+
+/// Width of a `bit` / `bit(n)` column (both engines report this spelling); `None` for other types,
+/// including PostgreSQL `bit varying`.
+pub(crate) fn mysql_bit_width(type_name: &str) -> Option<u32> {
+    let lowered = type_name.trim().to_ascii_lowercase();
+    let rest = lowered.strip_prefix("bit")?;
+    let rest = rest.trim_start();
+    if rest.is_empty() || rest.starts_with("unsigned") {
+        return Some(1);
+    }
+    let (digits, tail) = rest.strip_prefix('(')?.split_once(')')?;
+    let tail = tail.trim();
+    if !(tail.is_empty() || tail == "unsigned") {
+        return None;
+    }
+    digits.trim().parse::<u32>().ok().filter(|width| (1..=64).contains(width))
+}
+
+/// Legacy (format_version < 4) MySQL dumps stored BIT cells as the raw bytes read as text. Bytes that
+/// were valid UTF-8 (e.g. BIT(1) flags) are recoverable; a replacement character means the value was lost.
+pub(crate) fn legacy_mysql_bit_digits(text: &str, width: u32) -> Result<String, String> {
+    if text.contains('\u{fffd}') {
+        // ponytail: a genuine 0xEFBFBD byte run is indistinguishable from lossy decoding here.
+        return Err("value may have been corrupted by a previous export (BIT bytes >= 0x80); re-export with this version".into());
+    }
+    let value = text.as_bytes().iter().try_fold(0u128, |acc, byte| {
+        acc.checked_mul(256).map(|shifted| shifted | u128::from(*byte))
+    }).ok_or("BIT value wider than 64 bits")?;
+    if width < 128 && value >> width != 0 {
+        return Err(format!("BIT value does not fit in bit({width})"));
+    }
+    Ok(format!("{value:0width$b}", width = width as usize))
 }
 
 pub fn is_decimal_type(type_name: &str) -> bool {
@@ -1481,6 +1545,15 @@ fn map_default_literal(target: &str, default_value: &str, source_type: &str) -> 
             return "FALSE".to_string();
         }
     }
+    if let Some(width) = mysql_bit_width(&source_type) {
+        let digits = value.trim_matches('\'');
+        let digits = digits.strip_prefix("b'").or_else(|| digits.strip_prefix("B'")).unwrap_or(digits).trim_end_matches('\'');
+        if !digits.is_empty() && digits.len() <= width as usize && digits.bytes().all(|byte| byte == b'0' || byte == b'1') {
+            // MySQL reads a quoted '0101' as bytes; PostgreSQL bit(n) does not pad shorter literals.
+            let padded = format!("{digits:0>width$}", width = width as usize);
+            return if target == "mysql" { format!("b'{padded}'") } else { format!("B'{padded}'") };
+        }
+    }
     if target == "mysql" && matches!(source_type.as_str(), "boolean" | "bool") {
         if value.eq_ignore_ascii_case("true") {
             return "1".to_string();
@@ -1759,6 +1832,8 @@ fn map_mysql_to_postgres(ty: &str) -> String {
         "BYTEA".to_string()
     } else if ty.starts_with("decimal") {
         ty.to_ascii_uppercase()
+    } else if let Some(width) = mysql_bit_width(ty) {
+        format!("BIT({width})")
     } else {
         "TEXT".to_string()
     }
@@ -1810,6 +1885,8 @@ fn map_postgres_to_mysql(ty: &str) -> String {
         "LONGBLOB".to_string()
     } else if ty.starts_with("numeric") || ty.starts_with("decimal") {
         ty.replacen("numeric", "DECIMAL", 1).to_ascii_uppercase()
+    } else if let Some(width) = mysql_bit_width(ty) {
+        format!("BIT({width})")
     } else {
         "TEXT".to_string()
     }
@@ -3442,6 +3519,38 @@ mod binary_keyset_tests {
         assert!(sql.contains("`events`.`k` > '0.10000000149011612'"), "{sql}");
         let pg = table(vec![column("k", "real")]);
         assert!(after_key("postgresql", &pg, &["k"], &["0.1"]).contains("\"events\".\"k\" > '0.1'"));
+    }
+
+    #[test]
+    fn mysql_bit_columns_are_read_as_padded_digits_and_written_as_bit_literals() {
+        let bits = table(vec![column("k", "bit(8)"), column("flag", "bit")]);
+        let sql = after_key("mysql", &bits, &["k"], &["10000000"]);
+        assert!(sql.contains("LPAD(BIN(`k`), 8, '0') AS `k`"), "{sql}");
+        assert!(sql.contains("LPAD(BIN(`flag`), 1, '0') AS `flag`"), "{sql}");
+        assert!(sql.contains("`events`.`k` > 128"), "{sql}");
+        assert_eq!(sql_literal_for_column("mysql", "bit(8)", &Value::String("10000000".into())), "b'10000000'");
+        assert_eq!(sql_literal_for_column("postgresql", "bit(8)", &Value::String("10000000".into())), "'10000000'");
+        assert!(has_binary_columns(&bits));
+        assert_eq!(mysql_bit_width("bit"), Some(1));
+        assert_eq!(mysql_bit_width("bit(64)"), Some(64));
+        assert_eq!(mysql_bit_width("bit varying(8)"), None);
+        assert_eq!(mysql_bit_width("bit(8)[]"), None);
+        assert_eq!(map_type("postgresql", "mysql", "bit(8)[]"), "TEXT");
+        assert_eq!(map_default_literal("mysql", "'00000101'::\"bit\"", "bit(8)"), "b'00000101'");
+        assert_eq!(map_default_literal("postgresql", "b'101'", "bit(8)"), "B'00000101'");
+        assert_eq!(map_default_literal("postgresql", "b'0'", "bit(1)"), "B'0'");
+        assert!(legacy_projected_text_columns_sql("mysql", &bits).contains("`k`") && !legacy_projected_text_columns_sql("mysql", &bits).contains("BIN("));
+        assert_eq!(map_type("mysql", "postgresql", "bit(8)"), "BIT(8)");
+        assert_eq!(map_type("postgresql", "mysql", "bit(8)"), "BIT(8)");
+    }
+
+    #[test]
+    fn legacy_bit_cells_are_recovered_unless_already_corrupted() {
+        assert_eq!(legacy_mysql_bit_digits("\u{1}", 1).unwrap(), "1");
+        assert_eq!(legacy_mysql_bit_digits("\u{0}", 1).unwrap(), "0");
+        assert_eq!(legacy_mysql_bit_digits("\u{0}A", 16).unwrap(), "0000000001000001");
+        assert!(legacy_mysql_bit_digits("\u{fffd}", 8).is_err());
+        assert!(legacy_mysql_bit_digits("\u{2}", 1).is_err());
     }
 
     #[test]

@@ -191,8 +191,13 @@ pub(super) fn run<F: FnMut(Value)>(request: &Request, mut emit: F) -> Result<Val
         }
         let manifest = read_dump_manifest(path)?;
         state["dump_manifest_sha256"] = json!(sha256_file(&path.join("_tunnelforge_dump.json"))?);
-        if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3) {
+        if manifest.format != "tunnelforge-dump" || !matches!(manifest.format_version, 1 | 2 | 3 | 4) {
             return Err("unsupported dump manifest format".into());
+        }
+        if manifest.format_version < 4 && manifest.source_engine == "mysql"
+            && manifest.schema.tables.iter().any(|table| table.columns.iter().any(|column| mysql_bit_width(&column.type_name).is_some()))
+        {
+            return Err("safe restore cannot verify BIT columns from a dump written before format version 4 (their values were stored as raw bytes); re-export the database with this version, or use the advanced replace import".into());
         }
         if manifest.source_engine != original.engine {
             return Err("safe restore currently verifies same-engine dumps only; use the explicit cross-engine migration workflow".into());
