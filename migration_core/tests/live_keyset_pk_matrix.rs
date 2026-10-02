@@ -66,8 +66,7 @@ fn count_rows(endpoint: &Endpoint, table: &str) -> Result<u64, String> {
 }
 
 /// One key type. `values` are SQL row tuples; `migrate` says whether the column types map to the
-/// other engine (cases that do not map are still covered by dump.run). PostgreSQL TEXT/UUID/REAL/
-/// TIMESTAMPTZ keys do not map to MySQL keys yet (separate type-mapping limit).
+/// other engine (cases that do not map are still covered by dump.run).
 struct Case {
     name: &'static str,
     ddl: &'static str,
@@ -75,8 +74,7 @@ struct Case {
     values: Vec<String>,
     migrate: bool,
     /// Cross-engine verify pages both sides with the source cursor; text keys under different
-    /// collations misalign the pages (false mismatches, follow-up), and MySQL FLOAT/DOUBLE still map
-    /// to PostgreSQL TEXT (type-mapping follow-up), so those cases skip verify.
+    /// collations misalign the pages (false mismatches, follow-up), so those cases skip verify.
     verify: bool,
 }
 
@@ -118,7 +116,7 @@ fn mysql_cases() -> Vec<Case> {
         Case { name: "float_precise", ddl: "k FLOAT PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "float", true), col("v", "varchar(8)", false)]),
             values: ["1.2345678", "1.2345679", "1.234569", "1234567", "1234568", "1234569", "16777215"].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
-            migrate: false, verify: false },
+            migrate: true, verify: true },
         // A leading ENUM key with a second column: equality on the label, IN for later labels.
         Case { name: "enum_composite", ddl: "k ENUM('zulu','alpha','mike') NOT NULL, id INT NOT NULL, v VARCHAR(8), PRIMARY KEY (k, id)",
             columns: json!([col("k", "enum('zulu','alpha','mike')", true), col("id", "int", true), col("v", "varchar(8)", false)]),
@@ -128,7 +126,7 @@ fn mysql_cases() -> Vec<Case> {
             columns: json!([col("k", "double", true), col("v", "varchar(8)", false)]),
             values: ["0.1", "0.2", "0.30000000000000004", "1e-300", "1.7976931348623157e308", "-2.5", "3.141592653589793"]
                 .iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
-            migrate: true, verify: false },
+            migrate: true, verify: true },
         Case { name: "datetime6", ddl: "k DATETIME(6) PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "datetime(6)", true), col("v", "varchar(8)", false)]),
             values: (0..7).map(|i| format!("('2026-03-08 01:59:59.99999{i}', {})", label(i))).collect(),
@@ -144,7 +142,7 @@ fn mysql_cases() -> Vec<Case> {
         Case { name: "bigint_unsigned", ddl: "k BIGINT UNSIGNED PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "bigint unsigned", true), col("v", "varchar(8)", false)]),
             values: (0..7).map(|i| format!("({}, {})", 18446744073709551609u64 + i as u64, label(i))).collect(),
-            migrate: false, verify: false },
+            migrate: true, verify: true },
         Case { name: "bigint_2p53", ddl: "k BIGINT PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "bigint", true), col("v", "varchar(8)", false)]),
             values: (1..=7).map(|i| format!("({}, {})", 9007199254740992i64 + i, label(i as usize))).collect(),
@@ -178,7 +176,7 @@ fn postgres_cases() -> Vec<Case> {
         Case { name: "text_icu", ddl: "k TEXT COLLATE \"en-US-x-icu\" PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "text", true), col("v", "varchar(8)", false)]),
             values: ["'a'", "'B'", "'\u{00e1}x'", "'a\\b'", "'x\\'", "'it''s'", "'_z'", "'Zz'"].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
-            migrate: false, verify: false },
+            migrate: true, verify: false },
         Case { name: "numeric_wide", ddl: "k NUMERIC(38,0) PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "numeric(38,0)", true), col("v", "varchar(8)", false)]),
             values: (1..=7).map(|i| format!("(1000000000000000000000000000000{i}, {})", label(i))).collect(),
@@ -186,11 +184,11 @@ fn postgres_cases() -> Vec<Case> {
         Case { name: "real", ddl: "k REAL PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "real", true), col("v", "varchar(8)", false)]),
             values: ["0.1", "0.2", "0.3", "0.7", "1.1", "3.3", "-0.1"].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
-            migrate: false, verify: false },
+            migrate: true, verify: true },
         Case { name: "timestamptz6", ddl: "k TIMESTAMPTZ(6) PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "timestamp with time zone", true), col("v", "varchar(8)", false)]),
             values: (0..7).map(|i| format!("('2026-11-01 05:30:00.00000{i}+00', {})", label(i))).collect(),
-            migrate: false, verify: false },
+            migrate: true, verify: true },
         Case { name: "bigint_extremes", ddl: "k BIGINT PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "bigint", true), col("v", "varchar(8)", false)]),
             values: [i64::MIN, -9007199254740993, -1, 0, 9007199254740993, 9007199254740994, i64::MAX].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),
@@ -198,11 +196,11 @@ fn postgres_cases() -> Vec<Case> {
         Case { name: "uuid", ddl: "k UUID PRIMARY KEY, v VARCHAR(8)",
             columns: json!([col("k", "uuid", true), col("v", "varchar(8)", false)]),
             values: (0..7).map(|i| format!("('{:08x}-0000-4000-8000-{:012x}', {})", 0xffff_fff0u32 - i as u32 * 0x1111_1111, i, label(i))).collect(),
-            migrate: false, verify: false },
+            migrate: true, verify: true },
         Case { name: "composite_text_numeric", ddl: "a TEXT COLLATE \"en-US-x-icu\" NOT NULL, b NUMERIC(30,20) NOT NULL, v VARCHAR(8), PRIMARY KEY (a, b)",
             columns: json!([col("a", "text", true), col("b", "numeric(30,20)", true), col("v", "varchar(8)", false)]),
             values: (0..7).map(|i| format!("('{}', 1.0000000000000000000{}, {})", if i < 4 { "g\\1" } else { "G2" }, i, label(i))).collect(),
-            migrate: false, verify: false },
+            migrate: true, verify: false },
         Case { name: "nullable_unique", ddl: "k VARCHAR(16) NULL UNIQUE, v VARCHAR(8)",
             columns: json!([{"name": "k", "type": "varchar(16)", "nullable": true, "unique": true}, col("v", "varchar(8)", false)]),
             values: ["NULL", "NULL", "NULL", "'a'", "'b'", "'c'", "'d'"].iter().enumerate().map(|(i, k)| format!("({k}, {})", label(i))).collect(),

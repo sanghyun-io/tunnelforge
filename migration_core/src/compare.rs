@@ -54,10 +54,26 @@ pub fn normalize_value_for_type(source_type: &str, value: Option<&Value>) -> Val
         if matches!(text.as_str(), "0" | "false" | "f" | "no" | "off") {
             return Value::Bool(false);
         }
+        if let Ok(number) = text.parse::<i64>() {
+            return Value::Bool(number != 0);
+        }
     }
     if is_binary_type(&source_type) {
         if let Value::String(text) = value {
             return Value::String(text.to_ascii_lowercase());
+        }
+    }
+    // MySQL prints 1e300 and PostgreSQL 1e+300 for the same double; compare the number.
+    let base = source_type.split(['(', ' ']).next().unwrap_or("");
+    if matches!(base, "float" | "double" | "real" | "float4" | "float8") {
+        if let Some(number) = scalar_text(value).and_then(|text| text.parse::<f64>().ok()) {
+            return Value::String(number.to_string());
+        }
+    }
+    // ZEROFILL and YEAR text ('007', '0000') reads back as a plain integer on PostgreSQL.
+    if matches!(base, "tinyint" | "smallint" | "mediumint" | "int" | "integer" | "bigint" | "year") {
+        if let Some(text) = scalar_text(value).filter(|text| text.trim().parse::<i128>().is_ok()) {
+            return Value::String(normalize_decimal_text(&text));
         }
     }
     if is_decimal_type(&source_type) {
@@ -509,6 +525,14 @@ pub fn next_table_to_copy(state: &ResumeState) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn float_cells_compare_by_value_across_engines() {
+        for ty in ["double", "double precision", "float", "real"] {
+            assert_eq!(normalize_value_for_type(ty, Some(&json!("1e300"))), normalize_value_for_type(ty, Some(&json!("1e+300"))), "{ty}");
+            assert_eq!(normalize_value_for_type(ty, Some(&json!("0.10000000149011612"))), json!("0.10000000149011612"));
+        }
+    }
+
     use super::*;
     
     

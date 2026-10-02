@@ -587,7 +587,9 @@ fn keyset_term(engine: &str, table: &NormalizedTable, column: &str, value: &str,
         }
         _ => {}
     }
-    format!("{column_ref} {op} {}", sql_literal(&text))
+    // A PostgreSQL timestamptz cursor compared on a MySQL DATETIME (cross-engine verify) drops the
+    // UTC offset the same way the copy does.
+    format!("{column_ref} {op} {}", sql_literal_for_column(engine, &found.type_name, &text))
 }
 
 /// A sql_mode-independent text literal (no backslash processing). It is only coercible, so MySQL
@@ -804,10 +806,8 @@ pub fn copy_csv_field_for_column(target_engine: &str, source_type: &str, value: 
 
     let source_type = source_type.to_ascii_lowercase();
     if target_engine == "postgresql" && source_type.starts_with("tinyint(1)") {
-        if text == "1" || text.eq_ignore_ascii_case("true") {
-            text = "true".to_string();
-        } else if text == "0" || text.eq_ignore_ascii_case("false") {
-            text = "false".to_string();
+        if let Some(flag) = tinyint_flag(&text) {
+            text = flag.to_string();
         }
     }
     if target_engine == "postgresql" && is_binary_type(&source_type) {
@@ -820,6 +820,17 @@ pub fn copy_csv_field_for_column(target_engine: &str, source_type: &str, value: 
     csv_quote(&text)
 }
 
+/// MySQL TINYINT(1) holds -128..127; any nonzero value is true, as MySQL itself treats it.
+fn tinyint_flag(text: &str) -> Option<bool> {
+    if text.eq_ignore_ascii_case("true") {
+        return Some(true);
+    }
+    if text.eq_ignore_ascii_case("false") {
+        return Some(false);
+    }
+    text.trim().parse::<i64>().ok().map(|number| number != 0)
+}
+
 fn csv_quote(value: &str) -> String {
     format!("\"{}\"", value.replace('"', "\"\""))
 }
@@ -830,6 +841,17 @@ pub(crate) fn sanitize_postgresql_text(value: &str) -> String {
 
 pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Value) -> String {
     if let Value::String(text) = value {
+        if target_engine == "mysql" {
+            let lowered = source_type.trim().to_ascii_lowercase();
+            if lowered.starts_with("timestamptz") || (lowered.starts_with("timestamp") && lowered.contains("with time zone")) {
+                // Sessions are UTC (migrate, dump), so the offset is +00; DATETIME stores the bare UTC value.
+                for suffix in ["+00:00", "+00", "Z"] {
+                    if let Some(utc) = text.strip_suffix(suffix) {
+                        return sql_literal(&Value::String(utc.to_string()));
+                    }
+                }
+            }
+        }
         if target_engine == "mysql"
             && mysql_bit_width(source_type).is_some()
             && !text.is_empty()
@@ -854,11 +876,8 @@ pub fn sql_literal_for_column(target_engine: &str, source_type: &str, value: &Va
             }
         }
         if target_engine == "postgresql" && source_type.starts_with("tinyint(1)") {
-            if text == "1" || text.eq_ignore_ascii_case("true") {
-                return "TRUE".to_string();
-            }
-            if text == "0" || text.eq_ignore_ascii_case("false") {
-                return "FALSE".to_string();
+            if let Some(flag) = tinyint_flag(text) {
+                return flag.to_string().to_ascii_uppercase();
             }
         }
         if target_engine == "postgresql" {
@@ -1167,11 +1186,10 @@ fn column_ddl_lines(
 ) -> Option<(Vec<String>, Vec<String>)> {
     let mut lines = Vec::new();
     let mut primary_keys = Vec::new();
+    let mapped_types = column_target_types(table, source, target);
 
-    for column in &table.columns {
+    for (column, (_, mapped_type)) in table.columns.iter().zip(mapped_types) {
         let auto_increment = is_auto_increment_type(&column.type_name);
-        let stripped = strip_generation_marker(&column.type_name);
-        let mapped_type = map_type(source, target, &stripped);
         // 최종 DDL에 들어가는 타입 문자열(mapped_type)을 검증한다. same-engine은 원문이 그대로 들어가고,
         // cross-engine도 map_type이 varchar/decimal/numeric 등에서 원문을 대문자화만 해 통과시키므로
         // (예: `varchar(45), evil int` -> `VARCHAR(45), EVIL INT`), 변환 후 값을 검증해야 same/cross-engine
@@ -1807,17 +1825,39 @@ pub fn map_type(source: &str, target: &str, type_name: &str) -> String {
     }
 }
 
+/// MySQL -> PostgreSQL. Keeps value range (UNSIGNED widens), precision and keyability; only
+/// types without a PostgreSQL equivalent (ENUM, SET, spatial) fall back to TEXT.
 fn map_mysql_to_postgres(ty: &str) -> String {
     let stripped = strip_mysql_character_options(ty);
     let ty = stripped.trim();
-    if ty.starts_with("bigint") {
-        "BIGINT".to_string()
-    } else if ty.starts_with("int") || ty.starts_with("integer") {
-        "INTEGER".to_string()
-    } else if ty.starts_with("tinyint(1)") || ty == "boolean" || ty == "bool" {
+    let unsigned = ty.split_whitespace().any(|word| word == "unsigned");
+    // UNSIGNED/ZEROFILL are MySQL-only modifiers; the range is carried by the widened type.
+    let base_with_args = ty.split_whitespace().next().unwrap_or("");
+    let base = base_with_args.split('(').next().unwrap_or("");
+    if ty.starts_with("tinyint(1)") || ty == "boolean" || ty == "bool" {
         "BOOLEAN".to_string()
-    } else if ty.starts_with("varchar") {
-        ty.to_ascii_uppercase()
+    } else if base == "bigint" {
+        if unsigned { "NUMERIC(20,0)".to_string() } else { "BIGINT".to_string() }
+    } else if base == "int" || base == "integer" {
+        if unsigned { "BIGINT".to_string() } else { "INTEGER".to_string() }
+    } else if base == "mediumint" {
+        "INTEGER".to_string()
+    } else if base == "smallint" {
+        if unsigned { "INTEGER".to_string() } else { "SMALLINT".to_string() }
+    } else if base == "tinyint" || base == "year" {
+        "SMALLINT".to_string()
+    } else if base == "float" || base == "double" || base == "real" {
+        // FLOAT is read as an exact double (projected_text_columns_sql), so DOUBLE PRECISION keeps it.
+        "DOUBLE PRECISION".to_string()
+    } else if base == "decimal" || base == "numeric" || base == "dec" || base == "fixed" {
+        format!("NUMERIC{}", &base_with_args[base.len()..]).to_ascii_uppercase()
+    } else if base == "varchar" {
+        base_with_args.to_ascii_uppercase()
+    } else if base == "char" {
+        // MySQL returns CHAR without trailing padding; VARCHAR keeps that value and the length.
+        let args = &base_with_args[base.len()..];
+        // CHAR(0) is legal in MySQL; PostgreSQL VARCHAR needs a length of at least 1.
+        if args == "(0)" { "VARCHAR(1)".to_string() } else { format!("VARCHAR{args}").to_ascii_uppercase() }
     } else if ty == "date" {
         "DATE".to_string()
     } else if ty.starts_with("datetime") {
@@ -1830,8 +1870,6 @@ fn map_mysql_to_postgres(ty: &str) -> String {
         "JSONB".to_string()
     } else if ty.contains("blob") || ty.contains("binary") {
         "BYTEA".to_string()
-    } else if ty.starts_with("decimal") {
-        ty.to_ascii_uppercase()
     } else if let Some(width) = mysql_bit_width(ty) {
         format!("BIT({width})")
     } else {
@@ -1861,18 +1899,39 @@ fn strip_mysql_character_options(type_name: &str) -> String {
     kept.join(" ")
 }
 
+/// PostgreSQL -> MySQL. Unbounded text and binary use the LONG variants (MySQL TEXT/BLOB stop at
+/// 64 KB); `column_ddl_lines` narrows them when the column is part of a key, which MySQL cannot
+/// index without a length.
 fn map_postgres_to_mysql(ty: &str) -> String {
+    if ty.ends_with("[]") {
+        // Arrays arrive as PostgreSQL array text (`{1,2}`).
+        return "LONGTEXT".to_string();
+    }
     if ty == "bigint" || ty == "bigserial" {
         "BIGINT".to_string()
     } else if ty == "integer" || ty == "int" || ty == "serial" {
         "INT".to_string()
+    } else if ty == "smallint" || ty == "smallserial" {
+        "SMALLINT".to_string()
+    } else if ty == "real" {
+        // Widened: MySQL FLOAT reads back as its exact double, which would not equal PostgreSQL's
+        // shortest real text; DOUBLE stores and prints the same digits.
+        "DOUBLE".to_string()
+    } else if ty == "double precision" {
+        "DOUBLE".to_string()
     } else if ty == "boolean" || ty == "bool" {
         "TINYINT(1)".to_string()
+    } else if ty == "uuid" {
+        "CHAR(36)".to_string()
+    } else if ty == "character varying" || ty == "varchar" || ty == "text" {
+        "LONGTEXT".to_string()
     } else if ty.starts_with("character varying") {
         ty.replacen("character varying", "VARCHAR", 1)
             .to_ascii_uppercase()
     } else if ty.starts_with("varchar") {
         ty.to_ascii_uppercase()
+    } else if let Some(length) = ty.strip_prefix("character(").and_then(|rest| rest.strip_suffix(')')).and_then(|n| n.parse::<u32>().ok()) {
+        if length <= 255 { format!("CHAR({length})") } else { format!("VARCHAR({length})") }
     } else if ty == "date" {
         "DATE".to_string()
     } else if ty == "time" || ty.starts_with("time ") || ty.starts_with("time(") {
@@ -1883,13 +1942,67 @@ fn map_postgres_to_mysql(ty: &str) -> String {
         "JSON".to_string()
     } else if ty == "bytea" {
         "LONGBLOB".to_string()
+    } else if ty == "numeric" || ty == "decimal" {
+        // An unconstrained numeric would become MySQL DECIMAL(10,0) and silently drop fractions.
+        "DECIMAL(65,30)".to_string()
     } else if ty.starts_with("numeric") || ty.starts_with("decimal") {
         ty.replacen("numeric", "DECIMAL", 1).to_ascii_uppercase()
+    } else if ty == "inet" || ty == "cidr" {
+        "VARCHAR(43)".to_string()
+    } else if ty == "macaddr" || ty == "macaddr8" {
+        "VARCHAR(23)".to_string()
     } else if let Some(width) = mysql_bit_width(ty) {
         format!("BIT({width})")
     } else {
-        "TEXT".to_string()
+        "LONGTEXT".to_string()
     }
+}
+
+/// `(source type, target DDL type)` per column, in column order. Cross-engine key columns are
+/// adjusted so the key can exist: MySQL cannot index TEXT/BLOB without a length (ERROR 1170), so
+/// they become VARCHAR/VARBINARY sized to fit the 3072-byte InnoDB key (utf8mb4) and a longer value
+/// fails on insert (strict sessions). PostgreSQL identity columns must be integers and a NUMERIC
+/// FK cannot reference one, so identity and FK-child BIGINT UNSIGNED stay BIGINT (a value above
+/// 2^63-1 then fails instead of being altered); a BIGINT FK may still reference a NUMERIC key.
+pub(crate) fn column_target_types(table: &NormalizedTable, source: &str, target: &str) -> Vec<(String, String)> {
+    let key_widths = key_column_widths(table);
+    let fk_columns = table.foreign_keys.iter().flat_map(|foreign_key| foreign_key.columns.iter()).collect::<Vec<_>>();
+    table.columns.iter().map(|column| {
+        let stripped = strip_generation_marker(&column.type_name);
+        let mut mapped = map_type(source, target, &stripped);
+        let key_width = key_widths.get(&column.name).copied();
+        if source != target && target == "mysql" {
+            if let Some(width) = key_width {
+                let length = (768 / width.max(1)).min(255);
+                match mapped.as_str() {
+                    "LONGTEXT" | "TEXT" => mapped = format!("VARCHAR({length})"),
+                    "LONGBLOB" | "BLOB" => mapped = format!("VARBINARY({length})"),
+                    _ => {}
+                }
+            }
+        }
+        if source != target && target == "postgresql" && mapped == "NUMERIC(20,0)"
+            && (fk_columns.contains(&&column.name) || is_auto_increment_type(&column.type_name)) {
+            mapped = "BIGINT".to_string();
+        }
+        (stripped, mapped)
+    }).collect()
+}
+
+/// Key columns -> column count of the widest key (PK, unique, index or FK) they belong to.
+fn key_column_widths(table: &NormalizedTable) -> BTreeMap<String, usize> {
+    let mut keys = vec![table.columns.iter().filter(|column| column.primary_key).map(|column| column.name.clone()).collect::<Vec<_>>()];
+    keys.extend(table.columns.iter().filter(|column| column.unique).map(|column| vec![column.name.clone()]));
+    keys.extend(table.indexes.iter().map(|index| index.columns.clone()));
+    keys.extend(table.foreign_keys.iter().map(|foreign_key| foreign_key.columns.clone()));
+    let mut widths = BTreeMap::new();
+    for key in keys {
+        for name in &key {
+            let width = widths.entry(name.clone()).or_insert(0);
+            *width = (*width).max(key.len());
+        }
+    }
+    widths
 }
 
 fn temporal_type_with_precision(base: &str, source_type: &str, default_precision: &str) -> String {
@@ -3535,7 +3648,7 @@ mod binary_keyset_tests {
         assert_eq!(mysql_bit_width("bit(64)"), Some(64));
         assert_eq!(mysql_bit_width("bit varying(8)"), None);
         assert_eq!(mysql_bit_width("bit(8)[]"), None);
-        assert_eq!(map_type("postgresql", "mysql", "bit(8)[]"), "TEXT");
+        assert_eq!(map_type("postgresql", "mysql", "bit(8)[]"), "LONGTEXT");
         assert_eq!(map_default_literal("mysql", "'00000101'::\"bit\"", "bit(8)"), "b'00000101'");
         assert_eq!(map_default_literal("postgresql", "b'101'", "bit(8)"), "B'00000101'");
         assert_eq!(map_default_literal("postgresql", "b'0'", "bit(1)"), "B'0'");
@@ -3551,6 +3664,53 @@ mod binary_keyset_tests {
         assert_eq!(legacy_mysql_bit_digits("\u{0}A", 16).unwrap(), "0000000001000001");
         assert!(legacy_mysql_bit_digits("\u{fffd}", 8).is_err());
         assert!(legacy_mysql_bit_digits("\u{2}", 1).is_err());
+    }
+
+    #[test]
+    fn cross_engine_types_keep_range_precision_and_keyability() {
+        for (mysql, pg) in [
+            ("tinyint(4)", "SMALLINT"), ("tinyint unsigned", "SMALLINT"), ("tinyint(1)", "BOOLEAN"),
+            ("smallint", "SMALLINT"), ("smallint unsigned", "INTEGER"), ("mediumint unsigned", "INTEGER"),
+            ("int unsigned", "BIGINT"), ("bigint unsigned", "NUMERIC(20,0)"), ("bigint", "BIGINT"),
+            ("float", "DOUBLE PRECISION"), ("double", "DOUBLE PRECISION"), ("year", "SMALLINT"),
+            ("decimal(10,2) unsigned zerofill", "NUMERIC(10,2)"), ("char(36)", "VARCHAR(36)"),
+            ("enum('a','b')", "TEXT"),
+        ] {
+            assert_eq!(map_type("mysql", "postgresql", mysql), pg, "{mysql}");
+        }
+        for (pg, mysql) in [
+            ("smallint", "SMALLINT"), ("real", "DOUBLE"), ("double precision", "DOUBLE"), ("uuid", "CHAR(36)"),
+            ("text", "LONGTEXT"), ("character varying", "LONGTEXT"), ("character(3)", "CHAR(3)"),
+            ("numeric", "DECIMAL(65,30)"), ("numeric(12,4)", "DECIMAL(12,4)"), ("integer[]", "LONGTEXT"),
+            ("character varying(255)[]", "LONGTEXT"), ("inet", "VARCHAR(43)"), ("bytea", "LONGBLOB"),
+        ] {
+            assert_eq!(map_type("postgresql", "mysql", pg), mysql, "{pg}");
+        }
+        // Key columns cannot be TEXT/BLOB in MySQL (ERROR 1170).
+        let mut keyed = table(vec![column("code", "text"), column("blob_key", "bytea")]);
+        keyed.columns[1].primary_key = false;
+        keyed.indexes.push(NormalizedIndex { name: "uq_blob".into(), columns: vec!["blob_key".into()], column_prefixes: vec![None], unique: true, visible: None });
+        let ddl = generate_table_ddl(&keyed, "postgresql", "mysql").unwrap();
+        assert!(ddl.contains("`code` VARCHAR(255) NOT NULL"), "{ddl}");
+        assert!(ddl.contains("`blob_key` VARBINARY(255)"), "{ddl}");
+        // A four-column text key must fit 3072 bytes (ERROR 1071 otherwise).
+        let wide = table(vec![column("a", "text"), column("b", "text"), column("c", "text"), column("d", "text")]);
+        let ddl = generate_table_ddl(&wide, "postgresql", "mysql").unwrap();
+        assert_eq!(ddl.matches("VARCHAR(192)").count(), 4, "{ddl}");
+        // PostgreSQL identity columns must be integers.
+        let ids = table(vec![column("id", "bigint unsigned auto_increment")]);
+        let ddl = generate_table_ddl(&ids, "mysql", "postgresql").unwrap();
+        assert!(ddl.contains("\"id\" BIGINT GENERATED BY DEFAULT AS IDENTITY"), "{ddl}");
+        assert_eq!(map_type("mysql", "postgresql", "char(0)"), "VARCHAR(1)");
+        assert_eq!(copy_csv_field_for_column("postgresql", "tinyint(1)", &Value::String("2".into())), "\"true\"");
+        assert_eq!(sql_literal_for_column("postgresql", "tinyint(1)", &Value::String("-1".into())), "TRUE");
+    }
+
+    #[test]
+    fn timestamptz_values_lose_the_utc_offset_for_mysql_datetime() {
+        let utc = Value::String("2026-11-01 05:30:00.123+00".into());
+        assert_eq!(sql_literal_for_column("mysql", "timestamp with time zone", &utc), "'2026-11-01 05:30:00.123'");
+        assert_eq!(sql_literal_for_column("postgresql", "timestamp with time zone", &utc), "'2026-11-01 05:30:00.123+00'");
     }
 
     #[test]

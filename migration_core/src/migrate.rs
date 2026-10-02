@@ -404,6 +404,12 @@ pub(crate) fn plan(request: &Request) -> Vec<Value> {
     };
     let table_order = table_dependency_order(&schema);
     let tables = plan_table_summaries(request, &schema);
+    // Distinct source -> target column types, shown in the migration plan summary.
+    let type_mappings = schema.tables.iter().flat_map(|table| crate::ddl::column_target_types(table, &source, &target))
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|(source_type, target_type)| json!({"source_type": source_type, "target_type": target_type}))
+        .collect::<Vec<_>>();
 
     vec![
         phase_event(request, "plan", "migration plan generation started"),
@@ -416,6 +422,7 @@ pub(crate) fn plan(request: &Request) -> Vec<Value> {
                 "ddl": ddl,
                 "tables": tables,
                 "table_order": table_order,
+                "type_mappings": type_mappings,
                 "execution_options": parse_options(&request.payload)
             }
         }),
@@ -491,8 +498,8 @@ pub(crate) fn migrate_streaming<F: FnMut(Value)>(request: &Request, mut emit: F)
         };
 
         match (
-            LiveAdapter::connect(&source_endpoint),
-            LiveAdapter::connect(&target_endpoint),
+            connect_migration_endpoint(&source_endpoint),
+            connect_migration_endpoint(&target_endpoint),
         ) {
             (Ok(mut source), Ok(mut target)) => {
                 if let Err(err) = prepare_target_schema(&mut target, &target_endpoint) {
@@ -637,8 +644,8 @@ pub(crate) fn verify(request: &Request) -> Vec<Value> {
         };
         let options = parse_options(&request.payload);
         match (
-            LiveAdapter::connect(&source_endpoint),
-            LiveAdapter::connect(&target_endpoint),
+            connect_migration_endpoint(&source_endpoint),
+            connect_migration_endpoint(&target_endpoint),
         ) {
             (Ok(mut source), Ok(mut target)) => {
                 let mut emit =
@@ -1152,6 +1159,22 @@ fn migrate_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: 
 enum TableCopyControl {
     Error(String),
     Cancelled,
+}
+
+/// Migration sessions read and write instants in UTC on both engines, as dumps do. Otherwise
+/// MySQL TIMESTAMP text (no offset) is reinterpreted in PostgreSQL's server time zone and
+/// PostgreSQL timestamptz text carries that zone's offset into MySQL DATETIME. MySQL sessions are
+/// strict like dump.import, so a value the target column cannot hold (NaN, a key longer than the
+/// mapped VARCHAR) fails instead of being zeroed or truncated.
+fn connect_migration_endpoint(endpoint: &Endpoint) -> Result<LiveAdapter, String> {
+    let mut adapter = LiveAdapter::connect(endpoint)?;
+    if endpoint.engine == "mysql" {
+        adapter.execute_sql("SET SESSION time_zone = '+00:00'")?;
+        adapter.execute_sql(crate::import::MYSQL_STRICT_SQL_MODE)?;
+    } else {
+        adapter.execute_sql("SET TIME ZONE 'UTC'; SET DateStyle = 'ISO, YMD'")?;
+    }
+    Ok(adapter)
 }
 
 /// create_table 후 keyset/offset 페이지네이션으로 한 테이블의 행을 청크 단위로 복사하고

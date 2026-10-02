@@ -568,7 +568,7 @@ impl MigrationAdapter for LiveAdapter {
         }
     }
 
-    fn create_table(&mut self, _table: &NormalizedTable, ddl: &str) -> Result<(), String> {
+    fn create_table(&mut self, table: &NormalizedTable, ddl: &str) -> Result<(), String> {
         if ddl.trim().is_empty() {
             return Ok(());
         }
@@ -581,9 +581,14 @@ impl MigrationAdapter for LiveAdapter {
                 }
             }),
             Self::PostgreSql(client) => client.batch_execute(ddl).or_else(|err| {
-                if err.code() == Some(&SqlState::DUPLICATE_TABLE)
-                    || looks_like_existing_table(&err.to_string())
-                {
+                // 42P07 is also raised for an index or sequence name; accept it only when the
+                // table itself exists, otherwise the copy would fail later with a missing table.
+                let table_exists = err.code() == Some(&SqlState::DUPLICATE_TABLE)
+                    && client
+                        .query_one("SELECT to_regclass($1) IS NOT NULL", &[&quote_ident("postgresql", &table.name)])
+                        .map(|row| row.get::<_, bool>(0))
+                        .unwrap_or(false);
+                if table_exists {
                     Ok(())
                 } else {
                     Err(format_postgres_error("postgresql create table error", &err))
@@ -823,9 +828,11 @@ fn looks_like_missing_table(message: &str) -> bool {
         || lower.contains("no such table")
 }
 
+/// Only "this table already exists" (MySQL ERROR 1050). Any other "already exists" (a sequence,
+/// an index name) means the CREATE failed and must not be reported as success.
 fn looks_like_existing_table(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
-    lower.contains("already exists") || lower.contains("table exists") || lower.contains("1050")
+    lower.contains("error 1050") || (lower.contains("table '") && lower.contains("already exists"))
 }
 
 fn default_nullable() -> bool {
@@ -1182,12 +1189,14 @@ mod tests {
     }
 
     #[test]
-    fn existing_table_detection_accepts_mysql_and_postgres_messages() {
+    fn existing_table_detection_accepts_only_the_mysql_table_message() {
         assert!(looks_like_existing_table(
             "ERROR 1050 (42S01): Table 'users' already exists"
         ));
-        assert!(looks_like_existing_table(
-            "ERROR: relation \"users\" already exists"
+        // PostgreSQL is decided by SQLSTATE 42P07 plus a check that the table exists;
+        // a sequence or index name collision must not count as an existing table.
+        assert!(!looks_like_existing_table(
+            "ERROR: relation \"users_id_seq\" already exists"
         ));
         assert!(!looks_like_existing_table(
             "permission denied for table users"

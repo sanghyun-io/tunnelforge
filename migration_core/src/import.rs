@@ -422,6 +422,7 @@ fn dump_import_attempt<F: FnMut(Value)>(request: &Request, journal: &mut ImportJ
                 &compression,
                 mode,
                 legacy_bit_text,
+                manifest.source_engine != endpoint.engine,
                 timezone_sql.as_deref(),
                 threads,
                 request.request_id.clone(),
@@ -711,6 +712,10 @@ fn convert_legacy_bit_cells(table: &NormalizedTable, rows: &mut [Value]) -> Resu
     Ok(())
 }
 
+/// Strict MySQL session: out-of-range, too-long or invalid values fail instead of being clamped,
+/// truncated or zeroed. Shared by dump.import and migrate.
+pub(crate) const MYSQL_STRICT_SQL_MODE: &str = "SET SESSION sql_mode = CONCAT_WS(',', 'STRICT_ALL_TABLES', 'NO_AUTO_VALUE_ON_ZERO', TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ',')))";
+
 fn import_table_rows<F: FnMut(Value)>(
     endpoint: &Endpoint,
     adapter: &mut LiveAdapter,
@@ -721,6 +726,7 @@ fn import_table_rows<F: FnMut(Value)>(
     compression: &str,
     mode: &str,
     legacy_bit_text: bool,
+    cross_engine: bool,
     timezone_sql: Option<&str>,
     threads: usize,
     request_id: Option<String>,
@@ -728,7 +734,9 @@ fn import_table_rows<F: FnMut(Value)>(
     overall_rows_total: u64,
     mut emit: F,
 ) -> Result<(u64, u64), String> {
-    if data_format == "tsv" && !has_binary_columns(table) {
+    // LOAD DATA takes cells verbatim; cross-engine cells (timestamptz offsets, booleans) need the
+    // per-column conversion of the INSERT path.
+    if data_format == "tsv" && !cross_engine && !has_binary_columns(table) {
         if let LiveAdapter::MySql(conn) = adapter {
             let chunk_ctx = MysqlImportChunkContext {
                 table,
@@ -1445,7 +1453,7 @@ fn mysql_import_session_tuning_sql(restore: bool) -> Vec<String> {
         // 자동 소멸한다. 또한 원래 글로벌 기본값을 알 수 없어 되돌릴 대상이 애매하다.
     } else {
         vec![
-            "SET SESSION sql_mode = CONCAT_WS(',', 'STRICT_ALL_TABLES', 'NO_AUTO_VALUE_ON_ZERO', TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ',')))".to_string(),
+            MYSQL_STRICT_SQL_MODE.to_string(),
             "SET SESSION foreign_key_checks=0".to_string(),
             "SET SESSION unique_checks=1".to_string(),
             "SET SESSION default_storage_engine='InnoDB'".to_string(),
@@ -2246,7 +2254,7 @@ mod tests {
         assert_eq!(
             mysql_import_session_tuning_sql(false),
             vec![
-                "SET SESSION sql_mode = CONCAT_WS(',', 'STRICT_ALL_TABLES', 'NO_AUTO_VALUE_ON_ZERO', TRIM(BOTH ',' FROM REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(REPLACE(@@SESSION.sql_mode, 'NO_BACKSLASH_ESCAPES', ''), 'NO_ZERO_IN_DATE', ''), 'NO_ZERO_DATE', ''), 'STRICT_TRANS_TABLES', ''), 'STRICT_ALL_TABLES', ''), ',,', ','), ',,', ',')))".to_string(),
+                MYSQL_STRICT_SQL_MODE.to_string(),
                 "SET SESSION foreign_key_checks=0".to_string(),
                 "SET SESSION unique_checks=1".to_string(),
             "SET SESSION default_storage_engine='InnoDB'".to_string(),
