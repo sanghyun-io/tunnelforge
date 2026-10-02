@@ -2115,14 +2115,8 @@ fn run_table_dump_loop<F: FnMut(Value)>(
 }
 
 fn dump_key_columns(table: &NormalizedTable) -> Vec<String> {
-    let keys = key_columns(table);
-    // NULL cannot advance a strict > cursor. Offset reads on the same snapshot
-    // preserve nullable UNIQUE rows, including multiple NULL values.
-    if keys.iter().any(|key| table.columns.iter().any(|column| &column.name == key && column.nullable)) {
-        Vec::new()
-    } else {
-        keys
-    }
+    // Offset reads on the same snapshot preserve nullable UNIQUE rows, including multiple NULL values.
+    cursor_key_columns(table)
 }
 
 fn dump_mysql_table_stream<F: FnMut(Value)>(

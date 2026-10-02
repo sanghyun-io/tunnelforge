@@ -386,6 +386,14 @@ pub(crate) fn projected_text_columns_sql(engine: &str, table: &NormalizedTable) 
                     quote_ident(engine, &column.name),
                     quote_ident(engine, &column.name)
                 )
+            } else if engine == "mysql" && column.type_name.trim().to_ascii_lowercase().starts_with("float") {
+                // The text protocol renders FLOAT with 6 significant digits; as a double it round-trips
+                // exactly, so dumps keep the stored value and keyset cursors stay exact.
+                format!(
+                    "({} + 0e0) AS {}",
+                    quote_ident(engine, &column.name),
+                    quote_ident(engine, &column.name)
+                )
             } else if engine == "mysql" {
                 quote_ident(engine, &column.name)
             } else {
@@ -412,9 +420,12 @@ pub fn select_chunk_text_sql(
     } else {
         key_columns.to_vec()
     };
+    // MySQL sorts NULL first; PostgreSQL sorts it last. Offset pages compared across engines
+    // (verify, keyless copy) must line up, so PostgreSQL uses MySQL's NULL placement.
+    let null_order = if engine == "postgresql" && key_columns.is_empty() { " NULLS FIRST" } else { "" };
     let order_by = order_columns
         .iter()
-        .map(|column| quote_ident(engine, column))
+        .map(|column| format!("{}{null_order}", quote_ident(engine, column)))
         .collect::<Vec<_>>()
         .join(", ");
     let limit_placeholder = if engine == "postgresql" { "$1" } else { "?" };
@@ -498,12 +509,68 @@ pub fn select_chunk_text_range_sql(
 /// binary columns is the HEX of the bytes (`projected_text_columns_sql`). Comparing that text to the raw
 /// binary column compares bytes against ASCII hex digits, so the cursor skips and repeats rows (or stops
 /// advancing); binary keys must be decoded back to bytes.
-fn keyset_value_literal(engine: &str, table: &NormalizedTable, column: &str, value: &str) -> String {
+/// One keyset term (`column = value` or `column > value`) that orders exactly like `ORDER BY column`.
+/// MySQL types a comparison by its operands, not by the column alone:
+/// - a quoted text literal is parsed with backslash escapes, so `a\b` becomes another value;
+/// - ENUM orders by index in `ORDER BY` but compares as a string against a quoted label, so the
+///   `>` term lists the labels after the cursor (an IN list keeps the index range usable);
+/// - SET orders by its bitmask.
+/// FLOAT keys are exact because the projection reads them as doubles (`projected_text_columns_sql`).
+fn keyset_term(engine: &str, table: &NormalizedTable, column: &str, value: &str, greater: bool) -> String {
+    let column_ref = quote_column_ref(engine, &table.name, column);
+    let op = if greater { ">" } else { "=" };
     let text = Value::String(value.to_string());
-    match table.columns.iter().find(|candidate| candidate.name == column) {
-        Some(found) if is_binary_type(&found.type_name) => sql_literal_for_column(engine, &found.type_name, &text),
-        _ => sql_literal(&text),
+    let Some(found) = table.columns.iter().find(|candidate| candidate.name == column) else {
+        return format!("{column_ref} {op} {}", sql_literal(&text));
+    };
+    if is_binary_type(&found.type_name) {
+        return format!("{column_ref} {op} {}", sql_literal_for_column(engine, &found.type_name, &text));
     }
+    if engine != "mysql" {
+        return format!("{column_ref} {op} {}", sql_literal(&text));
+    }
+    let lowered = found.type_name.trim().to_ascii_lowercase();
+    let base = lowered.split(['(', ' ']).next().unwrap_or("");
+    match base {
+        "enum" => {
+            if let Some(labels) = crate::import::mysql_enum_labels(&found.type_name) {
+                if let Some(position) = labels.iter().position(|label| label == value) {
+                    if !greater {
+                        return format!("{column_ref} = {}", mysql_text_literal(value));
+                    }
+                    let later = labels[position + 1..].iter().map(|label| mysql_text_literal(label)).collect::<Vec<_>>();
+                    return if later.is_empty() {
+                        "FALSE".to_string()
+                    } else {
+                        format!("{column_ref} IN ({})", later.join(", "))
+                    };
+                }
+            }
+        }
+        "set" => {
+            // ponytail: SET keys page by bitmask expression (no index range); SET primary keys are rare.
+            let members = crate::import::mysql_enum_labels(&format!("enum{}", &found.type_name.trim()[3..]));
+            if let Some(members) = members {
+                let mask = value.split(',').filter(|item| !item.is_empty()).try_fold(0u64, |mask, item| {
+                    members.iter().position(|member| member == item).map(|bit| mask | (1u64 << bit))
+                });
+                if let Some(mask) = mask {
+                    return format!("({column_ref}+0) {op} {mask}");
+                }
+            }
+        }
+        "char" | "varchar" | "tinytext" | "text" | "mediumtext" | "longtext" => {
+            return format!("{column_ref} {op} {}", mysql_text_literal(value));
+        }
+        _ => {}
+    }
+    format!("{column_ref} {op} {}", sql_literal(&text))
+}
+
+/// A sql_mode-independent text literal (no backslash processing). It is only coercible, so MySQL
+/// converts it to the column's character set and compares in the column's collation, as `ORDER BY` does.
+fn mysql_text_literal(value: &str) -> String {
+    format!("_utf8mb4 X'{}'", hex::encode_upper(value.as_bytes()))
 }
 
 fn keyset_predicates(
@@ -517,17 +584,9 @@ fn keyset_predicates(
     for index in 0..pair_count {
         let mut parts = Vec::new();
         for previous in 0..index {
-            parts.push(format!(
-                "{} = {}",
-                quote_column_ref(engine, &table.name, &key_columns[previous]),
-                keyset_value_literal(engine, table, &key_columns[previous], &values[previous])
-            ));
+            parts.push(keyset_term(engine, table, &key_columns[previous], &values[previous], false));
         }
-        parts.push(format!(
-            "{} > {}",
-            quote_column_ref(engine, &table.name, &key_columns[index]),
-            keyset_value_literal(engine, table, &key_columns[index], &values[index])
-        ));
+        parts.push(keyset_term(engine, table, &key_columns[index], &values[index], true));
         predicates.push(format!("({})", parts.join(" AND ")));
     }
     predicates
@@ -3348,6 +3407,41 @@ mod binary_keyset_tests {
         assert!(after_key("mysql", &ints, &["id"], &["42"]).contains("`events`.`id` > '42'"));
         let text = table(vec![column("code", "varchar(20)")]);
         assert!(after_key("postgresql", &text, &["code"], &["it's"]).contains("\"events\".\"code\" > 'it''s'"));
+    }
+
+    #[test]
+    fn mysql_text_keys_use_an_escape_free_literal() {
+        // A quoted literal would read `a\b` as `a` + backspace (or not close at a trailing `\`).
+        let text = table(vec![column("code", "varchar(20)")]);
+        let sql = after_key("mysql", &text, &["code"], &["a\\b"]);
+        assert!(sql.contains("`events`.`code` > _utf8mb4 X'615C62'"), "{sql}");
+        let latin = table(vec![column("code", "varchar(20) character set latin1")]);
+        assert!(after_key("mysql", &latin, &["code"], &["x\\"]).contains("> _utf8mb4 X'785C'"));
+    }
+
+    #[test]
+    fn mysql_enum_and_set_keys_compare_by_index_like_order_by() {
+        let enums = table(vec![column("k", "enum('zulu','alpha','it''s')")]);
+        let sql = after_key("mysql", &enums, &["k"], &["zulu"]);
+        assert!(sql.contains("`events`.`k` IN (_utf8mb4 X'616C706861', _utf8mb4 X'69742773')"), "{sql}");
+        assert!(after_key("mysql", &enums, &["k"], &["it's"]).contains("(FALSE)"));
+        let composite = table(vec![column("k", "enum('zulu','alpha')"), column("id", "bigint")]);
+        let sql = after_key("mysql", &composite, &["k", "id"], &["zulu", "7"]);
+        assert!(sql.contains("`events`.`k` = _utf8mb4 X'7A756C75' AND `events`.`id` > '7'"), "{sql}");
+        let sets = table(vec![column("k", "set('a','b','c')")]);
+        assert!(after_key("mysql", &sets, &["k"], &["a,c"]).contains("(`events`.`k`+0) > 5"));
+        // An unknown label falls back to the plain literal instead of guessing an index.
+        assert!(after_key("mysql", &enums, &["k"], &["nope"]).contains("`events`.`k` > 'nope'"));
+    }
+
+    #[test]
+    fn mysql_float_keys_are_read_as_exact_doubles() {
+        let floats = table(vec![column("k", "float")]);
+        let sql = after_key("mysql", &floats, &["k"], &["0.10000000149011612"]);
+        assert!(sql.contains("(`k` + 0e0) AS `k`"), "{sql}");
+        assert!(sql.contains("`events`.`k` > '0.10000000149011612'"), "{sql}");
+        let pg = table(vec![column("k", "real")]);
+        assert!(after_key("postgresql", &pg, &["k"], &["0.1"]).contains("\"events\".\"k\" > '0.1'"));
     }
 
     #[test]
