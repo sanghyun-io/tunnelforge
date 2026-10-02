@@ -128,6 +128,104 @@ jobs:
           cargo test --manifest-path migration_core/Cargo.toml --lib safe_promote_ -- --test-threads=1
           cargo test --manifest-path migration_core/Cargo.toml --lib import::safe_restore_digest:: -- --include-ignored --test-threads=1
 
+  live-security-regression:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    services:
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: tf_local_test
+          MYSQL_ROOT_HOST: "%"
+          MYSQL_DATABASE: tfdb
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -ptf_local_test"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+      postgres:
+        image: postgres:18.4
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: tf_local_test
+          POSTGRES_DB: tfdb
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres -d tfdb"
+          --health-interval=10s --health-timeout=5s --health-retries=12
+    env:
+      # Live tests normally return early without their environment; here a
+      # missing variable must fail the gate instead of passing silently.
+      TF_LIVE_REQUIRED: "1"
+      TF_QUERY_LIVE_MYSQL_HOST: 127.0.0.1
+      TF_QUERY_LIVE_MYSQL_PORT: "3306"
+      TF_QUERY_LIVE_MYSQL_USER: root
+      TF_QUERY_LIVE_MYSQL_PASSWORD: tf_local_test
+      TF_QUERY_LIVE_MYSQL_DATABASE: tfdb
+      TF_QUERY_LIVE_PG_HOST: 127.0.0.1
+      TF_QUERY_LIVE_PG_PORT: "5432"
+      TF_QUERY_LIVE_PG_USER: postgres
+      TF_QUERY_LIVE_PG_PASSWORD: tf_local_test
+      TF_QUERY_LIVE_PG_DATABASE: tfdb
+      TF_TLS_CERT_DIR: /tmp/tf-tls-certs
+      TF_TLS_TEST_CERT_DIR: /tmp/tf-tls-certs
+
+    steps:
+      - name: Checkout PR
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          persist-credentials: false
+
+      - name: Build live security tests
+        run: |
+          cargo test --manifest-path migration_core/Cargo.toml --no-run \
+            --test live_query_control \
+            --test live_read_only_session \
+            --test live_tls \
+            --test live_tls_cancel
+
+      - name: Run query control and read-only session regressions
+        run: |
+          cargo test --manifest-path migration_core/Cargo.toml \
+            --test live_query_control \
+            --test live_read_only_session \
+            -- --test-threads=1
+
+      - name: Start TLS test servers
+        run: |
+          bash scripts/tls_live_env.sh certs
+          bash scripts/tls_live_env.sh up-pg
+          bash scripts/tls_live_env.sh up-mysql
+          bash scripts/tls_live_env.sh cert pg good
+          bash scripts/tls_live_env.sh cert mysql good
+
+      - name: Run TLS verification and cancellation regressions
+        env:
+          TF_TLS_TEST_ENV_SCRIPT: ${{ github.workspace }}/scripts/tls_live_env.sh
+        run: |
+          cargo test --manifest-path migration_core/Cargo.toml \
+            --test live_tls \
+            --test live_tls_cancel \
+            -- --test-threads=1
+
+      - name: Run TLS fail-closed regression without server TLS
+        env:
+          TF_TLS_TEST_ENV_SCRIPT: ${{ github.workspace }}/scripts/tls_live_env.sh
+          TF_TLS_TEST_MYSQL_NOSSL: "1"
+        run: |
+          bash scripts/tls_live_env.sh up-mysql-nossl
+          cargo test --manifest-path migration_core/Cargo.toml \
+            --test live_tls mysql_verified_tls_fails_closed_without_server_tls \
+            -- --test-threads=1
+
+      - name: Remove TLS test servers
+        if: always()
+        run: bash scripts/tls_live_env.sh down
+
   python-regression:
     runs-on: windows-latest
     timeout-minutes: 20
@@ -637,6 +735,7 @@ jobs:
       - macos-support-tracking-gate
       - rust-core-regression-gate
       - dump-roundtrip-regression
+      - live-security-regression
       - python-regression
       - python-linux-regression
       - macos-app-validation
@@ -651,6 +750,7 @@ jobs:
           MACOS_TRACKING_RESULT: ${{ needs.macos-support-tracking-gate.result }}
           RUST_RESULT: ${{ needs.rust-core-regression-gate.result }}
           DUMP_ROUNDTRIP_RESULT: ${{ needs.dump-roundtrip-regression.result }}
+          LIVE_SECURITY_RESULT: ${{ needs.live-security-regression.result }}
           PYTHON_RESULT: ${{ needs.python-regression.result }}
           LINUX_PYTHON_RESULT: ${{ needs.python-linux-regression.result }}
           MACOS_APP_RESULT: ${{ needs.macos-app-validation.result }}
@@ -664,6 +764,7 @@ jobs:
             "$MACOS_TRACKING_RESULT" \
             "$RUST_RESULT" \
             "$DUMP_ROUNDTRIP_RESULT" \
+            "$LIVE_SECURITY_RESULT" \
             "$PYTHON_RESULT" \
             "$LINUX_PYTHON_RESULT" \
             "$MACOS_APP_RESULT" \

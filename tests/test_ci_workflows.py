@@ -67,6 +67,7 @@ def test_pr_head_regression_jobs_use_read_only_checkout_without_credentials():
     expected_pr_head_jobs = {
         "rust-core-regression-gate": {"contents": "read"},
         "dump-roundtrip-regression": {"contents": "read"},
+        "live-security-regression": {"contents": "read"},
         "python-regression": {"contents": "read"},
         "python-linux-regression": {"contents": "read"},
         "macos-app-validation": {"contents": "read"},
@@ -387,6 +388,7 @@ def test_required_version_gate_is_terminal_and_aggregates_all_results():
         "macos-support-tracking-gate",
         "rust-core-regression-gate",
         "dump-roundtrip-regression",
+        "live-security-regression",
         "python-regression",
         "python-linux-regression",
         "macos-app-validation",
@@ -462,7 +464,7 @@ def test_linux_regression_builds_and_launches_main_app_after_full_suite():
     assert positions == sorted(positions)
 
 
-@pytest.mark.parametrize('result_key', ['LINUX_PYTHON_RESULT', 'DUMP_ROUNDTRIP_RESULT'])
+@pytest.mark.parametrize('result_key', ['LINUX_PYTHON_RESULT', 'DUMP_ROUNDTRIP_RESULT', 'LIVE_SECURITY_RESULT'])
 @pytest.mark.parametrize('job_result', ['success', 'failure', 'skipped', 'cancelled'])
 def test_terminal_gate_requires_live_and_linux_success(result_key, job_result):
     bash = shutil.which('bash')
@@ -504,6 +506,26 @@ def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
     assert '--include-ignored --test-threads=1' in commands
     assert '--lib safe_promote_ -- --test-threads=1' in commands
     assert '--lib import::safe_restore_digest:: -- --include-ignored --test-threads=1' in commands
+
+
+def test_live_security_gate_runs_tls_query_control_and_read_only_tests_strictly():
+    job = load_version_gate()['jobs']['live-security-regression']
+    assert job['runs-on'] == 'ubuntu-24.04'
+    # A missing environment must fail these tests instead of returning early.
+    assert job['env']['TF_LIVE_REQUIRED'] == '1'
+    for prefix, service in [('TF_QUERY_LIVE_MYSQL', 'mysql'), ('TF_QUERY_LIVE_PG', 'postgres')]:
+        assert job['env'][f'{prefix}_HOST'] == '127.0.0.1'
+        assert job['env'][f'{prefix}_DATABASE'] == 'tfdb'
+        assert '--health-cmd' in job['services'][service]['options']
+    assert job['env']['TF_TLS_TEST_CERT_DIR'] == job['env']['TF_TLS_CERT_DIR']
+    commands = '\n'.join(step.get('run', '') for step in job['steps'])
+    runs = '\n'.join(step.get('run', '') for step in job['steps'] if '--no-run' not in step.get('run', ''))
+    for fixture in ['live_query_control', 'live_read_only_session', 'live_tls', 'live_tls_cancel']:
+        assert re.search(rf'--test {fixture}\b', runs), fixture
+    assert 'bash scripts/tls_live_env.sh up-mysql-nossl' in commands
+    assert 'mysql_verified_tls_fails_closed_without_server_tls' in commands
+    down = [step for step in job['steps'] if step.get('run') == 'bash scripts/tls_live_env.sh down']
+    assert down and down[0]['if'] == 'always()'
 
 
 @pytest.mark.parametrize('workflow_path, job_name', [

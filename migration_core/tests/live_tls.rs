@@ -22,6 +22,15 @@ struct Env {
     mysql_port: u16,
 }
 
+/// The CI live gate sets TF_LIVE_REQUIRED so a missing environment fails instead
+/// of passing silently.
+fn require_env<T>(value: Option<T>, what: &str) -> Option<T> {
+    if value.is_none() && std::env::var_os("TF_LIVE_REQUIRED").is_some() {
+        panic!("TF_LIVE_REQUIRED is set but {what} is missing");
+    }
+    value
+}
+
 fn env() -> Option<Env> {
     let certs = std::env::var("TF_TLS_TEST_CERT_DIR").ok()?;
     Some(Env {
@@ -127,7 +136,7 @@ fn run_engine(env: &Env, engine: &str, target: &str) {
 #[test]
 fn postgres_tls_policy_against_live_server() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(env) = env() else { return };
+    let Some(env) = require_env(env(), "TF_TLS_TEST_CERT_DIR") else { return };
     run_engine(&env, "postgresql", "pg");
 
     // server without TLS: verified modes must fail closed, disable keeps working
@@ -141,7 +150,7 @@ fn postgres_tls_policy_against_live_server() {
 #[test]
 fn mysql_tls_policy_against_live_server() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(env) = env() else { return };
+    let Some(env) = require_env(env(), "TF_TLS_TEST_CERT_DIR") else { return };
     run_engine(&env, "mysql", "mysql");
 }
 
@@ -149,7 +158,7 @@ fn mysql_tls_policy_against_live_server() {
 #[test]
 fn mysql_verified_tls_fails_closed_without_server_tls() {
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(env) = env() else { return };
+    let Some(env) = require_env(env(), "TF_TLS_TEST_CERT_DIR") else { return };
     if std::env::var("TF_TLS_TEST_MYSQL_NOSSL").is_err() {
         return;
     }

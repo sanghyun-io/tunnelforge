@@ -95,8 +95,17 @@ impl Drop for Core {
     }
 }
 
+/// The CI live gate sets TF_LIVE_REQUIRED so a missing environment fails instead
+/// of passing silently.
+fn require_env<T>(value: Option<T>, what: &str) -> Option<T> {
+    if value.is_none() && std::env::var_os("TF_LIVE_REQUIRED").is_some() {
+        panic!("TF_LIVE_REQUIRED is set but {what} is missing");
+    }
+    value
+}
+
 fn check(engine: &str, port: u16, user: &str, database: &str, sleep_sql: &str, still_running: &str) {
-    let Ok(certs) = std::env::var("TF_TLS_TEST_CERT_DIR") else { return };
+    let Some(certs) = require_env(std::env::var("TF_TLS_TEST_CERT_DIR").ok(), "TF_TLS_TEST_CERT_DIR") else { return };
     let endpoint = json!({
         "engine": engine, "host": "127.0.0.1", "port": port, "user": user, "password": "tfpass",
         "database": database,
