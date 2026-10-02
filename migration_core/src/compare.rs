@@ -199,6 +199,17 @@ pub(crate) fn key_columns(table: &NormalizedTable) -> Vec<String> {
         .collect()
 }
 
+/// Key columns usable by a strict `>` cursor. A nullable key (a UNIQUE fallback) cannot advance past
+/// NULL and `>` never selects NULL rows, so such tables page by offset instead.
+pub(crate) fn cursor_key_columns(table: &NormalizedTable) -> Vec<String> {
+    let keys = key_columns(table);
+    if keys.iter().any(|key| table.columns.iter().any(|column| &column.name == key && column.nullable)) {
+        Vec::new()
+    } else {
+        keys
+    }
+}
+
 pub(crate) fn column_names(table: &NormalizedTable) -> Vec<String> {
     table
         .columns
@@ -247,6 +258,9 @@ pub(crate) fn advance_keyset_cursor(
             hex_bytes(left).zip(hex_bytes(right)).map(|(a, b)| a.cmp(&b))
         } else if type_name.contains("int") {
             left.parse::<i128>().ok().zip(right.parse::<i128>().ok()).map(|(a, b)| a.cmp(&b))
+        } else if ["float", "double", "real", "decimal", "numeric"].iter().any(|kind| type_name.starts_with(kind)) {
+            // Rounding to f64 never reverses an order, so a decrease here is a real rewind.
+            left.parse::<f64>().ok().zip(right.parse::<f64>().ok()).and_then(|(a, b)| a.partial_cmp(&b))
         } else {
             None
         };

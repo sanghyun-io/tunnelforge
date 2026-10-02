@@ -599,7 +599,8 @@ impl MigrationAdapter for LiveAdapter {
         limit: usize,
     ) -> Result<Vec<Value>, String> {
         let columns = column_names(table);
-        let key_columns = key_columns(table);
+        // Offset pages need a total order; a nullable UNIQUE key is not one (several NULLs).
+        let key_columns = cursor_key_columns(table);
         match self {
             Self::MySql(conn) => {
                 let sql = select_chunk_text_sql("mysql", table, &key_columns);

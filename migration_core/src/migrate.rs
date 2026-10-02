@@ -1175,8 +1175,19 @@ fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
         return Err(TableCopyControl::Error(err));
     }
     let total_rows = source.row_count(&table.name).ok();
-    let key_columns = key_columns(table);
+    let key_columns = cursor_key_columns(table);
     let use_keyset = !key_columns.is_empty();
+    // A state saved by an older version may hold a keyset token for a table that now pages by
+    // offset (nullable keys) or vice versa; continuing would skip or repeat rows.
+    let saved = state.tables[state_index].last_key.clone();
+    if let Some(saved) = saved.as_deref() {
+        if !state.tables[state_index].completed && use_keyset == saved.parse::<usize>().is_ok() {
+            return Err(TableCopyControl::Error(format!(
+                "the saved resume position of {} was written with a different paging mode; restart this table with a fresh migration",
+                table.name
+            )));
+        }
+    }
     let mut offset = if use_keyset {
         0
     } else {
@@ -1197,6 +1208,18 @@ fn copy_table_rows<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Value)>(
             Err(err) => return Err(TableCopyControl::Error(err)),
         };
         if rows.is_empty() {
+            // A cursor that skips rows ends early without an error; compare the target with the source
+            // before reporting the table as copied. The target count also covers resumed copies. A
+            // match with the source count before or after the copy is accepted so ordinary
+            // concurrent writes do not fail a correct copy.
+            if let (Ok(expected), Ok(copied)) = (source.row_count(&table.name), target.row_count(&table.name)) {
+                if copied != expected && total_rows != Some(copied) {
+                    return Err(TableCopyControl::Error(format!(
+                        "{} has {copied} rows in the target but {expected} in the source; the table was not fully copied. Run a fresh migration of this table after source writes stop, then verify",
+                        table.name
+                    )));
+                }
+            }
             state.tables[state_index].completed = true;
             state.tables[state_index].last_key = None;
             on_event(json!({
@@ -1408,7 +1431,7 @@ fn verify_with_adapters_reporting<S: MigrationAdapter, T: MigrationAdapter, F: F
             }));
         }
 
-        let key_columns = key_columns(table);
+        let key_columns = cursor_key_columns(table);
         let table_mismatches = if key_columns.is_empty() {
             verify_table_by_digest(source, target, table, chunk_size, total_rows, emit)
         } else {
@@ -1550,10 +1573,13 @@ fn verify_table_by_keyset<S: MigrationAdapter, T: MigrationAdapter, F: FnMut(Val
             .last()
             .or_else(|| target_rows.last())
             .and_then(|row| row_key_token(row, key_columns));
-        if next_key.is_none() || next_key == last_key {
-            break;
+        match advance_keyset_cursor(table, key_columns, last_key.as_deref(), next_key) {
+            Ok(token) => last_key = Some(token),
+            Err(err) => {
+                mismatches.push(json!({"table": table.name, "kind": "error", "side": "cursor", "message": err}));
+                break;
+            }
         }
-        last_key = next_key;
     }
     emit(json!({
         "event": "table_progress",

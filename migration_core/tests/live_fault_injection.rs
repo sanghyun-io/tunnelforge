@@ -196,6 +196,7 @@ fn manifest(dir: &std::path::Path) -> Value {
 /// snapshot therefore has identical id sets and value sums in both.
 struct PairWriter {
     stop: Arc<AtomicBool>,
+    committed: Arc<AtomicU64>,
     handle: Option<thread::JoinHandle<u64>>,
 }
 
@@ -203,6 +204,8 @@ impl PairWriter {
     fn start(endpoint: Endpoint, a: String, b: String, seeded: i64) -> PairWriter {
         let stop = Arc::new(AtomicBool::new(false));
         let flag = stop.clone();
+        let committed = Arc::new(AtomicU64::new(0));
+        let counter = committed.clone();
         let handle = thread::spawn(move || {
             let mysql = endpoint.engine == "mysql";
             let mut adapter = LiveAdapter::connect(&endpoint).unwrap();
@@ -219,10 +222,15 @@ impl PairWriter {
                 adapter.execute_sql(commit).unwrap();
                 next += 1;
                 commits += 1;
+                counter.store(commits, Ordering::SeqCst);
             }
             commits
         });
-        PairWriter { stop, handle: Some(handle) }
+        PairWriter { stop, committed, handle: Some(handle) }
+    }
+
+    fn commits(&self) -> u64 {
+        self.committed.load(Ordering::SeqCst)
     }
 
     fn finish(mut self) -> u64 {
@@ -263,9 +271,13 @@ fn export_and_assert_single_point(
     for (key, value) in extra.as_object().unwrap() {
         payload[key] = value.clone();
     }
+    // The precondition is concurrency, not throughput: count commits made while the export ran
+    // (a wall-clock threshold failed on loaded runners).
+    let before = writer.commits();
     let result = events(export_endpoint, "dump.run", payload);
-    let commits = writer.finish();
-    assert!(commits > 20, "{label}: writer must have committed during export (commits={commits})");
+    let during = writer.commits() - before;
+    writer.finish();
+    assert!(during > 0, "{label}: writer must have committed during export (commits during export={during})");
     ok(result);
     let manifest = manifest(&dir);
     let sets: Vec<BTreeMap<i64, i64>> = [a, b]
@@ -275,7 +287,7 @@ fn export_and_assert_single_point(
             read_rows(&dir, table).iter().map(|row| (num(&row["id"]), num(&row["v"]))).collect()
         })
         .collect();
-    assert_eq!(sets[0], sets[1], "{label}: tables come from different points in time (commits={commits})");
+    assert_eq!(sets[0], sets[1], "{label}: tables come from different points in time (commits during export={during})");
     assert!(sets[0].len() >= 5000, "{label}");
     fs::remove_dir_all(&dir).unwrap();
     manifest

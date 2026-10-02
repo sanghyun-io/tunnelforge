@@ -498,7 +498,7 @@ def test_live_dump_gate_runs_public_fixtures_against_disposable_databases():
     assert job['env']['TF_PROMOTE_MYSQL_HOST'] == job['env']['TF_MYSQL_HOST']
     assert job['services']['postgres']['env']['POSTGRES_DB'] == 'tf_test'
     commands = '\n'.join(step.get('run', '') for step in job['steps'])
-    fixtures = ['live_roundtrip', 'live_binary_keyset', 'live_dump_cross_engine', 'live_schema_fidelity',
+    fixtures = ['live_roundtrip', 'live_binary_keyset', 'live_keyset_pk_matrix', 'live_dump_cross_engine', 'live_schema_fidelity',
                 'live_import_policy', 'live_foreign_key_actions', 'live_export_contract',
                 'live_fault_injection', 'live_safe_restore', 'live_backup_lifecycle']
     assert re.findall(r'--test ([a-z_]+)', commands) == fixtures

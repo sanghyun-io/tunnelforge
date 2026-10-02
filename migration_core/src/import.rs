@@ -1765,7 +1765,7 @@ fn load_mysql_tsv_chunk(
 
 /// LOAD DATA LOCAL can downgrade coercions and duplicate keys to warnings even
 /// in strict SQL mode. Commit only statements that stored every value faithfully.
-fn mysql_enum_labels(type_name: &str) -> Option<Vec<String>> {
+pub(crate) fn mysql_enum_labels(type_name: &str) -> Option<Vec<String>> {
     let value = type_name.trim();
     if !value.get(..4)?.eq_ignore_ascii_case("enum") { return None; }
     let mut chars = value[4..].trim_start().strip_prefix('(')?.chars().peekable();

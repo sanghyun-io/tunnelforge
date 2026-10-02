@@ -2,7 +2,7 @@
 
 Last reviewed: 2026-09-29
 
-Current shipping version: `v2.12.0` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
+Current shipping version: `v2.12.1` <!-- managed by scripts/bump_version.py (versioning.sync_status_marker); do not edit by hand -->
 
 This document is the current repository status index. It separates verified
 state from planning documents and lists the next actionable issues.
@@ -2877,6 +2877,9 @@ Next action:
 
 | ID | Severity | Status | Area | Short Title | Next Action |
 | --- | --- | --- | --- | --- | --- |
+| TF-STATUS-148 | High | open | Cross-engine type mapping | MySQL FLOAT/DOUBLE/SMALLINT/TINYINT(n>1)/MEDIUMINT/CHAR/ENUM map to PostgreSQL TEXT, and UNSIGNED INT/BIGINT map to signed types that overflow (`map_mysql_to_postgres`); PostgreSQL TEXT/UUID/REAL keys cannot become MySQL keys, a failed CREATE surfaces as `table doesn't exist`, and TIMESTAMPTZ values are rejected by MySQL DATETIME. Found by the keyset matrix (146) | Fix the mapping per type with a live round-trip matrix; make a failed target CREATE a clear error |
+| TF-STATUS-147 | High | open | MySQL BIT data fidelity | The text protocol returns BIT as raw bytes, which become U+FFFD in dumps: BIT(8+) values >= 0x80 are corrupted (import then fails, or wider BIT columns store wrong bytes silently) and BIT keys page wrongly | Dump BIT as hex with a manifest format marker (format_version 4 only for dumps with BIT columns) and decode on import; add BIT keys back to the keyset matrix |
+| TF-STATUS-146 | High | fixed_pending_full_verify | Keyset pagination correctness | A live primary-key matrix (MySQL 8.4/8.0, PostgreSQL 18.4) showed MySQL ENUM keys and composite keys containing a backslash silently dropping/duplicating rows in `dump.run`, `migrate` reporting success with missing rows (backslash keys, PostgreSQL nullable UNIQUE keys), FLOAT keys failing and DOUBLE verify looping. MySQL keyset terms now use escape-free hex text literals, ENUM label equality / later-label IN lists, SET bitmasks; FLOAT is read as an exact double; nullable keys page by offset with a total order (PostgreSQL NULLS FIRST); migrate compares target and source counts; verify fails on a non-advancing cursor; an old resume state with another paging mode is refused | Merge through the protected PR (matrix in the CI live gate) and publish |
 | TF-STATUS-145 | High | closed | Versioned release | v2.12.0 published stable/latest via PR #296 and approved workflows; 10 asset digests, four macOS sidecars and live updater (2.11.3/2.11.2 -> 2.12.0) verified; release notes explain the overwrite Import mode (143) | Preserve exact-head checks and immutable tag |
 | TF-STATUS-144 | High | closed | CI / live security gate | Shipped TLS verification, server-side query cancel/limits and the production read-only session had live tests that no workflow ran, and missing environment made them pass silently. PR #295 adds the required `live-security-regression` job (MySQL 8.4 / PostgreSQL 18.4 services plus `scripts/tls_live_env.sh` TLS servers, including the no-TLS fail-closed case) with `TF_LIVE_REQUIRED=1` so missing env fails; the read-only state check no longer hard-codes `tfdb`. Passed on #295 and #296 | Python live tests (`test_tls_paths_live`, `test_trust_live`, `test_explain_plan_live`) still need Qt, SSH and extra DB versions in CI |
 | TF-STATUS-143 | Medium | closed | Import UX / safe overwrite | New Import mode "덮어쓰기" (option C, user decision 2026-10-02): one up-front confirmation, then the existing safe restore, then automatic promotion under the original name with the core's verified plan; replaced data stays under a backup name. Automatic only for `ready_for_switch` with a promotable, blocker-free plan; anything else falls back to the reviewed choice. Advanced direct `replace` stays visible | Shipped in v2.12.0 (PR #296). Live end-to-end through the UI is covered by unit tests plus the existing `safe_promote` live contract |
@@ -3029,8 +3032,10 @@ Current state (2026-10-02): the PM agenda after v2.11.1 is shipped -> (1) per-ta
 replace import and stricter surviving-FK preflight (139, v2.11.2), (2) allowlisted error
 codes in automatic reports (140, v2.11.3), (3) TLS/query-control/read-only live tests in
 the required CI gate (144), (4) "overwrite" backed by safe restore + automatic swap with
-`replace` kept as an always-visible advanced option (143, v2.12.0). Next candidates: the
-PK-type keyset live matrix (137 follow-up), Python live tests in CI, README/doc alignment.
+`replace` kept as an always-visible advanced option (143, v2.12.0). Then the PK-type keyset
+matrix (146) found and fixed silent row loss; its findings opened 147 (BIT data) and 148
+(cross-engine type mapping), which are next, followed by Python live tests in CI and README/doc
+alignment.
 v2.11.1 (TF-STATUS-138) fixed silent export corruption for binary primary keys (137);
 affected backups taken with <= 2.11.0 must be re-taken.
 Real Mac and managed-provider validation stay deferred by user decision.
