@@ -8,6 +8,7 @@ dry_run=False 실행은 항상 거부된다.
 from typing import Tuple
 
 from src.core.migration_analysis_models import ActionType, CleanupAction, OrphanRecord
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 
 class OrphanCleanupPlanner:
@@ -34,21 +35,21 @@ class OrphanCleanupPlanner:
         대용량 테이블 경로와 동일하게 NOT EXISTS로 통일한다.
         """
         if action == ActionType.DELETE:
-            sql = f"""DELETE c FROM `{schema}`.`{orphan.child_table}` AS c
-WHERE c.`{orphan.child_column}` IS NOT NULL
+            sql = f"""DELETE c FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(orphan.child_table)} AS c
+WHERE c.{quote_mysql_ident(orphan.child_column)} IS NOT NULL
     AND NOT EXISTS (
-        SELECT 1 FROM `{schema}`.`{orphan.parent_table}` AS p
-        WHERE p.`{orphan.parent_column}` = c.`{orphan.child_column}`
+        SELECT 1 FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(orphan.parent_table)} AS p
+        WHERE p.{quote_mysql_ident(orphan.parent_column)} = c.{quote_mysql_ident(orphan.child_column)}
     )"""
             description = f"{orphan.child_table}에서 고아 레코드 {orphan.orphan_count}개 삭제"
 
         elif action == ActionType.SET_NULL:
-            sql = f"""UPDATE `{schema}`.`{orphan.child_table}` AS c
-SET c.`{orphan.child_column}` = NULL
-WHERE c.`{orphan.child_column}` IS NOT NULL
+            sql = f"""UPDATE {quote_mysql_ident(schema)}.{quote_mysql_ident(orphan.child_table)} AS c
+SET c.{quote_mysql_ident(orphan.child_column)} = NULL
+WHERE c.{quote_mysql_ident(orphan.child_column)} IS NOT NULL
     AND NOT EXISTS (
-        SELECT 1 FROM `{schema}`.`{orphan.parent_table}` AS p
-        WHERE p.`{orphan.parent_column}` = c.`{orphan.child_column}`
+        SELECT 1 FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(orphan.parent_table)} AS p
+        WHERE p.{quote_mysql_ident(orphan.parent_column)} = c.{quote_mysql_ident(orphan.child_column)}
     )"""
             description = f"{orphan.child_table}.{orphan.child_column}을 NULL로 설정 ({orphan.orphan_count}개)"
 
@@ -116,7 +117,7 @@ WHERE c.`{orphan.child_column}` IS NOT NULL
         where_clause = action.sql[where_idx:]
 
         count_sql = (
-            f"SELECT COUNT(*) as cnt FROM `{action.target_schema}`.`{action.target_table}` AS c "
+            f"SELECT COUNT(*) as cnt FROM {quote_mysql_ident(action.target_schema)}.{quote_mysql_ident(action.target_table)} AS c "
             f"{where_clause}"
         )
         result = self.connector.execute(count_sql)

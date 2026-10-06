@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Set, Optional, Tuple, Callable, Any, TYPE_CHECKING
 
 from src.core.migration_constants import IssueType
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 if TYPE_CHECKING:
     from src.core.db_connector import MySQLConnector
@@ -49,15 +50,15 @@ class FKDefinition:
 
     def get_drop_sql(self, schema: str) -> str:
         """FK DROP SQL 생성"""
-        return f"ALTER TABLE `{schema}`.`{self.table_name}` DROP FOREIGN KEY `{self.constraint_name}`;"
+        return f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(self.table_name)} DROP FOREIGN KEY {quote_mysql_ident(self.constraint_name)};"
 
     def get_add_sql(self, schema: str) -> str:
         """FK ADD SQL 생성"""
-        cols = ", ".join(f"`{c}`" for c in self.columns)
-        ref_cols = ", ".join(f"`{c}`" for c in self.ref_columns)
+        cols = ", ".join(quote_mysql_ident(c) for c in self.columns)
+        ref_cols = ", ".join(quote_mysql_ident(c) for c in self.ref_columns)
         return (
-            f"ALTER TABLE `{schema}`.`{self.table_name}` ADD CONSTRAINT `{self.constraint_name}` "
-            f"FOREIGN KEY ({cols}) REFERENCES `{self.ref_table}` ({ref_cols}) "
+            f"ALTER TABLE {quote_mysql_ident(schema)}.{quote_mysql_ident(self.table_name)} ADD CONSTRAINT {quote_mysql_ident(self.constraint_name)} "
+            f"FOREIGN KEY ({cols}) REFERENCES {quote_mysql_ident(self.ref_table)} ({ref_cols}) "
             f"ON DELETE {self.on_delete} ON UPDATE {self.on_update};"
         )
 

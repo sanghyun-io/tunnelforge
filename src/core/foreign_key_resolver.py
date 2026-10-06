@@ -4,6 +4,7 @@ from datetime import datetime
 from typing import Callable, Dict, List, Optional, Set, Tuple
 
 from src.core.db_connector import MySQLConnector
+from src.core.db_core_dbapi_shim import quote_mysql_ident
 
 
 @dataclass
@@ -75,9 +76,9 @@ class ForeignKeyResolver:
     ) -> str:
         """Shared FROM/LEFT JOIN/WHERE fragment for orphan-record queries."""
         return (
-            f"FROM `{schema}`.`{table}` c "
-            f"LEFT JOIN `{schema}`.`{ref_table}` p ON c.`{column}` = p.`{ref_column}` "
-            f"WHERE c.`{column}` IS NOT NULL AND p.`{ref_column}` IS NULL"
+            f"FROM {quote_mysql_ident(schema)}.{quote_mysql_ident(table)} c "
+            f"LEFT JOIN {quote_mysql_ident(schema)}.{quote_mysql_ident(ref_table)} p ON c.{quote_mysql_ident(column)} = p.{quote_mysql_ident(ref_column)} "
+            f"WHERE c.{quote_mysql_ident(column)} IS NOT NULL AND p.{quote_mysql_ident(ref_column)} IS NULL"
         )
 
     def generate_orphan_query(
@@ -121,7 +122,7 @@ class ForeignKeyResolver:
             if orphan_count <= 0:
                 continue
 
-            sample_query = f"SELECT DISTINCT c.`{column}` as orphan_value {join_where} LIMIT {sample_limit}"
+            sample_query = f"SELECT DISTINCT c.{quote_mysql_ident(column)} as orphan_value {join_where} LIMIT {sample_limit}"
             sample_values = [
                 str(row["orphan_value"])
                 for row in self.connector.execute(sample_query)
