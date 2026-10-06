@@ -514,18 +514,7 @@ pub enum LiveAdapter {
 impl LiveAdapter {
     pub fn connect(endpoint: &Endpoint) -> Result<Self, String> {
         match endpoint.engine.as_str() {
-            "mysql" => {
-                let opts = mysql_opts(endpoint);
-                let pool =
-                    mysql::Pool::new(opts).map_err(|err| format!("mysql pool error: {err}"))?;
-                let conn = pool
-                    .get_conn()
-                    .map_err(|err| {
-                        let suffix = tls_error_suffix(classify_mysql_error(endpoint, &err));
-                        format!("mysql connection error: {err}{suffix}")
-                    })?;
-                Ok(Self::MySql(conn))
-            }
+            "mysql" => Ok(Self::MySql(mysql_conn(endpoint)?)),
             "postgresql" => {
                 let mut client = connect_postgres(endpoint)
                     .map_err(|err| format!("postgresql connection error: {err}"))?;
@@ -786,6 +775,15 @@ impl LiveAdapter {
                 .map_err(|err| format_postgres_error("postgresql create table error", &err)),
         }
     }
+}
+
+/// 연결 하나를 연다. 실패 메시지에는 TLS 분류 코드(error_code=...)가 붙는다.
+pub(crate) fn mysql_conn(endpoint: &Endpoint) -> Result<mysql::PooledConn, String> {
+    let pool = mysql::Pool::new(mysql_opts(endpoint)).map_err(|err| format!("mysql pool error: {err}"))?;
+    pool.get_conn().map_err(|err| {
+        let suffix = tls_error_suffix(classify_mysql_error(endpoint, &err));
+        format!("mysql connection error: {err}{suffix}")
+    })
 }
 
 pub(crate) fn mysql_opts(endpoint: &Endpoint) -> mysql::OptsBuilder {
