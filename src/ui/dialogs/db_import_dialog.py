@@ -30,29 +30,16 @@ from src.exporters.rust_dump_exporter import (
 )
 from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
 from src.ui.dialogs.collapsible_config_dialog import CollapsibleConfigDialog
-from src.ui.workers.error_reporting_worker import ErrorReportingMixin
+from src.ui.workers.error_reporting_worker import (
+    ErrorReportingMixin,
+    report_operation_error,
+    sanitize_local_diagnostic_json,
+)
 from src.ui.dialogs.job_recording import begin_import_job, begin_promotion_job, finish_import_job, finish_promotion_job
 from src.ui.workers.rust_dump_worker import RustDumpWorker
 from src.core.migration_analyzer import DumpFileAnalyzer, CompatibilityIssue
 
 logger = get_logger('db_dialogs')
-
-def _escape_local_diagnostic_text(value: object) -> str:
-    return sanitize_local_diagnostic(value)
-
-
-def _structured_local_diagnostic_text(value: object) -> str:
-    try:
-        serialized = json.dumps(
-            sanitize_local_diagnostic_data(value),
-            ensure_ascii=False,
-            separators=(",", ":"),
-            allow_nan=False,
-        )
-    except BaseException:
-        serialized = "REDACTED"
-    return sanitize_local_diagnostic(serialized)
-
 
 def _sanitized_rust_event(event: dict) -> dict:
     """Return a cycle-safe, recursively sanitized Rust event copy."""
@@ -133,13 +120,13 @@ def _promotion_review_text(plan: dict, profile: dict) -> str:
         namespace = str(endpoint.get("database") or "?")
         if endpoint.get("engine") == "postgresql":
             namespace += "/" + str(endpoint.get("schema") or "?")
-        return _escape_local_diagnostic_text(f"{endpoint.get('engine', '?')} {endpoint.get('host', '?')}:{endpoint.get('port', '?')} / {namespace}")
+        return sanitize_local_diagnostic(f"{endpoint.get('engine', '?')} {endpoint.get('host', '?')}:{endpoint.get('port', '?')} / {namespace}")
 
     lines = [translate_text("기존 대상") + ": " + endpoint_text(plan.get("original_target")),
              translate_text("새 복원 대상") + ": " + endpoint_text(plan.get("candidate_target")),
-             translate_text("이전 데이터 백업 이름") + ": " + _escape_local_diagnostic_text(plan.get("backup_namespace") or "?")]
+             translate_text("이전 데이터 백업 이름") + ": " + sanitize_local_diagnostic(plan.get("backup_namespace") or "?")]
     if profile:
-        lines.append(translate_text("연결 프로필") + ": " + _escape_local_diagnostic_text(f"{profile.get('name', '?')} / {profile.get('environment', '?')} / {profile.get('remote_host', '?')}:{profile.get('remote_port', '?')}"))
+        lines.append(translate_text("연결 프로필") + ": " + sanitize_local_diagnostic(f"{profile.get('name', '?')} / {profile.get('environment', '?')} / {profile.get('remote_host', '?')}:{profile.get('remote_port', '?')}"))
     summary = plan.get("summary") if isinstance(plan.get("summary"), dict) else {}
     for key, label in (("selected_tables", "교체할 테이블"), ("new_tables", "새 테이블"),
                        ("target_only_tables_preserved", "기존 대상에만 있는 테이블 (유지)"),
@@ -148,14 +135,14 @@ def _promotion_review_text(plan: dict, profile: dict) -> str:
                        ("views_replaced", "교체할 뷰")):
         values = summary.get(key)
         if isinstance(values, list):
-            preview = ", ".join(_escape_local_diagnostic_text(value) for value in values[:6]) or "-"
+            preview = ", ".join(sanitize_local_diagnostic(value) for value in values[:6]) or "-"
             if len(values) > 6:
                 preview += f" … (+{len(values) - 6})"
             lines.append(f"{translate_text(label)} ({len(values)}): {preview}")
     if summary.get("data_not_compared"):
         lines.append(translate_text("행 수만으로 데이터 일치를 보장하지 않습니다."))
     if summary.get("write_pause"):
-        lines.append(translate_text("전환 중 서비스 영향") + ": " + _escape_local_diagnostic_text(summary["write_pause"]))
+        lines.append(translate_text("전환 중 서비스 영향") + ": " + sanitize_local_diagnostic(summary["write_pause"]))
     if isinstance(summary.get("row_counts"), dict):
         lines.append(translate_text("행 수 비교 (기존 / 새 대상)"))
         for table, counts in list(summary["row_counts"].items())[:6]:
@@ -163,11 +150,11 @@ def _promotion_review_text(plan: dict, profile: dict) -> str:
                 old, new = counts.get("original"), counts.get("candidate")
                 old = old if isinstance(old, int) else translate_text("미확인")
                 new = new if isinstance(new, int) else translate_text("미확인")
-                lines.append(f"  {_escape_local_diagnostic_text(table)}: {old} / {new}")
+                lines.append(f"  {sanitize_local_diagnostic(table)}: {old} / {new}")
     for key, label in (("warnings", "주의 사항"), ("blockers", "전환 차단 사유")):
         items = plan.get(key) or summary.get(key) or []
         if items:
-            lines.append(translate_text(label) + ":\n" + "\n".join(_escape_local_diagnostic_text(item) for item in items))
+            lines.append(translate_text(label) + ":\n" + "\n".join(sanitize_local_diagnostic(item) for item in items))
     lines.append(translate_text("전체 목록과 비교 내용은 상세 정보를 펼쳐 확인하세요."))
     return "\n".join(lines)
 
@@ -1108,7 +1095,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _add_log(self, msg: str):
         """로그 항목 추가 (수집용, 최대 500개 유지)"""
         timestamp = datetime.now().strftime('%H:%M:%S')
-        log_entry = f"[{timestamp}] {_escape_local_diagnostic_text(msg)}"
+        log_entry = f"[{timestamp}] {sanitize_local_diagnostic(msg)}"
         self.log_entries.append(log_entry)
         if len(self.log_entries) > MAX_LOG_ENTRIES:
             del self.log_entries[:-MAX_LOG_ENTRIES]
@@ -1360,7 +1347,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def on_progress(self, msg: str):
         """일반 진행 메시지 처리"""
-        msg = _escape_local_diagnostic_text(msg)
+        msg = sanitize_local_diagnostic(msg)
         self.txt_log.addItem(msg)
         self.txt_log.scrollToBottom()
         self.label_status.setText(msg)
@@ -1380,7 +1367,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def on_table_progress(self, current: int, total: int, table_name: str):
         """테이블별 진행률 업데이트"""
         self.label_tables.setText(f"📋 테이블: {current} / {total} 완료")
-        display_table = _escape_local_diagnostic_text(table_name)
+        display_table = sanitize_local_diagnostic(table_name)
         self._add_log(f"테이블 완료: {display_table} ({current}/{total})")
 
     def on_detail_progress(self, info: dict):
@@ -1416,7 +1403,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         display_info = dict(info)
         for key in ("table", "current_phase", "strategy"):
             if key in display_info:
-                display_info[key] = _escape_local_diagnostic_text(
+                display_info[key] = sanitize_local_diagnostic(
                     display_info[key]
                 )
         data_label, speed_label, status_label = format_import_row_labels(
@@ -1448,8 +1435,8 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def on_table_status(self, table_name: str, status: str, message: str):
         """테이블 상태 업데이트 (메타데이터 정보 포함)"""
         icon = '⏸' if status == 'blocked' else TABLE_STATUS_ICONS.get(status, '❓')
-        display_table = _escape_local_diagnostic_text(table_name)
-        display_message = _escape_local_diagnostic_text(message)
+        display_table = sanitize_local_diagnostic(table_name)
+        display_message = sanitize_local_diagnostic(message)
 
         # 메타데이터에서 테이블 정보 가져오기
         size_info = ""
@@ -1527,14 +1514,14 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 # 단일 chunk 테이블: 진행률 표시 안 함
                 chunk_info = ""
 
-            display_table = _escape_local_diagnostic_text(table_name)
+            display_table = sanitize_local_diagnostic(table_name)
             display_text = f"{icon} {display_table}{size_info}{chunk_info}"
 
             # error 상태이면 메시지 추가
             if current_status == 'error':
                 message = self.import_results.get(table_name, {}).get('message', '')
                 if message:
-                    display_message = _escape_local_diagnostic_text(message)
+                    display_message = sanitize_local_diagnostic(message)
                     display_text += f" - {display_message[:50]}..."
 
             item.setText(display_text)
@@ -1559,7 +1546,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 _capture_import_audit(self.import_audit, sanitized_event)
                 normalized_event = _normalized_import_telemetry(sanitized_event)
                 if normalized_event is None:
-                    visible_summary = _structured_local_diagnostic_text(
+                    visible_summary = sanitize_local_diagnostic_json(
                         sanitized_event
                     )
                 else:
@@ -1567,7 +1554,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                         normalized_event
                     )
             else:
-                visible_summary = _structured_local_diagnostic_text(event)
+                visible_summary = sanitize_local_diagnostic_json(event)
         except (
             json.JSONDecodeError,
             RecursionError,
@@ -1576,13 +1563,13 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             OverflowError,
         ):
             visible_summary = (
-                _structured_local_diagnostic_text(sanitized_event)
+                sanitize_local_diagnostic_json(sanitized_event)
                 if sanitized_event is not None
                 else _sanitize_plain_rust_line(line)
             )
 
         if visible_summary:
-            visible_summary = _escape_local_diagnostic_text(visible_summary)
+            visible_summary = sanitize_local_diagnostic(visible_summary)
             self.txt_log.addItem(visible_summary)
             self.txt_log.scrollToBottom()
             self._add_log(visible_summary)
@@ -1619,7 +1606,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 for table_name, size_bytes, chunk_count in large_tables[:10]:
                     size_str = self._format_bytes(size_bytes)
 
-                    display_table = _escape_local_diagnostic_text(table_name)
+                    display_table = sanitize_local_diagnostic(table_name)
                     display = f"⏳ {display_table} ({size_str}, {chunk_count} chunks)"
                     item = QListWidgetItem(display)
                     item.setForeground(Qt.GlobalColor.gray)
@@ -1640,6 +1627,10 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.label_rerun_hint.setVisible(True)
             self.txt_log.addItem(f"⚠️ {len(failed_tables)}개 테이블 Import 실패")
 
+    def _report_error_anonymously(self):
+        """Submit a privacy-allowlisted report in the background."""
+        report_operation_error(self, "import", "dump.import")
+
     def on_finished(self, success: bool, message: str):
         """작업 완료 처리"""
         new_target = (self.import_audit.get("restore_status") == "completed_new_target"
@@ -1653,7 +1644,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         ):
             success = False
             message = "안전 복원의 검증 결과가 없습니다. 원본과 새 대상의 상태를 보고서에서 확인하세요."
-        message = _escape_local_diagnostic_text(message)
+        message = sanitize_local_diagnostic(message)
         # 로그 기록
         self.import_end_time = datetime.now()
         self.import_success = success
@@ -1767,20 +1758,6 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 
-    def _report_error_anonymously(self):
-        """Submit a privacy-allowlisted report in the background."""
-        if not self.config_manager:
-            return
-        report_args = {
-            "operation_kind": "import",
-            "db_engine": getattr(self.connector, "engine", ""),
-            "phase": "dump.import",
-        }
-        error_code = getattr(getattr(self, "worker", None), "error_code", None)
-        if error_code:
-            report_args["error_code"] = error_code
-        self._start_error_report_worker(**report_args)
-
     def copy_restore_target(self):
         candidate = restore_target_connection_info(self.import_audit.get("candidate_target"))
         if (candidate and self.import_audit.get("verified") is True
@@ -1867,7 +1844,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             self.btn_copy_restore_target.setEnabled(True)
             self.label_status.setText("✅ 기존 이름으로 전환 완료 · 교체한 테이블 데이터는 백업으로 보존")
             self._add_log(self.label_status.text())
-            QMessageBox.information(self, "전환 완료", _structured_local_diagnostic_text(result))
+            QMessageBox.information(self, "전환 완료", sanitize_local_diagnostic_json(result))
         else:
             if action == "plan":
                 self._auto_overwrite = False
@@ -1882,7 +1859,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 self.label_status.setText("전환 차단 · 원본 미변경" if known_unchanged else "전환 결과 미확인 · 원본/백업/복원 대상의 상태를 확인하세요")
                 self.btn_review_restore.setEnabled(known_unchanged)
             self._add_log(message or "Promotion result could not be verified")
-            QMessageBox.warning(self, "전환 작업 확인 필요", _escape_local_diagnostic_text(message) or self.label_status.text())
+            QMessageBox.warning(self, "전환 작업 확인 필요", sanitize_local_diagnostic(message) or self.label_status.text())
         if self._close_after_cancel:
             QTimer.singleShot(0, self.close)
 
@@ -1950,7 +1927,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
     def _confirm_promotion_guard(self, plan: dict) -> bool:
         from html import escape
         from src.core.production_guard import ProductionGuard
-        details = _structured_local_diagnostic_text({
+        details = sanitize_local_diagnostic_json({
             "operation": "promote verified candidate", "original_target": plan.get("original_target"),
             "candidate_target": plan.get("candidate_target"), "backup_namespace": plan.get("backup_namespace"),
         })
@@ -1991,7 +1968,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                            else candidate.get("database")) or schema_name
         if not self.last_import_context and self.last_target_schema:
             schema_name = self.last_target_schema
-        schema_name = safe_filename_component(_escape_local_diagnostic_text(schema_name), "unknown")
+        schema_name = safe_filename_component(sanitize_local_diagnostic(schema_name), "unknown")
         default_filename = f"import_log_{schema_name}_{status}_{timestamp}.txt"
 
         # 기본 저장 경로
@@ -2009,7 +1986,7 @@ class RustDumpImportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             return
 
         try:
-            safe = _escape_local_diagnostic_text
+            safe = sanitize_local_diagnostic
             # 결과 요약
             table_results = self._table_results()
             done_count = self._count_by_status(table_results, 'done')
