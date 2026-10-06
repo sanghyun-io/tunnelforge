@@ -988,6 +988,10 @@ pub(crate) fn legacy_mysql_bit_digits(text: &str, width: u32) -> Result<String, 
 
 fn temporal_base(type_name: &str) -> String {
     let lowered = type_name.trim().to_ascii_lowercase();
+    if lowered.ends_with("[]") {
+        // Arrays move as their text form (LONGTEXT); their elements are not checked here.
+        return String::new();
+    }
     if lowered.starts_with("time") && lowered.contains("with time zone") && !lowered.starts_with("timestamp") {
         return "timetz".to_string();
     }
@@ -1004,7 +1008,13 @@ pub(crate) fn temporal_value_problem(source_engine: &str, source_type: &str, tex
         if matches!(base.as_str(), "date" | "datetime" | "timestamp") {
             let mut parts = text.get(..10)?.split('-').map(|part| part.parse::<u32>().ok());
             let (year, month, day) = (parts.next()??, parts.next()??, parts.next()??);
-            return (year == 0 || month == 0 || day == 0).then_some("a zero or partial date (year, month or day 0)");
+            if year == 0 || month == 0 || day == 0 {
+                return Some("a zero or partial date (year, month or day 0)");
+            }
+            // ALLOW_INVALID_DATES keeps days such as 2024-02-30.
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            let days = match month { 2 if leap => 29, 2 => 28, 4 | 6 | 9 | 11 => 30, _ => 31 };
+            return (month > 12 || day > days).then_some("an invalid date (day past the end of the month)");
         }
         if base == "time" {
             if text.starts_with('-') {
@@ -1031,7 +1041,7 @@ pub(crate) fn temporal_value_problem(source_engine: &str, source_type: &str, tex
 /// SQL condition (on the source) matching the values `temporal_value_problem` refuses.
 pub(crate) fn temporal_scan_condition(source_engine: &str, source_type: &str, column_ref: &str) -> Option<String> {
     match (source_engine, temporal_base(source_type).as_str()) {
-        ("mysql", "date" | "datetime" | "timestamp") => Some(format!("(YEAR({column_ref}) = 0 OR MONTH({column_ref}) = 0 OR DAY({column_ref}) = 0)")),
+        ("mysql", "date" | "datetime" | "timestamp") => Some(format!("(YEAR({column_ref}) = 0 OR MONTH({column_ref}) = 0 OR DAY({column_ref}) = 0 OR DAY({column_ref}) > DAY(LAST_DAY({column_ref})))")),
         ("mysql", "time") => Some(format!("({column_ref} < '00:00:00' OR {column_ref} > '24:00:00')")),
         ("postgresql", "date" | "timestamp") => Some(format!("(NOT isfinite({column_ref}) OR extract(year from {column_ref}) NOT BETWEEN 1 AND 9999)")),
         _ => None,
@@ -3849,13 +3859,16 @@ mod binary_keyset_tests {
             ("postgresql", "date", "infinity", true), ("postgresql", "timestamp(3) with time zone", "-infinity", true),
             ("postgresql", "date", "0044-03-15 BC", true), ("postgresql", "timestamp without time zone", "12000-01-01 00:00:00", true),
             ("postgresql", "date", "2024-02-29", false), ("postgresql", "time without time zone", "24:00:00", false),
-            ("mysql", "varchar(10)", "0000-00-00", false),
+            ("mysql", "varchar(10)", "0000-00-00", false), ("mysql", "date", "2024-02-30", true),
+            ("mysql", "date", "2024-02-29", false), ("mysql", "date", "2023-02-29", true),
+            ("postgresql", "timestamp without time zone[]", "{infinity}", false),
         ] {
             assert_eq!(temporal_value_problem(engine, ty, text).is_some(), refused, "{engine} {ty} {text}");
         }
         assert!(temporal_scan_condition("mysql", "datetime(3)", "`d`").unwrap().contains("MONTH(`d`) = 0"));
         assert!(temporal_scan_condition("postgresql", "timestamp(3) with time zone", "\"d\"").unwrap().contains("isfinite"));
         assert!(temporal_scan_condition("postgresql", "time without time zone", "\"t\"").is_none());
+        assert!(temporal_scan_condition("postgresql", "timestamp(3) with time zone[]", "\"a\"").is_none());
         assert_eq!(temporal_type_problem("postgresql", "time with time zone"), Some((true, "time with time zone has no MySQL type that keeps the offset")));
         assert!(temporal_type_problem("postgresql", "interval").is_some_and(|(blocking, _)| !blocking));
         assert!(temporal_type_problem("postgresql", "timestamp with time zone").is_none());

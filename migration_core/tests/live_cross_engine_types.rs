@@ -160,12 +160,12 @@ fn cross_engine_migration_keeps_types_when_configured() {
 
     // Temporal values the other engine cannot store are refused by preflight, before any DDL.
     let zero = format!("tf_xtypes_zero_{suffix}");
-    my.execute_sql("SET SESSION sql_mode = ''").unwrap();
-    my.execute_sql(&format!("CREATE TABLE {zero} (id INT PRIMARY KEY, d DATE, dt DATETIME, t TIME)")).unwrap();
-    my.execute_sql(&format!("INSERT INTO {zero} VALUES (1, '0000-00-00', '2024-00-15 00:00:00', '100:00:00'), (2, '2024-01-15', '2024-01-15 00:00:00', '12:34:56')")).unwrap();
-    let zero_columns = json!([col("id", "int", true), col("d", "date", false), col("dt", "datetime", false), col("t", "time", false)]);
+    my.execute_sql("SET SESSION sql_mode = 'ALLOW_INVALID_DATES'").unwrap();
+    my.execute_sql(&format!("CREATE TABLE {zero} (id INT PRIMARY KEY, d DATE, dt DATETIME, t TIME, inv DATE)")).unwrap();
+    my.execute_sql(&format!("INSERT INTO {zero} VALUES (1, '0000-00-00', '2024-00-15 00:00:00', '100:00:00', NULL), (2, '2024-01-15', '2024-01-15 00:00:00', '12:34:56', '2024-02-30')")).unwrap();
+    let zero_columns = json!([col("id", "int", true), col("d", "date", false), col("dt", "datetime", false), col("t", "time", false), col("inv", "date", false)]);
     let refused = preflight_refusals(&mysql, &postgres, &zero, zero_columns.clone());
-    for column in ["d", "dt", "t"] {
+    for column in ["d", "dt", "t", "inv"] {
         if !refused.iter().any(|location| location == &format!("{zero}.{column}")) {
             failures.push(format!("MySQL {zero}.{column} with an unstorable value was not refused: {refused:?}"));
         }
@@ -204,6 +204,17 @@ fn cross_engine_migration_keeps_types_when_configured() {
     if refused.iter().any(|location| location == &format!("{inf}.iv")) {
         failures.push("PostgreSQL interval was refused instead of warned".into());
     }
+    // dump.import refuses the timetz column type too, before the target changes.
+    let dir = std::env::temp_dir().join(format!("tf-xtypes-inf-{suffix}"));
+    if let Err(error) = run("dump.run", json!({"source": &postgres, "tables": [&inf], "output_dir": dir, "threads": 1, "data_format": "jsonl", "compression": "none"})) {
+        failures.push(format!("dump of timetz table: {error}"));
+    } else {
+        match run("dump.import", json!({"target": &mysql, "input_dir": dir, "mode": "replace", "threads": 1})) {
+            Err(error) if error.contains("time with time zone") => {}
+            other => failures.push(format!("dump.import of timetz into MySQL was not refused: {other:?}")),
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
 
     for (adapter, tables) in [(&mut my, [&child, &m, &p, &ai, &wide, &nan, &zero, &keyless, &inf]), (&mut pg, [&child, &m, &p, &ai, &wide, &nan, &zero, &keyless, &inf])] {
         for table in tables {
