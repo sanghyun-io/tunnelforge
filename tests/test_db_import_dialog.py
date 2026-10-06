@@ -1216,6 +1216,9 @@ def test_import_close_running_requests_cancel_and_keeps_dialog_until_finished(mo
         def setEnabled(self, enabled):
             self.enabled = enabled
 
+        def setText(self, text):
+            self.text = text
+
     class FakeLabel:
         def __init__(self):
             self.text = ""
@@ -1242,11 +1245,13 @@ def test_import_close_running_requests_cancel_and_keeps_dialog_until_finished(mo
     dialog.worker = FakeWorker()
     dialog.connector = FakeConnector()
     dialog.btn_save_log = FakeButton()
+    dialog.btn_stop = FakeButton()
     dialog.label_status = FakeLabel()
     dialog.log_entries = []
     dialog._cancel_requested = False
     dialog._close_after_cancel = False
     dialog._add_log = lambda message: dialog.log_entries.append(message)
+    dialog.request_stop = lambda close_after=False: RustDumpImportDialog.request_stop(dialog, close_after)
     event = FakeEvent()
 
     RustDumpImportDialog.closeEvent(dialog, event)
@@ -1755,3 +1760,61 @@ def test_import_and_export_titles_do_not_expose_the_engine_name(monkeypatch):
         assert dialog.windowTitle() == "데이터 Import"
     finally:
         dialog.close()
+
+
+def test_import_stop_button_cancels_without_closing_and_shows_final_status_and_report(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: QMessageBox.StandardButton.Yes)
+    dialog = RustDumpImportDialog()
+    try:
+        assert dialog.btn_stop.isHidden(), "stop is offered only while running"
+        dialog.set_ui_enabled(False)
+        assert not dialog.btn_stop.isHidden() and dialog.btn_stop.isEnabled()
+        dialog.worker = MagicMock()
+        dialog.worker.isRunning.return_value = True
+
+        dialog.btn_stop.click()
+
+        dialog.worker.cancel.assert_called_once_with()
+        assert dialog._cancel_requested is True and dialog._close_after_cancel is False
+        assert dialog.btn_stop.text() == "중지 중…" and not dialog.btn_stop.isEnabled()
+        assert dialog.label_status.text() == "⏹ 중지 중…"
+
+        report = tmp_path / "_tunnelforge_import_report.json"
+        report.write_text("{}", encoding="utf-8")
+        dialog.last_input_dir = str(tmp_path)
+        dialog.last_import_mode = "replace"
+        dialog.import_results = {"a": {"status": "done"}, "b": {"status": "blocked"}}
+        dialog.worker.isRunning.return_value = False
+        closed = []
+        monkeypatch.setattr(dialog, "close", lambda: closed.append(True))
+        dialog.on_finished(False, "cancelled")
+        app.processEvents()
+
+        assert closed == [], "stopping keeps the dialog open"
+        assert dialog.label_status.text().startswith("⏹ Import 취소됨")
+        assert dialog.btn_stop.isHidden()
+        assert not dialog.label_report_link.isHidden()
+        assert "_tunnelforge_import_report.json" in dialog.label_report_link.text()
+    finally:
+        dialog.worker = None
+        type(dialog).close(dialog)
+
+
+def test_import_close_while_running_still_stops_and_closes_after_finish(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    monkeypatch.setattr("src.ui.dialogs.db_import_dialog.check_rust_dump", lambda: (True, "Rust DB Core OK"))
+    asked = []
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: asked.append(1) or QMessageBox.StandardButton.Yes)
+    dialog = RustDumpImportDialog()
+    try:
+        dialog.worker = MagicMock()
+        dialog.worker.isRunning.return_value = True
+        dialog.request_stop(close_after=False)
+        dialog.close()  # stop already requested: closing only schedules close-after-finish, no second prompt
+        assert asked == [1] and dialog._close_after_cancel is True
+        dialog.worker.cancel.assert_called_once_with()
+    finally:
+        dialog.worker = None
+        type(dialog).close(dialog)

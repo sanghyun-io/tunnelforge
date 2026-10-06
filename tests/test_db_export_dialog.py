@@ -1278,3 +1278,50 @@ def test_export_title_does_not_expose_the_engine_name(monkeypatch):
         assert dialog.windowTitle() == "데이터 Export"
     finally:
         dialog.close()
+
+
+def _export_with_tables(tables):
+    QApplication.instance() or QApplication([])
+    connector = MagicMock()
+    connector.get_schemas.return_value = ["app"]
+    connector.get_tables.return_value = tables
+    return RustDumpExportDialog(connector=connector)
+
+
+def test_export_table_filter_and_selection_counter():
+    dialog = _export_with_tables(["orders", "order_items", "users"])
+    try:
+        assert dialog.label_table_count.text() == "3/3 선택"
+        dialog.input_table_filter.setText("ORDER")
+        visible = [dialog.list_tables.item(i).text() for i in range(dialog.list_tables.count())
+                   if not dialog.list_tables.item(i).isHidden()]
+        assert visible == ["orders", "order_items"]
+        dialog.deselect_all_tables()  # applies to the filtered rows only
+        assert dialog.get_selected_tables() == ["users"]
+        assert dialog.label_table_count.text() == "1/3 선택"
+        dialog.input_table_filter.clear()
+        assert all(not dialog.list_tables.item(i).isHidden() for i in range(dialog.list_tables.count()))
+        dialog.select_all_tables()
+        assert dialog.label_table_count.text() == "3/3 선택"
+    finally:
+        dialog.close()
+
+
+def test_export_done_offers_open_folder(monkeypatch, tmp_path):
+    from src.ui.dialogs import db_export_dialog
+
+    dialog = _export_with_tables(["a"])
+    opened = []
+    monkeypatch.setattr(db_export_dialog.QDesktopServices, "openUrl", lambda url: opened.append(url.toLocalFile()) or True)
+
+    try:
+        dialog.input_output_dir.setText(str(tmp_path))
+        box = dialog._show_export_done("done")  # non-blocking: the caller (job recording etc.) continues
+        buttons = {b.text(): b for b in box.buttons()}
+        assert "📂 폴더 열기" in buttons
+        buttons["📂 폴더 열기"].click()
+        assert [os.path.normcase(os.path.normpath(p)) for p in opened] == [os.path.normcase(str(tmp_path))]
+        dialog.input_output_dir.setText(str(tmp_path / "missing"))
+        assert dialog.open_output_folder() is False
+    finally:
+        dialog.close()

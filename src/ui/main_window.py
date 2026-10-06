@@ -638,7 +638,40 @@ class TunnelManagerUI(QMainWindow):
         """작업 목록 (TF-STATUS-132)"""
         from src.core.job_history import make_history
         from src.ui.dialogs.job_list_dialog import JobListDialog
-        JobListDialog(make_history(), reopen=self.reopen_job_dialog, parent=self).exec()
+        JobListDialog(make_history(), reopen=self.reopen_job_dialog, parent=self,
+                      manage_backups=self.open_job_backups).exec()
+
+    def open_job_backups(self, record):
+        """작업 목록의 Import 기록 → 복원 백업 관리. 앱을 다시 켠 뒤에도 그 Dump 폴더의 저널과
+        보고서의 원래 대상(자격 증명 없음) + 프로필에 저장된 자격 증명으로 연다."""
+        import json
+        from src.core.connection_trust import apply_registered_tls
+        from src.exporters.rust_dump_exporter import restore_target_connection_info
+        from src.ui.dialogs.backup_lifecycle_dialog import BackupLifecycleDialog
+        try:
+            with open(record.report_path, encoding='utf-8') as f:
+                report = json.load(f)
+        except (OSError, ValueError):
+            report = {}
+        original = restore_target_connection_info(report.get('original_target') if isinstance(report, dict) else None)
+        if not original:
+            QMessageBox.information(self, "백업 관리", "이 기록의 Dump 폴더에서 안전 복원 보고서를 찾을 수 없습니다.")
+            return
+        tunnel = next((t for t in self.config_mgr.load_config().get('tunnels', [])
+                       if record.profile_id and t.get('id') == record.profile_id), None)
+        if tunnel is None:
+            QMessageBox.information(self, "백업 관리", "이 기록의 연결 프로필을 찾을 수 없습니다.")
+            return
+        if not self._ensure_tunnel_running(tunnel, prompt=True):
+            return
+        user, password = self.config_mgr.get_tunnel_credentials(tunnel['id'])
+        if not user:
+            QMessageBox.warning(self, "백업 관리", "DB 자격 증명이 저장되어 있지 않습니다.")
+            return
+        original.update(user=user, password=password)
+        dialog = BackupLifecycleDialog(apply_registered_tls(original), [os.path.dirname(record.report_path)], self)
+        dialog.refresh()
+        dialog.exec()
 
     def reopen_job_dialog(self, record):
         """작업 목록에서 원래 대화상자를 연다. Export 만 이전 설정으로 화면을 채우고, 나머지는 설정 없이 연다

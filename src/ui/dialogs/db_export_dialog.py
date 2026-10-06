@@ -9,7 +9,8 @@ from PyQt6.QtWidgets import (
     QRadioButton, QButtonGroup, QWidget, QAbstractItemView,
     QSplitter, QScrollArea
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer, QUrl
+from PyQt6.QtGui import QDesktopServices
 from typing import List, Optional
 from datetime import datetime
 import json
@@ -486,9 +487,21 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
         btn_layout.addStretch()
         table_layout.addLayout(btn_layout)
 
+        filter_layout = QHBoxLayout()
+        self.input_table_filter = QLineEdit()
+        self.input_table_filter.setPlaceholderText("테이블 이름 필터")
+        self.input_table_filter.setClearButtonEnabled(True)
+        self.input_table_filter.textChanged.connect(self._apply_table_filter)
+        self.label_table_count = QLabel("0/0 선택")
+        filter_layout.addWidget(self.input_table_filter, 1)
+        filter_layout.addWidget(self.label_table_count)
+        table_layout.addLayout(filter_layout)
+
         self.list_tables = QListWidget()
         self.list_tables.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
         self.list_tables.setMaximumHeight(150)
+        self.list_tables.setMinimumHeight(100)  # 낮은 창에서는 눌리지 않고 설정 영역이 스크롤된다
+        self.list_tables.itemChanged.connect(self._update_table_count)
         table_layout.addWidget(self.list_tables)
 
         self.chk_include_fk = QCheckBox("FK 의존성 테이블 자동 포함")
@@ -924,6 +937,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
 
     def on_schema_changed(self, schema: str):
         self.list_tables.clear()
+        self._update_table_count()
         if not schema or not self.connector:
             return
         tables = self.connector.get_tables(schema)
@@ -931,17 +945,35 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             item = QListWidgetItem(table)
             item.setCheckState(Qt.CheckState.Checked)
             self.list_tables.addItem(item)
+        self._apply_table_filter(self.input_table_filter.text())
+        self._update_table_count()
 
         # 출력 폴더명 업데이트 (스키마 반영)
         self._update_output_dir_preview()
 
+    def _visible_table_items(self):
+        return [self.list_tables.item(i) for i in range(self.list_tables.count())
+                if not self.list_tables.item(i).isHidden()]
+
     def select_all_tables(self):
-        for i in range(self.list_tables.count()):
-            self.list_tables.item(i).setCheckState(Qt.CheckState.Checked)
+        """전체 선택/해제는 필터에 보이는 테이블에만 적용한다 (필터가 없으면 전체)."""
+        for item in self._visible_table_items():
+            item.setCheckState(Qt.CheckState.Checked)
 
     def deselect_all_tables(self):
+        for item in self._visible_table_items():
+            item.setCheckState(Qt.CheckState.Unchecked)
+
+    def _apply_table_filter(self, text: str = ""):
+        needle = (text or "").strip().lower()
         for i in range(self.list_tables.count()):
-            self.list_tables.item(i).setCheckState(Qt.CheckState.Unchecked)
+            item = self.list_tables.item(i)
+            item.setHidden(bool(needle) and needle not in item.text().lower())
+
+    def _update_table_count(self, *_):
+        total = self.list_tables.count()
+        checked = sum(1 for i in range(total) if self.list_tables.item(i).checkState() == Qt.CheckState.Checked)
+        self.label_table_count.setText(f"{checked}/{total} 선택")
 
     def get_selected_tables(self) -> List[str]:
         tables = []
@@ -1383,8 +1415,7 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
             total_count = len(self.table_items)
             if total_count > 0:
                 self.label_tables.setText(f"📋 테이블: {done_count} / {total_count} 완료")
-            QMessageBox.information(
-                self, "Export 완료",
+            self._show_export_done(
                 f"✅ Export가 완료되었습니다.\n\n폴더: {self.input_output_dir.text()}"
                 + (
                     "\n\n⚠️ 테이블 데이터만 내보낸 불완전 Export입니다. "
@@ -1558,6 +1589,25 @@ class RustDumpExportDialog(CollapsibleConfigDialog, ErrorReportingMixin, QDialog
                 self.txt_log.takeItem(0)
             self.txt_log.addItem(visible_line)
             self.txt_log.scrollToBottom()
+
+    def _show_export_done(self, text: str) -> QMessageBox:
+        """완료 안내 + '폴더 열기'(결과 폴더를 탐색기로 연다). open() 이라 호출부를 막지 않는다."""
+        box = QMessageBox(self)
+        box.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("Export 완료")
+        box.setText(text)
+        open_button = box.addButton("📂 폴더 열기", QMessageBox.ButtonRole.ActionRole)
+        box.addButton(QMessageBox.StandardButton.Ok)
+        box.buttonClicked.connect(lambda button: self.open_output_folder() if button is open_button else None)
+        box.open()
+        return box
+
+    def open_output_folder(self) -> bool:
+        folder = self.input_output_dir.text()
+        if folder and os.path.isdir(folder):
+            return QDesktopServices.openUrl(QUrl.fromLocalFile(folder))
+        return False
 
     def _report_error_anonymously(self):
         """Submit a privacy-allowlisted report in the background."""
