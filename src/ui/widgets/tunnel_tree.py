@@ -440,14 +440,39 @@ class TunnelTreeWidget(QTreeWidget):
             # 그룹 더블클릭: 접기/펼치기
             item.setExpanded(not item.isExpanded())
         elif item_type == self.ITEM_TYPE_TUNNEL:
-            # 터널 더블클릭: 연결 상태에 따라 분기
-            # - 🟢 (연결됨) → SQL 에디터 열기
-            # - 그 외 → 수정 다이얼로그 (기존 동작)
+            # 터널 더블클릭(= Enter): 상태와 무관하게 항상 SQL 에디터.
+            # 연결 안 된 터널은 open_sql_editor 가 시작 여부를 묻고(_ensure_tunnel_running),
+            # 자격 증명이 없으면 안내한다. 수정은 F2 / 수정 버튼 / ⋯ 메뉴로 한다.
+            self.tunnel_sql_editor.emit(item_data.get('data', {}))
+
+    def keyPressEvent(self, event):
+        """선택한 연결 단축키: Enter=SQL 에디터, Space=시작/중지, F2=수정, Delete=삭제(확인 대화상자 거침)"""
+        item = self.currentItem()
+        item_data = item.data(0, Qt.ItemDataRole.UserRole) if item else None
+        if (
+            item_data
+            and item_data.get('type') == self.ITEM_TYPE_TUNNEL
+            and self.state() != QAbstractItemView.State.EditingState
+            and not (event.modifiers() & ~Qt.KeyboardModifier.KeypadModifier)
+        ):
             tunnel_data = item_data.get('data', {})
-            if item.text(0) == "🟢":
+            key = event.key()
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
                 self.tunnel_sql_editor.emit(tunnel_data)
-            else:
+                return
+            if key == Qt.Key.Key_Space:
+                if item.text(0) == "🟢":
+                    self.tunnel_stop_requested.emit(tunnel_data)
+                else:
+                    self.tunnel_start_requested.emit(tunnel_data)
+                return
+            if key == Qt.Key.Key_F2:
                 self.tunnel_edit_requested.emit(tunnel_data)
+                return
+            if key == Qt.Key.Key_Delete:
+                self.tunnel_delete_requested.emit(tunnel_data)
+                return
+        super().keyPressEvent(event)
 
     def _on_item_expanded(self, item):
         """아이템 확장됨"""
