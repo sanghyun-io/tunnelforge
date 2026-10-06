@@ -362,6 +362,20 @@ _EN_TEXT_TRANSLATIONS = {
         "A query is running. The current DB operation may not stop immediately. Wait for it to finish before closing?"
     ),
     "저장되지 않은 셀 편집 {}건": "{} unsaved cell edit(s)",
+    "구분": "Kind",
+    "내용": "Details",
+    "해결 방법": "How to Fix",
+    "차단": "Blocking",
+    "점검 로그 보기": "Show Check Log",
+    "이슈 목록 보기": "Show Issue List",
+    "실행 모드가 바뀌어 전환 가능 여부를 다시 점검해야 합니다.": "The run mode changed. Run the migration readiness check again.",
+    "Target 데이터 있음": "Target Has Data",
+    "문자셋": "Charset",
+    "공간 타입 미지원": "Unsupported Spatial Type",
+    "날짜/시간 타입 미지원": "Unsupported Date/Time Type",
+    "날짜/시간 값 범위 초과": "Date/Time Value Out of Range",
+    "날짜/시간 값 검사 실패": "Date/Time Value Scan Failed",
+    "FK 동작 미지원": "Unsupported FK Action",
 }
 
 _EN_PHRASE_TRANSLATIONS = {
